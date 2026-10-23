@@ -1,0 +1,226 @@
+# mu — design
+
+A terminal coding agent with pi's pluggability and omp's capabilities, where the memory it holds is the
+user's content plus what the user is using right now. A native Rust core does the agent work; every other
+feature is a plugin that loads on use.
+
+Status: draft. All decisions so far are recorded in place.
+
+## Principles
+
+1. **Resident memory = content + active capability.** Content (conversation, tool output, images) may use
+   whatever it needs. Anything incidental — runtimes, eager initialization, idle processes, caches nobody
+   reads, allocator retention — must go to zero.
+2. **Load on use.** Nothing starts, parses or allocates until the user or the model needs it.
+3. **omp-compatible files.** Context files, skills, rules, MCP config and sessions work unchanged.
+4. **Reuse before rewrite.** omp's MIT-licensed Rust crates for tools; omp's own gateway for providers.
+
+## Why
+
+Measured 2026-10-23 on this machine (method in the appendix).
+
+| Agent | Private RAM per idle session | Notes |
+|---|---|---|
+| omp 18.12.6 | 165 MB (133 MB with extensions, LSP, skills, rules off) | Disabled features stay resident; plus machine-wide helpers of 97 + 23 + 23 MB |
+| pi 1.4.0 | 72 MB | Node runtime floor |
+| Codex CLI (Rust) | 27 MB | 308 MB binary; everything bundled |
+| Rust floor (HTTPS + TLS + async runtime) | 0.6 MB | 6.2 MB binary |
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph core["mu core (one binary)"]
+    loop[agent loop] --- prov[native providers]
+    loop --- sess[sessions]
+    loop --- tui[terminal UI]
+    loop --- tools[built-in tools]
+    loop --- host[plugin host]
+  end
+  host <-->|JSON-RPC over stdio, started on use| gw[gateway: omp auth-gateway]
+  host <-->|JSON-RPC| lsp[lsp]
+  host <-->|JSON-RPC| web[web]
+  host <-->|JSON-RPC| ast[ast]
+  host <-->|JSON-RPC| mem[memory]
+  host <-->|MCP| mcp[any MCP server]
+  loop -->|spawns mu --headless| sub[subagent]
+```
+
+## Core
+
+| Component | Responsibility | Reuse |
+|---|---|---|
+| Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
+| Native providers | Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Gemini; API keys | — |
+| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume, branching, checkpoint/rewind | — |
+| Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
+| Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
+| Built-in tools | read, write, edit (hash-anchored), bash, grep, glob, find, todo, ask | `pi-edit`, `pi-shell`, `pi-walker`, `pi-diff`, `pi-vcs` |
+| Output spill | Tool output and images above a threshold go to `artifact://` files, not the heap | — |
+| Subagents | Spawn `mu --headless` with a task; receive a schema-validated result | — |
+| Plugin host | Manifests, lazy start, lifetimes, hooks, MCP client | — |
+| Terminal UI | Inline rendering into the terminal's scrollback; streaming markdown, diffs, status line | — |
+
+Stream rules stay in the core because they run on every streamed token; a process hop there buys nothing.
+
+## Plugins
+
+### Protocol
+
+- **Transport:** JSON-RPC 2.0, newline-delimited over stdio — MCP's stdio framing. An MCP server is a plugin
+  that only provides tools.
+- **Manifest:** each plugin ships a static `plugin.toml`. The core reads manifests at startup (small files)
+  and advertises their tools to the model **without starting the plugin process**.
+
+  ```toml
+  name = "lsp"
+  command = ["mu-lsp"]
+  lifetime = "session"            # session | idle:<duration> | call
+  hooks = ["tool_result:write", "tool_result:edit"]
+
+  [[tools]]
+  name = "lsp"
+  description = "Definitions, references, rename, diagnostics"
+  schema = "schemas/lsp.json"
+  ```
+
+- **Activation:** a plugin process starts on the first call to one of its tools or commands, or the first
+  occurrence of a hook it subscribes to. A plugin subscribed to a per-turn hook therefore starts on the first
+  turn — that is use, not waste.
+- **MCP servers without a manifest:** their tool list is cached on disk, keyed by a hash of the server's
+  config, and refreshed whenever the server actually starts. First session after a config change starts the
+  server once to list tools.
+- **Lifetimes:** `session` (until the session ends), `idle:<duration>` (exit after inactivity), `call` (exit
+  after each call). Language servers run for the whole session.
+
+### Hooks
+
+| Hook | Fires | Plugin may | Used by |
+|---|---|---|---|
+| `session_start` | Session opens or resumes | Return context to inject | memory (recall) |
+| `prompt_submit` | User sends a prompt | Return context to inject | memory |
+| `tool_call` | Before a tool runs | Block, rewrite arguments | approval-style plugins |
+| `tool_result:<tool>` | After a tool runs | Append context to the result | lsp (diagnostics after write/edit) |
+| `turn_end` | Assistant turn completes | Observe the turn | memory (retain), advisor |
+| `pre_compaction` | Before compaction | Return context to preserve | memory |
+| `session_end` | Session closes | Flush state | memory |
+
+### Plugin ↔ core calls
+
+| Direction | Call | Purpose |
+|---|---|---|
+| plugin → core | `core/complete` | One-off model call through the configured providers (memory summaries, advisor, commit messages) |
+| plugin → core | `core/tool` | Invoke a built-in tool |
+| plugin → core | `ui/notify`, `ui/confirm`, `ui/select`, `ui/input` | User interaction (the subset pi's RPC extension UI proves workable) |
+| core → plugin | `tool/call`, `command/run`, `hook/<name>` | Dispatch |
+
+Tool results carry `content` for the model and optional `display` for the user, as in pi.
+
+### First-party plugins
+
+All omp features outside the core become first-party plugins that load on use.
+
+| Plugin | Day one | Implementation |
+|---|---|---|
+| gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider, OAuth logins, account pools, quota. See Providers. |
+| lsp | yes | Rust; spawns language servers per workspace, lifetime `session` |
+| web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway is verified in M4. |
+| ast | yes | Rust; `ast_grep` / `ast_edit` on `pi-ast`. Grammars live here, keeping the core binary small. |
+| memory | yes | Day one: wraps the `mnemopi` CLI against the user's existing store (a Bun process only during recall/retain). Later: Rust port on the same SQLite schema with `fastembed-rs`. |
+| debugger, eval, github, browser, ssh | later | — |
+| advisor, commit messages, export/share, usage display | later | Need `core/complete` / `turn_end` |
+| prediction, voice | later | Prediction needs a composer-keystroke hook, not in the table above |
+| agent hub, agent messaging, collab, live streaming | later | Need a session API beyond the hooks above |
+| vibe, autoresearch, autolearn, auto-thinking, compress, marketplace | later | — |
+
+## Providers
+
+- **Native in the core:** the four wire protocols above, with API keys, plus custom OpenAI-compatible models
+  from omp's `models.yml` (local endpoints). Most providers speak one of them.
+- **Gateway plugin:** everything else omp supports, through `omp auth-gateway serve` backed by
+  `omp auth-broker serve`. (`auth-gateway stdio` was rejected: it returns a streamed reply as one string after
+  the stream ends.) The gateway accepts Anthropic Messages, OpenAI Chat/Responses and pi-native stream
+  requests, dispatches through omp's provider layer with the broker's credentials, and lists usable models at
+  `GET /v1/models`.
+- **Lifecycle:** the plugin starts both processes when a gateway-served model is first selected, on loopback
+  ports, passing `OMP_AUTH_BROKER_URL` only to the gateway process it spawns — the user's omp config is not
+  changed. It authenticates with the bearer tokens omp keeps in its config dir. Lifetime `idle:<duration>`
+  stops both. One pair serves all mu sessions. The gateway alone measured 161 MB; the broker is unmeasured.
+- **What `serve` does not do** (unlike `stdio`): role selectors such as `@smol`, omp's fallback chains, and
+  `models.yml` custom models. The core resolves roles itself from omp's config and sends provider-qualified
+  ids; custom models go to native providers.
+- **Risk to verify in M3:** the broker refreshes OAuth tokens in the same credential store that running omp
+  sessions use. If a provider rotates refresh tokens, omp and the broker could invalidate each other's.
+
+## Compatibility
+
+Reads omp's files in place. Agent dir: `~/.omp/agent`, or `~/.omp/profiles/<name>/agent` for a profile;
+`PI_CODING_AGENT_DIR` overrides.
+
+| Artifact | omp location | mu |
+|---|---|---|
+| Context files | `<agent>/AGENTS.md`, nearest non-empty `.omp/AGENTS.md`, `AGENTS.md` / `CLAUDE.md` conventions | Read |
+| Sticky rules | `<agent>/RULES.md`, `.omp/RULES.md` | Read; carried on every request |
+| Stream rules | omp rule files | Read |
+| Skills | `<root>/skills/<name>/SKILL.md`, one level deep | Read |
+| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` | Read |
+| Sessions | `<agent>/sessions/<encoded-cwd>/<ts>_<id>.jsonl`, v3 tree; blobs `<agent>/blobs/<sha256>` | Written in omp's v3 format to mu's own directory; omp opens them with `--resume <path>` or `--session-dir` |
+
+Non-goal: running pi or omp TypeScript extensions.
+
+## Memory discipline
+
+| Incidental source | Rule |
+|---|---|
+| Runtime heap | Native code; unused code paths are never paged in |
+| Eager initialization | Data built into the binary or loaded on first use; nothing parsed at startup |
+| Allocator retention | Stream request bodies to the socket; release memory after each turn (allocator choice measured in M0) |
+| Background processes | None in the core; plugins start on use and follow their lifetime |
+| Threads | Single-threaded runtime; worker threads only for the duration of parallel work |
+| Terminal UI copies | Finished output lives in the terminal's scrollback; resize redraws from the session file |
+| Inactive session parts | Old branches and compacted history stay on disk |
+| Large tool output, images | Spilled to files; read on expand |
+| Highlighting | No bulk-loaded syntax sets (`syntect` defaults measured at +6.5 MB); per-language, lazily |
+
+**Check:** `incidental = private RAM − bytes of content held`. A harness runs scripted sessions, measures after
+each turn at idle, and fails if `incidental` grows across turns or exceeds a constant set from M1's
+measurements.
+
+## Technology
+
+| Need | Choice | Reason |
+|---|---|---|
+| Async | `tokio`, current-thread runtime | Measured floor 0.6 MB private |
+| HTTP / TLS | `reqwest` + `rustls` | Same measurement |
+| Terminal | `crossterm` | Inline rendering, no alternate screen |
+| Markdown | `pulldown-cmark` | Streaming-friendly, no global state |
+| Highlighting | tree-sitter grammars, loaded per language on first use | Avoids the `syntect` bulk load |
+| omp crates | git dependency on `can1357/oh-my-pi` at a pinned revision | MIT; no Node-API dependency. Verify in M0 that workspace inheritance and the vendored `brush` resolve as a git dependency. |
+
+## Milestones
+
+| | Scope | Exit criterion |
+|---|---|---|
+| M0 | Workspace, omp crates building as dependencies, memory harness, allocator measurement | Harness reports `incidental` for an empty session |
+| M1 | Agent loop, Anthropic + OpenAI-compatible providers, built-in tools, sessions, terminal UI | Usable for a real task with an API key; `incidental` constant across turns |
+| M2 | Context files, skills, rules (sticky + stream), slash commands, MCP client, compaction | An omp project's files work unchanged |
+| M3 | Plugin host, manifests, lifetimes, hooks; gateway plugin | Any omp provider usable with streaming; broker/omp token-refresh interaction checked |
+| M4 | lsp, web, ast, memory plugins | Day-one feature set complete |
+| M5 | Subagents | Parallel headless tasks with typed results |
+
+## Appendix: measurement method
+
+- Metric: `Pss_Anon` (private) and `Pss` (total, shared pages divided) from `/proc/<pid>/smaps_rollup`.
+- Idle sessions: each agent started in a pseudo-terminal in an empty directory, measured 10 s after launch.
+  pi and Codex ran with an empty `HOME`; Codex likely sat at its login screen.
+- omp gateway: `omp auth-gateway stdio`, measured 6 s after start.
+- Rust floor: single-threaded `tokio` + `reqwest`/`rustls` binary that sends one HTTPS request to
+  `api.anthropic.com` (401), holds a synthetic conversation, then idles.
+
+| Rust floor variant | Total (MB) | Private (MB) |
+|---|---|---|
+| Empty conversation | 4.1 | 0.6 |
+| 200k-token conversation | 5.9 | 2.4 |
+| 1M-token conversation | 12.8 | 9.1 |
+| `syntect` defaults, empty conversation | 11.5 | 6.5 |
+| `syntect` defaults, 200k tokens | 13.0 | 8.1 |
