@@ -1,0 +1,33 @@
+[package]
+name = "mu"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+pi-edit   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+pi-shell  = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+pi-walker = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+tokio = { version = "1", features = ["rt", "macros", "signal", "time", "sync"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+flume = "0.12"
+async-trait = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+jiff = "0.2"
+anyhow = "1"
+libc = "0.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
+rustyline = "19.0.0"
+
+[patch.crates-io]
+brush-core   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+brush-parser = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+
+[profile.release]
+strip = true

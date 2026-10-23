@@ -1,0 +1,77 @@
+use super::{ToolOutput, Tools};
+use async_trait::async_trait;
+use pi_edit::{
+    ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, WriteRequest, WriteResponse,
+    engine::FileOp, session::SessionConfig,
+};
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Deserialize)]
+pub struct Args {
+    input: String,
+}
+
+struct FsWriter;
+
+fn werr(e: impl std::fmt::Display) -> EditError {
+    EditError::Writer(e.to_string())
+}
+
+#[async_trait]
+impl EditWriter for FsWriter {
+    async fn write(&self, r: WriteRequest) -> EditResult<WriteResponse> {
+        match r.op {
+            FileOp::Delete => {
+                std::fs::remove_file(&r.absolute).map_err(werr)?;
+                Ok(WriteResponse::default())
+            }
+            FileOp::Noop => Ok(WriteResponse::default()),
+            FileOp::Create | FileOp::Update => {
+                let content = r.content.ok_or_else(|| werr("edit request omitted content"))?;
+                let dest = r.move_to.as_deref().unwrap_or(&r.absolute);
+                if let Some(p) = dest.parent() {
+                    std::fs::create_dir_all(p).map_err(werr)?;
+                }
+                std::fs::write(dest, &content).map_err(werr)?;
+                if r.move_to.is_some() {
+                    if let Ok(m) = std::fs::metadata(&r.absolute) {
+                        let _ = std::fs::set_permissions(dest, m.permissions());
+                    }
+                    std::fs::remove_file(&r.absolute).map_err(werr)?;
+                }
+                Ok(WriteResponse { written: content, ..Default::default() })
+            }
+        }
+    }
+}
+
+impl Tools {
+    pub async fn edit(&self, a: Args) -> ToolOutput {
+        let policy = PathPolicy {
+            cwd: self.cwd.clone(),
+            home_dir: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
+            url_schemes: vec![],
+            url_alias_schemes: vec![],
+            plan_writable_roots: vec![],
+            plan_active: false,
+            block_auto_generated: true,
+        };
+        let cfg = SessionConfig {
+            mode: EditMode::Hashline,
+            policy,
+            allow_fuzzy: true,
+            fuzzy_threshold: 0.95,
+            enforce_seen_lines: true,
+            max_columns: 768,
+            raw_input: false,
+        };
+        let mut s = Session::new(cfg, self.edit_store.clone());
+        s.set_args_json(&json!({"input": a.input}).to_string());
+        s.finish();
+        match s.apply(ApplyRequest::default(), &FsWriter).await {
+            Ok(o) => ToolOutput::ok(o.text),
+            Err(e) => ToolOutput::err(e.to_string()),
+        }
+    }
+}
