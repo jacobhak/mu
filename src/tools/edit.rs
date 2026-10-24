@@ -1,7 +1,8 @@
+use super::uri::Scheme;
 use super::{ToolOutput, Tools};
 use async_trait::async_trait;
 use pi_edit::{
-    ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, WriteRequest, WriteResponse,
+    ApplyRequest, UrlResolution, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, WriteRequest, WriteResponse,
     engine::FileOp, session::SessionConfig,
 };
 use serde::Deserialize;
@@ -51,10 +52,10 @@ impl Tools {
         let policy = PathPolicy {
             cwd: self.cwd.clone(),
             home_dir: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
-            url_schemes: vec![],
+            url_schemes: vec!["local".into(), "artifact".into(), "skill".into()],
             url_alias_schemes: vec![],
-            plan_writable_roots: vec![],
-            plan_active: false,
+            plan_writable_roots: vec![self.local_root()],
+            plan_active: self.plan.get(),
             block_auto_generated: true,
         };
         let cfg = SessionConfig {
@@ -69,8 +70,26 @@ impl Tools {
         let mut s = Session::new(cfg, self.edit_store.clone());
         s.set_args_json(&json!({"input": a.input}).to_string());
         s.finish();
+        for url in s.begin_apply_url_targets() {
+            let r = match self.resolve(&url) {
+                Ok(r) => match r.scheme {
+                    Some(Scheme::Local) => UrlResolution { absolute: Some(r.path), error: None, plan_writable: true },
+                    Some(sc) => UrlResolution { absolute: None, error: Some(format!("{}:// is read-only", sc.name())), plan_writable: false },
+                    None => UrlResolution { absolute: Some(r.path), error: None, plan_writable: false },
+                },
+                Err(e) => UrlResolution { absolute: None, error: Some(e), plan_writable: false },
+            };
+            s.provide(url, r);
+        }
         match s.apply(ApplyRequest::default(), &FsWriter).await {
-            Ok(o) => ToolOutput::ok(o.text),
+            Ok(o) => {
+                let mut out = ToolOutput::ok(o.text);
+                let diffs: Vec<&str> = o.files.iter().map(|f| f.diff.as_str()).filter(|d| !d.is_empty()).collect();
+                if !diffs.is_empty() {
+                    out.display = Some(diffs.join("\n"));
+                }
+                out
+            }
             Err(e) => ToolOutput::err(e.to_string()),
         }
     }

@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "description": "One self-contained fact: who, what, when, why" },
+      "description": "Memories to retain"
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["project", "global"],
+      "description": "Storage scope; defaults to project. global is for durable cross-project knowledge (needs global or per-project-tagged mnemopi scoping)"
+    }
+  },
+  "required": ["items"]
+}

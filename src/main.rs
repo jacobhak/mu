@@ -1,135 +1,200 @@
 mod agent;
-mod anthropic;
+mod compaction;
 mod config;
 mod context;
+mod events;
+mod gitinfo;
+mod gateway;
+mod headless;
+mod image;
+mod jobs;
 mod mem;
 mod message;
-mod paths;
+mod models;
+mod pricing;
+mod plugin;
+mod quota;
+mod provider;
 mod session;
-mod supervise;
 mod tools;
-mod ui;
+mod tui;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use rustyline::{DefaultEditor, error::ReadlineError};
+use mu_common::paths;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5-5";
-const LEVELS: [&str; 4] = ["off", "low", "medium", "high"];
 
 #[derive(Parser)]
 #[command(name = "mu", version)]
 struct Cli {
     #[arg(long)]
     model: Option<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(LEVELS))]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(models::Thinking::NAMES))]
     thinking: Option<String>,
-    /// Resume the latest session for this directory, or PATH.
+    /// Resume the latest session for this directory.
+    #[arg(short = 'c', long = "continue")]
+    continue_latest: bool,
+    /// Resume a session by id or path, or pick one when no value is given.
     #[arg(long, num_args = 0..=1)]
     resume: Option<Option<PathBuf>>,
+    /// Config profile (sets OMP_PROFILE).
+    #[arg(long)]
+    profile: Option<String>,
+    /// Run one prompt and print the final answer.
+    #[arg(short = 'p', long = "print")]
+    print: Option<String>,
+    /// Run as a subagent: read one JSON task on stdin, write NDJSON results.
+    #[arg(long, hide = true)]
+    headless: bool,
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("{e}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<i32> {
     let cli = Cli::parse();
+    if let Some(p) = &cli.profile {
+        // Single-threaded here: no runtime or plugin has started yet.
+        unsafe { std::env::set_var("OMP_PROFILE", p) };
+    }
     let cwd = std::env::current_dir()?;
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let files = context::load(&cwd, &home, &paths::omp_agent_dir());
-    let gateway = supervise::ensure_gateway()?;
-    let gw = anthropic::Gateway::from_env(gateway.as_ref().map(|g| g.gateway_url.as_str()))?;
+    let cfgs = Rc::new(config::Configs::load());
+    let ctx = Rc::new(context::Context::load_all(&cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user));
 
-    let (cfg_model, cfg_level) = config::default_model().unzip();
-    let mut model = cli.model.clone().or(cfg_model).unwrap_or_else(|| DEFAULT_MODEL.into());
-    let mut thinking = cli.thinking.clone().or(cfg_level.flatten()).unwrap_or_else(|| "medium".into());
-    let mut session = None;
-    let mut messages = Vec::new();
-    if let Some(r) = &cli.resume {
-        let path = match r {
-            Some(p) => p.clone(),
-            None => match session::latest_for(&cwd) {
-                Some(p) => p,
-                None => bail!("no sessions for {} in {}", cwd.display(), paths::session_dir(&cwd).display()),
-            },
-        };
-        let loaded = session::load(&path)?;
-        let mut s = session::SessionFile::open_append(&path)?;
-        match (&cli.model, loaded.model) {
-            (Some(m), prev) => {
-                if prev.as_deref() != Some(m) {
-                    s.model_change(m);
-                }
+    let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (manifests, warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
+    let host = plugin::PluginHost::new(
+        manifests,
+        warnings,
+        notice_tx,
+        plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
+    );
+    let providers = Rc::new(provider::Providers::new(cfgs.clone(), gateway::GatewaySource::new(host.clone())));
+    host.set_providers(&providers);
+
+    let (cfg_model, cfg_level) = cfgs.role("default").map(|v| models::split_level(&v)).unzip();
+    let mut task_payload: Option<serde_json::Value> = None;
+    let mut sel = cli.model.clone().or(cfg_model).unwrap_or_else(|| DEFAULT_MODEL.into());
+    if cli.headless {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        let p: serde_json::Value = serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
+        let role = if p["agent"] == "scout" { "smol" } else { "task" };
+        if cli.model.is_none() {
+            if let Some(r) = models::role_selector(role, &cfgs) {
+                sel = r;
             }
-            (None, Some(prev)) => model = prev,
-            _ => {}
         }
-        match (&cli.thinking, loaded.thinking) {
-            (Some(t), prev) => {
-                if prev.as_deref() != Some(t) {
-                    s.thinking_change(t);
-                }
-            }
-            (None, Some(prev)) => thinking = prev,
-            _ => {}
-        }
-        messages = loaded.messages;
-        session = Some(s);
+        task_payload = Some(p);
+    }
+    let (spec, role_level) = providers.resolve(&sel)?;
+    let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
+    let thinking = cli_thinking.or(role_level).or(cfg_level.flatten()).unwrap_or(models::Thinking::Medium);
+
+    let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;
+    let resume = match (&cli.resume, cli.continue_latest) {
+        (Some(Some(p)), _) => match session::find(&cwd, p) {
+            Some(f) => Some(f),
+            None => bail!("session {} not found", p.display()),
+        },
+        (_, true) => match session::latest_for(&cwd) {
+            Some(p) => Some(p),
+            None => bail!("no sessions for {} in {}", cwd.display(), paths::session_dir(&cwd).display()),
+        },
+        _ => None,
+    };
+    if cli.print.is_none() && !cli.headless && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        bail!("mu: interactive mode needs a terminal; use -p");
     }
 
-    println!(
-        "mu · {model} · thinking {thinking} · {}",
-        session.as_ref().map_or("new session".into(), |s| s.path.display().to_string())
-    );
+    let cfgs_ui = cfgs.clone();
+    let (providers_ui, ctx_ui, cwd_ui) = (providers.clone(), ctx.clone(), cwd.clone());
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let inbox = events::new_inbox();
+    let mut agent = agent::Agent::new(agent::AgentInit {
+        providers,
+        plugins: host.clone(),
+        cwd,
+        ctx: ctx.clone(),
+        model: spec,
+        thinking,
+        events: ev_tx,
+        inbox: inbox.clone(),
+    });
+    agent.pin_model = cli.model.is_some() && resume.is_some();
+    agent.pin_thinking = cli_thinking.is_some() && resume.is_some();
+    if let Some(p) = &task_payload {
+        agent.subagent = true;
+        agent.excluded = vec!["ask", "propose_plan"];
+        agent.parent_session = p["parentSession"].as_str().map(PathBuf::from);
+        if p["agent"] == "scout" {
+            agent.allow = Some(vec!["read", "grep", "glob", "web_search", "fetch"]);
+        }
+    }
+    if cli.print.is_none() && task_payload.is_none() {
+        agent.enable_jobs();
+    }
+    if let Some(p) = resume {
+        let _ = cmd_tx.send(events::Command::Resume(p));
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(repl(agent::Agent::new(gw, cwd, files, model, thinking, session, messages)))
-}
-
-async fn repl(mut agent: agent::Agent) -> Result<()> {
-    let mut rl = DefaultEditor::new()?;
-    let mut interrupted = false;
-    loop {
-        let line = match rl.readline("› ") {
-            Ok(l) => l,
-            Err(ReadlineError::Interrupted) => {
-                if interrupted {
-                    break;
-                }
-                interrupted = true;
-                agent.ui.line("(press Ctrl-C again or Ctrl-D to exit)");
-                continue;
+    let local = tokio::task::LocalSet::new();
+    let code = local.block_on(&rt, async move {
+        let mut notice_rx = notice_rx;
+        let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
+        let code = match (cli.print, task_payload) {
+            (_, Some(p)) => {
+                tokio::task::spawn_local(async move {
+                    while let Some(n) = notice_rx.recv().await {
+                        eprintln!("{n}");
+                    }
+                });
+                let ctx = p["context"].as_str().filter(|c| !c.is_empty());
+                let task = p["task"].as_str().unwrap_or("");
+                let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
+                headless::subagent_mode(prompt, cmd_tx, ev_rx).await
             }
-            Err(ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
+            (Some(prompt), None) => {
+                tokio::task::spawn_local(async move {
+                    while let Some(n) = notice_rx.recv().await {
+                        eprintln!("{n}");
+                    }
+                });
+                headless::print_mode(prompt, cmd_tx, ev_rx).await
+            }
+            (None, None) => {
+                tui::theme::init(cfgs_ui.omp.theme.dark.as_deref().unwrap_or("dark"), &paths::omp_agent_dir());
+                tui::app::run(tui::app::AppInit {
+                    cmd_tx,
+                    ev_rx,
+                    inbox,
+                    providers: providers_ui,
+                    ctx: ctx_ui,
+                    plugins: host.clone(),
+                    notice_rx,
+                    cwd: cwd_ui,
+                    pick_session,
+                    status_cfg: cfgs_ui.omp.status_line.clone(),
+                })
+                .await
+            }
         };
-        interrupted = false;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let _ = rl.add_history_entry(line);
-        if let Some(cmd) = line.strip_prefix('/') {
-            let (name, arg) = cmd.split_once(' ').map_or((cmd, ""), |(n, a)| (n, a.trim()));
-            match name {
-                "exit" => break,
-                "model" if !arg.is_empty() => agent.set_model(arg),
-                "thinking" if LEVELS.contains(&arg) => agent.set_thinking(arg),
-                "thinking" => agent.ui.error("usage: /thinking off|low|medium|high"),
-                "session" => {
-                    let p = agent.session.as_ref().map_or("no session yet".into(), |s| s.path.display().to_string());
-                    agent.ui.line(&p)
-                }
-                _ => agent.ui.error("unknown command"),
-            }
-            continue;
-        }
-        agent.turn(line).await;
-    }
-    Ok(())
+        let _ = agent_task.await;
+        host.shutdown_all().await;
+        code
+    });
+    Ok(code)
 }

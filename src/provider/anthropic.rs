@@ -1,94 +1,43 @@
+use super::sse::SseDecoder;
+use super::{ProviderError, Request, StreamEvent, normalize_id, same_origin, stream_error};
 use crate::message::{Block, Message, StopReason, Usage, now_ms};
-use crate::paths;
-use anyhow::{Result, anyhow, bail};
-use futures_util::StreamExt;
+use crate::models::{ModelSpec, Thinking};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub trait Events {
-    fn text(&mut self, s: &str);
-    fn thinking(&mut self, s: &str);
+pub fn url(base: &str) -> String {
+    format!("{base}/v1/messages")
 }
 
-pub struct Gateway {
-    base: String,
-    token: String,
-    client: Option<reqwest::Client>,
+/// The gateway takes the full `provider/model` id and adds prompt caching itself.
+pub fn body(req: &Request) -> Value {
+    let th = match req.thinking.budget() {
+        Some(b) => json!({"type":"enabled","budget_tokens":b}),
+        None => json!({"type":"disabled"}),
+    };
+    let tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.schema}))
+        .collect();
+    let mut body = json!({
+        "model": req.model.id,
+        "max_tokens": req.max_tokens.unwrap_or(req.model.max_output),
+        "stream": true,
+        "system": [{"type":"text","text":req.system}],
+        "thinking": th,
+        "messages": to_wire(req.messages, req.model),
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+    if req.thinking != Thinking::Off {
+        body["output_config"] = json!({"effort": req.thinking.as_str()});
+    }
+    body
 }
 
-impl Gateway {
-    pub fn from_env(spawned: Option<&str>) -> Result<Self> {
-        let base = match spawned {
-            Some(u) => u.to_string(),
-            None => std::env::var("MU_GATEWAY_URL")?,
-        };
-        let token = match std::env::var("MU_GATEWAY_TOKEN") {
-            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-            _ => {
-                let p = paths::omp_config_root().join("auth-gateway.token");
-                std::fs::read_to_string(&p).map(|s| s.trim().to_string()).map_err(|_| {
-                    anyhow!("gateway token not found at {}; run `omp auth-gateway token`", p.display())
-                })?
-            }
-        };
-        Ok(Self { base: base.trim_end_matches('/').into(), token, client: None })
-    }
-
-    pub fn thinking_budget(level: &str) -> Option<u32> {
-        match level {
-            "low" => Some(4096),
-            "medium" => Some(8192),
-            "high" => Some(16384),
-            _ => None,
-        }
-    }
-
-    pub async fn stream(
-        &mut self,
-        model: &str,
-        thinking: &str,
-        system: &str,
-        tools: &[Value],
-        messages: &[Message],
-        ev: &mut dyn Events,
-    ) -> Result<Message> {
-        let client = self.client.get_or_insert_with(reqwest::Client::new);
-        let th = match Self::thinking_budget(thinking) {
-            Some(b) => json!({"type":"enabled","budget_tokens":b}),
-            None => json!({"type":"disabled"}),
-        };
-        let body = json!({
-            "model": model, "max_tokens": 32000, "stream": true,
-            "system": [{"type":"text","text":system}],
-            "thinking": th, "tools": tools, "messages": to_wire(messages),
-        });
-        let resp = client
-            .post(format!("{}/v1/messages", self.base))
-            .bearer_auth(&self.token)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| anyhow!("cannot reach gateway at {}: {e}; is the gateway running?", self.base))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let t = resp.text().await.unwrap_or_default();
-            bail!("HTTP {}: {}", status.as_u16(), t.chars().take(2000).collect::<String>());
-        }
-        let mut asm = Assembler::new(model);
-        let mut bytes = resp.bytes_stream();
-        while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(|e| anyhow!("stream error: {e}"))?;
-            if let Some(m) = asm.feed(&chunk, ev)? {
-                return Ok(m);
-            }
-        }
-        bail!("stream ended early")
-    }
-}
-
-pub fn to_wire(messages: &[Message]) -> Vec<Value> {
+pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
     let mut out: Vec<(String, Vec<Value>)> = Vec::new();
     let mut push = |role: &str, blocks: Vec<Value>| match out.last_mut() {
         Some((r, c)) if r == role => c.extend(blocks),
@@ -101,6 +50,7 @@ pub fn to_wire(messages: &[Message]) -> Vec<Value> {
                     .iter()
                     .filter_map(|b| match b {
                         Block::Text { text } => Some(json!({"type":"text","text":text})),
+                        Block::Image(i) => Some(json!({"type":"image","source":{"type":"base64","media_type":i.mime_type,"data":i.data}})),
                         _ => None,
                     })
                     .collect();
@@ -108,16 +58,17 @@ pub fn to_wire(messages: &[Message]) -> Vec<Value> {
                     push("user", b);
                 }
             }
-            Message::Assistant { content, .. } => {
+            Message::Assistant { content, api, provider, .. } => {
+                let origin = same_origin(api, provider, model);
                 let mut b = Vec::new();
                 for blk in content {
                     match blk {
-                        Block::Thinking { thinking, thinking_signature: Some(sig) } => {
+                        Block::Thinking { thinking, thinking_signature: Some(sig) } if origin => {
                             b.push(json!({"type":"thinking","thinking":thinking,"signature":sig}))
                         }
                         Block::Text { text } if !text.is_empty() => b.push(json!({"type":"text","text":text})),
                         Block::ToolCall { id, name, arguments } => {
-                            b.push(json!({"type":"tool_use","id":id,"name":name,"input":arguments}))
+                            b.push(json!({"type":"tool_use","id":normalize_id(id),"name":name,"input":arguments}))
                         }
                         _ => {}
                     }
@@ -136,7 +87,7 @@ pub fn to_wire(messages: &[Message]) -> Vec<Value> {
                     .collect();
                 push(
                     "user",
-                    vec![json!({"type":"tool_result","tool_use_id":tool_call_id,"content":c,"is_error":is_error})],
+                    vec![json!({"type":"tool_result","tool_use_id":normalize_id(tool_call_id),"content":c,"is_error":is_error})],
                 );
             }
         }
@@ -153,7 +104,8 @@ enum Open {
 
 pub struct Assembler {
     model: String,
-    buf: Vec<u8>,
+    provider: String,
+    sse: SseDecoder,
     blocks: BTreeMap<u64, Open>,
     done: Vec<Block>,
     usage: Usage,
@@ -162,10 +114,11 @@ pub struct Assembler {
 }
 
 impl Assembler {
-    pub fn new(model: &str) -> Self {
+    pub fn new(model: &ModelSpec) -> Self {
         Self {
-            model: model.into(),
-            buf: Vec::new(),
+            model: model.id.clone(),
+            provider: model.provider.clone(),
+            sse: SseDecoder::default(),
             blocks: BTreeMap::new(),
             done: Vec::new(),
             usage: Usage::default(),
@@ -174,28 +127,8 @@ impl Assembler {
         }
     }
 
-    pub fn feed(&mut self, chunk: &[u8], ev: &mut dyn Events) -> Result<Option<Message>> {
-        self.buf.extend_from_slice(chunk);
-        while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
-            let frame: Vec<u8> = self.buf.drain(..pos + 2).collect();
-            if let Some(m) = self.frame(&frame, ev)? {
-                return Ok(Some(m));
-            }
-        }
-        Ok(None)
-    }
-
-    fn frame(&mut self, frame: &[u8], ev: &mut dyn Events) -> Result<Option<Message>> {
-        let text = String::from_utf8_lossy(frame);
-        let data: Vec<&str> = text
-            .lines()
-            .filter_map(|l| l.strip_prefix("data:"))
-            .map(|d| d.strip_prefix(' ').unwrap_or(d))
-            .collect();
-        if data.is_empty() {
-            return Ok(None);
-        }
-        let v: Value = serde_json::from_str(&data.join("\n"))?;
+    fn frame(&mut self, data: &str, ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
+        let v: Value = serde_json::from_str(data).map_err(|e| ProviderError::Fatal(format!("bad stream json: {e}")))?;
         let idx = v["index"].as_u64().unwrap_or(0);
         match v["type"].as_str().unwrap_or("") {
             "message_start" => self.response_id = v["message"]["id"].as_str().map(String::from),
@@ -204,11 +137,14 @@ impl Assembler {
                 let open = match cb["type"].as_str() {
                     Some("text") => Open::Text(String::new()),
                     Some("thinking") => Open::Thinking(String::new(), None),
-                    Some("tool_use") => Open::Tool {
+                    Some("tool_use") => {
+                        ev(StreamEvent::ToolCallStart);
+                        Open::Tool {
                         id: cb["id"].as_str().unwrap_or("").into(),
                         name: cb["name"].as_str().unwrap_or("").into(),
                         json: String::new(),
-                    },
+                        }
+                    }
                     _ => Open::Ignored,
                 };
                 self.blocks.insert(idx, open);
@@ -219,11 +155,11 @@ impl Assembler {
                 match (self.blocks.get_mut(&idx), d["type"].as_str()) {
                     (Some(Open::Text(t)), Some("text_delta")) => {
                         t.push_str(s("text"));
-                        ev.text(s("text"));
+                        ev(StreamEvent::Text(s("text")));
                     }
                     (Some(Open::Thinking(t, _)), Some("thinking_delta")) => {
                         t.push_str(s("thinking"));
-                        ev.thinking(s("thinking"));
+                        ev(StreamEvent::Thinking(s("thinking")));
                     }
                     (Some(Open::Thinking(_, sig)), Some("signature_delta")) => *sig = Some(s("signature").into()),
                     (Some(Open::Tool { json, .. }), Some("input_json_delta")) => json.push_str(s("partial_json")),
@@ -231,7 +167,7 @@ impl Assembler {
                 }
             }
             "content_block_stop" => match self.blocks.remove(&idx) {
-                Some(Open::Text(text)) => self.done.push(Block::Text { text }),
+                Some(Open::Text(text)) => self.done.push(Block::text(text)),
                 Some(Open::Thinking(thinking, sig)) => {
                     self.done.push(Block::Thinking { thinking, thinking_signature: sig })
                 }
@@ -274,7 +210,7 @@ impl Assembler {
                 return Ok(Some(Message::Assistant {
                     content: std::mem::take(&mut self.done),
                     api: "anthropic-messages".into(),
-                    provider: self.model.split('/').next().unwrap_or("anthropic").into(),
+                    provider: self.provider.clone(),
                     model: self.model.clone(),
                     usage: self.usage.clone(),
                     stop_reason: self.stop,
@@ -283,8 +219,24 @@ impl Assembler {
                     error_message: None,
                 }));
             }
-            "error" => bail!("{}", v["error"]["message"].as_str().unwrap_or("unknown stream error")),
+            "error" => {
+                return Err(stream_error(
+                    v["error"]["type"].as_str().unwrap_or(""),
+                    v["error"]["message"].as_str().unwrap_or("unknown stream error"),
+                ));
+            }
             _ => {}
+        }
+        Ok(None)
+    }
+}
+
+impl Assembler {
+    pub fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
+        for (_, data) in self.sse.push(chunk) {
+            if let Some(m) = self.frame(&data, ev)? {
+                return Ok(Some(m));
+            }
         }
         Ok(None)
     }
@@ -294,10 +246,17 @@ impl Assembler {
 mod tests {
     use super::*;
 
-    struct Null;
-    impl Events for Null {
-        fn text(&mut self, _: &str) {}
-        fn thinking(&mut self, _: &str) {}
+    fn spec(provider: &str) -> ModelSpec {
+        ModelSpec {
+            id: format!("{provider}/m"),
+            provider: provider.into(),
+            context_window: 1000,
+            max_output: 100,
+        }
+    }
+
+    fn gw() -> ModelSpec {
+        spec("anthropic")
     }
 
     fn sse() -> Vec<u8> {
@@ -317,10 +276,10 @@ mod tests {
     }
 
     fn run(chunks: &[&[u8]]) -> Message {
-        let mut a = Assembler::new("m");
+        let mut a = Assembler::new(&gw());
         let mut out = None;
         for c in chunks {
-            if let Some(m) = a.feed(c, &mut Null).unwrap() {
+            if let Some(m) = a.feed(c, &mut |_| {}).unwrap() {
                 out = Some(m);
             }
         }
@@ -368,9 +327,10 @@ mod tests {
         let tr = |id: &str| Message::ToolResult {
             tool_call_id: id.into(),
             tool_name: "read".into(),
-            content: vec![Block::Text { text: "ok".into() }],
+            content: vec![Block::text("ok")],
             is_error: false,
             timestamp: 0,
+            details: None,
         };
         let msgs = vec![
             asst(vec![
@@ -382,12 +342,23 @@ mod tests {
             tr("b"),
             Message::user("next"),
         ];
-        let w = to_wire(&msgs);
+        let w = to_wire(&msgs, &gw());
         assert_eq!(w.len(), 2);
         assert_eq!(w[0]["content"].as_array().unwrap().len(), 2);
         let u = w[1]["content"].as_array().unwrap();
         assert_eq!(u.len(), 3);
         assert_eq!(u[0]["type"], "tool_result");
         assert_eq!(u[2]["type"], "text");
+    }
+
+    #[test]
+    fn user_image_follows_text_block() {
+        use crate::events::UserInput;
+        let input = UserInput { text: "look".into(), images: vec![crate::message::Image { data: "QUJD".into(), mime_type: "image/png".into() }] };
+        let w = to_wire(&[Message::user_input(&input)], &gw());
+        let c = w[0]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["type"], "text");
+        assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
     }
 }

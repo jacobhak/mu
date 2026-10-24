@@ -34,20 +34,30 @@ fn select(sel: Option<&str>, total: usize) -> Option<(usize, usize)> {
 
 impl Tools {
     pub fn read(&self, a: Args) -> ToolOutput {
-        let mut abs = self.abs(&a.path);
         let mut sel = None;
-        if !abs.exists() {
-            if let Some((p, s)) = a.path.rsplit_once(':') {
-                let cand = self.abs(p);
-                if cand.exists() && !s.is_empty() {
-                    abs = cand;
+        let mut authored = a.path.as_str();
+        let first = self.resolve(&a.path).ok().filter(|r| r.path.exists());
+        let res = match first {
+            Some(r) => r,
+            None => match super::uri::split_selector(&a.path).and_then(|(p, s)| Some((self.resolve(p).ok()?, p, s))) {
+                Some((r, p, s)) if r.path.exists() => {
                     sel = Some(s.to_string());
+                    authored = p;
+                    r
                 }
-            }
-        }
-        let disp = self.display(&abs);
+                _ => match self.resolve(&a.path) {
+                    Ok(r) => r,
+                    Err(e) => return ToolOutput::err(e),
+                },
+            },
+        };
+        let abs = res.path;
+        let disp = if res.scheme.is_some() { authored.to_string() } else { self.display(&abs) };
         if !abs.exists() {
-            return ToolOutput::err(format!("File not found: {disp}"));
+            return ToolOutput::err(match res.scheme {
+                Some(super::uri::Scheme::Artifact) => format!("{authored} not found"),
+                _ => format!("File not found: {disp}"),
+            });
         }
         if abs.is_dir() {
             return list_dir(&abs);
@@ -142,7 +152,8 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let body: String = (1..=400).map(|i| format!("line{i}\n")).collect();
         std::fs::write(d.join("p.txt"), body).unwrap();
-        let t = Tools::new(d.clone());
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
         let o = t.read(Args { path: "p.txt".into() });
         assert!(!o.is_error);
         assert!(o.text.contains("\n300:line300"));

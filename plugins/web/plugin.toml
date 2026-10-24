@@ -1,0 +1,14 @@
+name = "web"
+command = ["mu-web"]
+lifetime = "idle:10m"
+hooks = []
+
+[[tools]]
+name = "web_search"
+description = "Search the web. Returns ranked sources with URLs and excerpts."
+schema = "schemas/web_search.json"
+
+[[tools]]
+name = "fetch"
+description = "Fetch a URL and return it as markdown (HTML is converted; raw=true returns the raw body)."
+schema = "schemas/fetch.json"

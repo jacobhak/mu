@@ -1,62 +1,76 @@
+mod ask;
 mod bash;
+mod diff;
 mod edit;
 mod glob;
 pub mod grep;
+mod plan;
+pub mod task;
 mod read;
+pub mod todo;
+pub mod uri;
+mod wait;
 mod write;
 
-use pi_shell::cancel::{AbortReason, AbortToken};
+use crate::provider::ToolDef;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::cell::{OnceCell, RefCell};
+use crate::events::EventTx;
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use crate::jobs::JobsHandle;
+use crate::plugin::PluginHost;
+use tokio_util::sync::CancellationToken;
 
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
+    /// UI-only rendering (e.g. a diff); never sent to the model.
+    pub display: Option<String>,
+    pub details: Option<Value>,
 }
 
 impl ToolOutput {
     pub fn ok(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false }
+        Self { text: text.into(), is_error: false, display: None, details: None }
     }
     pub fn err(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true }
+        Self { text: text.into(), is_error: true, display: None, details: None }
     }
 }
 
-/// Lets Ctrl-C reach an in-flight bash run.
-#[derive(Default)]
-pub struct AbortHandle(RefCell<Option<AbortToken>>, std::cell::Cell<bool>);
-
-impl AbortHandle {
-    pub fn set(&self, t: AbortToken) {
-        self.1.set(false);
-        *self.0.borrow_mut() = Some(t);
-    }
-    pub fn fired(&self) -> bool {
-        self.1.get()
-    }
-    pub fn clear(&self) {
-        *self.0.borrow_mut() = None;
-    }
-    pub fn fire(&self) {
-        self.1.set(true);
-        if let Some(t) = self.0.borrow().as_ref() {
-            t.abort(AbortReason::Signal);
-        }
-    }
+pub struct ToolCtx {
+    pub events: EventTx,
+    pub cancel: CancellationToken,
+    pub call_id: String,
 }
+
+pub const BUILTIN_NAMES: [&str; 11] = ["read", "write", "edit", "bash", "grep", "glob", "todo", "ask", "propose_plan", "task", "wait"];
 
 pub struct Tools {
     pub cwd: PathBuf,
+    pub plugins: Rc<PluginHost>,
+    /// Set in interactive sessions: `task` then runs in the background.
+    pub jobs: Option<Rc<JobsHandle>>,
+    todo: std::cell::RefCell<Vec<todo::Phase>>,
+    session_id: std::cell::RefCell<String>,
+    session_path: std::cell::RefCell<Option<PathBuf>>,
+    skills: std::cell::RefCell<Vec<(String, PathBuf)>>,
+    pub plan: std::cell::Cell<bool>,
     pub edit_store: pi_edit::EditStore,
     shell: OnceCell<pi_shell::shell::Shell>,
 }
 
 impl Tools {
-    pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd, edit_store: pi_edit::EditStore::new(), shell: OnceCell::new() }
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Self::new(PathBuf::from("/tmp"), PluginHost::new(vec![], vec![], tx, Default::default()))
+    }
+
+    pub fn new(cwd: PathBuf, plugins: Rc<PluginHost>) -> Self {
+        Self { cwd, plugins, jobs: None, todo: Default::default(), session_id: Default::default(), session_path: Default::default(), skills: Default::default(), plan: Default::default(), edit_store: pi_edit::EditStore::new(), shell: OnceCell::new() }
     }
 
     pub fn shell(&self) -> &pi_shell::shell::Shell {
@@ -76,8 +90,8 @@ impl Tools {
         }
     }
 
-    pub fn definitions() -> Vec<Value> {
-        vec![
+    pub fn definitions() -> Vec<ToolDef> {
+        let defs = vec![
             json!({"name":"read","description":READ_DESC,"input_schema":{"type":"object","properties":{
                 "path":{"type":"string","description":"File or directory path, optionally with a selector suffix"}},"required":["path"]}}),
             json!({"name":"write","description":"Create a file or replace it entirely. Creates parent directories. Returns a `[path#TAG]` header usable by `edit`.","input_schema":{"type":"object","properties":{
@@ -93,10 +107,35 @@ impl Tools {
                 "case":{"type":"boolean","description":"Case-sensitive; default true"}},"required":["pattern"]}}),
             json!({"name":"glob","description":"Find files by glob pattern (e.g. `**/*.rs`), newest first. Respects .gitignore, skips hidden files.","input_schema":{"type":"object","properties":{
                 "pattern":{"type":"string"},"path":{"type":"string","description":"Directory; default ."}},"required":["pattern"]}}),
-        ]
+        ];
+        defs.into_iter()
+            .chain([
+                json!({"name":"todo","description":todo::description(),"input_schema":todo::schema()}),
+                json!({"name":"ask","description":ask::description(),"input_schema":ask::schema()}),
+            ])
+            .map(|d| ToolDef {
+                name: d["name"].as_str().unwrap_or_default().into(),
+                description: d["description"].as_str().unwrap_or_default().into(),
+                schema: d["input_schema"].clone(),
+            })
+            .collect()
     }
 
-    pub async fn call(&self, name: &str, args: &Value, abort: &AbortHandle) -> ToolOutput {
+    /// `async_jobs`: `task` returns job ids immediately instead of blocking.
+    pub fn task_def(async_jobs: bool) -> ToolDef {
+        let description = if async_jobs { task::ASYNC_DESCRIPTION } else { task::DESCRIPTION };
+        ToolDef { name: "task".into(), description: description.into(), schema: task::schema() }
+    }
+
+    pub fn wait_def() -> ToolDef {
+        ToolDef { name: "wait".into(), description: wait::DESCRIPTION.into(), schema: wait::schema() }
+    }
+
+    pub fn plan_def() -> ToolDef {
+        ToolDef { name: "propose_plan".into(), description: plan::DESCRIPTION.into(), schema: plan::schema() }
+    }
+
+    pub async fn call(&self, name: &str, args: &Value, ctx: &ToolCtx) -> ToolOutput {
         if let Some(raw) = args.get("__invalid_json") {
             return ToolOutput::err(format!("Invalid arguments for {name}: arguments were not valid JSON: {raw}"));
         }
@@ -109,10 +148,31 @@ impl Tools {
                 Ok(a) => self.edit(a).await,
                 Err(e) => e,
             },
-            "bash" => match parse::<bash::Args>(name, args) {
-                Ok(a) => self.bash(a, abort).await,
+            "task" => match parse::<task::Args>(name, args) {
+                Ok(a) => self.task(a, ctx).await,
                 Err(e) => e,
             },
+            "propose_plan" => match parse::<plan::Args>(name, args) {
+                Ok(a) => self.propose_plan(a, ctx).await,
+                Err(e) => e,
+            },
+            "todo" => with_args(name, args, |a| self.todo(a)),
+            "ask" => match parse::<ask::Args>(name, args) {
+                Ok(a) => self.ask(a, ctx).await,
+                Err(e) => e,
+            },
+            "wait" => match parse::<wait::Args>(name, args) {
+                Ok(a) => self.wait(a, ctx).await,
+                Err(e) => e,
+            },
+            "bash" => match parse::<bash::Args>(name, args) {
+                Ok(a) => self.bash(a, ctx).await,
+                Err(e) => e,
+            },
+            _ if self.plugins.has_tool(name) => {
+                let r = self.plugins.call_tool(name, args, &ctx.cancel).await;
+                ToolOutput { text: r.content, is_error: r.is_error, display: r.display, details: None }
+            }
             _ => ToolOutput::err(format!("Unknown tool: {name}")),
         }
     }
@@ -130,4 +190,31 @@ fn with_args<A: DeserializeOwned>(name: &str, args: &Value, f: impl FnOnce(A) ->
         Ok(a) => f(a),
         Err(e) => e,
     }
+}
+
+fn trunc(s: &str, n: usize) -> String {
+    if s.chars().count() > n { s.chars().take(n).chain(['…']).collect() } else { s.into() }
+}
+
+/// One-line description of a tool call.
+pub fn summary(name: &str, args: &Value) -> String {
+    let first = |k: &str| args[k].as_str().and_then(|s| s.lines().next()).unwrap_or("");
+    let s = match name {
+        "read" | "write" => first("path"),
+        "glob" | "grep" => first("pattern"),
+        "edit" => first("input"),
+        "bash" => first("command"),
+        "web_search" => first("query"),
+        "fetch" => first("url"),
+        "wait" => {
+            let ids: Vec<&str> = args["ids"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            return if ids.is_empty() { "any".into() } else { ids.join(", ") };
+        }
+        "task" => {
+            let n = args["tasks"].as_array().map_or(0, |t| t.len());
+            return format!("{n} subagent{}", if n == 1 { "" } else { "s" });
+        }
+        _ => "",
+    };
+    trunc(s, 120)
 }

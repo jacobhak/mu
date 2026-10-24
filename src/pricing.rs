@@ -1,0 +1,279 @@
+//! Per-model token prices, from omp's catalogue.
+//!
+//! Source: `omp models ls --json` (per-million rates, `pricingStatus`). Its output is cached at
+//! `$MU_HOME/pricing.json` and refreshed at most once a day, off the draw path.
+use crate::message::{Cost, Usage};
+use mu_common::paths;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
+
+const MAX_CACHE_AGE: Duration = Duration::from_secs(24 * 3600);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rates {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LongContext {
+    threshold: f64,
+    rates: Rates,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    name: Option<String>,
+    reasoning: bool,
+    /// `None` unless omp reports the price as fixed.
+    rates: Option<Rates>,
+    long_context: Option<LongContext>,
+}
+
+#[derive(Debug, Default)]
+pub struct Table {
+    entries: HashMap<String, Entry>,
+}
+
+#[derive(Deserialize)]
+struct Raw {
+    models: Vec<RawModel>,
+}
+
+#[derive(Deserialize)]
+struct RawModel {
+    provider: String,
+    id: String,
+    name: Option<String>,
+    #[serde(default)]
+    reasoning: bool,
+    #[serde(rename = "pricingStatus", default)]
+    pricing_status: String,
+    #[serde(default)]
+    cost: RawCost,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RawCost {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+    long_context: Option<RawLong>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLong {
+    input_threshold: f64,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+}
+
+impl Table {
+    pub fn from_json(text: &str) -> Option<Self> {
+        let raw: Raw = serde_json::from_str(text).ok()?;
+        let entries = raw
+            .models
+            .into_iter()
+            .map(|m| {
+                let rates = |c: &RawCost| Rates {
+                    input: c.input,
+                    output: c.output,
+                    cache_read: c.cache_read,
+                    cache_write: c.cache_write,
+                };
+                let fixed = m.pricing_status == "fixed";
+                let long_context = m.cost.long_context.as_ref().map(|l| LongContext {
+                    threshold: l.input_threshold,
+                    rates: Rates {
+                        input: l.input,
+                        output: l.output,
+                        cache_read: l.cache_read,
+                        cache_write: l.cache_write,
+                    },
+                });
+                let entry = Entry {
+                    name: m.name,
+                    reasoning: m.reasoning,
+                    rates: fixed.then(|| rates(&m.cost)),
+                    long_context: if fixed { long_context } else { None },
+                };
+                (format!("{}/{}", m.provider, m.id), entry)
+            })
+            .collect();
+        Some(Self { entries })
+    }
+
+    fn cost_with(&self, model_id: &str, usage: &Usage) -> Option<Cost> {
+        let entry = self.entries.get(model_id)?;
+        let base = entry.rates?;
+        // omp prices the whole prompt (fresh + cached) against the long-context threshold.
+        let prompt = (usage.input + usage.cache_read + usage.cache_write) as f64;
+        let r = match &entry.long_context {
+            Some(l) if prompt > l.threshold => l.rates,
+            _ => base,
+        };
+        let million = 1_000_000.0;
+        let input = usage.input as f64 * r.input / million;
+        let output = usage.output as f64 * r.output / million;
+        let cache_read = usage.cache_read as f64 * r.cache_read / million;
+        let cache_write = usage.cache_write as f64 * r.cache_write / million;
+        Some(Cost { input, output, cache_read, cache_write, total: input + output + cache_read + cache_write })
+    }
+
+    fn display_name_with(&self, model_id: &str) -> Option<String> {
+        let name = self.entries.get(model_id)?.name.as_deref()?;
+        Some(name.strip_prefix("Claude ").unwrap_or(name).to_string())
+    }
+}
+
+static TABLE: RwLock<Option<Arc<Table>>> = RwLock::new(None);
+
+fn cache_path() -> PathBuf {
+    paths::mu_home().join("pricing.json")
+}
+
+fn table() -> Arc<Table> {
+    if let Some(t) = TABLE.read().ok().and_then(|g| g.clone()) {
+        return t;
+    }
+    let t = Arc::new(std::fs::read_to_string(cache_path()).ok().and_then(|s| Table::from_json(&s)).unwrap_or_default());
+    if let Ok(mut g) = TABLE.write() {
+        *g = Some(t.clone());
+    }
+    t
+}
+
+/// Priced usage for `model_id` (`provider/model`), or `None` when omp has no fixed price for it.
+pub fn cost(model_id: &str, usage: &Usage) -> Option<Cost> {
+    table().cost_with(model_id, usage)
+}
+
+/// Whether omp lists the model as reasoning-capable; `None` when unknown.
+pub fn reasoning(model_id: &str) -> Option<bool> {
+    table().entries.get(model_id).map(|e| e.reasoning)
+}
+
+/// Catalogue name without the `Claude ` prefix, else a name derived from the model id.
+pub fn display_name(model_id: &str) -> String {
+    table().display_name_with(model_id).unwrap_or_else(|| heuristic_name(model_id))
+}
+
+fn heuristic_name(model_id: &str) -> String {
+    let id = model_id.rsplit('/').next().unwrap_or(model_id);
+    let mut out = String::new();
+    let mut prev_numeric = false;
+    for w in id.split('-').filter(|w| !w.is_empty() && *w != "claude") {
+        let numeric = w.chars().all(|c| c.is_ascii_digit() || c == '.');
+        if !out.is_empty() {
+            out.push(if numeric && prev_numeric { '.' } else { ' ' });
+        }
+        if numeric {
+            out.push_str(w);
+        } else if w.len() <= 3 {
+            out.push_str(&w.to_ascii_uppercase());
+        } else {
+            let mut cs = w.chars();
+            if let Some(c) = cs.next() {
+                out.extend(c.to_uppercase());
+                out.push_str(cs.as_str());
+            }
+        }
+        prev_numeric = numeric;
+    }
+    if out.is_empty() { model_id.to_string() } else { out }
+}
+
+fn cache_fresh(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age < MAX_CACHE_AGE)
+}
+
+/// Refreshes the cached catalogue when it is missing or older than a day. Failures keep the old cache.
+/// Runs `omp models ls --json` at most once per day; never called from the draw path.
+pub async fn refresh() {
+    let path = cache_path();
+    if cache_fresh(&path) {
+        return;
+    }
+    let out = tokio::process::Command::new("omp")
+        .args(["models", "ls", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let Ok(Ok(out)) = tokio::time::timeout(REFRESH_TIMEOUT, out).await else { return };
+    if !out.status.success() {
+        return;
+    }
+    let Ok(text) = String::from_utf8(out.stdout) else { return };
+    let Some(parsed) = Table::from_json(&text) else { return };
+    let tmp = path.with_extension("json.tmp");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        if let Ok(mut g) = TABLE.write() {
+            *g = Some(Arc::new(parsed));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CATALOGUE: &str = r#"{"models":[
+      {"provider":"anthropic","id":"claude-haiku-5-5","name":"Claude Haiku 5.5","pricingStatus":"fixed",
+       "cost":{"input":0.1,"output":0.5,"cacheRead":0.01,"cacheWrite":0.125,
+               "longContext":{"inputThreshold":100000,"input":0.5,"output":2.5,"cacheRead":0.05,"cacheWrite":0.625}}},
+      {"provider":"anthropic","id":"claude-x","name":"Claude X","pricingStatus":"unknown",
+       "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}
+    ]}"#;
+
+    fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Usage {
+        Usage { input, output, cache_read, cache_write, ..Default::default() }
+    }
+
+    #[test]
+    fn prices_base_and_long_context_tiers() {
+        let t = Table::from_json(CATALOGUE).unwrap();
+        let c = t.cost_with("anthropic/claude-haiku-5-5", &usage(2000, 500, 10_000, 0)).unwrap();
+        assert!((c.input - 0.0002).abs() < 1e-12);
+        assert!((c.output - 0.00025).abs() < 1e-12);
+        assert!((c.cache_read - 0.0001).abs() < 1e-12);
+        assert!((c.total - 0.00055).abs() < 1e-12);
+        // 150k prompt tokens crosses the 100k threshold: long-context rates for every leg.
+        let c = t.cost_with("anthropic/claude-haiku-5-5", &usage(150_000, 1000, 0, 0)).unwrap();
+        assert!((c.input - 0.075).abs() < 1e-12);
+        assert!((c.output - 0.0025).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unpriced_models_have_no_cost() {
+        let t = Table::from_json(CATALOGUE).unwrap();
+        assert!(t.cost_with("anthropic/claude-x", &usage(1, 1, 0, 0)).is_none());
+        assert!(t.cost_with("unknown/model", &usage(1, 1, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn display_names() {
+        let t = Table::from_json(CATALOGUE).unwrap();
+        assert_eq!(t.display_name_with("anthropic/claude-haiku-5-5").as_deref(), Some("Haiku 5.5"));
+        assert_eq!(heuristic_name("anthropic/claude-haiku-5-5"), "Haiku 5.5");
+        assert_eq!(heuristic_name("modal/zai-org/glm-5.3-flash"), "GLM 5.3 Flash");
+    }
+}

@@ -4,11 +4,53 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[workspace]
+members = ["crates/mu-common", "plugins/gateway", "plugins/web"]
+resolver = "3"
+
+[features]
+default = ["lang-rust", "lang-json", "lang-bash", "lang-toml", "lang-yaml", "lang-python", "lang-javascript", "lang-typescript", "lang-diff", "lang-markdown"]
+all-langs = ["lang-rust", "lang-json", "lang-bash", "lang-toml", "lang-yaml", "lang-python", "lang-javascript", "lang-typescript", "lang-diff", "lang-markdown"]
+highlight = ["dep:tree-sitter", "dep:tree-sitter-highlight"]
+lang-rust = ["highlight", "dep:tree-sitter-rust"]
+lang-json = ["highlight", "dep:tree-sitter-json"]
+lang-bash = ["highlight", "dep:tree-sitter-bash"]
+lang-toml = ["highlight", "dep:tree-sitter-toml-ng"]
+lang-yaml = ["highlight", "dep:tree-sitter-yaml"]
+lang-python = ["highlight", "dep:tree-sitter-python"]
+lang-javascript = ["highlight", "dep:tree-sitter-javascript"]
+lang-typescript = ["lang-javascript", "dep:tree-sitter-typescript"]
+lang-diff = ["highlight", "dep:tree-sitter-diff"]
+lang-markdown = ["highlight", "dep:tree-sitter-md"]
+
 [dependencies]
+mu-common = { path = "crates/mu-common" }
 pi-edit   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
 pi-shell  = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+pi-diff   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
 pi-walker = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
-tokio = { version = "1", features = ["rt", "macros", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "signal", "time", "sync", "process", "io-util", "io-std", "fs", "net"] }
+tokio-util = "0.7"
+serde_yaml_ng = "0.10"
+toml = "1"
+crossterm = "0.28"
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-highlight = { version = "0.25", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-json = { version = "0.24", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
+tree-sitter-toml-ng = { version = "0.7", optional = true }
+tree-sitter-yaml = { version = "0.7", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-diff = { version = "0.1", optional = true }
+tree-sitter-md = { version = "0.5", optional = true }
+base64 = "0.22"
+terminput = "0.5"
+terminput-crossterm = { version = "0.4", default-features = false, features = ["crossterm_0_28"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -22,7 +64,6 @@ jiff = "0.2"
 anyhow = "1"
 libc = "0.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
-rustyline = "19.0.0"
 
 [patch.crates-io]
 brush-core   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }

@@ -1,0 +1,9 @@
+{
+  "name": "mu-memory",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@oh-my-pi/pi-mnemopi": "18.12.6",
+    "yaml": "^2"
+  }
+}

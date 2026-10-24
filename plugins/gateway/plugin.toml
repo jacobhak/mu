@@ -1,0 +1,4 @@
+name = "gateway"
+command = ["mu-gateway"]
+lifetime = "session"
+provider = "gateway"

@@ -1,0 +1,14 @@
+name = "memory"
+command = ["bun", "run", "main.ts"]
+lifetime = "idle:5m"
+hooks = ["prompt_submit", "turn_end", "pre_compaction", "session_end"]
+
+[[tools]]
+name = "recall"
+description = "Search long-term memory; return raw relevance-ranked matching entries. Use proactively before questions about past conversations, user preferences, project decisions, or topics where prior context improves accuracy. When in doubt, recall first."
+schema = "schemas/recall.json"
+
+[[tools]]
+name = "retain"
+description = "Store facts in long-term memory for future sessions. Use for durable, reusable knowledge: user preferences, project decisions, architectural choices. No ephemeral task state. Each item must be specific and self-contained: who, what, when, why. Batch related facts per call; deduplicated and consolidated."
+schema = "schemas/retain.json"

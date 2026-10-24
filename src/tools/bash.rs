@@ -1,9 +1,11 @@
-use super::{AbortHandle, ToolOutput, Tools};
+use super::{ToolCtx, ToolOutput, Tools};
+use crate::events::AgentEvent;
 use pi_shell::{
-    cancel::CancelToken,
+    cancel::{AbortReason, CancelToken},
     shell::ShellRunOptions,
 };
 use serde::Deserialize;
+use std::io::Write;
 use std::time::Instant;
 
 #[derive(Deserialize)]
@@ -21,10 +23,15 @@ struct Collector {
     head: String,
     tail: String,
     elided: usize,
+    /// Full output spill, opened when the first byte is elided.
+    artifact: Option<(u32, std::fs::File)>,
 }
 
 impl Collector {
-    fn push(&mut self, mut s: &str) {
+    fn push(&mut self, mut s: &str, alloc: &dyn Fn() -> (u32, std::path::PathBuf)) {
+        if let Some((_, f)) = self.artifact.as_mut() {
+            let _ = f.write_all(s.as_bytes());
+        }
         if self.tail.is_empty() && self.elided == 0 && self.head.len() < HEAD {
             let mut n = (HEAD - self.head.len()).min(s.len());
             while !s.is_char_boundary(n) {
@@ -39,26 +46,42 @@ impl Collector {
             while !self.tail.is_char_boundary(cut) {
                 cut += 1;
             }
+            if self.artifact.is_none() {
+                let (n, path) = alloc();
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if let Ok(mut f) = std::fs::File::create(&path) {
+                    let _ = f.write_all(self.head.as_bytes());
+                    let _ = f.write_all(self.tail.as_bytes());
+                    self.artifact = Some((n, f));
+                }
+            }
             self.elided += cut;
             self.tail.drain(..cut);
         }
     }
 
     fn finish(self) -> String {
-        if self.elided > 0 {
+        let mut out = if self.elided > 0 {
             format!("{}\n[…{}B elided…]\n{}", self.head, self.elided, self.tail)
         } else {
             self.head + &self.tail
+        };
+        if let Some((n, _)) = self.artifact {
+            out.push_str(&format!("\n[full output: artifact://{n}]"));
         }
+        out
     }
 }
 
 impl Tools {
-    pub async fn bash(&self, a: Args, abort: &AbortHandle) -> ToolOutput {
+    pub async fn bash(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
         let secs = a.timeout.unwrap_or(300.0);
         let timeout_ms = if secs == 0.0 { None } else { Some((secs.clamp(1.0, 3600.0) * 1000.0) as u32) };
         let mut cancel = CancelToken::new(timeout_ms);
-        abort.set(cancel.emplace_abort_token());
+        let abort = cancel.emplace_abort_token();
+        let aborted = std::cell::Cell::new(false);
         let (tx, rx) = flume::unbounded::<String>();
         let opts = ShellRunOptions {
             command: a.command,
@@ -68,21 +91,29 @@ impl Tools {
         };
         let start = Instant::now();
         let run = async {
-            let r = self.shell().run(opts, Some(tx), cancel).await;
-            r
+            let fut = self.shell().run(opts, Some(tx), cancel);
+            tokio::pin!(fut);
+            tokio::select! {
+                r = &mut fut => r,
+                _ = ctx.cancel.cancelled() => {
+                    aborted.set(true);
+                    abort.abort(AbortReason::Signal);
+                    fut.await
+                }
+            }
         };
         let drain = async {
             let mut c = Collector::default();
             while let Ok(s) = rx.recv_async().await {
-                c.push(&s);
+                let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: s.clone() });
+                c.push(&s, &|| self.next_artifact());
             }
             c.finish()
         };
         let (res, output) = tokio::join!(run, drain);
-        abort.clear();
         let res = match res {
             Ok(r) => r,
-            Err(_) if abort.fired() => {
+            Err(_) if aborted.get() => {
                 let out = if output.is_empty() { String::new() } else { format!("{output}\n\n") };
                 return ToolOutput::err(format!("{out}[Command cancelled]"));
             }

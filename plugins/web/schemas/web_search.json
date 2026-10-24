@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "query": { "type": "string", "description": "Search query" },
+    "recency": { "type": "string", "enum": ["day", "week", "month", "year"], "description": "Limit results to this recency window" },
+    "limit": { "type": "integer", "minimum": 1, "description": "Max results (default 5)" }
+  },
+  "required": ["query"]
+}

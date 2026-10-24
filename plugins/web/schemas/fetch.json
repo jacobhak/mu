@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "url": { "type": "string", "description": "http(s) URL to fetch" },
+    "raw": { "type": "boolean", "description": "Return the raw body instead of markdown" }
+  },
+  "required": ["url"]
+}
