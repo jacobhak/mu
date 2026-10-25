@@ -1,6 +1,7 @@
 use crate::image;
 use super::blocks;
 use super::clipboard;
+use super::complete::Entry;
 use super::composer::{Action, Composer};
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
@@ -20,7 +21,7 @@ use crate::tools::todo::{Phase, Status};
 use super::input::{self, Input};
 use crossterm::event::{Event, KeyEvent};
 use mu_common::paths;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -30,9 +31,26 @@ use tokio::sync::oneshot;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
-const BUILTINS: [&str; 19] = [
-    "exit", "quit", "new", "resume", "model", "switch", "login", "thinking", "compact", "plan", "session", "rename", "todo", "skills", "plugins", "hotkeys",
-    "copy", "image", "jobs",
+const BUILTIN_DESC: [(&str, &str, bool); 19] = [
+    ("exit", "Exit mu", false),
+    ("quit", "Exit mu", false),
+    ("new", "Start a new session", false),
+    ("resume", "Resume a session from this directory", false),
+    ("model", "Pick a model and assign a role", false),
+    ("switch", "Switch this session's model", false),
+    ("login", "Log in to a provider", false),
+    ("thinking", "Set the thinking level", false),
+    ("compact", "Compact the context [focus]", false),
+    ("plan", "Toggle plan mode", false),
+    ("session", "Show the session file and title", false),
+    ("rename", "Rename this session", true),
+    ("todo", "Show the todo list", false),
+    ("skills", "List skills", false),
+    ("plugins", "List plugins", false),
+    ("hotkeys", "Show key bindings", false),
+    ("copy", "Copy a reply, code block or command", false),
+    ("image", "Attach an image file", true),
+    ("jobs", "List or kill background jobs", false),
 ];
 
 pub struct AppInit {
@@ -64,6 +82,7 @@ enum UiMsg {
     Models(Result<Vec<GatewayModel>, String>),
     LoginProviders(Result<Vec<(usize, String)>, String>),
     ClipboardImage(Result<Option<Image>, String>),
+    Ghost { seq: u64, text: String, ghost: String },
 }
 
 struct RunningTool {
@@ -89,7 +108,7 @@ struct App {
     pick_assign: bool,
     renderer: Renderer,
     composer: Composer,
-    commands: Vec<String>,
+    commands: Vec<Entry>,
     pending: Vec<Line>,
     live_text: String,
     committed_in_block: bool,
@@ -100,6 +119,8 @@ struct App {
     jobs_committed: HashSet<String>,
     /// Assistant text blocks (newest last, capped) and bash commands, for `/copy`.
     replies: Vec<String>,
+    ghost_seq: u64,
+    ghost_asked: String,
     block_text: String,
     bash_cmds: Vec<String>,
     compacting: bool,
@@ -147,9 +168,20 @@ pub async fn run(init: AppInit) -> i32 {
     term::install_panic_hook();
     let AppInit { cmd_tx, mut ev_rx, inbox, providers, ctx, plugins, mut notice_rx, cwd, pick_session, status_cfg } = init;
     let (ui_tx, mut ui_rx) = unbounded_channel();
-    let mut commands: Vec<String> = BUILTINS.iter().map(|s| s.to_string()).collect();
-    commands.extend(ctx.commands.iter().map(|c| c.name.clone()));
-    commands.extend(ctx.skills.iter().map(|s| format!("skill:{}", s.name)));
+    let mut commands: Vec<Entry> = BUILTIN_DESC
+        .iter()
+        .map(|&(name, desc, needs_arg)| {
+            let args: Vec<String> = match name {
+                "thinking" => Thinking::NAMES.iter().map(|s| s.to_string()).collect(),
+                "copy" => ["code", "cmd", "link"].map(String::from).to_vec(),
+                "jobs" => vec!["kill".to_string()],
+                _ => vec![],
+            };
+            Entry { name: name.into(), desc: desc.into(), needs_arg, args }
+        })
+        .collect();
+    commands.extend(ctx.commands.iter().map(|c| Entry { name: c.name.clone(), desc: c.description.clone(), needs_arg: false, args: vec![] }));
+    commands.extend(ctx.skills.iter().map(|s| Entry { name: format!("skill:{}", s.name), desc: s.description.clone(), needs_arg: false, args: vec![] }));
     let mut app = App {
         cmd_tx,
         inbox,
@@ -160,10 +192,12 @@ pub async fn run(init: AppInit) -> i32 {
         status_cfg,
         turn_started: None,
         pick_assign: false,
-        cwd,
+        cwd: cwd.clone(),
         renderer: Renderer::new(),
-        composer: Composer::new(Some(paths::mu_home().join("history.jsonl"))),
+        composer: Composer::new(Some(paths::mu_home().join("history.jsonl"))).with_cwd(&cwd),
         commands,
+        ghost_seq: 0,
+        ghost_asked: String::new(),
         pending: Vec::new(),
         live_text: String::new(),
         committed_in_block: false,
@@ -451,6 +485,11 @@ impl App {
                 Ok(None) => self.notice("clipboard has no image"),
                 Err(e) => self.notice(&e),
             },
+            UiMsg::Ghost { seq, text, ghost } => {
+                if seq == self.ghost_seq && self.overlay.is_none() {
+                    self.composer.set_ghost(&text, ghost);
+                }
+            }
         }
     }
 
@@ -564,21 +603,64 @@ impl App {
                     sel.on_paste(&s)
                 }
                 None => {
-                    if let Err(e) = self.composer.on_paste(&s) {
+                    if let Err(e) = self.composer.on_paste(&s, &self.commands) {
                         self.error(&format!("image: {e}"));
                     }
+                    self.request_ghost();
                 }
             },
             _ => {}
         }
     }
 
-    fn on_key(&mut self, k: KeyEvent) {
+    /// Asks the predict plugin for a ghost when the composer wants one. Failures are silent.
+    fn request_ghost(&mut self) {
+        let cfg = &self.providers.cfg.mu.predict;
+        if !cfg.enabled || self.composer.has_ghost() {
+            return;
+        }
+        let Some(q) = self.composer.predict_query() else { return };
+        if q == self.ghost_asked {
+            return;
+        }
+        self.ghost_seq += 1;
+        self.ghost_asked = q.clone();
+        let seq = self.ghost_seq;
+        let assistant: String = {
+            let r = self.replies.last().map(String::as_str).unwrap_or_default();
+            let skip = r.chars().count().saturating_sub(4000);
+            r.chars().skip(skip).collect()
+        };
+        let params = json!({ "text": q, "cwd": self.cwd, "assistant": assistant, "threshold": cfg.threshold });
+        let (plugins, tx) = (self.plugins.clone(), self.ui_tx.clone());
+        tokio::task::spawn_local(async move {
+            let ghost = plugins
+                .request("predict", "predict/complete", params, Duration::from_millis(300))
+                .await
+                .ok()
+                .and_then(|v| v["ghost"].as_str().map(String::from))
+                .unwrap_or_default();
+            let _ = tx.send(UiMsg::Ghost { seq, text: q, ghost });
+        });
+    }
+
+    fn observe_prompt(&self, text: &str) {
+        if !self.providers.cfg.mu.predict.enabled {
+            return;
+        }
+        let params = json!({ "text": text, "cwd": self.cwd });
+        let plugins = self.plugins.clone();
+        tokio::task::spawn_local(async move {
+            let _ = plugins.request("predict", "predict/observe", params, Duration::from_secs(2)).await;
+        });
+    }
+
+    fn on_key_inner(&mut self, k: KeyEvent) {
         if self.overlay.is_some() {
             return self.overlay_key(k);
         }
-        let cmds = self.commands.clone();
-        match self.composer.on_key(k, self.running, &cmds) {
+        let action = self.composer.on_key(k, self.running, &self.commands);
+        match action {
             Action::None | Action::Redraw => {}
             Action::Submit(t) => self.submit(t, false),
             Action::QueueFollowUp(t) => self.submit(t, true),
@@ -607,6 +689,13 @@ impl App {
                     self.composer.restore(vec![p]);
                 }
             }
+        }
+    }
+
+    fn on_key(&mut self, k: KeyEvent) {
+        self.on_key_inner(k);
+        if self.overlay.is_none() {
+            self.request_ghost();
         }
     }
 
@@ -741,6 +830,8 @@ impl App {
             if let Some(cmd) = t.strip_prefix('/') {
                 return self.slash(cmd);
             }
+            let t = t.to_string();
+            self.observe_prompt(&t);
         }
         self.send_prompt(input, follow_up);
     }
@@ -1120,7 +1211,7 @@ impl App {
 const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Alt+↑  edit last queued
 Shift+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn      Ctrl+C  clear · abort · exit (twice)
 Shift+Tab  cycle thinking      Ctrl+T  show thinking      Ctrl+O  expand output      Alt+M  model picker
-Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  complete /command      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
+Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
 
 /// Drives a child `omp login` whose stdin and stdout are piped (see `run_login`).

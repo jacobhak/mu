@@ -341,6 +341,13 @@ impl PluginHost {
         }
     }
 
+    /// One request to a named plugin, starting it if needed.
+    pub async fn request(&self, plugin: &str, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        let slot = self.slots.iter().find(|s| s.manifest.name == plugin).ok_or_else(|| format!("no plugin {plugin}"))?;
+        let proc = self.ensure(slot).await?;
+        proc.request(method, params, Some(timeout)).await
+    }
+
     /// Runs `hook/<event>` on every plugin subscribed to `sub` (`event` or `event:key`), in name order.
     /// Failures and timeouts become notices and are skipped.
     pub async fn hook(&self, sub: &str, params: Value) -> Vec<(String, Value)> {

@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace]
-members = ["crates/mu-common", "plugins/gateway", "plugins/web"]
+members = ["crates/mu-common", "plugins/gateway", "plugins/predict", "plugins/web"]
 resolver = "3"
 
 [features]

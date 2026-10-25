@@ -5,13 +5,13 @@ A small, memory-lean coding agent. Rust core; everything heavy (gateway, web, me
 ## Build and install
 
 ```sh
-cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web}
+cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web,mu-predict}
 mkdir -p ~/.mu/plugins
-for p in gateway web memory; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
+for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
 (cd plugins/memory && bun install)       # memory plugin needs Bun on PATH
 ```
 
-Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway` and `mu-web` are resolved next to the `mu` binary. `MU_GATEWAY_URL` / `MU_GATEWAY_TOKEN` bypass the gateway plugin.
+Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web` and `mu-predict` are resolved next to the `mu` binary. `MU_GATEWAY_URL` / `MU_GATEWAY_TOKEN` bypass the gateway plugin.
 
 ### Syntax highlighting
 
@@ -30,7 +30,9 @@ Grammars load on first use of that language (about 1-2 MB resident each); idle m
 mu [--model SEL] [--thinking off|low|medium|high] [-c] [--resume [PATH]] [-p PROMPT]
 ```
 
-`SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory, `--resume` opens a picker. `-p` runs one prompt and prints the answer. Tab completes slash commands.
+`SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory, `--resume` opens a picker. `-p` runs one prompt and prints the answer. Typing `/` opens a command menu with descriptions and argument completion (↑/↓, Tab, Enter, Esc).
+
+Ghost text predicts the rest of the word or a prompt you repeat here; Tab or → accepts. `[predict] enabled/threshold` in config.toml. `mu-predict bench` replays your own prompt history to measure keystrokes saved.
 
 Slash commands: `/new /resume /model /thinking /compact /plan /session /rename /todo /skills /plugins /copy /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`.
 

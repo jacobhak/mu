@@ -1,6 +1,7 @@
 pub mod app;
 pub mod blocks;
 pub mod clipboard;
+pub mod complete;
 pub mod composer;
 pub mod highlight;
 pub mod input;

@@ -122,6 +122,21 @@ pub struct ModelOverride {
 #[serde(default)]
 pub struct MuConfig {
     pub compaction: MuCompaction,
+    pub predict: MuPredict,
+}
+
+/// `[predict]`: ghost-text prediction in the composer.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct MuPredict {
+    pub enabled: bool,
+    pub threshold: f32,
+}
+
+impl Default for MuPredict {
+    fn default() -> Self {
+        Self { enabled: true, threshold: 0.3 }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

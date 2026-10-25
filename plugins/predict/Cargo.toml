@@ -1,0 +1,11 @@
+[package]
+name = "mu-predict"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mu-common = { path = "../../crates/mu-common" }
+pi-predict = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util"] }

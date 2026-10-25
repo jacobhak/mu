@@ -2,12 +2,14 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
-use super::line::{Line, dim, plain, span};
+use super::complete::{self, Entry};
+use super::line::{self, Line, dim, plain, span};
 use super::theme;
 use crate::events::UserInput;
 use crate::image;
@@ -21,6 +23,7 @@ const PROMPT: &str = "μ ❯ ";
 const INDENT: &str = "    ";
 /// Display width of `PROMPT` and `INDENT`.
 const PREFIX_W: usize = 4;
+const MENU_ROWS: usize = 8;
 const CTRL_C_HINT: &str = "(press Ctrl-C again to exit)";
 /// Blank cells left of the prompt.
 const PAD: usize = 1;
@@ -269,6 +272,23 @@ pub struct Composer {
     paste_count: usize,
     image_count: usize,
     ctrl_c_armed: bool,
+    cwd: String,
+    ghost: Option<String>,
+    menu: Option<Menu>,
+    /// Text for which the user dismissed the menu with Esc.
+    menu_closed_for: Option<String>,
+}
+
+/// Slash-command menu. `items` are completion tokens (command or argument names).
+struct Menu {
+    items: Vec<String>,
+    descs: Vec<String>,
+    needs_arg: Vec<bool>,
+    sel: usize,
+    /// Completing an argument of `cmd`.
+    arg: Option<String>,
+    /// The typed token already equals an exact command (or argument).
+    exact: bool,
 }
 
 impl Composer {
@@ -278,7 +298,11 @@ impl Composer {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_default()
             .lines()
-            .filter_map(|l| serde_json::from_str::<String>(l).ok())
+            .filter_map(|l| match serde_json::from_str::<serde_json::Value>(l).ok()? {
+                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::Object(o) => o.get("text").and_then(|t| t.as_str()).map(String::from),
+                _ => None,
+            })
             .collect();
         let skip = history.len().saturating_sub(HISTORY_MAX);
         history.drain(..skip);
@@ -290,10 +314,193 @@ impl Composer {
             paste_count: 0,
             image_count: 0,
             ctrl_c_armed: false,
+            cwd: String::new(),
+            ghost: None,
+            menu: None,
+            menu_closed_for: None,
         }
     }
 
-    pub fn on_key(&mut self, key: KeyEvent, running: bool, commands: &[String]) -> Action {
+    /// Records `cwd` with each prompt written to the history file.
+    pub fn with_cwd(mut self, cwd: &Path) -> Self {
+        self.cwd = cwd.to_string_lossy().into_owned();
+        self
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent, running: bool, commands: &[Entry]) -> Action {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Action::None;
+        }
+        let plain_mods = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let ctrl_only = key.modifiers == KeyModifiers::CONTROL;
+        let ghost = self.ghost.take();
+        let action = 'act: {
+            if self.menu.is_some() {
+                if let Some(a) = self.menu_key(&key, plain_mods, ctrl_only) {
+                    break 'act a;
+                }
+            } else if key.code == KeyCode::Tab {
+                self.ctrl_c_armed = false;
+                break 'act match ghost {
+                    Some(g) => self.accept_ghost(&g, true),
+                    None => Action::None,
+                };
+            } else if let (KeyCode::Right, Some(g)) = (key.code, ghost.as_deref()) {
+                if plain_mods && self.at_end() {
+                    self.ctrl_c_armed = false;
+                    break 'act self.accept_ghost(g, false);
+                }
+            }
+            let a = self.on_key_inner(key, running);
+            if let (KeyCode::Char(c), Some(g)) = (key.code, ghost.as_deref()) {
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    if let Some(rest) = g.strip_prefix(c).filter(|r| !r.is_empty()) {
+                        self.ghost = Some(rest.to_owned());
+                    }
+                }
+            }
+            a
+        };
+        self.refresh_menu(commands);
+        action
+    }
+
+    fn at_end(&self) -> bool {
+        self.buf.row + 1 == self.buf.lines.len() && self.buf.col == self.buf.cur_len()
+    }
+
+    fn accept_ghost(&mut self, g: &str, space: bool) -> Action {
+        let add_space = space && !g.contains(char::is_whitespace);
+        self.edit(|b| {
+            b.insert_str(g);
+            if add_space {
+                b.insert_str(" ");
+            }
+        })
+    }
+
+    /// Stores a prediction for `text_for` if the buffer still holds exactly that with the cursor at its end.
+    pub fn set_ghost(&mut self, text_for: &str, g: String) {
+        if !g.is_empty() && self.menu.is_none() && self.at_end() && self.text() == text_for {
+            self.ghost = Some(g);
+        }
+    }
+
+    /// The buffer text worth predicting a continuation for, if any.
+    pub fn predict_query(&self) -> Option<String> {
+        let t = self.text();
+        let ok = self.at_end() && !self.buf.is_blank() && !t.starts_with('/') && !t.starts_with('!') && self.browse.is_none() && self.menu.is_none();
+        ok.then_some(t)
+    }
+
+    pub fn has_ghost(&self) -> bool {
+        self.ghost.is_some()
+    }
+
+    /// Menu keys; `None` falls through to normal handling.
+    fn menu_key(&mut self, key: &KeyEvent, plain_mods: bool, ctrl_only: bool) -> Option<Action> {
+        let m = self.menu.as_mut()?;
+        let n = m.items.len();
+        match key.code {
+            KeyCode::Up if plain_mods => m.sel = (m.sel + n - 1) % n,
+            KeyCode::Down if plain_mods => m.sel = (m.sel + 1) % n,
+            KeyCode::Char('p') if ctrl_only => m.sel = (m.sel + n - 1) % n,
+            KeyCode::Char('n') if ctrl_only => m.sel = (m.sel + 1) % n,
+            KeyCode::Tab => {
+                let text = self.menu_text(true);
+                self.set_text(&text);
+            }
+            KeyCode::Enter if plain_mods => {
+                let (exact, arg, needs) = (m.exact, m.arg.is_some(), m.needs_arg[m.sel]);
+                if exact {
+                    return None;
+                }
+                if arg {
+                    let text = self.menu_text(false);
+                    self.set_text(&text);
+                } else if needs {
+                    let text = self.menu_text(true);
+                    self.set_text(&text);
+                    return Some(Action::Redraw);
+                } else {
+                    let text = self.menu_text(false);
+                    self.set_text(&text);
+                }
+                return Some(self.submit(false));
+            }
+            KeyCode::Esc => {
+                self.menu_closed_for = Some(self.text());
+                self.menu = None;
+            }
+            _ => return None,
+        }
+        self.ctrl_c_armed = false;
+        Some(Action::Redraw)
+    }
+
+    /// The selected completion as buffer text, optionally with a trailing space.
+    fn menu_text(&self, space: bool) -> String {
+        let m = self.menu.as_ref().expect("menu open");
+        let item = &m.items[m.sel];
+        let mut t = match &m.arg {
+            Some(cmd) => format!("/{cmd} {item}"),
+            None => format!("/{item}"),
+        };
+        if space {
+            t.push(' ');
+        }
+        t
+    }
+
+    fn refresh_menu(&mut self, commands: &[Entry]) {
+        let text = self.text();
+        if self.menu_closed_for.as_ref().is_some_and(|c| *c != text) {
+            self.menu_closed_for = None;
+        }
+        let new = self.build_menu(&text, commands);
+        self.menu = match (new, self.menu.take()) {
+            (Some(mut n), Some(old)) if old.items == n.items && old.arg == n.arg => {
+                n.sel = old.sel.min(n.items.len() - 1);
+                Some(n)
+            }
+            (n, _) => n,
+        };
+    }
+
+    fn build_menu(&self, text: &str, commands: &[Entry]) -> Option<Menu> {
+        if self.buf.lines.len() != 1 || self.browse.is_some() || self.menu_closed_for.as_deref() == Some(text) {
+            return None;
+        }
+        let body = text.strip_prefix('/')?;
+        let (items, descs, needs_arg, arg, exact) = match body.split_once(char::is_whitespace) {
+            None => {
+                let mut usage: HashMap<String, u32> = HashMap::new();
+                for h in &self.history {
+                    if let Some(name) = h.split_whitespace().next().and_then(|t| t.strip_prefix('/')) {
+                        *usage.entry(name.to_owned()).or_default() += 1;
+                    }
+                }
+                let idx = complete::rank(commands, body, &usage);
+                let pick = |f: fn(&Entry) -> String| idx.iter().map(|&i| f(&commands[i])).collect::<Vec<_>>();
+                let exact = commands.iter().any(|c| c.name == body);
+                (pick(|e| e.name.clone()), pick(|e| e.desc.clone()), idx.iter().map(|&i| commands[i].needs_arg).collect::<Vec<_>>(), None, exact)
+            }
+            Some((name, partial)) => {
+                if partial.contains(char::is_whitespace) {
+                    return None;
+                }
+                let e = commands.iter().find(|c| c.name == name && !c.args.is_empty())?;
+                let lower = partial.to_lowercase();
+                let items: Vec<String> = e.args.iter().filter(|a| a.to_lowercase().starts_with(&lower)).cloned().collect();
+                let n = items.len();
+                let exact = e.args.iter().any(|a| a == partial);
+                (items, vec![String::new(); n], vec![false; n], Some(name.to_owned()), exact)
+            }
+        };
+        (!items.is_empty()).then_some(Menu { items, descs, needs_arg, sel: 0, arg, exact })
+    }
+
+    fn on_key_inner(&mut self, key: KeyEvent, running: bool) -> Action {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
@@ -329,7 +536,6 @@ impl Composer {
                     Action::None
                 }
             }
-            KeyCode::Tab => self.complete(commands),
             KeyCode::BackTab => Action::CycleThinking,
             KeyCode::Char('t') if ctrl => Action::ToggleThinking,
             KeyCode::Char('o') if ctrl => Action::ToggleExpanded,
@@ -371,7 +577,14 @@ impl Composer {
     }
 
     /// Pasted text. A paste made only of image-file paths attaches those images instead.
-    pub fn on_paste(&mut self, s: &str) -> Result<(), String> {
+    pub fn on_paste(&mut self, s: &str, commands: &[Entry]) -> Result<(), String> {
+        let r = self.paste_inner(s);
+        self.refresh_menu(commands);
+        r
+    }
+
+    fn paste_inner(&mut self, s: &str) -> Result<(), String> {
+        self.ghost = None;
         self.ctrl_c_armed = false;
         self.browse = None;
         if let Some(paths) = image::paths_in_paste(s) {
@@ -448,6 +661,21 @@ impl Composer {
                 }
             })
             .collect();
+        if let Some(g) = self.ghost.as_deref().filter(|_| !self.is_empty()) {
+            let mut left = avail.saturating_sub(cursor.1);
+            let mut shown = String::new();
+            for ch in g.chars() {
+                let w = ch.width().unwrap_or(0);
+                if w > left {
+                    break;
+                }
+                left -= w;
+                shown.push(ch);
+            }
+            if let Some(row) = body.get_mut(cursor.0).filter(|_| !shown.is_empty()) {
+                row.push(span(shown, dim()));
+            }
+        }
         if self.is_empty() {
             let used = PAD + PREFIX_W;
             let placeholder = "type here…";
@@ -462,6 +690,27 @@ impl Composer {
         }
         if self.ctrl_c_armed {
             body.push(vec![span(format!("{pad}{CTRL_C_HINT}"), dim())]);
+        }
+        if let Some(m) = &self.menu {
+            let n = m.items.len();
+            let start = m.sel.saturating_sub(MENU_ROWS - 1).min(n.saturating_sub(MENU_ROWS));
+            for i in start..n.min(start + MENU_ROWS) {
+                let mut row: Line = match &m.arg {
+                    Some(_) => vec![span(format!("{pad}  {}", m.items[i]), ContentStyle::default())],
+                    None => {
+                        let mut r = vec![span(format!("{pad}  /{}", m.items[i]), ContentStyle::default())];
+                        if !m.descs[i].is_empty() {
+                            r.push(span(format!("  {}", m.descs[i]), dim()));
+                        }
+                        r
+                    }
+                };
+                row = line::truncate(&row, width);
+                if i == m.sel {
+                    row = line::fill(&row, width, theme::get().color("selectedBg"));
+                }
+                body.push(row);
+            }
         }
         let mut out = Vec::with_capacity(body.len() + 1);
         out.push(Vec::new());
@@ -478,6 +727,7 @@ impl Composer {
     /// buffer remain expandable.
     pub fn set_text(&mut self, s: &str) {
         self.browse = None;
+        self.ghost = None;
         let pastes = std::mem::take(&mut self.buf.pastes);
         let images = std::mem::take(&mut self.buf.images);
         self.buf = Buf::from_text(s);
@@ -545,6 +795,7 @@ impl Composer {
     }
 
     fn clear(&mut self) {
+        self.ghost = None;
         self.buf = Buf::default();
         self.browse = None;
         self.image_count = 0;
@@ -581,7 +832,9 @@ impl Composer {
             }
             // Best effort: history persistence must not block the prompt.
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(f, "{}", serde_json::to_string(text).unwrap_or_default());
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let row = serde_json::json!({ "text": text, "cwd": self.cwd, "ts": ts });
+                let _ = writeln!(f, "{row}");
             }
         }
         self.history.push(text.to_owned());
@@ -591,6 +844,7 @@ impl Composer {
     }
 
     fn history_prev(&mut self) {
+        self.ghost = None;
         match self.browse.take() {
             None => {
                 if self.history.is_empty() {
@@ -623,32 +877,6 @@ impl Composer {
             buf.images.clear();
             self.buf = buf;
         }
-    }
-
-    fn complete(&mut self, commands: &[String]) -> Action {
-        let text = self.buf.text();
-        let Some(prefix) = text.strip_prefix('/') else { return Action::None };
-        if prefix.contains(char::is_whitespace) {
-            return Action::None;
-        }
-        let matches: Vec<&str> = commands
-            .iter()
-            .map(String::as_str)
-            .filter(|c| c.starts_with(prefix))
-            .collect();
-        let completed = match matches.as_slice() {
-            [] => return Action::None,
-            [only] => format!("/{only} "),
-            many => {
-                let common = common_prefix(many);
-                if common.len() <= prefix.len() {
-                    return Action::None;
-                }
-                format!("/{common}")
-            }
-        };
-        self.set_text(&completed);
-        Action::Redraw
     }
 }
 
@@ -692,16 +920,6 @@ fn normalize_paste(s: &str) -> String {
     out
 }
 
-/// Longest common char prefix of a non-empty slice.
-fn common_prefix(xs: &[&str]) -> String {
-    let mut acc = xs[0].to_owned();
-    for x in &xs[1..] {
-        let n = acc.chars().zip(x.chars()).take_while(|(a, b)| a == b).count();
-        acc = acc.chars().take(n).collect();
-    }
-    acc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,8 +943,31 @@ mod tests {
         }
     }
 
-    fn cmds() -> Vec<String> {
-        ["exit", "exec", "model"].map(str::to_owned).to_vec()
+    fn entry(name: &str, needs_arg: bool, args: &[&str]) -> Entry {
+        Entry { name: name.into(), desc: format!("{name} desc"), needs_arg, args: args.iter().map(|s| s.to_string()).collect() }
+    }
+
+    fn cmds() -> Vec<Entry> {
+        vec![
+            entry("exit", false, &[]),
+            entry("model", false, &[]),
+            entry("rename", true, &[]),
+            entry("thinking", false, &["off", "low", "medium", "high"]),
+        ]
+    }
+
+    fn tab(c: &mut Composer) -> Action {
+        c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cmds())
+    }
+
+    fn pr(c: &mut Composer, code: KeyCode) -> Action {
+        c.on_key(key(code, KeyModifiers::NONE), false, &cmds())
+    }
+
+    fn typ(c: &mut Composer, s: &str) {
+        for ch in s.chars() {
+            pr(c, KeyCode::Char(ch));
+        }
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -828,38 +1069,113 @@ mod tests {
     }
 
     #[test]
-    fn tab_completes_commands() {
+    fn slash_menu() {
         let mut c = Composer::new(None);
-        let cm = cmds();
-        type_str(&mut c, "/");
-        assert_eq!(c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cm), Action::None);
-        assert_eq!(c.text(), "/");
+        typ(&mut c, "/mo");
+        assert_eq!(c.menu.as_ref().unwrap().items[0], "model");
+        let (lines, _) = c.render(40);
+        assert!(crate::tui::line::line_text(&lines[lines.len() - 1]).contains("/model  model desc"));
+        pr(&mut c, KeyCode::Down);
+        assert_eq!(c.text(), "/mo");
+        assert_eq!(pr(&mut c, KeyCode::Enter), Action::Submit("/model".into()));
 
         let mut c = Composer::new(None);
-        type_str(&mut c, "/mo");
-        c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cm);
-        assert_eq!(c.text(), "/model ");
+        typ(&mut c, "/ren");
+        assert_eq!(pr(&mut c, KeyCode::Enter), Action::Redraw);
+        assert_eq!(c.text(), "/rename ");
 
         let mut c = Composer::new(None);
-        type_str(&mut c, "/e");
-        c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cm);
-        assert_eq!(c.text(), "/ex", "extends to common prefix without a space");
-        assert_eq!(c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cm), Action::None);
-        assert_eq!(c.text(), "/ex");
+        typ(&mut c, "/thinking h");
+        tab(&mut c);
+        assert_eq!(c.text(), "/thinking high ");
+        assert!(c.menu.is_none());
 
         let mut c = Composer::new(None);
-        type_str(&mut c, "/x");
-        assert_eq!(c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cm), Action::None);
+        typ(&mut c, "/thinking h");
+        assert_eq!(pr(&mut c, KeyCode::Enter), Action::Submit("/thinking high".into()));
 
         let mut c = Composer::new(None);
-        type_str(&mut c, "/model arg");
-        assert_eq!(c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cm), Action::None);
-        assert_eq!(c.text(), "/model arg");
+        typ(&mut c, "/model");
+        assert_eq!(pr(&mut c, KeyCode::Enter), Action::Submit("/model".into()), "exact name submits");
 
         let mut c = Composer::new(None);
-        type_str(&mut c, "hi");
-        assert_eq!(c.on_key(key(KeyCode::Tab, KeyModifiers::NONE), false, &cm), Action::None);
-        assert_eq!(c.text(), "hi");
+        typ(&mut c, "/mo");
+        assert_eq!(c.on_key(key(KeyCode::Esc, KeyModifiers::NONE), true, &cmds()), Action::Redraw);
+        assert!(c.menu.is_none());
+        c.on_key(key(KeyCode::Down, KeyModifiers::NONE), false, &cmds());
+        assert!(c.menu.is_none(), "stays closed until an edit");
+        typ(&mut c, "d");
+        assert!(c.menu.is_some());
+
+        let mut c = Composer::new(None);
+        typ(&mut c, "hello");
+        assert!(c.menu.is_none());
+        assert_eq!(tab(&mut c), Action::None);
+        assert_eq!(c.text(), "hello");
+    }
+
+    #[test]
+    fn ghost_text() {
+        let mut c = Composer::new(None);
+        typ(&mut c, "fix the bu");
+        c.set_ghost("fix the b", "ug".into());
+        assert!(c.ghost.is_none(), "stale text_for is ignored");
+        c.set_ghost("fix the bu", "g".into());
+        typ(&mut c, "g");
+        assert!(c.ghost.is_none());
+        assert_eq!(c.text(), "fix the bug");
+
+        c.set_text("fix the bu");
+        c.set_ghost("fix the bu", "gfix".into());
+        typ(&mut c, "g");
+        assert_eq!(c.ghost.as_deref(), Some("fix"), "typing the ghost's first char projects it");
+        typ(&mut c, "x");
+        assert!(c.ghost.is_none());
+
+        c.set_text("please com");
+        c.set_ghost("please com", "mit".into());
+        tab(&mut c);
+        assert_eq!(c.text(), "please commit ");
+
+        c.set_text("please com");
+        c.set_ghost("please com", "mit".into());
+        pr(&mut c, KeyCode::Right);
+        assert_eq!(c.text(), "please commit");
+
+        c.set_text("a b");
+        c.set_ghost("a b", " c d".into());
+        let (lines, _) = c.render(40);
+        assert!(crate::tui::line::line_text(&lines[1]).ends_with("a b c d"));
+        tab(&mut c);
+        assert_eq!(c.text(), "a b c d", "multi-word ghost gets no trailing space");
+
+        let mut c = Composer::new(None);
+        c.history = vec!["old".into()];
+        typ(&mut c, "x");
+        c.set_ghost("x", "yz".into());
+        pr(&mut c, KeyCode::Up);
+        assert!(c.ghost.is_none());
+        assert_eq!(c.predict_query(), None, "browsing history");
+        let mut c = Composer::new(None);
+        typ(&mut c, "hi");
+        assert_eq!(c.predict_query().as_deref(), Some("hi"));
+        c.set_text("/x");
+        assert_eq!(c.predict_query(), None);
+    }
+
+    #[test]
+    fn history_loads_both_formats() {
+        let path = temp_path("formats");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "\"legacy\"\n{\"text\":\"new\",\"cwd\":\"/x\",\"ts\":5}\n").unwrap();
+        let c = Composer::new(Some(path.clone()));
+        assert_eq!(c.history, ["legacy", "new"]);
+        let mut c = c.with_cwd(Path::new("/w"));
+        c.push_history("third");
+        let last = std::fs::read_to_string(&path).unwrap().lines().last().unwrap().to_owned();
+        let v: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert_eq!((v["text"].as_str(), v["cwd"].as_str()), (Some("third"), Some("/w")));
+        assert!(v["ts"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -878,7 +1194,7 @@ mod tests {
 
         let mut c = Composer::new(None);
         ctrl(&mut c, 'c');
-        c.on_paste("y").unwrap();
+        c.on_paste("y", &[]).unwrap();
         assert_eq!(ctrl(&mut c, 'c'), Action::Redraw, "paste resets the armed state");
         assert!(c.is_empty());
 
@@ -898,28 +1214,28 @@ mod tests {
     #[test]
     fn paste_normalizes_and_marks_large_pastes() {
         let mut c = Composer::new(None);
-        c.on_paste("a\r\nb\rc\td\u{7}e").unwrap();
+        c.on_paste("a\r\nb\rc\td\u{7}e", &[]).unwrap();
         assert_eq!(c.text(), "a\nb\nc   de");
 
         let mut c = Composer::new(None);
         let body: Vec<String> = (0..12).map(|i| format!("line {i}")).collect();
         let original = body.join("\n");
-        c.on_paste(&original).unwrap();
+        c.on_paste(&original, &[]).unwrap();
         assert_eq!(c.text(), "[Paste #1, +11 lines]");
         assert_eq!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), Action::Submit(original.into()));
 
         let mut c = Composer::new(None);
-        c.on_paste(&"x".repeat(1500)).unwrap();
+        c.on_paste(&"x".repeat(1500), &[]).unwrap();
         assert_eq!(c.text(), "[Paste #1, 1500 chars]");
-        c.on_paste("tail").unwrap();
+        c.on_paste("tail", &[]).unwrap();
         assert_eq!(c.text(), "[Paste #1, 1500 chars]tail");
         // Two pastes get distinct numbers.
-        c.on_paste(&"y".repeat(1500)).unwrap();
+        c.on_paste(&"y".repeat(1500), &[]).unwrap();
         assert_eq!(c.text(), "[Paste #1, 1500 chars]tail[Paste #2, 1500 chars]");
 
         // Editing a marker makes it literal text; the broken marker is not expanded.
         let mut c = Composer::new(None);
-        c.on_paste(&"z".repeat(1500)).unwrap();
+        c.on_paste(&"z".repeat(1500), &[]).unwrap();
         press(&mut c, KeyCode::Backspace, KeyModifiers::NONE);
         match press(&mut c, KeyCode::Enter, KeyModifiers::NONE) {
             Action::Submit(s) => assert_eq!(s.text, "[Paste #1, 1500 chars"),

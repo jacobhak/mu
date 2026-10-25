@@ -1,0 +1,4 @@
+name = "predict"
+command = ["mu-predict"]
+lifetime = "idle:10m"
+hooks = []

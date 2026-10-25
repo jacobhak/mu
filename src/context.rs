@@ -63,6 +63,7 @@ pub struct Skill {
 pub struct SlashCommand {
     pub name: String,
     pub body: String,
+    pub description: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -143,8 +144,13 @@ pub fn discover_commands(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<Slash
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&f) else { continue };
-            let (_, body) = frontmatter(&text);
-            out.push(SlashCommand { name, body: body.trim_start_matches('\n').into() });
+            let (front, body) = frontmatter(&text);
+            let description = front
+                .description
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().chars().take(60).collect());
+            out.push(SlashCommand { name, body: body.trim_start_matches('\n').into(), description });
         }
     }
     out
