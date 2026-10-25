@@ -46,6 +46,7 @@ impl Threshold {
 #[serde(default, rename_all = "camelCase")]
 pub struct OmpConfig {
     pub model_roles: BTreeMap<String, String>,
+    pub cycle_order: Vec<String>,
     pub compaction: OmpCompaction,
     pub skills: OmpSkills,
     pub theme: OmpTheme,
@@ -54,6 +55,16 @@ pub struct OmpConfig {
     pub symbol_preset: Option<String>,
     #[allow(dead_code)]
     pub mnemopi: Option<serde_yaml_ng::Value>,
+}
+
+impl OmpConfig {
+    pub fn role_cycle(&self) -> Vec<String> {
+        if self.cycle_order.is_empty() {
+            ["smol", "default", "slow"].map(String::from).to_vec()
+        } else {
+            self.cycle_order.clone()
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -259,6 +270,14 @@ mod tests {
         assert_eq!(rewrite_role(t, "plan", "p/q").unwrap(), "a: 1\nmodelRoles:\n  default: x/y:high\n  smol: s\n  plan: p/q\n\ntheme:\n  dark: d\n");
         assert_eq!(rewrite_role("a: 1\n", "plan", "p/q").unwrap(), "a: 1\nmodelRoles:\n  plan: p/q\n");
         assert!(rewrite_role("modelRoles: {}\n", "plan", "p").is_err());
+    }
+
+    #[test]
+    fn role_cycle_default_and_configured() {
+        let omp: OmpConfig = serde_yaml_ng::from_str("modelRoles: {}\n").unwrap();
+        assert_eq!(omp.role_cycle(), ["smol", "default", "slow"]);
+        let omp: OmpConfig = serde_yaml_ng::from_str("cycleOrder: [slow, default]\n").unwrap();
+        assert_eq!(omp.role_cycle(), ["slow", "default"]);
     }
 
     #[test]

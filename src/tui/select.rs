@@ -170,14 +170,7 @@ impl Select {
 
     /// Replaces line breaks and tabs with spaces and drops other control characters.
     pub fn on_paste(&mut self, s: &str) {
-        let clean: String = s
-            .chars()
-            .filter_map(|c| match c {
-                '\r' | '\n' | '\t' => Some(' '),
-                c if c.is_control() => None,
-                c => Some(c),
-            })
-            .collect();
+        let clean = clean_paste(s);
         if self.editing {
             self.text.push_str(&clean);
         } else {
@@ -485,4 +478,14 @@ mod tests {
             }
         }
     }
+}
+
+pub fn clean_paste(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match c {
+            '\r' | '\n' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }

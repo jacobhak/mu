@@ -315,7 +315,7 @@ fn context_color(pct: Option<f64>, window: u64) -> &'static str {
 }
 
 /// omp's `formatNumber`: `999`, `1.5K`, `25K`, `1M`, `1.5B`.
-fn format_number(n: u64) -> String {
+pub(super) fn format_number(n: u64) -> String {
     let trim1 = |v: f64, unit: &str| {
         let s = format!("{v:.1}");
         format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))

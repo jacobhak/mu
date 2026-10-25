@@ -303,6 +303,11 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
         return lines;
     }
     match name {
+        "write" if args["path"].as_str().is_some_and(|p| p.starts_with("local://") && p.ends_with("-plan.md")) => {
+            let n = args["content"].as_str().map_or(0, |c| c.lines().count());
+            lines[0].push(span(format!(" · {n} lines"), tfg("toolOutput")));
+            lines[0] = truncate(&lines[0], width);
+        }
         "edit" | "write" if out.display.is_some() => {
             let (rows, adds, dels) = diff_rows(out.display.as_deref().unwrap_or(""), expanded);
             let card = Card {
@@ -385,6 +390,14 @@ mod tests {
 
     fn texts(lines: &[Line]) -> Vec<String> {
         lines.iter().map(text_of).collect()
+    }
+
+    #[test]
+    fn plan_write_is_one_line() {
+        let mut out = ToolOutput::ok("ok");
+        out.display = Some("+a\n+b\n+c".into());
+        let args = json!({"path": "local://x-plan.md", "content": "a\nb\nc\n"});
+        assert_eq!(texts(&tool_result("write", &args, &out, false, 60)), ["● write local://x-plan.md · 3 lines"]);
     }
 
     #[test]

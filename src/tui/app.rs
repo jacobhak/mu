@@ -5,6 +5,7 @@ use super::complete::Entry;
 use super::composer::{Action, Composer};
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
+use super::plan_review::{PlanReview, ReviewResult, Tier};
 use super::render::Renderer;
 use super::select::{Item, Select, SelectResult};
 use super::status;
@@ -74,7 +75,7 @@ enum Overlay {
     Login { sel: Select, nums: Vec<usize> },
     Session { sel: Select, paths: Vec<PathBuf> },
     Ask { qs: Vec<AskQuestion>, idx: usize, answers: Vec<Answer>, sel: Select, reply: Option<oneshot::Sender<Option<Vec<Answer>>>> },
-    Plan { sel: Select, reply: Option<oneshot::Sender<PlanDecision>> },
+    Review { review: Box<PlanReview>, reply: Option<oneshot::Sender<PlanDecision>> },
     Copy { sel: Select, texts: Vec<String> },
 }
 
@@ -414,16 +415,10 @@ impl App {
                 self.commit(vec![styled(format!("↳ job results delivered: {}", ids.join(", ")), |_| dim())]);
             }
             AgentEvent::Ask { questions, reply } => self.start_ask(questions, reply),
-            AgentEvent::PlanReview { title, path, reply } => {
-                let sel = Select::new(
-                    &format!("Plan: {title} ({path})"),
-                    vec![
-                        Item { label: "Approve and execute".into(), detail: "new session, run the plan".into() },
-                        Item { label: "Approve and keep context".into(), detail: "implement in this session".into() },
-                    ],
-                )
-                .free_text("Refine plan");
-                self.overlay = Some(Overlay::Plan { sel, reply: Some(reply) });
+            AgentEvent::PlanReview { title, uri, file, content, reply } => {
+                let context = self.status.context_tokens.filter(|_| self.status.context_window > 0).map(|t| (t, self.status.context_window as u64));
+                let review = PlanReview::new(title, uri, file, content, context, self.plan_tiers());
+                self.overlay = Some(Overlay::Review { review: Box::new(review), reply: Some(reply) });
             }
             AgentEvent::Status(s) => {
                 self.status = s;
@@ -599,9 +594,10 @@ impl App {
         match e {
             Event::Key(k) => self.on_key(k),
             Event::Paste(s) => match self.overlay.as_mut() {
-                Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. } | Overlay::Plan { sel, .. } | Overlay::Copy { sel, .. }) => {
+                Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. } | Overlay::Copy { sel, .. }) => {
                     sel.on_paste(&s)
                 }
+                Some(Overlay::Review { review, .. }) => review.on_paste(&s),
                 None => {
                     if let Err(e) = self.composer.on_paste(&s, &self.commands) {
                         self.error(&format!("image: {e}"));
@@ -758,20 +754,38 @@ impl App {
                 }
                 _ => {}
             },
-            Overlay::Plan { mut sel, mut reply } => {
-                let decision = match sel.on_key(k) {
-                    SelectResult::Pending => {
-                        self.overlay = Some(Overlay::Plan { sel, reply });
+            Overlay::Review { mut review, mut reply } => {
+                match review.on_key(k) {
+                    ReviewResult::Pending => {}
+                    ReviewResult::Copy => {
+                        match clipboard::copy(review.content()) {
+                            Ok(()) => self.notice("plan copied"),
+                            Err(e) => self.error(&e),
+                        }
+                    }
+                    ReviewResult::Edit => {
+                        let file = review.file.clone();
+                        if let Err(e) = self.run_editor(&file) {
+                            self.error(&e);
+                        }
+                        match std::fs::read_to_string(&file) {
+                            Ok(t) => review.set_content(t),
+                            Err(e) => self.error(&format!("cannot read plan: {e}")),
+                        }
+                    }
+                    ReviewResult::Cancelled => {
+                        self.inbox.borrow().cancel.cancel();
+                        self.notice("plan review cancelled; plan mode stays on");
                         return;
                     }
-                    SelectResult::Chosen(i) if i.first() == Some(&0) => PlanDecision::Execute,
-                    SelectResult::Chosen(_) => PlanDecision::Keep,
-                    SelectResult::Text(t) => PlanDecision::Refine(t),
-                    SelectResult::Cancelled => PlanDecision::Refine(String::new()),
-                };
-                if let Some(r) = reply.take() {
-                    let _ = r.send(decision);
+                    ReviewResult::Decided(d) => {
+                        if let Some(r) = reply.take() {
+                            let _ = r.send(d);
+                        }
+                        return;
+                    }
                 }
+                self.overlay = Some(Overlay::Review { review, reply });
             }
             Overlay::Ask { qs, idx, mut answers, mut sel, mut reply } => {
                 let ans = match sel.on_key(k) {
@@ -1089,23 +1103,50 @@ impl App {
         }
     }
 
-    fn edit_external(&mut self) {
+    /// Runs `$VISUAL`/`$EDITOR` on `path` with the terminal handed over; `Ok(exited_ok)`.
+    fn run_editor(&mut self, path: &std::path::Path) -> Result<bool, String> {
         let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+        let committed = std::mem::take(&mut self.pending);
+        let _ = self.renderer.draw(&committed, &[], (0, 0));
+        let _ = self.renderer.finish();
+        let _ = term::suspend();
+        let status = std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(path).status();
+        let _ = term::resume();
+        self.renderer = Renderer::new();
+        status.map(|s| s.success()).map_err(|e| format!("editor failed: {e}"))
+    }
+
+    fn edit_external(&mut self) {
         let path = std::env::temp_dir().join(format!("mu-edit-{}.md", std::process::id()));
         if std::fs::write(&path, self.composer.text()).is_err() {
             return self.error("cannot create temp file");
         }
-        let _ = self.renderer.finish();
-        let _ = term::suspend();
-        let status = std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(&path).status();
-        let _ = term::resume();
-        self.renderer = Renderer::new();
-        match (status, std::fs::read_to_string(&path)) {
-            (Ok(s), Ok(t)) if s.success() => self.composer.set_text(t.trim_end_matches('\n')),
-            (Ok(_), _) => {}
-            (Err(e), _) => self.error(&format!("editor failed: {e}")),
+        match self.run_editor(&path) {
+            Ok(true) => {
+                if let Ok(t) = std::fs::read_to_string(&path) {
+                    self.composer.set_text(t.trim_end_matches('\n'));
+                }
+            }
+            Ok(false) => {}
+            Err(e) => self.error(&e),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Roles from omp's `cycleOrder` that can be switched to when implementing an approved plan.
+    fn plan_tiers(&self) -> Vec<Tier> {
+        let cfg = &self.providers.cfg;
+        let mut out = Vec::new();
+        for r in cfg.omp.role_cycle() {
+            match cfg.role(&r) {
+                Some(v) if self.providers.resolve(&format!("@{r}")).is_ok() => {
+                    out.push(Tier { model: Some(format!("@{r}")), detail: v, role: r });
+                }
+                None if r == "default" => out.push(Tier { role: r, detail: "current model".into(), model: None }),
+                _ => {}
+            }
+        }
+        out
     }
 
     // ---- drawing ------------------------------------------------------------------------------
@@ -1185,9 +1226,20 @@ impl App {
         vp.extend(self.live_lines(w));
         vp.extend(self.todo_hud(w));
         vp.extend(self.queue_bar(w));
-        let (lines, cur) = match &self.overlay {
-            Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. } | Overlay::Plan { sel, .. } | Overlay::Copy { sel, .. }) => {
+        let mut env = status::StatusEnv::new(&self.cwd, &self.status_cfg);
+        env.expanded = self.expanded;
+        env.turn_elapsed = self.turn_started.map(|t| t.elapsed());
+        let status_lines = status::render(&self.status, &env, w);
+        let (lines, cur) = match &mut self.overlay {
+            Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. }| Overlay::Copy { sel, .. }) => {
                 let (body, cur) = sel.render(w, (rows / 2).max(6).saturating_sub(2));
+                let mut framed: Vec<Line> = vec![Vec::new()];
+                framed.extend(body);
+                (framed, (cur.0 + 1, cur.1))
+            }
+            Some(Overlay::Review { review, .. }) => {
+                let avail = rows.saturating_sub(1).saturating_sub(vp.len() + status_lines.len());
+                let (body, cur) = review.render(w, avail.saturating_sub(1));
                 let mut framed: Vec<Line> = vec![Vec::new()];
                 framed.extend(body);
                 (framed, (cur.0 + 1, cur.1))
@@ -1196,10 +1248,7 @@ impl App {
         };
         let cursor = (vp.len() + cur.0, cur.1);
         vp.extend(lines);
-        let mut env = status::StatusEnv::new(&self.cwd, &self.status_cfg);
-        env.expanded = self.expanded;
-        env.turn_elapsed = self.turn_started.map(|t| t.elapsed());
-        vp.extend(status::render(&self.status, &env, w));
+        vp.extend(status_lines);
         let committed = std::mem::take(&mut self.pending);
         self.renderer.draw(&committed, &vp, cursor)?;
         self.last_draw = Instant::now();
