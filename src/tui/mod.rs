@@ -14,4 +14,4 @@ pub mod select;
 pub mod status;
 pub mod term;
 pub mod theme;
-mod theme_data;
+mod probe;

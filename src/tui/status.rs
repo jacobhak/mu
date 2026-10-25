@@ -1,7 +1,7 @@
 //! Footer: an optional quota line, then one status line built from the user's omp
 //! `statusLine` segments (`config.yml`). Segment ids mu cannot supply (e.g. `pr`, `subagents`) are skipped.
 use super::line::{Line, line_width, span, truncate};
-use super::theme;
+use super::theme::{self, Role};
 use crate::config::OmpStatusLine;
 use crate::events::StatusSnapshot;
 use crate::gitinfo::GitInfo;
@@ -68,10 +68,10 @@ fn usage_line(u: &ProviderUsage) -> Line {
             out.push(span("  ", plain));
         }
         let pct = w.used_percent.round() as i64;
-        let level = if pct >= 80 { "error" } else if pct >= 50 { "warning" } else { "success" };
-        out.push(span(format!("{} ", w.label), t.fg("dim")));
+        let level = if pct >= 80 { Role::Err } else if pct >= 50 { Role::Warn } else { Role::Muted };
+        out.push(span(format!("{} ", w.label), t.fg(Role::Faint)));
         out.push(span(format!("{pct}%"), t.fg(level)));
-        out.push(span(format!(" {}", reset_text(&w.label, w.resets_in).replace(' ', "")), t.fg("dim")));
+        out.push(span(format!(" {}", reset_text(&w.label, w.resets_in).replace(' ', "")), t.fg(Role::Faint)));
     }
     out
 }
@@ -113,7 +113,7 @@ fn status_line(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Line {
         .map_or(DEFAULT_PATH_MAX, |n| n as usize);
     let mut left = segments(&env.config.left_segments, DEFAULT_LEFT, s, env, path_max);
     if env.expanded {
-        left.push(Part { id: "expanded", line: vec![span("expanded", theme::get().fg("dim"))] });
+        left.push(Part { id: "expanded", line: vec![span("expanded", theme::get().fg(Role::Faint))] });
     }
     let mut right = segments(&env.config.right_segments, DEFAULT_RIGHT, s, env, path_max);
     if let Some(u) = s.usage.as_ref().filter(|u| !u.windows.is_empty()) {
@@ -173,12 +173,12 @@ fn group(parts: &[Part]) -> Line {
     if parts.is_empty() {
         return vec![];
     }
-    let sep = theme::get().fg("statusLineSep");
+    let sep = theme::get().fg(Role::Line);
     let plain = ContentStyle::default();
     let mut out: Line = vec![span(" ", plain)];
     for (i, p) in parts.iter().enumerate() {
         if i > 0 {
-            out.extend([span(" ", plain), span("│", sep), span(" ", plain)]);
+            out.push(span(" · ", sep));
         }
         out.extend(p.line.iter().cloned());
     }
@@ -200,35 +200,37 @@ fn segments(ids: &[String], fallback: &[&str], s: &StatusSnapshot, env: &StatusE
 
 fn segment(id: &str, s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Option<Line> {
     let t = theme::get();
-    let st = |key: &str| t.fg(key);
+    let st = |role: Role| t.fg(role);
     Some(match id {
         "pi" => {
             let glyph = match env.turn_elapsed {
                 Some(d) => ACTIVITY_FRAMES[(d.as_millis() / SPINNER_ADVANCE_MS) as usize % ACTIVITY_FRAMES.len()],
                 None => "μ",
             };
-            let mut text = match &env.profile {
-                Some(p) => format!("{glyph} {p}"),
-                None => glyph.to_string(),
-            };
+            let mut rest = env.profile.as_ref().map(|p| format!(" {p}")).unwrap_or_default();
             if let Some(d) = env.turn_elapsed {
-                text.push(' ');
-                text.push_str(&timer(d));
+                rest.push(' ');
+                rest.push_str(&timer(d));
             }
-            vec![span(text, st("dim"))]
+            let glyph_role = if env.turn_elapsed.is_some() { Role::Accent } else { Role::Muted };
+            let mut line = vec![span(glyph, st(glyph_role))];
+            if !rest.is_empty() {
+                line.push(span(rest, st(Role::Muted)));
+            }
+            line
         }
         "model" => {
-            let text = match thinking_glyph(s, env) {
-                Some(g) => format!("{} {g}", s.model_name),
-                None => s.model_name.clone(),
-            };
-            vec![span(text, st("statusLineModel"))]
+            let mut line = vec![span(s.model_name.clone(), ContentStyle::default())];
+            if let Some(g) = thinking_glyph(s, env) {
+                line.push(span(format!(" {g}"), st(Role::Muted)));
+            }
+            line
         }
         "mode" => {
             if !s.plan {
                 return None;
             }
-            vec![span("plan", st("accent"))]
+            vec![span("plan", st(Role::Accent))]
         }
         "path" => path_line(env, path_max),
         "git" => git_line(s.git.as_ref()?, env)?,
@@ -237,7 +239,7 @@ fn segment(id: &str, s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Op
             if s.context_window == 0 {
                 return None;
             }
-            vec![span(format!("{} ctx", format_number(s.context_window as u64)), st("statusLineContext"))]
+            vec![span(format!("{} ctx", format_number(s.context_window as u64)), st(Role::Muted))]
         }
         "cost" => {
             if !s.subscription && s.cost <= 0.0 {
@@ -249,11 +251,11 @@ fn segment(id: &str, s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Op
                 (true, true) => format!("S{:.2}", s.cost),
                 (true, false) => format!("${:.2}", s.cost),
             };
-            vec![span(text, st("statusLineCost"))]
+            vec![span(text, st(Role::Muted))]
         }
         "session_name" => {
             let title = s.title.as_deref().filter(|t| !t.is_empty())?;
-            vec![span(title, st("accent"))]
+            vec![span(title, st(Role::Faint))]
         }
         _ => return None,
     })
@@ -288,29 +290,29 @@ fn timer(d: Duration) -> String {
 fn context_line(s: &StatusSnapshot) -> Line {
     let window = s.context_window as u64;
     let pct = s.context_tokens.filter(|_| window > 0).map(|t| t as f64 / window as f64 * 100.0);
-    let color = theme::get().fg(context_color(pct, window));
-    let body = match pct {
-        Some(p) => format!("{p:.1}% of {}", format_number(window)),
-        None => format_number(window),
-    };
-    vec![span(body, color)]
+    let t = theme::get();
+    match pct {
+        Some(p) => vec![
+            span(format!("{p:.1}%"), t.fg(context_color(pct, window))),
+            span(format!(" of {}", format_number(window)), t.fg(Role::Faint)),
+        ],
+        None => vec![span(format_number(window), t.fg(Role::Muted))],
+    }
 }
 
 /// omp's `getContextUsageLevel`: a level is reached at its percent or its token count, whichever is lower.
-fn context_color(pct: Option<f64>, window: u64) -> &'static str {
-    let Some(p) = pct.filter(|p| *p > 0.0) else { return "statusLineContext" };
+fn context_color(pct: Option<f64>, window: u64) -> Role {
+    let Some(p) = pct.filter(|p| *p > 0.0) else { return Role::Muted };
     let reaches = |percent: f64, tokens: f64| {
         let token_pct = if window > 0 { tokens / window as f64 * 100.0 } else { f64::INFINITY };
         p >= percent.min(token_pct)
     };
-    if reaches(90.0, 500_000.0) {
-        "error"
-    } else if reaches(70.0, 270_000.0) {
-        "thinkingHigh"
+    if reaches(70.0, 270_000.0) {
+        Role::Err
     } else if reaches(50.0, 150_000.0) {
-        "warning"
+        Role::Warn
     } else {
-        "statusLineContext"
+        Role::Muted
     }
 }
 
@@ -336,28 +338,22 @@ fn git_line(g: &GitInfo, env: &StatusEnv) -> Option<Line> {
     let opts = env.config.segment_options.get("git");
     let opt = |k: &str| opts.and_then(|o| o[k].as_bool()).unwrap_or(true);
     let t = theme::get();
-    let dirty = g.staged > 0 || g.dirty > 0 || g.untracked > 0;
-    let color = t.fg(if dirty { "statusLineGitDirty" } else { "statusLineGitClean" });
-    let counts: Vec<(String, &'static str)> = [
-        (opt("showUnstaged"), g.dirty, "*", "statusLineDirty"),
-        (opt("showStaged"), g.staged, "+", "statusLineStaged"),
-        (opt("showUntracked"), g.untracked, "?", "statusLineUntracked"),
-    ]
-    .into_iter()
-    .filter(|(on, n, ..)| *on && *n > 0)
-    .map(|(_, n, prefix, key)| (format!("{prefix}{n}"), key))
-    .collect();
+    let counts: Vec<String> = [(opt("showUnstaged"), g.dirty, "*"), (opt("showStaged"), g.staged, "+"), (opt("showUntracked"), g.untracked, "?")]
+        .into_iter()
+        .filter(|(on, n, _)| *on && *n > 0)
+        .map(|(_, n, prefix)| format!("{prefix}{n}"))
+        .collect();
     let mut line: Line = vec![];
     if opt("showBranch") {
         if let Some(b) = &g.branch {
-            line.push(span(b.clone(), color));
+            line.push(span(b.clone(), t.fg(Role::Muted)));
         }
     }
-    for (text, key) in counts {
+    for text in counts {
         if !line.is_empty() {
             line.push(span(" ", ContentStyle::default()));
         }
-        line.push(span(text, t.fg(key)));
+        line.push(span(text, t.fg(Role::Faint)));
     }
     (!line.is_empty()).then_some(line)
 }
@@ -372,7 +368,7 @@ fn path_line(env: &StatusEnv, max: usize) -> Line {
     let (_, display) = path_display(env.cwd, home, strip);
     let text = if abbreviate { abbreviate_home(&display, home) } else { display };
     let text = clamp_left(&text, max);
-    vec![span(text, theme::get().fg("statusLinePath"))]
+    vec![span(text, theme::get().fg(Role::Muted))]
 }
 
 /// `(in a scratch dir, text)`: the path relative to its scratch or project root when stripping, else the full path.
@@ -485,9 +481,9 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let t = line_text(&lines[0]);
         assert_eq!(line_width(&lines[0]), 140);
-        assert!(t.contains(" 5h 82% 2h  7d 16% 4d │ EVENTS"), "{t}");
+        assert!(t.contains(" 5h 82% 2h  7d 16% 4d · EVENTS"), "{t}");
         assert!(
-            t.starts_with(" μ private │ Haiku 5.5 ◒ │ ~/code/mu │ main *2 +1 ?3 │ 1.5% of 1M │ (sub) "),
+            t.starts_with(" μ private · Haiku 5.5 ◒ · ~/code/mu · main *2 +1 ?3 · 1.5% of 1M · (sub) "),
             "{t}"
         );
         assert!(t.ends_with(" EVENTS: Read mu events.rs header "), "{t}");
@@ -507,7 +503,7 @@ mod tests {
         s.plan = true;
         s.cost = 0.25;
         let c = cfg(&["mode", "cost"], &[]);
-        assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " plan │ $0.25 ");
+        assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " plan · $0.25 ");
     }
 
     #[test]
@@ -544,9 +540,10 @@ mod tests {
         assert_eq!(format_number(200_000), "200K");
         assert_eq!(format_number(1_500), "1.5K");
         assert_eq!(format_number(1_500_000_000), "1.5B");
-        assert_eq!(context_color(Some(1.5), 1_000_000), "statusLineContext");
-        assert_eq!(context_color(Some(20.0), 1_000_000), "warning");
-        assert_eq!(context_color(None, 1_000_000), "statusLineContext");
+        assert_eq!(context_color(Some(1.5), 1_000_000), Role::Muted);
+        assert_eq!(context_color(Some(20.0), 1_000_000), Role::Warn);
+        assert_eq!(context_color(None, 1_000_000), Role::Muted);
+        assert_eq!(context_color(Some(30.0), 1_000_000), Role::Err);
         assert_eq!(reset_text("5h", Duration::from_secs(90 * 60)), "1h 30m");
         assert_eq!(reset_text("7d", Duration::from_secs(30 * 3600)), "1d 6h");
         assert_eq!(reset_text("7d", Duration::from_secs(4 * 86400)), "4d");

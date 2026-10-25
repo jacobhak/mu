@@ -7,10 +7,10 @@ use crossterm::style::ContentStyle;
 use unicode_width::UnicodeWidthStr;
 
 use super::line::{self, Line, bold, dim, span};
-use super::theme;
+use super::theme::{self, Role};
 
 fn accent_bold() -> ContentStyle {
-    let mut s = theme::get().fg("accent");
+    let mut s = theme::get().fg(Role::Accent);
     s.attributes.set(crossterm::style::Attribute::Bold);
     s
 }
@@ -259,7 +259,7 @@ impl Select {
 
     fn row_line(&self, row: Row, selected: bool, width: usize) -> Line {
         let emphasis = if selected { bold() } else { ContentStyle::default() };
-        let marker = if selected { theme::get().fg("accent") } else { ContentStyle::default() };
+        let marker = if selected { theme::get().fg(Role::Accent) } else { ContentStyle::default() };
         let mut l: Line = vec![span(if selected { "❯ " } else { "  " }, marker)];
         match row {
             Row::Item(i) => {
@@ -282,7 +282,7 @@ impl Select {
             }
         }
         if selected {
-            l = line::fill(&l, width, theme::get().color("selectedBg"));
+            l = line::fill(&l, width, theme::get().color(Role::Selected));
         }
         l
     }
