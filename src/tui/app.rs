@@ -10,7 +10,7 @@ use super::render::Renderer;
 use super::select::{Item, Select, SelectResult};
 use super::status;
 use super::term::{self, Term};
-use super::theme;
+use super::theme::{self, Role};
 use crate::context::Context;
 use crate::events::{Command, SharedInbox};
 use crate::events::{AgentEvent, Answer, AskQuestion, PlanDecision, StatusSnapshot, SubagentState, SubagentStatus, UserInput};
@@ -65,6 +65,7 @@ pub struct AppInit {
     pub cwd: PathBuf,
     pub pick_session: bool,
     pub status_cfg: crate::config::OmpStatusLine,
+    pub theme: crate::config::MuTheme,
 }
 
 enum Overlay {
@@ -208,7 +209,8 @@ pub async fn run(init: AppInit) -> i32 {
         }
     };
     term::install_panic_hook();
-    let AppInit { cmd_tx, mut ev_rx, inbox, providers, ctx, plugins, mut notice_rx, cwd, pick_session, status_cfg } = init;
+    let AppInit { cmd_tx, mut ev_rx, inbox, providers, ctx, plugins, mut notice_rx, cwd, pick_session, status_cfg, theme } = init;
+    let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
     let mut commands: Vec<Entry> = BUILTIN_DESC
         .iter()
@@ -268,8 +270,8 @@ pub async fn run(init: AppInit) -> i32 {
         last_draw: Instant::now() - FRAME,
         started: Instant::now(),
     };
-    for w in &app.plugins.warnings {
-        app.pending.push(styled(w.clone(), |_| theme::get().fg("warning")));
+    for w in theme_warnings.iter().chain(app.plugins.warnings.iter()) {
+        app.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
     }
     if pick_session {
         app.open_session_picker();
@@ -341,7 +343,7 @@ impl App {
     }
 
     fn error(&mut self, s: &str) {
-        let l = s.lines().map(|l| styled(l.to_string(), |_| theme::get().fg("error"))).collect();
+        let l = s.lines().map(|l| styled(l.to_string(), |_| theme::get().fg(Role::Err))).collect();
         self.commit(l);
     }
 
@@ -1340,7 +1342,7 @@ impl App {
         let running: Vec<SubagentStatus> = self.jobs.iter().filter(|j| j.state == SubagentState::Running).cloned().collect();
         out.extend(blocks::subagent_rows(&running, self.spin()));
         if self.compacting {
-            out.push(styled(format!("{} Compacting context…", self.spin()), |_| theme::get().fg("warning")));
+            out.push(styled(format!("{} Compacting context…", self.spin()), |_| theme::get().fg(Role::Warn)));
         }
         out
     }
@@ -1355,7 +1357,7 @@ impl App {
         let done = all.iter().filter(|t| matches!(t.status, Status::Completed | Status::Abandoned)).count();
         let mut out = vec![styled(trunc(&format!("todo {done}/{} · {}", all.len(), phase.name), w), |_| dim())];
         for t in phase.tasks.iter().filter(|t| t.status == Status::InProgress).take(1) {
-            out.push(styled(trunc(&format!("  ▸ {}", t.content), w), |_| theme::get().fg("warning")));
+            out.push(styled(trunc(&format!("  ▸ {}", t.content), w), |_| theme::get().fg(Role::Warn)));
         }
         for t in phase.tasks.iter().filter(|t| t.status == Status::Pending).take(3) {
             out.push(styled(trunc(&format!("  ○ {}", t.content), w), |_| dim()));

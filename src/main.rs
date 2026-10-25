@@ -252,7 +252,6 @@ fn run() -> Result<i32> {
                 headless::print_mode(prompt, cmd_tx, ev_rx, inbox.clone(), max_cost).await
             }
             (None, None) => {
-                tui::theme::init(cfgs_ui.omp.theme.dark.as_deref().unwrap_or("dark"), &paths::omp_agent_dir());
                 tui::app::run(tui::app::AppInit {
                     cmd_tx,
                     ev_rx,
@@ -264,6 +263,7 @@ fn run() -> Result<i32> {
                     cwd: cwd_ui,
                     pick_session,
                     status_cfg: cfgs_ui.omp.status_line.clone(),
+                    theme: cfgs_ui.mu.theme.clone(),
                 })
                 .await
             }

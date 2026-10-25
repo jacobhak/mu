@@ -66,7 +66,7 @@ mod ts {
     use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
     use crate::tui::line::{Line, span};
-    use crate::tui::theme;
+    use crate::tui::theme::{self, Role};
 
     #[derive(Clone, Copy)]
     enum Cat {
@@ -90,24 +90,22 @@ mod ts {
     }
 
     impl Cat {
-        fn key(self) -> Option<&'static str> {
+        fn key(self) -> Option<Role> {
             Some(match self {
-                Cat::Comment => "syntaxComment",
-                Cat::Keyword => "syntaxKeyword",
-                Cat::Function => "syntaxFunction",
-                Cat::Variable => "syntaxVariable",
-                Cat::String => "syntaxString",
-                Cat::Number => "syntaxNumber",
-                Cat::Type => "syntaxType",
-                Cat::Operator => "syntaxOperator",
-                Cat::Punctuation => "syntaxPunctuation",
-                Cat::Inserted => "toolDiffAdded",
-                Cat::Deleted => "toolDiffRemoved",
-                Cat::Heading => "mdHeading",
-                Cat::Code => "mdCode",
-                Cat::Url => "mdLinkUrl",
-                Cat::Link => "mdLink",
-                Cat::Emph | Cat::Strong => return None,
+                Cat::Comment => Role::SynComment,
+                Cat::Keyword => Role::SynKeyword,
+                Cat::Function => Role::SynFunction,
+                Cat::String => Role::SynString,
+                Cat::Number => Role::SynNumber,
+                Cat::Type => Role::SynType,
+                Cat::Punctuation => Role::SynPunct,
+                Cat::Inserted => Role::Ok,
+                Cat::Deleted => Role::Err,
+                Cat::Heading => Role::Strong,
+                Cat::Code => Role::Literal,
+                Cat::Url => Role::Faint,
+                Cat::Link => Role::Accent,
+                Cat::Variable | Cat::Operator | Cat::Emph | Cat::Strong => return None,
             })
         }
 
@@ -115,6 +113,7 @@ mod ts {
             let mut s = ContentStyle { foreground_color: self.key().and_then(|k| t.color(k)).or(plain.foreground_color), ..plain };
             match self {
                 Cat::Heading | Cat::Strong => s.attributes.set(Attribute::Bold),
+                Cat::Comment => s.attributes.set(Attribute::Italic),
                 Cat::Emph => s.attributes.set(Attribute::Italic),
                 _ => {}
             }
@@ -233,8 +232,8 @@ mod ts {
     pub fn run(code: &str, lang: &'static str) -> Option<Vec<Line>> {
         let cfg = config(lang)?;
         let t = theme::get();
-        let plain = t.fg("mdCodeBlock");
-        let styles: Vec<ContentStyle> = CAPTURES.iter().map(|(_, c)| c.style(&t, plain)).collect();
+        let plain = ContentStyle::default();
+        let styles: Vec<ContentStyle> = CAPTURES.iter().map(|(_, c)| c.style(t, plain)).collect();
         let mut hl = Highlighter::new();
         let events = hl
             .highlight(cfg, code.as_bytes(), None, |name| {
@@ -281,7 +280,7 @@ mod ts {
 mod tests {
     use super::*;
     use crate::tui::line::line_text;
-    use crate::tui::theme;
+    use crate::tui::theme::{self, Role};
     use crossterm::style::Color;
 
     fn fg_of(lines: &[Line], text: &str) -> Option<Color> {
@@ -296,9 +295,9 @@ mod tests {
         assert_eq!(ls.len(), 3);
         assert_eq!(line_text(&ls[1]), "    let s = \"hi\"; // note");
         let (kw, st, cm) = (fg_of(&ls, "fn"), fg_of(&ls, "hi"), fg_of(&ls, "note"));
-        assert_eq!(kw, t.color("syntaxKeyword"));
-        assert_eq!(st, t.color("syntaxString"));
-        assert_eq!(cm, t.color("syntaxComment"));
+        assert_eq!(kw, t.color(Role::SynKeyword));
+        assert_eq!(st, t.color(Role::SynString));
+        assert_eq!(cm, t.color(Role::SynComment));
         assert!(kw.is_some() && st.is_some() && cm.is_some());
         assert_ne!(kw, st);
         assert_ne!(st, cm);
@@ -316,9 +315,9 @@ mod tests {
     fn diff_lines_use_diff_colours() {
         let t = theme::get();
         let ls = highlight("@@ -1 +1 @@\n-a\n+b\n", "diff").expect("diff is known");
-        assert_eq!(fg_of(&ls, "-a"), t.color("toolDiffRemoved"));
-        assert_eq!(fg_of(&ls, "+b"), t.color("toolDiffAdded"));
-        assert!(t.color("toolDiffAdded").is_some());
+        assert_eq!(fg_of(&ls, "-a"), t.color(Role::Err));
+        assert_eq!(fg_of(&ls, "+b"), t.color(Role::Ok));
+        assert!(t.color(Role::Ok).is_some());
     }
 
     #[cfg(all(feature = "lang-markdown", feature = "lang-rust"))]
@@ -326,8 +325,8 @@ mod tests {
     fn markdown_heading_and_injected_rust() {
         let t = theme::get();
         let ls = highlight("# Title\n\n```rust\nfn x() {}\n```\n", "markdown").expect("markdown is known");
-        assert_eq!(fg_of(&ls, "Title"), t.color("mdHeading"));
-        assert_eq!(fg_of(&ls, "fn"), t.color("syntaxKeyword"));
+        assert_eq!(fg_of(&ls, "Title"), t.color(Role::Strong));
+        assert_eq!(fg_of(&ls, "fn"), t.color(Role::SynKeyword));
     }
 
     #[test]

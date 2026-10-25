@@ -8,15 +8,15 @@ use unicode_width::UnicodeWidthChar;
 
 use super::highlight;
 use super::line::{Line, bold, line_text, span, wrap};
-use super::theme;
+use super::theme::{self, Role};
 
-/// Theme colour `k` as a foreground style.
-fn key(k: &str) -> ContentStyle {
-    theme::get().fg(k)
+/// Role `r` as a foreground style.
+fn key(r: Role) -> ContentStyle {
+    theme::get().fg(r)
 }
 
 fn heading_style() -> ContentStyle {
-    let mut s = key("mdHeading");
+    let mut s = key(Role::Strong);
     s.attributes.set(Attribute::Bold);
     s
 }
@@ -187,7 +187,9 @@ impl<'a> R<'a> {
             Event::Start(Tag::Heading { level, .. }) => {
                 self.pos += 1;
                 let hs = heading_style();
-                let mut segs = chs(&format!("{} ", "#".repeat(level as usize)), hs);
+                let mut prefix = key(Role::Faint);
+                prefix.attributes.set(Attribute::Bold);
+                let mut segs = chs(&format!("{} ", "#".repeat(level as usize)), prefix);
                 segs.extend(self.inline(hs));
                 self.close();
                 (wrap_chs(&segs, w), Kind::Para)
@@ -196,13 +198,14 @@ impl<'a> R<'a> {
                 self.pos += 1;
                 let inner = self.blocks(w.saturating_sub(2).max(1));
                 self.close();
-                let q = key("mdQuote").foreground_color;
                 let lines = inner
                     .into_iter()
                     .map(|l| {
-                        let mut v = chs("│ ", key("mdQuoteBorder"));
+                        let mut v = chs("│ ", key(Role::Line));
                         v.extend(l.into_iter().map(|(c, mut st)| {
-                            st.foreground_color = st.foreground_color.or(q);
+                            if st.foreground_color.is_none() {
+                                st = theme::get().apply(Role::Muted, st);
+                            }
                             st.attributes.set(Attribute::Italic);
                             (c, st)
                         }));
@@ -247,7 +250,7 @@ impl<'a> R<'a> {
             }
             Event::Rule => {
                 self.pos += 1;
-                (vec![chs(&"─".repeat(w.min(80)), key("mdHr"))], Kind::Other)
+                (vec![chs(&"─".repeat(w.min(80)), key(Role::Line))], Kind::Other)
             }
             Event::Start(tag) if !is_inline(&tag) => {
                 // Unknown container (html block, footnote, ...): render its children.
@@ -281,7 +284,7 @@ impl<'a> R<'a> {
                 Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => push_str(&mut out, &s, st),
                 Event::Code(s) => {
                     let mut c = st;
-                    c.foreground_color = key("mdCode").foreground_color;
+                    c.foreground_color = theme::get().color(Role::Literal);
                     push_str(&mut out, &s, c);
                 }
                 Event::SoftBreak => out.push((' ', st)),
@@ -305,7 +308,7 @@ impl<'a> R<'a> {
                 Event::Start(Tag::Link { dest_url, .. }) => {
                     stack.push(st);
                     st.attributes.set(Attribute::Underlined);
-                    st.foreground_color = key("mdLink").foreground_color;
+                    st.foreground_color = theme::get().color(Role::Accent);
                     links.push((out.len(), dest_url.to_string()));
                 }
                 Event::Start(Tag::Image { .. }) => stack.push(st),
@@ -317,7 +320,7 @@ impl<'a> R<'a> {
                     if let Some((start, url)) = links.pop() {
                         let text: String = out[start..].iter().map(|c| c.0).collect();
                         if !url.is_empty() && text != url {
-                            push_str(&mut out, &format!(" ({url})"), key("mdLinkUrl"));
+                            push_str(&mut out, &format!(" ({url})"), key(Role::Faint));
                         }
                     }
                 }
@@ -348,9 +351,9 @@ impl<'a> R<'a> {
                     self.close();
                     let pad = " ".repeat(mw);
                     if child.is_empty() {
-                        out.push(chs(marker.trim_end(), key("mdListBullet")));
+                        out.push(chs(marker.trim_end(), key(Role::Faint)));
                     } else if first_is_list {
-                        out.push(chs(marker.trim_end(), key("mdListBullet")));
+                        out.push(chs(marker.trim_end(), key(Role::Faint)));
                         for l in child {
                             let mut v = chs(&pad, Default::default());
                             v.extend(l);
@@ -359,7 +362,7 @@ impl<'a> R<'a> {
                     } else {
                         for (i, l) in child.into_iter().enumerate() {
                             let mut v = if i == 0 {
-                                chs(&marker, key("mdListBullet"))
+                                chs(&marker, key(Role::Faint))
                             } else {
                                 chs(&pad, Default::default())
                             };
@@ -477,14 +480,14 @@ impl<'a> R<'a> {
 }
 
 /// Fenced code as omp shows it: fence lines in the border colour, body indented 2 columns.
-/// The body is syntax-highlighted when the language is known, else plain `mdCodeBlock`.
+/// The body is syntax-highlighted when the language is known, else the default style.
 fn code_lines(lang: &str, body: &str, w: usize) -> Vec<Vec<Ch>> {
-    let border = key("mdCodeBlockBorder");
-    let mut out = vec![chs(&format!("```{lang}"), border)];
+    let mut open = chs("```", key(Role::Line));
+    open.extend(chs(lang, key(Role::Faint)));
+    let mut out = vec![open];
     let body = body.replace('\t', "    ");
     let src: Vec<Line> = highlight::highlight(&body, lang).unwrap_or_else(|| {
-        let plain = key("mdCodeBlock");
-        body.lines().map(|l| vec![span(l, plain)]).collect()
+        body.lines().map(|l| vec![span(l, ContentStyle::default())]).collect()
     });
     for line in &src {
         if line_text(line).is_empty() {
@@ -497,7 +500,7 @@ fn code_lines(lang: &str, body: &str, w: usize) -> Vec<Vec<Ch>> {
             out.push(p);
         }
     }
-    out.push(chs("```", border));
+    out.push(chs("```", key(Role::Line)));
     out
 }
 
@@ -605,7 +608,8 @@ mod tests {
         let ls = render("## Title", 40);
         assert_eq!(line_text(&ls[0]), "## Title");
         assert!(ls[0].iter().all(|s| s.style.attributes.has(Attribute::Bold)));
-        assert_eq!(ls[0][0].style.foreground_color, theme::get().color("mdHeading"));
+        assert_eq!(ls[0][0].style.foreground_color, theme::get().color(Role::Faint));
+        assert_eq!(ls[0][1].style.foreground_color, theme::get().color(Role::Strong));
     }
 
     #[test]
@@ -678,7 +682,7 @@ mod tests {
     #[test]
     fn inline_code_uses_theme_mdcode() {
         let ls = render("use `x`", 40);
-        assert_eq!(ls[0][1].style.foreground_color, theme::get().color("mdCode"));
+        assert_eq!(ls[0][1].style.foreground_color, theme::get().color(Role::Literal));
     }
 
     #[test]
@@ -696,7 +700,7 @@ mod tests {
     fn fence_body_uses_syntax_colours() {
         let ls = render("```rust\nfn f() {}\n```", 40);
         assert_eq!(line_text(&ls[1]), "  fn f() {}");
-        assert!(ls[1].iter().any(|s| s.style.foreground_color == theme::get().color("syntaxKeyword")));
+        assert!(ls[1].iter().any(|s| s.style.foreground_color == theme::get().color(Role::SynKeyword)));
     }
 
     #[test]

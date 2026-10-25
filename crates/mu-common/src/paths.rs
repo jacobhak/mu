@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-fn home() -> PathBuf {
+pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
 

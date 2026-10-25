@@ -34,7 +34,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
-OMP_THEME = REPO / "src/tui/themes/dark-tokyo-night.json"
+OMP_THEME = HERE / "omp-dark-tokyo-night.json"
 
 # ── colours ──────────────────────────────────────────────────────────────────────────────────────
 # A colour is ("rgb", "#rrggbb") or ("idx", n): n < 16 is a terminal palette slot, else xterm-256.
@@ -117,7 +117,7 @@ def fill(line: Line, w: int, bg: Color | None) -> Line:
 def load_palette(name_or_path: str) -> dict[str, str]:
     p = Path(name_or_path)
     if not p.exists():
-        p = HERE / "palettes" / f"{name_or_path}.toml"
+        p = REPO / "src/tui/palettes" / f"{name_or_path}.toml"
     pal = tomllib.loads(p.read_text())
     pal.setdefault("orange", pal.get("bright_yellow", pal["yellow"]))
     pal["_name"] = p.stem

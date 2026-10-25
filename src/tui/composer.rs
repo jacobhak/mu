@@ -9,8 +9,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use super::complete::{self, Entry};
-use super::line::{self, Line, dim, plain, span};
-use super::theme;
+use super::line::{self, Line, plain, span};
+use super::theme::{self, Role};
 use crate::events::UserInput;
 use crate::image;
 use crate::message::Image;
@@ -670,7 +670,7 @@ impl Composer {
             rows.extend(wrapped);
         }
         let pad = " ".repeat(PAD);
-        let accent = theme::get().fg("accent");
+        let accent = theme::get().fg(Role::Accent);
         let mut body: Vec<Line> = rows
             .iter()
             .enumerate()
@@ -682,6 +682,7 @@ impl Composer {
                 }
             })
             .collect();
+        let faint = theme::get().fg(Role::Faint);
         if let Some(g) = self.ghost.as_deref().filter(|_| !self.is_empty()) {
             let mut left = avail.saturating_sub(cursor.1);
             let mut shown = String::new();
@@ -694,7 +695,7 @@ impl Composer {
                 shown.push(ch);
             }
             if let Some(row) = body.get_mut(cursor.0).filter(|_| !shown.is_empty()) {
-                row.push(span(shown, dim()));
+                row.push(span(shown, faint));
             }
         }
         if self.is_empty() {
@@ -702,15 +703,15 @@ impl Composer {
             let placeholder = "type here…";
             let ph_w = unicode_width::UnicodeWidthStr::width(placeholder);
             let h_w = unicode_width::UnicodeWidthStr::width(hint);
-            let mut row = vec![span(format!("{pad}{}", PROMPT.trim_end()), accent), span(" ", ContentStyle::default()), span(placeholder, dim())];
+            let mut row = vec![span(format!("{pad}{}", PROMPT.trim_end()), accent), span(" ", ContentStyle::default()), span(placeholder, theme::get().fg(Role::Faint))];
             if used + ph_w + 2 + h_w <= width {
                 row.push(span(" ".repeat(width - used - ph_w - h_w), ContentStyle::default()));
-                row.push(span(hint, dim()));
+                row.push(span(hint, theme::get().fg(Role::Faint)));
             }
             body[0] = row;
         }
         if self.ctrl_c_armed {
-            body.push(vec![span(format!("{pad}{CTRL_C_HINT}"), dim())]);
+            body.push(vec![span(format!("{pad}{CTRL_C_HINT}"), theme::get().fg(Role::Faint))]);
         }
         if let Some(m) = &self.menu {
             let n = m.items.len();
@@ -721,20 +722,20 @@ impl Composer {
                     None => {
                         let mut r = vec![span(format!("{pad}  /{}", m.items[i]), ContentStyle::default())];
                         if !m.descs[i].is_empty() {
-                            r.push(span(format!("  {}", m.descs[i]), dim()));
+                            r.push(span(format!("  {}", m.descs[i]), theme::get().fg(Role::Faint)));
                         }
                         r
                     }
                 };
                 row = line::truncate(&row, width);
                 if i == m.sel {
-                    row = line::fill(&row, width, theme::get().color("selectedBg"));
+                    row = line::fill(&row, width, theme::get().color(Role::Selected));
                 }
                 body.push(row);
             }
         }
         let mut out = Vec::with_capacity(body.len() + 1);
-        out.push(Vec::new());
+        out.push(vec![span("─".repeat(width), theme::get().fg(Role::LineFaint))]);
         out.extend(body);
         (out, (cursor.0 + 1, cursor.1 + PAD + PREFIX_W))
     }
@@ -1271,7 +1272,7 @@ mod tests {
         // width 11 => 6 cells of text per row after the 1-cell pad and 4-cell prompt.
         let (lines, cur) = c.render(11);
         let texts: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
-        assert_eq!(texts, ["".to_string(), " μ ❯ 日本語".into(), "     日本".into()]);
+        assert_eq!(texts, ["─".repeat(11), " μ ❯ 日本語".into(), "     日本".into()]);
         assert_eq!(cur, (2, 9));
 
         press(&mut c, KeyCode::Left, KeyModifiers::NONE);
@@ -1286,7 +1287,8 @@ mod tests {
     fn render_empty_and_enter_guard() {
         let mut c = Composer::new(None);
         let (lines, cur) = c.render(20);
-        assert_eq!(lines.len(), 2, "blank line, one input row");
+        assert_eq!(lines.len(), 2, "rule, one input row");
+        assert_eq!(line::line_text(&lines[0]), "─".repeat(20));
         assert_eq!(cur, (1, 5));
         type_str(&mut c, "   ");
         assert_eq!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), Action::None);

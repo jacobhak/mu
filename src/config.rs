@@ -49,7 +49,6 @@ pub struct OmpConfig {
     pub cycle_order: Vec<String>,
     pub compaction: OmpCompaction,
     pub skills: OmpSkills,
-    pub theme: OmpTheme,
     pub status_line: OmpStatusLine,
     pub composer: OmpComposer,
     pub symbol_preset: Option<String>,
@@ -79,13 +78,6 @@ impl OmpConfig {
             self.cycle_order.clone()
         }
     }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct OmpTheme {
-    pub dark: Option<String>,
-    pub light: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -148,6 +140,32 @@ pub struct ModelOverride {
 pub struct MuConfig {
     pub compaction: MuCompaction,
     pub predict: MuPredict,
+    pub theme: MuTheme,
+}
+
+/// `[theme]`: palette source, accent and card style.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MuTheme {
+    /// "terminal" | "omarchy" | bundled or ~/.mu/themes name | path to a colors.toml
+    pub source: String,
+    /// Palette key (e.g. "blue", "magenta", "accent") or "#rrggbb".
+    pub accent: Option<String>,
+    pub cards: Cards,
+}
+
+impl Default for MuTheme {
+    fn default() -> Self {
+        Self { source: "terminal".into(), accent: None, cards: Cards::Outline }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cards {
+    #[default]
+    Outline,
+    Filled,
 }
 
 /// `[predict]`: ghost-text prediction in the composer.
@@ -276,6 +294,14 @@ impl Configs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_section_parses_with_defaults() {
+        let c = toml::from_str::<MuConfig>("[theme]\nsource = \"gruvbox\"\ncards = \"filled\"\n").unwrap();
+        assert_eq!((c.theme.source.as_str(), c.theme.cards), ("gruvbox", Cards::Filled));
+        let d = toml::from_str::<MuConfig>("").unwrap();
+        assert_eq!((d.theme.source.as_str(), d.theme.accent, d.theme.cards), ("terminal", None, Cards::Outline));
+    }
 
     #[test]
     fn rewrite_role_edits_in_place_or_appends() {

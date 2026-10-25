@@ -2,7 +2,7 @@ use super::line::{self, Line, dim, span, styled};
 use super::markdown;
 use super::select::clean_paste;
 use super::status::format_number;
-use super::theme;
+use super::theme::{self, Role};
 use crate::events::PlanDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::ContentStyle;
@@ -48,7 +48,7 @@ pub struct PlanReview {
 }
 
 fn accent_bold() -> ContentStyle {
-    let mut s = theme::get().fg("accent");
+    let mut s = theme::get().fg(Role::Accent);
     s.attributes.set(crossterm::style::Attribute::Bold);
     s
 }
@@ -227,7 +227,7 @@ impl PlanReview {
         }
         out.push(styled("─".repeat(width), |_| dim()));
         if slider {
-            let accent = theme::get().fg("accent");
+            let accent = theme::get().fg(Role::Accent);
             let arrow = |on: bool| if on { accent } else { dim() };
             let last = self.tiers.len() - 1;
             out.push(line::truncate(
@@ -245,7 +245,7 @@ impl PlanReview {
         for (i, (label, off)) in self.actions.iter().enumerate() {
             let selected = i == self.sel;
             let focused = selected && self.focus == Focus::Actions;
-            let marker_style = if focused { theme::get().fg("accent") } else { dim() };
+            let marker_style = if focused { theme::get().fg(Role::Accent) } else { dim() };
             let mut l: Line = vec![span(if selected { "❯ " } else { "  " }, marker_style)];
             if i == 3 && self.editing {
                 l.push(span(format!("{label}: {}", self.text), if focused { line::bold() } else { ContentStyle::default() }));
@@ -264,7 +264,7 @@ impl PlanReview {
             }
             let mut l = line::truncate(&l, width);
             if focused {
-                l = line::fill(&l, width, theme::get().color("selectedBg"));
+                l = line::fill(&l, width, theme::get().color(Role::Selected));
             }
             out.push(l);
         }
