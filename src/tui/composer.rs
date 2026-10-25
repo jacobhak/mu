@@ -206,6 +206,16 @@ impl Buf {
         }
     }
 
+    fn delete_word_fwd(&mut self) {
+        if self.col >= self.cur_len() {
+            self.delete();
+        } else {
+            let chars: Vec<char> = self.cur().chars().collect();
+            let end = word_right_col(&chars, self.col);
+            self.cut(self.col, end);
+        }
+    }
+
     fn left(&mut self) {
         if self.col > 0 {
             self.col -= 1;
@@ -523,7 +533,13 @@ impl Composer {
                     Action::Redraw
                 }
             }
-            KeyCode::Char('d') if ctrl => Action::None,
+            KeyCode::Char('d') if ctrl => {
+                if self.is_empty() {
+                    Action::None
+                } else {
+                    self.edit(Buf::delete)
+                }
+            }
             KeyCode::Enter if shift || alt => self.edit(Buf::newline),
             KeyCode::Enter => self.submit(false),
             KeyCode::Char('j') if ctrl => self.edit(Buf::newline),
@@ -541,7 +557,7 @@ impl Composer {
             KeyCode::Char('o') if ctrl => Action::ToggleExpanded,
             KeyCode::Char('m') if alt => Action::ModelPicker,
             KeyCode::Char('g') if ctrl => Action::EditExternal,
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('p') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
                 if self.buf.row == 0 {
                     self.history_prev();
                 } else {
@@ -549,7 +565,7 @@ impl Composer {
                 }
                 Action::Redraw
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('n') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
                 if self.buf.row + 1 == self.buf.lines.len() {
                     self.history_next();
                 } else {
@@ -563,6 +579,11 @@ impl Composer {
             KeyCode::End => self.mv(Buf::end),
             KeyCode::Char('a') if ctrl => self.mv(Buf::home),
             KeyCode::Char('e') if ctrl => self.mv(Buf::end),
+            KeyCode::Char('b') if ctrl => self.mv(Buf::left),
+            KeyCode::Char('f') if ctrl => self.mv(Buf::right),
+            KeyCode::Char('h') if ctrl => self.edit(Buf::backspace),
+            KeyCode::Char('d') if alt => self.edit(Buf::delete_word_fwd),
+            KeyCode::Backspace if alt => self.edit(Buf::delete_word_back),
             KeyCode::Char('b') if alt => self.mv(Buf::word_left),
             KeyCode::Char('f') if alt => self.mv(Buf::word_right),
             KeyCode::Backspace => self.edit(Buf::backspace),
