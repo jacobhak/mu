@@ -21,7 +21,7 @@ pub fn start(dir: &Path) -> Result<String, String> {
     fs::create_dir_all(shared::logs_dir()).map_err(|e| e.to_string())?;
     let log_path = shared::daemon_log();
     let log = OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| e.to_string())?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = paths::self_exe().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);
     cmd.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     unsafe {

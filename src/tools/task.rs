@@ -64,7 +64,7 @@ impl Tools {
             })
             .collect();
         let parent = self.session_path.borrow().clone();
-        let exe = match std::env::current_exe() {
+        let exe = match mu_common::paths::self_exe() {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),
         };

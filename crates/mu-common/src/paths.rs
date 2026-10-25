@@ -36,6 +36,18 @@ pub fn mu_home() -> PathBuf {
     }
 }
 
+/// The running executable, for re-spawning ourselves (subagents, daemons). After the binary is replaced on
+/// disk (`cargo install` under a running session) `current_exe()` names a path that no longer exists
+/// (`… (deleted)`); `/proc/self/exe` still executes the running image, so children match the parent's version.
+pub fn self_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    let proc_exe = PathBuf::from("/proc/self/exe");
+    if proc_exe.exists() { Ok(proc_exe) } else { Ok(exe) }
+}
+
 pub fn session_dir(cwd: &Path) -> PathBuf {
     mu_home().join("sessions").join(encode_cwd(cwd))
 }
