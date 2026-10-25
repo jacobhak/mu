@@ -44,6 +44,9 @@ struct Cli {
     /// Config profile (sets OMP_PROFILE).
     #[arg(long)]
     profile: Option<String>,
+    /// Palette for this run, overriding `[theme] source` (a bundled name, `terminal`, or a file).
+    #[arg(long)]
+    theme: Option<String>,
     /// Run one prompt and print the final answer.
     #[arg(short = 'p', long = "print")]
     print: Option<String>,
@@ -133,6 +136,9 @@ fn run() -> Result<i32> {
     if let Some(p) = &cli.profile {
         // Single-threaded here: no runtime or plugin has started yet.
         unsafe { std::env::set_var("OMP_PROFILE", p) };
+    }
+    if let Some(t) = &cli.theme {
+        unsafe { std::env::set_var("MU_THEME", t) };
     }
     let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
     if cli.acp {
