@@ -263,13 +263,17 @@ impl Configs {
 
     pub fn load() -> Self {
         let p = paths::mu_home().join("config.toml");
-        let mu = match std::fs::read_to_string(&p) {
+        let mut mu: MuConfig = match std::fs::read_to_string(&p) {
             Ok(t) => toml::from_str(&t).unwrap_or_else(|e| {
                 eprintln!("warning: {}: {e}", p.display());
                 MuConfig::default()
             }),
             Err(_) => MuConfig::default(),
         };
+        // `--theme` (via MU_THEME) overrides `[theme] source` for this run.
+        if let Some(t) = std::env::var("MU_THEME").ok().filter(|t| !t.is_empty()) {
+            mu.theme.source = t;
+        }
         Self { omp: read_yaml("config.yml"), models: read_yaml("models.yml"), mu, role_edits: Default::default() }
     }
 

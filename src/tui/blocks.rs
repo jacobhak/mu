@@ -66,7 +66,7 @@ pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
 }
 
 fn name_style() -> ContentStyle {
-    bold(tfg(Role::Strong))
+    bold(tfg(Role::Tool))
 }
 
 /// Header target: edit's first input line is `[path#tag]`, shown as the bare path.
@@ -85,7 +85,7 @@ fn header_line(icon: &str, icon_style: ContentStyle, name: &str, args: &Value, w
     let summary = summary(name, args);
     let mut l = vec![span(format!("{icon} "), icon_style), span(name.to_string(), name_style())];
     if !summary.is_empty() {
-        l.push(span(format!(" {summary}"), tfg(Role::Muted)));
+        l.push(span(format!(" {summary}"), tfg(Role::Accent)));
     }
     truncate(&l, width)
 }
@@ -322,7 +322,7 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
         let tone = if out.is_error || failed { Tone::Error } else { Tone::Success };
         return bash_box(args, &body, expanded, tone, facts, width);
     }
-    let icon_style = if out.is_error { tfg(Role::Err) } else { tfg(Role::Faint) };
+    let icon_style = if out.is_error { tfg(Role::Err) } else { tfg(Role::Ok) };
     let mut lines = vec![header_line("●", icon_style, name, args, width)];
     if out.is_error {
         let card = Card { tone: Tone::Error, sections: vec![Section { label: None, rows: error_rows(&out.text) }], footer: None };
@@ -415,14 +415,19 @@ pub fn thinking_body(text: &str, width: usize) -> Vec<Line> {
     markdown::render(text, width.saturating_sub(2))
         .into_iter()
         .map(|l| {
-            let mut out = vec![span("  ", ContentStyle::default())];
+            let mut out = vec![span("│ ", tfg(Role::Line))];
             out.extend(l.into_iter().map(|mut s| {
-                s.style = italic(t.apply(Role::Muted, s.style));
+                s.style = italic(t.apply(Role::Thinking, s.style));
                 s
             }));
             out
         })
         .collect()
+}
+
+/// Gutter-only row joining separately committed thinking chunks.
+pub fn thinking_gap() -> Line {
+    vec![span("│", tfg(Role::Line))]
 }
 
 /// Viewport rows for a tool call whose arguments are still streaming.
@@ -573,5 +578,30 @@ mod tests {
     fn unicode_width_of(l: &str) -> usize {
         use unicode_width::UnicodeWidthStr;
         l.width()
+    }
+
+    #[test]
+    fn thinking_body_has_gutter() {
+        let t = theme::get();
+        let ls = thinking_body("a\n\nb", 20);
+        let txt: Vec<String> = ls.iter().map(text_of).collect();
+        assert_eq!(txt, ["│ a", "│ ", "│ b"]);
+        assert_eq!(ls[0][0].style.foreground_color, t.color(Role::Line));
+        assert_eq!(ls[0][1].style.foreground_color, t.color(Role::Thinking));
+        assert!(ls[0][1].style.attributes.has(Attribute::Italic));
+        assert_eq!(text_of(&thinking_gap()), "│");
+    }
+
+    #[test]
+    fn tool_header_colours() {
+        let t = theme::get();
+        let ls = tool_result("read", &json!({"path":"x"}), &ToolOutput::ok("a\nb"), false, 40);
+        let h = &ls[0];
+        assert_eq!(h[0].style.foreground_color, t.color(Role::Ok));
+        assert_eq!(h[1].style.foreground_color, t.color(Role::Tool));
+        assert!(h[1].style.attributes.has(Attribute::Bold));
+        assert_eq!(h[2].style.foreground_color, t.color(Role::Accent));
+        assert_eq!(h[0].text, "● ");
+        assert_eq!(h[2].text, " x");
     }
 }

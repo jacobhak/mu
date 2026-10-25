@@ -37,6 +37,7 @@ pub enum Role {
     Strong,
     Muted,
     Faint,
+    Thinking,
     Line,
     LineFaint,
     Raised,
@@ -50,6 +51,7 @@ pub enum Role {
     OkTint,
     ErrTint,
     Literal,
+    Tool,
     SynKeyword,
     SynFunction,
     SynString,
@@ -82,9 +84,10 @@ const DEFS: [Def; ROLE_COUNT] = [
     Key("bright_foreground", Slot(15)),
     Mix("foreground", "background", 35, Dim),
     Key("dark_foreground", Slot(8)),
+    Mix("foreground", "background", 45, Dim),
     Mix("background", "foreground", 22, Slot(8)),
     Mix("background", "foreground", 13, Slot(8)),
-    Mix("background", "foreground", 5, No),
+    Mix("background", "foreground", 8, No),
     Key("selection", Slot(8)),
     Key("accent", Slot(4)),
     Mix("background", "accent", 55, Slot(4)),
@@ -95,6 +98,7 @@ const DEFS: [Def; ROLE_COUNT] = [
     Mix("background", "green", 15, No),
     Mix("background", "red", 15, No),
     Key("cyan", Slot(6)),
+    Key("magenta", Slot(5)),
     Key("magenta", Slot(5)),
     Key("blue", Slot(4)),
     Key("green", Slot(2)),
@@ -229,7 +233,7 @@ pub fn truecolor_terminal() -> bool {
 
 pub struct Theme {
     colors: [Option<Color>; ROLE_COUNT],
-    dim_muted: bool,
+    dim: [bool; ROLE_COUNT],
     cards: Cards,
 }
 
@@ -296,7 +300,7 @@ impl Theme {
             pal.rgb.get(k).copied()
         };
         let mut colors = [None; ROLE_COUNT];
-        let mut dim_muted = !truecolor;
+        let mut dim = [false; ROLE_COUNT];
         for (i, def) in DEFS.iter().enumerate() {
             let fb = |f: Fb, accent_slot: bool| match f {
                 Slot(n) => Some(Color::AnsiValue(if accent_slot { acc.slot } else { n })),
@@ -333,11 +337,9 @@ impl Theme {
             };
             let used_fallback = c.is_none();
             colors[i] = c.or_else(|| fb(fallback, is_accent));
-            if i == Role::Muted as usize {
-                dim_muted = used_fallback && matches!(fallback, Dim);
-            }
+            dim[i] = used_fallback && matches!(fallback, Dim);
         }
-        (Self { colors, dim_muted, cards }, warnings)
+        (Self { colors, dim, cards }, warnings)
     }
 
     /// `None` means the terminal default.
@@ -352,7 +354,7 @@ impl Theme {
     /// `s` with its foreground replaced by the role's, and Dim added where the role is SGR-dim.
     pub fn apply(&self, r: Role, mut s: ContentStyle) -> ContentStyle {
         s.foreground_color = self.color(r);
-        if r == Role::Muted && self.dim_muted {
+        if self.dim[r as usize] {
             s.attributes.set(Attribute::Dim);
         }
         s
@@ -381,7 +383,9 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(t.color(Role::Muted), rgb("#777d98"));
         assert_eq!(t.color(Role::Line), rgb("#393c4d"));
-        assert_eq!(t.color(Role::Raised), rgb("#21232f"));
+        assert_eq!(t.color(Role::Raised), rgb("#252734"));
+        assert_eq!(t.color(Role::Thinking), rgb("#696e87"));
+        assert_eq!(t.color(Role::Tool), rgb("#ad8ee6"));
         assert_eq!(t.color(Role::OkTint), rgb("#2e3630"));
         assert_eq!(t.color(Role::ErrTint), rgb("#3b2936"));
         assert_eq!(t.color(Role::AccentSoft), rgb("#4f6599"));
@@ -398,6 +402,9 @@ mod tests {
         assert_eq!(t.color(Role::OkTint), None);
         assert_eq!(t.color(Role::Raised), None);
         assert_eq!(t.color(Role::Accent), Some(Color::AnsiValue(4)));
+        assert_eq!(t.color(Role::Thinking), None);
+        assert!(t.fg(Role::Thinking).attributes.has(Attribute::Dim));
+        assert_eq!(t.color(Role::Tool), Some(Color::AnsiValue(5)));
     }
 
     #[test]

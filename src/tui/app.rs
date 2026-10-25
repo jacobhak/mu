@@ -150,6 +150,8 @@ struct App {
     committed_in_block: bool,
     /// Uncommitted thinking text (stable chunks are committed while thinking is shown).
     thinking: Option<(Instant, String)>,
+    /// A chunk of the current thinking block is committed: later chunks start with a gutter row, and the block ends with one blank row.
+    thinking_shown: bool,
     tools: Vec<RunningTool>,
     /// Latest background-job snapshot, and finished jobs already printed to the transcript.
     jobs: Vec<SubagentStatus>,
@@ -251,6 +253,7 @@ pub async fn run(init: AppInit) -> i32 {
         live_text: String::new(),
         committed_in_block: false,
         thinking: None,
+        thinking_shown: false,
         tools: Vec::new(),
         jobs: Vec::new(),
         jobs_committed: HashSet::new(),
@@ -359,11 +362,20 @@ impl App {
 
     fn finish_thinking(&mut self) {
         let Some((start, text)) = self.thinking.take() else { return };
+        let shown = std::mem::take(&mut self.thinking_shown);
         if self.show_thinking {
-            if !text.trim().is_empty() {
-                let w = self.width();
-                let mut l = blocks::thinking_body(text.trim(), w);
+            let mut l = Vec::new();
+            let blank = text.trim().is_empty();
+            if !blank {
+                if shown {
+                    l.push(blocks::thinking_gap());
+                }
+                l.extend(blocks::thinking_body(text.trim(), self.width()));
+            }
+            if shown || !blank {
                 l.push(vec![]);
+            }
+            if !l.is_empty() {
                 self.commit(l);
             }
         } else {
@@ -411,8 +423,12 @@ impl App {
         let chunk: String = text.drain(..n).collect();
         if !chunk.trim().is_empty() {
             let w = self.width();
-            let mut l = blocks::thinking_body(chunk.trim(), w);
-            l.push(vec![]);
+            let mut l = Vec::new();
+            if self.thinking_shown {
+                l.push(blocks::thinking_gap());
+            }
+            l.extend(blocks::thinking_body(chunk.trim(), w));
+            self.thinking_shown = true;
             self.commit(l);
         }
     }
@@ -562,6 +578,7 @@ impl App {
             AgentEvent::Retry { attempt, delay, reason } => {
                 self.live_text.clear();
                 self.thinking = None;
+                self.thinking_shown = false;
                 self.calls.clear();
                 self.reveal.clear();
                 self.reveal_chars = 0;
@@ -1359,6 +1376,9 @@ impl App {
         }
         if let Some((start, text)) = &self.thinking {
             if self.show_thinking && !text.trim().is_empty() {
+                if self.thinking_shown {
+                    out.push(blocks::thinking_gap());
+                }
                 out.extend(blocks::thinking_body(text.trim(), w));
             }
             out.push(blocks::thinking_live(self.spin(), start.elapsed().as_secs()));

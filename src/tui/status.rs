@@ -220,7 +220,7 @@ fn segment(id: &str, s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Op
             line
         }
         "model" => {
-            let mut line = vec![span(s.model_name.clone(), ContentStyle::default())];
+            let mut line = vec![span(s.model_name.clone(), st(Role::Tool))];
             if let Some(g) = thinking_glyph(s, env) {
                 line.push(span(format!(" {g}"), st(Role::Muted)));
             }
@@ -338,22 +338,27 @@ fn git_line(g: &GitInfo, env: &StatusEnv) -> Option<Line> {
     let opts = env.config.segment_options.get("git");
     let opt = |k: &str| opts.and_then(|o| o[k].as_bool()).unwrap_or(true);
     let t = theme::get();
-    let counts: Vec<String> = [(opt("showUnstaged"), g.dirty, "*"), (opt("showStaged"), g.staged, "+"), (opt("showUntracked"), g.untracked, "?")]
-        .into_iter()
-        .filter(|(on, n, _)| *on && *n > 0)
-        .map(|(_, n, prefix)| format!("{prefix}{n}"))
+    let counts: Vec<(String, Role)> = [
+        (opt("showUnstaged"), g.dirty, "*", Role::Warn),
+        (opt("showStaged"), g.staged, "+", Role::Ok),
+        (opt("showUntracked"), g.untracked, "?", Role::Accent),
+    ]
+    .into_iter()
+    .filter(|(on, n, _, _)| *on && *n > 0)
+    .map(|(_, n, prefix, role)| (format!("{prefix}{n}"), role))
         .collect();
     let mut line: Line = vec![];
     if opt("showBranch") {
         if let Some(b) = &g.branch {
-            line.push(span(b.clone(), t.fg(Role::Muted)));
+            let role = if g.dirty + g.staged + g.untracked == 0 { Role::Ok } else { Role::Warn };
+            line.push(span(b.clone(), t.fg(role)));
         }
     }
-    for text in counts {
+    for (text, role) in counts {
         if !line.is_empty() {
             line.push(span(" ", ContentStyle::default()));
         }
-        line.push(span(text, t.fg(Role::Faint)));
+        line.push(span(text, t.fg(role)));
     }
     (!line.is_empty()).then_some(line)
 }
@@ -368,7 +373,7 @@ fn path_line(env: &StatusEnv, max: usize) -> Line {
     let (_, display) = path_display(env.cwd, home, strip);
     let text = if abbreviate { abbreviate_home(&display, home) } else { display };
     let text = clamp_left(&text, max);
-    vec![span(text, theme::get().fg(Role::Muted))]
+    vec![span(text, theme::get().fg(Role::Literal))]
 }
 
 /// `(in a scratch dir, text)`: the path relative to its scratch or project root when stripping, else the full path.
@@ -562,5 +567,22 @@ mod tests {
         assert_eq!(line_text(&render(&s, &env(&c, cwd), 40)[0]), " +2 ");
         s.git = None;
         assert_eq!(render(&s, &env(&c, cwd), 40).len(), 1);
+    }
+
+    #[test]
+    fn git_colours() {
+        let c = cfg(&["git"], &[]);
+        let cwd = Path::new("/home/u/x");
+        let mut s = snap();
+        s.title = None;
+        s.usage = None;
+        let fg = |l: &Line, txt: &str| l.iter().find(|p| p.text == txt).unwrap().style.foreground_color;
+        s.git = Some(GitInfo { branch: Some("dev".into()), ..Default::default() });
+        let l = &render(&s, &env(&c, cwd), 40)[0];
+        assert_eq!(fg(l, "dev"), theme::get().color(Role::Ok));
+        s.git = Some(GitInfo { branch: Some("dev".into()), dirty: 2, ..Default::default() });
+        let l = &render(&s, &env(&c, cwd), 40)[0];
+        assert_eq!(fg(l, "dev"), theme::get().color(Role::Warn));
+        assert_eq!(fg(l, "*2"), theme::get().color(Role::Warn));
     }
 }
