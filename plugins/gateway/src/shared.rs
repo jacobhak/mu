@@ -1,4 +1,6 @@
-//! `$MU_HOME/gateway/`: state shared by the plugin process and the daemon.
+//! `$MU_HOME/gateway/` (`$MU_HOME/gateway/profiles/<name>/` under an omp profile): state shared by the
+//! plugin process and the daemon. The daemon serves one profile's credentials and `models.yml`, so each
+//! profile gets its own.
 
 use fs4::FileExt;
 use mu_common::paths;
@@ -12,7 +14,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn gw_dir() -> PathBuf {
-    paths::mu_home().join("gateway")
+    gw_dir_for(paths::profile().as_deref())
+}
+
+fn gw_dir_for(profile: Option<&str>) -> PathBuf {
+    let base = paths::mu_home().join("gateway");
+    match profile {
+        // The name becomes a path component; anything that could escape it falls back to the default dir.
+        Some(p) if !p.contains(['/', '\\']) && p != "." && p != ".." => base.join("profiles").join(p),
+        _ => base,
+    }
 }
 
 pub fn logs_dir() -> PathBuf {
@@ -127,4 +138,20 @@ pub fn has_fresh_lease(dir: &Path, idle: Duration) -> bool {
         let Ok(m) = e.metadata().and_then(|m| m.modified()) else { return false };
         SystemTime::now().duration_since(m).map_or(true, |age| age < idle)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gw_dir_is_per_profile() {
+        let base = paths::mu_home().join("gateway");
+        assert_eq!(gw_dir_for(None), base);
+        assert_eq!(gw_dir_for(Some("private")), base.join("profiles/private"));
+        assert_ne!(gw_dir_for(Some("a")), gw_dir_for(Some("b")));
+        // Path-like names must not escape or alias another profile's directory.
+        assert_eq!(gw_dir_for(Some("../x")), base);
+        assert_eq!(gw_dir_for(Some("..")), base);
+    }
 }

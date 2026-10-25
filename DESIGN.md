@@ -145,7 +145,7 @@ All omp features outside the core become first-party plugins that load on use.
 - **Lifecycle:** the plugin starts both processes when a gateway-served model is first selected, on loopback
   ports, passing `OMP_AUTH_BROKER_URL` only to the gateway process it spawns — the user's omp config is not
   changed. It authenticates with the bearer tokens omp keeps in its config dir. Lifetime `idle:<duration>`
-  stops both. One pair serves all mu sessions. The gateway alone measured 161 MB; the broker is unmeasured.
+  stops both. One pair serves all mu sessions of the same omp profile (state in `$MU_HOME/gateway/`, or `gateway/profiles/<name>/` under a profile): the pair holds that profile's credentials and `models.yml`, so profiles never share one. The gateway alone measured 161 MB; the broker is unmeasured.
 - **What `serve` does not do** (unlike `stdio`): role selectors such as `@smol`, omp's fallback chains, and
   `models.yml` custom models. The core resolves roles itself from omp's config and sends provider-qualified
   ids; custom models go to native providers.

@@ -4,7 +4,8 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
 
-fn profile() -> Option<String> {
+/// The active omp profile name (`OMP_PROFILE`, else `PI_PROFILE`), if any.
+pub fn profile() -> Option<String> {
     std::env::var("OMP_PROFILE")
         .ok()
         .or_else(|| std::env::var("PI_PROFILE").ok())

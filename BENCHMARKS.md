@@ -56,7 +56,7 @@ mu gets non-native providers through one shared `mu-gateway daemon` (one `omp au
 - Four concurrent `mu -p` sessions against a running daemon all answered, and the process counts stayed at 1 daemon, 1 gateway and 1 broker with unchanged PIDs.
 - The shared pair costs about 280-300 MB PSS once (broker about 80 MB, gateway about 200 MB). Each extra session adds its own mu process (about 10 MB) and a small plugin shim.
 - One session is roughly the same as omp (about 300 MB). The saving starts with the second session. The multi-session saving was not measured against several omp sessions.
-- The daemon is keyed by `~/.mu/gateway/`, not by profile. The first session to start it decides which profile's credentials and `models.yml` it serves, so a session using another profile can get a 401 or an "Unknown model" 404.
+- At the time of the benchmark the daemon was keyed by `~/.mu/gateway/` and not by profile, so the first session to start it decided which profile's credentials and `models.yml` it served, and a session in another profile could get a 401 or an "Unknown model" 404. That is fixed: each profile now gets its own daemon under `gateway/profiles/<name>/`. The profile-less default path is unchanged.
 
 ## 4. Method and caveats
 
