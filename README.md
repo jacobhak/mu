@@ -4,6 +4,22 @@ A small, memory-lean coding agent. Rust core; everything heavy (gateway, web, me
 
 ## Build and install
 
+Releases (Linux x86_64, macOS arm64) are published from `main`. The repo is private, so the installer needs an authenticated `gh`:
+
+```sh
+gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash
+scripts/install.sh --tag mu-YYYYMMDD-<sha7>   # a specific release
+scripts/install.sh --from-source .            # build and install a checkout
+```
+
+This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). The memory plugin is skipped without Bun on PATH. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
+
+### Pinned omp
+
+`upstream.toml` pins one oh-my-pi release for everything mu uses: the Rust crates (`tag = "v<ver>"` in `Cargo.toml`), `@oh-my-pi/pi-mnemopi` in `plugins/memory`, and the `omp` CLI mu runs as a subprocess. mu runs `$MU_OMP`, else `~/.mu/bin/omp`, else `omp` on PATH, so the `omp` you use interactively can update itself without affecting mu. `scripts/fetch-omp.sh <ver> <dest>` installs a checksummed omp binary.
+
+### Manual build
+
 ```sh
 cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web,mu-predict}
 mkdir -p ~/.mu/plugins
@@ -65,10 +81,29 @@ Not supported: `mcpServers` in `session/new` (ignored; mu uses its own plugins),
 "anthropic/claude-haiku-5-5" = "f200000"
 ```
 
+Custom agents: omp-format `.md` files in `.omp/agents` and `<agentDir>/agents` (frontmatter `name`, `description`, `tools`, `model` as a list of `@role`/`provider/model`, `thinkingLevel`). `mu -p PROMPT --agent NAME` runs one; they also appear in the `task` tool. `--max-cost USD` (with `-p`) aborts when the session cost passes the cap and always prints `mu: cost $X` to stderr.
+
 Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
 
 ## Tests
 
 `cargo test --workspace` runs the unit tests. `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
+
+`cargo test --workspace --locked -- --ignored contract_` checks the pinned omp's output formats against mu's parsers (needs network and the omp from `MU_OMP`/`~/.mu/bin`).
+
+## Maintenance bot
+
+A local systemd timer keeps mu current with oh-my-pi; everything is reported through GitHub issues and PRs. `scripts/maint/setup.sh [--profile NAME]` installs it (config in `~/.mu/maint/config.env`, budgets `MU_MAINT_*_USD`, `MU_MAINT_DRY_RUN=1` prints instead of mutating GitHub). Its LLM steps are the agents in `.omp/agents/` (`maint-triage`, `maint-fixer`, `maint-digest`), run by the installed `mu`.
+
+| Level | Trigger | Action |
+|---|---|---|
+| S0 | `scripts/maint/check.sh` fails on `origin/main` | issue `maint:s0`; fixer PR `maint:needs-review`; no bump or publish |
+| S1 | new omp release, bump fails checks | fixer adapts mu; PR `maint:bump` + `maint:needs-review` (+ `maint:red`) |
+| S2 | green bump, no behaviour change | PR `maint:bump` + `maint:auto`, squash-merged |
+| S2r | green bump, behaviour change | PR `maint:bump` + `maint:needs-review`, not merged |
+| S3 | weekly | issue `maint:digest` with omp changes worth porting |
+| publish | `origin/main` is green and newer than the last release | tag `mu-YYYYMMDD-<sha7>`; `.github/workflows/release.yml` builds and releases; the bot reinstalls unless a dev build is installed |
+
+Nightly runs at 03:30, the digest on Mondays 05:00. The bot never edits `.github/`.
 
 Design notes and milestones: `DESIGN.md`.
