@@ -62,7 +62,7 @@ fn resolve_command(m: &Manifest) -> std::path::PathBuf {
     if c.contains('/') {
         return m.dir.join(c);
     }
-    if let Some(sib) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(c))).filter(|p| p.exists()) {
+    if let Some(sib) = std::env::current_exe().and_then(std::fs::canonicalize).ok().and_then(|e| e.parent().map(|d| d.join(c))).filter(|p| p.exists()) {
         return sib;
     }
     c.into()
@@ -260,6 +260,7 @@ impl PluginHost {
         let mut cmd = Command::new(resolve_command(m));
         cmd.args(&m.command[1..]).current_dir(&m.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log);
         cmd.process_group(0);
+        #[cfg(target_os = "linux")]
         unsafe {
             cmd.pre_exec(|| {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);

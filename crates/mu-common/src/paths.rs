@@ -29,6 +29,15 @@ pub fn omp_agent_dir() -> PathBuf {
     }
 }
 
+/// The omp binary mu runs: `$MU_OMP`, else `<mu_home>/bin/omp` when installed, else `omp` on PATH.
+pub fn omp_bin() -> PathBuf {
+    if let Some(p) = std::env::var_os("MU_OMP").filter(|p| !p.is_empty()) {
+        return PathBuf::from(p);
+    }
+    let own = mu_home().join("bin").join("omp");
+    if own.is_file() { own } else { PathBuf::from("omp") }
+}
+
 pub fn mu_home() -> PathBuf {
     match std::env::var_os("MU_HOME") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
@@ -88,4 +97,37 @@ mod tests {
         assert_eq!(encode_cwd(&h), "-");
         assert_eq!(encode_cwd(Path::new("/opt/x")), "--opt-x--");
     }
+}
+
+/// Runs the real `omp_bin()` with `args` (stdin null, 60 s limit) and returns its stdout. For contract tests.
+pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(omp_bin())
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cannot run omp");
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait().expect("wait") {
+            Some(_) => break,
+            None if start.elapsed() > std::time::Duration::from_secs(60) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("omp {args:?} timed out after 60s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    String::from_utf8_lossy(&reader.join().unwrap()).into_owned()
 }

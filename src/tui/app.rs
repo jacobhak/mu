@@ -1238,7 +1238,7 @@ impl App {
         use std::process::Stdio;
         let _ = self.renderer.finish();
         let _ = term::suspend();
-        let mut cmd = std::process::Command::new("omp");
+        let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
         cmd.arg("login").args(args);
         if pick.is_some() {
             cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -1488,7 +1488,7 @@ fn relay_login(child: &mut std::process::Child, pick: usize) -> std::io::Result<
 
 /// Provider menu of `omp login`, scraped from its numbered prompt (omp has no machine-readable list).
 async fn list_login_providers() -> Result<Vec<(usize, String)>, String> {
-    let out = tokio::process::Command::new("omp")
+    let out = tokio::process::Command::new(mu_common::paths::omp_bin())
         .arg("login")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1529,5 +1529,12 @@ mod login_tests {
     fn menu_numbers_and_names_survive_ansi_and_noise() {
         let t = "Select a provider:\n\n  1. ChatGPT Plus/Pro (Codex)\n\x1b[2m  12. Z.AI (GLM · Sign in)\x1b[0m\nEnter number: ";
         assert_eq!(parse_login_menu(t), vec![(1, "ChatGPT Plus/Pro (Codex)".into()), (12, "Z.AI (GLM · Sign in)".into())]);
+    }
+
+    #[test]
+    #[ignore]
+    fn contract_omp_login_menu() {
+        let out = mu_common::paths::run_omp_blocking(&["login"], &[]);
+        assert!(!parse_login_menu(&out).is_empty(), "no providers parsed from: {out}");
     }
 }

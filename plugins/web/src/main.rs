@@ -46,7 +46,7 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 /// Runs `omp <args>` in the session cwd with a timeout. Returns (stdout, stderr, success).
 async fn run_omp(args: &[String], env: &[(&str, &str)]) -> Result<(String, String, bool), String> {
-    let mut cmd = Command::new("omp");
+    let mut cmd = Command::new(mu_common::paths::omp_bin());
     cmd.args(args).kill_on_drop(true).stdin(std::process::Stdio::null());
     for (k, v) in env {
         cmd.env(k, v);
@@ -203,5 +203,12 @@ mod tests {
         let t = truncate(s);
         assert!(t.ends_with("\n[truncated at 100KB]"));
         assert!(t.len() <= FETCH_CAP + 32);
+    }
+
+    #[test]
+    #[ignore]
+    fn contract_omp_read() {
+        let out = mu_common::paths::run_omp_blocking(&["read", "https://example.com"], &[("COLUMNS", "200"), ("NO_COLOR", "1")]);
+        assert!(out.contains("Example Domain"), "{out}");
     }
 }

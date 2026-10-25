@@ -25,10 +25,10 @@ lang-markdown = ["highlight", "dep:tree-sitter-md"]
 
 [dependencies]
 mu-common = { path = "crates/mu-common" }
-pi-edit   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
-pi-shell  = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
-pi-diff   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
-pi-walker = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+pi-edit   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.12.6" }
+pi-shell  = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.12.6" }
+pi-diff   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.12.6" }
+pi-walker = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.12.6" }
 tokio = { version = "1", features = ["rt", "macros", "signal", "time", "sync", "process", "io-util", "io-std", "fs", "net"] }
 tokio-util = "0.7"
 serde_yaml_ng = "0.10"
@@ -66,9 +66,9 @@ libc = "0.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
 
 [patch.crates-io]
-brush-core   = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
-brush-parser = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
-tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
+brush-core   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.12.6" }
+brush-parser = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.12.6" }
+tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.12.6" }
 
 [profile.release]
 strip = true

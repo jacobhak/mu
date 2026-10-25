@@ -75,7 +75,7 @@ fn serve() -> Result<i32, String> {
     let mut kids = Kids(Vec::new());
     let (broker, broker_url) = spawn_omp(&["auth-broker", "serve", "--bind=127.0.0.1:0"], &[])?;
     kids.0.push(broker);
-    let _ = Command::new("omp")
+    let _ = Command::new(mu_common::paths::omp_bin())
         .args(["auth-gateway", "token"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -158,9 +158,10 @@ impl Drop for Kids {
 /// Spawns `omp <args>` on an ephemeral loopback port and returns the URL it reports.
 /// Output is forwarded to the daemon log; the child dies with the daemon (PDEATHSIG).
 fn spawn_omp(args: &[&str], env: &[(&str, &str)]) -> Result<(Child, String), String> {
-    let mut cmd = Command::new("omp");
+    let mut cmd = Command::new(mu_common::paths::omp_bin());
     cmd.args(args).envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.process_group(0);
+    #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);

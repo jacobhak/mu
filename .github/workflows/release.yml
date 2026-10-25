@@ -1,0 +1,40 @@
+name: release
+on:
+  push:
+    tags: ['mu-*']
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, plat: linux-x64 }
+          - { os: macos-14, plat: darwin-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --workspace --locked
+      - run: scripts/package.sh ${{ matrix.plat }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mu-${{ matrix.plat }}
+          path: dist/mu-${{ matrix.plat }}.tar.gz
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --title "$GITHUB_REF_NAME" \
+            --notes "omp $(git show "$GITHUB_REF_NAME:upstream.toml" | sed -n 's/^omp = "\(.*\)"/\1/p')"

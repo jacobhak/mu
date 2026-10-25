@@ -140,6 +140,7 @@ pub async fn run_child(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd.process_group(0);
+    #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);

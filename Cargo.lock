@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "brush-core"
 version = "0.5.0"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -406,7 +406,7 @@ dependencies = [
 [[package]]
 name = "brush-parser"
 version = "0.4.0"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "bon",
  "cached",
@@ -4849,7 +4849,7 @@ dependencies = [
 [[package]]
 name = "pi-ast"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4881,7 +4881,7 @@ dependencies = [
 [[package]]
 name = "pi-builtins"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "ansi-width",
  "argmax",
@@ -4968,12 +4968,12 @@ dependencies = [
 [[package]]
 name = "pi-diff"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 
 [[package]]
 name = "pi-edit"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -4991,7 +4991,7 @@ dependencies = [
 [[package]]
 name = "pi-iso"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "async-trait",
  "libc",
@@ -5023,7 +5023,7 @@ dependencies = [
 [[package]]
 name = "pi-shell"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "anyhow",
  "brush-core",
@@ -5053,7 +5053,7 @@ dependencies = [
 [[package]]
 name = "pi-vcs"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "futures",
  "gix",
@@ -5069,7 +5069,7 @@ dependencies = [
 [[package]]
 name = "pi-vfs"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "async-trait",
  "libc",
@@ -5083,7 +5083,7 @@ dependencies = [
 [[package]]
 name = "pi-walker"
 version = "18.12.6"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "globset",
  "ignore",
@@ -6449,7 +6449,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
-source = "git+https://github.com/can1357/oh-my-pi?rev=0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0#0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.12.6#45c35e40c46166dc726ccc52f5d27f40f2449f99"
 dependencies = [
  "cc",
  "tree-sitter-language",

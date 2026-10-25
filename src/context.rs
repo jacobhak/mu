@@ -275,8 +275,8 @@ pub fn system_prompt(i: &PromptInput) -> String {
 - Use `write` only to create a file or replace it entirely.\n\
 - Search with `grep` and `glob` rather than `bash`.\n\
 - Be concise; the user sees each tool call.\n\n\
-<workstation>\n- OS: linux {}\n- Arch: {}\n- Model: {}\n- Date: {date}\n- Working directory: {}\n</workstation>\n",
-        os.trim(),
+<workstation>\n- OS: {}\n- Arch: {}\n- Model: {}\n- Date: {date}\n- Working directory: {}\n</workstation>\n",
+        format!("{} {}", std::env::consts::OS, os.trim()).trim_end(),
         std::env::consts::ARCH,
         i.model,
         i.cwd.display()

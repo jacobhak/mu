@@ -29,7 +29,7 @@ use std::rc::Rc;
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5-5";
 
 #[derive(Parser)]
-#[command(name = "mu", version)]
+#[command(name = "mu", version = env!("MU_VERSION"))]
 struct Cli {
     #[arg(long)]
     model: Option<String>,
@@ -226,4 +226,14 @@ fn run() -> Result<i32> {
         code
     });
     Ok(code)
+}
+
+#[cfg(test)]
+mod contract_tests {
+    #[test]
+    #[ignore]
+    fn contract_omp_version() {
+        let out = mu_common::paths::run_omp_blocking(&["--version"], &[]);
+        assert_eq!(out.trim(), format!("omp/{}", env!("MU_OMP_VERSION")));
+    }
 }

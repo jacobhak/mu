@@ -228,7 +228,7 @@ pub async fn refresh_missing() {
 
 async fn fetch() {
     let path = cache_path();
-    let out = tokio::process::Command::new("omp")
+    let out = tokio::process::Command::new(mu_common::paths::omp_bin())
         .args(["models", "ls", "--json"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -297,5 +297,17 @@ mod tests {
         assert_eq!(t.display_name_with("anthropic/claude-haiku-5-5").as_deref(), Some("Haiku 5.5"));
         assert_eq!(heuristic_name("anthropic/claude-haiku-5-5"), "Haiku 5.5");
         assert_eq!(heuristic_name("modal/zai-org/glm-5.3-flash"), "GLM 5.3 Flash");
+    }
+
+    #[test]
+    #[ignore]
+    fn contract_omp_models_ls() {
+        let out = mu_common::paths::run_omp_blocking(&["models", "ls", "--json"], &[]);
+        let t = Table::from_json(&out).expect("models ls --json did not parse");
+        assert!(!t.entries.is_empty());
+        assert!(
+            t.entries.iter().any(|(k, e)| k.starts_with("anthropic/") && e.rates.as_ref().is_some_and(|r| r.input > 0.0)),
+            "no anthropic model with a non-zero input price"
+        );
     }
 }
