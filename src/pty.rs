@@ -86,7 +86,10 @@ pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16) -> io::Result<Pty>
     drop(cmd);
     let child = child?;
     let pid = child.id().map(|p| p as i32).unwrap_or(0);
-    Ok(Pty { io: std::rc::Rc::new(PtyIo { master: AsyncFd::register_with_interest(master, tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE)?, pid }), child })
+    let interest = tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE;
+    // SAFETY: `master` is an owned, non-blocking descriptor that stays open as long as the `AsyncFd`.
+    let master = unsafe { AsyncFd::register_with_interest(master, interest) }?;
+    Ok(Pty { io: std::rc::Rc::new(PtyIo { master, pid }), child })
 }
 
 impl PtyIo {
