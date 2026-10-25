@@ -1,0 +1,9 @@
+[Unit]
+Description=mu maintenance bot, nightly
+[Timer]
+Unit=mu-maint@nightly.service
+OnCalendar=*-*-* 03:30
+Persistent=true
+RandomizedDelaySec=10m
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=mu maintenance bot, weekly omp parity digest
+[Timer]
+Unit=mu-maint@digest.service
+OnCalendar=Mon *-*-* 05:00
+Persistent=true
+[Install]
+WantedBy=timers.target
