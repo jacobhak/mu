@@ -53,7 +53,7 @@ nightly() {
   checked_sha="$(git -C "$wt" rev-parse HEAD)"
   mkdir -p "$RUN/main"
   log "baseline check of ${checked_sha:0:7}"
-  if ! "$here/check.sh" "$wt" "$RUN/main" > "$RUN/main/check.out" 2>&1; then
+  if ! "$here/check.sh" "$wt" "$RUN/main" 9>&- > "$RUN/main/check.out" 2>&1; then
     result=s0
     log "baseline red"
     local body="$RUN/s0-issue.md" branch="maint/fix-main-$(date +%Y%m%d)"
@@ -68,7 +68,7 @@ P
     local green=0
     if [ "$rc" = 0 ] && tree_changed "$fixwt"; then
       mkdir -p "$RUN/fix"
-      if "$here/check.sh" "$fixwt" "$RUN/fix" > "$RUN/fix/check.out" 2>&1; then green=1; fi
+      if "$here/check.sh" "$fixwt" "$RUN/fix" 9>&- > "$RUN/fix/check.out" 2>&1; then green=1; fi
     fi
     if [ "$green" = 1 ]; then
       local title="Fix main: $(first_line "$fout")"
@@ -136,7 +136,7 @@ bump_flow() {
 
   mkdir -p "$RUN/bump"
   local green=0
-  "$here/check.sh" "$bwt" "$RUN/bump" > "$RUN/bump/check.out" 2>&1 && green=1
+  "$here/check.sh" "$bwt" "$RUN/bump" 9>&- > "$RUN/bump/check.out" 2>&1 && green=1
 
   "$here/material.sh" "$pinned" "$latest" "$RUN/material"
   local tprompt="$RUN/triage-prompt.md" tout="$RUN/triage.md" change=true summary="triage unavailable" risk=unknown
@@ -171,7 +171,7 @@ P
       git -C "$bwt" add -A
       git -C "$bwt" commit -q -m "Adapt to oh-my-pi v$latest" -m "$fixout"
       mkdir -p "$RUN/bump-fixed"
-      if "$here/check.sh" "$bwt" "$RUN/bump-fixed" > "$RUN/bump-fixed/check.out" 2>&1; then
+      if "$here/check.sh" "$bwt" "$RUN/bump-fixed" 9>&- > "$RUN/bump-fixed/check.out" 2>&1; then
         green=1
       fi
       cp "$RUN/bump-fixed/check.txt" "$RUN/bump/check.txt"
@@ -207,7 +207,7 @@ publish() {
   if [ "$sha" != "$checked_sha" ]; then
     worktree main origin/main
     mkdir -p "$RUN/publish"
-    if ! "$here/check.sh" "$wt" "$RUN/publish" > "$RUN/publish/check.out" 2>&1; then
+    if ! "$here/check.sh" "$wt" "$RUN/publish" 9>&- > "$RUN/publish/check.out" 2>&1; then
       log "origin/main ${sha7} is red; not publishing"
       return 0
     fi

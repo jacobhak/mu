@@ -87,7 +87,7 @@ run_agent() {
   err="$out.err"
   log "agent $agent (cap \$$cap) in $cwd"
   rc=0
-  (cd "$cwd" && timeout 45m "$MU" -p "$(cat "$prompt")" --agent "$agent" --max-cost "$cap" > "$out" 2> "$err") || rc=$?
+  (cd "$cwd" && timeout 45m "$MU" -p "$(cat "$prompt")" --agent "$agent" --max-cost "$cap" > "$out" 2> "$err" 9>&-) || rc=$?
   cost="$(sed -n 's/^mu: cost \$\([0-9.]*\).*/\1/p' "$err" | tail -1)"
   printf '%s\t%s\t%s\t%s\n' "$(date +%F)" "$MODE" "$agent" "${cost:-$cap}" >> "$MAINT/spend.tsv"
   log "agent $agent exit=$rc cost=\$${cost:-$cap}"
