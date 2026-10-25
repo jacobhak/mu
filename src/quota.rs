@@ -1,7 +1,7 @@
 //! Subscription usage windows (`5h`, `7d`) from the gateway's `GET /v1/usage`.
 //!
-//! Only an already-running gateway is queried: the lookup reads `$MU_HOME/gateway/state.json` and
-//! checks its pid, so refreshing never starts one.
+//! Only an already-running gateway is queried: the lookup reads `state.json` and checks its pid, so
+//! refreshing never starts one. State lives in `$MU_HOME/gateway/` (`profiles/<name>/` under an omp profile).
 use mu_common::paths;
 use serde_json::Value;
 use std::time::Duration;
@@ -53,6 +53,15 @@ pub fn parse_usage(body: &str, provider: &str, now_ms: i64) -> Option<ProviderUs
     (!windows.is_empty()).then(|| ProviderUsage { provider: provider.into(), windows })
 }
 
+/// Mirrors the gateway plugin's per-profile state directory.
+fn gateway_dir() -> std::path::PathBuf {
+    let base = paths::mu_home().join("gateway");
+    match paths::profile() {
+        Some(p) if !p.contains(['/', '\\']) && p != "." && p != ".." => base.join("profiles").join(p),
+        _ => base,
+    }
+}
+
 /// Gateway URL and bearer token of a running gateway, or `None` when none is running.
 fn running_gateway() -> Option<(String, String)> {
     if let Some(url) = std::env::var("MU_GATEWAY_URL").ok().filter(|u| !u.is_empty()) {
@@ -62,8 +71,7 @@ fn running_gateway() -> Option<(String, String)> {
             .or_else(|| std::fs::read_to_string(paths::omp_config_root().join("auth-gateway.token")).ok())?;
         return Some((url.trim_end_matches('/').into(), token.trim().into()));
     }
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(paths::mu_home().join("gateway/state.json")).ok()?).ok()?;
+    let state: Value = serde_json::from_str(&std::fs::read_to_string(gateway_dir().join("state.json")).ok()?).ok()?;
     let pid = state["pid"].as_i64()? as libc::pid_t;
     // SAFETY: signal 0 only checks that the process exists.
     if unsafe { libc::kill(pid, 0) } != 0 {
