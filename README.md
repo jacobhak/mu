@@ -2,13 +2,15 @@
 
 A small, memory-lean coding agent. Rust core; everything heavy (gateway, web, memory) is an out-of-process plugin that starts on first use and exits when idle. It talks to models through the omp auth gateway and reads omp's config (`modelRoles`, `compaction.modelThresholds`, `models.yml`).
 
+mu is a personal, experimental reimplementation of [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) and is built on it: it uses omp's Rust crates, CLI and auth gateway, and borrows many of its prompts and much of its behaviour. Expect breaking changes. Credit for the design goes to the omp authors.
+
 ## Build and install
 
-Releases (Linux x86_64, macOS arm64) are published from `main`. The repo is private, so the installer needs an authenticated `gh`:
+Releases (Linux x86_64, macOS arm64) are published from `main`:
 
 ```sh
-gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash
-scripts/install.sh --tag mu-YYYYMMDD-<sha7>   # a specific release
+curl -fsSL https://raw.githubusercontent.com/jacobhak/mu/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jacobhak/mu/main/scripts/install.sh | bash -s -- --tag mu-YYYYMMDD-<sha7>
 scripts/install.sh --from-source .            # build and install a checkout
 ```
 
@@ -16,7 +18,7 @@ This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` a
 
 ### Updating
 
-`mu update` installs the latest release (it runs the repo's `install.sh` through `gh`, so it needs an authenticated `gh`). `mu update --check` only reports; `--tag mu-YYYYMMDD-<sha7>` picks a release; `--force` replaces a dev build, which is otherwise refused. On startup the TUI checks for a newer release at most once a day (cached in `~/.mu/update-check`) and shows a notice; it stays silent when offline, without `gh`, or on a dev build. Turn it off with `[update] check = false` in config.toml.
+`mu update` installs the latest release by running the repo's `install.sh`. `mu update --check` only reports; `--tag mu-YYYYMMDD-<sha7>` picks a release; `--force` replaces a dev build, which is otherwise refused. On startup the TUI checks for a newer release at most once a day (cached in `~/.mu/update-check`) and shows a notice; it stays silent when offline or on a dev build. Turn it off with `[update] check = false` in config.toml. Checks use the unauthenticated GitHub API (60 requests an hour).
 
 ### Pinned omp
 
@@ -111,3 +113,7 @@ A local systemd timer keeps mu current with oh-my-pi; everything is reported thr
 Nightly runs at 03:30, the digest on Mondays 05:00. The bot never edits `.github/`.
 
 Design notes and milestones: `DESIGN.md`.
+
+## License
+
+MIT, see `LICENSE`. mu includes prompts and other material from [oh-my-pi](https://github.com/can1357/oh-my-pi) (MIT) and colour palettes from [omarchy](https://github.com/basecamp/omarchy) (MIT); see `THIRD-PARTY-NOTICES.md`.

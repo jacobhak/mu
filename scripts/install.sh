@@ -32,11 +32,9 @@ if [ -n "$src" ]; then
   . "$src/scripts/lib-layout.sh"
   stage_layout "$src" "${CARGO_TARGET_DIR:-$src/target}/release" "$tmp"
 else
-  if ! gh auth status >/dev/null 2>&1; then
-    echo "install.sh needs an authenticated gh (gh auth login)" >&2
-    exit 1
-  fi
-  gh release download ${tag:+"$tag"} -R "$REPO" -p "mu-$plat.tar.gz" -D "$tmp" --clobber
+  if [ -n "$tag" ]; then url="https://github.com/$REPO/releases/download/$tag/mu-$plat.tar.gz"
+  else url="https://github.com/$REPO/releases/latest/download/mu-$plat.tar.gz"; fi
+  curl -fsSL -o "$tmp/mu-$plat.tar.gz" "$url" || { echo "install.sh: could not download $url" >&2; exit 1; }
   tar -C "$tmp" -xzf "$tmp/mu-$plat.tar.gz"
 fi
 stage="$tmp/mu"
@@ -52,7 +50,9 @@ if [ "$skip_dev" = 1 ] && [ -x "$home/bin/mu" ]; then
         if [ -n "$src" ]; then
           git -C "$src" merge-base --is-ancestor "$sha" origin/main 2>/dev/null || dev=1
         else
-          st="$(gh api "repos/$REPO/compare/$sha...main" -q .status 2>/dev/null || true)"
+          # GitHub pretty-prints JSON; only the top-level "status" is indented two spaces (file entries have one too).
+          st="$(curl -fsSL "https://api.github.com/repos/$REPO/compare/$sha...main?per_page=1" 2>/dev/null \
+            | sed -n 's/^  "status": "\([a-z]*\)".*/\1/p' | head -1 || true)"
           case "$st" in ahead | identical) ;; *) dev=1 ;; esac
         fi ;;
     esac

@@ -16,6 +16,6 @@ stage_layout() {
   cp -R "$root/plugins/web/schemas" "$dest/mu/plugins/web/schemas"
   mkdir -p "$dest/mu/plugins/memory"
   (cd "$root/plugins/memory" && tar --exclude=./node_modules -cf - .) | (cd "$dest/mu/plugins/memory" && tar -xf -)
-  cp "$root/upstream.toml" "$dest/mu/upstream.toml"
+  cp "$root/upstream.toml" "$root/LICENSE" "$root/THIRD-PARTY-NOTICES.md" "$dest/mu/"
   cp "$root/scripts/install.sh" "$root/scripts/fetch-omp.sh" "$dest/mu/scripts/"
 }

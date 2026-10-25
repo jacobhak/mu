@@ -251,7 +251,7 @@ DIFF = [
 TEST_OUT = ["running 41 tests", "........................................ 41/41", "test result: ok. 41 passed; 0 failed"]
 CLIPPY_OUT = ["error: unused import: `theme`", "  --> src/tui/status.rs:4:5", "  |", "4 | use super::theme;",
               "  |     ^^^^^^^^^^^^", "error: could not compile `mu` (bin \"mu\") due to 1 previous error"]
-LIVE_TAIL = ["   Compiling mu v0.9.0 (/home/jacob/code/private/mu)", "   Compiling crossterm v0.28.1"]
+LIVE_TAIL = ["   Compiling mu v0.9.0 (~/code/mu)", "   Compiling crossterm v0.28.1"]
 SUBAGENTS = [("running", "scout", 4, "reading src/tui/theme.rs"), ("done", "palette", 9, "derived 22 roles"),
              ("failed", "osc-probe", 2, "tmux did not answer OSC 4")]
 SPIN = "⠋"

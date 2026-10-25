@@ -1,4 +1,4 @@
-//! `mu update`: release check and self-update through `gh`, against the private release repo.
+//! `mu update`: release check and self-update through the public GitHub API (via `curl`).
 //! Releases are tagged `mu-YYYYMMDD-<sha7>` by the maintenance bot; the installed build knows its own sha.
 
 use anyhow::{Result, bail};
@@ -16,7 +16,7 @@ pub enum Status {
     /// The installed build is dirty, unknown, or not on the release lineage.
     Dev { sha: String },
     NoReleases,
-    /// gh missing, unauthenticated, or offline.
+    /// curl missing, offline, or rate limited.
     Unknown(String),
 }
 
@@ -62,19 +62,39 @@ fn classify(tag: &str, status: &str, ahead: u64, sha: &str) -> Status {
     }
 }
 
-struct Out {
-    ok: bool,
-    stdout: String,
-    stderr: String,
+enum Api {
+    Ok(serde_json::Value),
+    NotFound,
+    Err(String),
 }
 
-fn gh(args: &[&str]) -> Result<Out> {
-    let o = Command::new("gh").args(args).stdin(Stdio::null()).output().map_err(|e| anyhow::anyhow!("gh unavailable: {e}"))?;
-    Ok(Out {
-        ok: o.status.success(),
-        stdout: String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&o.stderr).trim().to_string(),
-    })
+/// Runs `curl` and returns (HTTP status, body). HTTP errors are returned, not raised; network failures are errors.
+fn curl(url: &str, accept: &str) -> Result<(u16, String)> {
+    let o = Command::new("curl")
+        .args(["-sSL", "-H", accept, "-H", "X-GitHub-Api-Version: 2022-11-28", "-w", "\n%{http_code}", url])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| anyhow::anyhow!("curl unavailable: {e}"))?;
+    let out = String::from_utf8_lossy(&o.stdout);
+    let (body, code) = out.rsplit_once('\n').unwrap_or(("", &out));
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr);
+        bail!("{}", err.lines().next().unwrap_or("curl failed"));
+    }
+    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+}
+
+fn api(path: &str) -> Api {
+    match curl(&format!("https://api.github.com/{path}"), "Accept: application/vnd.github+json") {
+        Ok((200, body)) => match serde_json::from_str(&body) {
+            Ok(v) => Api::Ok(v),
+            Err(e) => Api::Err(format!("bad response from GitHub: {e}")),
+        },
+        Ok((404, _)) => Api::NotFound,
+        Ok((403 | 429, _)) => Api::Err("GitHub API rate limit reached".into()),
+        Ok((code, _)) => Api::Err(format!("GitHub API returned HTTP {code}")),
+        Err(e) => Api::Err(e.to_string()),
+    }
 }
 
 /// Queries GitHub. Blocking; call from a thread or before the runtime starts.
@@ -83,37 +103,23 @@ pub fn check() -> Status {
     if is_dev_sha(sha) {
         return Status::Dev { sha: sha.into() };
     }
-    let rel = match gh(&["release", "list", "-R", REPO, "-L", "1", "--json", "tagName", "-q", ".[0].tagName"]) {
-        Ok(o) if o.ok => o,
-        Ok(o) => return Status::Unknown(first_line(&o.stderr)),
-        Err(e) => return Status::Unknown(e.to_string()),
+    let tag = match api(&format!("repos/{REPO}/releases/latest")) {
+        Api::Ok(v) => v["tag_name"].as_str().unwrap_or_default().to_string(),
+        Api::NotFound => return Status::NoReleases,
+        Api::Err(e) => return Status::Unknown(e),
     };
-    let tag = rel.stdout;
     if tag.is_empty() {
         return Status::NoReleases;
     }
     let Some(rsha) = tag_sha(&tag) else {
         return Status::Unknown(format!("unrecognised release tag {tag}"));
     };
-    let path = format!("repos/{REPO}/compare/{sha}...{rsha}");
-    match gh(&["api", &path, "-q", r#".status + " " + (.ahead_by|tostring)"#]) {
-        Ok(o) if o.ok => {
-            let mut it = o.stdout.split_whitespace();
-            let status = it.next().unwrap_or("");
-            let ahead = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
-            classify(&tag, status, ahead, sha)
-        }
-        // An unknown sha (a local build never pushed) is a 404, not a network error.
-        Ok(o) if o.stderr.contains("404") || o.stderr.contains("Not Found") || o.stderr.contains("No common ancestor") => {
-            Status::Dev { sha: sha.into() }
-        }
-        Ok(o) => Status::Unknown(first_line(&o.stderr)),
-        Err(e) => Status::Unknown(e.to_string()),
+    match api(&format!("repos/{REPO}/compare/{sha}...{rsha}?per_page=1")) {
+        Api::Ok(v) => classify(&tag, v["status"].as_str().unwrap_or(""), v["ahead_by"].as_u64().unwrap_or(0), sha),
+        // An unknown sha (a local build never pushed) or unrelated history is a 404, not a network error.
+        Api::NotFound => Status::Dev { sha: sha.into() },
+        Api::Err(e) => Status::Unknown(e),
     }
-}
-
-fn first_line(s: &str) -> String {
-    s.lines().next().unwrap_or("gh failed").to_string()
 }
 
 fn now() -> u64 {
@@ -172,10 +178,11 @@ pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
         _ => {}
     }
     // The installer is fetched from the repo, as in the README, so it always matches the release layout.
-    let script = gh(&["api", &format!("repos/{REPO}/contents/scripts/install.sh"), "-H", "Accept: application/vnd.github.raw"])?;
-    if !script.ok || script.stdout.is_empty() {
-        bail!("could not fetch install.sh: {}", first_line(&script.stderr));
-    }
+    let url = format!("https://raw.githubusercontent.com/{REPO}/main/scripts/install.sh");
+    let script = match curl(&url, "Accept: text/plain")? {
+        (200, body) if !body.is_empty() => body,
+        (code, _) => bail!("could not fetch install.sh: HTTP {code}"),
+    };
     let mut cmd = Command::new("bash");
     cmd.args(["-s", "--"]);
     if let Some(t) = &tag {
@@ -185,7 +192,7 @@ pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
     {
         use std::io::Write;
         let mut stdin = child.stdin.take().expect("piped");
-        stdin.write_all(script.stdout.as_bytes())?;
+        stdin.write_all(script.as_bytes())?;
         stdin.write_all(b"\n")?;
     }
     let status = child.wait()?;

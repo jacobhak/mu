@@ -2,6 +2,7 @@
 // Point it at a COPY of a store, never the live one.
 import { Database } from "bun:sqlite";
 import * as path from "node:path";
+import { computeBankScope } from "./store";
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -10,9 +11,9 @@ const str = (o: Obj, key: string) => (typeof o[key] === "string" ? String(o[key]
 const agentDir = process.argv[2];
 const scenario = process.argv[3] ?? "basic";
 if (!agentDir) throw new Error("usage: bun run smoke.ts <agentDir> [basic|turns|idle]");
-const cwd = "/home/jacob/code/private/mu";
+const cwd = path.resolve(import.meta.dir, "../.."); // the mu checkout
 const CANNED = "ZETA-4242 is the mu memory plugin smoke-test codename.";
-const BANK_DB = path.join(agentDir, "memories", "mnemopi", "banks", "mu-1b36eqsi5x5u6", "mnemopi.db");
+const BANK_DB = path.join(agentDir, "memories", "mnemopi", "banks", computeBankScope(undefined, cwd, "per-project").bank, "mnemopi.db");
 
 /** One plugin process speaking NDJSON; answers core/complete with a canned reply. */
 class Plugin {
