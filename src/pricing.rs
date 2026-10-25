@@ -1,7 +1,8 @@
 //! Per-model token prices, from omp's catalogue.
 //!
-//! Source: `omp models ls --json` (per-million rates, `pricingStatus`). Its output is cached at
-//! `$MU_HOME/pricing.json` and refreshed at most once a day, off the draw path.
+//! Source: `omp models ls --json` (per-million rates, `pricingStatus`). It lists only models the active
+//! profile can use, so its output is cached per profile (`paths::profile_cache_dir()/pricing.json`) and
+//! refreshed at most once a day, off the draw path. A model missing from the cache forces one refresh.
 use crate::message::{Cost, Usage};
 use mu_common::paths;
 use serde::Deserialize;
@@ -138,9 +139,11 @@ impl Table {
 }
 
 static TABLE: RwLock<Option<Arc<Table>>> = RwLock::new(None);
+/// A forced refresh (for a model missing from the cache) already ran or is running in this process.
+static FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn cache_path() -> PathBuf {
-    paths::mu_home().join("pricing.json")
+    paths::profile_cache_dir().join("pricing.json")
 }
 
 fn table() -> Arc<Table> {
@@ -162,6 +165,11 @@ pub fn cost(model_id: &str, usage: &Usage) -> Option<Cost> {
 /// Whether omp lists the model as reasoning-capable; `None` when unknown.
 pub fn reasoning(model_id: &str) -> Option<bool> {
     table().entries.get(model_id).map(|e| e.reasoning)
+}
+
+/// Whether the catalogue has an entry for the model, priced or not.
+pub fn known(model_id: &str) -> bool {
+    table().entries.contains_key(model_id)
 }
 
 /// Catalogue name without the `Claude ` prefix, else a name derived from the model id.
@@ -205,10 +213,21 @@ fn cache_fresh(path: &std::path::Path) -> bool {
 /// Refreshes the cached catalogue when it is missing or older than a day. Failures keep the old cache.
 /// Runs `omp models ls --json` at most once per day; never called from the draw path.
 pub async fn refresh() {
-    let path = cache_path();
-    if cache_fresh(&path) {
-        return;
+    if !cache_fresh(&cache_path()) {
+        fetch().await;
     }
+}
+
+/// Refreshes regardless of the cache's age, once per process: for a model the cache does not list
+/// (new model, or a cache written while its provider was not logged in).
+pub async fn refresh_missing() {
+    if !FORCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        fetch().await;
+    }
+}
+
+async fn fetch() {
+    let path = cache_path();
     let out = tokio::process::Command::new("omp")
         .args(["models", "ls", "--json"])
         .stdin(std::process::Stdio::null())
@@ -221,6 +240,9 @@ pub async fn refresh() {
     }
     let Ok(text) = String::from_utf8(out.stdout) else { return };
     let Some(parsed) = Table::from_json(&text) else { return };
+    if parsed.entries.is_empty() {
+        return;
+    }
     let tmp = path.with_extension("json.tmp");
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

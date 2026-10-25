@@ -290,9 +290,9 @@ impl Providers {
 }
 
 /// Last gateway model metadata, so the first status line shows real context windows
-/// without starting the gateway.
+/// without starting the gateway. Per profile: each profile's gateway serves its own models.
 fn cache_path() -> std::path::PathBuf {
-    mu_common::paths::mu_home().join("gateway-models.json")
+    mu_common::paths::profile_cache_dir().join("gateway-models.json")
 }
 
 fn load_cache() -> Option<Vec<GatewayModel>> {
@@ -316,5 +316,12 @@ fn save_cache(rows: &[GatewayModel]) {
         .iter()
         .map(|m| serde_json::json!({"id": m.id, "context_length": m.context_length, "max_output_tokens": m.max_output_tokens}))
         .collect();
-    let _ = std::fs::write(cache_path(), Value::Array(v).to_string());
+    let path = cache_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, Value::Array(v).to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }

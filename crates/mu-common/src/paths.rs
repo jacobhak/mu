@@ -36,6 +36,16 @@ pub fn mu_home() -> PathBuf {
     }
 }
 
+/// Per-profile cache dir: `$MU_HOME`, or `$MU_HOME/profiles/<name>` under an omp profile. Data that depends
+/// on a profile's credentials (model catalogue, prices) lives here so profiles never overwrite each other's.
+pub fn profile_cache_dir() -> PathBuf {
+    match profile() {
+        // The name becomes a path component; anything that could escape it falls back to the default dir.
+        Some(p) if !p.contains(['/', '\\']) && p != "." && p != ".." => mu_home().join("profiles").join(p),
+        _ => mu_home(),
+    }
+}
+
 /// The running executable, for re-spawning ourselves (subagents, daemons). After the binary is replaced on
 /// disk (`cargo install` under a running session) `current_exe()` names a path that no longer exists
 /// (`… (deleted)`); `/proc/self/exe` still executes the running image, so children match the parent's version.

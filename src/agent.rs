@@ -6,13 +6,14 @@ use crate::mem;
 use crate::gitinfo::{self, GitInfo};
 use crate::pricing;
 use crate::quota::{self, ProviderUsage};
-use crate::message::{Block, Message, StopReason, now_ms};
+use crate::message::{Block, Message, StopReason, Usage, now_ms};
 use crate::models::{ModelSpec, Thinking};
 use crate::plugin::{InitParams, PluginHost};
 use crate::provider::{ProviderError, Providers, Request, StreamEvent, ToolDef};
 use crate::session::{self, CompactionState, SessionFile};
 use crate::tools::{ToolCtx, ToolOutput, Tools};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -57,12 +58,25 @@ pub struct Agent {
     resumed: bool,
     user_turn: u32,
     session_cost: f64,
+    /// Assistant usage the price table could not price yet (`provider/model`, usage). Priced into
+    /// `session_cost` once the table knows the model; dropped if the table lists it without a price.
+    unpriced: Vec<(String, Usage)>,
     tokens_in: u64,
     tokens_out: u64,
     git: Option<GitInfo>,
     quota: Option<ProviderUsage>,
+    /// When the last quota fetch finished; `None` means one is due now.
     quota_at: Option<Instant>,
     quota_failures: u32,
+    /// The last fetch found no running gateway (cheap to re-check, so retried on a short fixed interval).
+    quota_no_gateway: bool,
+    quota_inflight: bool,
+    /// Set by `run`: quota is fetched only for the top-level interactive agent.
+    quota_enabled: bool,
+    /// The background fetch writes its result here and pings `quota_wake`.
+    quota_slot: Rc<RefCell<Option<(String, quota::Fetch)>>>,
+    quota_wake: UnboundedSender<()>,
+    quota_wake_rx: Option<UnboundedReceiver<()>>,
     turn_msgs: Vec<Value>,
     jobs: Option<Rc<JobsHandle>>,
     wake_rx: Option<UnboundedReceiver<()>>,
@@ -109,6 +123,20 @@ fn quota_interval(failures: u32) -> Duration {
     }
 }
 
+/// While no gateway runs, check again this often (a local file read), so quota shows soon after the
+/// first request starts one.
+const QUOTA_NO_GATEWAY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// `provider/model` as the price table keys it. Assistant messages from mu carry the full id; omp's carry
+/// the bare model id next to the provider.
+fn priced_id(provider: &str, model: &str) -> String {
+    if model.contains('/') { model.to_string() } else { format!("{provider}/{model}") }
+}
+
+fn has_tokens(u: &Usage) -> bool {
+    u.input + u.output + u.cache_read + u.cache_write > 0
+}
+
 async fn recv_opt(rx: &mut Option<UnboundedReceiver<()>>) -> Option<()> {
     match rx {
         Some(r) => r.recv().await,
@@ -135,6 +163,7 @@ impl Agent {
         tools.set_skills(i.ctx.skills.iter().map(|s| (s.name.clone(), s.dir.clone())).collect());
         let base_defs = Tools::definitions().into_iter().chain(i.plugins.tool_defs()).collect();
         let (title_tx, title_rx) = unbounded_channel();
+        let (quota_wake, quota_wake_rx) = unbounded_channel();
         Self {
             tools,
             providers: i.providers,
@@ -168,12 +197,19 @@ impl Agent {
             resumed: false,
             user_turn: 0,
             session_cost: 0.0,
+            unpriced: Vec::new(),
             tokens_in: 0,
             tokens_out: 0,
             git: None,
             quota: None,
             quota_at: None,
             quota_failures: 0,
+            quota_no_gateway: false,
+            quota_inflight: false,
+            quota_enabled: false,
+            quota_slot: Rc::new(RefCell::new(None)),
+            quota_wake,
+            quota_wake_rx: Some(quota_wake_rx),
             turn_msgs: Vec::new(),
             jobs: None,
             wake_rx: None,
@@ -286,27 +322,80 @@ impl Agent {
     /// Git state for the status line. Runs between turns, never from the draw path.
     async fn refresh_external(&mut self) {
         self.git = gitinfo::git_status(&self.cwd).await;
-        if self.quota_wait().is_zero() {
-            self.refresh_quota().await;
-        }
+        self.tick_quota();
+        self.settle_prices();
     }
 
-    /// Time until the next quota fetch is due.
+    /// Time until the next quota fetch is due. Long while one is in flight: its completion wakes `run`.
     fn quota_wait(&self) -> Duration {
+        if !self.quota_enabled || self.quota_inflight {
+            return Duration::from_secs(3600);
+        }
         let Some(at) = self.quota_at else { return Duration::ZERO };
-        quota_interval(self.quota_failures).saturating_sub(at.elapsed())
+        let interval = if self.quota_no_gateway { QUOTA_NO_GATEWAY_INTERVAL } else { quota_interval(self.quota_failures) };
+        interval.saturating_sub(at.elapsed())
     }
 
-    /// Only a gateway that is already running is queried. Failures retry on a short backoff.
-    async fn refresh_quota(&mut self) {
-        let got = quota::fetch(&self.model.provider).await;
-        self.quota_at = Some(Instant::now());
-        match got {
-            Some(q) => {
-                self.quota_failures = 0;
-                self.quota = Some(q);
+    /// Applies a finished quota fetch, then starts the next one if due. Never waits on the network:
+    /// the gateway may fetch usage upstream on a cache miss, which can take seconds.
+    fn tick_quota(&mut self) {
+        if !self.quota_enabled {
+            return;
+        }
+        if let Some((provider, got)) = self.quota_slot.borrow_mut().take() {
+            self.quota_inflight = false;
+            self.quota_at = Some(Instant::now());
+            match got {
+                quota::Fetch::Got(q) => {
+                    self.quota_failures = 0;
+                    self.quota_no_gateway = false;
+                    self.quota = Some(q);
+                }
+                quota::Fetch::NoGateway => self.quota_no_gateway = true,
+                quota::Fetch::Failed => {
+                    self.quota_no_gateway = false;
+                    self.quota_failures = self.quota_failures.saturating_add(1);
+                }
             }
-            None => self.quota_failures = self.quota_failures.saturating_add(1),
+            // Fetched for a provider the session has since switched away from: fetch again now.
+            if provider != self.model.provider {
+                self.quota_at = None;
+            }
+        }
+        if self.quota_inflight || !self.quota_wait().is_zero() {
+            return;
+        }
+        self.quota_inflight = true;
+        let (provider, slot, wake) = (self.model.provider.clone(), self.quota_slot.clone(), self.quota_wake.clone());
+        tokio::task::spawn_local(async move {
+            let got = quota::fetch(&provider).await;
+            *slot.borrow_mut() = Some((provider, got));
+            let _ = wake.send(());
+        });
+    }
+
+    /// Prices usage recorded before the table knew its model. A model the table does not list forces
+    /// one catalogue refresh per process.
+    fn settle_prices(&mut self) {
+        if self.unpriced.is_empty() {
+            return;
+        }
+        let mut missing = false;
+        let mut added = 0.0;
+        self.unpriced.retain(|(id, usage)| match pricing::cost(id, usage) {
+            Some(c) => {
+                added += c.total;
+                false
+            }
+            None if pricing::known(id) => false,
+            None => {
+                missing = true;
+                true
+            }
+        });
+        self.session_cost += added;
+        if missing && self.quota_enabled {
+            tokio::task::spawn_local(pricing::refresh_missing());
         }
     }
 
@@ -393,6 +482,7 @@ impl Agent {
                 }
                 if self.model.provider != spec.provider {
                     self.quota_at = None;
+                    self.quota_failures = 0;
                 }
                 self.model = spec;
                 if let Some(l) = level {
@@ -413,9 +503,12 @@ impl Agent {
     }
 
     pub fn push(&mut self, mut m: Message) {
-        if let Message::Assistant { usage, .. } = &mut m {
-            if let Some(c) = pricing::cost(&self.model.id, usage) {
-                usage.cost = c;
+        if let Message::Assistant { usage, provider, model, .. } = &mut m {
+            let id = priced_id(provider, model);
+            match pricing::cost(&id, usage) {
+                Some(c) => usage.cost = c,
+                None if has_tokens(usage) => self.unpriced.push((id, usage.clone())),
+                None => {}
             }
             self.session_cost += usage.cost.total;
             self.tokens_in += usage.input + usage.cache_read + usage.cache_write;
@@ -450,6 +543,7 @@ impl Agent {
         self.title = None;
         self.user_turn = 0;
         self.session_cost = 0.0;
+        self.unpriced.clear();
         self.tokens_in = 0;
         self.tokens_out = 0;
         self.turn_msgs.clear();
@@ -530,10 +624,17 @@ impl Agent {
         } else if self.pin_thinking {
             s.thinking_change(self.thinking.as_str());
         }
-        self.session_cost = loaded.messages.iter().map(|m| match m {
-            Message::Assistant { usage, .. } => usage.cost.total,
-            _ => 0.0,
-        }).sum();
+        // Stored costs, except turns that were saved unpriced (price table missing the model at the time).
+        for m in &loaded.messages {
+            if let Message::Assistant { usage, provider, model, .. } = m {
+                if usage.cost.total == 0.0 && has_tokens(usage) {
+                    self.unpriced.push((priced_id(provider, model), usage.clone()));
+                } else {
+                    self.session_cost += usage.cost.total;
+                }
+            }
+        }
+        self.settle_prices();
         self.messages = loaded.messages;
         self.entry_ids = loaded.entry_ids;
         self.plugin_ctx = loaded.plugin_context;
@@ -562,16 +663,22 @@ impl Agent {
     }
 
     pub async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
+        self.quota_enabled = true;
         tokio::task::spawn_local(pricing::refresh());
         self.refresh_external().await;
         self.emit_status();
         let mut title_rx = self.title_rx.take().expect("run once");
         let mut wake_rx = self.wake_rx.take();
+        let mut quota_rx = self.quota_wake_rx.take();
         loop {
             let cmd = tokio::select! {
                 c = rx.recv() => match c { Some(c) => c, None => break },
                 () = tokio::time::sleep(self.quota_wait()) => {
-                    self.refresh_quota().await;
+                    self.tick_quota();
+                    continue;
+                }
+                Some(()) = recv_opt(&mut quota_rx) => {
+                    self.tick_quota();
                     self.emit_status();
                     continue;
                 }
@@ -855,6 +962,11 @@ impl Agent {
             };
             self.push(msg);
             self.request_title();
+            // Context, cost and quota move with every response, not just at turn end.
+            self.refresh_model_meta();
+            self.tick_quota();
+            self.settle_prices();
+            self.emit_status();
             if stop == StopReason::Length {
                 self.error("[output truncated: max_tokens reached]");
             }

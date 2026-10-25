@@ -2,11 +2,13 @@
 //!
 //! Only an already-running gateway is queried: the lookup reads `state.json` and checks its pid, so
 //! refreshing never starts one. State lives in `$MU_HOME/gateway/` (`profiles/<name>/` under an omp profile).
+//! The gateway caches each account's usage for 5 minutes and fetches it upstream on a miss, so a call can
+//! take seconds; callers run it off the agent loop.
 use mu_common::paths;
 use serde_json::Value;
 use std::time::Duration;
 
-const TIMEOUT: Duration = Duration::from_secs(3);
+const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaWindow {
@@ -82,23 +84,26 @@ fn running_gateway() -> Option<(String, String)> {
     Some((url, token.trim().into()))
 }
 
-/// `None` when no gateway is running, or the request fails or times out.
-pub async fn fetch(provider: &str) -> Option<ProviderUsage> {
-    let (url, token) = running_gateway()?;
-    let client = reqwest::Client::builder().timeout(TIMEOUT).build().ok()?;
-    let body = client
-        .get(format!("{url}/v1/usage"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .text()
-        .await
-        .ok()?;
+pub enum Fetch {
+    Got(ProviderUsage),
+    /// No gateway is running; checking again is a local file read.
+    NoGateway,
+    /// The request failed, timed out, or the report has no windows for the provider.
+    Failed,
+}
+
+pub async fn fetch(provider: &str) -> Fetch {
+    let Some((url, token)) = running_gateway() else { return Fetch::NoGateway };
+    let body = async {
+        let client = reqwest::Client::builder().timeout(TIMEOUT).build().ok()?;
+        client.get(format!("{url}/v1/usage")).bearer_auth(token).send().await.ok()?.error_for_status().ok()?.text().await.ok()
+    };
+    let body = body.await;
     let now_ms = jiff::Timestamp::now().as_millisecond();
-    parse_usage(&body, provider, now_ms)
+    match body.and_then(|b| parse_usage(&b, provider, now_ms)) {
+        Some(u) => Fetch::Got(u),
+        None => Fetch::Failed,
+    }
 }
 
 #[cfg(test)]
