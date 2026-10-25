@@ -25,6 +25,10 @@ d() { git -C "$OMPSRC" diff "v$old" "v$new" -- "${@}" > "$out/$DEST" || true; ca
 DEST=changelog.diff; d 'packages/*/CHANGELOG.md'
 DEST=cli.diff; d packages/coding-agent/src/cli packages/mnemopi/src
 DEST=crates.diff; d crates/pi-edit crates/pi-shell crates/pi-diff crates/pi-walker crates/vendor
+# stat files list every changed file even when the diffs above are truncated
+stat() { git -C "$OMPSRC" diff --stat=200 "v$old" "v$new" -- "${@:2}" > "$out/$1" || true; }
+stat cli.stat packages/coding-agent/src/cli packages/mnemopi/src
+stat crates.stat crates/pi-edit crates/pi-shell crates/pi-diff crates/pi-walker crates/vendor
 
 cat > "$out/touchpoints.md" <<'TP'
 # omp touchpoints in mu
