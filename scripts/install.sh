@@ -76,22 +76,19 @@ fi
 
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
-for b in mu mu-gateway mu-web mu-predict; do
+for b in mu mu-gateway mu-web mu-predict mu-memory; do
+  [ -e "$stage/bin/$b" ] || continue
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"
 done
 omp_ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' "$stage/upstream.toml")"
 "$stage/scripts/fetch-omp.sh" "$omp_ver" "$home/bin/omp"
 for p in gateway web predict memory; do
+  [ -d "$stage/plugins/$p" ] || continue
   rm -rf "${home:?}/plugins/$p"
   cp -R "$stage/plugins/$p" "$home/plugins/$p"
 done
-if command -v bun >/dev/null; then
-  (cd "$home/plugins/memory" && bun install --frozen-lockfile)
-else
-  rm -rf "$home/plugins/memory"
-  echo "memory plugin skipped: needs bun" >&2
-fi
+[ -d "$stage/plugins/memory" ] || echo "this release has no memory plugin; any installed one is left as is" >&2
 
 # 4. Link
 if [ "$link" = 1 ]; then

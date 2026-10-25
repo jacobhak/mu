@@ -1,4 +1,4 @@
-// Fake core for the memory plugin. `bun run smoke.ts <agentDir> [basic|turns|idle]`.
+// Fake core for the memory plugin. `bun run smoke.ts <agentDir> [basic|turns|idle]`; MU_MEMORY_BIN=<path> runs a compiled plugin instead of `bun run main.ts`.
 // Point it at a COPY of a store, never the live one.
 import { Database } from "bun:sqlite";
 import * as path from "node:path";
@@ -18,7 +18,7 @@ const BANK_DB = path.join(agentDir, "memories", "mnemopi", "banks", computeBankS
 /** One plugin process speaking NDJSON; answers core/complete with a canned reply. */
 class Plugin {
 	readonly requests: string[] = [];
-	readonly #proc = Bun.spawn(["bun", "run", "main.ts"], {
+	readonly #proc = Bun.spawn(process.env.MU_MEMORY_BIN ? [process.env.MU_MEMORY_BIN] : ["bun", "run", "main.ts"], {
 		cwd: import.meta.dir,
 		stdin: "pipe",
 		stdout: "pipe",

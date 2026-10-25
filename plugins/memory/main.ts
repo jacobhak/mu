@@ -1,6 +1,4 @@
 // mu memory plugin: mnemopi recall, retention and the recall/retain tools over JSON-RPC (see plugin.toml).
-import { readFileSync } from "node:fs";
-import * as path from "node:path";
 import type { RememberFacadeOptions } from "@oh-my-pi/pi-mnemopi/core/memory";
 import {
 	type Msg,
@@ -13,6 +11,9 @@ import {
 	truncateApproxTokens,
 	truncateRecallQuery,
 } from "./content";
+// Embedded as text so `bun build --compile` carries them; `bun run` resolves the same imports.
+import instructionsTemplate from "./prompts/mnemopi-instructions.md" with { type: "text" };
+import extractionPrompt from "./prompts/memory-extraction-system.md" with { type: "text" };
 import { type Client, type Obj, RpcError, isObj, log, serve } from "./rpc";
 import {
 	type Complete,
@@ -32,14 +33,14 @@ import {
 const IDLE_RETAIN_MS = 4 * 60 * 1000;
 
 // mu has no reflect tool, so that line of the omp template is dropped.
-const INSTRUCTIONS = readFileSync(path.join(import.meta.dir, "prompts/mnemopi-instructions.md"), "utf8")
+const INSTRUCTIONS = instructionsTemplate
 	.split("\n")
 	.filter(line => !line.includes("{{toolRefs.reflect}}"))
 	.join("\n")
 	.replaceAll("{{toolRefs.recall}}", "recall")
 	.replaceAll("{{toolRefs.retain}}", "retain")
 	.trim();
-const EXTRACTION_PROMPT = readFileSync(path.join(import.meta.dir, "prompts/memory-extraction-system.md"), "utf8");
+const EXTRACTION_PROMPT = extractionPrompt;
 
 const RETAIN_OPTIONS = {
 	source: "coding-agent-retain",

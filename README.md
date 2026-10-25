@@ -25,7 +25,7 @@ scripts/install.sh --from-source .            # build and install a checkout
 
 If the repo is private (or you install from a private fork), the public URLs return 404. `install.sh` and `mu update` then fall back to an authenticated `gh`; fetch the script itself with `gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash`.
 
-This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). The memory plugin is skipped without Bun on PATH. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
+This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). The memory plugin ships as a compiled `mu-memory` binary built by `bun build --compile`, so installing a release needs no Bun. Installing `--from-source` needs Bun to build it and leaves the memory plugin out (keeping any installed one) without. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
 
 ### Updating
 
@@ -41,7 +41,7 @@ This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` a
 cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web,mu-predict}
 mkdir -p ~/.mu/plugins
 for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
-(cd plugins/memory && bun install)       # memory plugin needs Bun on PATH
+(cd plugins/memory && bun install)       # dev checkout: the memory plugin runs under Bun
 ```
 
 Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web` and `mu-predict` are resolved next to the `mu` binary. `MU_GATEWAY_URL` / `MU_GATEWAY_TOKEN` bypass the gateway plugin.

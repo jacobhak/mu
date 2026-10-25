@@ -14,8 +14,16 @@ stage_layout() {
   mkdir -p "$dest/mu/plugins/web"
   cp "$root/plugins/web/plugin.toml" "$dest/mu/plugins/web/"
   cp -R "$root/plugins/web/schemas" "$dest/mu/plugins/web/schemas"
-  mkdir -p "$dest/mu/plugins/memory"
-  (cd "$root/plugins/memory" && tar --exclude=./node_modules -cf - .) | (cd "$dest/mu/plugins/memory" && tar -xf -)
+  # The memory plugin ships as a `bun build --compile` binary next to `mu`, so installs need no Bun.
+  # Without bun at build time it is left out, and install.sh keeps whatever memory plugin is installed.
+  if command -v bun >/dev/null; then
+    (cd "$root/plugins/memory" && bun install --frozen-lockfile >&2 && bun build --compile --outfile "$dest/mu/bin/mu-memory" main.ts >&2)
+    mkdir -p "$dest/mu/plugins/memory"
+    cp -R "$root/plugins/memory/schemas" "$dest/mu/plugins/memory/schemas"
+    sed 's|^command = .*|command = ["mu-memory"]|' "$root/plugins/memory/plugin.toml" > "$dest/mu/plugins/memory/plugin.toml"
+  else
+    echo "memory plugin not packaged: bun not found" >&2
+  fi
   cp "$root/upstream.toml" "$root/LICENSE" "$root/THIRD-PARTY-NOTICES.md" "$dest/mu/"
   cp "$root/scripts/install.sh" "$root/scripts/fetch-omp.sh" "$dest/mu/scripts/"
 }
