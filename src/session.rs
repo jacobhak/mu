@@ -41,6 +41,8 @@ pub struct SessionInfo {
     pub title: Option<String>,
     pub first_prompt: String,
     pub modified: std::time::SystemTime,
+    /// Working directory recorded in the session header.
+    pub cwd: Option<PathBuf>,
 }
 
 pub fn iso_ms() -> String {
@@ -302,7 +304,21 @@ pub fn find(cwd: &Path, arg: &Path) -> Option<PathBuf> {
 
 /// Sessions for `cwd`, newest first. Reads only the title slot, header and first user message.
 pub fn list_for(cwd: &Path) -> Vec<SessionInfo> {
-    let Ok(rd) = std::fs::read_dir(paths::session_dir(cwd)) else { return vec![] };
+    list_dir(&paths::session_dir(cwd))
+}
+
+/// Sessions of every project, newest first.
+pub fn list_all(cwd: &Path) -> Vec<SessionInfo> {
+    let own = paths::session_dir(cwd);
+    let Some(root) = own.parent() else { return vec![] };
+    let Ok(rd) = std::fs::read_dir(root) else { return vec![] };
+    let mut out: Vec<SessionInfo> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).flat_map(|d| list_dir(&d)).collect();
+    out.sort_by(|a, b| b.path.file_name().cmp(&a.path.file_name()));
+    out
+}
+
+fn list_dir(dir: &Path) -> Vec<SessionInfo> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
     let mut out: Vec<SessionInfo> = rd
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
@@ -311,11 +327,13 @@ pub fn list_for(cwd: &Path) -> Vec<SessionInfo> {
             let modified = e.metadata().ok()?.modified().ok()?;
             let f = std::io::BufReader::new(File::open(&path).ok()?);
             let mut title = None;
+            let mut cwd = None;
             let mut first_prompt = String::new();
             for (i, l) in std::io::BufRead::lines(f).map_while(Result::ok).enumerate() {
                 let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
                 match v["type"].as_str() {
                     Some("title") if i == 0 => title = slot_title(&v),
+                    Some("session") => cwd = v["cwd"].as_str().map(PathBuf::from),
                     Some("title_change") => title = v["title"].as_str().filter(|t| !t.is_empty()).map(String::from),
                     Some("message") if first_prompt.is_empty() && v["message"]["role"] == "user" => {
                         if let Ok(Message::User { content, .. }) = serde_json::from_value(v["message"].clone()) {
@@ -337,7 +355,7 @@ pub fn list_for(cwd: &Path) -> Vec<SessionInfo> {
                     break;
                 }
             }
-            Some(SessionInfo { path, title, first_prompt, modified })
+            Some(SessionInfo { path, title, first_prompt, modified, cwd })
         })
         .collect();
     out.sort_by(|a, b| b.path.file_name().cmp(&a.path.file_name()));

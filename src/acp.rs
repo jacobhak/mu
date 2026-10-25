@@ -157,7 +157,7 @@ impl Server {
                         "agentCapabilities": {
                             "loadSession": true,
                             "promptCapabilities": {"image": true, "embeddedContext": true},
-                            "sessionCapabilities": {"resume": {}, "close": {}},
+                            "sessionCapabilities": {"list": {}, "resume": {}, "close": {}},
                         },
                         "agentInfo": {"name": "mu", "title": "mu", "version": env!("CARGO_PKG_VERSION")},
                         "authMethods": [],
@@ -170,6 +170,24 @@ impl Server {
                     Ok(sid) => respond(&id, json!({"sessionId": sid, "configOptions": self.sessions[&sid].config_options()})),
                     Err(e) => fail(&id, INTERNAL, e.to_string()),
                 }
+            }
+            ("session/list", Some(id)) => {
+                let home = std::env::current_dir().unwrap_or_default();
+                let want = p["cwd"].as_str().map(PathBuf::from);
+                let sessions: Vec<Value> = session::list_all(&home)
+                    .into_iter()
+                    .filter_map(|s| {
+                        let cwd = s.cwd.clone().filter(|c| c.is_absolute())?;
+                        if want.as_ref().is_some_and(|w| *w != cwd) {
+                            return None;
+                        }
+                        let updated = jiff::Timestamp::try_from(s.modified).ok()?.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                        let title = s.title.or_else(|| Some(s.first_prompt.clone()).filter(|t| !t.is_empty()));
+                        Some(json!({"sessionId": session::id_of(&s.path), "cwd": cwd, "title": title, "updatedAt": updated}))
+                    })
+                    .take(500)
+                    .collect();
+                respond(&id, json!({"sessions": sessions}));
             }
             ("session/load" | "session/resume", Some(id)) => {
                 let Some(cwd) = self.cwd_param(&id, p) else { return };
