@@ -9,6 +9,7 @@ pub mod line;
 pub mod markdown;
 pub mod partial_json;
 pub mod plan_review;
+pub mod ptyview;
 pub mod render;
 pub mod select;
 pub mod status;

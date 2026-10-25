@@ -366,6 +366,16 @@ pub fn tool_live(name: &str, args: &Value, tail: &[String], spin: char, elapsed:
     vec![header_line(&spin.to_string(), tfg(Role::Accent), name, args, width)]
 }
 
+/// Live bash card around an embedded terminal screen. Returns the lines and the cursor `(row, col)` within them.
+pub fn pty_live(args: &Value, rows: &[String], cursor: (usize, usize), elapsed: u64, width: usize) -> (Vec<Line>, (usize, usize)) {
+    let body: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let footer = vec![format!("running {elapsed}s"), "esc kills".to_string()];
+    let lines = bash_box(args, &body, true, Tone::Pending, footer, width);
+    // Rows never wrap (at most the inner width) and the footer rule is the last line.
+    let row = (lines.len() - 1).saturating_sub(rows.len()) + cursor.0;
+    (lines, (row, 2 + cursor.1))
+}
+
 /// Subagent rows: state mark, name, tool count, and the last activity.
 pub fn subagent_rows(rows: &[SubagentStatus], spin: char) -> Vec<Line> {
     rows.iter()
@@ -457,6 +467,14 @@ mod tests {
     use super::*;
     use crate::tui::line::line_text as text_of;
     use serde_json::json;
+
+    #[test]
+    fn pty_live_cursor() {
+        let (lines, cur) = pty_live(&json!({"command":"sudo ls"}), &["[sudo] password: ".into()], (0, 17), 1, 40);
+        let t: Vec<String> = lines.iter().map(text_of).collect();
+        assert!(t[cur.0].starts_with("│ [sudo] password:"), "{t:?}");
+        assert_eq!(cur.1, 19);
+    }
 
     #[test]
     fn streaming_write_tail() {

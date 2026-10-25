@@ -134,6 +134,13 @@ pub struct SubagentStatus {
     pub state: SubagentState,
 }
 
+/// Input from the TUI to a command running on a pseudo-terminal.
+pub enum PtyInput {
+    Bytes(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+    Kill,
+}
+
 pub enum AgentEvent {
     TurnStart,
     /// A user message entered the conversation (initial, steer or follow-up).
@@ -146,7 +153,10 @@ pub enum AgentEvent {
     /// Raw JSON fragment of a streaming tool call's arguments.
     ToolCallDelta { id: String, json: String },
     ToolStart { id: String, name: String, args: Value },
+    /// For a pty call the chunk is raw terminal text, escape sequences included.
     ToolOutput { id: String, chunk: String },
+    /// A bash call wants a terminal. `reply` carries `(cols, rows)`; dropping it makes the tool fall back.
+    PtyOpen { id: String, input: mpsc::UnboundedSender<PtyInput>, reply: oneshot::Sender<(u16, u16)> },
     /// Current todo phases (JSON), after a change or a resume.
     Todo(Value),
     ToolEnd { id: String, name: String, output: ToolOutput },

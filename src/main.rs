@@ -16,6 +16,7 @@ mod pricing;
 mod plugin;
 mod quota;
 mod provider;
+mod pty;
 mod session;
 mod tools;
 mod tui;

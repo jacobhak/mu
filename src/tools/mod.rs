@@ -101,7 +101,8 @@ impl Tools {
             json!({"name":"bash","description":"Run a shell command. The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large.","input_schema":{"type":"object","properties":{
                 "command":{"type":"string"},
                 "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
-                "cwd":{"type":"string","description":"Working directory for this command"}},"required":["command"]}}),
+                "cwd":{"type":"string","description":"Working directory for this command"},
+                "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}}),
             json!({"name":"grep","description":"Regex search in file contents (respects .gitignore, skips hidden files). Returns `path:line:text` rows; max 20 per file, 200 total.","input_schema":{"type":"object","properties":{
                 "pattern":{"type":"string"},"path":{"type":"string","description":"File or directory; default ."},
                 "case":{"type":"boolean","description":"Case-sensitive; default true"}},"required":["pattern"]}}),

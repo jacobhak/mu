@@ -5,6 +5,7 @@ use super::complete::Entry;
 use super::composer::{Action, Composer};
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
+use super::ptyview::PtyView;
 use super::plan_review::{PlanReview, ReviewResult, Tier};
 use super::render::Renderer;
 use super::select::{Item, Select, SelectResult};
@@ -163,6 +164,8 @@ struct App {
     todo: Vec<Phase>,
     status: StatusSnapshot,
     overlay: Option<Overlay>,
+    /// Embedded terminal of a running `bash` call with `pty: true`.
+    pty: Option<PtyView>,
     running: bool,
     quitting: bool,
     show_thinking: bool,
@@ -258,6 +261,7 @@ pub async fn run(init: AppInit) -> i32 {
         todo: Vec::new(),
         status: StatusSnapshot::default(),
         overlay: None,
+        pty: None,
         running: false,
         quitting: false,
         show_thinking,
@@ -523,8 +527,19 @@ impl App {
                 }
                 self.tools.push(RunningTool { id, name, args, started: Instant::now(), tail: VecDeque::new(), partial: String::new() });
             }
+            AgentEvent::PtyOpen { id, input, reply } => {
+                // A pty is already open: dropping `reply` makes the tool fall back.
+                if self.pty.is_none() {
+                    let (w, h) = self.renderer.size();
+                    let size = PtyView::size_for(w, h);
+                    self.pty = Some(PtyView::new(id, input, size));
+                    let _ = reply.send(size);
+                }
+            }
             AgentEvent::ToolOutput { id, chunk } => {
-                if let Some(t) = self.tools.iter_mut().find(|t| t.id == id) {
+                if let Some(p) = self.pty.as_mut().filter(|p| p.id == id) {
+                    p.feed(&chunk);
+                } else if let Some(t) = self.tools.iter_mut().find(|t| t.id == id) {
                     t.partial.push_str(&chunk);
                     while let Some(i) = t.partial.find('\n') {
                         let line: String = t.partial.drain(..=i).collect();
@@ -536,6 +551,9 @@ impl App {
                 }
             }
             AgentEvent::ToolEnd { id, name, output } => {
+                if self.pty.as_ref().is_some_and(|p| p.id == id) {
+                    self.pty = None;
+                }
                 let args = self.tools.iter().position(|t| t.id == id).map(|i| self.tools.remove(i).args).unwrap_or(Value::Null);
                 let w = self.width();
                 let l = blocks::tool_result(&name, &args, &output, self.expanded, w);
@@ -581,6 +599,7 @@ impl App {
             }
             AgentEvent::Todo(v) => self.todo = serde_json::from_value(v).unwrap_or_default(),
             AgentEvent::TurnEnd { aborted } => {
+                self.pty = None;
                 self.calls.clear();
                 self.finish_thinking();
                 if !self.live_text.trim().is_empty() {
@@ -749,6 +768,17 @@ impl App {
     fn on_terminal(&mut self, e: Event) {
         self.dirty = true;
         match e {
+            Event::Paste(s) if self.pty.is_some() => {
+                if let Some(p) = &self.pty {
+                    p.paste(&s);
+                }
+            }
+            Event::Resize(..) if self.pty.is_some() => {
+                let (w, h) = self.renderer.size();
+                if let Some(p) = self.pty.as_mut() {
+                    p.resize(w, h);
+                }
+            }
             Event::Key(k) => self.on_key(k),
             Event::Paste(s) => match self.overlay.as_mut() {
                 Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. } | Overlay::Copy { sel, .. }) => {
@@ -851,6 +881,10 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        if let Some(p) = &self.pty {
+            p.key(k);
+            return;
+        }
         self.on_key_inner(k);
         if self.overlay.is_none() {
             self.request_ghost();
@@ -1317,7 +1351,8 @@ impl App {
         SPINNER[(self.started.elapsed().as_millis() / 80) as usize % SPINNER.len()]
     }
 
-    fn live_lines(&self, w: usize) -> Vec<Line> {
+    fn live_lines(&self, w: usize) -> (Vec<Line>, Option<(usize, usize)>) {
+        let mut pty_cursor = None;
         let mut out: Vec<Line> = Vec::new();
         if !self.live_text.is_empty() {
             out.extend(markdown::render(&self.live_text, w));
@@ -1329,6 +1364,13 @@ impl App {
             out.push(blocks::thinking_live(self.spin(), start.elapsed().as_secs()));
         }
         for t in &self.tools {
+            if let Some(p) = self.pty.as_ref().filter(|p| p.id == t.id) {
+                let (rows, cur) = p.screen();
+                let (lines, c) = blocks::pty_live(&t.args, &rows, cur, t.started.elapsed().as_secs(), w);
+                pty_cursor = Some((out.len() + c.0, c.1));
+                out.extend(lines);
+                continue;
+            }
             let mut tail: Vec<String> = t.tail.iter().cloned().collect();
             if !t.partial.is_empty() {
                 tail.push(t.partial.clone());
@@ -1344,7 +1386,7 @@ impl App {
         if self.compacting {
             out.push(styled(format!("{} Compacting context…", self.spin()), |_| theme::get().fg(Role::Warn)));
         }
-        out
+        (out, pty_cursor)
     }
 
     fn todo_hud(&self, w: usize) -> Vec<Line> {
@@ -1396,14 +1438,17 @@ impl App {
         }
         let (w, rows) = self.renderer.size();
         let mut vp: Vec<Line> = Vec::new();
-        vp.extend(self.live_lines(w));
+        let (live, pty_cursor) = self.live_lines(w);
+        vp.extend(live);
         vp.extend(self.todo_hud(w));
         vp.extend(self.queue_bar(w));
         let mut env = status::StatusEnv::new(&self.cwd, &self.status_cfg);
         env.expanded = self.expanded;
         env.turn_elapsed = self.turn_started.map(|t| t.elapsed());
         let status_lines = status::render(&self.status, &env, w);
+        let pty_open = self.pty.is_some();
         let (lines, cur) = match &mut self.overlay {
+            _ if pty_open => (vec![styled("  keys go to the command · esc force-kills".to_string(), |_| dim())], (0, 0)),
             Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. }| Overlay::Copy { sel, .. }) => {
                 let (body, cur) = sel.render(w, (rows / 2).max(6).saturating_sub(2));
                 let mut framed: Vec<Line> = vec![Vec::new()];
@@ -1419,7 +1464,7 @@ impl App {
             }
             None => self.composer.render(w),
         };
-        let cursor = (vp.len() + cur.0, cur.1);
+        let cursor = pty_cursor.filter(|_| pty_open).unwrap_or((vp.len() + cur.0, cur.1));
         vp.extend(lines);
         vp.extend(status_lines);
         let committed = std::mem::take(&mut self.pending);
