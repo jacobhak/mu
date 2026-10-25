@@ -26,6 +26,9 @@ esac
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# Public URLs first; a private repo (or fork) falls back to an authenticated gh.
+has_gh() { command -v gh >/dev/null && gh auth status >/dev/null 2>&1; }
+
 # 1. Source
 if [ -n "$src" ]; then
   (cd "$src" && cargo build --release --workspace --locked)
@@ -34,7 +37,14 @@ if [ -n "$src" ]; then
 else
   if [ -n "$tag" ]; then url="https://github.com/$REPO/releases/download/$tag/mu-$plat.tar.gz"
   else url="https://github.com/$REPO/releases/latest/download/mu-$plat.tar.gz"; fi
-  curl -fsSL -o "$tmp/mu-$plat.tar.gz" "$url" || { echo "install.sh: could not download $url" >&2; exit 1; }
+  if ! curl -fsSL -o "$tmp/mu-$plat.tar.gz" "$url" 2>/dev/null; then
+    if has_gh; then
+      gh release download ${tag:+"$tag"} -R "$REPO" -p "mu-$plat.tar.gz" -D "$tmp" --clobber
+    else
+      echo "install.sh: could not download $url (a private repo needs an authenticated gh)" >&2
+      exit 1
+    fi
+  fi
   tar -C "$tmp" -xzf "$tmp/mu-$plat.tar.gz"
 fi
 stage="$tmp/mu"
@@ -53,6 +63,7 @@ if [ "$skip_dev" = 1 ] && [ -x "$home/bin/mu" ]; then
           # GitHub pretty-prints JSON; only the top-level "status" is indented two spaces (file entries have one too).
           st="$(curl -fsSL "https://api.github.com/repos/$REPO/compare/$sha...main?per_page=1" 2>/dev/null \
             | sed -n 's/^  "status": "\([a-z]*\)".*/\1/p' | head -1 || true)"
+          case "$st" in "") has_gh && st="$(gh api "repos/$REPO/compare/$sha...main" -q .status 2>/dev/null || true)" ;; esac
           case "$st" in ahead | identical) ;; *) dev=1 ;; esac
         fi ;;
     esac

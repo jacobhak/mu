@@ -1,4 +1,5 @@
-//! `mu update`: release check and self-update through the public GitHub API (via `curl`).
+//! `mu update`: release check and self-update through the public GitHub API (via `curl`), falling back to
+//! an authenticated `gh` when the repo is private.
 //! Releases are tagged `mu-YYYYMMDD-<sha7>` by the maintenance bot; the installed build knows its own sha.
 
 use anyhow::{Result, bail};
@@ -84,17 +85,29 @@ fn curl(url: &str, accept: &str) -> Result<(u16, String)> {
     Ok((code.trim().parse().unwrap_or(0), body.to_string()))
 }
 
+/// Public API first; on a 404 (which is also what a private repo looks like), retries through an
+/// authenticated `gh`. Without a working `gh` the 404 stands.
 fn api(path: &str) -> Api {
     match curl(&format!("https://api.github.com/{path}"), "Accept: application/vnd.github+json") {
-        Ok((200, body)) => match serde_json::from_str(&body) {
-            Ok(v) => Api::Ok(v),
-            Err(e) => Api::Err(format!("bad response from GitHub: {e}")),
-        },
-        Ok((404, _)) => Api::NotFound,
+        Ok((200, body)) => parse(&body),
+        Ok((404, _)) => gh(&["api", path]).map_or(Api::NotFound, |body| parse(&body)),
         Ok((403 | 429, _)) => Api::Err("GitHub API rate limit reached".into()),
         Ok((code, _)) => Api::Err(format!("GitHub API returned HTTP {code}")),
         Err(e) => Api::Err(e.to_string()),
     }
+}
+
+fn parse(body: &str) -> Api {
+    match serde_json::from_str(body) {
+        Ok(v) => Api::Ok(v),
+        Err(e) => Api::Err(format!("bad response from GitHub: {e}")),
+    }
+}
+
+/// Stdout of a successful `gh` run; `None` when gh is missing, unauthenticated, or the request fails.
+fn gh(args: &[&str]) -> Option<String> {
+    let o = Command::new("gh").args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 /// Queries GitHub. Blocking; call from a thread or before the runtime starts.
@@ -181,6 +194,9 @@ pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
     let url = format!("https://raw.githubusercontent.com/{REPO}/main/scripts/install.sh");
     let script = match curl(&url, "Accept: text/plain")? {
         (200, body) if !body.is_empty() => body,
+        (404, _) => gh(&["api", &format!("repos/{REPO}/contents/scripts/install.sh"), "-H", "Accept: application/vnd.github.raw"])
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("could not fetch install.sh: HTTP 404 (a private repo needs an authenticated gh)"))?,
         (code, _) => bail!("could not fetch install.sh: HTTP {code}"),
     };
     let mut cmd = Command::new("bash");
