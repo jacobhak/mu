@@ -7,6 +7,7 @@ pub mod highlight;
 pub mod input;
 pub mod line;
 pub mod markdown;
+pub mod plan_review;
 pub mod render;
 pub mod select;
 pub mod status;

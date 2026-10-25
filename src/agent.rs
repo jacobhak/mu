@@ -44,7 +44,7 @@ pub struct Agent {
     /// Only these tools are offered when set.
     pub allow: Option<Vec<&'static str>>,
     pub parent_session: Option<PathBuf>,
-    exec_plan: Option<String>,
+    exec_plan: Option<ExecPlan>,
     pub pin_model: bool,
     pub pin_thinking: bool,
     pub compaction: Option<CompactionState>,
@@ -72,6 +72,14 @@ pub struct PlanState {
     prev_model: Option<String>,
     prev_thinking: Thinking,
 }
+
+struct ExecPlan {
+    content: String,
+    compact: bool,
+    model: Option<String>,
+}
+
+const PLAN_COMPACT_FOCUS: &str = "The user approved an implementation plan; it will be supplied in full right after this summary. Preserve what implementing it needs: decisions, constraints, file paths, symbols, and findings from exploration. Omit the plan text itself.";
 
 const PLAN_PROMPT: &str = include_str!("prompts/plan-mode.md");
 
@@ -365,6 +373,14 @@ impl Agent {
             if let Some(s) = self.session.as_mut() {
                 s.custom("plugin_context", json!({"plugin": plugin, "context": ctx}));
             }
+        }
+    }
+
+    fn continue_with(&mut self, sel: &str) {
+        let before = self.model.id.clone();
+        self.set_model(sel);
+        if self.model.id != before {
+            self.notice(format!("continuing with {sel}: {}", self.model.id));
         }
     }
 
@@ -694,24 +710,39 @@ impl Agent {
             match self.run_loop(&cancel).await {
                 Flow::Aborted => {
                     aborted = true;
+                    self.turn_end_hook().await;
                     break;
                 }
                 Flow::Failed => break,
                 Flow::Done => {}
             }
             self.turn_end_hook().await;
-            if let Some(content) = self.exec_plan.take() {
+            if let Some(p) = self.exec_plan.take() {
                 self.exit_plan();
-                self.end_session().await;
-                self.reset_conversation();
-                self.notice("── new session");
-                next = Some(Some(format!("Execute this plan:\n\n{content}").into()));
+                if let Some(m) = &p.model {
+                    self.continue_with(m);
+                }
+                if p.compact {
+                    match self.compact(Some(PLAN_COMPACT_FOCUS), &cancel).await {
+                        Outcome::Done => {}
+                        Outcome::Skipped(why) => self.notice(why),
+                        Outcome::Failed(e) if !cancel.is_cancelled() => self.error(format!("compaction failed: {e}")),
+                        Outcome::Failed(_) => {}
+                    }
+                    if cancel.is_cancelled() {
+                        self.notice("Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.");
+                        aborted = true;
+                        break;
+                    }
+                } else {
+                    self.end_session().await;
+                    self.reset_conversation();
+                    self.notice("── new session");
+                }
+                next = Some(Some(format!("Execute this plan:\n\n{}", p.content).into()));
                 continue;
             }
             next = self.inbox.borrow_mut().follow_up.pop_front().map(Some);
-        }
-        if aborted {
-            self.turn_end_hook().await;
         }
         mem::trim();
         self.refresh_model_meta();
@@ -887,10 +918,20 @@ impl Agent {
                 out.text.push_str(a);
             }
         }
-        match out.details.as_ref().and_then(|d| d["planDecision"].as_str()) {
-            Some("execute") => self.exec_plan = out.details.as_ref().and_then(|d| d["content"].as_str()).map(String::from),
-            Some("keep") => self.exit_plan(),
-            _ => {}
+        if let Some(d) = out.details.as_ref() {
+            let model = d["model"].as_str().map(String::from);
+            match d["planDecision"].as_str() {
+                Some(k @ ("execute" | "compact")) => {
+                    self.exec_plan = Some(ExecPlan { content: d["content"].as_str().unwrap_or_default().into(), compact: k == "compact", model });
+                }
+                Some("keep") => {
+                    self.exit_plan();
+                    if let Some(m) = model {
+                        self.continue_with(&m);
+                    }
+                }
+                _ => {}
+            }
         }
         if name == "todo" && !out.is_error {
             self.emit(AgentEvent::Todo(self.tools.todo_json()));

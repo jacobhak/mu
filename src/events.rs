@@ -108,8 +108,9 @@ pub enum Answer {
 }
 
 pub enum PlanDecision {
-    Execute,
-    Keep,
+    Execute { model: Option<String> },
+    Compact { model: Option<String> },
+    Keep { model: Option<String> },
     Refine(String),
 }
 
@@ -151,7 +152,7 @@ pub enum AgentEvent {
     /// Finished jobs whose results were handed to the model.
     JobsDelivered(Vec<String>),
     Ask { questions: Vec<AskQuestion>, reply: oneshot::Sender<Option<Vec<Answer>>> },
-    PlanReview { title: String, path: String, reply: oneshot::Sender<PlanDecision> },
+    PlanReview { title: String, uri: String, file: PathBuf, content: String, reply: oneshot::Sender<PlanDecision> },
     Status(StatusSnapshot),
     TurnEnd { aborted: bool },
     Exit,

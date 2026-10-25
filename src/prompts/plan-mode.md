@@ -82,6 +82,7 @@ Cut decision-free material: restated invariants, unaffected behavior, mechanical
 <caution>
 Review options:
 - **Approve and execute** — fresh context (new session).
+- **Approve and compact context** — compacts this conversation, then executes here.
 - **Approve and keep context** — executes here with exploration history.
 - **Refine plan** — the user's feedback comes back as the tool result; stay in plan mode.
 
