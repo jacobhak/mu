@@ -16,7 +16,7 @@ fn key(r: Role) -> ContentStyle {
 }
 
 fn heading_style() -> ContentStyle {
-    let mut s = key(Role::Strong);
+    let mut s = key(Role::Accent);
     s.attributes.set(Attribute::Bold);
     s
 }
@@ -187,7 +187,7 @@ impl<'a> R<'a> {
             Event::Start(Tag::Heading { level, .. }) => {
                 self.pos += 1;
                 let hs = heading_style();
-                let mut prefix = key(Role::Faint);
+                let mut prefix = key(Role::AccentSoft);
                 prefix.attributes.set(Attribute::Bold);
                 let mut segs = chs(&format!("{} ", "#".repeat(level as usize)), prefix);
                 segs.extend(self.inline(hs));
@@ -351,9 +351,9 @@ impl<'a> R<'a> {
                     self.close();
                     let pad = " ".repeat(mw);
                     if child.is_empty() {
-                        out.push(chs(marker.trim_end(), key(Role::Faint)));
+                        out.push(chs(marker.trim_end(), key(Role::Accent)));
                     } else if first_is_list {
-                        out.push(chs(marker.trim_end(), key(Role::Faint)));
+                        out.push(chs(marker.trim_end(), key(Role::Accent)));
                         for l in child {
                             let mut v = chs(&pad, Default::default());
                             v.extend(l);
@@ -362,7 +362,7 @@ impl<'a> R<'a> {
                     } else {
                         for (i, l) in child.into_iter().enumerate() {
                             let mut v = if i == 0 {
-                                chs(&marker, key(Role::Faint))
+                                chs(&marker, key(Role::Accent))
                             } else {
                                 chs(&pad, Default::default())
                             };
@@ -608,8 +608,8 @@ mod tests {
         let ls = render("## Title", 40);
         assert_eq!(line_text(&ls[0]), "## Title");
         assert!(ls[0].iter().all(|s| s.style.attributes.has(Attribute::Bold)));
-        assert_eq!(ls[0][0].style.foreground_color, theme::get().color(Role::Faint));
-        assert_eq!(ls[0][1].style.foreground_color, theme::get().color(Role::Strong));
+        assert_eq!(ls[0][0].style.foreground_color, theme::get().color(Role::AccentSoft));
+        assert_eq!(ls[0][1].style.foreground_color, theme::get().color(Role::Accent));
     }
 
     #[test]
@@ -761,5 +761,10 @@ mod tests {
         let md = "text\n\n```rust\nfn a() {}\n```\n\n    indented\n\nsee (https://x.io/a?b=1). and <http://y.z>, `https://q.r;`";
         assert_eq!(code_blocks(md), [("rust".to_string(), "fn a() {}\n".to_string()), (String::new(), "indented\n".to_string())]);
         assert_eq!(links(md), ["https://x.io/a?b=1", "http://y.z", "https://q.r"]);
+    }
+
+    #[test]
+    fn list_markers_use_accent() {
+        assert_eq!(render("- a\n- b", 20)[0][0].style.foreground_color, theme::get().color(Role::Accent));
     }
 }
