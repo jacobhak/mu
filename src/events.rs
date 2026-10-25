@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 pub enum Command {
     Prompt(UserInput),
+    /// Creates the session file now, so its id is known before the first prompt.
+    EnsureSession,
     SetModel(String),
     SetThinking(Thinking),
     NewSession,
@@ -61,6 +63,8 @@ pub fn new_inbox() -> SharedInbox {
 
 #[derive(Clone, Debug, Default)]
 pub struct StatusSnapshot {
+    /// `provider/model`.
+    pub model_id: String,
     /// Display name, e.g. `Haiku 5.5`.
     pub model_name: String,
     /// The model supports thinking levels.

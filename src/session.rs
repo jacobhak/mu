@@ -105,8 +105,7 @@ impl SessionFile {
     }
 
     pub fn id(&self) -> String {
-        let name = self.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        name.rsplit_once('_').map_or(name.clone(), |(_, id)| id.to_string())
+        id_of(&self.path)
     }
 
     /// Appends an entry and returns its id.
@@ -171,6 +170,12 @@ impl SessionFile {
 }
 
 type Parsed = (Loaded, Option<String>, std::collections::HashSet<String>);
+
+/// Session id from a file named `<timestamp>_<id>.jsonl`.
+pub fn id_of(path: &Path) -> String {
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    name.rsplit_once('_').map_or(name.clone(), |(_, id)| id.to_string())
+}
 
 fn slot_title(first: &Value) -> Option<String> {
     first["title"].as_str().filter(|t| !t.is_empty()).map(String::from)
