@@ -2,6 +2,7 @@ mod agent;
 mod compaction;
 mod config;
 mod context;
+mod acp;
 mod events;
 mod gitinfo;
 mod gateway;
@@ -49,6 +50,48 @@ struct Cli {
     /// Run as a subagent: read one JSON task on stdin, write NDJSON results.
     #[arg(long, hide = true)]
     headless: bool,
+    /// Serve the Agent Client Protocol over stdio.
+    #[arg(long)]
+    acp: bool,
+}
+
+/// Everything a session needs that depends only on the working directory.
+struct Setup {
+    cfgs: Rc<config::Configs>,
+    ctx: Rc<context::Context>,
+    host: Rc<plugin::PluginHost>,
+    providers: Rc<provider::Providers>,
+    notice_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+fn setup(cwd: &std::path::Path) -> Setup {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let cfgs = Rc::new(config::Configs::load());
+    let ctx = Rc::new(context::Context::load_all(cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user));
+    let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (manifests, warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
+    let host = plugin::PluginHost::new(
+        manifests,
+        warnings,
+        notice_tx,
+        plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
+    );
+    let providers = Rc::new(provider::Providers::new(cfgs.clone(), gateway::GatewaySource::new(host.clone())));
+    host.set_providers(&providers);
+    Setup { cfgs, ctx, host, providers, notice_rx }
+}
+
+/// Model and thinking level for a new agent: `sel` (command line or headless role) beats the `default` role.
+fn pick_model(
+    cfgs: &config::Configs,
+    providers: &provider::Providers,
+    sel: Option<String>,
+    cli_thinking: Option<models::Thinking>,
+) -> Result<(models::ModelSpec, models::Thinking)> {
+    let (cfg_model, cfg_level) = cfgs.role("default").map(|v| models::split_level(&v)).unzip();
+    let sel = sel.or(cfg_model).unwrap_or_else(|| DEFAULT_MODEL.into());
+    let (spec, role_level) = providers.resolve(&sel)?;
+    Ok((spec, cli_thinking.or(role_level).or(cfg_level.flatten()).unwrap_or(models::Thinking::Medium)))
 }
 
 fn main() {
@@ -67,40 +110,26 @@ fn run() -> Result<i32> {
         // Single-threaded here: no runtime or plugin has started yet.
         unsafe { std::env::set_var("OMP_PROFILE", p) };
     }
+    let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
+    if cli.acp {
+        return acp::run(cli.model, cli_thinking);
+    }
     let cwd = std::env::current_dir()?;
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let cfgs = Rc::new(config::Configs::load());
-    let ctx = Rc::new(context::Context::load_all(&cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user));
+    let Setup { cfgs, ctx, host, providers, notice_rx } = setup(&cwd);
 
-    let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (manifests, warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
-    let host = plugin::PluginHost::new(
-        manifests,
-        warnings,
-        notice_tx,
-        plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
-    );
-    let providers = Rc::new(provider::Providers::new(cfgs.clone(), gateway::GatewaySource::new(host.clone())));
-    host.set_providers(&providers);
-
-    let (cfg_model, cfg_level) = cfgs.role("default").map(|v| models::split_level(&v)).unzip();
     let mut task_payload: Option<serde_json::Value> = None;
-    let mut sel = cli.model.clone().or(cfg_model).unwrap_or_else(|| DEFAULT_MODEL.into());
+    let mut sel = cli.model.clone();
     if cli.headless {
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
         let p: serde_json::Value = serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
         let role = if p["agent"] == "scout" { "smol" } else { "task" };
         if cli.model.is_none() {
-            if let Some(r) = models::role_selector(role, &cfgs) {
-                sel = r;
-            }
+            sel = models::role_selector(role, &cfgs);
         }
         task_payload = Some(p);
     }
-    let (spec, role_level) = providers.resolve(&sel)?;
-    let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
-    let thinking = cli_thinking.or(role_level).or(cfg_level.flatten()).unwrap_or(models::Thinking::Medium);
+    let (spec, thinking) = pick_model(&cfgs, &providers, sel, cli_thinking)?;
 
     let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;
     let resume = match (&cli.resume, cli.continue_latest) {

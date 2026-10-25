@@ -265,6 +265,7 @@ impl Agent {
 
     pub fn snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
+            model_id: self.model.id.clone(),
             model_name: pricing::display_name(&self.model.id),
             reasoning: pricing::reasoning(&self.model.id).unwrap_or(true),
             thinking: self.thinking.as_str().into(),
@@ -585,6 +586,10 @@ impl Agent {
             };
             match cmd {
                 Command::Prompt(t) => self.turn(Some(t)).await,
+                Command::EnsureSession => {
+                    self.ensure_session().await;
+                    self.emit_status();
+                }
                 Command::SetModel(sel) => self.set_model(&sel),
                 Command::SetThinking(t) => self.set_thinking(t),
                 Command::NewSession => {
