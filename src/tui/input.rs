@@ -28,10 +28,40 @@ pub enum Input {
 }
 
 pub struct Reader {
-    fd: AsyncFd<OwnedFd>,
+    src: Source,
     parser: Parser,
     winch: Signal,
     queue: VecDeque<Input>,
+}
+
+/// How readiness of the tty is learned. epoll (Linux) lets tokio watch the fd; kqueue (macOS) cannot register
+/// `/dev/tty` (EINVAL), so there a helper thread waits in select(2) and the reader drains on its signal.
+enum Source {
+    Async(AsyncFd<OwnedFd>),
+    Select { fd: OwnedFd, ready: tokio::sync::mpsc::UnboundedReceiver<()>, ack: std::sync::mpsc::Sender<()> },
+}
+
+/// Blocks in select(2) until `fd` is readable, tells the reader, and waits for it to drain before selecting
+/// again. It never reads, so keystrokes meant for a child process (editor, `omp login`) are not stolen.
+fn select_thread(fd: RawFd, ready: tokio::sync::mpsc::UnboundedSender<()>, ack: std::sync::mpsc::Receiver<()>) {
+    loop {
+        // SAFETY: `set` is zeroed and initialised by FD_ZERO/FD_SET; `fd` is below FD_SETSIZE for a freshly opened tty.
+        let r = unsafe {
+            let mut set: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut set);
+            libc::FD_SET(fd, &mut set);
+            libc::select(fd + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if r < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if ready.send(()).is_err() || ack.recv().is_err() {
+            return;
+        }
+    }
 }
 
 impl Reader {
@@ -45,8 +75,26 @@ impl Reader {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `raw` is a freshly opened descriptor that nothing else owns, and `OwnedFd` keeps it open.
-        let fd = unsafe { AsyncFd::register_with_interest(OwnedFd::from_raw_fd(raw), tokio::io::Interest::READABLE) }?;
-        Ok(Self { fd, parser: Parser::default(), winch: signal(SignalKind::window_change())?, queue: VecDeque::new() })
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        // MU_INPUT_SELECT forces the select backend, so it can be tested on Linux.
+        let src = if cfg!(target_os = "macos") || std::env::var_os("MU_INPUT_SELECT").is_some() {
+            let (rtx, ready) = tokio::sync::mpsc::unbounded_channel();
+            let (ack, arx) = std::sync::mpsc::channel();
+            std::thread::Builder::new().name("tty-select".into()).spawn(move || select_thread(raw, rtx, arx))?;
+            Source::Select { fd: owned, ready, ack }
+        } else {
+            // SAFETY: `owned` is the only owner of the descriptor and stays open as long as the `AsyncFd`.
+            Source::Async(unsafe { AsyncFd::register_with_interest(owned, tokio::io::Interest::READABLE) }?)
+        };
+        Ok(Self { src, parser: Parser::default(), winch: signal(SignalKind::window_change())?, queue: VecDeque::new() })
+    }
+
+    fn consume(&mut self, bytes: &[u8]) {
+        let inputs = self.parser.feed(bytes);
+        for seq in self.parser.take_writes() {
+            term::write_terminal_seq(&seq);
+        }
+        self.queue.extend(inputs);
     }
 
     /// The next input, or `None` when the terminal closed.
@@ -56,35 +104,67 @@ impl Reader {
             if let Some(i) = self.queue.pop_front() {
                 return Some(i);
             }
-            tokio::select! {
-                _ = self.winch.recv() => {
-                    if let Ok((c, r)) = crossterm::terminal::size() {
-                        self.queue.push_back(Input::Term(Event::Resize(c, r)));
+            let winch = &mut self.winch;
+            match &mut self.src {
+                Source::Async(fd) => {
+                    tokio::select! {
+                        _ = winch.recv() => self.queue.push_back_resize(),
+                        ready = fd.readable() => {
+                            let mut guard = ready.ok()?;
+                            let res = guard.try_io(|fd| read_fd(fd.as_raw_fd(), &mut buf));
+                            match res {
+                                Ok(Ok(0)) => return None,
+                                Ok(Ok(n)) => self.consume(&buf[..n]),
+                                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+                                Ok(Err(_)) => return None,
+                                // Spurious readiness: `try_io` cleared it.
+                                Err(_) => {}
+                            }
+                        }
                     }
                 }
-                ready = self.fd.readable() => {
-                    let mut guard = ready.ok()?;
-                    let res = guard.try_io(|fd| {
-                        // SAFETY: `buf` is valid for `buf.len()` bytes for the duration of the call.
-                        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-                        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
-                    });
-                    match res {
-                        Ok(Ok(0)) => return None,
-                        Ok(Ok(n)) => {
-                            let inputs = self.parser.feed(&buf[..n]);
-                            for seq in self.parser.take_writes() {
-                                term::write_terminal_seq(&seq);
+                Source::Select { fd, ready, ack } => {
+                    tokio::select! {
+                        _ = winch.recv() => self.queue.push_back_resize(),
+                        got = ready.recv() => {
+                            got?;
+                            let raw = fd.as_raw_fd();
+                            let mut chunks: Vec<Vec<u8>> = Vec::new();
+                            loop {
+                                match read_fd(raw, &mut buf) {
+                                    Ok(0) => return None,
+                                    Ok(n) => chunks.push(buf[..n].to_vec()),
+                                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(_) => return None,
+                                }
                             }
-                            self.queue.extend(inputs);
+                            let _ = ack.send(());
+                            for c in chunks {
+                                self.consume(&c);
+                            }
                         }
-                        Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
-                        Ok(Err(_)) => return None,
-                        // Spurious readiness: `try_io` cleared it.
-                        Err(_) => {}
                     }
                 }
             }
+        }
+    }
+}
+
+fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is valid for `buf.len()` bytes for the duration of the call.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+
+trait PushResize {
+    fn push_back_resize(&mut self);
+}
+
+impl PushResize for VecDeque<Input> {
+    fn push_back_resize(&mut self) {
+        if let Ok((c, r)) = crossterm::terminal::size() {
+            self.push_back(Input::Term(Event::Resize(c, r)));
         }
     }
 }
