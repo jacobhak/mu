@@ -137,6 +137,10 @@ pub enum AgentEvent {
     Text(String),
     Thinking(String),
     BlockEnd,
+    /// The model began a tool call; its arguments follow as `ToolCallDelta`s.
+    ToolCallStart { id: String, name: String },
+    /// Raw JSON fragment of a streaming tool call's arguments.
+    ToolCallDelta { id: String, json: String },
     ToolStart { id: String, name: String, args: Value },
     ToolOutput { id: String, chunk: String },
     /// Current todo phases (JSON), after a change or a resume.

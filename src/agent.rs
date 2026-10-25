@@ -806,7 +806,8 @@ impl Agent {
                     let _ = tx.send(match e {
                         StreamEvent::Text(t) => AgentEvent::Text(t.into()),
                         StreamEvent::Thinking(t) => AgentEvent::Thinking(t.into()),
-                        StreamEvent::ToolCallStart => return,
+                        StreamEvent::ToolCallStart { id, name } => AgentEvent::ToolCallStart { id: id.into(), name: name.into() },
+                        StreamEvent::ToolCallDelta { id, json } => AgentEvent::ToolCallDelta { id: id.into(), json: json.into() },
                         StreamEvent::Retry { attempt, delay, reason } => AgentEvent::Retry { attempt, delay, reason },
                     });
                 };

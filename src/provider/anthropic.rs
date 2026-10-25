@@ -138,12 +138,10 @@ impl Assembler {
                     Some("text") => Open::Text(String::new()),
                     Some("thinking") => Open::Thinking(String::new(), None),
                     Some("tool_use") => {
-                        ev(StreamEvent::ToolCallStart);
-                        Open::Tool {
-                        id: cb["id"].as_str().unwrap_or("").into(),
-                        name: cb["name"].as_str().unwrap_or("").into(),
-                        json: String::new(),
-                        }
+                        let id: String = cb["id"].as_str().unwrap_or("").into();
+                        let name: String = cb["name"].as_str().unwrap_or("").into();
+                        ev(StreamEvent::ToolCallStart { id: &id, name: &name });
+                        Open::Tool { id, name, json: String::new() }
                     }
                     _ => Open::Ignored,
                 };
@@ -162,7 +160,10 @@ impl Assembler {
                         ev(StreamEvent::Thinking(s("thinking")));
                     }
                     (Some(Open::Thinking(_, sig)), Some("signature_delta")) => *sig = Some(s("signature").into()),
-                    (Some(Open::Tool { json, .. }), Some("input_json_delta")) => json.push_str(s("partial_json")),
+                    (Some(Open::Tool { id, json, .. }), Some("input_json_delta")) => {
+                        json.push_str(s("partial_json"));
+                        ev(StreamEvent::ToolCallDelta { id, json: s("partial_json") });
+                    }
                     _ => {}
                 }
             }
@@ -306,6 +307,24 @@ mod tests {
         assert_eq!(arguments, &json!({"path":"a"}));
         let Block::Text { text } = &a[0] else { panic!() };
         assert_eq!(text, "héllo ✓");
+    }
+
+    #[test]
+    fn tool_call_events_stream_args() {
+        let mut a = Assembler::new(&gw());
+        let mut log: Vec<String> = vec![];
+        for c in sse().chunks(1) {
+            a.feed(c, &mut |e| match e {
+                StreamEvent::ToolCallStart { id, name } => log.push(format!("start:{id}:{name}")),
+                StreamEvent::ToolCallDelta { id, json } => log.push(format!("delta:{id}:{json}")),
+                _ => {}
+            })
+            .unwrap();
+        }
+        assert_eq!(log.iter().filter(|l| l.starts_with("start:")).count(), 1);
+        assert_eq!(log[0], "start:t1:read");
+        let joined: String = log.iter().filter_map(|l| l.strip_prefix("delta:t1:")).collect();
+        assert_eq!(joined, r#"{"path":"a"}"#);
     }
 
     fn asst(blocks: Vec<Block>) -> Message {

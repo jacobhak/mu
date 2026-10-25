@@ -26,7 +26,9 @@ pub struct Request<'a> {
 pub enum StreamEvent<'a> {
     Text(&'a str),
     Thinking(&'a str),
-    ToolCallStart,
+    ToolCallStart { id: &'a str, name: &'a str },
+    /// Raw fragment of the call's JSON arguments.
+    ToolCallDelta { id: &'a str, json: &'a str },
     Retry { attempt: u32, delay: Duration, reason: String },
 }
 

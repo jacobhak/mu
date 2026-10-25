@@ -53,8 +53,22 @@ pub struct OmpConfig {
     pub status_line: OmpStatusLine,
     pub composer: OmpComposer,
     pub symbol_preset: Option<String>,
+    pub hide_thinking_block: bool,
+    pub display: OmpDisplay,
     #[allow(dead_code)]
     pub mnemopi: Option<serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OmpDisplay {
+    pub smooth_streaming: bool,
+}
+
+impl Default for OmpDisplay {
+    fn default() -> Self {
+        Self { smooth_streaming: true }
+    }
 }
 
 impl OmpConfig {
@@ -300,5 +314,15 @@ mod tests {
         let t = cfg.thresholds();
         assert_eq!(t["anthropic/claude-haiku-5-5"], Threshold::Fixed(20000));
         assert_eq!(t["openai/*"], Threshold::Percent(50));
+    }
+
+    #[test]
+    fn display_flags() {
+        let omp: OmpConfig = serde_yaml_ng::from_str("hideThinkingBlock: true\ndisplay:\n  smoothStreaming: false\n").unwrap();
+        assert!(omp.hide_thinking_block);
+        assert!(!omp.display.smooth_streaming);
+        let omp: OmpConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert!(!omp.hide_thinking_block);
+        assert!(omp.display.smooth_streaming);
     }
 }

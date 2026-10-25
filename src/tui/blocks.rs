@@ -8,6 +8,7 @@ use crossterm::style::{Attribute, Color, ContentStyle};
 use serde_json::Value;
 
 const BASH_TAIL: usize = 10;
+const STREAM_TAIL: usize = 12;
 const CMD_CUT: usize = 12;
 const DIFF_CUT: usize = 40;
 const TEXT_CUT: usize = 10;
@@ -375,6 +376,7 @@ pub fn thinking_body(text: &str, width: usize) -> Vec<Line> {
             let mut out = vec![span("  ", ContentStyle::default())];
             out.extend(l.into_iter().map(|mut s| {
                 s.style.foreground_color = style.foreground_color;
+                s.style.attributes.set(Attribute::Italic);
                 s
             }));
             out
@@ -382,11 +384,66 @@ pub fn thinking_body(text: &str, width: usize) -> Vec<Line> {
         .collect()
 }
 
+/// Viewport rows for a tool call whose arguments are still streaming.
+pub fn tool_streaming(name: &str, args: &Value, spin: char, width: usize) -> Vec<Line> {
+    if name == "bash" {
+        return bash_box(args, &[], false, Tone::Pending, vec![], width);
+    }
+    let mut out = vec![header_line(&spin.to_string(), tfg("accent"), name, args, width)];
+    let (body, footer) = match name {
+        "write" => (args["content"].as_str(), true),
+        "edit" => (args["input"].as_str(), false),
+        _ => (None, false),
+    };
+    let Some(body) = body.filter(|b| !b.is_empty()) else { return out };
+    let lines: Vec<&str> = body.lines().collect();
+    let skip = lines.len().saturating_sub(STREAM_TAIL);
+    let mut rows = Vec::new();
+    if skip > 0 {
+        rows.push(more(skip));
+    }
+    rows.extend(lines[skip..].iter().map(|l| {
+        let style = if name == "edit" {
+            if l.starts_with('+') {
+                tfg("toolDiffAdded")
+            } else if l.starts_with("PUT") || l.starts_with("CUT") || l.starts_with('[') {
+                tfg("toolTitle")
+            } else {
+                tfg("toolOutput")
+            }
+        } else {
+            tfg("toolOutput")
+        };
+        styled_text(l, style)
+    }));
+    let footer = footer.then(|| format!("{} lines", lines.len()));
+    out.extend(frame(&Card { tone: Tone::Pending, sections: vec![Section { label: None, rows }], footer }, width));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::line::line_text as text_of;
     use serde_json::json;
+
+    #[test]
+    fn streaming_write_tail() {
+        let content: String = (1..=20).map(|i| format!("{i}\n")).collect();
+        let t: Vec<String> = tool_streaming("write", &json!({"path": "/tmp/x", "content": content}), '⠋', 60).iter().map(text_of).collect();
+        assert!(t[0].contains("write"));
+        assert!(t.iter().any(|l| l.contains("… 8 more lines")));
+        assert!(t.iter().any(|l| l.contains(" 9 ")));
+        assert!(t.iter().any(|l| l.contains(" 20 ")));
+        assert!(t.iter().any(|l| l.contains("20 lines")));
+        assert!(!t.iter().any(|l| l.trim_matches(|c: char| !c.is_alphanumeric()) == "8"));
+    }
+
+    #[test]
+    fn streaming_bash_shows_command() {
+        let t: Vec<String> = tool_streaming("bash", &json!({"command": "echo hi"}), '⠋', 60).iter().map(text_of).collect();
+        assert!(t.iter().any(|l| l.contains("$ echo hi")));
+    }
 
     fn texts(lines: &[Line]) -> Vec<String> {
         lines.iter().map(text_of).collect()

@@ -94,6 +94,39 @@ struct RunningTool {
     tail: VecDeque<String>,
     partial: String,
 }
+struct StreamingCall {
+    id: String,
+    name: String,
+    json: String,
+    args: Value,
+    parsed: usize,
+}
+
+const REVEAL_MIN_STEP: usize = 3;
+const REVEAL_CATCHUP_FRAMES: usize = 8;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Stream {
+    Text,
+    Thinking,
+}
+
+fn reveal_step(backlog: usize) -> usize {
+    backlog.div_ceil(REVEAL_CATCHUP_FRAMES).max(REVEAL_MIN_STEP)
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::reveal_step;
+
+    #[test]
+    fn steps() {
+        assert_eq!(reveal_step(0), 3);
+        assert_eq!(reveal_step(8), 3);
+        assert_eq!(reveal_step(100), 13);
+        assert_eq!(reveal_step(800), 100);
+    }
+}
 
 struct App {
     cmd_tx: UnboundedSender<Command>,
@@ -113,6 +146,7 @@ struct App {
     pending: Vec<Line>,
     live_text: String,
     committed_in_block: bool,
+    /// Uncommitted thinking text (stable chunks are committed while thinking is shown).
     thinking: Option<(Instant, String)>,
     tools: Vec<RunningTool>,
     /// Latest background-job snapshot, and finished jobs already printed to the transcript.
@@ -131,6 +165,13 @@ struct App {
     running: bool,
     quitting: bool,
     show_thinking: bool,
+    smooth: bool,
+    /// Tool calls whose arguments are still streaming or that are not yet executing.
+    calls: Vec<StreamingCall>,
+    /// Streamed text and thinking not yet shown, oldest first.
+    reveal: VecDeque<(Stream, String)>,
+    /// Total `char` count of `reveal`.
+    reveal_chars: usize,
     expanded: bool,
     dirty: bool,
     last_draw: Instant,
@@ -183,6 +224,8 @@ pub async fn run(init: AppInit) -> i32 {
         .collect();
     commands.extend(ctx.commands.iter().map(|c| Entry { name: c.name.clone(), desc: c.description.clone(), needs_arg: false, args: vec![] }));
     commands.extend(ctx.skills.iter().map(|s| Entry { name: format!("skill:{}", s.name), desc: s.description.clone(), needs_arg: false, args: vec![] }));
+    let show_thinking = !providers.cfg.omp.hide_thinking_block;
+    let smooth = providers.cfg.omp.display.smooth_streaming;
     let mut app = App {
         cmd_tx,
         inbox,
@@ -215,7 +258,11 @@ pub async fn run(init: AppInit) -> i32 {
         overlay: None,
         running: false,
         quitting: false,
-        show_thinking: false,
+        show_thinking,
+        smooth,
+        calls: Vec::new(),
+        reveal: VecDeque::new(),
+        reveal_chars: 0,
         expanded: false,
         dirty: true,
         last_draw: Instant::now() - FRAME,
@@ -236,12 +283,12 @@ pub async fn run(init: AppInit) -> i32 {
     };
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     loop {
-        let due = app.last_draw + FRAME;
-        if app.dirty && Instant::now() >= due {
+        if app.dirty && Instant::now() >= app.last_draw + FRAME {
             if let Err(e) = app.draw() {
                 eprintln!("mu: draw failed: {e}");
             }
         }
+        let due = app.last_draw + FRAME;
         tokio::select! {
             inp = reader.next() => match inp {
                 Some(Input::Term(e)) => app.on_terminal(e),
@@ -257,7 +304,7 @@ pub async fn run(init: AppInit) -> i32 {
             Some(n) = notice_rx.recv() => app.notice(&n),
             Some(m) = ui_rx.recv() => app.on_ui(m),
             _ = tick.tick(), if app.busy() => app.dirty = true,
-            _ = tokio::time::sleep_until(due.into()), if app.dirty && Instant::now() < due => {}
+            _ = tokio::time::sleep_until(due.into()), if app.dirty => {}
         }
     }
     let _ = app.renderer.finish();
@@ -271,7 +318,12 @@ pub async fn run(init: AppInit) -> i32 {
 
 impl App {
     fn busy(&self) -> bool {
-        self.running || self.compacting || self.thinking.is_some() || !self.tools.is_empty() || self.jobs.iter().any(|j| j.state == SubagentState::Running)
+        self.running
+            || self.compacting
+            || self.thinking.is_some()
+            || !self.tools.is_empty()
+            || !self.calls.is_empty()
+            || self.jobs.iter().any(|j| j.state == SubagentState::Running)
     }
 
     fn width(&self) -> usize {
@@ -301,9 +353,13 @@ impl App {
 
     fn finish_thinking(&mut self) {
         let Some((start, text)) = self.thinking.take() else { return };
-        if self.show_thinking && !text.trim().is_empty() {
-            let w = self.width();
-            self.commit(blocks::thinking_body(text.trim(), w));
+        if self.show_thinking {
+            if !text.trim().is_empty() {
+                let w = self.width();
+                let mut l = blocks::thinking_body(text.trim(), w);
+                l.push(vec![]);
+                self.commit(l);
+            }
         } else {
             self.commit(vec![blocks::thinking_done(start.elapsed().as_secs())]);
         }
@@ -319,8 +375,104 @@ impl App {
         self.commit(lines);
     }
 
+    fn ingest_text(&mut self, s: &str) {
+        self.finish_thinking();
+        self.live_text.push_str(s);
+        self.block_text.push_str(s);
+        let n = markdown::stable_prefix(&self.live_text);
+        if n > 0 {
+            let chunk: String = self.live_text.drain(..n).collect();
+            self.commit_text(chunk.trim_end(), true);
+        }
+    }
+
+    fn ingest_thinking(&mut self, s: &str) {
+        match self.thinking.as_mut() {
+            Some((_, t)) => t.push_str(s),
+            None => self.thinking = Some((Instant::now(), s.to_string())),
+        }
+        if self.show_thinking {
+            self.commit_stable_thinking();
+        }
+    }
+
+    fn commit_stable_thinking(&mut self) {
+        let Some((_, text)) = self.thinking.as_mut() else { return };
+        let n = markdown::stable_prefix(text);
+        if n == 0 {
+            return;
+        }
+        let chunk: String = text.drain(..n).collect();
+        if !chunk.trim().is_empty() {
+            let w = self.width();
+            let mut l = blocks::thinking_body(chunk.trim(), w);
+            l.push(vec![]);
+            self.commit(l);
+        }
+    }
+
+    fn ingest(&mut self, k: Stream, s: &str) {
+        match k {
+            Stream::Text => self.ingest_text(s),
+            Stream::Thinking => self.ingest_thinking(s),
+        }
+    }
+
+    fn queue_reveal(&mut self, k: Stream, s: String) {
+        if !self.smooth {
+            self.ingest(k, &s);
+            return;
+        }
+        self.reveal_chars += s.chars().count();
+        match self.reveal.back_mut() {
+            Some((bk, t)) if *bk == k => t.push_str(&s),
+            _ => self.reveal.push_back((k, s)),
+        }
+    }
+
+    fn flush_reveal(&mut self) {
+        while let Some((k, s)) = self.reveal.pop_front() {
+            self.ingest(k, &s);
+        }
+        self.reveal_chars = 0;
+    }
+
+    fn advance_reveal(&mut self) {
+        if self.reveal_chars == 0 {
+            return;
+        }
+        let mut n = reveal_step(self.reveal_chars);
+        while n > 0 {
+            let Some((k, t)) = self.reveal.front_mut() else { break };
+            let k = *k;
+            let end = t.char_indices().nth(n).map_or(t.len(), |(i, _)| i);
+            let piece: String = t.drain(..end).collect();
+            if t.is_empty() {
+                self.reveal.pop_front();
+            }
+            let c = piece.chars().count();
+            n -= c;
+            self.reveal_chars -= c;
+            self.ingest(k, &piece);
+        }
+    }
+
     fn on_agent(&mut self, e: AgentEvent) {
         self.dirty = true;
+        if !matches!(
+            e,
+            AgentEvent::Text(_)
+                | AgentEvent::Thinking(_)
+                | AgentEvent::ToolCallDelta { .. }
+                | AgentEvent::ToolOutput { .. }
+                | AgentEvent::Status(_)
+                | AgentEvent::Jobs(_)
+                | AgentEvent::Todo(_)
+                | AgentEvent::TurnStart
+                | AgentEvent::Retry { .. }
+        ) {
+            self.flush_reveal();
+        }
         match e {
             AgentEvent::TurnStart => {
                 self.running = true;
@@ -332,20 +484,17 @@ impl App {
                 l.extend(blocks::user_prompt(&t, w));
                 self.commit(l);
             }
-            AgentEvent::Text(s) => {
+            AgentEvent::Text(s) => self.queue_reveal(Stream::Text, s),
+            AgentEvent::Thinking(s) => self.queue_reveal(Stream::Thinking, s),
+            AgentEvent::ToolCallStart { id, name } => {
                 self.finish_thinking();
-                self.live_text.push_str(&s);
-                self.block_text.push_str(&s);
-                let n = markdown::stable_prefix(&self.live_text);
-                if n > 0 {
-                    let chunk: String = self.live_text.drain(..n).collect();
-                    self.commit_text(chunk.trim_end(), true);
+                self.calls.push(StreamingCall { id, name, json: String::new(), args: json!({}), parsed: 0 });
+            }
+            AgentEvent::ToolCallDelta { id, json } => {
+                if let Some(c) = self.calls.iter_mut().find(|c| c.id == id) {
+                    c.json.push_str(&json);
                 }
             }
-            AgentEvent::Thinking(s) => match self.thinking.as_mut() {
-                Some((_, t)) => t.push_str(&s),
-                None => self.thinking = Some((Instant::now(), s)),
-            },
             AgentEvent::BlockEnd => {
                 self.finish_thinking();
                 if !self.live_text.trim().is_empty() {
@@ -363,6 +512,7 @@ impl App {
                 self.committed_in_block = false;
             }
             AgentEvent::ToolStart { id, name, args } => {
+                self.calls.retain(|c| c.id != id);
                 self.finish_thinking();
                 if name == "bash" {
                     if let Some(c) = args["command"].as_str() {
@@ -391,6 +541,10 @@ impl App {
             }
             AgentEvent::Retry { attempt, delay, reason } => {
                 self.live_text.clear();
+                self.thinking = None;
+                self.calls.clear();
+                self.reveal.clear();
+                self.reveal_chars = 0;
                 self.notice(&format!("↻ retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs()));
             }
             AgentEvent::Notice(s) => self.notice(&s),
@@ -425,6 +579,7 @@ impl App {
             }
             AgentEvent::Todo(v) => self.todo = serde_json::from_value(v).unwrap_or_default(),
             AgentEvent::TurnEnd { aborted } => {
+                self.calls.clear();
                 self.finish_thinking();
                 if !self.live_text.trim().is_empty() {
                     let t = std::mem::take(&mut self.live_text);
@@ -666,7 +821,12 @@ impl App {
                 let cur = Thinking::parse(&self.status.thinking).unwrap_or(Thinking::Medium);
                 self.send(Command::SetThinking(cur.cycle()));
             }
-            Action::ToggleThinking => self.show_thinking = !self.show_thinking,
+            Action::ToggleThinking => {
+                self.show_thinking = !self.show_thinking;
+                if self.show_thinking {
+                    self.commit_stable_thinking();
+                }
+            }
             Action::ToggleExpanded => self.expanded = !self.expanded,
             Action::ModelPicker => self.request_models(),
             Action::EditExternal => self.edit_external(),
@@ -1161,11 +1321,10 @@ impl App {
             out.extend(markdown::render(&self.live_text, w));
         }
         if let Some((start, text)) = &self.thinking {
-            out.push(blocks::thinking_live(self.spin(), start.elapsed().as_secs()));
-            if self.show_thinking {
-                let last = text.lines().last().unwrap_or("");
-                out.push(styled(format!("  {}", trunc(last, w.saturating_sub(2))), |_| theme::get().fg("thinkingText")));
+            if self.show_thinking && !text.trim().is_empty() {
+                out.extend(blocks::thinking_body(text.trim(), w));
             }
+            out.push(blocks::thinking_live(self.spin(), start.elapsed().as_secs()));
         }
         for t in &self.tools {
             let mut tail: Vec<String> = t.tail.iter().cloned().collect();
@@ -1174,6 +1333,9 @@ impl App {
             }
             let tail = &tail[tail.len().saturating_sub(10)..];
             out.extend(blocks::tool_live(&t.name, &t.args, tail, self.spin(), t.started.elapsed().as_secs(), w));
+        }
+        for c in &self.calls {
+            out.extend(blocks::tool_streaming(&c.name, &c.args, self.spin(), w));
         }
         let running: Vec<SubagentStatus> = self.jobs.iter().filter(|j| j.state == SubagentState::Running).cloned().collect();
         out.extend(blocks::subagent_rows(&running, self.spin()));
@@ -1221,6 +1383,15 @@ impl App {
     }
 
     fn draw(&mut self) -> std::io::Result<()> {
+        self.advance_reveal();
+        for c in &mut self.calls {
+            if c.json.len() != c.parsed {
+                if let Some(v) = super::partial_json::parse(&c.json) {
+                    c.args = v;
+                }
+                c.parsed = c.json.len();
+            }
+        }
         let (w, rows) = self.renderer.size();
         let mut vp: Vec<Line> = Vec::new();
         vp.extend(self.live_lines(w));
@@ -1252,14 +1423,14 @@ impl App {
         let committed = std::mem::take(&mut self.pending);
         self.renderer.draw(&committed, &vp, cursor)?;
         self.last_draw = Instant::now();
-        self.dirty = false;
+        self.dirty = self.reveal_chars > 0;
         Ok(())
     }
 }
 
 const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Alt+↑  edit last queued
 Shift+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn      Ctrl+C  clear · abort · exit (twice)
-Shift+Tab  cycle thinking      Ctrl+T  show thinking      Ctrl+O  expand output      Alt+M  model picker
+Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model picker
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
 
