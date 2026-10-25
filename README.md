@@ -2,7 +2,16 @@
 
 A small, memory-lean coding agent. Rust core; everything heavy (gateway, web, memory) is an out-of-process plugin that starts on first use and exits when idle. It talks to models through the omp auth gateway and reads omp's config (`modelRoles`, `compaction.modelThresholds`, `models.yml`).
 
-mu is a personal, experimental reimplementation of [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) and is built on it: it uses omp's Rust crates, CLI and auth gateway, and borrows many of its prompts and much of its behaviour. Expect breaking changes. Credit for the design goes to the omp authors.
+mu is a personal reimplementation of [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) and is built on it: it uses omp's Rust crates, CLI and auth gateway, and borrows many of its prompts and much of its behaviour. Credit for the design goes to the omp authors.
+
+## Status
+
+Early and experimental: started in October 2026 and changing quickly.
+
+- No stable version. Releases are nightly builds of `main` (`mu-YYYYMMDD-<sha7>`); config, flags and plugin interfaces can change without notice.
+- Needs a working omp setup: mu uses omp's credentials, `models.yml` and model roles, and has no login of its own.
+- Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
+- No support promised. Issues and PRs are welcome but may go unanswered.
 
 ## Build and install
 
