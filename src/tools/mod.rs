@@ -122,9 +122,15 @@ impl Tools {
     }
 
     /// `async_jobs`: `task` returns job ids immediately instead of blocking.
-    pub fn task_def(async_jobs: bool) -> ToolDef {
-        let description = if async_jobs { task::ASYNC_DESCRIPTION } else { task::DESCRIPTION };
-        ToolDef { name: "task".into(), description: description.into(), schema: task::schema() }
+    pub fn task_def(async_jobs: bool, agents: &[crate::context::AgentDef]) -> ToolDef {
+        let mut description = String::from(if async_jobs { task::ASYNC_DESCRIPTION } else { task::DESCRIPTION });
+        if !agents.is_empty() {
+            let list: Vec<String> = agents.iter().map(|a| format!("`{}`: {}", a.name, a.description)).collect();
+            description.push_str("\nCustom agents: ");
+            description.push_str(&list.join("; "));
+        }
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        ToolDef { name: "task".into(), description, schema: task::schema(&names) }
     }
 
     pub fn wait_def() -> ToolDef {

@@ -4,12 +4,30 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// `-p`: runs one prompt to completion. Final assistant text goes to stdout, progress to stderr.
 /// Returns the process exit code.
-pub async fn print_mode(prompt: String, cmd: UnboundedSender<Command>, mut ev: UnboundedReceiver<AgentEvent>) -> i32 {
+pub async fn print_mode(
+    prompt: String,
+    cmd: UnboundedSender<Command>,
+    mut ev: UnboundedReceiver<AgentEvent>,
+    inbox: crate::events::SharedInbox,
+    max_cost: Option<f64>,
+) -> i32 {
     let _ = cmd.send(Command::Prompt(prompt.into()));
     let _ = cmd.send(Command::Exit);
     let (mut buf, mut last, mut code) = (String::new(), String::new(), 0);
+    let (mut cost, mut capped) = (0.0f64, false);
     while let Some(e) = ev.recv().await {
         match e {
+            AgentEvent::Status(s) => {
+                cost = s.cost;
+                if let Some(max) = max_cost.filter(|m| s.cost > *m)
+                    && !capped
+                {
+                    capped = true;
+                    inbox.borrow().cancel.cancel();
+                    eprintln!("mu: cost cap ${max:.2} exceeded");
+                    code = 1;
+                }
+            }
             AgentEvent::Text(t) => buf.push_str(&t),
             AgentEvent::BlockEnd => {
                 if !buf.is_empty() {
@@ -33,6 +51,9 @@ pub async fn print_mode(prompt: String, cmd: UnboundedSender<Command>, mut ev: U
     }
     if !buf.is_empty() {
         last = buf;
+    }
+    if max_cost.is_some() {
+        eprintln!("mu: cost ${cost:.4}");
     }
     if code == 0 {
         println!("{}", last.trim_end());

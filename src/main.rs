@@ -50,6 +50,12 @@ struct Cli {
     /// Run as a subagent: read one JSON task on stdin, write NDJSON results.
     #[arg(long, hide = true)]
     headless: bool,
+    /// Run `-p` as a custom agent from `.omp/agents` or `<agent dir>/agents`.
+    #[arg(long, requires = "print")]
+    agent: Option<String>,
+    /// Abort `-p` once the session has cost more than this many USD.
+    #[arg(long, requires = "print")]
+    max_cost: Option<f64>,
     /// Serve the Agent Client Protocol over stdio.
     #[arg(long)]
     acp: bool,
@@ -94,6 +100,24 @@ fn pick_model(
     Ok((spec, cli_thinking.or(role_level).or(cfg_level.flatten()).unwrap_or(models::Thinking::Medium)))
 }
 
+/// First `provider/model[:level]` or configured `@role` in the agent's model list, else the `task` role chain.
+fn agent_selector(def: &context::AgentDef, cfgs: &config::Configs) -> Option<String> {
+    def.model
+        .iter()
+        .find(|m| match m.strip_prefix('@') {
+            Some(role) => cfgs.role(models::split_level(role).0.as_str()).is_some(),
+            None => m.contains('/'),
+        })
+        .cloned()
+        .or_else(|| models::role_selector("task", cfgs))
+}
+
+fn apply_agent(agent: &mut agent::Agent, def: &context::AgentDef) {
+    agent.allow = def.tools.clone();
+    agent.excluded = vec!["ask", "propose_plan"];
+    agent.agent_prompt = Some(format!("\nYou are running as the custom agent `{0}`. Follow its instructions exactly; they override your defaults.\n<agent name=\"{0}\">\n{1}\n</agent>\n", def.name, def.prompt.trim()));
+}
+
 fn main() {
     match run() {
         Ok(code) => std::process::exit(code),
@@ -119,17 +143,36 @@ fn run() -> Result<i32> {
 
     let mut task_payload: Option<serde_json::Value> = None;
     let mut sel = cli.model.clone();
+    let mut agent_def: Option<context::AgentDef> = None;
+    if let Some(name) = &cli.agent {
+        match ctx.agents.iter().find(|a| &a.name == name) {
+            Some(d) => agent_def = Some(d.clone()),
+            None => bail!("unknown agent `{name}`; looked in .omp/agents and {}/agents", paths::omp_agent_dir().display()),
+        }
+    }
     if cli.headless {
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
         let p: serde_json::Value = serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
         let role = if p["agent"] == "scout" { "smol" } else { "task" };
+        if let Some(name) = p["agent"].as_str().filter(|n| !matches!(*n, "task" | "scout")) {
+            match ctx.agents.iter().find(|a| a.name == name) {
+                Some(d) => agent_def = Some(d.clone()),
+                None => bail!("unknown agent `{name}`"),
+            }
+        }
         if cli.model.is_none() {
-            sel = models::role_selector(role, &cfgs);
+            sel = match &agent_def {
+                Some(d) => agent_selector(d, &cfgs),
+                None => models::role_selector(role, &cfgs),
+            };
         }
         task_payload = Some(p);
+    } else if cli.model.is_none() {
+        sel = agent_def.as_ref().and_then(|d| agent_selector(d, &cfgs));
     }
-    let (spec, thinking) = pick_model(&cfgs, &providers, sel, cli_thinking)?;
+    let def_thinking = agent_def.as_ref().and_then(|d| d.thinking.as_deref()).and_then(models::Thinking::parse);
+    let (spec, thinking) = pick_model(&cfgs, &providers, sel, cli_thinking.or(def_thinking))?;
 
     let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;
     let resume = match (&cli.resume, cli.continue_latest) {
@@ -169,8 +212,11 @@ fn run() -> Result<i32> {
         agent.excluded = vec!["ask", "propose_plan"];
         agent.parent_session = p["parentSession"].as_str().map(PathBuf::from);
         if p["agent"] == "scout" {
-            agent.allow = Some(vec!["read", "grep", "glob", "web_search", "fetch"]);
+            agent.allow = Some(["read", "grep", "glob", "web_search", "fetch"].map(String::from).to_vec());
         }
+    }
+    if let Some(d) = &agent_def {
+        apply_agent(&mut agent, d);
     }
     if cli.print.is_none() && task_payload.is_none() {
         agent.enable_jobs();
@@ -184,7 +230,8 @@ fn run() -> Result<i32> {
     let code = local.block_on(&rt, async move {
         let mut notice_rx = notice_rx;
         let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
-        let code = match (cli.print, task_payload) {
+        let (print, max_cost) = (cli.print, cli.max_cost);
+        let code = match (print, task_payload) {
             (_, Some(p)) => {
                 tokio::task::spawn_local(async move {
                     while let Some(n) = notice_rx.recv().await {
@@ -202,7 +249,7 @@ fn run() -> Result<i32> {
                         eprintln!("{n}");
                     }
                 });
-                headless::print_mode(prompt, cmd_tx, ev_rx).await
+                headless::print_mode(prompt, cmd_tx, ev_rx, inbox.clone(), max_cost).await
             }
             (None, None) => {
                 tui::theme::init(cfgs_ui.omp.theme.dark.as_deref().unwrap_or("dark"), &paths::omp_agent_dir());

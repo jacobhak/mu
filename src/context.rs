@@ -79,8 +79,12 @@ struct Front {
 
 /// Splits leading `---` YAML frontmatter from the body.
 fn frontmatter(text: &str) -> (Front, &str) {
-    let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else { return (Front::default(), text) };
-    let Some(end) = rest.find("\n---") else { return (Front::default(), text) };
+    frontmatter_as(text)
+}
+
+fn frontmatter_as<T: serde::de::DeserializeOwned + Default>(text: &str) -> (T, &str) {
+    let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else { return (T::default(), text) };
+    let Some(end) = rest.find("\n---") else { return (T::default(), text) };
     let front = serde_yaml_ng::from_str(&rest[..end]).unwrap_or_default();
     let after = &rest[end + 4..];
     let body = after.split_once('\n').map_or("", |(_, b)| b);
@@ -120,6 +124,73 @@ pub fn discover_skills(cwd: &Path, home: &Path, agent_dir: &Path, claude_user: b
                 continue;
             }
             out.push(Skill { name, description: description.trim().into(), dir, hidden: f.hide || f.disable_model_invocation });
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentDef {
+    pub name: String,
+    pub description: String,
+    pub tools: Option<Vec<String>>,
+    pub model: Vec<String>,
+    pub thinking: Option<String>,
+    pub prompt: String,
+    #[allow(dead_code)]
+    pub path: PathBuf,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct AgentFront {
+    name: Option<String>,
+    description: Option<String>,
+    tools: Option<serde_yaml_ng::Value>,
+    model: Option<serde_yaml_ng::Value>,
+    #[serde(rename = "thinkingLevel")]
+    thinking_level: Option<String>,
+}
+
+/// A YAML sequence of strings, or one string split on `,`.
+fn string_list(v: &serde_yaml_ng::Value) -> Option<Vec<String>> {
+    let items: Vec<String> = match v {
+        serde_yaml_ng::Value::String(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
+        serde_yaml_ng::Value::Sequence(q) => q.iter().filter_map(|x| x.as_str()).map(|x| x.trim().to_string()).collect(),
+        _ => return None,
+    };
+    Some(items.into_iter().filter(|x| !x.is_empty()).collect())
+}
+
+/// omp-format custom agents: `<dir>/.omp/agents/*.md` (nearest first), then `<agent_dir>/agents/*.md`.
+pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDef> {
+    let mut roots: Vec<PathBuf> = walk(cwd, home).iter().map(|d| d.join(".omp/agents")).collect();
+    roots.push(agent_dir.join("agents"));
+    let mut out: Vec<AgentDef> = Vec::new();
+    for root in roots {
+        let Ok(rd) = std::fs::read_dir(&root) else { continue };
+        let mut files: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+        files.sort();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let (f, body) = frontmatter_as::<AgentFront>(&text);
+            let (Some(name), Some(description)) = (f.name.map(|n| n.trim().to_string()), f.description.map(|d| d.trim().to_string())) else { continue };
+            if name.is_empty() || description.is_empty() {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if ["main", "sub", "task", "scout"].contains(&lower.as_str()) || out.iter().any(|a| a.name == name) {
+                continue;
+            }
+            out.push(AgentDef {
+                name,
+                description,
+                tools: f.tools.as_ref().and_then(string_list),
+                model: f.model.as_ref().and_then(string_list).unwrap_or_default(),
+                thinking: f.thinking_level,
+                prompt: body.trim().to_string(),
+                path,
+            });
         }
     }
     out
@@ -223,6 +294,7 @@ pub struct Context {
     pub rules: Vec<String>,
     pub skills: Vec<Skill>,
     pub commands: Vec<SlashCommand>,
+    pub agents: Vec<AgentDef>,
 }
 
 impl Context {
@@ -240,6 +312,7 @@ impl Context {
             rules,
             skills: discover_skills(cwd, home, agent_dir, claude_user),
             commands: discover_commands(cwd, home, agent_dir),
+            agents: discover_agents(cwd, home, agent_dir),
         }
     }
 
@@ -263,6 +336,7 @@ pub struct PromptInput<'a> {
     pub ctx: &'a Context,
     pub plan: Option<&'a str>,
     pub subagent: bool,
+    pub agent_prompt: Option<&'a str>,
     pub plugin_ctx: &'a std::collections::BTreeMap<String, String>,
 }
 
@@ -283,6 +357,9 @@ pub fn system_prompt(i: &PromptInput) -> String {
     );
     if i.subagent {
         s.push_str("\nYou are a subagent. Your final message is returned verbatim to the parent agent as your result; make it complete and self-contained.\n");
+    }
+    if let Some(p) = i.agent_prompt {
+        s.push_str(p);
     }
     if !i.ctx.files.is_empty() {
         s.push_str("\n<repo-rules>\nMUST follow these context files for all tasks:\n");
@@ -361,8 +438,44 @@ mod tests {
         assert_eq!(greet.expand("Bob \"a b\""), "Say hi to Bob (Bob a b)");
         let plain = ctx.commands.iter().find(|c| c.name == "plain").unwrap();
         assert_eq!(plain.expand("extra"), "Do the thing\n\nextra");
-        let sp = system_prompt(&PromptInput { model: "m", cwd: &proj, ctx: &ctx, plan: None, subagent: false, plugin_ctx: &Default::default() });
+        let sp = system_prompt(&PromptInput { model: "m", cwd: &proj, ctx: &ctx, plan: None, subagent: false, agent_prompt: None, plugin_ctx: &Default::default() });
         assert!(sp.contains("- alpha: first\n") && !sp.contains("- hid:") && sp.contains("<rules>\nuser rule"));
         assert!(ctx.skill_prompt("alpha", "go").unwrap().ends_with("body A\n</skill>\n\ngo"));
+    }
+
+    #[test]
+    fn agents_precedence_formats_and_reserved_names() {
+        let root = std::env::temp_dir().join(format!("mu-ctx3-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        let agent = root.join("agent");
+        fs::create_dir_all(proj.join(".omp/agents")).unwrap();
+        fs::create_dir_all(agent.join("agents")).unwrap();
+        let w = |p: std::path::PathBuf, t: &str| fs::write(p, t).unwrap();
+        w(proj.join(".omp/agents/a.md"), "---\nname: a\ndescription: project a\ntools: read, grep\nmodel: \"@smol\"\nthinkingLevel: high\n---\nBODY\n");
+        w(agent.join("agents/a.md"), "---\nname: a\ndescription: user a\n---\nOTHER\n");
+        w(agent.join("agents/b.md"), "---\nname: b\ndescription: user b\ntools: [read, write]\nmodel: [\"@smol\", \"@default\"]\n---\nB\n");
+        w(agent.join("agents/scout.md"), "---\nname: Scout\ndescription: reserved\n---\nx\n");
+        w(agent.join("agents/main.md"), "---\nname: main\ndescription: reserved\n---\nx\n");
+        w(agent.join("agents/nodesc.md"), "---\nname: nodesc\n---\nx\n");
+        let got = discover_agents(&proj, &home, &agent);
+        let names: Vec<_> = got.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(got[0].description, "project a");
+        assert_eq!(got[0].tools.as_deref(), Some(&["read".to_string(), "grep".to_string()][..]));
+        assert_eq!(got[0].model, ["@smol"]);
+        assert_eq!(got[0].thinking.as_deref(), Some("high"));
+        assert_eq!(got[0].prompt, "BODY");
+        assert_eq!(got[1].tools.as_deref(), Some(&["read".to_string(), "write".to_string()][..]));
+        assert_eq!(got[1].model, ["@smol", "@default"]);
+        assert!(got[1].thinking.is_none());
+    }
+
+    #[test]
+    fn system_prompt_includes_agent_block() {
+        let ctx = Context { files: vec![], rules: vec![], skills: vec![], commands: vec![], agents: vec![] };
+        let block = "\n<agent name=\"x\">\nDo it.\n</agent>\n";
+        let sp = system_prompt(&PromptInput { model: "m", cwd: Path::new("/tmp"), ctx: &ctx, plan: None, subagent: true, agent_prompt: Some(block), plugin_ctx: &Default::default() });
+        assert!(sp.contains("<agent name=\"x\">\nDo it.\n</agent>"));
     }
 }

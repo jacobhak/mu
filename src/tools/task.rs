@@ -29,13 +29,15 @@ pub const DESCRIPTION: &str = "Run subagents in parallel and wait for all of the
 
 pub const ASYNC_DESCRIPTION: &str = "Spawn subagents in the background; job ids return immediately. Each task runs in a fresh context with its own tools and returns its final message. `scout` agents are read-only (read, grep, glob, web); `task` agents can also edit and run commands. Results arrive automatically as a <system-notice> message; never poll. Call `wait` only when blocked with nothing else to do. Give every task a self-contained description; optional `context` is prepended to each.";
 
-pub fn schema() -> Value {
+pub fn schema(names: &[&str]) -> Value {
+    let mut agents = vec!["task", "scout"];
+    agents.extend_from_slice(names);
     json!({"type":"object","properties":{
         "context":{"type":"string","description":"shared background prepended to every task"},
         "tasks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{
             "name":{"type":"string"},
             "task":{"type":"string"},
-            "agent":{"type":"string","enum":["task","scout"]}},"required":["task"]}}},"required":["tasks"]})
+            "agent":{"type":"string","enum":agents}},"required":["task"]}}},"required":["tasks"]})
 }
 
 pub fn depth() -> u32 {
@@ -196,5 +198,14 @@ pub async fn run_child(
             ok: false,
             text: if cancelled { "cancelled".into() } else if stderr_tail.is_empty() { "subagent exited without a result".into() } else { stderr_tail },
         },
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    #[test]
+    fn schema_enum_includes_custom_agents() {
+        let s = super::schema(&["x"]);
+        assert_eq!(s["properties"]["tasks"]["items"]["properties"]["agent"]["enum"], serde_json::json!(["task", "scout", "x"]));
     }
 }

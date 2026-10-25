@@ -43,7 +43,9 @@ pub struct Agent {
     pub excluded: Vec<&'static str>,
     pub plan: Option<PlanState>,
     /// Only these tools are offered when set.
-    pub allow: Option<Vec<&'static str>>,
+    pub allow: Option<Vec<String>>,
+    /// Custom-agent instructions, appended verbatim to the system prompt.
+    pub agent_prompt: Option<String>,
     pub parent_session: Option<PathBuf>,
     exec_plan: Option<ExecPlan>,
     pub pin_model: bool,
@@ -184,6 +186,7 @@ impl Agent {
             excluded: Vec::new(),
             plan: None,
             allow: None,
+            agent_prompt: None,
             parent_session: None,
             exec_plan: None,
             pin_model: false,
@@ -231,14 +234,14 @@ impl Agent {
             v.push(Tools::plan_def());
         }
         if crate::tools::task::depth() < 2 {
-            v.push(Tools::task_def(self.jobs.is_some()));
+            v.push(Tools::task_def(self.jobs.is_some(), &self.ctx.agents));
         }
         if self.jobs.is_some() {
             v.push(Tools::wait_def());
         }
         v.retain(|d| !self.excluded.contains(&d.name.as_str()));
         if let Some(allow) = &self.allow {
-            v.retain(|d| allow.contains(&d.name.as_str()));
+            v.retain(|d| allow.iter().any(|a| a == &d.name));
         }
         v
     }
@@ -291,6 +294,7 @@ impl Agent {
             ctx: &self.ctx,
             plan: self.plan.as_ref().map(|_| PLAN_PROMPT),
             subagent: self.subagent,
+            agent_prompt: self.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
         })
     }
