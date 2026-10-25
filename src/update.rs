@@ -1,0 +1,238 @@
+//! `mu update`: release check and self-update through `gh`, against the private release repo.
+//! Releases are tagged `mu-YYYYMMDD-<sha7>` by the maintenance bot; the installed build knows its own sha.
+
+use anyhow::{Result, bail};
+use mu_common::paths;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const REPO: &str = "jacobhak/mu";
+const CACHE_TTL_SECS: u64 = 24 * 3600;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    UpToDate { tag: String },
+    Available { tag: String, ahead: u64 },
+    /// The installed build is dirty, unknown, or not on the release lineage.
+    Dev { sha: String },
+    NoReleases,
+    /// gh missing, unauthenticated, or offline.
+    Unknown(String),
+}
+
+impl Status {
+    pub fn describe(&self) -> String {
+        match self {
+            Status::UpToDate { tag } => format!("mu is up to date (latest release {tag})"),
+            Status::Available { tag, ahead } => {
+                format!("update available: {tag} ({ahead} commit{} ahead of this build). Run `mu update`.", if *ahead == 1 { "" } else { "s" })
+            }
+            Status::Dev { sha } => format!("this is a dev build ({sha}); not comparable with releases. `mu update --force` replaces it."),
+            Status::NoReleases => "no releases published yet".into(),
+            Status::Unknown(why) => format!("could not check for updates: {why}"),
+        }
+    }
+}
+
+/// Short sha of the running build, from the compile-time `MU_GIT_SHA`.
+fn installed_sha() -> &'static str {
+    env!("MU_GIT_SHA")
+}
+
+fn is_dev_sha(sha: &str) -> bool {
+    sha == "unknown" || sha.ends_with("-dirty") || sha.is_empty()
+}
+
+/// Last `-`-separated part of `mu-YYYYMMDD-<sha7>`.
+fn tag_sha(tag: &str) -> Option<&str> {
+    let mut parts = tag.split('-');
+    let (prefix, date, s) = (parts.next()?, parts.next()?, parts.next()?);
+    if prefix != "mu" || date.len() != 8 || parts.next().is_some() {
+        return None;
+    }
+    (s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit())).then_some(s)
+}
+
+/// Maps the compare API's `status` and `ahead_by` (installed...release) to a result.
+fn classify(tag: &str, status: &str, ahead: u64, sha: &str) -> Status {
+    match status {
+        "ahead" => Status::Available { tag: tag.into(), ahead },
+        "identical" | "behind" => Status::UpToDate { tag: tag.into() },
+        _ => Status::Dev { sha: sha.into() },
+    }
+}
+
+struct Out {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn gh(args: &[&str]) -> Result<Out> {
+    let o = Command::new("gh").args(args).stdin(Stdio::null()).output().map_err(|e| anyhow::anyhow!("gh unavailable: {e}"))?;
+    Ok(Out {
+        ok: o.status.success(),
+        stdout: String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&o.stderr).trim().to_string(),
+    })
+}
+
+/// Queries GitHub. Blocking; call from a thread or before the runtime starts.
+pub fn check() -> Status {
+    let sha = installed_sha();
+    if is_dev_sha(sha) {
+        return Status::Dev { sha: sha.into() };
+    }
+    let rel = match gh(&["release", "list", "-R", REPO, "-L", "1", "--json", "tagName", "-q", ".[0].tagName"]) {
+        Ok(o) if o.ok => o,
+        Ok(o) => return Status::Unknown(first_line(&o.stderr)),
+        Err(e) => return Status::Unknown(e.to_string()),
+    };
+    let tag = rel.stdout;
+    if tag.is_empty() {
+        return Status::NoReleases;
+    }
+    let Some(rsha) = tag_sha(&tag) else {
+        return Status::Unknown(format!("unrecognised release tag {tag}"));
+    };
+    let path = format!("repos/{REPO}/compare/{sha}...{rsha}");
+    match gh(&["api", &path, "-q", r#".status + " " + (.ahead_by|tostring)"#]) {
+        Ok(o) if o.ok => {
+            let mut it = o.stdout.split_whitespace();
+            let status = it.next().unwrap_or("");
+            let ahead = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            classify(&tag, status, ahead, sha)
+        }
+        // An unknown sha (a local build never pushed) is a 404, not a network error.
+        Ok(o) if o.stderr.contains("404") || o.stderr.contains("Not Found") || o.stderr.contains("No common ancestor") => {
+            Status::Dev { sha: sha.into() }
+        }
+        Ok(o) => Status::Unknown(first_line(&o.stderr)),
+        Err(e) => Status::Unknown(e.to_string()),
+    }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("gh failed").to_string()
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn cache_path() -> std::path::PathBuf {
+    paths::mu_home().join("update-check")
+}
+
+/// Cache line: `<unix>\t<sha of running build>\t<tag or ->\t<ahead>`; only available updates are stored.
+fn parse_cache(s: &str, sha: &str, at: u64) -> Option<Option<(String, u64)>> {
+    let mut f = s.trim().split('\t');
+    let ts: u64 = f.next()?.parse().ok()?;
+    if f.next()? != sha || at.saturating_sub(ts) > CACHE_TTL_SECS {
+        return None;
+    }
+    let tag = f.next()?;
+    let ahead: u64 = f.next()?.parse().ok()?;
+    Some((tag != "-").then(|| (tag.to_string(), ahead)))
+}
+
+/// The cached or freshly checked notice text, or `None` when up to date, unreachable, or a dev build.
+/// Blocking.
+pub fn startup_notice() -> Option<String> {
+    let sha = installed_sha();
+    if is_dev_sha(sha) {
+        return None;
+    }
+    let cached = std::fs::read_to_string(cache_path()).ok().and_then(|s| parse_cache(&s, sha, now()));
+    let avail = match cached {
+        Some(a) => a,
+        None => match check() {
+            Status::Available { tag, ahead } => Some((tag, ahead)),
+            Status::UpToDate { .. } | Status::NoReleases => None,
+            Status::Dev { .. } | Status::Unknown(_) => return None,
+        },
+    };
+    let (tag, ahead) = avail.clone().unwrap_or(("-".into(), 0));
+    let _ = std::fs::create_dir_all(paths::mu_home());
+    let _ = std::fs::write(cache_path(), format!("{}\t{sha}\t{tag}\t{ahead}\n", now()));
+    avail.map(|(tag, ahead)| Status::Available { tag, ahead }.describe())
+}
+
+/// `mu update [--check] [--force] [--tag T]`.
+pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
+    let st = check();
+    println!("{}", st.describe());
+    if check_only {
+        return Ok(0);
+    }
+    match (&st, &tag) {
+        (Status::UpToDate { .. } | Status::NoReleases, None) => return Ok(0),
+        (Status::Unknown(_), _) => bail!("not updating: cannot reach the release repo"),
+        (Status::Dev { .. }, _) if !force => bail!("not updating a dev build; pass --force to replace it"),
+        _ => {}
+    }
+    // The installer is fetched from the repo, as in the README, so it always matches the release layout.
+    let script = gh(&["api", &format!("repos/{REPO}/contents/scripts/install.sh"), "-H", "Accept: application/vnd.github.raw"])?;
+    if !script.ok || script.stdout.is_empty() {
+        bail!("could not fetch install.sh: {}", first_line(&script.stderr));
+    }
+    let mut cmd = Command::new("bash");
+    cmd.args(["-s", "--"]);
+    if let Some(t) = &tag {
+        cmd.args(["--tag", t]);
+    }
+    let mut child = cmd.stdin(Stdio::piped()).spawn()?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("piped");
+        stdin.write_all(script.stdout.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+    let status = child.wait()?;
+    let _ = std::fs::remove_file(cache_path());
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_sha_parses_release_tags() {
+        assert_eq!(tag_sha("mu-20261026-799ca34"), Some("799ca34"));
+        assert_eq!(tag_sha("mu-20261026"), None);
+        assert_eq!(tag_sha("v1"), None);
+    }
+
+    #[test]
+    fn classify_maps_compare_status() {
+        let t = "mu-20261026-799ca34";
+        assert_eq!(classify(t, "ahead", 3, "abc"), Status::Available { tag: t.into(), ahead: 3 });
+        assert_eq!(classify(t, "identical", 0, "abc"), Status::UpToDate { tag: t.into() });
+        assert_eq!(classify(t, "behind", 2, "abc"), Status::UpToDate { tag: t.into() });
+        assert_eq!(classify(t, "diverged", 1, "abc"), Status::Dev { sha: "abc".into() });
+    }
+
+    #[test]
+    fn dev_shas() {
+        assert!(is_dev_sha("unknown"));
+        assert!(is_dev_sha("abc123-dirty"));
+        assert!(!is_dev_sha("799ca34873a1"));
+    }
+
+    #[test]
+    fn cache_respects_ttl_and_sha() {
+        let line = "1000\tabc\tmu-1-abcdef0\t2\n";
+        assert_eq!(parse_cache(line, "abc", 1500), Some(Some(("mu-1-abcdef0".into(), 2))));
+        assert_eq!(parse_cache(line, "other", 1500), None);
+        assert_eq!(parse_cache(line, "abc", 1000 + CACHE_TTL_SECS + 1), None);
+        assert_eq!(parse_cache("1000\tabc\t-\t0\n", "abc", 1500), Some(None));
+        assert_eq!(parse_cache("junk", "abc", 1500), None);
+    }
+
+    #[test]
+    fn describe_pluralises() {
+        let s = Status::Available { tag: "t".into(), ahead: 1 }.describe();
+        assert!(s.contains("1 commit ahead"));
+    }
+}

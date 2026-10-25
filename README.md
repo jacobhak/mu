@@ -14,6 +14,10 @@ scripts/install.sh --from-source .            # build and install a checkout
 
 This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). The memory plugin is skipped without Bun on PATH. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
 
+### Updating
+
+`mu update` installs the latest release (it runs the repo's `install.sh` through `gh`, so it needs an authenticated `gh`). `mu update --check` only reports; `--tag mu-YYYYMMDD-<sha7>` picks a release; `--force` replaces a dev build, which is otherwise refused. On startup the TUI checks for a newer release at most once a day (cached in `~/.mu/update-check`) and shows a notice; it stays silent when offline, without `gh`, or on a dev build. Turn it off with `[update] check = false` in config.toml.
+
 ### Pinned omp
 
 `upstream.toml` pins one oh-my-pi release for everything mu uses: the Rust crates (`tag = "v<ver>"` in `Cargo.toml`), `@oh-my-pi/pi-mnemopi` in `plugins/memory`, and the `omp` CLI mu runs as a subprocess. mu runs `$MU_OMP`, else `~/.mu/bin/omp`, else `omp` on PATH, so the `omp` you use interactively can update itself without affecting mu. `scripts/fetch-omp.sh <ver> <dest>` installs a checksummed omp binary.

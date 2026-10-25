@@ -20,6 +20,7 @@ mod pty;
 mod session;
 mod tools;
 mod tui;
+mod update;
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -63,6 +64,24 @@ struct Cli {
     /// Serve the Agent Client Protocol over stdio.
     #[arg(long)]
     acp: bool,
+    #[command(subcommand)]
+    command: Option<Sub>,
+}
+
+#[derive(clap::Subcommand)]
+enum Sub {
+    /// Check for a newer release and install it (needs an authenticated `gh`).
+    Update {
+        /// Only report whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+        /// Replace a dev build.
+        #[arg(long)]
+        force: bool,
+        /// Install this release tag instead of the latest.
+        #[arg(long)]
+        tag: Option<String>,
+    },
 }
 
 /// Everything a session needs that depends only on the working directory.
@@ -71,6 +90,7 @@ struct Setup {
     ctx: Rc<context::Context>,
     host: Rc<plugin::PluginHost>,
     providers: Rc<provider::Providers>,
+    notice_tx: tokio::sync::mpsc::UnboundedSender<String>,
     notice_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
@@ -83,12 +103,12 @@ fn setup(cwd: &std::path::Path) -> Setup {
     let host = plugin::PluginHost::new(
         manifests,
         warnings,
-        notice_tx,
+        notice_tx.clone(),
         plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
     );
     let providers = Rc::new(provider::Providers::new(cfgs.clone(), gateway::GatewaySource::new(host.clone())));
     host.set_providers(&providers);
-    Setup { cfgs, ctx, host, providers, notice_rx }
+    Setup { cfgs, ctx, host, providers, notice_tx, notice_rx }
 }
 
 /// Model and thinking level for a new agent: `sel` (command line or headless role) beats the `default` role.
@@ -141,12 +161,25 @@ fn run() -> Result<i32> {
     if let Some(t) = &cli.theme {
         unsafe { std::env::set_var("MU_THEME", t) };
     }
+    if let Some(Sub::Update { check, force, tag }) = cli.command {
+        return update::run(check, force, tag);
+    }
     let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
     if cli.acp {
         return acp::run(cli.model, cli_thinking);
     }
     let cwd = std::env::current_dir()?;
-    let Setup { cfgs, ctx, host, providers, notice_rx } = setup(&cwd);
+    let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup(&cwd);
+    if cli.print.is_none() && !cli.headless && cfgs.mu.update.check {
+        // Background release check at most once a day; silent when offline or on a dev build.
+        let tx = notice_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(n) = update::startup_notice() {
+                let _ = tx.send(n);
+            }
+        });
+    }
+    drop(notice_tx);
 
     let mut task_payload: Option<serde_json::Value> = None;
     let mut sel = cli.model.clone();

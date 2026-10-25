@@ -269,7 +269,7 @@ impl Server {
     /// Starts an agent for `cwd` and waits until its session file exists. Replayed history, if
     /// requested, is streamed before this returns. Yields the ACP session id.
     async fn open(&mut self, cwd: PathBuf, resume: Option<PathBuf>, replay: bool) -> Result<String> {
-        let Setup { cfgs, ctx, host, providers, notice_rx } = setup(&cwd);
+        let Setup { cfgs, ctx, host, providers, notice_rx, .. } = setup(&cwd);
         let (spec, thinking) = pick_model(&cfgs, &providers, self.model.clone(), self.thinking)?;
         let (ev_tx, mut ev_rx) = unbounded_channel();
         let (cmd_tx, cmd_rx) = unbounded_channel();

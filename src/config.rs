@@ -141,6 +141,20 @@ pub struct MuConfig {
     pub compaction: MuCompaction,
     pub predict: MuPredict,
     pub theme: MuTheme,
+    pub update: MuUpdate,
+}
+
+/// `[update]`: `check = false` turns off the daily release check at startup.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct MuUpdate {
+    pub check: bool,
+}
+
+impl Default for MuUpdate {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 /// `[theme]`: palette source, accent and card style.
