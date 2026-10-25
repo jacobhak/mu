@@ -62,6 +62,7 @@ pub struct Agent {
     git: Option<GitInfo>,
     quota: Option<ProviderUsage>,
     quota_at: Option<Instant>,
+    quota_failures: u32,
     turn_msgs: Vec<Value>,
     jobs: Option<Rc<JobsHandle>>,
     wake_rx: Option<UnboundedReceiver<()>>,
@@ -90,6 +91,14 @@ enum Flow {
     Done,
     Aborted,
     Failed,
+}
+
+/// Quota refresh cadence: a minute after success; 5s, 10s, 20s, 40s, then a minute after failures.
+fn quota_interval(failures: u32) -> Duration {
+    match failures {
+        0 => Duration::from_secs(60),
+        n => Duration::from_secs(5u64 << (n - 1).min(4)).min(Duration::from_secs(60)),
+    }
 }
 
 async fn recv_opt(rx: &mut Option<UnboundedReceiver<()>>) -> Option<()> {
@@ -156,6 +165,7 @@ impl Agent {
             git: None,
             quota: None,
             quota_at: None,
+            quota_failures: 0,
             turn_msgs: Vec::new(),
             jobs: None,
             wake_rx: None,
@@ -264,15 +274,30 @@ impl Agent {
         }
     }
 
-    /// Git and quota state for the status line. Runs between turns, never from the draw path.
-    /// Quota is fetched at most once a minute, and only from an already-running gateway.
+    /// Git state for the status line. Runs between turns, never from the draw path.
     async fn refresh_external(&mut self) {
-        const QUOTA_INTERVAL: Duration = Duration::from_secs(60);
         self.git = gitinfo::git_status(&self.cwd).await;
-        let stale = self.quota_at.is_none_or(|t| t.elapsed() >= QUOTA_INTERVAL);
-        if stale {
-            self.quota_at = Some(Instant::now());
-            self.quota = quota::fetch(&self.model.provider).await;
+        if self.quota_wait().is_zero() {
+            self.refresh_quota().await;
+        }
+    }
+
+    /// Time until the next quota fetch is due.
+    fn quota_wait(&self) -> Duration {
+        let Some(at) = self.quota_at else { return Duration::ZERO };
+        quota_interval(self.quota_failures).saturating_sub(at.elapsed())
+    }
+
+    /// Only a gateway that is already running is queried. Failures retry on a short backoff.
+    async fn refresh_quota(&mut self) {
+        let got = quota::fetch(&self.model.provider).await;
+        self.quota_at = Some(Instant::now());
+        match got {
+            Some(q) => {
+                self.quota_failures = 0;
+                self.quota = Some(q);
+            }
+            None => self.quota_failures = self.quota_failures.saturating_add(1),
         }
     }
 
@@ -348,6 +373,9 @@ impl Agent {
             Ok((spec, level)) => {
                 if let Some(s) = self.session.as_mut() {
                     s.model_change(&spec.id);
+                }
+                if self.model.provider != spec.provider {
+                    self.quota_at = None;
                 }
                 self.model = spec;
                 if let Some(l) = level {
@@ -525,6 +553,11 @@ impl Agent {
         loop {
             let cmd = tokio::select! {
                 c = rx.recv() => match c { Some(c) => c, None => break },
+                () = tokio::time::sleep(self.quota_wait()) => {
+                    self.refresh_quota().await;
+                    self.emit_status();
+                    continue;
+                }
                 Some((sid, t)) = title_rx.recv() => {
                     self.apply_title(&sid, t);
                     continue;
@@ -868,5 +901,17 @@ impl Agent {
             output: ToolOutput { text: out.text.clone(), is_error: out.is_error, display: out.display.clone(), details: out.details.clone() },
         });
         out
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn quota_retries_fast_then_settles() {
+        let s: Vec<u64> = (0..7).map(|n| quota_interval(n).as_secs()).collect();
+        assert_eq!(s, [60, 5, 10, 20, 40, 60, 60]);
+        assert_eq!(quota_interval(u32::MAX).as_secs(), 60);
     }
 }
