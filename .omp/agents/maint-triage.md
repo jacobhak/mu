@@ -13,9 +13,13 @@ Decide whether the upgrade changes mu-observable behaviour. It does if it change
 - the auth-broker / auth-gateway protocol or token handling
 - crate APIs or semantics that mu calls (pi-edit, pi-shell, pi-diff, pi-walker, brush-core)
 - the mnemopi storage format
-- defaults users see through mu (models, roles, pricing, prompts)
+- prompts or defaults that mu itself ships to the model, or hands to omp, and that change what the agent does (not mere catalog data)
 
-Pure internal refactors, fixes to features mu does not use, docs and new features mu does not call are NOT behaviour changes. When unsure, say true.
+These are NOT behaviour changes, even though they show up in mu:
+- catalog data: models added, removed or re-priced, changed default or role models, new capability axes. mu displays what `models ls --json` returns. It is a change only if the JSON shape or field names mu parses (`src/pricing.rs`) change.
+- internal refactors, fixes to features mu does not use, docs, TUI and ACP/RPC changes, and new features mu does not call.
+
+Decide from evidence: grep mu's source for the affected API before calling it a change. If a diff is `[truncated]` or empty for a surface that mu couples to (`cli.diff`, `crates.diff`), say so in the summary and set risk to at least medium, but do not set `behaviour_change` true on that alone. When you cannot tell whether a change to a coupled surface alters what mu parses or calls, say true.
 
 Do not modify anything. Be brief.
 
