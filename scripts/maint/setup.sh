@@ -15,10 +15,18 @@ REPO=jacobhak/mu
 mkdir -p "$MAINT"
 
 [ -d "$CLONE/.git" ] || git clone "https://github.com/$REPO.git" "$CLONE"
-git -C "$CLONE" config credential.helper '!gh auth git-credential'
-git -C "$CLONE" config user.name "mu-maint"
+# Private gitconfig for the bot (the unit sets GIT_CONFIG_GLOBAL to it), so a
+# user-level url.insteadOf https->ssh rewrite can't make unattended runs hang on ssh-agent.
 email="$(git config --global user.email || true)"
-[ -n "$email" ] && git -C "$CLONE" config user.email "$email"
+cat > "$MAINT/gitconfig" <<EOC
+[credential "https://github.com"]
+	helper =
+	helper = !$(command -v gh) auth git-credential
+[user]
+	name = mu-maint
+	email = ${email:-mu-maint@localhost}
+EOC
+git -C "$CLONE" remote set-url origin "https://github.com/$REPO.git"
 
 [ -f "$MAINT/config.env" ] || echo "OMP_PROFILE=$profile" > "$MAINT/config.env"
 [ -f "$MAINT/digest-last" ] || sed -n 's/^omp = "\(.*\)"/\1/p' "$here/../../upstream.toml" > "$MAINT/digest-last"

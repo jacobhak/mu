@@ -3,8 +3,9 @@ Description=mu maintenance bot (%i)
 [Service]
 Type=oneshot
 Environment=PATH=%h/.mu/bin:%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GIT_CONFIG_GLOBAL=%h/.mu/maint/gitconfig GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1
 EnvironmentFile=-%h/.mu/maint/config.env
 WorkingDirectory=%h/.mu/maint/mu
 ExecStart=/bin/bash -c 'git fetch -q origin && git reset -q --hard origin/main && exec scripts/maint/run.sh %i'
-TimeoutStartSec=4h
+TimeoutStartSec=2h
 Nice=10
