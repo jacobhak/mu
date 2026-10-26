@@ -1,23 +1,29 @@
+mod acp;
 mod agent;
 mod compaction;
 mod config;
 mod context;
-mod acp;
+mod cost;
 mod events;
-mod gitinfo;
 mod gateway;
+mod gitinfo;
 mod headless;
 mod image;
 mod jobs;
+mod jsoncache;
 mod mem;
 mod message;
 mod models;
-mod pricing;
 mod plugin;
-mod quota;
+mod policy;
+mod pricing;
+mod proc;
 mod provider;
 mod pty;
+mod quota;
 mod session;
+#[cfg(test)]
+mod testutil;
 mod tools;
 mod tui;
 mod update;
@@ -94,11 +100,39 @@ struct Setup {
     notice_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
+/// Prints notices to stderr until told to stop, then prints whatever is still queued.
+fn spawn_notice_printer(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (done, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::task::spawn_local(async move {
+        loop {
+            tokio::select! {
+                n = rx.recv() => match n {
+                    Some(n) => eprintln!("{n}"),
+                    None => break,
+                },
+                _ = &mut done_rx => {
+                    while let Ok(n) = rx.try_recv() {
+                        eprintln!("{n}");
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    (done, handle)
+}
+
 fn setup(cwd: &std::path::Path) -> Setup {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let cfgs = Rc::new(config::Configs::load());
-    let ctx = Rc::new(context::Context::load_all(cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user));
+    let ctx =
+        Rc::new(context::Context::load_all(cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user));
     let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    for w in cfgs.warnings.iter().chain(&ctx.warnings) {
+        let _ = notice_tx.send(format!("warning: {w}"));
+    }
     let (manifests, warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
     let host = plugin::PluginHost::new(
         manifests,
@@ -139,7 +173,11 @@ fn agent_selector(def: &context::AgentDef, cfgs: &config::Configs) -> Option<Str
 fn apply_agent(agent: &mut agent::Agent, def: &context::AgentDef) {
     agent.allow = def.tools.clone();
     agent.excluded = vec!["ask", "propose_plan"];
-    agent.agent_prompt = Some(format!("\nYou are running as the custom agent `{0}`. Follow its instructions exactly; they override your defaults.\n<agent name=\"{0}\">\n{1}\n</agent>\n", def.name, def.prompt.trim()));
+    agent.agent_prompt = Some(format!(
+        "\nYou are running as the custom agent `{0}`. Follow its instructions exactly; they override your defaults.\n<agent name=\"{0}\">\n{1}\n</agent>\n",
+        def.name,
+        def.prompt.trim()
+    ));
 }
 
 fn main() {
@@ -187,13 +225,16 @@ fn run() -> Result<i32> {
     if let Some(name) = &cli.agent {
         match ctx.agents.iter().find(|a| &a.name == name) {
             Some(d) => agent_def = Some(d.clone()),
-            None => bail!("unknown agent `{name}`; looked in .omp/agents and {}/agents", paths::omp_agent_dir().display()),
+            None => {
+                bail!("unknown agent `{name}`; looked in .omp/agents and {}/agents", paths::omp_agent_dir().display())
+            }
         }
     }
     if cli.headless {
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-        let p: serde_json::Value = serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
+        let p: serde_json::Value =
+            serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
         let role = if p["agent"] == "scout" { "smol" } else { "task" };
         if let Some(name) = p["agent"].as_str().filter(|n| !matches!(*n, "task" | "scout")) {
             match ctx.agents.iter().find(|a| a.name == name) {
@@ -217,8 +258,8 @@ fn run() -> Result<i32> {
     let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;
     let resume = match (&cli.resume, cli.continue_latest) {
         (Some(Some(p)), _) => match session::find(&cwd, p) {
-            Some(f) => Some(f),
-            None => bail!("session {} not found", p.display()),
+            Ok(f) => Some(f),
+            Err(e) => bail!("{e}"),
         },
         (_, true) => match session::latest_for(&cwd) {
             Some(p) => Some(p),
@@ -258,6 +299,10 @@ fn run() -> Result<i32> {
     if let Some(d) = &agent_def {
         apply_agent(&mut agent, d);
     }
+    if cli.print.is_some() && !agent.excluded.contains(&"ask") {
+        // No one can answer in `-p` mode.
+        agent.excluded.push("ask");
+    }
     if cli.print.is_none() && task_payload.is_none() {
         agent.enable_jobs();
     }
@@ -268,27 +313,20 @@ fn run() -> Result<i32> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
     let code = local.block_on(&rt, async move {
-        let mut notice_rx = notice_rx;
+        let notice_rx = notice_rx;
         let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
         let (print, max_cost) = (cli.print, cli.max_cost);
+        let mut printer = None;
         let code = match (print, task_payload) {
             (_, Some(p)) => {
-                tokio::task::spawn_local(async move {
-                    while let Some(n) = notice_rx.recv().await {
-                        eprintln!("{n}");
-                    }
-                });
+                printer = Some(spawn_notice_printer(notice_rx));
                 let ctx = p["context"].as_str().filter(|c| !c.is_empty());
                 let task = p["task"].as_str().unwrap_or("");
                 let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
                 headless::subagent_mode(prompt, cmd_tx, ev_rx).await
             }
             (Some(prompt), None) => {
-                tokio::task::spawn_local(async move {
-                    while let Some(n) = notice_rx.recv().await {
-                        eprintln!("{n}");
-                    }
-                });
+                printer = Some(spawn_notice_printer(notice_rx));
                 headless::print_mode(prompt, cmd_tx, ev_rx, inbox.clone(), max_cost).await
             }
             (None, None) => {
@@ -308,8 +346,19 @@ fn run() -> Result<i32> {
                 .await
             }
         };
-        let _ = agent_task.await;
+        let code = match agent_task.await {
+            Err(e) => {
+                eprintln!("mu: agent task failed: {e}");
+                1
+            }
+            Ok(()) => code,
+        };
         host.shutdown_all().await;
+        // Notices raised during shutdown are printed before the process exits.
+        if let Some((done, handle)) = printer {
+            let _ = done.send(());
+            let _ = handle.await;
+        }
         code
     });
     Ok(code)

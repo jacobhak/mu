@@ -46,16 +46,14 @@ impl State {
         if text.is_empty() {
             return None;
         }
-        let lower = text.to_lowercase();
         let (best, _) = self
             .lines
             .get(cwd)?
             .iter()
-            .filter(|(e, n)| **n >= 2 && e.len() > text.len() && e.to_lowercase().starts_with(&lower))
+            // Exact case: a candidate that differs only in case could never be shown as a suffix, and
+            // picking it as the maximum used to hide valid ones.
+            .filter(|(e, n)| **n >= 2 && e.len() > text.len() && e.starts_with(text))
             .max_by(|(a, na), (b, nb)| na.cmp(nb).then(a.len().cmp(&b.len())).then(b.cmp(a)))?;
-        if !best.starts_with(text) {
-            return None;
-        }
         Some(best[text.len()..].to_owned())
     }
 
@@ -70,7 +68,8 @@ impl State {
 /// letter) and the preceding text capped to its last 2000 chars. Words glued to code or paths
 /// (`src/fo`, `a_b`, `v2x`) are skipped.
 pub fn split_word(text: &str) -> Option<(&str, &str)> {
-    let start = text.char_indices().rev().take_while(|(_, c)| c.is_alphabetic() || *c == '\'').last().map(|(i, _)| i)?;
+    let start =
+        text.char_indices().rev().take_while(|(_, c)| c.is_alphabetic() || *c == '\'').last().map(|(i, _)| i)?;
     let prefix = &text[start..];
     if !prefix.chars().any(char::is_alphabetic) {
         return None;
@@ -125,7 +124,8 @@ pub fn reply_ghost(text: &str, assistant: &str) -> Option<String> {
         let e = seen.entry(t).or_default();
         *e = (e.0 + 1, i);
     }
-    let (best, _) = seen.into_iter().filter(|(t, _)| t.len() > tail.len() && t.starts_with(tail)).max_by_key(|&(_, v)| v)?;
+    let (best, _) =
+        seen.into_iter().filter(|(t, _)| t.len() > tail.len() && t.starts_with(tail)).max_by_key(|&(_, v)| v)?;
     Some(best[tail.len()..].to_owned())
 }
 
@@ -147,6 +147,19 @@ mod tests {
         assert_eq!(s.complete("comm", "/x", "", 0.3), "it and push");
         assert_eq!(s.line_ghost("comm", "/y"), None);
         assert_eq!(s.line_ghost("COMM", "/x"), None, "casing must match");
+    }
+
+    #[test]
+    fn a_case_variant_does_not_hide_a_valid_candidate() {
+        let mut s = state();
+        // "Commit" is more frequent but cannot continue "comm"; "commit" can.
+        for _ in 0..5 {
+            s.observe("Commit all of it now please", "/z");
+        }
+        for _ in 0..2 {
+            s.observe("commit it", "/z");
+        }
+        assert_eq!(s.line_ghost("comm", "/z"), Some("it it".into()));
     }
 
     #[test]

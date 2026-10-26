@@ -21,6 +21,9 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 const MAX_PENDING: usize = 64 * 1024 * 1024;
 
 pub enum Input {
+    /// A terminal control sequence the parser wants sent back (e.g. a clipboard request); the
+    /// app writes it, so this module never touches the terminal's output.
+    Reply(String),
     Term(Event),
     PasteText(String),
     PasteImage(Image),
@@ -32,6 +35,8 @@ pub struct Reader {
     parser: Parser,
     winch: Signal,
     queue: VecDeque<Input>,
+    /// Read buffer, kept across reads instead of allocating 64 KB per call.
+    buf: Vec<u8>,
 }
 
 /// How readiness of the tty is learned. epoll (Linux) lets tokio watch the fd; kqueue (macOS) cannot register
@@ -69,8 +74,11 @@ impl Reader {
     /// which stdout and stderr usually share with stdin, and non-blocking stdout would fail writes with
     /// `EAGAIN`. Children (editor, `omp login`) also keep a blocking stdin.
     pub fn new() -> io::Result<Self> {
-        // SAFETY: plain open(2) with a NUL-terminated literal path.
-        let raw: RawFd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        let shared = term::tty().ok_or_else(|| io::Error::other("no controlling terminal"))?;
+        // A duplicate of the shared handle: same open file description (so the same non-blocking
+        // mode the colour probe used), owned separately so dropping the reader closes only this fd.
+        // SAFETY: plain dup(2) of a valid descriptor.
+        let raw: RawFd = unsafe { libc::fcntl(shared, libc::F_DUPFD_CLOEXEC, 3) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -86,20 +94,30 @@ impl Reader {
             // SAFETY: `owned` is the only owner of the descriptor and stays open as long as the `AsyncFd`.
             Source::Async(unsafe { AsyncFd::register_with_interest(owned, tokio::io::Interest::READABLE) }?)
         };
-        Ok(Self { src, parser: Parser::default(), winch: signal(SignalKind::window_change())?, queue: VecDeque::new() })
+        Ok(Self {
+            src,
+            parser: Parser::default(),
+            winch: signal(SignalKind::window_change())?,
+            queue: VecDeque::new(),
+            buf: vec![0u8; 64 * 1024],
+        })
     }
 
     fn consume(&mut self, bytes: &[u8]) {
         let inputs = self.parser.feed(bytes);
-        for seq in self.parser.take_writes() {
-            term::write_terminal_seq(&seq);
-        }
+        self.queue.extend(self.parser.take_writes().into_iter().map(Input::Reply));
         self.queue.extend(inputs);
     }
 
     /// The next input, or `None` when the terminal closed.
     pub async fn next(&mut self) -> Option<Input> {
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = std::mem::take(&mut self.buf);
+        let r = self.next_with(&mut buf).await;
+        self.buf = buf;
+        r
+    }
+
+    async fn next_with(&mut self, buf: &mut [u8]) -> Option<Input> {
         loop {
             if let Some(i) = self.queue.pop_front() {
                 return Some(i);
@@ -108,10 +126,10 @@ impl Reader {
             match &mut self.src {
                 Source::Async(fd) => {
                     tokio::select! {
-                        _ = winch.recv() => self.queue.push_back_resize(),
+                        _ = winch.recv() => push_resize(&mut self.queue),
                         ready = fd.readable() => {
                             let mut guard = ready.ok()?;
-                            let res = guard.try_io(|fd| read_fd(fd.as_raw_fd(), &mut buf));
+                            let res = guard.try_io(|fd| read_fd(fd.as_raw_fd(), buf));
                             match res {
                                 Ok(Ok(0)) => return None,
                                 Ok(Ok(n)) => self.consume(&buf[..n]),
@@ -125,13 +143,13 @@ impl Reader {
                 }
                 Source::Select { fd, ready, ack } => {
                     tokio::select! {
-                        _ = winch.recv() => self.queue.push_back_resize(),
+                        _ = winch.recv() => push_resize(&mut self.queue),
                         got = ready.recv() => {
                             got?;
                             let raw = fd.as_raw_fd();
                             let mut chunks: Vec<Vec<u8>> = Vec::new();
                             loop {
-                                match read_fd(raw, &mut buf) {
+                                match read_fd(raw, buf) {
                                     Ok(0) => return None,
                                     Ok(n) => chunks.push(buf[..n].to_vec()),
                                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -157,32 +175,36 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
-trait PushResize {
-    fn push_back_resize(&mut self);
-}
-
-impl PushResize for VecDeque<Input> {
-    fn push_back_resize(&mut self) {
-        if let Ok((c, r)) = crossterm::terminal::size() {
-            self.push_back(Input::Term(Event::Resize(c, r)));
-        }
+fn push_resize(q: &mut VecDeque<Input>) {
+    if let Ok((c, r)) = crossterm::terminal::size() {
+        q.push_back(Input::Term(Event::Resize(c, r)));
     }
 }
+
+/// Prefix of the OSC the terminal answers a clipboard request with. Any other `ESC ]` is Alt+].
+const OSC_5522: &[u8] = b"\x1b]5522;";
+/// An OSC without a terminator stops being buffered at this size and is read as plain keys.
+const MAX_OSC: usize = 64 * 1024;
 
 #[derive(Default)]
 struct Parser {
     buf: Vec<u8>,
     paste: Paste5522,
     writes: Vec<String>,
+    /// Where the search for a paste end / OSC terminator resumes, so a long paste arriving in
+    /// many chunks is not rescanned from the start each time.
+    scan_from: usize,
+    /// A paste outgrew `MAX_PENDING`: its remaining bytes are dropped up to the end marker.
+    discarding_paste: bool,
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
 }
 
-/// Index just past the OSC terminator (BEL or ST) at or after byte 2, and the payload end.
-fn osc_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 2;
+/// Index just past the OSC terminator (BEL or ST) at or after `from` (at least byte 2), and the payload end.
+fn osc_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from.max(2);
     while i < buf.len() {
         match buf[i] {
             0x07 => return Some((i, i + 1)),
@@ -201,24 +223,81 @@ impl Parser {
     /// Consumes `chunk` (one `read`), returning every complete input. Incomplete sequences stay
     /// buffered for the next chunk; a lone ESC at the end of the data is an Escape key press.
     fn feed(&mut self, chunk: &[u8]) -> Vec<Input> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        let mut chunk = chunk;
+        if self.discarding_paste {
+            // Skip to the end marker; it can be split across chunks, so keep a short tail.
+            self.buf.extend_from_slice(chunk);
+            match find(&self.buf, PASTE_END, 0) {
+                Some(end) => {
+                    self.discarding_paste = false;
+                    self.buf.drain(..end + PASTE_END.len());
+                    chunk = &[];
+                }
+                None => {
+                    let keep = PASTE_END.len() - 1;
+                    let cut = self.buf.len().saturating_sub(keep);
+                    self.buf.drain(..cut);
+                    return out;
+                }
+            }
+        }
+        self.buf.extend_from_slice(chunk);
         'next: while !self.buf.is_empty() {
             if self.buf.starts_with(b"\x1b]") {
-                let Some((end, next)) = osc_end(&self.buf) else { break };
-                let body = String::from_utf8_lossy(&self.buf[2..end]).into_owned();
-                self.buf.drain(..next);
-                if let Some(rest) = body.strip_prefix("5522;") {
-                    let (input, writes) = self.paste.handle(rest);
-                    self.writes.extend(writes);
-                    out.extend(input);
+                let prefix_len = OSC_5522.len().min(self.buf.len());
+                if self.buf[..prefix_len] == OSC_5522[..prefix_len] && self.buf.len() >= 3 {
+                    // Possibly the clipboard reply (or the start of it): buffer until its terminator.
+                    if self.buf.len() >= OSC_5522.len() {
+                        match osc_end(&self.buf, self.scan_from) {
+                            Some((end, next)) => {
+                                let body = String::from_utf8_lossy(&self.buf[2..end]).into_owned();
+                                self.buf.drain(..next);
+                                self.scan_from = 0;
+                                if let Some(rest) = body.strip_prefix("5522;") {
+                                    let (input, writes) = self.paste.handle(rest);
+                                    self.writes.extend(writes);
+                                    out.extend(input);
+                                }
+                                continue;
+                            }
+                            None if self.buf.len() <= MAX_OSC => {
+                                self.scan_from = self.buf.len().saturating_sub(1);
+                                break;
+                            }
+                            None => {
+                                // Never terminated: stop treating it as an OSC; its bytes become keys.
+                                self.scan_from = 0;
+                                self.buf.drain(..2);
+                                out.push(Input::Term(Event::Key(crossterm::event::KeyEvent::new(
+                                    crossterm::event::KeyCode::Char(']'),
+                                    crossterm::event::KeyModifiers::ALT,
+                                ))));
+                                continue;
+                            }
+                        }
+                    }
+                    break; // a partial prefix such as `ESC ] 5`: wait for the rest
                 }
-                continue;
+                // Any other `ESC ]` is Alt+]: fall through to the key parser.
             }
             if self.buf.starts_with(PASTE_START) {
-                let Some(end) = find(&self.buf, PASTE_END, PASTE_START.len()) else { break };
+                let from = self.scan_from.max(PASTE_START.len());
+                let Some(end) = find(&self.buf, PASTE_END, from) else {
+                    if self.buf.len() > MAX_PENDING {
+                        // Too big to keep: drop the rest of this paste and say so.
+                        self.buf.clear();
+                        self.scan_from = 0;
+                        self.discarding_paste = true;
+                        out.push(Input::Status("paste truncated: too large".into()));
+                    } else {
+                        self.scan_from = self.buf.len().saturating_sub(PASTE_END.len() - 1);
+                    }
+                    break;
+                };
                 let text = String::from_utf8_lossy(&self.buf[PASTE_START.len()..end]).into_owned();
                 self.buf.drain(..end + PASTE_END.len());
+                self.scan_from = 0;
                 out.push(Input::Term(Event::Paste(text)));
                 continue;
             }
@@ -239,9 +318,6 @@ impl Parser {
             }
             break;
         }
-        if self.buf.len() > MAX_PENDING {
-            self.buf.clear();
-        }
         out
     }
 }
@@ -256,8 +332,17 @@ enum Kind {
 enum Paste5522 {
     #[default]
     Idle,
-    Listing { mimes: Vec<String>, dot_payload: bool, pw: Option<String>, loc: Option<String> },
-    Reading { kind: Kind, mime: String, bytes: Vec<u8> },
+    Listing {
+        mimes: Vec<String>,
+        dot_payload: bool,
+        pw: Option<String>,
+        loc: Option<String>,
+    },
+    Reading {
+        kind: Kind,
+        mime: String,
+        bytes: Vec<u8>,
+    },
 }
 
 const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
@@ -271,7 +356,8 @@ impl Paste5522 {
     /// terminal sequences to send back. A port of omp's `EnhancedPasteController`.
     fn handle(&mut self, body: &str) -> (Option<Input>, Vec<String>) {
         let (meta, payload) = body.split_once(';').unwrap_or((body, ""));
-        let meta: Vec<(&str, &str)> = meta.split(':').filter_map(|p| p.split_once('=').filter(|(k, _)| !k.is_empty())).collect();
+        let meta: Vec<(&str, &str)> =
+            meta.split(':').filter_map(|p| p.split_once('=').filter(|(k, _)| !k.is_empty())).collect();
         let get = |k: &str| meta.iter().find(|(m, _)| *m == k).map(|(_, v)| *v);
         if get("type") != Some("read") {
             return (None, vec![]);
@@ -320,10 +406,11 @@ impl Paste5522 {
                 }
             }
             Paste5522::Reading { mime: want, bytes, .. } => {
-                if *want == mime && !payload.is_empty() {
-                    if let Ok(chunk) = STANDARD_NO_PAD.decode(payload.trim_end_matches('=')) {
-                        bytes.extend(chunk);
-                    }
+                if *want == mime
+                    && !payload.is_empty()
+                    && let Ok(chunk) = STANDARD_NO_PAD.decode(payload.trim_end_matches('='))
+                {
+                    bytes.extend(chunk);
                 }
             }
         }
@@ -399,7 +486,10 @@ mod tests {
         assert!(same(&p.feed(b"\x1b[A"), &[key(KeyCode::Up)]));
         assert!(same(&p.feed(b"\x1b"), &[key(KeyCode::Esc)]));
         let got = p.feed(b"a\x1b[200~x\ny\x1b[201~b");
-        assert!(same(&got, &[key(KeyCode::Char('a')), Input::Term(Event::Paste("x\ny".into())), key(KeyCode::Char('b'))]));
+        assert!(same(
+            &got,
+            &[key(KeyCode::Char('a')), Input::Term(Event::Paste("x\ny".into())), key(KeyCode::Char('b'))]
+        ));
     }
 
     #[test]
@@ -409,6 +499,46 @@ mod tests {
         assert!(same(&p.feed(b"B"), &[key(KeyCode::Down)]));
         assert!(p.feed(b"\x1b[200~par").is_empty());
         assert!(same(&p.feed(b"t\x1b[201~"), &[Input::Term(Event::Paste("part".into()))]));
+    }
+
+    #[test]
+    fn alt_bracket_is_a_key_not_an_osc() {
+        let mut p = Parser::default();
+        let alt = |c| Input::Term(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)));
+        assert!(same(&p.feed(b"\x1b]"), &[alt(']')]));
+        assert!(same(&p.feed(b"\x1b]x"), &[alt(']'), key(KeyCode::Char('x'))]));
+        // An unterminated 5522 OSC is buffered, but only up to the cap.
+        assert!(p.feed(b"\x1b]5522;type=read").is_empty());
+        let out = p.feed(&vec![b'a'; MAX_OSC + 10]);
+        assert!(!out.is_empty(), "flushed as keys once the cap is passed");
+    }
+
+    #[test]
+    fn long_paste_in_many_chunks_is_scanned_incrementally() {
+        let mut p = Parser::default();
+        assert!(p.feed(PASTE_START).is_empty());
+        let t = std::time::Instant::now();
+        for _ in 0..2000 {
+            assert!(p.feed(&vec![b'x'; 8192]).is_empty());
+        }
+        let out = p.feed(b"\x1b[201~");
+        assert_eq!(out.len(), 1);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn oversized_paste_is_dropped_up_to_its_end_marker() {
+        let mut p = Parser::default();
+        p.feed(PASTE_START);
+        let mut statuses = 0;
+        for _ in 0..(MAX_PENDING / 65536 + 2) {
+            for i in p.feed(&vec![b'y'; 65536]) {
+                statuses += matches!(i, Input::Status(_)) as u32;
+            }
+        }
+        assert_eq!(statuses, 1);
+        let out = p.feed(b"tail\x1b[201~z");
+        assert!(same(&out, &[key(KeyCode::Char('z'))]), "text after the end marker is read normally");
     }
 
     fn osc(body: &str) -> Vec<u8> {

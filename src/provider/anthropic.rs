@@ -9,20 +9,26 @@ pub fn url(base: &str) -> String {
     format!("{base}/v1/messages")
 }
 
+/// The thinking budget must leave room for the answer: at most `max_tokens - 1024`, and
+/// Anthropic needs at least 1024. Below that, thinking is turned off for the request.
+pub fn clamp_budget(budget: Option<u32>, max_tokens: u32) -> Option<u32> {
+    let b = budget?.min(max_tokens.saturating_sub(1024));
+    (b >= 1024).then_some(b)
+}
+
 /// The gateway takes the full `provider/model` id and adds prompt caching itself.
 pub fn body(req: &Request) -> Value {
-    let th = match req.thinking.budget() {
+    let max_tokens = req.max_tokens.unwrap_or(req.model.max_output);
+    let budget = clamp_budget(req.thinking.budget(), max_tokens);
+    let th = match budget {
         Some(b) => json!({"type":"enabled","budget_tokens":b}),
         None => json!({"type":"disabled"}),
     };
-    let tools: Vec<Value> = req
-        .tools
-        .iter()
-        .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.schema}))
-        .collect();
+    let tools: Vec<Value> =
+        req.tools.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.schema})).collect();
     let mut body = json!({
         "model": req.model.id,
-        "max_tokens": req.max_tokens.unwrap_or(req.model.max_output),
+        "max_tokens": max_tokens,
         "stream": true,
         "system": [{"type":"text","text":req.system}],
         "thinking": th,
@@ -31,13 +37,22 @@ pub fn body(req: &Request) -> Value {
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    if req.thinking != Thinking::Off {
+    if req.thinking != Thinking::Off && budget.is_some() {
         body["output_config"] = json!({"effort": req.thinking.as_str()});
     }
     body
 }
 
 pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
+    // Backstop: never send unpaired tool calls/results, whatever the history holds.
+    let mut repaired;
+    let messages = if crate::message::check_tool_pairs(messages).is_err() {
+        repaired = messages.to_vec();
+        crate::message::repair_tool_pairs(&mut repaired);
+        &repaired[..]
+    } else {
+        messages
+    };
     let mut out: Vec<(String, Vec<Value>)> = Vec::new();
     let mut push = |role: &str, blocks: Vec<Value>| match out.last_mut() {
         Some((r, c)) if r == role => c.extend(blocks),
@@ -49,8 +64,13 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
                 let b: Vec<Value> = content
                     .iter()
                     .filter_map(|b| match b {
-                        Block::Text { text } => Some(json!({"type":"text","text":text})),
-                        Block::Image(i) => Some(json!({"type":"image","source":{"type":"base64","media_type":i.mime_type,"data":i.data}})),
+                        Block::Text { text } if !text.is_empty() => Some(json!({"type":"text","text":text})),
+                        Block::Image(i) => Some(match crate::image::resolve(&i.data) {
+                            Some(data) => {
+                                json!({"type":"image","source":{"type":"base64","media_type":i.mime_type,"data":data}})
+                            }
+                            None => json!({"type":"text","text":format!("[image unavailable: {}]", i.mime_type)}),
+                        }),
                         _ => None,
                     })
                     .collect();
@@ -65,6 +85,9 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
                     match blk {
                         Block::Thinking { thinking, thinking_signature: Some(sig) } if origin => {
                             b.push(json!({"type":"thinking","thinking":thinking,"signature":sig}))
+                        }
+                        Block::RedactedThinking { data } if origin => {
+                            b.push(json!({"type":"redacted_thinking","data":data}))
                         }
                         Block::Text { text } if !text.is_empty() => b.push(json!({"type":"text","text":text})),
                         Block::ToolCall { id, name, arguments } => {
@@ -87,7 +110,9 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
                     .collect();
                 push(
                     "user",
-                    vec![json!({"type":"tool_result","tool_use_id":normalize_id(tool_call_id),"content":c,"is_error":is_error})],
+                    vec![
+                        json!({"type":"tool_result","tool_use_id":normalize_id(tool_call_id),"content":c,"is_error":is_error}),
+                    ],
                 );
             }
         }
@@ -98,6 +123,7 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
 enum Open {
     Text(String),
     Thinking(String, Option<String>),
+    Redacted(String),
     Tool { id: String, name: String, json: String },
     Ignored,
 }
@@ -137,6 +163,7 @@ impl Assembler {
                 let open = match cb["type"].as_str() {
                     Some("text") => Open::Text(String::new()),
                     Some("thinking") => Open::Thinking(String::new(), None),
+                    Some("redacted_thinking") => Open::Redacted(cb["data"].as_str().unwrap_or_default().into()),
                     Some("tool_use") => {
                         let id: String = cb["id"].as_str().unwrap_or("").into();
                         let name: String = cb["name"].as_str().unwrap_or("").into();
@@ -169,6 +196,7 @@ impl Assembler {
             }
             "content_block_stop" => match self.blocks.remove(&idx) {
                 Some(Open::Text(text)) => self.done.push(Block::text(text)),
+                Some(Open::Redacted(data)) => self.done.push(Block::RedactedThinking { data }),
                 Some(Open::Thinking(thinking, sig)) => {
                     self.done.push(Block::Thinking { thinking, thinking_signature: sig })
                 }
@@ -210,7 +238,7 @@ impl Assembler {
             "message_stop" => {
                 return Ok(Some(Message::Assistant {
                     content: std::mem::take(&mut self.done),
-                    api: "anthropic-messages".into(),
+                    api: crate::models::API.into(),
                     provider: self.provider.clone(),
                     model: self.model.clone(),
                     usage: self.usage.clone(),
@@ -234,7 +262,11 @@ impl Assembler {
 
 impl Assembler {
     pub fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
-        for (_, data) in self.sse.push(chunk) {
+        let frames = self.sse.push(chunk);
+        if self.sse.overflow {
+            return Err(ProviderError::Fatal("stream frame larger than 16 MB".into()));
+        }
+        for (_, data) in frames {
             if let Some(m) = self.frame(&data, ev)? {
                 return Ok(Some(m));
             }
@@ -248,12 +280,7 @@ mod tests {
     use super::*;
 
     fn spec(provider: &str) -> ModelSpec {
-        ModelSpec {
-            id: format!("{provider}/m"),
-            provider: provider.into(),
-            context_window: 1000,
-            max_output: 100,
-        }
+        ModelSpec { id: format!("{provider}/m"), provider: provider.into(), context_window: 1000, max_output: 100 }
     }
 
     fn gw() -> ModelSpec {
@@ -294,8 +321,10 @@ mod tests {
         // split at every byte boundary, including mid-UTF-8 and mid-frame
         let singles: Vec<&[u8]> = all.chunks(1).collect();
         let split = run(&singles);
-        let (Message::Assistant { content: a, stop_reason: sa, usage: ua, .. }, Message::Assistant { content: b, stop_reason: sb, .. }) =
-            (&whole, &split)
+        let (
+            Message::Assistant { content: a, stop_reason: sa, usage: ua, .. },
+            Message::Assistant { content: b, stop_reason: sb, .. },
+        ) = (&whole, &split)
         else {
             panic!()
         };
@@ -330,7 +359,7 @@ mod tests {
     fn asst(blocks: Vec<Block>) -> Message {
         Message::Assistant {
             content: blocks,
-            api: "anthropic-messages".into(),
+            api: crate::models::API.into(),
             provider: "anthropic".into(),
             model: "m".into(),
             usage: Usage::default(),
@@ -372,12 +401,54 @@ mod tests {
 
     #[test]
     fn user_image_follows_text_block() {
-        use crate::events::UserInput;
-        let input = UserInput { text: "look".into(), images: vec![crate::message::Image { data: "QUJD".into(), mime_type: "image/png".into() }] };
+        use crate::message::UserInput;
+        let input = UserInput {
+            text: "look".into(),
+            images: vec![crate::message::Image { data: "QUJD".into(), mime_type: "image/png".into() }],
+        };
         let w = to_wire(&[Message::user_input(&input)], &gw());
         let c = w[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 2);
         assert_eq!(c[0]["type"], "text");
         assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::clamp_budget;
+
+    #[test]
+    fn budget_leaves_room_for_the_answer() {
+        assert_eq!(clamp_budget(Some(16000), 64000), Some(16000));
+        assert_eq!(clamp_budget(Some(16000), 8000), Some(6976));
+        assert_eq!(clamp_budget(Some(16000), 2000), None);
+        assert_eq!(clamp_budget(None, 64000), None);
+    }
+}
+
+#[cfg(test)]
+mod redacted_tests {
+    use super::*;
+
+    #[test]
+    fn redacted_thinking_round_trips_and_image_only_prompts_have_no_empty_text() {
+        let model =
+            ModelSpec { id: "anthropic/m".into(), provider: "anthropic".into(), context_window: 1, max_output: 1 };
+        let mut asm = Assembler::new(&model);
+        let mut ev = |_: StreamEvent| {};
+        let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"abc\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let msg = asm.feed(sse.as_bytes(), &mut ev).unwrap().expect("message");
+        let Message::Assistant { content, .. } = &msg else { panic!() };
+        assert!(matches!(&content[0], Block::RedactedThinking { data } if data == "abc"));
+        let w = to_wire(&[Message::user("hi"), msg], &model);
+        assert_eq!(w[1]["content"][0], json!({"type":"redacted_thinking","data":"abc"}));
+        let img = crate::message::UserInput {
+            text: String::new(),
+            images: vec![crate::message::Image { data: "x".into(), mime_type: "image/png".into() }],
+        };
+        let w = to_wire(&[Message::user_input(&img)], &model);
+        assert_eq!(w[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(w[0]["content"][0]["type"], "image");
     }
 }

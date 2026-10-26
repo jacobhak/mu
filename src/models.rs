@@ -150,7 +150,7 @@ mod tests {
             "providers:\n  modal:\n    models:\n      - id: a/b\n        contextWindow: 1000\n  openai-codex:\n    modelOverrides:\n      g:\n        contextWindow: 272000\n",
         )
         .unwrap();
-        Configs { omp, models, mu: MuConfig::default(), role_edits: Default::default() }
+        Configs { omp, models, mu: MuConfig::default(), ..Default::default() }
     }
 
     #[test]
@@ -164,8 +164,15 @@ mod tests {
     fn metadata_precedence() {
         let c = cfg();
         let (m, l) = resolve("@smol", &c, None).unwrap();
-        assert_eq!((l, m.id.as_str(), m.context_window, m.max_output), (Some(Thinking::High), "modal/a/b", 1000, 32000));
-        let gw = [GatewayModel { id: "anthropic/claude-sonnet-5-5".into(), context_length: Some(500), max_output_tokens: Some(9) }];
+        assert_eq!(
+            (l, m.id.as_str(), m.context_window, m.max_output),
+            (Some(Thinking::High), "modal/a/b", 1000, 32000)
+        );
+        let gw = [GatewayModel {
+            id: "anthropic/claude-sonnet-5-5".into(),
+            context_length: Some(500),
+            max_output_tokens: Some(9),
+        }];
         let (m, l) = resolve("@default:low", &c, Some(&gw)).unwrap();
         assert_eq!((m.context_window, m.max_output, l), (500, 9, Some(Thinking::Low)));
         let (m, _) = resolve("openai-codex/g", &c, Some(&gw)).unwrap();

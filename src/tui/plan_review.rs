@@ -7,7 +7,6 @@ use crate::events::PlanDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::ContentStyle;
 use std::path::PathBuf;
-use unicode_width::UnicodeWidthStr;
 
 pub struct Tier {
     pub role: String,
@@ -54,9 +53,18 @@ fn accent_bold() -> ContentStyle {
 }
 
 impl PlanReview {
-    pub fn new(title: String, uri: String, file: PathBuf, content: String, context: Option<(u64, u64)>, tiers: Vec<Tier>) -> Self {
+    pub fn new(
+        title: String,
+        uri: String,
+        file: PathBuf,
+        content: String,
+        context: Option<(u64, u64)>,
+        tiers: Vec<Tier>,
+    ) -> Self {
         let (keep, keep_off) = match context {
-            Some((t, w)) => (format!("Approve and keep context (~{} / {})", format_number(t), format_number(w)), t * 100 > 95 * w),
+            Some((t, w)) => {
+                (format!("Approve and keep context (~{} / {})", format_number(t), format_number(w)), t * 100 > 95 * w)
+            }
             None => ("Approve and keep context".to_string(), false),
         };
         let tier = tiers.iter().position(|t| t.role == "default").unwrap_or(0);
@@ -74,7 +82,7 @@ impl PlanReview {
                 ("Approve and execute".into(), false),
                 ("Approve and compact context".into(), false),
                 (keep, keep_off),
-                ("Refine plan".into(), false),
+                (REFINE_LABEL.into(), false),
             ],
             sel: 0,
             tiers,
@@ -242,13 +250,20 @@ impl PlanReview {
             out.push(line::truncate(&styled(format!("  ↳ {}", self.tiers[self.tier].detail), |_| dim()), width));
         }
         let first_action = out.len();
+        // Where the text cursor goes: measured on the row as it is built, so it cannot drift from
+        // what is drawn.
+        let mut edit_cursor: Option<(usize, usize)> = None;
         for (i, (label, off)) in self.actions.iter().enumerate() {
             let selected = i == self.sel;
             let focused = selected && self.focus == Focus::Actions;
             let marker_style = if focused { theme::get().fg(Role::Accent) } else { dim() };
             let mut l: Line = vec![span(if selected { "❯ " } else { "  " }, marker_style)];
-            if i == 3 && self.editing {
-                l.push(span(format!("{label}: {}", self.text), if focused { line::bold() } else { ContentStyle::default() }));
+            if i == REFINE && self.editing {
+                l.push(span(
+                    format!("{label}: {}", self.text),
+                    if focused { line::bold() } else { ContentStyle::default() },
+                ));
+                edit_cursor = Some((out.len(), line::line_width(&l).min(width.saturating_sub(1))));
                 if self.text.is_empty() {
                     l.push(span("type feedback", dim()));
                 }
@@ -282,15 +297,17 @@ impl PlanReview {
         };
         out.push(line::truncate(&styled(help.join(" · "), |_| dim()), width));
 
-        let cur = if self.editing {
-            let w = format!("❯ Refine plan: {}", self.text).width();
-            (first_action + 3, w.min(width.saturating_sub(1)))
-        } else {
-            (first_action + self.sel, 0)
+        let cur = match edit_cursor.filter(|_| self.editing) {
+            Some(c) => c,
+            None => (first_action + self.sel, 0),
         };
         (out, cur)
     }
 }
+
+/// The action that takes free-text feedback, its label and its row among the actions.
+const REFINE_LABEL: &str = "Refine plan";
+const REFINE: usize = 3;
 
 #[cfg(test)]
 mod tests {
@@ -305,7 +322,10 @@ mod tests {
     }
 
     fn tiers() -> Vec<Tier> {
-        ["smol", "default"].iter().map(|r| Tier { role: r.to_string(), detail: "d".into(), model: Some(format!("@{r}")) }).collect()
+        ["smol", "default"]
+            .iter()
+            .map(|r| Tier { role: r.to_string(), detail: "d".into(), model: Some(format!("@{r}")) })
+            .collect()
     }
 
     #[test]
@@ -351,16 +371,24 @@ mod tests {
         assert!(!r.editing);
         r.on_key(key(KeyCode::Enter));
         r.on_key(key(KeyCode::Char('x')));
+        let (rows, (row, col)) = r.render(60, 30);
+        let text = line::line_text(&rows[row]);
+        assert!(text.starts_with(&format!("❯ {REFINE_LABEL}: x")), "{text:?}");
+        assert_eq!(col, line::line_width(&vec![span(format!("❯ {REFINE_LABEL}: x"), ContentStyle::default())]));
         assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Refine(t)) if t == "x"));
     }
 
     #[test]
     fn tier_model() {
         let mut r = review("x", None, tiers());
-        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: Some(m) }) if m == "@default"));
+        assert!(
+            matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: Some(m) }) if m == "@default")
+        );
         let mut r = review("x", None, tiers());
         r.on_key(key(KeyCode::Left));
-        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: Some(m) }) if m == "@smol"));
+        assert!(
+            matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: Some(m) }) if m == "@smol")
+        );
         let mut r = review("x", None, tiers().into_iter().take(1).collect());
         assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: None })));
     }

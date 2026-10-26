@@ -18,7 +18,7 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
         if cwd.starts_with(home) && dir == home {
             break;
         }
-        if dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+        if dir != cwd && dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
             continue;
         }
         let omp = (!took_omp).then(|| non_empty(&dir.join(".omp/AGENTS.md"))).flatten();
@@ -36,14 +36,14 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     near_first
 }
 
-/// Directories from `cwd` up to (excluding) `home`, skipping dot-named ones.
+/// Directories from `cwd` up to (excluding) `home`, skipping dot-named ancestors (never `cwd` itself).
 fn walk(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in cwd.ancestors() {
         if cwd.starts_with(home) && dir == home {
             break;
         }
-        if dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+        if dir != cwd && dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
             continue;
         }
         out.push(dir.to_path_buf());
@@ -77,18 +77,42 @@ struct Front {
     disable_model_invocation: bool,
 }
 
-/// Splits leading `---` YAML frontmatter from the body.
-fn frontmatter(text: &str) -> (Front, &str) {
-    frontmatter_as(text)
+thread_local! {
+    /// Problems met while reading context files; drained by `Context::load_all`.
+    static WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn frontmatter_as<T: serde::de::DeserializeOwned + Default>(text: &str) -> (T, &str) {
-    let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else { return (T::default(), text) };
-    let Some(end) = rest.find("\n---") else { return (T::default(), text) };
-    let front = serde_yaml_ng::from_str(&rest[..end]).unwrap_or_default();
-    let after = &rest[end + 4..];
-    let body = after.split_once('\n').map_or("", |(_, b)| b);
-    (front, body)
+/// Splits leading `---` YAML frontmatter from the body.
+fn frontmatter<'a>(path: &Path, text: &'a str) -> (Front, &'a str) {
+    frontmatter_as(path, text)
+}
+
+/// The front matter is a first line `---`, then YAML, then a line that is exactly `---`.
+/// An empty block is fine; invalid YAML is reported (naming the file) and read as empty.
+fn frontmatter_as<'a, T: serde::de::DeserializeOwned + Default>(path: &Path, text: &'a str) -> (T, &'a str) {
+    let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else {
+        return (T::default(), text);
+    };
+    let mut pos = 0;
+    let mut close = None;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == "---" {
+            close = Some((pos, pos + line.len()));
+            break;
+        }
+        pos += line.len();
+    }
+    let Some((yaml_end, body_start)) = close else { return (T::default(), text) };
+    let yaml = &rest[..yaml_end];
+    let front = if yaml.trim().is_empty() {
+        T::default()
+    } else {
+        serde_yaml_ng::from_str(yaml).unwrap_or_else(|e| {
+            WARNINGS.with(|w| w.borrow_mut().push(format!("{}: invalid front matter: {e}", path.display())));
+            T::default()
+        })
+    };
+    (front, &rest[body_start..])
 }
 
 fn skill_roots(cwd: &Path, home: &Path, agent_dir: &Path, claude_user: bool) -> Vec<PathBuf> {
@@ -116,14 +140,19 @@ pub fn discover_skills(cwd: &Path, home: &Path, agent_dir: &Path, claude_user: b
         dirs.sort();
         for dir in dirs {
             let Ok(text) = std::fs::read_to_string(dir.join("SKILL.md")) else { continue };
-            let (f, _) = frontmatter(&text);
+            let (f, _) = frontmatter(&dir.join("SKILL.md"), &text);
             let dir_name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let name = f.name.unwrap_or(dir_name);
             let Some(description) = f.description.filter(|d| !d.trim().is_empty()) else { continue };
             if name.contains('/') || f.enabled == Some(false) || out.iter().any(|s| s.name == name) {
                 continue;
             }
-            out.push(Skill { name, description: description.trim().into(), dir, hidden: f.hide || f.disable_model_invocation });
+            out.push(Skill {
+                name,
+                description: description.trim().into(),
+                dir,
+                hidden: f.hide || f.disable_model_invocation,
+            });
         }
     }
     out
@@ -137,8 +166,6 @@ pub struct AgentDef {
     pub model: Vec<String>,
     pub thinking: Option<String>,
     pub prompt: String,
-    #[allow(dead_code)]
-    pub path: PathBuf,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -156,7 +183,9 @@ struct AgentFront {
 fn string_list(v: &serde_yaml_ng::Value) -> Option<Vec<String>> {
     let items: Vec<String> = match v {
         serde_yaml_ng::Value::String(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
-        serde_yaml_ng::Value::Sequence(q) => q.iter().filter_map(|x| x.as_str()).map(|x| x.trim().to_string()).collect(),
+        serde_yaml_ng::Value::Sequence(q) => {
+            q.iter().filter_map(|x| x.as_str()).map(|x| x.trim().to_string()).collect()
+        }
         _ => return None,
     };
     Some(items.into_iter().filter(|x| !x.is_empty()).collect())
@@ -169,12 +198,17 @@ pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDe
     let mut out: Vec<AgentDef> = Vec::new();
     for root in roots {
         let Ok(rd) = std::fs::read_dir(&root) else { continue };
-        let mut files: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+        let mut files: Vec<PathBuf> =
+            rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
         files.sort();
         for path in files {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let (f, body) = frontmatter_as::<AgentFront>(&text);
-            let (Some(name), Some(description)) = (f.name.map(|n| n.trim().to_string()), f.description.map(|d| d.trim().to_string())) else { continue };
+            let (f, body) = frontmatter_as::<AgentFront>(&path, &text);
+            let (Some(name), Some(description)) =
+                (f.name.map(|n| n.trim().to_string()), f.description.map(|d| d.trim().to_string()))
+            else {
+                continue;
+            };
             if name.is_empty() || description.is_empty() {
                 continue;
             }
@@ -189,7 +223,6 @@ pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDe
                 model: f.model.as_ref().and_then(string_list).unwrap_or_default(),
                 thinking: f.thinking_level,
                 prompt: body.trim().to_string(),
-                path,
             });
         }
     }
@@ -207,7 +240,8 @@ pub fn discover_commands(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<Slash
     let mut out: Vec<SlashCommand> = Vec::new();
     for root in roots {
         let Ok(rd) = std::fs::read_dir(&root) else { continue };
-        let mut files: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+        let mut files: Vec<PathBuf> =
+            rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
         files.sort();
         for f in files {
             let Some(name) = f.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
@@ -215,12 +249,11 @@ pub fn discover_commands(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<Slash
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&f) else { continue };
-            let (front, body) = frontmatter(&text);
-            let description = front
-                .description
-                .map(|d| d.trim().to_string())
-                .filter(|d| !d.is_empty())
-                .unwrap_or_else(|| body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().chars().take(60).collect());
+            let (front, body) = frontmatter(&f, &text);
+            let description =
+                front.description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).unwrap_or_else(|| {
+                    body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().chars().take(60).collect()
+                });
             out.push(SlashCommand { name, body: body.trim_start_matches('\n').into(), description });
         }
     }
@@ -290,6 +323,8 @@ impl SlashCommand {
 }
 
 pub struct Context {
+    /// Problems found while loading (bad front matter); shown as notices at startup.
+    pub warnings: Vec<String>,
     pub files: Vec<ContextFile>,
     pub rules: Vec<String>,
     pub skills: Vec<Skill>,
@@ -307,13 +342,13 @@ impl Context {
                 rules.push(r.trim_end().to_string());
             }
         }
-        Self {
-            files: load(cwd, home, agent_dir),
-            rules,
-            skills: discover_skills(cwd, home, agent_dir, claude_user),
-            commands: discover_commands(cwd, home, agent_dir),
-            agents: discover_agents(cwd, home, agent_dir),
-        }
+        WARNINGS.with(|w| w.borrow_mut().clear());
+        let files = load(cwd, home, agent_dir);
+        let skills = discover_skills(cwd, home, agent_dir, claude_user);
+        let commands = discover_commands(cwd, home, agent_dir);
+        let agents = discover_agents(cwd, home, agent_dir);
+        let warnings = WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+        Self { warnings, files, rules, skills, commands, agents }
     }
 
     /// `/skill:<name> [args]` prompt text.
@@ -321,7 +356,7 @@ impl Context {
         let sk = self.skills.iter().find(|s| s.name == name)?;
         let path = sk.dir.join("SKILL.md");
         let text = std::fs::read_to_string(&path).ok()?;
-        let (_, body) = frontmatter(&text);
+        let (_, body) = frontmatter(&path, &text);
         let mut out = format!("<skill name=\"{name}\" path=\"{}\">\n{}\n</skill>", path.display(), body.trim());
         if !args.trim().is_empty() {
             out.push_str(&format!("\n\n{}", args.trim()));
@@ -341,7 +376,9 @@ pub struct PromptInput<'a> {
 }
 
 pub fn system_prompt(i: &PromptInput) -> String {
-    let os = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    // The kernel release does not change under a running process: read it once.
+    static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let os = OS.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
     let date = jiff::Zoned::now().strftime("%Y-%m-%d");
     let mut s = format!(
         "You are mu, a coding agent running in the user's terminal. Work in the current directory with the provided tools.\n\
@@ -438,7 +475,15 @@ mod tests {
         assert_eq!(greet.expand("Bob \"a b\""), "Say hi to Bob (Bob a b)");
         let plain = ctx.commands.iter().find(|c| c.name == "plain").unwrap();
         assert_eq!(plain.expand("extra"), "Do the thing\n\nextra");
-        let sp = system_prompt(&PromptInput { model: "m", cwd: &proj, ctx: &ctx, plan: None, subagent: false, agent_prompt: None, plugin_ctx: &Default::default() });
+        let sp = system_prompt(&PromptInput {
+            model: "m",
+            cwd: &proj,
+            ctx: &ctx,
+            plan: None,
+            subagent: false,
+            agent_prompt: None,
+            plugin_ctx: &Default::default(),
+        });
         assert!(sp.contains("- alpha: first\n") && !sp.contains("- hid:") && sp.contains("<rules>\nuser rule"));
         assert!(ctx.skill_prompt("alpha", "go").unwrap().ends_with("body A\n</skill>\n\ngo"));
     }
@@ -452,9 +497,15 @@ mod tests {
         fs::create_dir_all(proj.join(".omp/agents")).unwrap();
         fs::create_dir_all(agent.join("agents")).unwrap();
         let w = |p: std::path::PathBuf, t: &str| fs::write(p, t).unwrap();
-        w(proj.join(".omp/agents/a.md"), "---\nname: a\ndescription: project a\ntools: read, grep\nmodel: \"@smol\"\nthinkingLevel: high\n---\nBODY\n");
+        w(
+            proj.join(".omp/agents/a.md"),
+            "---\nname: a\ndescription: project a\ntools: read, grep\nmodel: \"@smol\"\nthinkingLevel: high\n---\nBODY\n",
+        );
         w(agent.join("agents/a.md"), "---\nname: a\ndescription: user a\n---\nOTHER\n");
-        w(agent.join("agents/b.md"), "---\nname: b\ndescription: user b\ntools: [read, write]\nmodel: [\"@smol\", \"@default\"]\n---\nB\n");
+        w(
+            agent.join("agents/b.md"),
+            "---\nname: b\ndescription: user b\ntools: [read, write]\nmodel: [\"@smol\", \"@default\"]\n---\nB\n",
+        );
         w(agent.join("agents/scout.md"), "---\nname: Scout\ndescription: reserved\n---\nx\n");
         w(agent.join("agents/main.md"), "---\nname: main\ndescription: reserved\n---\nx\n");
         w(agent.join("agents/nodesc.md"), "---\nname: nodesc\n---\nx\n");
@@ -473,9 +524,55 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_agent_block() {
-        let ctx = Context { files: vec![], rules: vec![], skills: vec![], commands: vec![], agents: vec![] };
+        let ctx = Context {
+            warnings: vec![],
+            files: vec![],
+            rules: vec![],
+            skills: vec![],
+            commands: vec![],
+            agents: vec![],
+        };
         let block = "\n<agent name=\"x\">\nDo it.\n</agent>\n";
-        let sp = system_prompt(&PromptInput { model: "m", cwd: Path::new("/tmp"), ctx: &ctx, plan: None, subagent: true, agent_prompt: Some(block), plugin_ctx: &Default::default() });
+        let sp = system_prompt(&PromptInput {
+            model: "m",
+            cwd: Path::new("/tmp"),
+            ctx: &ctx,
+            plan: None,
+            subagent: true,
+            agent_prompt: Some(block),
+            plugin_ctx: &Default::default(),
+        });
         assert!(sp.contains("<agent name=\"x\">\nDo it.\n</agent>"));
+    }
+
+    #[test]
+    fn frontmatter_edge_cases() {
+        let p = Path::new("x/SKILL.md");
+        let (f, body) = frontmatter(p, "---\n---\nbody\n");
+        assert!(f.name.is_none());
+        assert_eq!(body, "body\n");
+        // `---` inside a value is not the closing line.
+        let (f, body) = frontmatter(p, "---\nname: a\ndescription: x --- y\n---\nB\n");
+        assert_eq!(f.name.as_deref(), Some("a"));
+        assert_eq!(body, "B\n");
+        let (f, body) = frontmatter(p, "---\r\nname: c\r\n---\r\nB");
+        assert_eq!((f.name.as_deref(), body), (Some("c"), "B"));
+        // Unclosed: the whole text is the body.
+        assert_eq!(frontmatter(p, "---\nname: a\n").1, "---\nname: a\n");
+        WARNINGS.with(|w| w.borrow_mut().clear());
+        let _ = frontmatter(Path::new("bad.md"), "---\nname: [unclosed\n---\nx");
+        let w = WARNINGS.with(|w| w.borrow().clone());
+        assert!(w.len() == 1 && w[0].contains("bad.md"), "{w:?}");
+    }
+
+    #[test]
+    fn a_dot_named_cwd_keeps_its_context() {
+        let d = std::env::temp_dir().join(format!("mu-ctx-{}/.work", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("AGENTS.md"), "rules").unwrap();
+        let files = load(&d, Path::new("/nonexistent-home"), Path::new("/nonexistent-agent"));
+        assert_eq!(files.len(), 1);
+        assert!(walk(&d, Path::new("/nonexistent-home")).contains(&d));
+        let _ = std::fs::remove_dir_all(d.parent().unwrap());
     }
 }

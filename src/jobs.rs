@@ -74,7 +74,13 @@ impl JobsHandle {
         self.inner
             .borrow()
             .iter()
-            .map(|j| SubagentStatus { name: j.id.clone(), agent: j.agent.clone(), tools: j.tools, last: j.last.clone(), state: j.state.clone() })
+            .map(|j| SubagentStatus {
+                name: j.id.clone(),
+                agent: j.agent.clone(),
+                tools: j.tools,
+                last: j.last.clone(),
+                state: j.state.clone(),
+            })
             .collect()
     }
 
@@ -108,7 +114,9 @@ impl JobsHandle {
                 me.emit();
             })
             .await;
-            let (ok, text) = if cancel.is_cancelled() { (false, "cancelled".to_string()) } else { (out.ok, out.text) };
+            // `run_child` already says "cancelled" when a cancelled child produced no result; a child
+            // that finished before the kill landed keeps its real result.
+            let (ok, text) = (out.ok, out.text);
             if let Some(j) = me.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
                 j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
                 j.text = text;
@@ -127,7 +135,13 @@ impl JobsHandle {
             .filter(|j| j.state != SubagentState::Running && !j.delivered && (ids.is_empty() || ids.contains(&j.id)))
             .map(|j| {
                 j.delivered = true;
-                Done { id: j.id.clone(), agent: j.agent.clone(), ok: j.state == SubagentState::Done, text: j.text.clone() }
+                Done {
+                    id: j.id.clone(),
+                    agent: j.agent.clone(),
+                    ok: j.state == SubagentState::Done,
+                    // Delivered output is not kept: only the snapshot fields stay resident.
+                    text: std::mem::take(&mut j.text),
+                }
             })
             .collect()
     }
@@ -139,7 +153,8 @@ impl JobsHandle {
     /// Cancels running jobs (all when `id` is `None`); returns how many.
     pub fn kill(&self, id: Option<&str>) -> usize {
         let jobs = self.inner.borrow();
-        let targets: Vec<&Job> = jobs.iter().filter(|j| j.state == SubagentState::Running && id.is_none_or(|i| i == j.id)).collect();
+        let targets: Vec<&Job> =
+            jobs.iter().filter(|j| j.state == SubagentState::Running && id.is_none_or(|i| i == j.id)).collect();
         for j in &targets {
             j.cancel.cancel();
         }
@@ -219,7 +234,11 @@ pub fn notice(done: &[Done]) -> String {
             result_text(d)
         );
     }
-    let body = done.iter().map(|d| format!("── Job {} ({}) ──\n{}", d.id, d.agent, result_text(d))).collect::<Vec<_>>().join("\n");
+    let body = done
+        .iter()
+        .map(|d| format!("── Job {} ({}) ──\n{}", d.id, d.agent, result_text(d)))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "<system-notice>\n{} background jobs have completed. Resume your work using the results below.\n\n{body}\n</system-notice>",
         done.len()
@@ -238,6 +257,26 @@ mod tests {
 
     fn done(id: &str, ok: bool, text: &str) -> Done {
         Done { id: id.into(), agent: "scout".into(), ok, text: text.into() }
+    }
+
+    #[test]
+    fn delivered_output_is_released() {
+        let h = handle();
+        h.inner.borrow_mut().push(Job {
+            seq: 0,
+            id: "A".into(),
+            agent: "scout".into(),
+            tools: 0,
+            last: String::new(),
+            state: SubagentState::Done,
+            text: "big output".into(),
+            delivered: false,
+            cancel: CancellationToken::new(),
+        });
+        let got = h.take_undelivered(&[]);
+        assert_eq!(got[0].text, "big output");
+        assert!(h.inner.borrow()[0].text.is_empty());
+        assert!(h.take_undelivered(&[]).is_empty());
     }
 
     #[test]

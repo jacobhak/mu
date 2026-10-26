@@ -5,23 +5,68 @@ mod edit;
 mod glob;
 pub mod grep;
 mod plan;
-pub mod task;
 mod read;
+pub mod task;
 pub mod todo;
 pub mod uri;
 mod wait;
 mod write;
 
+use crate::events::EventTx;
+use crate::jobs::JobsHandle;
+use crate::plugin::PluginHost;
 use crate::provider::ToolDef;
+use crate::tui::line::truncate_text as trunc;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use crate::events::EventTx;
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use crate::jobs::JobsHandle;
-use crate::plugin::PluginHost;
 use tokio_util::sync::CancellationToken;
+
+/// Facts about a tool result that the UI needs, recorded by the tool itself so the UI never has
+/// to recover them by parsing the text the model sees. The model gets the same text as before.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ToolMeta {
+    Bash(BashMeta),
+    /// `read`, `write` and `edit`: the file the call touched.
+    File(FileMeta),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashMeta {
+    /// Byte length of the command's own output at the start of the result text; what follows is
+    /// notes added by mu (wall time, exit code, spill notice).
+    pub output_end: usize,
+    pub exit_code: Option<i32>,
+    pub wall_secs: Option<f64>,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    /// Number of the artifact holding the full output, when it was cut.
+    pub artifact: Option<u32>,
+    /// The full-output spill was cut short or could not be written.
+    pub spill_note: Option<String>,
+}
+
+impl BashMeta {
+    /// The command ended abnormally: it exited non-zero, timed out or was cancelled.
+    pub fn failed(&self) -> bool {
+        self.timed_out || self.cancelled || self.exit_code.is_some_and(|c| c != 0)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMeta {
+    /// The path as the model wrote it (or `local://…`), shown in the header.
+    pub path: String,
+    /// The `edit` hash tag of the file after the call.
+    pub tag: Option<String>,
+    /// A plan file (`local://<slug>-plan.md`): shown as a line count, not a diff.
+    pub plan: bool,
+}
 
 pub struct ToolOutput {
     pub text: String,
@@ -29,14 +74,36 @@ pub struct ToolOutput {
     /// UI-only rendering (e.g. a diff); never sent to the model.
     pub display: Option<String>,
     pub details: Option<Value>,
+    pub meta: Option<ToolMeta>,
 }
+
+/// Key under which `meta` is stored in a persisted tool result's `details`.
+pub const META_KEY: &str = "muMeta";
 
 impl ToolOutput {
     pub fn ok(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false, display: None, details: None }
+        Self { text: text.into(), is_error: false, display: None, details: None, meta: None }
     }
     pub fn err(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true, display: None, details: None }
+        Self { text: text.into(), is_error: true, display: None, details: None, meta: None }
+    }
+
+    /// `details` as stored in the session: the tool's own details plus `meta`.
+    pub fn stored_details(&self) -> Option<Value> {
+        let Some(meta) = &self.meta else { return self.details.clone() };
+        let mut d = match &self.details {
+            Some(Value::Object(m)) => Value::Object(m.clone()),
+            None | Some(Value::Null) => Value::Object(Default::default()),
+            Some(other) => return Some(other.clone()), // not an object: leave it alone
+        };
+        d[META_KEY] = serde_json::to_value(meta).unwrap_or(Value::Null);
+        Some(d)
+    }
+
+    /// The reverse of `stored_details`: a result rebuilt from a stored message.
+    pub fn from_stored(text: String, is_error: bool, details: Option<Value>) -> Self {
+        let meta = details.as_ref().and_then(|d| d.get(META_KEY)).and_then(|m| serde_json::from_value(m.clone()).ok());
+        Self { text, is_error, display: None, details, meta }
     }
 }
 
@@ -45,8 +112,6 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     pub call_id: String,
 }
-
-pub const BUILTIN_NAMES: [&str; 11] = ["read", "write", "edit", "bash", "grep", "glob", "todo", "ask", "propose_plan", "task", "wait"];
 
 pub struct Tools {
     pub cwd: PathBuf,
@@ -70,7 +135,18 @@ impl Tools {
     }
 
     pub fn new(cwd: PathBuf, plugins: Rc<PluginHost>) -> Self {
-        Self { cwd, plugins, jobs: None, todo: Default::default(), session_id: Default::default(), session_path: Default::default(), skills: Default::default(), plan: Default::default(), edit_store: pi_edit::EditStore::new(), shell: OnceCell::new() }
+        Self {
+            cwd,
+            plugins,
+            jobs: None,
+            todo: Default::default(),
+            session_id: Default::default(),
+            session_path: Default::default(),
+            skills: Default::default(),
+            plan: Default::default(),
+            edit_store: pi_edit::EditStore::new(),
+            shell: OnceCell::new(),
+        }
     }
 
     pub fn shell(&self) -> &pi_shell::shell::Shell {
@@ -83,43 +159,13 @@ impl Tools {
     }
 
     pub fn display(&self, abs: &Path) -> String {
-        match abs.strip_prefix(&self.cwd) {
-            Ok(r) if !r.as_os_str().is_empty() => r.to_string_lossy().into_owned(),
-            Ok(_) => ".".into(),
-            Err(_) => abs.to_string_lossy().into_owned(),
-        }
+        display_in(&self.cwd, abs)
     }
 
+    /// Tool definitions that do not depend on the session (the rest are built by `task_def`,
+    /// `wait_def` and `plan_def`).
     pub fn definitions() -> Vec<ToolDef> {
-        let defs = vec![
-            json!({"name":"read","description":READ_DESC,"input_schema":{"type":"object","properties":{
-                "path":{"type":"string","description":"File or directory path, optionally with a selector suffix"}},"required":["path"]}}),
-            json!({"name":"write","description":"Create a file or replace it entirely. Creates parent directories. Returns a `[path#TAG]` header usable by `edit`.","input_schema":{"type":"object","properties":{
-                "path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}),
-            json!({"name":"edit","description":pi_edit::description(pi_edit::EditMode::Hashline),"input_schema":{"type":"object","properties":{
-                "input":{"type":"string","description":"The edit payload, in the format described above"}},"required":["input"]}}),
-            json!({"name":"bash","description":"Run a shell command. The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large.","input_schema":{"type":"object","properties":{
-                "command":{"type":"string"},
-                "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
-                "cwd":{"type":"string","description":"Working directory for this command"},
-                "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}}),
-            json!({"name":"grep","description":"Regex search in file contents (respects .gitignore, skips hidden files). Returns `path:line:text` rows; max 20 per file, 200 total.","input_schema":{"type":"object","properties":{
-                "pattern":{"type":"string"},"path":{"type":"string","description":"File or directory; default ."},
-                "case":{"type":"boolean","description":"Case-sensitive; default true"}},"required":["pattern"]}}),
-            json!({"name":"glob","description":"Find files by glob pattern (e.g. `**/*.rs`), newest first. Respects .gitignore, skips hidden files.","input_schema":{"type":"object","properties":{
-                "pattern":{"type":"string"},"path":{"type":"string","description":"Directory; default ."}},"required":["pattern"]}}),
-        ];
-        defs.into_iter()
-            .chain([
-                json!({"name":"todo","description":todo::description(),"input_schema":todo::schema()}),
-                json!({"name":"ask","description":ask::description(),"input_schema":ask::schema()}),
-            ])
-            .map(|d| ToolDef {
-                name: d["name"].as_str().unwrap_or_default().into(),
-                description: d["description"].as_str().unwrap_or_default().into(),
-                schema: d["input_schema"].clone(),
-            })
-            .collect()
+        BUILTINS.iter().filter_map(|b| b.def.map(|d| d())).collect()
     }
 
     /// `async_jobs`: `task` returns job ids immediately instead of blocking.
@@ -146,61 +192,182 @@ impl Tools {
         if let Some(raw) = args.get("__invalid_json") {
             return ToolOutput::err(format!("Invalid arguments for {name}: arguments were not valid JSON: {raw}"));
         }
-        match name {
-            "read" => with_args(name, args, |a| self.read(a)),
-            "write" => with_args(name, args, |a| self.write(a)),
-            "grep" => with_args(name, args, |a| self.grep(a)),
-            "glob" => with_args(name, args, |a| self.glob(a)),
-            "edit" => match parse::<edit::Args>(name, args) {
-                Ok(a) => self.edit(a).await,
-                Err(e) => e,
-            },
-            "task" => match parse::<task::Args>(name, args) {
-                Ok(a) => self.task(a, ctx).await,
-                Err(e) => e,
-            },
-            "propose_plan" => match parse::<plan::Args>(name, args) {
-                Ok(a) => self.propose_plan(a, ctx).await,
-                Err(e) => e,
-            },
-            "todo" => with_args(name, args, |a| self.todo(a)),
-            "ask" => match parse::<ask::Args>(name, args) {
-                Ok(a) => self.ask(a, ctx).await,
-                Err(e) => e,
-            },
-            "wait" => match parse::<wait::Args>(name, args) {
-                Ok(a) => self.wait(a, ctx).await,
-                Err(e) => e,
-            },
-            "bash" => match parse::<bash::Args>(name, args) {
-                Ok(a) => self.bash(a, ctx).await,
-                Err(e) => e,
-            },
-            _ if self.plugins.has_tool(name) => {
-                let r = self.plugins.call_tool(name, args, &ctx.cancel).await;
-                ToolOutput { text: r.content, is_error: r.is_error, display: r.display, details: None }
-            }
-            _ => ToolOutput::err(format!("Unknown tool: {name}")),
+        #[cfg(test)]
+        if name == "__panic" {
+            panic!("boom");
         }
+        if let Some(b) = BUILTINS.iter().find(|b| b.name == name) {
+            return (b.call)(self, args, ctx).await;
+        }
+        if self.plugins.has_tool(name) {
+            let r = self.plugins.call_tool(name, args, &ctx.cancel).await;
+            return ToolOutput { text: r.content, is_error: r.is_error, display: r.display, details: None, meta: None };
+        }
+        ToolOutput::err(format!("Unknown tool: {name}"))
     }
+}
+
+/// `abs` as shown to the model: relative to `cwd` when inside it.
+pub fn display_in(cwd: &Path, abs: &Path) -> String {
+    match abs.strip_prefix(cwd) {
+        Ok(r) if !r.as_os_str().is_empty() => r.to_string_lossy().into_owned(),
+        Ok(_) => ".".into(),
+        Err(_) => abs.to_string_lossy().into_owned(),
+    }
+}
+
+type CallFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ToolOutput> + 'a>>;
+
+/// One built-in tool: its name, its definition when that does not depend on the session, and its
+/// dispatcher. Everything that lists or runs built-ins reads this table.
+pub struct Builtin {
+    pub name: &'static str,
+    pub def: Option<fn() -> ToolDef>,
+    call: for<'a> fn(&'a Tools, &'a Value, &'a ToolCtx) -> CallFuture<'a>,
+}
+
+fn tool_def(name: &str, description: impl Into<String>, schema: Value) -> ToolDef {
+    ToolDef { name: name.into(), description: description.into(), schema }
+}
+
+macro_rules! dispatch {
+    // Synchronous tool: `|tools, args|`.
+    ($name:literal, |$t:ident, $a:ident: $A:ty| $body:expr) => {
+        |tools, args, _ctx| {
+            Box::pin(async move {
+                let $t = tools;
+                with_args($name, args, |$a: $A| $body)
+            })
+        }
+    };
+    // Async tool with the call context.
+    ($name:literal, async |$t:ident, $a:ident: $A:ty, $c:ident| $body:expr) => {
+        |tools, args, ctx| {
+            Box::pin(async move {
+                let ($t, $c) = (tools, ctx);
+                match parse::<$A>($name, args) {
+                    Ok($a) => $body.await,
+                    Err(e) => *e,
+                }
+            })
+        }
+    };
+}
+
+/// Built-in tools, in the order they are offered to the model.
+pub static BUILTINS: &[Builtin] = &[
+    Builtin {
+        name: "read",
+        def: Some(|| {
+            tool_def(
+                "read",
+                READ_DESC,
+                json!({"type":"object","properties":{
+                    "path":{"type":"string","description":"File or directory path, optionally with a selector suffix"}},"required":["path"]}),
+            )
+        }),
+        call: dispatch!("read", async |t, a: read::Args, _c| t.read(a)),
+    },
+    Builtin {
+        name: "write",
+        def: Some(|| {
+            tool_def(
+                "write",
+                "Create a file or replace it entirely. Creates parent directories. Returns a `[path#TAG]` header usable by `edit`.",
+                json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
+            )
+        }),
+        call: dispatch!("write", async |t, a: write::Args, _c| t.write(a)),
+    },
+    Builtin {
+        name: "edit",
+        def: Some(|| {
+            tool_def(
+                "edit",
+                pi_edit::description(pi_edit::EditMode::Hashline),
+                json!({"type":"object","properties":{
+                    "input":{"type":"string","description":"The edit payload, in the format described above"}},"required":["input"]}),
+            )
+        }),
+        call: dispatch!("edit", async |t, a: edit::Args, _c| t.edit(a)),
+    },
+    Builtin {
+        name: "bash",
+        def: Some(|| {
+            tool_def(
+                "bash",
+                "Run a shell command. The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. Background processes started with a plain `&` end with the command (in pty mode too); use `setsid nohup cmd >/dev/null 2>&1 &` to keep one alive. Stays available in plan mode (as in omp), where you must not change anything with it.",
+                json!({"type":"object","properties":{
+                    "command":{"type":"string"},
+                    "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
+                    "cwd":{"type":"string","description":"Working directory for this command"},
+                    "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
+            )
+        }),
+        call: dispatch!("bash", async |t, a: bash::Args, c| t.bash(a, c)),
+    },
+    Builtin {
+        name: "grep",
+        def: Some(|| {
+            tool_def(
+                "grep",
+                "Regex search in file contents (respects .gitignore, skips hidden files). Returns `path:line:text` rows; max 20 per file, 200 total.",
+                json!({"type":"object","properties":{
+                    "pattern":{"type":"string"},"path":{"type":"string","description":"File or directory; default ."},
+                    "case":{"type":"boolean","description":"Case-sensitive; default true"}},"required":["pattern"]}),
+            )
+        }),
+        call: dispatch!("grep", async |t, a: grep::Args, _c| t.grep(a)),
+    },
+    Builtin {
+        name: "glob",
+        def: Some(|| {
+            tool_def(
+                "glob",
+                "Find files by glob pattern (e.g. `**/*.rs`), newest first. Respects .gitignore, skips hidden files.",
+                json!({"type":"object","properties":{
+                    "pattern":{"type":"string"},"path":{"type":"string","description":"Directory; default ."}},"required":["pattern"]}),
+            )
+        }),
+        call: dispatch!("glob", async |t, a: glob::Args, _c| t.glob(a)),
+    },
+    Builtin {
+        name: "todo",
+        def: Some(|| tool_def("todo", todo::description(), todo::schema())),
+        call: dispatch!("todo", |t, a: todo::Args| t.todo(a)),
+    },
+    Builtin {
+        name: "ask",
+        def: Some(|| tool_def("ask", ask::description(), ask::schema())),
+        call: dispatch!("ask", async |t, a: ask::Args, c| t.ask(a, c)),
+    },
+    // Offered per session (plan mode, jobs, custom agents), so no static definition.
+    Builtin {
+        name: "propose_plan",
+        def: None,
+        call: dispatch!("propose_plan", async |t, a: plan::Args, c| t.propose_plan(a, c)),
+    },
+    Builtin { name: "task", def: None, call: dispatch!("task", async |t, a: task::Args, c| t.task(a, c)) },
+    Builtin { name: "wait", def: None, call: dispatch!("wait", async |t, a: wait::Args, c| t.wait(a, c)) },
+];
+
+/// Whether `name` is a built-in tool.
+pub fn is_builtin(name: &str) -> bool {
+    BUILTINS.iter().any(|b| b.name == name)
 }
 
 const READ_DESC: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows under a `[path#TAG]` header; the header and line numbers are what `edit` anchors on. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
 
-fn parse<A: DeserializeOwned>(name: &str, args: &Value) -> Result<A, ToolOutput> {
+fn parse<A: DeserializeOwned>(name: &str, args: &Value) -> Result<A, Box<ToolOutput>> {
     serde_json::from_value(args.clone())
-        .map_err(|e| ToolOutput::err(format!("Invalid arguments for {name}: {e}")))
+        .map_err(|e| Box::new(ToolOutput::err(format!("Invalid arguments for {name}: {e}"))))
 }
 
 fn with_args<A: DeserializeOwned>(name: &str, args: &Value, f: impl FnOnce(A) -> ToolOutput) -> ToolOutput {
     match parse(name, args) {
         Ok(a) => f(a),
-        Err(e) => e,
+        Err(e) => *e,
     }
-}
-
-fn trunc(s: &str, n: usize) -> String {
-    if s.chars().count() > n { s.chars().take(n).chain(['…']).collect() } else { s.into() }
 }
 
 /// One-line description of a tool call.
@@ -214,7 +381,8 @@ pub fn summary(name: &str, args: &Value) -> String {
         "web_search" => first("query"),
         "fetch" => first("url"),
         "wait" => {
-            let ids: Vec<&str> = args["ids"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            let ids: Vec<&str> =
+                args["ids"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
             return if ids.is_empty() { "any".into() } else { ids.join(", ") };
         }
         "task" => {
@@ -224,4 +392,26 @@ pub fn summary(name: &str, args: &Value) -> String {
         _ => "",
     };
     trunc(s, 120)
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    #[test]
+    fn one_table_drives_names_definitions_and_dispatch() {
+        let names: Vec<String> = Tools::definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "todo", "ask"]);
+        assert!(is_builtin("task") && is_builtin("wait") && is_builtin("propose_plan"));
+        assert!(!is_builtin("web_search"));
+        // Every built-in dispatches (bad arguments are an argument error, never "Unknown tool").
+        let t = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for b in BUILTINS {
+            let out = rt.block_on(t.call(b.name, &json!({"__nonsense": true}), &ctx));
+            assert!(!out.text.contains("Unknown tool"), "{}: {}", b.name, out.text);
+        }
+    }
 }

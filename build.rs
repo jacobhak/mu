@@ -7,7 +7,8 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-changed=upstream.toml");
-    let mut sha = git(&["rev-parse", "--short=12", "HEAD"]).filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into());
+    let mut sha =
+        git(&["rev-parse", "--short=12", "HEAD"]).filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into());
     if sha != "unknown" && git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty()) {
         sha.push_str("-dirty");
     }

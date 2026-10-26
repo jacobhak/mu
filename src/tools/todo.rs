@@ -73,7 +73,11 @@ fn resolve_task(phases: &[Phase], content: Option<&str>, errors: &mut Vec<String
         if c.strip_prefix("task-").is_some_and(|n| !n.is_empty() && n.chars().all(|d| d.is_ascii_digit())) {
             errors.push(format!("Task \"{c}\" not found. Tasks are referenced by content, not by IDs — pass the task's full text from the previous result."));
         } else {
-            let hint = if phases.iter().all(|p| p.tasks.is_empty()) { " (todo list is empty — was it replaced or not yet created?)" } else { "" };
+            let hint = if phases.iter().all(|p| p.tasks.is_empty()) {
+                " (todo list is empty — was it replaced or not yet created?)"
+            } else {
+                ""
+            };
             errors.push(format!("Task \"{c}\" not found{hint}"));
         }
     }
@@ -115,10 +119,8 @@ fn normalize(phases: &mut [Phase]) {
             seen = true;
         }
     }
-    if !seen {
-        if let Some(t) = phases.iter_mut().flat_map(|p| p.tasks.iter_mut()).find(|t| t.status == Status::Pending) {
-            t.status = Status::InProgress;
-        }
+    if !seen && let Some(t) = phases.iter_mut().flat_map(|p| p.tasks.iter_mut()).find(|t| t.status == Status::Pending) {
+        t.status = Status::InProgress;
     }
 }
 
@@ -127,7 +129,9 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
         "init" => {
             let list: Vec<(String, Vec<String>)> = match (&a.list, &a.items) {
                 (Some(l), _) => l.iter().map(|e| (e.phase.clone(), e.items.clone())).collect(),
-                (None, Some(i)) if !i.is_empty() => vec![(a.phase.clone().unwrap_or_else(|| "Tasks".into()), i.clone())],
+                (None, Some(i)) if !i.is_empty() => {
+                    vec![(a.phase.clone().unwrap_or_else(|| "Tasks".into()), i.clone())]
+                }
                 _ => {
                     errors.push("Missing list for init operation".into());
                     return phases;
@@ -147,7 +151,10 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
             list.into_iter()
                 .map(|(name, items)| Phase {
                     name,
-                    tasks: items.into_iter().map(|content| Task { content, status: Status::Pending, blocker: None }).collect(),
+                    tasks: items
+                        .into_iter()
+                        .map(|content| Task { content, status: Status::Pending, blocker: None })
+                        .collect(),
                 })
                 .collect()
         }
@@ -176,7 +183,11 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
                 errors.push("block requires a task or phase target".into());
                 return phases;
             }
-            let reason = a.reason.as_deref().map(|r| r.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|r| !r.is_empty());
+            let reason = a
+                .reason
+                .as_deref()
+                .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|r| !r.is_empty());
             for (p, t) in targets(&phases, a, errors) {
                 let task = &mut phases[p].tasks[t];
                 if matches!(task.status, Status::Pending | Status::InProgress | Status::Blocked) {
@@ -242,7 +253,11 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
                     phases.len() - 1
                 }
             };
-            phases[idx].tasks.extend(items.iter().map(|c| Task { content: c.clone(), status: Status::Pending, blocker: None }));
+            phases[idx].tasks.extend(items.iter().map(|c| Task {
+                content: c.clone(),
+                status: Status::Pending,
+                blocker: None,
+            }));
             phases
         }
         _ => phases,
@@ -340,7 +355,12 @@ pub fn format_summary(phases: &[Phase], errors: &[String], read_only: bool) -> S
     for p in phases {
         lines.push(format!("  {}:", p.name));
         for t in &p.tasks {
-            lines.push(format!("    - {} {}{}", if t.status == Status::Completed { "[X]" } else { "[ ]" }, t.content, tag(t)));
+            lines.push(format!(
+                "    - {} {}{}",
+                if t.status == Status::Completed { "[X]" } else { "[ ]" },
+                t.content,
+                tag(t)
+            ));
         }
     }
     lines.join("\n")

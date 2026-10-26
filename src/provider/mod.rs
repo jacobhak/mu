@@ -26,10 +26,20 @@ pub struct Request<'a> {
 pub enum StreamEvent<'a> {
     Text(&'a str),
     Thinking(&'a str),
-    ToolCallStart { id: &'a str, name: &'a str },
+    ToolCallStart {
+        id: &'a str,
+        name: &'a str,
+    },
     /// Raw fragment of the call's JSON arguments.
-    ToolCallDelta { id: &'a str, json: &'a str },
-    Retry { attempt: u32, delay: Duration, reason: String },
+    ToolCallDelta {
+        id: &'a str,
+        json: &'a str,
+    },
+    Retry {
+        attempt: u32,
+        delay: Duration,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +94,12 @@ struct Endpoint {
     token: String,
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// No bytes for this long on a response stream: treat the connection as dead and retry.
+const STREAM_IDLE: Duration = Duration::from_secs(90);
+/// Ceiling for one-shot completions (titles, summaries use their own cancel token as well).
+const COMPLETE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct Providers {
     pub cfg: Rc<Configs>,
     client: OnceCell<reqwest::Client>,
@@ -91,15 +107,33 @@ pub struct Providers {
     /// `gw_models` came from the running gateway, not the on-disk cache.
     gw_fresh: std::cell::Cell<bool>,
     gateway: crate::gateway::GatewaySource,
+    /// Test seam: scripted replies, popped in order by `stream`.
+    #[cfg(test)]
+    pub scripted: RefCell<std::collections::VecDeque<Result<Message, ProviderError>>>,
 }
 
 impl Providers {
     pub fn new(cfg: Rc<Configs>, gateway: crate::gateway::GatewaySource) -> Self {
-        Self { cfg, client: OnceCell::new(), gw_models: RefCell::new(load_cache()), gw_fresh: std::cell::Cell::new(false), gateway }
+        Self {
+            cfg,
+            client: OnceCell::new(),
+            gw_models: RefCell::new(load_cache()),
+            gw_fresh: std::cell::Cell::new(false),
+            gateway,
+            #[cfg(test)]
+            scripted: Default::default(),
+        }
     }
 
+    /// One shared client: a 10 s connect timeout, no overall timeout (streams are long-lived;
+    /// `STREAM_IDLE` guards them instead).
     fn client(&self) -> &reqwest::Client {
-        self.client.get_or_init(reqwest::Client::new)
+        self.client.get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
     }
 
     pub fn resolve(&self, sel: &str) -> Result<(ModelSpec, Option<Thinking>)> {
@@ -111,12 +145,17 @@ impl Providers {
         Ok(Endpoint { base, token })
     }
 
+    /// The last known model list (from the on-disk cache or the latest fetch); never touches the network.
+    pub fn cached_models(&self) -> Vec<GatewayModel> {
+        self.gw_models.borrow().clone().unwrap_or_default()
+    }
+
     /// Gateway `/v1/models` rows (context windows). `None` when the gateway is not running or unreachable.
     pub async fn gateway_models(&self) -> Result<Vec<GatewayModel>> {
-        if self.gw_fresh.get() {
-            if let Some(m) = self.gw_models.borrow().as_ref() {
-                return Ok(m.clone());
-            }
+        if self.gw_fresh.get()
+            && let Some(m) = self.gw_models.borrow().as_ref()
+        {
+            return Ok(m.clone());
         }
         let ep = self.endpoint().await.map_err(|e| anyhow!("{e}"))?;
         let text = self
@@ -143,6 +182,9 @@ impl Providers {
                     .collect()
             })
             .unwrap_or_default();
+        if rows.is_empty() {
+            return Err(anyhow!("the gateway returned no models"));
+        }
         save_cache(&rows);
         *self.gw_models.borrow_mut() = Some(rows.clone());
         self.gw_fresh.set(true);
@@ -155,6 +197,16 @@ impl Providers {
         cancel: &CancellationToken,
         ev: &mut dyn FnMut(StreamEvent),
     ) -> Result<Message, ProviderError> {
+        #[cfg(test)]
+        if let Some(r) = self.scripted.borrow_mut().pop_front() {
+            return r;
+        }
+        if !self.gw_fresh.get() {
+            tokio::select! {
+                _ = self.gateway_models() => {}
+                _ = cancel.cancelled() => return Err(ProviderError::Aborted),
+            }
+        }
         let mut attempt = 1;
         loop {
             match self.attempt(req, cancel, ev).await {
@@ -180,9 +232,6 @@ impl Providers {
     ) -> Result<Message, ProviderError> {
         let m = req.model;
         let ep = self.endpoint().await?;
-        if !self.gw_fresh.get() {
-            let _ = self.gateway_models().await;
-        }
         let mut dec = anthropic::Assembler::new(m);
         let rb = self
             .client()
@@ -205,13 +254,24 @@ impl Providers {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .map(Duration::from_secs);
+            if let Some(e) = retry::too_long(retry_after) {
+                return Err(e);
+            }
             let text = resp.text().await.unwrap_or_default();
             return Err(retry::classify_http(status.as_u16(), retry_after, &text));
         }
         let mut bytes = resp.bytes_stream();
         loop {
             let chunk = tokio::select! {
-                c = bytes.next() => c,
+                c = tokio::time::timeout(STREAM_IDLE, bytes.next()) => match c {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Err(ProviderError::Retryable {
+                            msg: format!("no data from the gateway for {}s", STREAM_IDLE.as_secs()),
+                            retry_after: None,
+                        });
+                    }
+                },
                 _ = cancel.cancelled() => return Err(ProviderError::Aborted),
             };
             match chunk {
@@ -245,7 +305,7 @@ impl Providers {
         } else {
             models::role_chain(role_or_model.trim_start_matches('@'))
                 .into_iter()
-                .filter(|r| self.cfg.omp.model_roles.contains_key(r))
+                .filter(|r| self.cfg.role(r).is_some())
                 .map(|r| format!("@{r}"))
                 .collect()
         };
@@ -270,7 +330,15 @@ impl Providers {
                 messages: &msgs,
                 max_tokens: Some(max_tokens.min(spec.max_output)),
             };
-            match self.stream(&req, cancel, &mut |_| {}).await {
+            let mut sink = |_: StreamEvent| {};
+            let attempt = tokio::time::timeout(COMPLETE_TIMEOUT, self.stream(&req, cancel, &mut sink));
+            let attempt = attempt.await.unwrap_or_else(|_| {
+                Err(ProviderError::Retryable {
+                    msg: format!("timed out after {}s", COMPLETE_TIMEOUT.as_secs()),
+                    retry_after: None,
+                })
+            });
+            match attempt {
                 Ok(Message::Assistant { content, .. }) => {
                     return Ok(content
                         .iter()
@@ -291,37 +359,35 @@ impl Providers {
 
 /// Last gateway model metadata, so the first status line shows real context windows
 /// without starting the gateway. Per profile: each profile's gateway serves its own models.
-fn cache_path() -> std::path::PathBuf {
-    mu_common::paths::profile_cache_dir().join("gateway-models.json")
+fn cache() -> crate::jsoncache::JsonCache {
+    crate::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("gateway-models.json"))
 }
 
 fn load_cache() -> Option<Vec<GatewayModel>> {
-    let v: Value = serde_json::from_slice(&std::fs::read(cache_path()).ok()?).ok()?;
-    Some(
-        v.as_array()?
-            .iter()
-            .filter_map(|m| {
-                Some(GatewayModel {
-                    id: m["id"].as_str()?.into(),
-                    context_length: m["context_length"].as_u64().map(|n| n as u32),
-                    max_output_tokens: m["max_output_tokens"].as_u64().map(|n| n as u32),
+    cache().load(|text| {
+        let v: Value = serde_json::from_str(text).ok()?;
+        Some(
+            v.as_array()?
+                .iter()
+                .filter_map(|m| {
+                    Some(GatewayModel {
+                        id: m["id"].as_str()?.into(),
+                        context_length: m["context_length"].as_u64().map(|n| n as u32),
+                        max_output_tokens: m["max_output_tokens"].as_u64().map(|n| n as u32),
+                    })
                 })
-            })
-            .collect(),
-    )
+                .collect(),
+        )
+    })
 }
 
 fn save_cache(rows: &[GatewayModel]) {
+    if rows.is_empty() {
+        return;
+    }
     let v: Vec<Value> = rows
         .iter()
         .map(|m| serde_json::json!({"id": m.id, "context_length": m.context_length, "max_output_tokens": m.max_output_tokens}))
         .collect();
-    let path = cache_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, Value::Array(v).to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    cache().save(&Value::Array(v).to_string());
 }

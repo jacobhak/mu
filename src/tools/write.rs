@@ -1,5 +1,5 @@
 use super::uri::Scheme;
-use super::{ToolOutput, Tools, diff};
+use super::{FileMeta, ToolMeta, ToolOutput, Tools, diff};
 use pi_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
 
@@ -10,7 +10,7 @@ pub struct Args {
 }
 
 impl Tools {
-    pub fn write(&self, a: Args) -> ToolOutput {
+    pub async fn write(&self, a: Args) -> ToolOutput {
         let res = match self.resolve(&a.path) {
             Ok(r) => r,
             Err(e) => return ToolOutput::err(e),
@@ -25,18 +25,28 @@ impl Tools {
         }
         let abs = res.path;
         let disp = if res.scheme.is_some() { a.path.clone() } else { self.display(&abs) };
-        if let Some(parent) = abs.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return ToolOutput::err(format!("Cannot create {}: {e}", parent.display()));
+        // The filesystem work runs on a blocking thread; `content` moves in and comes back.
+        let (path, content) = (abs.clone(), a.content);
+        let done = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
             }
-        }
-        let old = std::fs::read_to_string(&abs).unwrap_or_default();
-        if let Err(e) = std::fs::write(&abs, &a.content) {
-            return ToolOutput::err(format!("Cannot write {disp}: {e}"));
-        }
+            let old = std::fs::read_to_string(&path).unwrap_or_default();
+            std::fs::write(&path, &content).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
+            Ok((old, content))
+        })
+        .await;
+        let (old, content) = match done {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return ToolOutput::err(e.replace(&abs.display().to_string(), &disp)),
+            Err(e) => return ToolOutput::err(format!("write failed: {e}")),
+        };
+        let a = Args { path: a.path, content };
         let norm = text::normalize_to_lf(text::strip_bom(&a.content).1).into_owned();
         let tag = self.edit_store.record(&canonical_key(&abs), &norm, Some(&[]));
         let mut out = ToolOutput::ok(format!("[{disp}#{tag}]\nSuccessfully wrote {} bytes to {disp}", a.content.len()));
+        let plan = a.path.starts_with("local://") && a.path.ends_with("-plan.md");
+        out.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag: Some(tag), plan }));
         let d = diff::unified(&old, &a.content);
         if !d.is_empty() {
             out.display = Some(d);

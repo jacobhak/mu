@@ -13,10 +13,7 @@ pub struct Answers {
 
 /// Queries the controlling terminal; needs raw mode. Returns whatever arrived before `timeout`.
 pub fn query(timeout: Duration) -> Answers {
-    let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Answers::default();
-    }
+    let Some(fd) = super::term::tty() else { return Answers::default() };
     let mut out = String::from("\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]17;?\x1b\\");
     for i in 0..16 {
         out.push_str(&format!("\x1b]4;{i};?\x1b\\"));
@@ -59,12 +56,14 @@ pub fn query(timeout: Duration) -> Answers {
         }
         let mut chunk = [0u8; 1024];
         let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+            continue; // the handle is non-blocking: poll said readable but another reader took it
+        }
         if n <= 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n as usize]);
     }
-    unsafe { libc::close(fd) };
     parse(&buf)
 }
 
@@ -134,14 +133,12 @@ fn parse(buf: &[u8]) -> Answers {
             a.bg = parse_spec(s);
         } else if let Some(s) = body.strip_prefix("17;") {
             a.selection = parse_spec(s);
-        } else if let Some(s) = body.strip_prefix("4;") {
-            if let Some((n, spec)) = s.split_once(';') {
-                if let Ok(n) = n.parse::<usize>() {
-                    if n < 16 {
-                        a.slots[n] = parse_spec(spec);
-                    }
-                }
-            }
+        } else if let Some(s) = body.strip_prefix("4;")
+            && let Some((n, spec)) = s.split_once(';')
+            && let Ok(n) = n.parse::<usize>()
+            && n < 16
+        {
+            a.slots[n] = parse_spec(spec);
         }
     }
     a
@@ -169,7 +166,8 @@ mod tests {
 
     #[test]
     fn garbage_is_ignored() {
-        let a = parse(b"junk\x1b]99;foo\x07\x1b]4;40;rgb:00/00/00\x07\x1b]11;nope\x07\x1b]4;3;rgb:1/2\x07\x1b]10;rgb:00");
+        let a =
+            parse(b"junk\x1b]99;foo\x07\x1b]4;40;rgb:00/00/00\x07\x1b]11;nope\x07\x1b]4;3;rgb:1/2\x07\x1b]10;rgb:00");
         assert_eq!(a, Answers::default());
     }
 }

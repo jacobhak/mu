@@ -39,7 +39,8 @@ pub fn score(query: &str, cand: &str) -> Option<u32> {
 
 /// Indices of matching entries, best first.
 pub fn rank(entries: &[Entry], query: &str, usage: &HashMap<String, u32>) -> Vec<usize> {
-    let mut hits: Vec<(usize, u32)> = entries.iter().enumerate().filter_map(|(i, e)| score(query, &e.name).map(|s| (i, s))).collect();
+    let mut hits: Vec<(usize, u32)> =
+        entries.iter().enumerate().filter_map(|(i, e)| score(query, &e.name).map(|s| (i, s))).collect();
     let used = |i: usize| usage.get(&entries[i].name).copied().unwrap_or(0);
     hits.sort_by(|&(a, sa), &(b, sb)| {
         (sb / 1000)

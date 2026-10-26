@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 over NDJSON (MCP's stdio framing): one JSON object per line.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -55,8 +55,56 @@ pub enum Frame {
     Response(Response),
 }
 
-pub fn parse_frame(line: &str) -> Option<Frame> {
-    let v: Value = serde_json::from_str(line).ok()?;
+/// Reads newline-delimited JSON-RPC from any async reader. Lines are read as bytes, so one invalid
+/// UTF-8 line is reported and skipped instead of ending the stream.
+pub struct Framed<R> {
+    reader: R,
+    buf: Vec<u8>,
+}
+
+/// One line of input.
+pub enum Line {
+    Value(Value),
+    /// A line that is not valid UTF-8 or not valid JSON; the stream goes on.
+    Bad(String),
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> Framed<R> {
+    pub fn new(reader: R) -> Self {
+        Self { reader, buf: Vec::new() }
+    }
+
+    /// The next non-blank line, or `None` at end of input or on a read error.
+    pub async fn next_line(&mut self) -> Option<Line> {
+        loop {
+            self.buf.clear();
+            match self.reader.read_until(b'\n', &mut self.buf).await {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {}
+            }
+            if self.buf.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            return Some(match serde_json::from_slice::<Value>(&self.buf) {
+                Ok(v) => Line::Value(v),
+                Err(e) => Line::Bad(e.to_string()),
+            });
+        }
+    }
+
+    /// The next request or response, skipping lines that are bad or neither.
+    pub async fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            if let Line::Value(v) = self.next_line().await?
+                && let Some(f) = frame_of(v)
+            {
+                return Some(f);
+            }
+        }
+    }
+}
+
+pub fn frame_of(v: Value) -> Option<Frame> {
     if v.get("method").is_some() {
         serde_json::from_value(v).ok().map(Frame::Request)
     } else if v.get("id").is_some() {
@@ -66,36 +114,50 @@ pub fn parse_frame(line: &str) -> Option<Frame> {
     }
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
-
-/// Handle for a plugin to call back into the core.
-#[derive(Clone)]
-pub struct Client {
-    tx: mpsc::UnboundedSender<String>,
-    pending: Pending,
-    next: Arc<Mutex<u64>>,
+/// Requests sent and not yet answered: hands out ids and routes each reply to its waiter.
+#[derive(Default)]
+pub struct Pending {
+    inner: Mutex<PendingInner>,
 }
 
-impl Client {
-    pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        let id = {
-            let mut n = self.next.lock().unwrap();
-            *n += 1;
-            *n
-        };
+#[derive(Default)]
+struct PendingInner {
+    next: u64,
+    waiting: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
+}
+
+impl Pending {
+    /// A new id and the receiver its reply arrives on.
+    pub fn register(&self) -> (u64, oneshot::Receiver<Result<Value, String>>) {
+        let mut g = self.inner.lock().unwrap();
+        g.next += 1;
+        let id = g.next;
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        let line = serde_json::to_string(&Request::new(Some(json!(id)), method, params)).unwrap();
-        if self.tx.send(line).is_err() {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(RpcError { code: -32000, message: "core connection closed".into() });
-        }
-        rx.await.unwrap_or_else(|_| Err(RpcError { code: -32000, message: "core connection closed".into() }))
+        g.waiting.insert(id, tx);
+        (id, rx)
     }
 
-    pub fn notify(&self, method: &str, params: Value) {
-        let line = serde_json::to_string(&Request::new(None, method, params)).unwrap();
-        let _ = self.tx.send(line);
+    /// Delivers `result` to the waiter for `id`, if it is still waiting.
+    pub fn resolve(&self, id: u64, result: Result<Value, String>) {
+        if let Some(tx) = self.inner.lock().unwrap().waiting.remove(&id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    /// Forgets `id` (its caller gave up).
+    pub fn cancel(&self, id: u64) {
+        self.inner.lock().unwrap().waiting.remove(&id);
+    }
+
+    /// Fails every waiter, e.g. when the connection ended.
+    pub fn fail_all(&self, message: &str) {
+        for (_, tx) in self.inner.lock().unwrap().waiting.drain() {
+            let _ = tx.send(Err(message.to_string()));
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().waiting.is_empty()
     }
 }
 
@@ -103,7 +165,7 @@ impl Client {
 /// `shutdown` is answered and then ends the loop. Notifications get no response.
 pub async fn serve_stdio<F, Fut>(handler: F)
 where
-    F: Fn(Request, Client) -> Fut + Send + Sync + 'static,
+    F: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Value, RpcError>> + Send + 'static,
 {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -116,44 +178,58 @@ where
             let _ = out.flush().await;
         }
     });
-    let client = Client { tx: tx.clone(), pending: Default::default(), next: Default::default() };
     let handler = Arc::new(handler);
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        match parse_frame(&line) {
-            Some(Frame::Response(r)) => {
-                let Some(id) = r.id.as_u64() else { continue };
-                if let Some(w) = client.pending.lock().unwrap().remove(&id) {
-                    let _ = w.send(match r.error {
-                        Some(e) => Err(e),
-                        None => Ok(r.result.unwrap_or(Value::Null)),
-                    });
-                }
+    let mut input = Framed::new(BufReader::new(tokio::io::stdin()));
+    while let Some(frame) = input.next_frame().await {
+        // Plugins served here only answer requests; replies to calls they never make are ignored.
+        let Frame::Request(req) = frame else { continue };
+        let stop = req.method == "shutdown";
+        let (h, tx) = (handler.clone(), tx.clone());
+        let task = tokio::spawn(async move {
+            let id = req.id.clone();
+            let res = h(req).await;
+            if let Some(id) = id {
+                let resp = match res {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e.code, e.message),
+                };
+                let _ = tx.send(serde_json::to_string(&resp).unwrap());
             }
-            Some(Frame::Request(req)) => {
-                let stop = req.method == "shutdown";
-                let (h, c, tx) = (handler.clone(), client.clone(), tx.clone());
-                let task = tokio::spawn(async move {
-                    let id = req.id.clone();
-                    let res = h(req, c).await;
-                    if let Some(id) = id {
-                        let resp = match res {
-                            Ok(v) => Response::ok(id, v),
-                            Err(e) => Response::err(id, e.code, e.message),
-                        };
-                        let _ = tx.send(serde_json::to_string(&resp).unwrap());
-                    }
-                });
-                if stop {
-                    let _ = task.await;
-                    break;
-                }
-            }
-            None => {}
+        });
+        if stop {
+            let _ = task.await;
+            break;
         }
     }
     // dropping every sender lets the writer drain and finish
-    drop(client);
     drop(tx);
     let _ = writer.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn framed_skips_bad_lines_and_pending_routes_replies() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let data: &[u8] = b"\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\"}\n\xff\xfe not json\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":7}\n{\"x\":1}\n";
+            let mut f = Framed::new(BufReader::new(data));
+            assert!(matches!(f.next_frame().await, Some(Frame::Request(r)) if r.method == "a"));
+            assert!(matches!(f.next_frame().await, Some(Frame::Response(r)) if r.id == 2));
+            assert!(f.next_frame().await.is_none());
+        });
+        let p = Pending::default();
+        let (id, rx) = p.register();
+        let (id2, rx2) = p.register();
+        assert_ne!(id, id2);
+        p.resolve(id, Ok(json!(5)));
+        p.fail_all("gone");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert_eq!(rt.block_on(rx).unwrap().unwrap(), json!(5));
+        assert_eq!(rt.block_on(rx2).unwrap().unwrap_err(), "gone");
+        assert!(p.is_empty());
+    }
 }

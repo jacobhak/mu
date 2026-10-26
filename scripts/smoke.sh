@@ -11,7 +11,14 @@ tm="mu-smoke-$$"
 fail=0
 pass() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
-cleanup() { tmux kill-session -t "$tm" 2>/dev/null; pkill -f "mu-gateway daemon" 2>/dev/null; rm -rf "$MU_HOME" "$work"; }
+# Kill only gateway daemons that were started with this run's MU_HOME.
+kill_daemons() {
+  local p
+  for p in $(pgrep -f "mu-gateway daemon" 2>/dev/null); do
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qxF "MU_HOME=$MU_HOME" && kill "$p" 2>/dev/null
+  done
+}
+cleanup() { tmux kill-session -t "$tm" 2>/dev/null; kill_daemons; rm -rf "$MU_HOME" "$work"; }
 trap cleanup EXIT
 
 screen() { tmux capture-pane -pt "$tm" -S -200; }

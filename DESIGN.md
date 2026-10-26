@@ -52,11 +52,11 @@ flowchart LR
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
 | Native providers | Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Gemini; API keys | — |
-| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume, branching, checkpoint/rewind | — |
+| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
 | Built-in tools | read, write, edit (hash-anchored), bash, grep, glob, find, todo, ask | `pi-edit`, `pi-shell`, `pi-walker`, `pi-diff`, `pi-vcs` |
-| Output spill | Tool output and images above a threshold go to `artifact://` files, not the heap | — |
+| Output spill | Tool output above a threshold goes to `artifact://` files, not the heap. Images are stored once as content-addressed blob files (`$MU_HOME/blobs/<sha256>`) and messages keep only omp's `blob:sha256:<hash>` reference; the bytes are read back when a request is built. mu also reads blobs from omp's own store, so omp sessions with images load; omp does not read mu's store | — |
 | Subagents | Spawn `mu --headless` with a task; receive a schema-validated result | — |
 | Plugin host | Manifests, lazy start, lifetimes, hooks, MCP client | — |
 | Terminal UI | Inline rendering into the terminal's scrollback; streaming markdown, diffs, status line | — |
@@ -110,8 +110,8 @@ Stream rules stay in the core because they run on every streamed token; a proces
 | Direction | Call | Purpose |
 |---|---|---|
 | plugin → core | `core/complete` | One-off model call through the configured providers (memory summaries, advisor, commit messages) |
-| plugin → core | `core/tool` | Invoke a built-in tool |
-| plugin → core | `ui/notify`, `ui/confirm`, `ui/select`, `ui/input` | User interaction (the subset pi's RPC extension UI proves workable) |
+| plugin → core | `core/tool` | Invoke a built-in tool. *Not yet implemented; add it when a plugin needs it.* |
+| plugin → core | `ui/notify`, `ui/confirm`, `ui/select`, `ui/input` | User interaction (the subset pi's RPC extension UI proves workable). Only `ui/notify` is implemented; `ui/confirm`, `ui/select` and `ui/input` are *not yet implemented* — add them when a plugin needs them. |
 | core → plugin | `tool/call`, `command/run`, `hook/<name>` | Dispatch |
 
 Tool results carry `content` for the model and optional `display` for the user, as in pi.

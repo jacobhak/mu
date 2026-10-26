@@ -48,10 +48,20 @@ export function formatCurrentTime(now: Date = new Date()): string {
 	return `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())} ${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}`;
 }
 
+/** Cuts to at most `max` UTF-16 units without ever splitting a surrogate pair (a split pair is a lone, invalid half). */
+export function truncateCodePoints(text: string, max: number): string {
+	if (max <= 0) return "";
+	if (text.length <= max) return text;
+	let end = max;
+	const last = text.charCodeAt(end - 1);
+	if (last >= 0xd800 && last <= 0xdbff) end--; // the cut would leave a high surrogate without its low half
+	return text.slice(0, end);
+}
+
 export function truncateApproxTokens(text: string, tokenLimit: number): string {
 	const maxChars = Math.max(0, tokenLimit * 4);
 	if (text.length <= maxChars) return text;
-	return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+	return `${truncateCodePoints(text, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
 function sliceLastTurnsByUserBoundary(messages: Msg[], turns: number): Msg[] {
@@ -84,7 +94,7 @@ export function composeRecallQuery(latestQuery: string, messages: Msg[], recallC
 export function truncateRecallQuery(query: string, latestQuery: string, maxChars: number): string {
 	if (maxChars <= 0 || query.length <= maxChars) return query;
 	const latest = latestQuery.trim();
-	const latestOnly = latest.length > maxChars ? latest.slice(0, maxChars) : latest;
+	const latestOnly = truncateCodePoints(latest, maxChars);
 	const marker = "Prior context:\n\n";
 	const markerIndex = query.indexOf(marker);
 	if (markerIndex === -1) return latestOnly;

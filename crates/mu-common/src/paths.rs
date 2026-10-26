@@ -6,14 +6,29 @@ pub fn home() -> PathBuf {
 
 /// The active omp profile name (`OMP_PROFILE`, else `PI_PROFILE`), if any.
 pub fn profile() -> Option<String> {
-    std::env::var("OMP_PROFILE")
-        .ok()
-        .or_else(|| std::env::var("PI_PROFILE").ok())
-        .filter(|s| !s.is_empty())
+    std::env::var("OMP_PROFILE").ok().or_else(|| std::env::var("PI_PROFILE").ok()).filter(|s| !s.is_empty())
+}
+
+/// `name` is safe to use as one path component: no separators, not `.` or `..`.
+pub fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".."
+}
+
+/// The active profile name, only if it is safe as a path component (anything else reads as no profile).
+pub fn safe_profile() -> Option<String> {
+    profile().filter(|p| valid_profile_name(p))
+}
+
+/// `base` itself, or `base/profiles/<name>` under a profile: the one rule for per-profile state dirs.
+pub fn profile_subdir(base: PathBuf, profile: Option<&str>) -> PathBuf {
+    match profile.filter(|p| valid_profile_name(p)) {
+        Some(p) => base.join("profiles").join(p),
+        None => base,
+    }
 }
 
 pub fn omp_config_root() -> PathBuf {
-    match profile() {
+    match safe_profile() {
         Some(p) => home().join(".omp/profiles").join(p),
         None => home().join(".omp"),
     }
@@ -48,11 +63,7 @@ pub fn mu_home() -> PathBuf {
 /// Per-profile cache dir: `$MU_HOME`, or `$MU_HOME/profiles/<name>` under an omp profile. Data that depends
 /// on a profile's credentials (model catalogue, prices) lives here so profiles never overwrite each other's.
 pub fn profile_cache_dir() -> PathBuf {
-    match profile() {
-        // The name becomes a path component; anything that could escape it falls back to the default dir.
-        Some(p) if !p.contains(['/', '\\']) && p != "." && p != ".." => mu_home().join("profiles").join(p),
-        _ => mu_home(),
-    }
+    profile_subdir(mu_home(), profile().as_deref())
 }
 
 /// The running executable, for re-spawning ourselves (subagents, daemons). After the binary is replaced on
@@ -86,19 +97,6 @@ pub fn encode_cwd(cwd: &Path) -> String {
     format!("--{}--", s.trim_start_matches('/').replace('/', "-"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encode() {
-        let h = home();
-        assert_eq!(encode_cwd(&h.join("code/private/mu")), "-code-private-mu");
-        assert_eq!(encode_cwd(&h), "-");
-        assert_eq!(encode_cwd(Path::new("/opt/x")), "--opt-x--");
-    }
-}
-
 /// Runs the real `omp_bin()` with `args` (stdin null, 60 s limit) and returns its stdout. For contract tests.
 pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
     use std::io::Read;
@@ -130,4 +128,17 @@ pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
         }
     }
     String::from_utf8_lossy(&reader.join().unwrap()).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode() {
+        let h = home();
+        assert_eq!(encode_cwd(&h.join("code/private/mu")), "-code-private-mu");
+        assert_eq!(encode_cwd(&h), "-");
+        assert_eq!(encode_cwd(Path::new("/opt/x")), "--opt-x--");
+    }
 }

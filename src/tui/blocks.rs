@@ -1,10 +1,11 @@
 //! Transcript blocks: user prompts, tool headers and framed tool cards, thinking markers, subagent rows.
+use super::line::truncate_text as trunc;
 use super::line::{self, Line, fill, span, truncate, wrap};
 use super::markdown;
 use super::theme::{self, Role};
 use crate::config::Cards;
 use crate::events::{SubagentState, SubagentStatus};
-use crate::tools::ToolOutput;
+use crate::tools::{BashMeta, FileMeta, ToolMeta, ToolOutput};
 use crossterm::style::{Attribute, Color, ContentStyle};
 use serde_json::Value;
 
@@ -34,17 +35,13 @@ fn bold(mut s: ContentStyle) -> ContentStyle {
     s
 }
 
-fn trunc(s: &str, n: usize) -> String {
-    if s.chars().count() > n { s.chars().take(n.saturating_sub(1)).chain(['…']).collect() } else { s.into() }
-}
-
 fn more(n: usize) -> Line {
     vec![span(format!("… {n} more lines"), tfg(Role::Faint))]
 }
 
 /// Whole-line text in one style; tabs expanded so cell widths stay predictable.
 fn styled_text(l: &str, style: ContentStyle) -> Line {
-    vec![span(l.replace('\t', "   "), style)]
+    vec![span(l, style)]
 }
 
 /// `user` block: a full-width raised band, an accent bar on every row, and one padding row above and below.
@@ -55,7 +52,7 @@ pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
     let blank = || fill(&vec![bar()], width, bg);
     let mut out = vec![blank()];
     for l in text.lines() {
-        for w in wrap(&vec![span(l.replace('\t', "   "), tfg(Role::Strong))], inner) {
+        for w in wrap(&vec![span(l, tfg(Role::Strong))], inner) {
             let mut row = vec![bar()];
             row.extend(w);
             out.push(fill(&row, width, bg));
@@ -69,8 +66,14 @@ fn name_style() -> ContentStyle {
     bold(tfg(Role::Tool))
 }
 
-/// Header target: edit's first input line is `[path#tag]`, shown as the bare path.
-fn summary(name: &str, args: &Value) -> String {
+/// Header target. A finished call shows the path its tool recorded; a call still running only has
+/// the arguments, where edit's first input line is `[path#tag]` (the model's own text, not output).
+fn summary(name: &str, args: &Value, meta: Option<&ToolMeta>) -> String {
+    if let Some(ToolMeta::File(FileMeta { path, .. })) = meta
+        && !path.is_empty()
+    {
+        return path.clone();
+    }
     if name == "edit" {
         let first = args["input"].as_str().and_then(|s| s.lines().next()).unwrap_or("");
         let path = first.strip_prefix('[').unwrap_or(first).split(['#', ']']).next().unwrap_or("").trim();
@@ -81,8 +84,15 @@ fn summary(name: &str, args: &Value) -> String {
     crate::tools::summary(name, args)
 }
 
-fn header_line(icon: &str, icon_style: ContentStyle, name: &str, args: &Value, width: usize) -> Line {
-    let summary = summary(name, args);
+fn header_line(
+    icon: &str,
+    icon_style: ContentStyle,
+    name: &str,
+    args: &Value,
+    meta: Option<&ToolMeta>,
+    width: usize,
+) -> Line {
+    let summary = summary(name, args, meta);
     let mut l = vec![span(format!("{icon} "), icon_style), span(name.to_string(), name_style())];
     if !summary.is_empty() {
         l.push(span(format!(" {summary}"), tfg(Role::Accent)));
@@ -126,6 +136,11 @@ struct Card {
 
 /// Rounded frame with `│` sides, an optional card fill, and footer facts on the bottom rule.
 fn frame(card: &Card, width: usize) -> Vec<Line> {
+    frame_at(card, width).0
+}
+
+/// `frame`, plus the index of the first row of the `output` section (`None` if there is none).
+fn frame_at(card: &Card, width: usize) -> (Vec<Line>, Option<usize>) {
     let w = width.max(6);
     let cw = w - 4;
     let bg = card_bg();
@@ -145,6 +160,7 @@ fn frame(card: &Card, width: usize) -> Vec<Line> {
         fill(&out, w, bg)
     };
     let mut out = vec![rule('╭', '╮', None)];
+    let mut anchor = None;
     let mut first = true;
     for s in &card.sections {
         if s.rows.is_empty() && s.label.is_none() {
@@ -156,6 +172,9 @@ fn frame(card: &Card, width: usize) -> Vec<Line> {
             out.push(rule('├', '┤', None));
         }
         first = false;
+        if s.label == Some("output") {
+            anchor = Some(out.len());
+        }
         for row in &s.rows {
             for w_line in wrap(row, cw) {
                 let row_bg = w_line.first().and_then(|s| s.style.background_color).or(bg);
@@ -167,72 +186,113 @@ fn frame(card: &Card, width: usize) -> Vec<Line> {
         }
     }
     out.push(rule('╰', '╯', card.footer.clone()));
-    out
+    (out, anchor)
+}
+
+/// One footer fact: what it says and how loudly.
+#[derive(Clone, Debug, PartialEq)]
+enum Fact {
+    Wall(f64),
+    Exit(i32),
+    TimedOut,
+    Cancelled,
+    Timeout(String),
+    Artifact(u32),
+    Running(u64),
+    KillHint,
+    Lines(usize),
+    Note(String),
+}
+
+impl Fact {
+    fn label(&self) -> String {
+        match self {
+            Fact::Wall(s) => format!("Wall: {s:.1}s"),
+            Fact::Exit(c) => format!("Exit: {c}"),
+            Fact::TimedOut => "timed out".into(),
+            Fact::Cancelled => "cancelled".into(),
+            Fact::Timeout(t) => t.clone(),
+            Fact::Artifact(n) => format!("artifact://{n}"),
+            Fact::Running(s) => format!("running {s}s"),
+            Fact::KillHint => "ctrl+c twice kills".into(),
+            Fact::Lines(n) => format!("{n} lines"),
+            Fact::Note(n) => n.clone(),
+        }
+    }
+
+    fn role(&self) -> Role {
+        match self {
+            Fact::Exit(_) | Fact::TimedOut => Role::Err,
+            _ => Role::Faint,
+        }
+    }
 }
 
 /// Footer facts joined by faint dots; failures stand out.
-fn facts(parts: &[String]) -> Line {
+fn facts(parts: &[Fact]) -> Line {
     let mut out = Line::new();
     for (i, p) in parts.iter().enumerate() {
         if i > 0 {
             out.push(span(" · ", tfg(Role::Line)));
         }
-        let role = if p.starts_with("Exit") || p == "timed out" { Role::Err } else { Role::Faint };
-        out.push(span(p.clone(), tfg(role)));
+        out.push(span(p.label(), tfg(p.role())));
     }
     out
 }
 
 /// Timeout footer part from the call's `timeout` argument (seconds; 0 disables it).
-fn timeout_part(args: &Value) -> String {
-    match args["timeout"].as_f64() {
-        Some(t) if t == 0.0 => "Timeout: disabled".into(),
+fn timeout_part(args: &Value) -> Fact {
+    Fact::Timeout(match args["timeout"].as_f64() {
+        Some(0.0) => "Timeout: disabled".into(),
         Some(t) if t.fract() == 0.0 => format!("Timeout: {}s", t as u64),
         Some(t) => format!("Timeout: {t}s"),
         None => format!("Timeout: {}s", DEFAULT_TIMEOUT_SECS as u64),
-    }
+    })
 }
 
-/// Splits a bash result into body lines and footer facts. Trailer notices are removed from the body.
-fn bash_trailer(text: &str) -> (Vec<&str>, Vec<String>, bool) {
-    let mut body = Vec::new();
-    let mut facts = Vec::new();
-    let mut failed = false;
-    for l in text.lines() {
-        if let Some(rest) = l.strip_prefix("Wall time: ") {
-            facts.push(format!("Wall: {}s", rest.trim_end_matches(" seconds").trim()));
-        } else if let Some(code) = l.strip_prefix("Command exited with code ") {
-            failed |= code.trim() != "0";
-            if code.trim() != "0" {
-                facts.push(format!("Exit: {}", code.trim()));
-            }
-        } else if l.starts_with("[Command timed out") {
-            facts.push("timed out".into());
-            failed = true;
-        } else if l.contains("[Command cancelled]") {
-            facts.push("cancelled".into());
-            failed = true;
-        } else if let Some(rest) = l.strip_prefix("[full output: ") {
-            facts.push(rest.trim_end_matches(']').to_string());
-        } else if l != "(no output)" {
-            body.push(l);
-        }
+/// The footer facts of a finished bash call, from what the tool recorded.
+fn bash_facts(m: &BashMeta) -> Vec<Fact> {
+    let mut f = Vec::new();
+    if let Some(n) = m.artifact {
+        f.push(Fact::Artifact(n));
     }
-    while body.last().is_some_and(|l| l.trim().is_empty()) {
-        body.pop();
+    if let Some(n) = &m.spill_note {
+        f.push(Fact::Note(n.clone()));
     }
-    (body, facts, failed)
+    if let Some(w) = m.wall_secs {
+        f.push(Fact::Wall(w));
+    }
+    if m.cancelled {
+        f.push(Fact::Cancelled);
+    } else if m.timed_out {
+        f.push(Fact::TimedOut);
+    } else if let Some(c) = m.exit_code.filter(|c| *c != 0) {
+        f.push(Fact::Exit(c));
+    }
+    f
 }
 
 /// Bash box: `$ command`, an `Output` section (last `BASH_TAIL` lines unless expanded), and the footer facts.
-fn bash_box(args: &Value, output: &[&str], expanded: bool, tone: Tone, mut footer: Vec<String>, width: usize) -> Vec<Line> {
+fn bash_box(args: &Value, output: &[&str], expanded: bool, tone: Tone, footer: Vec<Fact>, width: usize) -> Vec<Line> {
+    bash_box_at(args, output, expanded, tone, footer, width).0
+}
+
+/// `bash_box`, plus the index of the first output row among the lines (`None` when there is no output).
+fn bash_box_at(
+    args: &Value,
+    output: &[&str],
+    expanded: bool,
+    tone: Tone,
+    mut footer: Vec<Fact>,
+    width: usize,
+) -> (Vec<Line>, Option<usize>) {
     let cmd_lines: Vec<&str> = args["command"].as_str().unwrap_or("").lines().collect();
     let faint = tfg(Role::Faint);
     let mut cmd_rows: Vec<Line> = cmd_lines
         .iter()
         .take(CMD_CUT)
         .enumerate()
-        .map(|(i, l)| vec![span(if i == 0 { "$ " } else { "  " }, faint), span(l.replace('\t', "   "), tfg(Role::Strong))])
+        .map(|(i, l)| vec![span(if i == 0 { "$ " } else { "  " }, faint), span(*l, tfg(Role::Strong))])
         .collect();
     if cmd_lines.len() > CMD_CUT {
         cmd_rows.push(more(cmd_lines.len() - CMD_CUT));
@@ -253,20 +313,27 @@ fn bash_box(args: &Value, output: &[&str], expanded: bool, tone: Tone, mut foote
         }));
         sections.push(Section { label: Some("output"), rows });
     }
-    let at = footer.iter().position(|f| f.starts_with("Wall:") || f.starts_with("running")).map_or(0, |i| i + 1);
+    let at = footer.iter().position(|f| matches!(f, Fact::Wall(_) | Fact::Running(_))).map_or(0, |i| i + 1);
     footer.insert(at, timeout_part(args));
-    frame(&Card { tone, sections, footer: Some(facts(&footer)) }, width)
+    frame_at(&Card { tone, sections, footer: Some(facts(&footer)) }, width)
 }
 
 /// Lines of a `+`/`-`/`@@` unified diff, with the add/remove counts.
 fn diff_rows(diff: &str, expanded: bool) -> (Vec<Line>, usize, usize) {
     let all: Vec<&str> = diff.lines().collect();
     let (mut adds, mut dels) = (0, 0);
+    // Only the file headers (before the first hunk) are not content; inside a hunk a line that
+    // starts `++` or `--` is a real added or removed line.
+    let mut in_hunk = false;
     for l in &all {
-        if l.starts_with('+') && !l.starts_with("+++") {
-            adds += 1;
-        } else if l.starts_with('-') && !l.starts_with("---") {
-            dels += 1;
+        if l.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk || !(l.starts_with("+++") || l.starts_with("---")) {
+            if l.starts_with('+') {
+                adds += 1;
+            } else if l.starts_with('-') {
+                dels += 1;
+            }
         }
     }
     let shown = if expanded { all.len() } else { all.len().min(DIFF_CUT) };
@@ -281,7 +348,7 @@ fn diff_rows(diff: &str, expanded: bool) -> (Vec<Line>, usize, usize) {
             };
             match tbg(tint) {
                 Some(b) => {
-                    let sign = l.replace('\t', "   ");
+                    let sign = l;
                     let (head, rest) = sign.split_at(1);
                     vec![span(head, with_bg(tfg(role), Some(b))), span(rest, with_bg(ContentStyle::default(), Some(b)))]
                 }
@@ -308,7 +375,11 @@ fn text_rows(text: &str, expanded: bool, style: impl Fn(&str) -> ContentStyle) -
 
 fn error_rows(text: &str) -> Vec<Line> {
     let lines: Vec<&str> = text.lines().collect();
-    let mut rows: Vec<Line> = lines[..lines.len().min(ERR_LINES)].iter().enumerate().map(|(i, l)| styled_text(l, tfg(if i == 0 { Role::Err } else { Role::Muted }))).collect();
+    let mut rows: Vec<Line> = lines[..lines.len().min(ERR_LINES)]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| styled_text(l, tfg(if i == 0 { Role::Err } else { Role::Muted })))
+        .collect();
     if lines.len() > ERR_LINES {
         rows.push(more(lines.len() - ERR_LINES));
     }
@@ -317,20 +388,31 @@ fn error_rows(text: &str) -> Vec<Line> {
 
 /// Committed result of one tool call: header plus whatever box or summary the tool uses.
 pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, width: usize) -> Vec<Line> {
-    if name == "bash" {
-        let (body, facts, failed) = bash_trailer(&out.text);
-        let tone = if out.is_error || failed { Tone::Error } else { Tone::Success };
-        return bash_box(args, &body, expanded, tone, facts, width);
+    if name == "bash"
+        && let Some(ToolMeta::Bash(m)) = &out.meta
+    {
+        // The command's own output ends where the tool said; nothing after it is parsed.
+        let end = m.output_end.min(out.text.len());
+        let mut body: Vec<&str> = out.text.get(..end).unwrap_or_default().lines().collect();
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body.pop();
+        }
+        let tone = if out.is_error || m.failed() { Tone::Error } else { Tone::Success };
+        return bash_box(args, &body, expanded, tone, bash_facts(m), width);
     }
     let icon_style = if out.is_error { tfg(Role::Err) } else { tfg(Role::Ok) };
-    let mut lines = vec![header_line("●", icon_style, name, args, width)];
+    let mut lines = vec![header_line("●", icon_style, name, args, out.meta.as_ref(), width)];
     if out.is_error {
-        let card = Card { tone: Tone::Error, sections: vec![Section { label: None, rows: error_rows(&out.text) }], footer: None };
+        let card = Card {
+            tone: Tone::Error,
+            sections: vec![Section { label: None, rows: error_rows(&out.text) }],
+            footer: None,
+        };
         lines.extend(frame(&card, width));
         return lines;
     }
     match name {
-        "write" if args["path"].as_str().is_some_and(|p| p.starts_with("local://") && p.ends_with("-plan.md")) => {
+        "write" if matches!(&out.meta, Some(ToolMeta::File(FileMeta { plan: true, .. }))) => {
             let n = args["content"].as_str().map_or(0, |c| c.lines().count());
             lines[0].push(span(format!(" · {n} lines"), tfg(Role::Faint)));
             lines[0] = truncate(&lines[0], width);
@@ -340,7 +422,11 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
             let card = Card {
                 tone: Tone::Success,
                 sections: vec![Section { label: None, rows }],
-                footer: Some(vec![span(format!("+{adds}"), tfg(Role::Ok)), span(" ", ContentStyle::default()), span(format!("-{dels}"), tfg(Role::Err))]),
+                footer: Some(vec![
+                    span(format!("+{adds}"), tfg(Role::Ok)),
+                    span(" ", ContentStyle::default()),
+                    span(format!("-{dels}"), tfg(Role::Err)),
+                ]),
             };
             lines.extend(frame(&card, width));
         }
@@ -350,7 +436,9 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
         }
         "grep" => lines.push(vec![span(format!("  {} matches", out.text.lines().count()), tfg(Role::Muted))]),
         "glob" => lines.push(vec![span(format!("  {} files", out.text.lines().count()), tfg(Role::Muted))]),
-        "task" => lines.extend(text_rows(&out.text, expanded, |l| if l.starts_with("## ") { name_style() } else { tfg(Role::Muted) })),
+        "task" => lines.extend(text_rows(&out.text, expanded, |l| {
+            if l.starts_with("## ") { name_style() } else { tfg(Role::Muted) }
+        })),
         _ => lines.extend(text_rows(&out.text, expanded, |_| tfg(Role::Muted))),
     }
     lines
@@ -360,20 +448,27 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
 pub fn tool_live(name: &str, args: &Value, tail: &[String], spin: char, elapsed: u64, width: usize) -> Vec<Line> {
     if name == "bash" {
         let body: Vec<&str> = tail.iter().map(String::as_str).collect();
-        let footer = vec![format!("running {elapsed}s")];
+        let footer = vec![Fact::Running(elapsed)];
         return bash_box(args, &body, false, Tone::Pending, footer, width);
     }
-    vec![header_line(&spin.to_string(), tfg(Role::Accent), name, args, width)]
+    vec![header_line(&spin.to_string(), tfg(Role::Accent), name, args, None, width)]
 }
 
 /// Live bash card around an embedded terminal screen. Returns the lines and the cursor `(row, col)` within them.
-pub fn pty_live(args: &Value, rows: &[String], cursor: (usize, usize), elapsed: u64, width: usize) -> (Vec<Line>, (usize, usize)) {
+pub fn pty_live(
+    args: &Value,
+    rows: &[String],
+    cursor: (usize, usize),
+    elapsed: u64,
+    width: usize,
+) -> (Vec<Line>, Option<(usize, usize)>) {
     let body: Vec<&str> = rows.iter().map(String::as_str).collect();
-    let footer = vec![format!("running {elapsed}s"), "esc kills".to_string()];
-    let lines = bash_box(args, &body, true, Tone::Pending, footer, width);
-    // Rows never wrap (at most the inner width) and the footer rule is the last line.
-    let row = (lines.len() - 1).saturating_sub(rows.len()) + cursor.0;
-    (lines, (row, 2 + cursor.1))
+    let footer = vec![Fact::Running(elapsed), Fact::KillHint];
+    let (lines, first) = bash_box_at(args, &body, true, Tone::Pending, footer, width);
+    // Terminal rows never wrap (they are at most the inner width), so the screen row `r` is
+    // `first + r`. With no output rows there is nowhere to put the cursor.
+    let cur = first.map(|first| (first + cursor.0, 2 + cursor.1));
+    (lines, cur)
 }
 
 /// Subagent rows: state mark, name, tool count, and the last activity.
@@ -435,7 +530,7 @@ pub fn tool_streaming(name: &str, args: &Value, spin: char, width: usize) -> Vec
     if name == "bash" {
         return bash_box(args, &[], false, Tone::Pending, vec![], width);
     }
-    let mut out = vec![header_line(&spin.to_string(), tfg(Role::Accent), name, args, width)];
+    let mut out = vec![header_line(&spin.to_string(), tfg(Role::Accent), name, args, None, width)];
     let (body, footer) = match name {
         "write" => (args["content"].as_str(), true),
         "edit" => (args["input"].as_str(), false),
@@ -462,7 +557,7 @@ pub fn tool_streaming(name: &str, args: &Value, spin: char, width: usize) -> Vec
         };
         styled_text(l, style)
     }));
-    let footer = footer.then(|| facts(&[format!("{} lines", lines.len())]));
+    let footer = footer.then(|| facts(&[Fact::Lines(lines.len())]));
     out.extend(frame(&Card { tone: Tone::Pending, sections: vec![Section { label: None, rows }], footer }, width));
     out
 }
@@ -477,14 +572,20 @@ mod tests {
     fn pty_live_cursor() {
         let (lines, cur) = pty_live(&json!({"command":"sudo ls"}), &["[sudo] password: ".into()], (0, 17), 1, 40);
         let t: Vec<String> = lines.iter().map(text_of).collect();
+        let cur = cur.expect("output rows exist");
         assert!(t[cur.0].starts_with("│ [sudo] password:"), "{t:?}");
         assert_eq!(cur.1, 19);
+        let (_, none) = pty_live(&json!({"command":"x"}), &[], (0, 0), 1, 40);
+        assert_eq!(none, None, "no output rows: the cursor is hidden");
     }
 
     #[test]
     fn streaming_write_tail() {
         let content: String = (1..=20).map(|i| format!("{i}\n")).collect();
-        let t: Vec<String> = tool_streaming("write", &json!({"path": "/tmp/x", "content": content}), '⠋', 60).iter().map(text_of).collect();
+        let t: Vec<String> = tool_streaming("write", &json!({"path": "/tmp/x", "content": content}), '⠋', 60)
+            .iter()
+            .map(text_of)
+            .collect();
         assert!(t[0].contains("write"));
         assert!(t.iter().any(|l| l.contains("… 8 more lines")));
         assert!(t.iter().any(|l| l.contains(" 9 ")));
@@ -495,7 +596,8 @@ mod tests {
 
     #[test]
     fn streaming_bash_shows_command() {
-        let t: Vec<String> = tool_streaming("bash", &json!({"command": "echo hi"}), '⠋', 60).iter().map(text_of).collect();
+        let t: Vec<String> =
+            tool_streaming("bash", &json!({"command": "echo hi"}), '⠋', 60).iter().map(text_of).collect();
         assert!(t.iter().any(|l| l.contains("$ echo hi")));
     }
 
@@ -507,6 +609,7 @@ mod tests {
     fn plan_write_is_one_line() {
         let mut out = ToolOutput::ok("ok");
         out.display = Some("+a\n+b\n+c".into());
+        out.meta = Some(ToolMeta::File(FileMeta { path: "local://x-plan.md".into(), tag: None, plan: true }));
         let args = json!({"path": "local://x-plan.md", "content": "a\nb\nc\n"});
         assert_eq!(texts(&tool_result("write", &args, &out, false, 60)), ["● write local://x-plan.md · 3 lines"]);
     }
@@ -514,7 +617,9 @@ mod tests {
     #[test]
     fn bash_box_tails_and_footer() {
         let body: String = (1..=30).map(|i| format!("row{i}\n")).collect();
-        let out = ToolOutput::ok(format!("{body}\nWall time: 2.0 seconds\n\nCommand exited with code 0"));
+        let mut out = ToolOutput::ok(format!("{body}\nWall time: 2.0 seconds\n\nCommand exited with code 0"));
+        out.meta =
+            Some(ToolMeta::Bash(BashMeta { output_end: body.len(), wall_secs: Some(2.0), ..Default::default() }));
         let args = json!({"command": "seq 30", "timeout": 60});
         let t = texts(&tool_result("bash", &args, &out, false, 40));
         assert_eq!(t.len(), 15);
@@ -530,10 +635,51 @@ mod tests {
 
     #[test]
     fn bash_error_box_uses_error_tone_and_exit_fact() {
-        let out = ToolOutput::err("nope\n\nCommand exited with code 3");
+        let mut out = ToolOutput::ok("nope\n\nCommand exited with code 3");
+        out.meta = Some(ToolMeta::Bash(BashMeta { output_end: 4, exit_code: Some(3), ..Default::default() }));
         let t = texts(&tool_result("bash", &json!({"command": "false"}), &out, false, 30));
         assert!(t.last().unwrap().contains("Exit: 3"), "{t:?}");
         assert!(!t.iter().any(|l| l.contains("Command exited")), "trailer moved into footer");
+    }
+
+    #[test]
+    fn program_output_that_looks_like_a_trailer_is_just_output() {
+        // The program itself printed these lines; only `meta` decides what is a fact.
+        let printed = "Wall time: 9.0 seconds\nCommand exited with code 7\n[Command cancelled]";
+        let mut out = ToolOutput::ok(printed);
+        out.meta = Some(ToolMeta::Bash(BashMeta { output_end: printed.len(), ..Default::default() }));
+        let t = texts(&tool_result("bash", &json!({"command": "echo"}), &out, false, 60));
+        assert!(t.iter().any(|l| l.contains("Wall time: 9.0 seconds")), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("Command exited with code 7")), "{t:?}");
+        let last = t.last().unwrap();
+        assert!(!last.contains("Exit") && !last.contains("cancelled") && !last.contains("Wall"), "{last}");
+        // And the footer facts come from `meta` alone.
+        let mut out = ToolOutput::ok("x");
+        out.meta =
+            Some(ToolMeta::Bash(BashMeta { output_end: 1, artifact: Some(2), timed_out: true, ..Default::default() }));
+        let t = texts(&tool_result("bash", &json!({"command": "x"}), &out, false, 60));
+        assert!(t.last().unwrap().contains("artifact://2") && t.last().unwrap().contains("timed out"), "{t:?}");
+    }
+
+    #[test]
+    fn tool_meta_survives_storage() {
+        let mut out = ToolOutput::ok("hi");
+        out.details = Some(json!({"planDecision": "keep"}));
+        out.meta = Some(ToolMeta::Bash(BashMeta { output_end: 2, exit_code: Some(1), ..Default::default() }));
+        let stored = out.stored_details();
+        assert_eq!(stored.as_ref().unwrap()["planDecision"], "keep");
+        let back = ToolOutput::from_stored("hi".into(), false, stored);
+        assert_eq!(back.meta, out.meta);
+        assert_eq!(ToolOutput::from_stored("x".into(), false, None).meta, None);
+    }
+
+    #[test]
+    fn diff_counts_ignore_headers_but_not_content() {
+        let d = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n--- removed text\n+++ added text\n-x\n+y\n";
+        let (_, adds, dels) = diff_rows(d, true);
+        assert_eq!((adds, dels), (2, 2));
+        let (_, adds, dels) = diff_rows("+a\n+b\n-c\n", true);
+        assert_eq!((adds, dels), (2, 1), "a headerless diff counts every line");
     }
 
     #[test]

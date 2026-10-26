@@ -10,6 +10,8 @@ pub struct PtyView {
     input: UnboundedSender<PtyInput>,
     /// (cols, rows)
     size: (u16, u16),
+    /// When Ctrl+C was last pressed; a second press within a second kills the command.
+    last_ctrl_c: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 fn nz(n: u16) -> NonZeroU16 {
@@ -25,7 +27,7 @@ impl PtyView {
     }
 
     pub fn new(id: String, input: UnboundedSender<PtyInput>, size: (u16, u16)) -> Self {
-        Self { id, parser: vt100::Parser::new(nz(size.1), nz(size.0), 0), input, size }
+        Self { id, parser: vt100::Parser::new(nz(size.1), nz(size.0), 0), input, size, last_ctrl_c: Default::default() }
     }
 
     pub fn feed(&mut self, s: &str) {
@@ -60,9 +62,18 @@ impl PtyView {
         if k.kind == KeyEventKind::Release {
             return;
         }
-        if k.code == KeyCode::Esc {
-            let _ = self.input.send(PtyInput::Kill);
-            return;
+        // Ctrl+C reaches the command as an ordinary keystroke (SIGINT through the pty). A second
+        // one within a second means the command is not listening: kill it. Esc goes to the child.
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            let now = std::time::Instant::now();
+            if self
+                .last_ctrl_c
+                .replace(Some(now))
+                .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+            {
+                let _ = self.input.send(PtyInput::Kill);
+                return;
+            }
         }
         if let Some(b) = encode_key(k, self.parser.screen().application_cursor()) {
             let _ = self.input.send(PtyInput::Bytes(b));
@@ -75,7 +86,8 @@ impl PtyView {
         if bracketed {
             b.extend_from_slice(b"\x1b[200~");
         }
-        b.extend_from_slice(s.as_bytes());
+        // An ESC in the text could end the bracketed paste early and smuggle in keystrokes.
+        b.extend_from_slice(s.replace('\x1b', "").as_bytes());
         if bracketed {
             b.extend_from_slice(b"\x1b[201~");
         }
@@ -114,6 +126,7 @@ pub fn encode_key(k: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
         }
+        KeyCode::Esc => out.push(0x1b),
         KeyCode::Enter => out.push(b'\r'),
         KeyCode::Tab => out.push(b'\t'),
         KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
@@ -153,6 +166,19 @@ mod tests {
 
     fn k(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
+    }
+
+    #[test]
+    fn esc_goes_to_the_child_and_double_ctrl_c_kills() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let v = PtyView::new("x".into(), tx, (80, 24));
+        v.key(k(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv(), Ok(PtyInput::Bytes(b)) if b == [0x1b]));
+        let ctrl_c = k(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        v.key(ctrl_c);
+        assert!(matches!(rx.try_recv(), Ok(PtyInput::Bytes(b)) if b == [3]), "first Ctrl+C is a keystroke");
+        v.key(ctrl_c);
+        assert!(matches!(rx.try_recv(), Ok(PtyInput::Kill)));
     }
 
     #[test]

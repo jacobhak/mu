@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(200);
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Spawns (detached, setsid) `mu-gateway daemon` unless one is already healthy, and returns its URL.
@@ -36,12 +37,25 @@ pub fn start(dir: &Path) -> Result<String, String> {
     let fail = || format!("gateway daemon did not start; see {}", log_path.display());
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        if let Some(st) = shared::read_state(dir) {
-            if st.pid == pid as i32 && shared::healthy(&st.url) {
-                return Ok(st.url);
-            }
+        if let Some(st) = shared::read_state(dir)
+            && st.pid == pid as i32
+            && shared::healthy(&st.url)
+        {
+            return Ok(st.url);
         }
-        if !shared::alive(pid as i32) || Instant::now() >= deadline {
+        if !shared::alive(pid as i32) {
+            return Err(fail());
+        }
+        if Instant::now() >= deadline {
+            // Still starting after the deadline: it is not coming up, so do not leave it running.
+            // SAFETY: the daemon called setsid, so -pid is its own process group.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+            thread::sleep(STOP_GRACE.min(Duration::from_millis(500)));
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
             return Err(fail());
         }
         thread::sleep(POLL);
@@ -55,6 +69,23 @@ pub fn run() -> i32 {
         Err(e) => {
             eprintln!("mu-gateway daemon: {e}");
             1
+        }
+    }
+}
+
+/// Runs `cmd` and waits up to `limit`; a command still running then is killed. Returns whether it exited in time.
+fn run_with_timeout(cmd: &mut Command, limit: Duration) -> bool {
+    let Ok(mut child) = cmd.spawn() else { return false };
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
         }
     }
 }
@@ -75,12 +106,14 @@ fn serve() -> Result<i32, String> {
     let mut kids = Kids(Vec::new());
     let (broker, broker_url) = spawn_omp(&["auth-broker", "serve", "--bind=127.0.0.1:0"], &[])?;
     kids.0.push(broker);
-    let _ = Command::new(mu_common::paths::omp_bin())
-        .args(["auth-gateway", "token"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    run_with_timeout(
+        Command::new(mu_common::paths::omp_bin())
+            .args(["auth-gateway", "token"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        TOKEN_TIMEOUT,
+    );
     let token_path = paths::omp_config_root().join("auth-broker.token");
     let token = fs::read_to_string(&token_path).map(|t| t.trim().to_string()).unwrap_or_default();
     if token.is_empty() {
@@ -108,13 +141,13 @@ fn serve() -> Result<i32, String> {
             continue;
         }
         // Re-check under the lock: a plugin holding it is about to adopt this gateway.
-        if let Some(lock) = shared::try_lock(&dir).map_err(|e| e.to_string())? {
-            if !shared::has_fresh_lease(&dir, idle) {
-                shared::remove_state_if_owned(&dir, me);
-                drop(lock);
-                eprintln!("mu-gateway daemon {me}: no client lease within {}s; stopping", idle.as_secs_f64());
-                return Ok(0);
-            }
+        if let Some(lock) = shared::try_lock(&dir).map_err(|e| e.to_string())?
+            && !shared::has_fresh_lease(&dir, idle)
+        {
+            shared::remove_state_if_owned(&dir, me);
+            drop(lock);
+            eprintln!("mu-gateway daemon {me}: no client lease within {}s; stopping", idle.as_secs_f64());
+            return Ok(0);
         }
     }
 }
@@ -216,5 +249,18 @@ mod tests {
         assert_eq!(listen_url("auth-gateway listening on http://127.0.0.1:4321"), Some("http://127.0.0.1:4321".into()));
         assert_eq!(listen_url(r#"{"url":"http://127.0.0.1:9"}"#), Some("http://127.0.0.1:9".into()));
         assert_eq!(listen_url("no url here"), None);
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn a_hung_command_is_killed() {
+        let t = Instant::now();
+        assert!(!run_with_timeout(Command::new("sleep").arg("30"), Duration::from_millis(200)));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(run_with_timeout(&mut Command::new("true"), Duration::from_secs(5)));
     }
 }

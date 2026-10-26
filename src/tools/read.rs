@@ -1,4 +1,4 @@
-use super::{ToolOutput, Tools};
+use super::{FileMeta, ToolMeta, ToolOutput, Tools};
 use pi_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
 use std::fmt::Write;
@@ -17,23 +17,23 @@ const MAX_COL: usize = 768;
 fn select(sel: Option<&str>, total: usize) -> Option<(usize, usize)> {
     let Some(sel) = sel else { return Some((1, DEFAULT_LINES.min(total))) };
     if let Some(k) = sel.strip_prefix('-') {
-        let k: usize = k.parse().ok()?;
+        let k: usize = k.parse().ok().filter(|&k| k > 0)?;
         return Some((total.saturating_sub(k) + 1, total));
     }
     if let Some((n, m)) = sel.split_once('-') {
-        let (n, m): (usize, usize) = (n.parse().ok()?, m.parse().ok()?);
-        return Some((n.saturating_sub(1).max(1), (m + 3).min(total)));
+        let (n, m): (usize, usize) = (n.parse().ok().filter(|&n| n > 0)?, m.parse().ok().filter(|&m| m > 0)?);
+        return Some((n.saturating_sub(1).max(1), m.saturating_add(3).min(total)));
     }
     if let Some((n, k)) = sel.split_once('+') {
-        let (n, k): (usize, usize) = (n.parse().ok()?, k.parse().ok()?);
-        return Some((n, (n + k).saturating_sub(1).min(total)));
+        let (n, k): (usize, usize) = (n.parse().ok().filter(|&n| n > 0)?, k.parse().ok()?);
+        return Some((n, n.saturating_add(k).saturating_sub(1).min(total)));
     }
-    let n: usize = sel.parse().ok()?;
-    Some((n, (n + DEFAULT_LINES - 1).min(total)))
+    let n: usize = sel.parse().ok().filter(|&n| n > 0)?;
+    Some((n, n.saturating_add(DEFAULT_LINES - 1).min(total)))
 }
 
 impl Tools {
-    pub fn read(&self, a: Args) -> ToolOutput {
+    pub async fn read(&self, a: Args) -> ToolOutput {
         let mut sel = None;
         let mut authored = a.path.as_str();
         let first = self.resolve(&a.path).ok().filter(|r| r.path.exists());
@@ -59,24 +59,28 @@ impl Tools {
                 _ => format!("File not found: {disp}"),
             });
         }
-        if abs.is_dir() {
-            return list_dir(&abs);
-        }
-        let raw = match std::fs::read(&abs) {
-            Ok(r) => r,
-            Err(e) => return ToolOutput::err(format!("Cannot read {disp}: {e}")),
+        // Directory listing and file reading run on a blocking thread.
+        let path = abs.clone();
+        let source = tokio::task::spawn_blocking(move || {
+            if path.is_dir() { Source::Dir(list_dir(&path)) } else { Source::File(std::fs::read(&path)) }
+        })
+        .await;
+        let raw = match source {
+            Ok(Source::Dir(out)) => return out,
+            Ok(Source::File(Ok(raw))) => raw,
+            Ok(Source::File(Err(e))) => return ToolOutput::err(format!("Cannot read {disp}: {e}")),
+            Err(e) => return ToolOutput::err(format!("read failed: {e}")),
         };
         let head = &raw[..raw.len().min(8192)];
-        let Ok(s) = std::str::from_utf8(&raw).map(String::from).map_err(|_| ()).and_then(|s| {
-            if head.contains(&0) { Err(()) } else { Ok(s) }
-        }) else {
-            return ToolOutput::ok(format!("Binary file ({} bytes); not displayed", raw.len()));
+        let s = match std::str::from_utf8(&raw) {
+            Ok(s) if !head.contains(&0) => s,
+            _ => return ToolOutput::ok(format!("Binary file ({} bytes); not displayed", raw.len())),
         };
-        let norm = text::normalize_to_lf(text::strip_bom(&s).1).into_owned();
+        // Borrowed all the way unless the file has CRLFs: no copy of a large file just to read it.
+        let norm = text::normalize_to_lf(text::strip_bom(s).1);
         let key = canonical_key(&abs);
         let tag = self.edit_store.record(&key, &norm, None);
-        let lines: Vec<&str> = norm.lines().collect();
-        let total = lines.len();
+        let total = line_count(&norm);
         let Some((start, end)) = select(sel.as_deref(), total) else {
             return ToolOutput::err(format!("Invalid selector in {}", a.path));
         };
@@ -90,8 +94,10 @@ impl Tools {
         let mut seen = Vec::new();
         let mut bytes = 0;
         let mut last = start - 1;
-        for n in start..=end.min(start + MAX_LINES - 1) {
-            let line = lines[n - 1];
+        // Only the window is walked; lines before it are skipped and lines after it never visited.
+        let window = end.min(start + MAX_LINES - 1) + 1 - start;
+        for (k, line) in norm.lines().skip(start - 1).take(window).enumerate() {
+            let n = start + k;
             let row = if line.chars().count() > MAX_COL {
                 format!("{n}:{}…", line.chars().take(MAX_COL).collect::<String>())
             } else {
@@ -111,8 +117,20 @@ impl Tools {
         if last < total {
             let _ = write!(out, "\n\n[{} more lines in file. Use {disp}:{} to continue]", total - last, last + 1);
         }
-        ToolOutput::ok(out)
+        let mut result = ToolOutput::ok(out);
+        result.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag: Some(tag), plan: false }));
+        result
     }
+}
+
+enum Source {
+    Dir(ToolOutput),
+    File(std::io::Result<Vec<u8>>),
+}
+
+/// Number of lines `str::lines` would yield, without building them.
+fn line_count(s: &str) -> usize {
+    s.bytes().filter(|&b| b == b'\n').count() + usize::from(!s.is_empty() && !s.ends_with('\n'))
 }
 
 fn list_dir(p: &std::path::Path) -> ToolOutput {
@@ -147,24 +165,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_and_range_selectors() {
+    fn zero_and_out_of_range_selectors() {
+        for s in ["0", "-0", "0-5", "3-0", "0+5", "00"] {
+            assert_eq!(select(Some(s), 10), None, "{s}");
+        }
+        assert_eq!(select(Some("11"), 10), Some((11, 10)));
+        assert_eq!(select(Some("18446744073709551615-18446744073709551615"), 10), Some((18446744073709551614, 10)));
+        assert_eq!(select(Some("2+0"), 10), Some((2, 1)));
+    }
+
+    #[test]
+    fn line_count_matches_str_lines() {
+        for s in ["", "a", "a\n", "a\nb", "\n\n", "a\n\nb\n", "x\n\n\n"] {
+            assert_eq!(line_count(s), s.lines().count(), "{s:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_and_range_selectors() {
         let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         let body: String = (1..=400).map(|i| format!("line{i}\n")).collect();
         std::fs::write(d.join("p.txt"), body).unwrap();
         let mut t = Tools::for_test();
         t.cwd = d.clone();
-        let o = t.read(Args { path: "p.txt".into() });
+        let o = t.read(Args { path: "p.txt".into() }).await;
         assert!(!o.is_error);
         assert!(o.text.contains("\n300:line300"));
         assert!(!o.text.contains("301:line301"));
         assert!(o.text.contains("Use p.txt:301 to continue"));
-        let o = t.read(Args { path: "p.txt:50-80".into() });
+        let o = t.read(Args { path: "p.txt:50-80".into() }).await;
         assert!(o.text.contains("\n49:line49\n"));
         assert!(o.text.contains("\n83:line83"));
         assert!(!o.text.contains("84:line84"));
         assert!(!o.text.contains("\n48:"));
-        let o = t.read(Args { path: "p.txt:-2".into() });
+        let o = t.read(Args { path: "p.txt:-2".into() }).await;
         assert!(o.text.contains("399:line399\n400:line400"));
     }
 }

@@ -11,4 +11,4 @@ else
   echo "mu process not found" >&2
 fi
 kill -- "-$spid" 2>/dev/null || kill "$spid" 2>/dev/null || true
-pkill -f "^$bin" 2>/dev/null || true
+[[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true

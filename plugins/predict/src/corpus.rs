@@ -1,7 +1,30 @@
 //! Prompt corpus: omp's history.db, Claude Code's history.jsonl and mu's own history.
 
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
+use std::io::BufRead;
 use std::path::Path;
+
+/// Prompts kept per working directory; older ones are dropped as new ones stream in.
+const PER_CWD: usize = 2000;
+
+/// Keeps the most recent `PER_CWD` rows per cwd, in arrival order.
+#[derive(Default)]
+struct Recent(HashMap<String, VecDeque<Row>>);
+
+impl Recent {
+    fn push(&mut self, r: Row) {
+        let q = self.0.entry(r.cwd.clone()).or_default();
+        if q.len() == PER_CWD {
+            q.pop_front();
+        }
+        q.push_back(r);
+    }
+
+    fn into_rows(self) -> Vec<Row> {
+        self.0.into_values().flatten().collect()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -12,10 +35,14 @@ pub struct Row {
     pub count: u32,
 }
 
-fn omp_rows(agent_dir: &Path, out: &mut Vec<Row>) {
+fn omp_rows(agent_dir: &Path, out: &mut Recent) {
     use rusqlite::{Connection, OpenFlags};
-    let Ok(db) = Connection::open_with_flags(agent_dir.join("history.db"), OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
-    let Ok(mut st) = db.prepare("SELECT prompt, cwd, created_at, use_count FROM history") else { return };
+    let Ok(db) = Connection::open_with_flags(agent_dir.join("history.db"), OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return;
+    };
+    let Ok(mut st) = db.prepare("SELECT prompt, cwd, created_at, use_count FROM history ORDER BY created_at") else {
+        return;
+    };
     let Ok(rows) = st.query_map([], |r| {
         Ok(Row {
             text: r.get(0)?,
@@ -26,13 +53,15 @@ fn omp_rows(agent_dir: &Path, out: &mut Vec<Row>) {
     }) else {
         return;
     };
-    out.extend(rows.flatten());
+    for r in rows.flatten() {
+        out.push(r);
+    }
 }
 
-fn claude_rows(home: &Path, out: &mut Vec<Row>) {
-    let Ok(text) = std::fs::read_to_string(home.join(".claude/history.jsonl")) else { return };
-    for l in text.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
+fn claude_rows(home: &Path, out: &mut Recent) {
+    let Ok(f) = std::fs::File::open(home.join(".claude/history.jsonl")) else { return };
+    for l in std::io::BufReader::new(f).split(b'\n').map_while(Result::ok) {
+        let Ok(v) = serde_json::from_slice::<Value>(&l) else { continue };
         let Some(t) = v["display"].as_str() else { continue };
         out.push(Row {
             text: t.to_owned(),
@@ -57,18 +86,41 @@ pub fn mu_row(line: &str) -> Option<Row> {
     }
 }
 
-fn mu_rows(mu_home: &Path, out: &mut Vec<Row>) {
-    let Ok(text) = std::fs::read_to_string(mu_home.join("history.jsonl")) else { return };
-    out.extend(text.lines().filter_map(mu_row));
+fn mu_rows(mu_home: &Path, out: &mut Recent) {
+    let Ok(f) = std::fs::File::open(mu_home.join("history.jsonl")) else { return };
+    for l in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        if let Some(r) = mu_row(&l) {
+            out.push(r);
+        }
+    }
 }
 
 /// All rows from every readable source, oldest first. Missing sources are skipped.
 pub fn load_corpus(agent_dir: &Path, mu_home: &Path, home: &Path) -> Vec<Row> {
-    let mut rows = Vec::new();
-    omp_rows(agent_dir, &mut rows);
-    claude_rows(home, &mut rows);
-    mu_rows(mu_home, &mut rows);
+    let mut recent = Recent::default();
+    omp_rows(agent_dir, &mut recent);
+    claude_rows(home, &mut recent);
+    mu_rows(mu_home, &mut recent);
+    let mut rows = recent.into_rows();
     rows.retain(|r| !r.text.trim().is_empty());
     rows.sort_by_key(|r| r.ts);
     rows
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_only_the_most_recent_per_cwd() {
+        let mut r = Recent::default();
+        for i in 0..PER_CWD + 5 {
+            r.push(Row { text: format!("p{i}"), cwd: "/a".into(), ts: i as i64, count: 1 });
+        }
+        r.push(Row { text: "other".into(), cwd: "/b".into(), ts: 0, count: 1 });
+        let rows = r.into_rows();
+        assert_eq!(rows.len(), PER_CWD + 1);
+        assert!(!rows.iter().any(|x| x.text == "p0"));
+        assert!(rows.iter().any(|x| x.text == format!("p{}", PER_CWD + 4)));
+    }
 }

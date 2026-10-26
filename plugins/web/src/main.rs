@@ -14,7 +14,7 @@ static CWD: OnceLock<PathBuf> = OnceLock::new();
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    serve_stdio(|req: Request, _client| async move { dispatch(req).await }).await;
+    serve_stdio(|req: Request| async move { dispatch(req).await }).await;
 }
 
 async fn dispatch(req: Request) -> Result<Value, RpcError> {
@@ -100,6 +100,9 @@ async fn fetch(args: &Value) -> (String, bool) {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return ("fetch only supports http(s) URLs".into(), true);
     }
+    if let Err(e) = check_destination(url).await {
+        return (e, true);
+    }
     let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
     let target = if raw { format!("{url}:raw") } else { url.to_string() };
     match run_omp(&["read".into(), target], &[("COLUMNS", "200"), ("NO_COLOR", "1")]).await {
@@ -107,6 +110,81 @@ async fn fetch(args: &Value) -> (String, bool) {
         Ok((_, stderr, false)) => (format!("omp read failed:\n{}", tail(&stderr, 20)), true),
         Ok((stdout, _, true)) => (truncate(stdout), false),
     }
+}
+
+/// Splits `scheme://[user@]host[:port]/…` into host and port.
+fn host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
+    let auth = rest.split(['/', '?', '#']).next()?;
+    let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
+    let (host, port) = if let Some(v6) = auth.strip_prefix('[') {
+        let (h, after) = v6.split_once(']')?;
+        (h, after.strip_prefix(':'))
+    } else {
+        match auth.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (auth, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port.filter(|p| !p.is_empty()) {
+        Some(p) => p.parse().ok()?,
+        None => default,
+    };
+    Some((host.to_string(), port))
+}
+
+/// Addresses a fetch must not reach: loopback, link-local, private, unique-local, unspecified,
+/// CGNAT and multicast.
+fn is_internal(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.is_multicast()
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        IpAddr::V6(v) => {
+            if let Some(m) = v.to_ipv4_mapped() {
+                return is_internal(IpAddr::V4(m));
+            }
+            let s = v.segments();
+            v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00 // unique local
+                || (s[0] & 0xffc0) == 0xfe80 // link local
+        }
+    }
+}
+
+/// Refuses URLs that resolve to internal addresses unless `MU_WEB_ALLOW_PRIVATE=1`.
+/// Limit: `omp read` follows redirects itself, so a redirect target is not checked, and a DNS
+/// answer can change between this check and the fetch.
+async fn check_destination(url: &str) -> Result<(), String> {
+    if std::env::var("MU_WEB_ALLOW_PRIVATE").is_ok_and(|v| v == "1") {
+        return Ok(());
+    }
+    let (host, port) = host_port(url).ok_or("invalid URL")?;
+    let addrs =
+        tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| format!("cannot resolve {host}: {e}"))?;
+    for a in addrs {
+        if is_internal(a.ip()) {
+            return Err(format!(
+                "refusing to fetch {host}: it resolves to an internal address ({}). Set MU_WEB_ALLOW_PRIVATE=1 to allow.",
+                a.ip()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn truncate(mut s: String) -> String {
@@ -208,7 +286,53 @@ mod tests {
     #[test]
     #[ignore]
     fn contract_omp_read() {
-        let out = mu_common::paths::run_omp_blocking(&["read", "https://example.com"], &[("COLUMNS", "200"), ("NO_COLOR", "1")]);
+        let out = mu_common::paths::run_omp_blocking(
+            &["read", "https://example.com"],
+            &[("COLUMNS", "200"), ("NO_COLOR", "1")],
+        );
         assert!(out.contains("Example Domain"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[test]
+    fn internal_addresses_are_refused() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::",
+        ] {
+            assert!(is_internal(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700::1111"] {
+            assert!(!is_internal(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn host_port_parsing() {
+        assert_eq!(host_port("http://a.com/x"), Some(("a.com".into(), 80)));
+        assert_eq!(host_port("https://u:p@a.com:8443/x?y"), Some(("a.com".into(), 8443)));
+        assert_eq!(host_port("http://[::1]:9000/"), Some(("::1".into(), 9000)));
+        assert_eq!(host_port("http:///x"), None);
+    }
+
+    #[test]
+    fn localhost_fetch_is_blocked() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(rt.block_on(check_destination("http://127.0.0.1:1/")).is_err());
+        assert!(rt.block_on(check_destination("http://169.254.169.254/latest")).is_err());
     }
 }

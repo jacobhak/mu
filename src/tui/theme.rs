@@ -163,10 +163,10 @@ impl Palette {
             ("selection", "selection_background"),
             ("orange", "yellow"),
         ] {
-            if !rgb.contains_key(to) {
-                if let Some(c) = rgb.get(from).copied() {
-                    rgb.insert(to.into(), c);
-                }
+            if !rgb.contains_key(to)
+                && let Some(c) = rgb.get(from).copied()
+            {
+                rgb.insert(to.into(), c);
             }
         }
         for k in ["background", "foreground"] {
@@ -228,7 +228,10 @@ fn load_palette(source: &str) -> Result<Palette, String> {
 pub fn truecolor_terminal() -> bool {
     let v = |k: &str| std::env::var(k).unwrap_or_default().to_lowercase();
     let ct = v("COLORTERM");
-    ct.contains("truecolor") || ct.contains("24bit") || v("TERM").contains("direct") || std::env::var_os("WT_SESSION").is_some()
+    ct.contains("truecolor")
+        || ct.contains("24bit")
+        || v("TERM").contains("direct")
+        || std::env::var_os("WT_SESSION").is_some()
 }
 
 pub struct Theme {
@@ -238,13 +241,21 @@ pub struct Theme {
 }
 
 static THEME: OnceLock<Theme> = OnceLock::new();
+/// `init` ran. Reading the theme earlier would pin the bundled default for the whole run.
+static INIT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The active theme; bundled tokyo-night, truecolor, outline cards before `init`.
+fn bundled_default() -> Palette {
+    Palette::from_toml(PALETTES.iter().find(|(k, _)| *k == "tokyo-night").map_or("", |p| p.1))
+        .unwrap_or(Palette { rgb: HashMap::new(), by_slot: false })
+}
+
+/// The active theme; bundled tokyo-night, truecolor, outline cards before `init` (tests only).
 pub fn get() -> &'static Theme {
-    THEME.get_or_init(|| {
-        let pal = Palette::from_toml(PALETTES.iter().find(|(k, _)| *k == "tokyo-night").map_or("", |p| p.1)).unwrap_or(Palette { rgb: HashMap::new(), by_slot: false });
-        Theme::build(&pal, None, true, Cards::Outline).0
-    })
+    debug_assert!(
+        cfg!(test) || INIT_DONE.load(std::sync::atomic::Ordering::Relaxed),
+        "theme::get() called before theme::init()"
+    );
+    THEME.get_or_init(|| Theme::build(&bundled_default(), None, true, Cards::Outline).0)
 }
 
 /// Loads the configured palette (probing the terminal if asked) and installs the theme. Returns warnings.
@@ -253,13 +264,18 @@ pub fn init(cfg: &MuTheme) -> Vec<String> {
     let pal = match load_palette(&cfg.source) {
         Ok(p) => p,
         Err(e) => {
-            warnings.push(e);
-            Palette::from_answers(&probe::query(Duration::from_millis(1000)))
+            // A bad name or file falls back to the bundled default at once. Only `theme = "terminal"`
+            // asks the terminal (and waits for its answer).
+            warnings.push(format!("{e}; using the bundled tokyo-night palette"));
+            bundled_default()
         }
     };
     let (t, w) = Theme::build(&pal, cfg.accent.as_deref(), truecolor_terminal(), cfg.cards);
     warnings.extend(w);
-    let _ = THEME.set(t);
+    INIT_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    if THEME.set(t).is_err() {
+        warnings.push("theme: it was read before it was configured, so the configured theme is ignored".into());
+    }
     warnings
 }
 
@@ -294,7 +310,10 @@ impl Theme {
             if k == "accent" {
                 return acc.rgb.or_else(|| {
                     let key = acc.key.as_deref()?;
-                    pal.rgb.get(key).copied().or_else(|| if key == "accent" { pal.rgb.get("blue").copied() } else { None })
+                    pal.rgb
+                        .get(key)
+                        .copied()
+                        .or_else(|| if key == "accent" { pal.rgb.get("blue").copied() } else { None })
                 });
             }
             pal.rgb.get(k).copied()
@@ -420,8 +439,8 @@ mod tests {
     #[test]
     fn terminal_with_all_slots() {
         let mut a = Answers { fg: Some((169, 177, 214)), bg: Some((26, 27, 38)), ..Default::default() };
-        for i in 0..16 {
-            a.slots[i] = Some((i as u8 * 10, 100, 50));
+        for (i, s) in a.slots.iter_mut().enumerate().take(16) {
+            *s = Some((i as u8 * 10, 100, 50));
         }
         let (t, _) = Theme::build(&Palette::from_answers(&a), None, true, Cards::Outline);
         assert!(matches!(t.color(Role::OkTint), Some(Color::Rgb { .. })));
@@ -458,5 +477,14 @@ mod tests {
         let (t, w) = Theme::build(&p, Some("bogus"), true, Cards::Outline);
         assert_eq!(w, vec!["theme: accent bogus is not a palette key or #rrggbb"]);
         assert_eq!(t.color(Role::Accent), rgb("#7aa2f7"));
+    }
+
+    #[test]
+    fn an_unknown_palette_falls_back_without_probing_the_terminal() {
+        let started = std::time::Instant::now();
+        let err = load_palette("no-such-palette").err().expect("unknown palette is an error");
+        assert!(err.contains("unknown palette"));
+        assert!(started.elapsed() < Duration::from_millis(500), "no terminal probe for a name lookup");
+        assert!(bundled_default().rgb.contains_key("background") || !bundled_default().rgb.is_empty());
     }
 }

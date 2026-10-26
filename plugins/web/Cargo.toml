@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 mu-common = { path = "../../crates/mu-common" }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util", "net"] }

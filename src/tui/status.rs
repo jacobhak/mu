@@ -13,9 +13,6 @@ use std::time::Duration;
 /// Segments shown when `statusLine` lists none (omp's `default` preset).
 const DEFAULT_LEFT: &[&str] = &["pi", "model", "mode", "path", "git", "context_pct", "cost"];
 const DEFAULT_RIGHT: &[&str] = &["session_name"];
-/// Every id this renderer knows.
-const SEGMENT_IDS: &[&str] =
-    &["pi", "model", "mode", "path", "git", "context_pct", "context_total", "cost", "session_name"];
 const ACTIVITY_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_ADVANCE_MS: u128 = 80;
 const DEFAULT_PATH_MAX: usize = 40;
@@ -68,7 +65,13 @@ fn usage_line(u: &ProviderUsage) -> Line {
             out.push(span("  ", plain));
         }
         let pct = w.used_percent.round() as i64;
-        let level = if pct >= 80 { Role::Err } else if pct >= 50 { Role::Warn } else { Role::Muted };
+        let level = if pct >= 80 {
+            Role::Err
+        } else if pct >= 50 {
+            Role::Warn
+        } else {
+            Role::Muted
+        };
         out.push(span(format!("{} ", w.label), t.fg(Role::Faint)));
         out.push(span(format!("{pct}%"), t.fg(level)));
         out.push(span(format!(" {}", reset_text(&w.label, w.resets_in).replace(' ', "")), t.fg(Role::Faint)));
@@ -83,7 +86,7 @@ fn reset_text(label: &str, resets_in: Duration) -> String {
         let m = (secs / 60.0).round() as u64;
         return if m < 60 {
             format!("{m}m")
-        } else if m % 60 == 0 {
+        } else if m.is_multiple_of(60) {
             format!("{}h", m / 60)
         } else {
             format!("{}h {}m", m / 60, m % 60)
@@ -92,7 +95,7 @@ fn reset_text(label: &str, resets_in: Duration) -> String {
     let h = (secs / 3600.0).round() as u64;
     if h < 24 {
         format!("{h}h")
-    } else if h % 24 == 0 {
+    } else if h.is_multiple_of(24) {
         format!("{}d", h / 24)
     } else {
         format!("{}d {}h", h / 24, h % 24)
@@ -122,20 +125,20 @@ fn status_line(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Line {
 
     // Overflow, in omp's order: shorten the title, drop right segments, shorten the path, drop left segments.
     let total = |left: &[Part], right: &[Part]| group_width(left) + group_width(right) + gap(left, right);
-    if total(&left, &right) > width {
-        if let Some(i) = right.iter().position(|p| p.id == "session_name") {
-            let overflow = total(&left, &right) - width;
-            let cur = line_width(&right[i].line);
-            let target = cur.saturating_sub(overflow).max(MIN_TITLE_WIDTH.min(cur));
-            right[i].line = truncate(&right[i].line, target);
-        }
+    if total(&left, &right) > width
+        && let Some(i) = right.iter().position(|p| p.id == "session_name")
+    {
+        let overflow = total(&left, &right) - width;
+        let cur = line_width(&right[i].line);
+        let target = cur.saturating_sub(overflow).max(MIN_TITLE_WIDTH.min(cur));
+        right[i].line = truncate(&right[i].line, target);
     }
     while total(&left, &right) > width && !right.is_empty() {
         right.pop();
     }
     while total(&left, &right) > width && path_max > MIN_PATH_MAX && left.iter().any(|p| p.id == "path") {
         path_max -= 1;
-        let line = segment("path", s, env, path_max).unwrap_or_default();
+        let line = seg_path(s, env, path_max).unwrap_or_default();
         if let Some(p) = left.iter_mut().find(|p| p.id == "path") {
             p.line = line;
         }
@@ -187,78 +190,105 @@ fn group(parts: &[Part]) -> Line {
 }
 
 /// Renders the configured ids in order, skipping unknown ids and segments with nothing to show.
+type Render = fn(&StatusSnapshot, &StatusEnv, usize) -> Option<Line>;
+
+/// A status segment: its omp id and how to draw it. The only list of segments; ids mu cannot
+/// supply (`pr`, `subagents`, …) are simply absent and skipped.
+struct Segment {
+    id: &'static str,
+    render: Render,
+}
+
+static SEGMENTS: &[Segment] = &[
+    Segment { id: "pi", render: seg_pi },
+    Segment { id: "model", render: seg_model },
+    Segment { id: "mode", render: seg_mode },
+    Segment { id: "path", render: seg_path },
+    Segment { id: "git", render: seg_git },
+    Segment { id: "context_pct", render: seg_context_pct },
+    Segment { id: "context_total", render: seg_context_total },
+    Segment { id: "cost", render: seg_cost },
+    Segment { id: "session_name", render: seg_session_name },
+];
+
 fn segments(ids: &[String], fallback: &[&str], s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Vec<Part> {
     let names: Vec<&str> = if ids.is_empty() { fallback.to_vec() } else { ids.iter().map(String::as_str).collect() };
     names
         .into_iter()
         .filter_map(|name| {
-            let id = SEGMENT_IDS.iter().copied().find(|k| *k == name)?;
-            Some(Part { id, line: segment(id, s, env, path_max)? })
+            let seg = SEGMENTS.iter().find(|g| g.id == name)?;
+            Some(Part { id: seg.id, line: (seg.render)(s, env, path_max)? })
         })
         .collect()
 }
 
-fn segment(id: &str, s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Option<Line> {
-    let t = theme::get();
-    let st = |role: Role| t.fg(role);
-    Some(match id {
-        "pi" => {
-            let glyph = match env.turn_elapsed {
-                Some(d) => ACTIVITY_FRAMES[(d.as_millis() / SPINNER_ADVANCE_MS) as usize % ACTIVITY_FRAMES.len()],
-                None => "μ",
-            };
-            let mut rest = env.profile.as_ref().map(|p| format!(" {p}")).unwrap_or_default();
-            if let Some(d) = env.turn_elapsed {
-                rest.push(' ');
-                rest.push_str(&timer(d));
-            }
-            let glyph_role = if env.turn_elapsed.is_some() { Role::Accent } else { Role::Muted };
-            let mut line = vec![span(glyph, st(glyph_role))];
-            if !rest.is_empty() {
-                line.push(span(rest, st(Role::Muted)));
-            }
-            line
-        }
-        "model" => {
-            let mut line = vec![span(s.model_name.clone(), st(Role::Tool))];
-            if let Some(g) = thinking_glyph(s, env) {
-                line.push(span(format!(" {g}"), st(Role::Muted)));
-            }
-            line
-        }
-        "mode" => {
-            if !s.plan {
-                return None;
-            }
-            vec![span("plan", st(Role::Accent))]
-        }
-        "path" => path_line(env, path_max),
-        "git" => git_line(s.git.as_ref()?, env)?,
-        "context_pct" => context_line(s),
-        "context_total" => {
-            if s.context_window == 0 {
-                return None;
-            }
-            vec![span(format!("{} ctx", format_number(s.context_window as u64)), st(Role::Muted))]
-        }
-        "cost" => {
-            if !s.subscription && s.cost <= 0.0 {
-                return None;
-            }
-            // omp: a zero subscription spend reads `(sub)`; otherwise the unit (`S` subscription, `$` metered) and amount.
-            let text = match (s.cost > 0.0, s.subscription) {
-                (false, _) => "(sub)".to_string(),
-                (true, true) => format!("S{:.2}", s.cost),
-                (true, false) => format!("${:.2}", s.cost),
-            };
-            vec![span(text, st(Role::Muted))]
-        }
-        "session_name" => {
-            let title = s.title.as_deref().filter(|t| !t.is_empty())?;
-            vec![span(title, st(Role::Faint))]
-        }
-        _ => return None,
-    })
+fn st(role: Role) -> ContentStyle {
+    theme::get().fg(role)
+}
+
+fn seg_pi(_: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+    let glyph = match env.turn_elapsed {
+        Some(d) => ACTIVITY_FRAMES[(d.as_millis() / SPINNER_ADVANCE_MS) as usize % ACTIVITY_FRAMES.len()],
+        None => "μ",
+    };
+    let mut rest = env.profile.as_ref().map(|p| format!(" {p}")).unwrap_or_default();
+    if let Some(d) = env.turn_elapsed {
+        rest.push(' ');
+        rest.push_str(&timer(d));
+    }
+    let glyph_role = if env.turn_elapsed.is_some() { Role::Accent } else { Role::Muted };
+    let mut line = vec![span(glyph, st(glyph_role))];
+    if !rest.is_empty() {
+        line.push(span(rest, st(Role::Muted)));
+    }
+    Some(line)
+}
+
+fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+    let mut line = vec![span(s.model_name.clone(), st(Role::Tool))];
+    if let Some(g) = thinking_glyph(s, env) {
+        line.push(span(format!(" {g}"), st(Role::Muted)));
+    }
+    Some(line)
+}
+
+fn seg_mode(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
+    s.plan.then(|| vec![span("plan", st(Role::Accent))])
+}
+
+fn seg_path(_: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Option<Line> {
+    Some(path_line(env, path_max))
+}
+
+fn seg_git(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+    git_line(s.git.as_ref()?, env)
+}
+
+fn seg_context_pct(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
+    Some(context_line(s))
+}
+
+fn seg_context_total(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
+    (s.context_window != 0)
+        .then(|| vec![span(format!("{} ctx", format_number(s.context_window as u64)), st(Role::Muted))])
+}
+
+fn seg_cost(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
+    if !s.subscription && s.cost <= 0.0 {
+        return None;
+    }
+    // omp: a zero subscription spend reads `(sub)`; otherwise the unit (`S` subscription, `$` metered) and amount.
+    let text = match (s.cost > 0.0, s.subscription) {
+        (false, _) => "(sub)".to_string(),
+        (true, true) => format!("S{:.2}", s.cost),
+        (true, false) => format!("${:.2}", s.cost),
+    };
+    Some(vec![span(text, st(Role::Muted))])
+}
+
+fn seg_session_name(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
+    let title = s.title.as_deref().filter(|t| !t.is_empty())?;
+    Some(vec![span(title, st(Role::Faint))])
 }
 
 /// Glyph omp shows in place of the model icon when thinking levels are shown (`compactThinkingLevel`).
@@ -322,12 +352,19 @@ pub(super) fn format_number(n: u64) -> String {
         let s = format!("{v:.1}");
         format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))
     };
+    // The unit is chosen after rounding: 999_600 is "1M", not "1000K".
     match n {
         0..1_000 => n.to_string(),
         1_000..10_000 => trim1(n as f64 / 1e3, "K"),
-        10_000..1_000_000 => format!("{}K", (n as f64 / 1e3).round() as u64),
+        10_000..1_000_000 => match (n as f64 / 1e3).round() as u64 {
+            1000 => "1M".into(),
+            k => format!("{k}K"),
+        },
         1_000_000..10_000_000 => trim1(n as f64 / 1e6, "M"),
-        10_000_000..1_000_000_000 => format!("{}M", (n as f64 / 1e6).round() as u64),
+        10_000_000..1_000_000_000 => match (n as f64 / 1e6).round() as u64 {
+            1000 => "1B".into(),
+            m => format!("{m}M"),
+        },
         1_000_000_000..10_000_000_000 => trim1(n as f64 / 1e9, "B"),
         _ => format!("{}B", (n as f64 / 1e9).round() as u64),
     }
@@ -346,13 +383,13 @@ fn git_line(g: &GitInfo, env: &StatusEnv) -> Option<Line> {
     .into_iter()
     .filter(|(on, n, _, _)| *on && *n > 0)
     .map(|(_, n, prefix, role)| (format!("{prefix}{n}"), role))
-        .collect();
+    .collect();
     let mut line: Line = vec![];
-    if opt("showBranch") {
-        if let Some(b) = &g.branch {
-            let role = if g.dirty + g.staged + g.untracked == 0 { Role::Ok } else { Role::Warn };
-            line.push(span(b.clone(), t.fg(role)));
-        }
+    if opt("showBranch")
+        && let Some(b) = &g.branch
+    {
+        let role = if g.dirty + g.staged + g.untracked == 0 { Role::Ok } else { Role::Warn };
+        line.push(span(b.clone(), t.fg(role)));
     }
     for (text, role) in counts {
         if !line.is_empty() {
@@ -370,17 +407,17 @@ fn path_line(env: &StatusEnv, max: usize) -> Line {
     let strip = opts.and_then(|o| o["stripWorkPrefix"].as_bool()).unwrap_or(true);
     let abbreviate = opts.and_then(|o| o["abbreviate"].as_bool()).unwrap_or(true);
     let home = env.home.as_deref().map(|h| h.trim_end_matches('/')).filter(|h| !h.is_empty());
-    let (_, display) = path_display(env.cwd, home, strip);
+    let display = path_display(env.cwd, home, strip);
     let text = if abbreviate { abbreviate_home(&display, home) } else { display };
     let text = clamp_left(&text, max);
     vec![span(text, theme::get().fg(Role::Literal))]
 }
 
-/// `(in a scratch dir, text)`: the path relative to its scratch or project root when stripping, else the full path.
-fn path_display(cwd: &Path, home: Option<&str>, strip: bool) -> (bool, String) {
+/// The path relative to its scratch or project root when stripping, else the full path.
+fn path_display(cwd: &Path, home: Option<&str>, strip: bool) -> String {
     let full = cwd.display().to_string();
     if !strip {
-        return (false, full);
+        return full;
     }
     let mut scratch_roots: Vec<PathBuf> = vec![std::env::temp_dir(), "/tmp".into(), "/var/tmp".into()];
     if let Some(h) = home {
@@ -389,7 +426,7 @@ fn path_display(cwd: &Path, home: Option<&str>, strip: bool) -> (bool, String) {
     for root in scratch_roots {
         if let Ok(rel) = cwd.strip_prefix(&root) {
             let rel = rel.display().to_string();
-            return (true, if rel.is_empty() { full } else { rel });
+            return if rel.is_empty() { full } else { rel };
         }
     }
     if let Some(h) = home {
@@ -399,12 +436,12 @@ fn path_display(cwd: &Path, home: Option<&str>, strip: bool) -> (bool, String) {
             if let Ok(rel) = cwd.strip_prefix(&root) {
                 let rel = rel.display().to_string();
                 if !rel.is_empty() {
-                    return (false, rel);
+                    return rel;
                 }
             }
         }
     }
-    (false, full)
+    full
 }
 
 fn abbreviate_home(p: &str, home: Option<&str>) -> String {
@@ -487,10 +524,7 @@ mod tests {
         let t = line_text(&lines[0]);
         assert_eq!(line_width(&lines[0]), 140);
         assert!(t.contains(" 5h 82% 2h  7d 16% 4d · EVENTS"), "{t}");
-        assert!(
-            t.starts_with(" μ private · Haiku 5.5 ◒ · ~/code/mu · main *2 +1 ?3 · 1.5% of 1M · (sub) "),
-            "{t}"
-        );
+        assert!(t.starts_with(" μ private · Haiku 5.5 ◒ · ~/code/mu · main *2 +1 ?3 · 1.5% of 1M · (sub) "), "{t}");
         assert!(t.ends_with(" EVENTS: Read mu events.rs header "), "{t}");
     }
 
@@ -529,11 +563,11 @@ mod tests {
     #[test]
     fn path_rules() {
         let home = Some("/home/u");
-        assert_eq!(path_display(Path::new("/tmp"), home, true), (true, "/tmp".into()));
-        assert_eq!(path_display(Path::new("/tmp/a/b"), home, true), (true, "a/b".into()));
-        assert_eq!(path_display(Path::new("/home/u/Projects/x"), home, true), (false, "x".into()));
-        assert_eq!(path_display(Path::new("/home/u/src/x"), home, true), (false, "/home/u/src/x".into()));
-        assert_eq!(path_display(Path::new("/home/u/src/x"), home, false), (false, "/home/u/src/x".into()));
+        assert_eq!(path_display(Path::new("/tmp"), home, true), "/tmp");
+        assert_eq!(path_display(Path::new("/tmp/a/b"), home, true), "a/b");
+        assert_eq!(path_display(Path::new("/home/u/Projects/x"), home, true), "x");
+        assert_eq!(path_display(Path::new("/home/u/src/x"), home, true), "/home/u/src/x");
+        assert_eq!(path_display(Path::new("/home/u/src/x"), home, false), "/home/u/src/x");
         assert_eq!(abbreviate_home("/home/u/src/x", home), "~/src/x");
         assert_eq!(abbreviate_home("/home/user2/x", home), "/home/user2/x");
         assert_eq!(clamp_left("abcdefghij", 6), "…fghij");
@@ -542,6 +576,10 @@ mod tests {
     #[test]
     fn context_levels_and_numbers() {
         assert_eq!(format_number(1_000_000), "1M");
+        assert_eq!(format_number(999_600), "1M");
+        assert_eq!(format_number(999_400), "999K");
+        assert_eq!(format_number(999_600_000), "1B");
+        assert_eq!(format_number(999_400_000), "999M");
         assert_eq!(format_number(200_000), "200K");
         assert_eq!(format_number(1_500), "1.5K");
         assert_eq!(format_number(1_500_000_000), "1.5B");

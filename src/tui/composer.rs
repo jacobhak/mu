@@ -1,8 +1,8 @@
 //! Multi-line prompt buffer: editing keys, input history, paste markers, Ctrl-C state.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -11,12 +11,78 @@ use unicode_width::UnicodeWidthChar;
 use super::complete::{self, Entry};
 use super::line::{self, Line, plain, span};
 use super::theme::{self, Role};
-use crate::events::UserInput;
 use crate::image;
-use crate::message::Image;
+use crate::message::{Image, UserInput};
 use crossterm::style::ContentStyle;
 
 const HISTORY_MAX: usize = 1000;
+/// The history file is rewritten down to `HISTORY_MAX` lines once it passes this many.
+const HISTORY_COMPACT_AT: usize = 4 * HISTORY_MAX;
+
+/// The last `n` non-empty lines of a file, read by seeking back from the end.
+fn tail_lines(path: &std::path::Path, n: usize) -> Vec<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return vec![] };
+    let Ok(mut pos) = f.seek(SeekFrom::End(0)) else { return vec![] };
+    let mut data: Vec<u8> = Vec::new();
+    // Need n+1 newlines (or the start of the file) so the first kept line is whole.
+    while pos > 0 && data.iter().filter(|b| **b == b'\n').count() <= n {
+        let step = pos.min(64 * 1024);
+        pos -= step;
+        let mut chunk = vec![0u8; step as usize];
+        if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(&mut chunk).is_err() {
+            return vec![];
+        }
+        chunk.extend_from_slice(&data);
+        data = chunk;
+    }
+    let mut lines: Vec<Vec<u8>> = data.split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect();
+    if pos > 0 && !lines.is_empty() {
+        lines.remove(0); // the first line may be cut at the chunk boundary
+    }
+    let skip = lines.len().saturating_sub(n);
+    lines.drain(..skip);
+    lines
+}
+
+fn slash_usage(history: &[String]) -> HashMap<String, u32> {
+    let mut usage: HashMap<String, u32> = HashMap::new();
+    for h in history {
+        if let Some(name) = h.split_whitespace().next().and_then(|t| t.strip_prefix('/')) {
+            *usage.entry(name.to_owned()).or_default() += 1;
+        }
+    }
+    usage
+}
+
+fn count_lines(path: &std::path::Path) -> usize {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(path) else { return 0 };
+    let mut r = std::io::BufReader::new(f);
+    let (mut n, mut buf) = (0, Vec::new());
+    while r.read_until(b'\n', &mut buf).is_ok_and(|k| k > 0) {
+        n += 1;
+        buf.clear();
+    }
+    n
+}
+
+/// Reads the last `HISTORY_MAX` lines. A file that has grown past `HISTORY_COMPACT_AT` lines is
+/// first rewritten, atomically, down to those lines.
+fn load_history(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let lines = tail_lines(path, HISTORY_MAX);
+    // Counting is only worth doing for a file big enough to plausibly exceed the limit.
+    let big = std::fs::metadata(path).is_ok_and(|m| m.len() > (HISTORY_COMPACT_AT as u64) * 40);
+    if big && count_lines(path) > HISTORY_COMPACT_AT {
+        let mut out = Vec::new();
+        for l in &lines {
+            out.extend_from_slice(l);
+            out.push(b'\n');
+        }
+        let _ = mu_common::fs::write_atomic(path, &out);
+    }
+    lines
+}
 const PASTE_MAX_LINES: usize = 10;
 const PASTE_MAX_CHARS: usize = 1000;
 const PROMPT: &str = "μ ❯ ";
@@ -74,6 +140,51 @@ fn nch(s: &str) -> usize {
 
 fn bidx(s: &str, col: usize) -> usize {
     s.char_indices().nth(col).map_or(s.len(), |(b, _)| b)
+}
+
+/// Char index of the grapheme boundary before `col` (0 at the start).
+fn prev_boundary(s: &str, col: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut at = 0;
+    for (b, g) in s.grapheme_indices(true) {
+        let start = s[..b].chars().count();
+        let end = start + g.chars().count();
+        if end >= col {
+            return if start < col { start } else { at };
+        }
+        at = start;
+    }
+    at.min(col)
+}
+
+/// Char index of the grapheme boundary after `col` (the line end at most).
+fn next_boundary(s: &str, col: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    for (b, g) in s.grapheme_indices(true) {
+        let start = s[..b].chars().count();
+        let end = start + g.chars().count();
+        if end > col {
+            return end;
+        }
+    }
+    nch(s)
+}
+
+/// `col` moved back to the start of the cluster it is inside.
+fn snap_boundary(s: &str, col: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut last = 0;
+    for (b, g) in s.grapheme_indices(true) {
+        let start = s[..b].chars().count();
+        if start > col {
+            break;
+        }
+        last = start;
+        if start + g.chars().count() > col {
+            return start;
+        }
+    }
+    last.min(col)
 }
 
 fn is_word(c: char) -> bool {
@@ -164,7 +275,8 @@ impl Buf {
 
     fn backspace(&mut self) {
         if self.col > 0 {
-            self.cut(self.col - 1, self.col);
+            let from = prev_boundary(self.cur(), self.col);
+            self.cut(from, self.col);
         } else if self.row > 0 {
             let cur = self.lines.remove(self.row);
             self.row -= 1;
@@ -175,7 +287,8 @@ impl Buf {
 
     fn delete(&mut self) {
         if self.col < self.cur_len() {
-            self.cut(self.col, self.col + 1);
+            let to = next_boundary(self.cur(), self.col);
+            self.cut(self.col, to);
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             self.cur_mut().push_str(&next);
@@ -218,7 +331,7 @@ impl Buf {
 
     fn left(&mut self) {
         if self.col > 0 {
-            self.col -= 1;
+            self.col = prev_boundary(self.cur(), self.col);
         } else if self.row > 0 {
             self.row -= 1;
             self.col = self.cur_len();
@@ -227,7 +340,7 @@ impl Buf {
 
     fn right(&mut self) {
         if self.col < self.cur_len() {
-            self.col += 1;
+            self.col = next_boundary(self.cur(), self.col);
         } else if self.row + 1 < self.lines.len() {
             self.row += 1;
             self.col = 0;
@@ -237,13 +350,13 @@ impl Buf {
     /// Caller guarantees `row > 0`.
     fn up(&mut self) {
         self.row -= 1;
-        self.col = self.col.min(self.cur_len());
+        self.col = snap_boundary(self.cur(), self.col.min(self.cur_len()));
     }
 
     /// Caller guarantees `row + 1 < lines.len()`.
     fn down(&mut self) {
         self.row += 1;
-        self.col = self.col.min(self.cur_len());
+        self.col = snap_boundary(self.cur(), self.col.min(self.cur_len()));
     }
 
     fn home(&mut self) {
@@ -276,6 +389,8 @@ impl Buf {
 pub struct Composer {
     buf: Buf,
     history: Vec<String>,
+    /// How often each slash command appears in `history`; rebuilt only when history changes.
+    slash_usage: HashMap<String, u32>,
     history_path: Option<PathBuf>,
     /// History index being browsed, and the draft it replaces.
     browse: Option<(usize, Buf)>,
@@ -305,10 +420,10 @@ impl Composer {
     pub fn new(history_path: Option<PathBuf>) -> Self {
         let mut history: Vec<String> = history_path
             .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(load_history)
             .unwrap_or_default()
-            .lines()
-            .filter_map(|l| match serde_json::from_str::<serde_json::Value>(l).ok()? {
+            .into_iter()
+            .filter_map(|l| match serde_json::from_slice::<serde_json::Value>(&l).ok()? {
                 serde_json::Value::String(s) => Some(s),
                 serde_json::Value::Object(o) => o.get("text").and_then(|t| t.as_str()).map(String::from),
                 _ => None,
@@ -318,6 +433,7 @@ impl Composer {
         history.drain(..skip);
         Self {
             buf: Buf::default(),
+            slash_usage: slash_usage(&history),
             history,
             history_path,
             browse: None,
@@ -355,19 +471,19 @@ impl Composer {
                     Some(g) => self.accept_ghost(&g, true),
                     None => Action::None,
                 };
-            } else if let (KeyCode::Right, Some(g)) = (key.code, ghost.as_deref()) {
-                if plain_mods && self.at_end() {
-                    self.ctrl_c_armed = false;
-                    break 'act self.accept_ghost(g, false);
-                }
+            } else if let (KeyCode::Right, Some(g)) = (key.code, ghost.as_deref())
+                && plain_mods
+                && self.at_end()
+            {
+                self.ctrl_c_armed = false;
+                break 'act self.accept_ghost(g, false);
             }
             let a = self.on_key_inner(key, running);
-            if let (KeyCode::Char(c), Some(g)) = (key.code, ghost.as_deref()) {
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
-                    if let Some(rest) = g.strip_prefix(c).filter(|r| !r.is_empty()) {
-                        self.ghost = Some(rest.to_owned());
-                    }
-                }
+            if let (KeyCode::Char(c), Some(g)) = (key.code, ghost.as_deref())
+                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && let Some(rest) = g.strip_prefix(c).filter(|r| !r.is_empty())
+            {
+                self.ghost = Some(rest.to_owned());
             }
             a
         };
@@ -399,7 +515,12 @@ impl Composer {
     /// The buffer text worth predicting a continuation for, if any.
     pub fn predict_query(&self) -> Option<String> {
         let t = self.text();
-        let ok = self.at_end() && !self.buf.is_blank() && !t.starts_with('/') && !t.starts_with('!') && self.browse.is_none() && self.menu.is_none();
+        let ok = self.at_end()
+            && !self.buf.is_blank()
+            && !t.starts_with('/')
+            && !t.starts_with('!')
+            && self.browse.is_none()
+            && self.menu.is_none();
         ok.then_some(t)
     }
 
@@ -484,16 +605,16 @@ impl Composer {
         let body = text.strip_prefix('/')?;
         let (items, descs, needs_arg, arg, exact) = match body.split_once(char::is_whitespace) {
             None => {
-                let mut usage: HashMap<String, u32> = HashMap::new();
-                for h in &self.history {
-                    if let Some(name) = h.split_whitespace().next().and_then(|t| t.strip_prefix('/')) {
-                        *usage.entry(name.to_owned()).or_default() += 1;
-                    }
-                }
-                let idx = complete::rank(commands, body, &usage);
+                let idx = complete::rank(commands, body, &self.slash_usage);
                 let pick = |f: fn(&Entry) -> String| idx.iter().map(|&i| f(&commands[i])).collect::<Vec<_>>();
                 let exact = commands.iter().any(|c| c.name == body);
-                (pick(|e| e.name.clone()), pick(|e| e.desc.clone()), idx.iter().map(|&i| commands[i].needs_arg).collect::<Vec<_>>(), None, exact)
+                (
+                    pick(|e| e.name.clone()),
+                    pick(|e| e.desc.clone()),
+                    idx.iter().map(|&i| commands[i].needs_arg).collect::<Vec<_>>(),
+                    None,
+                    exact,
+                )
             }
             Some((name, partial)) => {
                 if partial.contains(char::is_whitespace) {
@@ -501,7 +622,8 @@ impl Composer {
                 }
                 let e = commands.iter().find(|c| c.name == name && !c.args.is_empty())?;
                 let lower = partial.to_lowercase();
-                let items: Vec<String> = e.args.iter().filter(|a| a.to_lowercase().starts_with(&lower)).cloned().collect();
+                let items: Vec<String> =
+                    e.args.iter().filter(|a| a.to_lowercase().starts_with(&lower)).cloned().collect();
                 let n = items.len();
                 let exact = e.args.iter().any(|a| a == partial);
                 (items, vec![String::new(); n], vec![false; n], Some(name.to_owned()), exact)
@@ -609,8 +731,9 @@ impl Composer {
         self.ctrl_c_armed = false;
         self.browse = None;
         if let Some(paths) = image::paths_in_paste(s) {
-            for p in paths {
-                let img = image::load(&p)?;
+            // Load everything first: a failure part-way must not leave some of the paste attached.
+            let imgs = paths.iter().map(|p| image::load(p)).collect::<Result<Vec<_>, _>>()?;
+            for img in imgs {
                 self.attach_image(img);
                 self.buf.insert_str(" ");
             }
@@ -644,28 +767,16 @@ impl Composer {
         let mut cursor = (0, 0);
         for (r, line) in self.buf.lines.iter().enumerate() {
             let start = rows.len();
-            let mut wrapped = vec![String::new()];
-            let mut col = 0;
-            let on_cursor_line = r == self.buf.row;
-            for (ci, ch) in line.chars().enumerate() {
-                let w = ch.width().unwrap_or(0);
-                if col > 0 && col + w > avail {
+            let lay = line::layout(&plain(line.as_str()), avail);
+            let mut wrapped: Vec<String> = lay.rows.iter().map(line::line_text).collect();
+            if r == self.buf.row {
+                cursor = lay.locate_char(self.buf.col);
+                if self.buf.col >= lay.chars && cursor.1 + 1 > avail {
+                    // The cursor cell needs one column; wrap if the line is full.
                     wrapped.push(String::new());
-                    col = 0;
+                    cursor = (cursor.0 + 1, 0);
                 }
-                if on_cursor_line && ci == self.buf.col {
-                    cursor = (start + wrapped.len() - 1, col);
-                }
-                wrapped.last_mut().unwrap().push(ch);
-                col += w;
-            }
-            if on_cursor_line && self.buf.col == nch(line) {
-                // The cursor cell needs one column; wrap if the line is full.
-                if col + 1 > avail {
-                    wrapped.push(String::new());
-                    col = 0;
-                }
-                cursor = (start + wrapped.len() - 1, col);
+                cursor.0 += start;
             }
             rows.extend(wrapped);
         }
@@ -676,7 +787,10 @@ impl Composer {
             .enumerate()
             .map(|(i, t)| {
                 if i == 0 {
-                    vec![span(format!("{pad}{}", PROMPT.trim_end()), accent), span(format!(" {t}"), ContentStyle::default())]
+                    vec![
+                        span(format!("{pad}{}", PROMPT.trim_end()), accent),
+                        span(format!(" {t}"), ContentStyle::default()),
+                    ]
                 } else {
                     plain(format!("{pad}{INDENT}{t}"))
                 }
@@ -703,7 +817,11 @@ impl Composer {
             let placeholder = "type here…";
             let ph_w = unicode_width::UnicodeWidthStr::width(placeholder);
             let h_w = unicode_width::UnicodeWidthStr::width(hint);
-            let mut row = vec![span(format!("{pad}{}", PROMPT.trim_end()), accent), span(" ", ContentStyle::default()), span(placeholder, theme::get().fg(Role::Faint))];
+            let mut row = vec![
+                span(format!("{pad}{}", PROMPT.trim_end()), accent),
+                span(" ", ContentStyle::default()),
+                span(placeholder, theme::get().fg(Role::Faint)),
+            ];
             if used + ph_w + 2 + h_w <= width {
                 row.push(span(" ".repeat(width - used - ph_w - h_w), ContentStyle::default()));
                 row.push(span(hint, theme::get().fg(Role::Faint)));
@@ -768,8 +886,10 @@ impl Composer {
         for p in &self.buf.pastes {
             text = text.replace(&p.marker, &p.content);
         }
-        let mut found: Vec<(usize, Image)> =
-            std::mem::take(&mut self.buf.images).into_iter().filter_map(|(m, img)| text.find(&m).map(|at| (at, img))).collect();
+        let mut found: Vec<(usize, Image)> = std::mem::take(&mut self.buf.images)
+            .into_iter()
+            .filter_map(|(m, img)| text.find(&m).map(|at| (at, img)))
+            .collect();
         found.sort_by_key(|(at, _)| *at);
         self.push_history(&text);
         self.clear();
@@ -863,6 +983,7 @@ impl Composer {
         if self.history.len() > HISTORY_MAX {
             self.history.remove(0);
         }
+        self.slash_usage = slash_usage(&self.history);
     }
 
     fn history_prev(&mut self) {
@@ -966,7 +1087,12 @@ mod tests {
     }
 
     fn entry(name: &str, needs_arg: bool, args: &[&str]) -> Entry {
-        Entry { name: name.into(), desc: format!("{name} desc"), needs_arg, args: args.iter().map(|s| s.to_string()).collect() }
+        Entry {
+            name: name.into(),
+            desc: format!("{name} desc"),
+            needs_arg,
+            args: args.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     fn cmds() -> Vec<Entry> {
@@ -1299,7 +1425,10 @@ mod tests {
     fn queue_and_abort_keys() {
         let mut c = Composer::new(None);
         type_str(&mut c, "a");
-        assert_eq!(c.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), true, &[]), Action::QueueFollowUp("a".into()));
+        assert_eq!(
+            c.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), true, &[]),
+            Action::QueueFollowUp("a".into())
+        );
         type_str(&mut c, "b");
         assert_eq!(c.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), false, &[]), Action::Submit("b".into()));
         assert_eq!(c.on_key(key(KeyCode::Up, KeyModifiers::ALT), true, &[]), Action::PopQueue);
@@ -1335,10 +1464,59 @@ mod tests {
         c.attach_image(png());
         let mut other = png();
         other.data = "REVG".into();
-        let queued = UserInput { text: "see [Image #1] and [Image #2]".into(), images: vec![other.clone(), other.clone()] };
+        let queued =
+            UserInput { text: "see [Image #1] and [Image #2]".into(), images: vec![other.clone(), other.clone()] };
         c.restore(vec![queued]);
         assert_eq!(c.text(), "[Image #1]\n\nsee [Image #2] and [Image #3]");
         let input = c.take_for_submit();
         assert_eq!(input.images, vec![png(), other.clone(), other]);
+    }
+
+    #[test]
+    fn history_reads_only_the_tail_and_compacts() {
+        let d = std::env::temp_dir().join(format!("mu-hist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("h.jsonl");
+        let body: String = (0..HISTORY_COMPACT_AT + 500)
+            .map(|i| format!("{{\"text\":\"prompt number {i} padded padded\"}}\n"))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        let c = Composer::new(Some(p.clone()));
+        assert_eq!(c.history.len(), HISTORY_MAX);
+        assert!(c.history.last().unwrap().contains(&format!("{}", HISTORY_COMPACT_AT + 499)));
+        assert_eq!(count_lines(&p), HISTORY_MAX, "file rewritten to the tail");
+        assert_eq!(tail_lines(&p, 3).len(), 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn editing_moves_by_grapheme_cluster() {
+        // "e" + combining acute, a family emoji (ZWJ sequence), a flag.
+        let text = "e\u{301}x👨‍👩‍👧🇸🇪";
+        let mut b = Buf::from_text(text);
+        b.backspace();
+        assert_eq!(b.cur(), "e\u{301}x👨‍👩‍👧");
+        b.left();
+        assert_eq!(b.col, 3, "left lands before the whole family emoji");
+        b.left();
+        assert_eq!(b.col, 2);
+        b.left();
+        assert_eq!(b.col, 0, "the accented e is one step");
+        b.delete();
+        assert_eq!(b.cur(), "x👨‍👩‍👧");
+        b.end();
+        b.backspace();
+        assert_eq!(b.cur(), "x");
+    }
+
+    #[test]
+    fn wide_and_combining_text_wraps_by_width() {
+        let mut c = Composer::new(None);
+        c.set_text("日本語日本語日本語");
+        let (rows, cur) = c.render(14);
+        assert!(rows.len() > 2);
+        assert!(cur.1 <= 14);
+        let lay = line::layout(&plain("e\u{301}e\u{301}e\u{301}"), 2);
+        assert_eq!(lay.rows.len(), 2, "each accented e is one column");
     }
 }

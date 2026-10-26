@@ -9,6 +9,7 @@ import {
 	hasSubstantiveContent,
 	textOf,
 	truncateApproxTokens,
+	truncateCodePoints,
 	truncateRecallQuery,
 } from "./content";
 // Embedded as text so `bun build --compile` carries them; `bun run` resolves the same imports.
@@ -62,22 +63,16 @@ let lastUserTurn = 0;
 let idleTimer: Timer | undefined;
 let client: Client | undefined;
 
-function withTimeout<T>(p: Promise<T>, ms: number | undefined): Promise<T> {
-	if (!ms || ms <= 0) return p;
-	const { promise, reject } = Promise.withResolvers<never>();
-	const timer = setTimeout(() => reject(new Error("timeout")), ms);
-	return Promise.race([p, promise]).finally(() => clearTimeout(timer));
-}
-
 /** Mnemopi's LLM hook: fact extraction and consolidation go through the core's `memory` role chain. */
 const complete: Complete = async (prompt, opts) => {
 	const task = opts?.task;
 	const req = task?.kind === "memory-extraction" ? { system: EXTRACTION_PROMPT, prompt: task.input } : { prompt };
 	try {
 		if (!client) throw new Error("no core connection");
-		const res = await withTimeout(
-			client.call("core/complete", { role: "memory", ...req, maxTokens: opts?.maxTokens }),
-			opts?.timeout,
+		const res = await client.call(
+			"core/complete",
+			{ role: "memory", ...req, maxTokens: opts?.maxTokens },
+			{ timeoutMs: opts?.timeout },
 		);
 		const text = isObj(res) && typeof res.text === "string" ? res.text.trim() : "";
 		return text || null;
@@ -168,7 +163,7 @@ async function promptSubmit(p: Obj): Promise<Obj> {
 	if (!prompt) return {};
 	const s = getStore();
 	// First turn of a fresh session has no history, so the query is the prompt alone.
-	const query = prompt.slice(0, s.cfg.recallMaxQueryChars);
+	const query = truncateCodePoints(prompt, s.cfg.recallMaxQueryChars);
 	const results = await collectRecall(s, query);
 	const block = results.length > 0 ? `\n\n${formatRecallBlock(results)}` : "";
 	return { context: truncateApproxTokens(`${INSTRUCTIONS}${block}`, s.cfg.injectionTokenLimit) };

@@ -8,10 +8,10 @@ use tokio::io::unix::AsyncFd;
 
 /// `$SHELL` when it is bash or zsh, else the first `bash` on `PATH`, else `/bin/sh`.
 pub fn login_shell() -> String {
-    if let Ok(sh) = std::env::var("SHELL") {
-        if matches!(Path::new(&sh).file_name().and_then(|n| n.to_str()), Some("bash" | "zsh")) {
-            return sh;
-        }
+    if let Ok(sh) = std::env::var("SHELL")
+        && matches!(Path::new(&sh).file_name().and_then(|n| n.to_str()), Some("bash" | "zsh"))
+    {
+        return sh;
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -44,9 +44,9 @@ impl std::ops::Deref for Pty {
 
 pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16) -> io::Result<Pty> {
     let (mut m, mut s) = (-1 as c_int, -1 as c_int);
-    let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: valid out-pointers; name and termios are null.
-    let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) };
+    let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &ws) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -93,6 +93,11 @@ pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16) -> io::Result<Pty>
 }
 
 impl PtyIo {
+    /// The child's pid, which is also its process group id.
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
     /// `Ok(0)` on EOF and on `EIO` (Linux: every slave fd closed).
     pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -111,8 +116,9 @@ impl PtyIo {
         }
     }
 
-    pub async fn write_all(&self, mut data: &[u8]) -> io::Result<()> {
-        while !data.is_empty() {
+    /// Waits until the master is writable, then writes what fits. Returns the bytes written.
+    pub async fn write_some(&self, data: &[u8]) -> io::Result<usize> {
+        loop {
             let mut guard = self.master.writable().await?;
             let res = guard.try_io(|fd| {
                 // SAFETY: `data` is valid for `data.len()` bytes for the call.
@@ -120,12 +126,10 @@ impl PtyIo {
                 if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
             });
             match res {
-                Ok(Ok(n)) => data = &data[n..],
-                Ok(Err(e)) => return Err(e),
+                Ok(r) => return r,
                 Err(_) => continue,
             }
         }
-        Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -207,6 +211,9 @@ impl Cleaner {
                 self.state = if c == '\\' { State::Ground } else { State::Str };
             }
             State::Cr => {
+                if c == '\r' {
+                    return; // `\r\r\n` is still a line ending
+                }
                 self.state = State::Ground;
                 if c == '\n' {
                     self.newline(out);
@@ -258,6 +265,12 @@ mod tests {
     }
 
     #[test]
+    fn double_cr_before_newline_keeps_the_line() {
+        assert_eq!(clean("abc\r\r\n"), "abc\n");
+        assert_eq!(clean("abc\rdef\n"), "def\n");
+    }
+
+    #[test]
     fn strips_csi() {
         assert_eq!(clean("\x1b[31mred\x1b[0m\r\n"), "red\n");
     }
@@ -288,7 +301,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn spawn_echo() {
         let mut p = spawn("[ -t 0 ] && echo tty; read x; echo got:$x", Path::new("/tmp"), 80, 24).unwrap();
-        p.write_all(b"hi\r").await.unwrap();
+        p.io.write_some(b"hi\r").await.unwrap();
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
         loop {

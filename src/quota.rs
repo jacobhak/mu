@@ -4,9 +4,12 @@
 //! refreshing never starts one. State lives in `$MU_HOME/gateway/` (`profiles/<name>/` under an omp profile).
 //! The gateway caches each account's usage for 5 minutes and fetches it upstream on a miss, so a call can
 //! take seconds; callers run it off the agent loop.
-use mu_common::paths;
 use serde_json::Value;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -33,7 +36,9 @@ pub fn parse_usage(body: &str, provider: &str, now_ms: i64) -> Option<ProviderUs
         if !limit["scope"]["tier"].is_null() {
             continue;
         }
-        let label = match limit["window"]["id"].as_str()? {
+        // One malformed limit must not hide the others.
+        let Some(id) = limit["window"]["id"].as_str() else { continue };
+        let label = match id {
             "5h" => "5h",
             "1d" => "1d",
             "7d" => "7d",
@@ -55,35 +60,6 @@ pub fn parse_usage(body: &str, provider: &str, now_ms: i64) -> Option<ProviderUs
     (!windows.is_empty()).then(|| ProviderUsage { provider: provider.into(), windows })
 }
 
-/// Mirrors the gateway plugin's per-profile state directory.
-fn gateway_dir() -> std::path::PathBuf {
-    let base = paths::mu_home().join("gateway");
-    match paths::profile() {
-        Some(p) if !p.contains(['/', '\\']) && p != "." && p != ".." => base.join("profiles").join(p),
-        _ => base,
-    }
-}
-
-/// Gateway URL and bearer token of a running gateway, or `None` when none is running.
-fn running_gateway() -> Option<(String, String)> {
-    if let Some(url) = std::env::var("MU_GATEWAY_URL").ok().filter(|u| !u.is_empty()) {
-        let token = std::env::var("MU_GATEWAY_TOKEN")
-            .ok()
-            .filter(|t| !t.trim().is_empty())
-            .or_else(|| std::fs::read_to_string(paths::omp_config_root().join("auth-gateway.token")).ok())?;
-        return Some((url.trim_end_matches('/').into(), token.trim().into()));
-    }
-    let state: Value = serde_json::from_str(&std::fs::read_to_string(gateway_dir().join("state.json")).ok()?).ok()?;
-    let pid = state["pid"].as_i64()? as libc::pid_t;
-    // SAFETY: signal 0 only checks that the process exists.
-    if unsafe { libc::kill(pid, 0) } != 0 {
-        return None;
-    }
-    let url = state["url"].as_str()?.trim_end_matches('/').to_string();
-    let token = std::fs::read_to_string(paths::omp_config_root().join("auth-gateway.token")).ok()?;
-    Some((url, token.trim().into()))
-}
-
 pub enum Fetch {
     Got(ProviderUsage),
     /// No gateway is running; checking again is a local file read.
@@ -93,10 +69,20 @@ pub enum Fetch {
 }
 
 pub async fn fetch(provider: &str) -> Fetch {
-    let Some((url, token)) = running_gateway() else { return Fetch::NoGateway };
+    let Some((url, token)) = crate::gateway::running_endpoint() else { return Fetch::NoGateway };
     let body = async {
         let client = reqwest::Client::builder().timeout(TIMEOUT).build().ok()?;
-        client.get(format!("{url}/v1/usage")).bearer_auth(token).send().await.ok()?.error_for_status().ok()?.text().await.ok()
+        client
+            .get(format!("{url}/v1/usage"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .text()
+            .await
+            .ok()
     };
     let body = body.await;
     let now_ms = jiff::Timestamp::now().as_millisecond();
@@ -106,9 +92,138 @@ pub async fn fetch(provider: &str) -> Fetch {
     }
 }
 
+/// Quota refresh cadence: a minute after success; 5s, 10s, 20s, 40s, then a minute after failures.
+fn interval(failures: u32) -> Duration {
+    match failures {
+        0 => Duration::from_secs(60),
+        n => Duration::from_secs(5u64 << (n - 1).min(4)).min(Duration::from_secs(60)),
+    }
+}
+
+/// While no gateway runs, check again this often (a local file read), so quota shows soon after the
+/// first request starts one.
+const NO_GATEWAY_INTERVAL: Duration = Duration::from_secs(5);
+
+type Slot = Rc<RefCell<Option<(String, Fetch)>>>;
+
+/// Keeps the provider's usage windows fresh in the background and answers what the status line needs.
+/// It never waits on the network: a fetch runs as a task, and its result is picked up by `tick`.
+pub struct QuotaTracker {
+    usage: Option<ProviderUsage>,
+    /// When the last fetch finished; `None` means one is due now.
+    at: Option<Instant>,
+    failures: u32,
+    /// The last fetch found no running gateway (cheap to re-check, so retried on a short fixed interval).
+    no_gateway: bool,
+    inflight: bool,
+    /// Quota is fetched only for the top-level interactive agent.
+    pub enabled: bool,
+    /// The background fetch writes its result here and pings `wake`.
+    slot: Slot,
+    wake: UnboundedSender<()>,
+    wake_rx: Option<UnboundedReceiver<()>>,
+}
+
+impl Default for QuotaTracker {
+    fn default() -> Self {
+        let (wake, wake_rx) = unbounded_channel();
+        Self {
+            usage: None,
+            at: None,
+            failures: 0,
+            no_gateway: false,
+            inflight: false,
+            enabled: false,
+            slot: Rc::new(RefCell::new(None)),
+            wake,
+            wake_rx: Some(wake_rx),
+        }
+    }
+}
+
+impl QuotaTracker {
+    /// The receiver that is pinged when a fetch finishes; taken once by the run loop.
+    pub fn take_wake(&mut self) -> Option<UnboundedReceiver<()>> {
+        self.wake_rx.take()
+    }
+
+    /// The windows for `provider`, if the last fetch was for it.
+    pub fn usage_for(&self, provider: &str) -> Option<ProviderUsage> {
+        self.usage.clone().filter(|q| q.provider == provider)
+    }
+
+    /// Whether `provider` bills a subscription. Every request goes through the gateway, which reports
+    /// usage windows only for subscription (OAuth) accounts; a provider that keeps answering without
+    /// any is metered by API key. Assumed subscription until that is known.
+    pub fn is_subscription(&self, provider: &str) -> bool {
+        self.usage_for(provider).is_some() || self.failures < 3
+    }
+
+    /// The provider changed: what was learned about the old one no longer applies.
+    pub fn provider_changed(&mut self) {
+        self.at = None;
+        self.failures = 0;
+    }
+
+    /// Time until the next fetch is due. Long while one is in flight: its completion wakes the run loop.
+    pub fn wait(&self) -> Duration {
+        if !self.enabled || self.inflight {
+            return Duration::from_secs(3600);
+        }
+        let Some(at) = self.at else { return Duration::ZERO };
+        let every = if self.no_gateway { NO_GATEWAY_INTERVAL } else { interval(self.failures) };
+        every.saturating_sub(at.elapsed())
+    }
+
+    /// Applies a finished fetch, then starts the next one if due.
+    pub fn tick(&mut self, provider: &str) {
+        if !self.enabled {
+            return;
+        }
+        if let Some((fetched_for, got)) = self.slot.borrow_mut().take() {
+            self.inflight = false;
+            self.at = Some(Instant::now());
+            match got {
+                Fetch::Got(q) => {
+                    self.failures = 0;
+                    self.no_gateway = false;
+                    self.usage = Some(q);
+                }
+                Fetch::NoGateway => self.no_gateway = true,
+                Fetch::Failed => {
+                    self.no_gateway = false;
+                    self.failures = self.failures.saturating_add(1);
+                }
+            }
+            // Fetched for a provider the session has since switched away from: fetch again now.
+            if fetched_for != provider {
+                self.at = None;
+            }
+        }
+        if self.inflight || !self.wait().is_zero() {
+            return;
+        }
+        self.inflight = true;
+        let (provider, slot, wake) = (provider.to_string(), self.slot.clone(), self.wake.clone());
+        tokio::task::spawn_local(async move {
+            let got = fetch(&provider).await;
+            *slot.borrow_mut() = Some((provider, got));
+            let _ = wake.send(());
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_without_a_window_id_is_skipped() {
+        let body = r#"{"reports":[{"provider":"anthropic","limits":[
+            {"scope":{},"window":{},"amount":{"usedFraction":0.5}},
+            {"scope":{},"window":{"id":"5h","resetsAt":0},"amount":{"usedFraction":0.5}}]}]}"#;
+        assert_eq!(parse_usage(body, "anthropic", 0).unwrap().windows.len(), 1);
+    }
 
     #[test]
     fn parses_windows_for_one_provider() {
@@ -130,5 +245,26 @@ mod tests {
         assert_eq!(u.windows[1].label, "7d");
         assert!((u.windows[1].used_percent - 17.0).abs() < 1e-9);
         assert!(parse_usage(body, "google", 0).is_none());
+    }
+
+    #[test]
+    fn retries_fast_then_settles() {
+        let s: Vec<u64> = (0..7).map(|n| interval(n).as_secs()).collect();
+        assert_eq!(s, [60, 5, 10, 20, 40, 60, 60]);
+        assert_eq!(interval(u32::MAX).as_secs(), 60);
+    }
+
+    #[test]
+    fn subscription_until_the_provider_keeps_answering_without_windows() {
+        let mut q = QuotaTracker::default();
+        assert!(q.is_subscription("anthropic"));
+        q.failures = 3;
+        assert!(!q.is_subscription("anthropic"));
+        q.usage = Some(ProviderUsage { provider: "anthropic".into(), windows: vec![] });
+        assert!(q.is_subscription("anthropic"), "windows reported: a subscription");
+        assert!(!q.is_subscription("openai"));
+        q.provider_changed();
+        assert!(q.is_subscription("openai"));
+        assert_eq!(q.wait(), Duration::from_secs(3600), "disabled: nothing to wait for");
     }
 }

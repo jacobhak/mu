@@ -1,12 +1,12 @@
 //! `--acp`: Agent Client Protocol server over stdio (newline-delimited JSON-RPC).
 //! One mu `Agent` per ACP session, so each session keeps its own working directory.
 
-use crate::events::{self, AgentEvent, Command, SharedInbox, UserInput};
-use crate::message::Image;
+use crate::events::{self, AgentEvent, Command, SharedInbox};
+use crate::message::{Image, UserInput};
 use crate::models::Thinking;
 use crate::plugin::PluginHost;
 use crate::tools::summary;
-use crate::{agent, pick_model, pricing, session, setup, Setup};
+use crate::{Setup, agent, pick_model, pricing, session, setup};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
@@ -48,20 +49,18 @@ fn update(sid: &str, u: Value) {
 }
 
 fn spawn_stdin() -> UnboundedReceiver<Value> {
+    use mu_common::rpc::{Framed, Line};
     let (tx, rx) = unbounded_channel();
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lines() {
-            let Ok(line) = line else { break };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Value>(&line) {
-                Ok(v) => {
+    tokio::task::spawn_local(async move {
+        let mut input = Framed::new(tokio::io::BufReader::new(tokio::io::stdin()));
+        while let Some(line) = input.next_line().await {
+            match line {
+                Line::Value(v) => {
                     if tx.send(v).is_err() {
                         break;
                     }
                 }
-                Err(e) => fail(&Value::Null, -32700, format!("parse error: {e}")),
+                Line::Bad(e) => fail(&Value::Null, PARSE_ERROR, format!("parse error: {e}")),
             }
         }
     });
@@ -94,7 +93,8 @@ struct Session {
 
 impl Session {
     fn config_options(&self) -> Value {
-        let models: Vec<Value> = self.models.iter().map(|m| json!({"value": m, "name": pricing::display_name(m)})).collect();
+        let models: Vec<Value> =
+            self.models.iter().map(|m| json!({"value": m, "name": pricing::display_name(m)})).collect();
         let levels: Vec<Value> = Thinking::NAMES.iter().map(|n| json!({"value": n, "name": n})).collect();
         json!([
             {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": self.advertised.0, "options": models},
@@ -111,12 +111,42 @@ struct Server {
     sessions: HashMap<String, Session>,
     ev_tx: UnboundedSender<(String, u64, AgentEvent)>,
     next_epoch: u64,
+    /// Results of work that runs off the request loop (opening sessions, listing, model lists).
+    done_tx: UnboundedSender<Done>,
+}
+
+/// What a background task hands back to the request loop.
+enum Done {
+    Opened {
+        id: Value,
+        /// `session/new` (answers with the id) as opposed to load/resume.
+        new: bool,
+        result: Result<Box<Opened>>,
+    },
+    Models {
+        sid: String,
+        epoch: u64,
+        models: Vec<String>,
+    },
+    Listed {
+        id: Value,
+        sessions: Vec<Value>,
+    },
+}
+
+struct Opened {
+    sid: String,
+    session: Session,
+    ev_rx: UnboundedReceiver<AgentEvent>,
+    notice_rx: UnboundedReceiver<String>,
+    providers: Rc<crate::provider::Providers>,
 }
 
 async fn serve(model: Option<String>, thinking: Option<Thinking>) {
     let mut input = spawn_stdin();
     let (ev_tx, mut ev_rx) = unbounded_channel();
-    let mut srv = Server { model, thinking, notices: false, sessions: HashMap::new(), ev_tx, next_epoch: 0 };
+    let (done_tx, mut done_rx) = unbounded_channel();
+    let mut srv = Server { model, thinking, notices: false, sessions: HashMap::new(), ev_tx, next_epoch: 0, done_tx };
     loop {
         tokio::select! {
             m = input.recv() => match m {
@@ -124,6 +154,7 @@ async fn serve(model: Option<String>, thinking: Option<Thinking>) {
                 None => break,
             },
             Some((sid, epoch, e)) = ev_rx.recv() => srv.on_event(&sid, epoch, e),
+            Some(d) = done_rx.recv() => srv.on_done(d),
         }
     }
     srv.shutdown().await;
@@ -137,14 +168,20 @@ fn notice(enabled: bool, sid: &str, severity: &str, msg: String) {
     }
 }
 
-fn valid_id(id: &str) -> bool {
-    !id.is_empty() && !id.contains(['/', '\\'])
-}
-
 impl Server {
     async fn handle(&mut self, msg: Value) {
-        let Some(method) = msg["method"].as_str() else { return };
         let id = msg.get("id").filter(|v| !v.is_null()).cloned();
+        let Some(method) = msg["method"].as_str() else {
+            // A response to something we asked has an id and no method; we ask nothing, so it is
+            // ignored. Anything else with an id is a malformed request and gets an answer.
+            if let Some(id) = id
+                && msg.get("result").is_none()
+                && msg.get("error").is_none()
+            {
+                fail(&id, INVALID_REQUEST, "request has no method");
+            }
+            return;
+        };
         let p = &msg["params"];
         let sid = p["sessionId"].as_str().unwrap_or("");
         match (method, id) {
@@ -166,44 +203,45 @@ impl Server {
             }
             ("session/new", Some(id)) => {
                 let Some(cwd) = self.cwd_param(&id, p) else { return };
-                match self.open(cwd, None, false).await {
-                    Ok(sid) => respond(&id, json!({"sessionId": sid, "configOptions": self.sessions[&sid].config_options()})),
-                    Err(e) => fail(&id, INTERNAL, e.to_string()),
-                }
+                self.spawn_open(id, cwd, None, false, true);
             }
             ("session/list", Some(id)) => {
                 let home = std::env::current_dir().unwrap_or_default();
                 let want = p["cwd"].as_str().map(PathBuf::from);
-                let sessions: Vec<Value> = session::list_all(&home)
-                    .into_iter()
-                    .filter_map(|s| {
-                        let cwd = s.cwd.clone().filter(|c| c.is_absolute())?;
-                        if want.as_ref().is_some_and(|w| *w != cwd) {
-                            return None;
+                let done = self.done_tx.clone();
+                // Sorted by file name and capped before any file is read; off the request loop.
+                let work = tokio::task::spawn_blocking(move || {
+                    let sessions: Vec<Value> = session::list_recent(&home, want.as_deref(), 500)
+                        .into_iter()
+                        .filter_map(|s| {
+                            let cwd = s.cwd.clone().filter(|c| c.is_absolute())?;
+                            let updated =
+                                jiff::Timestamp::try_from(s.modified).ok()?.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                            let title = s.title.or_else(|| Some(s.first_prompt.clone()).filter(|t| !t.is_empty()));
+                            Some(json!({"sessionId": session::id_of(&s.path), "cwd": cwd, "title": title, "updatedAt": updated}))
+                        })
+                        .collect();
+                    sessions
+                });
+                tokio::task::spawn_local(async move {
+                    match work.await {
+                        Ok(sessions) => {
+                            let _ = done.send(Done::Listed { id, sessions });
                         }
-                        let updated = jiff::Timestamp::try_from(s.modified).ok()?.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                        let title = s.title.or_else(|| Some(s.first_prompt.clone()).filter(|t| !t.is_empty()));
-                        Some(json!({"sessionId": session::id_of(&s.path), "cwd": cwd, "title": title, "updatedAt": updated}))
-                    })
-                    .take(500)
-                    .collect();
-                respond(&id, json!({"sessions": sessions}));
+                        Err(e) => fail(&id, INTERNAL, format!("listing failed: {e}")),
+                    }
+                });
             }
             ("session/load" | "session/resume", Some(id)) => {
                 let Some(cwd) = self.cwd_param(&id, p) else { return };
-                if !valid_id(sid) {
-                    return fail(&id, INVALID_PARAMS, "invalid sessionId");
-                }
-                let Some(path) = session::find(&cwd, Path::new(sid)) else {
-                    return fail(&id, INVALID_PARAMS, format!("session {sid} not found"));
+                let path = match session::find_id(&cwd, sid) {
+                    Ok(p) => p,
+                    Err(e) => return fail(&id, INVALID_PARAMS, e),
                 };
                 if self.sessions.contains_key(&session::id_of(&path)) {
                     return fail(&id, INVALID_REQUEST, "session is already open");
                 }
-                match self.open(cwd, Some(path), method == "session/load").await {
-                    Ok(sid) => respond(&id, json!({"configOptions": self.sessions[&sid].config_options()})),
-                    Err(e) => fail(&id, INTERNAL, e.to_string()),
-                }
+                self.spawn_open(id, cwd, Some(path), method == "session/load", false);
             }
             ("session/prompt", Some(id)) => {
                 let Some(s) = self.sessions.get_mut(sid) else { return fail(&id, INVALID_PARAMS, "unknown session") };
@@ -243,6 +281,9 @@ impl Server {
                     if let Some(pid) = s.prompt.take() {
                         respond(&pid, json!({"stopReason": "cancelled"}));
                     }
+                    if let Some(p) = s.pending_cfg.take() {
+                        fail(&p.id, INTERNAL, "session closed");
+                    }
                     tokio::task::spawn_local(async move {
                         let _ = s.task.await;
                         s.host.shutdown_all().await;
@@ -266,89 +307,75 @@ impl Server {
         }
     }
 
-    /// Starts an agent for `cwd` and waits until its session file exists. Replayed history, if
-    /// requested, is streamed before this returns. Yields the ACP session id.
-    async fn open(&mut self, cwd: PathBuf, resume: Option<PathBuf>, replay: bool) -> Result<String> {
-        let Setup { cfgs, ctx, host, providers, notice_rx, .. } = setup(&cwd);
-        let (spec, thinking) = pick_model(&cfgs, &providers, self.model.clone(), self.thinking)?;
-        let (ev_tx, mut ev_rx) = unbounded_channel();
-        let (cmd_tx, cmd_rx) = unbounded_channel();
-        let inbox = events::new_inbox();
-        let mut agent = agent::Agent::new(agent::AgentInit {
-            providers: providers.clone(),
-            plugins: host.clone(),
-            cwd: cwd.clone(),
-            ctx,
-            model: spec,
-            thinking,
-            events: ev_tx,
-            inbox: inbox.clone(),
-        });
-        agent.pin_model = self.model.is_some() && resume.is_some();
-        agent.pin_thinking = self.thinking.is_some() && resume.is_some();
-        agent.excluded = vec!["ask", "propose_plan"];
-        agent.enable_jobs();
-        let task = tokio::task::spawn_local(agent.run(cmd_rx));
-        let known = resume.as_deref().map(session::id_of);
-        let _ = cmd_tx.send(match resume {
-            Some(p) => Command::Resume(p),
-            None => Command::EnsureSession,
-        });
-
-        let ready = loop {
-            match ev_rx.recv().await {
-                Some(AgentEvent::Status(s)) if s.session_path.is_some() => break Ok(s),
-                Some(AgentEvent::Error(e)) => break Err(anyhow!(e)),
-                Some(AgentEvent::Exit) | None => break Err(anyhow!("agent exited during startup")),
-                Some(e) => {
-                    if let (true, Some(sid)) = (replay, &known) {
-                        for u in translate(&cwd, e, false) {
-                            update(sid, u);
-                        }
-                    }
-                }
-            }
-        };
-        let st = match ready {
-            Ok(st) => st,
-            Err(e) => {
-                let _ = cmd_tx.send(Command::Exit);
-                let _ = task.await;
-                host.shutdown_all().await;
-                return Err(e);
-            }
-        };
-        let sid = known.unwrap_or_else(|| session::id_of(Path::new(st.session_path.as_deref().unwrap_or(""))));
-
-        let mut models: Vec<String> = match tokio::time::timeout(Duration::from_secs(10), providers.gateway_models()).await {
-            Ok(Ok(rows)) => rows.into_iter().map(|m| m.id).collect(),
-            _ => Vec::new(),
-        };
-        if !models.contains(&st.model_id) {
-            models.push(st.model_id.clone());
-        }
+    /// Starts opening a session in the background; the reply goes out from `on_done`.
+    fn spawn_open(&mut self, id: Value, cwd: PathBuf, resume: Option<PathBuf>, replay: bool, new: bool) {
         self.next_epoch += 1;
         let epoch = self.next_epoch;
-        tokio::task::spawn_local(forward(sid.clone(), epoch, ev_rx, self.ev_tx.clone(), |e| e));
-        tokio::task::spawn_local(forward(sid.clone(), epoch, notice_rx, self.ev_tx.clone(), AgentEvent::Notice));
-        self.sessions.insert(
-            sid.clone(),
-            Session {
-                cmd: cmd_tx,
-                inbox,
-                cwd,
-                host,
-                task,
-                prompt: None,
-                pending_cfg: None,
-                models,
-                advertised: (st.model_id, st.thinking),
-                used: st.context_tokens,
-                title: st.title,
-                epoch,
-            },
-        );
-        Ok(sid)
+        let (model, thinking, done) = (self.model.clone(), self.thinking, self.done_tx.clone());
+        tokio::task::spawn_local(async move {
+            let result = open_session(model, thinking, epoch, cwd, resume, replay).await;
+            let _ = done.send(Done::Opened { id, new, result });
+        });
+    }
+
+    fn on_done(&mut self, d: Done) {
+        match d {
+            Done::Listed { id, sessions } => respond(&id, json!({"sessions": sessions})),
+            Done::Models { sid, epoch, models } => {
+                let Some(s) = self.sessions.get_mut(&sid).filter(|s| s.epoch == epoch) else { return };
+                let before = s.models.len();
+                for m in models {
+                    if !s.models.contains(&m) {
+                        s.models.push(m);
+                    }
+                }
+                if s.models.len() != before {
+                    update(&sid, json!({"sessionUpdate": "config_option_update", "configOptions": s.config_options()}));
+                }
+            }
+            Done::Opened { id, new, result } => {
+                let o = match result {
+                    Ok(o) => o,
+                    Err(e) => return fail(&id, INTERNAL, e.to_string()),
+                };
+                let Opened { sid, session, ev_rx, notice_rx, providers } = *o;
+                if self.sessions.contains_key(&sid) {
+                    // Another request opened it first.
+                    let _ = session.cmd.send(Command::Exit);
+                    tokio::task::spawn_local(async move {
+                        let _ = session.task.await;
+                        session.host.shutdown_all().await;
+                    });
+                    return fail(&id, INVALID_REQUEST, "session is already open");
+                }
+                let epoch = session.epoch;
+                tokio::task::spawn_local(forward(sid.clone(), epoch, ev_rx, self.ev_tx.clone(), |e| e));
+                tokio::task::spawn_local(forward(
+                    sid.clone(),
+                    epoch,
+                    notice_rx,
+                    self.ev_tx.clone(),
+                    AgentEvent::Notice,
+                ));
+                self.sessions.insert(sid.clone(), session);
+                let opts = self.sessions[&sid].config_options();
+                respond(
+                    &id,
+                    if new { json!({"sessionId": sid, "configOptions": opts}) } else { json!({"configOptions": opts}) },
+                );
+                // The full model list comes from the gateway, which can be slow: fetch it now that
+                // the session is usable, and add to the cached list the session started with.
+                let done = self.done_tx.clone();
+                tokio::task::spawn_local(async move {
+                    if let Ok(Ok(rows)) =
+                        tokio::time::timeout(Duration::from_secs(10), providers.gateway_models()).await
+                    {
+                        let models = rows.into_iter().map(|m| m.id).collect();
+                        let _ = done.send(Done::Models { sid, epoch, models });
+                    }
+                });
+            }
+        }
     }
 
     fn on_event(&mut self, sid: &str, epoch: u64, e: AgentEvent) {
@@ -359,6 +386,9 @@ impl Server {
             if let Some(s) = self.sessions.remove(sid) {
                 if let Some(id) = s.prompt {
                     fail(&id, INTERNAL, "agent exited");
+                }
+                if let Some(p) = s.pending_cfg {
+                    fail(&p.id, INTERNAL, "agent exited");
                 }
             }
             return;
@@ -371,8 +401,12 @@ impl Server {
                     s.models.push(st.model_id.clone());
                 }
                 let cur = (st.model_id.clone(), st.thinking.clone());
-                let satisfied = s.pending_cfg.as_ref().is_some_and(|p| if p.config == "model" { cur.0 == p.value } else { cur.1 == p.value });
                 let changed = s.advertised != cur;
+                // A model request may resolve to a different id than the one asked for (an alias),
+                // so a model change also answers it; otherwise the request would never be answered.
+                let satisfied = s.pending_cfg.as_ref().is_some_and(|p| {
+                    if p.config == "model" { cur.0 == p.value || s.advertised.0 != cur.0 } else { cur.1 == p.value }
+                });
                 s.advertised = cur;
                 if satisfied {
                     let p = s.pending_cfg.take().expect("checked above");
@@ -380,10 +414,10 @@ impl Server {
                 } else if changed {
                     update(sid, json!({"sessionUpdate": "config_option_update", "configOptions": s.config_options()}));
                 }
-                if let Some(used) = st.context_tokens.filter(|_| st.context_window > 0) {
-                    if s.used != Some(used) {
-                        update(sid, json!({"sessionUpdate": "usage_update", "used": used, "size": st.context_window}));
-                    }
+                if let Some(used) = st.context_tokens.filter(|_| st.context_window > 0)
+                    && s.used != Some(used)
+                {
+                    update(sid, json!({"sessionUpdate": "usage_update", "used": used, "size": st.context_window}));
                 }
                 s.used = st.context_tokens;
                 if st.title != s.title {
@@ -403,14 +437,22 @@ impl Server {
                     fail(&p.id, INVALID_PARAMS, m);
                 } else {
                     eprintln!("{m}");
-                    update(sid, json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": format!("**Error:** {m}\n\n")}}));
+                    update(
+                        sid,
+                        json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": format!("**Error:** {m}\n\n")}}),
+                    );
                 }
             }
             AgentEvent::Notice(m) => notice(notices, sid, "info", m),
-            AgentEvent::Retry { attempt, delay, reason } => {
-                notice(notices, sid, "warning", format!("retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs()))
+            AgentEvent::Retry { attempt, delay, reason } => notice(
+                notices,
+                sid,
+                "warning",
+                format!("retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs()),
+            ),
+            AgentEvent::Compacted { before, after } => {
+                notice(notices, sid, "info", format!("compacted {before}→{after} tokens"))
             }
-            AgentEvent::Compacted { before, after } => notice(notices, sid, "info", format!("compacted {before}→{after} tokens")),
             e => {
                 for u in translate(&s.cwd, e, true) {
                     update(sid, u);
@@ -430,6 +472,88 @@ impl Server {
             s.host.shutdown_all().await;
         }
     }
+}
+
+/// Starts an agent for `cwd` and waits until its session file exists. Replayed history, if
+/// requested, is streamed before this returns. Runs off the request loop.
+async fn open_session(
+    model: Option<String>,
+    thinking: Option<Thinking>,
+    epoch: u64,
+    cwd: PathBuf,
+    resume: Option<PathBuf>,
+    replay: bool,
+) -> Result<Box<Opened>> {
+    let Setup { cfgs, ctx, host, providers, notice_rx, .. } = setup(&cwd);
+    let (spec, level) = pick_model(&cfgs, &providers, model.clone(), thinking)?;
+    let (ev_tx, mut ev_rx) = unbounded_channel();
+    let (cmd_tx, cmd_rx) = unbounded_channel();
+    let inbox = events::new_inbox();
+    let mut agent = agent::Agent::new(agent::AgentInit {
+        providers: providers.clone(),
+        plugins: host.clone(),
+        cwd: cwd.clone(),
+        ctx,
+        model: spec,
+        thinking: level,
+        events: ev_tx,
+        inbox: inbox.clone(),
+    });
+    agent.pin_model = model.is_some() && resume.is_some();
+    agent.pin_thinking = thinking.is_some() && resume.is_some();
+    agent.excluded = vec!["ask", "propose_plan"];
+    agent.enable_jobs();
+    let task = tokio::task::spawn_local(agent.run(cmd_rx));
+    let known = resume.as_deref().map(session::id_of);
+    let _ = cmd_tx.send(match resume {
+        Some(p) => Command::Resume(p),
+        None => Command::EnsureSession,
+    });
+
+    let ready = loop {
+        match ev_rx.recv().await {
+            Some(AgentEvent::Status(s)) if s.session_path.is_some() => break Ok(s),
+            Some(AgentEvent::Error(e)) => break Err(anyhow!(e)),
+            Some(AgentEvent::Exit) | None => break Err(anyhow!("agent exited during startup")),
+            Some(e) => {
+                if let (true, Some(sid)) = (replay, &known) {
+                    for u in translate(&cwd, e, false) {
+                        update(sid, u);
+                    }
+                }
+            }
+        }
+    };
+    let st = match ready {
+        Ok(st) => st,
+        Err(e) => {
+            let _ = cmd_tx.send(Command::Exit);
+            let _ = task.await;
+            host.shutdown_all().await;
+            return Err(e);
+        }
+    };
+    let sid = known.unwrap_or_else(|| session::id_of(Path::new(st.session_path.as_deref().unwrap_or(""))));
+    // Start from the cached list: no network wait before the session is usable.
+    let mut models: Vec<String> = providers.cached_models().into_iter().map(|m| m.id).collect();
+    if !models.contains(&st.model_id) {
+        models.push(st.model_id.clone());
+    }
+    let session = Session {
+        cmd: cmd_tx,
+        inbox,
+        cwd,
+        host,
+        task,
+        prompt: None,
+        pending_cfg: None,
+        models,
+        advertised: (st.model_id, st.thinking),
+        used: st.context_tokens,
+        title: st.title,
+        epoch,
+    };
+    Ok(Box::new(Opened { sid, session, ev_rx, notice_rx, providers }))
 }
 
 async fn forward<T: 'static>(
@@ -452,10 +576,10 @@ fn user_input(blocks: &Value) -> UserInput {
     for b in blocks.as_array().into_iter().flatten() {
         match b["type"].as_str() {
             Some("text") => parts.push(b["text"].as_str().unwrap_or("").into()),
-            Some("image") => images.push(Image {
+            Some("image") => images.push(crate::image::externalize(Image {
                 data: b["data"].as_str().unwrap_or("").into(),
                 mime_type: b["mimeType"].as_str().unwrap_or("").into(),
-            }),
+            })),
             Some("resource") => {
                 let r = &b["resource"];
                 let uri = r["uri"].as_str().unwrap_or("");
@@ -548,7 +672,11 @@ fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
         }
         AgentEvent::Todo(v) => {
             let entries = plan_entries(&v);
-            if entries.is_empty() && !live { vec![] } else { vec![json!({"sessionUpdate": "plan", "entries": entries})] }
+            if entries.is_empty() && !live {
+                vec![]
+            } else {
+                vec![json!({"sessionUpdate": "plan", "entries": entries})]
+            }
         }
         _ => vec![],
     }
@@ -572,19 +700,31 @@ mod tests {
 
     #[test]
     fn tool_call_carries_kind_title_and_absolute_location() {
-        let u = translate(Path::new("/w"), AgentEvent::ToolStart { id: "c1".into(), name: "read".into(), args: json!({"path": "a/b.rs"}) }, true);
+        let u = translate(
+            Path::new("/w"),
+            AgentEvent::ToolStart { id: "c1".into(), name: "read".into(), args: json!({"path": "a/b.rs"}) },
+            true,
+        );
         assert_eq!(u[0]["kind"], "read");
         assert_eq!(u[0]["title"], "read: a/b.rs");
         assert_eq!(u[0]["locations"][0]["path"], "/w/a/b.rs");
-        let u = translate(Path::new("/w"), AgentEvent::ToolStart { id: "c2".into(), name: "bash".into(), args: json!({"command": "ls"}) }, true);
+        let u = translate(
+            Path::new("/w"),
+            AgentEvent::ToolStart { id: "c2".into(), name: "bash".into(), args: json!({"command": "ls"}) },
+            true,
+        );
         assert_eq!((u[0]["kind"].as_str(), u[0].get("locations")), (Some("execute"), None));
     }
 
     #[test]
     fn failed_tool_maps_to_failed_status() {
-        let out = ToolOutput { text: "boom".into(), is_error: true, display: None, details: None };
-        let u = translate(Path::new("/w"), AgentEvent::ToolEnd { id: "c1".into(), name: "bash".into(), output: out }, true);
-        assert_eq!((u[0]["status"].as_str(), u[0]["content"][0]["content"]["text"].as_str()), (Some("failed"), Some("boom")));
+        let out = ToolOutput::err("boom");
+        let u =
+            translate(Path::new("/w"), AgentEvent::ToolEnd { id: "c1".into(), name: "bash".into(), output: out }, true);
+        assert_eq!(
+            (u[0]["status"].as_str(), u[0]["content"][0]["content"]["text"].as_str()),
+            (Some("failed"), Some("boom"))
+        );
     }
 
     #[test]
@@ -595,8 +735,12 @@ mod tests {
         ]);
         let u = translate(Path::new("/w"), AgentEvent::Todo(phases), true);
         let e = u[0]["entries"].as_array().unwrap();
-        let got: Vec<(&str, &str)> = e.iter().map(|x| (x["content"].as_str().unwrap(), x["status"].as_str().unwrap())).collect();
-        assert_eq!(got, [("A: x", "in_progress"), ("A: y (blocked: dep)", "pending"), ("B: z (abandoned)", "completed")]);
+        let got: Vec<(&str, &str)> =
+            e.iter().map(|x| (x["content"].as_str().unwrap(), x["status"].as_str().unwrap())).collect();
+        assert_eq!(
+            got,
+            [("A: x", "in_progress"), ("A: y (blocked: dep)", "pending"), ("B: z (abandoned)", "completed")]
+        );
         assert!(translate(Path::new("/w"), AgentEvent::Todo(json!([])), false).is_empty());
         assert_eq!(translate(Path::new("/w"), AgentEvent::Todo(json!([])), true).len(), 1);
     }
@@ -615,8 +759,8 @@ mod tests {
 
     #[test]
     fn session_ids_cannot_escape_the_session_dir() {
-        assert!(valid_id("0198abcd"));
-        assert!(!valid_id(""));
-        assert!(!valid_id("../x"));
+        assert!(session::valid_id("0198abcd"));
+        assert!(!session::valid_id(""));
+        assert!(!session::valid_id("../x"));
     }
 }

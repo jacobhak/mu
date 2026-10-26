@@ -23,16 +23,69 @@ fn sniff(b: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Validates size and type, then base64-encodes. No resizing.
+/// `data` of an image whose bytes live in a blob file, in omp's form: `blob:sha256:<hex>`.
+const BLOB_PREFIX: &str = "blob:sha256:";
+
+fn blob_dir() -> PathBuf {
+    mu_common::paths::mu_home().join("blobs")
+}
+
+/// Whether `data` is a blob reference rather than inline base64.
+pub fn is_ref(data: &str) -> bool {
+    data.strip_prefix(BLOB_PREFIX)
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Writes `bytes` to the content-addressed blob store (idempotent: the file is named by its hash,
+/// so the same image is stored once) and returns its reference. Messages keep only the reference.
+fn store(bytes: &[u8]) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let hash: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let path = blob_dir().join(&hash);
+    if !std::fs::metadata(&path).is_ok_and(|m| m.len() == bytes.len() as u64) {
+        std::fs::create_dir_all(blob_dir())?;
+        mu_common::fs::write_atomic(&path, bytes)?;
+    }
+    Ok(format!("{BLOB_PREFIX}{hash}"))
+}
+
+/// The base64 an API request needs for `data`: inline data as is, a reference read back from the
+/// blob store (mu's own, then omp's, which writes the same references). `None` if the blob is gone.
+pub fn resolve(data: &str) -> Option<String> {
+    let Some(hash) = data.strip_prefix(BLOB_PREFIX).filter(|_| is_ref(data)) else { return Some(data.to_string()) };
+    let dirs = [blob_dir(), mu_common::paths::omp_agent_dir().join("blobs")];
+    let bytes = dirs.iter().find_map(|d| std::fs::read(d.join(hash)).ok())?;
+    Some(STANDARD.encode(bytes))
+}
+
+/// Moves an image's inline base64 into the blob store, so what stays in memory (and in the session
+/// file) is a short reference. An image that cannot be stored stays inline: attaching never fails for it.
+pub fn externalize(img: Image) -> Image {
+    if is_ref(&img.data) {
+        return img;
+    }
+    match STANDARD.decode(&img.data).ok().and_then(|b| store(&b).ok()) {
+        Some(data) => Image { data, ..img },
+        None => img,
+    }
+}
+
+/// Validates size and type, then stores the bytes. No resizing.
 pub fn from_bytes(bytes: Vec<u8>) -> Result<Image, String> {
     if bytes.len() > MAX_BYTES {
         return Err(format!("image too large ({:.1} MB, max 5 MB)", bytes.len() as f64 / (1024.0 * 1024.0)));
     }
     let mime = sniff(&bytes).ok_or("not a png, jpeg, gif or webp image")?;
-    Ok(Image { data: STANDARD.encode(&bytes), mime_type: mime.into() })
+    let data = store(&bytes).unwrap_or_else(|_| STANDARD.encode(&bytes));
+    Ok(Image { data, mime_type: mime.into() })
 }
 
 pub fn load(path: &Path) -> Result<Image, String> {
+    // Refuse before reading: a huge file must not be pulled into memory just to be rejected.
+    let len = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
+    if len > MAX_BYTES as u64 {
+        return Err(format!("image too large ({:.1} MB, max 5 MB)", len as f64 / (1024.0 * 1024.0)));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     from_bytes(bytes)
 }
@@ -43,12 +96,13 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         let hex = |c: u8| (c as char).to_digit(16);
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -74,7 +128,8 @@ fn image_path(line: &str) -> Option<PathBuf> {
     }
     let path = PathBuf::from(p);
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    (path.is_absolute() && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") && path.is_file()).then_some(path)
+    (path.is_absolute() && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") && path.is_file())
+        .then_some(path)
 }
 
 /// The image files a paste consists of, when every non-empty line is one.
@@ -115,5 +170,40 @@ mod tests {
         assert_eq!(paths_in_paste("relative.png"), None);
         assert_eq!(paths_in_paste(&dir.join("missing.png").display().to_string()), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_files_are_refused_by_size_alone() {
+        let f = std::env::temp_dir().join(format!("mu-big-{}.png", uuid::Uuid::new_v4()));
+        let file = std::fs::File::create(&f).unwrap();
+        file.set_len(MAX_BYTES as u64 + 1).unwrap(); // sparse: nothing is written
+        let e = load(&f).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn images_are_kept_as_references_and_read_back_for_requests() {
+        crate::testutil::home();
+        let mut png = PNG.to_vec();
+        png.extend(std::iter::repeat_n(7u8, 200_000));
+        let img = from_bytes(png.clone()).unwrap();
+        assert!(is_ref(&img.data), "{}", img.data);
+        assert!(img.data.len() < 100, "the message holds a reference, not 200 KB of base64");
+        // The same bytes are stored once.
+        assert_eq!(from_bytes(png.clone()).unwrap().data, img.data);
+        // Requests read the bytes back.
+        assert_eq!(resolve(&img.data).unwrap(), STANDARD.encode(&png));
+        // A session file written with it stays small and still parses.
+        let msg =
+            crate::message::Message::User { content: vec![crate::message::Block::Image(img.clone())], timestamp: 0 };
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(line.len() < 300, "{}", line.len());
+        // Inline data from older sessions passes through, and a missing blob is reported, not sent.
+        assert_eq!(resolve("QUJD").as_deref(), Some("QUJD"));
+        assert_eq!(resolve(&format!("{BLOB_PREFIX}{}", "0".repeat(64))), None);
+        // Inline data can be moved into the store.
+        let moved = externalize(Image { data: STANDARD.encode(&png), mime_type: "image/png".into() });
+        assert_eq!(moved.data, img.data);
     }
 }

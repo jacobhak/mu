@@ -12,17 +12,13 @@ use std::sync::{Mutex, OnceLock};
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
-pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-}
-
 fn rpc_err(code: i64, message: impl Into<String>) -> RpcError {
     RpcError { code, message: message.into() }
 }
 
 fn load_state(agent_dir: &std::path::Path, mu_home: &std::path::Path) -> Result<State, String> {
     let mut st = State::open(&mu_home.join("predict"))?;
-    for r in corpus::load_corpus(agent_dir, mu_home, &home()) {
+    for r in corpus::load_corpus(agent_dir, mu_home, &mu_common::paths::home()) {
         st.observe_n(&r.text, &r.cwd, r.count);
     }
     Ok(st)
@@ -67,5 +63,5 @@ async fn main() {
         }
         return;
     }
-    serve_stdio(|req: Request, _client| async move { dispatch(req) }).await;
+    serve_stdio(|req: Request| async move { dispatch(req) }).await;
 }

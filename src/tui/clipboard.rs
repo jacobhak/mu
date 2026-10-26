@@ -42,15 +42,42 @@ fn osc52(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn pipe_to_local(text: &str) {
-    let mut cmd = if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) {
-        Command::new("wl-copy")
-    } else if std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()) {
-        let mut c = Command::new("xclip");
-        c.args(["-selection", "clipboard"]);
-        c
+/// Which local display server a clipboard helper can talk to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Display {
+    Wayland,
+    X11,
+    None,
+}
+
+fn detect_display(wayland: Option<&std::ffi::OsStr>, x11: Option<&std::ffi::OsStr>) -> Display {
+    let set = |v: Option<&std::ffi::OsStr>| v.is_some_and(|v| !v.is_empty());
+    if set(wayland) {
+        Display::Wayland
+    } else if set(x11) {
+        Display::X11
     } else {
-        return;
+        Display::None
+    }
+}
+
+/// Detected once: the environment does not change under a running session.
+fn display() -> Display {
+    static D: std::sync::OnceLock<Display> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        detect_display(std::env::var_os("WAYLAND_DISPLAY").as_deref(), std::env::var_os("DISPLAY").as_deref())
+    })
+}
+
+fn pipe_to_local(text: &str) {
+    let mut cmd = match display() {
+        Display::Wayland => Command::new("wl-copy"),
+        Display::X11 => {
+            let mut c = Command::new("xclip");
+            c.args(["-selection", "clipboard"]);
+            c
+        }
+        Display::None => return,
     };
     let Ok(mut child) = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
     if let Some(mut stdin) = child.stdin.take() {
@@ -71,25 +98,28 @@ async fn run(bin: &str, args: &[&str]) -> Result<Vec<u8>, String> {
         .stderr(Stdio::null())
         .output()
         .await
-        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { format!("{bin} not found") } else { format!("{bin}: {e}") })?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound { format!("{bin} not found") } else { format!("{bin}: {e}") }
+        })?;
     // A non-zero exit means the clipboard is empty or lacks the target.
     Ok(if out.status.success() { out.stdout } else { Vec::new() })
 }
 
 /// Reads an image from the local clipboard (`wl-paste` or `xclip`). `Ok(None)` when it holds none.
+type ReadArgs = fn(&str) -> Vec<String>;
+
 pub async fn read_image() -> Result<Option<crate::message::Image>, String> {
-    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
-    let x11 = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
-    let (bin, list_args, read_args): (&str, &[&str], fn(&str) -> Vec<String>) = if wayland {
-        ("wl-paste", &["--list-types"], |m| vec!["--type".into(), m.into()])
-    } else if x11 {
-        (
-            "xclip",
-            &["-selection", "clipboard", "-t", "TARGETS", "-o"],
-            |m| ["-selection", "clipboard", "-t", m, "-o"].map(String::from).to_vec(),
-        )
-    } else {
-        return Err("no local clipboard (DISPLAY/WAYLAND_DISPLAY unset); use the terminal's paste key or /image <path>".into());
+    let (bin, list_args, read_args): (&str, &[&str], ReadArgs) = match display() {
+        Display::Wayland => ("wl-paste", &["--list-types"], |m| vec!["--type".into(), m.into()]),
+        Display::X11 => ("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"], |m| {
+            ["-selection", "clipboard", "-t", m, "-o"].map(String::from).to_vec()
+        }),
+        Display::None => {
+            return Err(
+                "no local clipboard (DISPLAY/WAYLAND_DISPLAY unset); use the terminal's paste key or /image <path>"
+                    .into(),
+            );
+        }
     };
     let types = String::from_utf8_lossy(&run(bin, list_args).await?).into_owned();
     let Some(mime) = IMAGE_TYPES.iter().find(|m| types.lines().any(|l| l.trim() == **m)) else { return Ok(None) };
@@ -100,4 +130,18 @@ pub async fn read_image() -> Result<Option<crate::message::Image>, String> {
         return Ok(None);
     }
     crate::image::from_bytes(bytes).map(Some)
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn wayland_wins_and_empty_means_unset() {
+        let o = |s: &'static str| Some(OsStr::new(s));
+        assert_eq!(detect_display(o("wayland-0"), o(":0")), Display::Wayland);
+        assert_eq!(detect_display(o(""), o(":0")), Display::X11);
+        assert_eq!(detect_display(None, o("")), Display::None);
+    }
 }

@@ -1,7 +1,7 @@
 use crate::gitinfo::GitInfo;
-use crate::quota::ProviderUsage;
+use crate::message::UserInput;
 use crate::models::Thinking;
-use crate::message::Image;
+use crate::quota::ProviderUsage;
 use crate::tools::ToolOutput;
 use serde_json::Value;
 use std::cell::RefCell;
@@ -22,7 +22,10 @@ pub enum Command {
     Compact(Option<String>),
     TogglePlan(Option<String>),
     Resume(PathBuf),
-    Bash { cmd: String, include: bool },
+    Bash {
+        cmd: String,
+        include: bool,
+    },
     Rename(String),
     /// Cancel one background job by id, or all of them.
     KillJobs(Option<String>),
@@ -36,29 +39,14 @@ pub struct Inbox {
     pub cancel: CancellationToken,
 }
 
-/// A user prompt: text plus attached images.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct UserInput {
-    pub text: String,
-    pub images: Vec<Image>,
-}
-
-impl From<String> for UserInput {
-    fn from(text: String) -> Self {
-        Self { text, images: Vec::new() }
-    }
-}
-
-impl From<&str> for UserInput {
-    fn from(text: &str) -> Self {
-        Self { text: text.into(), images: Vec::new() }
-    }
-}
-
 pub type SharedInbox = Rc<RefCell<Inbox>>;
 
 pub fn new_inbox() -> SharedInbox {
-    Rc::new(RefCell::new(Inbox { steer: VecDeque::new(), follow_up: VecDeque::new(), cancel: CancellationToken::new() }))
+    Rc::new(RefCell::new(Inbox {
+        steer: VecDeque::new(),
+        follow_up: VecDeque::new(),
+        cancel: CancellationToken::new(),
+    }))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -74,7 +62,8 @@ pub struct StatusSnapshot {
     /// Served through the gateway, so spend is subscription-billed (shown as `S`, not `$`).
     pub subscription: bool,
     pub plan: bool,
-    /// Context tokens of the current request; `None` right after compaction or before any usage is known.
+    /// Estimated context tokens of the next request: the last response's usage plus an estimate for
+    /// what was added since. `None` only when a producer cannot estimate.
     pub context_tokens: Option<u64>,
     pub context_window: u32,
     /// Session spend in dollars (from catalogue prices).
@@ -149,30 +138,69 @@ pub enum AgentEvent {
     Thinking(String),
     BlockEnd,
     /// The model began a tool call; its arguments follow as `ToolCallDelta`s.
-    ToolCallStart { id: String, name: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
     /// Raw JSON fragment of a streaming tool call's arguments.
-    ToolCallDelta { id: String, json: String },
-    ToolStart { id: String, name: String, args: Value },
+    ToolCallDelta {
+        id: String,
+        json: String,
+    },
+    ToolStart {
+        id: String,
+        name: String,
+        args: Value,
+    },
     /// For a pty call the chunk is raw terminal text, escape sequences included.
-    ToolOutput { id: String, chunk: String },
+    ToolOutput {
+        id: String,
+        chunk: String,
+    },
     /// A bash call wants a terminal. `reply` carries `(cols, rows)`; dropping it makes the tool fall back.
-    PtyOpen { id: String, input: mpsc::UnboundedSender<PtyInput>, reply: oneshot::Sender<(u16, u16)> },
+    PtyOpen {
+        id: String,
+        input: mpsc::UnboundedSender<PtyInput>,
+        reply: oneshot::Sender<(u16, u16)>,
+    },
     /// Current todo phases (JSON), after a change or a resume.
     Todo(Value),
-    ToolEnd { id: String, name: String, output: ToolOutput },
-    Retry { attempt: u32, delay: Duration, reason: String },
+    ToolEnd {
+        id: String,
+        name: String,
+        output: ToolOutput,
+    },
+    Retry {
+        attempt: u32,
+        delay: Duration,
+        reason: String,
+    },
     Notice(String),
     Error(String),
     Compacting,
-    Compacted { before: u64, after: u64 },
+    Compacted {
+        before: u64,
+        after: u64,
+    },
     /// Snapshot of every background job (running and finished).
     Jobs(Vec<SubagentStatus>),
     /// Finished jobs whose results were handed to the model.
     JobsDelivered(Vec<String>),
-    Ask { questions: Vec<AskQuestion>, reply: oneshot::Sender<Option<Vec<Answer>>> },
-    PlanReview { title: String, uri: String, file: PathBuf, content: String, reply: oneshot::Sender<PlanDecision> },
+    Ask {
+        questions: Vec<AskQuestion>,
+        reply: oneshot::Sender<Option<Vec<Answer>>>,
+    },
+    PlanReview {
+        title: String,
+        uri: String,
+        file: PathBuf,
+        content: String,
+        reply: oneshot::Sender<PlanDecision>,
+    },
     Status(StatusSnapshot),
-    TurnEnd { aborted: bool },
+    TurnEnd {
+        aborted: bool,
+    },
     Exit,
 }
 

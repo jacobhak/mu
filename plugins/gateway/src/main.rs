@@ -16,7 +16,7 @@ fn main() {
     rt.block_on(rpc::serve_stdio(handle));
 }
 
-async fn handle(req: rpc::Request, _client: rpc::Client) -> Result<Value, rpc::RpcError> {
+async fn handle(req: rpc::Request) -> Result<Value, rpc::RpcError> {
     match req.method.as_str() {
         "initialize" => Ok(json!({})),
         "provider/endpoint" => {
@@ -51,13 +51,10 @@ fn endpoint(pid: u32) -> Result<(String, String), String> {
         _ => daemon::start(&dir)?,
     };
     let token_path = paths::omp_config_root().join("auth-gateway.token");
-    let token = fs::read_to_string(&token_path)
-        .map(|t| t.trim().to_string())
-        .ok()
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            format!("gateway token not found at {}; run `omp auth-gateway token`", token_path.display())
-        })?;
+    let token =
+        fs::read_to_string(&token_path).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty()).ok_or_else(
+            || format!("gateway token not found at {}; run `omp auth-gateway token`", token_path.display()),
+        )?;
     shared::touch_lease(&dir, pid).map_err(|e| e.to_string())?;
     Ok((url, token))
 }

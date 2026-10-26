@@ -7,7 +7,6 @@ use crate::message::{Cost, Usage};
 use mu_common::paths;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -142,15 +141,15 @@ static TABLE: RwLock<Option<Arc<Table>>> = RwLock::new(None);
 /// A forced refresh (for a model missing from the cache) already ran or is running in this process.
 static FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn cache_path() -> PathBuf {
-    paths::profile_cache_dir().join("pricing.json")
+fn cache() -> crate::jsoncache::JsonCache {
+    crate::jsoncache::JsonCache::new(paths::profile_cache_dir().join("pricing.json"))
 }
 
 fn table() -> Arc<Table> {
     if let Some(t) = TABLE.read().ok().and_then(|g| g.clone()) {
         return t;
     }
-    let t = Arc::new(std::fs::read_to_string(cache_path()).ok().and_then(|s| Table::from_json(&s)).unwrap_or_default());
+    let t = Arc::new(cache().load(Table::from_json).unwrap_or_default());
     if let Ok(mut g) = TABLE.write() {
         *g = Some(t.clone());
     }
@@ -213,7 +212,7 @@ fn cache_fresh(path: &std::path::Path) -> bool {
 /// Refreshes the cached catalogue when it is missing or older than a day. Failures keep the old cache.
 /// Runs `omp models ls --json` at most once per day; never called from the draw path.
 pub async fn refresh() {
-    if !cache_fresh(&cache_path()) {
+    if !cache_fresh(&paths::profile_cache_dir().join("pricing.json")) {
         fetch().await;
     }
 }
@@ -227,7 +226,6 @@ pub async fn refresh_missing() {
 }
 
 async fn fetch() {
-    let path = cache_path();
     let out = tokio::process::Command::new(mu_common::paths::omp_bin())
         .args(["models", "ls", "--json"])
         .stdin(std::process::Stdio::null())
@@ -243,14 +241,10 @@ async fn fetch() {
     if parsed.entries.is_empty() {
         return;
     }
-    let tmp = path.with_extension("json.tmp");
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
-        if let Ok(mut g) = TABLE.write() {
-            *g = Some(Arc::new(parsed));
-        }
+    if cache().save(&text)
+        && let Ok(mut g) = TABLE.write()
+    {
+        *g = Some(Arc::new(parsed));
     }
 }
 
@@ -306,7 +300,9 @@ mod tests {
         let t = Table::from_json(&out).expect("models ls --json did not parse");
         assert!(!t.entries.is_empty());
         assert!(
-            t.entries.iter().any(|(k, e)| k.starts_with("anthropic/") && e.rates.as_ref().is_some_and(|r| r.input > 0.0)),
+            t.entries
+                .iter()
+                .any(|(k, e)| k.starts_with("anthropic/") && e.rates.as_ref().is_some_and(|r| r.input > 0.0)),
             "no anthropic model with a non-zero input price"
         );
     }

@@ -1,9 +1,9 @@
 use super::uri::Scheme;
-use super::{ToolOutput, Tools};
+use super::{FileMeta, ToolMeta, ToolOutput, Tools};
 use async_trait::async_trait;
 use pi_edit::{
-    ApplyRequest, UrlResolution, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, WriteRequest, WriteResponse,
-    engine::FileOp, session::SessionConfig,
+    ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, UrlResolution, WriteRequest,
+    WriteResponse, engine::FileOp, session::SessionConfig,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -24,7 +24,7 @@ impl EditWriter for FsWriter {
     async fn write(&self, r: WriteRequest) -> EditResult<WriteResponse> {
         match r.op {
             FileOp::Delete => {
-                std::fs::remove_file(&r.absolute).map_err(werr)?;
+                tokio::fs::remove_file(&r.absolute).await.map_err(werr)?;
                 Ok(WriteResponse::default())
             }
             FileOp::Noop => Ok(WriteResponse::default()),
@@ -32,14 +32,14 @@ impl EditWriter for FsWriter {
                 let content = r.content.ok_or_else(|| werr("edit request omitted content"))?;
                 let dest = r.move_to.as_deref().unwrap_or(&r.absolute);
                 if let Some(p) = dest.parent() {
-                    std::fs::create_dir_all(p).map_err(werr)?;
+                    tokio::fs::create_dir_all(p).await.map_err(werr)?;
                 }
-                std::fs::write(dest, &content).map_err(werr)?;
+                tokio::fs::write(dest, &content).await.map_err(werr)?;
                 if r.move_to.is_some() {
-                    if let Ok(m) = std::fs::metadata(&r.absolute) {
-                        let _ = std::fs::set_permissions(dest, m.permissions());
+                    if let Ok(m) = tokio::fs::metadata(&r.absolute).await {
+                        let _ = tokio::fs::set_permissions(dest, m.permissions()).await;
                     }
-                    std::fs::remove_file(&r.absolute).map_err(werr)?;
+                    tokio::fs::remove_file(&r.absolute).await.map_err(werr)?;
                 }
                 Ok(WriteResponse { written: content, ..Default::default() })
             }
@@ -74,7 +74,11 @@ impl Tools {
             let r = match self.resolve(&url) {
                 Ok(r) => match r.scheme {
                     Some(Scheme::Local) => UrlResolution { absolute: Some(r.path), error: None, plan_writable: true },
-                    Some(sc) => UrlResolution { absolute: None, error: Some(format!("{}:// is read-only", sc.name())), plan_writable: false },
+                    Some(sc) => UrlResolution {
+                        absolute: None,
+                        error: Some(format!("{}:// is read-only", sc.name())),
+                        plan_writable: false,
+                    },
                     None => UrlResolution { absolute: Some(r.path), error: None, plan_writable: false },
                 },
                 Err(e) => UrlResolution { absolute: None, error: Some(e), plan_writable: false },
@@ -84,6 +88,10 @@ impl Tools {
         match s.apply(ApplyRequest::default(), &FsWriter).await {
             Ok(o) => {
                 let mut out = ToolOutput::ok(o.text);
+                out.meta = o
+                    .files
+                    .first()
+                    .map(|f| ToolMeta::File(FileMeta { path: f.display.clone(), tag: None, plan: false }));
                 let diffs: Vec<&str> = o.files.iter().map(|f| f.diff.as_str()).filter(|d| !d.is_empty()).collect();
                 if !diffs.is_empty() {
                     out.display = Some(diffs.join("\n"));

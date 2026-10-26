@@ -97,11 +97,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
             _ => return Err(format!("unknown option {a}")),
         }
     }
-    let rows = load_corpus(&omp_agent_dir(), &mu_home(), &crate::home());
+    let rows = load_corpus(&omp_agent_dir(), &mu_home(), &mu_common::paths::home());
     let dir = std::env::temp_dir().join(format!("mu-predict-bench-{}", std::process::id()));
     let mut st = State::open(&dir)?;
     let eval_from = rows.len().saturating_sub(last);
-    let cfgs = [("ngram τ=0.15 (omp default)".to_string(), 0.15f32, false), (format!("ngram τ={tau}"), tau, false), (format!("mu τ={tau}"), tau, true)];
+    let cfgs = [
+        ("ngram τ=0.15 (omp default)".to_string(), 0.15f32, false),
+        (format!("ngram τ={tau}"), tau, false),
+        (format!("mu τ={tau}"), tau, true),
+    ];
     let mut tallies: Vec<Tally> = cfgs.iter().map(|_| Tally { cost: 0, chars: 0, wrong: 0, words: 0 }).collect();
     let mut evaluated = 0;
     for (n, r) in rows.iter().enumerate() {
@@ -122,10 +126,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             for ((_, t, use_line), tally) in cfgs.iter().zip(&mut tallies) {
                 let ghost_at = |i: usize| -> String {
                     let g = &ghosts[i];
-                    if *use_line {
-                        if let Some(l) = &g.line {
-                            return l.clone();
-                        }
+                    if *use_line && let Some(l) = &g.line {
+                        return l.clone();
                     }
                     g.word.as_ref().filter(|(_, c)| c >= t).map(|(s, _)| s.clone()).unwrap_or_default()
                 };
@@ -143,7 +145,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     println!("{:<30} {:>8} {:>20} {:>10}", "config", "KSR", "wrong/100 words", "keystrokes");
     for ((name, _, _), t) in cfgs.iter().zip(&tallies) {
         let ksr = 1.0 - t.cost as f64 / t.chars.max(1) as f64;
-        println!("{name:<30} {:>7.2}% {:>20.2} {:>10}", ksr * 100.0, t.wrong as f64 * 100.0 / t.words.max(1) as f64, t.cost);
+        println!(
+            "{name:<30} {:>7.2}% {:>20.2} {:>10}",
+            ksr * 100.0,
+            t.wrong as f64 * 100.0 / t.words.max(1) as f64,
+            t.cost
+        );
     }
     Ok(())
 }

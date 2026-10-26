@@ -12,10 +12,17 @@ const CACHE_TTL_SECS: u64 = 24 * 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    UpToDate { tag: String },
-    Available { tag: String, ahead: u64 },
+    UpToDate {
+        tag: String,
+    },
+    Available {
+        tag: String,
+        ahead: u64,
+    },
     /// The installed build is dirty, unknown, or not on the release lineage.
-    Dev { sha: String },
+    Dev {
+        sha: String,
+    },
     NoReleases,
     /// curl missing, offline, or rate limited.
     Unknown(String),
@@ -26,9 +33,14 @@ impl Status {
         match self {
             Status::UpToDate { tag } => format!("mu is up to date (latest release {tag})"),
             Status::Available { tag, ahead } => {
-                format!("update available: {tag} ({ahead} commit{} ahead of this build). Run `mu update`.", if *ahead == 1 { "" } else { "s" })
+                format!(
+                    "update available: {tag} ({ahead} commit{} ahead of this build). Run `mu update`.",
+                    if *ahead == 1 { "" } else { "s" }
+                )
             }
-            Status::Dev { sha } => format!("this is a dev build ({sha}); not comparable with releases. `mu update --force` replaces it."),
+            Status::Dev { sha } => {
+                format!("this is a dev build ({sha}); not comparable with releases. `mu update --force` replaces it.")
+            }
             Status::NoReleases => "no releases published yet".into(),
             Status::Unknown(why) => format!("could not check for updates: {why}"),
         }
@@ -72,7 +84,20 @@ enum Api {
 /// Runs `curl` and returns (HTTP status, body). HTTP errors are returned, not raised; network failures are errors.
 fn curl(url: &str, accept: &str) -> Result<(u16, String)> {
     let o = Command::new("curl")
-        .args(["-sSL", "-H", accept, "-H", "X-GitHub-Api-Version: 2022-11-28", "-w", "\n%{http_code}", url])
+        .args([
+            "-sSL",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "20",
+            "-H",
+            accept,
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+            "-w",
+            "\n%{http_code}",
+            url,
+        ])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| anyhow::anyhow!("curl unavailable: {e}"))?;
@@ -118,7 +143,16 @@ pub fn check() -> Status {
     }
     let tag = match api(&format!("repos/{REPO}/releases/latest")) {
         Api::Ok(v) => v["tag_name"].as_str().unwrap_or_default().to_string(),
-        Api::NotFound => return Status::NoReleases,
+        // A repo with no releases and a private repo both answer 404; the repo itself tells them apart.
+        Api::NotFound => {
+            return match api(&format!("repos/{REPO}")) {
+                Api::Ok(_) => Status::NoReleases,
+                Api::NotFound => {
+                    Status::Unknown("repo is private or missing; authenticate gh (`gh auth login`)".into())
+                }
+                Api::Err(e) => Status::Unknown(e),
+            };
+        }
         Api::Err(e) => return Status::Unknown(e),
     };
     if tag.is_empty() {
@@ -168,7 +202,14 @@ pub fn startup_notice() -> Option<String> {
         None => match check() {
             Status::Available { tag, ahead } => Some((tag, ahead)),
             Status::UpToDate { .. } | Status::NoReleases => None,
-            Status::Dev { .. } | Status::Unknown(_) => return None,
+            Status::Dev { .. } => return None,
+            Status::Unknown(_) => {
+                // Back off for an hour instead of retrying on every start.
+                let _ = std::fs::create_dir_all(paths::mu_home());
+                let ts = now().saturating_sub(CACHE_TTL_SECS.saturating_sub(3600));
+                let _ = std::fs::write(cache_path(), format!("{ts}\t{sha}\t-\t0\n"));
+                return None;
+            }
         },
     };
     let (tag, ahead) = avail.clone().unwrap_or(("-".into(), 0));
@@ -182,7 +223,7 @@ pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
     let st = check();
     println!("{}", st.describe());
     if check_only {
-        return Ok(0);
+        return Ok(i32::from(matches!(st, Status::Unknown(_))));
     }
     match (&st, &tag) {
         (Status::UpToDate { .. } | Status::NoReleases, None) => return Ok(0),
@@ -190,20 +231,31 @@ pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
         (Status::Dev { .. }, _) if !force => bail!("not updating a dev build; pass --force to replace it"),
         _ => {}
     }
-    // The installer is fetched from the repo, as in the README, so it always matches the release layout.
-    let url = format!("https://raw.githubusercontent.com/{REPO}/main/scripts/install.sh");
+    // The installer comes from the release tag being installed, never from `main`: it matches
+    // that release's layout and checksums, and nothing unreleased can run.
+    let target = match (&tag, &st) {
+        (Some(t), _) => t.clone(),
+        (None, Status::Available { tag, .. }) => tag.clone(),
+        _ => bail!("not updating: no release tag to install"),
+    };
+    let url = format!("https://raw.githubusercontent.com/{REPO}/{target}/scripts/install.sh");
     let script = match curl(&url, "Accept: text/plain")? {
         (200, body) if !body.is_empty() => body,
-        (404, _) => gh(&["api", &format!("repos/{REPO}/contents/scripts/install.sh"), "-H", "Accept: application/vnd.github.raw"])
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("could not fetch install.sh: HTTP 404 (a private repo needs an authenticated gh)"))?,
+        (404, _) => gh(&[
+            "api",
+            &format!("repos/{REPO}/contents/scripts/install.sh?ref={target}"),
+            "-H",
+            "Accept: application/vnd.github.raw",
+        ])
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not fetch install.sh: HTTP 404 (a private repo needs an authenticated gh)")
+        })?,
         (code, _) => bail!("could not fetch install.sh: HTTP {code}"),
     };
     let mut cmd = Command::new("bash");
     cmd.args(["-s", "--"]);
-    if let Some(t) = &tag {
-        cmd.args(["--tag", t]);
-    }
+    cmd.args(["--tag", &target]);
     let mut child = cmd.stdin(Stdio::piped()).spawn()?;
     {
         use std::io::Write;
@@ -257,5 +309,15 @@ mod tests {
     fn describe_pluralises() {
         let s = Status::Available { tag: "t".into(), ahead: 1 }.describe();
         assert!(s.contains("1 commit ahead"));
+    }
+
+    #[test]
+    fn failure_backoff_entry_is_fresh_for_one_hour_only() {
+        let sha = "abcdef1";
+        let at = 1_000_000;
+        let ts = at - (CACHE_TTL_SECS - 3600);
+        let line = format!("{ts}\t{sha}\t-\t0\n");
+        assert_eq!(parse_cache(&line, sha, at), Some(None));
+        assert_eq!(parse_cache(&line, sha, at + 3601), None);
     }
 }

@@ -1,23 +1,25 @@
 use crate::compaction::Outcome;
 use crate::context::{self, Context, PromptInput};
-use crate::events::{AgentEvent, Command, EventTx, SharedInbox, StatusSnapshot, UserInput};
+use crate::cost::CostLedger;
+use crate::events::{AgentEvent, Command, EventTx, SharedInbox, StatusSnapshot};
+use crate::gitinfo::{self, GitInfo};
 use crate::jobs::{self, JobsHandle};
 use crate::mem;
-use crate::gitinfo::{self, GitInfo};
-use crate::pricing;
-use crate::quota::{self, ProviderUsage};
-use crate::message::{Block, Message, StopReason, Usage, now_ms};
+use crate::message::UserInput;
+use crate::message::{Block, Message, StopReason, now_ms, text_of};
 use crate::models::{ModelSpec, Thinking};
 use crate::plugin::{InitParams, PluginHost};
+use crate::policy::ToolPolicy;
+use crate::pricing;
 use crate::provider::{ProviderError, Providers, Request, StreamEvent, ToolDef};
+use crate::quota::QuotaTracker;
 use crate::session::{self, CompactionState, SessionFile};
 use crate::tools::{ToolCtx, ToolOutput, Tools};
 use serde_json::{Value, json};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::rc::Rc;
+
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
@@ -38,7 +40,9 @@ pub struct Agent {
     pub ctx: Rc<Context>,
     pub subagent: bool,
     pub plugin_ctx: BTreeMap<String, String>,
-    pub base_defs: Vec<ToolDef>,
+    /// Built-in and plugin tool definitions, built on the first request: plugin schemas are not
+    /// read at startup.
+    base_defs: std::cell::OnceCell<Vec<ToolDef>>,
     /// Tool names hidden from the model (e.g. `ask` when headless).
     pub excluded: Vec<&'static str>,
     pub plan: Option<PlanState>,
@@ -55,30 +59,19 @@ pub struct Agent {
     pub fresh_from: usize,
     pub since_compaction: usize,
     pub title_requested: bool,
+    /// Cancels an in-flight title request when the session ends.
+    pub title_cancel: CancellationToken,
     pub title_tx: UnboundedSender<(String, String)>,
     title_rx: Option<UnboundedReceiver<(String, String)>>,
     resumed: bool,
     user_turn: u32,
-    session_cost: f64,
-    /// Assistant usage the price table could not price yet (`provider/model`, usage). Priced into
-    /// `session_cost` once the table knows the model; dropped if the table lists it without a price.
-    unpriced: Vec<(String, Usage)>,
-    tokens_in: u64,
-    tokens_out: u64,
+    cost: CostLedger,
+    /// `(inputs hash, tokens)` of the system prompt, see `system_tokens`.
+    system_memo: std::cell::RefCell<Option<(u64, u64)>>,
+    /// `((message count, last timestamp), tokens)`, see `messages_tokens`.
+    messages_memo: std::cell::RefCell<Option<((usize, i64), u64)>>,
     git: Option<GitInfo>,
-    quota: Option<ProviderUsage>,
-    /// When the last quota fetch finished; `None` means one is due now.
-    quota_at: Option<Instant>,
-    quota_failures: u32,
-    /// The last fetch found no running gateway (cheap to re-check, so retried on a short fixed interval).
-    quota_no_gateway: bool,
-    quota_inflight: bool,
-    /// Set by `run`: quota is fetched only for the top-level interactive agent.
-    quota_enabled: bool,
-    /// The background fetch writes its result here and pings `quota_wake`.
-    quota_slot: Rc<RefCell<Option<(String, quota::Fetch)>>>,
-    quota_wake: UnboundedSender<()>,
-    quota_wake_rx: Option<UnboundedReceiver<()>>,
+    quota: QuotaTracker,
     turn_msgs: Vec<Value>,
     jobs: Option<Rc<JobsHandle>>,
     wake_rx: Option<UnboundedReceiver<()>>,
@@ -117,32 +110,36 @@ enum Flow {
     Failed,
 }
 
-/// Quota refresh cadence: a minute after success; 5s, 10s, 20s, 40s, then a minute after failures.
-fn quota_interval(failures: u32) -> Duration {
-    match failures {
-        0 => Duration::from_secs(60),
-        n => Duration::from_secs(5u64 << (n - 1).min(4)).min(Duration::from_secs(60)),
-    }
-}
-
-/// While no gateway runs, check again this often (a local file read), so quota shows soon after the
-/// first request starts one.
-const QUOTA_NO_GATEWAY_INTERVAL: Duration = Duration::from_secs(5);
-
-/// `provider/model` as the price table keys it. Assistant messages from mu carry the full id; omp's carry
-/// the bare model id next to the provider.
-fn priced_id(provider: &str, model: &str) -> String {
-    if model.contains('/') { model.to_string() } else { format!("{provider}/{model}") }
-}
-
-fn has_tokens(u: &Usage) -> bool {
-    u.input + u.output + u.cache_read + u.cache_write > 0
-}
-
 async fn recv_opt(rx: &mut Option<UnboundedReceiver<()>>) -> Option<()> {
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Runs `fut` (a turn) while still reading commands. Commands that are safe mid-turn (`KillJobs`)
+/// take effect at once, so `/jobs kill` works while `wait` blocks; the rest queue in `backlog`.
+async fn drive<F: std::future::Future<Output = ()>>(
+    fut: F,
+    rx: &mut UnboundedReceiver<Command>,
+    backlog: &mut std::collections::VecDeque<Command>,
+    jobs: Option<Rc<JobsHandle>>,
+    events: EventTx,
+) {
+    tokio::pin!(fut);
+    let mut open = true;
+    loop {
+        tokio::select! {
+            () = &mut fut => return,
+            c = rx.recv(), if open => match c {
+                Some(Command::KillJobs(id)) => {
+                    let n = jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
+                    let _ = events.send(AgentEvent::Notice(format!("killed {n} job(s)")));
+                }
+                Some(other) => backlog.push_back(other),
+                None => open = false,
+            },
+        }
     }
 }
 
@@ -163,9 +160,7 @@ impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let tools = Tools::new(i.cwd.clone(), i.plugins.clone());
         tools.set_skills(i.ctx.skills.iter().map(|s| (s.name.clone(), s.dir.clone())).collect());
-        let base_defs = Tools::definitions().into_iter().chain(i.plugins.tool_defs()).collect();
         let (title_tx, title_rx) = unbounded_channel();
-        let (quota_wake, quota_wake_rx) = unbounded_channel();
         Self {
             tools,
             providers: i.providers,
@@ -182,7 +177,7 @@ impl Agent {
             ctx: i.ctx,
             subagent: false,
             plugin_ctx: BTreeMap::new(),
-            base_defs,
+            base_defs: Default::default(),
             excluded: Vec::new(),
             plan: None,
             allow: None,
@@ -195,24 +190,16 @@ impl Agent {
             fresh_from: 0,
             since_compaction: 0,
             title_requested: false,
+            title_cancel: CancellationToken::new(),
             title_tx,
             title_rx: Some(title_rx),
             resumed: false,
             user_turn: 0,
-            session_cost: 0.0,
-            unpriced: Vec::new(),
-            tokens_in: 0,
-            tokens_out: 0,
+            cost: CostLedger::default(),
+            system_memo: Default::default(),
+            messages_memo: Default::default(),
             git: None,
-            quota: None,
-            quota_at: None,
-            quota_failures: 0,
-            quota_no_gateway: false,
-            quota_inflight: false,
-            quota_enabled: false,
-            quota_slot: Rc::new(RefCell::new(None)),
-            quota_wake,
-            quota_wake_rx: Some(quota_wake_rx),
+            quota: QuotaTracker::default(),
             turn_msgs: Vec::new(),
             jobs: None,
             wake_rx: None,
@@ -229,21 +216,30 @@ impl Agent {
     }
 
     pub fn tool_defs(&self) -> Vec<ToolDef> {
-        let mut v = self.base_defs.clone();
+        let mut v = self
+            .base_defs
+            .get_or_init(|| Tools::definitions().into_iter().chain(self.plugins.tool_defs()).collect())
+            .clone();
         if self.plan.is_some() {
             v.push(Tools::plan_def());
         }
-        if crate::tools::task::depth() < 2 {
-            v.push(Tools::task_def(self.jobs.is_some(), &self.ctx.agents));
-        }
+        v.push(Tools::task_def(self.jobs.is_some(), &self.ctx.agents));
         if self.jobs.is_some() {
             v.push(Tools::wait_def());
         }
-        v.retain(|d| !self.excluded.contains(&d.name.as_str()));
-        if let Some(allow) = &self.allow {
-            v.retain(|d| allow.iter().any(|a| a == &d.name));
-        }
+        let policy = self.policy();
+        v.retain(|d| policy.permits(&d.name));
         v
+    }
+
+    /// The tool limits for this run; enforced in `run_tool` and used to build the advertised list.
+    pub fn policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            allow: self.allow.clone(),
+            excluded: self.excluded.clone(),
+            depth: crate::tools::task::depth(),
+            plan: self.plan.is_some(),
+        }
     }
 
     async fn enter_plan(&mut self) {
@@ -253,7 +249,10 @@ impl Agent {
             self.set_model("@plan");
         }
         if let Some(s) = self.session.as_mut() {
-            s.mode_change("plan", json!({"planFilePath": "local://"}));
+            s.mode_change(
+                "plan",
+                json!({"planFilePath": "local://", "prevModel": prev.prev_model, "prevThinking": prev.prev_thinking.as_str()}),
+            );
         }
         self.plan = Some(prev);
         self.tools.plan.set(true);
@@ -299,6 +298,37 @@ impl Agent {
         })
     }
 
+    /// Tokens of the system prompt, measured again only when what it is built from changes.
+    pub fn system_tokens(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&self.model.id, self.plan.is_some(), &self.plugin_ctx, &self.agent_prompt, self.subagent).hash(&mut h);
+        let key = h.finish();
+        let mut memo = self.system_memo.borrow_mut();
+        match *memo {
+            Some((k, t)) if k == key => t,
+            _ => {
+                let t = self.system().len() as u64 / 4;
+                *memo = Some((key, t));
+                t
+            }
+        }
+    }
+
+    /// Sum of the messages' estimates, kept until the message list changes.
+    pub fn messages_tokens(&self) -> u64 {
+        let key = (self.messages.len(), self.messages.last().map_or(0, Message::timestamp));
+        let mut memo = self.messages_memo.borrow_mut();
+        match *memo {
+            Some((k, t)) if k == key => t,
+            _ => {
+                let t = self.messages.iter().map(Message::estimate_tokens).sum();
+                *memo = Some((key, t));
+                t
+            }
+        }
+    }
+
     pub fn session_id(&self) -> String {
         self.session.as_ref().map(|s| s.id()).unwrap_or_default()
     }
@@ -309,17 +339,17 @@ impl Agent {
             model_name: pricing::display_name(&self.model.id),
             reasoning: pricing::reasoning(&self.model.id).unwrap_or(true),
             thinking: self.thinking.as_str().into(),
-            subscription: true,
+            subscription: self.quota.is_subscription(&self.model.provider),
             plan: self.plan.is_some(),
             context_tokens: Some(self.context_tokens()),
             context_window: self.model.context_window,
-            cost: self.session_cost,
-            tokens_in: self.tokens_in,
-            tokens_out: self.tokens_out,
+            cost: self.cost.total,
+            tokens_in: self.cost.tokens_in,
+            tokens_out: self.cost.tokens_out,
             title: self.title.clone(),
             session_path: self.session.as_ref().map(|s| s.path.to_string_lossy().into_owned()),
             git: self.git.clone(),
-            usage: self.quota.clone().filter(|q| q.provider == self.model.provider),
+            usage: self.quota.usage_for(&self.model.provider),
         }
     }
 
@@ -330,75 +360,15 @@ impl Agent {
         self.settle_prices();
     }
 
-    /// Time until the next quota fetch is due. Long while one is in flight: its completion wakes `run`.
-    fn quota_wait(&self) -> Duration {
-        if !self.quota_enabled || self.quota_inflight {
-            return Duration::from_secs(3600);
-        }
-        let Some(at) = self.quota_at else { return Duration::ZERO };
-        let interval = if self.quota_no_gateway { QUOTA_NO_GATEWAY_INTERVAL } else { quota_interval(self.quota_failures) };
-        interval.saturating_sub(at.elapsed())
-    }
-
-    /// Applies a finished quota fetch, then starts the next one if due. Never waits on the network:
-    /// the gateway may fetch usage upstream on a cache miss, which can take seconds.
     fn tick_quota(&mut self) {
-        if !self.quota_enabled {
-            return;
-        }
-        if let Some((provider, got)) = self.quota_slot.borrow_mut().take() {
-            self.quota_inflight = false;
-            self.quota_at = Some(Instant::now());
-            match got {
-                quota::Fetch::Got(q) => {
-                    self.quota_failures = 0;
-                    self.quota_no_gateway = false;
-                    self.quota = Some(q);
-                }
-                quota::Fetch::NoGateway => self.quota_no_gateway = true,
-                quota::Fetch::Failed => {
-                    self.quota_no_gateway = false;
-                    self.quota_failures = self.quota_failures.saturating_add(1);
-                }
-            }
-            // Fetched for a provider the session has since switched away from: fetch again now.
-            if provider != self.model.provider {
-                self.quota_at = None;
-            }
-        }
-        if self.quota_inflight || !self.quota_wait().is_zero() {
-            return;
-        }
-        self.quota_inflight = true;
-        let (provider, slot, wake) = (self.model.provider.clone(), self.quota_slot.clone(), self.quota_wake.clone());
-        tokio::task::spawn_local(async move {
-            let got = quota::fetch(&provider).await;
-            *slot.borrow_mut() = Some((provider, got));
-            let _ = wake.send(());
-        });
+        let provider = self.model.provider.clone();
+        self.quota.tick(&provider);
     }
 
     /// Prices usage recorded before the table knew its model. A model the table does not list forces
     /// one catalogue refresh per process.
     fn settle_prices(&mut self) {
-        if self.unpriced.is_empty() {
-            return;
-        }
-        let mut missing = false;
-        let mut added = 0.0;
-        self.unpriced.retain(|(id, usage)| match pricing::cost(id, usage) {
-            Some(c) => {
-                added += c.total;
-                false
-            }
-            None if pricing::known(id) => false,
-            None => {
-                missing = true;
-                true
-            }
-        });
-        self.session_cost += added;
-        if missing && self.quota_enabled {
+        if self.cost.settle() && self.quota.enabled {
             tokio::task::spawn_local(pricing::refresh_missing());
         }
     }
@@ -418,16 +388,18 @@ impl Agent {
         let msgs = self.messages.get(self.fresh_from..)?;
         let i = msgs.iter().rposition(|m| matches!(m, Message::Assistant { .. }))?;
         let Message::Assistant { usage, .. } = &msgs[i] else { return None };
-        let trailing: u64 = msgs[i + 1..].iter().map(crate::compaction::est).sum();
+        let trailing: u64 = msgs[i + 1..].iter().map(Message::estimate_tokens).sum();
         Some(usage.input + usage.cache_read + usage.cache_write + usage.output + trailing)
     }
 
-    async fn ensure_session(&mut self) {
+    /// Makes sure a session file exists. `false` (with an error shown) when it cannot be created.
+    async fn ensure_session(&mut self) -> bool {
         if self.session.is_some() {
-            return;
+            return true;
         }
         match SessionFile::create(&self.cwd, self.parent_session.as_deref()) {
             Ok(mut s) => {
+                self.attach_error_sink(&mut s);
                 s.model_change(&self.model.id);
                 s.thinking_change(self.thinking.as_str());
                 self.session = Some(s);
@@ -435,9 +407,21 @@ impl Agent {
                 self.sync_plugin_session();
                 let res = self.plugins.hook("session_start", json!({"resumed": self.resumed})).await;
                 self.apply_plugin_context(res);
+                true
             }
-            Err(e) => self.error(format!("session write failed: {e}")),
+            Err(e) => {
+                self.error(format!("cannot create the session file: {e}"));
+                false
+            }
         }
+    }
+
+    /// Session write errors reach the user as error events.
+    fn attach_error_sink(&self, s: &mut SessionFile) {
+        let tx = self.events.clone();
+        s.on_error = Some(Box::new(move |m| {
+            let _ = tx.send(AgentEvent::Error(m));
+        }));
     }
 
     fn sync_plugin_session(&self) {
@@ -485,8 +469,7 @@ impl Agent {
                     s.model_change(&spec.id);
                 }
                 if self.model.provider != spec.provider {
-                    self.quota_at = None;
-                    self.quota_failures = 0;
+                    self.quota.provider_changed();
                 }
                 self.model = spec;
                 if let Some(l) = level {
@@ -508,21 +491,14 @@ impl Agent {
 
     pub fn push(&mut self, mut m: Message) {
         if let Message::Assistant { usage, provider, model, .. } = &mut m {
-            let id = priced_id(provider, model);
-            match pricing::cost(&id, usage) {
-                Some(c) => usage.cost = c,
-                None if has_tokens(usage) => self.unpriced.push((id, usage.clone())),
-                None => {}
-            }
-            self.session_cost += usage.cost.total;
-            self.tokens_in += usage.input + usage.cache_read + usage.cache_write;
-            self.tokens_out += usage.output;
+            self.cost.record(provider, model, usage);
         }
-        let plugin_view = if m.image_stats().0 > 0 { serde_json::to_value(m.without_images()) } else { serde_json::to_value(&m) };
+        let plugin_view =
+            if m.image_stats().0 > 0 { serde_json::to_value(m.without_images()) } else { serde_json::to_value(&m) };
         if let Ok(v) = plugin_view {
             self.turn_msgs.push(v);
         }
-        let id = self.session.as_mut().map(|s| s.message(&m)).unwrap_or_default();
+        let id = self.session.as_mut().and_then(|s| s.message(&m)).unwrap_or_default();
         self.entry_ids.push(id);
         self.messages.push(m);
         self.since_compaction += 1;
@@ -535,7 +511,7 @@ impl Agent {
             content: vec![Block::text(out.text.clone())],
             is_error: out.is_error,
             timestamp: now_ms(),
-            details: out.details.clone(),
+            details: out.stored_details(),
         });
     }
 
@@ -546,15 +522,14 @@ impl Agent {
         self.plugin_ctx.clear();
         self.title = None;
         self.user_turn = 0;
-        self.session_cost = 0.0;
-        self.unpriced.clear();
-        self.tokens_in = 0;
-        self.tokens_out = 0;
+        self.cost.reset();
         self.turn_msgs.clear();
         self.compaction = None;
         self.fresh_from = 0;
         self.since_compaction = 0;
         self.title_requested = false;
+        self.title_cancel.cancel();
+        self.title_cancel = CancellationToken::new();
         self.plan = None;
         self.tools.plan.set(false);
         self.exec_plan = None;
@@ -577,9 +552,6 @@ impl Agent {
     /// Loads `path`, applying its model/thinking unless pinned by the command line.
     /// Re-emits the loaded conversation as UI events so a resumed session shows its history.
     fn replay_history(&self) {
-        let text_of = |blocks: &[Block]| {
-            blocks.iter().filter_map(|b| if let Block::Text { text } = b { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
-        };
         for m in &self.messages {
             match m {
                 Message::User { content, .. } => self.emit(AgentEvent::UserPrompt(text_of(content))),
@@ -591,14 +563,18 @@ impl Agent {
                                 self.emit(AgentEvent::BlockEnd);
                             }
                             Block::ToolCall { id, name, arguments } => {
-                                self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: arguments.clone() });
+                                self.emit(AgentEvent::ToolStart {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    args: arguments.clone(),
+                                });
                             }
                             _ => {}
                         }
                     }
                 }
                 Message::ToolResult { tool_call_id, tool_name, content, is_error, details, .. } => {
-                    let output = ToolOutput { text: text_of(content), is_error: *is_error, display: None, details: details.clone() };
+                    let output = ToolOutput::from_stored(text_of(content), *is_error, details.clone());
                     self.emit(AgentEvent::ToolEnd { id: tool_call_id.clone(), name: tool_name.clone(), output });
                 }
             }
@@ -610,10 +586,26 @@ impl Agent {
             Ok(l) => l,
             Err(e) => return self.error(e.to_string()),
         };
+        // Re-opening the session that is current: release its lock first.
+        let same = self.session.as_ref().is_some_and(|c| c.path == path);
+        if same {
+            self.end_session().await;
+            self.session = None;
+        }
         let mut s = match SessionFile::open_append(path) {
-            Ok(s) => s,
+            Ok(mut s) => {
+                self.attach_error_sink(&mut s);
+                s
+            }
             Err(e) => return self.error(e.to_string()),
         };
+        // Only now, with the target loaded and open, does the current session end.
+        if !same {
+            self.end_session().await;
+        }
+        if !loaded.warnings.is_empty() {
+            self.notice(format!("session repaired on load: {}", loaded.warnings.join("; ")));
+        }
         self.reset_conversation();
         if let Some(m) = loaded.model.as_deref().filter(|_| !self.pin_model) {
             match self.providers.resolve(m) {
@@ -631,11 +623,7 @@ impl Agent {
         // Stored costs, except turns that were saved unpriced (price table missing the model at the time).
         for m in &loaded.messages {
             if let Message::Assistant { usage, provider, model, .. } = m {
-                if usage.cost.total == 0.0 && has_tokens(usage) {
-                    self.unpriced.push((priced_id(provider, model), usage.clone()));
-                } else {
-                    self.session_cost += usage.cost.total;
-                }
+                self.cost.add_stored(provider, model, usage);
             }
         }
         self.settle_prices();
@@ -653,8 +641,11 @@ impl Agent {
         self.user_turn = self.messages.iter().filter(|m| matches!(m, Message::User { .. })).count() as u32;
         self.session = Some(s);
         self.tools.set_session(&self.session_id(), self.session.as_ref().map(|s| s.path.clone()));
-        if loaded.mode.as_ref().is_some_and(|(m, _)| m == "plan") {
-            self.plan = Some(PlanState { prev_model: None, prev_thinking: self.thinking });
+        if let Some((_, data)) = loaded.mode.as_ref().filter(|(m, _)| m == "plan") {
+            // The model and thinking level in force before plan mode, so leaving it restores them.
+            let prev_model = data["prevModel"].as_str().map(String::from);
+            let prev_thinking = data["prevThinking"].as_str().and_then(Thinking::parse).unwrap_or(self.thinking);
+            self.plan = Some(PlanState { prev_model, prev_thinking });
             self.tools.plan.set(true);
         }
         self.resumed = true;
@@ -667,17 +658,21 @@ impl Agent {
     }
 
     pub async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
-        self.quota_enabled = true;
+        self.quota.enabled = true;
         tokio::task::spawn_local(pricing::refresh());
         self.refresh_external().await;
         self.emit_status();
         let mut title_rx = self.title_rx.take().expect("run once");
         let mut wake_rx = self.wake_rx.take();
-        let mut quota_rx = self.quota_wake_rx.take();
+        let mut quota_rx = self.quota.take_wake();
+        let mut backlog: std::collections::VecDeque<Command> = Default::default();
         loop {
-            let cmd = tokio::select! {
+            let cmd = if let Some(c) = backlog.pop_front() {
+                c
+            } else {
+                tokio::select! {
                 c = rx.recv() => match c { Some(c) => c, None => break },
-                () = tokio::time::sleep(self.quota_wait()) => {
+                () = tokio::time::sleep(self.quota.wait()) => {
                     self.tick_quota();
                     continue;
                 }
@@ -691,12 +686,15 @@ impl Agent {
                     continue;
                 }
                 Some(()) = recv_opt(&mut wake_rx) => {
-                    self.turn(None).await;
+                    let (jobs, events) = (self.jobs.clone(), self.events.clone());
+                    drive(self.turn(None), &mut rx, &mut backlog, jobs, events).await;
                     continue;
                 }
+                }
             };
+            let (jobs, events) = (self.jobs.clone(), self.events.clone());
             match cmd {
-                Command::Prompt(t) => self.turn(Some(t)).await,
+                Command::Prompt(t) => drive(self.turn(Some(t)), &mut rx, &mut backlog, jobs, events).await,
                 Command::EnsureSession => {
                     self.ensure_session().await;
                     self.emit_status();
@@ -710,24 +708,23 @@ impl Agent {
                     self.emit_status();
                 }
                 Command::Resume(p) => {
-                    self.end_session().await;
                     self.load_session(&p).await;
                 }
                 Command::TogglePlan(prompt) => match (self.plan.is_some(), prompt) {
                     (false, p) => {
                         self.enter_plan().await;
                         if let Some(p) = p {
-                            self.turn(Some(p.into())).await;
+                            drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events).await;
                         }
                     }
-                    (true, Some(p)) => self.turn(Some(p.into())).await,
+                    (true, Some(p)) => drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events).await,
                     (true, None) => self.exit_plan(),
                 },
                 Command::Compact(focus) => self.manual_compact(focus).await,
                 Command::Rename(t) => {
                     self.ensure_session().await;
                     if let Some(s) = self.session.as_mut() {
-                        s.set_title(&t, "user");
+                        s.set_title(&t, session::TitleSource::User);
                     }
                     self.title = Some(t);
                     self.emit_status();
@@ -751,7 +748,7 @@ impl Agent {
             return;
         }
         if let Some(s) = self.session.as_mut() {
-            s.set_title(&t, "auto");
+            s.set_title(&t, session::TitleSource::Auto);
         }
         self.title = Some(t);
         self.emit_status();
@@ -764,13 +761,16 @@ impl Agent {
         match self.compact(focus.as_deref(), &cancel).await {
             Outcome::Done => {}
             Outcome::Skipped(why) => self.notice(why),
-            Outcome::Failed(e) => self.error(format!("compaction failed: {e}")),
+            Outcome::Failed(e) if !cancel.is_cancelled() => self.error(format!("compaction failed: {e}")),
+            Outcome::Failed(_) => {}
         }
         self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
     }
 
     async fn user_bash(&mut self, cmd: String, include: bool) {
-        self.ensure_session().await;
+        if !self.ensure_session().await {
+            return;
+        }
         let cancel = CancellationToken::new();
         self.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
@@ -781,6 +781,7 @@ impl Agent {
         let out = self.tools.call("bash", &args, &ctx).await;
         if include {
             self.push(Message::user(&format!("I ran `{cmd}`:\n```\n{}\n```", out.text)));
+            self.turn_msgs.clear(); // not a model turn: no `turn_end` hook for it
         }
         self.emit(AgentEvent::ToolEnd { id, name: "bash".into(), output: out });
         self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
@@ -791,31 +792,39 @@ impl Agent {
         if first.is_none() && !self.jobs.as_ref().is_some_and(|j| j.has_undelivered()) {
             return;
         }
-        self.ensure_session().await;
+        if !self.ensure_session().await {
+            return;
+        }
         let cancel = CancellationToken::new();
         self.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
         let mut next = Some(first);
         let mut aborted = false;
         while let Some(input) = next.take() {
-            self.ensure_session().await;
+            if !self.ensure_session().await {
+                break;
+            }
             let extra = match &input {
                 Some(i) => {
                     self.emit(AgentEvent::UserPrompt(i.text.clone()));
                     self.user_turn += 1;
                     let res = self
                         .plugins
-                        .hook("prompt_submit", json!({"prompt": i.text, "userTurn": self.user_turn, "resumed": self.resumed}))
+                        .hook(
+                            "prompt_submit",
+                            json!({"prompt": i.text, "userTurn": self.user_turn, "resumed": self.resumed}),
+                        )
                         .await;
                     self.apply_plugin_context(res);
                     i.text.len() as u64 / 4 + 1600 * i.images.len() as u64
                 }
                 None => 0,
             };
-            if self.needs_compaction(extra) {
-                if let Outcome::Failed(e) = self.compact(None, &cancel).await {
-                    self.error(format!("compaction failed: {e}"));
-                }
+            if self.needs_compaction(extra)
+                && let Outcome::Failed(e) = self.compact(None, &cancel).await
+                && !cancel.is_cancelled()
+            {
+                self.error(format!("compaction failed: {e}"));
             }
             match &input {
                 Some(i) => self.push(Message::user_input(i)),
@@ -826,10 +835,14 @@ impl Agent {
             match self.run_loop(&cancel).await {
                 Flow::Aborted => {
                     aborted = true;
+                    self.exec_plan = None;
                     self.turn_end_hook().await;
                     break;
                 }
-                Flow::Failed => break,
+                Flow::Failed => {
+                    self.exec_plan = None;
+                    break;
+                }
                 Flow::Done => {}
             }
             self.turn_end_hook().await;
@@ -859,6 +872,14 @@ impl Agent {
                 continue;
             }
             next = self.inbox.borrow_mut().follow_up.pop_front().map(Some);
+        }
+        // Failed and cancelled passes leave messages the hook has not seen; do not let them
+        // leak into the next turn's `turn_end`.
+        if !self.turn_msgs.is_empty() {
+            self.turn_end_hook().await;
+        }
+        if let Some(s) = &self.session {
+            s.sync();
         }
         mem::trim();
         self.refresh_model_meta();
@@ -899,14 +920,18 @@ impl Agent {
         let mut first = true;
         let mut compacted_for_overflow = false;
         loop {
-            if !first && self.needs_compaction(0) {
-                if let Outcome::Failed(e) = self.compact(None, cancel).await {
-                    self.error(format!("compaction failed: {e}"));
-                }
+            if !first
+                && self.needs_compaction(0)
+                && let Outcome::Failed(e) = self.compact(None, cancel).await
+                && !cancel.is_cancelled()
+            {
+                self.error(format!("compaction failed: {e}"));
             }
             first = false;
             let system = self.system();
             let wire = self.wire_messages();
+            // Every tool call in the history has its result and vice versa (`to_wire` also repairs).
+            debug_assert!(crate::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
             let defs = self.tool_defs();
             let reply = {
                 let req = Request {
@@ -922,8 +947,12 @@ impl Agent {
                     let _ = tx.send(match e {
                         StreamEvent::Text(t) => AgentEvent::Text(t.into()),
                         StreamEvent::Thinking(t) => AgentEvent::Thinking(t.into()),
-                        StreamEvent::ToolCallStart { id, name } => AgentEvent::ToolCallStart { id: id.into(), name: name.into() },
-                        StreamEvent::ToolCallDelta { id, json } => AgentEvent::ToolCallDelta { id: id.into(), json: json.into() },
+                        StreamEvent::ToolCallStart { id, name } => {
+                            AgentEvent::ToolCallStart { id: id.into(), name: name.into() }
+                        }
+                        StreamEvent::ToolCallDelta { id, json } => {
+                            AgentEvent::ToolCallDelta { id: id.into(), json: json.into() }
+                        }
                         StreamEvent::Retry { attempt, delay, reason } => AgentEvent::Retry { attempt, delay, reason },
                     });
                 };
@@ -947,6 +976,7 @@ impl Agent {
                             self.error(format!("error: {m}"));
                             return Flow::Failed;
                         }
+                        Outcome::Failed(_) if cancel.is_cancelled() => return Flow::Aborted,
                         Outcome::Failed(e) => {
                             self.error(format!("compaction failed: {e}"));
                             return Flow::Failed;
@@ -974,6 +1004,20 @@ impl Agent {
             if stop == StopReason::Length {
                 self.error("[output truncated: max_tokens reached]");
             }
+            if stop != StopReason::ToolUse && !calls.is_empty() {
+                // A truncated reply: its tool calls never run, but each still needs a result.
+                for (id, name, args) in &calls {
+                    let reason = "Tool call not executed: output was truncated (max_tokens)";
+                    let out = ToolOutput::err(reason);
+                    self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
+                    self.emit(AgentEvent::ToolEnd {
+                        id: id.clone(),
+                        name: name.clone(),
+                        output: ToolOutput::err(reason),
+                    });
+                    self.push_result(id, name, &out);
+                }
+            }
             if stop != StopReason::ToolUse || calls.is_empty() {
                 let steered = self.take_steer();
                 let delivered = self.take_jobs();
@@ -987,7 +1031,11 @@ impl Agent {
                 if let Some(reason) = skip {
                     let out = ToolOutput::err(reason);
                     self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                    self.emit(AgentEvent::ToolEnd { id: id.clone(), name: name.clone(), output: ToolOutput::err(reason) });
+                    self.emit(AgentEvent::ToolEnd {
+                        id: id.clone(),
+                        name: name.clone(),
+                        output: ToolOutput::err(reason),
+                    });
                     self.push_result(&id, &name, &out);
                     continue;
                 }
@@ -1022,19 +1070,31 @@ impl Agent {
             }
         }
         self.emit(AgentEvent::ToolStart { id: id.into(), name: name.into(), args: args.clone() });
-        let mut out = match blocked {
+        let denied = self.policy().check(name).err();
+        let mut out = match blocked.or(denied) {
             Some(b) => ToolOutput::err(b),
             None => {
-                let ctx = ToolCtx {
-                    events: self.events.clone(),
-                    cancel: cancel.clone(),
-                    call_id: id.into(),
-                };
-                self.tools.call(name, &args, &ctx).await
+                let ctx = ToolCtx { events: self.events.clone(), cancel: cancel.clone(), call_id: id.into() };
+                use futures_util::FutureExt;
+                match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await {
+                    Ok(o) => o,
+                    Err(p) => {
+                        let msg = p
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| p.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".into());
+                        ToolOutput::err(format!("tool panicked: {msg}"))
+                    }
+                }
             }
         };
         let sub = format!("tool_result:{name}");
-        for (_, v) in self.plugins.hook(&sub, json!({"name": name, "arguments": args, "content": out.text, "isError": out.is_error})).await {
+        for (_, v) in self
+            .plugins
+            .hook(&sub, json!({"name": name, "arguments": args, "content": out.text, "isError": out.is_error}))
+            .await
+        {
             if let Some(a) = v["append"].as_str().filter(|a| !a.is_empty()) {
                 out.text.push_str("\n\n");
                 out.text.push_str(a);
@@ -1044,7 +1104,11 @@ impl Agent {
             let model = d["model"].as_str().map(String::from);
             match d["planDecision"].as_str() {
                 Some(k @ ("execute" | "compact")) => {
-                    self.exec_plan = Some(ExecPlan { content: d["content"].as_str().unwrap_or_default().into(), compact: k == "compact", model });
+                    self.exec_plan = Some(ExecPlan {
+                        content: d["content"].as_str().unwrap_or_default().into(),
+                        compact: k == "compact",
+                        model,
+                    });
                 }
                 Some("keep") => {
                     self.exit_plan();
@@ -1061,20 +1125,163 @@ impl Agent {
         self.emit(AgentEvent::ToolEnd {
             id: id.into(),
             name: name.into(),
-            output: ToolOutput { text: out.text.clone(), is_error: out.is_error, display: out.display.clone(), details: out.details.clone() },
+            output: ToolOutput {
+                text: out.text.clone(),
+                is_error: out.is_error,
+                display: out.display.clone(),
+                details: out.details.clone(),
+                meta: out.meta.clone(),
+            },
         });
         out
     }
 }
 
 #[cfg(test)]
-mod quota_tests {
+mod loop_tests {
     use super::*;
+    use crate::config::Configs;
+    use crate::events::new_inbox;
+    use crate::provider::ProviderError;
+
+    fn assistant(blocks: Vec<Block>, stop: StopReason) -> Message {
+        Message::Assistant {
+            content: blocks,
+            api: crate::models::API.into(),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            usage: Default::default(),
+            stop_reason: stop,
+            timestamp: 0,
+            response_id: None,
+            error_message: None,
+        }
+    }
+
+    fn call(id: &str, name: &str) -> Block {
+        Block::ToolCall { id: id.into(), name: name.into(), arguments: json!({}) }
+    }
+
+    fn agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
+        let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
+        let providers =
+            Rc::new(Providers::new(Rc::new(Configs::default()), crate::gateway::GatewaySource::new(plugins.clone())));
+        providers.scripted.borrow_mut().extend(script);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = Rc::new(crate::context::Context {
+            warnings: vec![],
+            files: vec![],
+            rules: vec![],
+            skills: vec![],
+            commands: vec![],
+            agents: vec![],
+        });
+        let model = ModelSpec {
+            id: "anthropic/m".into(),
+            provider: "anthropic".into(),
+            context_window: 200_000,
+            max_output: 8192,
+        };
+        let a = Agent::new(AgentInit {
+            providers,
+            plugins,
+            cwd: std::env::temp_dir(),
+            ctx,
+            model,
+            thinking: Thinking::parse("off").unwrap(),
+            events: tx,
+            inbox: new_inbox(),
+        });
+        (a, rx)
+    }
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tokio::task::LocalSet::new().run_until(f))
+    }
 
     #[test]
-    fn quota_retries_fast_then_settles() {
-        let s: Vec<u64> = (0..7).map(|n| quota_interval(n).as_secs()).collect();
-        assert_eq!(s, [60, 5, 10, 20, 40, 60, 60]);
-        assert_eq!(quota_interval(u32::MAX).as_secs(), 60);
+    fn tool_panic_becomes_an_error_result() {
+        run(async {
+            let script = vec![
+                Ok(assistant(vec![call("t1", "__panic")], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+            ];
+            let (mut a, _rx) = agent(script);
+            a.turn(Some("go".to_string().into())).await;
+            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            let err = a.messages.iter().find_map(|m| match m {
+                Message::ToolResult { is_error: true, content, .. } => Some(format!("{content:?}")),
+                _ => None,
+            });
+            assert!(err.unwrap().contains("tool panicked: boom"));
+            assert_eq!(a.messages.len(), 4, "the turn continued after the panic");
+        });
+    }
+
+    #[test]
+    fn truncated_reply_with_calls_stays_paired() {
+        run(async {
+            let script = vec![
+                Ok(assistant(vec![call("t1", "read")], StopReason::Length)),
+                Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+            ];
+            let (mut a, _rx) = agent(script);
+            a.turn(Some("go".to_string().into())).await;
+            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            a.turn(Some("again".to_string().into())).await;
+            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(a.messages.iter().any(|m| matches!(m, Message::ToolResult { is_error: true, .. })));
+        });
+    }
+
+    #[test]
+    fn failed_turn_clears_stale_exec_plan() {
+        run(async {
+            let (mut a, _rx) = agent(vec![Err(ProviderError::Fatal("nope".into()))]);
+            a.exec_plan = Some(ExecPlan { content: "plan".into(), compact: false, model: None });
+            a.turn(Some("go".to_string().into())).await;
+            assert!(a.exec_plan.is_none());
+        });
+    }
+
+    #[test]
+    fn policy_is_enforced_at_dispatch_and_in_defs() {
+        run(async {
+            let script = vec![
+                Ok(assistant(vec![call("t1", "bash")], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+            ];
+            let (mut a, _rx) = agent(script);
+            assert!(a.tool_defs().iter().any(|d| d.name == "ask"));
+            a.allow = Some(vec!["read".into()]);
+            a.excluded = vec!["ask"];
+            assert!(a.tool_defs().iter().all(|d| d.name == "read"));
+            a.turn(Some("go".to_string().into())).await;
+            let err = a.messages.iter().find_map(|m| match m {
+                Message::ToolResult { is_error: true, content, .. } => Some(format!("{content:?}")),
+                _ => None,
+            });
+            assert!(err.unwrap().contains("not allowed"));
+        });
+    }
+
+    #[test]
+    fn kill_jobs_is_handled_mid_turn_and_other_commands_queue() {
+        run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+            let mut backlog = Default::default();
+            tx.send(Command::KillJobs(None)).unwrap();
+            tx.send(Command::NewSession).unwrap();
+            drive(tokio::time::sleep(std::time::Duration::from_millis(50)), &mut rx, &mut backlog, None, etx).await;
+            assert!(matches!(erx.try_recv(), Ok(AgentEvent::Notice(m)) if m.contains("killed")));
+            assert_eq!(backlog.len(), 1);
+            assert!(matches!(backlog.pop_front(), Some(Command::NewSession)));
+        });
     }
 }

@@ -47,11 +47,18 @@ pub struct Select {
     /// True while typing into the free-text row.
     editing: bool,
     text: String,
+    /// Lowercased `label detail` of each item, built once.
+    haystacks: Vec<String>,
+    /// The filtered rows for the filter they were computed with; reused until the filter changes.
+    rows_cache: std::cell::RefCell<Option<(String, std::rc::Rc<Vec<Row>>)>>,
 }
 
 impl Select {
     pub fn new(title: &str, items: Vec<Item>) -> Self {
+        let haystacks = items.iter().map(|it| format!("{} {}", it.label, it.detail).to_lowercase()).collect();
         Select {
+            haystacks,
+            rows_cache: Default::default(),
             title: title.to_string(),
             items,
             multi: false,
@@ -71,6 +78,7 @@ impl Select {
 
     pub fn free_text(mut self, label: &str) -> Self {
         self.free = Some(label.to_string());
+        *self.rows_cache.borrow_mut() = None;
         self
     }
 
@@ -116,11 +124,15 @@ impl Select {
                 SelectResult::Pending
             }
             KeyCode::Enter => self.choose(&rows),
-            KeyCode::Char(' ') if self.multi && !ctrl => {
-                if let Some(Row::Item(i)) = rows.get(self.sel) {
-                    if !self.checked.remove(i) {
-                        self.checked.insert(*i);
-                    }
+            // Space toggles only while the filter is empty; with text in it, Space is part of the
+            // filter. Tab always toggles.
+            KeyCode::Tab | KeyCode::Char(' ')
+                if self.multi && !ctrl && (key.code == KeyCode::Tab || self.filter.is_empty()) =>
+            {
+                if let Some(Row::Item(i)) = rows.get(self.sel)
+                    && !self.checked.remove(i)
+                {
+                    self.checked.insert(*i);
                 }
                 SelectResult::Pending
             }
@@ -183,10 +195,8 @@ impl Select {
     pub fn render(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
         let width = width.max(1);
         let input = if self.editing { &self.text } else { &self.filter };
-        let mut out: Vec<Line> = vec![
-            line::styled(self.title.clone(), |_| accent_bold()),
-            line::plain(format!("› {input}")),
-        ];
+        let mut out: Vec<Line> =
+            vec![line::styled(self.title.clone(), |_| accent_bold()), line::plain(format!("› {input}"))];
         let cursor = (1, (2 + input.width()).min(width - 1));
 
         if self.editing {
@@ -220,21 +230,23 @@ impl Select {
         (out, cursor)
     }
 
-    fn rows(&self) -> Vec<Row> {
+    /// The rows for the current filter, recomputed only when the filter changed.
+    fn rows(&self) -> std::rc::Rc<Vec<Row>> {
+        let mut cache = self.rows_cache.borrow_mut();
+        if let Some((f, rows)) = cache.as_ref()
+            && *f == self.filter
+        {
+            return rows.clone();
+        }
         let q = self.filter.to_lowercase();
-        let mut rows: Vec<Row> = (0..self.items.len())
-            .filter(|&i| q.is_empty() || self.haystack(i).contains(&q))
-            .map(Row::Item)
-            .collect();
+        let mut rows: Vec<Row> =
+            (0..self.items.len()).filter(|&i| q.is_empty() || self.haystacks[i].contains(&q)).map(Row::Item).collect();
         if self.free.is_some() {
             rows.push(Row::Free);
         }
+        let rows = std::rc::Rc::new(rows);
+        *cache = Some((self.filter.clone(), rows.clone()));
         rows
-    }
-
-    fn haystack(&self, i: usize) -> String {
-        let it = &self.items[i];
-        format!("{} {}", it.label, it.detail).to_lowercase()
     }
 
     fn step(&mut self, delta: isize, n: usize) {
@@ -316,6 +328,16 @@ fn window(n: usize, sel: usize, avail: usize) -> (usize, usize, bool) {
     (a, b, true)
 }
 
+pub fn clean_paste(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match c {
+            '\r' | '\n' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,10 +378,7 @@ mod tests {
     fn filter_matches_detail() {
         let mut s = Select::new(
             "t",
-            vec![
-                Item { label: "a".into(), detail: "fast".into() },
-                Item { label: "b".into(), detail: "slow".into() },
-            ],
+            vec![Item { label: "a".into(), detail: "fast".into() }, Item { label: "b".into(), detail: "slow".into() }],
         );
         type_str(&mut s, "SLOW");
         assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![1]));
@@ -478,14 +497,15 @@ mod tests {
             }
         }
     }
-}
 
-pub fn clean_paste(s: &str) -> String {
-    s.chars()
-        .filter_map(|c| match c {
-            '\r' | '\n' | '\t' => Some(' '),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect()
+    #[test]
+    fn space_types_in_the_filter_and_tab_toggles() {
+        let mut s = Select::new("t", items(&["new york", "newark"])).multi();
+        s.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "empty filter: space toggles");
+        let mut s = Select::new("t", items(&["new york", "newark"])).multi();
+        type_str(&mut s, "new y");
+        s.on_key(key(KeyCode::Tab));
+        assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "the filter kept its space");
+    }
 }

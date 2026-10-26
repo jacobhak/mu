@@ -1,26 +1,29 @@
-use crate::image;
 use super::blocks;
 use super::clipboard;
 use super::complete::Entry;
 use super::composer::{Action, Composer};
+use super::input::{self, Input};
+use super::line::truncate_text as trunc;
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
+use super::overlay::{Overlay, OverlayEvent, ask_select};
+use super::plan_review::{PlanReview, Tier};
 use super::ptyview::PtyView;
-use super::plan_review::{PlanReview, ReviewResult, Tier};
 use super::render::Renderer;
-use super::select::{Item, Select, SelectResult};
+use super::select::{Item, Select};
 use super::status;
 use super::term::{self, Term};
 use super::theme::{self, Role};
+use super::transcript::{Stream, Transcript};
 use crate::context::Context;
+use crate::events::{AgentEvent, Answer, AskQuestion, StatusSnapshot, SubagentState, SubagentStatus};
 use crate::events::{Command, SharedInbox};
-use crate::events::{AgentEvent, Answer, AskQuestion, PlanDecision, StatusSnapshot, SubagentState, SubagentStatus, UserInput};
-use crate::message::Image;
+use crate::image;
+use crate::message::{Image, UserInput};
 use crate::models::{GatewayModel, Thinking};
 use crate::plugin::PluginHost;
 use crate::provider::Providers;
 use crate::tools::todo::{Phase, Status};
-use super::input::{self, Input};
 use crossterm::event::{Event, KeyEvent};
 use mu_common::paths;
 use serde_json::{Value, json};
@@ -69,23 +72,31 @@ pub struct AppInit {
     pub theme: crate::config::MuTheme,
 }
 
-enum Overlay {
-    Model { sel: Select, ids: Vec<String>, assign: bool },
-    /// Where a picked model goes: this session, or a role in omp's config.
-    Role { sel: Select, model: String, roles: Vec<Option<String>> },
-    /// `omp login` providers as (menu number, name).
-    Login { sel: Select, nums: Vec<usize> },
-    Session { sel: Select, paths: Vec<PathBuf> },
-    Ask { qs: Vec<AskQuestion>, idx: usize, answers: Vec<Answer>, sel: Select, reply: Option<oneshot::Sender<Option<Vec<Answer>>>> },
-    Review { review: Box<PlanReview>, reply: Option<oneshot::Sender<PlanDecision>> },
-    Copy { sel: Select, texts: Vec<String> },
+/// What to do when a child that owned the terminal exits.
+enum ChildThen {
+    Login,
+    /// The external editor was run on the composer text kept in this file.
+    ComposerEdit(std::path::PathBuf),
+    /// The editor was run on the plan file shown in the review overlay.
+    PlanEdit(std::path::PathBuf),
 }
 
 enum UiMsg {
+    ChildDone {
+        then: ChildThen,
+        status: Result<std::process::ExitStatus, String>,
+    },
+    Sessions(Vec<crate::session::SessionInfo>),
+    /// The result of a clipboard copy: the notice to show, or the error.
+    Copied(Result<String, String>),
     Models(Result<Vec<GatewayModel>, String>),
     LoginProviders(Result<Vec<(usize, String)>, String>),
     ClipboardImage(Result<Option<Image>, String>),
-    Ghost { seq: u64, text: String, ghost: String },
+    Ghost {
+        seq: u64,
+        text: String,
+        ghost: String,
+    },
 }
 
 struct RunningTool {
@@ -99,38 +110,15 @@ struct RunningTool {
 struct StreamingCall {
     id: String,
     name: String,
-    json: String,
+    json: super::partial_json::Partial,
     args: Value,
-    parsed: usize,
-}
-
-const REVEAL_MIN_STEP: usize = 3;
-const REVEAL_CATCHUP_FRAMES: usize = 8;
-
-#[derive(Clone, Copy, PartialEq)]
-enum Stream {
-    Text,
-    Thinking,
-}
-
-fn reveal_step(backlog: usize) -> usize {
-    backlog.div_ceil(REVEAL_CATCHUP_FRAMES).max(REVEAL_MIN_STEP)
-}
-
-#[cfg(test)]
-mod reveal_tests {
-    use super::reveal_step;
-
-    #[test]
-    fn steps() {
-        assert_eq!(reveal_step(0), 3);
-        assert_eq!(reveal_step(8), 3);
-        assert_eq!(reveal_step(100), 13);
-        assert_eq!(reveal_step(800), 100);
-    }
+    /// New bytes arrived since `args` was last computed.
+    stale: bool,
 }
 
 struct App {
+    /// The streamed conversation: committed lines, open text and thinking, smooth reveal.
+    tr: Transcript,
     cmd_tx: UnboundedSender<Command>,
     inbox: SharedInbox,
     providers: Rc<Providers>,
@@ -145,22 +133,13 @@ struct App {
     renderer: Renderer,
     composer: Composer,
     commands: Vec<Entry>,
-    pending: Vec<Line>,
-    live_text: String,
-    committed_in_block: bool,
-    /// Uncommitted thinking text (stable chunks are committed while thinking is shown).
-    thinking: Option<(Instant, String)>,
-    /// A chunk of the current thinking block is committed: later chunks start with a gutter row, and the block ends with one blank row.
-    thinking_shown: bool,
     tools: Vec<RunningTool>,
     /// Latest background-job snapshot, and finished jobs already printed to the transcript.
     jobs: Vec<SubagentStatus>,
     jobs_committed: HashSet<String>,
-    /// Assistant text blocks (newest last, capped) and bash commands, for `/copy`.
-    replies: Vec<String>,
     ghost_seq: u64,
     ghost_asked: String,
-    block_text: String,
+    /// Bash commands the user ran, for `/copy`.
     bash_cmds: Vec<String>,
     compacting: bool,
     todo: Vec<Phase>,
@@ -170,16 +149,13 @@ struct App {
     pty: Option<PtyView>,
     running: bool,
     quitting: bool,
-    show_thinking: bool,
-    smooth: bool,
     /// Tool calls whose arguments are still streaming or that are not yet executing.
     calls: Vec<StreamingCall>,
-    /// Streamed text and thinking not yet shown, oldest first.
-    reveal: VecDeque<(Stream, String)>,
-    /// Total `char` count of `reveal`.
-    reveal_chars: usize,
     expanded: bool,
     dirty: bool,
+    /// A child process (editor, `omp login`) owns the terminal: no drawing and no input reading
+    /// until it exits, but agent and plugin tasks keep running.
+    child_busy: bool,
     last_draw: Instant,
     started: Instant,
 }
@@ -189,10 +165,6 @@ fn push_capped<T>(v: &mut Vec<T>, item: T) {
         v.remove(0);
     }
     v.push(item);
-}
-
-fn trunc(s: &str, n: usize) -> String {
-    if s.chars().count() > n { s.chars().take(n.saturating_sub(1)).chain(['…']).collect() } else { s.into() }
 }
 
 fn ago(t: std::time::SystemTime) -> String {
@@ -214,7 +186,19 @@ pub async fn run(init: AppInit) -> i32 {
         }
     };
     term::install_panic_hook();
-    let AppInit { cmd_tx, mut ev_rx, inbox, providers, ctx, plugins, mut notice_rx, cwd, pick_session, status_cfg, theme } = init;
+    let AppInit {
+        cmd_tx,
+        mut ev_rx,
+        inbox,
+        providers,
+        ctx,
+        plugins,
+        mut notice_rx,
+        cwd,
+        pick_session,
+        status_cfg,
+        theme,
+    } = init;
     let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
     let mut commands: Vec<Entry> = BUILTIN_DESC
@@ -229,11 +213,22 @@ pub async fn run(init: AppInit) -> i32 {
             Entry { name: name.into(), desc: desc.into(), needs_arg, args }
         })
         .collect();
-    commands.extend(ctx.commands.iter().map(|c| Entry { name: c.name.clone(), desc: c.description.clone(), needs_arg: false, args: vec![] }));
-    commands.extend(ctx.skills.iter().map(|s| Entry { name: format!("skill:{}", s.name), desc: s.description.clone(), needs_arg: false, args: vec![] }));
+    commands.extend(ctx.commands.iter().map(|c| Entry {
+        name: c.name.clone(),
+        desc: c.description.clone(),
+        needs_arg: false,
+        args: vec![],
+    }));
+    commands.extend(ctx.skills.iter().map(|s| Entry {
+        name: format!("skill:{}", s.name),
+        desc: s.description.clone(),
+        needs_arg: false,
+        args: vec![],
+    }));
     let show_thinking = !providers.cfg.omp.hide_thinking_block;
     let smooth = providers.cfg.omp.display.smooth_streaming;
     let mut app = App {
+        tr: Transcript::new(show_thinking, smooth),
         cmd_tx,
         inbox,
         providers,
@@ -249,16 +244,9 @@ pub async fn run(init: AppInit) -> i32 {
         commands,
         ghost_seq: 0,
         ghost_asked: String::new(),
-        pending: Vec::new(),
-        live_text: String::new(),
-        committed_in_block: false,
-        thinking: None,
-        thinking_shown: false,
         tools: Vec::new(),
         jobs: Vec::new(),
         jobs_committed: HashSet::new(),
-        replies: Vec::new(),
-        block_text: String::new(),
         bash_cmds: Vec::new(),
         compacting: false,
         todo: Vec::new(),
@@ -267,18 +255,15 @@ pub async fn run(init: AppInit) -> i32 {
         pty: None,
         running: false,
         quitting: false,
-        show_thinking,
-        smooth,
         calls: Vec::new(),
-        reveal: VecDeque::new(),
-        reveal_chars: 0,
         expanded: false,
         dirty: true,
+        child_busy: false,
         last_draw: Instant::now() - FRAME,
         started: Instant::now(),
     };
     for w in theme_warnings.iter().chain(app.plugins.warnings.iter()) {
-        app.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
+        app.tr.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
     }
     if pick_session {
         app.open_session_picker();
@@ -291,35 +276,62 @@ pub async fn run(init: AppInit) -> i32 {
         }
     };
     let mut tick = tokio::time::interval(Duration::from_millis(80));
+    let mut signals = term::Shutdown::new().ok();
+    let mut draw_failed = false;
     loop {
-        if app.dirty && Instant::now() >= app.last_draw + FRAME {
-            if let Err(e) = app.draw() {
-                eprintln!("mu: draw failed: {e}");
-            }
+        if let Some(p) = term::take_panic() {
+            app.error(&p);
+        }
+        if app.dirty
+            && !app.child_busy
+            && Instant::now() >= app.last_draw + FRAME
+            && let Err(e) = app.draw()
+            && !draw_failed
+        {
+            // Said once: stderr is the terminal, and repeating it would flood the screen.
+            draw_failed = true;
+            eprintln!("mu: draw failed: {e}");
         }
         let due = app.last_draw + FRAME;
         tokio::select! {
-            inp = reader.next() => match inp {
+            inp = reader.next(), if !app.child_busy => match inp {
                 Some(Input::Term(e)) => app.on_terminal(e),
                 Some(Input::PasteText(s)) => app.on_terminal(Event::Paste(s)),
                 Some(Input::PasteImage(img)) => app.on_ui(UiMsg::ClipboardImage(Ok(Some(img)))),
                 Some(Input::Status(s)) => app.notice(&s),
+                Some(Input::Reply(seq)) => term::write_terminal_seq(&seq),
                 None => break,
             },
             e = ev_rx.recv() => match e {
                 Some(AgentEvent::Exit) | None => break,
                 Some(e) => app.on_agent(e),
             },
+            Some(()) = async { match signals.as_mut() { Some(s) => { s.next().await; Some(()) } None => std::future::pending().await } } => {
+                // A second signal while shutting down means the agent is stuck: leave now.
+                if app.quitting { break }
+                app.quit();
+            }
             Some(n) = notice_rx.recv() => app.notice(&n),
             Some(m) = ui_rx.recv() => app.on_ui(m),
             _ = tick.tick(), if app.busy() => app.dirty = true,
             _ = tokio::time::sleep_until(due.into()), if app.dirty => {}
         }
     }
+    // Lines committed in the last moments (a final reply, the exit notice) are drawn before the
+    // terminal is handed back.
+    let _ = app.draw();
     let _ = app.renderer.finish();
     if let Some(path) = app.status.session_path.as_deref().filter(|p| std::path::Path::new(p).exists()) {
-        let id = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit_once('_')).map_or(path, |(_, id)| id);
-        let profile = std::env::var("OMP_PROFILE").ok().filter(|p| !p.is_empty()).map(|p| format!("--profile {p} ")).unwrap_or_default();
+        let id = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.rsplit_once('_'))
+            .map_or(path, |(_, id)| id);
+        let profile = std::env::var("OMP_PROFILE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|p| format!("--profile {p} "))
+            .unwrap_or_default();
         eprint!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n");
     }
     0
@@ -329,7 +341,7 @@ impl App {
     fn busy(&self) -> bool {
         self.running
             || self.compacting
-            || self.thinking.is_some()
+            || self.tr.thinking_active()
             || !self.tools.is_empty()
             || !self.calls.is_empty()
             || self.jobs.iter().any(|j| j.state == SubagentState::Running)
@@ -340,7 +352,7 @@ impl App {
     }
 
     fn commit(&mut self, lines: Vec<Line>) {
-        self.pending.extend(lines);
+        self.tr.commit(lines);
         self.dirty = true;
     }
 
@@ -360,123 +372,10 @@ impl App {
 
     // ---- agent events -------------------------------------------------------------------------
 
+    /// Streamed text and thinking go to the transcript, which commits and paces them.
     fn finish_thinking(&mut self) {
-        let Some((start, text)) = self.thinking.take() else { return };
-        let shown = std::mem::take(&mut self.thinking_shown);
-        if self.show_thinking {
-            let mut l = Vec::new();
-            let blank = text.trim().is_empty();
-            if !blank {
-                if shown {
-                    l.push(blocks::thinking_gap());
-                }
-                l.extend(blocks::thinking_body(text.trim(), self.width()));
-            }
-            if shown || !blank {
-                l.push(vec![]);
-            }
-            if !l.is_empty() {
-                self.commit(l);
-            }
-        } else {
-            self.commit(vec![blocks::thinking_done(start.elapsed().as_secs())]);
-        }
-    }
-
-    fn commit_text(&mut self, text: &str, blank_after: bool) {
         let w = self.width();
-        let mut lines = markdown::render(text, w);
-        if blank_after {
-            lines.push(vec![]);
-        }
-        self.committed_in_block = true;
-        self.commit(lines);
-    }
-
-    fn ingest_text(&mut self, s: &str) {
-        self.finish_thinking();
-        self.live_text.push_str(s);
-        self.block_text.push_str(s);
-        let n = markdown::stable_prefix(&self.live_text);
-        if n > 0 {
-            let chunk: String = self.live_text.drain(..n).collect();
-            self.commit_text(chunk.trim_end(), true);
-        }
-    }
-
-    fn ingest_thinking(&mut self, s: &str) {
-        match self.thinking.as_mut() {
-            Some((_, t)) => t.push_str(s),
-            None => self.thinking = Some((Instant::now(), s.to_string())),
-        }
-        if self.show_thinking {
-            self.commit_stable_thinking();
-        }
-    }
-
-    fn commit_stable_thinking(&mut self) {
-        let Some((_, text)) = self.thinking.as_mut() else { return };
-        let n = markdown::stable_prefix(text);
-        if n == 0 {
-            return;
-        }
-        let chunk: String = text.drain(..n).collect();
-        if !chunk.trim().is_empty() {
-            let w = self.width();
-            let mut l = Vec::new();
-            if self.thinking_shown {
-                l.push(blocks::thinking_gap());
-            }
-            l.extend(blocks::thinking_body(chunk.trim(), w));
-            self.thinking_shown = true;
-            self.commit(l);
-        }
-    }
-
-    fn ingest(&mut self, k: Stream, s: &str) {
-        match k {
-            Stream::Text => self.ingest_text(s),
-            Stream::Thinking => self.ingest_thinking(s),
-        }
-    }
-
-    fn queue_reveal(&mut self, k: Stream, s: String) {
-        if !self.smooth {
-            self.ingest(k, &s);
-            return;
-        }
-        self.reveal_chars += s.chars().count();
-        match self.reveal.back_mut() {
-            Some((bk, t)) if *bk == k => t.push_str(&s),
-            _ => self.reveal.push_back((k, s)),
-        }
-    }
-
-    fn flush_reveal(&mut self) {
-        while let Some((k, s)) = self.reveal.pop_front() {
-            self.ingest(k, &s);
-        }
-        self.reveal_chars = 0;
-    }
-
-    fn advance_reveal(&mut self) {
-        if self.reveal_chars == 0 {
-            return;
-        }
-        let mut n = reveal_step(self.reveal_chars);
-        while n > 0 {
-            let Some((k, t)) = self.reveal.front_mut() else { break };
-            let k = *k;
-            let end = t.char_indices().nth(n).map_or(t.len(), |(i, _)| i);
-            let piece: String = t.drain(..end).collect();
-            if t.is_empty() {
-                self.reveal.pop_front();
-            }
-            let c = piece.chars().count();
-            n -= c;
-            self.reveal_chars -= c;
-            self.ingest(k, &piece);
-        }
+        self.tr.finish_thinking(w);
     }
 
     fn on_agent(&mut self, e: AgentEvent) {
@@ -493,7 +392,8 @@ impl App {
                 | AgentEvent::TurnStart
                 | AgentEvent::Retry { .. }
         ) {
-            self.flush_reveal();
+            let w = self.width();
+            self.tr.flush_reveal(w);
         }
         match e {
             AgentEvent::TurnStart => {
@@ -506,42 +406,46 @@ impl App {
                 l.extend(blocks::user_prompt(&t, w));
                 self.commit(l);
             }
-            AgentEvent::Text(s) => self.queue_reveal(Stream::Text, s),
-            AgentEvent::Thinking(s) => self.queue_reveal(Stream::Thinking, s),
+            AgentEvent::Text(s) => {
+                let w = self.width();
+                self.tr.queue_reveal(Stream::Text, s, w);
+            }
+            AgentEvent::Thinking(s) => {
+                let w = self.width();
+                self.tr.queue_reveal(Stream::Thinking, s, w);
+            }
             AgentEvent::ToolCallStart { id, name } => {
                 self.finish_thinking();
-                self.calls.push(StreamingCall { id, name, json: String::new(), args: json!({}), parsed: 0 });
+                self.calls.push(StreamingCall { id, name, json: Default::default(), args: json!({}), stale: false });
             }
             AgentEvent::ToolCallDelta { id, json } => {
                 if let Some(c) = self.calls.iter_mut().find(|c| c.id == id) {
-                    c.json.push_str(&json);
+                    {
+                        c.json.push(&json);
+                        c.stale = true;
+                    }
                 }
             }
             AgentEvent::BlockEnd => {
-                self.finish_thinking();
-                if !self.live_text.trim().is_empty() {
-                    let t = std::mem::take(&mut self.live_text);
-                    self.commit_text(t.trim_end(), false);
-                }
-                self.live_text.clear();
-                let block = std::mem::take(&mut self.block_text);
-                if !block.trim().is_empty() {
-                    push_capped(&mut self.replies, block);
-                }
-                if self.committed_in_block {
-                    self.commit(vec![vec![]]);
-                }
-                self.committed_in_block = false;
+                let w = self.width();
+                self.tr.end_block(w);
             }
             AgentEvent::ToolStart { id, name, args } => {
                 self.calls.retain(|c| c.id != id);
                 self.finish_thinking();
-                if name == "bash" {
-                    if let Some(c) = args["command"].as_str() {
-                        push_capped(&mut self.bash_cmds, c.to_string());
-                    }
+                if name == "bash"
+                    && let Some(c) = args["command"].as_str()
+                {
+                    push_capped(&mut self.bash_cmds, c.to_string());
                 }
-                self.tools.push(RunningTool { id, name, args, started: Instant::now(), tail: VecDeque::new(), partial: String::new() });
+                self.tools.push(RunningTool {
+                    id,
+                    name,
+                    args,
+                    started: Instant::now(),
+                    tail: VecDeque::new(),
+                    partial: String::new(),
+                });
             }
             AgentEvent::PtyOpen { id, input, reply } => {
                 // A pty is already open: dropping `reply` makes the tool fall back.
@@ -570,18 +474,19 @@ impl App {
                 if self.pty.as_ref().is_some_and(|p| p.id == id) {
                     self.pty = None;
                 }
-                let args = self.tools.iter().position(|t| t.id == id).map(|i| self.tools.remove(i).args).unwrap_or(Value::Null);
+                let args = self
+                    .tools
+                    .iter()
+                    .position(|t| t.id == id)
+                    .map(|i| self.tools.remove(i).args)
+                    .unwrap_or(Value::Null);
                 let w = self.width();
                 let l = blocks::tool_result(&name, &args, &output, self.expanded, w);
                 self.commit(l);
             }
             AgentEvent::Retry { attempt, delay, reason } => {
-                self.live_text.clear();
-                self.thinking = None;
-                self.thinking_shown = false;
+                self.tr.reset_stream();
                 self.calls.clear();
-                self.reveal.clear();
-                self.reveal_chars = 0;
                 self.notice(&format!("↻ retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs()));
             }
             AgentEvent::Notice(s) => self.notice(&s),
@@ -607,7 +512,11 @@ impl App {
             }
             AgentEvent::Ask { questions, reply } => self.start_ask(questions, reply),
             AgentEvent::PlanReview { title, uri, file, content, reply } => {
-                let context = self.status.context_tokens.filter(|_| self.status.context_window > 0).map(|t| (t, self.status.context_window as u64));
+                let context = self
+                    .status
+                    .context_tokens
+                    .filter(|_| self.status.context_window > 0)
+                    .map(|t| (t, self.status.context_window as u64));
                 let review = PlanReview::new(title, uri, file, content, context, self.plan_tiers());
                 self.overlay = Some(Overlay::Review { review: Box::new(review), reply: Some(reply) });
             }
@@ -618,27 +527,28 @@ impl App {
             AgentEvent::TurnEnd { aborted } => {
                 self.pty = None;
                 self.calls.clear();
-                self.finish_thinking();
-                if !self.live_text.trim().is_empty() {
-                    let t = std::mem::take(&mut self.live_text);
-                    self.commit_text(t.trim_end(), false);
-                }
-                self.live_text.clear();
+                let w = self.width();
+                self.tr.end_turn(w);
                 self.tools.clear();
                 self.compacting = false;
                 self.running = false;
                 self.turn_started = None;
                 if aborted {
                     self.notice("[aborted]");
-                    let queued: Vec<UserInput> = {
-                        let mut ib = self.inbox.borrow_mut();
-                        let mut q: Vec<UserInput> = ib.steer.drain(..).collect();
-                        q.extend(ib.follow_up.drain(..));
-                        q
-                    };
-                    if !queued.is_empty() {
-                        self.composer.restore(queued);
+                }
+                // Whatever is still queued when a turn ends (it was aborted or failed) was written
+                // for that turn; it comes back as editable text instead of leaking into the next one.
+                let queued: Vec<UserInput> = {
+                    let mut ib = self.inbox.borrow_mut();
+                    let mut q: Vec<UserInput> = ib.steer.drain(..).collect();
+                    q.extend(ib.follow_up.drain(..));
+                    q
+                };
+                if !queued.is_empty() {
+                    if !aborted {
+                        self.notice("queued messages were not sent; they are back in the composer");
                     }
+                    self.composer.restore(queued);
                 }
             }
             AgentEvent::Exit => {}
@@ -648,6 +558,12 @@ impl App {
     fn on_ui(&mut self, m: UiMsg) {
         self.dirty = true;
         match m {
+            UiMsg::ChildDone { then, status } => self.on_child_done(then, status),
+            UiMsg::Sessions(list) => self.show_sessions(list),
+            UiMsg::Copied(r) => match r {
+                Ok(n) => self.notice(&n),
+                Err(e) => self.error(&format!("copy failed: {e}")),
+            },
             UiMsg::Models(r) => {
                 let gw = match r {
                     Ok(g) => g,
@@ -683,33 +599,12 @@ impl App {
 
     // ---- ask / plan overlays ------------------------------------------------------------------
 
-    fn ask_select(q: &AskQuestion) -> Select {
-        let items: Vec<Item> = q
-            .options
-            .iter()
-            .enumerate()
-            .map(|(i, o)| Item {
-                label: if q.recommended == Some(i) { format!("{} (Recommended)", o.label) } else { o.label.clone() },
-                detail: o.description.clone().unwrap_or_default(),
-            })
-            .collect();
-        let title = q.header.as_ref().map_or(q.question.clone(), |h| format!("{h}: {}", q.question));
-        let mut s = Select::new(&title, items).free_text("Other (type your own)");
-        if q.multi {
-            s = s.multi();
-        }
-        if let Some(r) = q.recommended {
-            s = s.preselect(r);
-        }
-        s
-    }
-
     fn start_ask(&mut self, qs: Vec<AskQuestion>, reply: oneshot::Sender<Option<Vec<Answer>>>) {
         if qs.is_empty() {
             let _ = reply.send(Some(vec![]));
             return;
         }
-        let sel = Self::ask_select(&qs[0]);
+        let sel = ask_select(&qs[0]);
         self.overlay = Some(Overlay::Ask { qs, idx: 0, answers: vec![], sel, reply: Some(reply) });
     }
 
@@ -735,7 +630,10 @@ impl App {
             }
         }
         for g in &gateway {
-            items.push(Item { label: g.id.clone(), detail: g.context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000)) });
+            items.push(Item {
+                label: g.id.clone(),
+                detail: g.context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000)),
+            });
             ids.push(g.id.clone());
         }
         for (p, pc) in &self.providers.cfg.models.providers {
@@ -747,7 +645,11 @@ impl App {
                 }
             }
         }
-        let title = if self.pick_assign { "Select model (then choose where it applies)" } else { "Switch model (this session)" };
+        let title = if self.pick_assign {
+            "Select model (then choose where it applies)"
+        } else {
+            "Switch model (this session)"
+        };
         self.overlay = Some(Overlay::Model { sel: Select::new(title, items), ids, assign: self.pick_assign });
     }
 
@@ -760,21 +662,45 @@ impl App {
         let mut roles = vec![None];
         for n in names {
             let detail = cfg.role(&n).map_or("(unset)".to_string(), |v| format!("now {v}"));
-            items.push(Item { label: if n == "default" { "Set as @default (and switch now)".into() } else { format!("Set as @{n}") }, detail });
+            items.push(Item {
+                label: if n == "default" { "Set as @default (and switch now)".into() } else { format!("Set as @{n}") },
+                detail,
+            });
             roles.push(Some(n));
         }
         self.overlay = Some(Overlay::Role { sel: Select::new(&format!("Use {model}"), items), model, roles });
     }
 
+    /// Opens the picker at once with a loading row; the (capped, sorted) listing is read on a
+    /// blocking thread and fills it in when it arrives.
     fn open_session_picker(&mut self) {
-        let list = crate::session::list_for(&self.cwd);
+        let items = vec![Item { label: "Loading…".into(), detail: String::new() }];
+        self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths: vec![] });
+        let (cwd, tx) = (self.cwd.clone(), self.ui_tx.clone());
+        tokio::task::spawn_local(async move {
+            let list = tokio::task::spawn_blocking(move || crate::session::list_recent(&cwd, Some(&cwd), 200))
+                .await
+                .unwrap_or_default();
+            let _ = tx.send(UiMsg::Sessions(list));
+        });
+    }
+
+    fn show_sessions(&mut self, list: Vec<crate::session::SessionInfo>) {
+        // Only fill in a picker that is still the loading one.
+        if !matches!(&self.overlay, Some(Overlay::Session { paths, .. }) if paths.is_empty()) {
+            return;
+        }
         if list.is_empty() {
+            self.overlay = None;
             self.notice("no sessions for this directory");
             return;
         }
         let items = list
             .iter()
-            .map(|s| Item { label: s.title.clone().unwrap_or_else(|| trunc(&s.first_prompt, 80)), detail: ago(s.modified) })
+            .map(|s| Item {
+                label: s.title.clone().unwrap_or_else(|| trunc(&s.first_prompt, 80)),
+                detail: ago(s.modified),
+            })
             .collect();
         let paths = list.into_iter().map(|s| s.path).collect();
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths });
@@ -798,10 +724,7 @@ impl App {
             }
             Event::Key(k) => self.on_key(k),
             Event::Paste(s) => match self.overlay.as_mut() {
-                Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. } | Overlay::Copy { sel, .. }) => {
-                    sel.on_paste(&s)
-                }
-                Some(Overlay::Review { review, .. }) => review.on_paste(&s),
+                Some(ov) => ov.on_paste(&s),
                 None => {
                     if let Err(e) = self.composer.on_paste(&s, &self.commands) {
                         self.error(&format!("image: {e}"));
@@ -827,7 +750,7 @@ impl App {
         self.ghost_asked = q.clone();
         let seq = self.ghost_seq;
         let assistant: String = {
-            let r = self.replies.last().map(String::as_str).unwrap_or_default();
+            let r = self.tr.replies.last().map(String::as_str).unwrap_or_default();
             let skip = r.chars().count().saturating_sub(4000);
             r.chars().skip(skip).collect()
         };
@@ -871,10 +794,8 @@ impl App {
                 self.send(Command::SetThinking(cur.cycle()));
             }
             Action::ToggleThinking => {
-                self.show_thinking = !self.show_thinking;
-                if self.show_thinking {
-                    self.commit_stable_thinking();
-                }
+                let w = self.width();
+                self.tr.toggle_thinking(w);
             }
             Action::ToggleExpanded => self.expanded = !self.expanded,
             Action::ModelPicker => self.request_models(),
@@ -910,123 +831,36 @@ impl App {
 
     fn overlay_key(&mut self, k: KeyEvent) {
         let Some(ov) = self.overlay.take() else { return };
-        match ov {
-            Overlay::Model { mut sel, ids, assign } => match sel.on_key(k) {
-                SelectResult::Pending => self.overlay = Some(Overlay::Model { sel, ids, assign }),
-                SelectResult::Chosen(i) => {
-                    if let Some(id) = i.first().and_then(|i| ids.get(*i)) {
-                        if assign && !id.starts_with('@') {
-                            self.open_role_picker(id.clone());
-                        } else {
-                            self.send(Command::SetModel(id.clone()));
-                        }
+        let (rest, event) = ov.on_key(k);
+        self.overlay = rest;
+        if let Some(e) = event {
+            self.on_overlay_event(e);
+        }
+    }
+
+    /// Carries out what the user chose in an overlay.
+    fn on_overlay_event(&mut self, e: OverlayEvent) {
+        match e {
+            OverlayEvent::SetModel(id) => self.send(Command::SetModel(id)),
+            OverlayEvent::PickRole(model) => self.open_role_picker(model),
+            OverlayEvent::AssignRole { role: Some(role), model } => match self.providers.cfg.set_role(&role, &model) {
+                Ok(v) => {
+                    self.notice(&format!("@{role} = {v}"));
+                    if role == "default" {
+                        self.send(Command::SetModel(model));
                     }
                 }
-                _ => {}
+                Err(e) => self.error(&format!("could not set @{role}: {e}")),
             },
-            Overlay::Role { mut sel, model, roles } => match sel.on_key(k) {
-                SelectResult::Pending => self.overlay = Some(Overlay::Role { sel, model, roles }),
-                SelectResult::Chosen(i) => match i.first().and_then(|i| roles.get(*i)) {
-                    Some(Some(role)) => match self.providers.cfg.set_role(role, &model) {
-                        Ok(v) => {
-                            self.notice(&format!("@{role} = {v}"));
-                            if role == "default" {
-                                self.send(Command::SetModel(model));
-                            }
-                        }
-                        Err(e) => self.error(&format!("could not set @{role}: {e}")),
-                    },
-                    Some(None) => self.send(Command::SetModel(model)),
-                    None => {}
-                },
-                _ => {}
-            },
-            Overlay::Login { mut sel, nums } => match sel.on_key(k) {
-                SelectResult::Pending => self.overlay = Some(Overlay::Login { sel, nums }),
-                SelectResult::Chosen(i) => {
-                    if let Some(n) = i.first().and_then(|i| nums.get(*i)) {
-                        self.run_login(&[], Some(*n));
-                    }
-                }
-                _ => {}
-            },
-            Overlay::Copy { mut sel, texts } => match sel.on_key(k) {
-                SelectResult::Pending => self.overlay = Some(Overlay::Copy { sel, texts }),
-                SelectResult::Chosen(i) => {
-                    let t = i.first().and_then(|i| texts.get(*i)).cloned();
-                    self.copy_text(t, "nothing to copy");
-                }
-                _ => {}
-            },
-            Overlay::Session { mut sel, paths } => match sel.on_key(k) {
-                SelectResult::Pending => self.overlay = Some(Overlay::Session { sel, paths }),
-                SelectResult::Chosen(i) => {
-                    if let Some(p) = i.first().and_then(|i| paths.get(*i)) {
-                        self.send(Command::Resume(p.clone()));
-                    }
-                }
-                _ => {}
-            },
-            Overlay::Review { mut review, mut reply } => {
-                match review.on_key(k) {
-                    ReviewResult::Pending => {}
-                    ReviewResult::Copy => {
-                        match clipboard::copy(review.content()) {
-                            Ok(()) => self.notice("plan copied"),
-                            Err(e) => self.error(&e),
-                        }
-                    }
-                    ReviewResult::Edit => {
-                        let file = review.file.clone();
-                        if let Err(e) = self.run_editor(&file) {
-                            self.error(&e);
-                        }
-                        match std::fs::read_to_string(&file) {
-                            Ok(t) => review.set_content(t),
-                            Err(e) => self.error(&format!("cannot read plan: {e}")),
-                        }
-                    }
-                    ReviewResult::Cancelled => {
-                        self.inbox.borrow().cancel.cancel();
-                        self.notice("plan review cancelled; plan mode stays on");
-                        return;
-                    }
-                    ReviewResult::Decided(d) => {
-                        if let Some(r) = reply.take() {
-                            let _ = r.send(d);
-                        }
-                        return;
-                    }
-                }
-                self.overlay = Some(Overlay::Review { review, reply });
-            }
-            Overlay::Ask { qs, idx, mut answers, mut sel, mut reply } => {
-                let ans = match sel.on_key(k) {
-                    SelectResult::Pending => {
-                        self.overlay = Some(Overlay::Ask { qs, idx, answers, sel, reply });
-                        return;
-                    }
-                    SelectResult::Chosen(i) => {
-                        let labels = i.iter().filter_map(|i| qs[idx].options.get(*i)).map(|o| o.label.clone()).collect();
-                        Answer::Options(labels)
-                    }
-                    SelectResult::Text(t) => Answer::Custom(t),
-                    SelectResult::Cancelled => {
-                        let mut all = answers;
-                        all.extend(std::iter::repeat(Answer::Cancelled).take(qs.len() - all.len()));
-                        if let Some(r) = reply.take() {
-                            let _ = r.send(Some(all));
-                        }
-                        return;
-                    }
-                };
-                answers.push(ans);
-                if idx + 1 < qs.len() {
-                    let sel = Self::ask_select(&qs[idx + 1]);
-                    self.overlay = Some(Overlay::Ask { qs, idx: idx + 1, answers, sel, reply });
-                } else if let Some(r) = reply.take() {
-                    let _ = r.send(Some(answers));
-                }
+            OverlayEvent::AssignRole { role: None, model } => self.send(Command::SetModel(model)),
+            OverlayEvent::Login(n) => self.run_login(&[], Some(n)),
+            OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
+            OverlayEvent::Resume(p) => self.send(Command::Resume(p)),
+            OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
+            OverlayEvent::EditPlan(file) => self.run_editor(&file.clone(), ChildThen::PlanEdit(file)),
+            OverlayEvent::PlanCancelled => {
+                self.inbox.borrow().cancel.cancel();
+                self.notice("plan review cancelled; plan mode stays on");
             }
         }
     }
@@ -1087,7 +921,10 @@ impl App {
 
     fn slash(&mut self, cmd: &str) {
         let (name, arg) = cmd.split_once(char::is_whitespace).map_or((cmd, ""), |(n, a)| (n, a.trim()));
-        let allowed_busy = matches!(name, "thinking" | "model" | "todo" | "skills" | "plugins" | "session" | "copy" | "image" | "jobs") && !(name == "model" && arg.is_empty());
+        let allowed_busy = matches!(
+            name,
+            "thinking" | "model" | "todo" | "skills" | "plugins" | "session" | "copy" | "image" | "jobs"
+        ) && !(name == "model" && arg.is_empty());
         if self.running && !allowed_busy {
             return self.notice("busy — Esc to abort first");
         }
@@ -1205,7 +1042,7 @@ impl App {
         match arg {
             "" => self.open_copy_picker(),
             "code" => {
-                let t = self.replies.iter().rev().find_map(|r| markdown::code_blocks(r).pop().map(|(_, b)| b));
+                let t = self.tr.replies.iter().rev().find_map(|r| markdown::code_blocks(r).pop().map(|(_, b)| b));
                 self.copy_text(t, "No code block to copy.");
             }
             "cmd" | "command" => {
@@ -1213,7 +1050,7 @@ impl App {
                 self.copy_text(t, "No command to copy.");
             }
             "link" | "url" => {
-                let t = self.replies.iter().rev().find_map(|r| markdown::links(r).pop());
+                let t = self.tr.replies.iter().rev().find_map(|r| markdown::links(r).pop());
                 self.copy_text(t, "No link to copy.");
             }
             _ => self.error("usage: /copy [code|cmd|link]"),
@@ -1222,27 +1059,52 @@ impl App {
 
     fn copy_text(&mut self, text: Option<String>, none: &str) {
         let Some(t) = text else { return self.notice(none) };
-        match clipboard::copy(&t) {
-            Ok(()) => self.notice(&format!("copied {} chars", t.chars().count())),
-            Err(e) => self.error(&format!("copy failed: {e}")),
-        }
+        let done = format!("copied {} chars", t.chars().count());
+        self.copy_async(t, done);
+    }
+
+    /// Copies on a blocking thread with a 2 s limit, so a stuck clipboard helper cannot freeze the UI.
+    fn copy_async(&mut self, text: String, done: String) {
+        let tx = self.ui_tx.clone();
+        tokio::task::spawn_local(async move {
+            let r = match tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || clipboard::copy(&text)),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("the clipboard helper did not answer in 2 s".into()),
+            };
+            let _ = tx.send(UiMsg::Copied(r.map(|()| done)));
+        });
     }
 
     fn open_copy_picker(&mut self) {
         let first = |s: &str| s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
         let mut items = Vec::new();
         let mut texts = Vec::new();
-        for r in self.replies.iter().rev().take(20) {
-            items.push(Item { label: format!("Reply: {}", trunc(&first(r), 60)), detail: format!("{} lines", r.lines().count()) });
+        for r in self.tr.replies.iter().rev().take(20) {
+            items.push(Item {
+                label: format!("Reply: {}", trunc(&first(r), 60)),
+                detail: format!("{} lines", r.lines().count()),
+            });
             texts.push(r.clone());
             for (lang, body) in markdown::code_blocks(r) {
                 let lang = if lang.is_empty() { "text" } else { &lang };
-                items.push(Item { label: format!("Code {lang}: {}", trunc(&first(&body), 50)), detail: format!("{} lines", body.lines().count()) });
+                items.push(Item {
+                    label: format!("Code {lang}: {}", trunc(&first(&body), 50)),
+                    detail: format!("{} lines", body.lines().count()),
+                });
                 texts.push(body);
             }
         }
         for c in self.bash_cmds.iter().rev().take(10) {
-            items.push(Item { label: format!("Command: {}", trunc(&first(c), 60)), detail: format!("{} lines", c.lines().count()) });
+            items.push(Item {
+                label: format!("Command: {}", trunc(&first(c), 60)),
+                detail: format!("{} lines", c.lines().count()),
+            });
             texts.push(c.clone());
         }
         if items.is_empty() {
@@ -1284,66 +1146,109 @@ impl App {
         });
     }
 
+    /// Hands the terminal to a child that runs on a blocking thread, so the agent, plugins and
+    /// timers keep running. Input reading and drawing pause until `ChildDone` arrives.
+    fn start_child(
+        &mut self,
+        then: ChildThen,
+        job: impl FnOnce() -> std::io::Result<std::process::ExitStatus> + Send + 'static,
+    ) {
+        if self.child_busy {
+            return self.notice("another program already has the terminal");
+        }
+        let committed = std::mem::take(&mut self.tr.pending);
+        let _ = self.renderer.draw(&committed, &[], (0, 0));
+        let _ = self.renderer.finish();
+        let _ = term::suspend();
+        self.child_busy = true;
+        let tx = self.ui_tx.clone();
+        tokio::task::spawn_local(async move {
+            let status = match tokio::task::spawn_blocking(job).await {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(UiMsg::ChildDone { then, status });
+        });
+    }
+
+    fn on_child_done(&mut self, then: ChildThen, status: Result<std::process::ExitStatus, String>) {
+        let _ = term::resume();
+        self.renderer = Renderer::new();
+        self.child_busy = false;
+        self.dirty = true;
+        match then {
+            ChildThen::Login => match status {
+                Ok(s) if s.success() => self.notice("login finished"),
+                Ok(s) => self.error(&format!("omp login exited with {s}")),
+                Err(e) => self.error(&format!("cannot run omp login: {e}")),
+            },
+            ChildThen::ComposerEdit(path) => {
+                match status {
+                    Ok(s) if s.success() => {
+                        if let Ok(t) = std::fs::read_to_string(&path) {
+                            self.composer.set_text(t.trim_end_matches('\n'));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.error(&format!("editor failed: {e}")),
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            ChildThen::PlanEdit(path) => {
+                if let Err(e) = status {
+                    self.error(&format!("editor failed: {e}"));
+                }
+                match (std::fs::read_to_string(&path), &mut self.overlay) {
+                    (Ok(t), Some(Overlay::Review { review, .. })) => review.set_content(t),
+                    (Err(e), _) => self.error(&format!("cannot read plan: {e}")),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Runs `omp login` on the real terminal. With `pick`, omp's own provider menu is swallowed and
     /// answered with that number once its prompt appears; terminal input is then relayed so OAuth
     /// prompts still work. The gateway reads the stored credentials.
     fn run_login(&mut self, args: &[&str], pick: Option<usize>) {
         use std::process::Stdio;
-        let _ = self.renderer.finish();
-        let _ = term::suspend();
-        let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
-        cmd.arg("login").args(args);
-        if pick.is_some() {
-            cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
-        }
-        extern "C" fn noop(_: libc::c_int) {}
-        // A caught (not ignored) SIGINT: Ctrl-C reaches omp, which resets it on exec, but not mu.
-        // SAFETY: installs a no-op handler; restored to the default below.
-        unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
-        let status = match (cmd.spawn(), pick) {
-            (Ok(mut child), Some(n)) => relay_login(&mut child, n),
-            (Ok(mut child), None) => child.wait(),
-            (Err(e), _) => Err(e),
-        };
-        // SAFETY: back to the default disposition.
-        unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
-        let _ = term::resume();
-        self.renderer = Renderer::new();
-        match status {
-            Ok(s) if s.success() => self.notice("login finished"),
-            Ok(s) => self.error(&format!("omp login exited with {s}")),
-            Err(e) => self.error(&format!("cannot run omp login: {e}")),
-        }
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        self.start_child(ChildThen::Login, move || {
+            let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
+            cmd.arg("login").args(&args);
+            if pick.is_some() {
+                cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+            }
+            extern "C" fn noop(_: libc::c_int) {}
+            // A caught (not ignored) SIGINT: Ctrl-C reaches omp, which resets it on exec, but not mu.
+            // SAFETY: installs a no-op handler; restored to the default below.
+            unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+            let status = match (cmd.spawn(), pick) {
+                (Ok(mut child), Some(n)) => relay_login(&mut child, n),
+                (Ok(mut child), None) => child.wait(),
+                (Err(e), _) => Err(e),
+            };
+            // SAFETY: back to the default disposition.
+            unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+            status
+        });
     }
 
-    /// Runs `$VISUAL`/`$EDITOR` on `path` with the terminal handed over; `Ok(exited_ok)`.
-    fn run_editor(&mut self, path: &std::path::Path) -> Result<bool, String> {
+    /// Runs `$VISUAL`/`$EDITOR` on `path` with the terminal handed over.
+    fn run_editor(&mut self, path: &std::path::Path, then: ChildThen) {
         let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-        let committed = std::mem::take(&mut self.pending);
-        let _ = self.renderer.draw(&committed, &[], (0, 0));
-        let _ = self.renderer.finish();
-        let _ = term::suspend();
-        let status = std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(path).status();
-        let _ = term::resume();
-        self.renderer = Renderer::new();
-        status.map(|s| s.success()).map_err(|e| format!("editor failed: {e}"))
+        let path = path.to_path_buf();
+        self.start_child(then, move || {
+            std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(&path).status()
+        });
     }
 
     fn edit_external(&mut self) {
-        let path = std::env::temp_dir().join(format!("mu-edit-{}.md", std::process::id()));
-        if std::fs::write(&path, self.composer.text()).is_err() {
-            return self.error("cannot create temp file");
-        }
-        match self.run_editor(&path) {
-            Ok(true) => {
-                if let Ok(t) = std::fs::read_to_string(&path) {
-                    self.composer.set_text(t.trim_end_matches('\n'));
-                }
-            }
-            Ok(false) => {}
-            Err(e) => self.error(&e),
-        }
-        let _ = std::fs::remove_file(&path);
+        let path = match private_temp_file(&self.composer.text()) {
+            Ok(p) => p,
+            Err(e) => return self.error(&format!("cannot create temp file: {e}")),
+        };
+        self.run_editor(&path.clone(), ChildThen::ComposerEdit(path));
     }
 
     /// Roles from omp's `cycleOrder` that can be switched to when implementing an approved plan.
@@ -1371,23 +1276,12 @@ impl App {
     fn live_lines(&self, w: usize) -> (Vec<Line>, Option<(usize, usize)>) {
         let mut pty_cursor = None;
         let mut out: Vec<Line> = Vec::new();
-        if !self.live_text.is_empty() {
-            out.extend(markdown::render(&self.live_text, w));
-        }
-        if let Some((start, text)) = &self.thinking {
-            if self.show_thinking && !text.trim().is_empty() {
-                if self.thinking_shown {
-                    out.push(blocks::thinking_gap());
-                }
-                out.extend(blocks::thinking_body(text.trim(), w));
-            }
-            out.push(blocks::thinking_live(self.spin(), start.elapsed().as_secs()));
-        }
+        out.extend(self.tr.live_lines(w, self.spin()));
         for t in &self.tools {
             if let Some(p) = self.pty.as_ref().filter(|p| p.id == t.id) {
                 let (rows, cur) = p.screen();
                 let (lines, c) = blocks::pty_live(&t.args, &rows, cur, t.started.elapsed().as_secs(), w);
-                pty_cursor = Some((out.len() + c.0, c.1));
+                pty_cursor = c.map(|c| (out.len() + c.0, c.1));
                 out.extend(lines);
                 continue;
             }
@@ -1401,7 +1295,8 @@ impl App {
         for c in &self.calls {
             out.extend(blocks::tool_streaming(&c.name, &c.args, self.spin(), w));
         }
-        let running: Vec<SubagentStatus> = self.jobs.iter().filter(|j| j.state == SubagentState::Running).cloned().collect();
+        let running: Vec<SubagentStatus> =
+            self.jobs.iter().filter(|j| j.state == SubagentState::Running).cloned().collect();
         out.extend(blocks::subagent_rows(&running, self.spin()));
         if self.compacting {
             out.push(styled(format!("{} Compacting context…", self.spin()), |_| theme::get().fg(Role::Warn)));
@@ -1447,13 +1342,15 @@ impl App {
     }
 
     fn draw(&mut self) -> std::io::Result<()> {
-        self.advance_reveal();
+        let w = self.width();
+        self.tr.advance_reveal(w);
         for c in &mut self.calls {
-            if c.json.len() != c.parsed {
-                if let Some(v) = super::partial_json::parse(&c.json) {
+            // At most once per frame: deltas arrive far more often than frames are drawn.
+            if c.stale {
+                if let Some(v) = c.json.value() {
                     c.args = v;
                 }
-                c.parsed = c.json.len();
+                c.stale = false;
             }
         }
         let (w, rows) = self.renderer.size();
@@ -1468,35 +1365,31 @@ impl App {
         let status_lines = status::render(&self.status, &env, w);
         let pty_open = self.pty.is_some();
         let (lines, cur) = match &mut self.overlay {
-            _ if pty_open => (vec![styled("  keys go to the command · esc force-kills".to_string(), |_| dim())], (0, 0)),
-            Some(Overlay::Model { sel, .. } | Overlay::Role { sel, .. } | Overlay::Login { sel, .. } | Overlay::Session { sel, .. } | Overlay::Ask { sel, .. }| Overlay::Copy { sel, .. }) => {
-                let (body, cur) = sel.render(w, (rows / 2).max(6).saturating_sub(2));
-                let mut framed: Vec<Line> = vec![Vec::new()];
-                framed.extend(body);
-                (framed, (cur.0 + 1, cur.1))
+            _ if pty_open => {
+                (vec![styled("  keys go to the command · ctrl+c twice force-kills".to_string(), |_| dim())], (0, 0))
             }
-            Some(Overlay::Review { review, .. }) => {
-                let avail = rows.saturating_sub(1).saturating_sub(vp.len() + status_lines.len());
-                let (body, cur) = review.render(w, avail.saturating_sub(1));
-                let mut framed: Vec<Line> = vec![Vec::new()];
-                framed.extend(body);
-                (framed, (cur.0 + 1, cur.1))
-            }
+            Some(ov) => ov.render(w, rows, vp.len() + status_lines.len()),
             None => self.composer.render(w),
         };
         let cursor = pty_cursor.filter(|_| pty_open).unwrap_or((vp.len() + cur.0, cur.1));
         vp.extend(lines);
         vp.extend(status_lines);
-        let committed = std::mem::take(&mut self.pending);
-        self.renderer.draw(&committed, &vp, cursor)?;
+        let committed = std::mem::take(&mut self.tr.pending);
+        if let Err(e) = self.renderer.draw(&committed, &vp, cursor) {
+            // Nothing reached the terminal: keep the lines for the next try, and wait a frame
+            // before it so a persistent failure cannot spin the loop.
+            self.tr.pending = committed;
+            self.last_draw = Instant::now();
+            return Err(e);
+        }
         self.last_draw = Instant::now();
-        self.dirty = self.reveal_chars > 0;
+        self.dirty = self.tr.revealing();
         Ok(())
     }
 }
 
 const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Alt+↑  edit last queued
-Shift+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn      Ctrl+C  clear · abort · exit (twice)
+Shift+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn (in a pty command: sent to it)      Ctrl+C  clear · abort · exit (twice)
 Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model picker
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
@@ -1595,7 +1488,10 @@ mod login_tests {
     #[test]
     fn menu_numbers_and_names_survive_ansi_and_noise() {
         let t = "Select a provider:\n\n  1. ChatGPT Plus/Pro (Codex)\n\x1b[2m  12. Z.AI (GLM · Sign in)\x1b[0m\nEnter number: ";
-        assert_eq!(parse_login_menu(t), vec![(1, "ChatGPT Plus/Pro (Codex)".into()), (12, "Z.AI (GLM · Sign in)".into())]);
+        assert_eq!(
+            parse_login_menu(t),
+            vec![(1, "ChatGPT Plus/Pro (Codex)".into()), (12, "Z.AI (GLM · Sign in)".into())]
+        );
     }
 
     #[test]
@@ -1603,5 +1499,32 @@ mod login_tests {
     fn contract_omp_login_menu() {
         let out = mu_common::paths::run_omp_blocking(&["login"], &[]);
         assert!(!parse_login_menu(&out).is_empty(), "no providers parsed from: {out}");
+    }
+}
+
+/// Creates a new file (`O_EXCL`, mode 0600, random name) in `$XDG_RUNTIME_DIR` or the temp dir.
+fn private_temp_file(content: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!("mu-edit-{}.md", uuid::Uuid::new_v4().simple()));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+    f.write_all(content.as_bytes())?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod temp_tests {
+    #[test]
+    fn temp_file_is_private_and_unique() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = super::private_temp_file("x").unwrap();
+        let b = super::private_temp_file("y").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = (std::fs::remove_file(a), std::fs::remove_file(b));
     }
 }

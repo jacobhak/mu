@@ -7,7 +7,7 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagE
 use unicode_width::UnicodeWidthChar;
 
 use super::highlight;
-use super::line::{Line, bold, line_text, span, wrap};
+use super::line::{Line, bold, line_text, sanitize, span, wrap};
 use super::theme::{self, Role};
 
 /// Role `r` as a foreground style.
@@ -33,9 +33,11 @@ enum Kind {
     Other,
 }
 
+const OPTS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_STRIKETHROUGH).union(Options::ENABLE_TASKLISTS);
+
 /// Renders `md` wrapped to `width` columns. Never ends with a blank line.
 pub fn render(md: &str, width: usize) -> Vec<Line> {
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let opts = OPTS;
     let ev: Vec<(Event, Range<usize>)> = Parser::new_ext(md, opts).into_offset_iter().collect();
     let mut r = R { ev, pos: 0, src: md };
     let w = width.max(1);
@@ -78,58 +80,91 @@ pub fn code_blocks(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// `http(s)://` URLs in `text`, split on whitespace and brackets/quotes, minus trailing punctuation.
+/// `http(s)://` URLs in `text`, minus trailing punctuation. A URL ends at whitespace or a quote or
+/// bracket; parentheses belong to it only when balanced (`…/Rust_(language)`, not `(see …)`). A URL
+/// with no host is not a link.
 pub fn links(text: &str) -> Vec<String> {
-    text.split(|c: char| c.is_whitespace() || "()<>[]\"'`".contains(c))
-        .filter(|t| t.starts_with("http://") || t.starts_with("https://"))
-        .map(|t| t.trim_end_matches(['.', ',', ';', ':', '!', '?']).to_string())
-        .collect()
-}
-
-/// Byte offset just after the last blank line outside an open code fence; 0 if none.
-/// Everything before it is complete and can be committed.
-pub fn stable_prefix(buf: &str) -> usize {
-    let mut open: Option<(char, usize)> = None;
-    let mut last = 0;
-    let mut off = 0;
-    for line in buf.split_inclusive('\n') {
-        let end = off + line.len();
-        match open {
-            Some((c, n)) => {
-                if let Some((c2, m)) = fence_run(line) {
-                    if c2 == c && m >= n && line.trim_start()[m..].trim().is_empty() {
-                        open = None;
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = ["http://", "https://"].iter().filter_map(|p| text[from..].find(p).map(|i| from + i)).min() {
+        let mut depth = 0usize;
+        let mut end = text.len();
+        for (i, c) in text[at..].char_indices() {
+            let stop = match c {
+                '(' => {
+                    depth += 1;
+                    false
+                }
+                ')' => match depth {
+                    0 => true,
+                    _ => {
+                        depth -= 1;
+                        false
                     }
-                }
-            }
-            None => {
-                if let Some(f) = fence_run(line) {
-                    open = Some(f);
-                } else if line.trim().is_empty() && off > 0 && line.ends_with('\n') {
-                    last = end;
-                }
+                },
+                c => c.is_whitespace() || "<>[]\"'`".contains(c),
+            };
+            if stop {
+                end = at + i;
+                break;
             }
         }
-        off = end;
+        let url = text[at..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        from = end.max(at + 1);
+        let rest = &url[url.find("://").map_or(0, |i| i + 3)..];
+        let host = rest.split(['/', '?', '#', ':']).next().unwrap_or("");
+        if !host.is_empty() {
+            out.push(url.to_string());
+        }
     }
-    last
+    out
 }
 
-fn fence_run(line: &str) -> Option<(char, usize)> {
-    let t = line.trim_start();
-    let c = t.chars().next()?;
-    if c != '`' && c != '~' {
-        return None;
+/// Byte offset up to which `buf` is complete and can be committed; 0 if none.
+///
+/// Parses `buf` and returns the start of the last top-level block: everything before it is made of
+/// blocks that already have a successor, so later text cannot change them. A list or quote that is
+/// still open is the last block, so it is never cut in the middle, and an open code fence is too.
+pub fn stable_prefix(buf: &str) -> usize {
+    let mut depth = 0usize;
+    let mut starts: Vec<usize> = Vec::new();
+    for (ev, range) in Parser::new_ext(buf, OPTS).into_offset_iter() {
+        match ev {
+            Event::Start(_) => {
+                if depth == 0 {
+                    starts.push(range.start);
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ if depth == 0 => starts.push(range.start),
+            _ => {}
+        }
     }
-    let n = t.chars().take_while(|&x| x == c).count();
-    (n >= 3).then_some((c, n))
+    match starts.as_slice() {
+        [.., last] if starts.len() >= 2 => *last,
+        _ => 0,
+    }
+}
+
+/// The reference definitions (`[label]: url`) in `text`, as source lines to prepend when rendering
+/// later text that is committed separately.
+pub fn reference_defs(text: &str) -> String {
+    let p = Parser::new_ext(text, OPTS);
+    let mut spans: Vec<Range<usize>> = p.reference_definitions().iter().map(|(_, d)| d.span.clone()).collect();
+    spans.sort_by_key(|r| r.start);
+    let mut out = String::new();
+    for r in spans {
+        if let Some(t) = text.get(r) {
+            out.push_str(t.trim_end());
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn is_inline(tag: &Tag) -> bool {
-    matches!(
-        tag,
-        Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. }
-    )
+    matches!(tag, Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. })
 }
 
 struct R<'a> {
@@ -217,9 +252,7 @@ impl<'a> R<'a> {
             Event::Start(Tag::CodeBlock(kind)) => {
                 self.pos += 1;
                 let lang = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        info.split_whitespace().next().unwrap_or("").to_string()
-                    }
+                    CodeBlockKind::Fenced(info) => info.split_whitespace().next().unwrap_or("").to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
                 let mut body = String::new();
@@ -289,10 +322,7 @@ impl<'a> R<'a> {
                 }
                 Event::SoftBreak => out.push((' ', st)),
                 Event::HardBreak => out.push(('\n', st)),
-                Event::TaskListMarker(done) => {
-                    push_str(&mut out, if done { "[x] " } else { "[ ] " }, st)
-                }
-                Event::FootnoteReference(s) => push_str(&mut out, &format!("[^{s}]"), st),
+                Event::TaskListMarker(done) => push_str(&mut out, if done { "☑ " } else { "☐ " }, st),
                 Event::Start(Tag::Emphasis) => {
                     stack.push(st);
                     st.attributes.set(Attribute::Italic);
@@ -361,11 +391,8 @@ impl<'a> R<'a> {
                         }
                     } else {
                         for (i, l) in child.into_iter().enumerate() {
-                            let mut v = if i == 0 {
-                                chs(&marker, key(Role::Accent))
-                            } else {
-                                chs(&pad, Default::default())
-                            };
+                            let mut v =
+                                if i == 0 { chs(&marker, key(Role::Accent)) } else { chs(&pad, Default::default()) };
                             v.extend(l);
                             out.push(v);
                         }
@@ -434,11 +461,7 @@ impl<'a> R<'a> {
         let total: usize = colw.iter().map(|c| c + 3).sum::<usize>() + 1;
         if total > w {
             // Too wide: show the source markdown instead.
-            return self.src[range]
-                .trim_end()
-                .lines()
-                .flat_map(|l| wrap_chs(&chs(l, Default::default()), w))
-                .collect();
+            return self.src[range].trim_end().lines().flat_map(|l| wrap_chs(&chs(l, Default::default()), w)).collect();
         }
 
         let bdr = ContentStyle::default();
@@ -454,9 +477,9 @@ impl<'a> R<'a> {
         let n_rows = rows.len();
         for (ri, (is_head, cells)) in rows.iter().enumerate() {
             let mut v = vec![('│', bdr)];
-            for i in 0..ncols {
+            for (i, &cw) in colw.iter().enumerate().take(ncols) {
                 let cell: &[Ch] = cells.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                let pad = colw[i] - text_width(cell);
+                let pad = cw - text_width(cell);
                 let (l, r) = match aligns.get(i).copied().unwrap_or(Alignment::None) {
                     Alignment::Right => (pad, 0),
                     Alignment::Center => (pad / 2, pad - pad / 2),
@@ -485,10 +508,9 @@ fn code_lines(lang: &str, body: &str, w: usize) -> Vec<Vec<Ch>> {
     let mut open = chs("```", key(Role::Line));
     open.extend(chs(lang, key(Role::Faint)));
     let mut out = vec![open];
-    let body = body.replace('\t', "    ");
-    let src: Vec<Line> = highlight::highlight(&body, lang).unwrap_or_else(|| {
-        body.lines().map(|l| vec![span(l, ContentStyle::default())]).collect()
-    });
+    let body = sanitize(body);
+    let src: Vec<Line> = highlight::highlight(&body, lang)
+        .unwrap_or_else(|| body.lines().map(|l| vec![span(l, ContentStyle::default())]).collect());
     for line in &src {
         if line_text(line).is_empty() {
             out.push(Vec::new());
@@ -576,11 +598,11 @@ fn text_width(chs: &[Ch]) -> usize {
 }
 
 fn chs(s: &str, st: ContentStyle) -> Vec<Ch> {
-    s.chars().map(|c| (c, st)).collect()
+    sanitize(s).chars().map(|c| (c, st)).collect()
 }
 
 fn push_str(out: &mut Vec<Ch>, s: &str, st: ContentStyle) {
-    out.extend(s.chars().map(|c| (c, st)));
+    out.extend(sanitize(s).chars().map(|c| (c, st)));
 }
 
 fn chars_to_line(cs: &[Ch]) -> Line {
@@ -643,10 +665,7 @@ mod tests {
 
     #[test]
     fn code_fence_is_raw_and_indented() {
-        assert_eq!(
-            texts("```rust\nfn main() {}\n```", 40),
-            vec!["```rust", "  fn main() {}", "```"]
-        );
+        assert_eq!(texts("```rust\nfn main() {}\n```", 40), vec!["```rust", "  fn main() {}", "```"]);
         assert_eq!(texts("```\n*x*\n", 40), vec!["```", "  *x*", "```"]);
     }
 
@@ -744,6 +763,35 @@ mod tests {
     }
 
     #[test]
+    fn a_list_is_never_cut_in_the_middle() {
+        let b = "intro\n\n- a\n  - nested\n\n  more of a\n- b\n\n";
+        let n = stable_prefix(b);
+        assert_eq!(&b[..n], "intro\n\n", "the open list is the last block");
+        let b = "- a\n- b\n\nafter";
+        assert_eq!(&b[..stable_prefix(b)], "- a\n- b\n\n");
+        let q = "> quote\n> more\n\ntail";
+        assert_eq!(&q[..stable_prefix(q)], "> quote\n> more\n\n");
+    }
+
+    #[test]
+    fn reference_definitions_survive_commits() {
+        let first = "see [docs] here\n\n[docs]: https://example.com/d\n\nnext";
+        let cut = stable_prefix(first);
+        let refs = reference_defs(&first[..cut]);
+        assert!(refs.contains("[docs]: https://example.com/d"));
+        // A later chunk that uses the label still resolves it.
+        let later = render(&format!("{refs}\nuse [docs] again"), 80);
+        let text: String = later.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("https://example.com/d"), "{text}");
+    }
+
+    #[test]
+    fn task_lists_render_boxes() {
+        let text: String = render("- [x] done\n- [ ] todo", 40).iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("☑ done") && text.contains("☐ todo"), "{text}");
+    }
+
+    #[test]
     fn stable_prefix_none() {
         assert_eq!(stable_prefix("abc"), 0);
         assert_eq!(stable_prefix("abc\n"), 0);
@@ -759,8 +807,25 @@ mod tests {
     #[test]
     fn code_blocks_and_links_are_extracted() {
         let md = "text\n\n```rust\nfn a() {}\n```\n\n    indented\n\nsee (https://x.io/a?b=1). and <http://y.z>, `https://q.r;`";
-        assert_eq!(code_blocks(md), [("rust".to_string(), "fn a() {}\n".to_string()), (String::new(), "indented\n".to_string())]);
+        assert_eq!(
+            code_blocks(md),
+            [("rust".to_string(), "fn a() {}\n".to_string()), (String::new(), "indented\n".to_string())]
+        );
         assert_eq!(links(md), ["https://x.io/a?b=1", "http://y.z", "https://q.r"]);
+    }
+
+    #[test]
+    fn links_keep_balanced_parentheses_and_need_a_host() {
+        assert_eq!(
+            links("see https://en.wikipedia.org/wiki/Rust_(programming_language)."),
+            ["https://en.wikipedia.org/wiki/Rust_(programming_language)"]
+        );
+        assert_eq!(links("(see https://x.io/a)"), ["https://x.io/a"]);
+        assert!(links("http:// and https:///path and https://").is_empty());
+        assert_eq!(
+            links("a https://a.b/c, b http://d.e:8080/f?x=1&y=2;"),
+            ["https://a.b/c", "http://d.e:8080/f?x=1&y=2"]
+        );
     }
 
     #[test]

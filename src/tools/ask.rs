@@ -60,7 +60,11 @@ impl Tools {
             .map(|q| AskQuestion {
                 question: q.question.clone(),
                 header: q.header.clone(),
-                options: q.options.iter().map(|o| AskOption { label: o.label.clone(), description: o.description.clone() }).collect(),
+                options: q
+                    .options
+                    .iter()
+                    .map(|o| AskOption { label: o.label.clone(), description: o.description.clone() })
+                    .collect(),
                 multi: q.multi,
                 recommended: q.recommended,
             })
@@ -72,7 +76,8 @@ impl Tools {
             _ = ctx.cancel.cancelled() => None,
         };
         let Some(answers) = answers else { return ToolOutput::err("Ask cancelled") };
-        let lines: Vec<String> = a.questions.iter().zip(&answers).map(|(q, ans)| format_answer(&q.id, ans, q.multi)).collect();
+        let lines: Vec<String> =
+            a.questions.iter().zip(&answers).map(|(q, ans)| format_answer(&q.id, ans, q.multi)).collect();
         ToolOutput::ok(format!("User answers:\n{}", lines.join("\n")))
     }
 }

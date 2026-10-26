@@ -18,12 +18,7 @@ pub fn gw_dir() -> PathBuf {
 }
 
 fn gw_dir_for(profile: Option<&str>) -> PathBuf {
-    let base = paths::mu_home().join("gateway");
-    match profile {
-        // The name becomes a path component; anything that could escape it falls back to the default dir.
-        Some(p) if !p.contains(['/', '\\']) && p != "." && p != ".." => base.join("profiles").join(p),
-        _ => base,
-    }
+    paths::profile_subdir(paths::mu_home().join("gateway"), profile)
 }
 
 pub fn logs_dir() -> PathBuf {
@@ -116,7 +111,8 @@ pub fn healthy(url: &str) -> bool {
 
 /// Marks a client pid as using the gateway now (mtime = lease time).
 pub fn touch_lease(dir: &Path, pid: u32) -> io::Result<()> {
-    let f = OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("leases").join(pid.to_string()))?;
+    let f =
+        OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("leases").join(pid.to_string()))?;
     f.set_modified(SystemTime::now())
 }
 

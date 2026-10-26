@@ -1,7 +1,7 @@
 use crate::agent::Agent;
 use crate::config::Threshold;
 use crate::events::AgentEvent;
-use crate::message::{Block, Message};
+use crate::message::{Block, Message, text_of};
 use crate::session::CompactionState;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -14,6 +14,11 @@ const CONTEXT_TEMPLATE: &str = include_str!("prompts/compaction-summary-context.
 const KEEP_TOKENS: u64 = 20_000;
 const SUMMARY_MAX_TOKENS: u32 = 13_107;
 const TOOL_RESULT_CHARS: usize = 2000;
+
+/// The summary input may fill 60% of the summarizer's window (about 4 chars per token).
+fn summary_input_chars(window: u32) -> usize {
+    (window as usize).saturating_mul(4) * 6 / 10
+}
 
 const TITLE_SYSTEM: &str = "Write a 3–7 word title for a coding session that starts with the user request below. Reply with only <title>…</title>.";
 
@@ -43,12 +48,6 @@ pub fn window_and_threshold(window: u32, th: Option<Threshold>) -> (u64, u64) {
     (w, fixed.unwrap_or(default))
 }
 
-/// Token estimate: JSON length / 4, with image base64 excluded and a flat 1600 tokens per image.
-pub fn est(m: &Message) -> u64 {
-    let (images, b64) = m.image_stats();
-    serde_json::to_vec(m).map_or(0, |v| v.len().saturating_sub(b64) as u64 / 4) + 1600 * images
-}
-
 /// Index of the first kept message: the smallest user/assistant index whose suffix fits `KEEP_TOKENS`,
 /// but never past the last user/assistant message.
 pub fn cut_point(messages: &[Message]) -> usize {
@@ -56,7 +55,7 @@ pub fn cut_point(messages: &[Message]) -> usize {
     let mut sum = 0;
     let mut chosen = last;
     for i in (0..messages.len()).rev() {
-        sum += est(&messages[i]);
+        sum += messages[i].estimate_tokens();
         if sum > KEEP_TOKENS {
             break;
         }
@@ -67,37 +66,62 @@ pub fn cut_point(messages: &[Message]) -> usize {
     chosen.min(last)
 }
 
-fn text_of(blocks: &[Block]) -> String {
-    blocks.iter().filter_map(|b| if let Block::Text { text } = b { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
+/// Keeps the head and tail of `t` when it is longer than `max` chars, with an elision marker between.
+pub fn cap_chars(t: &str, max: usize) -> String {
+    let n = t.chars().count();
+    if n <= max {
+        return t.to_string();
+    }
+    let head = max / 2;
+    let tail = max - head;
+    let h: String = t.chars().take(head).collect();
+    let l: String = t.chars().skip(n - tail).collect();
+    format!("{h}\n[… {} chars elided …]\n{l}", n - max)
 }
 
-pub fn serialize(messages: &[Message]) -> String {
+fn serialize_one(m: &Message) -> Vec<String> {
     let mut out = Vec::new();
-    for m in messages {
-        match m {
-            Message::User { content, .. } => out.push(format!("[User]: {}", text_of(content))),
-            Message::Assistant { content, .. } => {
-                let t = text_of(content);
-                if !t.is_empty() {
-                    out.push(format!("[Assistant]: {t}"));
-                }
-                for b in content {
-                    if let Block::ToolCall { name, arguments, .. } = b {
-                        out.push(format!("[Assistant tool call]: {name} {arguments}"));
-                    }
-                }
+    match m {
+        Message::User { content, .. } => {
+            out.push(format!("[User]: {}", cap_chars(&text_of(content), TOOL_RESULT_CHARS)));
+        }
+        Message::Assistant { content, .. } => {
+            let t = text_of(content);
+            if !t.is_empty() {
+                out.push(format!("[Assistant]: {t}"));
             }
-            Message::ToolResult { tool_name, content, is_error, .. } => {
-                let t = text_of(content);
-                let t = if t.chars().count() > TOOL_RESULT_CHARS {
-                    format!("{}…", t.chars().take(TOOL_RESULT_CHARS).collect::<String>())
-                } else {
-                    t
-                };
-                out.push(format!("[Tool result {tool_name}{}]: {t}", if *is_error { " (error)" } else { "" }));
+            for b in content {
+                if let Block::ToolCall { name, arguments, .. } = b {
+                    out.push(format!(
+                        "[Assistant tool call]: {name} {}",
+                        cap_chars(&arguments.to_string(), TOOL_RESULT_CHARS)
+                    ));
+                }
             }
         }
+        Message::ToolResult { tool_name, content, is_error, .. } => {
+            let t = cap_chars(&text_of(content), TOOL_RESULT_CHARS);
+            out.push(format!("[Tool result {tool_name}{}]: {t}", if *is_error { " (error)" } else { "" }));
+        }
     }
+    out
+}
+
+/// Serializes `messages` into at most about `max_chars` characters, dropping the oldest first.
+pub fn serialize_within(messages: &[Message], max_chars: usize) -> String {
+    let parts: Vec<Vec<String>> = messages.iter().map(serialize_one).collect();
+    let size = |p: &Vec<String>| p.iter().map(|s| s.len() + 2).sum::<usize>();
+    let mut total: usize = parts.iter().map(size).sum();
+    let mut skip = 0;
+    while total > max_chars && skip + 1 < parts.len() {
+        total -= size(&parts[skip]);
+        skip += 1;
+    }
+    let mut out: Vec<String> = Vec::new();
+    if skip > 0 {
+        out.push(format!("[{skip} older messages omitted to fit the summarizer's context window]"));
+    }
+    out.extend(parts.into_iter().skip(skip).flatten());
     out.join("\n\n")
 }
 
@@ -137,8 +161,13 @@ impl Agent {
         window_and_threshold(self.model.context_window, lookup(&th, &self.model.id))
     }
 
+    /// Estimated tokens of the next request: system prompt, summary context and messages. The
+    /// system prompt is only measured when its inputs change, and the messages' sum is reused until
+    /// a message is added or removed, so frequent status updates do not recompute either.
     pub fn estimate_tokens(&self) -> u64 {
-        (self.system().len() as u64 / 4) + self.messages.iter().map(est).sum::<u64>() + self.compaction.as_ref().map_or(0, |c| c.summary.len() as u64 / 4)
+        self.system_tokens()
+            + self.messages_tokens()
+            + self.compaction.as_ref().map_or(0, |c| c.summary.len() as u64 / 4)
     }
 
     /// Newest usage if it postdates the last compaction, else an estimate.
@@ -180,16 +209,28 @@ impl Agent {
             .into_iter()
             .filter_map(|(_, v)| v["context"].as_str().filter(|c| !c.is_empty()).map(String::from))
             .collect();
-        let prompt = summary_prompt(&serialize(&self.messages[..cut]), self.compaction.as_ref().map(|c| c.summary.as_str()), focus, &extra);
-        let summary = match self.providers.complete(&self.model.id, SYSTEM_PROMPT, &prompt, SUMMARY_MAX_TOKENS, cancel).await {
-            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
-            Ok(_) => return Outcome::Failed("empty summary".into()),
-            Err(e) => return Outcome::Failed(e.to_string()),
-        };
+        let prompt = summary_prompt(
+            &serialize_within(&self.messages[..cut], summary_input_chars(self.model.context_window)),
+            self.compaction.as_ref().map(|c| c.summary.as_str()),
+            focus,
+            &extra,
+        );
+        let summary =
+            match self.providers.complete(&self.model.id, SYSTEM_PROMPT, &prompt, SUMMARY_MAX_TOKENS, cancel).await {
+                Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+                Ok(_) => return Outcome::Failed("empty summary".into()),
+                Err(e) => return Outcome::Failed(e.to_string()),
+            };
         let first_kept = self.entry_ids.get(cut).cloned().unwrap_or_default();
+        if self.session.is_some() && first_kept.is_empty() {
+            // The entry the summary would point at was never written; cutting there would corrupt the chain.
+            return Outcome::Skipped("Cannot compact: the session file is missing entries");
+        }
         self.messages.drain(..cut);
         self.entry_ids.drain(..cut);
-        let after_est = (self.system().len() as u64 / 4) + summary.len() as u64 / 4 + self.messages.iter().map(est).sum::<u64>();
+        let after_est = self.system_tokens()
+            + summary.len() as u64 / 4
+            + self.messages.iter().map(Message::estimate_tokens).sum::<u64>();
         if let Some(s) = self.session.as_mut() {
             s.compaction(&summary, &first_kept, before, after_est);
         }
@@ -206,12 +247,16 @@ impl Agent {
         if self.title.is_some() || self.title_requested {
             return;
         }
-        let Some(Message::User { content, .. }) = self.messages.iter().find(|m| matches!(m, Message::User { .. })) else { return };
+        let Some(Message::User { content, .. }) = self.messages.iter().find(|m| matches!(m, Message::User { .. }))
+        else {
+            return;
+        };
         let prompt: String = text_of(content).chars().take(2000).collect();
         self.title_requested = true;
         let (providers, tx, sid) = (self.providers.clone(), self.title_tx.clone(), self.session_id());
+        let cancel = self.title_cancel.clone();
         tokio::task::spawn_local(async move {
-            let r = providers.complete("smol", TITLE_SYSTEM, &prompt, 64, &CancellationToken::new()).await;
+            let r = providers.complete("smol", TITLE_SYSTEM, &prompt, 64, &cancel).await;
             if let Some(t) = r.ok().and_then(|s| extract_title(&s)) {
                 let _ = tx.send((sid, t));
             }
@@ -222,6 +267,18 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caps_keep_head_and_tail_and_oldest_messages_go_first() {
+        let c = cap_chars(&"a".repeat(3000), 2000);
+        assert!(c.starts_with("aaa") && c.contains("1000 chars elided") && c.chars().count() < 2100);
+        assert_eq!(cap_chars("short", 2000), "short");
+        let msgs: Vec<Message> = (0..10).map(|i| Message::user(&format!("{i}{}", "x".repeat(900)))).collect();
+        let s = serialize_within(&msgs, 3000);
+        assert!(s.contains("older messages omitted") && s.contains("[User]: 9") && !s.contains("[User]: 0"));
+        assert!(s.len() < 4000);
+        assert_eq!(summary_input_chars(200_000), 480_000);
+    }
 
     #[test]
     fn thresholds() {
@@ -265,8 +322,13 @@ mod tests {
     #[test]
     fn prompts_and_titles() {
         let p = summary_prompt("S", Some("OLD"), Some("focus"), &["ctx".into()]);
-        assert!(p.starts_with("<conversation>\nS\n</conversation>\n\n<previous-summary>\nOLD\n</previous-summary>\n\n"));
-        assert!(p.contains("\n\nAdditional focus: focus") && p.ends_with("<additional-context>\nctx\n</additional-context>"));
+        assert!(
+            p.starts_with("<conversation>\nS\n</conversation>\n\n<previous-summary>\nOLD\n</previous-summary>\n\n")
+        );
+        assert!(
+            p.contains("\n\nAdditional focus: focus")
+                && p.ends_with("<additional-context>\nctx\n</additional-context>")
+        );
         assert_eq!(extract_title("<title> Fix bug </title>").as_deref(), Some("Fix bug"));
         assert_eq!(extract_title("<title>none</title>"), None);
         assert_eq!(extract_title("no tags"), None);

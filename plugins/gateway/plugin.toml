@@ -1,4 +1,4 @@
 name = "gateway"
 command = ["mu-gateway"]
-lifetime = "session"
+lifetime = "idle:10m"
 provider = "gateway"

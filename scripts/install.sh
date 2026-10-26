@@ -37,13 +37,21 @@ if [ -n "$src" ]; then
 else
   if [ -n "$tag" ]; then url="https://github.com/$REPO/releases/download/$tag/mu-$plat.tar.gz"
   else url="https://github.com/$REPO/releases/latest/download/mu-$plat.tar.gz"; fi
-  if ! curl -fsSL -o "$tmp/mu-$plat.tar.gz" "$url" 2>/dev/null; then
-    if has_gh; then
-      gh release download ${tag:+"$tag"} -R "$REPO" -p "mu-$plat.tar.gz" -D "$tmp" --clobber
-    else
-      echo "install.sh: could not download $url (a private repo needs an authenticated gh)" >&2
-      exit 1
-    fi
+  sums_url="${url%/*}/SHA256SUMS"
+  if curl -fsSL -o "$tmp/mu-$plat.tar.gz" "$url" 2>/dev/null && curl -fsSL -o "$tmp/SHA256SUMS" "$sums_url" 2>/dev/null; then :
+  elif has_gh; then
+    gh release download ${tag:+"$tag"} -R "$REPO" -p "mu-$plat.tar.gz" -p SHA256SUMS -D "$tmp" --clobber
+  else
+    echo "install.sh: could not download $url (a private repo needs an authenticated gh)" >&2
+    exit 1
+  fi
+  # Refuse to unpack anything that does not match the published checksum.
+  want="$(awk -v f="mu-$plat.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS" 2>/dev/null | head -1)"
+  if command -v sha256sum >/dev/null; then got="$(sha256sum "$tmp/mu-$plat.tar.gz" | awk '{print $1}')"
+  else got="$(shasum -a 256 "$tmp/mu-$plat.tar.gz" | awk '{print $1}')"; fi
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    echo "install.sh: mu-$plat.tar.gz does not match SHA256SUMS (or the release has none); not installing" >&2
+    exit 1
   fi
   tar -C "$tmp" -xzf "$tmp/mu-$plat.tar.gz"
 fi
@@ -85,8 +93,13 @@ omp_ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' "$stage/upstream.toml")"
 "$stage/scripts/fetch-omp.sh" "$omp_ver" "$home/bin/omp"
 for p in gateway web predict memory; do
   [ -d "$stage/plugins/$p" ] || continue
-  rm -rf "${home:?}/plugins/$p"
-  cp -R "$stage/plugins/$p" "$home/plugins/$p"
+  # Swap in whole: a half-copied plugin directory is never visible, and the old one is kept on failure.
+  dest="${home:?}/plugins/$p"
+  rm -rf "$dest.new" "$dest.old"
+  cp -R "$stage/plugins/$p" "$dest.new"
+  [ -e "$dest" ] && mv "$dest" "$dest.old"
+  mv "$dest.new" "$dest"
+  rm -rf "$dest.old"
 done
 [ -d "$stage/plugins/memory" ] || echo "this release has no memory plugin; any installed one is left as is" >&2
 

@@ -33,12 +33,7 @@ impl Renderer {
 
     /// Draws committed lines (scrolled into scrollback) followed by the viewport. The cursor is
     /// placed at `cursor` = (viewport row, display column) in the given viewport coordinates.
-    pub fn draw(
-        &mut self,
-        committed: &[Line],
-        viewport: &[Line],
-        cursor: (usize, usize),
-    ) -> io::Result<()> {
+    pub fn draw(&mut self, committed: &[Line], viewport: &[Line], cursor: (usize, usize)) -> io::Result<()> {
         let (cols, rows) = self.size();
         let (up, _) = self.positions(cols);
         let mut buf = Vec::new();
@@ -59,17 +54,26 @@ impl Renderer {
         let mut at = None;
         for (i, l) in viewport.iter().enumerate() {
             let base = wrapped.len();
+            let lay = line::layout(l, cols);
             if i == cursor.0 {
-                let (sub, col) = locate(l, cols, cursor.1);
+                let (sub, col) = lay.locate_col(cursor.1);
                 at = Some((base + sub, col));
             }
-            wrapped.extend(line::wrap(l, cols));
+            wrapped.extend(lay.rows);
         }
 
         // Keep the last rows when the viewport is taller than the space left (rows - 1).
         let cap = rows.saturating_sub(1).max(1);
-        let skip = wrapped.len().saturating_sub(cap);
-        let shown = &wrapped[skip..];
+        let mut skip = wrapped.len().saturating_sub(cap);
+        // The cursor's row must stay on screen: a window that would cut it off (the status bar
+        // below the composer can crowd it out) moves to include it.
+        if let Some((r, _)) = at {
+            skip = skip.min(r);
+            if r >= skip + cap {
+                skip = r + 1 - cap;
+            }
+        }
+        let shown = &wrapped[skip..(skip + cap).min(wrapped.len())];
         let (crow, ccol) = match at {
             Some((r, c)) if r >= skip => (r - skip, c),
             _ => (shown.len().saturating_sub(1), 0),
@@ -96,6 +100,7 @@ impl Renderer {
         }
         queue!(buf, MoveToColumn(self.cursor.1 as u16))?;
         queue!(buf, EndSynchronizedUpdate)?;
+        super::term::set_rows_below(total.saturating_sub(1).saturating_sub(cur));
 
         let mut out = io::stdout().lock();
         out.write_all(&buf)?;
@@ -146,25 +151,6 @@ fn u16_of(n: usize) -> u16 {
     n.min(u16::MAX as usize) as u16
 }
 
-/// Maps display column `target` of an unwrapped line to (sub-row, column) under `wrap` at `cols`.
-fn locate(l: &Line, cols: usize, target: usize) -> (usize, usize) {
-    use unicode_width::UnicodeWidthChar;
-    let (mut row, mut col, mut disp) = (0, 0, 0);
-    for ch in l.iter().flat_map(|s| s.text.chars()) {
-        if disp >= target {
-            break;
-        }
-        let w = ch.width().unwrap_or(0);
-        if col + w > cols {
-            row += 1;
-            col = 0;
-        }
-        col += w;
-        disp += w;
-    }
-    (row, col)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,9 +158,10 @@ mod tests {
 
     #[test]
     fn locate_follows_wrap() {
-        assert_eq!(locate(&plain("abcdef"), 4, 5), (1, 1));
-        assert_eq!(locate(&plain("abcdef"), 4, 0), (0, 0));
-        assert_eq!(locate(&plain("abcdef"), 4, 4), (0, 4));
+        let at = |t| line::layout(&plain("abcdef"), 4).locate_col(t);
+        assert_eq!(at(5), (1, 1));
+        assert_eq!(at(0), (0, 0));
+        assert_eq!(at(4), (0, 4));
     }
 
     #[test]

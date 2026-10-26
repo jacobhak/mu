@@ -22,7 +22,8 @@ export class RpcError extends Error {
 }
 
 export interface Client {
-	call(method: string, params?: unknown): Promise<unknown>;
+	/** `opts.timeoutMs` rejects the call and forgets its pending entry, so a lost reply cannot leak it. */
+	call(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
 	notify(method: string, params?: unknown): void;
 }
 
@@ -40,13 +41,18 @@ export async function serve(handler: Handler): Promise<void> {
 	let closed = false;
 	const write = (msg: object) => process.stdout.write(`${JSON.stringify(msg)}\n`);
 	const client: Client = {
-		call(method, params = {}) {
+		call(method, params = {}, opts) {
 			if (closed) return Promise.reject(new RpcError(-32000, "core connection closed"));
 			const id = ++nextId;
 			const waiter = Promise.withResolvers<unknown>();
 			pending.set(id, waiter);
 			write({ jsonrpc: "2.0", id, method, params });
-			return waiter.promise;
+			const ms = opts?.timeoutMs;
+			if (!ms || ms <= 0) return waiter.promise;
+			const timer = setTimeout(() => {
+				if (pending.delete(id)) waiter.reject(new RpcError(-32000, `${method} timed out after ${ms}ms`));
+			}, ms);
+			return waiter.promise.finally(() => clearTimeout(timer));
 		},
 		notify(method, params = {}) {
 			write({ jsonrpc: "2.0", method, params });

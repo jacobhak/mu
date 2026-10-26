@@ -75,7 +75,9 @@ impl Tools {
         if let Some(jobs) = &self.jobs {
             let running = jobs.running();
             if running + specs.len() > MAX_TASKS {
-                return ToolOutput::err(format!("too many background jobs running ({running}/{MAX_TASKS}); wait for some to finish"));
+                return ToolOutput::err(format!(
+                    "too many background jobs running ({running}/{MAX_TASKS}); wait for some to finish"
+                ));
             }
             let mut started = Vec::new();
             for (name, agent, task) in &specs {
@@ -93,7 +95,13 @@ impl Tools {
         let rows = RefCell::new(
             specs
                 .iter()
-                .map(|(n, a, _)| SubagentStatus { name: n.clone(), agent: a.clone(), tools: 0, last: String::new(), state: SubagentState::Running })
+                .map(|(n, a, _)| SubagentStatus {
+                    name: n.clone(),
+                    agent: a.clone(),
+                    tools: 0,
+                    last: String::new(),
+                    state: SubagentState::Running,
+                })
                 .collect::<Vec<_>>(),
         );
         let futs = specs.iter().enumerate().map(|(i, (_, agent, task))| {
@@ -119,7 +127,9 @@ impl Tools {
             .collect::<Vec<_>>()
             .join("\n\n");
         let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
-        res.details = Some(json!({"subagents": rows.borrow().iter().map(|r| json!({"name": r.name, "agent": r.agent, "tools": r.tools})).collect::<Vec<_>>()}));
+        res.details = Some(
+            json!({"subagents": rows.borrow().iter().map(|r| json!({"name": r.name, "agent": r.agent, "tools": r.tools})).collect::<Vec<_>>()}),
+        );
         res
     }
 }
@@ -169,34 +179,60 @@ pub async fn run_child(
         }
         tail.into_iter().collect::<Vec<_>>().join("\n")
     });
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut result: Option<Value> = None;
     let mut cancelled = false;
+    let mut line: Vec<u8> = Vec::new();
     loop {
+        line.clear();
         tokio::select! {
-            l = lines.next_line() => match l {
-                Ok(Some(l)) => match serde_json::from_str::<Value>(&l) {
-                    Ok(v) if v["type"] == "tool" => on_tool(v["name"].as_str().unwrap_or(""), v["summary"].as_str().unwrap_or("")),
-                    Ok(v) if v["type"] == "result" => result = Some(v),
-                    _ => {}
-                },
-                _ => break,
+            n = stdout.read_until(b'\n', &mut line) => match n {
+                Ok(0) => break,
+                Ok(_) => {
+                    // Bytes, not `lines()`: a stray invalid UTF-8 byte must not end the read.
+                    match serde_json::from_slice::<Value>(&line) {
+                        Ok(v) if v["type"] == "tool" => on_tool(v["name"].as_str().unwrap_or(""), v["summary"].as_str().unwrap_or("")),
+                        Ok(v) if v["type"] == "result" => result = Some(v),
+                        _ => {}
+                    }
+                }
+                Err(_) => {
+                    // The pipe is broken: stop the child instead of leaving it running unobserved.
+                    if pid > 0 {
+                        tokio::task::spawn_local(crate::proc::terminate_group(pid));
+                    }
+                    break;
+                }
             },
             _ = cancel.cancelled(), if !cancelled => {
                 cancelled = true;
                 if pid > 0 {
-                    unsafe { libc::kill(-pid, libc::SIGTERM) };
+                    tokio::task::spawn_local(crate::proc::terminate_group(pid));
                 }
             }
         }
     }
-    let _ = child.wait().await;
+    // A child that ignores everything must not hang the parent: bound the wait, then kill.
+    if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await.is_err() {
+        if pid > 0 {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+    }
     let stderr_tail = err_task.await.unwrap_or_default();
     match result {
-        Some(v) => Outcome { ok: !v["isError"].as_bool().unwrap_or(false), text: v["text"].as_str().unwrap_or("").to_string() },
+        Some(v) => {
+            Outcome { ok: !v["isError"].as_bool().unwrap_or(false), text: v["text"].as_str().unwrap_or("").to_string() }
+        }
         None => Outcome {
             ok: false,
-            text: if cancelled { "cancelled".into() } else if stderr_tail.is_empty() { "subagent exited without a result".into() } else { stderr_tail },
+            text: if cancelled {
+                "cancelled".into()
+            } else if stderr_tail.is_empty() {
+                "subagent exited without a result".into()
+            } else {
+                stderr_tail
+            },
         },
     }
 }
@@ -206,6 +242,9 @@ mod schema_tests {
     #[test]
     fn schema_enum_includes_custom_agents() {
         let s = super::schema(&["x"]);
-        assert_eq!(s["properties"]["tasks"]["items"]["properties"]["agent"]["enum"], serde_json::json!(["task", "scout", "x"]));
+        assert_eq!(
+            s["properties"]["tasks"]["items"]["properties"]["agent"]["enum"],
+            serde_json::json!(["task", "scout", "x"])
+        );
     }
 }

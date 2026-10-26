@@ -36,6 +36,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
       - run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --title "$GITHUB_REF_NAME" \
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --title "$GITHUB_REF_NAME" \
             --notes "omp $(git show "$GITHUB_REF_NAME:upstream.toml" | sed -n 's/^omp = "\(.*\)"/\1/p')"
