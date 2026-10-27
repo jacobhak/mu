@@ -105,6 +105,14 @@ P
         go=0
       fi
     done <<< "$open"
+    # A bump PR for this version that was closed unmerged is a rejection: do not reopen it every night.
+    if [ "$go" = 1 ]; then
+      n="$(gh pr list -R "$REPO" --state closed --head "maint/omp-$latest" --json number,mergedAt -q '[.[] | select(.mergedAt == null)][0].number // empty')"
+      if [ -n "$n" ]; then
+        log "bump PR #$n for v$latest was closed unmerged; skipping until a newer omp release"
+        go=0
+      fi
+    fi
     if [ "$go" = 1 ]; then
       while read -r n head; do
         [ -z "$n" ] && continue
