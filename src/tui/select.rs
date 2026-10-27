@@ -19,6 +19,9 @@ fn accent_bold() -> ContentStyle {
 /// Rows the detail panel may take: a description wrapped past this ends in `…`.
 const DETAIL_MAX_LINES: usize = 4;
 
+/// Rows the title may take; a longer one ends in `…`.
+const TITLE_MAX_LINES: usize = 6;
+
 pub struct Item {
     pub label: String,
     pub detail: String,
@@ -208,9 +211,9 @@ impl Select {
     pub fn render(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
         let width = width.max(1);
         let input = if self.editing { &self.text } else { &self.filter };
-        let mut out: Vec<Line> =
-            vec![line::styled(self.title.clone(), |_| accent_bold()), line::plain(format!("› {input}"))];
-        let cursor = (1, (2 + input.width()).min(width - 1));
+        let mut out = self.title_rows(width, max_rows);
+        let cursor = (out.len(), (2 + input.width()).min(width - 1));
+        out.push(line::plain(format!("› {input}")));
 
         if self.editing {
             if out.len() < max_rows {
@@ -260,6 +263,26 @@ impl Select {
 
         let out = out.iter().map(|l| line::truncate(l, width)).collect();
         (out, cursor)
+    }
+
+    /// The title wrapped to `width`, honouring its newlines. It takes at most half of `max_rows`
+    /// (and `TITLE_MAX_LINES`) so the list keeps room; a cut title ends in `…`.
+    fn title_rows(&self, width: usize, max_rows: usize) -> Vec<Line> {
+        let cap = (max_rows / 2).clamp(1, TITLE_MAX_LINES);
+        let mut rows: Vec<Line> =
+            wrap_chs(&chs(&self.title, accent_bold()), width).iter().map(|r| chars_to_line(r)).collect();
+        if rows.is_empty() {
+            rows.push(Vec::new());
+        }
+        if rows.len() > cap {
+            rows.truncate(cap);
+            if let Some(last) = rows.last_mut() {
+                let mut row = last.clone();
+                row.push(span("…", accent_bold()));
+                *last = line::truncate(&row, width);
+            }
+        }
+        rows
     }
 
     /// The rows for the current filter, recomputed only when the filter changed.
@@ -670,5 +693,54 @@ mod tests {
         assert_eq!(t[2], "  [ ] a", "{t:?}");
         assert!(t[3].starts_with('❯') && t[3].contains("Other"), "{t:?}");
         assert!(t[4..].iter().all(|l| l.trim().is_empty()), "{t:?}");
+    }
+
+    #[test]
+    fn title_wraps_to_the_width_and_honours_newlines() {
+        let title = "Deploy?\nstatus: 3 services\nthe canary has been running for a long while now";
+        let s = Select::new(title, items(&["yes", "no"]));
+        let (lines, cur) = s.render(20, 20);
+        let t = texts(&lines);
+        assert_eq!(t[..5], ["Deploy?", "status: 3 services", "the canary has been", "running for a long", "while now"]);
+        assert_eq!(cur, (5, 2), "the cursor sits on the input row under the title");
+        assert!(t[6].starts_with("❯ yes"), "{t:?}");
+        assert!(lines.iter().all(|l| line::line_width(l) <= 20), "{t:?}");
+    }
+
+    #[test]
+    fn title_is_capped_with_an_ellipsis_and_the_list_keeps_rows() {
+        let title = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let s = Select::new(&title, items(&["yes", "no"]));
+        let (lines, cur) = s.render(30, 20);
+        let t = texts(&lines);
+        assert_eq!(cur.0, TITLE_MAX_LINES, "{t:?}");
+        assert_eq!(t[..TITLE_MAX_LINES], ["line 0", "line 1", "line 2", "line 3", "line 4", "line 5…"], "{t:?}");
+        assert!(t[TITLE_MAX_LINES + 1].starts_with("❯ yes"), "{t:?}");
+        // Short heights: the title shrinks further and the list still shows its selected row.
+        let (lines, _) = s.render(30, 3);
+        let t = texts(&lines);
+        assert_eq!(t.len(), 3, "{t:?}");
+        assert_eq!(t[0], "line 0…");
+        assert!(t[2].starts_with("❯ yes"), "{t:?}");
+        let (lines, _) = s.render(30, 4);
+        let t = texts(&lines);
+        assert_eq!(t.len(), 4, "{t:?}");
+        assert_eq!(t[1], "line 1…");
+        assert!(t[3].starts_with("❯ yes"), "{t:?}");
+    }
+
+    #[test]
+    fn title_lines_never_exceed_the_width() {
+        let title = "日本語のタイトルは幅が二倍です、長いのでいくつにも折り返されます\n\nshort\tab";
+        let s = Select::new(title, items(&["a", "b"]));
+        for width in [1, 3, 8, 20] {
+            for max_rows in [3, 4, 8, 20] {
+                let (lines, _) = s.render(width, max_rows);
+                assert!(lines.len() <= max_rows, "width {width}, rows {max_rows}: {:?}", texts(&lines));
+                for l in &lines {
+                    assert!(line::line_width(l) <= width, "width {width}: {:?}", line::line_text(l));
+                }
+            }
+        }
     }
 }

@@ -475,12 +475,38 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
             let card = Card { tone, sections: vec![Section { label: None, rows }], footer: None };
             lines.extend(frame(&card, width));
         }
+        "ask" => lines.extend(ask_rows(args, &out.text, width)),
         "task" => lines.extend(text_rows(&out.text, expanded, |l| {
             if l.starts_with("## ") { name_style() } else { tfg(Role::Muted) }
         })),
         _ => lines.extend(text_rows(&out.text, expanded, |_| tfg(Role::Muted))),
     }
     lines
+}
+
+/// An answered `ask`: each question's text, dim and wrapped, above the answer the tool returned for
+/// it (`id: answer` lines after the `User answers:` header). The model still gets only the tool text.
+fn ask_rows(args: &Value, text: &str, width: usize) -> Vec<Line> {
+    let inner = width.saturating_sub(2).max(1);
+    let mut rows = Vec::new();
+    for q in args["questions"].as_array().into_iter().flatten() {
+        let id = q["id"].as_str().unwrap_or("");
+        let question = q["question"].as_str().unwrap_or("");
+        let question = match q["header"].as_str().filter(|h| !h.is_empty()) {
+            Some(h) => format!("{h}: {question}"),
+            None => question.to_string(),
+        };
+        for r in markdown::wrap_chs(&markdown::chs(&question, line::dim()), inner) {
+            let mut row = vec![span("  ", line::dim())];
+            row.extend(markdown::chars_to_line(&r));
+            rows.push(row);
+        }
+        let prefix = format!("{id}: ");
+        if let Some(a) = text.lines().find(|l| l.starts_with(&prefix)) {
+            rows.push(truncate(&vec![span(format!("  {a}"), tfg(Role::Muted))], width));
+        }
+    }
+    rows
 }
 
 /// Viewport rows for a running tool: the bash box with its streaming tail, or a spinner header.
@@ -651,6 +677,30 @@ mod tests {
         out.meta = Some(ToolMeta::File(FileMeta { path: "local://x-plan.md".into(), tag: None, plan: true }));
         let args = json!({"path": "local://x-plan.md", "content": "a\nb\nc\n"});
         assert_eq!(texts(&tool_result("write", &args, &out, false, 60)), ["● write local://x-plan.md · 3 lines"]);
+    }
+
+    #[test]
+    fn answered_ask_shows_each_question_above_its_answer() {
+        let args = json!({"questions": [
+            {"id": "approve", "question": "Deploy the canary now?\nstatus: 3 services green", "header": "Release", "options": []},
+            {"id": "tests", "question": "Which suite?", "options": []}
+        ]});
+        let out = ToolOutput::ok("User answers:\napprove: yes\ntests: \"custom text\"");
+        let t = texts(&tool_result("ask", &args, &out, false, 24));
+        assert_eq!(
+            t[1..],
+            [
+                "  Release: Deploy the",
+                "  canary now?",
+                "  status: 3 services",
+                "  green",
+                "  approve: yes",
+                "  Which suite?",
+                "  tests: \"custom text\"",
+            ],
+            "{t:?}"
+        );
+        assert!(t.iter().all(|l| l.chars().count() <= 24), "{t:?}");
     }
 
     #[test]

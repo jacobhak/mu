@@ -323,4 +323,29 @@ mod tests {
         assert_eq!(t[6], "  ↳ apply the change now and run the", "{t:?}");
         assert_eq!(t[7], "    tests afterwards", "{t:?}");
     }
+
+    #[test]
+    fn ask_picker_shows_a_multi_line_question_in_full() {
+        let q = AskQuestion {
+            question: "Deploy the canary?\nstatus: 3 services green\nerrors: none in the last hour".into(),
+            header: None,
+            options: vec![
+                AskOption { label: "Yes".into(), description: None },
+                AskOption { label: "No".into(), description: None },
+            ],
+            multi: false,
+            recommended: None,
+        };
+        let (lines, cur) = ask_select(&q).render(30, 20);
+        let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
+        assert_eq!(
+            t[..3],
+            ["Deploy the canary?", "status: 3 services green", "errors: none in the last hour"],
+            "{t:?}"
+        );
+        assert_eq!(t[3].trim_end(), "›", "{t:?}");
+        assert_eq!(cur, (3, 2));
+        assert!(t[4].starts_with("❯ Yes"), "{t:?}");
+        assert!(lines.iter().all(|l| crate::tui::line::line_width(l) <= 30), "{t:?}");
+    }
 }
