@@ -66,18 +66,29 @@ impl TitleSource {
     }
 }
 
+/// How long `lock` keeps retrying a busy lock. A process forked while the session is open keeps
+/// a copy of the fd until it execs, so a lock released a moment ago can still look busy. A real
+/// holder keeps the lock indefinitely and is refused once this runs out.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Takes an exclusive, non-blocking `flock` that lives as long as `file`.
 fn lock(file: &File, path: &Path) -> Result<()> {
     use std::os::fd::AsRawFd;
-    // SAFETY: the fd is valid for the duration of the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let deadline = std::time::Instant::now() + LOCK_RETRY;
+    loop {
+        // SAFETY: the fd is valid for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
         let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock {
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(e).with_context(|| format!("lock {}", path.display()));
+        }
+        if std::time::Instant::now() >= deadline {
             bail!("session is open in another mu process: {}", path.display());
         }
-        return Err(e).with_context(|| format!("lock {}", path.display()));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -835,16 +846,43 @@ mod tests {
         assert!(e.contains("another mu process"), "{e}");
         let path = s.path.clone();
         drop(s);
-        // flock is released on close, but a concurrently forked child (another test
-        // spawning a process) holds a copy of the fd until it execs. Retry briefly.
-        let reopened = (0..200).find_map(|_| match SessionFile::open_append(&path) {
-            Ok(f) => Some(f),
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                None
-            }
+        assert!(SessionFile::open_append(&path).is_ok());
+    }
+
+    /// Reopen-after-drop loop, optionally racing a thread that spawns children. Run with
+    /// `MU_STRESS_SPAWN=1 MU_STRESS_N=3000 cargo test stress_reopen -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "stress harness, see the comment above"]
+    fn stress_reopen_vs_spawn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        home();
+        let n: u32 = std::env::var("MU_STRESS_N").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+        let spawn = std::env::var("MU_STRESS_SPAWN").is_ok();
+        let s = SessionFile::create(Path::new("/opt/lock"), None).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawner = spawn.then(|| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
         });
-        assert!(reopened.is_some(), "lock not released after drop");
+        let mut fails = 0;
+        for _ in 0..n {
+            match SessionFile::open_append(&path) {
+                Ok(f) => drop(f),
+                Err(_) => fails += 1,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        if let Some(h) = spawner {
+            h.join().unwrap();
+        }
+        eprintln!("STRESS spawn={spawn} n={n} fails={fails}");
+        assert_eq!(fails, 0);
     }
 
     #[test]
