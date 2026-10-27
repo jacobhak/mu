@@ -130,6 +130,9 @@ fn setup(cwd: &std::path::Path) -> Setup {
     let ctx =
         Rc::new(context::Context::load_all(cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user));
     let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    if let Err(e) = tools::edit::set_mode(&cfgs.mu.edit.mode) {
+        let _ = notice_tx.send(format!("warning: {e}"));
+    }
     for w in cfgs.warnings.iter().chain(&ctx.warnings) {
         let _ = notice_tx.send(format!("warning: {w}"));
     }

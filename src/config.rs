@@ -166,6 +166,14 @@ pub struct MuConfig {
     pub predict: MuPredict,
     pub theme: MuTheme,
     pub update: MuUpdate,
+    pub edit: MuEdit,
+}
+
+/// `[edit]`: `mode = "hashline"` (default) or `"sloppy"` (find/replace by text, no tags).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MuEdit {
+    pub mode: String,
 }
 
 /// `[update]`: `check = false` turns off the daily release check at startup.
@@ -370,6 +378,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         predict: parse(section("predict"), "predict", warn),
         theme: parse(section("theme"), "theme", warn),
         update: parse(section("update"), "update", warn),
+        edit: parse(section("edit"), "edit", warn),
     }
 }
 

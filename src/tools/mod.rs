@@ -1,7 +1,7 @@
 mod ask;
 mod bash;
 mod diff;
-mod edit;
+pub mod edit;
 mod glob;
 pub mod grep;
 mod plan;
@@ -261,7 +261,7 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| {
             tool_def(
                 "read",
-                READ_DESC,
+                read_desc(),
                 json!({"type":"object","properties":{
                     "path":{"type":"string","description":"File or directory path, optionally with a selector suffix"}},"required":["path"]}),
             )
@@ -273,7 +273,11 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| {
             tool_def(
                 "write",
-                "Create a file or replace it entirely. Creates parent directories. Returns a `[path#TAG]` header usable by `edit`.",
+                if edit::is_hashline() {
+                    "Create a file or replace it entirely. Creates parent directories. Returns a `[path#TAG]` header usable by `edit`."
+                } else {
+                    "Create a file or replace it entirely. Creates parent directories."
+                },
                 json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
             )
         }),
@@ -284,7 +288,7 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| {
             tool_def(
                 "edit",
-                pi_edit::description(pi_edit::EditMode::Hashline),
+                pi_edit::description(edit::mode()),
                 json!({"type":"object","properties":{
                     "input":{"type":"string","description":"The edit payload, in the format described above"}},"required":["input"]}),
             )
@@ -355,6 +359,12 @@ pub static BUILTINS: &[Builtin] = &[
 pub fn is_builtin(name: &str) -> bool {
     BUILTINS.iter().any(|b| b.name == name)
 }
+
+fn read_desc() -> &'static str {
+    if edit::is_hashline() { READ_DESC } else { READ_DESC_PLAIN }
+}
+
+const READ_DESC_PLAIN: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows, where `N:` is a line number and not part of the file. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
 
 const READ_DESC: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows under a `[path#TAG]` header; the header and line numbers are what `edit` anchors on. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
 

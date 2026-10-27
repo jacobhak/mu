@@ -13,6 +13,29 @@ pub struct Args {
     input: String,
 }
 
+static MODE: std::sync::OnceLock<EditMode> = std::sync::OnceLock::new();
+
+/// Set the edit format once at startup from `[edit] mode` (`MU_EDIT_MODE` overrides). Only the
+/// formats that take a single `input` string are offered: `hashline` (default) and `sloppy`.
+pub fn set_mode(configured: &str) -> Result<(), String> {
+    let name = std::env::var("MU_EDIT_MODE").unwrap_or_else(|_| configured.to_string());
+    let m = match name.trim() {
+        "" | "hashline" => EditMode::Hashline,
+        "sloppy" => EditMode::Sloppy,
+        other => return Err(format!("unknown edit mode {other:?}; use \"hashline\" or \"sloppy\"")),
+    };
+    let _ = MODE.set(m);
+    Ok(())
+}
+
+pub fn mode() -> EditMode {
+    *MODE.get().unwrap_or(&EditMode::Hashline)
+}
+
+pub fn is_hashline() -> bool {
+    mode() == EditMode::Hashline
+}
+
 struct FsWriter;
 
 fn werr(e: impl std::fmt::Display) -> EditError {
@@ -59,7 +82,7 @@ impl Tools {
             block_auto_generated: true,
         };
         let cfg = SessionConfig {
-            mode: EditMode::Hashline,
+            mode: mode(),
             policy,
             allow_fuzzy: true,
             fuzzy_threshold: 0.95,

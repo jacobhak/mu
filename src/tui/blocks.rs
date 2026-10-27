@@ -76,7 +76,10 @@ fn summary(name: &str, args: &Value, meta: Option<&ToolMeta>) -> String {
     }
     if name == "edit" {
         let first = args["input"].as_str().and_then(|s| s.lines().next()).unwrap_or("");
-        let path = first.strip_prefix('[').unwrap_or(first).split(['#', ']']).next().unwrap_or("").trim();
+        let path = match first.strip_prefix("*** Edit File:") {
+            Some(p) => p.trim().trim_end_matches(" all").trim_matches('"'),
+            None => first.strip_prefix('[').unwrap_or(first).split(['#', ']']).next().unwrap_or("").trim(),
+        };
         if !path.is_empty() {
             return path.to_string();
         }
@@ -547,7 +550,7 @@ pub fn tool_streaming(name: &str, args: &Value, spin: char, width: usize) -> Vec
         let style = if name == "edit" {
             if l.starts_with('+') {
                 tfg(Role::Ok)
-            } else if l.starts_with("PUT") || l.starts_with("CUT") || l.starts_with('[') {
+            } else if l.starts_with("PUT") || l.starts_with("CUT") || l.starts_with('[') || l.starts_with("***") {
                 tfg(Role::Strong)
             } else {
                 tfg(Role::Muted)
