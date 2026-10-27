@@ -247,7 +247,8 @@ impl Agent {
         if self.title.is_some() || self.title_requested {
             return;
         }
-        let Some(Message::User { content, .. }) = self.messages.iter().find(|m| matches!(m, Message::User { .. }))
+        let Some(Message::User { content, .. }) =
+            self.messages.iter().find(|m| matches!(m, Message::User { synthetic: false, .. }))
         else {
             return;
         };

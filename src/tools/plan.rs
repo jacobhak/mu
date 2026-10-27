@@ -31,8 +31,8 @@ impl Tools {
             };
         let (tx, rx) = oneshot::channel();
         let _ = ctx.events.send(AgentEvent::PlanReview {
-            title: a.title,
-            uri,
+            title: a.title.clone(),
+            uri: uri.clone(),
             file: path.clone(),
             content: content.clone(),
             reply: tx,
@@ -46,11 +46,14 @@ impl Tools {
             },
         };
         let content = std::fs::read_to_string(&path).unwrap_or(content);
+        let title = a.title;
         let approved = |text: &str, kind: &str, model: Option<String>, with_content: bool| {
             let mut o = ToolOutput::ok(text);
             let mut d = json!({"planDecision": kind, "model": model});
             if with_content {
                 d["content"] = json!(content);
+                d["title"] = json!(title);
+                d["uri"] = json!(uri);
             }
             o.details = Some(d);
             o

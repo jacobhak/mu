@@ -195,8 +195,11 @@ mod tests {
         // Requests read the bytes back.
         assert_eq!(resolve(&img.data).unwrap(), STANDARD.encode(&png));
         // A session file written with it stays small and still parses.
-        let msg =
-            crate::message::Message::User { content: vec![crate::message::Block::Image(img.clone())], timestamp: 0 };
+        let msg = crate::message::Message::User {
+            content: vec![crate::message::Block::Image(img.clone())],
+            timestamp: 0,
+            synthetic: false,
+        };
         let line = serde_json::to_string(&msg).unwrap();
         assert!(line.len() < 300, "{}", line.len());
         // Inline data from older sessions passes through, and a missing blob is reported, not sent.

@@ -85,6 +85,9 @@ pub enum Message {
         #[serde(deserialize_with = "blocks_or_string")]
         content: Vec<Block>,
         timestamp: i64,
+        /// Sent by mu itself (an approved plan), not typed by the user; the UI does not echo it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        synthetic: bool,
     },
     #[serde(rename = "assistant", rename_all = "camelCase")]
     Assistant {
@@ -196,7 +199,12 @@ impl Block {
 
 impl Message {
     pub fn user(text: &str) -> Self {
-        Message::User { content: vec![Block::text(text)], timestamp: now_ms() }
+        Message::User { content: vec![Block::text(text)], timestamp: now_ms(), synthetic: false }
+    }
+
+    /// A user-role message the user did not type and the transcript does not echo.
+    pub fn synthetic_user(text: &str) -> Self {
+        Message::User { content: vec![Block::text(text)], timestamp: now_ms(), synthetic: true }
     }
 
     /// A user message: the text, then one image block per attachment.
@@ -204,7 +212,7 @@ impl Message {
         // An image-only prompt has no text block: the API rejects empty ones.
         let text = (!i.text.is_empty() || i.images.is_empty()).then(|| Block::text(i.text.as_str()));
         let content = text.into_iter().chain(i.images.iter().cloned().map(Block::Image)).collect();
-        Message::User { content, timestamp: now_ms() }
+        Message::User { content, timestamp: now_ms(), synthetic: false }
     }
 
     /// Token estimate of what this message adds to a request: about 4 bytes per token over its
@@ -413,6 +421,7 @@ mod estimate_tests {
                 Block::Image(Image { data: "A".repeat(1_000_000), mime_type: "image/png".into() }),
             ],
             timestamp: 0,
+            synthetic: false,
         };
         let est = with_image.estimate_tokens();
         assert!((1600..1700).contains(&est), "a flat 1600 for the image, its bytes not counted: {est}");

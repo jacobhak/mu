@@ -87,8 +87,23 @@ pub struct PlanState {
 
 struct ExecPlan {
     content: String,
+    title: String,
+    /// `local://<slug>-plan.md`
+    uri: String,
     compact: bool,
     model: Option<String>,
+}
+
+const PLAN_APPROVED: &str = include_str!("prompts/plan-approved.md");
+
+/// The hidden prompt that starts executing an approved plan.
+fn plan_prompt(p: &ExecPlan) -> String {
+    let context = if p.compact {
+        "- History usable; the plan below authoritative if it conflicts with earlier exploration.\n"
+    } else {
+        ""
+    };
+    PLAN_APPROVED.replace("{{context}}", context).replace("{{path}}", &p.uri).replace("{{plan}}", p.content.trim_end())
 }
 
 const PLAN_COMPACT_FOCUS: &str = "The user approved an implementation plan; it will be supplied in full right after this summary. Preserve what implementing it needs: decisions, constraints, file paths, symbols, and findings from exploration. Omit the plan text itself.";
@@ -566,6 +581,7 @@ impl Agent {
     fn replay_history(&self) {
         for m in &self.messages {
             match m {
+                Message::User { synthetic: true, .. } => self.notice("▸ Plan approved"),
                 Message::User { content, .. } => self.emit(AgentEvent::UserPrompt(text_of(content))),
                 Message::Assistant { content, .. } => {
                     for b in content {
@@ -758,6 +774,28 @@ impl Agent {
         self.emit(AgentEvent::Exit);
     }
 
+    /// Gives a fresh session the approved plan as a `local://` file, so the path in the execution
+    /// prompt resolves, and names the session after the plan.
+    fn seed_plan(&mut self, p: &ExecPlan) {
+        match self.tools.resolve(&p.uri) {
+            Ok(r) => {
+                if let Err(e) = std::fs::create_dir_all(r.path.parent().unwrap_or(&r.path))
+                    .and_then(|_| std::fs::write(&r.path, &p.content))
+                {
+                    self.error(format!("cannot copy the plan to {}: {e}", p.uri));
+                }
+            }
+            Err(e) => self.error(format!("cannot copy the plan to {}: {e}", p.uri)),
+        }
+        if self.title.is_none() && !p.title.trim().is_empty() {
+            if let Some(s) = self.session.as_mut() {
+                s.set_title(&p.title, session::TitleSource::Auto);
+            }
+            self.title = Some(p.title.clone());
+            self.emit_status();
+        }
+    }
+
     fn apply_title(&mut self, sid: &str, t: String) {
         if self.session_id() != sid || self.title.is_some() {
             return;
@@ -815,13 +853,16 @@ impl Agent {
         self.emit(AgentEvent::TurnStart);
         let mut next = Some(first);
         let mut aborted = false;
+        let mut synthetic = false;
         while let Some(input) = next.take() {
             if !self.ensure_session().await {
                 break;
             }
             let extra = match &input {
                 Some(i) => {
-                    self.emit(AgentEvent::UserPrompt(i.text.clone()));
+                    if !synthetic {
+                        self.emit(AgentEvent::UserPrompt(i.text.clone()));
+                    }
                     self.user_turn += 1;
                     let res = self
                         .plugins
@@ -842,11 +883,13 @@ impl Agent {
                 self.error(format!("compaction failed: {e}"));
             }
             match &input {
+                Some(i) if synthetic => self.push(Message::synthetic_user(&i.text)),
                 Some(i) => self.push(Message::user_input(i)),
                 None => {
                     self.take_jobs();
                 }
             }
+            synthetic = false;
             match self.run_loop(&cancel).await {
                 Flow::Aborted => {
                     aborted = true;
@@ -882,8 +925,13 @@ impl Agent {
                     self.end_session().await;
                     self.reset_conversation();
                     self.notice("── new session");
+                    if self.ensure_session().await {
+                        self.seed_plan(&p);
+                    }
                 }
-                next = Some(Some(format!("Execute this plan:\n\n{}", p.content).into()));
+                self.notice(format!("▸ Plan approved: {}", p.title));
+                synthetic = true;
+                next = Some(Some(plan_prompt(&p).into()));
                 continue;
             }
             next = self.inbox.borrow_mut().follow_up.pop_front().map(Some);
@@ -1134,6 +1182,8 @@ impl Agent {
                 Some(k @ ("execute" | "compact")) => {
                     self.exec_plan = Some(ExecPlan {
                         content: d["content"].as_str().unwrap_or_default().into(),
+                        title: d["title"].as_str().unwrap_or_default().into(),
+                        uri: d["uri"].as_str().unwrap_or_default().into(),
                         compact: k == "compact",
                         model,
                     });
@@ -1268,10 +1318,30 @@ mod loop_tests {
     }
 
     #[test]
+    fn plan_prompt_inlines_plan_and_path() {
+        let p = ExecPlan {
+            content: "do it\n".into(),
+            title: "T".into(),
+            uri: "local://t-plan.md".into(),
+            compact: true,
+            model: None,
+        };
+        let s = plan_prompt(&p);
+        assert!(s.contains("<plan path=\"local://t-plan.md\">\ndo it\n</plan>") && s.contains("History usable"));
+        assert!(!s.contains("{{"));
+    }
+
+    #[test]
     fn failed_turn_clears_stale_exec_plan() {
         run(async {
             let (mut a, _rx) = agent(vec![Err(ProviderError::Fatal("nope".into()))]);
-            a.exec_plan = Some(ExecPlan { content: "plan".into(), compact: false, model: None });
+            a.exec_plan = Some(ExecPlan {
+                content: "plan".into(),
+                title: String::new(),
+                uri: String::new(),
+                compact: false,
+                model: None,
+            });
             a.turn(Some("go".to_string().into())).await;
             assert!(a.exec_plan.is_none());
         });
