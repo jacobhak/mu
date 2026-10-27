@@ -4,7 +4,7 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +23,7 @@ struct T {
     name: Option<String>,
     task: String,
     agent: Option<String>,
+    cwd: Option<String>,
 }
 
 macro_rules! guidance {
@@ -31,10 +32,13 @@ macro_rules! guidance {
     };
 }
 
-pub const DESCRIPTION: &str = concat!("Run subagents in parallel and wait for all of them.", guidance!());
+pub const DESCRIPTION: &str = concat!(
+    "Run subagents in parallel and wait for all of them. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
+    guidance!()
+);
 
 pub const ASYNC_DESCRIPTION: &str = concat!(
-    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message: keep working, never poll, and call `wait` only when blocked with nothing else to do.",
+    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message: keep working, never poll, and call `wait` only when blocked with nothing else to do. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
     guidance!()
 );
 
@@ -46,11 +50,25 @@ pub fn schema(names: &[&str]) -> Value {
         "tasks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{
             "name":{"type":"string"},
             "task":{"type":"string"},
-            "agent":{"type":"string","enum":agents}},"required":["task"]}}},"required":["tasks"]})
+            "agent":{"type":"string","enum":agents},
+            "cwd":{"type":"string","description":"absolute path of an existing directory the task runs in (e.g. a git worktree); defaults to this session's directory"}},"required":["task"]}}},"required":["tasks"]})
 }
 
 pub fn depth() -> u32 {
     std::env::var("MU_TASK_DEPTH").ok().and_then(|d| d.parse().ok()).unwrap_or(0)
+}
+
+/// The directory a task runs in: its `cwd` when given (absolute and existing), else `default`.
+fn resolve_cwd(raw: Option<&str>, default: &Path) -> Result<PathBuf, String> {
+    let Some(raw) = raw else { return Ok(default.to_path_buf()) };
+    let p = Path::new(raw);
+    if !p.is_absolute() {
+        return Err(format!("task: cwd must be an absolute path: {raw}"));
+    }
+    if !p.is_dir() {
+        return Err(format!("task: cwd does not exist or is not a directory: {raw}"));
+    }
+    Ok(p.to_path_buf())
 }
 
 pub struct Outcome {
@@ -64,16 +82,21 @@ impl Tools {
             return ToolOutput::err("task: provide 1-8 tasks");
         }
         let plan = self.plan.get();
-        // (name, agent, task)
-        let specs: Vec<(String, String, String)> = a
+        // (name, agent, task, cwd)
+        let specs: Vec<(String, String, String, PathBuf)> = match a
             .tasks
             .iter()
             .enumerate()
-            .map(|(i, t)| {
+            .map(|(i, t)| -> Result<_, String> {
                 let agent = if plan { "scout" } else { t.agent.as_deref().unwrap_or("task") };
-                (t.name.clone().unwrap_or_else(|| format!("Task{}", i + 1)), agent.to_string(), t.task.clone())
+                let cwd = resolve_cwd(t.cwd.as_deref(), &self.cwd)?;
+                Ok((t.name.clone().unwrap_or_else(|| format!("Task{}", i + 1)), agent.to_string(), t.task.clone(), cwd))
             })
-            .collect();
+            .collect::<Result<_, String>>()
+        {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::err(e),
+        };
         let parent = self.session_path.borrow().clone();
         let exe = match mu_common::paths::self_exe() {
             Ok(e) => e,
@@ -89,9 +112,9 @@ impl Tools {
                 ));
             }
             let mut started = Vec::new();
-            for (name, agent, task) in &specs {
+            for (name, agent, task, cwd) in &specs {
                 let id = jobs.unique_id(name);
-                jobs.spawn(id.clone(), agent.clone(), exe.clone(), self.cwd.clone(), payload(agent, task));
+                jobs.spawn(id.clone(), agent.clone(), exe.clone(), cwd.clone(), payload(agent, task));
                 started.push(format!("{id} ({agent})"));
             }
             return ToolOutput::ok(format!(
@@ -104,7 +127,7 @@ impl Tools {
         let rows = RefCell::new(
             specs
                 .iter()
-                .map(|(n, a, _)| SubagentStatus {
+                .map(|(n, a, _, _)| SubagentStatus {
                     name: n.clone(),
                     agent: a.clone(),
                     tools: 0,
@@ -113,11 +136,11 @@ impl Tools {
                 })
                 .collect::<Vec<_>>(),
         );
-        let futs = specs.iter().enumerate().map(|(i, (_, agent, task))| {
+        let futs = specs.iter().enumerate().map(|(i, (_, agent, task, cwd))| {
             let (rows, exe) = (&rows, &exe);
             let payload = payload(agent, task);
             async move {
-                let out = run_child(exe, &self.cwd, &payload, &ctx.cancel, |name, summary| {
+                let out = run_child(exe, cwd, &payload, &ctx.cancel, |name, summary| {
                     let mut r = rows.borrow_mut();
                     r[i].tools += 1;
                     r[i].last = format!("{name} {summary}");
@@ -132,7 +155,7 @@ impl Tools {
         let text = specs
             .iter()
             .zip(&outs)
-            .map(|((n, a, _), o)| format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, o.text))
+            .map(|((n, a, _, _), o)| format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, o.text))
             .collect::<Vec<_>>()
             .join("\n\n");
         let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
@@ -255,5 +278,43 @@ mod schema_tests {
             s["properties"]["tasks"]["items"]["properties"]["agent"]["enum"],
             serde_json::json!(["task", "scout", "x"])
         );
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    #[test]
+    fn schema_accepts_an_optional_cwd_per_task() {
+        let s = schema(&[]);
+        assert_eq!(s["properties"]["tasks"]["items"]["properties"]["cwd"]["type"], "string");
+        assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task"]));
+    }
+
+    #[test]
+    fn resolve_cwd_defaults_and_rejects_relative_or_missing_paths() {
+        let d = std::env::temp_dir();
+        assert_eq!(resolve_cwd(None, &d).unwrap(), d);
+        assert_eq!(resolve_cwd(d.to_str(), Path::new("/")).unwrap(), d);
+        assert!(resolve_cwd(Some("relative/dir"), &d).unwrap_err().contains("absolute"));
+        assert!(resolve_cwd(Some("/definitely/not/a/dir-mu"), &d).unwrap_err().contains("does not exist"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_runs_in_the_given_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-cwd-{}", std::process::id()));
+        let dir = base.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, "#!/bin/sh\nprintf '{\"type\":\"result\",\"text\":\"%s\"}\\n' \"$(pwd -P)\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = tokio::task::LocalSet::new()
+            .run_until(run_child(&exe, &dir, &json!({}), &CancellationToken::new(), |_, _| {}))
+            .await;
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text, dir.canonicalize().unwrap().display().to_string());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
