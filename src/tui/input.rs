@@ -83,7 +83,11 @@ impl Reader {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `raw` is a freshly opened descriptor that nothing else owns, and `OwnedFd` keeps it open.
-        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        Self::from_fd(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+
+    fn from_fd(owned: OwnedFd) -> io::Result<Self> {
+        let raw = owned.as_raw_fd();
         // MU_INPUT_SELECT forces the select backend, so it can be tested on Linux.
         let src = if cfg!(target_os = "macos") || std::env::var_os("MU_INPUT_SELECT").is_some() {
             let (rtx, ready) = tokio::sync::mpsc::unbounded_channel();
@@ -103,36 +107,29 @@ impl Reader {
         })
     }
 
-    fn consume(&mut self, bytes: &[u8]) {
-        let inputs = self.parser.feed(bytes);
-        self.queue.extend(self.parser.take_writes().into_iter().map(Input::Reply));
-        self.queue.extend(inputs);
+    fn consume(parser: &mut Parser, queue: &mut VecDeque<Input>, bytes: &[u8]) {
+        let inputs = parser.feed(bytes);
+        queue.extend(parser.take_writes().into_iter().map(Input::Reply));
+        queue.extend(inputs);
     }
 
-    /// The next input, or `None` when the terminal closed.
+    /// The next input, or `None` when the terminal closed. Cancel-safe: the caller's `select!`
+    /// drops this future whenever another branch wins, so the read buffer must stay in `self`.
     pub async fn next(&mut self) -> Option<Input> {
-        let mut buf = std::mem::take(&mut self.buf);
-        let r = self.next_with(&mut buf).await;
-        self.buf = buf;
-        r
-    }
-
-    async fn next_with(&mut self, buf: &mut [u8]) -> Option<Input> {
         loop {
             if let Some(i) = self.queue.pop_front() {
                 return Some(i);
             }
-            let winch = &mut self.winch;
-            match &mut self.src {
+            let Self { src, parser, winch, queue, buf } = self;
+            match src {
                 Source::Async(fd) => {
                     tokio::select! {
-                        _ = winch.recv() => push_resize(&mut self.queue),
+                        _ = winch.recv() => push_resize(queue),
                         ready = fd.readable() => {
                             let mut guard = ready.ok()?;
-                            let res = guard.try_io(|fd| read_fd(fd.as_raw_fd(), buf));
-                            match res {
+                            match guard.try_io(|fd| read_fd(fd.as_raw_fd(), buf)) {
                                 Ok(Ok(0)) => return None,
-                                Ok(Ok(n)) => self.consume(&buf[..n]),
+                                Ok(Ok(n)) => Self::consume(parser, queue, &buf[..n]),
                                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
                                 Ok(Err(_)) => return None,
                                 // Spurious readiness: `try_io` cleared it.
@@ -143,7 +140,7 @@ impl Reader {
                 }
                 Source::Select { fd, ready, ack } => {
                     tokio::select! {
-                        _ = winch.recv() => push_resize(&mut self.queue),
+                        _ = winch.recv() => push_resize(queue),
                         got = ready.recv() => {
                             got?;
                             let raw = fd.as_raw_fd();
@@ -159,7 +156,7 @@ impl Reader {
                             }
                             let _ = ack.send(());
                             for c in chunks {
-                                self.consume(&c);
+                                Self::consume(parser, queue, &c);
                             }
                         }
                     }
@@ -467,6 +464,25 @@ impl Paste5522 {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// The app's `select!` drops `next()` whenever another branch wins; input must survive that.
+    #[tokio::test]
+    async fn next_survives_cancellation() {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe2 writes.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors are fresh and owned here.
+        let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let mut reader = Reader::from_fd(rd).unwrap();
+        for _ in 0..3 {
+            let idle = tokio::time::timeout(std::time::Duration::from_millis(20), reader.next()).await;
+            assert!(idle.is_err(), "no input yet, so next() must still be pending");
+        }
+        // SAFETY: `wr` is a valid pipe write end.
+        assert_eq!(unsafe { libc::write(wr.as_raw_fd(), b"a".as_ptr().cast(), 1) }, 1);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next()).await.unwrap();
+        assert!(matches!(got, Some(Input::Term(Event::Key(k))) if k.code == KeyCode::Char('a')), "keypress after cancelled polls");
+    }
 
     fn key(c: KeyCode) -> Input {
         Input::Term(Event::Key(KeyEvent::new(c, KeyModifiers::NONE)))
