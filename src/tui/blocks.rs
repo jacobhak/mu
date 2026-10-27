@@ -45,14 +45,15 @@ fn styled_text(l: &str, style: ContentStyle) -> Line {
 }
 
 /// `user` block: a full-width lifted band, an accent bar on every row, the prompt rendered as
-/// markdown, and one padding row above and below.
+/// markdown, and one padding row above and below. A skill invocation shows as one header row
+/// instead of its expanded body (see `skill_call`).
 pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
     let bg = tbg(Role::Raised);
     let inner = width.saturating_sub(1).max(1);
     let bar = || span("▎", with_bg(tfg(Role::Accent), bg));
     let blank = || fill(&vec![bar()], width, bg);
     let mut out = vec![blank()];
-    for l in markdown::render(text, inner) {
+    for l in prompt_rows(text, inner) {
         let mut row = vec![bar()];
         row.extend(l.into_iter().map(|mut s| {
             if s.style.foreground_color.is_none() {
@@ -64,6 +65,65 @@ pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
     }
     out.push(blank());
     out
+}
+
+/// The rows of a user prompt's text, before the band is drawn around them.
+fn prompt_rows(text: &str, inner: usize) -> Vec<Line> {
+    let Some(call) = skill_call(text) else {
+        return markdown::render(text, inner);
+    };
+    let home = std::env::var("HOME").ok();
+    let head = vec![
+        span(format!("/skill:{}", call.name), name_style()),
+        span(format!(" · {}", tilde(call.path, home.as_deref())), tfg(Role::Faint)),
+    ];
+    let mut rows = vec![truncate(&head, inner)];
+    if !call.args.is_empty() {
+        rows.extend(markdown::render(call.args, inner));
+    }
+    rows
+}
+
+/// A `/skill:` invocation as `Context::skill_prompt` expands it: the envelope, then the user's args.
+#[derive(Debug, PartialEq)]
+pub struct SkillCall<'a> {
+    pub name: &'a str,
+    pub path: &'a str,
+    pub args: &'a str,
+}
+
+/// Parses `<skill name="N" path="P">\n<body>\n</skill>` with optional `\n\n<args>` after it.
+/// The path may contain quotes, since the writer does not escape it. The body ends at the first
+/// `\n</skill>` that is followed by the end of the text or by the blank line before the args.
+/// `None` for any other text, which then shows as it is.
+pub fn skill_call(text: &str) -> Option<SkillCall<'_>> {
+    const CLOSE: &str = "\n</skill>";
+    let rest = text.strip_prefix("<skill name=\"")?;
+    let (name, rest) = rest.split_once("\" path=\"")?;
+    let (path, rest) = rest.split_once("\">\n")?;
+    if name.is_empty() || path.is_empty() {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(i) = rest[from..].find(CLOSE) {
+        let after = &rest[from + i + CLOSE.len()..];
+        if after.is_empty() {
+            return Some(SkillCall { name, path, args: "" });
+        }
+        if let Some(args) = after.strip_prefix("\n\n").map(str::trim).filter(|a| !a.is_empty()) {
+            return Some(SkillCall { name, path, args });
+        }
+        from += i + 1;
+    }
+    None
+}
+
+/// `p` with the home directory written as `~`.
+fn tilde(p: &str, home: Option<&str>) -> String {
+    match home.filter(|h| !h.is_empty()).and_then(|h| p.strip_prefix(h)) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => p.to_string(),
+    }
 }
 
 fn name_style() -> ContentStyle {
@@ -714,6 +774,80 @@ mod tests {
         let row = text_of(&l[1]);
         assert!(row.starts_with("▎use x and l (http://u)"), "{row}");
         assert!(!row.contains('`'));
+    }
+
+    #[test]
+    fn skill_call_parses_envelope() {
+        let text = "<skill name=\"steward\" path=\"/x/SKILL.md\">\n# Body\n\nmore\n</skill>";
+        assert_eq!(skill_call(text), Some(SkillCall { name: "steward", path: "/x/SKILL.md", args: "" }));
+        let with_args = format!("{text}\n\nnext keyboard");
+        assert_eq!(
+            skill_call(&with_args),
+            Some(SkillCall { name: "steward", path: "/x/SKILL.md", args: "next keyboard" })
+        );
+    }
+
+    #[test]
+    fn skill_call_handles_odd_paths_and_bodies() {
+        let quoted = "<skill name=\"a\" path=\"/tmp/my \"odd\" dir/SKILL.md\">\nbody\n</skill>\n\ngo \"now\"";
+        assert_eq!(
+            skill_call(quoted),
+            Some(SkillCall { name: "a", path: "/tmp/my \"odd\" dir/SKILL.md", args: "go \"now\"" })
+        );
+        // A closer inside the body that is not at the end of the text does not end the body.
+        let nested = "<skill name=\"n\" path=\"/p\">\nx\n</skill>\ny\n</skill>\n\nargs";
+        assert_eq!(skill_call(nested), Some(SkillCall { name: "n", path: "/p", args: "args" }));
+    }
+
+    #[test]
+    fn skill_call_rejects_other_text() {
+        for text in [
+            "plain prompt",
+            "<skill name=\"x\">\nbody\n</skill>",
+            "<skill name=\"\" path=\"/p\">\nbody\n</skill>",
+            "<skill name=\"x\" path=\"/p\">\nbody",
+            "<skill name=\"x\" path=\"/p\">\nbody\n</skill>tail",
+            "<skill name=\"x\" path=\"/p\">\nbody\n</skill>\n\n   ",
+        ] {
+            assert_eq!(skill_call(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn tilde_abbreviates_home_only_at_a_boundary() {
+        assert_eq!(tilde("/home/u/.agents/s", Some("/home/u")), "~/.agents/s");
+        assert_eq!(tilde("/home/user2/s", Some("/home/u")), "/home/user2/s");
+        assert_eq!(tilde("/opt/s", None), "/opt/s");
+    }
+
+    #[test]
+    fn skill_invocation_renders_one_header_and_args() {
+        let body: String = (0..40).map(|i| format!("step {i}\n")).collect();
+        let text =
+            format!("<skill name=\"steward\" path=\"/opt/sk/steward/SKILL.md\">\n{body}</skill>\n\nnext keyboard");
+        let l = user_prompt(&text, 60);
+        let rows: Vec<String> = l.iter().map(text_of).collect();
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows[1].starts_with("▎/skill:steward · /opt/sk/steward/SKILL.md"), "{rows:?}");
+        assert!(rows[2].starts_with("▎next keyboard"), "{rows:?}");
+        assert!(l.iter().all(|r| line::line_width(r) == 60));
+        assert!(!rows.iter().any(|r| r.contains("step")));
+    }
+
+    #[test]
+    fn skill_invocation_without_args_is_one_header() {
+        let text = "<skill name=\"steward\" path=\"/opt/s/SKILL.md\">\nbody\n</skill>";
+        let rows: Vec<String> = user_prompt(text, 60).iter().map(text_of).collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[1].starts_with("▎/skill:steward"));
+    }
+
+    #[test]
+    fn skill_header_truncates_to_the_band() {
+        let text = "<skill name=\"s\" path=\"/opt/a/very/long/path/that/keeps/going/SKILL.md\">\nb\n</skill>";
+        let l = user_prompt(text, 30);
+        assert_eq!(l.len(), 3);
+        assert!(l.iter().all(|r| line::line_width(r) == 30));
     }
 
     fn unicode_width_of(l: &str) -> usize {
