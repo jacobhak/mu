@@ -322,6 +322,7 @@ impl SlashCommand {
     }
 }
 
+#[derive(Default)]
 pub struct Context {
     /// Problems found while loading (bad front matter); shown as notices at startup.
     pub warnings: Vec<String>,
@@ -380,11 +381,30 @@ pub fn system_prompt(i: &PromptInput) -> String {
     static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let os = OS.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
     let date = jiff::Zoned::now().strftime("%Y-%m-%d");
+    let edit_rule = if crate::tools::edit::is_hashline() {
+        "- Surgical edits: `edit`, with the `[path#TAG]` header from your latest `read`, `write` or `edit` of that file. Every edit changes the tag and shifts line numbers: put all changes to one file in a single call, or re-read the affected window before editing it again.\n"
+    } else {
+        "- Surgical edits: `edit`. Copy `*** Find` text verbatim from a recent `read`, and give each `*** Find` exactly one of `*** Replace`, `*** Insert Before` or `*** Insert After`.\n"
+    };
     let mut s = format!(
         "You are mu, a coding agent running in the user's terminal. Work in the current directory with the provided tools.\n\
-- Read a file before editing it. Edit with `edit`, using the `[path#TAG]` header from your latest read, write or edit of that file.\n\
-- Use `write` only to create a file or replace it entirely.\n\
-- Search with `grep` and `glob` rather than `bash`.\n\
+RFC 2119 keywords: MUST, SHOULD, MAY. `NEVER` = `MUST NOT`.\n\n\
+# Tool policy\n\
+MUST use the specialized tool over its shell equivalent:\n\
+- File and directory reads: `read` (a directory lists its entries). Use selector ranges, not whole files. NEVER `cat`, `head`, `tail`, `sed -n`, `awk`, `ls` or Python to read.\n\
+{edit_rule}\
+- Create or overwrite a file: `write`. Use it only for new files or complete rewrites.\n\
+- Content search: `grep`, NEVER shell `grep`/`rg`/`awk`. File names and structure: `glob`, NEVER `find`/`fd`/`ls **/*.ext`.\n\
+- `bash`: real binaries (builds, tests, git, package managers) and short fact pipelines such as counts or checksums. NEVER specialized-tool work, and NEVER paging, moving or trimming bytes you could `read`.\n\
+<critical>\n\
+NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `bash` to change files, singly or in bulk; MUST use `edit` or `write`. If `edit` fails, read its error, fix the payload and retry with `edit`. A failed edit is NEVER a reason to switch to the shell.\n\
+</critical>\n\n\
+# Editing\n\
+- Read the relevant sections before editing; reuse existing patterns rather than starting a second convention.\n\
+- After a tool failure, or if a file may have changed, re-read before acting.\n\
+- Touch only the lines the task needs; NEVER restyle unrelated code.\n\
+- Resolve prerequisites first and parallelize independent calls. NEVER open guessed files.\n\
+- Tool results are verification: NEVER re-read a file just to check an applied edit.\n\
 - Be concise; the user sees each tool call.\n\n\
 <workstation>\n- OS: {}\n- Arch: {}\n- Model: {}\n- Date: {date}\n- Working directory: {}\n</workstation>\n",
         format!("{} {}", std::env::consts::OS, os.trim()).trim_end(),
@@ -486,6 +506,21 @@ mod tests {
         });
         assert!(sp.contains("- alpha: first\n") && !sp.contains("- hid:") && sp.contains("<rules>\nuser rule"));
         assert!(ctx.skill_prompt("alpha", "go").unwrap().ends_with("body A\n</skill>\n\ngo"));
+    }
+
+    #[test]
+    fn system_prompt_forbids_shell_file_edits_and_tracks_edit_mode() {
+        let sp = system_prompt(&PromptInput {
+            model: "m",
+            cwd: Path::new("/tmp"),
+            ctx: &Context::default(),
+            plan: None,
+            subagent: false,
+            agent_prompt: None,
+            plugin_ctx: &Default::default(),
+        });
+        assert!(sp.contains("NEVER use `sed`, `perl`") && sp.contains("NEVER `cat`"));
+        assert!(sp.contains("[path#TAG]") && !sp.contains("*** Find"));
     }
 
     #[test]
