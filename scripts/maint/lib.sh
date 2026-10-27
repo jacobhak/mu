@@ -119,3 +119,15 @@ on_err() {
   exit "$rc"
 }
 trap on_err ERR
+# systemd kills a run that outlives TimeoutStartSec with SIGTERM: leave a trace instead of dying silently.
+on_term() {
+  trap - ERR TERM
+  log "ERROR: terminated (timeout or stop)"
+  local b; b="$(mktemp)"
+  { echo "The maintenance bot was terminated in mode \`$MODE\` (hung or timed out)."; echo; echo '```'; tail -n 50 "$LOGFILE"; echo '```'; } > "$b"
+  timeout 60 gh issue comment "$(gh issue list -R "$REPO" -l maint:bot-error --state open --json number -q '.[0].number' 2>/dev/null)" -R "$REPO" --body-file "$b" 2>/dev/null \
+    || timeout 60 gh issue create -R "$REPO" --label maint:bot-error --title "maint bot failed ($MODE)" --body-file "$b" || true
+  rm -f "$b"
+  exit 143
+}
+trap on_term TERM

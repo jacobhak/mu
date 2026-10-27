@@ -7,5 +7,5 @@ Environment=GIT_CONFIG_GLOBAL=%h/.mu/maint/gitconfig GIT_TERMINAL_PROMPT=0 GH_PR
 EnvironmentFile=-%h/.mu/maint/config.env
 WorkingDirectory=%h/.mu/maint/mu
 ExecStart=/bin/bash -c 'git fetch -q origin && git reset -q --hard origin/main && exec scripts/maint/run.sh %i'
-TimeoutStartSec=2h
+TimeoutStartSec=3h
 Nice=10

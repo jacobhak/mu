@@ -9,9 +9,9 @@ OMPSRC="${OMPSRC:-$MAINT/oh-my-pi}"
 mkdir -p "$out"
 
 if [ -d "$OMPSRC/.git" ] || [ -f "$OMPSRC/HEAD" ]; then
-  git -C "$OMPSRC" fetch -q --tags
+  timeout 600 git -C "$OMPSRC" fetch -q --tags
 else
-  git clone -q --filter=blob:none https://github.com/can1357/oh-my-pi "$OMPSRC"
+  timeout 1200 git clone -q --filter=blob:none https://github.com/can1357/oh-my-pi "$OMPSRC"
 fi
 
 d() { git -C "$OMPSRC" diff "v$old" "v$new" -- "${@}" > "$out/$DEST" || true; }

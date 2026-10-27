@@ -112,7 +112,13 @@ P
       done <<< "$open"
     fi
   fi
-  if [ "$go" = 1 ]; then bump_flow "$pinned" "$latest"; fi
+  # Run in a background subshell so its failure (ERR trap, set -e) is reported but must not stop
+  # the publish below: a broken bump must never block the nightly build of main.
+  if [ "$go" = 1 ]; then
+    rc=0; ( bump_flow "$pinned" "$latest" ) & wait $! || rc=$?
+    [ -f "$RUN/result" ] && result="$(cat "$RUN/result")"
+    if [ "$rc" != 0 ]; then result=bump-error; log "bump flow failed (exit $rc); publishing main anyway"; fi
+  fi
 
   publish
   log "maint: result=$result published=$published spend=\$$(run_spend)"
@@ -125,7 +131,7 @@ bump_flow() {
   rc=0; "$here/bump.sh" "$bwt" "$latest" > "$RUN/bump.log" 2>&1 || rc=$?
   if [ "$rc" = 75 ]; then
     log "npm package not published yet; retry next run"
-    result=waiting-npm
+    result=waiting-npm; echo "$result" > "$RUN/result"
     return 0
   elif [ "$rc" != 0 ]; then
     tail -n 50 "$RUN/bump.log" >&2
@@ -187,6 +193,7 @@ P
     echo "## Agent spend"; echo '```'; run_spend_rows; echo '```'
   } > "$RUN/pr-body.md"
 
+  echo "$result" > "$RUN/result"
   pushw "$bwt" push -f -u origin "$branch"
   pr_create "$branch" "Bump oh-my-pi to v$latest" "$RUN/pr-body.md" "${labels[@]}"
   if [ "$result" = s2 ]; then
