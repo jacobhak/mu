@@ -7,6 +7,7 @@ use crossterm::style::ContentStyle;
 use unicode_width::UnicodeWidthStr;
 
 use super::line::{self, Line, bold, dim, span};
+use super::markdown::{chars_to_line, chs, wrap_chs};
 use super::theme::{self, Role};
 
 fn accent_bold() -> ContentStyle {
@@ -14,6 +15,9 @@ fn accent_bold() -> ContentStyle {
     s.attributes.set(crossterm::style::Attribute::Bold);
     s
 }
+
+/// Rows the detail panel may take: a description wrapped past this ends in `…`.
+const DETAIL_MAX_LINES: usize = 4;
 
 pub struct Item {
     pub label: String,
@@ -51,6 +55,8 @@ pub struct Select {
     haystacks: Vec<String>,
     /// The filtered rows for the filter they were computed with; reused until the filter changes.
     rows_cache: std::cell::RefCell<Option<(String, std::rc::Rc<Vec<Row>>)>>,
+    /// Show the highlighted row's description wrapped beneath the list instead of inline.
+    detail_panel: bool,
 }
 
 impl Select {
@@ -59,6 +65,7 @@ impl Select {
         Select {
             haystacks,
             rows_cache: Default::default(),
+            detail_panel: false,
             title: title.to_string(),
             items,
             multi: false,
@@ -73,6 +80,12 @@ impl Select {
 
     pub fn multi(mut self) -> Self {
         self.multi = true;
+        self
+    }
+
+    /// Shows the highlighted row's full description wrapped beneath the list, not inline.
+    pub fn detail_panel(mut self) -> Self {
+        self.detail_panel = true;
         self
     }
 
@@ -213,7 +226,9 @@ impl Select {
                 }
             } else if avail > 0 {
                 let sel = self.sel.min(n - 1);
-                let (a, b, ind) = window(n, sel, avail);
+                // The panel never takes the last row, so the list always keeps one.
+                let panel = self.detail_height(width).min(avail - 1);
+                let (a, b, ind) = window(n, sel, avail - panel);
                 if ind && a > 0 {
                     out.push(line::styled(format!("  … {a} more"), |_| dim()));
                 }
@@ -222,6 +237,19 @@ impl Select {
                 }
                 if ind && b < n {
                     out.push(line::styled(format!("  … {} more", n - b), |_| dim()));
+                }
+                if panel > 0 {
+                    let detail = match rows[sel] {
+                        Row::Item(i) => detail_lines(&self.items[i].detail, width),
+                        Row::Free => Vec::new(),
+                    };
+                    for k in 0..panel {
+                        let mut l: Line = vec![span("  ", ContentStyle::default())];
+                        if let Some(d) = detail.get(k) {
+                            l.extend(d.iter().cloned());
+                        }
+                        out.push(l);
+                    }
                 }
             }
         }
@@ -247,6 +275,15 @@ impl Select {
         let rows = std::rc::Rc::new(rows);
         *cache = Some((self.filter.clone(), rows.clone()));
         rows
+    }
+
+    /// Rows the detail panel takes: the tallest description among the items, so the height does
+    /// not change as the cursor moves. Zero unless the panel is on.
+    fn detail_height(&self, width: usize) -> usize {
+        if !self.detail_panel {
+            return 0;
+        }
+        self.items.iter().map(|it| detail_lines(&it.detail, width).len()).max().unwrap_or(0)
     }
 
     fn step(&mut self, delta: isize, n: usize) {
@@ -281,7 +318,7 @@ impl Select {
                     l.push(span(if on { "[x] " } else { "[ ] " }, ContentStyle::default()));
                 }
                 l.push(span(it.label.clone(), emphasis));
-                if !it.detail.is_empty() {
+                if !it.detail.is_empty() && !self.detail_panel {
                     l.push(span("  ", ContentStyle::default()));
                     l.push(span(it.detail.clone(), dim()));
                 }
@@ -326,6 +363,19 @@ fn window(n: usize, sel: usize, avail: usize) -> (usize, usize, bool) {
         }
     }
     (a, b, true)
+}
+
+/// A description wrapped to `width` after a two-column indent, at most `DETAIL_MAX_LINES` rows.
+fn detail_lines(detail: &str, width: usize) -> Vec<Line> {
+    let rows = wrap_chs(&chs(detail, dim()), width.saturating_sub(2).max(1));
+    let mut out: Vec<Line> = rows.iter().map(|r| chars_to_line(r)).collect();
+    if out.len() > DETAIL_MAX_LINES {
+        out.truncate(DETAIL_MAX_LINES);
+        if let Some(last) = out.last_mut() {
+            last.push(span("…", dim()));
+        }
+    }
+    out
 }
 
 pub fn clean_paste(s: &str) -> String {
@@ -507,5 +557,64 @@ mod tests {
         type_str(&mut s, "new y");
         s.on_key(key(KeyCode::Tab));
         assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "the filter kept its space");
+    }
+
+    #[test]
+    fn detail_stays_inline_without_the_panel() {
+        let s = Select::new("t", vec![Item { label: "a".into(), detail: "fast".into() }]);
+        let (lines, _) = s.render(40, 10);
+        assert_eq!(texts(&lines)[2].trim_end(), "❯ a  fast");
+    }
+
+    #[test]
+    fn detail_panel_wraps_the_highlighted_description_below_the_list() {
+        let text = "the first option has a long description that wraps over several rows of the picker";
+        let mut s = Select::new(
+            "t",
+            vec![Item { label: "a".into(), detail: text.into() }, Item { label: "b".into(), detail: "short".into() }],
+        )
+        .detail_panel();
+        let (lines, _) = s.render(30, 20);
+        let t = texts(&lines);
+        assert_eq!(t.len(), 7, "{t:?}");
+        assert_eq!(t[2].trim_end(), "❯ a", "no inline detail in panel mode");
+        assert_eq!(t[4], "  the first option has a long");
+        assert_eq!(t[5], "  description that wraps over");
+        assert_eq!(t[6], "  several rows of the picker");
+        s.on_key(key(KeyCode::Down));
+        let (lines, _) = s.render(30, 20);
+        let t = texts(&lines);
+        assert_eq!(t.len(), 7, "the height holds while the cursor moves: {t:?}");
+        assert_eq!(t[4], "  short");
+        assert!(t[5].trim().is_empty() && t[6].trim().is_empty(), "{t:?}");
+    }
+
+    #[test]
+    fn detail_panel_caps_lines_with_an_ellipsis_and_keeps_one_list_row() {
+        let long = "word ".repeat(60);
+        let s = Select::new("t", vec![Item { label: "a".into(), detail: long }]).detail_panel();
+        let (lines, _) = s.render(30, 20);
+        let t = texts(&lines);
+        assert_eq!(t.len(), 2 + 1 + DETAIL_MAX_LINES, "{t:?}");
+        assert!(t[DETAIL_MAX_LINES + 2].ends_with('…'), "{t:?}");
+        let (lines, _) = s.render(30, 4);
+        let t = texts(&lines);
+        assert!(t.len() <= 4 && t.iter().any(|l| l.starts_with("❯ a")), "{t:?}");
+    }
+
+    #[test]
+    fn detail_panel_is_blank_on_the_free_row_and_keeps_its_height() {
+        let mut s = Select::new("t", vec![Item { label: "a".into(), detail: "x ".repeat(40) }])
+            .multi()
+            .free_text("Other (type your own)")
+            .detail_panel();
+        let (before, _) = s.render(30, 20);
+        s.on_key(key(KeyCode::Down));
+        let (free, _) = s.render(30, 20);
+        let t = texts(&free);
+        assert_eq!(before.len(), free.len());
+        assert_eq!(t[2], "  [ ] a", "{t:?}");
+        assert!(t[3].starts_with('❯') && t[3].contains("Other"), "{t:?}");
+        assert!(t[4..].iter().all(|l| l.trim().is_empty()), "{t:?}");
     }
 }

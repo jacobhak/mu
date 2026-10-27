@@ -83,7 +83,7 @@ pub fn ask_select(q: &AskQuestion) -> Select {
         })
         .collect();
     let title = q.header.as_ref().map_or(q.question.clone(), |h| format!("{h}: {}", q.question));
-    let mut s = Select::new(&title, items).free_text("Other (type your own)");
+    let mut s = Select::new(&title, items).free_text("Other (type your own)").detail_panel();
     if q.multi {
         s = s.multi();
     }
@@ -251,6 +251,7 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::AskOption;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(c: KeyCode) -> KeyEvent {
@@ -303,5 +304,22 @@ mod tests {
         assert!(rest.is_none());
         let all = rx.try_recv().unwrap().unwrap();
         assert_eq!(all.len(), 2, "cancelling answers every question");
+    }
+
+    #[test]
+    fn ask_picker_shows_the_highlighted_description_below_the_options() {
+        let opt = |label: &str, d: Option<&str>| AskOption { label: label.into(), description: d.map(Into::into) };
+        let q = AskQuestion {
+            question: "Which?".into(),
+            header: None,
+            options: vec![opt("Yes", Some("apply the change now and run the tests afterwards")), opt("No", None)],
+            multi: false,
+            recommended: None,
+        };
+        let (lines, _) = ask_select(&q).render(40, 20);
+        let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
+        assert_eq!(t[2].trim_end(), "❯ Yes", "{t:?}");
+        assert_eq!(t[5], "  apply the change now and run the tests", "{t:?}");
+        assert_eq!(t[6], "  afterwards", "{t:?}");
     }
 }

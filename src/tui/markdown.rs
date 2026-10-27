@@ -523,7 +523,7 @@ fn code_lines(lang: &str, body: &str, w: usize) -> Vec<Vec<Ch>> {
 }
 
 /// Word-wraps at spaces, hard-splitting words wider than `width`. `\n` forces a break.
-fn wrap_chs(chs: &[Ch], width: usize) -> Vec<Vec<Ch>> {
+pub(super) fn wrap_chs(chs: &[Ch], width: usize) -> Vec<Vec<Ch>> {
     let width = width.max(1);
     let mut out: Vec<Vec<Ch>> = Vec::new();
     let mut cur: Vec<Ch> = Vec::new();
@@ -593,7 +593,7 @@ fn text_width(chs: &[Ch]) -> usize {
     chs.iter().map(|c| char_w(c.0)).sum()
 }
 
-fn chs(s: &str, st: ContentStyle) -> Vec<Ch> {
+pub(super) fn chs(s: &str, st: ContentStyle) -> Vec<Ch> {
     sanitize(s).chars().map(|c| (c, st)).collect()
 }
 
@@ -601,7 +601,7 @@ fn push_str(out: &mut Vec<Ch>, s: &str, st: ContentStyle) {
     out.extend(sanitize(s).chars().map(|c| (c, st)));
 }
 
-fn chars_to_line(cs: &[Ch]) -> Line {
+pub(super) fn chars_to_line(cs: &[Ch]) -> Line {
     let mut out: Line = Vec::new();
     for &(c, st) in cs {
         match out.last_mut() {
