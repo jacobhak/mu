@@ -16,5 +16,5 @@ cd "$wt"
 sed -i -E "s/^omp = \"[^\"]*\"/omp = \"$ver\"/" upstream.toml
 sed -i -E "/can1357\/oh-my-pi/ s/(rev|tag) = \"[^\"]*\"/tag = \"v$ver\"/" Cargo.toml
 sed -i -E "s|(\"@oh-my-pi/pi-mnemopi\": *\")[^\"]*\"|\1$ver\"|" plugins/memory/package.json
-cargo fetch
+CARGO_NET_GIT_FETCH_WITH_CLI=true timeout 600 cargo fetch
 (cd plugins/memory && bun install)
