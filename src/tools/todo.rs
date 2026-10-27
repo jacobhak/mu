@@ -375,6 +375,11 @@ impl Tools {
         serde_json::to_value(&*self.todo.borrow()).unwrap_or(Value::Null)
     }
 
+    /// Contents of tasks still pending or in progress (blocked and closed ones excluded).
+    pub fn todo_open(&self) -> Vec<String> {
+        self.todo.borrow().iter().flat_map(|p| p.tasks.iter()).filter(|t| open(t)).map(|t| t.content.clone()).collect()
+    }
+
     pub fn todo(&self, mut a: Args) -> ToolOutput {
         let previous = self.todo.borrow().clone();
         let op = match a.op.take() {

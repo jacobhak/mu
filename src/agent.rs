@@ -918,6 +918,7 @@ impl Agent {
 
     async fn run_loop(&mut self, cancel: &CancellationToken) -> Flow {
         let mut first = true;
+        let mut todo_nags = 0u8;
         let mut compacted_for_overflow = false;
         loop {
             if !first
@@ -1022,6 +1023,18 @@ impl Agent {
                 let steered = self.take_steer();
                 let delivered = self.take_jobs();
                 if steered || delivered {
+                    continue;
+                }
+                // Stop reminder: the model is about to finish with open todo items. Nudge it to
+                // update the list or finish the work, at most twice per run so it cannot loop.
+                let open = if stop == StopReason::Stop && todo_nags < 2 { self.tools.todo_open() } else { Vec::new() };
+                if !open.is_empty() {
+                    todo_nags += 1;
+                    let list = open.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
+                    self.push(Message::user(&format!(
+                        "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work and keep the list current with `todo` (`done`/`start`, in the same response as your next action). If an item is finished or no longer needed, mark it `done` or `drop` it; if you are waiting on the user, `block` it. Do not reply to this reminder.\n</system-reminder>",
+                        open.len()
+                    )));
                     continue;
                 }
                 return Flow::Done;

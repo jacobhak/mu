@@ -405,7 +405,8 @@ NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `
 - Touch only the lines the task needs; NEVER restyle unrelated code.\n\
 - Resolve prerequisites first and parallelize independent calls. NEVER open guessed files.\n\
 - Tool results are verification: NEVER re-read a file just to check an applied edit.\n\
-- Be concise; the user sees each tool call.\n\n\
+- Be concise; the user sees each tool call.\n\
+- For work with 3+ steps, keep the `todo` list current: `start` an item before working on it and mark it `done` right after finishing it. NEVER leave finished items open or finish with items still pending.\n\n\
 <workstation>\n- OS: {}\n- Arch: {}\n- Model: {}\n- Date: {date}\n- Working directory: {}\n</workstation>\n",
         format!("{} {}", std::env::consts::OS, os.trim()).trim_end(),
         std::env::consts::ARCH,
