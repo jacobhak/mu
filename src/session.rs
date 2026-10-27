@@ -835,7 +835,16 @@ mod tests {
         assert!(e.contains("another mu process"), "{e}");
         let path = s.path.clone();
         drop(s);
-        assert!(SessionFile::open_append(&path).is_ok());
+        // flock is released on close, but a concurrently forked child (another test
+        // spawning a process) holds a copy of the fd until it execs. Retry briefly.
+        let reopened = (0..200).find_map(|_| match SessionFile::open_append(&path) {
+            Ok(f) => Some(f),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                None
+            }
+        });
+        assert!(reopened.is_some(), "lock not released after drop");
     }
 
     #[test]
