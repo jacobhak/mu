@@ -84,7 +84,7 @@ fi
 
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
-for b in mu mu-gateway mu-web mu-predict mu-memory; do
+for b in mu mu-gateway mu-web mu-predict mu-memory mu-memory-daemon; do
   [ -e "$stage/bin/$b" ] || continue
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"

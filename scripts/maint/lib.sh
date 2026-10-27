@@ -9,7 +9,7 @@ if [ -f "$MAINT/config.env" ]; then set -a; . "$MAINT/config.env"; set +a; fi
 : "${CARGO_TARGET_DIR:=$MAINT/target}"
 : "${MU:=$HOME/.mu/bin/mu}"
 : "${MU_MAINT_MONTHLY_USD:=40}"
-: "${MU_MAINT_TRIAGE_USD:=0.5}"
+: "${MU_MAINT_TRIAGE_USD:=1.5}"
 : "${MU_MAINT_FIX_USD:=5}"
 : "${MU_MAINT_DIGEST_USD:=2}"
 : "${MU_MAINT_DRY_RUN:=0}"

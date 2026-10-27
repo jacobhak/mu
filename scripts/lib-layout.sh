@@ -14,10 +14,12 @@ stage_layout() {
   mkdir -p "$dest/mu/plugins/web"
   cp "$root/plugins/web/plugin.toml" "$dest/mu/plugins/web/"
   cp -R "$root/plugins/web/schemas" "$dest/mu/plugins/web/schemas"
-  # The memory plugin ships as a `bun build --compile` binary next to `mu`, so installs need no Bun.
+  # The memory plugin is two binaries: `mu-memory`, a small Rust shim that starts the per-MU_HOME shared daemon
+  # on demand and relays stdio to it, and `mu-memory-daemon`, a `bun build --compile` binary, so installs need no Bun.
   # Without bun at build time it is left out, and install.sh keeps whatever memory plugin is installed.
   if command -v bun >/dev/null; then
-    (cd "$root/plugins/memory" && bun install --frozen-lockfile >&2 && bun build --compile --outfile "$dest/mu/bin/mu-memory" main.ts >&2)
+    (cd "$root/plugins/memory" && bun install --frozen-lockfile >&2 && bun build --compile --outfile "$dest/mu/bin/mu-memory-daemon" main.ts >&2)
+    cp "$rel/mu-memory" "$dest/mu/bin/mu-memory"
     mkdir -p "$dest/mu/plugins/memory"
     cp -R "$root/plugins/memory/schemas" "$dest/mu/plugins/memory/schemas"
     sed 's|^command = .*|command = ["mu-memory"]|' "$root/plugins/memory/plugin.toml" > "$dest/mu/plugins/memory/plugin.toml"

@@ -33,13 +33,20 @@ export function log(message: string): void {
 	process.stderr.write(`[memory] ${message}\n`);
 }
 
-/** Serves core requests until `shutdown` or stdin EOF. Requests run concurrently; resolves once they settle. */
-export async function serve(handler: Handler): Promise<void> {
+export interface Transport {
+	input: NodeJS.ReadableStream;
+	write(line: string): void;
+}
+
+const stdio: Transport = { input: process.stdin, write: line => void process.stdout.write(line) };
+
+/** Serves core requests until `shutdown` or input EOF. Requests run concurrently; resolves once they settle. */
+export async function serve(handler: Handler, io: Transport = stdio): Promise<void> {
 	const pending = new Map<number, PromiseWithResolvers<unknown>>();
 	const tasks = new Set<Promise<void>>();
 	let nextId = 0;
 	let closed = false;
-	const write = (msg: object) => process.stdout.write(`${JSON.stringify(msg)}\n`);
+	const write = (msg: object) => io.write(`${JSON.stringify(msg)}\n`);
 	const client: Client = {
 		call(method, params = {}, opts) {
 			if (closed) return Promise.reject(new RpcError(-32000, "core connection closed"));
@@ -58,7 +65,7 @@ export async function serve(handler: Handler): Promise<void> {
 			write({ jsonrpc: "2.0", method, params });
 		},
 	};
-	for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+	for await (const line of createInterface({ input: io.input, crlfDelay: Infinity })) {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(line);
