@@ -44,27 +44,30 @@ fn styled_text(l: &str, style: ContentStyle) -> Line {
     vec![span(l, style)]
 }
 
-/// `user` block: a full-width band on the recessed surface, an accent bar on every row, and one
-/// padding row above and below.
+/// `user` block: a full-width lifted band, an accent bar on every row, the prompt rendered as
+/// markdown, and one padding row above and below.
 pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
-    let bg = tbg(Role::Surface);
+    let bg = tbg(Role::Raised);
     let inner = width.saturating_sub(1).max(1);
     let bar = || span("▎", with_bg(tfg(Role::Accent), bg));
     let blank = || fill(&vec![bar()], width, bg);
     let mut out = vec![blank()];
-    for l in text.lines() {
-        for w in wrap(&vec![span(l, tfg(Role::Strong))], inner) {
-            let mut row = vec![bar()];
-            row.extend(w);
-            out.push(fill(&row, width, bg));
-        }
+    for l in markdown::render(text, inner) {
+        let mut row = vec![bar()];
+        row.extend(l.into_iter().map(|mut s| {
+            if s.style.foreground_color.is_none() {
+                s.style = theme::get().apply(Role::Strong, s.style);
+            }
+            s
+        }));
+        out.push(fill(&row, width, bg));
     }
     out.push(blank());
     out
 }
 
 fn name_style() -> ContentStyle {
-    bold(tfg(Role::Tool))
+    bold(tfg(Role::Strong))
 }
 
 /// Header target. A finished call shows the path its tool recorded; a call still running only has
@@ -99,7 +102,7 @@ fn header_line(
     let summary = summary(name, args, meta);
     let mut l = vec![span(format!("{icon} "), icon_style), span(name.to_string(), name_style())];
     if !summary.is_empty() {
-        l.push(span(format!(" {summary}"), tfg(Role::Accent)));
+        l.push(span(format!(" {summary}"), tfg(Role::Muted)));
     }
     truncate(&l, width)
 }
@@ -121,10 +124,9 @@ impl Tone {
     }
 }
 
-/// Card background: the recessed surface (tinted red for a failure) when cards are filled, else the terminal's.
-fn card_bg(tone: Tone) -> Option<Color> {
-    let role = if tone == Tone::Error { Role::ErrSurface } else { Role::Surface };
-    (theme::get().cards() == Cards::Filled).then(|| tbg(role)).flatten()
+/// Card background: the recessed surface when cards are filled, else the terminal's.
+fn card_bg() -> Option<Color> {
+    (theme::get().cards() == Cards::Filled).then(|| tbg(Role::Surface)).flatten()
 }
 
 /// One body section of a card. A labelled section draws a titled separator above it.
@@ -148,7 +150,7 @@ fn frame(card: &Card, width: usize) -> Vec<Line> {
 fn frame_at(card: &Card, width: usize) -> (Vec<Line>, Option<usize>) {
     let w = width.max(6);
     let cw = w - 4;
-    let bg = card_bg(card.tone);
+    let bg = card_bg();
     let bd = with_bg(card.tone.border(), bg);
     let rule = |l: char, r: char, label: Option<Line>| -> Line {
         let mut out = vec![span(format!("{l}─"), bd)];
@@ -245,14 +247,15 @@ fn facts(parts: &[Fact]) -> Line {
     out
 }
 
-/// Timeout footer part from the call's `timeout` argument (seconds; 0 disables it).
-fn timeout_part(args: &Value) -> Fact {
-    Fact::Timeout(match args["timeout"].as_f64() {
-        Some(0.0) => "Timeout: disabled".into(),
-        Some(t) if t.fract() == 0.0 => format!("Timeout: {}s", t as u64),
-        Some(t) => format!("Timeout: {t}s"),
-        None => format!("Timeout: {}s", DEFAULT_TIMEOUT_SECS as u64),
-    })
+/// Timeout footer part from the call's `timeout` argument (seconds; 0 disables it). `None` when
+/// it is absent or the default.
+fn timeout_part(args: &Value) -> Option<Fact> {
+    let t = args["timeout"].as_f64().filter(|t| *t != DEFAULT_TIMEOUT_SECS)?;
+    Some(Fact::Timeout(match t {
+        0.0 => "Timeout: disabled".into(),
+        t if t.fract() == 0.0 => format!("Timeout: {}s", t as u64),
+        t => format!("Timeout: {t}s"),
+    }))
 }
 
 /// The footer facts of a finished bash call, from what the tool recorded.
@@ -319,8 +322,11 @@ fn bash_box_at(
         sections.push(Section { label: Some("output"), rows });
     }
     let at = footer.iter().position(|f| matches!(f, Fact::Wall(_) | Fact::Running(_))).map_or(0, |i| i + 1);
-    footer.insert(at, timeout_part(args));
-    frame_at(&Card { tone, sections, footer: Some(facts(&footer)) }, width)
+    if let Some(t) = timeout_part(args) {
+        footer.insert(at, t);
+    }
+    let footer = (!footer.is_empty()).then(|| facts(&footer));
+    frame_at(&Card { tone, sections, footer }, width)
 }
 
 /// Plain indented result rows, cut at `TEXT_CUT` unless expanded.
@@ -361,7 +367,7 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
         let tone = if out.is_error || m.failed() { Tone::Error } else { Tone::Success };
         return bash_box(args, &body, expanded, tone, bash_facts(m), width);
     }
-    let icon_style = if out.is_error { tfg(Role::Err) } else { tfg(Role::Ok) };
+    let icon_style = if out.is_error { tfg(Role::Err) } else { tfg(Role::Faint) };
     let mut lines = vec![header_line("●", icon_style, name, args, out.meta.as_ref(), width)];
     if out.is_error {
         let card = Card {
@@ -601,6 +607,19 @@ mod tests {
     }
 
     #[test]
+    fn default_timeout_is_not_shown() {
+        let mut out = ToolOutput::ok("");
+        out.meta = Some(ToolMeta::Bash(BashMeta { output_end: 0, ..Default::default() }));
+        for args in [json!({"command":"true"}), json!({"command":"true","timeout":300})] {
+            let t = texts(&tool_result("bash", &args, &out, false, 40));
+            let last = t.last().unwrap();
+            assert!(last.starts_with("╰──") && !last.contains("Timeout"), "{last}");
+        }
+        let t = texts(&tool_result("bash", &json!({"command":"true","timeout":0}), &out, false, 40));
+        assert!(t.last().unwrap().contains("Timeout: disabled"));
+    }
+
+    #[test]
     fn bash_error_box_uses_error_tone_and_exit_fact() {
         let mut out = ToolOutput::ok("nope\n\nCommand exited with code 3");
         out.meta = Some(ToolMeta::Bash(BashMeta { output_end: 4, exit_code: Some(3), ..Default::default() }));
@@ -653,9 +672,9 @@ mod tests {
         // header, top rule, 40 diff rows, "more" row, bottom rule
         assert_eq!(l.len(), 1 + 1 + 40 + 1 + 1);
         assert!(text_of(&l[42]).starts_with("│ … 11 more lines"), "{}", text_of(&l[42]));
-        assert_eq!(l[2][2].text, "- ");
-        assert_eq!(l[2][2].style.foreground_color, theme::get().color(Role::Err));
-        assert_eq!(l[2][2].style.background_color, theme::get().color(Role::ErrTint));
+        assert_eq!(l[2][1].text, "- 1");
+        assert_eq!(l[2][1].style.foreground_color, theme::get().color(Role::Err));
+        assert_eq!(l[2][1].style.background_color, card_bg(), "fill applies the card surface (none when outlined)");
         assert!(text_of(l.last().unwrap()).contains("+50 -1"));
     }
 
@@ -683,6 +702,14 @@ mod tests {
         assert_eq!(text_of(&l[1]), format!("▎hi{}", " ".repeat(9)));
     }
 
+    #[test]
+    fn user_prompt_renders_markdown() {
+        let l = user_prompt("use `x` and [l](http://u)", 40);
+        let row = text_of(&l[1]);
+        assert!(row.starts_with("▎use x and l (http://u)"), "{row}");
+        assert!(!row.contains('`'));
+    }
+
     fn unicode_width_of(l: &str) -> usize {
         use unicode_width::UnicodeWidthStr;
         l.width()
@@ -705,10 +732,10 @@ mod tests {
         let t = theme::get();
         let ls = tool_result("read", &json!({"path":"x"}), &ToolOutput::ok("a\nb"), false, 40);
         let h = &ls[0];
-        assert_eq!(h[0].style.foreground_color, t.color(Role::Ok));
-        assert_eq!(h[1].style.foreground_color, t.color(Role::Tool));
+        assert_eq!(h[0].style.foreground_color, t.color(Role::Faint));
+        assert_eq!(h[1].style.foreground_color, t.color(Role::Strong));
         assert!(h[1].style.attributes.has(Attribute::Bold));
-        assert_eq!(h[2].style.foreground_color, t.color(Role::Accent));
+        assert_eq!(h[2].style.foreground_color, t.color(Role::Muted));
         assert_eq!(h[0].text, "● ");
         assert_eq!(h[2].text, " x");
     }

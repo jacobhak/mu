@@ -40,8 +40,10 @@ pub enum Role {
     Thinking,
     Line,
     LineFaint,
-    /// Recessed panel behind cards and the prompt band: the palette's `dark_background`.
+    /// Recessed panel behind cards: the palette's `dark_background`.
     Surface,
+    /// Lifted band behind the user prompt.
+    Raised,
     Selected,
     Accent,
     AccentSoft,
@@ -49,13 +51,6 @@ pub enum Role {
     Warn,
     Err,
     ErrSoft,
-    OkTint,
-    ErrTint,
-    /// The changed part of a modified diff line.
-    OkEmph,
-    ErrEmph,
-    /// Surface of a failed card.
-    ErrSurface,
     Literal,
     Tool,
     SynKeyword,
@@ -85,8 +80,7 @@ enum Def {
 use Def::{Key, Mix};
 use Fb::{Dim, None as No, Slot};
 
-/// Indexed by `Role as usize`. `"accent"` is the configured accent, not a palette key. Tints mix from
-/// `dark_background`, the surface they sit on.
+/// Indexed by `Role as usize`. `"accent"` is the configured accent, not a palette key.
 const DEFS: [Def; ROLE_COUNT] = [
     Key("bright_foreground", Slot(15)),
     Mix("foreground", "background", 35, Dim),
@@ -95,6 +89,7 @@ const DEFS: [Def; ROLE_COUNT] = [
     Mix("background", "foreground", 22, Slot(8)),
     Mix("background", "foreground", 13, Slot(8)),
     Key("dark_background", No),
+    Mix("background", "foreground", 10, No),
     Key("selection", Slot(8)),
     Key("accent", Slot(4)),
     Mix("background", "accent", 55, Slot(4)),
@@ -102,11 +97,6 @@ const DEFS: [Def; ROLE_COUNT] = [
     Key("yellow", Slot(3)),
     Key("red", Slot(1)),
     Mix("background", "red", 55, Slot(1)),
-    Mix("dark_background", "green", 14, No),
-    Mix("dark_background", "red", 14, No),
-    Mix("dark_background", "green", 32, No),
-    Mix("dark_background", "red", 32, No),
-    Mix("dark_background", "red", 9, No),
     Key("cyan", Slot(6)),
     Key("magenta", Slot(5)),
     Key("magenta", Slot(5)),
@@ -452,8 +442,7 @@ mod tests {
         assert_eq!(t.color(Role::Surface), rgb("#13141c"));
         assert_eq!(t.color(Role::Thinking), rgb("#696e87"));
         assert_eq!(t.color(Role::Tool), rgb("#ad8ee6"));
-        assert_eq!(t.color(Role::OkTint), rgb("#262e27"));
-        assert_eq!(t.color(Role::ErrTint), rgb("#33222c"));
+        assert_eq!(t.color(Role::Raised), rgb("#282a38"));
         assert_eq!(t.color(Role::Faint), rgb("#565f89"), "the palette's own dark_foreground is legible");
         assert_eq!(t.color(Role::AccentSoft), rgb("#4f6599"));
         assert_eq!(t.color(Role::Accent), rgb("#7aa2f7"));
@@ -466,7 +455,7 @@ mod tests {
         assert_eq!(t.color(Role::Strong), Some(Color::AnsiValue(15)));
         assert_eq!(t.color(Role::Muted), None);
         assert!(t.fg(Role::Muted).attributes.has(Attribute::Dim));
-        assert_eq!(t.color(Role::OkTint), None);
+        assert_eq!(t.color(Role::Raised), None);
         assert_eq!(t.color(Role::Surface), None);
         assert_eq!(t.color(Role::Accent), Some(Color::AnsiValue(4)));
         assert_eq!(t.color(Role::Thinking), None);
@@ -479,7 +468,6 @@ mod tests {
         let a = Answers { fg: Some((169, 177, 214)), bg: Some((26, 27, 38)), ..Default::default() };
         let (t, _) = Theme::build(&Palette::from_answers(&a), None, true, Cards::Outline);
         assert_eq!(t.color(Role::Ok), Some(Color::AnsiValue(2)));
-        assert_eq!(t.color(Role::OkTint), None);
         assert!(matches!(t.color(Role::Line), Some(Color::Rgb { .. })));
         assert_eq!(t.color(Role::AccentSoft), Some(Color::AnsiValue(4)));
         assert_eq!(t.color(Role::Surface), rgb("#14151e"), "derived: background toward black");
@@ -504,7 +492,7 @@ mod tests {
             *s = Some((i as u8 * 10, 100, 50));
         }
         let (t, _) = Theme::build(&Palette::from_answers(&a), None, true, Cards::Outline);
-        assert!(matches!(t.color(Role::OkTint), Some(Color::Rgb { .. })));
+        assert!(matches!(t.color(Role::Surface), Some(Color::Rgb { .. })));
         assert_eq!(t.color(Role::Ok), Some(Color::AnsiValue(2)));
         assert_eq!(t.color(Role::Accent), Some(Color::AnsiValue(4)));
     }

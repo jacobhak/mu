@@ -315,11 +315,7 @@ impl<'a> R<'a> {
         while let Some(ev) = self.cur() {
             match ev {
                 Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => push_str(&mut out, &s, st),
-                Event::Code(s) => {
-                    let mut c = st;
-                    c.foreground_color = theme::get().color(Role::Literal);
-                    push_str(&mut out, &s, c);
-                }
+                Event::Code(s) => push_str(&mut out, &s, st),
                 Event::SoftBreak => out.push((' ', st)),
                 Event::HardBreak => out.push(('\n', st)),
                 Event::TaskListMarker(done) => push_str(&mut out, if done { "☑ " } else { "☐ " }, st),
@@ -699,9 +695,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_uses_theme_mdcode() {
+    fn inline_code_has_no_hue() {
         let ls = render("use `x`", 40);
-        assert_eq!(ls[0][1].style.foreground_color, theme::get().color(Role::Literal));
+        assert_eq!(ls[0].last().unwrap().style.foreground_color, None);
     }
 
     #[test]

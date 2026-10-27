@@ -1,10 +1,10 @@
-//! Diff rows for edit and write cards: a line-number gutter, syntax-highlighted code, tinted
-//! added/removed rows, and the changed part of a modified line picked out. Reads both pi-edit's
-//! numbered rows (`-8|code`, `+8|code`, ` 9|code`, an empty row for a gap) and plain unified diffs.
+//! Diff rows for edit and write cards: a `│` line-number gutter, coloured added/removed rows with
+//! the changed part of a modified line reversed, and syntax-highlighted context. Reads both
+//! pi-edit's numbered rows (`-8|code`, `+8|code`, ` 9|code`, an empty row for a gap) and plain unified diffs.
 use super::highlight;
 use super::line::{Line, span};
 use super::theme::{self, Role};
-use crossterm::style::{Color, ContentStyle};
+use crossterm::style::{Attribute, ContentStyle};
 use std::ops::Range;
 
 /// Rows shown before the card cuts to `… n more lines` (unless expanded).
@@ -101,32 +101,29 @@ fn parse(diff: &str) -> Vec<Row<'_>> {
     rows
 }
 
-/// Highlights the old and new sides of the diff as whole files, so multi-line constructs
-/// (strings, comments) colour correctly, and returns each code row's highlighted line.
+/// Highlights the new side of the diff (context and added rows) as a whole file, so multi-line
+/// constructs (strings, comments) colour correctly, and returns each such row's highlighted line.
 fn highlighted(rows: &[Row], lang: &str) -> Vec<Option<Line>> {
-    let mut sides: [(String, Vec<usize>); 2] = Default::default();
+    let (mut text, mut idx) = (String::new(), Vec::new());
     for (i, r) in rows.iter().enumerate() {
-        if let Row::Code { kind, code, .. } = r {
-            let side = &mut sides[(*kind == Kind::Removed) as usize];
-            side.0.push_str(code);
-            side.0.push('\n');
-            side.1.push(i);
+        if let Row::Code { kind, code, .. } = r
+            && *kind != Kind::Removed
+        {
+            text.push_str(code);
+            text.push('\n');
+            idx.push(i);
         }
     }
     let mut out = vec![None; rows.len()];
     if lang.is_empty() {
         return out;
     }
-    for (code, idx) in &sides {
-        // Context rows go to the new side only; the old side holds only removed rows then, and is
-        // still worth highlighting on its own.
-        let Some(lines) = highlight::highlight(code, lang) else { continue };
-        if lines.len() != idx.len() {
-            continue;
-        }
-        for (l, &i) in lines.into_iter().zip(idx) {
-            out[i] = Some(l);
-        }
+    let Some(lines) = highlight::highlight(&text, lang) else { return out };
+    if lines.len() != idx.len() {
+        return out;
+    }
+    for (l, i) in lines.into_iter().zip(idx) {
+        out[i] = Some(l);
     }
     out
 }
@@ -188,25 +185,18 @@ fn emphasis(rows: &[Row]) -> Vec<Option<Range<usize>>> {
     out
 }
 
-/// `line` with `bg` on every span, and `emph` on the chars in `range`.
-fn paint(line: Line, bg: Option<Color>, range: Option<&Range<usize>>, emph: Option<Color>) -> Line {
+/// `code` in `style`, with the chars in `range` reversed (the card fill later turns that into the
+/// hue as background and the surface as text).
+fn emphasize(code: &str, style: ContentStyle, range: Option<&Range<usize>>) -> Line {
+    let Some(r) = range else { return vec![span(code, style)] };
+    let chars: Vec<char> = code.chars().collect();
+    let (a, b) = (r.start.min(chars.len()), r.end.min(chars.len()));
+    let mut rev = style;
+    rev.attributes.set(Attribute::Reverse);
     let mut out = Line::new();
-    let mut pos = 0;
-    for s in line {
-        let n = s.text.chars().count();
-        let (start, end) = (pos, pos + n);
-        pos = end;
-        let cut = range.filter(|r| r.start < end && r.end > start && emph.is_some());
-        let Some(r) = cut else {
-            out.push(span(s.text, ContentStyle { background_color: bg, ..s.style }));
-            continue;
-        };
-        let (a, b) = (r.start.max(start) - start, r.end.min(end) - start);
-        let chars: Vec<char> = s.text.chars().collect();
-        for (text, on) in [(&chars[..a], bg), (&chars[a..b], emph), (&chars[b..], bg)] {
-            if !text.is_empty() {
-                out.push(span(text.iter().collect::<String>(), ContentStyle { background_color: on, ..s.style }));
-            }
+    for (text, st) in [(&chars[..a], style), (&chars[a..b], rev), (&chars[b..], style)] {
+        if !text.is_empty() {
+            out.push(span(text.iter().collect::<String>(), st));
         }
     }
     out
@@ -219,7 +209,7 @@ pub fn rows(diff: &str, lang: &str, expanded: bool) -> (Vec<Line>, usize, usize)
     let parsed = parse(diff);
     let count = |k: Kind| parsed.iter().filter(|r| matches!(r, Row::Code { kind, .. } if *kind == k)).count();
     let (adds, dels) = (count(Kind::Added), count(Kind::Removed));
-    // A new file (only added rows) reads as a listing: numbers and code, no signs or tint.
+    // A new file (only added rows) reads as a listing: numbers and code, no signs.
     let listing = adds > 0 && adds == parsed.iter().filter(|r| matches!(r, Row::Code { .. })).count();
     let hl = highlighted(&parsed, lang);
     let emph = emphasis(&parsed);
@@ -230,12 +220,13 @@ pub fn rows(diff: &str, lang: &str, expanded: bool) -> (Vec<Line>, usize, usize)
             _ => None,
         })
         .max();
+    let w = width.unwrap_or(0);
     let faint = t.fg(Role::Faint);
     let mut out: Vec<Line> = Vec::new();
     for (i, r) in parsed.iter().enumerate() {
         let (kind, num, code) = match r {
             Row::Gap => {
-                out.push(vec![span(format!("{:>w$} ⋯", "", w = width.unwrap_or(0)), faint)]);
+                out.push(vec![span(format!("{}⋯", " ".repeat(w + 1)), faint)]);
                 continue;
             }
             Row::Note(n) => {
@@ -244,26 +235,30 @@ pub fn rows(diff: &str, lang: &str, expanded: bool) -> (Vec<Line>, usize, usize)
             }
             Row::Code { kind, num, code } => (*kind, *num, *code),
         };
-        let (sign, fg, tint, emph_bg) = match kind {
-            _ if listing => (' ', Role::Faint, None, None),
-            Kind::Context => (' ', Role::Faint, None, None),
-            Kind::Added => ('+', Role::Ok, t.color(Role::OkTint), t.color(Role::OkEmph)),
-            Kind::Removed => ('-', Role::Err, t.color(Role::ErrTint), t.color(Role::ErrEmph)),
+        let (sign, role) = match kind {
+            Kind::Context => (' ', Role::Faint),
+            Kind::Added => ('+', Role::Ok),
+            Kind::Removed => ('-', Role::Err),
         };
+        let n = num.map(|n| n.to_string()).unwrap_or_default();
         let mut row = Line::new();
-        if let Some(w) = width {
-            let n = num.map(|n| n.to_string()).unwrap_or_default();
-            let style = if listing || kind == Kind::Context { faint } else { t.fg(fg) };
-            row.push(span(format!("{n:>w$} "), ContentStyle { background_color: tint, ..style }));
+        if listing {
+            if width.is_some() {
+                row.push(span(format!("{n:>w$} "), faint));
+            }
+        } else {
+            row.push(span(format!("{sign}{n:>w$}"), t.fg(role)));
+            row.push(span("│", t.fg(Role::Line)));
         }
-        if !listing {
-            row.push(span(format!("{sign} "), ContentStyle { background_color: tint, ..t.fg(fg) }));
+        if !listing && kind != Kind::Context {
+            row.extend(emphasize(code, t.fg(role), emph[i].as_ref()));
+        } else {
+            let code_line = hl[i].clone().unwrap_or_else(|| {
+                let style = if kind == Kind::Context && !listing { t.fg(Role::Muted) } else { ContentStyle::default() };
+                vec![span(code, style)]
+            });
+            row.extend(code_line);
         }
-        let code_line = hl[i].clone().unwrap_or_else(|| {
-            let style = if kind == Kind::Context && !listing { t.fg(Role::Muted) } else { ContentStyle::default() };
-            vec![span(code, style)]
-        });
-        row.extend(paint(code_line, tint, emph[i].as_ref(), emph_bg));
         out.push(row);
     }
     if !expanded && out.len() > DIFF_CUT {
@@ -287,7 +282,7 @@ mod tests {
     fn numbered_rows_get_a_gutter() {
         let (ls, adds, dels) = rows(" 9|a\n-10|b\n+10|c\n 11|d\n\n 40|e", "", true);
         assert_eq!((adds, dels), (1, 1));
-        assert_eq!(texts(&ls), [" 9   a", "10 - b", "10 + c", "11   d", "   ⋯", "40   e"]);
+        assert_eq!(texts(&ls), ["  9│a", "-10│b", "+10│c", " 11│d", "   ⋯", " 40│e"]);
     }
 
     #[test]
@@ -295,7 +290,7 @@ mod tests {
         let d = "--- a/f\n+++ b/f\n@@ -3,2 +3,2 @@\n x\n-y\n+z\n@@ -20 +20 @@\n w\n";
         let (ls, adds, dels) = rows(d, "", true);
         assert_eq!((adds, dels), (1, 1));
-        assert_eq!(texts(&ls), ["--- a/f", "+++ b/f", " 3   x", " 4 - y", " 4 + z", "   ⋯", "20   w"]);
+        assert_eq!(texts(&ls), ["--- a/f", "+++ b/f", "  3│x", "- 4│y", "+ 4│z", "   ⋯", " 20│w"]);
     }
 
     #[test]
@@ -324,16 +319,12 @@ mod tests {
 
     #[test]
     fn emphasis_paints_only_the_change() {
-        let t = theme::get();
         let (ls, ..) = rows("-1|    total += x\n+1|    acc += x", "", true);
         let added = &ls[1];
-        let emph: String = added
-            .iter()
-            .filter(|s| s.style.background_color == t.color(Role::OkEmph))
-            .map(|s| s.text.as_str())
-            .collect();
+        let emph: String =
+            added.iter().filter(|s| s.style.attributes.has(Attribute::Reverse)).map(|s| s.text.as_str()).collect();
         assert_eq!(emph, "acc");
-        assert!(added.iter().all(|s| s.style.background_color.is_some()), "the whole row is tinted");
+        assert!(added.iter().all(|s| s.style.background_color.is_none()), "no row tint");
     }
 
     #[test]
@@ -352,8 +343,8 @@ mod tests {
         let (ls, ..) = rows(" 1|def f():\n-2|    return 1\n+2|    return 2", "py", true);
         let kw = ls[0].iter().find(|s| s.text == "def").expect("keyword span");
         assert_eq!(kw.style.foreground_color, t.color(Role::SynKeyword));
-        let ret = ls[2].iter().find(|s| s.text == "return").expect("keyword on an added row");
-        assert_eq!(ret.style.foreground_color, t.color(Role::SynKeyword));
-        assert_eq!(ret.style.background_color, t.color(Role::OkTint));
+        let ret = ls[2].iter().find(|s| s.text == "    return ").expect("plain code span");
+        assert_eq!(ret.style.foreground_color, t.color(Role::Ok));
+        assert!(ret.style.background_color.is_none());
     }
 }
