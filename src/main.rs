@@ -89,6 +89,25 @@ enum Sub {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Review the changes against a base the way `/review` does, without the TUI. Exit codes: 0 pass
+    /// or nothing to review, 1 fixes needed, 2 the review could not complete.
+    Review {
+        /// Git ref to diff against; `HEAD` (the default) reviews uncommitted changes.
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// The approved plan the changes should match.
+        #[arg(long)]
+        plan: Option<PathBuf>,
+        /// What the reviewer should look at hardest.
+        #[arg(long)]
+        focus: Option<String>,
+        /// Write the output here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print markdown instead of JSON.
+        #[arg(long)]
+        markdown: bool,
+    },
 }
 
 /// Everything a session needs that depends only on the working directory.
@@ -202,6 +221,9 @@ fn run() -> Result<i32> {
     }
     if let Some(t) = &cli.theme {
         unsafe { std::env::set_var("MU_THEME", t) };
+    }
+    if let Some(Sub::Review { base, plan, focus, out, markdown }) = cli.command {
+        return Ok(review::run_cli(review::CliOpts { base, plan, focus, out, markdown }, &std::env::current_dir()?));
     }
     if let Some(Sub::Update { check, force, tag }) = cli.command {
         return update::run(check, force, tag);

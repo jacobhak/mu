@@ -77,6 +77,8 @@ Images: paste an image file path, run `/image <path>`, press Ctrl+V (reads `wl-p
 
 `task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session. `wait` blocks until a job finishes; `/jobs` lists jobs and `/jobs kill <id|all>` cancels them. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
 
+`mu review [--base REF] [--plan FILE] [--focus TEXT] [--out FILE] [--markdown]` runs `/review` headlessly, for detached or scripted runs: the same request, `review-lead` and workers, with no TUI and no session. `--base` defaults to `HEAD` (uncommitted changes); `--plan` is the approved plan file. It prints the verdict as JSON (`verdict`: `pass`, `fail`, `nothing` or `error`; `findings` with a `blocking` flag per finding) to stdout or `--out`, and progress to stderr. Exit codes: 0 pass or nothing to review, 1 fixes needed, 2 the review did not complete. The reviewer runs with the configured `review` role.
+
 ### Agent Client Protocol
 
 `mu --acp` serves [ACP](https://agentclientprotocol.com) over stdio, so ACP clients such as [Paseo](https://paseo.sh) can drive it. In Paseo's `~/.paseo/config.json`:

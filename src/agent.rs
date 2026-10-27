@@ -905,14 +905,7 @@ impl Agent {
             self.notice(format!("nothing to review: no changes since {}", short(&base)));
             return None;
         }
-        let mut files = Vec::new();
-        let mut excluded = Vec::new();
-        for f in stats {
-            match review::excluded_reason(&f.path, f.added.is_none()) {
-                Some(why) => excluded.push((f, why)),
-                None => files.push(f),
-            }
-        }
+        let (files, excluded) = review::split_excluded(stats);
         if files.is_empty() {
             self.notice("nothing to review: only binary, generated or lock files changed");
             return None;
