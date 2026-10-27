@@ -408,9 +408,11 @@ fn detail_lines(detail: &str, width: usize, max_lines: usize) -> Vec<Line> {
     if out.len() > max_lines {
         out.truncate(max_lines);
         if let Some(last) = out.last_mut() {
-            let mut cut = line::truncate(last, tw - 1);
+            // Append the ellipsis, then cut back to the width: `truncate` supplies its own `…` when
+            // it has to cut, so the row ends in exactly one.
+            let mut cut = last.clone();
             cut.push(span("…", dim()));
-            *last = cut;
+            *last = line::truncate(&cut, tw);
         }
     }
     out
@@ -644,6 +646,13 @@ mod tests {
         let t = texts(&lines);
         assert_eq!(t.len(), 5, "{t:?}");
         assert!(t[3].is_empty() && t[4].starts_with("  ↳ word") && t[4].ends_with('…'), "{t:?}");
+        // A cut row that already fills the width still ends in a single `…`.
+        let full = "abcdefghijklmnopqrstuvwxyz ".repeat(10);
+        let filled = Select::new("t", vec![Item { label: "a".into(), detail: full }]).detail_panel();
+        let (lines, _) = filled.render(30, 20);
+        let t = texts(&lines);
+        assert!(t.iter().any(|l| l.ends_with('…')) && !t.iter().any(|l| l.contains("……")), "{t:?}");
+        assert!(lines.iter().all(|l| line::line_width(l) <= 30), "{t:?}");
         // Too few rows for any panel: the list keeps its row.
         let (lines, _) = s.render(30, 4);
         let t = texts(&lines);
