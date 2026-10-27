@@ -434,22 +434,28 @@ mod tests {
         assert!(out.text.contains("[pty unavailable without the terminal UI; ran without a terminal]"));
     }
 
-    async fn alive(marker: &str) -> bool {
-        std::process::Command::new("pgrep").args(["-f", marker]).output().unwrap().status.success()
+    /// True if a live process has exactly `sleep {arg}` as its command line. `$` anchors the
+    /// match so the wrapping shell (whose command line also contains the text) is not counted.
+    async fn alive(arg: &str) -> bool {
+        std::process::Command::new("pgrep").args(["-f", &format!("sleep {arg}$")]).output().unwrap().status.success()
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn background_processes_in_plain_mode() {
+        // `pgrep`/`pkill -f` see every process on the machine, so the sleep durations carry this
+        // process's pid: concurrent test runs cannot match or kill each other's sleeps.
+        let pid = std::process::id();
+        let (quiet, kept) = (format!("31337{pid}"), format!("31338{pid}"));
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
-        let cmd = "(sleep 31337 &); setsid nohup sleep 31338 >/dev/null 2>&1 & echo started";
+        let cmd = format!("(sleep {quiet} &); setsid nohup sleep {kept} >/dev/null 2>&1 & echo started");
         let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
         assert!(out.text.contains("started"), "{}", out.text);
         // A plain `&` ends with the command; `setsid nohup … &` is how to keep one alive.
-        assert!(!alive("sleep 31337").await);
-        assert!(alive("sleep 31338").await);
-        let _ = std::process::Command::new("pkill").args(["-f", "sleep 3133[78]"]).status();
+        assert!(!alive(&quiet).await);
+        assert!(alive(&kept).await);
+        let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {kept}$")]).status();
     }
 
     #[test]
