@@ -413,6 +413,17 @@ NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `
         i.model,
         i.cwd.display()
     );
+    if !i.subagent {
+        s.push_str(
+            "\n# Delegation\n\
+When the `task` tool is available, SHOULD use it instead of doing everything inline:\n\
+- User says `parallel` or `parallelize` → MUST use `task` subagents; parallel tool calls are not enough.\n\
+- Substantial work that splits into 2+ independent, self-contained slices (multi-file changes, refactors, features, tests, investigations) → fan the slices out in one `tasks[]` batch. Set shared interfaces in `context`; one agent owns any shared edit.\n\
+- Unmapped code spanning several areas → `scout` agents rather than reading file after file yourself.\n\
+- Do it yourself: a single small edit, a slice you already have open, a direct question, a prerequisite the others depend on.\n\
+- Agents start blank: give each full requirements, never rely on conversation history. NEVER spawn then idle, and NEVER serialize independent work.\n",
+        );
+    }
     if i.subagent {
         s.push_str("\nYou are a subagent. Your final message is returned verbatim to the parent agent as your result; make it complete and self-contained.\n");
     }

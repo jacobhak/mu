@@ -25,9 +25,18 @@ struct T {
     agent: Option<String>,
 }
 
-pub const DESCRIPTION: &str = "Run subagents in parallel and wait for all of them. Each task runs in a fresh context with its own tools and returns its final message. `scout` agents are read-only (read, grep, glob, web); `task` agents can also edit and run commands. Give every task a self-contained description; optional `context` is prepended to each.";
+macro_rules! guidance {
+    () => {
+        " Each task runs in a fresh context with its own tools and returns its final message.\n\n# Agents\n- `task` (default): can read, edit and run commands; prefer one agent to investigate and edit its slice.\n- `scout`: read-only (read, grep, glob, web); for research over code you have not mapped yet.\n\n# Delegation\nFan genuinely independent slices out in one `tasks[]` batch; do shared prerequisites inline and sequence only true dependencies. Shared edits need one integration owner; set interfaces in `context`. Tell tasks to skip build/lint/tests mid-flight and run them once afterward. Agents start blank, so never reference the conversation.\n\n# Format\n`context`: shared background (`# Goal`, `# Contract` interfaces); do not repeat it per task.\n`name`: CamelCase label.\n`task`: self-contained (`# Target` files and non-goals, `# Change` steps and APIs, `# Acceptance` observable result)."
+    };
+}
 
-pub const ASYNC_DESCRIPTION: &str = "Spawn subagents in the background; job ids return immediately. Each task runs in a fresh context with its own tools and returns its final message. `scout` agents are read-only (read, grep, glob, web); `task` agents can also edit and run commands. Results arrive automatically as a <system-notice> message; never poll. Call `wait` only when blocked with nothing else to do. Give every task a self-contained description; optional `context` is prepended to each.";
+pub const DESCRIPTION: &str = concat!("Run subagents in parallel and wait for all of them.", guidance!());
+
+pub const ASYNC_DESCRIPTION: &str = concat!(
+    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message: keep working, never poll, and call `wait` only when blocked with nothing else to do.",
+    guidance!()
+);
 
 pub fn schema(names: &[&str]) -> Value {
     let mut agents = vec!["task", "scout"];
