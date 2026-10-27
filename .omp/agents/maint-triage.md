@@ -1,7 +1,7 @@
 ---
 name: maint-triage
 description: Classify an oh-my-pi upgrade's impact on mu
-model: ["@default"]
+model: ["@smol", "@default"]
 tools: read, grep, glob
 ---
 You triage an oh-my-pi (omp) release for mu, a Rust coding agent that depends on omp.
