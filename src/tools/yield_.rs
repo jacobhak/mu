@@ -14,6 +14,20 @@ pub fn schema(output: &Value) -> Value {
         "error":{"type":"string","description":"Failure reason; mutually exclusive with data"}}})
 }
 
+/// `12.0` is a valid JSON Schema integer but serde rejects it for integer fields; store `12`.
+fn whole_floats_to_ints(v: &mut Value) {
+    match v {
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64().filter(|f| n.is_f64() && f.fract() == 0.0 && f.abs() < 9e15) {
+                *v = Value::from(f as i64);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(whole_floats_to_ints),
+        Value::Object(o) => o.values_mut().for_each(whole_floats_to_ints),
+        _ => {}
+    }
+}
+
 #[derive(Deserialize)]
 pub struct Args {
     data: Option<Value>,
@@ -37,8 +51,9 @@ impl Tools {
                 out.details = Some(json!({"status": "aborted", "error": e}));
                 out
             }
-            (Some(d), None) => match crate::schema::validate(&output, &d) {
+            (Some(mut d), None) => match crate::schema::validate(&output, &d) {
                 Ok(()) => {
+                    whole_floats_to_ints(&mut d);
                     let mut out = ToolOutput::ok("Result submitted.");
                     out.details = Some(json!({"status": "success", "data": d}));
                     out
@@ -79,6 +94,13 @@ mod tests {
         let out = call(&tools(), json!({"data":{"n":"x"}}));
         assert!(out.is_error && out.details.is_none());
         assert!(out.text.contains("$.n"), "{}", out.text);
+    }
+
+    #[test]
+    fn whole_floats_become_integers() {
+        let t = tools();
+        let out = call(&t, json!({"data":{"n":12.0,"x":[1.0,1.5]}}));
+        assert_eq!(out.details, Some(json!({"status":"success","data":{"n":12,"x":[1,1.5]}})));
     }
 
     #[test]

@@ -85,7 +85,7 @@ pub async fn subagent_mode(
     code
 }
 
-async fn run_subagent(
+pub(crate) async fn run_subagent(
     prompt: String,
     structured: bool,
     cmd: UnboundedSender<Command>,

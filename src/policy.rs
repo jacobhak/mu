@@ -52,6 +52,7 @@ mod tests {
     fn scout_rejects_bash_and_depth_rejects_task() {
         let scout = ToolPolicy { allow: Some(["read", "grep"].map(String::from).to_vec()), ..Default::default() };
         assert!(scout.check("read").is_ok());
+        assert!(scout.check("yield").is_ok(), "yield bypasses the allowlist");
         assert!(scout.check("bash").is_err());
         assert!(ToolPolicy { depth: 2, ..Default::default() }.check("task").is_err());
         assert!(ToolPolicy { depth: 1, ..Default::default() }.check("task").is_ok());

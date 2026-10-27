@@ -1127,6 +1127,8 @@ impl Agent {
             return;
         }
         if !self.ensure_session().await {
+            // Without this the caller (e.g. a headless subagent) waits for a `TurnEnd` forever.
+            self.emit(AgentEvent::TurnEnd { aborted: true });
             return;
         }
         let cancel = CancellationToken::new();
@@ -1668,6 +1670,69 @@ mod loop_tests {
                 _ => None,
             });
             assert!(err.unwrap().contains("not allowed"));
+        });
+    }
+
+    fn yield_call(id: &str, args: serde_json::Value) -> Block {
+        Block::ToolCall { id: id.into(), name: "yield".into(), arguments: args }
+    }
+
+    /// Runs `a` as a `--headless` child would be driven: `run_subagent` on one side, the agent loop on the other.
+    async fn drive_subagent(
+        mut a: Agent,
+        rx: UnboundedReceiver<AgentEvent>,
+        structured: bool,
+    ) -> (serde_json::Value, i32) {
+        let (ctx, mut crx) = tokio::sync::mpsc::unbounded_channel();
+        let agent_side = async move {
+            while let Some(c) = crx.recv().await {
+                match c {
+                    Command::Prompt(t) => a.turn(Some(t)).await,
+                    Command::Exit => {
+                        a.emit(AgentEvent::Exit);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let (_, r) = tokio::join!(agent_side, crate::headless::run_subagent("go".into(), structured, ctx, rx, |_| {}));
+        r
+    }
+
+    #[test]
+    fn structured_subagent_retries_invalid_yield_and_returns_data() {
+        crate::testutil::home();
+        run(async {
+            let script = vec![
+                Ok(assistant(vec![yield_call("y1", json!({"data":{"n":"x"}}))], StopReason::ToolUse)),
+                Ok(assistant(vec![yield_call("y2", json!({"data":{"n":2.0}}))], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+            ];
+            let (mut a, rx) = agent(script);
+            *a.tools.output_schema.borrow_mut() =
+                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+            a.allow = Some(vec!["read".into()]); // `yield` must still be allowed
+            let (r, code) = drive_subagent(a, rx, true).await;
+            assert_eq!((code, &r["schemaOk"], &r["data"]), (0, &true.into(), &json!({"n":2})), "{r}");
+        });
+    }
+
+    #[test]
+    fn structured_subagent_fails_instead_of_hanging_when_the_session_cannot_be_created() {
+        let home = crate::testutil::home();
+        run(async {
+            let cwd = std::env::temp_dir().join(format!("mu-nosess-{}", uuid::Uuid::new_v4()));
+            let dir = crate::paths::session_dir(&cwd);
+            std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+            std::fs::write(&dir, "not a directory").unwrap(); // create_dir_all now fails
+            assert!(dir.starts_with(home));
+            let (mut a, rx) = agent(vec![]);
+            a.cwd = cwd;
+            *a.tools.output_schema.borrow_mut() = Some(json!({"type":"object"}));
+            let r = tokio::time::timeout(std::time::Duration::from_secs(10), drive_subagent(a, rx, true)).await;
+            let (r, code) = r.expect("the run hung");
+            assert_eq!((code, &r["isError"]), (1, &true.into()), "{r}");
         });
     }
 

@@ -269,14 +269,6 @@ impl Default for Finding {
     }
 }
 
-/// The last ```` ```json ```` block of `text`, parsed and clamped.
-pub fn parse_report(text: &str) -> Option<Report> {
-    let start = text.rfind("```json")? + "```json".len();
-    let rest = &text[start..];
-    let body = &rest[..rest.find("```").unwrap_or(rest.len())];
-    clamp(serde_json::from_str(body.trim()).ok()?)
-}
-
 fn clamp(mut r: Report) -> Option<Report> {
     for f in &mut r.findings {
         f.priority = f.priority.min(3);
@@ -285,12 +277,9 @@ fn clamp(mut r: Report) -> Option<Report> {
     Some(r)
 }
 
-/// The lead's report: its schema-validated `data` when it returned any, else the last json block.
+/// The lead's report: its schema-validated `data`. A run without `data` has no report.
 pub fn report_of(out: &crate::tools::task::Outcome) -> Option<Report> {
-    match &out.data {
-        Some(d) => clamp(serde_json::from_value(d.clone()).ok()?),
-        None => parse_report(&out.text),
-    }
+    clamp(serde_json::from_value(out.data.clone()?).ok()?)
 }
 
 /// The result schema of the lead reviewer (`outputSchema` of its task).
@@ -649,7 +638,7 @@ mod tests {
         let with_data = Outcome { ok: true, text: "```json\n{\"verdict\":\"pass\"}\n```".into(), data: Some(data) };
         assert_eq!(report_of(&with_data).unwrap().verdict, "fail");
         let scraped = Outcome { ok: true, text: "x\n```json\n{\"verdict\":\"pass\"}\n```".into(), data: None };
-        assert_eq!(report_of(&scraped).unwrap().verdict, "pass");
+        assert!(report_of(&scraped).is_none());
     }
 
     fn finding(p: u8, c: f32) -> Finding {
@@ -681,16 +670,13 @@ mod tests {
     }
 
     #[test]
-    fn report_takes_last_block_and_clamps() {
-        let t = "x\n```json\n{\"summary\":\"old\"}\n```\nthen\n```json\n{\"verdict\":\"fail\",\"findings\":[{\"title\":\"a\",\"priority\":7,\"confidence\":3.0}]}\n```";
-        let r = parse_report(t).unwrap();
-        assert_eq!(r.verdict, "fail");
-        assert_eq!(r.findings[0].priority, 3);
-        assert_eq!(r.findings[0].confidence, 1.0);
-        assert!(parse_report("```json\n{nope\n```").is_none());
-        assert!(parse_report("no block").is_none());
-        let d = parse_report("```json\n{\"findings\":[{}]}\n```").unwrap();
-        assert_eq!((d.findings[0].priority, d.findings[0].confidence), (2, 1.0));
+    fn report_of_clamps() {
+        use crate::tools::task::Outcome;
+        let d = serde_json::json!({"verdict":"fail","findings":[{"title":"a","priority":7,"confidence":3.0},{}]});
+        let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(d) }).unwrap();
+        assert_eq!((r.findings[0].priority, r.findings[0].confidence), (3, 1.0));
+        assert_eq!((r.findings[1].priority, r.findings[1].confidence), (2, 1.0));
+        assert!(report_of(&Outcome { ok: true, text: "```json\n{}\n```".into(), data: None }).is_none());
     }
 
     #[test]
