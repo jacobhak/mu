@@ -168,6 +168,36 @@ pub struct AgentDef {
     pub prompt: String,
 }
 
+pub const REVIEW_LEAD: &str = "review-lead";
+pub const REVIEW_WORKER: &str = "review-worker";
+
+/// Agents mu ships. They are not in `Context::agents`, so the main agent's `task` tool never offers them.
+pub fn builtin_agent(name: &str) -> Option<AgentDef> {
+    let tools = |t: &[&str]| Some(t.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let model: Vec<String> = crate::models::role_chain("review").iter().map(|r| format!("@{r}")).collect();
+    let (description, tools, prompt) = match name {
+        REVIEW_LEAD => (
+            "Lead code reviewer",
+            tools(&["read", "grep", "glob", "bash", "task"]),
+            include_str!("prompts/review-lead.md"),
+        ),
+        REVIEW_WORKER => (
+            "Reviews an assigned slice of a diff; read-only; returns findings as JSON",
+            tools(&["read", "grep", "glob", "bash"]),
+            include_str!("prompts/review-worker.md"),
+        ),
+        _ => return None,
+    };
+    Some(AgentDef {
+        name: name.into(),
+        description: description.into(),
+        tools,
+        model,
+        thinking: None,
+        prompt: prompt.into(),
+    })
+}
+
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct AgentFront {
@@ -213,7 +243,9 @@ pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDe
                 continue;
             }
             let lower = name.to_lowercase();
-            if ["main", "sub", "task", "scout"].contains(&lower.as_str()) || out.iter().any(|a| a.name == name) {
+            if ["main", "sub", "task", "scout", REVIEW_LEAD, REVIEW_WORKER].contains(&lower.as_str())
+                || out.iter().any(|a| a.name == name)
+            {
                 continue;
             }
             out.push(AgentDef {

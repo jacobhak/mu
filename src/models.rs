@@ -85,6 +85,7 @@ pub fn role_chain(role: &str) -> Vec<String> {
     let rest: &[&str] = match role {
         "memory" => &["smol", "default"],
         "smol" | "task" | "plan" => &["default"],
+        "review" => &["plan", "default"],
         _ => &[],
     };
     std::iter::once(role).chain(rest.iter().copied()).map(String::from).collect()

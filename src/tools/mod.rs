@@ -408,6 +408,7 @@ pub fn summary(name: &str, args: &Value) -> String {
         "bash" => first("command"),
         "web_search" => first("query"),
         "fetch" => first("url"),
+        "review" => first("scope"),
         "wait" => {
             let ids: Vec<&str> =
                 args["ids"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();

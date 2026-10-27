@@ -96,6 +96,7 @@ pub struct Loaded {
     pub title: Option<String>,
     pub mode: Option<(String, Value)>,
     pub plugin_context: BTreeMap<String, String>,
+    pub review_base: Option<Value>,
     pub todo: Option<Value>,
     /// Problems found (and repaired) while loading.
     pub warnings: Vec<String>,
@@ -322,6 +323,8 @@ struct Index {
     todo: bool,
     /// A `plugin_context` custom entry.
     plugin_ctx: bool,
+    /// A `review_base` custom entry.
+    review_base: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -398,9 +401,10 @@ fn parse(path: &Path) -> Result<Parsed> {
         let todo = kind == "message"
             && p.message.is_some_and(|m| m.tool_name.as_deref() == Some("todo") && m.is_error == Some(false));
         let plugin_ctx = kind == "custom" && p.custom_type.as_deref() == Some("plugin_context");
+        let review_base = kind == "custom" && p.custom_type.as_deref() == Some("review_base");
         by_id.insert(id.clone(), index.len());
         last = Some(index.len());
-        index.push(Index { id, parent: p.parent_id, offset: start, kind, todo, plugin_ctx });
+        index.push(Index { id, parent: p.parent_id, offset: start, kind, todo, plugin_ctx, review_base });
     }
     if !header_seen {
         bail!("not a v3 session file: {}", path.display());
@@ -436,7 +440,7 @@ fn parse(path: &Path) -> Result<Parsed> {
             "message" => in_window || last_todo == Some(pos),
             "custom_message" => in_window,
             "model_change" | "thinking_level_change" | "title_change" | "mode_change" => true,
-            "custom" => e.plugin_ctx,
+            "custom" => e.plugin_ctx || e.review_base,
             _ => false,
         };
         if !needed {
@@ -477,7 +481,9 @@ fn parse(path: &Path) -> Result<Parsed> {
                 loaded.mode = Some((v["mode"].as_str().unwrap_or("none").into(), v["data"].clone()));
             }
             "custom" => {
-                if let (Some(p), Some(c)) = (v["data"]["plugin"].as_str(), v["data"]["context"].as_str()) {
+                if e.review_base {
+                    loaded.review_base = Some(v["data"].clone());
+                } else if let (Some(p), Some(c)) = (v["data"]["plugin"].as_str(), v["data"]["context"].as_str()) {
                     loaded.plugin_context.insert(p.into(), c.into());
                 }
             }
@@ -734,6 +740,18 @@ mod tests {
         assert_eq!(l.mode.unwrap().0, "plan");
         assert_eq!(l.plugin_context.len(), 1);
         assert_eq!(l.plugin_context["memory"], "ctx");
+    }
+
+    #[test]
+    fn review_base_reloads() {
+        home();
+        let mut s = SessionFile::create(Path::new("/opt/rb"), None).unwrap();
+        s.message(&Message::user("hi"));
+        s.custom("review_base", json!({"tree":"a","since":1}));
+        s.custom("review_base", json!({"tree":"b","planUri":"local://x-plan.md","since":2}));
+        let l = load(&s.path).unwrap();
+        assert_eq!(l.review_base.unwrap(), json!({"tree":"b","planUri":"local://x-plan.md","since":2}));
+        assert!(l.plugin_context.is_empty());
     }
 
     #[test]

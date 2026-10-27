@@ -36,7 +36,7 @@ use tokio::sync::oneshot;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
-const BUILTIN_DESC: [(&str, &str, bool); 19] = [
+const BUILTIN_DESC: [(&str, &str, bool); 20] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -47,6 +47,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 19] = [
     ("thinking", "Set the thinking level", false),
     ("compact", "Compact the context [focus]", false),
     ("plan", "Toggle plan mode", false),
+    ("review", "Review changes against the approved plan [focus]", false),
     ("session", "Show the session file and title", false),
     ("rename", "Rename this session", true),
     ("todo", "Show the todo list", false),
@@ -952,6 +953,10 @@ impl App {
             "compact" => {
                 self.running = true;
                 self.send(Command::Compact((!arg.is_empty()).then(|| arg.to_string())));
+            }
+            "review" => {
+                self.running = true;
+                self.send(Command::Review((!arg.is_empty()).then(|| arg.to_string())));
             }
             "session" => {
                 let p = self.status.session_path.clone().unwrap_or_else(|| "no session yet".into());

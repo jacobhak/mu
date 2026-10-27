@@ -49,11 +49,10 @@ impl Tools {
         let title = a.title;
         let approved = |text: &str, kind: &str, model: Option<String>, with_content: bool| {
             let mut o = ToolOutput::ok(text);
-            let mut d = json!({"planDecision": kind, "model": model});
+            let mut d = json!({"planDecision": kind, "model": model, "uri": uri});
             if with_content {
                 d["content"] = json!(content);
                 d["title"] = json!(title);
-                d["uri"] = json!(uri);
             }
             o.details = Some(d);
             o

@@ -21,6 +21,7 @@ mod proc;
 mod provider;
 mod pty;
 mod quota;
+mod review;
 mod session;
 #[cfg(test)]
 mod testutil;
@@ -210,7 +211,7 @@ fn run() -> Result<i32> {
         return acp::run(cli.model, cli_thinking);
     }
     let cwd = std::env::current_dir()?;
-    let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup(&cwd);
+    let Setup { cfgs, mut ctx, host, providers, notice_tx, notice_rx } = setup(&cwd);
     if cli.print.is_none() && !cli.headless && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
         let tx = notice_tx.clone();
@@ -240,9 +241,14 @@ fn run() -> Result<i32> {
             serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
         let role = if p["agent"] == "scout" { "smol" } else { "task" };
         if let Some(name) = p["agent"].as_str().filter(|n| !matches!(*n, "task" | "scout")) {
-            match ctx.agents.iter().find(|a| a.name == name) {
-                Some(d) => agent_def = Some(d.clone()),
+            match ctx.agents.iter().find(|a| a.name == name).cloned().or_else(|| context::builtin_agent(name)) {
+                Some(d) => agent_def = Some(d),
                 None => bail!("unknown agent `{name}`"),
+            }
+            if name == context::REVIEW_LEAD {
+                // Only the lead's `task` schema lists the worker; its children resolve it by the same fallback.
+                let w = context::builtin_agent(context::REVIEW_WORKER).expect("builtin");
+                Rc::get_mut(&mut ctx).expect("context not shared yet").agents.push(w);
             }
         }
         if cli.model.is_none() {

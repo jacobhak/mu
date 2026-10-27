@@ -409,6 +409,12 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
         }
         "grep" => lines.push(vec![span(format!("  {} matches", out.text.lines().count()), tfg(Role::Muted))]),
         "glob" => lines.push(vec![span(format!("  {} files", out.text.lines().count()), tfg(Role::Muted))]),
+        "review" => {
+            let tone = if out.text.starts_with("## Review: NEEDS FIXES") { Tone::Error } else { Tone::Success };
+            let rows = markdown::render(&out.text, width.saturating_sub(4));
+            let card = Card { tone, sections: vec![Section { label: None, rows }], footer: None };
+            lines.extend(frame(&card, width));
+        }
         "task" => lines.extend(text_rows(&out.text, expanded, |l| {
             if l.starts_with("## ") { name_style() } else { tfg(Role::Muted) }
         })),

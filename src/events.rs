@@ -20,6 +20,8 @@ pub enum Command {
     SetThinking(Thinking),
     NewSession,
     Compact(Option<String>),
+    /// `/review [focus]`.
+    Review(Option<String>),
     TogglePlan(Option<String>),
     Resume(PathBuf),
     Bash {
