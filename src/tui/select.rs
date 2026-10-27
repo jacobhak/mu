@@ -226,8 +226,10 @@ impl Select {
                 }
             } else if avail > 0 {
                 let sel = self.sel.min(n - 1);
-                // The panel never takes the last row, so the list always keeps one.
+                // The panel never takes the last row, so the list always keeps one. Too few rows
+                // for a separator and a line of text means no panel at all.
                 let panel = self.detail_height(width).min(avail - 1);
+                let panel = if panel < 2 { 0 } else { panel };
                 let (a, b, ind) = window(n, sel, avail - panel);
                 if ind && a > 0 {
                     out.push(line::styled(format!("  … {a} more"), |_| dim()));
@@ -240,12 +242,14 @@ impl Select {
                 }
                 if panel > 0 {
                     let detail = match rows[sel] {
-                        Row::Item(i) => detail_lines(&self.items[i].detail, width),
+                        Row::Item(i) => detail_lines(&self.items[i].detail, width, panel - 1),
                         Row::Free => Vec::new(),
                     };
-                    for k in 0..panel {
-                        let mut l: Line = vec![span("  ", ContentStyle::default())];
+                    out.push(Vec::new());
+                    for k in 0..panel - 1 {
+                        let mut l: Line = Vec::new();
                         if let Some(d) = detail.get(k) {
+                            l.push(span(if k == 0 { "  ↳ " } else { "    " }, dim()));
                             l.extend(d.iter().cloned());
                         }
                         out.push(l);
@@ -277,13 +281,17 @@ impl Select {
         rows
     }
 
-    /// Rows the detail panel takes: the tallest description among the items, so the height does
-    /// not change as the cursor moves. Zero unless the panel is on.
+    /// Rows the detail panel takes: a blank separator plus the tallest description among the
+    /// items, so the height does not change as the cursor moves. Zero unless the panel is on and
+    /// some item has a description.
     fn detail_height(&self, width: usize) -> usize {
         if !self.detail_panel {
             return 0;
         }
-        self.items.iter().map(|it| detail_lines(&it.detail, width).len()).max().unwrap_or(0)
+        match self.items.iter().map(|it| detail_lines(&it.detail, width, DETAIL_MAX_LINES).len()).max().unwrap_or(0) {
+            0 => 0,
+            tallest => tallest + 1,
+        }
     }
 
     fn step(&mut self, delta: isize, n: usize) {
@@ -365,14 +373,21 @@ fn window(n: usize, sel: usize, avail: usize) -> (usize, usize, bool) {
     (a, b, true)
 }
 
-/// A description wrapped to `width` after a two-column indent, at most `DETAIL_MAX_LINES` rows.
-fn detail_lines(detail: &str, width: usize) -> Vec<Line> {
-    let rows = wrap_chs(&chs(detail, dim()), width.saturating_sub(2).max(1));
+/// A description as panel rows: the first starts with a `↳` marker and the rest align under its
+/// text. Wrapped to fit `width`, at most `max_lines` rows; a cut row ends in `…` within `width`.
+fn detail_lines(detail: &str, width: usize, max_lines: usize) -> Vec<Line> {
+    if detail.trim().is_empty() {
+        return Vec::new();
+    }
+    let tw = width.saturating_sub(4).max(1);
+    let rows = wrap_chs(&chs(detail, dim()), tw);
     let mut out: Vec<Line> = rows.iter().map(|r| chars_to_line(r)).collect();
-    if out.len() > DETAIL_MAX_LINES {
-        out.truncate(DETAIL_MAX_LINES);
+    if out.len() > max_lines {
+        out.truncate(max_lines);
         if let Some(last) = out.last_mut() {
-            last.push(span("…", dim()));
+            let mut cut = line::truncate(last, tw - 1);
+            cut.push(span("…", dim()));
+            *last = cut;
         }
     }
     out
@@ -576,30 +591,69 @@ mod tests {
         .detail_panel();
         let (lines, _) = s.render(30, 20);
         let t = texts(&lines);
-        assert_eq!(t.len(), 7, "{t:?}");
+        assert_eq!(t.len(), 9, "{t:?}");
         assert_eq!(t[2].trim_end(), "❯ a", "no inline detail in panel mode");
-        assert_eq!(t[4], "  the first option has a long");
-        assert_eq!(t[5], "  description that wraps over");
-        assert_eq!(t[6], "  several rows of the picker");
+        assert_eq!(t[3], "  b");
+        assert_eq!(t[4], "", "a blank separator row");
+        assert_eq!(t[5], "  ↳ the first option has a");
+        assert_eq!(t[6], "    long description that");
+        assert_eq!(t[7], "    wraps over several rows of");
+        assert_eq!(t[8], "    the picker");
         s.on_key(key(KeyCode::Down));
         let (lines, _) = s.render(30, 20);
         let t = texts(&lines);
-        assert_eq!(t.len(), 7, "the height holds while the cursor moves: {t:?}");
-        assert_eq!(t[4], "  short");
-        assert!(t[5].trim().is_empty() && t[6].trim().is_empty(), "{t:?}");
+        assert_eq!(t.len(), 9, "the height holds while the cursor moves: {t:?}");
+        assert_eq!(t[5], "  ↳ short");
+        assert!(t[6..].iter().all(|l| l.trim().is_empty()), "{t:?}");
     }
 
     #[test]
-    fn detail_panel_caps_lines_with_an_ellipsis_and_keeps_one_list_row() {
+    fn detail_panel_caps_lines_with_an_ellipsis_inside_the_width() {
         let long = "word ".repeat(60);
         let s = Select::new("t", vec![Item { label: "a".into(), detail: long }]).detail_panel();
         let (lines, _) = s.render(30, 20);
         let t = texts(&lines);
-        assert_eq!(t.len(), 2 + 1 + DETAIL_MAX_LINES, "{t:?}");
-        assert!(t[DETAIL_MAX_LINES + 2].ends_with('…'), "{t:?}");
+        assert_eq!(t.len(), 2 + 1 + 1 + DETAIL_MAX_LINES, "{t:?}");
+        assert!(t[DETAIL_MAX_LINES + 3].ends_with('…'), "{t:?}");
+        assert!(lines.iter().all(|l| line::line_width(l) <= 30), "{t:?}");
+        // Too few rows for the panel: it shrinks to a separator and one line, still ellipsised.
+        let (lines, _) = s.render(30, 5);
+        let t = texts(&lines);
+        assert_eq!(t.len(), 5, "{t:?}");
+        assert!(t[3].is_empty() && t[4].starts_with("  ↳ word") && t[4].ends_with('…'), "{t:?}");
+        // Too few rows for any panel: the list keeps its row.
         let (lines, _) = s.render(30, 4);
         let t = texts(&lines);
         assert!(t.len() <= 4 && t.iter().any(|l| l.starts_with("❯ a")), "{t:?}");
+    }
+
+    #[test]
+    fn detail_panel_lines_never_exceed_the_width() {
+        let items = vec![
+            Item { label: "a".into(), detail: "word ".repeat(40) },
+            Item { label: "b".into(), detail: "日本語のテキストは幅が二倍です ".repeat(4) },
+            Item { label: "c".into(), detail: String::new() },
+        ];
+        let mut s = Select::new("t", items).free_text("Other").detail_panel();
+        for _ in 0..4 {
+            for width in [3, 8, 12, 30] {
+                for max_rows in [4, 6, 12, 40] {
+                    let (lines, _) = s.render(width, max_rows);
+                    assert!(lines.len() <= max_rows, "{:?}", texts(&lines));
+                    for l in &lines {
+                        assert!(line::line_width(l) <= width, "width {width}: {:?}", line::line_text(l));
+                    }
+                }
+            }
+            s.on_key(key(KeyCode::Down));
+        }
+    }
+
+    #[test]
+    fn detail_panel_reserves_no_rows_without_descriptions() {
+        let s = Select::new("t", vec![Item { label: "a".into(), detail: String::new() }]).detail_panel();
+        let (lines, _) = s.render(30, 20);
+        assert_eq!(texts(&lines).len(), 3, "{:?}", texts(&lines));
     }
 
     #[test]

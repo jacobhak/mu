@@ -319,7 +319,8 @@ mod tests {
         let (lines, _) = ask_select(&q).render(40, 20);
         let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
         assert_eq!(t[2].trim_end(), "❯ Yes", "{t:?}");
-        assert_eq!(t[5], "  apply the change now and run the tests", "{t:?}");
-        assert_eq!(t[6], "  afterwards", "{t:?}");
+        assert_eq!(t[5], "", "{t:?}");
+        assert_eq!(t[6], "  ↳ apply the change now and run the", "{t:?}");
+        assert_eq!(t[7], "    tests afterwards", "{t:?}");
     }
 }
