@@ -481,7 +481,10 @@ mod tests {
         // SAFETY: `wr` is a valid pipe write end.
         assert_eq!(unsafe { libc::write(wr.as_raw_fd(), b"a".as_ptr().cast(), 1) }, 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next()).await.unwrap();
-        assert!(matches!(got, Some(Input::Term(Event::Key(k))) if k.code == KeyCode::Char('a')), "keypress after cancelled polls");
+        assert!(
+            matches!(got, Some(Input::Term(Event::Key(k))) if k.code == KeyCode::Char('a')),
+            "keypress after cancelled polls"
+        );
     }
 
     fn key(c: KeyCode) -> Input {
