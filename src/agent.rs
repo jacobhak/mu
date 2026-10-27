@@ -259,6 +259,9 @@ impl Agent {
         if self.jobs.is_some() {
             v.push(Tools::wait_def());
         }
+        if let Some(o) = self.tools.output_schema.borrow().as_ref() {
+            v.push(Tools::yield_def(o));
+        }
         let policy = self.policy();
         v.retain(|d| policy.permits(&d.name));
         v
@@ -949,6 +952,7 @@ impl Agent {
         let payload = json!({
             "task": request,
             "agent": context::REVIEW_LEAD,
+            "outputSchema": review::report_schema(),
             "parentSession": self.session.as_ref().map(|s| s.path.clone()),
         });
         let id = "review".to_string();
@@ -972,7 +976,7 @@ impl Agent {
             self.emit(AgentEvent::ToolEnd { id, name: "review".into(), output: ToolOutput::err(out.text) });
             return None;
         }
-        let report = review::parse_report(&out.text);
+        let report = review::report_of(&out);
         let md = match &report {
             Some(r) => review::render_markdown(
                 r,

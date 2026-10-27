@@ -25,6 +25,7 @@ impl ToolPolicy {
             return Err(format!("Tool `{name}` is not available in this run."));
         }
         if let Some(allow) = &self.allow
+            && name != "yield" // how a subagent with an output schema returns its result
             && !allow.iter().any(|a| a == name)
         {
             return Err(format!("Tool `{name}` is not allowed for this agent."));

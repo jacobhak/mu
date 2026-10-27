@@ -24,6 +24,9 @@ struct T {
     task: String,
     agent: Option<String>,
     cwd: Option<String>,
+    /// JSON Schema of the result; the subagent then returns validated `data`.
+    #[serde(rename = "outputSchema")]
+    output_schema: Option<Value>,
 }
 
 macro_rules! guidance {
@@ -51,7 +54,8 @@ pub fn schema(names: &[&str]) -> Value {
             "name":{"type":"string"},
             "task":{"type":"string"},
             "agent":{"type":"string","enum":agents},
-            "cwd":{"type":"string","description":"absolute path of an existing directory the task runs in (e.g. a git worktree); defaults to this session's directory"}},"required":["task"]}}},"required":["tasks"]})
+            "cwd":{"type":"string","description":"absolute path of an existing directory the task runs in (e.g. a git worktree); defaults to this session's directory"},
+            "outputSchema":{"type":"object","description":"JSON Schema for this task's result. The subagent must submit matching JSON via `yield`; you get it back as a ```json block. Omit for a free-text answer."}},"required":["task"]}}},"required":["tasks"]})
 }
 
 pub fn depth() -> u32 {
@@ -73,7 +77,16 @@ fn resolve_cwd(raw: Option<&str>, default: &Path) -> Result<PathBuf, String> {
 
 pub struct Outcome {
     pub ok: bool,
+    /// The final message, or the validated `data` as a fenced JSON block when there is any.
     pub text: String,
+    /// Validated result of a task given an `outputSchema`.
+    pub data: Option<Value>,
+}
+
+impl Outcome {
+    fn failed(text: impl Into<String>) -> Self {
+        Self { ok: false, text: text.into(), data: None }
+    }
 }
 
 impl Tools {
@@ -81,6 +94,12 @@ impl Tools {
         if a.tasks.is_empty() || a.tasks.len() > MAX_TASKS {
             return ToolOutput::err("task: provide 1-8 tasks");
         }
+        if let Some(e) =
+            a.tasks.iter().filter_map(|t| t.output_schema.as_ref()).find_map(|s| crate::schema::check_schema(s).err())
+        {
+            return ToolOutput::err(format!("task: {e}"));
+        }
+        let schemas: Vec<Option<&Value>> = a.tasks.iter().map(|t| t.output_schema.as_ref()).collect();
         let plan = self.plan.get();
         // (name, agent, task, cwd)
         let specs: Vec<(String, String, String, PathBuf)> = match a
@@ -102,7 +121,13 @@ impl Tools {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),
         };
-        let payload = |agent: &str, task: &str| json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
+        let payload = |agent: &str, task: &str, schema: Option<&Value>| {
+            let mut p = json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
+            if let Some(s) = schema {
+                p["outputSchema"] = s.clone();
+            }
+            p
+        };
 
         if let Some(jobs) = &self.jobs {
             let running = jobs.running();
@@ -112,9 +137,9 @@ impl Tools {
                 ));
             }
             let mut started = Vec::new();
-            for (name, agent, task, cwd) in &specs {
+            for (i, (name, agent, task, cwd)) in specs.iter().enumerate() {
                 let id = jobs.unique_id(name);
-                jobs.spawn(id.clone(), agent.clone(), exe.clone(), cwd.clone(), payload(agent, task));
+                jobs.spawn(id.clone(), agent.clone(), exe.clone(), cwd.clone(), payload(agent, task, schemas[i]));
                 started.push(format!("{id} ({agent})"));
             }
             return ToolOutput::ok(format!(
@@ -138,7 +163,7 @@ impl Tools {
         );
         let futs = specs.iter().enumerate().map(|(i, (_, agent, task, cwd))| {
             let (rows, exe) = (&rows, &exe);
-            let payload = payload(agent, task);
+            let payload = payload(agent, task, schemas[i]);
             async move {
                 let out = run_child(exe, cwd, &payload, &ctx.cancel, |name, summary| {
                     let mut r = rows.borrow_mut();
@@ -159,9 +184,13 @@ impl Tools {
             .collect::<Vec<_>>()
             .join("\n\n");
         let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
-        res.details = Some(
-            json!({"subagents": rows.borrow().iter().map(|r| json!({"name": r.name, "agent": r.agent, "tools": r.tools})).collect::<Vec<_>>()}),
-        );
+        res.details = Some(json!({"subagents": rows.borrow().iter().zip(&outs).map(|(r, o)| {
+            let mut s = json!({"name": r.name, "agent": r.agent, "tools": r.tools});
+            if let Some(d) = &o.data {
+                s["data"] = d.clone();
+            }
+            s
+        }).collect::<Vec<_>>()}));
         res
     }
 }
@@ -193,7 +222,7 @@ pub async fn run_child(
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return Outcome { ok: false, text: format!("cannot start subagent: {e}") },
+        Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
     };
     let pid = child.id().unwrap_or(0) as i32;
     let mut stdin = child.stdin.take().unwrap();
@@ -254,18 +283,28 @@ pub async fn run_child(
     let stderr_tail = err_task.await.unwrap_or_default();
     match result {
         Some(v) => {
-            Outcome { ok: !v["isError"].as_bool().unwrap_or(false), text: v["text"].as_str().unwrap_or("").to_string() }
+            let ok = !v["isError"].as_bool().unwrap_or(false);
+            let text = v["text"].as_str().unwrap_or("").to_string();
+            let data = v.get("data").filter(|d| !d.is_null()).cloned();
+            match data {
+                Some(d) if ok && v["schemaOk"] != false => {
+                    let pretty = serde_json::to_string_pretty(&d).unwrap_or_else(|_| d.to_string());
+                    Outcome { ok: true, text: format!("```json\n{pretty}\n```"), data: Some(d) }
+                }
+                // Asked for typed data and none came back: never pass the free text off as the result.
+                None if ok && payload.get("outputSchema").is_some_and(|s| !s.is_null()) => {
+                    Outcome::failed(format!("subagent returned no schema-validated data\n{text}"))
+                }
+                _ => Outcome { ok, text, data: None },
+            }
         }
-        None => Outcome {
-            ok: false,
-            text: if cancelled {
-                "cancelled".into()
-            } else if stderr_tail.is_empty() {
-                "subagent exited without a result".into()
-            } else {
-                stderr_tail
-            },
-        },
+        None => Outcome::failed(if cancelled {
+            "cancelled".to_string()
+        } else if stderr_tail.is_empty() {
+            "subagent exited without a result".to_string()
+        } else {
+            stderr_tail
+        }),
     }
 }
 
@@ -316,5 +355,73 @@ mod cwd_tests {
         assert!(out.ok, "{}", out.text);
         assert_eq!(out.text, dir.canonicalize().unwrap().display().to_string());
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod typed_tests {
+    use super::*;
+
+    async fn child(line: &str, payload: Value) -> Outcome {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-typed-{}-{}", std::process::id(), line.len()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, format!("#!/bin/sh\ncat <<'EOF'\n{line}\nEOF\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = tokio::task::LocalSet::new()
+            .run_until(run_child(&exe, &base, &payload, &CancellationToken::new(), |_, _| {}))
+            .await;
+        let _ = std::fs::remove_dir_all(&base);
+        out
+    }
+
+    #[test]
+    fn schema_accepts_an_optional_output_schema_per_task() {
+        let s = schema(&[]);
+        assert_eq!(s["properties"]["tasks"]["items"]["properties"]["outputSchema"]["type"], "object");
+        assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_is_returned_as_a_json_block_and_as_value() {
+        let o = child(
+            r#"{"type":"result","text":"x","isError":false,"data":{"n":1},"schemaOk":true}"#,
+            json!({"outputSchema":{}}),
+        )
+        .await;
+        assert!(o.ok);
+        assert_eq!(o.data, Some(json!({"n": 1})));
+        assert!(o.text.starts_with("```json\n") && o.text.contains("\"n\": 1"), "{}", o.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_format_result_still_gives_text() {
+        let o = child(r#"{"type":"result","text":"plain","isError":false}"#, json!({})).await;
+        assert_eq!((o.ok, o.text.as_str(), o.data), (true, "plain", None));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_schema_task_without_data_fails() {
+        let o = child(r#"{"type":"result","text":"prose","isError":false}"#, json!({"outputSchema":{"type":"object"}}))
+            .await;
+        assert!(!o.ok && o.data.is_none());
+        assert!(o.text.contains("no schema-validated data"), "{}", o.text);
+        let o = child(
+            r#"{"type":"result","text":"no valid result submitted","isError":true,"schemaOk":false}"#,
+            json!({"outputSchema":{}}),
+        )
+        .await;
+        assert!(!o.ok);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bad_output_schema_is_rejected_before_spawning() {
+        let t = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
+        let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","outputSchema":{"type":"bogus"}}]})).unwrap();
+        let out = t.task(a, &ctx).await;
+        assert!(out.is_error && out.text.contains("outputSchema"), "{}", out.text);
     }
 }

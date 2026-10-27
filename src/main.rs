@@ -22,6 +22,7 @@ mod provider;
 mod pty;
 mod quota;
 mod review;
+mod schema;
 mod session;
 #[cfg(test)]
 mod testutil;
@@ -330,6 +331,14 @@ fn run() -> Result<i32> {
     if let Some(d) = &agent_def {
         apply_agent(&mut agent, d);
     }
+    if let Some(s) = task_payload.as_ref().and_then(|p| p.get("outputSchema")).filter(|s| !s.is_null()) {
+        if let Err(e) = schema::check_schema(s) {
+            bail!("bad subagent input: {e}");
+        }
+        *agent.tools.output_schema.borrow_mut() = Some(s.clone());
+        let note = "\nThis task has an output schema. Finish by calling the `yield` tool with `data` matching it; a plain final message is not a result.\n";
+        agent.agent_prompt = Some(agent.agent_prompt.take().unwrap_or_default() + note);
+    }
     if cli.print.is_some() && !agent.excluded.contains(&"ask") {
         // No one can answer in `-p` mode.
         agent.excluded.push("ask");
@@ -354,7 +363,8 @@ fn run() -> Result<i32> {
                 let ctx = p["context"].as_str().filter(|c| !c.is_empty());
                 let task = p["task"].as_str().unwrap_or("");
                 let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
-                headless::subagent_mode(prompt, cmd_tx, ev_rx).await
+                let out_schema = p.get("outputSchema").filter(|s| s.is_object()).cloned();
+                headless::subagent_mode(prompt, out_schema, cmd_tx, ev_rx).await
             }
             (Some(prompt), None) => {
                 printer = Some(spawn_notice_printer(notice_rx));

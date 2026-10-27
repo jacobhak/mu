@@ -43,7 +43,7 @@ Steps that are `missing` or `partial`, and `deviated` steps that are not sanctio
 </priority>
 
 <output>
-The final message ends with exactly one ```json block matching this schema, and nothing follows it:
+Submit the report by calling the `yield` tool with `data` = one object matching this schema (it is validated; fix and resubmit on error). If `yield` is not offered, end the final message with exactly one ```json block of the same object and nothing after it:
 
 ```json
 {

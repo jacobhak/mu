@@ -1,0 +1,93 @@
+//! `yield`: how a subagent with an output schema submits its result. Mirrors omp's tool of the
+//! same name: `{data}` for success, `{error}` for failure. A `data` that does not match the
+//! schema is returned to the model as a tool error so it can retry.
+
+use super::{ToolOutput, Tools};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+pub const DESCRIPTION: &str = "Submit this task's result: `{ data: <your output> }` for success, `{ error: \"message\" }` for failure. Never both; never a bare payload outside `data`. This task declares an output schema: `data` MUST match it, or the call is rejected with the reasons and you must call `yield` again. Prose in your final message is not a result.";
+
+pub fn schema(output: &Value) -> Value {
+    json!({"type":"object","properties":{
+        "data": output,
+        "error":{"type":"string","description":"Failure reason; mutually exclusive with data"}}})
+}
+
+#[derive(Deserialize)]
+pub struct Args {
+    data: Option<Value>,
+    error: Option<String>,
+}
+
+impl Tools {
+    pub fn yield_result(&self, a: Args) -> ToolOutput {
+        let Some(output) = self.output_schema.borrow().clone() else {
+            return ToolOutput::err("yield: this task has no output schema; finish with a normal message");
+        };
+        let error = a.error.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        let data = a.data.filter(|d| !d.is_null());
+        match (data, error) {
+            (Some(_), Some(_)) => ToolOutput::err("yield: submit `data` or `error`, never both"),
+            (None, None) => {
+                ToolOutput::err("yield: submit `{data: ...}` for success or `{error: \"...\"}` for failure")
+            }
+            (None, Some(e)) => {
+                let mut out = ToolOutput::ok("Failure recorded.");
+                out.details = Some(json!({"status": "aborted", "error": e}));
+                out
+            }
+            (Some(d), None) => match crate::schema::validate(&output, &d) {
+                Ok(()) => {
+                    let mut out = ToolOutput::ok("Result submitted.");
+                    out.details = Some(json!({"status": "success", "data": d}));
+                    out
+                }
+                Err(errs) => ToolOutput::err(format!(
+                    "yield: data does not match the output schema; nothing was submitted. Fix and call yield again.\n{}",
+                    errs.join("\n")
+                )),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tools() -> Tools {
+        let t = Tools::for_test();
+        *t.output_schema.borrow_mut() =
+            Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+        t
+    }
+
+    fn call(t: &Tools, v: Value) -> ToolOutput {
+        t.yield_result(serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn valid_data_is_recorded_in_details() {
+        let out = call(&tools(), json!({"data":{"n":1}}));
+        assert!(!out.is_error);
+        assert_eq!(out.details, Some(json!({"status":"success","data":{"n":1}})));
+    }
+
+    #[test]
+    fn invalid_data_is_a_retryable_error_with_paths() {
+        let out = call(&tools(), json!({"data":{"n":"x"}}));
+        assert!(out.is_error && out.details.is_none());
+        assert!(out.text.contains("$.n"), "{}", out.text);
+    }
+
+    #[test]
+    fn error_and_misuse() {
+        let t = tools();
+        let out = call(&t, json!({"error":" nope "}));
+        assert_eq!(out.details, Some(json!({"status":"aborted","error":"nope"})));
+        assert!(call(&t, json!({})).is_error);
+        assert!(call(&t, json!({"data":{"n":1},"error":"x"})).is_error);
+        assert!(call(&Tools::for_test(), json!({"data":1})).is_error);
+    }
+}

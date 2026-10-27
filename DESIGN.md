@@ -57,7 +57,7 @@ flowchart LR
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
 | Built-in tools | read, write, edit (hash-anchored), bash, grep, glob, find, todo, ask | `pi-edit`, `pi-shell`, `pi-walker`, `pi-diff`, `pi-vcs` |
 | Output spill | Tool output above a threshold goes to `artifact://` files, not the heap. Images are stored once as content-addressed blob files (`$MU_HOME/blobs/<sha256>`) and messages keep only omp's `blob:sha256:<hash>` reference; the bytes are read back when a request is built. mu also reads blobs from omp's own store, so omp sessions with images load; omp does not read mu's store | — |
-| Subagents | Spawn `mu --headless` with a task; receive a schema-validated result | — |
+| Subagents | Spawn `mu --headless` with a task; receive a schema-validated result. A `task` item may carry `outputSchema` (omp's name); the child then gets omp's `yield` tool (`{data}` or `{error}`; `data` is checked against the schema and a mismatch comes back as a tool error to retry). The `result` NDJSON line gains `data` and `schemaOk`; `text` and `isError` stay. A schema task with no valid `yield` fails (one nudge turn first). Validation is a small in-tree validator (no `$ref`), not a crate. | — |
 | Plugin host | Manifests, lazy start, lifetimes, hooks, MCP client | — |
 | Terminal UI | Inline rendering into the terminal's scrollback; streaming markdown, diffs, status line | — |
 

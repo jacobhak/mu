@@ -11,6 +11,7 @@ pub mod todo;
 pub mod uri;
 mod wait;
 mod write;
+mod yield_;
 
 use crate::events::EventTx;
 use crate::jobs::JobsHandle;
@@ -139,6 +140,8 @@ pub struct Tools {
     session_path: std::cell::RefCell<Option<PathBuf>>,
     skills: std::cell::RefCell<Vec<(String, PathBuf)>>,
     pub plan: std::cell::Cell<bool>,
+    /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
+    pub output_schema: std::cell::RefCell<Option<Value>>,
     pub edit_store: pi_edit::EditStore,
     shell: OnceCell<pi_shell::shell::Shell>,
 }
@@ -160,6 +163,7 @@ impl Tools {
             session_path: Default::default(),
             skills: Default::default(),
             plan: Default::default(),
+            output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
             shell: OnceCell::new(),
         }
@@ -198,6 +202,10 @@ impl Tools {
 
     pub fn wait_def() -> ToolDef {
         ToolDef { name: "wait".into(), description: wait::DESCRIPTION.into(), schema: wait::schema() }
+    }
+
+    pub fn yield_def(output: &Value) -> ToolDef {
+        ToolDef { name: "yield".into(), description: yield_::DESCRIPTION.into(), schema: yield_::schema(output) }
     }
 
     pub fn plan_def() -> ToolDef {
@@ -371,6 +379,7 @@ pub static BUILTINS: &[Builtin] = &[
     },
     Builtin { name: "task", def: None, call: dispatch!("task", async |t, a: task::Args, c| t.task(a, c)) },
     Builtin { name: "wait", def: None, call: dispatch!("wait", async |t, a: wait::Args, c| t.wait(a, c)) },
+    Builtin { name: "yield", def: None, call: dispatch!("yield", |t, a: yield_::Args| t.yield_result(a)) },
 ];
 
 /// Whether `name` is a built-in tool.

@@ -274,12 +274,46 @@ pub fn parse_report(text: &str) -> Option<Report> {
     let start = text.rfind("```json")? + "```json".len();
     let rest = &text[start..];
     let body = &rest[..rest.find("```").unwrap_or(rest.len())];
-    let mut r: Report = serde_json::from_str(body.trim()).ok()?;
+    clamp(serde_json::from_str(body.trim()).ok()?)
+}
+
+fn clamp(mut r: Report) -> Option<Report> {
     for f in &mut r.findings {
         f.priority = f.priority.min(3);
         f.confidence = if f.confidence.is_nan() { 1.0 } else { f.confidence.clamp(0.0, 1.0) };
     }
     Some(r)
+}
+
+/// The lead's report: its schema-validated `data` when it returned any, else the last json block.
+pub fn report_of(out: &crate::tools::task::Outcome) -> Option<Report> {
+    match &out.data {
+        Some(d) => clamp(serde_json::from_value(d.clone()).ok()?),
+        None => parse_report(&out.text),
+    }
+}
+
+/// The result schema of the lead reviewer (`outputSchema` of its task).
+pub fn report_schema() -> serde_json::Value {
+    serde_json::json!({"type":"object","required":["verdict","summary","findings"],"properties":{
+        "verdict":{"enum":["pass","fail"]},
+        "summary":{"type":"string"},
+        "plan":{"type":"array","items":{"type":"object","required":["step","status"],"properties":{
+            "step":{"type":"string"},
+            "status":{"enum":["done","partial","missing","deviated"]},
+            "evidence":{"type":"string"},
+            "sanctioned":{"type":"boolean"}}}},
+        "findings":{"type":"array","items":{"type":"object","required":["title","body","file","priority","confidence"],"properties":{
+            "title":{"type":"string"},
+            "body":{"type":"string"},
+            "file":{"type":"string"},
+            "line":{"type":"integer","minimum":1},
+            "end_line":{"type":"integer","minimum":1},
+            "priority":{"type":"integer","minimum":0,"maximum":3},
+            "confidence":{"type":"number","minimum":0,"maximum":1},
+            "kind":{"enum":["bug","plan","quality"]}}}},
+        "coverage":{"type":"string"},
+        "dropped":{"type":"integer","minimum":0}}})
 }
 
 pub fn is_blocking(f: &Finding) -> bool {
@@ -514,7 +548,8 @@ async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Opt
     let cfgs = crate::config::Configs::load();
     v.model = crate::models::role_selector("review", &cfgs).unwrap_or_else(|| "default".into());
     let exe = mu_common::paths::self_exe().map_err(|e| format!("cannot locate mu executable: {e}"))?;
-    let payload = serde_json::json!({"task": prompt, "agent": crate::context::REVIEW_LEAD});
+    let payload =
+        serde_json::json!({"task": prompt, "agent": crate::context::REVIEW_LEAD, "outputSchema": report_schema()});
     let cancel = tokio_util::sync::CancellationToken::new();
     let out = crate::tools::task::run_child(&exe, &root, &payload, &cancel, |name, summary| {
         eprintln!("  {name} {summary}");
@@ -523,7 +558,7 @@ async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Opt
     if !out.ok {
         return Err(out.text);
     }
-    let Some(report) = parse_report(&out.text) else {
+    let Some(report) = report_of(&out) else {
         v.raw_report = Some(out.text);
         return Err("reviewer returned an unstructured report".into());
     };
@@ -603,6 +638,19 @@ pub fn run_cli(o: CliOpts, cwd: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_schema_accepts_a_report_and_report_of_prefers_data() {
+        use crate::tools::task::Outcome;
+        let data = serde_json::json!({"verdict":"fail","summary":"s","findings":[{"title":"t","body":"b","file":"a.rs","priority":1,"confidence":0.9}]});
+        assert!(crate::schema::check_schema(&report_schema()).is_ok());
+        assert!(crate::schema::validate(&report_schema(), &data).is_ok());
+        assert!(crate::schema::validate(&report_schema(), &serde_json::json!({"verdict":"maybe"})).is_err());
+        let with_data = Outcome { ok: true, text: "```json\n{\"verdict\":\"pass\"}\n```".into(), data: Some(data) };
+        assert_eq!(report_of(&with_data).unwrap().verdict, "fail");
+        let scraped = Outcome { ok: true, text: "x\n```json\n{\"verdict\":\"pass\"}\n```".into(), data: None };
+        assert_eq!(report_of(&scraped).unwrap().verdict, "pass");
+    }
 
     fn finding(p: u8, c: f32) -> Finding {
         Finding {
