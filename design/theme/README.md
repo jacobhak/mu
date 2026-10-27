@@ -1,6 +1,6 @@
 # Theme redesign
 
-Design reference for replacing mu's omp-derived themes. Nothing here is wired into mu yet.
+Design reference for mu's palette-derived theme (implemented in `src/tui/theme.rs`).
 
 ```sh
 python3 design/theme/mock.py --side                 # mu as you see it today vs the proposal
@@ -10,10 +10,35 @@ python3 design/theme/mock.py --swatch               # derived roles for a palett
 python3 design/theme/mock.py --side --paint         # paint the palette background (terminal not themed with it)
 python3 design/theme/mock.py --html /tmp/mock.html  # every variant, browser-viewable
 python3 design/theme/osc_probe.py                   # what `source = "terminal"` would see in this terminal
+
+# Real renders, omp vs mu on the same transcript (private tmux server; resume costs nothing)
+design/theme/shot.sh resume /tmp/shots                       # omp, mu (tokyo-night), mu-term (Ghostty TokyoNight)
+design/theme/shot.sh resume /tmp/shots "" mu:catppuccin-latte
+design/theme/shot.sh live /tmp/shots                         # re-record the fixture (one small model run)
+python3 design/theme/ansi2png.py /tmp/shots/mu.ansi          # colours as text, for reading without a browser
 ```
+
+`fixture.jsonl` is a recorded session (read, failing bash, edit, write, bash, markdown summary; thinking added by
+hand). `ghostty-tokyo.toml` is what `source = "terminal"` reads from Ghostty's TokyoNight under tmux 3.6, which
+forwards OSC 4 palette queries to the client.
 
 Truecolor variants need a truecolor path: under tmux the client must list `RGB` in
 `tmux display -p '#{client_termfeatures}'` (detach and reattach after changing `terminal-features`).
+
+## Polish pass (tmux 3.6)
+
+With tmux 3.6 forwarding OSC 4, omp's Tokyo Night rendered in true colour looked better than mu. What omp did
+better, and what mu does now:
+
+| omp | mu before | mu now |
+|---|---|---|
+| cards and prompt on a recessed panel (`#16161e`) | outline only; prompt on a lighter band | `cards = "filled"` is the default, on `dark_background` (the palette's own mantle; derived for `terminal`); prompt band on the same surface; failed cards on a faint red surface |
+| syntax-highlighted diffs with a line-number gutter | grey diff text, numbers fused to the sign (`-8\|`) | gutter, sign column, both diff sides highlighted as whole files, tinted rows, the changed words of a modified line picked out; a new file reads as a numbered listing |
+| blank line between blocks | cards stacked tight | a blank row after every tool block |
+| readable dim text | `terminal` used slot 8 for faint text (`#414868`, 1.9:1 in Ghostty TokyoNight) | `dark_foreground` must reach 2.4:1, else it is lifted to fg→bg 55% |
+| — | resumed sessions lost edit diffs and thinking | diffs persist in `details.diff` (where omp keeps them); thinking replays |
+
+Kept from the redesign: one accent, hues only for meaning, no hand-picked hexes.
 
 ## Why the current themes look garish
 
@@ -63,7 +88,7 @@ The terminal maps onto the same schema, because it is exactly what omarchy pushe
 [theme]
 source = "terminal"     # "terminal" (default) | a bundled palette name | a path to a colors.toml | "omarchy"
 accent = "blue"         # palette key or hex; needed for "terminal", which has no accent slot
-cards  = "outline"      # "outline" (default) | "filled" (raised surface, see proposed-fill)
+cards  = "filled"       # "filled" (default: recessed dark_background surface) | "outline" (border only)
 [theme.roles]           # optional per-role overrides, e.g.
 # line = "#3b3e52"
 ```
@@ -93,7 +118,7 @@ Tokyo Night values; derivations are omarchy's sRGB `mix a b pct`.
 | `faint` | dark_foreground | `#565f89` (2.8:1) | slot 8 |
 | `line` | mix bg → fg 22% | `#393c4d` | slot 8 |
 | `line.faint` | mix bg → fg 13% | `#2d2e3d` | slot 8 |
-| `raised` | mix bg → fg 5% | `#21222f` | none |
+| `surface` | dark_background (derived: bg → black 22%, light themes bg → fg 6%) | `#13141c` | none |
 | `selected` | selection | `#292e42` | slot 8 bg |
 | `accent` | accent | `#7aa2f7` | slot 4 (configurable) |
 | `accent.soft` | mix bg → accent 55% | `#4f6599` | slot 4 |
@@ -110,7 +135,7 @@ hints, facts and glyphs.
 
 | surface | today | proposed |
 |---|---|---|
-| user prompt | `bgDark` band | `raised` band, accent `▎` left bar, `strong` text; ANSI tier keeps the bar only |
+| user prompt | `bgDark` band | `surface` band, accent `▎` left bar, `strong` text; ANSI tier keeps the bar only |
 | headings | bold purple | bold `strong`, `##` in `faint` |
 | bullets, quote | cyan, `comment` | `faint` bullet; `line` bar, `muted` italic quote |
 | inline code, links | lightBlue, cyan + URL | `literal`; `accent` underlined, URL in `faint` |

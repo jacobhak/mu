@@ -464,7 +464,7 @@ impl<'a> R<'a> {
             return self.src[range].trim_end().lines().flat_map(|l| wrap_chs(&chs(l, Default::default()), w)).collect();
         }
 
-        let bdr = ContentStyle::default();
+        let bdr = key(Role::Line);
         let border = |l: char, m: char, r: char| -> Vec<Ch> {
             let mut v = vec![(l, bdr)];
             for (i, cw) in colw.iter().enumerate() {

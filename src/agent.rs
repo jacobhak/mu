@@ -558,6 +558,9 @@ impl Agent {
                 Message::Assistant { content, .. } => {
                     for b in content {
                         match b {
+                            Block::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                                self.emit(AgentEvent::Thinking(thinking.clone()));
+                            }
                             Block::Text { text } => {
                                 self.emit(AgentEvent::Text(text.clone()));
                                 self.emit(AgentEvent::BlockEnd);

@@ -79,6 +79,8 @@ pub struct ToolOutput {
 
 /// Key under which `meta` is stored in a persisted tool result's `details`.
 pub const META_KEY: &str = "muMeta";
+/// Larger display diffs are not persisted; a resumed session shows the result text instead.
+const STORED_DIFF_MAX: usize = 64 * 1024;
 
 impl ToolOutput {
     pub fn ok(text: impl Into<String>) -> Self {
@@ -88,22 +90,34 @@ impl ToolOutput {
         Self { text: text.into(), is_error: true, display: None, details: None, meta: None }
     }
 
-    /// `details` as stored in the session: the tool's own details plus `meta`.
+    /// `details` as stored in the session: the tool's own details plus `meta`, and the display diff
+    /// under `diff` (where omp keeps it), so a resumed session still shows it.
     pub fn stored_details(&self) -> Option<Value> {
-        let Some(meta) = &self.meta else { return self.details.clone() };
+        if self.meta.is_none() && self.display.is_none() {
+            return self.details.clone();
+        }
         let mut d = match &self.details {
             Some(Value::Object(m)) => Value::Object(m.clone()),
             None | Some(Value::Null) => Value::Object(Default::default()),
             Some(other) => return Some(other.clone()), // not an object: leave it alone
         };
-        d[META_KEY] = serde_json::to_value(meta).unwrap_or(Value::Null);
+        if let Some(meta) = &self.meta {
+            d[META_KEY] = serde_json::to_value(meta).unwrap_or(Value::Null);
+        }
+        if let Some(diff) = &self.display
+            && diff.len() <= STORED_DIFF_MAX
+            && d.get("diff").is_none()
+        {
+            d["diff"] = Value::String(diff.clone());
+        }
         Some(d)
     }
 
     /// The reverse of `stored_details`: a result rebuilt from a stored message.
     pub fn from_stored(text: String, is_error: bool, details: Option<Value>) -> Self {
         let meta = details.as_ref().and_then(|d| d.get(META_KEY)).and_then(|m| serde_json::from_value(m.clone()).ok());
-        Self { text, is_error, display: None, details, meta }
+        let display = details.as_ref().and_then(|d| d.get("diff")).and_then(Value::as_str).map(str::to_string);
+        Self { text, is_error, display, details, meta }
     }
 }
 

@@ -1,4 +1,5 @@
 //! Transcript blocks: user prompts, tool headers and framed tool cards, thinking markers, subagent rows.
+use super::diffview;
 use super::line::truncate_text as trunc;
 use super::line::{self, Line, fill, span, truncate, wrap};
 use super::markdown;
@@ -12,7 +13,6 @@ use serde_json::Value;
 const BASH_TAIL: usize = 10;
 const STREAM_TAIL: usize = 12;
 const CMD_CUT: usize = 12;
-const DIFF_CUT: usize = 40;
 const TEXT_CUT: usize = 10;
 const ERR_LINES: usize = 10;
 const DEFAULT_TIMEOUT_SECS: f64 = 300.0;
@@ -44,9 +44,10 @@ fn styled_text(l: &str, style: ContentStyle) -> Line {
     vec![span(l, style)]
 }
 
-/// `user` block: a full-width raised band, an accent bar on every row, and one padding row above and below.
+/// `user` block: a full-width band on the recessed surface, an accent bar on every row, and one
+/// padding row above and below.
 pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
-    let bg = tbg(Role::Raised);
+    let bg = tbg(Role::Surface);
     let inner = width.saturating_sub(1).max(1);
     let bar = || span("▎", with_bg(tfg(Role::Accent), bg));
     let blank = || fill(&vec![bar()], width, bg);
@@ -120,9 +121,10 @@ impl Tone {
     }
 }
 
-/// Card background: raised when cards are filled, else the terminal's.
-fn card_bg() -> Option<Color> {
-    (theme::get().cards() == Cards::Filled).then(|| tbg(Role::Raised)).flatten()
+/// Card background: the recessed surface (tinted red for a failure) when cards are filled, else the terminal's.
+fn card_bg(tone: Tone) -> Option<Color> {
+    let role = if tone == Tone::Error { Role::ErrSurface } else { Role::Surface };
+    (theme::get().cards() == Cards::Filled).then(|| tbg(role)).flatten()
 }
 
 /// One body section of a card. A labelled section draws a titled separator above it.
@@ -146,7 +148,7 @@ fn frame(card: &Card, width: usize) -> Vec<Line> {
 fn frame_at(card: &Card, width: usize) -> (Vec<Line>, Option<usize>) {
     let w = width.max(6);
     let cw = w - 4;
-    let bg = card_bg();
+    let bg = card_bg(card.tone);
     let bd = with_bg(card.tone.border(), bg);
     let rule = |l: char, r: char, label: Option<Line>| -> Line {
         let mut out = vec![span(format!("{l}─"), bd)];
@@ -321,50 +323,6 @@ fn bash_box_at(
     frame_at(&Card { tone, sections, footer: Some(facts(&footer)) }, width)
 }
 
-/// Lines of a `+`/`-`/`@@` unified diff, with the add/remove counts.
-fn diff_rows(diff: &str, expanded: bool) -> (Vec<Line>, usize, usize) {
-    let all: Vec<&str> = diff.lines().collect();
-    let (mut adds, mut dels) = (0, 0);
-    // Only the file headers (before the first hunk) are not content; inside a hunk a line that
-    // starts `++` or `--` is a real added or removed line.
-    let mut in_hunk = false;
-    for l in &all {
-        if l.starts_with("@@") {
-            in_hunk = true;
-        } else if in_hunk || !(l.starts_with("+++") || l.starts_with("---")) {
-            if l.starts_with('+') {
-                adds += 1;
-            } else if l.starts_with('-') {
-                dels += 1;
-            }
-        }
-    }
-    let shown = if expanded { all.len() } else { all.len().min(DIFF_CUT) };
-    let mut rows: Vec<Line> = all[..shown]
-        .iter()
-        .map(|l| {
-            let (role, tint) = match l.chars().next() {
-                Some('+') => (Role::Ok, Role::OkTint),
-                Some('-') => (Role::Err, Role::ErrTint),
-                Some('@') => return styled_text(l, tfg(Role::Faint)),
-                _ => return styled_text(l, tfg(Role::Muted)),
-            };
-            match tbg(tint) {
-                Some(b) => {
-                    let sign = l;
-                    let (head, rest) = sign.split_at(1);
-                    vec![span(head, with_bg(tfg(role), Some(b))), span(rest, with_bg(ContentStyle::default(), Some(b)))]
-                }
-                None => styled_text(l, tfg(role)),
-            }
-        })
-        .collect();
-    if shown < all.len() {
-        rows.push(more(all.len() - shown));
-    }
-    (rows, adds, dels)
-}
-
 /// Plain indented result rows, cut at `TEXT_CUT` unless expanded.
 fn text_rows(text: &str, expanded: bool, style: impl Fn(&str) -> ContentStyle) -> Vec<Line> {
     let lines: Vec<&str> = text.lines().collect();
@@ -421,7 +379,9 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
             lines[0] = truncate(&lines[0], width);
         }
         "edit" | "write" if out.display.is_some() => {
-            let (rows, adds, dels) = diff_rows(out.display.as_deref().unwrap_or(""), expanded);
+            let path = summary(name, args, out.meta.as_ref());
+            let lang = std::path::Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("");
+            let (rows, adds, dels) = diffview::rows(out.display.as_deref().unwrap_or(""), lang, expanded);
             let card = Card {
                 tone: Tone::Success,
                 sections: vec![Section { label: None, rows }],
@@ -674,30 +634,25 @@ mod tests {
         let back = ToolOutput::from_stored("hi".into(), false, stored);
         assert_eq!(back.meta, out.meta);
         assert_eq!(ToolOutput::from_stored("x".into(), false, None).meta, None);
+        let mut out = ToolOutput::ok("ok");
+        out.display = Some("-1|a\n+1|b".into());
+        let back = ToolOutput::from_stored("ok".into(), false, out.stored_details());
+        assert_eq!(back.display.as_deref(), Some("-1|a\n+1|b"), "a resumed edit still shows its diff");
     }
 
     #[test]
-    fn diff_counts_ignore_headers_but_not_content() {
-        let d = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n--- removed text\n+++ added text\n-x\n+y\n";
-        let (_, adds, dels) = diff_rows(d, true);
-        assert_eq!((adds, dels), (2, 2));
-        let (_, adds, dels) = diff_rows("+a\n+b\n-c\n", true);
-        assert_eq!((adds, dels), (2, 1), "a headerless diff counts every line");
-    }
-
-    #[test]
-    fn diff_colors_and_cut() {
-        let d: String = (0..50).map(|i| format!("+l{i}\n")).collect();
+    fn diff_card_colours_and_cut() {
+        let d: String = "-1|old\n".to_string() + &(1..=50).map(|i| format!("+{i}|l{i}\n")).collect::<String>();
         let mut out = ToolOutput::ok("done");
         out.display = Some(d);
-        let l = tool_result("edit", &json!({"input":"x"}), &out, false, 40);
+        let l = tool_result("edit", &json!({"input":"[a.txt#AAAA]"}), &out, false, 40);
         // header, top rule, 40 diff rows, "more" row, bottom rule
         assert_eq!(l.len(), 1 + 1 + 40 + 1 + 1);
-        assert!(text_of(&l[42]).starts_with("│ … 10 more lines"));
-        assert_eq!(l[2][1].text, "+");
-        assert_eq!(l[2][1].style.foreground_color, theme::get().color(Role::Ok));
-        assert_eq!(l[2][1].style.background_color, theme::get().color(Role::OkTint));
-        assert!(text_of(l.last().unwrap()).contains("+50 -0"));
+        assert!(text_of(&l[42]).starts_with("│ … 11 more lines"), "{}", text_of(&l[42]));
+        assert_eq!(l[2][2].text, "- ");
+        assert_eq!(l[2][2].style.foreground_color, theme::get().color(Role::Err));
+        assert_eq!(l[2][2].style.background_color, theme::get().color(Role::ErrTint));
+        assert!(text_of(l.last().unwrap()).contains("+50 -1"));
     }
 
     #[test]

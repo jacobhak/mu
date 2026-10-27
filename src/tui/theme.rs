@@ -40,7 +40,8 @@ pub enum Role {
     Thinking,
     Line,
     LineFaint,
-    Raised,
+    /// Recessed panel behind cards and the prompt band: the palette's `dark_background`.
+    Surface,
     Selected,
     Accent,
     AccentSoft,
@@ -50,6 +51,11 @@ pub enum Role {
     ErrSoft,
     OkTint,
     ErrTint,
+    /// The changed part of a modified diff line.
+    OkEmph,
+    ErrEmph,
+    /// Surface of a failed card.
+    ErrSurface,
     Literal,
     Tool,
     SynKeyword,
@@ -79,7 +85,8 @@ enum Def {
 use Def::{Key, Mix};
 use Fb::{Dim, None as No, Slot};
 
-/// Indexed by `Role as usize`. `"accent"` is the configured accent, not a palette key.
+/// Indexed by `Role as usize`. `"accent"` is the configured accent, not a palette key. Tints mix from
+/// `dark_background`, the surface they sit on.
 const DEFS: [Def; ROLE_COUNT] = [
     Key("bright_foreground", Slot(15)),
     Mix("foreground", "background", 35, Dim),
@@ -87,7 +94,7 @@ const DEFS: [Def; ROLE_COUNT] = [
     Mix("foreground", "background", 45, Dim),
     Mix("background", "foreground", 22, Slot(8)),
     Mix("background", "foreground", 13, Slot(8)),
-    Mix("background", "foreground", 8, No),
+    Key("dark_background", No),
     Key("selection", Slot(8)),
     Key("accent", Slot(4)),
     Mix("background", "accent", 55, Slot(4)),
@@ -95,8 +102,11 @@ const DEFS: [Def; ROLE_COUNT] = [
     Key("yellow", Slot(3)),
     Key("red", Slot(1)),
     Mix("background", "red", 55, Slot(1)),
-    Mix("background", "green", 15, No),
-    Mix("background", "red", 15, No),
+    Mix("dark_background", "green", 14, No),
+    Mix("dark_background", "red", 14, No),
+    Mix("dark_background", "green", 32, No),
+    Mix("dark_background", "red", 32, No),
+    Mix("dark_background", "red", 9, No),
     Key("cyan", Slot(6)),
     Key("magenta", Slot(5)),
     Key("magenta", Slot(5)),
@@ -108,6 +118,8 @@ const DEFS: [Def; ROLE_COUNT] = [
     Mix("foreground", "background", 20, No),
 ];
 
+/// Palette keys the terminal answers by slot. `muted` (slot 8) is read but not emitted by slot:
+/// many terminal themes make it too dark for text, so `dark_foreground` is derived instead.
 const SLOTS: &[(&str, u8)] = &[
     ("red", 1),
     ("green", 2),
@@ -117,7 +129,6 @@ const SLOTS: &[(&str, u8)] = &[
     ("cyan", 6),
     ("foreground", 7),
     ("muted", 8),
-    ("dark_foreground", 8),
     ("bright_red", 9),
     ("bright_green", 10),
     ("bright_yellow", 11),
@@ -128,6 +139,9 @@ const SLOTS: &[(&str, u8)] = &[
     ("orange", 11),
     ("accent", 4),
 ];
+
+/// Text below this contrast with the background is hard to read; `dark_foreground` is lifted to it.
+const FAINT_MIN_CONTRAST: f64 = 2.4;
 
 fn slot_of(key: &str) -> Option<u8> {
     SLOTS.iter().find(|(k, _)| *k == key).map(|(_, n)| *n)
@@ -174,7 +188,7 @@ impl Palette {
                 return Err(format!("missing {k}"));
             }
         }
-        Ok(Self { rgb, by_slot: false })
+        Ok(Self { rgb, by_slot: false }.completed())
     }
 
     pub fn from_answers(a: &Answers) -> Self {
@@ -187,13 +201,46 @@ impl Palette {
         put("foreground", a.fg);
         put("background", a.bg);
         put("selection", a.selection);
+        put("dark_foreground", a.slots[8]);
         for (k, n) in SLOTS {
             if *k != "foreground" && *k != "accent" {
                 put(k, a.slots[*n as usize]);
             }
         }
-        Self { rgb, by_slot: true }
+        Self { rgb, by_slot: true }.completed()
     }
+
+    /// Fills what the theme needs and the source may lack: a recessed `dark_background` (darker on
+    /// dark themes, a step toward the text on light ones) and a `dark_foreground` that is legible.
+    fn completed(mut self) -> Self {
+        let (Some(bg), Some(fg)) = (self.rgb.get("background").copied(), self.rgb.get("foreground").copied()) else {
+            return self;
+        };
+        let dark = luminance(bg) < luminance(fg);
+        self.rgb
+            .entry("dark_background".into())
+            .or_insert_with(|| if dark { mix(bg, (0, 0, 0), 22) } else { mix(bg, fg, 6) });
+        let lifted = mix(fg, bg, 55);
+        let faint = self.rgb.get("dark_foreground").copied();
+        if faint.is_none_or(|c| contrast(c, bg) < FAINT_MIN_CONTRAST && contrast(lifted, bg) > contrast(c, bg)) {
+            self.rgb.insert("dark_foreground".into(), lifted);
+        }
+        self
+    }
+}
+
+/// WCAG relative luminance.
+fn luminance((r, g, b): Rgb) -> f64 {
+    let lin = |c: u8| {
+        let c = c as f64 / 255.0;
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+fn contrast(a: Rgb, b: Rgb) -> f64 {
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
 fn load_palette(source: &str) -> Result<Palette, String> {
@@ -402,11 +449,12 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(t.color(Role::Muted), rgb("#777d98"));
         assert_eq!(t.color(Role::Line), rgb("#393c4d"));
-        assert_eq!(t.color(Role::Raised), rgb("#252734"));
+        assert_eq!(t.color(Role::Surface), rgb("#13141c"));
         assert_eq!(t.color(Role::Thinking), rgb("#696e87"));
         assert_eq!(t.color(Role::Tool), rgb("#ad8ee6"));
-        assert_eq!(t.color(Role::OkTint), rgb("#2e3630"));
-        assert_eq!(t.color(Role::ErrTint), rgb("#3b2936"));
+        assert_eq!(t.color(Role::OkTint), rgb("#262e27"));
+        assert_eq!(t.color(Role::ErrTint), rgb("#33222c"));
+        assert_eq!(t.color(Role::Faint), rgb("#565f89"), "the palette's own dark_foreground is legible");
         assert_eq!(t.color(Role::AccentSoft), rgb("#4f6599"));
         assert_eq!(t.color(Role::Accent), rgb("#7aa2f7"));
         assert!(t.fg(Role::Muted).attributes.is_empty());
@@ -419,7 +467,7 @@ mod tests {
         assert_eq!(t.color(Role::Muted), None);
         assert!(t.fg(Role::Muted).attributes.has(Attribute::Dim));
         assert_eq!(t.color(Role::OkTint), None);
-        assert_eq!(t.color(Role::Raised), None);
+        assert_eq!(t.color(Role::Surface), None);
         assert_eq!(t.color(Role::Accent), Some(Color::AnsiValue(4)));
         assert_eq!(t.color(Role::Thinking), None);
         assert!(t.fg(Role::Thinking).attributes.has(Attribute::Dim));
@@ -434,6 +482,19 @@ mod tests {
         assert_eq!(t.color(Role::OkTint), None);
         assert!(matches!(t.color(Role::Line), Some(Color::Rgb { .. })));
         assert_eq!(t.color(Role::AccentSoft), Some(Color::AnsiValue(4)));
+        assert_eq!(t.color(Role::Surface), rgb("#14151e"), "derived: background toward black");
+        assert_eq!(t.color(Role::Faint), rgb("#5a5f75"), "derived: foreground toward background");
+    }
+
+    #[test]
+    fn terminal_faint_is_slot_8_only_when_legible() {
+        let mut a = Answers { fg: Some((192, 202, 245)), bg: Some((26, 27, 38)), ..Default::default() };
+        a.slots[8] = Some((0x41, 0x48, 0x68)); // Ghostty TokyoNight: 1.9:1 on the background
+        let (t, _) = Theme::build(&Palette::from_answers(&a), None, true, Cards::Outline);
+        assert!(t.color(Role::Faint) != rgb("#414868") && matches!(t.color(Role::Faint), Some(Color::Rgb { .. })));
+        a.slots[8] = Some((0x73, 0x7a, 0xa2));
+        let (t, _) = Theme::build(&Palette::from_answers(&a), None, true, Cards::Outline);
+        assert_eq!(t.color(Role::Faint), rgb("#737aa2"));
     }
 
     #[test]
@@ -454,7 +515,7 @@ mod tests {
             let p = Palette::from_toml(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (t, w) = Theme::build(&p, None, true, Cards::Outline);
             assert!(w.is_empty(), "{name}");
-            assert!(t.color(Role::Raised).is_some(), "{name}");
+            assert!(t.color(Role::Surface).is_some(), "{name}");
         }
     }
 
