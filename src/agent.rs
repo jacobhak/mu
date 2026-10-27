@@ -33,6 +33,9 @@ pub struct Agent {
     pub entry_ids: Vec<String>,
     pub model: ModelSpec,
     pub thinking: Thinking,
+    /// Mirror of `thinking` that the request reads, so a level set mid-turn (or during retries)
+    /// applies to the next attempt.
+    live_thinking: Rc<std::cell::Cell<Thinking>>,
     pub title: Option<String>,
     pub events: EventTx,
     pub inbox: SharedInbox,
@@ -125,6 +128,7 @@ async fn drive<F: std::future::Future<Output = ()>>(
     backlog: &mut std::collections::VecDeque<Command>,
     jobs: Option<Rc<JobsHandle>>,
     events: EventTx,
+    live: Rc<std::cell::Cell<Thinking>>,
 ) {
     tokio::pin!(fut);
     let mut open = true;
@@ -135,6 +139,12 @@ async fn drive<F: std::future::Future<Output = ()>>(
                 Some(Command::KillJobs(id)) => {
                     let n = jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
                     let _ = events.send(AgentEvent::Notice(format!("killed {n} job(s)")));
+                }
+                Some(Command::SetThinking(t)) => {
+                    // Takes effect on the next request (including retries); also queued so the
+                    // session records it once the turn ends.
+                    live.set(t);
+                    backlog.push_back(Command::SetThinking(t));
                 }
                 Some(other) => backlog.push_back(other),
                 None => open = false,
@@ -170,6 +180,7 @@ impl Agent {
             entry_ids: Vec::new(),
             model: i.model,
             thinking: i.thinking,
+            live_thinking: Rc::new(std::cell::Cell::new(i.thinking)),
             title: None,
             events: i.events,
             inbox: i.inbox,
@@ -483,6 +494,7 @@ impl Agent {
 
     pub fn set_thinking(&mut self, t: Thinking) {
         self.thinking = t;
+        self.live_thinking.set(t);
         if let Some(s) = self.session.as_mut() {
             s.thinking_change(t.as_str());
         }
@@ -617,6 +629,7 @@ impl Agent {
         }
         if let Some(t) = loaded.thinking.as_deref().and_then(Thinking::parse).filter(|_| !self.pin_thinking) {
             self.thinking = t;
+            self.live_thinking.set(t);
         } else if self.pin_thinking {
             s.thinking_change(self.thinking.as_str());
         }
@@ -686,15 +699,15 @@ impl Agent {
                     continue;
                 }
                 Some(()) = recv_opt(&mut wake_rx) => {
-                    let (jobs, events) = (self.jobs.clone(), self.events.clone());
-                    drive(self.turn(None), &mut rx, &mut backlog, jobs, events).await;
+                    let (jobs, events, live) = (self.jobs.clone(), self.events.clone(), self.live_thinking.clone());
+                    drive(self.turn(None), &mut rx, &mut backlog, jobs, events, live).await;
                     continue;
                 }
                 }
             };
-            let (jobs, events) = (self.jobs.clone(), self.events.clone());
+            let (jobs, events, live) = (self.jobs.clone(), self.events.clone(), self.live_thinking.clone());
             match cmd {
-                Command::Prompt(t) => drive(self.turn(Some(t)), &mut rx, &mut backlog, jobs, events).await,
+                Command::Prompt(t) => drive(self.turn(Some(t)), &mut rx, &mut backlog, jobs, events, live).await,
                 Command::EnsureSession => {
                     self.ensure_session().await;
                     self.emit_status();
@@ -714,10 +727,12 @@ impl Agent {
                     (false, p) => {
                         self.enter_plan().await;
                         if let Some(p) = p {
-                            drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events).await;
+                            drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events, live).await;
                         }
                     }
-                    (true, Some(p)) => drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events).await,
+                    (true, Some(p)) => {
+                        drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events, live).await
+                    }
                     (true, None) => self.exit_plan(),
                 },
                 Command::Compact(focus) => self.manual_compact(focus).await,
@@ -937,7 +952,7 @@ impl Agent {
             let reply = {
                 let req = Request {
                     model: &self.model,
-                    thinking: self.thinking,
+                    thinking: self.live_thinking.clone(),
                     system: &system,
                     tools: &defs,
                     messages: &wire,
@@ -1291,7 +1306,9 @@ mod loop_tests {
             let mut backlog = Default::default();
             tx.send(Command::KillJobs(None)).unwrap();
             tx.send(Command::NewSession).unwrap();
-            drive(tokio::time::sleep(std::time::Duration::from_millis(50)), &mut rx, &mut backlog, None, etx).await;
+            let live = Rc::new(std::cell::Cell::new(Thinking::Off));
+            drive(tokio::time::sleep(std::time::Duration::from_millis(50)), &mut rx, &mut backlog, None, etx, live)
+                .await;
             assert!(matches!(erx.try_recv(), Ok(AgentEvent::Notice(m)) if m.contains("killed")));
             assert_eq!(backlog.len(), 1);
             assert!(matches!(backlog.pop_front(), Some(Command::NewSession)));

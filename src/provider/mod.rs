@@ -16,7 +16,8 @@ pub struct ToolDef {
 
 pub struct Request<'a> {
     pub model: &'a ModelSpec,
-    pub thinking: Thinking,
+    /// Shared so retries and later requests of a turn pick up a level the user set mid-turn.
+    pub thinking: Rc<Cell<Thinking>>,
     pub system: &'a str,
     pub tools: &'a [ToolDef],
     pub messages: &'a [Message],
@@ -61,8 +62,18 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+/// The gateway surfaces thrown pre-flight errors (an unsupported effort, an unknown model, ...)
+/// as in-stream `api_error` events. Those are permanent: retrying only burns the backoff budget.
+fn permanent(kind: &str, msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    kind == "api_error" && (m.contains("not supported") || m.contains("unsupported"))
+}
+
 /// Maps an in-stream error event to a retry class by its error type name.
 pub fn stream_error(kind: &str, msg: &str) -> ProviderError {
+    if permanent(kind, msg) {
+        return ProviderError::Fatal(msg.into());
+    }
     match kind {
         "overloaded_error" | "rate_limit_error" | "api_error" | "upstream_error" => {
             ProviderError::Retryable { msg: msg.into(), retry_after: None }
@@ -85,7 +96,7 @@ use crate::config::Configs;
 use crate::message::Block;
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 use tokio_util::sync::CancellationToken;
 
@@ -324,7 +335,7 @@ impl Providers {
             let msgs = [Message::user(prompt)];
             let req = Request {
                 model: &spec,
-                thinking: Thinking::Off,
+                thinking: Rc::new(Cell::new(Thinking::Off)),
                 system,
                 tools: &[],
                 messages: &msgs,
@@ -390,4 +401,23 @@ fn save_cache(rows: &[GatewayModel]) {
         .map(|m| serde_json::json!({"id": m.id, "context_length": m.context_length, "max_output_tokens": m.max_output_tokens}))
         .collect();
     cache().save(&Value::Array(v).to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_wrapped_permanent_errors_fail_fast() {
+        // omp's auth-gateway reports thrown validation errors (here: an unsupported effort) as
+        // in-stream `api_error`; retrying those five times just delays the visible failure.
+        let e = stream_error(
+            "api_error",
+            "Thinking effort medium is not supported by baseten/zai-org/GLM-5.3-Flash. Supported efforts: low, high, max",
+        );
+        assert!(matches!(e, ProviderError::Fatal(_)));
+        assert!(matches!(stream_error("api_error", "upstream disconnected"), ProviderError::Retryable { .. }));
+        assert!(matches!(stream_error("overloaded_error", "busy"), ProviderError::Retryable { .. }));
+        assert!(matches!(stream_error("invalid_request_error", "not supported"), ProviderError::Fatal(_)));
+    }
 }

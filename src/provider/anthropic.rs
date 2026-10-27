@@ -19,7 +19,8 @@ pub fn clamp_budget(budget: Option<u32>, max_tokens: u32) -> Option<u32> {
 /// The gateway takes the full `provider/model` id and adds prompt caching itself.
 pub fn body(req: &Request) -> Value {
     let max_tokens = req.max_tokens.unwrap_or(req.model.max_output);
-    let budget = clamp_budget(req.thinking.budget(), max_tokens);
+    let level = req.thinking.get();
+    let budget = clamp_budget(level.budget(), max_tokens);
     let th = match budget {
         Some(b) => json!({"type":"enabled","budget_tokens":b}),
         None => json!({"type":"disabled"}),
@@ -37,8 +38,8 @@ pub fn body(req: &Request) -> Value {
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    if req.thinking != Thinking::Off && budget.is_some() {
-        body["output_config"] = json!({"effort": req.thinking.as_str()});
+    if level != Thinking::Off && budget.is_some() {
+        body["output_config"] = json!({"effort": level.as_str()});
     }
     body
 }
