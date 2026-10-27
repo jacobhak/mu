@@ -4,7 +4,7 @@ A terminal coding agent with pi's pluggability and omp's capabilities, where the
 user's content plus what the user is using right now. A native Rust core does the agent work; every other
 feature is a plugin that loads on use.
 
-Status: draft. All decisions so far are recorded in place.
+Status: early and experimental, changing quickly; no stable version (see README, Status). All decisions so far are recorded in place.
 
 ## Principles
 
