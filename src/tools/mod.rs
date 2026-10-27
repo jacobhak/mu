@@ -75,35 +75,51 @@ pub struct ToolOutput {
     pub display: Option<String>,
     pub details: Option<Value>,
     pub meta: Option<ToolMeta>,
+    /// Images the model sees after the text (e.g. `read` of a png). Not shown in the transcript.
+    pub images: Vec<crate::message::Image>,
 }
 
 /// Key under which `meta` is stored in a persisted tool result's `details`.
 pub const META_KEY: &str = "muMeta";
+/// Larger display diffs are not persisted; a resumed session shows the result text instead.
+const STORED_DIFF_MAX: usize = 64 * 1024;
 
 impl ToolOutput {
     pub fn ok(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false, display: None, details: None, meta: None }
+        Self { text: text.into(), is_error: false, display: None, details: None, meta: None, images: Vec::new() }
     }
     pub fn err(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true, display: None, details: None, meta: None }
+        Self { text: text.into(), is_error: true, display: None, details: None, meta: None, images: Vec::new() }
     }
 
-    /// `details` as stored in the session: the tool's own details plus `meta`.
+    /// `details` as stored in the session: the tool's own details plus `meta`, and the display diff
+    /// under `diff` (where omp keeps it), so a resumed session still shows it.
     pub fn stored_details(&self) -> Option<Value> {
-        let Some(meta) = &self.meta else { return self.details.clone() };
+        if self.meta.is_none() && self.display.is_none() {
+            return self.details.clone();
+        }
         let mut d = match &self.details {
             Some(Value::Object(m)) => Value::Object(m.clone()),
             None | Some(Value::Null) => Value::Object(Default::default()),
             Some(other) => return Some(other.clone()), // not an object: leave it alone
         };
-        d[META_KEY] = serde_json::to_value(meta).unwrap_or(Value::Null);
+        if let Some(meta) = &self.meta {
+            d[META_KEY] = serde_json::to_value(meta).unwrap_or(Value::Null);
+        }
+        if let Some(diff) = &self.display
+            && diff.len() <= STORED_DIFF_MAX
+            && d.get("diff").is_none()
+        {
+            d["diff"] = Value::String(diff.clone());
+        }
         Some(d)
     }
 
     /// The reverse of `stored_details`: a result rebuilt from a stored message.
     pub fn from_stored(text: String, is_error: bool, details: Option<Value>) -> Self {
         let meta = details.as_ref().and_then(|d| d.get(META_KEY)).and_then(|m| serde_json::from_value(m.clone()).ok());
-        Self { text, is_error, display: None, details, meta }
+        let display = details.as_ref().and_then(|d| d.get("diff")).and_then(Value::as_str).map(str::to_string);
+        Self { text, is_error, display, details, meta, images: Vec::new() }
     }
 }
 
@@ -201,7 +217,9 @@ impl Tools {
         }
         if self.plugins.has_tool(name) {
             let r = self.plugins.call_tool(name, args, &ctx.cancel).await;
-            return ToolOutput { text: r.content, is_error: r.is_error, display: r.display, details: None, meta: None };
+            let mut out = if r.is_error { ToolOutput::err(r.content) } else { ToolOutput::ok(r.content) };
+            out.display = r.display;
+            return out;
         }
         ToolOutput::err(format!("Unknown tool: {name}"))
     }
@@ -364,9 +382,9 @@ fn read_desc() -> &'static str {
     if edit::is_hashline() { READ_DESC } else { READ_DESC_PLAIN }
 }
 
-const READ_DESC_PLAIN: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows, where `N:` is a line number and not part of the file. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
+const READ_DESC_PLAIN: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows, where `N:` is a line number and not part of the file. Images (png, jpeg, gif, webp, up to 5 MB) are returned as images you can see. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
 
-const READ_DESC: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows under a `[path#TAG]` header; the header and line numbers are what `edit` anchors on. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
+const READ_DESC: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows under a `[path#TAG]` header; the header and line numbers are what `edit` anchors on. Images (png, jpeg, gif, webp, up to 5 MB) are returned as images you can see. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
 
 fn parse<A: DeserializeOwned>(name: &str, args: &Value) -> Result<A, Box<ToolOutput>> {
     serde_json::from_value(args.clone())

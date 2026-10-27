@@ -1,4 +1,5 @@
 //! Transcript blocks: user prompts, tool headers and framed tool cards, thinking markers, subagent rows.
+use super::diffview;
 use super::line::truncate_text as trunc;
 use super::line::{self, Line, fill, span, truncate, wrap};
 use super::markdown;
@@ -12,7 +13,6 @@ use serde_json::Value;
 const BASH_TAIL: usize = 10;
 const STREAM_TAIL: usize = 12;
 const CMD_CUT: usize = 12;
-const DIFF_CUT: usize = 40;
 const TEXT_CUT: usize = 10;
 const ERR_LINES: usize = 10;
 const DEFAULT_TIMEOUT_SECS: f64 = 300.0;
@@ -44,26 +44,30 @@ fn styled_text(l: &str, style: ContentStyle) -> Line {
     vec![span(l, style)]
 }
 
-/// `user` block: a full-width raised band, an accent bar on every row, and one padding row above and below.
+/// `user` block: a full-width lifted band, an accent bar on every row, the prompt rendered as
+/// markdown, and one padding row above and below.
 pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
     let bg = tbg(Role::Raised);
     let inner = width.saturating_sub(1).max(1);
     let bar = || span("▎", with_bg(tfg(Role::Accent), bg));
     let blank = || fill(&vec![bar()], width, bg);
     let mut out = vec![blank()];
-    for l in text.lines() {
-        for w in wrap(&vec![span(l, tfg(Role::Strong))], inner) {
-            let mut row = vec![bar()];
-            row.extend(w);
-            out.push(fill(&row, width, bg));
-        }
+    for l in markdown::render(text, inner) {
+        let mut row = vec![bar()];
+        row.extend(l.into_iter().map(|mut s| {
+            if s.style.foreground_color.is_none() {
+                s.style = theme::get().apply(Role::Strong, s.style);
+            }
+            s
+        }));
+        out.push(fill(&row, width, bg));
     }
     out.push(blank());
     out
 }
 
 fn name_style() -> ContentStyle {
-    bold(tfg(Role::Tool))
+    bold(tfg(Role::Strong))
 }
 
 /// Header target. A finished call shows the path its tool recorded; a call still running only has
@@ -98,7 +102,7 @@ fn header_line(
     let summary = summary(name, args, meta);
     let mut l = vec![span(format!("{icon} "), icon_style), span(name.to_string(), name_style())];
     if !summary.is_empty() {
-        l.push(span(format!(" {summary}"), tfg(Role::Accent)));
+        l.push(span(format!(" {summary}"), tfg(Role::Muted)));
     }
     truncate(&l, width)
 }
@@ -120,9 +124,9 @@ impl Tone {
     }
 }
 
-/// Card background: raised when cards are filled, else the terminal's.
+/// Card background: the recessed surface when cards are filled, else the terminal's.
 fn card_bg() -> Option<Color> {
-    (theme::get().cards() == Cards::Filled).then(|| tbg(Role::Raised)).flatten()
+    (theme::get().cards() == Cards::Filled).then(|| tbg(Role::Surface)).flatten()
 }
 
 /// One body section of a card. A labelled section draws a titled separator above it.
@@ -243,14 +247,15 @@ fn facts(parts: &[Fact]) -> Line {
     out
 }
 
-/// Timeout footer part from the call's `timeout` argument (seconds; 0 disables it).
-fn timeout_part(args: &Value) -> Fact {
-    Fact::Timeout(match args["timeout"].as_f64() {
-        Some(0.0) => "Timeout: disabled".into(),
-        Some(t) if t.fract() == 0.0 => format!("Timeout: {}s", t as u64),
-        Some(t) => format!("Timeout: {t}s"),
-        None => format!("Timeout: {}s", DEFAULT_TIMEOUT_SECS as u64),
-    })
+/// Timeout footer part from the call's `timeout` argument (seconds; 0 disables it). `None` when
+/// it is absent or the default.
+fn timeout_part(args: &Value) -> Option<Fact> {
+    let t = args["timeout"].as_f64().filter(|t| *t != DEFAULT_TIMEOUT_SECS)?;
+    Some(Fact::Timeout(match t {
+        0.0 => "Timeout: disabled".into(),
+        t if t.fract() == 0.0 => format!("Timeout: {}s", t as u64),
+        t => format!("Timeout: {t}s"),
+    }))
 }
 
 /// The footer facts of a finished bash call, from what the tool recorded.
@@ -317,52 +322,11 @@ fn bash_box_at(
         sections.push(Section { label: Some("output"), rows });
     }
     let at = footer.iter().position(|f| matches!(f, Fact::Wall(_) | Fact::Running(_))).map_or(0, |i| i + 1);
-    footer.insert(at, timeout_part(args));
-    frame_at(&Card { tone, sections, footer: Some(facts(&footer)) }, width)
-}
-
-/// Lines of a `+`/`-`/`@@` unified diff, with the add/remove counts.
-fn diff_rows(diff: &str, expanded: bool) -> (Vec<Line>, usize, usize) {
-    let all: Vec<&str> = diff.lines().collect();
-    let (mut adds, mut dels) = (0, 0);
-    // Only the file headers (before the first hunk) are not content; inside a hunk a line that
-    // starts `++` or `--` is a real added or removed line.
-    let mut in_hunk = false;
-    for l in &all {
-        if l.starts_with("@@") {
-            in_hunk = true;
-        } else if in_hunk || !(l.starts_with("+++") || l.starts_with("---")) {
-            if l.starts_with('+') {
-                adds += 1;
-            } else if l.starts_with('-') {
-                dels += 1;
-            }
-        }
+    if let Some(t) = timeout_part(args) {
+        footer.insert(at, t);
     }
-    let shown = if expanded { all.len() } else { all.len().min(DIFF_CUT) };
-    let mut rows: Vec<Line> = all[..shown]
-        .iter()
-        .map(|l| {
-            let (role, tint) = match l.chars().next() {
-                Some('+') => (Role::Ok, Role::OkTint),
-                Some('-') => (Role::Err, Role::ErrTint),
-                Some('@') => return styled_text(l, tfg(Role::Faint)),
-                _ => return styled_text(l, tfg(Role::Muted)),
-            };
-            match tbg(tint) {
-                Some(b) => {
-                    let sign = l;
-                    let (head, rest) = sign.split_at(1);
-                    vec![span(head, with_bg(tfg(role), Some(b))), span(rest, with_bg(ContentStyle::default(), Some(b)))]
-                }
-                None => styled_text(l, tfg(role)),
-            }
-        })
-        .collect();
-    if shown < all.len() {
-        rows.push(more(all.len() - shown));
-    }
-    (rows, adds, dels)
+    let footer = (!footer.is_empty()).then(|| facts(&footer));
+    frame_at(&Card { tone, sections, footer }, width)
 }
 
 /// Plain indented result rows, cut at `TEXT_CUT` unless expanded.
@@ -403,7 +367,7 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
         let tone = if out.is_error || m.failed() { Tone::Error } else { Tone::Success };
         return bash_box(args, &body, expanded, tone, bash_facts(m), width);
     }
-    let icon_style = if out.is_error { tfg(Role::Err) } else { tfg(Role::Ok) };
+    let icon_style = if out.is_error { tfg(Role::Err) } else { tfg(Role::Faint) };
     let mut lines = vec![header_line("●", icon_style, name, args, out.meta.as_ref(), width)];
     if out.is_error {
         let card = Card {
@@ -421,7 +385,9 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
             lines[0] = truncate(&lines[0], width);
         }
         "edit" | "write" if out.display.is_some() => {
-            let (rows, adds, dels) = diff_rows(out.display.as_deref().unwrap_or(""), expanded);
+            let path = summary(name, args, out.meta.as_ref());
+            let lang = std::path::Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("");
+            let (rows, adds, dels) = diffview::rows(out.display.as_deref().unwrap_or(""), lang, expanded);
             let card = Card {
                 tone: Tone::Success,
                 sections: vec![Section { label: None, rows }],
@@ -434,8 +400,12 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
             lines.extend(frame(&card, width));
         }
         "read" => {
-            let n = out.text.lines().count().saturating_sub(1);
-            lines.push(vec![span(format!("  {n} lines"), tfg(Role::Muted))]);
+            // An image read is one line: `Image: path (mime, n bytes)`.
+            let what = match out.text.strip_prefix("Image: ").and_then(|t| t.rsplit_once(" (")) {
+                Some((_, kind)) => format!("  image ({kind}"),
+                None => format!("  {} lines", out.text.lines().count().saturating_sub(1)),
+            };
+            lines.push(vec![span(what, tfg(Role::Muted))]);
         }
         "grep" => lines.push(vec![span(format!("  {} matches", out.text.lines().count()), tfg(Role::Muted))]),
         "glob" => lines.push(vec![span(format!("  {} files", out.text.lines().count()), tfg(Role::Muted))]),
@@ -637,6 +607,19 @@ mod tests {
     }
 
     #[test]
+    fn default_timeout_is_not_shown() {
+        let mut out = ToolOutput::ok("");
+        out.meta = Some(ToolMeta::Bash(BashMeta { output_end: 0, ..Default::default() }));
+        for args in [json!({"command":"true"}), json!({"command":"true","timeout":300})] {
+            let t = texts(&tool_result("bash", &args, &out, false, 40));
+            let last = t.last().unwrap();
+            assert!(last.starts_with("╰──") && !last.contains("Timeout"), "{last}");
+        }
+        let t = texts(&tool_result("bash", &json!({"command":"true","timeout":0}), &out, false, 40));
+        assert!(t.last().unwrap().contains("Timeout: disabled"));
+    }
+
+    #[test]
     fn bash_error_box_uses_error_tone_and_exit_fact() {
         let mut out = ToolOutput::ok("nope\n\nCommand exited with code 3");
         out.meta = Some(ToolMeta::Bash(BashMeta { output_end: 4, exit_code: Some(3), ..Default::default() }));
@@ -674,30 +657,25 @@ mod tests {
         let back = ToolOutput::from_stored("hi".into(), false, stored);
         assert_eq!(back.meta, out.meta);
         assert_eq!(ToolOutput::from_stored("x".into(), false, None).meta, None);
+        let mut out = ToolOutput::ok("ok");
+        out.display = Some("-1|a\n+1|b".into());
+        let back = ToolOutput::from_stored("ok".into(), false, out.stored_details());
+        assert_eq!(back.display.as_deref(), Some("-1|a\n+1|b"), "a resumed edit still shows its diff");
     }
 
     #[test]
-    fn diff_counts_ignore_headers_but_not_content() {
-        let d = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n--- removed text\n+++ added text\n-x\n+y\n";
-        let (_, adds, dels) = diff_rows(d, true);
-        assert_eq!((adds, dels), (2, 2));
-        let (_, adds, dels) = diff_rows("+a\n+b\n-c\n", true);
-        assert_eq!((adds, dels), (2, 1), "a headerless diff counts every line");
-    }
-
-    #[test]
-    fn diff_colors_and_cut() {
-        let d: String = (0..50).map(|i| format!("+l{i}\n")).collect();
+    fn diff_card_colours_and_cut() {
+        let d: String = "-1|old\n".to_string() + &(1..=50).map(|i| format!("+{i}|l{i}\n")).collect::<String>();
         let mut out = ToolOutput::ok("done");
         out.display = Some(d);
-        let l = tool_result("edit", &json!({"input":"x"}), &out, false, 40);
+        let l = tool_result("edit", &json!({"input":"[a.txt#AAAA]"}), &out, false, 40);
         // header, top rule, 40 diff rows, "more" row, bottom rule
         assert_eq!(l.len(), 1 + 1 + 40 + 1 + 1);
-        assert!(text_of(&l[42]).starts_with("│ … 10 more lines"));
-        assert_eq!(l[2][1].text, "+");
-        assert_eq!(l[2][1].style.foreground_color, theme::get().color(Role::Ok));
-        assert_eq!(l[2][1].style.background_color, theme::get().color(Role::OkTint));
-        assert!(text_of(l.last().unwrap()).contains("+50 -0"));
+        assert!(text_of(&l[42]).starts_with("│ … 11 more lines"), "{}", text_of(&l[42]));
+        assert_eq!(l[2][1].text, "- 1");
+        assert_eq!(l[2][1].style.foreground_color, theme::get().color(Role::Err));
+        assert_eq!(l[2][1].style.background_color, card_bg(), "fill applies the card surface (none when outlined)");
+        assert!(text_of(l.last().unwrap()).contains("+50 -1"));
     }
 
     #[test]
@@ -724,6 +702,14 @@ mod tests {
         assert_eq!(text_of(&l[1]), format!("▎hi{}", " ".repeat(9)));
     }
 
+    #[test]
+    fn user_prompt_renders_markdown() {
+        let l = user_prompt("use `x` and [l](http://u)", 40);
+        let row = text_of(&l[1]);
+        assert!(row.starts_with("▎use x and l (http://u)"), "{row}");
+        assert!(!row.contains('`'));
+    }
+
     fn unicode_width_of(l: &str) -> usize {
         use unicode_width::UnicodeWidthStr;
         l.width()
@@ -746,10 +732,10 @@ mod tests {
         let t = theme::get();
         let ls = tool_result("read", &json!({"path":"x"}), &ToolOutput::ok("a\nb"), false, 40);
         let h = &ls[0];
-        assert_eq!(h[0].style.foreground_color, t.color(Role::Ok));
-        assert_eq!(h[1].style.foreground_color, t.color(Role::Tool));
+        assert_eq!(h[0].style.foreground_color, t.color(Role::Faint));
+        assert_eq!(h[1].style.foreground_color, t.color(Role::Strong));
         assert!(h[1].style.attributes.has(Attribute::Bold));
-        assert_eq!(h[2].style.foreground_color, t.color(Role::Accent));
+        assert_eq!(h[2].style.foreground_color, t.color(Role::Muted));
         assert_eq!(h[0].text, "● ");
         assert_eq!(h[2].text, " x");
     }

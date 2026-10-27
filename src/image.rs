@@ -9,7 +9,8 @@ use crate::message::Image;
 
 const MAX_BYTES: usize = 5 * 1024 * 1024;
 
-fn sniff(b: &[u8]) -> Option<&'static str> {
+/// MIME type of a png, jpeg, gif or webp, from its leading bytes.
+pub fn sniff(b: &[u8]) -> Option<&'static str> {
     if b.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if b.starts_with(b"\xFF\xD8\xFF") {

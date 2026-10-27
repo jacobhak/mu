@@ -202,15 +202,17 @@ pub struct MuTheme {
 
 impl Default for MuTheme {
     fn default() -> Self {
-        Self { source: "terminal".into(), accent: None, cards: Cards::Outline }
+        Self { source: "terminal".into(), accent: None, cards: Cards::Filled }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Cards {
-    #[default]
+    /// Border only, on the terminal background.
     Outline,
+    /// Border on the recessed surface (`dark_background`).
+    #[default]
     Filled,
 }
 
@@ -455,10 +457,10 @@ mod tests {
 
     #[test]
     fn theme_section_parses_with_defaults() {
-        let c = toml::from_str::<MuConfig>("[theme]\nsource = \"gruvbox\"\ncards = \"filled\"\n").unwrap();
-        assert_eq!((c.theme.source.as_str(), c.theme.cards), ("gruvbox", Cards::Filled));
+        let c = toml::from_str::<MuConfig>("[theme]\nsource = \"gruvbox\"\ncards = \"outline\"\n").unwrap();
+        assert_eq!((c.theme.source.as_str(), c.theme.cards), ("gruvbox", Cards::Outline));
         let d = toml::from_str::<MuConfig>("").unwrap();
-        assert_eq!((d.theme.source.as_str(), d.theme.accent, d.theme.cards), ("terminal", None, Cards::Outline));
+        assert_eq!((d.theme.source.as_str(), d.theme.accent, d.theme.cards), ("terminal", None, Cards::Filled));
     }
 
     #[test]

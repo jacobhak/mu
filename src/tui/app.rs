@@ -481,7 +481,9 @@ impl App {
                     .map(|i| self.tools.remove(i).args)
                     .unwrap_or(Value::Null);
                 let w = self.width();
-                let l = blocks::tool_result(&name, &args, &output, self.expanded, w);
+                let mut l = blocks::tool_result(&name, &args, &output, self.expanded, w);
+                // Breathing room: a blank row after every tool block, as text blocks have.
+                l.push(vec![]);
                 self.commit(l);
             }
             AgentEvent::Retry { attempt, delay, reason } => {
