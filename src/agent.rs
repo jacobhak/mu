@@ -508,7 +508,9 @@ impl Agent {
         self.push(Message::ToolResult {
             tool_call_id: id.into(),
             tool_name: name.into(),
-            content: vec![Block::text(out.text.clone())],
+            content: std::iter::once(Block::text(out.text.clone()))
+                .chain(out.images.iter().cloned().map(Block::Image))
+                .collect(),
             is_error: out.is_error,
             timestamp: now_ms(),
             details: out.stored_details(),
@@ -1147,6 +1149,7 @@ impl Agent {
                 display: out.display.clone(),
                 details: out.details.clone(),
                 meta: out.meta.clone(),
+                images: Vec::new(),
             },
         });
         out

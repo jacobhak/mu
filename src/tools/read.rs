@@ -71,6 +71,16 @@ impl Tools {
             Ok(Source::File(Err(e))) => return ToolOutput::err(format!("Cannot read {disp}: {e}")),
             Err(e) => return ToolOutput::err(format!("read failed: {e}")),
         };
+        // Images go to the model as image blocks; the text names what it is looking at.
+        if let Some(mime) = crate::image::sniff(&raw) {
+            let n = raw.len();
+            return match crate::image::from_bytes(raw) {
+                Ok(img) => {
+                    ToolOutput { images: vec![img], ..ToolOutput::ok(format!("Image: {disp} ({mime}, {n} bytes)")) }
+                }
+                Err(e) => ToolOutput::err(format!("{disp}: {e}")),
+            };
+        }
         let head = &raw[..raw.len().min(8192)];
         let s = match std::str::from_utf8(&raw) {
             Ok(s) if !head.contains(&0) => s,
@@ -201,5 +211,22 @@ mod tests {
         assert!(!o.text.contains("\n48:"));
         let o = t.read(Args { path: "p.txt:-2".into() }).await;
         assert!(o.text.contains("399:line399\n400:line400"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn images_come_back_as_images() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("x.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "x.png".into() }).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert!(o.text.starts_with("Image: x.png (image/png, 16 bytes)"), "{}", o.text);
+        assert_eq!(o.images.len(), 1);
+        assert_eq!(o.images[0].mime_type, "image/png");
+        std::fs::write(d.join("b.bin"), b"\0\x01\x02").unwrap();
+        let o = t.read(Args { path: "b.bin".into() }).await;
+        assert!(o.images.is_empty() && o.text.starts_with("Binary file"));
     }
 }

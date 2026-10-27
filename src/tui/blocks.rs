@@ -394,8 +394,12 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
             lines.extend(frame(&card, width));
         }
         "read" => {
-            let n = out.text.lines().count().saturating_sub(1);
-            lines.push(vec![span(format!("  {n} lines"), tfg(Role::Muted))]);
+            // An image read is one line: `Image: path (mime, n bytes)`.
+            let what = match out.text.strip_prefix("Image: ").and_then(|t| t.rsplit_once(" (")) {
+                Some((_, kind)) => format!("  image ({kind}"),
+                None => format!("  {} lines", out.text.lines().count().saturating_sub(1)),
+            };
+            lines.push(vec![span(what, tfg(Role::Muted))]);
         }
         "grep" => lines.push(vec![span(format!("  {} matches", out.text.lines().count()), tfg(Role::Muted))]),
         "glob" => lines.push(vec![span(format!("  {} files", out.text.lines().count()), tfg(Role::Muted))]),

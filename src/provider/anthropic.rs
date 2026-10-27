@@ -65,12 +65,7 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
                     .iter()
                     .filter_map(|b| match b {
                         Block::Text { text } if !text.is_empty() => Some(json!({"type":"text","text":text})),
-                        Block::Image(i) => Some(match crate::image::resolve(&i.data) {
-                            Some(data) => {
-                                json!({"type":"image","source":{"type":"base64","media_type":i.mime_type,"data":data}})
-                            }
-                            None => json!({"type":"text","text":format!("[image unavailable: {}]", i.mime_type)}),
-                        }),
+                        Block::Image(i) => Some(image_json(i)),
                         _ => None,
                     })
                     .collect();
@@ -105,6 +100,7 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
                     .iter()
                     .filter_map(|b| match b {
                         Block::Text { text } => Some(json!({"type":"text","text":text})),
+                        Block::Image(i) => Some(image_json(i)),
                         _ => None,
                     })
                     .collect();
@@ -118,6 +114,14 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
         }
     }
     out.into_iter().map(|(role, content)| json!({"role":role,"content":content})).collect()
+}
+
+/// An image block, its bytes read back from the blob store; a text note if they are gone.
+fn image_json(i: &crate::message::Image) -> Value {
+    match crate::image::resolve(&i.data) {
+        Some(data) => json!({"type":"image","source":{"type":"base64","media_type":i.mime_type,"data":data}}),
+        None => json!({"type":"text","text":format!("[image unavailable: {}]", i.mime_type)}),
+    }
 }
 
 enum Open {
@@ -409,6 +413,26 @@ mod tests {
         let w = to_wire(&[Message::user_input(&input)], &gw());
         let c = w[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["type"], "text");
+        assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
+    }
+
+    #[test]
+    fn tool_result_carries_its_images() {
+        let img = crate::message::Image { data: "QUJD".into(), mime_type: "image/png".into() };
+        let msgs = vec![
+            asst(vec![Block::ToolCall { id: "a".into(), name: "read".into(), arguments: json!({}) }]),
+            Message::ToolResult {
+                tool_call_id: "a".into(),
+                tool_name: "read".into(),
+                content: vec![Block::text("Image: x.png"), Block::Image(img)],
+                is_error: false,
+                timestamp: 0,
+                details: None,
+            },
+        ];
+        let w = to_wire(&msgs, &gw());
+        let c = w[1]["content"][0]["content"].as_array().unwrap();
         assert_eq!(c[0]["type"], "text");
         assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
     }
