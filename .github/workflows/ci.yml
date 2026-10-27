@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install --component rustfmt --component clippy
+      - run: rustup toolchain install && rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
       - run: cargo fmt --all --check
