@@ -60,10 +60,10 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?
     };
     // The record was read a moment ago; make sure it is still the same live run before the first kill.
-    match session::owner(path) {
-        Owner::Live { pid: p, print_run: true, started: s } if p == pid && s == started => {}
-        Owner::Free => return Ok(None),
-        _ => {
+    match verify(session::owner(path), pid, started) {
+        Recheck::Same => {}
+        Recheck::Free => return Ok(None),
+        Recheck::Changed => {
             eprintln!("mu take: the session changed hands while starting; nothing was signalled, try again");
             return Ok(Some(1));
         }
@@ -99,12 +99,9 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
                     }
                     // Only signal again while it is still the same live run: the pid may have
                     // been reused after it exited.
-                    match session::owner(path) {
-                        Owner::Live { pid: p, print_run: true, started: s } if p == pid && s == started => {
-                            let _ = signal(pid);
-                            eprintln!("asked pid {pid} to stop now");
-                        }
-                        _ => {}
+                    if verify(session::owner(path), pid, started) == Recheck::Same {
+                        let _ = signal(pid);
+                        eprintln!("asked pid {pid} to stop now");
                     }
                 }
             }
@@ -112,6 +109,25 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
     });
     drop(rt);
     Ok(code)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Recheck {
+    /// Still the same `-p` run (pid and start time): safe to signal.
+    Same,
+    /// Nobody has the session any more.
+    Free,
+    /// Someone else (another pid, a reused pid, an interactive owner, no record): never signal.
+    Changed,
+}
+
+/// Compares a fresh owner lookup with the run `mu take` decided to stop.
+fn verify(now: Owner, pid: u32, started: &str) -> Recheck {
+    match now {
+        Owner::Live { pid: p, print_run: true, started: s } if p == pid && s == started => Recheck::Same,
+        Owner::Free => Recheck::Free,
+        _ => Recheck::Changed,
+    }
 }
 
 fn resume(path: &Path) -> anyhow::Result<i32> {
@@ -127,4 +143,26 @@ fn resume(path: &Path) -> anyhow::Result<i32> {
     let err = std::process::Command::new(exe).arg("--resume").arg(path).exec();
     eprintln!("mu take: cannot exec mu: {err}");
     Ok(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live(pid: u32, print_run: bool, started: &str) -> Owner {
+        Owner::Live { pid, print_run, started: started.into() }
+    }
+
+    #[test]
+    fn only_the_same_print_run_may_be_signalled() {
+        let t = "2026-01-01T00:00:00.000Z";
+        assert_eq!(verify(live(7, true, t), 7, t), Recheck::Same);
+        // A reused pid starts later.
+        assert_eq!(verify(live(7, true, "2026-01-01T00:00:01.000Z"), 7, t), Recheck::Changed);
+        assert_eq!(verify(live(8, true, t), 7, t), Recheck::Changed);
+        // The same pid reopened by an interactive mu.
+        assert_eq!(verify(live(7, false, t), 7, t), Recheck::Changed);
+        assert_eq!(verify(Owner::Unknown, 7, t), Recheck::Changed);
+        assert_eq!(verify(Owner::Free, 7, t), Recheck::Free);
+    }
 }

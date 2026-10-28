@@ -80,6 +80,8 @@ pub struct Agent {
     turn_msgs: Vec<Value>,
     jobs: Option<Rc<JobsHandle>>,
     wake_rx: Option<UnboundedReceiver<()>>,
+    /// `-p --resume`: when the session cannot be opened, the run ends instead of starting a fresh one.
+    pub exit_on_resume_failure: bool,
 }
 
 pub struct PlanState {
@@ -125,6 +127,11 @@ pub struct AgentInit {
     pub events: EventTx,
     pub inbox: SharedInbox,
 }
+
+const SKIP_STOPPED: &str = "Skipped: the run was stopped so the user can take over";
+const SKIP_ABORTED: &str = "Tool call aborted by user";
+const SKIP_STEER: &str = "Skipped: the user sent a new message";
+const SKIP_TRUNCATED: &str = "Tool call not executed: output was truncated (max_tokens)";
 
 /// How a loop pass ended.
 enum Flow {
@@ -237,6 +244,7 @@ impl Agent {
             turn_msgs: Vec::new(),
             jobs: None,
             wake_rx: None,
+            exit_on_resume_failure: false,
         }
     }
 
@@ -634,10 +642,14 @@ impl Agent {
         }
     }
 
-    pub async fn load_session(&mut self, path: &Path) {
+    /// `false` (with an error shown) when the session could not be loaded or opened.
+    pub async fn load_session(&mut self, path: &Path) -> bool {
         let loaded = match session::load(path) {
             Ok(l) => l,
-            Err(e) => return self.error(e.to_string()),
+            Err(e) => {
+                self.error(e.to_string());
+                return false;
+            }
         };
         // Re-opening the session that is current: release its lock first.
         let same = self.session.as_ref().is_some_and(|c| c.path == path);
@@ -650,7 +662,10 @@ impl Agent {
                 self.attach_error_sink(&mut s);
                 s
             }
-            Err(e) => return self.error(e.to_string()),
+            Err(e) => {
+                self.error(e.to_string());
+                return false;
+            }
         };
         // Only now, with the target loaded and open, does the current session end.
         if !same {
@@ -710,6 +725,7 @@ impl Agent {
         self.replay_history();
         self.notice(format!("resumed {}", path.display()));
         self.emit_status();
+        true
     }
 
     pub async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
@@ -763,7 +779,10 @@ impl Agent {
                     self.emit_status();
                 }
                 Command::Resume(p) => {
-                    self.load_session(&p).await;
+                    // A `-p` run that asked for a session must not quietly run in another one.
+                    if !self.load_session(&p).await && self.exit_on_resume_failure {
+                        break;
+                    }
                 }
                 Command::TogglePlan(prompt) => match (self.plan.is_some(), prompt) {
                     (false, p) => {
@@ -1384,8 +1403,9 @@ impl Agent {
             if stop != StopReason::ToolUse && !calls.is_empty() {
                 // A truncated reply: its tool calls never run, but each still needs a result.
                 for (id, name, args) in &calls {
-                    let reason = "Tool call not executed: output was truncated (max_tokens)";
+                    let reason = SKIP_TRUNCATED;
                     let out = ToolOutput::err(reason);
+                    self.emit(AgentEvent::ToolSkipped { id: id.clone() });
                     self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
                     self.emit(AgentEvent::ToolEnd {
                         id: id.clone(),
@@ -1422,13 +1442,14 @@ impl Agent {
             for (id, name, args) in calls {
                 if skip.is_none() {
                     if cancel.is_cancelled() {
-                        skip = Some("Tool call aborted by user");
+                        skip = Some(SKIP_ABORTED);
                     } else if self.inbox.borrow().stop {
-                        skip = Some("Skipped: the run was stopped so the user can take over");
+                        skip = Some(SKIP_STOPPED);
                     }
                 }
                 if let Some(reason) = skip {
                     let out = ToolOutput::err(reason);
+                    self.emit(AgentEvent::ToolSkipped { id: id.clone() });
                     self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
                     self.emit(AgentEvent::ToolEnd {
                         id: id.clone(),
@@ -1441,11 +1462,11 @@ impl Agent {
                 let out = self.run_tool(&id, &name, args, cancel).await;
                 self.push_result(&id, &name, &out);
                 if cancel.is_cancelled() {
-                    skip = Some("Tool call aborted by user");
+                    skip = Some(SKIP_ABORTED);
                 } else if self.inbox.borrow().stop {
-                    skip = Some("Skipped: the run was stopped so the user can take over");
+                    skip = Some(SKIP_STOPPED);
                 } else if !self.inbox.borrow().steer.is_empty() {
-                    skip = Some("Skipped: the user sent a new message");
+                    skip = Some(SKIP_STEER);
                 }
             }
             if cancel.is_cancelled() {
@@ -1785,12 +1806,16 @@ mod loop_tests {
             assert!(r.iter().all(|x| x.0 && x.1.contains("the run was stopped")), "{r:?}");
             assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
             let mut ended = None;
+            let mut skipped = Vec::new();
             while let Ok(e) = rx.try_recv() {
-                if let AgentEvent::TurnEnd { aborted } = e {
-                    ended = Some(aborted);
+                match e {
+                    AgentEvent::TurnEnd { aborted } => ended = Some(aborted),
+                    AgentEvent::ToolSkipped { id } => skipped.push(id),
+                    _ => {}
                 }
             }
             assert_eq!(ended, Some(false));
+            assert_eq!(skipped, ["t1", "t2"], "each skipped call is marked structurally");
         });
     }
 
@@ -1803,7 +1828,7 @@ mod loop_tests {
                 Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse)),
                 Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
             ];
-            let (mut a, _rx) = agent(script);
+            let (mut a, mut rx) = agent(script);
             let inbox = a.inbox.clone();
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1815,6 +1840,13 @@ mod loop_tests {
             assert_eq!(r.len(), 2);
             assert!(!r[0].0, "the running tool finished: {:?}", r[0]);
             assert!(r[1].0 && r[1].1.contains("the run was stopped"), "{:?}", r[1]);
+            let mut skipped = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                if let AgentEvent::ToolSkipped { id } = e {
+                    skipped.push(id);
+                }
+            }
+            assert_eq!(skipped, ["t2"], "the call that ran is not marked");
             assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
         });
     }
@@ -1888,6 +1920,99 @@ mod loop_tests {
             assert!(matches!(erx.try_recv(), Ok(AgentEvent::Notice(m)) if m.contains("killed")));
             assert_eq!(backlog.len(), 1);
             assert!(matches!(backlog.pop_front(), Some(Command::NewSession)));
+        });
+    }
+
+    #[test]
+    fn a_fatal_error_emits_turn_failed_before_turn_end() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![Err(ProviderError::Fatal("nope".into()))]);
+            a.turn(Some("go".to_string().into())).await;
+            let mut seen = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    AgentEvent::Error(_) => seen.push("error"),
+                    AgentEvent::TurnFailed => seen.push("failed"),
+                    AgentEvent::TurnEnd { .. } => seen.push("end"),
+                    _ => {}
+                }
+            }
+            assert_eq!(seen, ["error", "failed", "end"]);
+        });
+    }
+
+    #[test]
+    fn a_stop_with_no_calls_skips_the_todo_reminder() {
+        use crate::tools::todo::{Phase, Status, Task};
+        run(async {
+            let script = vec![
+                Ok(assistant(vec![Block::text("hi")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+            ];
+            let (mut a, _rx) = agent(script);
+            let task = Task { content: "open item".into(), status: Status::Pending, blocker: None };
+            a.tools.set_todo(vec![Phase { name: "p".into(), tasks: vec![task] }]);
+            a.inbox.borrow_mut().stop = true;
+            a.turn(Some("go".to_string().into())).await;
+            assert_eq!(a.messages.len(), 2, "no reminder was pushed: {:?}", a.messages.len());
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
+        });
+    }
+
+    #[test]
+    fn a_stop_skips_plan_dispatch_and_follow_ups() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![
+                Ok(assistant(vec![Block::text("hi")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+            ]);
+            a.exec_plan = Some(ExecPlan {
+                content: "plan".into(),
+                title: "T".into(),
+                uri: "local://t-plan.md".into(),
+                compact: false,
+                model: None,
+                base: None,
+                approved_at: 0,
+            });
+            a.inbox.borrow_mut().follow_up.push_back("later".to_string().into());
+            a.inbox.borrow_mut().stop = true;
+            a.turn(Some("go".to_string().into())).await;
+            assert!(a.exec_plan.is_none(), "the pending plan is dropped, not dispatched");
+            assert_eq!(a.inbox.borrow().follow_up.len(), 1, "the follow-up stays queued");
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
+            assert_eq!(a.messages.len(), 2);
+            while let Ok(e) = rx.try_recv() {
+                assert!(!matches!(e, AgentEvent::Notice(n) if n.contains("Plan approved")));
+            }
+        });
+    }
+
+    #[test]
+    fn a_print_run_does_not_fall_back_to_a_fresh_session_when_resume_fails() {
+        crate::testutil::home();
+        run(async {
+            let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("hi")], StopReason::Stop))]);
+            a.exit_on_resume_failure = true;
+            let (tx, crx) = tokio::sync::mpsc::unbounded_channel();
+            let missing = std::env::temp_dir().join(format!("mu-missing-{}.jsonl", uuid::Uuid::new_v4()));
+            tx.send(Command::Resume(missing)).unwrap();
+            tx.send(Command::EnsureSession).unwrap();
+            tx.send(Command::Prompt("go".to_string().into())).unwrap();
+            tx.send(Command::Exit).unwrap();
+            let providers = a.providers.clone();
+            a.run(crx).await;
+            assert_eq!(providers.scripted.borrow().len(), 1, "the prompt never ran");
+            let (mut errored, mut exited, mut sessions) = (false, false, false);
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    AgentEvent::Error(_) => errored = true,
+                    AgentEvent::Exit => exited = true,
+                    AgentEvent::Status(s) if s.session_path.is_some() => sessions = true,
+                    _ => {}
+                }
+            }
+            assert!(errored && exited && !sessions);
         });
     }
 }

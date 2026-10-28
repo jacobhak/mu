@@ -130,6 +130,11 @@ struct LiveRecord {
     started: String,
 }
 
+/// `--profile <name> ` (trailing space) when a profile is active, else empty: for resume hints.
+pub fn profile_flag() -> String {
+    std::env::var("OMP_PROFILE").ok().filter(|p| !p.is_empty()).map(|p| format!("--profile {p} ")).unwrap_or_default()
+}
+
 fn record_path(session: &Path) -> Option<PathBuf> {
     let id = id_of(session);
     valid_id(&id).then(|| paths::mu_home().join("run").join(format!("{id}.json")))
@@ -199,6 +204,36 @@ pub fn owner(session: &Path) -> Owner {
     }
 }
 
+/// Removes records in `dir` whose writer is gone (crashed or killed before it could unlink).
+/// A record is stale when nobody holds its lock. The probe is a shared lock, like the one
+/// `live_record` takes: a live writer holds an exclusive lock, so live records stay, and a stale
+/// record never looks live to a concurrent `owner()` while it is probed. A claimer's `rename` is
+/// not blocked by any lock; the dev/ino re-check catches it, but a rename landing between the check
+/// and the unlink still loses that new record. The result is then a missing record (`owner` says
+/// `Unknown`, `mu take` signals nothing), never a wrong signal.
+fn sweep_stale(dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || !name.ends_with(".json") {
+            continue;
+        }
+        let path = e.path();
+        let Ok(f) = File::open(&path) else { continue };
+        if try_flock(&f, libc::LOCK_SH).is_err() {
+            continue;
+        }
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(&path), f.metadata())
+            && a.dev() == b.dev()
+            && a.ino() == b.ino()
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// `$MU_HOME/run/<id>.json`, held under `flock` by the process that has the session open.
 /// Best effort: any failure just means no record.
 struct OwnerRecord {
@@ -216,6 +251,7 @@ impl OwnerRecord {
         let path = record_path(session)?;
         let dir = path.parent()?;
         std::fs::create_dir_all(dir).ok()?;
+        sweep_stale(dir);
         let pid = std::process::id();
         let tmp = dir.join(format!(".{}.{pid}.tmp", id_of(session)));
         let _ = std::fs::remove_file(&tmp);
@@ -1140,6 +1176,38 @@ mod tests {
         assert!(matches!(owner(&path), Owner::Live { print_run: true, .. }));
         let e = SessionFile::open_append(&path).err().unwrap().to_string();
         assert!(e.contains("mu take"), "{e}");
+    }
+
+    #[test]
+    fn claiming_sweeps_stale_records_but_not_live_ones() {
+        home();
+        let dir = home().join("run");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("sweep-stale-record.json");
+        std::fs::write(&stale, "{\"pid\":1}").unwrap();
+        let live = dir.join("sweep-live-record.json");
+        std::fs::write(&live, "{\"pid\":2}").unwrap();
+        let held = File::open(&live).unwrap();
+        try_flock(&held, libc::LOCK_EX).unwrap();
+        let s = SessionFile::create(Path::new("/opt/sweep"), None).unwrap();
+        assert!(!stale.exists(), "a record nobody holds is removed");
+        assert!(live.exists(), "a record under lock is kept");
+        assert!(record_of(&s.path).exists(), "the claimer's own record stays");
+    }
+
+    #[test]
+    fn sweeping_does_not_make_a_stale_record_look_live() {
+        home();
+        let dir = home().join("run");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("sweep-shared-probe.json");
+        std::fs::write(&stale, "{\"pid\":1}").unwrap();
+        // A concurrent `owner()` holds a shared lock while it reads the record. An exclusive probe
+        // would conflict with it (and, the other way round, make the record look live to it).
+        let reader = File::open(&stale).unwrap();
+        try_flock(&reader, libc::LOCK_SH).unwrap();
+        sweep_stale(&dir);
+        assert!(!stale.exists(), "the probe takes a shared lock, which coexists with a reader's");
     }
 
     /// Reopen-after-drop loop, optionally racing a thread that spawns children. Run with

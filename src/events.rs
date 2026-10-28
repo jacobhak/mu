@@ -172,6 +172,11 @@ pub enum AgentEvent {
     },
     /// Current todo phases (JSON), after a change or a resume.
     Todo(Value),
+    /// The next `ToolStart` (same `id`) is a call that will not run: its placeholder result follows
+    /// as `ToolEnd`. Sent for calls skipped by a stop, an abort, a new user message or truncation.
+    ToolSkipped {
+        id: String,
+    },
     ToolEnd {
         id: String,
         name: String,
@@ -208,7 +213,10 @@ pub enum AgentEvent {
     TurnEnd {
         aborted: bool,
     },
-    /// The turn ended on a fatal error (already reported as `Error`); the session is not at a clean boundary.
+    /// The turn ended on a fatal error, already reported as an `Error`, and is followed by `TurnEnd`.
+    /// The agent loop sends it when a run fails (a provider or compaction error), not when it is
+    /// aborted or stopped. A `-p` run that sees it exits 1 even if a stop was requested, so a
+    /// failure is not reported as "interrupted, resume with …".
     TurnFailed,
     Exit,
 }

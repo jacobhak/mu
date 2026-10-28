@@ -341,6 +341,7 @@ fn run() -> Result<i32> {
         events: ev_tx,
         inbox: inbox.clone(),
     });
+    agent.exit_on_resume_failure = cli.print.is_some();
     agent.pin_model = cli.model.is_some() && resume.is_some();
     agent.pin_thinking = cli_thinking.is_some() && resume.is_some();
     if let Some(p) = &task_payload {

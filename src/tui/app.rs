@@ -333,11 +333,7 @@ pub async fn run(init: AppInit) -> i32 {
             .and_then(|s| s.to_str())
             .and_then(|s| s.rsplit_once('_'))
             .map_or(path, |(_, id)| id);
-        let profile = std::env::var("OMP_PROFILE")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .map(|p| format!("--profile {p} "))
-            .unwrap_or_default();
+        let profile = crate::session::profile_flag();
         eprint!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n");
     }
     0
@@ -559,7 +555,7 @@ impl App {
                     self.composer.restore(queued);
                 }
             }
-            AgentEvent::Exit | AgentEvent::TurnFailed => {}
+            AgentEvent::Exit | AgentEvent::TurnFailed | AgentEvent::ToolSkipped { .. } => {}
         }
     }
 

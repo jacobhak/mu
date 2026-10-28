@@ -3,8 +3,8 @@ use crate::tools::summary;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// `-p`: runs one prompt to completion. Final assistant text goes to stdout, progress to stderr.
-/// Each message on `stop` is a request to hand the session over: the first finishes the current
-/// tool and ends the turn at the next boundary, the second cancels the current step. A stopped run
+/// Each message on `stop` is a request to hand the session over: the first ends the turn at the
+/// next boundary (after the running tool, if any), the second cancels the current step. A stopped run
 /// exits 3 and prints how to resume. Returns the process exit code.
 pub async fn print_mode(
     prompt: String,
@@ -21,6 +21,7 @@ pub async fn print_mode(
     let (mut buf, mut last, mut code) = (String::new(), String::new(), 0);
     let (mut cost, mut capped, mut exited, mut errored) = (0.0f64, false, false, false);
     let (mut session, mut stops) = (None::<String>, 0u32);
+    let mut skipped = None::<(String, String)>;
     loop {
         let e = tokio::select! {
             e = ev.recv() => match e {
@@ -40,7 +41,7 @@ pub async fn print_mode(
                 stops += 1;
                 if stops == 1 {
                     inbox.borrow_mut().stop = true;
-                    eprintln!("mu: stop requested; finishing the current tool");
+                    eprintln!("mu: stop requested; stopping at the next boundary");
                 } else {
                     inbox.borrow().cancel.cancel();
                     eprintln!("mu: stopping now");
@@ -69,7 +70,16 @@ pub async fn print_mode(
                     last = std::mem::take(&mut buf);
                 }
             }
-            AgentEvent::ToolStart { name, args, .. } => eprintln!("● {name} {}", summary(&name, &args)),
+            AgentEvent::ToolSkipped { id } => skipped = Some((id, String::new())),
+            AgentEvent::ToolStart { id, name, args } => match &mut skipped {
+                // One line for a call that will not run, printed with its reason at `ToolEnd`.
+                Some((sid, head)) if *sid == id => *head = format!("{name} {}", summary(&name, &args)),
+                _ => eprintln!("● {name} {}", summary(&name, &args)),
+            },
+            AgentEvent::ToolEnd { id, output, .. } if skipped.as_ref().is_some_and(|(s, _)| *s == id) => {
+                let (_, head) = skipped.take().unwrap_or_default();
+                eprintln!("○ {head} (not run: {})", output.text)
+            }
             AgentEvent::Retry { attempt, delay, reason } => {
                 eprintln!("↻ retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs())
             }
@@ -100,7 +110,7 @@ pub async fn print_mode(
     }
     if stops > 0 && exited && !capped && !errored {
         match &session {
-            Some(p) => eprintln!("mu: interrupted; resume with: mu --resume {p}"),
+            Some(p) => eprintln!("mu: interrupted; resume with: mu {}--resume {p}", crate::session::profile_flag()),
             None => eprintln!("mu: interrupted"),
         }
         return 3;
