@@ -1,13 +1,14 @@
 use crate::compaction::Outcome;
 use crate::context::{self, Context, PromptInput};
 use crate::cost::CostLedger;
-use crate::events::{AgentEvent, Command, EventTx, SharedInbox, StatusSnapshot};
+use crate::events::{AgentEvent, Command, EventTx, PlanDecision, SharedInbox, StatusSnapshot};
 use crate::gitinfo::{self, GitInfo};
 use crate::jobs::{self, JobsHandle};
 use crate::mem;
 use crate::message::UserInput;
 use crate::message::{Block, Message, StopReason, now_ms, text_of};
 use crate::models::{ModelSpec, Thinking};
+use crate::plans;
 use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
 use crate::pricing;
@@ -56,6 +57,8 @@ pub struct Agent {
     pub agent_prompt: Option<String>,
     pub parent_session: Option<PathBuf>,
     exec_plan: Option<ExecPlan>,
+    /// The stored plan being revised in plan mode; `propose_plan` updates it in place.
+    stored_plan: Option<String>,
     pub review_base: Option<crate::review::ReviewBase>,
     pub pin_model: bool,
     pub pin_thinking: bool,
@@ -89,23 +92,47 @@ pub struct PlanState {
     prev_thinking: Thinking,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PlanMode {
+    /// A new session (the Execute decision).
+    Fresh,
+    /// This session, compacted first.
+    Compact,
+    /// This session as it is.
+    Keep,
+}
+
 struct ExecPlan {
     content: String,
     title: String,
     /// `local://<slug>-plan.md`
     uri: String,
-    compact: bool,
+    mode: PlanMode,
     model: Option<String>,
     /// Tree snapshot at approval, the base for `/review`.
     base: Option<String>,
     approved_at: i64,
+    /// The id of the plan in the store, when it has one.
+    stored: Option<String>,
+}
+
+/// How a turn begins.
+enum Start {
+    User(UserInput),
+    /// A message mu sends itself; the UI does not echo it.
+    Synthetic(UserInput),
+    /// Only delivers finished background jobs.
+    Wake,
+    /// Begins executing an approved plan.
+    Plan(ExecPlan),
 }
 
 const PLAN_APPROVED: &str = include_str!("prompts/plan-approved.md");
+const PLAN_REFINE: &str = include_str!("prompts/plan-refine.md");
 
 /// The hidden prompt that starts executing an approved plan.
 fn plan_prompt(p: &ExecPlan) -> String {
-    let context = if p.compact {
+    let context = if p.mode != PlanMode::Fresh {
         "- History usable; the plan below authoritative if it conflicts with earlier exploration.\n"
     } else {
         ""
@@ -182,7 +209,7 @@ async fn drive<F: std::future::Future<Output = ()>>(
     }
 }
 
-fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
+pub(crate) fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
     match m {
         Message::Assistant { content, .. } => content
             .iter()
@@ -224,6 +251,7 @@ impl Agent {
             agent_prompt: None,
             parent_session: None,
             exec_plan: None,
+            stored_plan: None,
             review_base: None,
             pin_model: false,
             pin_thinking: false,
@@ -590,6 +618,7 @@ impl Agent {
         self.plan = None;
         self.tools.plan.set(false);
         self.exec_plan = None;
+        self.stored_plan = None;
         self.resumed = false;
         self.tools.set_todo(Vec::new());
         self.emit(AgentEvent::Todo(self.tools.todo_json()));
@@ -812,6 +841,22 @@ impl Agent {
                     self.notice(format!("killed {n} job(s)"));
                 }
                 Command::RefreshTools => self.refresh_tool_defs(),
+                Command::ListPlans => self.list_plans().await,
+                Command::OpenPlan(id) => {
+                    if let Some(s) = self.open_plan(&id).await {
+                        drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
+                    }
+                }
+                Command::StartPlan { id, decision, anyway } => {
+                    if let Some(s) = self.start_plan(&id, decision, anyway).await {
+                        drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
+                    }
+                }
+                Command::RefinePlan { id, text } => {
+                    if let Some(s) = self.refine_plan(&id, text).await {
+                        drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
+                    }
+                }
                 Command::Exit => {
                     self.end_session().await;
                     break;
@@ -1153,10 +1198,15 @@ impl Agent {
 
     /// One turn. `first` is `None` for a wake-up that only delivers finished background jobs.
     async fn turn(&mut self, first: Option<UserInput>) {
-        if first.is_none() && !self.jobs.as_ref().is_some_and(|j| j.has_undelivered()) {
+        self.turn_from(first.map_or(Start::Wake, Start::User)).await;
+    }
+
+    async fn turn_from(&mut self, start: Start) {
+        if matches!(start, Start::Wake) && !self.jobs.as_ref().is_some_and(|j| j.has_undelivered()) {
             return;
         }
-        if !self.ensure_session().await {
+        // An approved stored plan opens its own session when it needs one.
+        if !matches!(start, Start::Plan(_)) && !self.ensure_session().await {
             // Without this the caller (e.g. a headless subagent) waits for a `TurnEnd` forever.
             self.emit(AgentEvent::TurnEnd { aborted: true });
             return;
@@ -1164,9 +1214,26 @@ impl Agent {
         let cancel = CancellationToken::new();
         self.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
-        let mut next = Some(first);
         let mut aborted = false;
         let mut synthetic = false;
+        let mut next = match start {
+            Start::User(i) => Some(Some(i)),
+            Start::Synthetic(i) => {
+                synthetic = true;
+                Some(Some(i))
+            }
+            Start::Wake => Some(None),
+            Start::Plan(p) => match self.begin_plan(p, &cancel).await {
+                Some(i) => {
+                    synthetic = true;
+                    Some(Some(i))
+                }
+                None => {
+                    aborted = true;
+                    None
+                }
+            },
+        };
         while let Some(input) = next.take() {
             if !self.ensure_session().await {
                 break;
@@ -1224,39 +1291,17 @@ impl Agent {
             }
             self.turn_end_hook().await;
             if let Some(p) = self.exec_plan.take() {
-                self.exit_plan();
-                if let Some(m) = &p.model {
-                    self.continue_with(m);
-                }
-                if p.compact {
-                    match self.compact(Some(PLAN_COMPACT_FOCUS), &cancel).await {
-                        Outcome::Done => {}
-                        Outcome::Skipped(why) => self.notice(why),
-                        Outcome::Failed(e) if !cancel.is_cancelled() => self.error(format!("compaction failed: {e}")),
-                        Outcome::Failed(_) => {}
+                match self.begin_plan(p, &cancel).await {
+                    Some(i) => {
+                        synthetic = true;
+                        next = Some(Some(i));
+                        continue;
                     }
-                    if cancel.is_cancelled() {
-                        self.notice("Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.");
+                    None => {
                         aborted = true;
                         break;
                     }
-                } else {
-                    self.end_session().await;
-                    self.reset_conversation();
-                    self.notice("── new session");
-                    if self.ensure_session().await {
-                        self.seed_plan(&p);
-                    }
                 }
-                self.set_review_base(review::ReviewBase {
-                    tree: p.base.clone(),
-                    plan_uri: Some(p.uri.clone()),
-                    since: p.approved_at,
-                });
-                self.notice(format!("▸ Plan approved: {}", p.title));
-                synthetic = true;
-                next = Some(Some(plan_prompt(&p).into()));
-                continue;
             }
             next = self.inbox.borrow_mut().follow_up.pop_front().map(Some);
         }
@@ -1273,6 +1318,203 @@ impl Agent {
         self.refresh_external().await;
         self.emit_status();
         self.emit(AgentEvent::TurnEnd { aborted });
+    }
+
+    /// Saves the plan a `propose_plan` result describes into the repository's store.
+    async fn save_plan(&self, d: &Value) -> (plans::Store, Result<plans::PlanMeta, String>) {
+        let store = plans::store_for(&self.cwd).await;
+        let uri = d["uri"].as_str().unwrap_or_default();
+        let slug = uri.strip_prefix("local://").and_then(|u| u.strip_suffix("-plan.md")).unwrap_or_default();
+        let content = match d["content"].as_str() {
+            Some(c) => c.to_string(),
+            None => self.tools.resolve(uri).ok().and_then(|r| std::fs::read_to_string(r.path).ok()).unwrap_or_default(),
+        };
+        let (base, read) = match &store.root {
+            Some(root) => (plans::base_now(root).await, plans::reads_from(&self.messages, &self.cwd, root)),
+            None => (None, Vec::new()),
+        };
+        let session = self.session.as_ref().map(|s| s.path.clone());
+        let saved = store.save(plans::Save {
+            slug,
+            title: d["title"].as_str().unwrap_or_default(),
+            content: &content,
+            read,
+            session: session.as_deref(),
+            base,
+            adopt: self.stored_plan.as_deref(),
+        });
+        (store, saved)
+    }
+
+    /// Starts the approved plan in this session. `None`: it could not start (already reported).
+    async fn begin_plan(&mut self, p: ExecPlan, cancel: &CancellationToken) -> Option<UserInput> {
+        self.exit_plan();
+        if let Some(m) = &p.model {
+            self.continue_with(m);
+        }
+        match p.mode {
+            PlanMode::Fresh => {
+                self.end_session().await;
+                self.reset_conversation();
+                self.notice("── new session");
+                if !self.ensure_session().await {
+                    return None;
+                }
+            }
+            PlanMode::Compact => {
+                if !self.ensure_session().await {
+                    return None;
+                }
+                match self.compact(Some(PLAN_COMPACT_FOCUS), cancel).await {
+                    Outcome::Done => {}
+                    Outcome::Skipped(why) => self.notice(why),
+                    Outcome::Failed(e) if !cancel.is_cancelled() => self.error(format!("compaction failed: {e}")),
+                    Outcome::Failed(_) => {}
+                }
+                if cancel.is_cancelled() {
+                    self.notice("Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.");
+                    return None;
+                }
+            }
+            PlanMode::Keep => {
+                if !self.ensure_session().await {
+                    return None;
+                }
+            }
+        }
+        self.seed_plan(&p);
+        self.set_review_base(review::ReviewBase {
+            tree: p.base.clone(),
+            plan_uri: Some(p.uri.clone()),
+            since: p.approved_at,
+        });
+        if let Some(id) = &p.stored {
+            let decision = match p.mode {
+                PlanMode::Fresh => "execute",
+                PlanMode::Compact => "compact",
+                PlanMode::Keep => "keep",
+            };
+            let session = self.session.as_ref().map(|s| s.path.clone());
+            if let Err(e) = plans::store_for(&self.cwd).await.approve(id, decision, session.as_deref()) {
+                self.error(format!("could not record the approval: {e}"));
+            }
+        }
+        self.notice(format!("▸ Plan approved: {}", p.title));
+        Some(plan_prompt(&p).into())
+    }
+
+    async fn list_plans(&self) {
+        let store = plans::store_for(&self.cwd).await;
+        self.emit(AgentEvent::PlanList(store.list(false)));
+    }
+
+    /// A pending plan from the store with its drift; failures are reported and give `None`.
+    async fn pending_plan(&self, id: &str) -> Option<(plans::Store, plans::PlanMeta, String, plans::Drift)> {
+        let store = plans::store_for(&self.cwd).await;
+        match store.load_pending(id) {
+            Ok((meta, text)) => {
+                let drift = plans::drift(&meta, &self.cwd).await;
+                Some((store, meta, text, drift))
+            }
+            Err(e) => {
+                self.error(e);
+                None
+            }
+        }
+    }
+
+    /// `/plans`: shows the plan in the review dialog and applies the decision to this session.
+    async fn open_plan(&mut self, id: &str) -> Option<Start> {
+        let (store, meta, shown, drift) = self.pending_plan(id).await?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.emit(AgentEvent::PlanReview {
+            title: meta.title.clone(),
+            uri: format!("local://{id}-plan.md"),
+            file: store.md_path(id),
+            content: shown.clone(),
+            stored: true,
+            note: Some(format!("written against {} · {}", meta.base_label(), drift.describe())),
+            reply: tx,
+        });
+        let decision = rx.await.ok()?;
+        // The user may have edited the file with Ctrl-G while the dialog was up.
+        let content = std::fs::read_to_string(store.md_path(id)).unwrap_or(shown);
+        self.apply_stored(&store, &meta, content, drift.describe(), decision).await
+    }
+
+    async fn start_plan(&mut self, id: &str, decision: PlanDecision, anyway: bool) -> Option<Start> {
+        let (store, meta, content, drift) = self.pending_plan(id).await?;
+        if matches!(drift, plans::Drift::Changed { .. }) && !anyway {
+            self.error(format!(
+                "plan '{id}' is stale: {}. Refine it with `mu plan refine {id}` or run it anyway with --anyway.",
+                drift.describe()
+            ));
+            return None;
+        }
+        self.apply_stored(&store, &meta, content, drift.describe(), decision).await
+    }
+
+    async fn refine_plan(&mut self, id: &str, text: Option<String>) -> Option<Start> {
+        let (store, meta, content, drift) = self.pending_plan(id).await?;
+        let text = text.unwrap_or_else(|| "Bring the plan up to date with the current code.".into());
+        self.apply_stored(&store, &meta, content, drift.describe(), PlanDecision::Refine(text)).await
+    }
+
+    /// Carries out a decision on a stored plan; returns the turn to run, if any.
+    async fn apply_stored(
+        &mut self,
+        store: &plans::Store,
+        meta: &plans::PlanMeta,
+        content: String,
+        drift: String,
+        decision: PlanDecision,
+    ) -> Option<Start> {
+        let id = meta.id.as_str();
+        let uri = format!("local://{id}-plan.md");
+        let (mode, model) = match decision {
+            PlanDecision::Execute { model } => (PlanMode::Fresh, model),
+            PlanDecision::Compact { model } => (PlanMode::Compact, model),
+            PlanDecision::Keep { model } => (PlanMode::Keep, model),
+            PlanDecision::Drop => {
+                match store.drop(id) {
+                    Ok(()) => self.notice(format!("dropped plan {id}")),
+                    Err(e) => self.error(e),
+                }
+                return None;
+            }
+            PlanDecision::Refine(text) => {
+                if self.plan.is_none() {
+                    self.enter_plan().await;
+                }
+                self.stored_plan = Some(id.to_string());
+                let written = self.tools.resolve(&uri).and_then(|r| {
+                    std::fs::create_dir_all(r.path.parent().unwrap_or(&r.path))
+                        .and_then(|()| std::fs::write(&r.path, &content))
+                        .map_err(|e| e.to_string())
+                });
+                if let Err(e) = written {
+                    self.error(format!("cannot copy the plan to {uri}: {e}"));
+                    return None;
+                }
+                let prompt = PLAN_REFINE
+                    .replace("{{id}}", id)
+                    .replace("{{path}}", &uri)
+                    .replace("{{drift}}", &drift)
+                    .replace("{{request}}", &text);
+                return Some(Start::Synthetic(prompt.into()));
+            }
+            PlanDecision::Park => return None,
+        };
+        Some(Start::Plan(ExecPlan {
+            content,
+            title: meta.title.clone(),
+            uri,
+            mode,
+            model,
+            base: review::snapshot_tree(&self.cwd).await.ok(),
+            approved_at: now_ms(),
+            stored: Some(id.to_string()),
+        }))
     }
 
     async fn turn_end_hook(&mut self) {
@@ -1525,7 +1767,8 @@ impl Agent {
                 out.text.push_str(a);
             }
         }
-        if let Some(d) = out.details.as_ref() {
+        let details = out.details.clone();
+        if let Some(d) = details.as_ref() {
             let model = d["model"].as_str().map(String::from);
             let kind = d["planDecision"].as_str();
             let (base, now) = match kind {
@@ -1534,17 +1777,36 @@ impl Agent {
             };
             match kind {
                 Some(k @ ("execute" | "compact")) => {
+                    let (_, saved) = self.save_plan(d).await;
+                    let stored = match saved {
+                        Ok(m) => Some(m.id),
+                        Err(e) => {
+                            self.error(format!("could not save the plan: {e}"));
+                            None
+                        }
+                    };
                     self.exec_plan = Some(ExecPlan {
                         content: d["content"].as_str().unwrap_or_default().into(),
                         title: d["title"].as_str().unwrap_or_default().into(),
                         uri: d["uri"].as_str().unwrap_or_default().into(),
-                        compact: k == "compact",
+                        mode: if k == "compact" { PlanMode::Compact } else { PlanMode::Fresh },
                         model,
                         base,
                         approved_at: now,
+                        stored,
                     });
                 }
                 Some("keep") => {
+                    let (store, saved) = self.save_plan(d).await;
+                    match saved {
+                        Ok(m) => {
+                            let session = self.session.as_ref().map(|s| s.path.clone());
+                            if let Err(e) = store.approve(&m.id, "keep", session.as_deref()) {
+                                self.error(format!("could not record the approval: {e}"));
+                            }
+                        }
+                        Err(e) => self.error(format!("could not save the plan: {e}")),
+                    }
                     self.set_review_base(review::ReviewBase {
                         tree: base,
                         plan_uri: d["uri"].as_str().map(String::from),
@@ -1553,6 +1815,21 @@ impl Agent {
                     self.exit_plan();
                     if let Some(m) = model {
                         self.continue_with(&m);
+                    }
+                }
+                Some("park") => {
+                    let (store, saved) = self.save_plan(d).await;
+                    match saved {
+                        Ok(m) => {
+                            self.exit_plan();
+                            self.stored_plan = None;
+                            self.emit(AgentEvent::PlanParked { id: m.id.clone(), path: store.md_path(&m.id) });
+                            out.text.push_str(&format!(
+                                " Parked as `{0}`; approve it with /plans or `mu plan approve {0}`.",
+                                m.id
+                            ));
+                        }
+                        Err(e) => out = ToolOutput::err(format!("Could not park the plan: {e}")),
                     }
                 }
                 _ => {}
@@ -1687,10 +1964,11 @@ mod loop_tests {
             content: "do it\n".into(),
             title: "T".into(),
             uri: "local://t-plan.md".into(),
-            compact: true,
+            mode: PlanMode::Compact,
             model: None,
             base: None,
             approved_at: 0,
+            stored: None,
         };
         let s = plan_prompt(&p);
         assert!(s.contains("<plan path=\"local://t-plan.md\">\ndo it\n</plan>") && s.contains("History usable"));
@@ -1705,10 +1983,11 @@ mod loop_tests {
                 content: "plan".into(),
                 title: String::new(),
                 uri: String::new(),
-                compact: false,
+                mode: PlanMode::Fresh,
                 model: None,
                 base: None,
                 approved_at: 0,
+                stored: None,
             });
             a.turn(Some("go".to_string().into())).await;
             assert!(a.exec_plan.is_none());
@@ -1971,10 +2250,11 @@ mod loop_tests {
                 content: "plan".into(),
                 title: "T".into(),
                 uri: "local://t-plan.md".into(),
-                compact: false,
+                mode: PlanMode::Fresh,
                 model: None,
                 base: None,
                 approved_at: 0,
+                stored: None,
             });
             a.inbox.borrow_mut().follow_up.push_back("later".to_string().into());
             a.inbox.borrow_mut().stop = true;
@@ -2014,6 +2294,138 @@ mod loop_tests {
                 }
             }
             assert!(errored && exited && !sessions);
+        });
+    }
+
+    fn tmp_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-agent-plans-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    fn git_repo() -> PathBuf {
+        let d = tmp_dir();
+        let sh = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{args:?}");
+        };
+        sh(&["init", "-q"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-qm", "init"]);
+        d
+    }
+
+    async fn save_plan_in(cwd: &Path, read: &[&str]) -> plans::Store {
+        let store = plans::store_for(cwd).await;
+        let base = match store.root.as_deref() {
+            Some(r) => plans::base_now(r).await,
+            None => None,
+        };
+        store
+            .save(plans::Save {
+                slug: "t",
+                title: "T",
+                content: "do it\n",
+                read: read.iter().map(|s| s.to_string()).collect(),
+                session: None,
+                base,
+                adopt: None,
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn parking_a_plan_saves_it_and_leaves_plan_mode() {
+        run(async {
+            let args = json!({"slug": "t", "title": "T"});
+            let call = Block::ToolCall { id: "p1".into(), name: "propose_plan".into(), arguments: args };
+            let (mut a, mut rx) = agent(vec![
+                Ok(assistant(vec![call], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("parked")], StopReason::Stop)),
+            ]);
+            a.cwd = tmp_dir();
+            a.enter_plan().await;
+            let r = a.tools.resolve("local://t-plan.md").unwrap();
+            std::fs::create_dir_all(r.path.parent().unwrap()).unwrap();
+            std::fs::write(&r.path, "do it\n").unwrap();
+            let answer = async {
+                let mut parked = None;
+                while let Some(e) = rx.recv().await {
+                    match e {
+                        AgentEvent::PlanReview { reply, stored, .. } => {
+                            assert!(!stored);
+                            let _ = reply.send(PlanDecision::Park);
+                        }
+                        AgentEvent::PlanParked { id, .. } => parked = Some(id),
+                        AgentEvent::TurnEnd { .. } => break,
+                        _ => {}
+                    }
+                }
+                parked
+            };
+            let (_, parked) = futures_util::future::join(a.turn(Some("go".to_string().into())), answer).await;
+            assert_eq!(parked.as_deref(), Some("t"));
+            assert!(a.plan.is_none());
+            let store = plans::store_for(&a.cwd).await;
+            let (meta, text) = store.load("t").unwrap();
+            assert_eq!((meta.status, text.as_str()), (plans::Status::Pending, "do it\n"));
+        });
+    }
+
+    #[test]
+    fn a_stored_plan_starts_in_the_current_session() {
+        run(async {
+            let (mut a, _rx) = agent(vec![Ok(assistant(vec![Block::text("done")], StopReason::Stop))]);
+            a.cwd = git_repo();
+            let store = save_plan_in(&a.cwd, &["a.txt"]).await;
+            a.turn_from(Start::Plan(ExecPlan {
+                content: "do it\n".into(),
+                title: "T".into(),
+                uri: "local://t-plan.md".into(),
+                mode: PlanMode::Keep,
+                model: None,
+                base: review::snapshot_tree(&a.cwd).await.ok(),
+                approved_at: 1,
+                stored: Some("t".into()),
+            }))
+            .await;
+            assert!(a.providers.scripted.borrow().is_empty(), "exactly one request was made");
+            let plan_msg = a.messages.iter().find_map(|m| match m {
+                Message::User { content, synthetic: true, .. } => Some(text_of(content)),
+                _ => None,
+            });
+            assert!(plan_msg.unwrap().contains("<plan path=\"local://t-plan.md\">"));
+            let (meta, _) = store.load("t").unwrap();
+            assert_eq!(meta.status, plans::Status::Approved);
+            let session = a.session.as_ref().map(|s| s.path.clone());
+            assert!(session.is_some() && meta.approved.unwrap().session == session);
+            assert_eq!(a.review_base.unwrap().plan_uri.as_deref(), Some("local://t-plan.md"));
+        });
+    }
+
+    #[test]
+    fn a_drifted_plan_is_refused_without_anyway() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("never")], StopReason::Stop))]);
+            a.cwd = git_repo();
+            save_plan_in(&a.cwd, &["a.txt"]).await;
+            std::fs::write(a.cwd.join("a.txt"), "two\n").unwrap();
+            let start = a.start_plan("t", PlanDecision::Keep { model: None }, false).await;
+            assert!(start.is_none());
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no request was made");
+            let mut stale = false;
+            while let Ok(e) = rx.try_recv() {
+                stale |= matches!(e, AgentEvent::Error(m) if m.contains("is stale"));
+            }
+            assert!(stale);
+            assert!(a.start_plan("t", PlanDecision::Keep { model: None }, true).await.is_some());
         });
     }
 }

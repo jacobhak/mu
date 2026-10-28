@@ -35,6 +35,8 @@ impl Tools {
             uri: uri.clone(),
             file: path.clone(),
             content: content.clone(),
+            stored: false,
+            note: None,
             reply: tx,
         });
         let decision = tokio::select! {
@@ -49,10 +51,9 @@ impl Tools {
         let title = a.title;
         let approved = |text: &str, kind: &str, model: Option<String>, with_content: bool| {
             let mut o = ToolOutput::ok(text);
-            let mut d = json!({"planDecision": kind, "model": model, "uri": uri});
+            let mut d = json!({"planDecision": kind, "model": model, "uri": uri, "title": title});
             if with_content {
                 d["content"] = json!(content);
-                d["title"] = json!(title);
             }
             o.details = Some(d);
             o
@@ -69,6 +70,10 @@ impl Tools {
             ),
             PlanDecision::Keep { model } => approved("Plan approved. Implement it now.", "keep", model, false),
             PlanDecision::Refine(t) => ToolOutput::ok(format!("User requested changes:\n{t}")),
+            PlanDecision::Park => {
+                approved("Plan parked. End your turn now; the user approves it later.", "park", None, true)
+            }
+            PlanDecision::Drop => ToolOutput::err("Plan review was closed without a decision"),
         }
     }
 }

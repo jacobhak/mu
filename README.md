@@ -89,7 +89,7 @@ Ghost text predicts the rest of the word or a prompt you repeat here; Tab or →
 
 Typing `/` opens a command menu with descriptions and argument completion (↑/↓, Tab, Enter, Esc).
 
-Slash commands: `/new /resume /model /thinking /compact /plan /session /rename /todo /skills /plugins /login [provider|mcp:<name>] /copy /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`.
+Slash commands: `/new /resume /model /thinking /compact /plan /plans /session /rename /todo /skills /plugins /login [provider|mcp:<name>] /copy /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`.
 
 While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
 

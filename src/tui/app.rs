@@ -36,7 +36,7 @@ use tokio::sync::oneshot;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
-const BUILTIN_DESC: [(&str, &str, bool); 20] = [
+const BUILTIN_DESC: [(&str, &str, bool); 21] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -57,6 +57,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 20] = [
     ("copy", "Copy a reply, code block or command", false),
     ("image", "Attach an image file", true),
     ("jobs", "List or kill background jobs", false),
+    ("plans", "Approve, refine or drop a parked plan", false),
 ];
 
 pub struct AppInit {
@@ -515,15 +516,17 @@ impl App {
                 self.commit(vec![styled(format!("↳ job results delivered: {}", ids.join(", ")), |_| dim())]);
             }
             AgentEvent::Ask { questions, reply } => self.start_ask(questions, reply),
-            AgentEvent::PlanReview { title, uri, file, content, reply } => {
+            AgentEvent::PlanReview { title, uri, file, content, stored, note, reply } => {
                 let context = self
                     .status
                     .context_tokens
                     .filter(|_| self.status.context_window > 0)
                     .map(|t| (t, self.status.context_window as u64));
-                let review = PlanReview::new(title, uri, file, content, context, self.plan_tiers());
-                self.overlay = Some(Overlay::Review { review: Box::new(review), reply: Some(reply) });
+                let review = PlanReview::new(title, uri, file, content, context, self.plan_tiers(), stored, note);
+                self.overlay = Some(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
             }
+            AgentEvent::PlanParked { id, path } => self.notice(&format!("plan parked: {id} · {}", path.display())),
+            AgentEvent::PlanList(list) => self.show_plans(list),
             AgentEvent::Status(s) => {
                 self.status = s;
             }
@@ -731,6 +734,22 @@ impl App {
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths });
     }
 
+    fn show_plans(&mut self, list: Vec<crate::plans::PlanMeta>) {
+        if list.is_empty() {
+            self.notice("no parked plans for this repository");
+            return;
+        }
+        let items = list
+            .iter()
+            .map(|m| Item {
+                label: m.title.clone(),
+                detail: format!("{} · {}", m.id, m.updated.get(..10).unwrap_or(&m.updated)),
+            })
+            .collect();
+        let ids = list.into_iter().map(|m| m.id).collect();
+        self.overlay = Some(Overlay::Plans { sel: Select::new("Parked plans", items), ids });
+    }
+
     // ---- input --------------------------------------------------------------------------------
 
     fn on_terminal(&mut self, e: Event) {
@@ -884,10 +903,12 @@ impl App {
             OverlayEvent::Resume(p) => self.send(Command::Resume(p)),
             OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
             OverlayEvent::EditPlan(file) => self.run_editor(&file.clone(), ChildThen::PlanEdit(file)),
-            OverlayEvent::PlanCancelled => {
+            OverlayEvent::PlanCancelled { stored: true } => self.notice("plan left parked"),
+            OverlayEvent::PlanCancelled { stored: false } => {
                 self.inbox.borrow().cancel.cancel();
                 self.notice("plan review cancelled; plan mode stays on");
             }
+            OverlayEvent::OpenPlan(id) => self.send(Command::OpenPlan(id)),
         }
     }
 
@@ -973,6 +994,7 @@ impl App {
                 None => self.error("usage: /thinking off|low|medium|high"),
             },
             "plan" => self.send(Command::TogglePlan((!arg.is_empty()).then(|| arg.to_string()))),
+            "plans" => self.send(Command::ListPlans),
             "compact" => {
                 self.running = true;
                 self.send(Command::Compact((!arg.is_empty()).then(|| arg.to_string())));

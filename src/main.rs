@@ -15,6 +15,7 @@ mod jsoncache;
 mod mem;
 mod message;
 mod models;
+mod plans;
 mod plugin;
 mod policy;
 mod pricing;
@@ -115,6 +116,11 @@ enum Sub {
     Take {
         /// Session file or id (prefix).
         session: PathBuf,
+    },
+    /// Durable plans: park a plan, then refine and approve it later (see `mu plan --help`).
+    Plan {
+        #[command(subcommand)]
+        cmd: plans::PlanCmd,
     },
 }
 
@@ -253,13 +259,26 @@ fn run() -> Result<i32> {
     if let Some(Sub::Update { check, force, tag }) = cli.command {
         return update::run(check, force, tag);
     }
+    let plan_run = match cli.command {
+        Some(Sub::Plan { cmd }) => match cmd {
+            plans::PlanCmd::New { brief } => Some((events::Command::TogglePlan(Some(brief)), true)),
+            plans::PlanCmd::Refine { id, text } => Some((events::Command::RefinePlan { id, text }, true)),
+            plans::PlanCmd::Approve { id, anyway } => Some((
+                events::Command::StartPlan { id, decision: events::PlanDecision::Keep { model: None }, anyway },
+                false,
+            )),
+            other => return Ok(plans::run_cli(other, &std::env::current_dir()?)),
+        },
+        _ => None,
+    };
+    let headless_run = cli.print.is_some() || plan_run.is_some();
     let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
     if cli.acp {
         return acp::run(cli.model, cli_thinking);
     }
     let cwd = std::env::current_dir()?;
     let Setup { cfgs, mut ctx, host, providers, notice_tx, notice_rx } = setup(&cwd);
-    if cli.print.is_none() && !cli.headless && cfgs.mu.update.check {
+    if !headless_run && !cli.headless && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
         let tx = notice_tx.clone();
         std::thread::spawn(move || {
@@ -323,7 +342,7 @@ fn run() -> Result<i32> {
         },
         _ => None,
     };
-    if cli.print.is_none() && !cli.headless && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if !headless_run && !cli.headless && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("mu: interactive mode needs a terminal; use -p");
     }
 
@@ -364,11 +383,11 @@ fn run() -> Result<i32> {
         let note = "\nThis task has an output schema. Finish by calling the `yield` tool with `data` matching it; a plain final message is not a result.\n";
         agent.agent_prompt = Some(agent.agent_prompt.take().unwrap_or_default() + note);
     }
-    if cli.print.is_some() && !agent.excluded.contains(&"ask") {
+    if headless_run && !agent.excluded.contains(&"ask") {
         // No one can answer in `-p` mode.
         agent.excluded.push("ask");
     }
-    if cli.print.is_none() && task_payload.is_none() {
+    if !headless_run && task_payload.is_none() {
         agent.enable_jobs();
     }
     if let Some(p) = resume {
@@ -382,7 +401,7 @@ fn run() -> Result<i32> {
         // Before the agent task can create or lock a session: an owner record that says
         // `print_run` promises SIGUSR1 stops the run instead of killing it.
         let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        if cli.print.is_some() && task_payload.is_none() {
+        if headless_run && task_payload.is_none() {
             let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -402,8 +421,8 @@ fn run() -> Result<i32> {
         let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
         let (print, max_cost) = (cli.print, cli.max_cost);
         let mut printer = None;
-        let code = match (print, task_payload) {
-            (_, Some(p)) => {
+        let code = match (print, task_payload, plan_run) {
+            (_, Some(p), _) => {
                 printer = Some(spawn_notice_printer(notice_rx));
                 plugin::exit_on_signals();
                 let ctx = p["context"].as_str().filter(|c| !c.is_empty());
@@ -412,13 +431,20 @@ fn run() -> Result<i32> {
                 let out_schema = p.get("outputSchema").filter(|s| s.is_object()).cloned();
                 headless::subagent_mode(prompt, out_schema, cmd_tx, ev_rx).await
             }
-            (Some(prompt), None) => {
+            (Some(prompt), None, _) => {
                 printer = Some(spawn_notice_printer(notice_rx));
                 plugin::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
-                headless::print_mode(prompt, cmd_tx, ev_rx, inbox.clone(), max_cost, stop_rx).await
+                let first = events::Command::Prompt(prompt.into());
+                headless::print_mode(first, false, cmd_tx, ev_rx, inbox.clone(), max_cost, stop_rx).await
             }
-            (None, None) => {
+            (None, None, Some((first, expect_park))) => {
+                printer = Some(spawn_notice_printer(notice_rx));
+                plugin::exit_on_signals();
+                host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
+                headless::print_mode(first, expect_park, cmd_tx, ev_rx, inbox.clone(), None, stop_rx).await
+            }
+            (None, None, None) => {
                 host.set_interactive();
                 tui::app::run(tui::app::AppInit {
                     cmd_tx,

@@ -12,7 +12,7 @@ const MAX_FILES_LISTED: usize = 400;
 const REQUEST: &str = include_str!("prompts/review-request.md");
 
 /// Runs git in `dir`; stdout on success, git's first stderr line otherwise.
-async fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
+pub(crate) async fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args)
         .current_dir(dir)

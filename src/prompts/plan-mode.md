@@ -86,6 +86,9 @@ Review options:
 - **Approve and compact context** — compacts this conversation, then executes here.
 - **Approve and keep context** — executes here with exploration history.
 - **Refine plan** — the user's feedback comes back as the tool result; stay in plan mode.
+- **Park plan** — saved for later approval (/plans, mu plan approve); end the turn.
+
+Without a user (headless), propose_plan always parks the plan.
 
 All require self-contained file.
 </caution>

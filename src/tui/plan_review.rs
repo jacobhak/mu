@@ -28,6 +28,16 @@ enum Focus {
     Actions,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Act {
+    Execute,
+    Compact,
+    Keep,
+    Park,
+    Drop,
+    Refine,
+}
+
 pub struct PlanReview {
     pub file: PathBuf,
     title: String,
@@ -38,7 +48,8 @@ pub struct PlanReview {
     scroll: usize,
     body_h: usize,
     focus: Focus,
-    actions: [(String, bool); 4],
+    actions: Vec<(String, bool, Act)>,
+    note: Option<String>,
     sel: usize,
     tiers: Vec<Tier>,
     tier: usize,
@@ -53,6 +64,7 @@ fn accent_bold() -> ContentStyle {
 }
 
 impl PlanReview {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         title: String,
         uri: String,
@@ -60,6 +72,8 @@ impl PlanReview {
         content: String,
         context: Option<(u64, u64)>,
         tiers: Vec<Tier>,
+        stored: bool,
+        note: Option<String>,
     ) -> Self {
         let (keep, keep_off) = match context {
             Some((t, w)) => {
@@ -78,12 +92,14 @@ impl PlanReview {
             scroll: 0,
             body_h: 10,
             focus: Focus::Actions,
-            actions: [
-                ("Approve and execute".into(), false),
-                ("Approve and compact context".into(), false),
-                (keep, keep_off),
-                (REFINE_LABEL.into(), false),
+            actions: vec![
+                ("Approve and execute".into(), false, Act::Execute),
+                ("Approve and compact context".into(), false, Act::Compact),
+                (keep, keep_off, Act::Keep),
+                if stored { ("Drop plan".into(), false, Act::Drop) } else { ("Park plan".into(), false, Act::Park) },
+                (REFINE_LABEL.into(), false, Act::Refine),
             ],
+            note,
             sel: 0,
             tiers,
             tier,
@@ -194,15 +210,18 @@ impl PlanReview {
             KeyCode::Char('l') if self.slider() => self.tier = (self.tier + 1).min(self.tiers.len() - 1),
             KeyCode::Enter => {
                 let model = self.model();
-                return match self.sel {
-                    0 => ReviewResult::Decided(PlanDecision::Execute { model }),
-                    1 => ReviewResult::Decided(PlanDecision::Compact { model }),
-                    2 if self.enabled(2) => ReviewResult::Decided(PlanDecision::Keep { model }),
-                    3 => {
+                let Some((_, _, act)) = self.actions.get(self.sel) else { return ReviewResult::Pending };
+                return match act {
+                    Act::Execute => ReviewResult::Decided(PlanDecision::Execute { model }),
+                    Act::Compact => ReviewResult::Decided(PlanDecision::Compact { model }),
+                    Act::Keep if self.enabled(self.sel) => ReviewResult::Decided(PlanDecision::Keep { model }),
+                    Act::Keep => ReviewResult::Pending,
+                    Act::Park => ReviewResult::Decided(PlanDecision::Park),
+                    Act::Drop => ReviewResult::Decided(PlanDecision::Drop),
+                    Act::Refine => {
                         self.editing = true;
                         ReviewResult::Pending
                     }
-                    _ => ReviewResult::Pending,
                 };
             }
             _ => {}
@@ -217,7 +236,7 @@ impl PlanReview {
         }
         let n = self.lines.len();
         let slider = self.slider();
-        let chrome = 1 + 1 + if slider { 2 } else { 0 } + 4 + 1;
+        let chrome = 1 + 1 + usize::from(self.note.is_some()) + if slider { 2 } else { 0 } + 4 + 1;
         self.body_h = n.max(1).min(max_rows.saturating_sub(chrome).max(3));
         self.scroll = self.scroll.min(n.saturating_sub(self.body_h));
 
@@ -230,6 +249,9 @@ impl PlanReview {
         let mut title = vec![span(format!("Plan review: {}", self.title), accent_bold())];
         title.push(span(pos, dim()));
         out.push(line::truncate(&title, width));
+        if let Some(n) = &self.note {
+            out.push(line::truncate(&styled(n.clone(), |_| dim()), width));
+        }
         for l in self.lines.iter().skip(self.scroll).take(self.body_h) {
             out.push(line::truncate(l, width));
         }
@@ -253,12 +275,12 @@ impl PlanReview {
         // Where the text cursor goes: measured on the row as it is built, so it cannot drift from
         // what is drawn.
         let mut edit_cursor: Option<(usize, usize)> = None;
-        for (i, (label, off)) in self.actions.iter().enumerate() {
+        for (i, (label, off, act)) in self.actions.iter().enumerate() {
             let selected = i == self.sel;
             let focused = selected && self.focus == Focus::Actions;
             let marker_style = if focused { theme::get().fg(Role::Accent) } else { dim() };
             let mut l: Line = vec![span(if selected { "❯ " } else { "  " }, marker_style)];
-            if i == REFINE && self.editing {
+            if *act == Act::Refine && self.editing {
                 l.push(span(
                     format!("{label}: {}", self.text),
                     if focused { line::bold() } else { ContentStyle::default() },
@@ -305,9 +327,8 @@ impl PlanReview {
     }
 }
 
-/// The action that takes free-text feedback, its label and its row among the actions.
+/// The label of the action that takes free-text feedback.
 const REFINE_LABEL: &str = "Refine plan";
-const REFINE: usize = 3;
 
 #[cfg(test)]
 mod tests {
@@ -318,7 +339,7 @@ mod tests {
     }
 
     fn review(content: &str, ctx: Option<(u64, u64)>, tiers: Vec<Tier>) -> PlanReview {
-        PlanReview::new("T".into(), "local://t-plan.md".into(), PathBuf::new(), content.into(), ctx, tiers)
+        PlanReview::new("T".into(), "local://t-plan.md".into(), PathBuf::new(), content.into(), ctx, tiers, false, None)
     }
 
     fn tiers() -> Vec<Tier> {
@@ -360,7 +381,7 @@ mod tests {
     #[test]
     fn refine_flow() {
         let mut r = review("x", None, vec![]);
-        for _ in 0..3 {
+        for _ in 0..4 {
             r.on_key(key(KeyCode::Down));
         }
         r.on_key(key(KeyCode::Enter));
@@ -391,5 +412,30 @@ mod tests {
         );
         let mut r = review("x", None, tiers().into_iter().take(1).collect());
         assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: None })));
+    }
+
+    #[test]
+    fn park_and_drop_actions() {
+        let live = review("x", None, vec![]);
+        assert_eq!(live.actions[3].0, "Park plan");
+        let mut r = review("x", None, vec![]);
+        for _ in 0..3 {
+            r.on_key(key(KeyCode::Down));
+        }
+        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Park)));
+        let mut r = PlanReview::new("T".into(), "u".into(), PathBuf::new(), "x".into(), None, vec![], true, None);
+        assert_eq!(r.actions[3].0, "Drop plan");
+        for _ in 0..3 {
+            r.on_key(key(KeyCode::Down));
+        }
+        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Drop)));
+    }
+
+    #[test]
+    fn note_is_the_second_row() {
+        let mut r =
+            PlanReview::new("T".into(), "u".into(), PathBuf::new(), "x".into(), None, vec![], true, Some("N".into()));
+        let (rows, _) = r.render(60, 30);
+        assert_eq!(line::line_text(&rows[1]), "N");
     }
 }

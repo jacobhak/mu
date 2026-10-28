@@ -34,7 +34,8 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     near_first.reverse();
     near_first.extend(non_empty(&agent_dir.join("AGENTS.md")));
     for f in &mut near_first {
-        f.content = crate::at_imports::expand(&f.content, &f.path, home, &mut |w| WARNINGS.with(|x| x.borrow_mut().push(w)));
+        f.content =
+            crate::at_imports::expand(&f.content, &f.path, home, &mut |w| WARNINGS.with(|x| x.borrow_mut().push(w)));
     }
     near_first
 }

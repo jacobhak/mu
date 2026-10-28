@@ -41,6 +41,11 @@ pub enum Overlay {
         sel: Select,
         paths: Vec<PathBuf>,
     },
+    /// The repository's parked plans.
+    Plans {
+        sel: Select,
+        ids: Vec<String>,
+    },
     Ask {
         qs: Vec<AskQuestion>,
         idx: usize,
@@ -51,6 +56,8 @@ pub enum Overlay {
     Review {
         review: Box<PlanReview>,
         reply: Option<oneshot::Sender<PlanDecision>>,
+        /// Opened from the store, not from a running `propose_plan`.
+        stored: bool,
     },
     Copy {
         sel: Select,
@@ -76,8 +83,12 @@ pub enum OverlayEvent {
     CopyPlan(String),
     /// Edit the plan file; the overlay stays up and reloads it afterwards.
     EditPlan(PathBuf),
-    /// The plan review was dismissed: the turn is cancelled.
-    PlanCancelled,
+    /// The plan review was dismissed. A live plan cancels the turn; a stored one just stays parked.
+    PlanCancelled {
+        stored: bool,
+    },
+    /// A parked plan was chosen from the list.
+    OpenPlan(String),
 }
 
 /// The question as a picker: its options, a free-text row, multi-select, the recommended choice preselected.
@@ -110,6 +121,7 @@ impl Overlay {
             | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
             | Overlay::Session { sel, .. }
+            | Overlay::Plans { sel, .. }
             | Overlay::Ask { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
             Overlay::Review { .. } => None,
@@ -122,6 +134,7 @@ impl Overlay {
             | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
             | Overlay::Session { sel, .. }
+            | Overlay::Plans { sel, .. }
             | Overlay::Ask { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
             Overlay::Review { .. } => None,
@@ -206,17 +219,24 @@ impl Overlay {
                 }
                 _ => (None, None),
             },
-            Overlay::Review { mut review, mut reply } => match review.on_key(k) {
-                ReviewResult::Pending => (Some(Overlay::Review { review, reply }), None),
+            Overlay::Plans { mut sel, ids } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Plans { sel, ids }), None),
+                SelectResult::Chosen(i) => {
+                    (None, i.first().and_then(|i| ids.get(*i)).map(|id| OverlayEvent::OpenPlan(id.clone())))
+                }
+                _ => (None, None),
+            },
+            Overlay::Review { mut review, mut reply, stored } => match review.on_key(k) {
+                ReviewResult::Pending => (Some(Overlay::Review { review, reply, stored }), None),
                 ReviewResult::Copy => {
                     let text = review.content().to_string();
-                    (Some(Overlay::Review { review, reply }), Some(OverlayEvent::CopyPlan(text)))
+                    (Some(Overlay::Review { review, reply, stored }), Some(OverlayEvent::CopyPlan(text)))
                 }
                 ReviewResult::Edit => {
                     let file = review.file.clone();
-                    (Some(Overlay::Review { review, reply }), Some(OverlayEvent::EditPlan(file)))
+                    (Some(Overlay::Review { review, reply, stored }), Some(OverlayEvent::EditPlan(file)))
                 }
-                ReviewResult::Cancelled => (None, Some(OverlayEvent::PlanCancelled)),
+                ReviewResult::Cancelled => (None, Some(OverlayEvent::PlanCancelled { stored })),
                 ReviewResult::Decided(d) => {
                     if let Some(r) = reply.take() {
                         let _ = r.send(d);

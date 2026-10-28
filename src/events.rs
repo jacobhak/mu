@@ -34,6 +34,21 @@ pub enum Command {
     /// An MCP login added tools: rebuild the tool list for the next request (one prompt-cache miss).
     RefreshTools,
     Exit,
+    /// List the repository's pending plans.
+    ListPlans,
+    /// Open a parked plan in the review dialog.
+    OpenPlan(String),
+    /// Approve a parked plan without a dialog (headless).
+    StartPlan {
+        id: String,
+        decision: PlanDecision,
+        anyway: bool,
+    },
+    /// Revise a parked plan in plan mode.
+    RefinePlan {
+        id: String,
+        text: Option<String>,
+    },
 }
 
 /// Messages the UI queues while a turn runs, plus the turn's cancellation token.
@@ -108,10 +123,20 @@ pub enum Answer {
 }
 
 pub enum PlanDecision {
-    Execute { model: Option<String> },
-    Compact { model: Option<String> },
-    Keep { model: Option<String> },
+    Execute {
+        model: Option<String>,
+    },
+    Compact {
+        model: Option<String>,
+    },
+    Keep {
+        model: Option<String>,
+    },
     Refine(String),
+    /// Save the plan for later approval and end the turn (live review only).
+    Park,
+    /// Drop a stored plan (stored review only).
+    Drop,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,8 +232,19 @@ pub enum AgentEvent {
         uri: String,
         file: PathBuf,
         content: String,
+        /// The plan comes from the store (a parked plan being opened), not from a live `propose_plan`.
+        stored: bool,
+        /// One dim line under the title, e.g. how far the code drifted since the plan was written.
+        note: Option<String>,
         reply: oneshot::Sender<PlanDecision>,
     },
+    /// A plan was saved to the store without being approved.
+    PlanParked {
+        id: String,
+        path: PathBuf,
+    },
+    /// The repository's pending plans, newest first.
+    PlanList(Vec<crate::plans::PlanMeta>),
     Status(StatusSnapshot),
     TurnEnd {
         aborted: bool,

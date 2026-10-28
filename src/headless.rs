@@ -1,4 +1,4 @@
-use crate::events::{AgentEvent, Command};
+use crate::events::{AgentEvent, Command, PlanDecision};
 use crate::tools::summary;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -7,7 +7,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 /// next boundary (after the running tool, if any), the second cancels the current step. A stopped run
 /// exits 3 and prints how to resume. Returns the process exit code.
 pub async fn print_mode(
-    prompt: String,
+    first: Command,
+    expect_park: bool,
     cmd: UnboundedSender<Command>,
     mut ev: UnboundedReceiver<AgentEvent>,
     inbox: crate::events::SharedInbox,
@@ -16,10 +17,10 @@ pub async fn print_mode(
 ) -> i32 {
     let mut stop = Some(stop);
     let _ = cmd.send(Command::EnsureSession);
-    let _ = cmd.send(Command::Prompt(prompt.into()));
+    let _ = cmd.send(first);
     let _ = cmd.send(Command::Exit);
     let (mut buf, mut last, mut code) = (String::new(), String::new(), 0);
-    let (mut cost, mut capped, mut exited, mut errored) = (0.0f64, false, false, false);
+    let (mut cost, mut capped, mut exited, mut errored, mut parked) = (0.0f64, false, false, false, false);
     let (mut session, mut stops) = (None::<String>, 0u32);
     let mut skipped = None::<(String, String)>;
     loop {
@@ -95,6 +96,14 @@ pub async fn print_mode(
                 exited = true;
                 break;
             }
+            // Nobody is there to approve: a plan that reaches review is parked for later.
+            AgentEvent::PlanReview { reply, .. } => {
+                let _ = reply.send(PlanDecision::Park);
+            }
+            AgentEvent::PlanParked { id, path } => {
+                eprintln!("plan: {id} · {}", path.display());
+                parked = true;
+            }
             _ => {}
         }
     }
@@ -104,6 +113,10 @@ pub async fn print_mode(
     }
     if !buf.is_empty() {
         last = buf;
+    }
+    if expect_park && !parked && code == 0 && stops == 0 {
+        eprintln!("mu: no plan was parked");
+        code = 1;
     }
     if max_cost.is_some() {
         eprintln!("mu: cost ${cost:.4}");
@@ -268,7 +281,7 @@ mod tests {
         drop(etx);
         let inbox = crate::events::new_inbox();
         let (_stx, srx) = unbounded_channel();
-        assert_eq!(rt.block_on(print_mode("x".into(), ctx, erx, inbox, None, srx)), 1);
+        assert_eq!(rt.block_on(print_mode(Command::Prompt("x".into()), false, ctx, erx, inbox, None, srx)), 1);
     }
 
     fn status(cost: f64, path: Option<&str>) -> AgentEvent {
@@ -299,7 +312,8 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             };
-            let (code, _) = tokio::join!(print_mode("x".into(), ctx, erx, i2, max_cost, srx), feeder);
+            let (code, _) =
+                tokio::join!(print_mode(Command::Prompt("x".into()), false, ctx, erx, i2, max_cost, srx), feeder);
             code
         });
         assert!(matches!(crx.try_recv(), Ok(Command::EnsureSession)));
@@ -328,6 +342,36 @@ mod tests {
     fn a_second_stop_cancels() {
         let ev = vec![status(0.0, None), AgentEvent::TurnEnd { aborted: true }, AgentEvent::Exit];
         assert_eq!(drive(ev, 2, None).0, 3);
+    }
+
+    #[test]
+    fn a_plan_run_parks_the_review_and_needs_a_parked_plan() {
+        let run = |events: Vec<AgentEvent>, expect_park: bool| {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let (ctx, _crx) = unbounded_channel();
+            let (etx, erx) = unbounded_channel();
+            let (_stx, srx) = unbounded_channel();
+            for e in events {
+                etx.send(e).unwrap();
+            }
+            let inbox = crate::events::new_inbox();
+            rt.block_on(print_mode(Command::TogglePlan(None), expect_park, ctx, erx, inbox, None, srx))
+        };
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let review = AgentEvent::PlanReview {
+            title: "T".into(),
+            uri: "local://t-plan.md".into(),
+            file: std::path::PathBuf::new(),
+            content: String::new(),
+            stored: false,
+            note: None,
+            reply: tx,
+        };
+        assert_eq!(run(vec![review, AgentEvent::Exit], true), 1, "nothing was parked");
+        assert!(matches!(rx.try_recv(), Ok(PlanDecision::Park)));
+        let parked = AgentEvent::PlanParked { id: "t".into(), path: "/p/t.md".into() };
+        assert_eq!(run(vec![parked, AgentEvent::Exit], true), 0);
+        assert_eq!(run(vec![AgentEvent::Exit], false), 0);
     }
 
     #[test]
