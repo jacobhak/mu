@@ -1,15 +1,27 @@
 # mu
 
-A small, memory-lean coding agent. Rust core; everything heavy (gateway, web, memory) is an out-of-process plugin that starts on first use and exits when idle. It talks to models through the omp auth gateway and reads omp's config (`modelRoles`, `compaction.modelThresholds`, `models.yml`).
+I love omp, but in the age of AI, RAM ain't cheap and every session being the equivalent of a chrome tab simply isn't sustainable.
 
-mu is a personal reimplementation of [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) and is built on it: it uses omp's Rust crates, CLI and auth gateway, and borrows many of its prompts and much of its behaviour. Credit for the design goes to the omp authors.
+mu is a terminal coding agent with a Rust core (agent loop, TUI, sessions) built on the crates, CLI and auth gateway of [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp), and borrowing many of its prompts and much of its behaviour. Credit for the design goes to the omp authors.
+
+## How mu is different
+
+mu keeps most of what omp does and changes where the memory goes. A session holds your conversation, and anything else runs only while it's being used.
+
+- **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session uses about 2 MB.
+- **Features start on use.** Web, memory, prediction and the model gateway are separate processes. Each starts on first use and exits after a few idle minutes. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
+- **Shared across sessions.** Sessions on one omp profile share one gateway (about 160 MB while it runs), and all sessions share one memory daemon.
+- **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
+- **Works with your omp setup.** mu uses omp's login, config, models, MCP setup, context files and skills. Sessions are in omp's format, so you can use both and switch either way.
+
+The cost: features that live inside omp's runtime, such as TypeScript extensions, aren't available. The reasoning and measurements behind the design are in [`DESIGN.md`](DESIGN.md).
 
 ## Status
 
 Early and experimental: started in October 2026 and changing quickly.
 
 - No stable version. Releases are nightly builds of `main` (`mu-YYYYMMDD-<sha7>`); config, flags and plugin interfaces can change without notice.
-- Needs a working omp setup: mu uses omp's credentials, `models.yml` and model roles, and has no login of its own.
+- Needs a working omp setup: mu uses omp's credentials, `models.yml` and model roles, and has no login of its own; `/login` hands off to omp.
 - Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
 - No support promised. Issues and PRs are welcome but may go unanswered.
 
@@ -25,7 +37,7 @@ scripts/install.sh --from-source .            # build and install a checkout
 
 If the repo is private (or you install from a private fork), the public URLs return 404. `install.sh` and `mu update` then fall back to an authenticated `gh`; fetch the script itself with `gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash`.
 
-This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). The memory plugin ships as two binaries: `mu-memory`, a small Rust shim that each `mu` session starts, and `mu-memory-daemon`, built by `bun build --compile` (so installing a release needs no Bun). The shim starts one shared daemon per `$MU_HOME` on demand (socket `$MU_HOME/memory/sock`, log `$MU_HOME/logs/memory-daemon.log`) and relays the session to it, so several `mu` sessions share one Bun runtime and embedder. The daemon exits after 10 idle minutes without a session (`MU_MEMORY_IDLE_SECS`). Installing `--from-source` needs Bun to build the daemon and leaves the memory plugin out (keeping any installed one) without. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
+This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Releases include the memory daemon as a compiled binary, so they need no Bun; installing `--from-source` needs Bun to build it and otherwise leaves the memory plugin out (keeping any installed one). `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
 
 ### Updating
 
@@ -61,12 +73,21 @@ Grammars load on first use of that language (about 1-2 MB resident each); idle m
 ## Use
 
 ```
-mu [--model SEL] [--thinking off|low|medium|high] [-c] [--resume [PATH]] [-p PROMPT]
+mu [--model SEL] [--thinking off|low|medium|high] [--profile NAME] [--theme NAME] [-c] [--resume [ID|PATH]]
+mu -p PROMPT [--agent NAME] [--max-cost USD]
+mu --acp
+mu take <session|id>
+mu review [--base REF] [--plan FILE] [--focus TEXT] [--out FILE] [--markdown]
+mu update [--check] [--tag TAG] [--force]
 ```
 
-`SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory, `--resume` opens a picker. `-p` runs one prompt and prints the answer. Typing `/` opens a command menu with descriptions and argument completion (↑/↓, Tab, Enter, Esc).
+`SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory; `--resume` takes a session id or path, or opens a picker. `--profile` picks an omp profile (sets `OMP_PROFILE`); `--theme` overrides `[theme] source` for one run. Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
 
-Ghost text predicts the rest of the word or a prompt you repeat here; Tab or → accepts. `[predict] enabled/threshold` in config.toml. `mu-predict bench` replays your own prompt history to measure keystrokes saved.
+`-p` runs one prompt and prints the answer. `--agent` runs it as a custom agent (see Custom agents); `--max-cost` aborts once the session has cost more than that many USD and always prints `mu: cost $X` to stderr.
+
+Ghost text predicts the rest of the word or a prompt you repeat here; Tab or → accepts. It is configured under `[predict]` (see Config). `mu-predict bench` replays your own prompt history to measure keystrokes saved.
+
+Typing `/` opens a command menu with descriptions and argument completion (↑/↓, Tab, Enter, Esc).
 
 Slash commands: `/new /resume /model /thinking /compact /plan /session /rename /todo /skills /plugins /login [provider|mcp:<name>] /copy /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`.
 
@@ -78,7 +99,7 @@ Images: paste an image file path, run `/image <path>`, press Ctrl+V (reads `wl-p
 
 `task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session. `wait` blocks until a job finishes; `/jobs` lists jobs and `/jobs kill <id|all>` cancels them. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
 
-`mu review [--base REF] [--plan FILE] [--focus TEXT] [--out FILE] [--markdown]` runs `/review` headlessly, for detached or scripted runs: the same request, `review-lead` and workers, with no TUI and no session. `--base` defaults to `HEAD` (uncommitted changes); `--plan` is the approved plan file. It prints the verdict as JSON (`verdict`: `pass`, `fail`, `nothing` or `error`; `findings` with a `blocking` flag per finding) to stdout or `--out`, and progress to stderr. Exit codes: 0 pass or nothing to review, 1 fixes needed, 2 the review did not complete. The reviewer runs with the configured `review` role.
+`mu review` runs `/review` headlessly, for detached or scripted runs: the same request, `review-lead` and workers, with no TUI and no session. `--base` defaults to `HEAD` (uncommitted changes); `--plan` is the approved plan file. It prints the verdict as JSON (`verdict`: `pass`, `fail`, `nothing` or `error`; `findings` with a `blocking` flag per finding) to stdout or `--out`, and progress to stderr. Exit codes: 0 pass or nothing to review, 1 fixes needed, 2 the review did not complete. The reviewer runs with the configured `review` role.
 
 ### Detached runs and taking them over
 
@@ -109,26 +130,50 @@ Supported: `session/new`, `load` (replays history), `resume`, `close`, `prompt` 
 
 Not supported: `mcpServers` in `session/new` (ignored; mu uses its own plugins), the `ask` and `propose_plan` tools (hidden from the model), permission prompts (mu never asks), and streaming bash output (the full output arrives when the tool ends). Setting a config option while a prompt runs is rejected. A failed turn ends with `end_turn` plus an `**Error:**` message chunk, not a JSON-RPC error.
 
+### Custom agents
+
+Custom agents are omp-format `.md` files in `.omp/agents` and `<agentDir>/agents` (frontmatter `name`, `description`, `tools`, `model` as a list of `@role`/`provider/model`, `thinkingLevel`). `mu -p PROMPT --agent NAME` runs one; they also appear in the `task` tool.
+
+### Memory
+
+The memory plugin ships as two binaries: `mu-memory`, a small Rust shim that each `mu` session starts, and `mu-memory-daemon`, built by `bun build --compile`. The shim starts one shared daemon per `$MU_HOME` on demand (socket `$MU_HOME/memory/sock`, log `$MU_HOME/logs/memory-daemon.log`) and relays the session to it, so several `mu` sessions share one Bun runtime and embedder. The daemon exits after 10 idle minutes without a session (`MU_MEMORY_IDLE_SECS`).
+
 ## Config
 
-`~/.mu/config.toml` (optional):
+`~/.mu/config.toml` is optional, and so is every key in it. Apart from the compaction example, the values below are the defaults.
 
 ```toml
-[compaction.model_thresholds]      # same keys/values as omp's compaction.modelThresholds; overrides per key
+[compaction.model_thresholds]   # same keys/values as omp's compaction.modelThresholds; overrides per key
 "anthropic/claude-haiku-5-5" = "f200000"
+
+[theme]
+source = "terminal"   # "terminal", "omarchy", a bundled or ~/.mu/themes name, or a colors.toml path
+# accent = "blue"     # palette key or "#rrggbb"
+cards = "filled"      # or "outline"
+
+[predict]
+enabled = true
+threshold = 0.3       # minimum confidence for ghost text
+
+[edit]
+mode = "hashline"     # or "sloppy": find/replace by text, no line tags
+
+[mcp]
+lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
+
+[update]
+check = true          # daily release check at startup
 ```
 
-Custom agents: omp-format `.md` files in `.omp/agents` and `<agentDir>/agents` (frontmatter `name`, `description`, `tools`, `model` as a list of `@role`/`provider/model`, `thinkingLevel`). `mu -p PROMPT --agent NAME` runs one; they also appear in the `task` tool. `--max-cost USD` (with `-p`) aborts when the session cost passes the cap and always prints `mu: cost $X` to stderr.
+## Development
 
-Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
+### Tests
 
-## Tests
-
-`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see below). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
+`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see MCP servers). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
 
 `cargo test --workspace --locked -- --ignored contract_` checks the pinned omp's output formats against mu's parsers (needs network and the omp from `MU_OMP`/`~/.mu/bin`).
 
-## Maintenance bot
+### Maintenance bot
 
 A local systemd timer keeps mu current with oh-my-pi; everything is reported through GitHub issues and PRs. `scripts/maint/setup.sh [--profile NAME]` installs it (config in `~/.mu/maint/config.env`, budgets `MU_MAINT_*_USD`, `MU_MAINT_DRY_RUN=1` prints instead of mutating GitHub). Its LLM steps are the agents in `.omp/agents/` (`maint-triage`, `maint-fixer`, `maint-digest`), run by the installed `mu`.
 
@@ -142,8 +187,6 @@ A local systemd timer keeps mu current with oh-my-pi; everything is reported thr
 | publish | `origin/main` is green and newer than the last release | tag `mu-YYYYMMDD-<sha7>`; `.github/workflows/release.yml` builds and releases; the bot reinstalls unless a dev build is installed |
 
 Nightly runs at 03:30, the digest on Mondays 05:00. The bot never edits `.github/`.
-
-Design notes and milestones: `DESIGN.md`.
 
 ## License
 
