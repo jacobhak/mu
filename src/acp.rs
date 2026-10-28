@@ -25,7 +25,10 @@ const INTERNAL: i64 = -32603;
 pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, serve(model, thinking));
+    local.block_on(&rt, async {
+        crate::plugin::exit_on_signals();
+        serve(model, thinking).await
+    });
     Ok(0)
 }
 

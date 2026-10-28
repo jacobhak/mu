@@ -31,6 +31,8 @@ pub enum Command {
     Rename(String),
     /// Cancel one background job by id, or all of them.
     KillJobs(Option<String>),
+    /// An MCP login added tools: rebuild the tool list for the next request (one prompt-cache miss).
+    RefreshTools,
     Exit,
 }
 

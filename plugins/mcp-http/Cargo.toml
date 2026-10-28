@@ -1,0 +1,26 @@
+[package]
+name = "mu-mcp-http"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "mu-mcp-http"
+path = "src/main.rs"
+
+[dependencies]
+# Apache-2.0. Only this bridge uses rmcp; see THIRD-PARTY-NOTICES.md.
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "time"] }
+
+[dev-dependencies]
+rmcp = { version = "3.8", default-features = false, features = ["client", "server", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "time", "process", "net"] }
+
+[profile.release]
+strip = true

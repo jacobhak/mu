@@ -31,7 +31,7 @@ has_gh() { command -v gh >/dev/null && gh auth status >/dev/null 2>&1; }
 
 # 1. Source
 if [ -n "$src" ]; then
-  (cd "$src" && cargo build --release --workspace --locked)
+  (cd "$src" && cargo build --release --workspace --locked && scripts/build-mcp-http.sh build && scripts/build-mcp-http.sh check)
   . "$src/scripts/lib-layout.sh"
   stage_layout "$src" "${CARGO_TARGET_DIR:-$src/target}/release" "$tmp"
 else
@@ -84,7 +84,7 @@ fi
 
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
-for b in mu mu-gateway mu-web mu-predict mu-memory mu-memory-daemon; do
+for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory mu-memory-daemon; do
   [ -e "$stage/bin/$b" ] || continue
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"

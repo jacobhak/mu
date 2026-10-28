@@ -53,18 +53,24 @@ fn open_lock(dir: &Path) -> io::Result<File> {
 pub struct State {
     pub pid: i32,
     pub url: String,
+    /// The `omp auth-broker` URL. Absent in state.json files written before `broker/endpoint` existed.
+    pub broker_url: Option<String>,
 }
 
 pub fn read_state(dir: &Path) -> Option<State> {
     let v: Value = serde_json::from_str(&fs::read_to_string(dir.join("state.json")).ok()?).ok()?;
-    Some(State { pid: v["pid"].as_i64()? as i32, url: v["url"].as_str()?.to_string() })
+    Some(State {
+        pid: v["pid"].as_i64()? as i32,
+        url: v["url"].as_str()?.to_string(),
+        broker_url: v["brokerUrl"].as_str().filter(|u| !u.is_empty()).map(str::to_string),
+    })
 }
 
 /// Writes `state.json` atomically (tmp + rename).
-pub fn write_state(dir: &Path, pid: u32, url: &str) -> io::Result<()> {
+pub fn write_state(dir: &Path, pid: u32, url: &str, broker_url: &str) -> io::Result<()> {
     let started = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let tmp = dir.join("state.json.tmp");
-    fs::write(&tmp, json!({"pid": pid, "url": url, "startedAt": started}).to_string())?;
+    fs::write(&tmp, json!({"pid": pid, "url": url, "brokerUrl": broker_url, "startedAt": started}).to_string())?;
     fs::rename(tmp, dir.join("state.json"))
 }
 
@@ -149,5 +155,31 @@ mod tests {
         // Path-like names must not escape or alias another profile's directory.
         assert_eq!(gw_dir_for(Some("../x")), base);
         assert_eq!(gw_dir_for(Some("..")), base);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mu-gw-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn state_round_trips_broker_url() {
+        let dir = scratch("state-rt");
+        write_state(&dir, 42, "http://127.0.0.1:1", "http://127.0.0.1:2").unwrap();
+        let st = read_state(&dir).expect("state");
+        assert_eq!((st.pid, st.url.as_str()), (42, "http://127.0.0.1:1"));
+        assert_eq!(st.broker_url.as_deref(), Some("http://127.0.0.1:2"));
+    }
+
+    #[test]
+    fn state_without_broker_url_still_reads() {
+        // A state.json written before the field existed must still parse, with no broker URL.
+        let dir = scratch("state-old");
+        fs::write(dir.join("state.json"), r#"{"pid":42,"url":"http://127.0.0.1:1","startedAt":0}"#).unwrap();
+        let st = read_state(&dir).expect("state");
+        assert_eq!((st.pid, st.url.as_str()), (42, "http://127.0.0.1:1"));
+        assert!(st.broker_url.is_none());
     }
 }

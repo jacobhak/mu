@@ -324,6 +324,7 @@ impl Agent {
     }
 
     pub fn system(&self) -> String {
+        let mcp = self.plugins.mcp_instructions();
         context::system_prompt(&PromptInput {
             model: &self.model.id,
             cwd: &self.cwd,
@@ -332,7 +333,13 @@ impl Agent {
             subagent: self.subagent,
             agent_prompt: self.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
+            mcp_instructions: mcp.as_deref(),
         })
+    }
+
+    /// Drops the cached tool list so the next request rebuilds it (after an MCP login added tools).
+    pub fn refresh_tool_defs(&mut self) {
+        self.base_defs.take();
     }
 
     /// Tokens of the system prompt, measured again only when what it is built from changes.
@@ -340,6 +347,7 @@ impl Agent {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (&self.model.id, self.plan.is_some(), &self.plugin_ctx, &self.agent_prompt, self.subagent).hash(&mut h);
+        self.plugins.mcp_instructions().hash(&mut h);
         let key = h.finish();
         let mut memo = self.system_memo.borrow_mut();
         match *memo {
@@ -784,6 +792,7 @@ impl Agent {
                     let n = self.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
                     self.notice(format!("killed {n} job(s)"));
                 }
+                Command::RefreshTools => self.refresh_tool_defs(),
                 Command::Exit => {
                     self.end_session().await;
                     break;
@@ -1288,6 +1297,14 @@ impl Agent {
                 self.error(format!("compaction failed: {e}"));
             }
             first = false;
+            // MCP servers without a cached tool list are started and listed once, before the first request.
+            // A subagent restricted to named tools that include no MCP tool never needs the listing.
+            if self.allow.as_ref().is_none_or(|a| a.iter().any(|n| n.starts_with("mcp__"))) {
+                self.plugins.list_missing_until(cancel).await;
+            }
+            if cancel.is_cancelled() {
+                return Flow::Aborted;
+            }
             let system = self.system();
             let wire = self.wire_messages();
             // Every tool call in the history has its result and vice versa (`to_wire` also repairs).

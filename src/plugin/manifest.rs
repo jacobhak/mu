@@ -11,7 +11,7 @@ pub enum Lifetime {
 }
 
 impl Lifetime {
-    pub(super) fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "session" => Some(Self::Session),
             "call" => Some(Self::Call),
@@ -62,6 +62,12 @@ impl ToolSpec {
                 .map_err(|e| format!("{}: {e}", self.schema_path.display()))
                 .and_then(|s| serde_json::from_str(&s).map_err(|e| format!("{}: {e}", self.schema_path.display())))
         })
+    }
+    /// A tool whose schema is already in hand (an MCP server's cached tool list).
+    pub fn inline(name: String, description: String, schema: Value) -> Self {
+        let s = Self::new(name, description, PathBuf::new());
+        let _ = s.schema.set(Ok(schema));
+        s
     }
 
     #[cfg(test)]

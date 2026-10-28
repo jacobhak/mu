@@ -163,9 +163,23 @@ fn setup(cwd: &std::path::Path) -> Setup {
     for w in cfgs.warnings.iter().chain(&ctx.warnings) {
         let _ = notice_tx.send(format!("warning: {w}"));
     }
-    let (manifests, warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
-    let host = plugin::PluginHost::new(
+    let (manifests, mut warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
+    let (servers, mcp_warnings) = plugin::mcp::config::load(cwd, &paths::omp_agent_dir());
+    warnings.extend(mcp_warnings);
+    let mcp_lifetime = match plugin::manifest::Lifetime::parse(&cfgs.mu.mcp.lifetime) {
+        Some(l) => l,
+        None => {
+            if !cfgs.mu.mcp.lifetime.is_empty() {
+                warnings.push(format!("[mcp] lifetime `{}` is not valid; using session", cfgs.mu.mcp.lifetime));
+            }
+            plugin::manifest::Lifetime::Session
+        }
+    };
+    let host = plugin::PluginHost::new_with_mcp(
         manifests,
+        servers,
+        mcp_lifetime,
+        plugin::mcp::cache::dir(),
         warnings,
         notice_tx.clone(),
         plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
@@ -389,6 +403,7 @@ fn run() -> Result<i32> {
         let code = match (print, task_payload) {
             (_, Some(p)) => {
                 printer = Some(spawn_notice_printer(notice_rx));
+                plugin::exit_on_signals();
                 let ctx = p["context"].as_str().filter(|c| !c.is_empty());
                 let task = p["task"].as_str().unwrap_or("");
                 let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
@@ -397,9 +412,12 @@ fn run() -> Result<i32> {
             }
             (Some(prompt), None) => {
                 printer = Some(spawn_notice_printer(notice_rx));
+                plugin::exit_on_signals();
+                host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
                 headless::print_mode(prompt, cmd_tx, ev_rx, inbox.clone(), max_cost, stop_rx).await
             }
             (None, None) => {
+                host.set_interactive();
                 tui::app::run(tui::app::AppInit {
                     cmd_tx,
                     ev_rx,

@@ -225,11 +225,36 @@ impl Tools {
         }
         if self.plugins.has_tool(name) {
             let r = self.plugins.call_tool(name, args, &ctx.cancel).await;
-            let mut out = if r.is_error { ToolOutput::err(r.content) } else { ToolOutput::ok(r.content) };
+            // Only MCP results are capped here: native plugins size their own output (web caps fetches itself).
+            let text = if self.plugins.is_mcp_tool(name) { self.cap_text(r.content) } else { r.content };
+            let mut out = if r.is_error { ToolOutput::err(text) } else { ToolOutput::ok(text) };
             out.display = r.display;
+            out.details = r.details;
+            out.images = r.images;
             return out;
         }
         ToolOutput::err(format!("Unknown tool: {name}"))
+    }
+
+    /// Plugin output above 50 KB keeps its head; the whole text goes to an `artifact://` file.
+    fn cap_text(&self, text: String) -> String {
+        const CAP: usize = 50 * 1024;
+        if text.len() <= CAP {
+            return text;
+        }
+        let mut cut = CAP;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (n, path) = self.next_artifact();
+        let saved =
+            path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(&path, &text).is_ok();
+        let note = if saved {
+            format!("[Output truncated at {} KB of {} KB; full output: artifact://{n}]", CAP / 1024, text.len() / 1024)
+        } else {
+            format!("[Output truncated at {} KB of {} KB]", CAP / 1024, text.len() / 1024)
+        };
+        format!("{}\n\n{note}", &text[..cut])
     }
 }
 

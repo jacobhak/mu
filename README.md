@@ -39,12 +39,13 @@ This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` a
 
 ```sh
 cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web,mu-predict,mu-memory}
+scripts/build-mcp-http.sh                # target/release/mu-mcp-http (see below)
 mkdir -p ~/.mu/plugins
 for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
 (cd plugins/memory && bun install)       # dev checkout: the memory plugin runs under Bun
 ```
 
-Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web` and `mu-predict` are resolved next to the `mu` binary. `MU_GATEWAY_URL` / `MU_GATEWAY_TOKEN` bypass the gateway plugin.
+Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web`, `mu-predict` and `mu-mcp-http` are resolved next to the `mu` binary. `MU_GATEWAY_URL` / `MU_GATEWAY_TOKEN` bypass the gateway plugin.
 
 ### Syntax highlighting
 
@@ -67,7 +68,7 @@ mu [--model SEL] [--thinking off|low|medium|high] [-c] [--resume [PATH]] [-p PRO
 
 Ghost text predicts the rest of the word or a prompt you repeat here; Tab or → accepts. `[predict] enabled/threshold` in config.toml. `mu-predict bench` replays your own prompt history to measure keystrokes saved.
 
-Slash commands: `/new /resume /model /thinking /compact /plan /session /rename /todo /skills /plugins /copy /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`.
+Slash commands: `/new /resume /model /thinking /compact /plan /session /rename /todo /skills /plugins /login [provider|mcp:<name>] /copy /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`.
 
 While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
 
@@ -84,6 +85,17 @@ Images: paste an image file path, run `/image <path>`, press Ctrl+V (reads `wl-p
 `mu -p` prints `session: <path>` to stderr as soon as the session exists. Exit codes: 0 done, 1 error, abort or cost cap, 3 interrupted and resumable. `kill -USR1 <pid>` (never a process group) asks a `-p` run to stop: it finishes the running tool, skips the rest of that batch, ends the turn, releases the session and exits 3 with `mu: interrupted; resume with: mu --resume <path>`. A second `SIGUSR1` cancels the current step. Either way the session loads without repair. `mu take <session|id>` does this for you: it signals the run, waits until the session is free, changes to the session's directory and execs `mu --resume <path>`. It refuses unless stdin and stdout are terminals, and refuses a session open in an interactive mu or held by a process that left no owner record. Ctrl-C while waiting sends the second signal; a second Ctrl-C gives up waiting. Every open session is recorded in `$MU_HOME/run/<id>.json` (`pid`, `print_run`, `started`, `session`), held under `flock` by its owner, so a busy-lock error can name the pid; the files are safe to delete while no mu runs. The session file format is unchanged. A taken-over session loses `--max-cost` and a custom `--agent` prompt; `ask` and jobs come back.
 
 Stop details: a stop that arrives before the next tool starts skips every call of that batch, so the run ends at once; one that arrives during a tool lets that tool finish. Any second `SIGUSR1` cancels the current step, including one sent by `mu take` after a manual `kill -USR1` (or by two takes). A fatal error (such as a failed provider request) exits 1 even after a stop; non-fatal errors (a truncated reply, a failed auto-compaction) do not change exit 3. The pid in an owner record is only meaningful on the same host and pid namespace: `mu take` from another container or namespace that shares `MU_HOME` and the session directory can signal the wrong process or none, so run it where the `-p` run lives.
+
+### MCP servers
+
+mu reads omp's MCP config unchanged: `<cwd>/.omp/mcp.json`, `<agentDir>/mcp.json` and the other files omp reads (`.mcp.json` variants, `./mcp.json`), merged the way omp merges them, with `${VAR}` / `${VAR:-default}` expansion, `disabledServers` / `enabledServers` and `enabled`/`timeout`/`instructions`/`requestIdFormat` fields. Tools are named `mcp__<server>_<tool>`, as in omp.
+
+- **stdio** servers run as a child process. **http** servers (`"type": "http"`, or a `url` with no type) run through `mu-mcp-http`, a small bridge plugin that keeps TLS out of the core. Legacy `"type": "sse"` servers are skipped with a warning. The bridge is its own Cargo project outside the workspace (`scripts/build-mcp-http.sh`), because building it with `mu` would unify features and give the core's HTTP client rustls without a crypto provider; `scripts/build-mcp-http.sh check` fails if the core ever depends on rustls.
+- Nothing starts at launch. A server's tool list is cached in `~/.mu/mcp/tools/` (keyed by a hash of its config), so its tools are advertised without starting it; it starts on the first call. The first session after a config change starts the server once to list its tools. A server's process lives for the session (`[mcp] lifetime = "idle:10m"` in `config.toml` changes that).
+- **OAuth** goes through omp: mu runs `omp token <credential>` (through the auth broker when the gateway is running), never reads omp's credential store and never holds a refresh token. A server that needs a login is reported as `needs login`; log in from interactive mu with `/login mcp:<name>` (or pick it in `/login`), which hands the terminal to omp's own flow (`omp -p --no-session '/mcp reauth <name>'`) and makes the server usable in the same session. Headless, ACP and subagent runs cannot log in. Over SSH the browser needs a port forward to omp's local callback port, as for omp itself.
+- **Project config can run commands and contact URLs**: a repository's `.omp/mcp.json` starts whatever it names, exactly as in omp. Only use mu in directories you trust.
+- Not supported: `/mcp` management, MCP resources and prompts, and Claude/Cursor config imports.
+- Notes: with a cold cache the first turn waits (up to 30 s per server, 60 s when `timeout` is 0) for servers to list their tools; Esc or Ctrl-C leaves it. The broker is used for token refresh only once the gateway plugin is already running, so the first listing of a session may fetch the token without it. Config warnings (a skipped SSE server, a bad entry) show in the TUI and on stderr for `-p`; ACP and subagents do not show them.
 
 ### Agent Client Protocol
 
@@ -112,7 +124,7 @@ Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
 
 ## Tests
 
-`cargo test --workspace` runs the unit tests. `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
+`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see below). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
 
 `cargo test --workspace --locked -- --ignored contract_` checks the pinned omp's output formats against mu's parsers (needs network and the omp from `MU_OMP`/`~/.mu/bin`).
 

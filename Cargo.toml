@@ -6,6 +6,7 @@ license = "MIT"
 
 [workspace]
 members = ["crates/mu-common", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
+exclude = ["plugins/mcp-http"]
 resolver = "3"
 
 [features]

@@ -167,6 +167,14 @@ pub struct MuConfig {
     pub theme: MuTheme,
     pub update: MuUpdate,
     pub edit: MuEdit,
+    pub mcp: MuMcp,
+}
+
+/// `[mcp]`: `lifetime` of MCP server processes (`session`, `idle:10m`, `call`); default `session`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MuMcp {
+    pub lifetime: String,
 }
 
 /// `[edit]`: `mode = "hashline"` (default) or `"sloppy"` (find/replace by text, no tags).
@@ -381,6 +389,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         theme: parse(section("theme"), "theme", warn),
         update: parse(section("update"), "update", warn),
         edit: parse(section("edit"), "edit", warn),
+        mcp: parse(section("mcp"), "mcp", warn),
     }
 }
 

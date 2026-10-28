@@ -11,6 +11,15 @@ use super::plan_review::{PlanReview, ReviewResult};
 use super::select::{Item, Select, SelectResult};
 use crate::events::{Answer, AskQuestion, PlanDecision};
 
+/// One entry of the `/login` picker.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoginTarget {
+    /// An `omp login` provider, by its menu number.
+    Provider(usize),
+    /// An MCP server, by its name in `mcp.json`.
+    Mcp(String),
+}
+
 pub enum Overlay {
     Model {
         sel: Select,
@@ -23,10 +32,10 @@ pub enum Overlay {
         model: String,
         roles: Vec<Option<String>>,
     },
-    /// `omp login` providers as (menu number, name).
+    /// What can be logged into: `omp login` providers, then MCP servers that need auth.
     Login {
         sel: Select,
-        nums: Vec<usize>,
+        targets: Vec<LoginTarget>,
     },
     Session {
         sel: Select,
@@ -60,7 +69,7 @@ pub enum OverlayEvent {
         role: Option<String>,
         model: String,
     },
-    Login(usize),
+    Login(LoginTarget),
     Copy(Option<String>),
     Resume(PathBuf),
     /// Copy the plan text.
@@ -176,10 +185,10 @@ impl Overlay {
                 }
                 _ => (None, None),
             },
-            Overlay::Login { mut sel, nums } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Login { sel, nums }), None),
+            Overlay::Login { mut sel, targets } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Login { sel, targets }), None),
                 SelectResult::Chosen(i) => {
-                    (None, i.first().and_then(|i| nums.get(*i)).map(|n| OverlayEvent::Login(*n)))
+                    (None, i.first().and_then(|i| targets.get(*i)).cloned().map(OverlayEvent::Login))
                 }
                 _ => (None, None),
             },

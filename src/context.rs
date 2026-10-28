@@ -406,6 +406,8 @@ pub struct PromptInput<'a> {
     pub subagent: bool,
     pub agent_prompt: Option<&'a str>,
     pub plugin_ctx: &'a std::collections::BTreeMap<String, String>,
+    /// The MCP servers' instructions block (`PluginHost::mcp_instructions`).
+    pub mcp_instructions: Option<&'a str>,
 }
 
 pub fn system_prompt(i: &PromptInput) -> String {
@@ -490,6 +492,11 @@ When the `task` tool is available, SHOULD use it instead of doing everything inl
         s.push_str(c.trim_end());
         s.push('\n');
     }
+    if let Some(m) = i.mcp_instructions {
+        s.push('\n');
+        s.push_str(m.trim_end());
+        s.push('\n');
+    }
     s
 }
 
@@ -547,6 +554,7 @@ mod tests {
             subagent: false,
             agent_prompt: None,
             plugin_ctx: &Default::default(),
+            mcp_instructions: None,
         });
         assert!(sp.contains("- alpha: first\n") && !sp.contains("- hid:") && sp.contains("<rules>\nuser rule"));
         assert!(ctx.skill_prompt("alpha", "go").unwrap().ends_with("body A\n</skill>\n\ngo"));
@@ -562,6 +570,7 @@ mod tests {
             subagent: false,
             agent_prompt: None,
             plugin_ctx: &Default::default(),
+            mcp_instructions: None,
         });
         assert!(sp.contains("NEVER use `sed`, `perl`") && sp.contains("NEVER `cat`"));
         assert!(sp.contains("[path#TAG]") && !sp.contains("*** Find"));
@@ -620,6 +629,7 @@ mod tests {
             subagent: true,
             agent_prompt: Some(block),
             plugin_ctx: &Default::default(),
+            mcp_instructions: None,
         });
         assert!(sp.contains("<agent name=\"x\">\nDo it.\n</agent>"));
     }

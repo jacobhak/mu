@@ -87,9 +87,17 @@ Stream rules stay in the core because they run on every streamed token; a proces
 - **Activation:** a plugin process starts on the first call to one of its tools or commands, or the first
   occurrence of a hook it subscribes to. A plugin subscribed to a per-turn hook therefore starts on the first
   turn — that is use, not waste.
-- **MCP servers without a manifest:** their tool list is cached on disk, keyed by a hash of the server's
-  config, and refreshed whenever the server actually starts. First session after a config change starts the
-  server once to list tools.
+- **MCP servers:** each server in `mcp.json` is a plugin slot with no `plugin.toml` that only provides tools. A
+  stdio server's process is the server itself; an http server's process is the `mcp-http` bridge. The core speaks
+  MCP (`initialize`, `tools/list`, `tools/call`, `notifications/cancelled`; answers `ping` and `roots/list`)
+  instead of the plugin protocol, and everything else — spawn, lifetimes, `/plugins` — is the plugin host's.
+  The tool list is cached on disk (`$MU_HOME/mcp/tools/<hash>.json`), keyed by a hash of the server's config,
+  and checked again whenever the server actually starts. Nothing starts at launch; the first session after a
+  config change starts the server once, when the first turn builds its tool list, and a server started only to
+  list tools exits after 60 s unless it is used. A server that fails to list is left out of that session. Esc and
+  signals interrupt the listing, and connecting and listing are bounded (30 s, or 60 s when the server's `timeout`
+  is 0). MCP results above 50 KB keep their head and spill the full text to `artifact://`; native plugins size
+  their own output.
 - **Lifetimes:** `session` (until the session ends), `idle:<duration>` (exit after inactivity), `call` (exit
   after each call). Language servers run for the whole session.
 
@@ -112,6 +120,7 @@ Stream rules stay in the core because they run on every streamed token; a proces
 | plugin → core | `core/complete` | One-off model call through the configured providers (memory summaries, advisor, commit messages) |
 | plugin → core | `core/tool` | Invoke a built-in tool. *Not yet implemented; add it when a plugin needs it.* |
 | plugin → core | `ui/notify`, `ui/confirm`, `ui/select`, `ui/input` | User interaction (the subset pi's RPC extension UI proves workable). Only `ui/notify` is implemented; `ui/confirm`, `ui/select` and `ui/input` are *not yet implemented* — add them when a plugin needs them. |
+| plugin → core | `core/mcpToken` | Only from an MCP http bridge: an OAuth access token for its server, fetched with `omp token` (through the auth broker when the gateway is running) |
 | core → plugin | `tool/call`, `command/run`, `hook/<name>` | Dispatch |
 
 Tool results carry `content` for the model and optional `display` for the user, as in pi.
@@ -123,6 +132,7 @@ All omp features outside the core become first-party plugins that load on use.
 | Plugin | Day one | Implementation |
 |---|---|---|
 | gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider, OAuth logins, account pools, quota. See Providers. |
+| mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It keeps TLS and HTTP out of the core: it is built as a separate Cargo project outside the workspace (feature unification would otherwise give the core rustls), and `scripts/build-mcp-http.sh check` fails if `cargo tree -p mu` ever shows rustls. It answers any `core/*` request a server sends with -32601. |
 | lsp | yes | Rust; spawns language servers per workspace, lifetime `session` |
 | web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway is verified in M4. |
 | ast | yes | Rust; `ast_grep` / `ast_edit` on `pi-ast`. Grammars live here, keeping the core binary small. |
@@ -163,7 +173,7 @@ Reads omp's files in place. Agent dir: `~/.omp/agent`, or `~/.omp/profiles/<name
 | Sticky rules | `<agent>/RULES.md`, `.omp/RULES.md` | Read; carried on every request |
 | Stream rules | omp rule files | Read |
 | Skills | `<root>/skills/<name>/SKILL.md`, one level deep | Read |
-| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` | Read |
+| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. OAuth tokens come from `omp token`, and `/login mcp:<name>` runs omp's own flow; mu never reads omp's credential store |
 | Sessions | `<agent>/sessions/<encoded-cwd>/<ts>_<id>.jsonl`, v3 tree; blobs `<agent>/blobs/<sha256>` | Written in omp's v3 format to mu's own directory; omp opens them with `--resume <path>` or `--session-dir` |
 
 Non-goal: running pi or omp TypeScript extensions.

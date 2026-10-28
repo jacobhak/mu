@@ -45,3 +45,8 @@ SOFTWARE.
 
 <https://github.com/basecamp/omarchy>. The colour palettes in `src/tui/palettes/*.toml` are copied from
 omarchy's `themes/*/colors.toml`. Their license is in `src/tui/palettes/LICENSE`.
+
+## rmcp
+
+<https://github.com/modelcontextprotocol/rust-sdk>, version 3.8.0, Apache-2.0. The `mu-mcp-http` bridge
+(`plugins/mcp-http`) uses its Streamable HTTP client transport. No other part of mu uses it.

@@ -20,8 +20,8 @@ fi
 export MU_OMP="$omp"
 
 stages=(build test contract smoke)
-cmd_build() { cargo build --release --workspace --locked; }
-cmd_test() { cargo test --workspace --locked; }
+cmd_build() { cargo build --release --workspace --locked && scripts/build-mcp-http.sh build && scripts/build-mcp-http.sh check; }
+cmd_test() { cargo test --workspace --locked && scripts/build-mcp-http.sh test; }
 cmd_contract() { cargo test --workspace --locked -- --ignored contract_; }
 cmd_smoke() { scripts/smoke.sh "$CARGO_TARGET_DIR/release/mu" || scripts/smoke.sh "$CARGO_TARGET_DIR/release/mu"; }
 

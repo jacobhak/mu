@@ -6,7 +6,7 @@ use super::input::{self, Input};
 use super::line::truncate_text as trunc;
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
-use super::overlay::{Overlay, OverlayEvent, ask_select};
+use super::overlay::{LoginTarget, Overlay, OverlayEvent, ask_select};
 use super::plan_review::{PlanReview, Tier};
 use super::ptyview::PtyView;
 use super::render::Renderer;
@@ -43,7 +43,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 20] = [
     ("resume", "Resume a session from this directory", false),
     ("model", "Pick a model and assign a role", false),
     ("switch", "Switch this session's model", false),
-    ("login", "Log in to a provider", false),
+    ("login", "Log in to a provider or MCP server", false),
     ("thinking", "Set the thinking level", false),
     ("compact", "Compact the context [focus]", false),
     ("plan", "Toggle plan mode", false),
@@ -76,6 +76,8 @@ pub struct AppInit {
 /// What to do when a child that owned the terminal exits.
 enum ChildThen {
     Login,
+    /// `omp -p '/mcp reauth <name>'` for this MCP server.
+    McpLogin(String),
     /// The external editor was run on the composer text kept in this file.
     ComposerEdit(std::path::PathBuf),
     /// The editor was run on the plan file shown in the review overlay.
@@ -92,6 +94,8 @@ enum UiMsg {
     Copied(Result<String, String>),
     Models(Result<Vec<GatewayModel>, String>),
     LoginProviders(Result<Vec<(usize, String)>, String>),
+    /// An MCP login finished: tool count and whether the tool set changed.
+    McpLoggedIn(String, Result<(usize, bool), String>),
     ClipboardImage(Result<Option<Image>, String>),
     Ghost {
         seq: u64,
@@ -209,6 +213,7 @@ pub async fn run(init: AppInit) -> i32 {
                 "thinking" => Thinking::NAMES.iter().map(|s| s.to_string()).collect(),
                 "copy" => ["code", "cmd", "link"].map(String::from).to_vec(),
                 "jobs" => vec!["kill".to_string()],
+                "login" => plugins.mcp_names().iter().map(|n| format!("mcp:{n}")).collect(),
                 _ => vec![],
             };
             Entry { name: name.into(), desc: desc.into(), needs_arg, args }
@@ -577,15 +582,36 @@ impl App {
                 };
                 self.open_model_picker(gw);
             }
-            UiMsg::LoginProviders(r) => match r {
-                Ok(list) if !list.is_empty() => {
-                    let items = list.iter().map(|(_, n)| Item { label: n.clone(), detail: String::new() }).collect();
-                    let nums = list.iter().map(|(n, _)| *n).collect();
-                    self.overlay = Some(Overlay::Login { sel: Select::new("Log in to provider", items), nums });
+            UiMsg::McpLoggedIn(name, r) => match r {
+                Ok((n, changed)) => {
+                    self.notice(&format!("mcp:{name}: logged in, {n} tools"));
+                    if changed {
+                        self.send(Command::RefreshTools);
+                    }
                 }
-                Ok(_) => self.error("omp login listed no providers"),
-                Err(e) => self.error(&format!("cannot list login providers: {e}")),
+                Err(e) => self.error(&format!("mcp:{name}: logged in, but its tools could not be listed: {e}")),
             },
+            UiMsg::LoginProviders(r) => {
+                let (mut items, mut targets) = (Vec::new(), Vec::new());
+                match r {
+                    Ok(list) => {
+                        for (n, name) in list {
+                            items.push(Item { label: name, detail: String::new() });
+                            targets.push(LoginTarget::Provider(n));
+                        }
+                    }
+                    Err(e) => self.error(&format!("cannot list login providers: {e}")),
+                }
+                for (name, url) in self.plugins.needs_login() {
+                    items.push(Item { label: format!("mcp:{name}"), detail: url });
+                    targets.push(LoginTarget::Mcp(name));
+                }
+                if items.is_empty() {
+                    self.error("omp login listed no providers");
+                } else {
+                    self.overlay = Some(Overlay::Login { sel: Select::new("Log in", items), targets });
+                }
+            }
             UiMsg::ClipboardImage(r) => match r {
                 Ok(Some(img)) if self.overlay.is_none() => self.composer.attach_image(img),
                 Ok(Some(_)) => self.notice("image paste ignored in picker"),
@@ -856,7 +882,8 @@ impl App {
                 Err(e) => self.error(&format!("could not set @{role}: {e}")),
             },
             OverlayEvent::AssignRole { role: None, model } => self.send(Command::SetModel(model)),
-            OverlayEvent::Login(n) => self.run_login(&[], Some(n)),
+            OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
+            OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
             OverlayEvent::Resume(p) => self.send(Command::Resume(p)),
             OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
@@ -980,7 +1007,10 @@ impl App {
                     .plugins
                     .status()
                     .into_iter()
-                    .map(|(n, l, up)| format!("{n} · {l} · {}", if up { "running" } else { "stopped" }))
+                    .map(|(n, l, up, extra)| {
+                        let extra = if extra.is_empty() { extra } else { format!(" · {extra}") };
+                        format!("{n} · {l} · {}{extra}", if up { "running" } else { "stopped" })
+                    })
                     .collect();
                 self.notice(&if p.is_empty() { "no plugins".into() } else { p.join("\n") });
             }
@@ -1141,8 +1171,12 @@ impl App {
         self.notice(&out.join("\n"));
     }
 
-    /// `/login`: with a provider id run `omp login <id>`; otherwise list omp's providers in a picker.
+    /// `/login`: with a provider id run `omp login <id>`, with `mcp:<name>` log in to that MCP server;
+    /// otherwise list omp's providers and the MCP servers that need auth in a picker.
     fn login(&mut self, provider: &str) {
+        if let Some(name) = provider.strip_prefix("mcp:") {
+            return self.run_mcp_login(name);
+        }
         if !provider.is_empty() {
             return self.run_login(&[provider], None);
         }
@@ -1188,6 +1222,18 @@ impl App {
                 Ok(s) if s.success() => self.notice("login finished"),
                 Ok(s) => self.error(&format!("omp login exited with {s}")),
                 Err(e) => self.error(&format!("cannot run omp login: {e}")),
+            },
+            ChildThen::McpLogin(name) => match status {
+                Ok(s) if s.success() => {
+                    self.notice(&format!("mcp:{name}: logged in; loading tools…"));
+                    let (plugins, tx) = (self.plugins.clone(), self.ui_tx.clone());
+                    tokio::task::spawn_local(async move {
+                        let r = plugins.after_login(&name).await;
+                        let _ = tx.send(UiMsg::McpLoggedIn(name, r));
+                    });
+                }
+                Ok(s) => self.error(&format!("omp /mcp reauth {name} exited with {s}")),
+                Err(e) => self.error(&format!("cannot run omp: {e}")),
             },
             ChildThen::ComposerEdit(path) => {
                 match status {
@@ -1235,6 +1281,27 @@ impl App {
                 (Ok(mut child), None) => child.wait(),
                 (Err(e), _) => Err(e),
             };
+            // SAFETY: back to the default disposition.
+            unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+            status
+        });
+    }
+
+    /// Runs omp's own MCP OAuth flow (`omp -p --no-session '/mcp reauth <name>'`) on the real terminal,
+    /// then makes the server usable in this session (`PluginHost::after_login`).
+    fn run_mcp_login(&mut self, name: &str) {
+        if !self.plugins.mcp_names().iter().any(|n| n == name) {
+            return self.error(&format!("no MCP server `{name}` is configured"));
+        }
+        let (cwd, name) = (self.cwd.clone(), name.to_string());
+        self.start_child(ChildThen::McpLogin(name.clone()), move || {
+            let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
+            cmd.args(["-p", "--no-session"]).arg(format!("/mcp reauth {name}")).current_dir(&cwd);
+            extern "C" fn noop(_: libc::c_int) {}
+            // As in `run_login`: Ctrl-C reaches omp, not mu.
+            // SAFETY: installs a no-op handler; restored to the default below.
+            unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+            let status = cmd.status();
             // SAFETY: back to the default disposition.
             unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
             status

@@ -124,7 +124,7 @@ fn serve() -> Result<i32, String> {
         &[("OMP_AUTH_BROKER_URL", &broker_url), ("OMP_AUTH_BROKER_TOKEN", &token)],
     )?;
     kids.0.push(gw);
-    shared::write_state(&dir, me, &gw_url).map_err(|e| e.to_string())?;
+    shared::write_state(&dir, me, &gw_url, &broker_url).map_err(|e| e.to_string())?;
     eprintln!("mu-gateway daemon {me}: gateway at {gw_url}");
 
     loop {
