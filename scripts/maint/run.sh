@@ -105,14 +105,6 @@ P
         go=0
       fi
     done <<< "$open"
-    # A bump PR for this version that was closed unmerged is a rejection: do not reopen it every night.
-    if [ "$go" = 1 ]; then
-      n="$(gh pr list -R "$REPO" --state closed --head "maint/omp-$latest" --json number,mergedAt -q '[.[] | select(.mergedAt == null)][0].number // empty')"
-      if [ -n "$n" ]; then
-        log "bump PR #$n for v$latest was closed unmerged; skipping until a newer omp release"
-        go=0
-      fi
-    fi
     if [ "$go" = 1 ]; then
       while read -r n head; do
         [ -z "$n" ] && continue
@@ -168,18 +160,30 @@ P
     fi
   fi
 
-  local labels sev fixout=""
+  local labels sev fixout="" fixrc=0
+  local fprompt="$RUN/fix-prompt.md" fout="$RUN/fixer.md"
   if [ "$green" = 1 ] && [ "$change" = false ]; then
     result=s2; sev="S2 — green bump, no behaviour change; auto-merged"; labels=(maint:bump maint:auto)
-  elif [ "$green" = 1 ]; then
-    result=s2r; sev="S2r — green bump, behaviour change; needs review"; labels=(maint:bump maint:needs-review)
   else
-    result=s1; sev="S1 — bump fails checks"; labels=(maint:bump maint:needs-review)
-    local fprompt="$RUN/fix-prompt.md" fout="$RUN/fixer.md"
-    cat > "$fprompt" <<P
+    if [ "$green" = 1 ]; then
+      result=s2r; sev="S2r — green bump, behaviour change; needs review"; labels=(maint:bump maint:needs-review)
+      cat > "$fprompt" <<P
+MODE: behaviour review (checks are GREEN; do not go looking for failures). Triage found these user-visible behaviour changes in oh-my-pi v$latest (bumped from v$pinned):
+
+$summary
+
+Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
+
+For each listed change, decide whether mu must change to accommodate it (tool descriptions or prompts in src/, error handling, docs/README, tests or contract tests that should now cover the new behaviour). Make those changes. If a change needs no mu change, do not invent one. Your final message MUST list every change with a verdict: "adapted: <what>" or "no change needed: <why>", then a "Review checklist" of concrete things the human should verify by hand.
+P
+    else
+      result=s1; sev="S1 — bump fails checks"; labels=(maint:bump maint:needs-review)
+      cat > "$fprompt" <<P
 Adapt mu to oh-my-pi v$latest (bumped from v$pinned). The failing check run is in $RUN/bump (check.txt and one log per stage). Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
 P
+    fi
     rc=0; run_agent maint-fixer "$MU_MAINT_FIX_USD" "$bwt" "$fprompt" "$fout" || rc=$?
+    fixrc=$rc
     fixout="$(cat "$fout" 2>/dev/null || true)"
     if [ "$rc" = 0 ] && tree_changed "$bwt"; then
       git -C "$bwt" add -A
@@ -187,6 +191,8 @@ P
       mkdir -p "$RUN/bump-fixed"
       if "$here/check.sh" "$bwt" "$RUN/bump-fixed" 9>&- > "$RUN/bump-fixed/check.out" 2>&1; then
         green=1
+      else
+        green=0
       fi
       cp "$RUN/bump-fixed/check.txt" "$RUN/bump/check.txt"
     fi
@@ -197,7 +203,10 @@ P
     echo "## Severity"; echo "$sev"; echo
     echo "## Checks"; echo '```'; cat "$RUN/bump/check.txt"; echo '```'; echo
     echo "## Upstream changes"; echo "$summary"; echo; echo "Risk: $risk"; echo
-    if [ -n "$fixout" ]; then echo "## Fixer"; echo "$fixout"; echo; fi
+    if [ "$fixrc" != 0 ]; then
+      echo "## Fixer"; echo "**The fixer did not finish (exit $fixrc; 10 = monthly budget, 124 = timeout). No adaptation was made; any partial edits were discarded.**"; echo
+      [ -z "$fixout" ] || { echo "Partial output:"; echo; echo "$fixout"; echo; }
+    elif [ -n "$fixout" ]; then echo "## Fixer"; echo "$fixout"; echo; fi
     echo "## Agent spend"; echo '```'; run_spend_rows; echo '```'
   } > "$RUN/pr-body.md"
 

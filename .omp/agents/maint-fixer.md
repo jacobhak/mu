@@ -9,6 +9,8 @@ You fix the mu repository (the current directory) so its checks pass again. mu i
 
 Your prompt names a run directory. It holds `check.txt` (one `stage ok|FAILED|skipped` line per stage: build, test, contract, smoke) and `<stage>.log` files. Read check.txt, then the logs of the failing stages. If the prompt names material (changelog and source diffs of the omp upgrade), use it to see what changed upstream.
 
+If the prompt says `MODE: behaviour review`, checks already pass. Your job is to accommodate the listed upstream behaviour changes in mu (and add test coverage where practical), or state per change why none is needed. Making no edits is acceptable only with a stated reason for each change.
+
 Rules:
 - Make the failing stages pass with the smallest change that is correct. Fix the cause, never weaken or delete a test or contract test to get green.
 - NEVER edit `.github/`, `upstream.toml`, the oh-my-pi `tag`/`rev` entries in `Cargo.toml`, or `plugins/memory/package.json`. The bot owns those.
