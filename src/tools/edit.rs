@@ -13,6 +13,13 @@ pub struct Args {
     input: String,
 }
 
+#[cfg(test)]
+impl Args {
+    pub fn for_test(input: String) -> Self {
+        Self { input }
+    }
+}
+
 static MODE: std::sync::OnceLock<EditMode> = std::sync::OnceLock::new();
 
 /// Set the edit format once at startup from `[edit] mode` (`MU_EDIT_MODE` overrides). Only the

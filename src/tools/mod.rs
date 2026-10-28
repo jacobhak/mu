@@ -416,9 +416,9 @@ fn read_desc() -> &'static str {
     if edit::is_hashline() { READ_DESC } else { READ_DESC_PLAIN }
 }
 
-const READ_DESC_PLAIN: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows, where `N:` is a line number and not part of the file. Images (png, jpeg, gif, webp, up to 5 MB) are returned as images you can see. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
+const READ_DESC_PLAIN: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows, where `N:` is a line number and not part of the file. Images (png, jpeg, gif, webp, up to 5 MB) are returned as images you can see. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars; add `:raw` (e.g. `path:N-M:raw`, or a list `path:3,10-12:raw`) to see them in full.";
 
-const READ_DESC: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows under a `[path#TAG]` header; the header and line numbers are what `edit` anchors on. Images (png, jpeg, gif, webp, up to 5 MB) are returned as images you can see. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars.";
+const READ_DESC: &str = "Read a file or list a directory. Text files are returned as `N:TEXT` rows under a `[path#TAG]` header; the header and line numbers are what `edit` anchors on. Images (png, jpeg, gif, webp, up to 5 MB) are returned as images you can see. Default: first 300 lines. Selectors: `path:N` from line N, `path:N-M` range (with 1 line before, 3 after), `path:N+K` K lines from N, `path:-K` last K lines. Long lines are cut at 768 chars and cannot be edited until seen in full; add `:raw` (e.g. `path:N-M:raw`, or a list `path:3,10-12:raw`) to see them in full.";
 
 fn parse<A: DeserializeOwned>(name: &str, args: &Value) -> Result<A, Box<ToolOutput>> {
     serde_json::from_value(args.clone())

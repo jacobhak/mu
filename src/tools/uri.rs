@@ -117,8 +117,11 @@ impl Tools {
 /// Splits a trailing `:selector` (digits, `-`, `+`) off `p`.
 pub fn split_selector(p: &str) -> Option<(&str, &str)> {
     let (head, tail) = p.rsplit_once(':')?;
-    (!tail.is_empty() && !head.ends_with('/') && tail.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+'))
-        .then_some((head, tail))
+    (!tail.is_empty()
+        && !head.ends_with('/')
+        && tail.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | ','))
+        && tail.chars().any(|c| c.is_ascii_digit()))
+    .then_some((head, tail))
 }
 
 #[cfg(test)]

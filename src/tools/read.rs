@@ -32,24 +32,99 @@ fn select(sel: Option<&str>, total: usize) -> Option<(usize, usize)> {
     Some((n, n.saturating_add(DEFAULT_LINES - 1).min(total)))
 }
 
+/// A comma-separated list of `N` / `N-M` ranges, as the edit tool's unseen-lines message emits
+/// them. Unlike a lone `N` (300 lines from N), `N` here means exactly line N, and no context
+/// lines are added. Ranges are sorted and merged.
+fn parse_list(sel: &str, total: usize) -> Option<Vec<(usize, usize)>> {
+    sel.split(',')
+        .map(|p| {
+            let (n, m) = match p.split_once('-') {
+                Some((n, m)) => (n.parse::<usize>().ok()?, m.parse::<usize>().ok()?),
+                None => {
+                    let n = p.parse::<usize>().ok()?;
+                    (n, n)
+                }
+            };
+            (n > 0 && m >= n).then_some((n, m.min(total)))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|mut v| {
+            v.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+            for (s, e) in v {
+                match merged.last_mut() {
+                    Some(l) if s <= l.1.saturating_add(1) => l.1 = l.1.max(e),
+                    _ => merged.push((s, e)),
+                }
+            }
+            merged
+        })
+}
+
+/// Sorted line numbers as a selector list, runs collapsed to `N-M`, at most 20 items.
+fn runs(lines: &[usize]) -> String {
+    let mut items: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i;
+        while j + 1 < lines.len() && lines[j + 1] == lines[j] + 1 {
+            j += 1;
+        }
+        items.push(if j > i { format!("{}-{}", lines[i], lines[j]) } else { lines[i].to_string() });
+        i = j + 1;
+    }
+    let more = items.len() > 20;
+    items.truncate(20);
+    let mut s = items.join(",");
+    if more {
+        s.push_str(",…");
+    }
+    s
+}
+
 impl Tools {
     pub async fn read(&self, a: Args) -> ToolOutput {
         let mut sel = None;
         let mut authored = a.path.as_str();
+        let mut raw_mode = false;
         let first = self.resolve(&a.path).ok().filter(|r| r.path.exists());
+        // `:raw` (after a selector, or the reversed `path:raw:SEL`) asks for lines uncut by the column limit.
+        let (stem, raw) = match a.path.strip_suffix(":raw") {
+            Some(s) if !s.is_empty() => (s.to_string(), true),
+            _ => match a.path.rsplit_once(":raw:") {
+                Some((h, t))
+                    if !h.is_empty()
+                        && t.chars().any(|c| c.is_ascii_digit())
+                        && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | ',')) =>
+                {
+                    (format!("{h}:{t}"), true)
+                }
+                _ => (a.path.clone(), false),
+            },
+        };
         let res = match first {
             Some(r) => r,
-            None => match super::uri::split_selector(&a.path).and_then(|(p, s)| Some((self.resolve(p).ok()?, p, s))) {
-                Some((r, p, s)) if r.path.exists() => {
-                    sel = Some(s.to_string());
-                    authored = p;
+            None => {
+                let plain = if raw { self.resolve(&stem).ok().filter(|r| r.path.exists()) } else { None };
+                if let Some(r) = plain {
+                    raw_mode = true;
+                    authored = &stem;
                     r
+                } else {
+                    match super::uri::split_selector(&stem).and_then(|(p, s)| Some((self.resolve(p).ok()?, p, s))) {
+                        Some((r, p, s)) if r.path.exists() => {
+                            raw_mode = raw;
+                            sel = Some(s.to_string());
+                            authored = p;
+                            r
+                        }
+                        _ => match self.resolve(&a.path) {
+                            Ok(r) => r,
+                            Err(e) => return ToolOutput::err(e),
+                        },
+                    }
                 }
-                _ => match self.resolve(&a.path) {
-                    Ok(r) => r,
-                    Err(e) => return ToolOutput::err(e),
-                },
-            },
+            }
         };
         let abs = res.path;
         let disp = if res.scheme.is_some() { authored.to_string() } else { self.display(&abs) };
@@ -91,41 +166,109 @@ impl Tools {
         let key = canonical_key(&abs);
         let tag = self.edit_store.record(&key, &norm, None);
         let total = line_count(&norm);
-        let Some((start, end)) = select(sel.as_deref(), total) else {
+        let ranges = match sel.as_deref() {
+            Some(l) if l.contains(',') => parse_list(l, total),
+            s => select(s, total).map(|r| vec![r]),
+        };
+        let Some(ranges) = ranges else {
             return ToolOutput::err(format!("Invalid selector in {}", a.path));
         };
         if total == 0 {
             return ToolOutput::ok(format!("[{disp}#{tag}]\n(empty file)"));
         }
-        if start > total {
+        if ranges.iter().all(|r| r.0 > total) {
             return ToolOutput::err(format!("{disp} has only {total} lines"));
         }
         let mut out = format!("[{disp}#{tag}]\n");
         let mut seen = Vec::new();
+        let mut cut_lines: Vec<usize> = Vec::new();
         let mut bytes = 0;
-        let mut last = start - 1;
-        // Only the window is walked; lines before it are skipped and lines after it never visited.
-        let window = end.min(start + MAX_LINES - 1) + 1 - start;
-        for (k, line) in norm.lines().skip(start - 1).take(window).enumerate() {
-            let n = start + k;
-            let row = if line.chars().count() > MAX_COL {
-                format!("{n}:{}…", line.chars().take(MAX_COL).collect::<String>())
-            } else {
-                seen.push(n as u32);
-                format!("{n}:{line}")
-            };
-            if bytes + row.len() > MAX_BYTES && last >= start {
-                break;
+        let mut rows = 0;
+        let mut last = 0;
+        let mut capped_any = false;
+        // First unshown line (and its range) when the output limit ends a list early.
+        let mut stopped: Option<(usize, usize)> = None;
+        let multi = sel.as_deref().is_some_and(|s| s.contains(','));
+        'ranges: for (ri, &(start, end)) in ranges.iter().enumerate() {
+            if start > total {
+                continue;
             }
-            bytes += row.len() + 1;
-            out.push_str(&row);
-            out.push('\n');
-            last = n;
+            let mut separator = multi && bytes > 0;
+            last = start - 1;
+            // Only the window is walked; lines before it are skipped and lines after it never visited.
+            let window = end.min(start + MAX_LINES - 1) + 1 - start;
+            for (k, line) in norm.lines().skip(start - 1).take(window).enumerate() {
+                let n = start + k;
+                let mut capped = false;
+                let row = if raw_mode {
+                    let mut row = format!("{n}:{line}");
+                    if row.len() > MAX_BYTES {
+                        let mut cut = MAX_BYTES - '…'.len_utf8();
+                        while !row.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        row.truncate(cut);
+                        row.push('…');
+                        capped = true;
+                    }
+                    row
+                } else if line.chars().count() > MAX_COL {
+                    capped = true;
+                    format!("{n}:{}…", line.chars().take(MAX_COL).collect::<String>())
+                } else {
+                    format!("{n}:{line}")
+                };
+                // At least one row is always shown; after that the budget covers the whole read.
+                if bytes > 0 && (bytes + row.len() > MAX_BYTES || (multi && rows >= MAX_LINES)) {
+                    stopped = Some((ri, n));
+                    break 'ranges;
+                }
+                if capped {
+                    if raw_mode {
+                        capped_any = true;
+                    } else {
+                        cut_lines.push(n);
+                    }
+                } else {
+                    seen.push(n as u32);
+                }
+                if separator {
+                    out.push_str("...\n");
+                    bytes += 4;
+                    separator = false;
+                }
+                bytes += row.len() + 1;
+                rows += 1;
+                out.push_str(&row);
+                out.push('\n');
+                last = n;
+            }
         }
         out.pop();
         self.edit_store.record_seen_lines(&key, &tag, &seen);
-        if last < total {
-            let _ = write!(out, "\n\n[{} more lines in file. Use {disp}:{} to continue]", total - last, last + 1);
+        let sfx = if raw_mode { ":raw" } else { "" };
+        if let (true, Some((ri, n))) = (multi, stopped) {
+            let rest: Vec<String> = ranges[ri..]
+                .iter()
+                .enumerate()
+                .map(|(i, &(s, e))| {
+                    let s = if i == 0 { n } else { s };
+                    if s == e { s.to_string() } else { format!("{s}-{e}") }
+                })
+                .collect();
+            let _ = write!(out, "\n\n[Output limit reached. Use {disp}:{}{sfx} for the rest]", rest.join(","));
+        } else if !multi && last < total {
+            let _ = write!(out, "\n\n[{} more lines in file. Use {disp}:{}{sfx} to continue]", total - last, last + 1);
+        }
+        if raw_mode && capped_any {
+            let _ = write!(out, "\n[A line exceeded {MAX_BYTES} bytes and was cut]");
+        }
+        if !cut_lines.is_empty() {
+            let _ = write!(
+                out,
+                "\n[Lines cut at {MAX_COL} chars; use {disp}:{}:raw for their full content]",
+                runs(&cut_lines)
+            );
         }
         let mut result = ToolOutput::ok(out);
         result.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag: Some(tag), plan: false }));
@@ -211,6 +354,97 @@ mod tests {
         assert!(!o.text.contains("\n48:"));
         let o = t.read(Args { path: "p.txt:-2".into() }).await;
         assert!(o.text.contains("399:line399\n400:line400"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_selector_shows_long_lines_in_full() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let long = "x".repeat(1200);
+        std::fs::write(d.join("l.md"), format!("a\n{long}\nb\n")).unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "l.md".into() }).await;
+        assert!(!o.text.contains(&long));
+        // A plain read leaves the line unseen; the edit is refused and points at `:raw`.
+        let tag = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
+        let input = format!("[l.md#{tag}]\nPUT 2.=2:\n+short\n");
+        let o = t.edit(super::super::edit::Args::for_test(input.clone())).await;
+        assert!(o.is_error, "{}", o.text);
+        assert!(o.text.contains(":raw"), "{}", o.text);
+        for p in ["l.md:2:raw", "l.md:2-2:raw", "l.md:raw"] {
+            let o = t.read(Args { path: p.into() }).await;
+            assert!(!o.is_error, "{p}: {}", o.text);
+            assert!(o.text.contains(&format!("2:{long}")), "{p}");
+        }
+        // Same content, same tag: the raw read made the line seen.
+        let o = t.edit(super::super::edit::Args::for_test(input)).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert_eq!(std::fs::read_to_string(d.join("l.md")).unwrap(), "a\nshort\nb\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_list_from_the_edit_error_is_readable() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (l1, l2) = ("x".repeat(1200), "y".repeat(1300));
+        std::fs::write(d.join("l.md"), format!("a\n{l1}\nb\nc\nd\n{l2}\ne\n")).unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "l.md".into() }).await;
+        assert!(o.text.contains("l.md:2,6:raw"), "cut notice: {}", o.text);
+        let tag = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
+        let input = format!("[l.md#{tag}]\nPUT 2.=6:\n+short\n");
+        let o = t.edit(super::super::edit::Args::for_test(input.clone())).await;
+        assert!(o.is_error, "{}", o.text);
+        let from = o.text.find("Read `").expect(&o.text) + "Read `".len();
+        let path = &o.text[from..from + o.text[from..].find('`').unwrap()];
+        assert!(path.ends_with(":raw") && path.contains(','), "{path}");
+        let o = t.read(Args { path: path.to_string() }).await;
+        assert!(!o.is_error, "{path}: {}", o.text);
+        assert!(o.text.contains(&format!("2:{l1}\n")) && o.text.contains(&format!("6:{l2}")), "{}", o.text);
+        assert!(o.text.contains("\n...\n"), "{}", o.text);
+        let o = t.edit(super::super::edit::Args::for_test(input)).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert_eq!(std::fs::read_to_string(d.join("l.md")).unwrap(), "a\nshort\ne\n");
+        // Reversed alias.
+        let o = t.read(Args { path: "l.md:raw:2".into() }).await;
+        assert!(!o.is_error, "{}", o.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_reads_obey_the_byte_budget() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let body: String = ["a", "b", "c"].iter().map(|c| format!("{}\nsep\n", c.repeat(30_000))).collect();
+        std::fs::write(d.join("w.md"), body).unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "w.md:1,3,5:raw".into() }).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert!(o.text.contains("1:aaa") && !o.text.contains("3:bbb") && !o.text.contains("5:ccc"));
+        assert!(o.text.len() < MAX_BYTES + 512, "{}", o.text.len());
+        assert!(
+            o.text.contains("Output limit reached. Use w.md:3,5:raw for the rest"),
+            "{}",
+            &o.text[o.text.len() - 120..]
+        );
+        assert!(!o.text.contains("\n...\n"), "dangling separator");
+        // Neither unshown line was recorded as seen, so an edit touching them is refused.
+        let tag = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
+        let input = format!("[w.md#{tag}]\nPUT 5.=5:\n+x\n");
+        let e = t.edit(super::super::edit::Args::for_test(input)).await;
+        assert!(e.is_error, "{}", e.text);
+    }
+
+    #[test]
+    fn list_parsing_and_run_collapsing() {
+        assert_eq!(parse_list("5-8,2,3-6", 100), Some(vec![(2, 8)]));
+        assert_eq!(parse_list("9,2", 100), Some(vec![(2, 2), (9, 9)]));
+        assert_eq!(parse_list("3,,5", 100), None);
+        assert_eq!(runs(&[1, 2, 3, 7, 9, 10]), "1-3,7,9-10");
+        let many: Vec<usize> = (0..30).map(|i| i * 2 + 1).collect();
+        assert!(runs(&many).ends_with(",…"));
     }
 
     #[tokio::test(flavor = "current_thread")]
