@@ -428,7 +428,12 @@ impl SessionFile {
     }
 
     /// Flushes the file to disk. Called after entries that must survive a crash, and at turn end.
+    /// Unit tests skip it: `fdatasync` waits for the disk's journal and stalled a test for up to
+    /// two minutes on a busy disk, and nothing in-process can observe the difference.
     pub fn sync(&self) {
+        if cfg!(test) {
+            return;
+        }
         if let Some(f) = &self.file {
             let _ = f.sync_data();
         }

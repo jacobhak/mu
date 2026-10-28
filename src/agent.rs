@@ -1565,6 +1565,7 @@ mod loop_tests {
     }
 
     fn agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        crate::testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
         let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
         let providers =
