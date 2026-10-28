@@ -3,22 +3,57 @@ use crate::tools::summary;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// `-p`: runs one prompt to completion. Final assistant text goes to stdout, progress to stderr.
-/// Returns the process exit code.
+/// Each message on `stop` is a request to hand the session over: the first finishes the current
+/// tool and ends the turn at the next boundary, the second cancels the current step. A stopped run
+/// exits 3 and prints how to resume. Returns the process exit code.
 pub async fn print_mode(
     prompt: String,
     cmd: UnboundedSender<Command>,
     mut ev: UnboundedReceiver<AgentEvent>,
     inbox: crate::events::SharedInbox,
     max_cost: Option<f64>,
+    stop: UnboundedReceiver<()>,
 ) -> i32 {
+    let mut stop = Some(stop);
+    let _ = cmd.send(Command::EnsureSession);
     let _ = cmd.send(Command::Prompt(prompt.into()));
     let _ = cmd.send(Command::Exit);
     let (mut buf, mut last, mut code) = (String::new(), String::new(), 0);
-    let (mut cost, mut capped, mut exited) = (0.0f64, false, false);
-    while let Some(e) = ev.recv().await {
+    let (mut cost, mut capped, mut exited, mut errored) = (0.0f64, false, false, false);
+    let (mut session, mut stops) = (None::<String>, 0u32);
+    loop {
+        let e = tokio::select! {
+            e = ev.recv() => match e {
+                Some(e) => e,
+                None => break,
+            },
+            s = async {
+                match &mut stop {
+                    Some(r) => r.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if s.is_none() {
+                    stop = None;
+                    continue;
+                }
+                stops += 1;
+                if stops == 1 {
+                    inbox.borrow_mut().stop = true;
+                    eprintln!("mu: stop requested; finishing the current tool");
+                } else {
+                    inbox.borrow().cancel.cancel();
+                    eprintln!("mu: stopping now");
+                }
+                continue;
+            }
+        };
         match e {
             AgentEvent::Status(s) => {
                 cost = s.cost;
+                if let Some(p) = session_line(&mut session, s.session_path) {
+                    eprintln!("{p}");
+                }
                 if let Some(max) = max_cost.filter(|m| s.cost > *m)
                     && !capped
                 {
@@ -44,6 +79,7 @@ pub async fn print_mode(
                 eprintln!("{s}");
                 code = 1;
             }
+            AgentEvent::TurnFailed => errored = true,
             AgentEvent::TurnEnd { aborted: true } => code = 1,
             AgentEvent::Exit => {
                 exited = true;
@@ -62,10 +98,27 @@ pub async fn print_mode(
     if max_cost.is_some() {
         eprintln!("mu: cost ${cost:.4}");
     }
+    if stops > 0 && exited && !capped && !errored {
+        match &session {
+            Some(p) => eprintln!("mu: interrupted; resume with: mu --resume {p}"),
+            None => eprintln!("mu: interrupted"),
+        }
+        return 3;
+    }
     if code == 0 {
         println!("{}", last.trim_end());
     }
     code
+}
+
+/// The `session:` line for the first status that has a session path; `None` ever after.
+fn session_line(seen: &mut Option<String>, path: Option<String>) -> Option<String> {
+    if seen.is_some() {
+        return None;
+    }
+    let p = path?;
+    *seen = Some(p.clone());
+    Some(format!("session: {p}"))
 }
 
 /// Asked once when a turn ends without a result and the task has an output schema.
@@ -204,7 +257,93 @@ mod tests {
         let (etx, erx) = unbounded_channel();
         drop(etx);
         let inbox = crate::events::new_inbox();
-        assert_eq!(rt.block_on(print_mode("x".into(), ctx, erx, inbox, None)), 1);
+        let (_stx, srx) = unbounded_channel();
+        assert_eq!(rt.block_on(print_mode("x".into(), ctx, erx, inbox, None, srx)), 1);
+    }
+
+    fn status(cost: f64, path: Option<&str>) -> AgentEvent {
+        AgentEvent::Status(crate::events::StatusSnapshot {
+            cost,
+            session_path: path.map(String::from),
+            ..Default::default()
+        })
+    }
+
+    /// Runs `print_mode` over scripted events with `stops` stop requests already queued.
+    fn drive(events: Vec<AgentEvent>, stops: usize, max_cost: Option<f64>) -> (i32, bool) {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (ctx, mut crx) = unbounded_channel();
+        let (etx, erx) = unbounded_channel();
+        let (stx, srx) = unbounded_channel();
+        for _ in 0..stops {
+            stx.send(()).unwrap();
+        }
+        let inbox = crate::events::new_inbox();
+        let i2 = inbox.clone();
+        // Events are fed only after a yield, so the queued stops are handled first.
+        let code = rt.block_on(async {
+            let feeder = async {
+                tokio::task::yield_now().await;
+                for e in events {
+                    etx.send(e).unwrap();
+                    tokio::task::yield_now().await;
+                }
+            };
+            let (code, _) = tokio::join!(print_mode("x".into(), ctx, erx, i2, max_cost, srx), feeder);
+            code
+        });
+        assert!(matches!(crx.try_recv(), Ok(Command::EnsureSession)));
+        let stop = inbox.borrow().stop;
+        (code, stop)
+    }
+
+    #[test]
+    fn a_stopped_run_exits_3_and_sets_the_flag() {
+        let ev = vec![status(0.0, Some("/s/a_b.jsonl")), status(0.0, Some("/s/a_b.jsonl")), AgentEvent::Exit];
+        assert_eq!(drive(ev, 1, None), (3, true));
+    }
+
+    #[test]
+    fn no_stop_means_a_normal_exit() {
+        assert_eq!(drive(vec![status(0.0, Some("/s/a_b.jsonl")), AgentEvent::Exit], 0, None), (0, false));
+    }
+
+    #[test]
+    fn the_cost_cap_wins_over_a_stop() {
+        let ev = vec![status(5.0, Some("/s/a_b.jsonl")), AgentEvent::Exit];
+        assert_eq!(drive(ev, 1, Some(1.0)).0, 1);
+    }
+
+    #[test]
+    fn a_second_stop_cancels() {
+        let ev = vec![status(0.0, None), AgentEvent::TurnEnd { aborted: true }, AgentEvent::Exit];
+        assert_eq!(drive(ev, 2, None).0, 3);
+    }
+
+    #[test]
+    fn the_session_line_is_printed_once() {
+        let mut seen = None;
+        assert_eq!(session_line(&mut seen, None), None);
+        assert_eq!(session_line(&mut seen, Some("/s/a.jsonl".into())).as_deref(), Some("session: /s/a.jsonl"));
+        assert_eq!(session_line(&mut seen, Some("/s/a.jsonl".into())), None);
+        assert_eq!(session_line(&mut seen, Some("/s/b.jsonl".into())), None);
+    }
+
+    #[test]
+    fn a_non_fatal_error_does_not_suppress_exit_3() {
+        let ev = vec![
+            status(0.0, None),
+            AgentEvent::Error("[output truncated: max_tokens reached]".into()),
+            AgentEvent::Exit,
+        ];
+        assert_eq!(drive(ev, 1, None).0, 3);
+    }
+
+    #[test]
+    fn a_fatal_error_beats_a_stop() {
+        let ev =
+            vec![status(0.0, None), AgentEvent::Error("error: boom".into()), AgentEvent::TurnFailed, AgentEvent::Exit];
+        assert_eq!(drive(ev, 1, None).0, 1);
     }
 
     fn run(structured: bool, events: Vec<AgentEvent>) -> (serde_json::Value, i32, Vec<Command>) {

@@ -39,6 +39,8 @@ pub struct Inbox {
     pub steer: VecDeque<UserInput>,
     pub follow_up: VecDeque<UserInput>,
     pub cancel: CancellationToken,
+    /// Set by a headless run when asked to stop: finish at the next tool/turn boundary.
+    pub stop: bool,
 }
 
 pub type SharedInbox = Rc<RefCell<Inbox>>;
@@ -48,6 +50,7 @@ pub fn new_inbox() -> SharedInbox {
         steer: VecDeque::new(),
         follow_up: VecDeque::new(),
         cancel: CancellationToken::new(),
+        stop: false,
     }))
 }
 
@@ -203,6 +206,8 @@ pub enum AgentEvent {
     TurnEnd {
         aborted: bool,
     },
+    /// The turn ended on a fatal error (already reported as `Error`); the session is not at a clean boundary.
+    TurnFailed,
     Exit,
 }
 

@@ -12,6 +12,7 @@ const TITLE_SLOT_BYTES: usize = 256;
 pub struct SessionFile {
     pub path: PathBuf,
     file: Option<File>,
+    owner: Option<OwnerRecord>,
     leaf: Option<String>,
     ids: std::collections::HashSet<String>,
     /// Consecutive failed writes; persistence is given up at `MAX_WRITE_FAILURES`.
@@ -85,9 +86,178 @@ fn lock(file: &File, path: &Path) -> Result<()> {
             return Err(e).with_context(|| format!("lock {}", path.display()));
         }
         if std::time::Instant::now() >= deadline {
-            bail!("session is open in another mu process: {}", path.display());
+            let mut msg = format!("session is open in another mu process: {}", path.display());
+            if let Some(o) = live_record(path) {
+                msg.push_str(&format!(" (pid {})", o.pid));
+                if o.print_run {
+                    msg.push_str(&format!(
+                        ": a running `mu -p`; `mu take {}` stops it after its current step and opens it here",
+                        id_of(path)
+                    ));
+                }
+            }
+            bail!("{msg}");
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+static PRINT_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as a `mu -p` run. Call it only once the SIGUSR1 handler is installed and
+/// before any session is locked: an owner record that says `print_run` promises that
+/// `kill -USR1` stops the run instead of killing it.
+pub fn set_print_run() {
+    PRINT_RUN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Who has a session open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    Free,
+    Live {
+        pid: u32,
+        print_run: bool,
+        started: String,
+    },
+    /// Locked, but by a process that left no valid owner record.
+    Unknown,
+}
+
+struct LiveRecord {
+    pid: u32,
+    print_run: bool,
+    started: String,
+}
+
+fn record_path(session: &Path) -> Option<PathBuf> {
+    let id = id_of(session);
+    valid_id(&id).then(|| paths::mu_home().join("run").join(format!("{id}.json")))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+fn try_flock(file: &File, op: i32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the fd is valid for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The owner record of `session`, trusted only while the record's own lock is held (so the
+/// writer is alive) and while it names this very file.
+fn live_record(session: &Path) -> Option<LiveRecord> {
+    let rec = record_path(session)?;
+    let f = File::open(&rec).ok()?;
+    match try_flock(&f, libc::LOCK_SH) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        _ => return None,
+    }
+    let v: Value = serde_json::from_reader(&f).ok()?;
+    if !same_file(Path::new(v["session"].as_str()?), session) {
+        return None;
+    }
+    Some(LiveRecord {
+        pid: u32::try_from(v["pid"].as_u64()?).ok()?,
+        print_run: v["print_run"].as_bool()?,
+        started: v["started"].as_str()?.to_string(),
+    })
+}
+
+/// True when nobody holds the session's lock.
+pub fn is_free(session: &Path) -> bool {
+    match File::open(session) {
+        Ok(f) => try_flock(&f, libc::LOCK_SH).is_ok(),
+        Err(_) => true,
+    }
+}
+
+/// Looks up who has `session` open. Retries `Unknown` for `LOCK_RETRY`: a lock released a moment
+/// ago can look busy (forked fds), and a new owner writes its record just after locking.
+pub fn owner(session: &Path) -> Owner {
+    let deadline = std::time::Instant::now() + LOCK_RETRY;
+    loop {
+        if is_free(session) {
+            return Owner::Free;
+        }
+        if let Some(o) = live_record(session) {
+            return Owner::Live { pid: o.pid, print_run: o.print_run, started: o.started };
+        }
+        if std::time::Instant::now() >= deadline {
+            return Owner::Unknown;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// `$MU_HOME/run/<id>.json`, held under `flock` by the process that has the session open.
+/// Best effort: any failure just means no record.
+struct OwnerRecord {
+    path: PathBuf,
+    file: File,
+}
+
+impl OwnerRecord {
+    /// Call right after taking the session lock.
+    fn claim(session: &Path) -> Option<Self> {
+        Self::claim_as(session, PRINT_RUN.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn claim_as(session: &Path, print_run: bool) -> Option<Self> {
+        let path = record_path(session)?;
+        let dir = path.parent()?;
+        std::fs::create_dir_all(dir).ok()?;
+        let pid = std::process::id();
+        let tmp = dir.join(format!(".{}.{pid}.tmp", id_of(session)));
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp).ok()?;
+        let done = (|| -> std::io::Result<()> {
+            try_flock(&file, libc::LOCK_EX)?;
+            let abs = std::fs::canonicalize(session).unwrap_or_else(|_| session.to_path_buf());
+            let rec = json!({
+                "pid": pid,
+                "print_run": print_run,
+                "started": iso_ms(),
+                "session": abs.to_string_lossy(),
+            });
+            file.write_all(rec.to_string().as_bytes())?;
+            // The lock follows the inode through the rename.
+            std::fs::rename(&tmp, &path)
+        })();
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        Some(Self { path, file })
+    }
+}
+
+impl Drop for OwnerRecord {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        // Only unlink our own record: the name may have been taken over by another owner.
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(&self.path), self.file.metadata())
+            && a.dev() == b.dev()
+            && a.ino() == b.ino()
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for SessionFile {
+    fn drop(&mut self) {
+        // Unlink the record before the session lock is released.
+        self.owner = None;
     }
 }
 
@@ -174,10 +344,12 @@ impl SessionFile {
         if let Some(p) = parent_session {
             header["parentSession"] = json!(p.to_string_lossy());
         }
+        let owner = OwnerRecord::claim(&path);
         file.write_all(format!("{}{header}\n", title_slot("", None)).as_bytes())?;
         Ok(Self {
             path,
             file: Some(file),
+            owner,
             leaf: None,
             ids: Default::default(),
             failures: 0,
@@ -190,6 +362,7 @@ impl SessionFile {
     pub fn open_append(path: &Path) -> Result<Self> {
         let mut file = OpenOptions::new().append(true).read(true).open(path)?;
         lock(&file, path)?;
+        let owner = OwnerRecord::claim(path);
         let (_, leaf, ids) = parse(path)?;
         // A crash can leave the last line unterminated; the next entry must not join it.
         let torn = {
@@ -202,7 +375,7 @@ impl SessionFile {
             }
             last[0] != b'\n'
         };
-        Ok(Self { path: path.into(), file: Some(file), leaf, ids, failures: 0, torn, on_error: None })
+        Ok(Self { path: path.into(), file: Some(file), owner, leaf, ids, failures: 0, torn, on_error: None })
     }
 
     pub fn id(&self) -> String {
@@ -236,6 +409,7 @@ impl SessionFile {
             self.torn = true;
             self.failures += 1;
             if self.failures >= MAX_WRITE_FAILURES {
+                self.owner = None;
                 self.file = None;
                 self.report(format!(
                     "session write failed {} times in a row ({err}); this session is no longer saved",
@@ -615,6 +789,11 @@ fn read_info(path: PathBuf) -> Option<SessionInfo> {
     Some(SessionInfo { path, title, first_prompt, modified, cwd })
 }
 
+/// Working directory recorded in a session's header.
+pub fn header_cwd(path: &Path) -> Option<PathBuf> {
+    read_info(path.to_path_buf())?.cwd
+}
+
 /// The newest `limit` sessions (of `only_cwd`'s project, or of every project), newest first.
 /// File names start with a timestamp, so they are sorted without opening anything; only the
 /// files that make the cut are read.
@@ -796,6 +975,39 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_session_loads_without_warnings() {
+        home();
+        let mut s = SessionFile::create(Path::new("/opt/stopped"), None).unwrap();
+        s.message(&Message::user("run it"));
+        let call =
+            |id: &str| crate::message::Block::ToolCall { id: id.into(), name: "bash".into(), arguments: json!({}) };
+        s.message(&Message::Assistant {
+            content: vec![call("t1"), call("t2")],
+            api: "a".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            usage: Default::default(),
+            stop_reason: crate::message::StopReason::ToolUse,
+            timestamp: 0,
+            response_id: None,
+            error_message: None,
+        });
+        for (id, text) in [("t1", "done"), ("t2", "Skipped: the run was stopped so the user can take over")] {
+            s.message(&Message::ToolResult {
+                tool_call_id: id.into(),
+                tool_name: "bash".into(),
+                content: vec![crate::message::Block::text(text)],
+                is_error: id == "t2",
+                timestamp: 0,
+                details: None,
+            });
+        }
+        let l = load(&s.path).unwrap();
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!(l.messages.len(), 4);
+    }
+
+    #[test]
     fn id_validation_and_lookup() {
         assert!(valid_id("0198-abc"));
         for bad in ["", ".", "..", "a/b", "a.b", "a_b", "a b"] {
@@ -844,9 +1056,85 @@ mod tests {
         let s = SessionFile::create(Path::new("/opt/lock"), None).unwrap();
         let e = SessionFile::open_append(&s.path).err().unwrap().to_string();
         assert!(e.contains("another mu process"), "{e}");
+        assert!(e.contains(&format!("pid {}", std::process::id())), "{e}");
         let path = s.path.clone();
         drop(s);
         assert!(SessionFile::open_append(&path).is_ok());
+    }
+
+    fn record_of(path: &Path) -> PathBuf {
+        home().join("run").join(format!("{}.json", id_of(path)))
+    }
+
+    #[test]
+    fn the_owner_is_recorded_while_a_session_is_open() {
+        home();
+        let s = SessionFile::create(Path::new("/opt/owner"), None).unwrap();
+        let path = s.path.clone();
+        assert!(record_of(&path).exists());
+        match owner(&path) {
+            Owner::Live { pid, .. } => assert_eq!(pid, std::process::id()),
+            o => panic!("{o:?}"),
+        }
+        drop(s);
+        assert_eq!(owner(&path), Owner::Free);
+        assert!(!record_of(&path).exists());
+        let s = SessionFile::open_append(&path).unwrap();
+        assert!(record_of(&path).exists());
+        drop(s);
+        assert!(!record_of(&path).exists());
+    }
+
+    #[test]
+    fn a_stale_record_is_never_trusted() {
+        home();
+        let d = tmp("stale");
+        let path = d.join("x_stale-one.jsonl");
+        std::fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"stale-one\"}\n").unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::create_dir_all(home().join("run")).unwrap();
+        let rec = json!({"pid": child.id(), "print_run": true, "started": iso_ms(), "session": path.to_string_lossy()});
+        std::fs::write(record_of(&path), rec.to_string()).unwrap();
+        // Someone holds the session without leaving a live record.
+        let held = File::open(&path).unwrap();
+        try_flock(&held, libc::LOCK_EX).unwrap();
+        assert_eq!(owner(&path), Owner::Unknown);
+        let e = SessionFile::open_append(&path).err().unwrap().to_string();
+        assert!(e.contains("another mu process") && !e.contains("pid"), "{e}");
+        assert!(child.try_wait().unwrap().is_none(), "the pid in a stale record is never signalled");
+        drop(held);
+        assert_eq!(owner(&path), Owner::Free);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_record_for_another_file_with_the_same_id_is_ignored() {
+        home();
+        let s = SessionFile::create(Path::new("/opt/same-id"), None).unwrap();
+        let d = tmp("copy");
+        let copy = d.join(s.path.file_name().unwrap());
+        std::fs::copy(&s.path, &copy).unwrap();
+        let held = File::open(&copy).unwrap();
+        try_flock(&held, libc::LOCK_EX).unwrap();
+        // The live record names `s.path`, not the copy.
+        assert_eq!(owner(&copy), Owner::Unknown);
+        assert!(matches!(owner(&s.path), Owner::Live { .. }));
+    }
+
+    #[test]
+    fn print_run_is_reported() {
+        home();
+        let d = tmp("print-run");
+        let path = d.join("x_print-run.jsonl");
+        std::fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"print-run\"}\n").unwrap();
+        let held = File::open(&path).unwrap();
+        try_flock(&held, libc::LOCK_EX).unwrap();
+        // No process-global flag: other tests create sessions in parallel.
+        let _rec = OwnerRecord::claim_as(&path, true).unwrap();
+        assert!(matches!(owner(&path), Owner::Live { print_run: true, .. }));
+        let e = SessionFile::open_append(&path).err().unwrap().to_string();
+        assert!(e.contains("mu take"), "{e}");
     }
 
     /// Reopen-after-drop loop, optionally racing a thread that spawns children. Run with

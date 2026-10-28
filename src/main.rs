@@ -24,6 +24,7 @@ mod quota;
 mod review;
 mod schema;
 mod session;
+mod take;
 #[cfg(test)]
 mod testutil;
 mod tools;
@@ -108,6 +109,11 @@ enum Sub {
         /// Print markdown instead of JSON.
         #[arg(long)]
         markdown: bool,
+    },
+    /// Take over a running `mu -p` session: stop it after its current step, then resume it here.
+    Take {
+        /// Session file or id (prefix).
+        session: PathBuf,
     },
 }
 
@@ -222,6 +228,9 @@ fn run() -> Result<i32> {
     }
     if let Some(t) = &cli.theme {
         unsafe { std::env::set_var("MU_THEME", t) };
+    }
+    if let Some(Sub::Take { session }) = cli.command {
+        return take::run(&session, &std::env::current_dir()?);
     }
     if let Some(Sub::Review { base, plan, focus, out, markdown }) = cli.command {
         return Ok(review::run_cli(review::CliOpts { base, plan, focus, out, markdown }, &std::env::current_dir()?));
@@ -354,6 +363,26 @@ fn run() -> Result<i32> {
     let local = tokio::task::LocalSet::new();
     let code = local.block_on(&rt, async move {
         let notice_rx = notice_rx;
+        // Before the agent task can create or lock a session: an owner record that says
+        // `print_run` promises SIGUSR1 stops the run instead of killing it.
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        if cli.print.is_some() && task_payload.is_none() {
+            let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("mu: cannot install the SIGUSR1 handler: {e}");
+                    return 1;
+                }
+            };
+            session::set_print_run();
+            tokio::task::spawn_local(async move {
+                while sig.recv().await.is_some() {
+                    if stop_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
         let (print, max_cost) = (cli.print, cli.max_cost);
         let mut printer = None;
@@ -368,7 +397,7 @@ fn run() -> Result<i32> {
             }
             (Some(prompt), None) => {
                 printer = Some(spawn_notice_printer(notice_rx));
-                headless::print_mode(prompt, cmd_tx, ev_rx, inbox.clone(), max_cost).await
+                headless::print_mode(prompt, cmd_tx, ev_rx, inbox.clone(), max_cost, stop_rx).await
             }
             (None, None) => {
                 tui::app::run(tui::app::AppInit {

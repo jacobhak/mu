@@ -131,6 +131,8 @@ enum Flow {
     Done,
     Aborted,
     Failed,
+    /// A headless run was asked to stop: ended at a boundary, session paired and resumable.
+    Stopped,
 }
 
 async fn recv_opt(rx: &mut Option<UnboundedReceiver<()>>) -> Option<()> {
@@ -1181,7 +1183,13 @@ impl Agent {
                     break;
                 }
                 Flow::Failed => {
+                    self.emit(AgentEvent::TurnFailed);
                     self.exec_plan = None;
+                    break;
+                }
+                Flow::Stopped => {
+                    self.exec_plan = None;
+                    self.turn_end_hook().await;
                     break;
                 }
                 Flow::Done => {}
@@ -1376,6 +1384,9 @@ impl Agent {
                 if steered || delivered {
                     continue;
                 }
+                if self.inbox.borrow().stop {
+                    return Flow::Stopped;
+                }
                 // Stop reminder: the model is about to finish with open todo items. Nudge it to
                 // update the list or finish the work, at most twice per run so it cannot loop.
                 let open = if stop == StopReason::Stop && todo_nags < 2 { self.tools.todo_open() } else { Vec::new() };
@@ -1392,6 +1403,13 @@ impl Agent {
             }
             let mut skip: Option<&str> = None;
             for (id, name, args) in calls {
+                if skip.is_none() {
+                    if cancel.is_cancelled() {
+                        skip = Some("Tool call aborted by user");
+                    } else if self.inbox.borrow().stop {
+                        skip = Some("Skipped: the run was stopped so the user can take over");
+                    }
+                }
                 if let Some(reason) = skip {
                     let out = ToolOutput::err(reason);
                     self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
@@ -1407,12 +1425,17 @@ impl Agent {
                 self.push_result(&id, &name, &out);
                 if cancel.is_cancelled() {
                     skip = Some("Tool call aborted by user");
+                } else if self.inbox.borrow().stop {
+                    skip = Some("Skipped: the run was stopped so the user can take over");
                 } else if !self.inbox.borrow().steer.is_empty() {
                     skip = Some("Skipped: the user sent a new message");
                 }
             }
             if cancel.is_cancelled() {
                 return Flow::Aborted;
+            }
+            if self.inbox.borrow().stop {
+                return Flow::Stopped;
             }
             if self.exec_plan.is_some() {
                 return Flow::Done;
@@ -1718,6 +1741,66 @@ mod loop_tests {
         });
     }
 
+    fn results(a: &Agent) -> Vec<(bool, String)> {
+        a.messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { is_error, content, .. } => Some((*is_error, format!("{content:?}"))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stop_skips_the_rest_of_the_batch_and_ends_the_turn() {
+        run(async {
+            let script = vec![
+                Ok(assistant(vec![call("t1", "__panic"), call("t2", "__panic")], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+            ];
+            let (mut a, mut rx) = agent(script);
+            a.inbox.borrow_mut().stop = true;
+            a.turn(Some("go".to_string().into())).await;
+            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            let r = results(&a);
+            assert_eq!(r.len(), 2);
+            assert!(r.iter().all(|x| x.0 && x.1.contains("the run was stopped")), "{r:?}");
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
+            let mut ended = None;
+            while let Ok(e) = rx.try_recv() {
+                if let AgentEvent::TurnEnd { aborted } = e {
+                    ended = Some(aborted);
+                }
+            }
+            assert_eq!(ended, Some(false));
+        });
+    }
+
+    #[test]
+    fn stop_during_a_tool_lets_it_finish_and_skips_the_next() {
+        run(async {
+            let sleep =
+                Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": "sleep 1"}) };
+            let script = vec![
+                Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+            ];
+            let (mut a, _rx) = agent(script);
+            let inbox = a.inbox.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                inbox.borrow_mut().stop = true;
+            });
+            a.turn(Some("go".to_string().into())).await;
+            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            let r = results(&a);
+            assert_eq!(r.len(), 2);
+            assert!(!r[0].0, "the running tool finished: {:?}", r[0]);
+            assert!(r[1].0 && r[1].1.contains("the run was stopped"), "{:?}", r[1]);
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
+        });
+    }
+
     #[test]
     fn structured_subagent_fails_instead_of_hanging_when_the_session_cannot_be_created() {
         let home = crate::testutil::home();
@@ -1733,6 +1816,43 @@ mod loop_tests {
             let r = tokio::time::timeout(std::time::Duration::from_secs(10), drive_subagent(a, rx, true)).await;
             let (r, code) = r.expect("the run hung");
             assert_eq!((code, &r["isError"]), (1, &true.into()), "{r}");
+        });
+    }
+
+    #[test]
+    fn stop_with_a_plain_reply_ends_normally() {
+        run(async {
+            let (mut a, _rx) = agent(vec![Ok(assistant(vec![Block::text("hi")], StopReason::Stop))]);
+            a.inbox.borrow_mut().stop = true;
+            a.turn(Some("go".to_string().into())).await;
+            assert!(matches!(a.messages.last(), Some(Message::Assistant { .. })));
+            assert!(a.providers.scripted.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn stop_plus_cancel_is_an_abort_and_stays_paired() {
+        run(async {
+            let sleep =
+                Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": "sleep 5"}) };
+            let script = vec![Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse))];
+            let (mut a, mut rx) = agent(script);
+            let inbox = a.inbox.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                inbox.borrow_mut().stop = true;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                inbox.borrow().cancel.cancel();
+            });
+            a.turn(Some("go".to_string().into())).await;
+            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            let mut ended = None;
+            while let Ok(e) = rx.try_recv() {
+                if let AgentEvent::TurnEnd { aborted } = e {
+                    ended = Some(aborted);
+                }
+            }
+            assert_eq!(ended, Some(true));
         });
     }
 

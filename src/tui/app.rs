@@ -554,7 +554,7 @@ impl App {
                     self.composer.restore(queued);
                 }
             }
-            AgentEvent::Exit => {}
+            AgentEvent::Exit | AgentEvent::TurnFailed => {}
         }
     }
 
