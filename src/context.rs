@@ -33,7 +33,36 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     }
     near_first.reverse();
     near_first.extend(non_empty(&agent_dir.join("AGENTS.md")));
+    for f in &mut near_first {
+        f.content = crate::at_imports::expand(&f.content, &f.path, home, &mut |w| WARNINGS.with(|x| x.borrow_mut().push(w)));
+    }
     near_first
+}
+
+/// cwd-relative paths of AGENTS.md files 1–4 directories below cwd.
+fn nested_agents_md(cwd: &Path) -> Vec<String> {
+    use pi_walker::{WalkOptions, WalkRequest};
+    use std::time::{Duration, Instant};
+    let opts = WalkOptions { max_depth: 4, skip_node_modules: true, ..crate::tools::grep::walk_options() };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let dirs = WalkRequest::from_options(cwd, opts)
+        .collect_dirs_with_heartbeat(|| if Instant::now() < deadline { Ok(()) } else { Err("timed out after 2s") });
+    match dirs {
+        Err(e) => {
+            WARNINGS.with(|w| w.borrow_mut().push(format!("{}: nested AGENTS.md scan failed: {e:?}", cwd.display())));
+            vec![]
+        }
+        Ok(dirs) => {
+            let mut v: Vec<String> = dirs
+                .into_iter()
+                .filter(|d| cwd.join(&d.path).join("AGENTS.md").is_file())
+                .map(|d| format!("{}/AGENTS.md", d.path))
+                .collect();
+            v.sort();
+            v.truncate(200);
+            v
+        }
+    }
 }
 
 /// Directories from `cwd` up to (excluding) `home`, skipping dot-named ancestors (never `cwd` itself).
@@ -359,6 +388,8 @@ pub struct Context {
     /// Problems found while loading (bad front matter); shown as notices at startup.
     pub warnings: Vec<String>,
     pub files: Vec<ContextFile>,
+    /// cwd-relative paths of AGENTS.md files 1–4 directories below cwd, listed in `<dir-context>`.
+    pub nested: Vec<String>,
     pub rules: Vec<String>,
     pub skills: Vec<Skill>,
     pub commands: Vec<SlashCommand>,
@@ -377,11 +408,12 @@ impl Context {
         }
         WARNINGS.with(|w| w.borrow_mut().clear());
         let files = load(cwd, home, agent_dir);
+        let nested = nested_agents_md(cwd);
         let skills = discover_skills(cwd, home, agent_dir, claude_user);
         let commands = discover_commands(cwd, home, agent_dir);
         let agents = discover_agents(cwd, home, agent_dir);
         let warnings = WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
-        Self { warnings, files, rules, skills, commands, agents }
+        Self { warnings, files, nested, rules, skills, commands, agents }
     }
 
     /// `/skill:<name> [args]` prompt text.
@@ -470,6 +502,13 @@ When the `task` tool is available, SHOULD use it instead of doing everything inl
             s.push_str(&format!("<file path=\"{}\">\n{}\n</file>\n", f.path.display(), f.content.trim_end()));
         }
         s.push_str("</repo-rules>\n");
+    }
+    if !i.ctx.nested.is_empty() {
+        s.push_str("\n<dir-context>\nSome directories may have rules; deeper rules override higher ones.\nBefore changes in these directories, MUST read:\n");
+        for p in &i.ctx.nested {
+            s.push_str(&format!("- {p}\n"));
+        }
+        s.push_str("</dir-context>\n");
     }
     for r in &i.ctx.rules {
         s.push_str(&format!("\n<rules>\n{r}\n</rules>\n"));
@@ -614,6 +653,7 @@ mod tests {
     fn system_prompt_includes_agent_block() {
         let ctx = Context {
             warnings: vec![],
+            nested: vec![],
             files: vec![],
             rules: vec![],
             skills: vec![],
@@ -632,6 +672,58 @@ mod tests {
             mcp_instructions: None,
         });
         assert!(sp.contains("<agent name=\"x\">\nDo it.\n</agent>"));
+    }
+
+    #[test]
+    fn at_import_in_profile_agents_md() {
+        let root = std::env::temp_dir().join(format!("mu-ctx-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        let agent = root.join("agent");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::create_dir_all(home.join(".omp/agent")).unwrap();
+        fs::write(agent.join("AGENTS.md"), "@~/.omp/agent/global-instructions.md\n").unwrap();
+        fs::write(home.join(".omp/agent/global-instructions.md"), "# Shared\nrule").unwrap();
+        let files = load(&proj, &home, &agent);
+        assert_eq!(files.last().unwrap().content.trim_end(), "# Shared\nrule");
+    }
+
+    #[test]
+    fn import_warnings_reach_context() {
+        let root = std::env::temp_dir().join(format!("mu-ctx-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("AGENTS.md"), "@./missing.md").unwrap();
+        let ctx = Context::load_all(&proj, &home, &root.join("agent"), false);
+        assert_eq!(ctx.warnings.len(), 1, "{:?}", ctx.warnings);
+        assert!(ctx.warnings[0].contains("cannot read @-import"));
+    }
+
+    #[test]
+    fn nested_agents_md_listed() {
+        let root = std::env::temp_dir().join(format!("mu-ctx-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        for d in ["", "a", "a/b/c/d", "a/b/c/d/e", ".hidden", "node_modules/x"] {
+            let dir = proj.join(d);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("AGENTS.md"), "x").unwrap();
+        }
+        let ctx = Context::load_all(&proj, &home, &root.join("agent"), false);
+        assert_eq!(ctx.nested, ["a/AGENTS.md", "a/b/c/d/AGENTS.md"]);
+        let sp = system_prompt(&PromptInput {
+            model: "m",
+            cwd: &proj,
+            ctx: &ctx,
+            plan: None,
+            subagent: false,
+            agent_prompt: None,
+            plugin_ctx: &Default::default(),
+            mcp_instructions: None,
+        });
+        assert!(sp.contains("<dir-context>\nSome directories may have rules; deeper rules override higher ones.\nBefore changes in these directories, MUST read:\n- a/AGENTS.md\n- a/b/c/d/AGENTS.md\n</dir-context>"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod acp;
 mod agent;
+mod at_imports;
 mod compaction;
 mod config;
 mod context;

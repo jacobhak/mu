@@ -1613,6 +1613,7 @@ mod loop_tests {
         let ctx = Rc::new(crate::context::Context {
             warnings: vec![],
             files: vec![],
+            nested: vec![],
             rules: vec![],
             skills: vec![],
             commands: vec![],
