@@ -38,9 +38,7 @@ flowchart LR
     loop --- host[plugin host]
   end
   host <-->|JSON-RPC over stdio, started on use| gw[gateway: omp auth-gateway]
-  host <-->|JSON-RPC| lsp[lsp]
   host <-->|JSON-RPC| web[web]
-  host <-->|JSON-RPC| ast[ast]
   host <-->|JSON-RPC| mem[memory]
   host <-->|MCP| mcp[any MCP server]
   loop -->|spawns mu --headless| sub[subagent]
@@ -73,15 +71,15 @@ Stream rules stay in the core because they run on every streamed token; a proces
   and advertises their tools to the model **without starting the plugin process**.
 
   ```toml
-  name = "lsp"
-  command = ["mu-lsp"]
-  lifetime = "session"            # session | idle:<duration> | call
-  hooks = ["tool_result:write", "tool_result:edit"]
+  name = "web"
+  command = ["mu-web"]
+  lifetime = "idle:10m"           # session | idle:<duration> | call
+  hooks = []                      # e.g. ["tool_result:write"]
 
   [[tools]]
-  name = "lsp"
-  description = "Definitions, references, rename, diagnostics"
-  schema = "schemas/lsp.json"
+  name = "fetch"
+  description = "Fetch a URL and return it as markdown"
+  schema = "schemas/fetch.json"
   ```
 
 - **Activation:** a plugin process starts on the first call to one of its tools or commands, or the first
@@ -99,7 +97,7 @@ Stream rules stay in the core because they run on every streamed token; a proces
   is 0). MCP results above 50 KB keep their head and spill the full text to `artifact://`; native plugins size
   their own output.
 - **Lifetimes:** `session` (until the session ends), `idle:<duration>` (exit after inactivity), `call` (exit
-  after each call). Language servers run for the whole session.
+  after each call).
 
 ### Hooks
 
@@ -108,7 +106,7 @@ Stream rules stay in the core because they run on every streamed token; a proces
 | `session_start` | Session opens or resumes | Return context to inject | memory (recall) |
 | `prompt_submit` | User sends a prompt | Return context to inject | memory |
 | `tool_call` | Before a tool runs | Block, rewrite arguments | approval-style plugins |
-| `tool_result:<tool>` | After a tool runs | Append context to the result | lsp (diagnostics after write/edit) |
+| `tool_result:<tool>` | After a tool runs | Append context to the result | result-annotating plugins |
 | `turn_end` | Assistant turn completes | Observe the turn | memory (retain), advisor |
 | `pre_compaction` | Before compaction | Return context to preserve | memory |
 | `session_end` | Session closes | Flush state | memory |
@@ -133,9 +131,7 @@ All omp features outside the core become first-party plugins that load on use.
 |---|---|---|
 | gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider, OAuth logins, account pools, quota. See Providers. |
 | mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It keeps TLS and HTTP out of the core: it is built as a separate Cargo project outside the workspace (feature unification would otherwise give the core rustls), and `scripts/build-mcp-http.sh check` fails if `cargo tree -p mu` ever shows rustls. It answers any `core/*` request a server sends with -32601. |
-| lsp | yes | Rust; spawns language servers per workspace, lifetime `session` |
 | web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway is verified in M4. |
-| ast | yes | Rust; `ast_grep` / `ast_edit` on `pi-ast`. Grammars live here, keeping the core binary small. |
 | memory | yes | Day one: wraps the `mnemopi` CLI against the user's existing store (a Bun process only during recall/retain). Later: Rust port on the same SQLite schema with `fastembed-rs`. |
 | debugger, eval, github, browser, ssh | later | — |
 | advisor, commit messages, export/share, usage display | later | Need `core/complete` / `turn_end` |
@@ -215,7 +211,7 @@ measurements.
 | M1 | Agent loop, Anthropic + OpenAI-compatible providers, built-in tools, sessions, terminal UI | Usable for a real task with an API key; `incidental` constant across turns |
 | M2 | Context files, skills, rules (sticky + stream), slash commands, MCP client, compaction | An omp project's files work unchanged |
 | M3 | Plugin host, manifests, lifetimes, hooks; gateway plugin | Any omp provider usable with streaming; broker/omp token-refresh interaction checked |
-| M4 | lsp, web, ast, memory plugins | Day-one feature set complete |
+| M4 | web, memory plugins | Day-one feature set complete |
 | M5 | Subagents | Parallel headless tasks with typed results |
 
 ## Appendix: measurement method
