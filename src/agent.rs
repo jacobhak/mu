@@ -1,3 +1,4 @@
+use crate::ask_nudge;
 use crate::compaction::Outcome;
 use crate::context::{self, Context, PromptInput};
 use crate::cost::CostLedger;
@@ -231,6 +232,11 @@ pub(crate) fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
     }
 }
 
+/// A reply that is only `.` (declining a reminder): kept in the session, never rendered.
+fn is_dismissal(m: &Message) -> bool {
+    matches!(m, Message::Assistant { content, .. } if tool_calls(m).is_empty() && text_of(content).trim() == ".")
+}
+
 impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let tools = Tools::new(i.cwd.clone(), i.plugins.clone());
@@ -388,6 +394,7 @@ impl Agent {
             ctx: &self.ctx,
             plan: self.plan.as_ref().map(|_| PLAN_PROMPT),
             subagent: self.subagent,
+            ask: self.policy().permits("ask"),
             agent_prompt: self.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),
@@ -403,7 +410,15 @@ impl Agent {
     pub fn system_tokens(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (&self.model.id, self.plan.is_some(), &self.plugin_ctx, &self.agent_prompt, self.subagent).hash(&mut h);
+        (
+            &self.model.id,
+            self.plan.is_some(),
+            &self.plugin_ctx,
+            &self.agent_prompt,
+            self.subagent,
+            self.policy().permits("ask"),
+        )
+            .hash(&mut h);
         self.plugins.mcp_instructions().hash(&mut h);
         let key = h.finish();
         let mut memo = self.system_memo.borrow_mut();
@@ -661,10 +676,17 @@ impl Agent {
     /// Loads `path`, applying its model/thinking unless pinned by the command line.
     /// Re-emits the loaded conversation as UI events so a resumed session shows its history.
     fn replay_history(&self) {
+        let mut after_reminder = false;
         for m in &self.messages {
+            let reminded = std::mem::replace(
+                &mut after_reminder,
+                matches!(m, Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content))),
+            );
             match m {
                 Message::User { synthetic: true, .. } => self.notice("▸ Plan approved"),
+                Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content)) => {}
                 Message::User { content, .. } => self.emit(AgentEvent::UserPrompt(text_of(content))),
+                Message::Assistant { .. } if reminded && is_dismissal(m) => {}
                 Message::Assistant { content, .. } => {
                     for b in content {
                         match b {
@@ -1643,6 +1665,23 @@ impl Agent {
         true
     }
 
+    /// The end-of-turn `ask` reminder may fire: `ask` is offered to this run, and the current user
+    /// turn has neither called `ask` nor been reminded yet.
+    fn ask_nudge_due(&self) -> bool {
+        if !self.providers.cfg.mu.ask.nudge || self.subagent || !self.policy().permits("ask") {
+            return false;
+        }
+        for m in self.messages.iter().rev() {
+            match m {
+                Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content)) => return false,
+                Message::User { .. } => return true,
+                Message::Assistant { .. } if tool_calls(m).iter().any(|(_, name, _)| name == "ask") => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
     async fn run_loop(&mut self, cancel: &CancellationToken) -> Flow {
         let mut first = true;
         let mut todo_nags = 0u8;
@@ -1669,6 +1708,9 @@ impl Agent {
             // Every tool call in the history has its result and vice versa (`to_wire` also repairs).
             debug_assert!(crate::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
             let defs = self.tool_defs();
+            // Held until the reply ends: a reply that turns out to be a dismissal is never shown.
+            let answering_reminder = matches!(self.messages.last(), Some(Message::User { content, .. }) if ask_nudge::is_reminder(&text_of(content)));
+            let mut held = Vec::new();
             let reply = {
                 let req = Request {
                     model: &self.model,
@@ -1680,7 +1722,7 @@ impl Agent {
                 };
                 let tx = self.events.clone();
                 let mut ev = |e: StreamEvent| {
-                    let _ = tx.send(match e {
+                    let e = match e {
                         StreamEvent::Text(t) => AgentEvent::Text(t.into()),
                         StreamEvent::Thinking(t) => AgentEvent::Thinking(t.into()),
                         StreamEvent::ToolCallStart { id, name } => {
@@ -1690,10 +1732,21 @@ impl Agent {
                             AgentEvent::ToolCallDelta { id: id.into(), json: json.into() }
                         }
                         StreamEvent::Retry { attempt, delay, reason } => AgentEvent::Retry { attempt, delay, reason },
-                    });
+                    };
+                    if answering_reminder {
+                        held.push(e);
+                    } else {
+                        let _ = tx.send(e);
+                    }
                 };
                 self.providers.stream(&req, cancel, &mut ev).await
             };
+            let dismissed = answering_reminder && matches!(&reply, Ok(m) if is_dismissal(m));
+            if !dismissed {
+                for e in held {
+                    self.emit(e);
+                }
+            }
             let msg = match reply {
                 Ok(m) => m,
                 Err(ProviderError::Aborted) => return Flow::Aborted,
@@ -1724,12 +1777,17 @@ impl Agent {
                     return Flow::Failed;
                 }
             };
-            self.emit(AgentEvent::BlockEnd);
+            if !dismissed {
+                self.emit(AgentEvent::BlockEnd);
+            }
             let calls = tool_calls(&msg);
             let stop = match &msg {
                 Message::Assistant { stop_reason, .. } => *stop_reason,
                 _ => StopReason::Stop,
             };
+            let prose_question = stop == StopReason::Stop
+                && calls.is_empty()
+                && matches!(&msg, Message::Assistant { content, .. } if ask_nudge::asks_in_prose(&text_of(content)));
             self.push(msg);
             self.request_title();
             // Context, cost and quota move with every response, not just at turn end.
@@ -1774,6 +1832,11 @@ impl Agent {
                         "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work and keep the list current with `todo` (`done`/`start`, in the same response as your next action). If an item is finished or no longer needed, mark it `done` or `drop` it; if you are waiting on the user, `block` it. Do not reply to this reminder.\n</system-reminder>",
                         open.len()
                     )));
+                    continue;
+                }
+                // Ask reminder: the turn ends with a decision question in prose. Once per user turn.
+                if prose_question && self.ask_nudge_due() {
+                    self.push(Message::user(ask_nudge::REMINDER));
                     continue;
                 }
                 return Flow::Done;
@@ -1984,11 +2047,17 @@ mod loop_tests {
     }
 
     fn agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        agent_with(script, Configs::default())
+    }
+
+    fn agent_with(
+        script: Vec<Result<Message, ProviderError>>,
+        cfg: Configs,
+    ) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
         crate::testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
         let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
-        let providers =
-            Rc::new(Providers::new(Rc::new(Configs::default()), crate::gateway::GatewaySource::new(plugins.clone())));
+        let providers = Rc::new(Providers::new(Rc::new(cfg), crate::gateway::GatewaySource::new(plugins.clone())));
         providers.scripted.borrow_mut().extend(script);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = Rc::new(crate::context::Context {
@@ -2435,6 +2504,155 @@ mod loop_tests {
             a.turn(Some("go".to_string().into())).await;
             assert_eq!(a.messages.len(), 2, "no reminder was pushed: {:?}", a.messages.len());
             assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
+        });
+    }
+
+    /// A turn that ends with a prose question, with `tweak` applied first. Returns the message count
+    /// and how many scripted replies were left unused.
+    async fn question_turn(tweak: impl FnOnce(&mut Agent)) -> (usize, usize) {
+        let (mut a, _rx) = agent(vec![
+            Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+            Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+        ]);
+        tweak(&mut a);
+        a.turn(Some("go".to_string().into())).await;
+        let left = a.providers.scripted.borrow().len();
+        (a.messages.len(), left)
+    }
+
+    #[test]
+    fn ask_nudge_fires_once_then_the_loop_continues() {
+        run(async {
+            let (mut a, _rx) = agent(vec![
+                Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text(".")], StopReason::Stop)),
+            ]);
+            a.turn(Some("go".to_string().into())).await;
+            assert_eq!(a.messages.len(), 4);
+            assert!(
+                matches!(&a.messages[2], Message::User { content, .. } if text_of(content) == crate::ask_nudge::REMINDER)
+            );
+            assert!(a.providers.scripted.borrow().is_empty(), "the loop continued once");
+        });
+    }
+
+    #[test]
+    fn ask_nudge_is_not_repeated_in_the_same_turn() {
+        run(async {
+            let (mut a, _rx) = agent(vec![
+                Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text("Still keep it or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+            ]);
+            a.turn(Some("go".to_string().into())).await;
+            assert_eq!(a.messages.len(), 4);
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no third request");
+        });
+    }
+
+    #[test]
+    fn ask_nudge_is_skipped_after_an_ask_call() {
+        run(async {
+            let (mut a, rx) = agent(vec![
+                Ok(assistant(vec![call("t1", "ask")], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+            ]);
+            // Nobody listens for the overlay: the ask call ends at once.
+            drop(rx);
+            a.turn(Some("go".to_string().into())).await;
+            assert_eq!(a.messages.len(), 4, "user, ask call, its result, the question: no reminder");
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no third request");
+        });
+    }
+
+    #[test]
+    fn ask_nudge_is_off_without_the_ask_tool() {
+        run(async {
+            let (n, left) = question_turn(|a| a.excluded = vec!["ask"]).await;
+            assert_eq!((n, left), (2, 1), "-p, ACP and custom agents exclude ask");
+            let (n, left) = question_turn(|a| a.subagent = true).await;
+            assert_eq!((n, left), (2, 1), "subagents");
+            let (n, left) = question_turn(|a| a.allow = Some(vec!["read".into()])).await;
+            assert_eq!((n, left), (2, 1), "an allow list without ask");
+        });
+    }
+
+    #[test]
+    fn ask_nudge_follows_the_config_switch() {
+        run(async {
+            let mut cfg = Configs::default();
+            cfg.mu.ask.nudge = false;
+            let (mut a, _rx) = agent_with(
+                vec![
+                    Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+                    Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+                ],
+                cfg,
+            );
+            a.turn(Some("go".to_string().into())).await;
+            assert_eq!(a.messages.len(), 2);
+            assert_eq!(a.providers.scripted.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn each_user_turn_gets_its_own_nudge() {
+        run(async {
+            let (mut a, _rx) = agent(vec![
+                Ok(assistant(vec![Block::text("Keep it or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text(".")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text("Keep it or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text(".")], StopReason::Stop)),
+            ]);
+            a.turn(Some("one".to_string().into())).await;
+            a.turn(Some("two".to_string().into())).await;
+            assert_eq!(a.messages.len(), 8);
+            assert!(a.providers.scripted.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn the_nudge_is_not_echoed_on_resume() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![]);
+            a.messages.push(Message::user(crate::ask_nudge::REMINDER));
+            a.replay_history();
+            assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::UserPrompt(_))));
+        });
+    }
+
+    #[test]
+    fn a_dismissal_is_kept_in_history_but_not_streamed() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![
+                Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text(".")], StopReason::Stop)),
+            ]);
+            a.turn(Some("go".to_string().into())).await;
+            assert_eq!(a.messages.len(), 4);
+            assert!(
+                matches!(&a.messages[3], Message::Assistant { content, .. } if text_of(content) == "."),
+                "kept in history"
+            );
+            let events = drain(&mut rx);
+            assert!(events.iter().all(|e| !matches!(e, AgentEvent::Text(t) if t == ".")), "not streamed");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(t) if t == "Keep the cache or drop it?")));
+        });
+    }
+
+    #[test]
+    fn a_dismissal_is_not_rendered_on_resume() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![]);
+            a.messages.push(Message::user("go"));
+            a.messages.push(assistant(vec![Block::text("Keep it or drop it?")], StopReason::Stop));
+            a.messages.push(Message::user(crate::ask_nudge::REMINDER));
+            a.messages.push(assistant(vec![Block::text(".")], StopReason::Stop));
+            a.replay_history();
+            let events = drain(&mut rx);
+            assert!(events.iter().all(|e| !matches!(e, AgentEvent::Text(t) if t == ".")));
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(t) if t == "Keep it or drop it?")));
         });
     }
 

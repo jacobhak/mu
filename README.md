@@ -159,6 +159,9 @@ cards = "filled"      # or "outline"
 enabled = true
 threshold = 0.3       # minimum confidence for ghost text
 
+[ask]
+nudge = true         # when a turn ends with a decision question in prose, remind the model to use `ask` instead
+
 [edit]
 mode = "hashline"     # or "sloppy": find/replace by text, no line tags
 

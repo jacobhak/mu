@@ -197,10 +197,24 @@ pub struct ModelOverride {
 pub struct MuConfig {
     pub compaction: MuCompaction,
     pub predict: MuPredict,
+    pub ask: MuAsk,
     pub theme: MuTheme,
     pub update: MuUpdate,
     pub edit: MuEdit,
     pub mcp: MuMcp,
+}
+
+/// `[ask]`: `nudge = false` turns off the reminder to use `ask` when a turn ends with a decision question in prose.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct MuAsk {
+    pub nudge: bool,
+}
+
+impl Default for MuAsk {
+    fn default() -> Self {
+        Self { nudge: true }
+    }
 }
 
 /// `[mcp]`: `lifetime` of MCP server processes (`session`, `idle:10m`, `call`); default `session`.
@@ -420,6 +434,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
     MuConfig {
         compaction: parse(section("compaction"), "compaction", warn),
         predict: parse(section("predict"), "predict", warn),
+        ask: parse(section("ask"), "ask", warn),
         theme: parse(section("theme"), "theme", warn),
         update: parse(section("update"), "update", warn),
         edit: parse(section("edit"), "edit", warn),
