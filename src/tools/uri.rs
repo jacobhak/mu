@@ -124,6 +124,45 @@ pub fn split_selector(p: &str) -> Option<(&str, &str)> {
     .then_some((head, tail))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadTarget {
+    pub path: String,
+    pub sel: Option<String>,
+    pub raw: bool,
+}
+
+/// Where a `read` path points. The first candidate that `exists` wins: the whole path, the path
+/// without `:raw`, then the path before a line selector (`p:SEL`, `p:SEL:raw`, `p:raw:SEL`).
+/// When none exists: the whole path, no selector, not raw.
+pub fn read_target(p: &str, exists: impl Fn(&str) -> bool) -> ReadTarget {
+    if exists(p) {
+        return ReadTarget { path: p.to_string(), sel: None, raw: false };
+    }
+    // `:raw` (after a selector, or the reversed `path:raw:SEL`) asks for lines uncut by the column limit.
+    let (stem, raw) = match p.strip_suffix(":raw") {
+        Some(s) if !s.is_empty() => (s.to_string(), true),
+        _ => match p.rsplit_once(":raw:") {
+            Some((h, t))
+                if !h.is_empty()
+                    && t.chars().any(|c| c.is_ascii_digit())
+                    && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | ',')) =>
+            {
+                (format!("{h}:{t}"), true)
+            }
+            _ => (p.to_string(), false),
+        },
+    };
+    if raw && exists(&stem) {
+        return ReadTarget { path: stem, sel: None, raw: true };
+    }
+    if let Some((h, s)) = split_selector(&stem)
+        && exists(h)
+    {
+        return ReadTarget { path: h.to_string(), sel: Some(s.to_string()), raw };
+    }
+    ReadTarget { path: p.to_string(), sel: None, raw: false }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +181,24 @@ mod tests {
         assert!(r.path.ends_with("local/sid/a/plan.md"));
         assert!(t.resolve("skill://nope").is_err());
         assert!(t.resolve("artifact://x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod read_target_tests {
+    use super::*;
+
+    #[test]
+    fn read_targets_strip_selectors_and_raw() {
+        let ex = |q: &str| q == "a.rs" || q == "odd:raw";
+        let t = |p: &str, s: Option<&str>, raw: bool| ReadTarget { path: p.to_string(), sel: s.map(String::from), raw };
+        assert_eq!(read_target("a.rs", ex), t("a.rs", None, false));
+        assert_eq!(read_target("a.rs:raw", ex), t("a.rs", None, true));
+        assert_eq!(read_target("a.rs:10-20", ex), t("a.rs", Some("10-20"), false));
+        assert_eq!(read_target("a.rs:10-20:raw", ex), t("a.rs", Some("10-20"), true));
+        assert_eq!(read_target("a.rs:raw:10-20", ex), t("a.rs", Some("10-20"), true));
+        assert_eq!(read_target("a.rs:3,10-12:raw", ex), t("a.rs", Some("3,10-12"), true));
+        assert_eq!(read_target("odd:raw", ex), t("odd:raw", None, false));
+        assert_eq!(read_target("gone.rs:raw", ex), t("gone.rs:raw", None, false));
     }
 }

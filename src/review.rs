@@ -51,6 +51,15 @@ pub async fn snapshot_tree(cwd: &Path) -> Result<String, String> {
     let res = async {
         if real.exists() {
             std::fs::copy(&real, &tmp).map_err(|e| format!("cannot copy index: {e}"))?;
+            // Git's racy-entry check compares index entries with the index file's mtime; the copy must keep
+            // the real index's mtime, or a same-tick rewrite of a tracked file looks unchanged.
+            let mtime =
+                std::fs::metadata(&real).and_then(|m| m.modified()).map_err(|e| format!("cannot stat index: {e}"))?;
+            std::fs::File::options()
+                .write(true)
+                .open(&tmp)
+                .and_then(|f| f.set_modified(mtime))
+                .map_err(|e| format!("cannot stamp index copy: {e}"))?;
         }
         git(cwd, &["add", "-A"], Some(&tmp)).await?;
         git(cwd, &["write-tree"], Some(&tmp)).await

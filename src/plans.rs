@@ -109,9 +109,19 @@ fn hash_of(text: &str) -> String {
 }
 
 impl PlanMeta {
-    /// The short commit (or tree) the plan was written against.
-    pub fn base_label(&self) -> String {
-        self.base.as_ref().map_or("unknown", |b| short(b.commit.as_deref().unwrap_or(&b.tree))).to_string()
+    /// The short commit (or tree) the plan was written against, plus a note when the snapshot had uncommitted changes.
+    pub async fn base_label(&self, cwd: &Path) -> String {
+        let Some(b) = &self.base else { return "unknown".to_string() };
+        let mut s = short(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
+        if dirty(cwd, b).await {
+            s.push_str(DIRTY);
+        }
+        s
+    }
+
+    /// `read` minus entries that are directories now; plans saved before directory reads were skipped list them (the root as "").
+    pub fn files_read(&self, root: &Path) -> Vec<&String> {
+        self.read.iter().filter(|r| !root.join(r).is_dir()).collect()
     }
 }
 
@@ -294,24 +304,37 @@ impl Store {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Drift {
     Unknown(String),
-    Clean { base: String, other: usize },
-    Changed { base: String, files: Vec<String>, other: usize },
+    Clean { base: String, dirty: bool, other: usize },
+    Changed { base: String, dirty: bool, files: Vec<String>, other: usize },
+}
+
+const DIRTY: &str = " plus uncommitted changes";
+
+/// The snapshot has changes its commit lacks: its tree is not the commit's tree.
+async fn dirty(dir: &Path, b: &Base) -> bool {
+    let Some(c) = &b.commit else { return false };
+    match review::git(dir, &["rev-parse", "--verify", "--quiet", &format!("{c}^{{tree}}")], None).await {
+        Ok(t) => t.trim() != b.tree,
+        Err(_) => false, // commit gone: drift reports that separately
+    }
 }
 
 impl Drift {
     pub fn describe(&self) -> String {
         match self {
             Drift::Unknown(r) => format!("drift unknown: {r}"),
-            Drift::Clean { base, other } => {
-                let mut s = format!("none of the files it read changed since {base}");
+            Drift::Clean { base, dirty, other } => {
+                let d = if *dirty { DIRTY } else { "" };
+                let mut s = format!("none of the files it read changed since {base}{d}");
                 if *other > 0 {
                     s.push_str(&format!(" ({other} other files changed)"));
                 }
                 s
             }
-            Drift::Changed { base, files, .. } => {
+            Drift::Changed { base, dirty, files, .. } => {
+                let d = if *dirty { DIRTY } else { "" };
                 let mut s = format!(
-                    "{} file(s) it read changed since {base}: {}",
+                    "{} file(s) it read changed since {base}{d}: {}",
                     files.len(),
                     files.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
                 );
@@ -327,9 +350,11 @@ impl Drift {
         use serde_json::json;
         match self {
             Drift::Unknown(r) => json!({"state":"unknown","reason":r}),
-            Drift::Clean { base, other } => json!({"state":"clean","base":base,"files":[],"other":other}),
-            Drift::Changed { base, files, other } => {
-                json!({"state":"changed","base":base,"files":files,"other":other})
+            Drift::Clean { base, dirty, other } => {
+                json!({"state":"clean","base":base,"dirty":dirty,"files":[],"other":other})
+            }
+            Drift::Changed { base, dirty, files, other } => {
+                json!({"state":"changed","base":base,"dirty":dirty,"files":files,"other":other})
             }
         }
     }
@@ -344,11 +369,11 @@ pub async fn drift(meta: &PlanMeta, cwd: &Path) -> Drift {
         return Drift::Unknown("not a git repository".into());
     };
     let Some(b) = &meta.base else { return Drift::Unknown("no base recorded".into()) };
-    let base = if object_exists(&root, &b.tree).await {
-        &b.tree
+    let (base, is_dirty) = if object_exists(&root, &b.tree).await {
+        (&b.tree, dirty(&root, b).await)
     } else {
         match &b.commit {
-            Some(c) if object_exists(&root, c).await => c,
+            Some(c) if object_exists(&root, c).await => (c, false),
             _ => {
                 return Drift::Unknown(format!(
                     "base {} no longer exists",
@@ -366,10 +391,15 @@ pub async fn drift(meta: &PlanMeta, cwd: &Path) -> Drift {
         Ok(s) => s,
         Err(e) => return Drift::Unknown(e),
     };
+    let read = meta.files_read(&root);
     let (files, rest): (Vec<_>, Vec<_>) =
-        stats.into_iter().map(|s| s.path).partition(|p| meta.read.is_empty() || meta.read.contains(p));
+        stats.into_iter().map(|s| s.path).partition(|p| read.is_empty() || read.contains(&p));
     let other = rest.len();
-    if files.is_empty() { Drift::Clean { base: label, other } } else { Drift::Changed { base: label, files, other } }
+    if files.is_empty() {
+        Drift::Clean { base: label, dirty: is_dirty, other }
+    } else {
+        Drift::Changed { base: label, dirty: is_dirty, files, other }
+    }
 }
 
 fn normalize(p: &Path) -> PathBuf {
@@ -387,7 +417,7 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// Repo-relative paths of every file the session read, selectors stripped.
+/// Repo-relative paths of the files the session read, selectors and `:raw` stripped. Directory listings are skipped: they show names, not contents; so are paths that do not exist.
 pub fn reads_from(messages: &[Message], cwd: &Path, root: &Path) -> Vec<String> {
     let root = normalize(root);
     let mut out = Vec::new();
@@ -397,11 +427,14 @@ pub fn reads_from(messages: &[Message], cwd: &Path, root: &Path) -> Vec<String> 
                 continue;
             }
             let Some(p) = args.get("path").and_then(|v| v.as_str()) else { continue };
-            let p = crate::tools::uri::split_selector(p).map_or(p, |(h, _)| h);
             if p.contains("://") {
                 continue;
             }
-            let abs = normalize(&cwd.join(p));
+            let t = crate::tools::uri::read_target(p, |q| cwd.join(q).exists());
+            let abs = normalize(&cwd.join(&t.path));
+            if !abs.is_file() {
+                continue;
+            }
             if let Ok(rel) = abs.strip_prefix(&root) {
                 out.push(rel.to_string_lossy().into_owned());
             }
@@ -410,6 +443,35 @@ pub fn reads_from(messages: &[Message], cwd: &Path, root: &Path) -> Vec<String> 
     out.sort();
     out.dedup();
     out
+}
+
+const HEADLESS_NOTE: &str = concat!("\n", include_str!("prompts/plan-headless.md"));
+
+/// How `mu plan new|refine|approve` runs through `headless::print_mode`.
+pub struct PlanRun {
+    pub first: crate::events::Command,
+    pub expect_park: bool,
+    /// Appended to the system prompt.
+    pub note: Option<&'static str>,
+}
+
+/// `Err` gives back the store commands (`list`, `show`, `drop`) for `run_cli`.
+pub fn plan_run(cmd: PlanCmd) -> Result<PlanRun, PlanCmd> {
+    use crate::events::{Command, PlanDecision};
+    match cmd {
+        PlanCmd::New { brief } => {
+            Ok(PlanRun { first: Command::TogglePlan(Some(brief)), expect_park: true, note: Some(HEADLESS_NOTE) })
+        }
+        PlanCmd::Refine { id, text } => {
+            Ok(PlanRun { first: Command::RefinePlan { id, text }, expect_park: true, note: Some(HEADLESS_NOTE) })
+        }
+        PlanCmd::Approve { id, anyway } => Ok(PlanRun {
+            first: Command::StartPlan { id, decision: PlanDecision::Keep { model: None }, anyway },
+            expect_park: false,
+            note: None,
+        }),
+        other => Err(other),
+    }
 }
 
 fn fail(e: String) -> i32 {
@@ -452,9 +514,10 @@ async fn cli(cmd: PlanCmd, cwd: &Path) -> i32 {
                 v["drift"] = d.json();
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             } else {
-                let base = meta.base.as_ref().map_or("none", |b| short(b.commit.as_deref().unwrap_or(&b.tree)));
+                let base = if meta.base.is_none() { "none".to_string() } else { meta.base_label(cwd).await };
+                let n = store.root.as_deref().map_or(meta.read.len(), |r| meta.files_read(r).len());
                 println!("id: {}\ntitle: {}\nstatus: {}", meta.id, meta.title, meta.status.name());
-                println!("base: {base}\nread: {} files\ndrift: {}\n", meta.read.len(), d.describe());
+                println!("base: {base}\nread: {n} files\ndrift: {}\n", d.describe());
                 print!("{text}");
                 if !text.ends_with('\n') {
                     println!();
@@ -583,16 +646,12 @@ mod tests {
         assert_ne!(a.root, b.root);
     }
 
-    #[test]
-    fn drift_cases() {
-        crate::testutil::home();
-        let d = repo();
-        let rt = rt();
-        let mk = |read: &[&str], base: Option<Base>| PlanMeta {
+    fn meta(repo: &Path, read: &[&str], base: Option<Base>) -> PlanMeta {
+        PlanMeta {
             id: "x".into(),
             title: "T".into(),
             status: Status::Pending,
-            repo: d.clone(),
+            repo: repo.to_path_buf(),
             base,
             read: read.iter().map(|s| s.to_string()).collect(),
             session: None,
@@ -600,7 +659,15 @@ mod tests {
             updated: String::new(),
             hash: String::new(),
             approved: None,
-        };
+        }
+    }
+
+    #[test]
+    fn drift_cases() {
+        crate::testutil::home();
+        let d = repo();
+        let rt = rt();
+        let mk = |read: &[&str], base: Option<Base>| meta(&d, read, base);
         let base = rt.block_on(base_now(&d));
         assert!(base.as_ref().unwrap().commit.is_some());
         let clean = rt.block_on(drift(&mk(&["a.txt"], base.clone()), &d));
@@ -612,21 +679,34 @@ mod tests {
         }
         assert!(matches!(rt.block_on(drift(&mk(&["b.txt"], base.clone()), &d)), Drift::Clean { other: 1, .. }));
         assert!(matches!(rt.block_on(drift(&mk(&[], base.clone()), &d)), Drift::Changed { .. }));
+        assert!(matches!(rt.block_on(drift(&mk(&[""], base.clone()), &d)), Drift::Changed { .. }));
+        assert!(matches!(rt.block_on(drift(&mk(&["", "b.txt"], base.clone()), &d)), Drift::Clean { other: 1, .. }));
+        let commit = base.as_ref().unwrap().commit.clone().unwrap();
+        assert_eq!(rt.block_on(mk(&[], base.clone()).base_label(&d)), short(&commit));
         let stale = Base { tree: "0".repeat(40), commit: base.unwrap().commit };
         assert!(matches!(rt.block_on(drift(&mk(&["a.txt"], Some(stale)), &d)), Drift::Changed { .. }));
         assert_eq!(rt.block_on(drift(&mk(&[], None), &d)), Drift::Unknown("no base recorded".into()));
         let plain = tmp();
         assert_eq!(rt.block_on(drift(&mk(&[], None), &plain)), Drift::Unknown("not a git repository".into()));
-        let d = Drift::Changed { base: "abc".into(), files: (0..6).map(|i| format!("f{i}")).collect(), other: 0 };
+        let d = Drift::Changed {
+            base: "abc".into(),
+            dirty: false,
+            files: (0..6).map(|i| format!("f{i}")).collect(),
+            other: 0,
+        };
         assert_eq!(d.describe(), "6 file(s) it read changed since abc: f0, f1, f2, f3, f4, …");
         assert_eq!(
-            Drift::Clean { base: "abc".into(), other: 2 }.describe(),
+            Drift::Clean { base: "abc".into(), dirty: false, other: 2 }.describe(),
             "none of the files it read changed since abc (2 other files changed)"
+        );
+        assert_eq!(
+            Drift::Changed { base: "abc".into(), dirty: true, files: vec!["a.rs".into()], other: 0 }.describe(),
+            "1 file(s) it read changed since abc plus uncommitted changes: a.rs"
         );
     }
 
     #[test]
-    fn reads_from_normalizes() {
+    fn reads_from_keeps_files_only() {
         let call = |p: &str| Message::Assistant {
             content: vec![crate::message::Block::ToolCall {
                 id: "i".into(),
@@ -642,8 +722,63 @@ mod tests {
             response_id: None,
             error_message: None,
         };
-        let msgs: Vec<_> =
-            ["src/a.rs:10-20", "./src/a.rs", "local://x-plan.md", "/elsewhere/b.rs"].into_iter().map(call).collect();
-        assert_eq!(reads_from(&msgs, Path::new("/r"), Path::new("/r")), ["src/a.rs"]);
+        let root = tmp();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "x\n").unwrap();
+        std::fs::write(root.join("b.rs"), "x\n").unwrap();
+        let run = |cwd: &Path, ps: &[&str]| {
+            let msgs: Vec<_> = ps.iter().copied().map(call).collect();
+            reads_from(&msgs, cwd, &root)
+        };
+        let abs_root = root.to_string_lossy().into_owned();
+        let all = [
+            ".",
+            "src",
+            "src/",
+            abs_root.as_str(),
+            "src/a.rs:10-20",
+            "./src/a.rs",
+            "src/a.rs:raw",
+            "src/a.rs:10-20:raw",
+            "src/a.rs:raw:10-20",
+            "b.rs:3,10-12:raw",
+            "b.rs:raw:3,10-12",
+            "local://x-plan.md",
+            "/elsewhere/b.rs",
+            "missing.rs",
+        ];
+        assert_eq!(run(&root, &all), ["b.rs", "src/a.rs"]);
+        assert!(run(&root, &[".", "src"]).is_empty());
+        assert_eq!(run(&root, &["src/a.rs:raw"]), ["src/a.rs"]);
+        assert_eq!(run(&root, &["b.rs:raw:3,10-12"]), ["b.rs"]);
+        assert_eq!(run(&root.join("src"), &["a.rs:raw", "../b.rs:raw"]), ["b.rs", "src/a.rs"]);
+    }
+
+    #[test]
+    fn dirty_base_is_named() {
+        crate::testutil::home();
+        let d = repo();
+        let rt = rt();
+        std::fs::write(d.join("c.txt"), "new\n").unwrap();
+        let base = rt.block_on(base_now(&d));
+        let sha = short(base.as_ref().unwrap().commit.as_deref().unwrap()).to_string();
+        let m = meta(&d, &["a.txt"], base);
+        assert_eq!(rt.block_on(m.base_label(&d)), format!("{sha} plus uncommitted changes"));
+        let dr = rt.block_on(drift(&m, &d));
+        assert!(matches!(dr, Drift::Clean { dirty: true, other: 0, .. }), "{dr:?}");
+        assert_eq!(dr.describe(), format!("none of the files it read changed since {sha} plus uncommitted changes"));
+        assert_eq!(dr.json()["dirty"], true);
+    }
+
+    #[test]
+    fn headless_planning_expects_a_park() {
+        for cmd in [PlanCmd::New { brief: "b".into() }, PlanCmd::Refine { id: "x".into(), text: None }] {
+            let r = plan_run(cmd).ok().unwrap();
+            let n = r.note.unwrap();
+            assert!(r.expect_park && n.contains("parked for later approval") && n.contains("expected result"));
+        }
+        let r = plan_run(PlanCmd::Approve { id: "x".into(), anyway: false }).ok().unwrap();
+        assert!(!r.expect_park && r.note.is_none());
+        assert!(plan_run(PlanCmd::Drop { id: "x".into() }).is_err());
     }
 }

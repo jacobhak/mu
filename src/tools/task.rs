@@ -364,7 +364,7 @@ mod typed_tests {
 
     async fn child(line: &str, payload: Value) -> Outcome {
         use std::os::unix::fs::PermissionsExt;
-        let base = std::env::temp_dir().join(format!("mu-task-typed-{}-{}", std::process::id(), line.len()));
+        let base = std::env::temp_dir().join(format!("mu-task-typed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         let exe = base.join("fake-mu");
         std::fs::write(&exe, format!("#!/bin/sh\ncat <<'EOF'\n{line}\nEOF\n")).unwrap();

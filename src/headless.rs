@@ -16,7 +16,10 @@ pub async fn print_mode(
     stop: UnboundedReceiver<()>,
 ) -> i32 {
     let mut stop = Some(stop);
-    let _ = cmd.send(Command::EnsureSession);
+    // A stored plan opens its session once it starts, so a refusal leaves none behind.
+    if !matches!(first, Command::StartPlan { .. } | Command::RefinePlan { .. }) {
+        let _ = cmd.send(Command::EnsureSession);
+    }
     let _ = cmd.send(first);
     let _ = cmd.send(Command::Exit);
     let (mut buf, mut last, mut code) = (String::new(), String::new(), 0);

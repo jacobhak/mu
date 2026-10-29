@@ -1433,7 +1433,7 @@ impl Agent {
             file: store.md_path(id),
             content: shown.clone(),
             stored: true,
-            note: Some(format!("written against {} · {}", meta.base_label(), drift.describe())),
+            note: Some(format!("written against {} · {}", meta.base_label(&self.cwd).await, drift.describe())),
             reply: tx,
         });
         let decision = rx.await.ok()?;
@@ -2407,6 +2407,39 @@ mod loop_tests {
             let session = a.session.as_ref().map(|s| s.path.clone());
             assert!(session.is_some() && meta.approved.unwrap().session == session);
             assert_eq!(a.review_base.unwrap().plan_uri.as_deref(), Some("local://t-plan.md"));
+        });
+    }
+
+    /// Runs `first` through `print_mode` against a fresh git repo; returns the exit code and the session file count.
+    async fn headless_refusal(first: Command, prep: impl FnOnce(&Path, &plans::Store)) -> (i32, usize) {
+        let (mut a, rx) = agent(vec![]);
+        a.cwd = git_repo();
+        let store = save_plan_in(&a.cwd, &["a.txt"]).await;
+        prep(&a.cwd, &store);
+        let cwd = a.cwd.clone();
+        let inbox = a.inbox.clone();
+        let (tx, crx) = tokio::sync::mpsc::unbounded_channel();
+        let (_stop, srx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, code) =
+            futures_util::future::join(a.run(crx), crate::headless::print_mode(first, false, tx, rx, inbox, None, srx))
+                .await;
+        let n = std::fs::read_dir(mu_common::paths::session_dir(&cwd)).map_or(0, |d| d.count());
+        (code, n)
+    }
+
+    #[test]
+    fn a_refused_headless_plan_creates_no_session() {
+        let keep = || PlanDecision::Keep { model: None };
+        run(async {
+            let stale = Command::StartPlan { id: "t".into(), decision: keep(), anyway: false };
+            let r = headless_refusal(stale, |cwd, _| std::fs::write(cwd.join("a.txt"), "two\n").unwrap()).await;
+            assert_eq!(r, (1, 0), "stale");
+            let missing = Command::StartPlan { id: "nope".into(), decision: keep(), anyway: false };
+            assert_eq!(headless_refusal(missing, |_, _| {}).await, (1, 0), "not found");
+            let dropped = Command::StartPlan { id: "t".into(), decision: keep(), anyway: false };
+            assert_eq!(headless_refusal(dropped, |_, s| s.drop("t").unwrap()).await, (1, 0), "not pending");
+            let refine = Command::RefinePlan { id: "nope".into(), text: None };
+            assert_eq!(headless_refusal(refine, |_, _| {}).await, (1, 0), "refine not found");
         });
     }
 

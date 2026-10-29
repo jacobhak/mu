@@ -68,8 +68,18 @@ pub fn credential_ids(s: &McpServer, profile: Option<&str>) -> Vec<String> {
 /// Asks omp for an access token: `omp token [--force-refresh] <id>`, with the broker environment
 /// when `broker` is set so the broker is the only writer. `None` when omp has none.
 pub async fn fetch_token(ids: &[String], force: bool, broker: Option<&(String, String)>) -> Option<String> {
+    fetch_token_with(&mu_common::paths::omp_bin(), ids, force, broker).await
+}
+
+/// `fetch_token` with the omp binary given, so tests need no process-wide `MU_OMP`.
+async fn fetch_token_with(
+    omp: &Path,
+    ids: &[String],
+    force: bool,
+    broker: Option<&(String, String)>,
+) -> Option<String> {
     for id in ids {
-        let mut c = Command::new(mu_common::paths::omp_bin());
+        let mut c = Command::new(omp);
         c.arg("token");
         if force {
             c.arg("--force-refresh");
@@ -122,39 +132,15 @@ mod tests {
 
     #[test]
     fn tokens_come_from_omp_with_the_broker_env_and_force_flag() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = std::env::temp_dir().join(format!("mu-mcpomp-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        let (script, rec) = (d.join("omp"), d.join("rec"));
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho \"$*|$OMP_AUTH_BROKER_URL|$OMP_AUTH_BROKER_TOKEN\" >> \"$REC\"\ncase \" $* \" in *nosuch*) exit 1;; esac\ncase \"$*\" in *--force-refresh*) echo fresh;; *) echo tok;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // SAFETY: no other test reads MU_OMP or REC.
-        unsafe {
-            std::env::set_var("MU_OMP", &script);
-            std::env::set_var("REC", &rec);
-        }
+        let script = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/plugin/mcp/testdata/fake-omp.sh"));
         let ids = vec!["nosuch".to_string(), "good".to_string()];
         let broker = ("http://127.0.0.1:9".to_string(), "bt".to_string());
         rt(async {
-            assert_eq!(fetch_token(&ids, false, None).await.as_deref(), Some("tok"));
-            assert_eq!(fetch_token(&ids, true, Some(&broker)).await.as_deref(), Some("fresh"));
-            assert_eq!(fetch_token(&["nosuch".to_string()], false, None).await, None);
+            assert_eq!(fetch_token_with(script, &ids, false, None).await.as_deref(), Some("token good||"));
+            let forced = fetch_token_with(script, &ids, true, Some(&broker)).await;
+            assert_eq!(forced.as_deref(), Some("token --force-refresh good|http://127.0.0.1:9|bt"));
+            assert_eq!(fetch_token_with(script, &["nosuch".to_string()], false, None).await, None);
         });
-        let rec = std::fs::read_to_string(&rec).unwrap();
-        let lines: Vec<&str> = rec.lines().collect();
-        assert_eq!(lines[0], "token nosuch||", "{rec}");
-        assert_eq!(lines[1], "token good||");
-        assert_eq!(lines[3], "token --force-refresh good|http://127.0.0.1:9|bt", "{rec}");
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("MU_OMP");
-            std::env::remove_var("REC");
-        }
-        let _ = std::fs::remove_dir_all(d);
     }
 
     fn omp_output(args: &[&str]) -> std::process::Output {

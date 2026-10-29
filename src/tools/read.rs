@@ -84,47 +84,11 @@ fn runs(lines: &[usize]) -> String {
 
 impl Tools {
     pub async fn read(&self, a: Args) -> ToolOutput {
-        let mut sel = None;
-        let mut authored = a.path.as_str();
-        let mut raw_mode = false;
-        let first = self.resolve(&a.path).ok().filter(|r| r.path.exists());
-        // `:raw` (after a selector, or the reversed `path:raw:SEL`) asks for lines uncut by the column limit.
-        let (stem, raw) = match a.path.strip_suffix(":raw") {
-            Some(s) if !s.is_empty() => (s.to_string(), true),
-            _ => match a.path.rsplit_once(":raw:") {
-                Some((h, t))
-                    if !h.is_empty()
-                        && t.chars().any(|c| c.is_ascii_digit())
-                        && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | ',')) =>
-                {
-                    (format!("{h}:{t}"), true)
-                }
-                _ => (a.path.clone(), false),
-            },
-        };
-        let res = match first {
-            Some(r) => r,
-            None => {
-                let plain = if raw { self.resolve(&stem).ok().filter(|r| r.path.exists()) } else { None };
-                if let Some(r) = plain {
-                    raw_mode = true;
-                    authored = &stem;
-                    r
-                } else {
-                    match super::uri::split_selector(&stem).and_then(|(p, s)| Some((self.resolve(p).ok()?, p, s))) {
-                        Some((r, p, s)) if r.path.exists() => {
-                            raw_mode = raw;
-                            sel = Some(s.to_string());
-                            authored = p;
-                            r
-                        }
-                        _ => match self.resolve(&a.path) {
-                            Ok(r) => r,
-                            Err(e) => return ToolOutput::err(e),
-                        },
-                    }
-                }
-            }
+        let super::uri::ReadTarget { path: authored, sel, raw: raw_mode } =
+            super::uri::read_target(&a.path, |p| self.resolve(p).is_ok_and(|r| r.path.exists()));
+        let res = match self.resolve(&authored) {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::err(e),
         };
         let abs = res.path;
         let disp = if res.scheme.is_some() { authored.to_string() } else { self.display(&abs) };

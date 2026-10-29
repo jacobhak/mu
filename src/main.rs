@@ -260,14 +260,9 @@ fn run() -> Result<i32> {
         return update::run(check, force, tag);
     }
     let plan_run = match cli.command {
-        Some(Sub::Plan { cmd }) => match cmd {
-            plans::PlanCmd::New { brief } => Some((events::Command::TogglePlan(Some(brief)), true)),
-            plans::PlanCmd::Refine { id, text } => Some((events::Command::RefinePlan { id, text }, true)),
-            plans::PlanCmd::Approve { id, anyway } => Some((
-                events::Command::StartPlan { id, decision: events::PlanDecision::Keep { model: None }, anyway },
-                false,
-            )),
-            other => return Ok(plans::run_cli(other, &std::env::current_dir()?)),
+        Some(Sub::Plan { cmd }) => match plans::plan_run(cmd) {
+            Ok(r) => Some(r),
+            Err(other) => return Ok(plans::run_cli(other, &std::env::current_dir()?)),
         },
         _ => None,
     };
@@ -387,6 +382,9 @@ fn run() -> Result<i32> {
         // No one can answer in `-p` mode.
         agent.excluded.push("ask");
     }
+    if let Some(n) = plan_run.as_ref().and_then(|r| r.note) {
+        agent.agent_prompt = Some(agent.agent_prompt.take().unwrap_or_default() + n);
+    }
     if !headless_run && task_payload.is_none() {
         agent.enable_jobs();
     }
@@ -438,11 +436,11 @@ fn run() -> Result<i32> {
                 let first = events::Command::Prompt(prompt.into());
                 headless::print_mode(first, false, cmd_tx, ev_rx, inbox.clone(), max_cost, stop_rx).await
             }
-            (None, None, Some((first, expect_park))) => {
+            (None, None, Some(r)) => {
                 printer = Some(spawn_notice_printer(notice_rx));
                 plugin::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
-                headless::print_mode(first, expect_park, cmd_tx, ev_rx, inbox.clone(), None, stop_rx).await
+                headless::print_mode(r.first, r.expect_park, cmd_tx, ev_rx, inbox.clone(), None, stop_rx).await
             }
             (None, None, None) => {
                 host.set_interactive();

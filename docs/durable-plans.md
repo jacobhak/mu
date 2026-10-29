@@ -16,8 +16,8 @@ Per machine, under `$MU_HOME/plans/<repo-key>/`. The key is the main checkout's 
 - `<id>.md`: the plan text as written. No front matter; edit it with any tool. The review dialog re-reads it, so Ctrl-G edits count.
 - `<id>.json`: metadata.
   - `status`: `pending`, `approved` or `dropped`.
-  - `base`: the tree (working tree snapshot, uncommitted files included) and commit the plan was written against.
-  - `read`: repo-relative files the session read with `read`. `grep` and `glob` are ignored.
+  - `base`: the tree (working tree snapshot, uncommitted files included) and commit the plan was written against. When the snapshot differs from the commit, mu shows the base as `abc1234 plus uncommitted changes`.
+  - `read`: repo-relative files the session read with `read`, selectors and `:raw` stripped. Directory listings, `grep` and `glob` are ignored: they show names, not contents. Paths that do not exist when the plan is saved are dropped.
   - `session`: the session that last saved the plan.
   - `approved`: time, decision, approving session path and a hash of the text approved.
 
@@ -25,19 +25,20 @@ The id is the plan's slug, or `slug-2`, `slug-3`, … when taken. Saving again f
 
 ## Drift
 
-Opening a plan compares the current working tree with `base`. Only files in `read` count; with an empty `read`, any change counts.
+Opening a plan compares the current working tree with `base`. Only files in `read` count; with an empty `read`, any change counts. Entries that are directories now (older plans recorded directory reads) are skipped.
 
 - `none of the files it read changed since abc1234`, plus ` (N other files changed)`.
 - `N file(s) it read changed since abc1234: a.rs, b.rs`, listing five at most.
 - `drift unknown: …` when the directory is not a git repository, no base was recorded, or the base was garbage-collected.
+- ` plus uncommitted changes` follows the commit when the base snapshot differs from it; `--json` drift has `dirty`.
 
 ## Headless: `mu plan`
 
 - `list [--all] [--json]`: pending plans, or all. `--json` adds `path`.
 - `show <id> [--json]`: metadata, drift and text. `--json` adds `path`, `content` and `drift` (`state`: `unknown`, `clean` or `changed`).
-- `new "<brief>"`: plans in plan mode with no user and parks the result. Prints `plan: <id> · <path>` to stderr. Exits 1 if nothing was parked.
-- `refine <id> [text]`: revises a pending plan, then parks it again under the same id. Without text it brings the plan up to date with the current code.
+- `new "<brief>"`: plans in plan mode with no user and parks the result. The model is told the run is headless and that parking is the expected result. Prints `plan: <id> · <path>` to stderr. Exits 1 if nothing was parked.
+- `refine <id> [text]`: revises a pending plan, then parks it again under the same id. Without text it brings the plan up to date with the current code. The model is told the run is headless and that parking is the expected result.
 - `approve <id> [--anyway]`: runs the plan like `-p`, in the current directory. `ask` is unavailable, no terminal is needed and `mu take` works. It exits 1 with `is stale` if files the plan read changed, unless `--anyway`. `--model` goes before `plan`.
 - `drop <id>`: drops a pending plan.
 
-`approve`, `refine` and `drop` need a pending plan. mu knows nothing about outside tools that call these commands.
+`approve`, `refine` and `drop` need a pending plan. A refused `approve` or `refine` (not found, not pending, stale) creates no session. mu knows nothing about outside tools that call these commands.
