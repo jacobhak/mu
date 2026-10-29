@@ -3995,11 +3995,16 @@ dependencies = [
 name = "mu-predict"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "libc",
  "mu-common",
  "pi-predict",
  "rusqlite",
+ "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
+ "toml",
 ]
 
 [[package]]

@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
 mu-common = { path = "../../crates/mu-common" }
 pi-predict = { git = "https://github.com/can1357/oh-my-pi", rev = "0b5c27ab24719c86a5986b95ee55f4e75bc1aaa0" }
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util"] }
+sha2 = "0.11.1"
+tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util", "sync"] }
+toml = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

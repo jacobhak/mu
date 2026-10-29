@@ -87,7 +87,7 @@ Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal`
 
 `-p` runs one prompt and prints the answer. `--agent` runs it as a custom agent (see Custom agents); `--max-cost` aborts once the session has cost more than that many USD and always prints `mu: cost $X` to stderr.
 
-Ghost text predicts the rest of the word or a prompt you repeat here; Tab or → accepts. It is configured under `[predict]` (see Config). `mu-predict bench` replays your own prompt history to measure keystrokes saved.
+Ghost text predicts the rest of the word or a prompt you repeat here; Tab or → accepts. It is configured under `[predict]` (see Config). `mu-predict bench` replays your own prompt history to measure keystrokes saved. By default the word comes from an n-gram of your own history. `engine = "smollm"` switches to SmolLM2-135M, which first needs `mu predict setup smollm`: it downloads the 145 MB weights, checks each file's size and SHA-256, and keeps them under `~/.mu/models/SmolLM2-135M/` (`mu predict setup smollm --status` reports what is there). If the weights are missing or damaged, mu shows one notice and uses the n-gram.
 
 Typing `/` opens a command menu with descriptions and argument completion (↑/↓, Tab, Enter, Esc).
 
@@ -159,7 +159,9 @@ cards = "filled"      # or "outline"
 
 [predict]
 enabled = true
-threshold = 0.3       # minimum confidence for ghost text
+threshold = 0.3       # minimum confidence for ghost text; 0.15 saves a few more keystrokes but shows about 55% more wrong ghosts
+engine = "ngram"     # or "smollm" (opt-in, see above); any other value warns and means "ngram"
+threads = 4          # CPU threads for SmolLM; 0 = all cores. Linux only: macOS runs SmolLM on the GPU
 
 [ask]
 nudge = true         # when a turn ends with a decision question in prose, remind the model to use `ask` instead
