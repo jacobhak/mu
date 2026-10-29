@@ -991,7 +991,7 @@ impl App {
             "login" => self.login(arg),
             "thinking" => match Thinking::parse(arg) {
                 Some(t) => self.send(Command::SetThinking(t)),
-                None => self.error("usage: /thinking off|low|medium|high"),
+                None => self.error("usage: /thinking off|low|medium|high|xhigh|max"),
             },
             "plan" => self.send(Command::TogglePlan((!arg.is_empty()).then(|| arg.to_string()))),
             "plans" => self.send(Command::ListPlans),

@@ -7,10 +7,12 @@ pub enum Thinking {
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
 }
 
 impl Thinking {
-    pub const NAMES: [&'static str; 4] = ["off", "low", "medium", "high"];
+    pub const NAMES: [&'static str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
 
     pub fn as_str(self) -> &'static str {
         Self::NAMES[self as usize]
@@ -21,7 +23,9 @@ impl Thinking {
             "off" => Self::Off,
             "low" | "minimal" => Self::Low,
             "medium" => Self::Medium,
-            "high" | "xhigh" => Self::High,
+            "high" => Self::High,
+            "xhigh" => Self::XHigh,
+            "max" => Self::Max,
             _ => return None,
         })
     }
@@ -31,7 +35,9 @@ impl Thinking {
             Self::Off => Self::Low,
             Self::Low => Self::Medium,
             Self::Medium => Self::High,
-            Self::High => Self::Off,
+            Self::High => Self::XHigh,
+            Self::XHigh => Self::Max,
+            Self::Max => Self::Off,
         }
     }
 
@@ -41,6 +47,8 @@ impl Thinking {
             Self::Low => Some(4096),
             Self::Medium => Some(8192),
             Self::High => Some(16384),
+            Self::XHigh => Some(32768),
+            Self::Max => Some(64000),
         }
     }
 }
@@ -156,9 +164,28 @@ mod tests {
 
     #[test]
     fn level_split() {
-        assert_eq!(split_level("a/b:xhigh"), ("a/b".into(), Some(Thinking::High)));
+        assert_eq!(split_level("a/b:xhigh"), ("a/b".into(), Some(Thinking::XHigh)));
+        assert_eq!(split_level("a/b:max"), ("a/b".into(), Some(Thinking::Max)));
+        assert_eq!(split_level("a/b:minimal"), ("a/b".into(), Some(Thinking::Low)));
         assert_eq!(split_level("a/b:auto"), ("a/b".into(), None));
         assert_eq!(split_level("a/b:c"), ("a/b:c".into(), None));
+    }
+
+    #[test]
+    fn levels_parse_cycle_and_budget() {
+        for t in [Thinking::Off, Thinking::Low, Thinking::Medium, Thinking::High, Thinking::XHigh, Thinking::Max] {
+            assert_eq!(Thinking::parse(t.as_str()), Some(t));
+        }
+        assert_eq!(Thinking::parse("ultra"), None);
+        let mut t = Thinking::Off;
+        let order: Vec<&str> = (0..7)
+            .map(|_| {
+                t = t.cycle();
+                t.as_str()
+            })
+            .collect();
+        assert_eq!(order, ["low", "medium", "high", "xhigh", "max", "off", "low"]);
+        assert_eq!((Thinking::XHigh.budget(), Thinking::Max.budget()), (Some(32768), Some(64000)));
     }
 
     #[test]

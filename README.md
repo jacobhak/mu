@@ -73,7 +73,7 @@ Grammars load on first use of that language (about 1-2 MB resident each); idle m
 ## Use
 
 ```
-mu [--model SEL] [--thinking off|low|medium|high] [--profile NAME] [--theme NAME] [-c] [--resume [ID|PATH]]
+mu [--model SEL] [--thinking off|low|medium|high|xhigh|max] [--profile NAME] [--theme NAME] [-c] [--resume [ID|PATH]]
 mu -p PROMPT [--agent NAME] [--max-cost USD]
 mu --acp
 mu take <session|id>
@@ -82,6 +82,8 @@ mu update [--check] [--tag TAG] [--force]
 ```
 
 `SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory; `--resume` takes a session id or path, or opens a picker. `--profile` picks an omp profile (sets `OMP_PROFILE`); `--theme` overrides `[theme] source` for one run. Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
+
+Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal` reads as `low`). `xhigh` and `max` send the matching `output_config.effort` through the gateway, which clamps an effort the model does not support to the nearest one it does. Thinking budgets: low 4096, medium 8192, high 16384, xhigh 32768, max 64000, always capped to leave room for the answer.
 
 `-p` runs one prompt and prints the answer. `--agent` runs it as a custom agent (see Custom agents); `--max-cost` aborts once the session has cost more than that many USD and always prints `mu: cost $X` to stderr.
 
@@ -172,6 +174,10 @@ check = true          # daily release check at startup
 `cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see MCP servers). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
 
 `cargo test --workspace --locked -- --ignored contract_` checks the pinned omp's output formats against mu's parsers (needs network and the omp from `MU_OMP`/`~/.mu/bin`).
+
+### Debugging
+
+`MU_DUMP_REQUESTS=/path/file.jsonl` appends one JSON line per model request: timestamp, model, `max_tokens`, `thinking`, `output_config` and mu's level. The system prompt, messages and tools are only counted. The omp gateway's request log does not record the effort it sends upstream, so this file is the place to check it.
 
 ### Maintenance bot
 

@@ -301,6 +301,8 @@ fn thinking_glyph(s: &StatusSnapshot, env: &StatusEnv) -> Option<&'static str> {
         "low" => "◔",
         "medium" => "◑",
         "high" => "◒",
+        "xhigh" => "◓",
+        "max" => "●",
         _ => "⦸",
     })
 }

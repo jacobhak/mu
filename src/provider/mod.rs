@@ -4,7 +4,8 @@ pub mod sse;
 
 use crate::message::Message;
 use crate::models::{self, GatewayModel, ModelSpec, Thinking};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::io::Write;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -90,6 +91,26 @@ pub fn normalize_id(id: &str) -> String {
 /// Thinking blocks are only replayable to the same api + provider that produced them.
 pub fn same_origin(api: &str, provider: &str, model: &ModelSpec) -> bool {
     api == models::API && provider == model.provider
+}
+
+/// Appends one JSON line per model request to `$MU_DUMP_REQUESTS`, for debugging. Only the shape of
+/// the request is written: the system prompt, messages and tools are counted, not logged.
+fn dump_request(req: &Request, body: &Value) {
+    let Some(path) = std::env::var_os("MU_DUMP_REQUESTS").filter(|p| !p.is_empty()) else { return };
+    let line = json!({
+        "ts": crate::message::now_ms(),
+        "model": req.model.id,
+        "max_tokens": body["max_tokens"],
+        "thinking": body["thinking"],
+        "output_config": body.get("output_config").cloned().unwrap_or(Value::Null),
+        "mu_level": req.thinking.get().as_str(),
+        "system_chars": req.system.len(),
+        "messages": req.messages.len(),
+        "tools": req.tools.len(),
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 use crate::config::Configs;
@@ -243,6 +264,8 @@ impl Providers {
     ) -> Result<Message, ProviderError> {
         let m = req.model;
         let ep = self.endpoint().await?;
+        let body = anthropic::body(req);
+        dump_request(req, &body);
         let mut dec = anthropic::Assembler::new(m);
         let rb = self
             .client()
@@ -251,7 +274,7 @@ impl Providers {
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
         let resp = tokio::select! {
-            r = rb.body(anthropic::body(req).to_string()).send() => r.map_err(|e| ProviderError::Retryable {
+            r = rb.body(body.to_string()).send() => r.map_err(|e| ProviderError::Retryable {
                 msg: format!("cannot reach gateway at {}: {e}", ep.base),
                 retry_after: None,
             })?,

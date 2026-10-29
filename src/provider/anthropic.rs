@@ -453,6 +453,47 @@ mod budget_tests {
 }
 
 #[cfg(test)]
+mod effort_tests {
+    use super::*;
+    use crate::provider::Request;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn wire(level: Thinking, max_tokens: u32) -> Value {
+        let model =
+            ModelSpec { id: "anthropic/m".into(), provider: "anthropic".into(), context_window: 1000, max_output: 100 };
+        let req = Request {
+            model: &model,
+            thinking: Rc::new(Cell::new(level)),
+            system: "",
+            tools: &[],
+            messages: &[],
+            max_tokens: Some(max_tokens),
+        };
+        body(&req)
+    }
+
+    #[test]
+    fn new_levels_reach_the_wire_as_effort() {
+        let x = wire(Thinking::XHigh, 100_000);
+        assert_eq!(x["output_config"], json!({"effort": "xhigh"}));
+        assert_eq!(x["thinking"], json!({"type":"enabled","budget_tokens":32768}));
+        let m = wire(Thinking::Max, 100_000);
+        assert_eq!(m["output_config"], json!({"effort": "max"}));
+        assert_eq!(m["thinking"], json!({"type":"enabled","budget_tokens":64000}));
+        assert_eq!(wire(Thinking::Off, 100_000)["thinking"], json!({"type":"disabled"}));
+        assert!(wire(Thinking::Off, 100_000).get("output_config").is_none());
+    }
+
+    #[test]
+    fn max_budget_is_clamped_by_max_tokens() {
+        let m = wire(Thinking::Max, 8000);
+        assert_eq!(m["thinking"], json!({"type":"enabled","budget_tokens":6976}));
+        assert_eq!(m["output_config"], json!({"effort": "max"}));
+    }
+}
+
+#[cfg(test)]
 mod redacted_tests {
     use super::*;
 
