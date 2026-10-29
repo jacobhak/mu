@@ -452,7 +452,7 @@ mod tests {
         let cmd = format!("(/bin/sleep {quiet} &); nohup /bin/sleep {kept} >/dev/null 2>&1 & echo started");
         let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
         assert!(out.text.contains("started"), "{}", out.text);
-        // A plain `&` ends with the command; `nohup … &` (pi-shell's builtin, which detaches) keeps one alive.
+        // A `(… &)` subshell job ends with the command; `nohup … &` (pi-shell's builtin, which detaches) keeps one alive.
         assert!(!alive(&quiet).await);
         // The background process may not have exec'd `sleep` yet when the command returns.
         let mut up = false;
