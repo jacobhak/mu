@@ -454,7 +454,16 @@ mod tests {
         assert!(out.text.contains("started"), "{}", out.text);
         // A plain `&` ends with the command; `setsid nohup … &` is how to keep one alive.
         assert!(!alive(&quiet).await);
-        assert!(alive(&kept).await);
+        // The background process may not have exec'd `sleep` yet when the command returns.
+        let mut up = false;
+        for _ in 0..50 {
+            if alive(&kept).await {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up);
         let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {kept}$")]).status();
     }
 

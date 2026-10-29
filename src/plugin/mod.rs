@@ -1200,7 +1200,7 @@ done
     /// image, ping the client, or hang. Every line it receives is appended to `$LOG`.
     const MCP_SERVER: &str = r#"while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LOG"
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\("[0-9]*"\|[0-9]*\).*/\1/p')
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[0-9]*"|[0-9]*).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"instructions":"be nice"}}\n' "$id" ;;
     *'"method":"tools/list"'*'"cursor":"c2"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"other","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
