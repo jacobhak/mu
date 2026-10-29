@@ -1142,7 +1142,8 @@ impl Agent {
         }
         self.emit(AgentEvent::ToolEnd { id, name: "review".into(), output: ToolOutput::ok(md) });
 
-        let opt = |label: String, description: Option<String>| AskOption { label, description, preview: None };
+        let opt =
+            |label: String, description: Option<String>| AskOption { label, description, preview: None, kind: None };
         let Some(report) = report else {
             let q = AskQuestion {
                 question: "The reviewer returned an unstructured report.".into(),

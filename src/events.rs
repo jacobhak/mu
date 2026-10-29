@@ -102,13 +102,25 @@ pub struct StatusSnapshot {
     pub usage: Option<ProviderUsage>,
 }
 
+/// What an ask preview shows; a frontend styles its box by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewKind {
+    Code,
+    Diff,
+    Layout,
+    Text,
+}
+
 #[derive(Clone, Debug)]
 pub struct AskOption {
     pub label: String,
     pub description: Option<String>,
-    /// Monospace block shown while the option is highlighted (code, diff, layout). Frontends
-    /// without a preview pane may ignore it.
+    /// Monospace block shown with the option (code, diff, layout). Frontends without a preview
+    /// pane may ignore it.
     pub preview: Option<String>,
+    /// Declared content of `preview`; frontends guess it when `None`.
+    pub kind: Option<PreviewKind>,
 }
 
 #[derive(Clone, Debug)]

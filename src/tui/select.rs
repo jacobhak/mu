@@ -8,6 +8,7 @@ use super::editor::{self, Editor};
 use super::line::{self, Line, bold, dim, span};
 use super::markdown::{chars_to_line, chs, wrap_chs};
 use super::theme::{self, Role};
+use crate::events::PreviewKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::ContentStyle;
 
@@ -84,10 +85,11 @@ pub struct Select {
     quick: Vec<(char, usize)>,
     /// A dim line at the bottom naming the keys.
     hint: Option<String>,
-    /// One entry per item (by item index): a monospace block shown under the highlighted item.
+    /// One entry per item (by item index): a monospace block shown in a box under the item.
     previews: Vec<Option<String>>,
-    /// Ask layout: each option's description under its label, the highlighted option's preview
-    /// under it. Otherwise a description sits inline after its label.
+    /// The content kind the model declared for each preview; `None` is guessed from the text.
+    kinds: Vec<Option<PreviewKind>>,
+    /// Ask layout: each option's description under its label, then its note and preview box. Otherwise a description sits inline after its label.
     described: bool,
     /// Left (with the filter empty) and Shift-Tab return `SelectResult::Back`.
     back: bool,
@@ -115,6 +117,7 @@ impl Select {
             quick: Vec::new(),
             hint: None,
             previews: Vec::new(),
+            kinds: Vec::new(),
             described: false,
             back: false,
         }
@@ -194,6 +197,11 @@ impl Select {
 
     pub fn previews(mut self, previews: Vec<Option<String>>) -> Self {
         self.previews = previews;
+        self
+    }
+
+    pub fn preview_kinds(mut self, kinds: Vec<Option<PreviewKind>>) -> Self {
+        self.kinds = kinds;
         self
     }
 
@@ -447,10 +455,10 @@ impl Select {
         rows
     }
 
-    /// The described list: each option's label, its description under it, and the highlighted
-    /// option's preview under that. Heights are planned to fit `avail` rows. The highlighted option
-    /// keeps its label and full description; the others' descriptions give way first (to one
-    /// truncated line, then to none), and the preview takes whatever rows are left.
+    /// The described list: each option's label, its description under it, then its note (the
+    /// highlighted one) and preview box. Heights are planned to fit `avail` rows. The highlighted
+    /// option keeps its label, full description and as much preview as fits; the others' previews
+    /// and descriptions give way first (shorter, then one line, then none).
     fn described_list(&self, rows: &[Row], sel: usize, width: usize, avail: usize) -> Vec<Line> {
         let n = rows.len();
         let detail = |pos: usize| match rows[pos] {
@@ -464,28 +472,56 @@ impl Select {
             (0..n).map(|pos| desc_rows(detail(pos), width, if pos == sel { hl_cap } else { DESC_MAX_LINES })).collect();
         let short: Vec<Vec<Line>> =
             (0..n).map(|pos| if pos == sel { full[pos].clone() } else { desc_rows(detail(pos), width, 1) }).collect();
-        // Mode 0: every description in full; 1: one line each; 2: none but the highlighted one's.
-        let heights = |mode: usize| -> Vec<usize> {
+        let hl_base = 1 + full.get(sel).map_or(0, Vec::len) + note_h;
+        let hl_box_cap = (PREVIEW_MAX_LINES + 2).min(avail.saturating_sub(hl_base));
+        let boxes = |other_cap: usize| -> Vec<Vec<Line>> {
             (0..n)
-                .map(|pos| {
-                    let d = match mode {
-                        _ if pos == sel => full[pos].len(),
-                        0 => full[pos].len(),
-                        1 => short[pos].len(),
-                        _ => 0,
-                    };
-                    1 + d + if pos == sel { note_h } else { 0 }
+                .map(|pos| match rows[pos] {
+                    Row::Item(i) => match self.previews.get(i) {
+                        Some(Some(text)) => preview_box(
+                            text,
+                            self.kinds.get(i).copied().flatten(),
+                            width.saturating_sub(INDENT),
+                            if pos == sel { hl_box_cap } else { other_cap },
+                            pos == sel,
+                        ),
+                        _ => Vec::new(),
+                    },
+                    Row::Free => Vec::new(),
                 })
                 .collect()
         };
-        let mode = (0..2).find(|&m| heights(m).iter().sum::<usize>() <= avail).unwrap_or(2);
-        let h = heights(mode);
+        let desc_of = |mode: usize, pos: usize| -> usize {
+            match mode {
+                _ if pos == sel => full[pos].len(),
+                0 => full[pos].len(),
+                1 => short[pos].len(),
+                _ => 0,
+            }
+        };
+        let heights = |mode: usize, bx: &[Vec<Line>]| -> Vec<usize> {
+            (0..n)
+                .map(|pos| {
+                    1 + desc_of(mode, pos) + if pos == sel { note_h } else { 0 } + bx.get(pos).map_or(0, Vec::len)
+                })
+                .collect()
+        };
+        // (description mode, rows the other options' preview boxes may take); the last always applies.
+        let plans = [(0, PREVIEW_MAX_LINES + 2), (0, 8), (1, 8), (1, 4), (2, 4), (2, 0)];
+        let (mode, bx, h) = plans
+            .iter()
+            .enumerate()
+            .find_map(|(k, &(mode, cap))| {
+                let bx = boxes(cap);
+                let h = heights(mode, &bx);
+                (h.iter().sum::<usize>() <= avail || k + 1 == plans.len()).then_some((mode, bx, h))
+            })
+            .unwrap_or_else(|| (2, Vec::new(), heights(2, &[])));
         let (a, b, ind) = window_by(&h, sel, avail);
         let mut out: Vec<Line> = Vec::new();
         if ind && a > 0 {
             out.push(line::styled(format!("  … {a} more"), |_| dim()));
         }
-        let mut preview_at = None;
         for pos in a..b {
             out.push(self.row_line(rows[pos], pos == sel, width));
             let d: &[Line] = match mode {
@@ -495,32 +531,17 @@ impl Select {
                 _ => &[],
             };
             out.extend(d.iter().cloned());
-            if pos == sel {
-                if let Some(text) = &note {
-                    out.push(line::styled(format!("{}note: {text}", " ".repeat(INDENT)), |_| dim()));
-                }
-                preview_at = Some(out.len());
+            if pos == sel
+                && let Some(text) = &note
+            {
+                out.push(line::styled(format!("{}note: {text}", " ".repeat(INDENT)), |_| dim()));
+            }
+            if let Some(block) = bx.get(pos) {
+                out.extend(block.iter().cloned());
             }
         }
         if ind && b < n {
             out.push(line::styled(format!("  … {} more", n - b), |_| dim()));
-        }
-        if let (Some(at), Row::Item(i)) = (preview_at, rows[sel])
-            && let Some(Some(text)) = self.previews.get(i)
-        {
-            let room = avail.saturating_sub(out.len());
-            if room >= 2 {
-                let cap = (room - 1).min(PREVIEW_MAX_LINES);
-                let mut block: Vec<Line> = vec![Vec::new()];
-                block.extend(
-                    preview_rows(text, width.saturating_sub(INDENT).max(1), cap)
-                        .into_iter()
-                        .map(|l| indented(l, INDENT)),
-                );
-                let tail = out.split_off(at);
-                out.extend(block);
-                out.extend(tail);
-            }
         }
         out
     }
@@ -652,16 +673,120 @@ fn indented(l: Line, by: usize) -> Line {
     row
 }
 
-/// A monospace block as rows, each clipped to `width`. Past `max` rows the last one says how many
-/// lines were cut.
-fn preview_rows(text: &str, width: usize, max: usize) -> Vec<Line> {
-    let clean = line::sanitize(text.trim_end_matches('\n'));
-    let rows: Vec<&str> = clean.split('\n').collect();
-    let keep = if rows.len() > max { max.saturating_sub(1) } else { rows.len() };
-    let mut out: Vec<Line> = rows[..keep].iter().map(|r| line::plain(line::truncate_text(r, width))).collect();
-    if keep < rows.len() {
-        out.push(line::styled(line::truncate_text(&format!("… {} more lines", rows.len() - keep), width), |_| dim()));
+/// What a preview shows: the declared kind, else a guess from the text.
+fn preview_kind(text: &str, hint: Option<PreviewKind>) -> PreviewKind {
+    if let Some(k) = hint {
+        return k;
     }
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let n = lines.len();
+    let count = |p: &dyn Fn(&str) -> bool| lines.iter().filter(|l| p(l)).count();
+    let add = count(&|l| l.starts_with('+'));
+    let del = count(&|l| l.starts_with('-'));
+    if lines.iter().any(|l| l.starts_with("@@") || l.starts_with("diff --git"))
+        || (add > 0 && del > 0 && (add + del) * 2 >= n)
+    {
+        return PreviewKind::Diff;
+    }
+    if text.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c)) || count(&|l| l.trim_start().starts_with('|')) >= 2
+    {
+        return PreviewKind::Layout;
+    }
+    const STARTS: [&str; 12] =
+        ["fn ", "def ", "let ", "const ", "import ", "use ", "class ", "if ", "for ", "return ", "//", "#"];
+    let code = count(&|l| {
+        let t = l.trim();
+        t.ends_with([';', '{', '}', '(', ')', ',']) || STARTS.iter().any(|s| t.starts_with(s))
+    });
+    if n > 0 && code * 2 >= n { PreviewKind::Code } else { PreviewKind::Text }
+}
+
+fn preview_row_style(kind: PreviewKind, row: &str) -> ContentStyle {
+    let t = theme::get();
+    match kind {
+        PreviewKind::Diff if row.starts_with('+') => t.fg(Role::Ok),
+        PreviewKind::Diff if row.starts_with('-') => t.fg(Role::Err),
+        PreviewKind::Diff if row.starts_with("@@") => t.fg(Role::Accent),
+        PreviewKind::Text => t.fg(Role::Muted),
+        _ => ContentStyle::default(),
+    }
+}
+
+/// The tree-sitter language of a code preview, guessed from its text; only languages mu compiles in.
+fn guess_lang(code: &str) -> Option<&'static str> {
+    let has = |s: &str| code.contains(s);
+    let starts = |ps: &[&str]| code.lines().any(|l| ps.iter().any(|p| l.trim_start().starts_with(p)));
+    let t = code.trim_start();
+    if (t.starts_with('{') || t.starts_with('[')) && has("\":") {
+        Some("json")
+    } else if starts(&["fn ", "pub fn ", "let mut ", "impl ", "struct ", "pub struct ", "enum ", "use std"])
+        || has("println!")
+    {
+        Some("rust")
+    } else if starts(&["def ", "import ", "elif ", "print("]) || (starts(&["from "]) && has(" import ")) {
+        Some("python")
+    } else if starts(&["function ", "const ", "let "]) || has("=>") || has("console.") {
+        Some("javascript")
+    } else if t.starts_with("#!") || starts(&["$ ", "cargo ", "git "]) {
+        Some("bash")
+    } else {
+        None
+    }
+}
+
+/// A preview in a labelled box `width` columns wide and at most `cap` rows tall, indented under its
+/// option. Past the cap the last body row says how many lines were cut. Empty when it can't fit.
+fn preview_box(text: &str, hint: Option<PreviewKind>, width: usize, cap: usize, highlighted: bool) -> Vec<Line> {
+    if cap < 3 || width < 6 {
+        return Vec::new();
+    }
+    let kind = preview_kind(text, hint);
+    let (role, label) = match kind {
+        PreviewKind::Code => (Role::SynFunction, "code"),
+        PreviewKind::Diff => (Role::Warn, "diff"),
+        PreviewKind::Layout => (Role::Tool, "layout"),
+        PreviewKind::Text => (Role::Muted, "text"),
+    };
+    let mut border = theme::get().fg(role);
+    if highlighted {
+        border.attributes.set(crossterm::style::Attribute::Bold);
+    }
+    let inner = width - 4;
+    let clean = line::sanitize(text.trim_end_matches('\n'));
+    let src: Vec<&str> = clean.split('\n').collect();
+    let max = cap - 2;
+    let keep = if src.len() > max { max - 1 } else { src.len() };
+    let hl = (kind == PreviewKind::Code)
+        .then(|| guess_lang(&clean))
+        .flatten()
+        .and_then(|lang| super::highlight::highlight(&clean, lang))
+        .filter(|h| h.len() == src.len());
+    let mut body: Vec<Line> = src[..keep]
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match &hl {
+            Some(h) => line::truncate(&h[i], inner),
+            None => vec![span(line::truncate_text(r, inner), preview_row_style(kind, r))],
+        })
+        .collect();
+    if keep < src.len() {
+        body.push(line::styled(line::truncate_text(&format!("… {} more lines", src.len() - keep), inner), |_| dim()));
+    }
+    let title = format!(" {label} ");
+    let top = if title.len() + 3 <= width {
+        format!("┌─{title}{}┐", "─".repeat(width - 3 - title.len()))
+    } else {
+        format!("┌{}┐", "─".repeat(width - 2))
+    };
+    let mut out = vec![indented(vec![span(top, border)], INDENT)];
+    for l in body {
+        let pad = inner.saturating_sub(line::line_width(&l));
+        let mut row = vec![span("│ ", border)];
+        row.extend(l);
+        row.push(span(format!("{} │", " ".repeat(pad)), border));
+        out.push(indented(row, INDENT));
+    }
+    out.push(indented(vec![span(format!("└{}┘", "─".repeat(width - 2)), border)], INDENT));
     out
 }
 
@@ -678,6 +803,16 @@ pub fn clean_paste(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_previews_are_syntax_highlighted() {
+        let s = described(&[("a", "")]).previews(vec![Some("fn main() {\n    run();\n}".into())]);
+        let (lines, _) = s.render(40, 30);
+        let kw = theme::get().color(Role::SynKeyword);
+        let row = lines.iter().find(|l| line::line_text(l).contains("fn main")).expect("code row");
+        assert!(row.iter().any(|sp| sp.text.contains("fn") && sp.style.foreground_color == kw), "{row:?}");
+        assert!(lines.iter().all(|l| line::line_width(l) <= 40));
+    }
 
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
@@ -1095,25 +1230,28 @@ mod tests {
         assert!(lines.len() <= 8, "{t:?}");
     }
 
+    fn box_rows(t: &[String]) -> Vec<&str> {
+        t.iter().map(String::as_str).filter(|l| l.trim_start().starts_with('│')).collect()
+    }
+
     #[test]
-    fn described_preview_sits_under_the_highlighted_option_only() {
+    fn described_previews_show_in_labelled_boxes_under_every_option() {
         let mut s = described(&[("A", "first"), ("B", "second")])
             .previews(vec![Some("fn a() {}\nfn a2() {}".into()), Some("fn b() {}".into())]);
-        let (lines, _) = s.render(40, 20);
+        let (lines, _) = s.render(40, 30);
         let t = texts(&lines);
         assert_eq!(t[2], "❯ A", "{t:?}");
         assert_eq!(t[3], "    first", "{t:?}");
-        assert_eq!(t[4], "", "a blank row before the preview: {t:?}");
-        assert_eq!(t[5], "    fn a() {}", "{t:?}");
-        assert_eq!(t[6], "    fn a2() {}", "{t:?}");
-        assert_eq!(t[7], "  B", "{t:?}");
-        assert_eq!(t[8], "    second", "{t:?}");
-        assert!(!t.iter().skip(9).any(|l| l.contains("fn ")), "no preview under B: {t:?}");
+        assert!(t[4].starts_with("    ┌─ code ─") && t[4].ends_with('┐'), "{t:?}");
+        assert!(t[5].starts_with("    │ fn a() {}") && t[5].ends_with(" │"), "{t:?}");
+        assert!(t[6].starts_with("    │ fn a2() {}"), "{t:?}");
+        assert!(t[7].starts_with("    └─") && t[7].ends_with('┘'), "{t:?}");
+        assert_eq!(t[8], "  B", "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("    │ fn b() {}")), "B's preview shows without highlight: {t:?}");
         s.on_key(key(KeyCode::Down));
-        let (lines, _) = s.render(40, 20);
+        let (lines, _) = s.render(40, 30);
         let t = texts(&lines);
-        assert!(t.iter().any(|l| l == "    fn b() {}"), "{t:?}");
-        assert!(!t.iter().any(|l| l.contains("fn a")), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("fn a() {}")) && t.iter().any(|l| l.contains("fn b() {}")), "{t:?}");
     }
 
     #[test]
@@ -1122,13 +1260,14 @@ mod tests {
         let s = described(&[("a", "")]).previews(vec![Some(long)]);
         let (lines, _) = s.render(60, 40);
         let t = texts(&lines);
-        assert_eq!(t[3], "", "{t:?}");
-        assert_eq!(t[4], "    line 1", "{t:?}");
-        assert_eq!(t[4 + PREVIEW_MAX_LINES - 1], "    … 25 more lines", "{t:?}");
+        let body = box_rows(&t);
+        assert_eq!(body.len(), PREVIEW_MAX_LINES, "{t:?}");
+        assert!(body[0].starts_with("│ line 1") || t.iter().any(|l| l.starts_with("    │ line 1 ")), "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("    │ … 25 more lines")), "{t:?}");
         let s = described(&[("x", "")]).previews(vec![Some("x".repeat(100))]);
         let (lines, _) = s.render(20, 30);
         let t = texts(&lines);
-        assert!(t[4].ends_with('…') && t[4].chars().count() <= 20, "{t:?}");
+        assert!(t.iter().any(|l| l.contains("x…")), "{t:?}");
         assert!(lines.iter().all(|l| line::line_width(l) <= 20), "{t:?}");
     }
 
@@ -1137,7 +1276,35 @@ mod tests {
         let s = described(&[("a", "")]).previews(vec![Some("if x {\n\treturn 1;\n}".into())]);
         let (lines, _) = s.render(40, 30);
         let t = texts(&lines);
-        assert_eq!(t[4..7], ["    if x {", "        return 1;", "    }"], "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("    │ if x {")), "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("    │     return 1;")), "{t:?}");
+    }
+
+    #[test]
+    fn preview_kind_is_declared_or_guessed() {
+        let k = |t: &str| preview_kind(t, None);
+        assert_eq!(k("@@ -1 +1 @@\n-a\n+b"), PreviewKind::Diff);
+        assert_eq!(k("-old\n+new\n context"), PreviewKind::Diff);
+        assert_eq!(k("┌──┐\n│  │\n└──┘"), PreviewKind::Layout);
+        assert_eq!(k("| a | b |\n|---|---|\n| 1 | 2 |"), PreviewKind::Layout);
+        assert_eq!(k("fn main() {\n    run();\n}"), PreviewKind::Code);
+        assert_eq!(k("A plain sentence\nwith no syntax"), PreviewKind::Text);
+        assert_eq!(preview_kind("A plain sentence", Some(PreviewKind::Code)), PreviewKind::Code);
+    }
+
+    #[test]
+    fn described_previews_squeeze_others_before_the_highlighted_one() {
+        let body: String = (1..=10).map(|i| format!("l{i}\n")).collect();
+        let s = described(&[("A", ""), ("B", ""), ("C", "")]).previews(vec![
+            Some(body.clone()),
+            Some(body.clone()),
+            Some(body),
+        ]);
+        let (lines, _) = s.render(40, 22);
+        let t = texts(&lines);
+        assert!(lines.len() <= 22, "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("    │ l10 ")), "the highlighted preview is whole: {t:?}");
+        assert!(t.iter().any(|l| l.starts_with("❯ A")) && t.iter().any(|l| l.starts_with("  C")), "{t:?}");
     }
 
     #[test]
