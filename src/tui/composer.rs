@@ -468,7 +468,7 @@ impl Composer {
             } else if key.code == KeyCode::Tab {
                 self.ctrl_c_armed = false;
                 break 'act match ghost {
-                    Some(g) => self.accept_ghost(&g, true),
+                    Some(g) => self.accept_ghost(&g),
                     None => Action::None,
                 };
             } else if let (KeyCode::Right, Some(g)) = (key.code, ghost.as_deref())
@@ -476,7 +476,7 @@ impl Composer {
                 && self.at_end()
             {
                 self.ctrl_c_armed = false;
-                break 'act self.accept_ghost(g, false);
+                break 'act self.accept_ghost(g);
             }
             let a = self.on_key_inner(key, running);
             if let (KeyCode::Char(c), Some(g)) = (key.code, ghost.as_deref())
@@ -495,13 +495,9 @@ impl Composer {
         self.buf.row + 1 == self.buf.lines.len() && self.buf.col == self.buf.cur_len()
     }
 
-    fn accept_ghost(&mut self, g: &str, space: bool) -> Action {
-        let add_space = space && !g.contains(char::is_whitespace);
+    fn accept_ghost(&mut self, g: &str) -> Action {
         self.edit(|b| {
             b.insert_str(g);
-            if add_space {
-                b.insert_str(" ");
-            }
         })
     }
 
@@ -538,8 +534,9 @@ impl Composer {
             KeyCode::Char('p') if ctrl_only => m.sel = (m.sel + n - 1) % n,
             KeyCode::Char('n') if ctrl_only => m.sel = (m.sel + 1) % n,
             KeyCode::Tab => {
-                let text = self.menu_text(true);
+                let text = self.menu_text(false);
                 self.set_text(&text);
+                self.menu_closed_for = Some(text);
             }
             KeyCode::Enter if plain_mods => {
                 let (exact, arg, needs) = (m.exact, m.arg.is_some(), m.needs_arg[m.sel]);
@@ -1225,8 +1222,16 @@ mod tests {
         let mut c = Composer::new(None);
         typ(&mut c, "/thinking h");
         tab(&mut c);
-        assert_eq!(c.text(), "/thinking high ");
+        assert_eq!(c.text(), "/thinking high");
         assert!(c.menu.is_none());
+
+        let mut c = Composer::new(None);
+        typ(&mut c, "/thin");
+        tab(&mut c);
+        assert_eq!(c.text(), "/thinking");
+        assert!(c.menu.is_none());
+        typ(&mut c, " ");
+        assert_eq!(c.menu.as_ref().and_then(|m| m.arg.as_deref()), Some("thinking"));
 
         let mut c = Composer::new(None);
         typ(&mut c, "/thinking h");
@@ -1273,7 +1278,7 @@ mod tests {
         c.set_text("please com");
         c.set_ghost("please com", "mit".into());
         tab(&mut c);
-        assert_eq!(c.text(), "please commit ");
+        assert_eq!(c.text(), "please commit");
 
         c.set_text("please com");
         c.set_ghost("please com", "mit".into());
@@ -1285,7 +1290,7 @@ mod tests {
         let (lines, _) = c.render(40);
         assert!(crate::tui::line::line_text(&lines[1]).ends_with("a b c d"));
         tab(&mut c);
-        assert_eq!(c.text(), "a b c d", "multi-word ghost gets no trailing space");
+        assert_eq!(c.text(), "a b c d");
 
         let mut c = Composer::new(None);
         c.history = vec!["old".into()];
