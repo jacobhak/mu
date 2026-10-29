@@ -232,6 +232,11 @@ pub(crate) fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
     }
 }
 
+/// A reply that is only `.` (declining a reminder): kept in the session, never rendered.
+fn is_dismissal(m: &Message) -> bool {
+    matches!(m, Message::Assistant { content, .. } if tool_calls(m).is_empty() && text_of(content).trim() == ".")
+}
+
 impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let tools = Tools::new(i.cwd.clone(), i.plugins.clone());
@@ -671,11 +676,17 @@ impl Agent {
     /// Loads `path`, applying its model/thinking unless pinned by the command line.
     /// Re-emits the loaded conversation as UI events so a resumed session shows its history.
     fn replay_history(&self) {
+        let mut after_reminder = false;
         for m in &self.messages {
+            let reminded = std::mem::replace(
+                &mut after_reminder,
+                matches!(m, Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content))),
+            );
             match m {
                 Message::User { synthetic: true, .. } => self.notice("▸ Plan approved"),
                 Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content)) => {}
                 Message::User { content, .. } => self.emit(AgentEvent::UserPrompt(text_of(content))),
+                Message::Assistant { .. } if reminded && is_dismissal(m) => {}
                 Message::Assistant { content, .. } => {
                     for b in content {
                         match b {
@@ -1697,6 +1708,9 @@ impl Agent {
             // Every tool call in the history has its result and vice versa (`to_wire` also repairs).
             debug_assert!(crate::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
             let defs = self.tool_defs();
+            // Held until the reply ends: a reply that turns out to be a dismissal is never shown.
+            let answering_reminder = matches!(self.messages.last(), Some(Message::User { content, .. }) if ask_nudge::is_reminder(&text_of(content)));
+            let mut held = Vec::new();
             let reply = {
                 let req = Request {
                     model: &self.model,
@@ -1708,7 +1722,7 @@ impl Agent {
                 };
                 let tx = self.events.clone();
                 let mut ev = |e: StreamEvent| {
-                    let _ = tx.send(match e {
+                    let e = match e {
                         StreamEvent::Text(t) => AgentEvent::Text(t.into()),
                         StreamEvent::Thinking(t) => AgentEvent::Thinking(t.into()),
                         StreamEvent::ToolCallStart { id, name } => {
@@ -1718,10 +1732,21 @@ impl Agent {
                             AgentEvent::ToolCallDelta { id: id.into(), json: json.into() }
                         }
                         StreamEvent::Retry { attempt, delay, reason } => AgentEvent::Retry { attempt, delay, reason },
-                    });
+                    };
+                    if answering_reminder {
+                        held.push(e);
+                    } else {
+                        let _ = tx.send(e);
+                    }
                 };
                 self.providers.stream(&req, cancel, &mut ev).await
             };
+            let dismissed = answering_reminder && matches!(&reply, Ok(m) if is_dismissal(m));
+            if !dismissed {
+                for e in held {
+                    self.emit(e);
+                }
+            }
             let msg = match reply {
                 Ok(m) => m,
                 Err(ProviderError::Aborted) => return Flow::Aborted,
@@ -1752,7 +1777,9 @@ impl Agent {
                     return Flow::Failed;
                 }
             };
-            self.emit(AgentEvent::BlockEnd);
+            if !dismissed {
+                self.emit(AgentEvent::BlockEnd);
+            }
             let calls = tool_calls(&msg);
             let stop = match &msg {
                 Message::Assistant { stop_reason, .. } => *stop_reason,
@@ -2592,6 +2619,40 @@ mod loop_tests {
             a.messages.push(Message::user(crate::ask_nudge::REMINDER));
             a.replay_history();
             assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::UserPrompt(_))));
+        });
+    }
+
+    #[test]
+    fn a_dismissal_is_kept_in_history_but_not_streamed() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![
+                Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+                Ok(assistant(vec![Block::text(".")], StopReason::Stop)),
+            ]);
+            a.turn(Some("go".to_string().into())).await;
+            assert_eq!(a.messages.len(), 4);
+            assert!(
+                matches!(&a.messages[3], Message::Assistant { content, .. } if text_of(content) == "."),
+                "kept in history"
+            );
+            let events = drain(&mut rx);
+            assert!(events.iter().all(|e| !matches!(e, AgentEvent::Text(t) if t == ".")), "not streamed");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(t) if t == "Keep the cache or drop it?")));
+        });
+    }
+
+    #[test]
+    fn a_dismissal_is_not_rendered_on_resume() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![]);
+            a.messages.push(Message::user("go"));
+            a.messages.push(assistant(vec![Block::text("Keep it or drop it?")], StopReason::Stop));
+            a.messages.push(Message::user(crate::ask_nudge::REMINDER));
+            a.messages.push(assistant(vec![Block::text(".")], StopReason::Stop));
+            a.replay_history();
+            let events = drain(&mut rx);
+            assert!(events.iter().all(|e| !matches!(e, AgentEvent::Text(t) if t == ".")));
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(t) if t == "Keep it or drop it?")));
         });
     }
 
