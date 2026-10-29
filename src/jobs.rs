@@ -1,7 +1,8 @@
-//! Background subagent jobs: `task` returns ids at once, finished results are delivered to the
-//! model as a `<system-notice>` message, and `wait` blocks until a job finishes.
+//! Background jobs: `task` (subagents) and `bash` with `async` return ids at once; finished results
+//! are delivered to the model as a `<system-notice>` message, and `wait` blocks until a job finishes.
 
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -12,7 +13,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{AgentEvent, EventTx, SubagentState, SubagentStatus};
-use crate::tools::task::run_child;
+use crate::tools::bash::BackgroundResult;
+use crate::tools::task::{MAX_TASKS, run_child};
+use crate::tui::line::truncate_text;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
 
@@ -21,10 +24,14 @@ struct Job {
     seq: u64,
     id: String,
     agent: String,
+    /// The command of a bash job; taken on delivery, like `text`.
+    command: Option<String>,
     tools: u32,
     last: String,
     state: SubagentState,
     text: String,
+    /// How a bash job ended ("exit 3", "timed out", …).
+    note: Option<String>,
     delivered: bool,
     cancel: CancellationToken,
 }
@@ -34,6 +41,8 @@ pub struct Done {
     pub agent: String,
     pub ok: bool,
     pub text: String,
+    pub command: Option<String>,
+    pub note: Option<String>,
 }
 
 pub enum WaitResult {
@@ -70,6 +79,15 @@ impl JobsHandle {
         self.inner.borrow().iter().filter(|j| j.state == SubagentState::Running).count()
     }
 
+    /// Errs when `n` more running jobs would go over the cap.
+    pub fn check_capacity(&self, n: usize) -> Result<(), String> {
+        let running = self.running();
+        if running + n > MAX_TASKS {
+            return Err(format!("too many background jobs running ({running}/{MAX_TASKS}); wait for some to finish"));
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Vec<SubagentStatus> {
         self.inner
             .borrow()
@@ -88,22 +106,41 @@ impl JobsHandle {
         let _ = self.events.send(AgentEvent::Jobs(self.snapshot()));
     }
 
-    pub fn spawn(self: &Rc<Self>, id: String, agent: String, exe: PathBuf, cwd: PathBuf, payload: Value) {
+    fn start(&self, id: String, agent: &str, last: String, command: Option<String>, cancel: CancellationToken) -> u64 {
         let seq = self.next_seq.get();
         self.next_seq.set(seq + 1);
-        let cancel = CancellationToken::new();
         self.inner.borrow_mut().push(Job {
             seq,
             id,
-            agent,
+            agent: agent.into(),
+            command,
             tools: 0,
-            last: String::new(),
+            last,
             state: SubagentState::Running,
             text: String::new(),
+            note: None,
             delivered: false,
-            cancel: cancel.clone(),
+            cancel,
         });
         self.emit();
+        seq
+    }
+
+    /// Records a finished job and wakes an idle agent.
+    fn complete(&self, seq: u64, ok: bool, text: String, note: Option<String>) {
+        if let Some(j) = self.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
+            j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
+            j.text = text;
+            j.note = note;
+        }
+        self.notify.notify_waiters();
+        let _ = self.wake.send(());
+        self.emit();
+    }
+
+    pub fn spawn(self: &Rc<Self>, id: String, agent: String, exe: PathBuf, cwd: PathBuf, payload: Value) {
+        let cancel = CancellationToken::new();
+        let seq = self.start(id, &agent, String::new(), None, cancel.clone());
         let me = self.clone();
         tokio::task::spawn_local(async move {
             let out = run_child(&exe, &cwd, &payload, &cancel, |name, summary| {
@@ -116,15 +153,26 @@ impl JobsHandle {
             .await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
-            let (ok, text) = (out.ok, out.text);
-            if let Some(j) = me.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
-                j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
-                j.text = text;
-            }
-            me.notify.notify_waiters();
-            let _ = me.wake.send(());
-            me.emit();
+            me.complete(seq, out.ok, out.text, None);
         });
+    }
+
+    /// Starts a bash job and returns its id. `run` gets the job's cancel token, which `kill` and
+    /// `clear` fire.
+    pub fn spawn_bash<F>(self: &Rc<Self>, command: String, run: impl FnOnce(CancellationToken) -> F) -> String
+    where
+        F: Future<Output = BackgroundResult> + 'static,
+    {
+        let id = self.unique_id(&format!("bg_{}", self.next_seq.get() + 1));
+        let cancel = CancellationToken::new();
+        let seq = self.start(id.clone(), "bash", command_line(&command), Some(command), cancel.clone());
+        let fut = run(cancel);
+        let me = self.clone();
+        tokio::task::spawn_local(async move {
+            let r = fut.await;
+            me.complete(seq, r.ok, r.text, Some(r.note));
+        });
+        id
     }
 
     /// Finished, undelivered jobs (only `ids` when non-empty); marks them delivered.
@@ -141,6 +189,8 @@ impl JobsHandle {
                     ok: j.state == SubagentState::Done,
                     // Delivered output is not kept: only the snapshot fields stay resident.
                     text: std::mem::take(&mut j.text),
+                    command: j.command.take(),
+                    note: j.note.take(),
                 }
             })
             .collect()
@@ -205,24 +255,39 @@ impl JobsHandle {
     }
 
     #[cfg(test)]
-    fn push_running(&self, id: &str) {
+    pub(crate) fn push_running(&self, id: &str) {
         self.inner.borrow_mut().push(Job {
             seq: 0,
             id: id.into(),
             agent: "scout".into(),
+            command: None,
             tools: 0,
             last: String::new(),
             state: SubagentState::Running,
             text: String::new(),
+            note: None,
             delivered: false,
             cancel: CancellationToken::new(),
         });
     }
 }
 
-/// One job's result in the same shape the blocking `task` result uses.
+/// A command on one line for headings and the jobs list.
+fn command_line(command: &str) -> String {
+    truncate_text(&command.split_whitespace().collect::<Vec<_>>().join(" "), 120)
+}
+
+/// One job's result in the same shape the blocking `task` result uses. A bash job's heading names
+/// its command and how it ended.
 pub fn result_text(d: &Done) -> String {
-    format!("## {} ({}) — {}\n{}", d.id, d.agent, if d.ok { "ok" } else { "failed" }, d.text)
+    let status = if d.ok { "ok" } else { "failed" };
+    match &d.command {
+        Some(cmd) => {
+            let note = d.note.as_ref().map(|n| format!(", {n}")).unwrap_or_default();
+            format!("## {} (bash: {}) — {status}{note}\n{}", d.id, command_line(cmd), d.text)
+        }
+        None => format!("## {} ({}) — {status}\n{}", d.id, d.agent, d.text),
+    }
 }
 
 /// The user message that delivers finished jobs to the model.
@@ -246,17 +311,17 @@ pub fn notice(done: &[Done]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn handle() -> Rc<JobsHandle> {
+    pub(crate) fn handle() -> Rc<JobsHandle> {
         let (wake, _) = tokio::sync::mpsc::unbounded_channel();
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         JobsHandle::new(wake, events)
     }
 
     fn done(id: &str, ok: bool, text: &str) -> Done {
-        Done { id: id.into(), agent: "scout".into(), ok, text: text.into() }
+        Done { id: id.into(), agent: "scout".into(), ok, text: text.into(), command: None, note: None }
     }
 
     #[test]
@@ -266,16 +331,20 @@ mod tests {
             seq: 0,
             id: "A".into(),
             agent: "scout".into(),
+            command: Some("echo".into()),
             tools: 0,
             last: String::new(),
             state: SubagentState::Done,
             text: "big output".into(),
+            note: Some("exit 0".into()),
             delivered: false,
             cancel: CancellationToken::new(),
         });
         let got = h.take_undelivered(&[]);
         assert_eq!(got[0].text, "big output");
+        assert_eq!((got[0].command.as_deref(), got[0].note.as_deref()), (Some("echo"), Some("exit 0")));
         assert!(h.inner.borrow()[0].text.is_empty());
+        assert!(h.inner.borrow()[0].command.is_none());
         assert!(h.take_undelivered(&[]).is_empty());
     }
 
@@ -290,6 +359,19 @@ mod tests {
             "<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n\
              ── Job A (scout) ──\n## A (scout) — ok\nx\n── Job B (scout) ──\n## B (scout) — failed\ny\n</system-notice>"
         );
+    }
+
+    #[test]
+    fn bash_heading_names_the_command_and_exit() {
+        let d = Done {
+            id: "bg_1".into(),
+            agent: "bash".into(),
+            ok: false,
+            text: "out".into(),
+            command: Some("make\n  test".into()),
+            note: Some("exit 2".into()),
+        };
+        assert_eq!(result_text(&d), "## bg_1 (bash: make test) — failed, exit 2\nout");
     }
 
     #[test]

@@ -1,12 +1,18 @@
 use super::{BashMeta, ToolCtx, ToolMeta, ToolOutput, Tools};
 use crate::events::AgentEvent;
+use crate::jobs::JobsHandle;
 use pi_shell::{
     cancel::{AbortReason, CancelToken},
     shell::ShellRunOptions,
 };
 use serde::Deserialize;
 use std::io::Write;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::rc::Rc;
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -15,6 +21,9 @@ pub struct Args {
     cwd: Option<String>,
     #[serde(default)]
     pty: bool,
+    /// Run as a background job (interactive sessions; not with `pty`).
+    #[serde(default)]
+    r#async: bool,
 }
 
 const HEAD: usize = 20 * 1024;
@@ -160,6 +169,12 @@ impl Limits {
 
 impl Tools {
     pub async fn bash(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
+        if let Some(jobs) = &self.jobs
+            && a.r#async
+            && !a.pty
+        {
+            return self.bash_background(a, jobs);
+        }
         let fallback = a.pty;
         if a.pty
             && let Some(out) = self.bash_pty(&a, ctx).await
@@ -171,6 +186,22 @@ impl Tools {
             out.text.push_str("\n\n[pty unavailable without the terminal UI; ran without a terminal]");
         }
         out
+    }
+
+    /// `async`: the command runs as a tracked job; its result arrives as a system notice.
+    fn bash_background(&self, a: Args, jobs: &Rc<JobsHandle>) -> ToolOutput {
+        if let Err(e) = jobs.check_capacity(1) {
+            return ToolOutput::err(e);
+        }
+        let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or_else(|| self.cwd.clone());
+        let (env, artifact_dir) = (self.session_env(), self.artifact_dir());
+        let (command, timeout) = (a.command.clone(), a.timeout);
+        let id = jobs.spawn_bash(a.command, move |cancel| {
+            run_background(command, cwd, env, timeout, cancel, move || Tools::next_artifact_in(&artifact_dir))
+        });
+        ToolOutput::ok(format!(
+            "Started background job {id}.\nThe result arrives automatically as a system notice when the command finishes. Keep working or end your turn; never poll, sleep or loop for it."
+        ))
     }
 
     async fn bash_pty(&self, a: &Args, ctx: &ToolCtx) -> Option<ToolOutput> {
@@ -419,6 +450,117 @@ fn finish(
     out
 }
 
+/// A background command's finished result: the text the model sees, and how it ended.
+pub struct BackgroundResult {
+    pub ok: bool,
+    pub text: String,
+    /// "exit 3", "timed out", "cancelled", …
+    pub note: String,
+}
+
+/// Quiet time after the command exits before its pipes are given up: a background descendant
+/// may hold them open.
+const IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Reads from a pipe, or never completes once the pipe is closed (`None`).
+async fn read_or_pending<R: AsyncRead + Unpin>(r: &mut Option<R>, buf: &mut [u8]) -> std::io::Result<usize> {
+    match r {
+        Some(r) => r.read(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Runs `command` for a background job: a login shell in its own process group, with the
+/// foreground run's output limits and timeout. Cancel, timeout and the end of the command all kill
+/// the group, so nothing the command started outlives the job.
+pub async fn run_background(
+    command: String,
+    cwd: PathBuf,
+    env: Vec<(&'static str, String)>,
+    timeout: Option<f64>,
+    cancel: CancellationToken,
+    alloc: impl Fn() -> (u32, PathBuf),
+) -> BackgroundResult {
+    let limits = Limits::new(timeout);
+    let start = Instant::now();
+    let mut cmd = tokio::process::Command::new(crate::pty::login_shell());
+    cmd.arg("-lc")
+        .arg(&command)
+        .current_dir(&cwd)
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return BackgroundResult {
+                ok: false,
+                text: format!("cannot start command: {e}"),
+                note: "did not start".into(),
+            };
+        }
+    };
+    let pid = child.id().unwrap_or(0) as i32;
+    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
+    let (mut out_dec, mut err_dec) =
+        (pi_shell::output_decode::OutputDecoder::new(), pi_shell::output_decode::OutputDecoder::new());
+    let (mut obuf, mut ebuf) = (vec![0u8; 8192], vec![0u8; 8192]);
+    let mut collector = Collector::default();
+    let mut status: Option<std::process::ExitStatus> = None;
+    let (mut cancelled, mut timed_out, mut stopping) = (false, false, false);
+    let timeout_sleep = tokio::time::sleep(limits.timeout.unwrap_or_default());
+    tokio::pin!(timeout_sleep);
+    loop {
+        tokio::select! {
+            r = read_or_pending(&mut stdout, &mut obuf) => match r {
+                Ok(n) if n > 0 => collector.push(&out_dec.push(&obuf[..n]), &alloc),
+                _ => stdout = None,
+            },
+            r = read_or_pending(&mut stderr, &mut ebuf) => match r {
+                Ok(n) if n > 0 => collector.push(&err_dec.push(&ebuf[..n]), &alloc),
+                _ => stderr = None,
+            },
+            st = child.wait(), if status.is_none() => status = st.ok(),
+            _ = cancel.cancelled(), if !stopping => {
+                cancelled = true;
+                stopping = true;
+                crate::proc::terminate_group(pid).await;
+            }
+            _ = &mut timeout_sleep, if !stopping && limits.timeout.is_some() => {
+                timed_out = true;
+                stopping = true;
+                crate::proc::terminate_group(pid).await;
+            }
+            _ = tokio::time::sleep(IDLE), if status.is_some() => break,
+        }
+        if status.is_some() && stdout.is_none() && stderr.is_none() {
+            break;
+        }
+    }
+    if !stopping {
+        crate::proc::terminate_group(pid).await;
+    }
+    collector.push(&out_dec.finish(), &alloc);
+    collector.push(&err_dec.finish(), &alloc);
+    let code = status.and_then(|s| {
+        use std::os::unix::process::ExitStatusExt;
+        s.code().or_else(|| s.signal().map(|g| 128 + g))
+    });
+    let out = finish(collector.finish(), start.elapsed().as_secs_f64(), limits.secs, cancelled, timed_out, code, false);
+    let failed = cancelled || timed_out || code.is_some_and(|c| c != 0);
+    let note = if cancelled {
+        "cancelled".to_string()
+    } else if timed_out {
+        "timed out".to_string()
+    } else {
+        code.map_or("no exit status".to_string(), |c| format!("exit {c}"))
+    };
+    BackgroundResult { ok: !failed, text: out.text, note }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +687,92 @@ mod tests {
         let Some(ToolMeta::Bash(q)) = &quiet.meta else { panic!() };
         assert_eq!((q.output_end, q.exit_code), (0, None));
         assert_eq!(quiet.text, "(no output)");
+    }
+
+    /// Tools with a jobs handle attached; background jobs are spawned on the current LocalSet.
+    fn tools_with_jobs() -> (Tools, std::rc::Rc<crate::jobs::JobsHandle>) {
+        let mut tools = Tools::for_test();
+        let jobs = crate::jobs::tests::handle();
+        tools.jobs = Some(jobs.clone());
+        (tools, jobs)
+    }
+
+    fn ctx() -> ToolCtx {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ToolCtx { events, cancel: Default::default(), call_id: "c".into() }
+    }
+
+    async fn finished(jobs: &crate::jobs::JobsHandle) -> Vec<crate::jobs::Done> {
+        match jobs.wait(&[], &tokio_util::sync::CancellationToken::new()).await {
+            crate::jobs::WaitResult::Done(d) => d,
+            _ => panic!("no background job finished"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_job_is_delivered_once_with_output_and_exit_code() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let out = tools.call("bash", &json!({"command": "echo hi; exit 3", "async": true}), &ctx()).await;
+                assert!(!out.is_error && out.text.contains("bg_1"), "{}", out.text);
+                let done = finished(&jobs).await;
+                assert_eq!(done.len(), 1);
+                assert!(!done[0].ok && done[0].note.as_deref() == Some("exit 3"), "{:?}", done[0].note);
+                assert!(done[0].text.starts_with("hi"), "{}", done[0].text);
+                assert!(jobs.take_undelivered(&[]).is_empty() && !jobs.has_undelivered());
+                let msg = crate::jobs::notice(&done);
+                assert!(msg.contains("## bg_1 (bash: echo hi; exit 3) — failed, exit 3\nhi"), "{msg}");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_kills_the_background_command() {
+        // The duration carries this pid so `alive` sees only this test's sleep.
+        let arg = format!("4{}", std::process::id());
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let cmd = json!({"command": format!("sleep {arg}"), "async": true, "timeout": 1});
+                tools.call("bash", &cmd, &ctx()).await;
+                let done = finished(&jobs).await;
+                assert!(!done[0].ok && done[0].note.as_deref() == Some("timed out"), "{:?}", done[0].note);
+                assert!(done[0].text.contains("[Command timed out after 1 seconds]"), "{}", done[0].text);
+                assert!(!alive(&arg).await);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_kills_the_background_command() {
+        let arg = format!("5{}", std::process::id());
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                tools.call("bash", &json!({"command": format!("sleep {arg}"), "async": true}), &ctx()).await;
+                assert_eq!(jobs.kill(None), 1);
+                let done = finished(&jobs).await;
+                assert!(!done[0].ok && done[0].note.as_deref() == Some("cancelled"), "{:?}", done[0].note);
+                assert!(!alive(&arg).await);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_cap_applies_to_bash_jobs() {
+        let (tools, jobs) = tools_with_jobs();
+        for i in 0..crate::tools::task::MAX_TASKS {
+            jobs.push_running(&format!("R{i}"));
+        }
+        let out = tools.call("bash", &json!({"command": "echo no", "async": true}), &ctx()).await;
+        assert!(out.is_error && out.text.contains("too many background jobs running (8/8)"), "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_runs_in_the_foreground_without_jobs() {
+        let tools = Tools::for_test();
+        let out = tools.call("bash", &json!({"command": "echo fg", "async": true}), &ctx()).await;
+        assert_eq!(out.text.trim(), "fg");
     }
 }
