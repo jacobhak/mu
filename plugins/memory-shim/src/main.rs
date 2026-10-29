@@ -73,13 +73,14 @@ fn open_lock(dir: &Path) -> io::Result<File> {
 /// Connects and waits for the daemon's ready line; `None` for a dead socket or a daemon that is shutting down.
 fn try_connect(sock: &Path) -> Option<UnixStream> {
     let mut s = UnixStream::connect(sock).ok()?;
-    s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok()?;
+    // macOS fails setsockopt with EINVAL once the peer has closed; the data is still readable.
+    let _ = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let mut got = [0u8; READY_LINE.len()];
     s.read_exact(&mut got).ok()?;
     if got != READY_LINE {
         return None;
     }
-    s.set_read_timeout(None).ok()?;
+    let _ = s.set_read_timeout(None);
     Some(s)
 }
 
