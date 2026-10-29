@@ -44,9 +44,18 @@ impl std::ops::Deref for Pty {
 
 pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16) -> io::Result<Pty> {
     let (mut m, mut s) = (-1 as c_int, -1 as c_int);
-    let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-    // SAFETY: valid out-pointers; name and termios are null.
-    let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) };
+    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: valid out-pointers; name and termios are null. macOS declares the winsize pointer
+    // `*mut`, Linux `*const`; the cast is only read through.
+    let r = unsafe {
+        libc::openpty(
+            &mut m,
+            &mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::addr_of!(ws).cast_mut().cast(),
+        )
+    };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
