@@ -440,6 +440,8 @@ mod tests {
         std::process::Command::new("pgrep").args(["-f", &format!("sleep {arg}$")]).output().unwrap().status.success()
     }
 
+    // macOS ships no `setsid`.
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     #[tokio::test(flavor = "current_thread")]
     async fn background_processes_in_plain_mode() {
         // `pgrep`/`pkill -f` see every process on the machine, so the sleep durations carry this
