@@ -7,7 +7,7 @@ use pi_shell::{
 };
 use serde::Deserialize;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
 use std::time::Instant;
@@ -173,7 +173,7 @@ impl Tools {
             && a.r#async
             && !a.pty
         {
-            return self.bash_background(a, jobs);
+            return self.bash_background(a, jobs).await;
         }
         let fallback = a.pty;
         if a.pty
@@ -188,20 +188,45 @@ impl Tools {
         out
     }
 
-    /// `async`: the command runs as a tracked job; its result arrives as a system notice.
-    fn bash_background(&self, a: Args, jobs: &Rc<JobsHandle>) -> ToolOutput {
+    /// `async`: the command runs as a tracked job; its result arrives as a system notice. The job
+    /// starts from the persistent shell's cwd and exported environment as of launch.
+    async fn bash_background(&self, a: Args, jobs: &Rc<JobsHandle>) -> ToolOutput {
         if let Err(e) = jobs.check_capacity(1) {
             return ToolOutput::err(e);
         }
-        let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or_else(|| self.cwd.clone());
-        let (env, artifact_dir) = (self.session_env(), self.artifact_dir());
+        let snapshot = self.shell_snapshot().await;
+        let inherited = snapshot.is_some();
+        let (base_cwd, vars) = snapshot.unwrap_or_else(|| (self.cwd.clone(), process_env()));
+        let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or(base_cwd);
+        let env = job_env(vars, &cwd, self.session_env());
+        let artifact_dir = self.artifact_dir();
         let (command, timeout) = (a.command.clone(), a.timeout);
         let id = jobs.spawn_bash(a.command, move |cancel| {
             run_background(command, cwd, env, timeout, cancel, move || Tools::next_artifact_in(&artifact_dir))
         });
+        let note = if inherited {
+            String::new()
+        } else {
+            "\nShell state from earlier calls was not inherited (the shell was busy or did not answer in time): the job uses mu's own environment.".to_string()
+        };
         ToolOutput::ok(format!(
-            "Started background job {id}.\nThe result arrives automatically as a system notice when the command finishes. Keep working or end your turn; never poll, sleep or loop for it."
+            "Started background job {id}.{note}\nThe result arrives automatically as a system notice when the command finishes. Keep working or end your turn; never poll, sleep or loop for it."
         ))
+    }
+
+    /// The persistent shell's cwd and exported variables, from one state-neutral command. `None`
+    /// when the shell does not answer within `SNAPSHOT_TIMEOUT` (a foreground command holds it) or
+    /// the answer does not parse.
+    async fn shell_snapshot(&self) -> Option<(PathBuf, Vec<(String, String)>)> {
+        let ms = SNAPSHOT_TIMEOUT.as_millis() as u32;
+        let (tx, rx) = flume::unbounded::<String>();
+        let opts = ShellRunOptions { command: SNAPSHOT_COMMAND.into(), timeout_ms: Some(ms), ..Default::default() };
+        let run = self.shell().run(opts, Some(tx), CancelToken::new(Some(ms)));
+        let res = tokio::time::timeout(SNAPSHOT_TIMEOUT, run).await.ok()?.ok()?;
+        if res.cancelled || res.timed_out || res.exit_code != Some(0) {
+            return None;
+        }
+        parse_snapshot(&rx.drain().collect::<String>())
     }
 
     async fn bash_pty(&self, a: &Args, ctx: &ToolCtx) -> Option<ToolOutput> {
@@ -406,6 +431,57 @@ impl Tools {
     }
 }
 
+/// How long a background job waits for the persistent shell's snapshot before starting without it.
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Prints the cwd, then each exported name and value as NUL-terminated fields. Values hold anything
+/// but NUL, so the fields split exactly; `export -p` does not quote values and cannot be split.
+const SNAPSHOT_COMMAND: &str =
+    r#"printf '%s\0' "$(pwd)"; for n in $(compgen -e); do printf '%s\0%s\0' "$n" "${!n}"; done"#;
+
+/// Not inherited by a job: shell bookkeeping, and PWD, which is set from the job's cwd.
+const NOT_INHERITED: [&str; 4] = ["_", "SHLVL", "OLDPWD", "PWD"];
+
+/// Parses `SNAPSHOT_COMMAND`'s output: the cwd, then name/value pairs.
+fn parse_snapshot(out: &str) -> Option<(PathBuf, Vec<(String, String)>)> {
+    let fields: Vec<&str> = out.strip_suffix('\0')?.split('\0').collect();
+    let (&cwd, pairs) = fields.split_first()?;
+    if !Path::new(cwd).is_absolute() || pairs.len() % 2 != 0 {
+        return None;
+    }
+    let mut env = Vec::with_capacity(pairs.len() / 2);
+    for kv in pairs.chunks(2) {
+        if kv[0].is_empty() || kv[0].contains('=') {
+            return None;
+        }
+        env.push((kv[0].to_string(), kv[1].to_string()));
+    }
+    Some((PathBuf::from(cwd), env))
+}
+
+/// mu's own environment, for a job whose shell state could not be read.
+fn process_env() -> Vec<(String, String)> {
+    std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect()
+}
+
+/// The environment of a job: `vars` without what is not inherited, PWD set to `cwd`, then mu's
+/// session variables on top.
+fn job_env(vars: Vec<(String, String)>, cwd: &Path, session: Vec<(&'static str, String)>) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vars
+        .into_iter()
+        .filter(|(k, _)| !NOT_INHERITED.contains(&k.as_str()) && !session.iter().any(|(s, _)| *s == k.as_str()))
+        .collect();
+    env.push(("PWD".into(), cwd.to_string_lossy().into_owned()));
+    env.extend(session.into_iter().map(|(k, v)| (k.to_string(), v)));
+    env
+}
+
+/// `bash` on mu's `PATH`, the dialect of the foreground shell; `/bin/sh` when there is none.
+fn job_shell() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).map(|d| d.join("bash")).find(|p| p.is_file()).unwrap_or_else(|| "/bin/sh".into())
+}
+
 /// Builds the result: the same text the model has always seen, plus `meta` carrying the facts the
 /// UI shows (exit code, wall time, flags, artifact), so it never has to parse them back out.
 /// `quiet_wall`: a cancelled-by-user run reports no wall time.
@@ -470,23 +546,24 @@ async fn read_or_pending<R: AsyncRead + Unpin>(r: &mut Option<R>, buf: &mut [u8]
     }
 }
 
-/// Runs `command` for a background job: a login shell in its own process group, with the
-/// foreground run's output limits and timeout. Cancel, timeout and the end of the command all kill
-/// the group, so nothing the command started outlives the job.
+/// Runs `command` for a background job: `bash -c` in its own process group, with `env` as its whole
+/// environment and the foreground run's output limits and timeout. Cancel, timeout and the end of
+/// the command all kill the group, so nothing the command started outlives the job.
 pub async fn run_background(
     command: String,
     cwd: PathBuf,
-    env: Vec<(&'static str, String)>,
+    env: Vec<(String, String)>,
     timeout: Option<f64>,
     cancel: CancellationToken,
     alloc: impl Fn() -> (u32, PathBuf),
 ) -> BackgroundResult {
     let limits = Limits::new(timeout);
     let start = Instant::now();
-    let mut cmd = tokio::process::Command::new(crate::pty::login_shell());
-    cmd.arg("-lc")
+    let mut cmd = tokio::process::Command::new(job_shell());
+    cmd.arg("-c")
         .arg(&command)
         .current_dir(&cwd)
+        .env_clear()
         .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -774,5 +851,129 @@ mod tests {
         let tools = Tools::for_test();
         let out = tools.call("bash", &json!({"command": "echo fg", "async": true}), &ctx()).await;
         assert_eq!(out.text.trim(), "fg");
+    }
+
+    /// A job starts from the cwd and exported variables the persistent shell has at launch, and
+    /// values survive newlines, quotes, spaces and `=`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_job_inherits_the_shell_cwd_and_exports() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let setup = r#"cd /usr && export MU_SNAP_V="$(printf 'l1\nl2 "q" \\ $x `t` a=b\t')""#;
+                let (fg, c) = (json!({"command": setup}), ctx());
+                assert!(!tools.call("bash", &fg, &c).await.is_error);
+                let (job, c) = (json!({"command": r#"printf '%s\n%s' "$PWD" "$MU_SNAP_V""#, "async": true}), ctx());
+                tools.call("bash", &job, &c).await;
+                let done = finished(&jobs).await;
+                assert!(done[0].ok, "{}", done[0].text);
+                assert_eq!(done[0].text, "/usr\nl1\nl2 \"q\" \\ $x `t` a=b\t");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn variables_unset_in_the_shell_do_not_reappear() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let (fg, c) = (json!({"command": "unset HOME"}), ctx());
+                tools.call("bash", &fg, &c).await;
+                let (job, c) = (json!({"command": r#"printf '[%s]' "${HOME-unset}""#, "async": true}), ctx());
+                tools.call("bash", &job, &c).await;
+                let done = finished(&jobs).await;
+                assert_eq!(done[0].text, "[unset]");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_cwd_overrides_the_shell_cwd() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let (fg, c) = (json!({"command": "cd /usr"}), ctx());
+                tools.call("bash", &fg, &c).await;
+                let job = json!({"command": r#"printf '%s' "$PWD""#, "async": true, "cwd": "/"});
+                tools.call("bash", &job, &ctx()).await;
+                let done = finished(&jobs).await;
+                assert_eq!(done[0].text, "/");
+            })
+            .await;
+    }
+
+    /// The job is `bash -c`, not the user's `$SHELL` and not a login shell (`~/.profile` is not read).
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_runs_under_bash_without_a_login_profile() {
+        let home = std::env::temp_dir().join(format!("mu-job-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".profile"), "echo PROFILE_SOURCED\n").unwrap();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let setup = format!("export HOME='{}' SHELL=/nonexistent/zsh", home.display());
+                let (fg, c) = (json!({"command": setup}), ctx());
+                tools.call("bash", &fg, &c).await;
+                let probe =
+                    r#"printf '%s ' "${BASH_VERSION:+bash}"; shopt -q login_shell && echo login || echo nologin"#;
+                let (job, c) = (json!({"command": probe, "async": true}), ctx());
+                tools.call("bash", &job, &c).await;
+                let done = finished(&jobs).await;
+                assert!(done[0].ok, "{}", done[0].text);
+                assert_eq!(done[0].text.trim(), "bash nologin");
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A foreground command holds the persistent shell, so the snapshot times out: the job still
+    /// runs, with mu's own environment, and the call says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_shell_falls_back_to_mu_environment_and_says_so() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let (busy, c1) = (json!({"command": "sleep 2.5"}), ctx());
+                let (job, c2) = (json!({"command": "echo fallback-ran", "async": true}), ctx());
+                let start = async {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tools.call("bash", &job, &c2).await
+                };
+                let (_, out) = tokio::join!(tools.call("bash", &busy, &c1), start);
+                assert!(
+                    !out.is_error && out.text.contains("Shell state from earlier calls was not inherited"),
+                    "{}",
+                    out.text
+                );
+                let done = finished(&jobs).await;
+                assert!(done[0].ok && done[0].text.starts_with("fallback-ran"), "{}", done[0].text);
+            })
+            .await;
+    }
+
+    #[test]
+    fn snapshot_fields_split_exactly_and_reject_malformed_answers() {
+        let s = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let out = "/w d\0A\0x\ny \"q\" a=b\0B\0\0";
+        assert_eq!(parse_snapshot(out), Some((PathBuf::from("/w d"), vec![s("A", "x\ny \"q\" a=b"), s("B", "")])));
+        assert!(parse_snapshot("rel\0").is_none());
+        assert!(parse_snapshot("/a\0A\0").is_none());
+        assert!(parse_snapshot("/a\0=x\0v\0").is_none());
+        assert!(parse_snapshot("").is_none());
+    }
+
+    #[test]
+    fn job_env_drops_bookkeeping_and_applies_session_vars_last() {
+        let s = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let vars = vec![
+            s("PATH", "/bin"),
+            s("_", "/x"),
+            s("SHLVL", "3"),
+            s("OLDPWD", "/"),
+            s("PWD", "/old"),
+            s("PI_SESSION_ID", "stale"),
+        ];
+        let env = job_env(vars, Path::new("/new"), vec![("PI_SESSION_ID", "s1".into())]);
+        assert_eq!(env, vec![s("PATH", "/bin"), s("PWD", "/new"), s("PI_SESSION_ID", "s1")]);
     }
 }
