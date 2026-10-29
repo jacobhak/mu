@@ -119,6 +119,7 @@ fn ask_at(q: &AskQuestion, pos: Option<(usize, usize)>, prior: Option<&Answer>) 
         })
         .collect();
     let previews = q.options.iter().map(|o| o.preview.clone()).collect();
+    let kinds = q.options.iter().map(|o| o.kind).collect();
     let title = q.header.as_ref().map_or(q.question.clone(), |h| format!("{h}: {}", q.question));
     let title = match pos {
         Some((k, n)) => format!("{k}/{n} · {title}"),
@@ -128,6 +129,7 @@ fn ask_at(q: &AskQuestion, pos: Option<(usize, usize)>, prior: Option<&Answer>) 
     let mut s = Select::new(&title, items)
         .free_text("Other (type your own)")
         .previews(previews)
+        .preview_kinds(kinds)
         .notes()
         .described()
         .back_keys(back)
@@ -562,6 +564,7 @@ mod tests {
             label: label.into(),
             description: d.map(Into::into),
             preview: None,
+            kind: None,
         };
         let q = AskQuestion {
             question: "Which?".into(),
@@ -585,8 +588,8 @@ mod tests {
             question: "Deploy the canary?\nstatus: 3 services green\nerrors: none in the last hour".into(),
             header: None,
             options: vec![
-                AskOption { label: "Yes".into(), description: None, preview: None },
-                AskOption { label: "No".into(), description: None, preview: None },
+                AskOption { label: "Yes".into(), description: None, preview: None, kind: None },
+                AskOption { label: "No".into(), description: None, preview: None, kind: None },
             ],
             multi: false,
             recommended: None,
@@ -611,7 +614,8 @@ mod tests {
     }
 
     fn ask_q(labels: &[&str], multi: bool, confirm: bool, recommended: Option<usize>) -> AskQuestion {
-        let options = labels.iter().map(|l| AskOption { label: l.to_string(), description: None, preview: None });
+        let options =
+            labels.iter().map(|l| AskOption { label: l.to_string(), description: None, preview: None, kind: None });
         AskQuestion { question: "Q?".into(), header: None, options: options.collect(), multi, recommended, confirm }
     }
 
@@ -715,17 +719,15 @@ mod tests {
     }
 
     #[test]
-    fn preview_follows_the_highlighted_option() {
+    fn every_option_shows_its_preview_and_a_declared_kind_labels_the_box() {
         let mut q = ask_q(&["A", "B"], false, false, None);
         q.options[0].preview = Some("fn a() {}".into());
-        q.options[1].preview = Some("fn b() {}".into());
+        q.options[1].preview = Some("plain words".into());
+        q.options[1].kind = Some(crate::events::PreviewKind::Diff);
         let (lines, _) = ask_select(&q).render(40, 30);
         let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
-        assert_eq!(t[4], "    fn a() {}", "{t:?}");
-        let mut ov = press(ask_ov(q).0, &[KeyCode::Down]);
-        let (rendered, _) = ov.render(40, 30, 0);
-        let t: Vec<String> = rendered.iter().map(crate::tui::line::line_text).collect();
-        assert_eq!(t[6], "    fn b() {}", "{t:?}");
+        assert!(t[3].contains("┌─ code ─") && t[4].contains("fn a() {}"), "{t:?}");
+        assert!(t[7].contains("┌─ diff ─") && t[8].contains("plain words"), "{t:?}");
     }
 
     /// Two questions with two options each, for the back keys and the review.

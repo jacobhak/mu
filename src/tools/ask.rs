@@ -1,5 +1,5 @@
 use super::{ToolCtx, ToolOutput, Tools};
-use crate::events::{AgentEvent, Answer, AskOption, AskQuestion};
+use crate::events::{AgentEvent, Answer, AskOption, AskQuestion, PreviewKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -27,6 +27,7 @@ struct O {
     label: String,
     description: Option<String>,
     preview: Option<String>,
+    kind: Option<PreviewKind>,
 }
 
 pub fn description() -> &'static str {
@@ -39,7 +40,8 @@ pub fn schema() -> Value {
         "question":{"type":"string"},
         "header":{"type":"string"},
         "options":{"type":"array","minItems":2,"items":{"type":"object","properties":{
-            "label":{"type":"string"},"description":{"type":"string"},"preview":{"type":"string"}},"required":["label"]}},
+            "label":{"type":"string"},"description":{"type":"string"},"preview":{"type":"string"},
+            "kind":{"type":"string","enum":["code","diff","layout","text"],"description":"what preview holds; guessed when omitted"}},"required":["label"]}},
         "multi":{"type":"boolean"},
         "confirm":{"type":"boolean","description":"yes/no question: omit options, the picker offers Yes and No"},
         "recommended":{"type":"integer","description":"0-based default option index"}},
@@ -62,16 +64,16 @@ fn check(q: &Q) -> Result<(), String> {
 }
 
 fn question(q: &Q) -> AskQuestion {
-    let option = |label: &str, description: Option<String>, preview: Option<String>| AskOption {
-        label: label.into(),
-        description,
-        preview,
+    let option = |label: &str, description: Option<String>, preview: Option<String>, kind: Option<PreviewKind>| {
+        AskOption { label: label.into(), description, preview, kind }
     };
     let options = match &q.options {
-        _ if q.confirm => vec![option("Yes", None, None), option("No", None, None)],
+        _ if q.confirm => vec![option("Yes", None, None, None), option("No", None, None, None)],
         Some(o) => o
             .iter()
-            .map(|o| option(&o.label, o.description.clone(), o.preview.clone().filter(|p| !p.trim().is_empty())))
+            .map(|o| {
+                option(&o.label, o.description.clone(), o.preview.clone().filter(|p| !p.trim().is_empty()), o.kind)
+            })
             .collect(),
         None => Vec::new(),
     };
