@@ -472,8 +472,11 @@ impl<'a> R<'a> {
         let mut out = vec![border('┌', '┬', '┐')];
         let n_rows = rows.len();
         for (ri, (_, cells)) in rows.iter().enumerate() {
-            let wrapped: Vec<Vec<Vec<Ch>>> =
-                colw.iter().enumerate().map(|(i, &cw)| cells.get(i).map(|c| wrap_chs(c, cw)).unwrap_or_default()).collect();
+            let wrapped: Vec<Vec<Vec<Ch>>> = colw
+                .iter()
+                .enumerate()
+                .map(|(i, &cw)| cells.get(i).map(|c| wrap_chs(c, cw)).unwrap_or_default())
+                .collect();
             let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
             for li in 0..height {
                 let mut v = vec![('│', bdr)];
@@ -719,7 +722,8 @@ mod tests {
 
     #[test]
     fn wide_table_wraps_cells() {
-        let md = "| name | description |\n|---|---|\n| alpha | a fairly long description that must wrap |\n| b | short |";
+        let md =
+            "| name | description |\n|---|---|\n| alpha | a fairly long description that must wrap |\n| b | short |";
         let ls = texts(md, 30);
         assert!(ls.iter().all(|l| l.chars().count() <= 30), "{ls:#?}");
         assert!(ls[0].starts_with('┌') && ls.last().unwrap().starts_with('└'), "{ls:#?}");
