@@ -37,7 +37,7 @@ use tokio::sync::oneshot;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
-const BUILTIN_DESC: [(&str, &str, bool); 21] = [
+const BUILTIN_DESC: [(&str, &str, bool); 22] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -59,6 +59,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 21] = [
     ("image", "Attach an image file", true),
     ("jobs", "List or kill background jobs", false),
     ("plans", "Approve, refine or drop a parked plan", false),
+    ("deliver", "Implement, review and commit a parked plan in a worktree [id]", false),
 ];
 
 pub struct AppInit {
@@ -141,6 +142,7 @@ struct App {
     turn_started: Option<Instant>,
     /// `/model` assigns roles; `/switch` only changes this session.
     pick_assign: bool,
+    pick_deliver: bool,
     renderer: Renderer,
     composer: Composer,
     commands: Vec<Entry>,
@@ -253,6 +255,7 @@ pub async fn run(init: AppInit) -> i32 {
         notify,
         turn_started: None,
         pick_assign: false,
+        pick_deliver: false,
         cwd: cwd.clone(),
         renderer: Renderer::new(),
         composer: Composer::new(Some(paths::mu_home().join("history.jsonl"))).with_cwd(&cwd),
@@ -762,6 +765,7 @@ impl App {
     }
 
     fn show_plans(&mut self, list: Vec<crate::plans::PlanMeta>) {
+        let deliver = std::mem::take(&mut self.pick_deliver);
         if list.is_empty() {
             self.notice("no parked plans for this repository");
             return;
@@ -774,7 +778,8 @@ impl App {
             })
             .collect();
         let ids = list.into_iter().map(|m| m.id).collect();
-        self.overlay = Some(Overlay::Plans { sel: Select::new("Parked plans", items), ids });
+        let title = if deliver { "Deliver plan" } else { "Parked plans" };
+        self.overlay = Some(Overlay::Plans { sel: Select::new(title, items), ids, deliver });
     }
 
     // ---- input --------------------------------------------------------------------------------
@@ -936,6 +941,7 @@ impl App {
                 self.notice("plan review cancelled; plan mode stays on");
             }
             OverlayEvent::OpenPlan(id) => self.send(Command::OpenPlan(id)),
+            OverlayEvent::DeliverPlan(id) => self.send(Command::Deliver(id)),
         }
     }
 
@@ -1022,6 +1028,11 @@ impl App {
             },
             "plan" => self.send(Command::TogglePlan((!arg.is_empty()).then(|| arg.to_string()))),
             "plans" => self.send(Command::ListPlans),
+            "deliver" if arg.is_empty() => {
+                self.pick_deliver = true;
+                self.send(Command::ListPlans);
+            }
+            "deliver" => self.send(Command::Deliver(arg.into())),
             "compact" => {
                 self.running = true;
                 self.send(Command::Compact((!arg.is_empty()).then(|| arg.to_string())));

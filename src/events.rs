@@ -38,6 +38,8 @@ pub enum Command {
     ListPlans,
     /// Open a parked plan in the review dialog.
     OpenPlan(String),
+    /// `/deliver <id>`: start `mu deliver <id> --worktree` detached, notifying this session when it ends.
+    Deliver(String),
     /// Approve a parked plan without a dialog (headless).
     StartPlan {
         id: String,

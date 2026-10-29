@@ -909,6 +909,7 @@ impl Agent {
                         drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
                     }
                 }
+                Command::Deliver(id) => self.deliver(&id).await,
                 Command::StartPlan { id, decision, anyway } => {
                     if let Some(s) = self.start_plan(&id, decision, anyway).await {
                         drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
@@ -1495,6 +1496,33 @@ impl Agent {
     async fn list_plans(&self) {
         let store = plans::store_for(&self.cwd).await;
         self.emit(AgentEvent::PlanList(store.list(false)));
+    }
+
+    /// `/deliver`: detached `mu deliver`, which wakes this session when it finishes.
+    async fn deliver(&mut self, id: &str) {
+        if !self.ensure_session().await {
+            return;
+        }
+        let Some(session) = self.session.as_ref().map(|s| s.path.clone()) else { return };
+        let exe = match mu_common::paths::self_exe() {
+            Ok(e) => e,
+            Err(e) => return self.error(format!("cannot find the mu binary: {e}")),
+        };
+        self.notice(format!("starting delivery of plan {id}…"));
+        let out = tokio::process::Command::new(exe)
+            .args(["deliver", id, "--worktree", "--detach", "--notify"])
+            .arg(session)
+            .current_dir(&self.cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                self.notice(format!("▸ {}", String::from_utf8_lossy(&o.stdout).trim()));
+            }
+            Ok(o) => self.error(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => self.error(format!("cannot start mu deliver: {e}")),
+        }
     }
 
     /// A pending plan from the store with its drift; failures are reported and give `None`.

@@ -45,6 +45,8 @@ pub enum Overlay {
     Plans {
         sel: Select,
         ids: Vec<String>,
+        /// Chosen plans are delivered, not opened.
+        deliver: bool,
     },
     /// A question, or the review after the last one. Boxed: the largest variant.
     Ask(Box<AskState>),
@@ -84,6 +86,8 @@ pub enum OverlayEvent {
     },
     /// A parked plan was chosen from the list.
     OpenPlan(String),
+    /// A parked plan was chosen to be delivered.
+    DeliverPlan(String),
 }
 
 /// The question as a picker: its options, a free-text row, multi-select, the recommended choice
@@ -444,10 +448,14 @@ impl Overlay {
                 }
                 _ => (None, None),
             },
-            Overlay::Plans { mut sel, ids } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Plans { sel, ids }), None),
+            Overlay::Plans { mut sel, ids, deliver } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Plans { sel, ids, deliver }), None),
                 SelectResult::Chosen(i) => {
-                    (None, i.first().and_then(|i| ids.get(*i)).map(|id| OverlayEvent::OpenPlan(id.clone())))
+                    let id = i.first().and_then(|i| ids.get(*i)).cloned();
+                    (
+                        None,
+                        id.map(|id| if deliver { OverlayEvent::DeliverPlan(id) } else { OverlayEvent::OpenPlan(id) }),
+                    )
                 }
                 _ => (None, None),
             },
