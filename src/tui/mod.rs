@@ -16,6 +16,7 @@ pub mod plan_review;
 mod probe;
 pub mod ptyview;
 pub mod render;
+pub mod reply;
 pub mod select;
 pub mod status;
 pub mod term;

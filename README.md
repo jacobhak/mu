@@ -91,11 +91,13 @@ Ghost text predicts the rest of the word or a prompt you repeat here; Tab or →
 
 Typing `/` opens a command menu with descriptions and argument completion (↑/↓, Tab, Enter, Esc).
 
-Slash commands: `/new /resume /model /thinking /compact /plan /plans /deliver [id] /session /rename /todo /skills /plugins /login [provider|mcp:<name>] /copy /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`. `/deliver` starts `mu deliver <id> --worktree` detached (a picker of parked plans without an id) and wakes the session when it finishes.
+Slash commands: `/new /resume /model /thinking /compact /plan /plans /deliver [id] /session /rename /todo /skills /plugins /login [provider|mcp:<name>] /copy /reply /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`. `/deliver` starts `mu deliver <id> --worktree` detached (a picker of parked plans without an id) and wakes the session when it finishes.
 
 While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
 
 `/copy` opens a picker of recent replies, code blocks and bash commands; `/copy code`, `/copy cmd` and `/copy link` copy the latest one directly. Under tmux the text goes through `tmux load-buffer -w`; otherwise via OSC 52, plus `wl-copy`/`xclip` when a local display exists.
+
+`Ctrl+R` or `/reply` opens a reply picker on the newest finished assistant text (it works during a turn and shows the last finished reply, not the streaming one). `[` and `]` switch to older and newer replies. Up/Down (or j/k) move between sentences, list items, headings, table rows and code lines; Left/Right (h/l) move word by word; PgUp/PgDn, Home/End jump. Space marks the current unit, `v` starts a word-level visual selection (Left/Right grow or shrink it by a word, Up/Down by a unit; Space or Enter turns it into a mark, Esc drops it), `c` clears the marks. Enter quotes the marks (or the current unit when nothing is marked) as `> ` blockquotes at the end of the composer and puts the cursor on the blank line after the first quote; Esc closes without a change.
 
 Images: paste an image file path, run `/image <path>`, press Ctrl+V (reads `wl-paste`/`xclip`), or paste an image from the terminal clipboard when it supports kitty's OSC 5522 (tmux needs `allow-passthrough on`). PNG, JPEG, GIF and WebP up to 5 MB; no resizing.
 

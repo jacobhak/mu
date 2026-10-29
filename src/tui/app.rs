@@ -11,6 +11,7 @@ use super::overlay::{LoginTarget, Overlay, OverlayEvent};
 use super::plan_review::{PlanReview, Tier};
 use super::ptyview::PtyView;
 use super::render::Renderer;
+use super::reply::ReplyPicker;
 use super::select::{Item, Select};
 use super::status;
 use super::term::{self, Term};
@@ -37,7 +38,7 @@ use tokio::sync::oneshot;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
-const BUILTIN_DESC: [(&str, &str, bool); 22] = [
+const BUILTIN_DESC: [(&str, &str, bool); 23] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -56,6 +57,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 22] = [
     ("plugins", "List plugins", false),
     ("hotkeys", "Show key bindings", false),
     ("copy", "Copy a reply, code block or command", false),
+    ("reply", "Quote parts of the last reply into the composer", false),
     ("image", "Attach an image file", true),
     ("jobs", "List or kill background jobs", false),
     ("plans", "Approve, refine or drop a parked plan", false),
@@ -861,6 +863,7 @@ impl App {
         let action = self.composer.on_key(k, self.running, &self.commands);
         match action {
             Action::None | Action::Redraw => {}
+            Action::Reply => self.open_reply(),
             Action::Submit(t) => self.submit(t, false),
             Action::QueueFollowUp(t) => self.submit(t, true),
             Action::Abort => self.inbox.borrow().cancel.cancel(),
@@ -932,6 +935,7 @@ impl App {
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
+            OverlayEvent::Quote(q) => self.composer.append_quotes(&q),
             OverlayEvent::Resume(p) => self.send(Command::Resume(p)),
             OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
             OverlayEvent::EditPlan(file) => self.run_editor(&file.clone(), ChildThen::PlanEdit(file)),
@@ -1003,7 +1007,7 @@ impl App {
         let (name, arg) = cmd.split_once(char::is_whitespace).map_or((cmd, ""), |(n, a)| (n, a.trim()));
         let allowed_busy = matches!(
             name,
-            "thinking" | "model" | "todo" | "skills" | "plugins" | "session" | "copy" | "image" | "jobs"
+            "thinking" | "model" | "todo" | "skills" | "plugins" | "session" | "copy" | "reply" | "image" | "jobs"
         ) && !(name == "model" && arg.is_empty());
         if self.running && !allowed_busy {
             return self.notice("busy — Esc to abort first");
@@ -1072,6 +1076,7 @@ impl App {
             }
             "hotkeys" => self.notice(HOTKEYS),
             "copy" => self.copy_cmd(arg),
+            "reply" => self.open_reply(),
             "image" => self.image_cmd(arg),
             "jobs" => self.jobs_cmd(arg),
             _ => {
@@ -1204,6 +1209,14 @@ impl App {
             return self.notice("nothing to copy yet");
         }
         self.overlay = Some(Overlay::Copy { sel: Select::new("Copy", items), texts });
+    }
+
+    /// Opens the reply picker on the newest reply, or says there is none.
+    fn open_reply(&mut self) {
+        match ReplyPicker::open(&self.tr.replies) {
+            Some(st) => self.overlay = Some(Overlay::Reply { st: Box::new(st) }),
+            None => self.notice("no reply to quote yet"),
+        }
     }
 
     fn show_todo(&mut self) {
@@ -1520,7 +1533,7 @@ impl App {
 
 const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Alt+↑  edit last queued
 Shift+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn (in a pty command: sent to it)      Ctrl+C  clear · abort · exit (twice)
-Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model picker
+Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model picker      Ctrl+R  quote parts of a reply
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
 
