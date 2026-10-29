@@ -70,6 +70,22 @@ fn spawn_stdin() -> UnboundedReceiver<Value> {
     rx
 }
 
+/// The model id a `model` request waits for: an advertised id as is, or a role selector
+/// (`@slow`, `@slow:high`) resolved the way `--model` is. Fails at once for anything else.
+fn model_target(
+    value: &str,
+    models: &[String],
+    resolve: impl Fn(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    if models.iter().any(|m| m == value) {
+        Ok(value.into())
+    } else if value.starts_with('@') {
+        resolve(value)
+    } else {
+        Err(format!("unknown model {value}"))
+    }
+}
+
 struct Pending {
     id: Value,
     config: String,
@@ -92,6 +108,7 @@ struct Session {
     title: Option<String>,
     /// Distinguishes reopened sessions that share an id, so a closed agent's late events are dropped.
     epoch: u64,
+    providers: Rc<crate::provider::Providers>,
 }
 
 impl Session {
@@ -266,12 +283,23 @@ impl Server {
                 }
                 let (config, value) = (p["configId"].as_str().unwrap_or(""), p["value"].as_str().unwrap_or(""));
                 let cmd = match config {
-                    "model" if s.models.iter().any(|m| m == value) => Command::SetModel(value.into()),
+                    "model" => {
+                        let providers = s.providers.clone();
+                        match model_target(value, &s.models, |v| {
+                            providers.resolve(v).map(|(m, _)| m.id).map_err(|e| e.to_string())
+                        }) {
+                            Ok(target) => {
+                                s.pending_cfg = Some(Pending { id, config: config.into(), value: target });
+                                let _ = s.cmd.send(Command::SetModel(value.into()));
+                                return;
+                            }
+                            Err(e) => return fail(&id, INVALID_PARAMS, e),
+                        }
+                    }
                     "thinking" => match Thinking::parse(value) {
                         Some(t) => Command::SetThinking(t),
                         None => return fail(&id, INVALID_PARAMS, format!("unknown thinking level {value}")),
                     },
-                    "model" => return fail(&id, INVALID_PARAMS, format!("unknown model {value}")),
                     _ => return fail(&id, INVALID_PARAMS, format!("unknown config option {config}")),
                 };
                 s.pending_cfg = Some(Pending { id, config: config.into(), value: value.into() });
@@ -405,9 +433,9 @@ impl Server {
                 }
                 let cur = (st.model_id.clone(), st.thinking.clone());
                 let changed = s.advertised != cur;
-                // A model request may resolve to a different id than the one asked for (an alias),
-                // so a model change also answers it; otherwise the request would never be answered.
                 let satisfied = s.pending_cfg.as_ref().is_some_and(|p| {
+                    // A model request may resolve to a different id than the one asked for (an alias),
+                    // so a model change also answers it; otherwise the request would never be answered.
                     if p.config == "model" { cur.0 == p.value || s.advertised.0 != cur.0 } else { cur.1 == p.value }
                 });
                 s.advertised = cur;
@@ -552,6 +580,7 @@ async fn open_session(
         pending_cfg: None,
         models,
         advertised: (st.model_id, st.thinking),
+        providers: providers.clone(),
         used: st.context_tokens,
         title: st.title,
         epoch,
@@ -765,5 +794,19 @@ mod tests {
         assert!(session::valid_id("0198abcd"));
         assert!(!session::valid_id(""));
         assert!(!session::valid_id("../x"));
+    }
+
+    #[test]
+    fn model_target_resolves_roles_up_front_and_rejects_unknown_values() {
+        let models = vec!["a/m".to_string()];
+        let resolve = |s: &str| match s {
+            "@slow" | "@slow:high" => Ok("b/n".to_string()),
+            _ => Err(format!("model role {s} is not configured")),
+        };
+        assert_eq!(model_target("a/m", &models, resolve), Ok("a/m".into()));
+        assert_eq!(model_target("@slow", &models, resolve), Ok("b/n".into()));
+        assert_eq!(model_target("@slow:high", &models, resolve), Ok("b/n".into()));
+        assert!(model_target("@nope", &models, resolve).unwrap_err().contains("not configured"));
+        assert_eq!(model_target("x/y", &models, resolve), Err("unknown model x/y".into()));
     }
 }
