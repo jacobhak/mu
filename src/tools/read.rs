@@ -412,6 +412,41 @@ mod tests {
         assert!(!o.is_error, "{}", o.text);
     }
 
+    /// Under a stale tag, an edit of a cut line names the line's current number and the current
+    /// tag; mu's read of that selector must hand back the same tag so the re-issued edit applies.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_tag_cut_line_reply_is_readable_at_current_numbers() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wide = format!("note: {} TAIL", "abcdefghij".repeat(80));
+        std::fs::write(d.join("c.txt"), format!("{wide}\ntwo\nthree\n")).unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "c.txt".into() }).await;
+        assert!(!o.text.contains(&wide));
+        let tag0 = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
+        let o =
+            t.edit(super::super::edit::Args::for_test(format!("[c.txt#{tag0}]\nPUT <1:\n+head a\n+head b\n"))).await;
+        assert!(!o.is_error, "{}", o.text);
+        let before = std::fs::read_to_string(d.join("c.txt")).unwrap();
+        let stale = format!("[c.txt#{tag0}]\nPUT 1.=1:\n+NOTE: {}\n", &wide[6..768]);
+        let e = t.edit(super::super::edit::Args::for_test(stale)).await;
+        assert!(e.is_error, "{}", e.text);
+        assert_eq!(std::fs::read_to_string(d.join("c.txt")).unwrap(), before, "refused edits write nothing");
+        let from = e.text.find("Read `").expect(&e.text) + "Read `".len();
+        let path = &e.text[from..from + e.text[from..].find('`').unwrap()];
+        assert_eq!(path, "c.txt:3:raw", "{}", e.text);
+        let live = e.text.rsplit("[c.txt#").next().and_then(|r| r.split(']').next()).unwrap().to_string();
+        let o = t.read(Args { path: path.to_string() }).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert!(o.text.contains(&format!("[c.txt#{live}]")), "read tag differs from the reply's: {}", o.text);
+        assert!(o.text.contains(&format!("3:{wide}")), "{}", o.text);
+        let full = wide.replacen("note:", "NOTE:", 1);
+        let o = t.edit(super::super::edit::Args::for_test(format!("[c.txt#{live}]\nPUT 3.=3:\n+{full}\n"))).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert_eq!(std::fs::read_to_string(d.join("c.txt")).unwrap(), format!("head a\nhead b\n{full}\ntwo\nthree\n"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn list_reads_obey_the_byte_budget() {
         let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
