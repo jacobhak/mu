@@ -1,7 +1,7 @@
 # mu — design
 
 A terminal coding agent with pi's pluggability and omp's capabilities, where the memory it holds is the
-user's content plus what the user is using right now. A native Rust core does the agent work; every other
+user's content plus what the user is using right now. A Rust core does the agent work; every other
 feature is a plugin that loads on use.
 
 Status: early and experimental, changing quickly; no stable version (see README, Status). All decisions so far are recorded in place.
@@ -31,7 +31,7 @@ Measured 2026-10-23 on this machine (method in the appendix).
 ```mermaid
 flowchart LR
   subgraph core["mu core (one binary)"]
-    loop[agent loop] --- prov[native providers]
+    loop[agent loop] --- prov[provider client]
     loop --- sess[sessions]
     loop --- tui[terminal UI]
     loop --- tools[built-in tools]
@@ -49,7 +49,7 @@ flowchart LR
 | Component | Responsibility | Reuse |
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
-| Native providers | Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Gemini; API keys | — |
+| Provider client | Anthropic Messages requests to the omp gateway: streaming, retries, thinking budgets, usage | — |
 | Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `$MU_HOME/run/`, the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
@@ -131,7 +131,7 @@ All omp features outside the core become first-party plugins that load on use.
 |---|---|---|
 | gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider, OAuth logins, account pools, quota. See Providers. |
 | mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It keeps TLS and HTTP out of the core: it is built as a separate Cargo project outside the workspace (feature unification would otherwise give the core rustls), and `scripts/build-mcp-http.sh check` fails if `cargo tree -p mu` ever shows rustls. It answers any `core/*` request a server sends with -32601. |
-| web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway is verified in M4. |
+| web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway still needs verifying. |
 | memory | yes | Day one: wraps the `mnemopi` CLI against the user's existing store (a Bun process only during recall/retain). Later: Rust port on the same SQLite schema with `fastembed-rs`. |
 | debugger, eval, github, browser, ssh | later | — |
 | advisor, commit messages, export/share, usage display | later | Need `core/complete` / `turn_end` |
@@ -141,21 +141,18 @@ All omp features outside the core become first-party plugins that load on use.
 
 ## Providers
 
-- **Native in the core:** the four wire protocols above, with API keys, plus custom OpenAI-compatible models
-  from omp's `models.yml` (local endpoints). Most providers speak one of them.
-- **Gateway plugin:** everything else omp supports, through `omp auth-gateway serve` backed by
-  `omp auth-broker serve`. (`auth-gateway stdio` was rejected: it returns a streamed reply as one string after
-  the stream ends.) The gateway accepts Anthropic Messages, OpenAI Chat/Responses and pi-native stream
-  requests, dispatches through omp's provider layer with the broker's credentials, and lists usable models at
-  `GET /v1/models`.
-- **Lifecycle:** the plugin starts both processes when a gateway-served model is first selected, on loopback
+- **Gateway:** every model is served through `omp auth-gateway serve`, backed by `omp auth-broker serve`. The
+  core speaks one wire protocol, Anthropic Messages, and holds no provider credentials or API keys.
+  (`auth-gateway stdio` was rejected: it returns a streamed reply as one string after the stream ends.) The
+  gateway also accepts OpenAI Chat/Responses and pi-native stream requests, dispatches through omp's
+  provider layer with the broker's credentials, and lists usable models at `GET /v1/models`.
+- **Lifecycle:** the plugin starts both processes when a model is first used, on loopback
   ports, passing `OMP_AUTH_BROKER_URL` only to the gateway process it spawns — the user's omp config is not
   changed. It authenticates with the bearer tokens omp keeps in its config dir. Lifetime `idle:<duration>`
   stops both. One pair serves all mu sessions of the same omp profile (state in `$MU_HOME/gateway/`, or `gateway/profiles/<name>/` under a profile): the pair holds that profile's credentials and `models.yml`, so profiles never share one. The gateway alone measured 161 MB; the broker is unmeasured.
-- **What `serve` does not do** (unlike `stdio`): role selectors such as `@smol`, omp's fallback chains, and
-  `models.yml` custom models. The core resolves roles itself from omp's config and sends provider-qualified
-  ids; custom models go to native providers.
-- **Risk to verify in M3:** the broker refreshes OAuth tokens in the same credential store that running omp
+- **What `serve` does not do** (unlike `stdio`): role selectors such as `@smol` and omp's fallback chains.
+  The core resolves roles itself from omp's config and sends provider-qualified ids.
+- **Open risk:** the broker refreshes OAuth tokens in the same credential store that running omp
   sessions use. If a provider rotates refresh tokens, omp and the broker could invalidate each other's.
 
 ## Compatibility
@@ -180,7 +177,7 @@ Non-goal: running pi or omp TypeScript extensions.
 |---|---|
 | Runtime heap | Native code; unused code paths are never paged in |
 | Eager initialization | Data built into the binary or loaded on first use; nothing parsed at startup |
-| Allocator retention | Stream request bodies to the socket; release memory after each turn (allocator choice measured in M0) |
+| Allocator retention | Stream request bodies to the socket; release memory after each turn (allocator choice measured) |
 | Background processes | None in the core; plugins start on use and follow their lifetime |
 | Threads | Single-threaded runtime; worker threads only for the duration of parallel work |
 | Terminal UI copies | Finished output lives in the terminal's scrollback; resize redraws from the session file |
@@ -189,7 +186,7 @@ Non-goal: running pi or omp TypeScript extensions.
 | Highlighting | No bulk-loaded syntax sets (`syntect` defaults measured at +6.5 MB); per-language, lazily |
 
 **Check:** `incidental = private RAM − bytes of content held`. A harness runs scripted sessions, measures after
-each turn at idle, and fails if `incidental` grows across turns or exceeds a constant set from M1's
+each turn at idle, and fails if `incidental` grows across turns or exceeds a constant set from earlier
 measurements.
 
 ## Technology
@@ -201,18 +198,7 @@ measurements.
 | Terminal | `crossterm` | Inline rendering, no alternate screen |
 | Markdown | `pulldown-cmark` | Streaming-friendly, no global state |
 | Highlighting | tree-sitter grammars, loaded per language on first use | Avoids the `syntect` bulk load |
-| omp crates | git dependency on `can1357/oh-my-pi` at a pinned revision | MIT; no Node-API dependency. Verify in M0 that workspace inheritance and the vendored `brush` resolve as a git dependency. |
-
-## Milestones
-
-| | Scope | Exit criterion |
-|---|---|---|
-| M0 | Workspace, omp crates building as dependencies, memory harness, allocator measurement | Harness reports `incidental` for an empty session |
-| M1 | Agent loop, Anthropic + OpenAI-compatible providers, built-in tools, sessions, terminal UI | Usable for a real task with an API key; `incidental` constant across turns |
-| M2 | Context files, skills, rules (sticky + stream), slash commands, MCP client, compaction | An omp project's files work unchanged |
-| M3 | Plugin host, manifests, lifetimes, hooks; gateway plugin | Any omp provider usable with streaming; broker/omp token-refresh interaction checked |
-| M4 | web, memory plugins | Day-one feature set complete |
-| M5 | Subagents | Parallel headless tasks with typed results |
+| omp crates | git dependency on `can1357/oh-my-pi` at a pinned revision | MIT; no Node-API dependency |
 
 ## Appendix: measurement method
 

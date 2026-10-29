@@ -51,7 +51,7 @@ aider passed in 8.7-9.7 s (4 runs, 244 MB peak RSS), but it is a single-shot edi
 
 ## 3. mu and its shared gateway
 
-mu gets non-native providers through one shared `mu-gateway daemon` (one `omp auth-broker` plus one `omp auth-gateway`) used by every mu process. It is guarded by a lock file, and clients keep lease files. The daemon exits after 30 minutes without a fresh lease (`MU_GATEWAY_IDLE_SECS`).
+mu gets its providers through one shared `mu-gateway daemon` (one `omp auth-broker` plus one `omp auth-gateway`) used by every mu process. It is guarded by a lock file, and clients keep lease files. The daemon exits after 30 minutes without a fresh lease (`MU_GATEWAY_IDLE_SECS`).
 
 - Four concurrent `mu -p` sessions against a running daemon all answered, and the process counts stayed at 1 daemon, 1 gateway and 1 broker with unchanged PIDs.
 - The shared pair costs about 280-300 MB PSS once (broker about 80 MB, gateway about 200 MB). Each extra session adds its own mu process (about 10 MB) and a small plugin shim.
