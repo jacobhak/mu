@@ -112,9 +112,11 @@ fn resolve_command(m: &Manifest) -> std::path::PathBuf {
     if c.contains('/') {
         return m.dir.join(c);
     }
+    // After a reinstall replaces the binary, Linux reports the running exe as ".../mu (deleted)", which
+    // canonicalize rejects; its parent directory is still the right one, so don't require it to resolve.
     if let Some(sib) = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
         .ok()
+        .map(|e| std::fs::canonicalize(&e).unwrap_or(e))
         .and_then(|e| e.parent().map(|d| d.join(c)))
         .filter(|p| p.exists())
     {
