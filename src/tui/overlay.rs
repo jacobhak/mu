@@ -160,11 +160,10 @@ fn ask_hint(q: &AskQuestion, pos: Option<(usize, usize)>) -> String {
     } else {
         format!("↑↓ move · Enter choose · 1–{} pick · Tab/→ note", q.options.len().min(9))
     };
-    if pos.is_none_or(|(k, _)| k == 1) {
-        hint.push_str(" · Esc cancel");
-    } else {
-        hint.push_str(" · ← / ⇧Tab back · Esc back");
+    if pos.is_some_and(|(k, _)| k > 1) {
+        hint.push_str(" · ← / ⇧Tab back");
     }
+    hint.push_str(" · Esc cancel");
     hint
 }
 
@@ -187,7 +186,7 @@ fn review_select(qs: &[AskQuestion], answers: &[Option<Answer>]) -> Select {
     Select::new("Review your answers", items)
         .preselect(submit)
         .back_keys(true)
-        .hint("↑↓ move · Enter reopen or submit · ← / ⇧Tab back · Esc back")
+        .hint("↑↓ move · Enter reopen or submit · ← / ⇧Tab back · Esc cancel")
 }
 
 /// An answer on one line, as the review lists it.
@@ -288,7 +287,8 @@ impl AskState {
                         self.revisit = true;
                     }
                 }
-                SelectResult::Cancelled | SelectResult::Back => self.goto(n - 1),
+                SelectResult::Back => self.goto(n - 1),
+                SelectResult::Cancelled => return self.cancel(),
                 _ => {}
             }
             return self.keep();
@@ -303,11 +303,7 @@ impl AskState {
                 }
                 return self.keep();
             }
-            SelectResult::Cancelled if self.idx == 0 => return self.cancel(),
-            SelectResult::Cancelled => {
-                self.goto(self.idx - 1);
-                return self.keep();
-            }
+            SelectResult::Cancelled => return self.cancel(),
             SelectResult::Pending => return self.keep(),
         };
         self.answers[self.idx] = Some(ans);
@@ -788,17 +784,27 @@ mod tests {
     }
 
     #[test]
-    fn esc_steps_back_from_the_review_and_then_from_each_question() {
+    fn esc_cancels_the_ask_from_the_review_and_from_any_question() {
         let (ov, mut rx) = open(two_q());
         let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter]);
-        let mut ov = press(ov, &[KeyCode::Esc]);
+        assert!(ov.on_key(key(KeyCode::Esc)).0.is_none());
+        assert_eq!(answer(&mut rx), "[Cancelled, Cancelled]", "Esc on the review cancels everything");
+        let (ov, mut rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Enter]);
+        assert!(ov.on_key(key(KeyCode::Esc)).0.is_none());
+        assert_eq!(answer(&mut rx), "[Options([\"A\"]), Cancelled]", "Esc on question 2 cancels like Ctrl-C");
+    }
+
+    #[test]
+    fn left_steps_back_from_the_review_and_then_from_each_question() {
+        let (ov, _rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter, KeyCode::Left]);
+        let mut ov = ov;
         let t = screen(&mut ov);
         assert!(t.iter().any(|l| l.contains("2/2")) && t.iter().any(|l| l == "❯ X"), "{t:?}");
-        let mut ov = press(ov, &[KeyCode::Esc]);
+        let mut ov = press(ov, &[KeyCode::Left]);
         let t = screen(&mut ov);
         assert!(t.iter().any(|l| l.contains("1/2")) && t.iter().any(|l| l == "❯ A"), "{t:?}");
-        assert!(ov.on_key(key(KeyCode::Esc)).0.is_none());
-        assert_eq!(answer(&mut rx), "[Cancelled, Cancelled]", "Esc on the first question cancels");
     }
 
     #[test]
@@ -817,7 +823,7 @@ mod tests {
         assert!(screen(&mut ov).last().is_some_and(|l| l.ends_with("Esc cancel")), "{:?}", screen(&mut ov));
         let ov = press(ov, &[KeyCode::Enter]);
         let mut ov = ov;
-        assert!(screen(&mut ov).last().is_some_and(|l| l.ends_with("⇧Tab back · Esc back")));
+        assert!(screen(&mut ov).last().is_some_and(|l| l.ends_with("⇧Tab back · Esc cancel")));
         let ov = press(ov, &[KeyCode::Enter]);
         let mut ov = ov;
         assert!(screen(&mut ov).last().is_some_and(|l| l.contains("Enter reopen or submit")));
