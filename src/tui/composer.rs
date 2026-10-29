@@ -759,9 +759,8 @@ impl Composer {
     }
 
     /// The `mu` composer: a blank line, then the soft-wrapped input behind a `μ ❯` prompt; cursor `(row, col)` inside it.
-    /// An empty buffer shows a placeholder and a right-aligned command hint.
+    /// An empty buffer shows a placeholder.
     pub fn render(&self, width: usize) -> (Vec<Line>, (usize, usize)) {
-        let hint = "/ commands · ⇧⇥ thinking";
         let avail = width.saturating_sub(PAD + PREFIX_W).max(1);
         let mut rows: Vec<String> = Vec::new();
         let mut cursor = (0, 0);
@@ -813,20 +812,11 @@ impl Composer {
             }
         }
         if self.is_empty() {
-            let used = PAD + PREFIX_W;
-            let placeholder = "type here…";
-            let ph_w = unicode_width::UnicodeWidthStr::width(placeholder);
-            let h_w = unicode_width::UnicodeWidthStr::width(hint);
-            let mut row = vec![
+            body[0] = vec![
                 span(format!("{pad}{}", PROMPT.trim_end()), accent),
                 span(" ", ContentStyle::default()),
-                span(placeholder, theme::get().fg(Role::Faint)),
+                span("type here…", theme::get().fg(Role::Faint)),
             ];
-            if used + ph_w + 2 + h_w <= width {
-                row.push(span(" ".repeat(width - used - ph_w - h_w), ContentStyle::default()));
-                row.push(span(hint, theme::get().fg(Role::Faint)));
-            }
-            body[0] = row;
         }
         if self.ctrl_c_armed {
             body.push(vec![span(format!("{pad}{CTRL_C_HINT}"), theme::get().fg(Role::Faint))]);

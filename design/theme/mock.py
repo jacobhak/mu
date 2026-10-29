@@ -506,10 +506,8 @@ class Proposed(Current):
         return [[(f"{SPIN} ", self.k("accent")), ("Thinking… 3s", self.k("faint", italic=True))]]
 
     def composer(self, w):
-        hint = "/ commands · ⇧⇥ thinking"
         left = [(" μ ❯", self.k("accent")), (" ", PLAIN), ("type here…", self.k("faint"))]
-        return [[("─" * w, self.k("line.faint"))],
-                left + [(" " * (w - width(left) - len(hint)), PLAIN), (hint, self.k("faint"))]]
+        return [[("─" * w, self.k("line.faint"))], left]
 
     def status(self, w):
         m = self.k("muted")
