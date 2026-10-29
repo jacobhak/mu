@@ -7,7 +7,7 @@ use super::input::{self, Input};
 use super::line::truncate_text as trunc;
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
-use super::overlay::{LoginTarget, Overlay, OverlayEvent, ask_select};
+use super::overlay::{LoginTarget, Overlay, OverlayEvent};
 use super::plan_review::{PlanReview, Tier};
 use super::ptyview::PtyView;
 use super::render::Renderer;
@@ -662,8 +662,7 @@ impl App {
             let _ = reply.send(Some(vec![]));
             return;
         }
-        let sel = ask_select(&qs[0]);
-        self.overlay = Some(Overlay::Ask { qs, idx: 0, answers: vec![], sel, reply: Some(reply) });
+        self.overlay = Some(Overlay::new_ask(qs, reply));
     }
 
     // ---- pickers ------------------------------------------------------------------------------

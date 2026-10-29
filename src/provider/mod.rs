@@ -231,6 +231,14 @@ impl Providers {
     ) -> Result<Message, ProviderError> {
         #[cfg(test)]
         if let Some(r) = self.scripted.borrow_mut().pop_front() {
+            // Streams text blocks as the real provider does, so rendering can be tested.
+            if let Ok(Message::Assistant { content, .. }) = &r {
+                for b in content {
+                    if let Block::Text { text } = b {
+                        ev(StreamEvent::Text(text));
+                    }
+                }
+            }
             return r;
         }
         if !self.gw_fresh.get() {

@@ -3,12 +3,14 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use super::complete::{self, Entry};
+use super::editor::{Edit, Editor, normalize_paste};
 use super::line::{self, Line, plain, span};
 use super::theme::{self, Role};
 use crate::image;
@@ -118,272 +120,31 @@ struct Paste {
     content: String,
 }
 
-/// Editable buffer. `lines` is never empty; `row`/`col` are char indices.
-#[derive(Clone, Debug)]
+/// The composer's buffer: the shared editor's text plus the paste markers and images it carries.
+#[derive(Clone, Debug, Default)]
 struct Buf {
-    lines: Vec<String>,
-    row: usize,
-    col: usize,
+    ed: Editor,
     pastes: Vec<Paste>,
     /// `(marker, image)` for each `[Image #n]` marker inserted.
     images: Vec<(String, Image)>,
 }
 
-impl Default for Buf {
-    fn default() -> Self {
-        Self { lines: vec![String::new()], row: 0, col: 0, pastes: vec![], images: vec![] }
+impl Deref for Buf {
+    type Target = Editor;
+    fn deref(&self) -> &Editor {
+        &self.ed
     }
 }
 
-fn nch(s: &str) -> usize {
-    s.chars().count()
-}
-
-fn bidx(s: &str, col: usize) -> usize {
-    s.char_indices().nth(col).map_or(s.len(), |(b, _)| b)
-}
-
-/// Char index of the grapheme boundary before `col` (0 at the start).
-fn prev_boundary(s: &str, col: usize) -> usize {
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut at = 0;
-    for (b, g) in s.grapheme_indices(true) {
-        let start = s[..b].chars().count();
-        let end = start + g.chars().count();
-        if end >= col {
-            return if start < col { start } else { at };
-        }
-        at = start;
+impl DerefMut for Buf {
+    fn deref_mut(&mut self) -> &mut Editor {
+        &mut self.ed
     }
-    at.min(col)
-}
-
-/// Char index of the grapheme boundary after `col` (the line end at most).
-fn next_boundary(s: &str, col: usize) -> usize {
-    use unicode_segmentation::UnicodeSegmentation;
-    for (b, g) in s.grapheme_indices(true) {
-        let start = s[..b].chars().count();
-        let end = start + g.chars().count();
-        if end > col {
-            return end;
-        }
-    }
-    nch(s)
-}
-
-/// `col` moved back to the start of the cluster it is inside.
-fn snap_boundary(s: &str, col: usize) -> usize {
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut last = 0;
-    for (b, g) in s.grapheme_indices(true) {
-        let start = s[..b].chars().count();
-        if start > col {
-            break;
-        }
-        last = start;
-        if start + g.chars().count() > col {
-            return start;
-        }
-    }
-    last.min(col)
-}
-
-fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Start of the word left of `col`, not crossing line boundaries.
-fn word_left_col(chars: &[char], col: usize) -> usize {
-    let mut c = col;
-    while c > 0 && !is_word(chars[c - 1]) {
-        c -= 1;
-    }
-    while c > 0 && is_word(chars[c - 1]) {
-        c -= 1;
-    }
-    c
-}
-
-fn word_right_col(chars: &[char], col: usize) -> usize {
-    let n = chars.len();
-    let mut c = col;
-    while c < n && !is_word(chars[c]) {
-        c += 1;
-    }
-    while c < n && is_word(chars[c]) {
-        c += 1;
-    }
-    c
 }
 
 impl Buf {
     fn from_text(s: &str) -> Self {
-        let lines: Vec<String> = s.split('\n').map(str::to_owned).collect();
-        let row = lines.len() - 1;
-        let col = nch(&lines[row]);
-        Self { lines, row, col, pastes: vec![], images: vec![] }
-    }
-
-    fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    fn is_blank(&self) -> bool {
-        self.lines.iter().all(|l| l.trim().is_empty())
-    }
-
-    fn cur(&self) -> &str {
-        &self.lines[self.row]
-    }
-
-    fn cur_mut(&mut self) -> &mut String {
-        &mut self.lines[self.row]
-    }
-
-    fn cur_len(&self) -> usize {
-        nch(self.cur())
-    }
-
-    fn insert_str(&mut self, s: &str) {
-        for (i, part) in s.split('\n').enumerate() {
-            if i > 0 {
-                self.newline();
-            }
-            let col = self.col;
-            let line = self.cur_mut();
-            let b = bidx(line, col);
-            line.insert_str(b, part);
-            self.col += nch(part);
-        }
-    }
-
-    fn newline(&mut self) {
-        let b = bidx(self.cur(), self.col);
-        let rest = self.cur_mut().split_off(b);
-        self.lines.insert(self.row + 1, rest);
-        self.row += 1;
-        self.col = 0;
-    }
-
-    /// Removes chars `from..to` on the current line; cursor goes to `from`.
-    fn cut(&mut self, from: usize, to: usize) {
-        let line = self.cur_mut();
-        let b0 = bidx(line, from);
-        let b1 = bidx(line, to);
-        line.replace_range(b0..b1, "");
-        self.col = from;
-    }
-
-    fn backspace(&mut self) {
-        if self.col > 0 {
-            let from = prev_boundary(self.cur(), self.col);
-            self.cut(from, self.col);
-        } else if self.row > 0 {
-            let cur = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = nch(&self.lines[self.row]);
-            self.lines[self.row].push_str(&cur);
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.col < self.cur_len() {
-            let to = next_boundary(self.cur(), self.col);
-            self.cut(self.col, to);
-        } else if self.row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.row + 1);
-            self.cur_mut().push_str(&next);
-        }
-    }
-
-    fn kill_eol(&mut self) {
-        if self.col < self.cur_len() {
-            self.cut(self.col, self.cur_len());
-        } else {
-            self.delete();
-        }
-    }
-
-    fn kill_bol(&mut self) {
-        if self.col > 0 {
-            self.cut(0, self.col);
-        }
-    }
-
-    fn delete_word_back(&mut self) {
-        if self.col == 0 {
-            self.backspace();
-        } else {
-            let chars: Vec<char> = self.cur().chars().collect();
-            let start = word_left_col(&chars, self.col);
-            self.cut(start, self.col);
-        }
-    }
-
-    fn delete_word_fwd(&mut self) {
-        if self.col >= self.cur_len() {
-            self.delete();
-        } else {
-            let chars: Vec<char> = self.cur().chars().collect();
-            let end = word_right_col(&chars, self.col);
-            self.cut(self.col, end);
-        }
-    }
-
-    fn left(&mut self) {
-        if self.col > 0 {
-            self.col = prev_boundary(self.cur(), self.col);
-        } else if self.row > 0 {
-            self.row -= 1;
-            self.col = self.cur_len();
-        }
-    }
-
-    fn right(&mut self) {
-        if self.col < self.cur_len() {
-            self.col = next_boundary(self.cur(), self.col);
-        } else if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-    }
-
-    /// Caller guarantees `row > 0`.
-    fn up(&mut self) {
-        self.row -= 1;
-        self.col = snap_boundary(self.cur(), self.col.min(self.cur_len()));
-    }
-
-    /// Caller guarantees `row + 1 < lines.len()`.
-    fn down(&mut self) {
-        self.row += 1;
-        self.col = snap_boundary(self.cur(), self.col.min(self.cur_len()));
-    }
-
-    fn home(&mut self) {
-        self.col = 0;
-    }
-
-    fn end(&mut self) {
-        self.col = self.cur_len();
-    }
-
-    fn word_left(&mut self) {
-        while self.col == 0 && self.row > 0 {
-            self.row -= 1;
-            self.col = self.cur_len();
-        }
-        let chars: Vec<char> = self.cur().chars().collect();
-        self.col = word_left_col(&chars, self.col);
-    }
-
-    fn word_right(&mut self) {
-        while self.col == self.cur_len() && self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-        let chars: Vec<char> = self.cur().chars().collect();
-        self.col = word_right_col(&chars, self.col);
+        Buf { ed: Editor::from_text(s), pastes: vec![], images: vec![] }
     }
 }
 
@@ -638,7 +399,6 @@ impl Composer {
         let armed = std::mem::take(&mut self.ctrl_c_armed);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Char('c') if ctrl => {
                 if !self.is_empty() {
@@ -653,16 +413,11 @@ impl Composer {
                     Action::Redraw
                 }
             }
-            KeyCode::Char('d') if ctrl => {
-                if self.is_empty() {
-                    Action::None
-                } else {
-                    self.edit(Buf::delete)
-                }
+            KeyCode::Char('d') if ctrl && self.is_empty() => Action::None,
+            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                self.edit(|b| b.newline())
             }
-            KeyCode::Enter if shift || alt => self.edit(Buf::newline),
             KeyCode::Enter => self.submit(false),
-            KeyCode::Char('j') if ctrl => self.edit(Buf::newline),
             KeyCode::Char('q') if ctrl => self.submit(running),
             KeyCode::Up if alt => Action::PopQueue,
             KeyCode::Esc => {
@@ -682,7 +437,7 @@ impl Composer {
                 if self.buf.row == 0 {
                     self.history_prev();
                 } else {
-                    self.mv(Buf::up);
+                    self.buf.key(key, true);
                 }
                 Action::Redraw
             }
@@ -690,31 +445,16 @@ impl Composer {
                 if self.buf.row + 1 == self.buf.lines.len() {
                     self.history_next();
                 } else {
-                    self.mv(Buf::down);
+                    self.buf.key(key, true);
                 }
                 Action::Redraw
             }
-            KeyCode::Left => self.mv(Buf::left),
-            KeyCode::Right => self.mv(Buf::right),
-            KeyCode::Home => self.mv(Buf::home),
-            KeyCode::End => self.mv(Buf::end),
-            KeyCode::Char('a') if ctrl => self.mv(Buf::home),
-            KeyCode::Char('e') if ctrl => self.mv(Buf::end),
-            KeyCode::Char('b') if ctrl => self.mv(Buf::left),
-            KeyCode::Char('f') if ctrl => self.mv(Buf::right),
-            KeyCode::Char('h') if ctrl => self.edit(Buf::backspace),
-            KeyCode::Char('d') if alt => self.edit(Buf::delete_word_fwd),
-            KeyCode::Backspace if alt => self.edit(Buf::delete_word_back),
-            KeyCode::Char('b') if alt => self.mv(Buf::word_left),
-            KeyCode::Char('f') if alt => self.mv(Buf::word_right),
-            KeyCode::Backspace => self.edit(Buf::backspace),
-            KeyCode::Delete => self.edit(Buf::delete),
-            KeyCode::Char('k') if ctrl => self.edit(Buf::kill_eol),
-            KeyCode::Char('u') if ctrl => self.edit(Buf::kill_bol),
-            KeyCode::Char('w') if ctrl => self.edit(Buf::delete_word_back),
             KeyCode::Char('v') if ctrl => Action::PasteImage,
-            KeyCode::Char(c) if !ctrl && !alt => self.edit(|b| b.insert_str(&c.to_string())),
-            _ => Action::None,
+            _ => match self.buf.key(key, true) {
+                Edit::Changed => self.edit(|_| {}),
+                Edit::Moved => Action::Redraw,
+                Edit::Unhandled => Action::None,
+            },
         }
     }
 
@@ -761,23 +501,7 @@ impl Composer {
     /// An empty buffer shows a placeholder.
     pub fn render(&self, width: usize) -> (Vec<Line>, (usize, usize)) {
         let avail = width.saturating_sub(PAD + PREFIX_W).max(1);
-        let mut rows: Vec<String> = Vec::new();
-        let mut cursor = (0, 0);
-        for (r, line) in self.buf.lines.iter().enumerate() {
-            let start = rows.len();
-            let lay = line::layout(&plain(line.as_str()), avail);
-            let mut wrapped: Vec<String> = lay.rows.iter().map(line::line_text).collect();
-            if r == self.buf.row {
-                cursor = lay.locate_char(self.buf.col);
-                if self.buf.col >= lay.chars && cursor.1 + 1 > avail {
-                    // The cursor cell needs one column; wrap if the line is full.
-                    wrapped.push(String::new());
-                    cursor = (cursor.0 + 1, 0);
-                }
-                cursor.0 += start;
-            }
-            rows.extend(wrapped);
-        }
+        let (rows, cursor) = self.buf.wrap(avail);
         let pad = " ".repeat(PAD);
         let accent = theme::get().fg(Role::Accent);
         let mut body: Vec<Line> = rows
@@ -956,12 +680,6 @@ impl Composer {
         Action::Redraw
     }
 
-    /// Moves the cursor; keeps history browsing.
-    fn mv(&mut self, f: impl FnOnce(&mut Buf)) -> Action {
-        f(&mut self.buf);
-        Action::Redraw
-    }
-
     fn submit(&mut self, queue: bool) -> Action {
         if self.is_empty() {
             return Action::None;
@@ -1043,27 +761,6 @@ fn image_marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
             at = end;
         } else {
             at = start + 1;
-        }
-    }
-    out
-}
-
-/// CR and CRLF become LF, tabs become three spaces, other control characters are dropped.
-fn normalize_paste(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                out.push('\n');
-            }
-            '\n' => out.push('\n'),
-            '\t' => out.push_str("   "),
-            c if c.is_control() => {}
-            c => out.push(c),
         }
     }
     out
@@ -1514,26 +1211,6 @@ mod tests {
         assert_eq!(count_lines(&p), HISTORY_MAX, "file rewritten to the tail");
         assert_eq!(tail_lines(&p, 3).len(), 3);
         let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn editing_moves_by_grapheme_cluster() {
-        // "e" + combining acute, a family emoji (ZWJ sequence), a flag.
-        let text = "e\u{301}x👨‍👩‍👧🇸🇪";
-        let mut b = Buf::from_text(text);
-        b.backspace();
-        assert_eq!(b.cur(), "e\u{301}x👨‍👩‍👧");
-        b.left();
-        assert_eq!(b.col, 3, "left lands before the whole family emoji");
-        b.left();
-        assert_eq!(b.col, 2);
-        b.left();
-        assert_eq!(b.col, 0, "the accented e is one step");
-        b.delete();
-        assert_eq!(b.cur(), "x👨‍👩‍👧");
-        b.end();
-        b.backspace();
-        assert_eq!(b.cur(), "x");
     }
 
     #[test]

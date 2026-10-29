@@ -5,6 +5,7 @@ pub mod clipboard;
 pub mod complete;
 pub mod composer;
 pub mod diffview;
+pub mod editor;
 pub mod highlight;
 pub mod input;
 pub mod line;

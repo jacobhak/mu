@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::oneshot;
 
 use super::plan_review::{PlanReview, ReviewResult};
@@ -47,13 +47,8 @@ pub enum Overlay {
         sel: Select,
         ids: Vec<String>,
     },
-    Ask {
-        qs: Vec<AskQuestion>,
-        idx: usize,
-        answers: Vec<Answer>,
-        sel: Select,
-        reply: Option<oneshot::Sender<Option<Vec<Answer>>>>,
-    },
+    /// A question, or the review after the last one. Boxed: the largest variant.
+    Ask(Box<AskState>),
     Review {
         review: Box<PlanReview>,
         reply: Option<oneshot::Sender<PlanDecision>>,
@@ -98,8 +93,18 @@ pub enum OverlayEvent {
     OpenPlan(String),
 }
 
-/// The question as a picker: its options, a free-text row, multi-select, the recommended choice preselected.
+/// The question as a picker: its options, a free-text row, multi-select, the recommended choice
+/// preselected. Single-select answers on the digit keys (`y`/`n` for a confirm), and a note can be
+/// typed on the highlighted option (Right, or Tab in single-select). Options show their
+/// descriptions in place.
+#[cfg(test)]
 pub fn ask_select(q: &AskQuestion) -> Select {
+    ask_at(q, None, None)
+}
+
+/// A question's picker: `pos` is its place among the questions (`k` of `n`) for the title, and
+/// `prior` its earlier answer, preselected so a revisit shows it.
+fn ask_at(q: &AskQuestion, pos: Option<(usize, usize)>, prior: Option<&Answer>) -> Select {
     let items: Vec<Item> = q
         .options
         .iter()
@@ -109,18 +114,234 @@ pub fn ask_select(q: &AskQuestion) -> Select {
             detail: o.description.clone().unwrap_or_default(),
         })
         .collect();
+    let previews = q.options.iter().map(|o| o.preview.clone()).collect();
     let title = q.header.as_ref().map_or(q.question.clone(), |h| format!("{h}: {}", q.question));
-    let mut s = Select::new(&title, items).free_text("Other (type your own)").detail_panel();
+    let title = match pos {
+        Some((k, n)) => format!("{k}/{n} · {title}"),
+        None => title,
+    };
+    let back = pos.is_some_and(|(k, _)| k > 1);
+    let mut s = Select::new(&title, items)
+        .free_text("Other (type your own)")
+        .previews(previews)
+        .notes()
+        .described()
+        .back_keys(back)
+        .hint(&ask_hint(q, pos));
     if q.multi {
         s = s.multi();
+    } else if q.confirm {
+        s = s.quick_keys(vec![('y', 0), ('n', 1)]);
+    } else {
+        let n = q.options.len().min(9);
+        s = s.quick_keys((0..n).map(|i| (char::from(b'1' + i as u8), i)).collect());
     }
-    if let Some(r) = q.recommended {
-        s = s.preselect(r);
+    match prior {
+        Some(prior) => prefill(s, q, prior),
+        None => match q.recommended {
+            Some(r) => s.preselect(r),
+            None => s,
+        },
     }
-    s
+}
+
+/// Preselects an earlier answer: its options, its note, or its free text.
+fn prefill(s: Select, q: &AskQuestion, prior: &Answer) -> Select {
+    let indices = |labels: &[String]| -> Vec<usize> {
+        labels.iter().filter_map(|l| q.options.iter().position(|o| o.label == *l)).collect()
+    };
+    match prior {
+        Answer::Options(labels) => s.preselect_all(&indices(labels)),
+        Answer::Noted { picks, note } => s.preselect_all(&indices(picks)).note_text(note),
+        Answer::Custom(text) => s.prefill_text(text),
+        Answer::Cancelled => s,
+    }
+}
+
+/// The footer: the keys of the question's kind, then how to go back (or cancel, on the first).
+fn ask_hint(q: &AskQuestion, pos: Option<(usize, usize)>) -> String {
+    let mut hint = if q.multi {
+        "↑↓ move · Tab toggle · Enter submit · → note".to_string()
+    } else if q.confirm {
+        "y yes · n no · Enter choose · Tab/→ note".to_string()
+    } else {
+        format!("↑↓ move · Enter choose · 1–{} pick · Tab/→ note", q.options.len().min(9))
+    };
+    if pos.is_some_and(|(k, _)| k > 1) {
+        hint.push_str(" · ← / ⇧Tab back");
+    }
+    hint.push_str(" · Esc cancel");
+    hint
+}
+
+/// The review screen: each question with its answer, then a Submit row, which starts highlighted.
+fn review_select(qs: &[AskQuestion], answers: &[Option<Answer>]) -> Select {
+    let mut items: Vec<Item> = qs
+        .iter()
+        .zip(answers)
+        .enumerate()
+        .map(|(i, (q, a))| {
+            let name = q.header.as_deref().filter(|h| !h.is_empty()).map_or(q.question.as_str(), |h| h);
+            Item {
+                label: format!("{}. {}", i + 1, name.replace('\n', " ")),
+                detail: a.as_ref().map_or(String::new(), answer_text),
+            }
+        })
+        .collect();
+    items.push(Item { label: "Submit answers".into(), detail: String::new() });
+    let submit = qs.len();
+    Select::new("Review your answers", items)
+        .preselect(submit)
+        .back_keys(true)
+        .hint("↑↓ move · Enter reopen or submit · ← / ⇧Tab back · Esc cancel")
+}
+
+/// An answer on one line, as the review lists it.
+fn answer_text(a: &Answer) -> String {
+    let text = match a {
+        Answer::Options(picks) => picks.join(", "),
+        Answer::Noted { picks, note } => format!("{} — note: {note}", picks.join(", ")),
+        Answer::Custom(t) => format!("\"{t}\""),
+        Answer::Cancelled => "(cancelled)".to_string(),
+    };
+    text.replace('\n', " ")
+}
+
+/// An ask in progress: its questions, the answer to each so far, and the picker on screen.
+pub struct AskState {
+    qs: Vec<AskQuestion>,
+    /// The question being answered, or reopened from the review.
+    idx: usize,
+    /// Each question's answer. Going back keeps them, so a revised answer replaces the earlier one.
+    answers: Vec<Option<Answer>>,
+    /// The picker for question `idx`, or the review list while `review` is set.
+    sel: Select,
+    review: bool,
+    /// Reopened from the review: answering the question returns to the review.
+    revisit: bool,
+    reply: Option<oneshot::Sender<Option<Vec<Answer>>>>,
+}
+
+impl AskState {
+    fn new(qs: Vec<AskQuestion>, reply: oneshot::Sender<Option<Vec<Answer>>>) -> Self {
+        let answers = vec![None; qs.len()];
+        let sel = picker(&qs, 0, &answers);
+        AskState { qs, idx: 0, answers, sel, review: false, revisit: false, reply: Some(reply) }
+    }
+
+    /// Shows question `idx` with its earlier answer.
+    fn goto(&mut self, idx: usize) {
+        self.idx = idx;
+        self.review = false;
+        self.revisit = false;
+        self.sel = picker(&self.qs, idx, &self.answers);
+    }
+
+    fn show_review(&mut self) {
+        self.review = true;
+        self.revisit = false;
+        self.sel = review_select(&self.qs, &self.answers);
+    }
+
+    fn keep(self) -> (Option<Overlay>, Option<OverlayEvent>) {
+        (Some(Overlay::Ask(Box::new(self))), None)
+    }
+
+    /// Replies with every answer; a question never answered reads as cancelled.
+    fn done(mut self) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let all: Vec<Answer> = self.answers.drain(..).map(|a| a.unwrap_or(Answer::Cancelled)).collect();
+        self.reply_with(all)
+    }
+
+    /// Cancels from the current question on: the answers before it stand; from the review, all cancel.
+    fn cancel(mut self) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let cut = if self.review { 0 } else { self.idx };
+        let all: Vec<Answer> = self
+            .answers
+            .drain(..)
+            .enumerate()
+            .map(|(i, a)| match a {
+                Some(a) if i < cut => a,
+                _ => Answer::Cancelled,
+            })
+            .collect();
+        self.reply_with(all)
+    }
+
+    fn reply_with(&mut self, all: Vec<Answer>) -> (Option<Overlay>, Option<OverlayEvent>) {
+        if let Some(r) = self.reply.take() {
+            let _ = r.send(Some(all));
+        }
+        (None, None)
+    }
+
+    fn key(mut self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
+        let n = self.qs.len();
+        let res = self.sel.on_key(k);
+        if matches!(res, SelectResult::Pending) {
+            return self.keep();
+        }
+        if ctrl_c {
+            return self.cancel();
+        }
+        if self.review {
+            match res {
+                SelectResult::Chosen(i) if i.first() == Some(&n) => return self.done(),
+                SelectResult::Chosen(i) => {
+                    if let Some(&j) = i.first() {
+                        self.goto(j);
+                        self.revisit = true;
+                    }
+                }
+                SelectResult::Back => self.goto(n - 1),
+                SelectResult::Cancelled => return self.cancel(),
+                _ => {}
+            }
+            return self.keep();
+        }
+        let ans = match res {
+            SelectResult::Chosen(i) => Answer::Options(picked_labels(&self.qs[self.idx], &i)),
+            SelectResult::Noted(i, note) => Answer::Noted { picks: picked_labels(&self.qs[self.idx], &i), note },
+            SelectResult::Text(t) => Answer::Custom(t),
+            SelectResult::Back => {
+                if self.idx > 0 {
+                    self.goto(self.idx - 1);
+                }
+                return self.keep();
+            }
+            SelectResult::Cancelled => return self.cancel(),
+            SelectResult::Pending => return self.keep(),
+        };
+        self.answers[self.idx] = Some(ans);
+        if n == 1 {
+            return self.done();
+        }
+        if self.revisit || self.idx + 1 == n {
+            self.show_review();
+        } else {
+            self.goto(self.idx + 1);
+        }
+        self.keep()
+    }
+}
+
+/// The picker on screen for question `idx`.
+fn picker(qs: &[AskQuestion], idx: usize, answers: &[Option<Answer>]) -> Select {
+    let pos = (qs.len() > 1).then_some((idx + 1, qs.len()));
+    ask_at(&qs[idx], pos, answers[idx].as_ref())
+}
+
+/// The labels of the picked options of an ask question.
+fn picked_labels(q: &AskQuestion, picks: &[usize]) -> Vec<String> {
+    picks.iter().filter_map(|i| q.options.get(*i)).map(|o| o.label.clone()).collect()
 }
 
 impl Overlay {
+    /// An ask: its questions, answered one by one, then the review (after two or more).
+    pub fn new_ask(qs: Vec<AskQuestion>, reply: oneshot::Sender<Option<Vec<Answer>>>) -> Overlay {
+        Overlay::Ask(Box::new(AskState::new(qs, reply)))
+    }
     /// The picker inside this overlay, for everything but the plan review.
     pub fn select(&self) -> Option<&Select> {
         match self {
@@ -129,8 +350,8 @@ impl Overlay {
             | Overlay::Login { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
-            | Overlay::Ask { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
+            Overlay::Ask(a) => Some(&a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } => None,
         }
     }
@@ -142,8 +363,8 @@ impl Overlay {
             | Overlay::Login { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
-            | Overlay::Ask { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
+            Overlay::Ask(a) => Some(&mut a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } => None,
         }
     }
@@ -159,6 +380,10 @@ impl Overlay {
             Overlay::Reply { st } => {
                 let budget = (rows / 2).max(6).saturating_sub(2);
                 st.render(w, budget)
+            }
+            Overlay::Ask(a) => {
+                let avail = rows.saturating_sub(1).saturating_sub(used);
+                a.sel.render(w, avail.saturating_sub(1))
             }
             other => match other.select() {
                 Some(sel) => sel.render(w, (rows / 2).max(6).saturating_sub(2)),
@@ -260,35 +485,7 @@ impl Overlay {
                     (None, None)
                 }
             },
-            Overlay::Ask { qs, idx, mut answers, mut sel, mut reply } => {
-                let ans = match sel.on_key(k) {
-                    SelectResult::Pending => return (Some(Overlay::Ask { qs, idx, answers, sel, reply }), None),
-                    SelectResult::Chosen(i) => {
-                        let labels =
-                            i.iter().filter_map(|i| qs[idx].options.get(*i)).map(|o| o.label.clone()).collect();
-                        Answer::Options(labels)
-                    }
-                    SelectResult::Text(t) => Answer::Custom(t),
-                    SelectResult::Cancelled => {
-                        let mut all = answers;
-                        all.extend(std::iter::repeat_n(Answer::Cancelled, qs.len() - all.len()));
-                        if let Some(r) = reply.take() {
-                            let _ = r.send(Some(all));
-                        }
-                        return (None, None);
-                    }
-                };
-                answers.push(ans);
-                if idx + 1 < qs.len() {
-                    let sel = ask_select(&qs[idx + 1]);
-                    (Some(Overlay::Ask { qs, idx: idx + 1, answers, sel, reply }), None)
-                } else {
-                    if let Some(r) = reply.take() {
-                        let _ = r.send(Some(answers));
-                    }
-                    (None, None)
-                }
-            }
+            Overlay::Ask(a) => a.key(k),
         }
     }
 }
@@ -340,11 +537,11 @@ mod tests {
             options: vec![],
             multi: false,
             recommended: None,
+            confirm: false,
         };
         let (tx, mut rx) = oneshot::channel();
         let qs = vec![q("one"), q("two")];
-        let sel = ask_select(&qs[0]);
-        let ov = Overlay::Ask { qs, idx: 0, answers: vec![], sel, reply: Some(tx) };
+        let ov = Overlay::new_ask(qs, tx);
         let (rest, _) = ov.on_key(key(KeyCode::Esc));
         assert!(rest.is_none());
         let all = rx.try_recv().unwrap().unwrap();
@@ -353,20 +550,25 @@ mod tests {
 
     #[test]
     fn ask_picker_shows_the_highlighted_description_below_the_options() {
-        let opt = |label: &str, d: Option<&str>| AskOption { label: label.into(), description: d.map(Into::into) };
+        let opt = |label: &str, d: Option<&str>| AskOption {
+            label: label.into(),
+            description: d.map(Into::into),
+            preview: None,
+        };
         let q = AskQuestion {
             question: "Which?".into(),
             header: None,
             options: vec![opt("Yes", Some("apply the change now and run the tests afterwards")), opt("No", None)],
             multi: false,
             recommended: None,
+            confirm: false,
         };
         let (lines, _) = ask_select(&q).render(40, 20);
         let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
         assert_eq!(t[2].trim_end(), "❯ Yes", "{t:?}");
-        assert_eq!(t[5], "", "{t:?}");
-        assert_eq!(t[6], "  ↳ apply the change now and run the", "{t:?}");
-        assert_eq!(t[7], "    tests afterwards", "{t:?}");
+        assert_eq!(t[3], "    apply the change now and run the", "{t:?}");
+        assert_eq!(t[4], "    tests afterwards", "{t:?}");
+        assert_eq!(t[5], "  No", "{t:?}");
     }
 
     #[test]
@@ -375,11 +577,12 @@ mod tests {
             question: "Deploy the canary?\nstatus: 3 services green\nerrors: none in the last hour".into(),
             header: None,
             options: vec![
-                AskOption { label: "Yes".into(), description: None },
-                AskOption { label: "No".into(), description: None },
+                AskOption { label: "Yes".into(), description: None, preview: None },
+                AskOption { label: "No".into(), description: None, preview: None },
             ],
             multi: false,
             recommended: None,
+            confirm: false,
         };
         let (lines, cur) = ask_select(&q).render(30, 20);
         let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
@@ -392,5 +595,277 @@ mod tests {
         assert_eq!(cur, (3, 2));
         assert!(t[4].starts_with("❯ Yes"), "{t:?}");
         assert!(lines.iter().all(|l| crate::tui::line::line_width(l) <= 30), "{t:?}");
+    }
+
+    fn ask_ov(q: AskQuestion) -> (Overlay, oneshot::Receiver<Option<Vec<Answer>>>) {
+        let (tx, rx) = oneshot::channel();
+        (Overlay::new_ask(vec![q], tx), rx)
+    }
+
+    fn ask_q(labels: &[&str], multi: bool, confirm: bool, recommended: Option<usize>) -> AskQuestion {
+        let options = labels.iter().map(|l| AskOption { label: l.to_string(), description: None, preview: None });
+        AskQuestion { question: "Q?".into(), header: None, options: options.collect(), multi, recommended, confirm }
+    }
+
+    /// Feeds keys to an open ask, which must stay open.
+    fn press(ov: Overlay, keys: &[KeyCode]) -> Overlay {
+        keys.iter().fold(ov, |ov, k| ov.on_key(key(*k)).0.expect("still open"))
+    }
+
+    fn typed(s: &str) -> Vec<KeyCode> {
+        s.chars().map(KeyCode::Char).collect()
+    }
+
+    fn answer(rx: &mut oneshot::Receiver<Option<Vec<Answer>>>) -> String {
+        let all = rx.try_recv().expect("replied").expect("answered");
+        format!("{all:?}")
+    }
+
+    #[test]
+    fn note_on_the_highlighted_option_is_submitted_with_it() {
+        let (ov, mut rx) = ask_ov(ask_q(&["Skip", "Keep"], false, false, None));
+        let ov = press(ov, &[KeyCode::Down, KeyCode::Right]);
+        let ov = press(ov, &typed("tests later"));
+        let (rest, ev) = ov.on_key(key(KeyCode::Enter));
+        assert!(rest.is_none() && ev.is_none());
+        assert_eq!(answer(&mut rx), r#"[Noted { picks: ["Keep"], note: "tests later" }]"#);
+    }
+
+    #[test]
+    fn esc_leaves_the_note_open_and_enter_without_text_picks_plainly() {
+        let (ov, mut rx) = ask_ov(ask_q(&["Skip", "Keep"], false, false, None));
+        let ov = press(ov, &[KeyCode::Right, KeyCode::Char('x'), KeyCode::Esc]);
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["Skip"])]"#);
+    }
+
+    #[test]
+    fn multi_note_goes_with_the_list_of_picks() {
+        let (ov, mut rx) = ask_ov(ask_q(&["X", "Y", "Z"], true, false, None));
+        let ov = press(ov, &[KeyCode::Tab, KeyCode::Down, KeyCode::Right]);
+        let ov = press(ov, &typed("both"));
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Noted { picks: ["X"], note: "both" }]"#);
+    }
+
+    #[test]
+    fn confirm_answers_on_y_or_n_at_once() {
+        let (ov, mut rx) = ask_ov(ask_q(&["Yes", "No"], false, true, None));
+        assert!(ov.on_key(key(KeyCode::Char('n'))).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["No"])]"#);
+        let (ov, mut rx) = ask_ov(ask_q(&["Yes", "No"], false, true, None));
+        assert!(ov.on_key(key(KeyCode::Char('Y'))).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["Yes"])]"#);
+    }
+
+    #[test]
+    fn confirm_enter_takes_the_recommended_side_and_defaults_to_yes() {
+        let (ov, mut rx) = ask_ov(ask_q(&["Yes", "No"], false, true, None));
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["Yes"])]"#);
+        let (ov, mut rx) = ask_ov(ask_q(&["Yes", "No"], false, true, Some(1)));
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["No"])]"#);
+    }
+
+    #[test]
+    fn confirm_tab_adds_a_note_before_submitting() {
+        let (ov, mut rx) = ask_ov(ask_q(&["Yes", "No"], false, true, None));
+        let ov = press(ov, &[KeyCode::Down, KeyCode::Tab]);
+        let ov = press(ov, &typed("because"));
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Noted { picks: ["No"], note: "because" }]"#);
+    }
+
+    #[test]
+    fn confirm_esc_cancels_like_any_ask() {
+        let (ov, mut rx) = ask_ov(ask_q(&["Yes", "No"], false, true, None));
+        assert!(ov.on_key(key(KeyCode::Esc)).0.is_none());
+        assert_eq!(answer(&mut rx), "[Cancelled]");
+    }
+
+    #[test]
+    fn digit_keys_pick_an_option_in_single_select() {
+        let (ov, mut rx) = ask_ov(ask_q(&["A", "B", "C"], false, false, None));
+        assert!(ov.on_key(key(KeyCode::Char('2'))).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["B"])]"#);
+    }
+
+    #[test]
+    fn other_still_takes_custom_text() {
+        let (ov, mut rx) = ask_ov(ask_q(&["A"], false, false, None));
+        let ov = press(ov, &[KeyCode::Down, KeyCode::Enter]);
+        assert!(press(ov, &typed("hi")).on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Custom("hi")]"#);
+    }
+
+    #[test]
+    fn picker_footer_names_the_keys() {
+        let (lines, _) = ask_select(&ask_q(&["Yes", "No"], false, true, None)).render(60, 20);
+        let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
+        assert_eq!(t.last().map(String::as_str), Some("  y yes · n no · Enter choose · Tab/→ note · Esc cancel"));
+    }
+
+    #[test]
+    fn preview_follows_the_highlighted_option() {
+        let mut q = ask_q(&["A", "B"], false, false, None);
+        q.options[0].preview = Some("fn a() {}".into());
+        q.options[1].preview = Some("fn b() {}".into());
+        let (lines, _) = ask_select(&q).render(40, 30);
+        let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
+        assert_eq!(t[4], "    fn a() {}", "{t:?}");
+        let mut ov = press(ask_ov(q).0, &[KeyCode::Down]);
+        let (rendered, _) = ov.render(40, 30, 0);
+        let t: Vec<String> = rendered.iter().map(crate::tui::line::line_text).collect();
+        assert_eq!(t[6], "    fn b() {}", "{t:?}");
+    }
+
+    /// Two questions with two options each, for the back keys and the review.
+    fn two_q() -> Vec<AskQuestion> {
+        vec![ask_q(&["A", "B"], false, false, None), ask_q(&["X", "Y"], false, false, None)]
+    }
+
+    fn open(qs: Vec<AskQuestion>) -> (Overlay, oneshot::Receiver<Option<Vec<Answer>>>) {
+        let (tx, rx) = oneshot::channel();
+        (Overlay::new_ask(qs, tx), rx)
+    }
+
+    /// The overlay's rows as text, trailing spaces dropped.
+    fn screen(ov: &mut Overlay) -> Vec<String> {
+        let (lines, _) = ov.render(100, 30, 0);
+        lines.iter().map(|l| crate::tui::line::line_text(l).trim_end().to_string()).collect()
+    }
+
+    #[test]
+    fn left_and_shift_tab_go_back_and_restore_the_answer() {
+        let (ov, mut rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Down, KeyCode::Enter]);
+        let mut ov = press(ov, &[KeyCode::Left]);
+        let t = screen(&mut ov);
+        assert!(t.iter().any(|l| l == "❯ B"), "the earlier answer is preselected: {t:?}");
+        assert!(t.iter().any(|l| l.contains("1/2")), "{t:?}");
+        let ov = press(ov, &[KeyCode::Enter, KeyCode::Down, KeyCode::Enter]);
+        let mut ov = press(ov, &[KeyCode::BackTab]);
+        assert!(screen(&mut ov).iter().any(|l| l.contains("2/2")), "Shift-Tab on the review goes back to question two");
+        let ov = press(ov, &[KeyCode::Enter]);
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["B"]), Options(["Y"])]"#);
+    }
+
+    #[test]
+    fn left_with_text_in_the_filter_moves_the_cursor_instead() {
+        let (ov, _rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Enter]);
+        let ov = press(ov, &typed("x"));
+        let mut ov = press(ov, &[KeyCode::Left]);
+        assert!(screen(&mut ov).iter().any(|l| l.contains("2/2")), "still on question two");
+    }
+
+    #[test]
+    fn shift_tab_restores_notes_and_custom_text() {
+        let (ov, mut rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Right]);
+        let ov = press(ov, &typed("why"));
+        let ov = press(ov, &[KeyCode::Enter]);
+        let mut ov = press(ov, &[KeyCode::BackTab]);
+        assert!(screen(&mut ov).iter().any(|l| l == "    note: why"), "the note comes back under its option");
+        let ov = press(ov, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
+        let ov = press(ov, &typed("hi"));
+        let ov = press(ov, &[KeyCode::Enter]);
+        let mut ov = press(ov, &[KeyCode::BackTab]);
+        assert!(screen(&mut ov).iter().any(|l| l == "❯ hi"), "the custom answer comes back on the free row");
+        let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter]);
+        let mut ov = press(ov, &[KeyCode::Enter]);
+        assert!(screen(&mut ov).iter().any(|l| l.contains("Review your answers")));
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Custom("hi"), Options(["X"])]"#);
+    }
+
+    #[test]
+    fn review_reopens_a_question_and_returns_to_the_review() {
+        let (ov, mut rx) = open(two_q());
+        let mut ov = press(ov, &[KeyCode::Enter, KeyCode::Enter]);
+        let t = screen(&mut ov);
+        assert!(t.iter().any(|l| l.contains("1. Q?") && l.ends_with('A')), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("2. Q?") && l.ends_with('X')), "{t:?}");
+        assert!(t.iter().any(|l| l == "❯ Submit answers"), "Submit starts highlighted: {t:?}");
+        let mut ov = press(ov, &[KeyCode::Up, KeyCode::Enter]);
+        let t = screen(&mut ov);
+        assert!(t.iter().any(|l| l.contains("2/2")), "{t:?}");
+        assert!(t.iter().any(|l| l == "❯ X"), "the earlier answer is preselected: {t:?}");
+        let mut ov = press(ov, &[KeyCode::Down, KeyCode::Enter]);
+        assert!(screen(&mut ov).iter().any(|l| l.contains("2. Q?") && l.ends_with('Y')));
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["A"]), Options(["Y"])]"#);
+    }
+
+    #[test]
+    fn esc_cancels_the_ask_from_the_review_and_from_any_question() {
+        let (ov, mut rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter]);
+        assert!(ov.on_key(key(KeyCode::Esc)).0.is_none());
+        assert_eq!(answer(&mut rx), "[Cancelled, Cancelled]", "Esc on the review cancels everything");
+        let (ov, mut rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Enter]);
+        assert!(ov.on_key(key(KeyCode::Esc)).0.is_none());
+        assert_eq!(answer(&mut rx), "[Options([\"A\"]), Cancelled]", "Esc on question 2 cancels like Ctrl-C");
+    }
+
+    #[test]
+    fn left_steps_back_from_the_review_and_then_from_each_question() {
+        let (ov, _rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter, KeyCode::Left]);
+        let mut ov = ov;
+        let t = screen(&mut ov);
+        assert!(t.iter().any(|l| l.contains("2/2")) && t.iter().any(|l| l == "❯ X"), "{t:?}");
+        let mut ov = press(ov, &[KeyCode::Left]);
+        let t = screen(&mut ov);
+        assert!(t.iter().any(|l| l.contains("1/2")) && t.iter().any(|l| l == "❯ A"), "{t:?}");
+    }
+
+    #[test]
+    fn ctrl_c_cancels_from_the_current_question_and_keeps_earlier_answers() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let (ov, mut rx) = open(two_q());
+        let ov = press(ov, &[KeyCode::Enter]);
+        assert!(ov.on_key(ctrl_c).0.is_none());
+        assert_eq!(answer(&mut rx), "[Options([\"A\"]), Cancelled]");
+    }
+
+    #[test]
+    fn footers_name_the_back_and_cancel_keys_per_step() {
+        let (ov, _rx) = open(two_q());
+        let mut ov = ov;
+        assert!(screen(&mut ov).last().is_some_and(|l| l.ends_with("Esc cancel")), "{:?}", screen(&mut ov));
+        let ov = press(ov, &[KeyCode::Enter]);
+        let mut ov = ov;
+        assert!(screen(&mut ov).last().is_some_and(|l| l.ends_with("⇧Tab back · Esc cancel")));
+        let ov = press(ov, &[KeyCode::Enter]);
+        let mut ov = ov;
+        assert!(screen(&mut ov).last().is_some_and(|l| l.contains("Enter reopen or submit")));
+    }
+
+    #[test]
+    fn a_single_question_shows_no_position_and_no_review() {
+        let (ov, mut rx) = open(vec![ask_q(&["A", "B"], false, false, None)]);
+        let mut ov = ov;
+        assert!(!screen(&mut ov).iter().any(|l| l.contains("/1")));
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["A"])]"#);
+    }
+
+    #[test]
+    fn going_back_restores_a_multi_select_set() {
+        let qs = vec![ask_q(&["X", "Y", "Z"], true, false, None), ask_q(&["P", "Q"], false, false, None)];
+        let (ov, mut rx) = open(qs);
+        let ov = press(ov, &[KeyCode::Tab, KeyCode::Down, KeyCode::Tab, KeyCode::Enter]);
+        let mut ov = press(ov, &[KeyCode::BackTab]);
+        let t = screen(&mut ov);
+        assert!(t.iter().any(|l| l == "❯ [x] X"), "{t:?}");
+        assert!(t.iter().any(|l| l == "  [x] Y"), "{t:?}");
+        assert!(t.iter().any(|l| l == "  [ ] Z"), "{t:?}");
+        let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter]);
+        assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
+        assert_eq!(answer(&mut rx), r#"[Options(["X", "Y"]), Options(["P"])]"#);
     }
 }
