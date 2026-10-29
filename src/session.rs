@@ -111,6 +111,15 @@ pub fn set_print_run() {
     PRINT_RUN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+static INBOX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as taking `mu notify` wake-ups. Call it only once the SIGUSR2 handler is
+/// installed and before any session is locked: an owner record that says `inbox` promises that
+/// `kill -USR2` wakes the session instead of killing it.
+pub fn set_inbox() {
+    INBOX.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Who has a session open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Owner {
@@ -118,6 +127,7 @@ pub enum Owner {
     Live {
         pid: u32,
         print_run: bool,
+        inbox: bool,
         started: String,
     },
     /// Locked, but by a process that left no valid owner record.
@@ -127,6 +137,7 @@ pub enum Owner {
 struct LiveRecord {
     pid: u32,
     print_run: bool,
+    inbox: bool,
     started: String,
 }
 
@@ -174,6 +185,7 @@ fn live_record(session: &Path) -> Option<LiveRecord> {
     Some(LiveRecord {
         pid: u32::try_from(v["pid"].as_u64()?).ok()?,
         print_run: v["print_run"].as_bool()?,
+        inbox: v["inbox"].as_bool().unwrap_or(false),
         started: v["started"].as_str()?.to_string(),
     })
 }
@@ -195,7 +207,7 @@ pub fn owner(session: &Path) -> Owner {
             return Owner::Free;
         }
         if let Some(o) = live_record(session) {
-            return Owner::Live { pid: o.pid, print_run: o.print_run, started: o.started };
+            return Owner::Live { pid: o.pid, print_run: o.print_run, inbox: o.inbox, started: o.started };
         }
         if std::time::Instant::now() >= deadline {
             return Owner::Unknown;
@@ -244,10 +256,14 @@ struct OwnerRecord {
 impl OwnerRecord {
     /// Call right after taking the session lock.
     fn claim(session: &Path) -> Option<Self> {
-        Self::claim_as(session, PRINT_RUN.load(std::sync::atomic::Ordering::SeqCst))
+        Self::claim_as(
+            session,
+            PRINT_RUN.load(std::sync::atomic::Ordering::SeqCst),
+            INBOX.load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
-    fn claim_as(session: &Path, print_run: bool) -> Option<Self> {
+    fn claim_as(session: &Path, print_run: bool, inbox: bool) -> Option<Self> {
         let path = record_path(session)?;
         let dir = path.parent()?;
         std::fs::create_dir_all(dir).ok()?;
@@ -262,6 +278,7 @@ impl OwnerRecord {
             let rec = json!({
                 "pid": pid,
                 "print_run": print_run,
+                "inbox": inbox,
                 "started": iso_ms(),
                 "session": abs.to_string_lossy(),
             });
@@ -1172,8 +1189,8 @@ mod tests {
         let held = File::open(&path).unwrap();
         try_flock(&held, libc::LOCK_EX).unwrap();
         // No process-global flag: other tests create sessions in parallel.
-        let _rec = OwnerRecord::claim_as(&path, true).unwrap();
-        assert!(matches!(owner(&path), Owner::Live { print_run: true, .. }));
+        let _rec = OwnerRecord::claim_as(&path, true, false).unwrap();
+        assert!(matches!(owner(&path), Owner::Live { print_run: true, inbox: false, .. }));
         let e = SessionFile::open_append(&path).err().unwrap().to_string();
         assert!(e.contains("mu take"), "{e}");
     }
@@ -1208,6 +1225,18 @@ mod tests {
         try_flock(&reader, libc::LOCK_SH).unwrap();
         sweep_stale(&dir);
         assert!(!stale.exists(), "the probe takes a shared lock, which coexists with a reader's");
+    }
+
+    #[test]
+    fn inbox_is_reported() {
+        home();
+        let d = tmp("inbox-flag");
+        let path = d.join("x_inbox-flag.jsonl");
+        std::fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"inbox-flag\"}\n").unwrap();
+        let held = File::open(&path).unwrap();
+        try_flock(&held, libc::LOCK_EX).unwrap();
+        let _rec = OwnerRecord::claim_as(&path, false, true).unwrap();
+        assert!(matches!(owner(&path), Owner::Live { print_run: false, inbox: true, .. }));
     }
 
     /// Reopen-after-drop loop, optionally racing a thread that spawns children. Run with

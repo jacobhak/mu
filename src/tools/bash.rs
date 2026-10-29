@@ -186,7 +186,7 @@ impl Tools {
         let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or_else(|| self.cwd.clone());
         let limits = Limits::new(a.timeout);
         let (secs, timeout) = (limits.secs, limits.timeout);
-        let mut pty = match crate::pty::spawn(&a.command, &cwd, cols, rows) {
+        let mut pty = match crate::pty::spawn(&a.command, &cwd, cols, rows, &self.session_env()) {
             Ok(p) => p,
             Err(e) => return Some(ToolOutput::err(format!("PTY error: {e}"))),
         };
@@ -317,6 +317,7 @@ impl Tools {
             command: a.command,
             cwd: a.cwd.map(|c| self.abs(&c).to_string_lossy().into_owned()),
             timeout_ms,
+            env: Some(self.session_env().into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
             ..Default::default()
         };
         let start = Instant::now();
@@ -432,6 +433,19 @@ mod tests {
         let out = tools.call("bash", &json!({"command":"echo hi","pty":true}), &ctx).await;
         assert!(out.text.contains("hi"), "{}", out.text);
         assert!(out.text.contains("[pty unavailable without the terminal UI; ran without a terminal]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_env_reaches_commands() {
+        let tools = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
+        let cmd = json!({"command": "echo \"[$PI_SESSION_ID|$PI_SESSION_FILE]\""});
+        let out = tools.call("bash", &cmd, &ctx).await;
+        assert!(out.text.contains("[|]"), "{}", out.text);
+        tools.set_session("abc", Some(std::path::PathBuf::from("/tmp/x_abc.jsonl")));
+        let out = tools.call("bash", &cmd, &ctx).await;
+        assert!(out.text.contains("[abc|/tmp/x_abc.jsonl]"), "{}", out.text);
     }
 
     /// True if a live process has exactly `sleep {arg}` as its command line. `$` anchors the

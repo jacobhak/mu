@@ -5,6 +5,15 @@ use std::time::Duration;
 /// Time between SIGTERM and SIGKILL.
 pub const TERM_GRACE: Duration = Duration::from_millis(200);
 
+/// Sends `kill(pid, sig)` to that one pid (never a group). `Err` carries the errno.
+pub fn signal_pid(pid: u32, sig: libc::c_int) -> std::io::Result<()> {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    // SAFETY: plain syscall, no memory involved.
+    if unsafe { libc::kill(pid, sig) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 /// Terminates a whole process group: SIGTERM, then SIGKILL after `TERM_GRACE`.
 /// `pgid` must be a group the caller created (a child spawned with `process_group(0)` or `setsid`).
 pub async fn terminate_group(pgid: i32) {

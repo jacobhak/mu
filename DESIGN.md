@@ -50,7 +50,7 @@ flowchart LR
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
 | Provider client | Anthropic Messages requests to the omp gateway: streaming, retries, thinking budgets, usage | — |
-| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `$MU_HOME/run/`, the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
+| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `$MU_HOME/run/`; a per-session inbox in `$MU_HOME/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
 | Built-in tools | read, write, edit (hash-anchored), bash, grep, glob, find, todo, ask | `pi-edit`, `pi-shell`, `pi-walker`, `pi-diff`, `pi-vcs` |

@@ -33,7 +33,7 @@ pub fn run(arg: &Path, cwd: &Path) -> anyhow::Result<i32> {
             );
             return Ok(1);
         }
-        Owner::Live { pid, print_run: true, started } => {
+        Owner::Live { pid, print_run: true, started, .. } => {
             if let Some(code) = stop_and_wait(&path, pid, &started)? {
                 return Ok(code);
             }
@@ -42,13 +42,8 @@ pub fn run(arg: &Path, cwd: &Path) -> anyhow::Result<i32> {
     resume(&path)
 }
 
-/// Sends `kill(pid, sig)` to that one pid (never a group). `Err` carries the errno.
 fn signal(pid: u32) -> Result<(), std::io::Error> {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-    };
-    // SAFETY: plain syscall, no memory involved.
-    if unsafe { libc::kill(pid, libc::SIGUSR1) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    crate::proc::signal_pid(pid, libc::SIGUSR1)
 }
 
 /// `Ok(None)`: the session is free, go on. `Ok(Some(code))`: stop with that exit code.
@@ -124,7 +119,7 @@ enum Recheck {
 /// Compares a fresh owner lookup with the run `mu take` decided to stop.
 fn verify(now: Owner, pid: u32, started: &str) -> Recheck {
     match now {
-        Owner::Live { pid: p, print_run: true, started: s } if p == pid && s == started => Recheck::Same,
+        Owner::Live { pid: p, print_run: true, started: s, .. } if p == pid && s == started => Recheck::Same,
         Owner::Free => Recheck::Free,
         _ => Recheck::Changed,
     }
@@ -150,7 +145,7 @@ mod tests {
     use super::*;
 
     fn live(pid: u32, print_run: bool, started: &str) -> Owner {
-        Owner::Live { pid, print_run, started: started.into() }
+        Owner::Live { pid, print_run, started: started.into(), inbox: false }
     }
 
     #[test]

@@ -80,6 +80,7 @@ pub struct OmpConfig {
     pub symbol_preset: Option<String>,
     pub hide_thinking_block: bool,
     pub display: OmpDisplay,
+    pub completion: OmpCompletion,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +92,38 @@ pub struct OmpDisplay {
 impl Default for OmpDisplay {
     fn default() -> Self {
         Self { smooth_streaming: true }
+    }
+}
+
+/// omp's `completion.notify` (`on`/`off`, default on): ring the terminal when a turn nobody typed
+/// finishes. mu applies it only to those woken turns.
+#[derive(Debug, Clone, Copy)]
+pub struct OmpCompletion {
+    pub notify: bool,
+}
+
+impl Default for OmpCompletion {
+    fn default() -> Self {
+        Self { notify: true }
+    }
+}
+
+impl<'de> Deserialize<'de> for OmpCompletion {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Raw {
+            notify: Option<serde_yaml_ng::Value>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let notify = match raw.notify {
+            Some(serde_yaml_ng::Value::Bool(b)) => b,
+            Some(serde_yaml_ng::Value::String(s)) => {
+                !matches!(s.trim().to_ascii_lowercase().as_str(), "off" | "false" | "no")
+            }
+            _ => true,
+        };
+        Ok(Self { notify })
     }
 }
 
@@ -362,6 +395,7 @@ fn load_omp(warn: &mut Vec<String>) -> OmpConfig {
         symbol_preset: yaml_section(&d, "symbolPreset", f, warn),
         hide_thinking_block: yaml_section(&d, "hideThinkingBlock", f, warn),
         display: yaml_section(&d, "display", f, warn),
+        completion: yaml_section(&d, "completion", f, warn),
     }
 }
 
@@ -463,6 +497,18 @@ impl Configs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_notify_accepts_omp_spellings() {
+        let on = |y: &str| serde_yaml_ng::from_str::<OmpCompletion>(y).unwrap().notify;
+        assert!(on("{}"));
+        assert!(on("notify: on"));
+        assert!(!on("notify: off"));
+        assert!(!on("notify: \"off\""));
+        assert!(!on("notify: false"));
+        assert!(on("notify: true"));
+        assert!(OmpCompletion::default().notify);
+    }
 
     #[test]
     fn theme_section_parses_with_defaults() {

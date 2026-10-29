@@ -42,7 +42,7 @@ impl std::ops::Deref for Pty {
     }
 }
 
-pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16) -> io::Result<Pty> {
+pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16, env: &[(&str, String)]) -> io::Result<Pty> {
     let (mut m, mut s) = (-1 as c_int, -1 as c_int);
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: valid out-pointers; name and termios are null. macOS declares the winsize pointer
@@ -75,6 +75,9 @@ pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16) -> io::Result<Pty>
     }
     let mut cmd = tokio::process::Command::new(login_shell());
     cmd.arg("-lc").arg(command).current_dir(cwd).env("TERM", "xterm-256color");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::from(slave.try_clone()?));
     cmd.stdout(Stdio::from(slave.try_clone()?));
     cmd.stderr(Stdio::from(slave));
@@ -309,7 +312,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn spawn_echo() {
-        let mut p = spawn("[ -t 0 ] && echo tty; read x; echo got:$x", Path::new("/tmp"), 80, 24).unwrap();
+        let env = [("PI_X", "yes".to_string())];
+        let mut p = spawn("[ -t 0 ] && echo tty; echo env:$PI_X; read x; echo got:$x", Path::new("/tmp"), 80, 24, &env)
+            .unwrap();
         p.io.write_some(b"hi\r").await.unwrap();
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
@@ -321,7 +326,7 @@ mod tests {
             out.extend_from_slice(&buf[..n]);
         }
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("tty") && s.contains("got:hi"), "{s:?}");
+        assert!(s.contains("tty") && s.contains("got:hi") && s.contains("env:yes"), "{s:?}");
         assert_eq!(p.child.wait().await.unwrap().code(), Some(0));
     }
 }

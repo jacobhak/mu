@@ -8,6 +8,7 @@ use crate::mem;
 use crate::message::UserInput;
 use crate::message::{Block, Message, StopReason, now_ms, text_of};
 use crate::models::{ModelSpec, Thinking};
+use crate::notify;
 use crate::plans;
 use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
@@ -18,7 +19,7 @@ use crate::review;
 use crate::session::{self, CompactionState, SessionFile};
 use crate::tools::{ToolCtx, ToolOutput, Tools};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -85,6 +86,13 @@ pub struct Agent {
     wake_rx: Option<UnboundedReceiver<()>>,
     /// `-p --resume`: when the session cannot be opened, the run ends instead of starting a fresh one.
     pub exit_on_resume_failure: bool,
+    wake_tx: Option<UnboundedSender<()>>,
+    /// Interactive only: drain `mu notify` messages (the SIGUSR2 handler is installed).
+    notify: bool,
+    /// Inbox files that were handed over but could not be deleted (session write failed).
+    notify_seen: HashSet<String>,
+    /// Inbox files announced when the session was opened; they wait for the next prompt.
+    notify_announced: HashSet<String>,
 }
 
 pub struct PlanState {
@@ -273,16 +281,28 @@ impl Agent {
             jobs: None,
             wake_rx: None,
             exit_on_resume_failure: false,
+            wake_tx: None,
+            notify: false,
+            notify_seen: HashSet::new(),
+            notify_announced: HashSet::new(),
         }
     }
 
     /// Interactive sessions only: `task` runs in the background and finished jobs wake the agent.
     pub fn enable_jobs(&mut self) {
         let (wake, wake_rx) = unbounded_channel();
+        self.wake_tx = Some(wake.clone());
         let jobs = JobsHandle::new(wake, self.events.clone());
         self.tools.jobs = Some(jobs.clone());
         self.jobs = Some(jobs);
         self.wake_rx = Some(wake_rx);
+    }
+
+    /// Interactive sessions only: `mu notify` messages are delivered. Returns the sender the
+    /// SIGUSR2 handler uses to wake the agent (the jobs wake channel), `None` without jobs.
+    pub fn enable_notify(&mut self) -> Option<UnboundedSender<()>> {
+        self.notify = true;
+        self.wake_tx.clone()
     }
 
     pub fn tool_defs(&self) -> Vec<ToolDef> {
@@ -603,6 +623,8 @@ impl Agent {
         self.session = None;
         self.messages.clear();
         self.entry_ids.clear();
+        self.notify_seen.clear();
+        self.notify_announced.clear();
         self.plugin_ctx.clear();
         self.review_base = None;
         self.title = None;
@@ -739,6 +761,23 @@ impl Agent {
         self.since_compaction = self.messages.len();
         self.user_turn = self.messages.iter().filter(|m| matches!(m, Message::User { .. })).count() as u32;
         self.session = Some(s);
+        if self.notify {
+            let waiting = notify::pending(&self.session_id());
+            if !waiting.is_empty() {
+                let mut from: Vec<&str> = Vec::new();
+                for n in &waiting {
+                    if !from.contains(&n.from.as_str()) {
+                        from.push(&n.from);
+                    }
+                }
+                self.notice(format!(
+                    "{} message(s) from mu notify waiting (from {}); they go out with your next prompt",
+                    waiting.len(),
+                    from.join(", ")
+                ));
+                self.notify_announced.extend(waiting.into_iter().map(|n| n.name));
+            }
+        }
         self.tools.set_session(&self.session_id(), self.session.as_ref().map(|s| s.path.clone()));
         if let Some((_, data)) = loaded.mode.as_ref().filter(|(m, _)| m == "plan") {
             // The model and thinking level in force before plan mode, so leaving it restores them.
@@ -1202,7 +1241,10 @@ impl Agent {
     }
 
     async fn turn_from(&mut self, start: Start) {
-        if matches!(start, Start::Wake) && !self.jobs.as_ref().is_some_and(|j| j.has_undelivered()) {
+        if matches!(start, Start::Wake)
+            && !self.jobs.as_ref().is_some_and(|j| j.has_undelivered())
+            && !self.notify_pending(true)
+        {
             return;
         }
         // An approved stored plan opens its own session when it needs one.
@@ -1214,6 +1256,7 @@ impl Agent {
         let cancel = CancellationToken::new();
         self.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
+        let wake = matches!(start, Start::Wake);
         let mut aborted = false;
         let mut synthetic = false;
         let mut next = match start {
@@ -1263,10 +1306,23 @@ impl Agent {
                 self.error(format!("compaction failed: {e}"));
             }
             match &input {
-                Some(i) if synthetic => self.push(Message::synthetic_user(&i.text)),
-                Some(i) => self.push(Message::user_input(i)),
+                Some(i) => {
+                    self.take_notify();
+                    if synthetic {
+                        self.push(Message::synthetic_user(&i.text));
+                    } else {
+                        self.push(Message::user_input(i));
+                    }
+                }
                 None => {
-                    self.take_jobs();
+                    let jobs = self.take_jobs();
+                    if !(self.take_notify() | jobs) {
+                        break;
+                    }
+                    // Only a wake that delivered something is a woken turn (and rings at its end).
+                    if wake {
+                        self.emit(AgentEvent::Woken);
+                    }
                 }
             }
             synthetic = false;
@@ -1545,6 +1601,47 @@ impl Agent {
         true
     }
 
+    /// Is there a `mu notify` message to deliver? `wake`: for a turn nobody asked for, so
+    /// messages announced at open (which wait for the next prompt) do not count.
+    fn notify_pending(&self, wake: bool) -> bool {
+        self.notify
+            && self.session.is_some()
+            && notify::has_pending(&self.session_id())
+            && notify::pending(&self.session_id())
+                .iter()
+                .any(|n| !self.notify_seen.contains(&n.name) && !(wake && self.notify_announced.contains(&n.name)))
+    }
+
+    /// Hands queued `mu notify` messages to the model as one `<system-notice>` user message and
+    /// deletes the files, but only once that message is in the session file.
+    fn take_notify(&mut self) -> bool {
+        if !self.notify || self.session.is_none() || !notify::has_pending(&self.session_id()) {
+            return false;
+        }
+        let id = self.session_id();
+        let notes: Vec<notify::Note> =
+            notify::pending(&id).into_iter().filter(|n| !self.notify_seen.contains(&n.name)).collect();
+        if notes.is_empty() {
+            return false;
+        }
+        for n in &notes {
+            let line: String = n.text.lines().next().unwrap_or("").chars().take(80).collect();
+            self.notice(format!("↳ mu notify from {}: {line}", n.from));
+        }
+        self.push(Message::user(&notify::notice(&notes)));
+        let names: Vec<String> = notes.into_iter().map(|n| n.name).collect();
+        if self.entry_ids.last().is_some_and(|e| !e.is_empty()) {
+            if let Some(s) = &self.session {
+                s.sync();
+            }
+            notify::remove(&id, &names);
+        } else {
+            // Not written: keep the files for the next open, but never deliver them twice here.
+            self.notify_seen.extend(names);
+        }
+        true
+    }
+
     async fn run_loop(&mut self, cancel: &CancellationToken) -> Flow {
         let mut first = true;
         let mut todo_nags = 0u8;
@@ -1659,7 +1756,7 @@ impl Agent {
             }
             if stop != StopReason::ToolUse || calls.is_empty() {
                 let steered = self.take_steer();
-                let delivered = self.take_jobs();
+                let delivered = self.take_jobs() | self.take_notify();
                 if steered || delivered {
                     continue;
                 }
@@ -1722,6 +1819,7 @@ impl Agent {
             }
             self.take_steer();
             self.take_jobs();
+            self.take_notify();
         }
     }
 
@@ -2221,6 +2319,45 @@ mod loop_tests {
         });
     }
 
+    // ---- `mu notify` delivery ----
+
+    fn notify_agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, UnboundedReceiver<AgentEvent>) {
+        let (mut a, rx) = agent(script);
+        a.enable_jobs();
+        a.enable_notify();
+        (a, rx)
+    }
+
+    fn drain(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn user_text(m: &Message) -> Option<String> {
+        match m {
+            Message::User { content, .. } => Some(text_of(content)),
+            _ => None,
+        }
+    }
+
+    fn user_texts(a: &Agent) -> Vec<String> {
+        a.messages.iter().filter_map(user_text).collect()
+    }
+
+    fn session_text(a: &Agent) -> String {
+        std::fs::read_to_string(&a.session.as_ref().unwrap().path).unwrap()
+    }
+
+    #[test]
+    fn a_wake_with_nothing_pending_starts_no_turn() {
+        run(async {
+            let (mut a, mut rx) = notify_agent(vec![]);
+            a.ensure_session().await;
+            drain(&mut rx);
+            a.turn(None).await;
+            assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::TurnStart | AgentEvent::Woken)));
+        });
+    }
+
     #[test]
     fn a_stop_with_no_calls_skips_the_todo_reminder() {
         use crate::tools::todo::{Phase, Status, Task};
@@ -2266,6 +2403,56 @@ mod loop_tests {
             while let Ok(e) = rx.try_recv() {
                 assert!(!matches!(e, AgentEvent::Notice(n) if n.contains("Plan approved")));
             }
+        });
+    }
+
+    #[test]
+    fn a_wake_delivers_the_queued_message_and_empties_the_inbox() {
+        run(async {
+            let (mut a, mut rx) = notify_agent(vec![Ok(assistant(vec![Block::text("PONG")], StopReason::Stop))]);
+            a.ensure_session().await;
+            let id = a.session_id();
+            notify::enqueue(&id, "steward", "say PONG").unwrap();
+            a.turn(None).await;
+            let evs = drain(&mut rx);
+            assert!(evs.iter().any(|e| matches!(e, AgentEvent::Woken)));
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("mu notify from steward: say PONG")))
+            );
+            assert!(session_text(&a).contains("Message from steward (via mu notify"));
+            assert!(!notify::has_pending(&id));
+            assert!(a.providers.scripted.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_message_during_a_turn_joins_that_turn() {
+        run(async {
+            let sleep =
+                Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": "sleep 0.3"}) };
+            let script = vec![
+                Ok(assistant(vec![sleep], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("one")], StopReason::Stop)),
+            ];
+            let (mut a, mut rx) = notify_agent(script);
+            a.ensure_session().await;
+            let id = a.session_id();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                notify::enqueue(&id, "steward", "also HELLO").unwrap();
+            });
+            a.turn(Some("go".to_string().into())).await;
+            assert!(a.providers.scripted.borrow().is_empty(), "two requests in one turn");
+            let evs = drain(&mut rx);
+            assert_eq!(evs.iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count(), 1);
+            assert!(!evs.iter().any(|e| matches!(e, AgentEvent::Woken)));
+            let at = |f: &dyn Fn(&Message) -> bool| a.messages.iter().position(f).unwrap();
+            let result = at(&|m| matches!(m, Message::ToolResult { .. }));
+            let notice = at(&|m| user_text(m).is_some_and(|t| t.contains("also HELLO")));
+            let reply = at(&|m| matches!(m, Message::Assistant { content, .. } if text_of(content) == "one"));
+            assert!(result < notice && notice < reply, "the notice goes out before the model's next reply");
+            assert!(!notify::has_pending(&a.session_id()));
         });
     }
 
@@ -2444,6 +2631,63 @@ mod loop_tests {
     }
 
     #[test]
+    fn messages_waiting_at_open_are_announced_and_go_out_with_the_next_prompt() {
+        run(async {
+            let (mut a, mut rx) = notify_agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
+            a.ensure_session().await;
+            let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
+            a.end_session().await;
+            a.reset_conversation();
+            notify::enqueue(&id, "steward", "later").unwrap();
+            drain(&mut rx);
+            a.load_session(&path).await;
+            let evs = drain(&mut rx);
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("1 message(s) from mu notify waiting")))
+            );
+            assert!(!evs.iter().any(|e| matches!(e, AgentEvent::TurnStart)));
+            assert!(notify::has_pending(&id));
+            a.turn(None).await;
+            assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::TurnStart)), "announced is not a wake");
+            a.turn(Some("hi".to_string().into())).await;
+            let users = user_texts(&a);
+            assert_eq!(users.len(), 2, "{users:?}");
+            assert!(users[0].contains("Message from steward") && users[1] == "hi", "{users:?}");
+            assert!(!notify::has_pending(&id));
+        });
+    }
+
+    #[test]
+    fn the_real_loop_wakes_on_the_channel() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("PONG")], StopReason::Stop))]);
+            a.enable_jobs();
+            let wake = a.enable_notify().unwrap();
+            a.ensure_session().await;
+            let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
+            let (ctx, crx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::task::spawn_local(a.run(crx));
+            notify::enqueue(&id, "steward", "say PONG").unwrap();
+            wake.send(()).unwrap();
+            let waited = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                while let Some(e) = rx.recv().await {
+                    if matches!(e, AgentEvent::TurnEnd { .. }) {
+                        return;
+                    }
+                }
+            })
+            .await;
+            assert!(waited.is_ok(), "no turn ran");
+            ctx.send(Command::Exit).unwrap();
+            drop(ctx);
+            let _ = task.await;
+            assert!(std::fs::read_to_string(path).unwrap().contains("Message from steward (via mu notify"));
+            assert!(!notify::has_pending(&id));
+        });
+    }
+
+    #[test]
     fn a_drifted_plan_is_refused_without_anyway() {
         run(async {
             let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("never")], StopReason::Stop))]);
@@ -2459,6 +2703,38 @@ mod loop_tests {
             }
             assert!(stale);
             assert!(a.start_plan("t", PlanDecision::Keep { model: None }, true).await.is_some());
+        });
+    }
+
+    #[test]
+    fn two_senders_and_one_wake_give_one_notice() {
+        run(async {
+            let (mut a, _rx) = notify_agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
+            a.ensure_session().await;
+            let id = a.session_id();
+            notify::enqueue(&id, "a", "first").unwrap();
+            notify::enqueue(&id, "b", "second").unwrap();
+            a.turn(None).await;
+            let users = user_texts(&a);
+            assert_eq!(users.len(), 1, "{users:?}");
+            assert!(users[0].contains("Message from a") && users[0].contains("Message from b"));
+        });
+    }
+
+    #[test]
+    fn without_notify_pending_files_are_ignored() {
+        run(async {
+            let (mut a, mut rx) = agent(vec![]);
+            a.enable_jobs(); // interactive-like, but `enable_notify` was never called (-p, ACP)
+            a.ensure_session().await;
+            let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
+            notify::enqueue(&id, "steward", "x").unwrap();
+            a.turn(None).await;
+            assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::TurnStart)));
+            a.end_session().await;
+            a.load_session(&path).await;
+            assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::Notice(n) if n.contains("waiting"))));
+            assert!(notify::has_pending(&id));
         });
     }
 }

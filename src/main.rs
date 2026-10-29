@@ -15,6 +15,7 @@ mod jsoncache;
 mod mem;
 mod message;
 mod models;
+mod notify;
 mod plans;
 mod plugin;
 mod policy;
@@ -121,6 +122,17 @@ enum Sub {
     Plan {
         #[command(subcommand)]
         cmd: plans::PlanCmd,
+    },
+    /// Leave a message for a session; an interactive mu with it open wakes up and reads it.
+    Notify {
+        /// Session file or id (prefix).
+        session: PathBuf,
+        /// Who the message is from (shown to the model).
+        #[arg(long)]
+        from: Option<String>,
+        /// The message; `-` reads it from stdin.
+        #[arg(allow_hyphen_values = true)]
+        text: String,
     },
 }
 
@@ -252,6 +264,9 @@ fn run() -> Result<i32> {
     }
     if let Some(Sub::Take { session }) = cli.command {
         return take::run(&session, &std::env::current_dir()?);
+    }
+    if let Some(Sub::Notify { session, from, text }) = cli.command {
+        return notify::run(&session, from.as_deref(), &text, &std::env::current_dir()?);
     }
     if let Some(Sub::Review { base, plan, focus, out, markdown }) = cli.command {
         return Ok(review::run_cli(review::CliOpts { base, plan, focus, out, markdown }, &std::env::current_dir()?));
@@ -385,8 +400,10 @@ fn run() -> Result<i32> {
     if let Some(n) = plan_run.as_ref().and_then(|r| r.note) {
         agent.agent_prompt = Some(agent.agent_prompt.take().unwrap_or_default() + n);
     }
+    let mut notify_wake = None;
     if !headless_run && task_payload.is_none() {
         agent.enable_jobs();
+        notify_wake = agent.enable_notify();
     }
     if let Some(p) = resume {
         let _ = cmd_tx.send(events::Command::Resume(p));
@@ -415,6 +432,15 @@ fn run() -> Result<i32> {
                     }
                 }
             });
+        }
+        // Same order as above: the handler first, then the record flag, then the agent task.
+        if let Some(wake) = notify_wake {
+            match notify::forward_signal(wake) {
+                Ok(()) => session::set_inbox(),
+                Err(e) => {
+                    eprintln!("mu: cannot install the SIGUSR2 handler ({e}); `mu notify` messages will only queue")
+                }
+            }
         }
         let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
         let (print, max_cost) = (cli.print, cli.max_cost);
@@ -456,6 +482,7 @@ fn run() -> Result<i32> {
                     pick_session,
                     status_cfg: cfgs_ui.omp.status_line.clone(),
                     theme: cfgs_ui.mu.theme.clone(),
+                    notify: cfgs_ui.omp.completion.notify,
                 })
                 .await
             }

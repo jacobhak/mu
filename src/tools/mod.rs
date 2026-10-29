@@ -173,6 +173,14 @@ impl Tools {
         self.shell.get_or_init(|| pi_shell::shell::Shell::new(None))
     }
 
+    /// `PI_SESSION_FILE` / `PI_SESSION_ID` for bash commands (omp's names). Always both, empty
+    /// without a session, so a value inherited from a parent mu or omp is overwritten.
+    pub fn session_env(&self) -> Vec<(&'static str, String)> {
+        let file = self.session_path.borrow().as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let id = if file.is_empty() { String::new() } else { self.session_id.borrow().clone() };
+        vec![("PI_SESSION_FILE", file), ("PI_SESSION_ID", id)]
+    }
+
     pub fn abs(&self, p: &str) -> PathBuf {
         let p = Path::new(p);
         if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) }

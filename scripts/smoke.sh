@@ -82,6 +82,15 @@ tmux send-keys -t "$tm" 'Use the task tool to start one scout that replies ALPHA
 check "async task delivers notice" wait_for "job results delivered" 90
 wait_for "ctx" 60; sleep 3
 
+# mu notify: a real SIGUSR2 reaches the live TUI, which wakes by itself and answers
+sid="$(basename "$(session_file)" .jsonl)"; sid="${sid##*_}"
+out="$("$mu" notify "$(session_file)" --from smoke 'Reply with the word PONG spelled backwards, in capitals, and nothing else.')"
+check "notify delivered" test "${out#delivered (pid }" != "$out"
+check "notify wakes the TUI" wait_for "mu notify from smoke" 10
+check "notify answered" wait_for "GNOP" 60
+wait_for "ctx" 60; sleep 3
+check "inbox drained" test -z "$(ls "$MU_HOME/inbox/$sid" 2>/dev/null)"
+
 tmux send-keys -t "$tm" C-c
 tmux send-keys -t "$tm" C-c
 check "double Ctrl-C exits 0" wait_for "EXIT=0" 20

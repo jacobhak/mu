@@ -1,4 +1,5 @@
 pub mod app;
+mod bell;
 pub mod blocks;
 pub mod clipboard;
 pub mod complete;

@@ -152,6 +152,28 @@ pub fn write_terminal_seq(seq: &str) {
     let _ = out.flush();
 }
 
+/// The bytes that tell the user something happened: always a BEL (the terminal or tmux flags the
+/// pane), plus an OSC 9 toast under tmux (DCS passthrough) and in terminals known to show it.
+pub fn notify_bytes(msg: &str, env: impl Fn(&str) -> Option<String>) -> String {
+    let msg: String = msg.chars().filter(|c| !c.is_control()).take(100).collect();
+    let osc = format!("\x1b]9;{msg}\x1b\\");
+    let set = |k: &str| env(k).filter(|v| !v.is_empty());
+    if set("TMUX").is_some() {
+        return format!("\x1bPtmux;{}\x1b\\\x07", osc.replace('\x1b', "\x1b\x1b"));
+    }
+    let known = set("TERM_PROGRAM")
+        .is_some_and(|t| matches!(t.as_str(), "ghostty" | "WezTerm" | "iTerm.app" | "WarpTerminal"))
+        || set("LC_TERMINAL").is_some_and(|t| t == "iTerm2");
+    if known { osc } else { "\x07".into() }
+}
+
+/// Rings the terminal bell (and shows a toast where supported).
+pub fn notify(msg: &str) {
+    let mut out = io::stdout();
+    let _ = out.write_all(notify_bytes(msg, |k| std::env::var(k).ok()).as_bytes());
+    let _ = out.flush();
+}
+
 /// Records panics instead of printing them over the UI. Many panics are survivable (a tool or
 /// task that is caught); the terminal is restored only if one unwinds out of the UI, in
 /// `Term::drop`, which then prints the recorded message.
@@ -186,6 +208,24 @@ pub fn resume() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn notify_bytes_per_terminal() {
+        assert_eq!(notify_bytes("hi", env(&[])), "\x07");
+        assert_eq!(notify_bytes("hi", env(&[("TERM_PROGRAM", "vscode")])), "\x07");
+        assert_eq!(notify_bytes("hi", env(&[("TERM_PROGRAM", "ghostty")])), "\x1b]9;hi\x1b\\");
+        assert_eq!(notify_bytes("hi", env(&[("LC_TERMINAL", "iTerm2")])), "\x1b]9;hi\x1b\\");
+        assert_eq!(
+            notify_bytes("hi", env(&[("TMUX", "/tmp/t,1,0"), ("TERM_PROGRAM", "ghostty")])),
+            "\x1bPtmux;\x1b\x1b]9;hi\x1b\x1b\\\x1b\\\x07"
+        );
+        assert_eq!(notify_bytes("a\x1b]b\nc", env(&[])), "\x07");
+        assert_eq!(notify_bytes("a\x1bb\nc", env(&[("TERM_PROGRAM", "WezTerm")])), "\x1b]9;abc\x1b\\");
+        assert!(notify_bytes(&"x".repeat(500), env(&[("TERM_PROGRAM", "WezTerm")])).len() < 110);
+    }
 
     #[test]
     fn a_hangup_is_caught_not_fatal() {

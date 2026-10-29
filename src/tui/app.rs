@@ -1,3 +1,4 @@
+use super::bell::WokenBell;
 use super::blocks;
 use super::clipboard;
 use super::complete::Entry;
@@ -72,6 +73,8 @@ pub struct AppInit {
     pub pick_session: bool,
     pub status_cfg: crate::config::OmpStatusLine,
     pub theme: crate::config::MuTheme,
+    /// Ring the terminal at the end of a turn nobody typed (omp's `completion.notify`).
+    pub notify: bool,
 }
 
 /// What to do when a child that owned the terminal exits.
@@ -133,6 +136,8 @@ struct App {
     ui_tx: UnboundedSender<UiMsg>,
     cwd: PathBuf,
     status_cfg: crate::config::OmpStatusLine,
+    bell: WokenBell,
+    notify: bool,
     turn_started: Option<Instant>,
     /// `/model` assigns roles; `/switch` only changes this session.
     pick_assign: bool,
@@ -204,6 +209,7 @@ pub async fn run(init: AppInit) -> i32 {
         pick_session,
         status_cfg,
         theme,
+        notify,
     } = init;
     let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
@@ -243,6 +249,8 @@ pub async fn run(init: AppInit) -> i32 {
         plugins,
         ui_tx,
         status_cfg,
+        bell: WokenBell::default(),
+        notify,
         turn_started: None,
         pick_assign: false,
         cwd: cwd.clone(),
@@ -403,6 +411,7 @@ impl App {
                 self.running = true;
                 self.turn_started = Some(Instant::now());
             }
+            AgentEvent::Woken => self.bell.on_woken(),
             AgentEvent::UserPrompt(t) => {
                 let w = self.width();
                 let mut l = vec![vec![]];
@@ -515,8 +524,14 @@ impl App {
             AgentEvent::JobsDelivered(ids) => {
                 self.commit(vec![styled(format!("↳ job results delivered: {}", ids.join(", ")), |_| dim())]);
             }
-            AgentEvent::Ask { questions, reply } => self.start_ask(questions, reply),
+            AgentEvent::Ask { questions, reply } => {
+                let ring = self.bell.on_attention();
+                self.ring(ring);
+                self.start_ask(questions, reply)
+            }
             AgentEvent::PlanReview { title, uri, file, content, stored, note, reply } => {
+                let ring = self.bell.on_attention();
+                self.ring(ring);
                 let context = self
                     .status
                     .context_tokens
@@ -540,6 +555,8 @@ impl App {
                 self.compacting = false;
                 self.running = false;
                 self.turn_started = None;
+                let ring = self.bell.on_turn_end(aborted);
+                self.ring(ring);
                 if aborted {
                     self.notice("[aborted]");
                 }
@@ -559,6 +576,17 @@ impl App {
                 }
             }
             AgentEvent::Exit | AgentEvent::TurnFailed | AgentEvent::ToolSkipped { .. } => {}
+        }
+    }
+
+    /// Rings the terminal (BEL, plus a toast where supported) when `ring` and the setting is on.
+    fn ring(&self, ring: bool) {
+        if ring && self.notify {
+            let name =
+                self.status.title.clone().unwrap_or_else(|| {
+                    self.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                });
+            term::notify(&format!("mu: {name}"));
         }
     }
 

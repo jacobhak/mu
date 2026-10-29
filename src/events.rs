@@ -164,6 +164,9 @@ pub enum PtyInput {
 
 pub enum AgentEvent {
     TurnStart,
+    /// Sent right after `TurnStart` when the turn began without user input (a background job
+    /// finished or a `mu notify` message arrived).
+    Woken,
     /// A user message entered the conversation (initial, steer or follow-up).
     UserPrompt(String),
     Text(String),
