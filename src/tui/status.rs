@@ -283,12 +283,12 @@ fn seg_cost(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
         (true, true) => format!("S{:.2}", s.cost),
         (true, false) => format!("${:.2}", s.cost),
     };
-    Some(vec![span(text, st(Role::Muted))])
+    Some(vec![span(text, st(Role::SynType))])
 }
 
 fn seg_session_name(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
     let title = s.title.as_deref().filter(|t| !t.is_empty())?;
-    Some(vec![span(title, st(Role::Faint))])
+    Some(vec![span(title, st(Role::Tool))])
 }
 
 /// Glyph omp shows in place of the model icon when thinking levels are shown (`compactThinkingLevel`).
@@ -321,9 +321,10 @@ fn context_line(s: &StatusSnapshot) -> Line {
     let window = s.context_window as u64;
     let pct = s.context_tokens.filter(|_| window > 0).map(|t| t as f64 / window as f64 * 100.0);
     let t = theme::get();
+    let level = context_color(pct, window);
     match pct {
         Some(p) => vec![
-            span(format!("{p:.1}%"), t.fg(context_color(pct, window))),
+            span(format!("{p:.1}%"), t.fg(if level == Role::Muted { Role::Accent } else { level })),
             span(format!(" of {}", format_number(window)), t.fg(Role::Faint)),
         ],
         None => vec![span(format_number(window), t.fg(Role::Muted))],

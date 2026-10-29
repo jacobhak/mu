@@ -16,7 +16,7 @@ fn key(r: Role) -> ContentStyle {
 }
 
 fn heading_style() -> ContentStyle {
-    let mut s = key(Role::Accent);
+    let mut s = key(Role::Tool);
     s.attributes.set(Attribute::Bold);
     s
 }
@@ -222,7 +222,7 @@ impl<'a> R<'a> {
             Event::Start(Tag::Heading { level, .. }) => {
                 self.pos += 1;
                 let hs = heading_style();
-                let mut prefix = key(Role::AccentSoft);
+                let mut prefix = key(Role::Faint);
                 prefix.attributes.set(Attribute::Bold);
                 let mut segs = chs(&format!("{} ", "#".repeat(level as usize)), prefix);
                 segs.extend(self.inline(hs));
@@ -236,7 +236,7 @@ impl<'a> R<'a> {
                 let lines = inner
                     .into_iter()
                     .map(|l| {
-                        let mut v = chs("│ ", key(Role::Line));
+                        let mut v = chs("▏ ", key(Role::Line));
                         v.extend(l.into_iter().map(|(c, mut st)| {
                             if st.foreground_color.is_none() {
                                 st = theme::get().apply(Role::Muted, st);
@@ -315,7 +315,7 @@ impl<'a> R<'a> {
         while let Some(ev) = self.cur() {
             match ev {
                 Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => push_str(&mut out, &s, st),
-                Event::Code(s) => push_str(&mut out, &s, st),
+                Event::Code(s) => push_str(&mut out, &s, theme::get().apply(Role::Strong, st)),
                 Event::SoftBreak => out.push((' ', st)),
                 Event::HardBreak => out.push(('\n', st)),
                 Event::TaskListMarker(done) => push_str(&mut out, if done { "☑ " } else { "☐ " }, st),
@@ -334,7 +334,7 @@ impl<'a> R<'a> {
                 Event::Start(Tag::Link { dest_url, .. }) => {
                     stack.push(st);
                     st.attributes.set(Attribute::Underlined);
-                    st.foreground_color = theme::get().color(Role::Accent);
+                    st.foreground_color = theme::get().color(Role::Literal);
                     links.push((out.len(), dest_url.to_string()));
                 }
                 Event::Start(Tag::Image { .. }) => stack.push(st),
@@ -377,9 +377,9 @@ impl<'a> R<'a> {
                     self.close();
                     let pad = " ".repeat(mw);
                     if child.is_empty() {
-                        out.push(chs(marker.trim_end(), key(Role::Accent)));
+                        out.push(chs(marker.trim_end(), key(Role::Literal)));
                     } else if first_is_list {
-                        out.push(chs(marker.trim_end(), key(Role::Accent)));
+                        out.push(chs(marker.trim_end(), key(Role::Literal)));
                         for l in child {
                             let mut v = chs(&pad, Default::default());
                             v.extend(l);
@@ -388,7 +388,7 @@ impl<'a> R<'a> {
                     } else {
                         for (i, l) in child.into_iter().enumerate() {
                             let mut v =
-                                if i == 0 { chs(&marker, key(Role::Accent)) } else { chs(&pad, Default::default()) };
+                                if i == 0 { chs(&marker, key(Role::Literal)) } else { chs(&pad, Default::default()) };
                             v.extend(l);
                             out.push(v);
                         }
@@ -471,7 +471,7 @@ impl<'a> R<'a> {
         };
         let mut out = vec![border('┌', '┬', '┐')];
         let n_rows = rows.len();
-        for (ri, (is_head, cells)) in rows.iter().enumerate() {
+        for (ri, (_, cells)) in rows.iter().enumerate() {
             let mut v = vec![('│', bdr)];
             for (i, &cw) in colw.iter().enumerate().take(ncols) {
                 let cell: &[Ch] = cells.get(i).map(Vec::as_slice).unwrap_or(&[]);
@@ -489,7 +489,7 @@ impl<'a> R<'a> {
                 v.push(('│', bdr));
             }
             out.push(v);
-            if ri == 0 && *is_head && n_rows > 1 {
+            if ri + 1 < n_rows {
                 out.push(border('├', '┼', '┤'));
             }
         }
@@ -626,8 +626,8 @@ mod tests {
         let ls = render("## Title", 40);
         assert_eq!(line_text(&ls[0]), "## Title");
         assert!(ls[0].iter().all(|s| s.style.attributes.has(Attribute::Bold)));
-        assert_eq!(ls[0][0].style.foreground_color, theme::get().color(Role::AccentSoft));
-        assert_eq!(ls[0][1].style.foreground_color, theme::get().color(Role::Accent));
+        assert_eq!(ls[0][0].style.foreground_color, theme::get().color(Role::Faint));
+        assert_eq!(ls[0][1].style.foreground_color, theme::get().color(Role::Tool));
     }
 
     #[test]
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn blockquote_prefix() {
-        assert_eq!(texts("> q", 40), vec!["│ q"]);
+        assert_eq!(texts("> q", 40), vec!["▏ q"]);
     }
 
     #[test]
@@ -695,9 +695,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_has_no_hue() {
+    fn inline_code_is_strong() {
         let ls = render("use `x`", 40);
-        assert_eq!(ls[0].last().unwrap().style.foreground_color, None);
+        assert_eq!(ls[0].last().unwrap().style.foreground_color, theme::get().color(Role::Strong));
     }
 
     #[test]
@@ -825,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn list_markers_use_accent() {
-        assert_eq!(render("- a\n- b", 20)[0][0].style.foreground_color, theme::get().color(Role::Accent));
+    fn list_markers_are_cyan() {
+        assert_eq!(render("- a\n- b", 20)[0][0].style.foreground_color, theme::get().color(Role::Literal));
     }
 }

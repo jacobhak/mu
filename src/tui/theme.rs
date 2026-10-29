@@ -40,10 +40,8 @@ pub enum Role {
     Thinking,
     Line,
     LineFaint,
-    /// Recessed panel behind cards: the palette's `dark_background`.
+    /// Recessed panel behind cards and the user prompt: the palette's `dark_background`.
     Surface,
-    /// Lifted band behind the user prompt.
-    Raised,
     Selected,
     Accent,
     AccentSoft,
@@ -85,11 +83,10 @@ const DEFS: [Def; ROLE_COUNT] = [
     Key("bright_foreground", Slot(15)),
     Mix("foreground", "background", 35, Dim),
     Key("dark_foreground", Slot(8)),
-    Mix("foreground", "background", 45, Dim),
+    Key("dark_foreground", Slot(8)),
     Mix("background", "foreground", 22, Slot(8)),
     Mix("background", "foreground", 13, Slot(8)),
     Key("dark_background", No),
-    Mix("background", "foreground", 10, No),
     Key("selection", Slot(8)),
     Key("accent", Slot(4)),
     Mix("background", "accent", 55, Slot(4)),
@@ -97,7 +94,7 @@ const DEFS: [Def; ROLE_COUNT] = [
     Key("yellow", Slot(3)),
     Key("red", Slot(1)),
     Mix("background", "red", 55, Slot(1)),
-    Key("cyan", Slot(6)),
+    Mix("cyan", "bright_foreground", 40, Slot(6)),
     Key("magenta", Slot(5)),
     Key("magenta", Slot(5)),
     Key("blue", Slot(4)),
@@ -440,9 +437,8 @@ mod tests {
         assert_eq!(t.color(Role::Muted), rgb("#777d98"));
         assert_eq!(t.color(Role::Line), rgb("#393c4d"));
         assert_eq!(t.color(Role::Surface), rgb("#13141c"));
-        assert_eq!(t.color(Role::Thinking), rgb("#696e87"));
+        assert_eq!(t.color(Role::Thinking), rgb("#565f89"));
         assert_eq!(t.color(Role::Tool), rgb("#ad8ee6"));
-        assert_eq!(t.color(Role::Raised), rgb("#282a38"));
         assert_eq!(t.color(Role::Faint), rgb("#565f89"), "the palette's own dark_foreground is legible");
         assert_eq!(t.color(Role::AccentSoft), rgb("#4f6599"));
         assert_eq!(t.color(Role::Accent), rgb("#7aa2f7"));
@@ -455,11 +451,9 @@ mod tests {
         assert_eq!(t.color(Role::Strong), Some(Color::AnsiValue(15)));
         assert_eq!(t.color(Role::Muted), None);
         assert!(t.fg(Role::Muted).attributes.has(Attribute::Dim));
-        assert_eq!(t.color(Role::Raised), None);
         assert_eq!(t.color(Role::Surface), None);
         assert_eq!(t.color(Role::Accent), Some(Color::AnsiValue(4)));
-        assert_eq!(t.color(Role::Thinking), None);
-        assert!(t.fg(Role::Thinking).attributes.has(Attribute::Dim));
+        assert_eq!(t.color(Role::Thinking), Some(Color::AnsiValue(8)));
         assert_eq!(t.color(Role::Tool), Some(Color::AnsiValue(5)));
     }
 

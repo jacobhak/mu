@@ -25,6 +25,27 @@ forwards OSC 4 palette queries to the client.
 Truecolor variants need a truecolor path: under tmux the client must list `RGB` in
 `tmux display -p '#{client_termfeatures}'` (detach and reattach after changing `terminal-features`).
 
+## Parity pass (omp tokyo-night)
+
+Side by side on the same transcript, omp still looked better: it uses hue for structure where mu was almost grey.
+This pass supersedes principles 2 and 3 below ("one accent", "hues only for meaning") for structure:
+
+| element | now |
+|---|---|
+| tool names, header paths, card titles, `Output` label, headings, session name, model | `Tool` (magenta), names bold |
+| bash command, context % at rest | `Accent` (blue) |
+| bullets, links, status path | `Literal` (cyan mixed 40% toward bright_foreground, close to omp's `#7dcfff`) |
+| inline code | `Strong` |
+| thinking | `dark_foreground` italic, no gutter |
+| quote | `▏` bar in `Line` |
+| edit/write | title on the card's top rule (`✎ Edit: path ⟦+3/-3⟧`, `✎ Write: path · 9 lines`), no separate header row |
+| tables | grid with a rule between every row |
+| user prompt | on `Surface`, same as cards (`Raised` is gone) |
+| status line | spend in `bright_cyan`, session name in `Tool` |
+
+A failed bash card no longer colours its first output line red: after tail truncation that line is arbitrary. The
+`Exit:` fact still carries the failure.
+
 ## Polish pass (tmux 3.6)
 
 With tmux 3.6 forwarding OSC 4, omp's Tokyo Night rendered in true colour looked better than mu. What omp did
