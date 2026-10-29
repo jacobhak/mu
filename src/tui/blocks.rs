@@ -522,7 +522,12 @@ fn ask_rows(args: &Value, text: &str, width: usize) -> Vec<Line> {
         }
         let prefix = format!("{id}: ");
         if let Some(a) = text.lines().find(|l| l.starts_with(&prefix)) {
-            rows.push(truncate(&vec![span(format!("  {a}"), tfg(Role::Muted))], width));
+            // Wrapped, not cut: a note after the choice is part of the answer.
+            for r in markdown::wrap_chs(&markdown::chs(a, tfg(Role::Muted)), inner) {
+                let mut row = vec![span("  ", line::dim())];
+                row.extend(markdown::chars_to_line(&r));
+                rows.push(row);
+            }
         }
     }
     rows
@@ -723,6 +728,17 @@ mod tests {
             "{t:?}"
         );
         assert!(t.iter().all(|l| l.chars().count() <= 24), "{t:?}");
+    }
+
+    #[test]
+    fn noted_answer_wraps_so_the_note_stays_visible() {
+        let args = json!({"questions": [{"id": "skip", "question": "Run the tests?", "options": []}]});
+        let out =
+            ToolOutput::ok("User answers:\nskip: Skip — note: \"skip the tests for now, I will run them tomorrow\"");
+        let t = texts(&tool_result("ask", &args, &out, false, 30));
+        assert!(t.iter().any(|l| l.contains("tomorrow")), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("note")), "{t:?}");
+        assert!(t.iter().all(|l| l.chars().count() <= 30), "{t:?}");
     }
 
     #[test]

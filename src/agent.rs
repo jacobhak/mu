@@ -1119,7 +1119,7 @@ impl Agent {
         }
         self.emit(AgentEvent::ToolEnd { id, name: "review".into(), output: ToolOutput::ok(md) });
 
-        let opt = |label: String, description: Option<String>| AskOption { label, description };
+        let opt = |label: String, description: Option<String>| AskOption { label, description, preview: None };
         let Some(report) = report else {
             let q = AskQuestion {
                 question: "The reviewer returned an unstructured report.".into(),
@@ -1127,9 +1127,12 @@ impl Agent {
                 options: vec![opt("Send report to the implementer".into(), None), opt("Dismiss".into(), None)],
                 multi: false,
                 recommended: Some(1),
+                confirm: false,
             };
             return match self.review_ask(q, cancel).await {
-                Answer::Options(o) if o.first().is_some_and(|l| l.starts_with("Send")) => {
+                Answer::Options(o) | Answer::Noted { picks: o, .. }
+                    if o.first().is_some_and(|l| l.starts_with("Send")) =>
+                {
                     Some(review::raw_message(&out.text, plan_uri.as_deref(), &report_uri))
                 }
                 _ => None,
@@ -1158,9 +1161,14 @@ impl Agent {
             options,
             multi: false,
             recommended: Some(recommended),
+            confirm: false,
         };
         let default_set = if n > 0 { blocking.clone() } else { (0..m).collect() };
-        let (chosen, note): (Vec<usize>, Option<String>) = match self.review_ask(q, cancel).await {
+        let (answer, typed) = match self.review_ask(q, cancel).await {
+            Answer::Noted { picks, note } => (Answer::Options(picks), Some(note)),
+            a => (a, None),
+        };
+        let (chosen, note): (Vec<usize>, Option<String>) = match answer {
             Answer::Options(o) => match o.first().map(String::as_str) {
                 Some(l) if l.starts_with("Send all") => ((0..m).collect(), None),
                 Some(l) if l.starts_with("Send ") => (blocking.clone(), None),
@@ -1183,25 +1191,27 @@ impl Agent {
                         options,
                         multi: true,
                         recommended: None,
+                        confirm: false,
                     };
-                    match self.review_ask(q, cancel).await {
-                        Answer::Options(sel) => {
-                            let idx = sel
-                                .iter()
-                                .filter_map(|l| l.split('.').next()?.trim().parse::<usize>().ok())
-                                .filter(|i| (1..=m).contains(i))
-                                .map(|i| i - 1)
-                                .collect::<std::collections::BTreeSet<_>>();
-                            (idx.into_iter().collect(), None)
-                        }
+                    let (sel, typed) = match self.review_ask(q, cancel).await {
+                        Answer::Options(sel) => (sel, None),
+                        Answer::Noted { picks, note } => (picks, Some(note)),
                         _ => (Vec::new(), None),
-                    }
+                    };
+                    let idx = sel
+                        .iter()
+                        .filter_map(|l| l.split('.').next()?.trim().parse::<usize>().ok())
+                        .filter(|i| (1..=m).contains(i))
+                        .map(|i| i - 1)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    (idx.into_iter().collect(), typed)
                 }
                 _ => (Vec::new(), None),
             },
             Answer::Custom(t) => (default_set, Some(t)),
-            Answer::Cancelled => (Vec::new(), None),
+            Answer::Cancelled | Answer::Noted { .. } => (Vec::new(), None),
         };
+        let note = note.or(typed);
         if chosen.is_empty() {
             return None;
         }

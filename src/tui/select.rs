@@ -22,6 +22,9 @@ const DETAIL_MAX_LINES: usize = 4;
 /// Rows the title may take; a longer one ends in `…`.
 const TITLE_MAX_LINES: usize = 6;
 
+/// Rows a highlighted option's preview may take, the truncation marker included.
+const PREVIEW_MAX_LINES: usize = 16;
+
 pub struct Item {
     pub label: String,
     pub detail: String,
@@ -32,6 +35,8 @@ pub enum SelectResult {
     Cancelled,
     /// Indices into the original items, ascending.
     Chosen(Vec<usize>),
+    /// Like `Chosen`, with a note typed on the highlighted row (only when the note is non-empty).
+    Noted(Vec<usize>, String),
     Text(String),
 }
 
@@ -60,6 +65,17 @@ pub struct Select {
     rows_cache: std::cell::RefCell<Option<(String, std::rc::Rc<Vec<Row>>)>>,
     /// Show the highlighted row's description wrapped beneath the list instead of inline.
     detail_panel: bool,
+    /// Note key enabled: Right, or Tab in single-select, opens a one-line note on the highlighted row.
+    notes: bool,
+    /// True while typing the note.
+    noting: bool,
+    note: String,
+    /// Keys that pick an item at once while the filter is empty (single-select): `(key, item index)`.
+    quick: Vec<(char, usize)>,
+    /// A dim line at the bottom naming the keys.
+    hint: Option<String>,
+    /// One entry per item (by item index): a monospace block shown under the list for the highlighted item.
+    previews: Vec<Option<String>>,
 }
 
 impl Select {
@@ -78,6 +94,12 @@ impl Select {
             checked: BTreeSet::new(),
             editing: false,
             text: String::new(),
+            notes: false,
+            noting: false,
+            note: String::new(),
+            quick: Vec::new(),
+            hint: None,
+            previews: Vec::new(),
         }
     }
 
@@ -107,6 +129,27 @@ impl Select {
         self
     }
 
+    /// Enables the note key (see `notes`).
+    pub fn notes(mut self) -> Self {
+        self.notes = true;
+        self
+    }
+
+    pub fn quick_keys(mut self, keys: Vec<(char, usize)>) -> Self {
+        self.quick = keys;
+        self
+    }
+
+    pub fn hint(mut self, text: &str) -> Self {
+        self.hint = Some(text.to_string());
+        self
+    }
+
+    pub fn previews(mut self, previews: Vec<Option<String>>) -> Self {
+        self.previews = previews;
+        self
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> SelectResult {
         if key.kind == KeyEventKind::Release {
             return SelectResult::Pending;
@@ -117,6 +160,9 @@ impl Select {
         }
         if self.editing {
             return self.text_key(key, ctrl);
+        }
+        if self.noting {
+            return self.note_key(key, ctrl);
         }
         let rows = self.rows();
         let n = rows.len();
@@ -140,6 +186,8 @@ impl Select {
                 SelectResult::Pending
             }
             KeyCode::Enter => self.choose(&rows),
+            KeyCode::Right if self.notes => self.start_note(&rows),
+            KeyCode::Tab if self.notes && !self.multi => self.start_note(&rows),
             // Space toggles only while the filter is empty; with text in it, Space is part of the
             // filter. Tab always toggles.
             KeyCode::Tab | KeyCode::Char(' ')
@@ -156,6 +204,9 @@ impl Select {
                 self.filter.pop();
                 self.sel = 0;
                 SelectResult::Pending
+            }
+            KeyCode::Char(c) if !ctrl && self.filter.is_empty() && !self.multi && self.quick_item(c).is_some() => {
+                SelectResult::Chosen(self.quick_item(c).into_iter().collect())
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 self.filter.push(c);
@@ -196,11 +247,59 @@ impl Select {
         }
     }
 
+    /// Typing the note on the highlighted row: Enter submits it with the picks, Esc goes back.
+    fn note_key(&mut self, key: KeyEvent, ctrl: bool) -> SelectResult {
+        match key.code {
+            KeyCode::Esc => {
+                self.noting = false;
+                self.note.clear();
+                SelectResult::Pending
+            }
+            KeyCode::Enter => {
+                self.noting = false;
+                let note = std::mem::take(&mut self.note).trim().to_string();
+                let rows = self.rows();
+                match self.choose(&rows) {
+                    SelectResult::Chosen(picks) if !note.is_empty() => SelectResult::Noted(picks, note),
+                    other => other,
+                }
+            }
+            KeyCode::Backspace => {
+                self.note.pop();
+                SelectResult::Pending
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.note.clear();
+                SelectResult::Pending
+            }
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                self.note.push(c);
+                SelectResult::Pending
+            }
+            _ => SelectResult::Pending,
+        }
+    }
+
+    fn start_note(&mut self, rows: &[Row]) -> SelectResult {
+        if matches!(rows.get(self.sel), Some(Row::Item(_))) {
+            self.noting = true;
+            self.note.clear();
+        }
+        SelectResult::Pending
+    }
+
+    fn quick_item(&self, c: char) -> Option<usize> {
+        let c = c.to_ascii_lowercase();
+        self.quick.iter().find(|(k, _)| *k == c).map(|(_, i)| *i)
+    }
+
     /// Replaces line breaks and tabs with spaces and drops other control characters.
     pub fn on_paste(&mut self, s: &str) {
         let clean = clean_paste(s);
         if self.editing {
             self.text.push_str(&clean);
+        } else if self.noting {
+            self.note.push_str(&clean);
         } else {
             self.filter.push_str(&clean);
             self.sel = 0;
@@ -210,8 +309,19 @@ impl Select {
     /// Lines (title, filter/input, rows) fitted to `max_rows`, and the cursor (row, col).
     pub fn render(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
         let width = width.max(1);
-        let input = if self.editing { &self.text } else { &self.filter };
         let mut out = self.title_rows(width, max_rows);
+        if self.noting {
+            if let Some(&row) = self.rows().get(self.sel) {
+                out.push(self.row_line(row, true, width));
+            }
+            let cursor = (out.len(), (7 + self.note.width()).min(width - 1));
+            out.push(line::plain(format!("note › {}", self.note)));
+            if out.len() < max_rows {
+                out.push(line::styled("Enter submit · Esc back", |_| dim()));
+            }
+            return (out.iter().map(|l| line::truncate(l, width)).collect(), cursor);
+        }
+        let input = if self.editing { &self.text } else { &self.filter };
         let cursor = (out.len(), (2 + input.width()).min(width - 1));
         out.push(line::plain(format!("› {input}")));
 
@@ -222,7 +332,9 @@ impl Select {
         } else {
             let rows = self.rows();
             let n = rows.len();
-            let avail = max_rows.saturating_sub(out.len());
+            // The hint takes the last row when there is room for it and for one list row.
+            let hint = self.hint.as_ref().filter(|_| max_rows.saturating_sub(out.len()) > 1);
+            let avail = max_rows.saturating_sub(out.len() + usize::from(hint.is_some()));
             if n == 0 {
                 if avail > 0 {
                     out.push(line::styled("  no matches", |_| dim()));
@@ -233,7 +345,19 @@ impl Select {
                 // for a separator and a line of text means no panel at all.
                 let panel = self.detail_height(width).min(avail - 1);
                 let panel = if panel < 2 { 0 } else { panel };
-                let (a, b, ind) = window(n, sel, avail - panel);
+                // Every preview gets the height of the tallest, so the list does not jump as the
+                // cursor moves; the list keeps its first rows.
+                let tallest = self
+                    .previews
+                    .iter()
+                    .flatten()
+                    .map(|p| preview_rows(p, width, PREVIEW_MAX_LINES).len())
+                    .max()
+                    .unwrap_or(0);
+                let room = avail.saturating_sub(panel + n.min(3) + 1);
+                let prev = tallest.min(room);
+                let block = if prev > 0 { prev + 1 } else { 0 };
+                let (a, b, ind) = window(n, sel, avail - panel - block);
                 if ind && a > 0 {
                     out.push(line::styled(format!("  … {a} more"), |_| dim()));
                 }
@@ -258,6 +382,19 @@ impl Select {
                         out.push(l);
                     }
                 }
+                if block > 0 {
+                    out.push(Vec::new());
+                    let text = match rows[sel] {
+                        Row::Item(i) => self.previews.get(i).cloned().flatten(),
+                        Row::Free => None,
+                    };
+                    let mut lines = text.map(|t| preview_rows(&t, width, prev)).unwrap_or_default();
+                    lines.resize(prev, Vec::new());
+                    out.extend(lines);
+                }
+            }
+            if let Some(h) = hint {
+                out.push(line::styled(format!("  {h}"), |_| dim()));
             }
         }
 
@@ -414,6 +551,19 @@ fn detail_lines(detail: &str, width: usize, max_lines: usize) -> Vec<Line> {
             cut.push(span("…", dim()));
             *last = line::truncate(&cut, tw);
         }
+    }
+    out
+}
+
+/// A monospace block as rows, each clipped to `width`. Past `max` rows the last one says how many
+/// lines were cut.
+fn preview_rows(text: &str, width: usize, max: usize) -> Vec<Line> {
+    let clean = line::sanitize(text.trim_end_matches('\n'));
+    let rows: Vec<&str> = clean.split('\n').collect();
+    let keep = if rows.len() > max { max.saturating_sub(1) } else { rows.len() };
+    let mut out: Vec<Line> = rows[..keep].iter().map(|r| line::plain(line::truncate_text(r, width))).collect();
+    if keep < rows.len() {
+        out.push(line::styled(line::truncate_text(&format!("… {} more lines", rows.len() - keep), width), |_| dim()));
     }
     out
 }
@@ -751,5 +901,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn ask_items() -> Vec<Item> {
+        items(&["a", "b", "c"])
+    }
+
+    #[test]
+    fn note_submits_the_highlighted_pick_with_the_text() {
+        let mut s = Select::new("t", ask_items()).notes();
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Right));
+        type_str(&mut s, " later ");
+        assert!(matches!(s.on_key(key(KeyCode::Enter)), SelectResult::Noted(p, n) if p == vec![1] && n == "later"));
+    }
+
+    #[test]
+    fn note_needs_the_note_key_and_an_item() {
+        let mut s = Select::new("t", ask_items());
+        assert_eq!(chosen(s.on_key(key(KeyCode::Right))), None);
+        assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "Right does nothing without notes()");
+        let mut s = Select::new("t", ask_items()).notes().free_text("Other");
+        s.on_key(key(KeyCode::Up));
+        s.on_key(key(KeyCode::Right));
+        type_str(&mut s, "x");
+        assert!(matches!(s.on_key(key(KeyCode::Enter)), SelectResult::Pending), "no note on the free-text row");
+    }
+
+    #[test]
+    fn tab_opens_a_note_only_in_single_select() {
+        let mut s = Select::new("t", ask_items()).notes();
+        s.on_key(key(KeyCode::Tab));
+        type_str(&mut s, "z");
+        assert!(matches!(s.on_key(key(KeyCode::Enter)), SelectResult::Noted(p, n) if p == vec![0] && n == "z"));
+        let mut s = Select::new("t", ask_items()).notes().multi();
+        s.on_key(key(KeyCode::Tab));
+        assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "in multi, Tab toggles");
+    }
+
+    #[test]
+    fn note_render_shows_the_pick_and_the_input() {
+        let mut s = Select::new("t", ask_items()).notes();
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Right));
+        type_str(&mut s, "ok");
+        let (lines, cur) = s.render(40, 10);
+        let t = texts(&lines);
+        assert_eq!(t[1].trim_end(), "❯ b", "{t:?}");
+        assert_eq!(t[2], "note › ok", "{t:?}");
+        assert_eq!(cur, (2, 9));
+    }
+
+    #[test]
+    fn quick_keys_pick_at_once_while_the_filter_is_empty() {
+        let mut s = Select::new("t", ask_items()).quick_keys(vec![('y', 0), ('n', 2)]);
+        assert_eq!(chosen(s.on_key(key(KeyCode::Char('N')))), Some(vec![2]));
+        let mut s = Select::new("t", ask_items()).quick_keys(vec![('y', 0)]);
+        type_str(&mut s, "a");
+        assert_eq!(chosen(s.on_key(key(KeyCode::Char('y')))), None, "with a filter, y types");
+    }
+
+    #[test]
+    fn preview_is_bounded_and_marked() {
+        let long: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let s = Select::new("t", items(&["a"])).previews(vec![Some(long)]);
+        let (lines, _) = s.render(60, 40);
+        let t = texts(&lines);
+        assert_eq!(t.len(), 20, "{t:?}");
+        assert_eq!(t[4], "line 1", "{t:?}");
+        assert_eq!(t[18], "line 15", "{t:?}");
+        assert_eq!(t[19], "… 25 more lines", "{t:?}");
+    }
+
+    #[test]
+    fn preview_is_clipped_to_the_width() {
+        let s = Select::new("t", items(&["a"])).previews(vec![Some("x".repeat(100))]);
+        let (lines, _) = s.render(20, 30);
+        let t = texts(&lines);
+        assert!(t[4].ends_with('…') && t[4].chars().count() <= 20, "{t:?}");
+        assert!(lines.iter().all(|l| line::line_width(l) <= 20), "{t:?}");
+    }
+
+    #[test]
+    fn preview_keeps_its_leading_spaces_and_drops_tabs_to_spaces() {
+        let s = Select::new("t", items(&["a"])).previews(vec![Some("if x {\n\treturn 1;\n}".into())]);
+        let (lines, _) = s.render(40, 30);
+        let t = texts(&lines);
+        assert_eq!(t[4..7], ["if x {", "    return 1;", "}"], "{t:?}");
+    }
+
+    #[test]
+    fn hint_is_the_last_row() {
+        let s = Select::new("t", ask_items()).hint("keys");
+        let (lines, _) = s.render(40, 10);
+        assert_eq!(texts(&lines).last().map(String::as_str), Some("  keys"));
     }
 }
