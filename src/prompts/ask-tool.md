@@ -1,4 +1,4 @@
-Ask only for materially different tradeoffs the user must decide. Default: act using code/config/docs/history and conventions. Several viable choices: pick conservative/standard, proceed, state choice.
+Ask whenever a decision is the user's: preferences, scope, priorities, trade-offs, or anything ambiguous, risky or hard to undo. A short question beats a wrong guess. Don't ask what code, config, docs or history already answer; look those up first.
 
 <instruction>
 - Batch related questions; 2–5 distinct options each; short labels, tradeoffs in `description`.
