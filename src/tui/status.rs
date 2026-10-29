@@ -246,8 +246,8 @@ fn seg_pi(_: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
 
 fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
     let mut line = vec![span(s.model_name.clone(), st(Role::Tool))];
-    if let Some(g) = thinking_glyph(s, env) {
-        line.push(span(format!(" {g}"), st(Role::Muted)));
+    if let Some(l) = thinking_label(s, env) {
+        line.push(span(format!(" ({l})"), st(Role::Muted)));
     }
     Some(line)
 }
@@ -291,19 +291,19 @@ fn seg_session_name(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line>
     Some(vec![span(title, st(Role::Tool))])
 }
 
-/// Glyph omp shows in place of the model icon when thinking levels are shown (`compactThinkingLevel`).
-fn thinking_glyph(s: &StatusSnapshot, env: &StatusEnv) -> Option<&'static str> {
+/// Abbreviated level after the model name; parenthesised so `Haiku 5.5 h` doesn't read as a version suffix.
+fn thinking_label(s: &StatusSnapshot, env: &StatusEnv) -> Option<&'static str> {
     let show = env.config.segment_options.get("model").and_then(|m| m["showThinkingLevel"].as_bool()).unwrap_or(true);
     if !show || !s.reasoning {
         return None;
     }
     Some(match s.thinking.as_str() {
-        "low" => "◔",
-        "medium" => "◑",
-        "high" => "◒",
-        "xhigh" => "◓",
-        "max" => "●",
-        _ => "⦸",
+        "low" => "l",
+        "medium" => "m",
+        "high" => "h",
+        "xhigh" => "xh",
+        "max" => "max",
+        _ => "off",
     })
 }
 
@@ -527,8 +527,23 @@ mod tests {
         let t = line_text(&lines[0]);
         assert_eq!(line_width(&lines[0]), 140);
         assert!(t.contains(" 5h 82% 2h  7d 16% 4d · EVENTS"), "{t}");
-        assert!(t.starts_with(" μ private · Haiku 5.5 ◒ · ~/code/mu · main *2 +1 ?3 · 1.5% of 1M · (sub) "), "{t}");
+        assert!(t.starts_with(" μ private · Haiku 5.5 (h) · ~/code/mu · main *2 +1 ?3 · 1.5% of 1M · (sub) "), "{t}");
         assert!(t.ends_with(" EVENTS: Read mu events.rs header "), "{t}");
+    }
+
+    #[test]
+    fn model_shows_abbreviated_thinking_level() {
+        let c = cfg(&["model"], &[]);
+        let cwd = Path::new("/home/u/x");
+        let mut s = StatusSnapshot { usage: None, title: None, ..snap() };
+        for (level, label) in
+            [("off", "off"), ("low", "l"), ("medium", "m"), ("high", "h"), ("xhigh", "xh"), ("max", "max")]
+        {
+            s.thinking = level.into();
+            assert_eq!(line_text(&render(&s, &env(&c, cwd), 80)[0]).trim(), format!("Haiku 5.5 ({label})"));
+        }
+        s.reasoning = false;
+        assert_eq!(line_text(&render(&s, &env(&c, cwd), 80)[0]).trim(), "Haiku 5.5");
     }
 
     #[test]

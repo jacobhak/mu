@@ -516,7 +516,7 @@ class Proposed(Current):
         sep = [(" · ", self.k("line"))]
         parts = [
             [(SPIN, self.k("accent")), (" 42s", m)],
-            [("Opus 5.5", PLAIN), (" ◒", m)],
+            [("Opus 5.5", PLAIN), (" (h)", m)],
             [("~/c/p/mu", m)],
             [("main", m), (" *2 ?1", self.k("faint"))],
             [("12.3%", m), (" of 1M", self.k("faint"))],
