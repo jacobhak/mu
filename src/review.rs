@@ -327,7 +327,7 @@ pub struct Meta {
     pub model: String,
 }
 
-fn loc(f: &Finding) -> String {
+pub(crate) fn loc(f: &Finding) -> String {
     match (f.line, f.end_line) {
         (Some(l), Some(e)) if e != l => format!("{}:{l}-{e}", f.file),
         (Some(l), _) => format!("{}:{l}", f.file),

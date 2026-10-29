@@ -5,6 +5,7 @@ mod compaction;
 mod config;
 mod context;
 mod cost;
+mod deliver;
 mod events;
 mod gateway;
 mod gitinfo;
@@ -135,6 +136,8 @@ enum Sub {
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
+    /// Deliver a parked plan: approve and implement it, review it against the plan, send blocking findings back to the implementer (at most --max-fix rounds), then have it commit. Exit codes: 0 pass, 1 fixes still needed, 2 error or failed.
+    Deliver(deliver::DeliverArgs),
 }
 
 /// Everything a session needs that depends only on the working directory.
@@ -276,6 +279,9 @@ fn run() -> Result<i32> {
     }
     if let Some(Sub::Review { base, plan, focus, out, markdown }) = cli.command {
         return Ok(review::run_cli(review::CliOpts { base, plan, focus, out, markdown }, &std::env::current_dir()?));
+    }
+    if let Some(Sub::Deliver(a)) = cli.command {
+        return Ok(deliver::run_cli(a, &std::env::current_dir()?));
     }
     if let Some(Sub::Update { check, force, tag }) = cli.command {
         return update::run(check, force, tag);

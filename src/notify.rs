@@ -214,14 +214,28 @@ pub fn forward_signal(wake: tokio::sync::mpsc::UnboundedSender<()>) -> std::io::
     Ok(())
 }
 
-pub fn run(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> anyhow::Result<i32> {
-    let path = match session::find(cwd, arg) {
-        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
-        Err(e) => {
-            eprintln!("mu notify: {e}");
-            return Ok(1);
-        }
+/// Queues `text` for the session at `arg` and wakes it when it is live. Returns the outcome line.
+pub fn send(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> Result<String, String> {
+    let path = session::find(cwd, arg).map(|p| std::fs::canonicalize(&p).unwrap_or(p))?;
+    if text.trim().is_empty() {
+        return Err("empty message".into());
+    }
+    if text.len() > MAX_TEXT {
+        return Err(format!("message too long ({} bytes, at most {MAX_TEXT})", text.len()));
+    }
+    let id = session::id_of(&path);
+    // Queue first, then look at the owner: a session opened in between scans the inbox after it
+    // locks, and one that is already live gets the signal.
+    enqueue(&id, &sanitize_from(from), text).map_err(|e| format!("cannot queue the message: {e}"))?;
+    let line = match deliver(&path) {
+        Delivery::Signalled(pid) => format!("delivered (pid {pid})"),
+        Delivery::Queued(why) => format!("queued ({why})"),
     };
+    prune(PRUNE_AGE);
+    Ok(line)
+}
+
+pub fn run(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> anyhow::Result<i32> {
     let text = if text == "-" {
         let mut s = String::new();
         if let Err(e) = std::io::stdin().take(MAX_TEXT as u64 + 1).read_to_string(&mut s) {
@@ -232,27 +246,16 @@ pub fn run(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> anyhow::Re
     } else {
         text.to_string()
     };
-    if text.trim().is_empty() {
-        eprintln!("mu notify: empty message");
-        return Ok(1);
+    match send(arg, from, &text, cwd) {
+        Ok(line) => {
+            println!("{line}");
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("mu notify: {e}");
+            Ok(1)
+        }
     }
-    if text.len() > MAX_TEXT {
-        eprintln!("mu notify: message too long ({} bytes, at most {MAX_TEXT})", text.len());
-        return Ok(1);
-    }
-    let id = session::id_of(&path);
-    // Queue first, then look at the owner: a session opened in between scans the inbox after it
-    // locks, and one that is already live gets the signal.
-    if let Err(e) = enqueue(&id, &sanitize_from(from), &text) {
-        eprintln!("mu notify: cannot queue the message: {e}");
-        return Ok(1);
-    }
-    match deliver(&path) {
-        Delivery::Signalled(pid) => println!("delivered (pid {pid})"),
-        Delivery::Queued(why) => println!("queued ({why})"),
-    }
-    prune(PRUNE_AGE);
-    Ok(0)
 }
 
 #[cfg(test)]

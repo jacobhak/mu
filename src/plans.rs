@@ -129,7 +129,8 @@ pub fn short(s: &str) -> &str {
     &s[..s.len().min(7)]
 }
 
-pub async fn store_for(cwd: &Path) -> Store {
+/// The main checkout of the clone `cwd` is in, or `cwd` outside git.
+pub async fn main_checkout(cwd: &Path) -> PathBuf {
     let root = review::repo_root(cwd).await.ok();
     let common = review::git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None).await;
     let common = match common {
@@ -137,7 +138,7 @@ pub async fn store_for(cwd: &Path) -> Store {
         // Git older than 2.31: the common dir may come back relative.
         Err(_) => review::git(cwd, &["rev-parse", "--git-common-dir"], None).await.ok().map(|s| cwd.join(s.trim())),
     };
-    let main = match common {
+    match common {
         Some(c) if root.is_some() => {
             if c.file_name().is_some_and(|n| n == ".git") {
                 c.parent().map(Path::to_path_buf).unwrap_or(c)
@@ -146,8 +147,14 @@ pub async fn store_for(cwd: &Path) -> Store {
             }
         }
         _ => cwd.to_path_buf(),
-    };
-    Store { dir: mu_home().join("plans").join(encode_cwd(&main)), root }
+    }
+}
+
+pub async fn store_for(cwd: &Path) -> Store {
+    Store {
+        dir: mu_home().join("plans").join(encode_cwd(&main_checkout(cwd).await)),
+        root: review::repo_root(cwd).await.ok(),
+    }
 }
 
 pub async fn base_now(root: &Path) -> Option<Base> {
