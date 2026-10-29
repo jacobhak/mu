@@ -6,7 +6,7 @@ use super::{ToolOutput, Tools};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub const DESCRIPTION: &str = "Submit this task's result: `{ data: <your output> }` for success, `{ error: \"message\" }` for failure. Never both; never a bare payload outside `data`. This task declares an output schema: `data` MUST match it, or the call is rejected with the reasons and you must call `yield` again. Prose in your final message is not a result.";
+pub const DESCRIPTION: &str = "Submit this task's result: `{ data: <your output> }` for success, `{ error: \"message\" }` for failure. Never both; never a bare payload outside `data`. This task declares an output schema: `data` MUST match it, or the call is rejected with the reasons and you must call `yield` again. Prose in your final message is not a result. A successful call ends your run at once: finish all other work first.";
 
 pub fn schema(output: &Value) -> Value {
     json!({"type":"object","properties":{

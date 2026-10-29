@@ -166,6 +166,7 @@ pub struct AgentInit {
 const SKIP_STOPPED: &str = "Skipped: the run was stopped so the user can take over";
 const SKIP_ABORTED: &str = "Tool call aborted by user";
 const SKIP_STEER: &str = "Skipped: the user sent a new message";
+const SKIP_YIELDED: &str = "Skipped: the result was already submitted with `yield`";
 const SKIP_TRUNCATED: &str = "Tool call not executed: output was truncated (max_tokens)";
 
 /// How a loop pass ended.
@@ -1778,6 +1779,7 @@ impl Agent {
                 return Flow::Done;
             }
             let mut skip: Option<&str> = None;
+            let mut yielded = false;
             for (id, name, args) in calls {
                 if skip.is_none() {
                     if cancel.is_cancelled() {
@@ -1800,10 +1802,13 @@ impl Agent {
                 }
                 let out = self.run_tool(&id, &name, args, cancel).await;
                 self.push_result(&id, &name, &out);
+                yielded |= name == "yield" && !out.is_error;
                 if cancel.is_cancelled() {
                     skip = Some(SKIP_ABORTED);
                 } else if self.inbox.borrow().stop {
                     skip = Some(SKIP_STOPPED);
+                } else if yielded {
+                    skip = Some(SKIP_YIELDED);
                 } else if !self.inbox.borrow().steer.is_empty() {
                     skip = Some(SKIP_STEER);
                 }
@@ -1814,7 +1819,8 @@ impl Agent {
             if self.inbox.borrow().stop {
                 return Flow::Stopped;
             }
-            if self.exec_plan.is_some() {
+            // A successful yield is the subagent's result; another request would only produce an unused reply.
+            if yielded || self.exec_plan.is_some() {
                 return Flow::Done;
             }
             self.take_steer();
@@ -2119,12 +2125,12 @@ mod loop_tests {
 
     /// Runs `a` as a `--headless` child would be driven: `run_subagent` on one side, the agent loop on the other.
     async fn drive_subagent(
-        mut a: Agent,
+        a: &mut Agent,
         rx: UnboundedReceiver<AgentEvent>,
         structured: bool,
     ) -> (serde_json::Value, i32) {
         let (ctx, mut crx) = tokio::sync::mpsc::unbounded_channel();
-        let agent_side = async move {
+        let agent_side = async {
             while let Some(c) = crx.recv().await {
                 match c {
                     Command::Prompt(t) => a.turn(Some(t)).await,
@@ -2147,14 +2153,70 @@ mod loop_tests {
             let script = vec![
                 Ok(assistant(vec![yield_call("y1", json!({"data":{"n":"x"}}))], StopReason::ToolUse)),
                 Ok(assistant(vec![yield_call("y2", json!({"data":{"n":2.0}}))], StopReason::ToolUse)),
-                Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+                Err(ProviderError::Fatal("requested after a successful yield".into())),
             ];
             let (mut a, rx) = agent(script);
             *a.tools.output_schema.borrow_mut() =
                 Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
             a.allow = Some(vec!["read".into()]); // `yield` must still be allowed
-            let (r, code) = drive_subagent(a, rx, true).await;
+            let (r, code) = drive_subagent(&mut a, rx, true).await;
             assert_eq!((code, &r["schemaOk"], &r["data"]), (0, &true.into(), &json!({"n":2})), "{r}");
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no request after a successful yield");
+            let res = results(&a);
+            assert_eq!(res.len(), 2, "{res:?}");
+            assert!(res[0].0 && res[0].1.contains("does not match the output schema") && res[0].1.contains("$.n"));
+            assert!(!res[1].0 && res[1].1.contains("Result submitted"), "{:?}", res[1]);
+        });
+    }
+
+    #[test]
+    fn structured_subagent_ends_after_a_yielded_error() {
+        crate::testutil::home();
+        run(async {
+            let script = vec![
+                Ok(assistant(vec![yield_call("y1", json!({"error":"cannot"}))], StopReason::ToolUse)),
+                Err(ProviderError::Fatal("requested after a successful yield".into())),
+            ];
+            let (mut a, rx) = agent(script);
+            *a.tools.output_schema.borrow_mut() =
+                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+            let (r, code) = drive_subagent(&mut a, rx, true).await;
+            assert_eq!((code, r["text"].as_str(), &r["schemaOk"]), (1, Some("cannot"), &false.into()), "{r}");
+            assert_eq!(a.providers.scripted.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn calls_after_a_successful_yield_are_skipped() {
+        run(async {
+            let script = vec![
+                Ok(assistant(
+                    vec![yield_call("y1", json!({"data":{"n":1}})), call("t2", "__panic")],
+                    StopReason::ToolUse,
+                )),
+                Err(ProviderError::Fatal("requested after a successful yield".into())),
+            ];
+            let (mut a, mut rx) = agent(script);
+            *a.tools.output_schema.borrow_mut() =
+                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+            a.turn(Some("go".to_string().into())).await;
+            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            let r = results(&a);
+            assert_eq!(r.len(), 2, "{r:?}");
+            assert!(!r[0].0 && r[0].1.contains("Result submitted"), "{:?}", r[0]);
+            assert!(r[1].0 && r[1].1.contains("already submitted with `yield`"), "{:?}", r[1]);
+            let mut skipped = Vec::new();
+            let mut ended = None;
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    AgentEvent::TurnEnd { aborted } => ended = Some(aborted),
+                    AgentEvent::ToolSkipped { id } => skipped.push(id),
+                    _ => {}
+                }
+            }
+            assert_eq!(skipped, ["t2"]);
+            assert_eq!(ended, Some(false));
+            assert_eq!(a.providers.scripted.borrow().len(), 1);
         });
     }
 
@@ -2241,7 +2303,7 @@ mod loop_tests {
             let (mut a, rx) = agent(vec![]);
             a.cwd = cwd;
             *a.tools.output_schema.borrow_mut() = Some(json!({"type":"object"}));
-            let r = tokio::time::timeout(std::time::Duration::from_secs(10), drive_subagent(a, rx, true)).await;
+            let r = tokio::time::timeout(std::time::Duration::from_secs(10), drive_subagent(&mut a, rx, true)).await;
             let (r, code) = r.expect("the run hung");
             assert_eq!((code, &r["isError"]), (1, &true.into()), "{r}");
         });
