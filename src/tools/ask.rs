@@ -119,7 +119,11 @@ impl Tools {
             r = rx => r.ok().flatten(),
             _ = ctx.cancel.cancelled() => None,
         };
-        let Some(answers) = answers else { return ToolOutput::err("Ask cancelled") };
+        // A dismissed dialog ends the turn like Esc on a running one; the model hears nothing of it.
+        let Some(answers) = answers.filter(|a| !a.iter().any(|x| matches!(x, Answer::Cancelled))) else {
+            ctx.cancel.cancel();
+            return ToolOutput::err("Ask cancelled");
+        };
         let lines: Vec<String> = a.questions.iter().zip(&answers).map(|(q, ans)| format_answer(q, ans)).collect();
         ToolOutput::ok(format!("User answers:\n{}", lines.join("\n")))
     }
