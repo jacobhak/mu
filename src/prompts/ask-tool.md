@@ -3,5 +3,8 @@ Ask whenever a decision is the user's: preferences, scope, priorities, trade-off
 <instruction>
 - Batch related questions; 2–5 distinct options each; short labels, tradeoffs in `description`.
 - `recommended` auto-adds " (Recommended)"; `multi: true` permits multiple selections.
+- `confirm: true` for a yes/no question: omit `options`; the picker offers Yes and No (`recommended`: 0 yes, 1 no).
+- `preview` on an option: monospace text (code, diff, table, layout), max ~16 lines; only when seeing it helps the choice. Prose goes in `description`.
+- The user may attach a note to a choice: `id: Label — note: "…"`. Treat the note as part of that answer.
 - NEVER supply "Other": UI adds "Other (type your own)". Clarifying custom input? Answer first; re-ask unresolved questions.
 </instruction>

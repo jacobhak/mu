@@ -507,9 +507,11 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
 /// it (`id: answer` lines after the `User answers:` header). The model still gets only the tool text.
 fn ask_rows(args: &Value, text: &str, width: usize) -> Vec<Line> {
     let inner = width.saturating_sub(2).max(1);
+    let questions: Vec<&Value> = args["questions"].as_array().into_iter().flatten().collect();
+    let ids: Vec<&str> = questions.iter().map(|q| q["id"].as_str().unwrap_or("")).collect();
+    let answers = answer_blocks(&ids, text);
     let mut rows = Vec::new();
-    for q in args["questions"].as_array().into_iter().flatten() {
-        let id = q["id"].as_str().unwrap_or("");
+    for (q, answer) in questions.iter().zip(answers) {
         let question = q["question"].as_str().unwrap_or("");
         let question = match q["header"].as_str().filter(|h| !h.is_empty()) {
             Some(h) => format!("{h}: {question}"),
@@ -520,12 +522,35 @@ fn ask_rows(args: &Value, text: &str, width: usize) -> Vec<Line> {
             row.extend(markdown::chars_to_line(&r));
             rows.push(row);
         }
-        let prefix = format!("{id}: ");
-        if let Some(a) = text.lines().find(|l| l.starts_with(&prefix)) {
-            rows.push(truncate(&vec![span(format!("  {a}"), tfg(Role::Muted))], width));
+        if let Some(a) = answer {
+            // Wrapped, not cut: a note after the choice, and every line of a multi-line answer, is part of it.
+            for r in markdown::wrap_chs(&markdown::chs(&a, tfg(Role::Muted)), inner) {
+                let mut row = vec![span("  ", line::dim())];
+                row.extend(markdown::chars_to_line(&r));
+                rows.push(row);
+            }
         }
     }
     rows
+}
+
+/// Each question's answer from the tool text, in question order: the `id: ` line and the lines after
+/// it, up to the next question's line. A custom answer or a note can span several lines.
+fn answer_blocks(ids: &[&str], text: &str) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = vec![None; ids.len()];
+    let mut cur: Option<usize> = None;
+    let mut next = 0;
+    for line in text.lines() {
+        if let Some(j) = (next..ids.len()).find(|&j| line.starts_with(&format!("{}: ", ids[j]))) {
+            out[j] = Some(line.to_string());
+            cur = Some(j);
+            next = j + 1;
+        } else if let Some(block) = cur.and_then(|j| out[j].as_mut()) {
+            block.push('\n');
+            block.push_str(line);
+        }
+    }
+    out
 }
 
 /// Viewport rows for a running tool: the bash box with its streaming tail, or a spinner header.
@@ -723,6 +748,32 @@ mod tests {
             "{t:?}"
         );
         assert!(t.iter().all(|l| l.chars().count() <= 24), "{t:?}");
+    }
+
+    #[test]
+    fn noted_answer_wraps_so_the_note_stays_visible() {
+        let args = json!({"questions": [{"id": "skip", "question": "Run the tests?", "options": []}]});
+        let out =
+            ToolOutput::ok("User answers:\nskip: Skip — note: \"skip the tests for now, I will run them tomorrow\"");
+        let t = texts(&tool_result("ask", &args, &out, false, 30));
+        assert!(t.iter().any(|l| l.contains("tomorrow")), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("note")), "{t:?}");
+        assert!(t.iter().all(|l| l.chars().count() <= 30), "{t:?}");
+    }
+
+    #[test]
+    fn multi_line_answers_stay_under_their_question() {
+        let args = json!({"questions": [
+            {"id": "why", "question": "Why?", "options": []},
+            {"id": "next", "question": "Next?", "options": []}
+        ]});
+        let out = ToolOutput::ok("User answers:\nwhy: \"first line\nsecond line\"\nnext: Skip — note: \"a\nb\"");
+        let t = texts(&tool_result("ask", &args, &out, false, 30));
+        let at = |s: &str| t.iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("{s}: {t:?}"));
+        assert!(at("first line") < at("second line\""), "{t:?}");
+        assert!(at("second line\"") < at("Next?"), "the answer's last line stays with its question: {t:?}");
+        assert!(at("b\"") > at("Next?"), "{t:?}");
+        assert!(t.iter().all(|l| l.chars().count() <= 30), "{t:?}");
     }
 
     #[test]

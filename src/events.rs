@@ -104,6 +104,9 @@ pub struct StatusSnapshot {
 pub struct AskOption {
     pub label: String,
     pub description: Option<String>,
+    /// Monospace block shown while the option is highlighted (code, diff, layout). Frontends
+    /// without a preview pane may ignore it.
+    pub preview: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,11 +116,18 @@ pub struct AskQuestion {
     pub options: Vec<AskOption>,
     pub multi: bool,
     pub recommended: Option<usize>,
+    /// A yes/no question: `options` are Yes and No, and the picker answers on `y`/`n`.
+    pub confirm: bool,
 }
 
 #[derive(Clone, Debug)]
 pub enum Answer {
     Options(Vec<String>),
+    /// Picked options (one, or several when multi) with a free-text note attached.
+    Noted {
+        picks: Vec<String>,
+        note: String,
+    },
     Custom(String),
     Cancelled,
 }
