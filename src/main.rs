@@ -1,5 +1,6 @@
 mod acp;
 mod agent;
+mod ask_nudge;
 mod at_imports;
 mod compaction;
 mod config;

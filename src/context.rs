@@ -450,6 +450,8 @@ pub struct PromptInput<'a> {
     pub ctx: &'a Context,
     pub plan: Option<&'a str>,
     pub subagent: bool,
+    /// The `ask` tool is offered to this run; the decision rule is only stated then.
+    pub ask: bool,
     pub agent_prompt: Option<&'a str>,
     pub plugin_ctx: &'a std::collections::BTreeMap<String, String>,
     /// The MCP servers' instructions block (`PluginHost::mcp_instructions`).
@@ -493,6 +495,13 @@ NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `
         i.model,
         i.cwd.display()
     );
+    if i.ask {
+        s.push_str(
+            "\n# Decisions\n\
+- A decision that belongs to the user (scope, design, trade-offs, anything ambiguous, risky or hard to undo) MUST be asked with `ask`: 2-5 options, one recommended, each with its trade-off. NEVER end a turn with a decision question or an option list in prose.\n\
+- Informational and rhetorical questions are fine in prose. Do not ask what code, config or docs answer.\n",
+        );
+    }
     if !i.subagent {
         s.push_str(
             "\n# Delegation\n\
@@ -605,6 +614,7 @@ mod tests {
             ctx: &ctx,
             plan: None,
             subagent: false,
+            ask: false,
             agent_prompt: None,
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
@@ -621,12 +631,35 @@ mod tests {
             ctx: &Context::default(),
             plan: None,
             subagent: false,
+            ask: false,
             agent_prompt: None,
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
         });
         assert!(sp.contains("NEVER use `sed`, `perl`") && sp.contains("NEVER `cat`"));
         assert!(sp.contains("[path#TAG]") && !sp.contains("*** Find"));
+    }
+
+    #[test]
+    fn decision_rule_only_when_ask_is_offered() {
+        let ctx = Context::default();
+        let plugins = std::collections::BTreeMap::new();
+        let input = |ask| PromptInput {
+            model: "m",
+            cwd: Path::new("/tmp"),
+            ctx: &ctx,
+            plan: None,
+            subagent: false,
+            ask,
+            agent_prompt: None,
+            plugin_ctx: &plugins,
+            mcp_instructions: None,
+        };
+        let on = system_prompt(&input(true));
+        assert!(on.contains("# Decisions") && on.contains("MUST be asked with `ask`"));
+        assert!(on.contains("NEVER end a turn with a decision question or an option list in prose"));
+        let off = system_prompt(&input(false));
+        assert!(!off.contains("# Decisions") && !off.contains("MUST be asked with `ask`"));
     }
 
     #[test]
@@ -706,6 +739,7 @@ mod tests {
             ctx: &ctx,
             plan: None,
             subagent: true,
+            ask: false,
             agent_prompt: Some(block),
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
@@ -758,6 +792,7 @@ mod tests {
             ctx: &ctx,
             plan: None,
             subagent: false,
+            ask: false,
             agent_prompt: None,
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
