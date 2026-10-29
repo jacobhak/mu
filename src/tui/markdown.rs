@@ -454,9 +454,9 @@ impl<'a> R<'a> {
                 colw[i] = colw[i].max(text_width(c));
             }
         }
-        let total: usize = colw.iter().map(|c| c + 3).sum::<usize>() + 1;
-        if total > w {
-            // Too wide: show the source markdown instead.
+        let avail = w.saturating_sub(ncols * 3 + 1);
+        if colw.iter().sum::<usize>() > avail && !shrink(&mut colw, &rows, avail) {
+            // Cannot fit even at minimum widths: show the source markdown instead.
             return self.src[range].trim_end().lines().flat_map(|l| wrap_chs(&chs(l, Default::default()), w)).collect();
         }
 
@@ -472,23 +472,28 @@ impl<'a> R<'a> {
         let mut out = vec![border('┌', '┬', '┐')];
         let n_rows = rows.len();
         for (ri, (_, cells)) in rows.iter().enumerate() {
-            let mut v = vec![('│', bdr)];
-            for (i, &cw) in colw.iter().enumerate().take(ncols) {
-                let cell: &[Ch] = cells.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                let pad = cw - text_width(cell);
-                let (l, r) = match aligns.get(i).copied().unwrap_or(Alignment::None) {
-                    Alignment::Right => (pad, 0),
-                    Alignment::Center => (pad / 2, pad - pad / 2),
-                    _ => (0, pad),
-                };
-                v.push((' ', Default::default()));
-                v.extend(std::iter::repeat_n((' ', Default::default()), l));
-                v.extend_from_slice(cell);
-                v.extend(std::iter::repeat_n((' ', Default::default()), r));
-                v.push((' ', Default::default()));
-                v.push(('│', bdr));
+            let wrapped: Vec<Vec<Vec<Ch>>> =
+                colw.iter().enumerate().map(|(i, &cw)| cells.get(i).map(|c| wrap_chs(c, cw)).unwrap_or_default()).collect();
+            let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            for li in 0..height {
+                let mut v = vec![('│', bdr)];
+                for (i, &cw) in colw.iter().enumerate() {
+                    let cell: &[Ch] = wrapped[i].get(li).map(Vec::as_slice).unwrap_or(&[]);
+                    let pad = cw.saturating_sub(text_width(cell));
+                    let (l, r) = match aligns.get(i).copied().unwrap_or(Alignment::None) {
+                        Alignment::Right => (pad, 0),
+                        Alignment::Center => (pad / 2, pad - pad / 2),
+                        _ => (0, pad),
+                    };
+                    v.push((' ', Default::default()));
+                    v.extend(std::iter::repeat_n((' ', Default::default()), l));
+                    v.extend_from_slice(cell);
+                    v.extend(std::iter::repeat_n((' ', Default::default()), r));
+                    v.push((' ', Default::default()));
+                    v.push(('│', bdr));
+                }
+                out.push(v);
             }
-            out.push(v);
             if ri + 1 < n_rows {
                 out.push(border('├', '┼', '┤'));
             }
@@ -496,6 +501,31 @@ impl<'a> R<'a> {
         out.push(border('└', '┴', '┘'));
         out
     }
+}
+
+/// Narrows `colw` to sum to at most `avail`, taking from the widest column first. A column keeps at
+/// least its longest word (3 to 10 columns), else 3. False if even those minimums do not fit.
+fn shrink(colw: &mut [usize], rows: &[(bool, Vec<Vec<Ch>>)], avail: usize) -> bool {
+    let by_word: Vec<usize> = (0..colw.len())
+        .map(|i| {
+            let longest = rows
+                .iter()
+                .filter_map(|r| r.1.get(i))
+                .flat_map(|c| c.split(|x| x.0 == ' ').map(text_width))
+                .max()
+                .unwrap_or(0);
+            longest.clamp(3, 10).min(colw[i])
+        })
+        .collect();
+    let floor = if by_word.iter().sum::<usize>() <= avail { by_word } else { colw.iter().map(|&c| c.min(3)).collect() };
+    if floor.iter().sum::<usize>() > avail {
+        return false;
+    }
+    while colw.iter().sum::<usize>() > avail {
+        let Some(i) = (0..colw.len()).filter(|&i| colw[i] > floor[i]).max_by_key(|&i| colw[i]) else { return false };
+        colw[i] -= 1;
+    }
+    true
 }
 
 /// Fenced code as omp shows it: fence lines in the border colour, body indented 2 columns.
@@ -679,12 +709,24 @@ mod tests {
     }
 
     #[test]
-    fn narrow_table_falls_back_to_source() {
+    fn unfittable_table_falls_back_to_source() {
         let ls = texts("| a | b |\n|---|---|\n| 1 | 2 |", 5);
         assert!(ls.iter().all(|l| l.chars().count() <= 5));
         let joined: String = ls.concat().chars().filter(|c| *c != ' ').collect();
         assert!(joined.contains("|a|b|"), "{joined}");
         assert!(!ls.iter().any(|l| l.contains('┌')));
+    }
+
+    #[test]
+    fn wide_table_wraps_cells() {
+        let md = "| name | description |\n|---|---|\n| alpha | a fairly long description that must wrap |\n| b | short |";
+        let ls = texts(md, 30);
+        assert!(ls.iter().all(|l| l.chars().count() <= 30), "{ls:#?}");
+        assert!(ls[0].starts_with('┌') && ls.last().unwrap().starts_with('└'), "{ls:#?}");
+        let words: Vec<&str> = ["fairly", "long", "description", "that", "must", "wrap", "alpha"].into();
+        let body = ls.concat();
+        assert!(words.iter().all(|w| body.contains(w)), "{ls:#?}");
+        assert!(ls.iter().filter(|l| l.starts_with('│')).count() > 4, "cells should wrap over several lines");
     }
 
     #[test]
