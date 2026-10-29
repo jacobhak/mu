@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 /// Hard cap on tasks per call and on running background jobs.
-const MAX_TASKS: usize = 8;
+pub const MAX_TASKS: usize = 8;
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -41,7 +41,7 @@ pub const DESCRIPTION: &str = concat!(
 );
 
 pub const ASYNC_DESCRIPTION: &str = concat!(
-    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message: keep working, never poll, and call `wait` only when blocked with nothing else to do. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
+    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message and wake an idle session: keep working or end your turn. Never poll, sleep or loop for them. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
     guidance!()
 );
 
@@ -130,11 +130,8 @@ impl Tools {
         };
 
         if let Some(jobs) = &self.jobs {
-            let running = jobs.running();
-            if running + specs.len() > MAX_TASKS {
-                return ToolOutput::err(format!(
-                    "too many background jobs running ({running}/{MAX_TASKS}); wait for some to finish"
-                ));
+            if let Err(e) = jobs.check_capacity(specs.len()) {
+                return ToolOutput::err(e);
             }
             let mut started = Vec::new();
             for (i, (name, agent, task, cwd)) in specs.iter().enumerate() {
@@ -143,7 +140,7 @@ impl Tools {
                 started.push(format!("{id} ({agent})"));
             }
             return ToolOutput::ok(format!(
-                "Started {} background job(s): {}\nResults arrive automatically as a system notice; never poll. Call `wait` only when blocked with nothing else to do.",
+                "Started {} background job(s): {}\nResults arrive automatically as a system notice. Keep working or end your turn; never poll, sleep or loop for them.",
                 started.len(),
                 started.join(", ")
             ));

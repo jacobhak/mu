@@ -1,5 +1,5 @@
 mod ask;
-mod bash;
+pub mod bash;
 mod diff;
 pub mod edit;
 mod glob;
@@ -359,11 +359,12 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| {
             tool_def(
                 "bash",
-                "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits). The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. `cmd &` keeps running after the call and shows in `jobs` (stop with `kill %N`, await with `wait`); `(cmd &)` ends with the command. In pty mode, anything left running ends with the command. Stays available in plan mode (as in omp), where you must not change anything with it.",
+                "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits). The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. `cmd &` keeps running after the call and shows in `jobs` (stop with `kill %N`); nothing reports its exit. `(cmd &)` ends with the command. For a long command whose result you need later, use `async: true`: it runs as a tracked background job and its result arrives automatically as a system notice. Never poll, sleep or loop for it. An async job starts from the shell's cwd and exported environment as of launch; its own changes do not flow back, and functions and aliases are not carried over. In pty mode, anything left running ends with the command. Stays available in plan mode (as in omp), where you must not change anything with it.",
                 json!({"type":"object","properties":{
                     "command":{"type":"string"},
                     "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
                     "cwd":{"type":"string","description":"Working directory for this command"},
+                    "async":{"type":"boolean","description":"Run as a background job: returns at once and the result arrives automatically. Interactive sessions only (elsewhere it runs in the foreground); not with pty."},
                     "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
             )
         }),

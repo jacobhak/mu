@@ -74,8 +74,12 @@ impl Tools {
 
     /// Next unused artifact number for this session.
     pub fn next_artifact(&self) -> (u32, PathBuf) {
-        let dir = self.artifact_dir();
-        let max = std::fs::read_dir(&dir)
+        Self::next_artifact_in(&self.artifact_dir())
+    }
+
+    /// Next unused artifact number in `dir`, for jobs that outlive a borrow of `self`.
+    pub fn next_artifact_in(dir: &Path) -> (u32, PathBuf) {
+        let max = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok()?.path().file_stem()?.to_str()?.parse::<u32>().ok())
