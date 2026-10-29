@@ -458,6 +458,27 @@ mod tests {
         let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {kept}$")]).status();
     }
 
+    /// mu's runtime is current-thread: the persistent shell must still reap a finished `&` child
+    /// while idle, and keep its status for `wait` in a later call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn finished_background_job_is_reaped_and_keeps_its_status() {
+        let tools = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
+        let out = tools.call("bash", &json!({"command": "/bin/sh -c 'sleep 0.3; exit 7' & echo $!"}), &ctx).await;
+        let pid: i32 = out.text.trim().parse().unwrap_or_else(|_| panic!("no pid: {}", out.text));
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // SAFETY: signal 0 only probes whether the pid exists; a zombie still does.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(reaped.is_ok(), "finished background child stayed a zombie");
+        let out = tools.call("bash", &json!({"command": format!("wait {pid}; echo status=$?")}), &ctx).await;
+        assert!(out.text.contains("status=7"), "{}", out.text);
+    }
+
     #[test]
     fn pty_input_queue_does_not_block_exit() {
         use crate::events::PtyInput;
