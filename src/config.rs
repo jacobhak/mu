@@ -201,7 +201,7 @@ impl Default for MuUpdate {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MuTheme {
-    /// "terminal" | "omarchy" | bundled or ~/.mu/themes name | path to a colors.toml
+    /// Bundled or ~/.mu/themes name | "terminal" | "omarchy" | path to a colors.toml. Default "tokyo-night".
     pub source: String,
     /// Palette key (e.g. "blue", "magenta", "accent") or "#rrggbb".
     pub accent: Option<String>,
@@ -210,7 +210,7 @@ pub struct MuTheme {
 
 impl Default for MuTheme {
     fn default() -> Self {
-        Self { source: "terminal".into(), accent: None, cards: Cards::Filled }
+        Self { source: "tokyo-night".into(), accent: None, cards: Cards::Filled }
     }
 }
 
@@ -469,7 +469,7 @@ mod tests {
         let c = toml::from_str::<MuConfig>("[theme]\nsource = \"gruvbox\"\ncards = \"outline\"\n").unwrap();
         assert_eq!((c.theme.source.as_str(), c.theme.cards), ("gruvbox", Cards::Outline));
         let d = toml::from_str::<MuConfig>("").unwrap();
-        assert_eq!((d.theme.source.as_str(), d.theme.accent, d.theme.cards), ("terminal", None, Cards::Filled));
+        assert_eq!((d.theme.source.as_str(), d.theme.accent, d.theme.cards), ("tokyo-night", None, Cards::Filled));
     }
 
     #[test]

@@ -77,7 +77,7 @@ Kept from the redesign: one accent, hues only for meaning, no hand-picked hexes.
 | question | decision |
 |---|---|
 | tool cards | keep boxes, make them quiet: neutral outline, no fill, no coloured titles |
-| palette source | follow the terminal by default; a colors.toml can override or be selected |
+| palette source | the bundled `tokyo-night` by default (the same colours on every terminal); `source = "terminal"` follows the terminal instead; a colors.toml can override or be selected |
 | omp compatibility | dropped. omp theme JSON, `theme_data.rs` and omp's `theme.dark` are not read any more |
 
 ## Principles
@@ -107,7 +107,7 @@ The terminal maps onto the same schema, because it is exactly what omarchy pushe
 ```toml
 # ~/.mu/config.toml
 [theme]
-source = "terminal"     # "terminal" (default) | a bundled palette name | a path to a colors.toml | "omarchy"
+source = "tokyo-night" # default | "terminal" | another bundled palette name | a path to a colors.toml | "omarchy"
 accent = "blue"         # palette key or hex; needed for "terminal", which has no accent slot
 cards  = "filled"       # "filled" (default: recessed dark_background surface) | "outline" (border only)
 [theme.roles]           # optional per-role overrides, e.g.

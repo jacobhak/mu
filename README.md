@@ -147,7 +147,7 @@ The memory plugin ships as two binaries: `mu-memory`, a small Rust shim that eac
 "anthropic/claude-haiku-5-5" = "f200000"
 
 [theme]
-source = "terminal"   # "terminal", "omarchy", a bundled or ~/.mu/themes name, or a colors.toml path
+source = "tokyo-night"  # default; or "terminal" (follow your terminal's palette), "omarchy", a bundled or ~/.mu/themes name, or a colors.toml path
 # accent = "blue"     # palette key or "#rrggbb"
 cards = "filled"      # or "outline"
 
