@@ -12,6 +12,7 @@ mod headless;
 mod image;
 mod jobs;
 mod jsoncache;
+mod jtd;
 mod mem;
 mod message;
 mod models;
@@ -243,6 +244,11 @@ fn apply_agent(agent: &mut agent::Agent, def: &context::AgentDef) {
     ));
 }
 
+/// The result schema of a `--headless` run: the caller's `outputSchema`, else the agent file's `output:` (as omp).
+fn task_output_schema(payload: &serde_json::Value, def: Option<&context::AgentDef>) -> Option<serde_json::Value> {
+    payload.get("outputSchema").filter(|s| !s.is_null()).cloned().or_else(|| def.and_then(|d| d.output.clone()))
+}
+
 fn main() {
     match run() {
         Ok(code) => std::process::exit(code),
@@ -385,7 +391,8 @@ fn run() -> Result<i32> {
     if let Some(d) = &agent_def {
         apply_agent(&mut agent, d);
     }
-    if let Some(s) = task_payload.as_ref().and_then(|p| p.get("outputSchema")).filter(|s| !s.is_null()) {
+    let output_schema = task_payload.as_ref().and_then(|p| task_output_schema(p, agent_def.as_ref()));
+    if let Some(s) = &output_schema {
         if let Err(e) = schema::check_schema(s) {
             bail!("bad subagent input: {e}");
         }
@@ -452,8 +459,7 @@ fn run() -> Result<i32> {
                 let ctx = p["context"].as_str().filter(|c| !c.is_empty());
                 let task = p["task"].as_str().unwrap_or("");
                 let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
-                let out_schema = p.get("outputSchema").filter(|s| s.is_object()).cloned();
-                headless::subagent_mode(prompt, out_schema, cmd_tx, ev_rx).await
+                headless::subagent_mode(prompt, output_schema, cmd_tx, ev_rx).await
             }
             (Some(prompt), None, _) => {
                 printer = Some(spawn_notice_printer(notice_rx));
@@ -512,5 +518,30 @@ mod contract_tests {
     fn contract_omp_version() {
         let out = mu_common::paths::run_omp_blocking(&["--version"], &[]);
         assert_eq!(out.trim(), format!("omp/{}", env!("MU_OMP_VERSION")));
+    }
+}
+
+#[cfg(test)]
+mod output_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn task_output_schema_prefers_caller_then_agent() {
+        let def = context::AgentDef {
+            name: "x".into(),
+            description: "d".into(),
+            tools: None,
+            model: vec![],
+            thinking: None,
+            prompt: String::new(),
+            output: Some(json!({"type":"object"})),
+        };
+        assert_eq!(
+            task_output_schema(&json!({"outputSchema":{"type":"string"}}), Some(&def)),
+            Some(json!({"type":"string"}))
+        );
+        assert_eq!(task_output_schema(&json!({"outputSchema":null}), Some(&def)), Some(json!({"type":"object"})));
+        assert_eq!(task_output_schema(&json!({}), None), None);
     }
 }

@@ -305,13 +305,13 @@ pub fn report_schema() -> serde_json::Value {
             "title":{"type":"string"},
             "body":{"type":"string"},
             "file":{"type":"string"},
-            "line":{"type":"integer","minimum":1},
-            "end_line":{"type":"integer","minimum":1},
+            "line":{"type":"integer","minimum":1,"maximum":1000000},
+            "end_line":{"type":"integer","minimum":1,"maximum":1000000},
             "priority":{"type":"integer","minimum":0,"maximum":3},
             "confidence":{"type":"number","minimum":0,"maximum":1},
             "kind":{"enum":["bug","plan","quality"]}}}},
         "coverage":{"type":"string"},
-        "dropped":{"type":"integer","minimum":0}}})
+        "dropped":{"type":"integer","minimum":0,"maximum":10000}}})
 }
 
 pub fn is_blocking(f: &Finding) -> bool {
@@ -648,6 +648,32 @@ mod tests {
         assert_eq!(report_of(&with_data).unwrap().verdict, "fail");
         let scraped = Outcome { ok: true, text: "x\n```json\n{\"verdict\":\"pass\"}\n```".into(), data: None };
         assert!(report_of(&scraped).is_none());
+    }
+
+    #[test]
+    fn report_schema_caps_line_end_line_and_dropped() {
+        use crate::tools::task::Outcome;
+        use serde_json::json;
+        let base = json!({"verdict":"fail","summary":"s","dropped":3,"findings":[{"title":"t","body":"b","file":"a.rs","line":12,"end_line":14,"priority":1,"confidence":0.9}]});
+        assert!(crate::schema::validate(&report_schema(), &base).is_ok());
+        let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(base.clone()) }).unwrap();
+        assert_eq!(r.findings[0].line, Some(12));
+        assert_eq!(r.dropped, 3);
+        let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = base.clone();
+            f(&mut v);
+            crate::schema::validate(&report_schema(), &v)
+        };
+        assert!(mutate(&|v| v["findings"][0]["line"] = json!(-5)).is_err());
+        assert!(mutate(&|v| v["findings"][0]["line"] = json!(0)).is_err());
+        assert!(mutate(&|v| v["findings"][0]["line"] = json!(1000001)).is_err());
+        assert!(mutate(&|v| v["findings"][0]["end_line"] = json!(4294967296u64)).is_err());
+        assert!(mutate(&|v| v["findings"][0]["end_line"] = json!(-1)).is_err());
+        assert!(mutate(&|v| v["dropped"] = json!(10001)).is_err());
+        assert!(mutate(&|v| v["dropped"] = json!(-1)).is_err());
+        assert!(mutate(&|v| v["findings"][0]["line"] = json!(1000000)).is_ok());
+        assert!(mutate(&|v| v["findings"][0]["end_line"] = json!(1000000)).is_ok());
+        assert!(mutate(&|v| v["dropped"] = json!(10000)).is_ok());
     }
 
     fn finding(p: u8, c: f32) -> Finding {

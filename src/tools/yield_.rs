@@ -112,4 +112,36 @@ mod tests {
         assert!(call(&t, json!({"data":{"n":1},"error":"x"})).is_error);
         assert!(call(&Tools::for_test(), json!({"data":1})).is_error);
     }
+
+    #[test]
+    fn agent_file_output_drives_yield() {
+        let root = std::env::temp_dir().join(format!("mu-yield-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        let agent = root.join("agent");
+        std::fs::create_dir_all(proj.join(".omp/agents")).unwrap();
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            proj.join(".omp/agents/typed.md"),
+            "---\nname: typed\ndescription: typed result\noutput:\n  properties:\n    summary:\n      metadata:\n        description: One line\n      type: string\n    count:\n      type: uint8\n  optionalProperties:\n    files:\n      elements:\n        type: string\n---\nDo it.\n",
+        )
+        .unwrap();
+        let defs = crate::context::discover_agents(&proj, &home, &agent);
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].output.is_some());
+        let t = Tools::for_test();
+        *t.output_schema.borrow_mut() = defs[0].output.clone();
+        let data = json!({"summary":"ok","count":3,"files":["a.rs"]});
+        let out = call(&t, json!({"data": data}));
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(out.details, Some(json!({"status":"success","data":data})));
+        for bad in
+            [json!({"summary":"ok"}), json!({"summary":"ok","count":300}), json!({"summary":"ok","count":1,"extra":1})]
+        {
+            let out = call(&t, json!({"data": bad}));
+            assert!(out.is_error && out.details.is_none());
+            assert!(out.text.contains("call yield again"), "{}", out.text);
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

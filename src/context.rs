@@ -196,6 +196,8 @@ pub struct AgentDef {
     pub model: Vec<String>,
     pub thinking: Option<String>,
     pub prompt: String,
+    /// Result schema from frontmatter `output:` (JTD converted); `None` = free-text result.
+    pub output: Option<serde_json::Value>,
 }
 
 pub const REVIEW_LEAD: &str = "review-lead";
@@ -225,6 +227,7 @@ pub fn builtin_agent(name: &str) -> Option<AgentDef> {
         model,
         thinking: None,
         prompt: prompt.into(),
+        output: None,
     })
 }
 
@@ -237,6 +240,7 @@ struct AgentFront {
     model: Option<serde_yaml_ng::Value>,
     #[serde(rename = "thinkingLevel")]
     thinking_level: Option<String>,
+    output: Option<serde_json::Value>,
 }
 
 /// A YAML sequence of strings, or one string split on `,`.
@@ -278,6 +282,14 @@ pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDe
             {
                 continue;
             }
+            let output = match f.output.as_ref().map(crate::jtd::output_schema) {
+                None => None,
+                Some(Ok(s)) => Some(s),
+                Some(Err(e)) => {
+                    WARNINGS.with(|w| w.borrow_mut().push(format!("{}: invalid `output` schema: {e}", path.display())));
+                    continue;
+                }
+            };
             out.push(AgentDef {
                 name,
                 description,
@@ -285,6 +297,7 @@ pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDe
                 model: f.model.as_ref().and_then(string_list).unwrap_or_default(),
                 thinking: f.thinking_level,
                 prompt: body.trim().to_string(),
+                output,
             });
         }
     }
@@ -648,6 +661,31 @@ mod tests {
         assert_eq!(got[1].tools.as_deref(), Some(&["read".to_string(), "write".to_string()][..]));
         assert_eq!(got[1].model, ["@smol", "@default"]);
         assert!(got[1].thinking.is_none());
+        assert!(got.iter().all(|a| a.output.is_none()));
+    }
+
+    #[test]
+    fn agent_with_bad_output_is_skipped_with_warning() {
+        let root = std::env::temp_dir().join(format!("mu-ctx4-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        let agent = root.join("agent");
+        fs::create_dir_all(proj.join(".omp/agents")).unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            proj.join(".omp/agents/bad.md"),
+            "---\nname: bad\ndescription: d\noutput:\n  properties:\n    a:\n      ref: T\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(proj.join(".omp/agents/ok.md"), "---\nname: ok\ndescription: d\n---\nx\n").unwrap();
+        WARNINGS.with(|w| w.borrow_mut().clear());
+        let got = discover_agents(&proj, &home, &agent);
+        let names: Vec<_> = got.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["ok"]);
+        let w = WARNINGS.with(|w| w.borrow().clone());
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("bad.md") && w[0].contains("invalid `output` schema"));
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
