@@ -440,8 +440,6 @@ mod tests {
         std::process::Command::new("pgrep").args(["-f", &format!("sleep {arg}$")]).output().unwrap().status.success()
     }
 
-    // macOS ships no `setsid`.
-    #[cfg_attr(not(target_os = "linux"), ignore)]
     #[tokio::test(flavor = "current_thread")]
     async fn background_processes_in_plain_mode() {
         // `pgrep`/`pkill -f` see every process on the machine, so the sleep durations carry this
@@ -451,10 +449,10 @@ mod tests {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
-        let cmd = format!("(sleep {quiet} &); setsid nohup sleep {kept} >/dev/null 2>&1 & echo started");
+        let cmd = format!("(/bin/sleep {quiet} &); nohup /bin/sleep {kept} >/dev/null 2>&1 & echo started");
         let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
         assert!(out.text.contains("started"), "{}", out.text);
-        // A plain `&` ends with the command; `setsid nohup … &` is how to keep one alive.
+        // A plain `&` ends with the command; `nohup … &` (pi-shell's builtin, which detaches) keeps one alive.
         assert!(!alive(&quiet).await);
         // The background process may not have exec'd `sleep` yet when the command returns.
         let mut up = false;

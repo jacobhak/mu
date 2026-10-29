@@ -351,7 +351,7 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| {
             tool_def(
                 "bash",
-                "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits). The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. Background processes started with a plain `&` end with the command (in pty mode too); use `setsid nohup cmd >/dev/null 2>&1 &` to keep one alive. Stays available in plan mode (as in omp), where you must not change anything with it.",
+                "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits). The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. Background processes started with a plain `&` end with the command (in pty mode too); without `pty`, `nohup cmd >/dev/null 2>&1 &` keeps one alive. Stays available in plan mode (as in omp), where you must not change anything with it.",
                 json!({"type":"object","properties":{
                     "command":{"type":"string"},
                     "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
