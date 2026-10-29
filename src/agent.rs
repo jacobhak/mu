@@ -762,6 +762,20 @@ impl Agent {
         self.since_compaction = self.messages.len();
         self.user_turn = self.messages.iter().filter(|m| matches!(m, Message::User { .. })).count() as u32;
         self.session = Some(s);
+        self.tools.set_session(&self.session_id(), self.session.as_ref().map(|s| s.path.clone()));
+        if let Some((_, data)) = loaded.mode.as_ref().filter(|(m, _)| m == "plan") {
+            // The model and thinking level in force before plan mode, so leaving it restores them.
+            let prev_model = data["prevModel"].as_str().map(String::from);
+            let prev_thinking = data["prevThinking"].as_str().and_then(Thinking::parse).unwrap_or(self.thinking);
+            self.plan = Some(PlanState { prev_model, prev_thinking });
+            self.tools.plan.set(true);
+        }
+        self.resumed = true;
+        self.sync_plugin_session();
+        let res = self.plugins.hook("session_start", json!({"resumed": true})).await;
+        self.apply_plugin_context(res);
+        self.replay_history();
+        self.notice(format!("resumed {}", path.display()));
         if self.notify {
             let waiting = notify::pending(&self.session_id());
             if !waiting.is_empty() {
@@ -779,20 +793,6 @@ impl Agent {
                 self.notify_announced.extend(waiting.into_iter().map(|n| n.name));
             }
         }
-        self.tools.set_session(&self.session_id(), self.session.as_ref().map(|s| s.path.clone()));
-        if let Some((_, data)) = loaded.mode.as_ref().filter(|(m, _)| m == "plan") {
-            // The model and thinking level in force before plan mode, so leaving it restores them.
-            let prev_model = data["prevModel"].as_str().map(String::from);
-            let prev_thinking = data["prevThinking"].as_str().and_then(Thinking::parse).unwrap_or(self.thinking);
-            self.plan = Some(PlanState { prev_model, prev_thinking });
-            self.tools.plan.set(true);
-        }
-        self.resumed = true;
-        self.sync_plugin_session();
-        let res = self.plugins.hook("session_start", json!({"resumed": true})).await;
-        self.apply_plugin_context(res);
-        self.replay_history();
-        self.notice(format!("resumed {}", path.display()));
         self.emit_status();
         true
     }
@@ -2717,6 +2717,38 @@ mod loop_tests {
             assert_eq!(users.len(), 2, "{users:?}");
             assert!(users[0].contains("Message from steward") && users[1] == "hi", "{users:?}");
             assert!(!notify::has_pending(&id));
+        });
+    }
+
+    #[test]
+    fn the_waiting_notice_follows_the_replayed_history() {
+        run(async {
+            let (mut a, mut rx) =
+                notify_agent(vec![Ok(assistant(vec![Block::text("earlier reply")], StopReason::Stop))]);
+            a.ensure_session().await;
+            a.turn(Some("earlier prompt".to_string().into())).await;
+            let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
+            a.end_session().await;
+            a.reset_conversation();
+            notify::enqueue(&id, "steward", "later").unwrap();
+            drain(&mut rx);
+            a.load_session(&path).await;
+            let evs = drain(&mut rx);
+            let pos = |f: &dyn Fn(&AgentEvent) -> bool| evs.iter().position(f);
+            let waiting: Vec<usize> = evs
+                .iter()
+                .enumerate()
+                .filter(
+                    |(_, e)| matches!(e, AgentEvent::Notice(n) if n.contains("1 message(s) from mu notify waiting")),
+                )
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(waiting.len(), 1, "notice emitted exactly once");
+            let prompt =
+                pos(&|e| matches!(e, AgentEvent::UserPrompt(t) if t == "earlier prompt")).expect("prompt replayed");
+            let reply = pos(&|e| matches!(e, AgentEvent::Text(t) if t == "earlier reply")).expect("reply replayed");
+            assert!(prompt < waiting[0] && reply < waiting[0], "notice follows the replayed history");
+            assert!(notify::has_pending(&id), "still delivered with the next prompt, not at open");
         });
     }
 
