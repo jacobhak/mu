@@ -469,8 +469,15 @@ mod tests {
     #[tokio::test]
     async fn next_survives_cancellation() {
         let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` has room for the two descriptors pipe2 writes.
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) }, 0);
+        // SAFETY: `fds` has room for the two descriptors pipe writes; fcntl acts on those fresh fds.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
         // SAFETY: both descriptors are fresh and owned here.
         let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         let mut reader = Reader::from_fd(rd).unwrap();
