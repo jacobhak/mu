@@ -107,6 +107,7 @@ pub enum Action {
     ToggleExpanded,
     ModelPicker,
     EditExternal,
+    Reply,
     PopQueue,
     Redraw,
 }
@@ -676,6 +677,7 @@ impl Composer {
             KeyCode::Char('o') if ctrl => Action::ToggleExpanded,
             KeyCode::Char('m') if alt => Action::ModelPicker,
             KeyCode::Char('g') if ctrl => Action::EditExternal,
+            KeyCode::Char('r') if ctrl && self.menu.is_none() => Action::Reply,
             KeyCode::Up | KeyCode::Char('p') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
                 if self.buf.row == 0 {
                     self.history_prev();
@@ -860,6 +862,23 @@ impl Composer {
         self.buf = Buf::from_text(s);
         self.buf.pastes = pastes;
         self.buf.images = images;
+    }
+
+    /// Appends quote blocks after the text (a blank line apart) and puts the cursor on the blank
+    /// line after the first one, ready for the comment.
+    pub fn append_quotes(&mut self, quotes: &[String]) {
+        let old = self.text();
+        let mut text = if old.trim().is_empty() { String::new() } else { format!("{}\n\n", old.trim_end()) };
+        let base = text.matches('\n').count();
+        let first = quotes.first().map_or(0, |q| q.matches('\n').count() + 1);
+        for q in quotes {
+            text.push_str(q);
+            text.push_str("\n\n");
+        }
+        self.set_text(&text);
+        self.menu = None;
+        self.buf.row = base + first;
+        self.buf.col = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1065,6 +1084,19 @@ mod tests {
 
     fn ctrl(c: &mut Composer, ch: char) -> Action {
         press(c, KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn quotes_go_after_the_text_with_the_cursor_on_the_first_blank_line() {
+        let mut c = Composer::new(None);
+        c.set_text("hi");
+        c.append_quotes(&["> a".to_string(), "> b\n> c".to_string()]);
+        assert_eq!(c.text(), "hi\n\n> a\n\n> b\n> c\n\n");
+        assert_eq!((c.buf.row, c.buf.col), (3, 0));
+        let mut e = Composer::new(None);
+        e.append_quotes(&["> x".to_string()]);
+        assert_eq!(e.text(), "> x\n\n");
+        assert_eq!((e.buf.row, e.buf.col), (1, 0));
     }
 
     fn type_str(c: &mut Composer, s: &str) {

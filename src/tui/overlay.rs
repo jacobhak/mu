@@ -8,6 +8,7 @@ use crossterm::event::KeyEvent;
 use tokio::sync::oneshot;
 
 use super::plan_review::{PlanReview, ReviewResult};
+use super::reply::{ReplyPicker, ReplyResult};
 use super::select::{Item, Select, SelectResult};
 use crate::events::{Answer, AskQuestion, PlanDecision};
 
@@ -63,6 +64,10 @@ pub enum Overlay {
         sel: Select,
         texts: Vec<String>,
     },
+    /// Pick parts of the last reply to quote into the composer.
+    Reply {
+        st: Box<ReplyPicker>,
+    },
 }
 
 /// What the user chose; the app carries it out.
@@ -78,6 +83,8 @@ pub enum OverlayEvent {
     },
     Login(LoginTarget),
     Copy(Option<String>),
+    /// Insert these blockquotes at the end of the composer.
+    Quote(Vec<String>),
     Resume(PathBuf),
     /// Copy the plan text.
     CopyPlan(String),
@@ -124,7 +131,7 @@ impl Overlay {
             | Overlay::Plans { sel, .. }
             | Overlay::Ask { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
-            Overlay::Review { .. } => None,
+            Overlay::Review { .. } | Overlay::Reply { .. } => None,
         }
     }
 
@@ -137,7 +144,7 @@ impl Overlay {
             | Overlay::Plans { sel, .. }
             | Overlay::Ask { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
-            Overlay::Review { .. } => None,
+            Overlay::Review { .. } | Overlay::Reply { .. } => None,
         }
     }
 
@@ -148,6 +155,10 @@ impl Overlay {
             Overlay::Review { review, .. } => {
                 let avail = rows.saturating_sub(1).saturating_sub(used);
                 review.render(w, avail.saturating_sub(1))
+            }
+            Overlay::Reply { st } => {
+                let budget = (rows / 2).max(6).saturating_sub(2);
+                st.render(w, budget)
             }
             other => match other.select() {
                 Some(sel) => sel.render(w, (rows / 2).max(6).saturating_sub(2)),
@@ -211,6 +222,11 @@ impl Overlay {
                     (None, Some(OverlayEvent::Copy(i.first().and_then(|i| texts.get(*i)).cloned())))
                 }
                 _ => (None, None),
+            },
+            Overlay::Reply { mut st } => match st.on_key(k) {
+                ReplyResult::Pending => (Some(Overlay::Reply { st }), None),
+                ReplyResult::Close => (None, None),
+                ReplyResult::Quote(q) => (None, Some(OverlayEvent::Quote(q))),
             },
             Overlay::Session { mut sel, paths } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Session { sel, paths }), None),
