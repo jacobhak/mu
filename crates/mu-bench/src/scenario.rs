@@ -75,6 +75,11 @@ pub fn marker(turn: usize) -> String {
 }
 
 impl Scenario {
+    /// Streamed bytes per second, or `None` when replies are sent without pauses.
+    pub fn stream_rate(&self) -> Option<u64> {
+        (self.chunk_delay_ms > 0).then(|| self.chunk_bytes as u64 * 1000 / self.chunk_delay_ms)
+    }
+
     pub fn parse(text: &str) -> Result<Scenario> {
         let s: Scenario = toml::from_str(text)?;
         s.validate()?;
@@ -163,6 +168,9 @@ text_bytes = 100
     fn parses_nested_tables() {
         let s = Scenario::parse(OK).unwrap();
         assert_eq!((s.chunk_bytes, s.chunk_delay_ms), (48, 2));
+        assert_eq!(s.stream_rate(), Some(24_000));
+        let unpaced = Scenario::parse(&OK.replace("name = \"t\"", "name = \"t\"\nchunk_delay_ms = 0")).unwrap();
+        assert_eq!(unpaced.stream_rate(), None);
         assert_eq!(s.turns[0].steps[0].tools[0].args["path"], "a.txt");
         assert_eq!(s.turns[0].steps[1].text_bytes, 100);
     }

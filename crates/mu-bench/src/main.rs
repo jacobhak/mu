@@ -76,7 +76,7 @@ async fn run() -> Result<()> {
             eprintln!("{}: run {}/{}", sc.name, i + 1, a.runs);
             runs.push(driver::run_once(&sc, &opts).await?);
         }
-        let s = report::summarize(&sc.name, &runs);
+        let s = report::summarize(&sc.name, sc.stream_rate(), &runs);
         report::print(&s);
         summaries.push((s, runs));
     }

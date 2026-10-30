@@ -1,0 +1,29 @@
+name = "streaming"
+# 16 bytes every 40 ms = 400 B/s, about a real model's output. The other scenarios send bursts, which is right
+# for memory and wrong for latency: a burst backs up mu's reveal queue and inflates the first-token time.
+chunk_bytes = 16
+chunk_delay_ms = 40
+
+# Text straight away.
+[[turn]]
+prompt = "Say something short."
+[[turn.step]]
+text_bytes = 300
+
+# Thinking, then text: the text waits behind the thinking still queued for reveal.
+[[turn]]
+prompt = "Think about it, then answer."
+[[turn.step]]
+thinking_bytes = 600
+text_bytes = 400
+
+# A tool call, then text.
+[[turn]]
+prompt = "Run something."
+[[turn.step]]
+text_bytes = 80
+[[turn.step.tool]]
+name = "bash"
+args = { command = "seq 1 200" }
+[[turn.step]]
+text_bytes = 300

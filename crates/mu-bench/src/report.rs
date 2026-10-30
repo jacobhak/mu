@@ -37,6 +37,8 @@ pub struct Row {
 pub struct Summary {
     pub scenario: String,
     pub runs: usize,
+    /// How fast the fake model streamed; `None` for unpaced bursts.
+    pub stream_bytes_per_sec: Option<u64>,
     pub startup_first_byte_ms: f64,
     pub startup_prompt_ms: f64,
     pub rows: Vec<Row>,
@@ -46,7 +48,7 @@ pub struct Summary {
     pub unrouted: Vec<String>,
 }
 
-pub fn summarize(scenario: &str, runs: &[RunResult]) -> Summary {
+pub fn summarize(scenario: &str, stream_bytes_per_sec: Option<u64>, runs: &[RunResult]) -> Summary {
     let col = |f: &dyn Fn(&RunResult) -> Option<f64>| runs.iter().filter_map(f).collect::<Vec<_>>();
     let n_rows = runs.iter().map(|r| r.samples.len()).min().unwrap_or(0);
     let rows = (0..n_rows)
@@ -71,6 +73,7 @@ pub fn summarize(scenario: &str, runs: &[RunResult]) -> Summary {
     Summary {
         scenario: scenario.into(),
         runs: runs.len(),
+        stream_bytes_per_sec,
         startup_first_byte_ms: median(&col(&|r| r.startup_first_byte_ms)),
         startup_prompt_ms: median(&col(&|r| Some(r.startup_prompt_ms))),
         rows,
@@ -91,7 +94,13 @@ fn mb(kb: f64) -> String {
 }
 
 pub fn print(s: &Summary) {
-    println!("\n== {} ({} run{}, medians) ==", s.scenario, s.runs, if s.runs == 1 { "" } else { "s" });
+    let rate = s.stream_bytes_per_sec.map_or("unpaced bursts".to_string(), |r| format!("{r} B/s"));
+    println!(
+        "\n== {} ({} run{}, medians; model streams at {rate}) ==",
+        s.scenario,
+        s.runs,
+        if s.runs == 1 { "" } else { "s" }
+    );
     println!("startup: first output {:.0} ms, prompt drawn {:.0} ms", s.startup_first_byte_ms, s.startup_prompt_ms);
     println!(
         "{:<8} {:>11} {:>14} {:>16} {:>12} {:>13} {:>10} {:>6}",
@@ -167,7 +176,7 @@ mod tests {
     #[test]
     fn summary_takes_medians_per_sample() {
         let runs = [run(&[1000, 2000], Some(30.0)), run(&[1200, 2400], Some(50.0)), run(&[1100, 2200], None)];
-        let s = summarize("t", &runs);
+        let s = summarize("t", Some(400), &runs);
         assert_eq!(s.rows.len(), 2);
         assert_eq!(s.rows[0].mu_anon_kb, 1100.0);
         assert_eq!(s.rows[1].mu_anon_kb, 2200.0);
