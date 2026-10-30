@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const ALL: [&str; 4] = ["mu", "claude", "opencode", "omp"];
+pub const ALL: [&str; 5] = ["mu", "claude", "opencode", "omp", "pi"];
 const TIMEOUT: Duration = Duration::from_secs(240);
 const SAMPLE_EVERY: Duration = Duration::from_millis(10);
 const KEY: &str = "sk-bench";
@@ -47,12 +47,19 @@ const SCRUB: &[&str] = &[
     "OPENCODE_CONFIG_CONTENT",
 ];
 
+/// `name` on `PATH`, else in the tools directory (`$MU_BENCH_TOOLS`, default `~/.cache/mu-bench-tools`)
+/// where harnesses without a system install live: `npm install --prefix <dir> <package>`.
 fn which(name: &str) -> Result<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let tools = std::env::var_os("MU_BENCH_TOOLS")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/mu-bench-tools")))
+        .map(|d| d.join("node_modules/.bin"));
     std::env::split_paths(&path)
+        .chain(tools)
         .map(|d| d.join(name))
         .find(|p| p.is_file())
-        .with_context(|| format!("`{name}` is not on PATH"))
+        .with_context(|| format!("`{name}` is not on PATH or in the tools directory"))
 }
 
 fn s(v: impl Into<String>) -> String {
@@ -63,6 +70,16 @@ pub fn omp_models_yml(url: &str) -> String {
     format!(
         "providers:\n  bench:\n    baseUrl: {url}\n    apiKey: BENCH_KEY\n    api: anthropic-messages\n    auth: apiKey\n    models:\n      - id: bench-1\n        name: Bench 1\n        contextWindow: 200000\n        maxTokens: 32000\n"
     )
+}
+
+pub fn pi_models_json(url: &str) -> String {
+    serde_json::json!({"providers": {"bench": {
+        "baseUrl": url,
+        "api": "anthropic-messages",
+        "apiKey": KEY,
+        "models": [{"id": "bench-1", "contextWindow": 200000, "maxTokens": 32000}],
+    }}})
+    .to_string()
 }
 
 pub fn opencode_config(url: &str) -> String {
@@ -121,6 +138,15 @@ fn launch(name: &str, c: &Ctx) -> Result<Launch> {
                     ],
                 ]
                 .concat(),
+            }
+        }
+        "pi" => {
+            std::fs::create_dir_all(home.join("agent"))?;
+            std::fs::write(home.join("agent/models.json"), pi_models_json(c.url))?;
+            Launch {
+                program: which("pi")?,
+                args: vec![s("-p"), s(c.prompt), s("--model"), s("bench/bench-1")],
+                env: [base, vec![(s("PI_CODING_AGENT_DIR"), home.join("agent").display().to_string())]].concat(),
             }
         }
         "opencode" => {
@@ -412,6 +438,9 @@ mod tests {
         let oc: serde_json::Value = serde_json::from_str(&opencode_config("http://127.0.0.1:1")).unwrap();
         assert_eq!(oc["provider"]["anthropic"]["options"]["baseURL"], "http://127.0.0.1:1/v1");
         assert_eq!(oc["permission"]["bash"], "allow");
+        let pi: serde_json::Value = serde_json::from_str(&pi_models_json("http://127.0.0.1:1")).unwrap();
+        assert_eq!(pi["providers"]["bench"]["baseUrl"], "http://127.0.0.1:1");
+        assert_eq!(pi["providers"]["bench"]["api"], "anthropic-messages");
     }
 
     #[test]
