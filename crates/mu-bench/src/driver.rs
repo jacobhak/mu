@@ -190,9 +190,12 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
+/// A new scratch directory; unique even when several sessions are started at the same instant.
 pub fn scratch() -> Result<PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
-    let d = std::env::temp_dir().join(format!("mu-bench-{}-{n}", std::process::id()));
+    let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("mu-bench-{}-{n}-{c}", std::process::id()));
     std::fs::create_dir_all(&d)?;
     Ok(d)
 }

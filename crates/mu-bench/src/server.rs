@@ -166,19 +166,21 @@ pub fn build_frames(
     f
 }
 
-/// Bytes of tool output and the number of errors in the tool results of the last user message.
+/// Bytes of tool output and the number of errors in the tool results sent since the model's last reply
+/// (some harnesses put them in more than one message).
 pub fn tool_results(body: &Value) -> (usize, usize) {
-    let Some(blocks) = body["messages"].as_array().and_then(|m| m.last()).and_then(|m| m["content"].as_array()) else {
-        return (0, 0);
-    };
+    let Some(messages) = body["messages"].as_array() else { return (0, 0) };
+    let start = messages.iter().rposition(|m| m["role"] == "assistant").map_or(0, |i| i + 1);
     let (mut bytes, mut errors) = (0, 0);
-    for b in blocks.iter().filter(|b| b["type"] == "tool_result") {
-        errors += usize::from(b["is_error"] == true);
-        bytes += match &b["content"] {
-            Value::String(s) => s.len(),
-            Value::Array(a) => a.iter().filter_map(|x| x["text"].as_str()).map(str::len).sum(),
-            _ => 0,
-        };
+    for blocks in messages[start..].iter().filter_map(|m| m["content"].as_array()) {
+        for b in blocks.iter().filter(|b| b["type"] == "tool_result") {
+            errors += usize::from(b["is_error"] == true);
+            bytes += match &b["content"] {
+                Value::String(s) => s.len(),
+                Value::Array(a) => a.iter().filter_map(|x| x["text"].as_str()).map(str::len).sum(),
+                _ => 0,
+            };
+        }
     }
     (bytes, errors)
 }

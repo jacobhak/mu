@@ -29,14 +29,22 @@ Replies stream in bursts by default (`chunk_bytes` every `chunk_delay_ms`, 24 KB
 cargo build --release && cargo run --release -p mu-bench -- compare crates/mu-bench/scenarios/compare-agentic.toml
 ```
 
-Runs one prompt headless in each of mu, claude, opencode, omp and pi (`--harness` picks a subset, `--runs` sets the repeats, default 5, interleaved), all against the same fake model server. The table shows wall time, peak memory summed over the harness's whole process tree (sampled every 10 ms; total counts shared pages by their share, private is heap and stack), and how many model steps the harness got through. A harness that does not finish the scenario is reported with the tail of its output.
+Runs one prompt headless in each of mu, claude, opencode, omp and pi, all against the same fake model server. `--harness` picks a subset, `--runs` sets the rounds (default 5, harnesses interleaved), `--sessions` sets how many sessions of one harness run at once (default 3, 1 skips that part). Each round runs every harness alone and then as that many concurrent sessions that share one `HOME`, as several terminals of one user do.
 
+Each table row is the median over the runs. A harness that does not finish the scenario is reported with the tail of its output.
+
+- **private and total** are what the harness's whole process tree still held in its last sample before exit (sampled every 10 ms): private is heap, stack and other memory only it holds; total also counts the shared pages (the binary, the runtime) divided among the processes that share them. With several sessions at once, total is therefore each session's real share. They are not peaks.
+- **peak** is the total at its highest. The JSON also has the kernel's peak RSS of the largest process, which counts shared pages in full and cannot be under-sampled.
+- **cpu s** is user plus system CPU time of the process and its children, from the kernel.
+- **steps, result kB, files** check that every harness did the same work: model steps served, bytes of tool output sent back, files written.
+- One untimed warm-up run per harness comes first, so first-run setup (opencode's database, omp's native libraries) is not charged to the measured runs.
 - The fake model answers at once, so wall time is the harness's own cost: start-up and its tool loop. With a real model, model latency dominates.
 - The scenario names abstract tools (`read`, `bash`, `write`). The server rewrites each call into the tool and argument names the harness offered in its request (`Read`/`file_path`, `bash`/`description`, and so on), with absolute paths.
-- Each harness runs in a scratch `HOME` with its own config pointing at the fake server (`ANTHROPIC_BASE_URL` for claude, a provider in `models.yml` for omp, a provider in `models.json` for pi, a base-URL override for opencode, `MU_GATEWAY_URL` for mu). `mu-bench serve` prints every request a harness makes, to probe a new one.
+- Each harness gets a config pointing at the fake server: `ANTHROPIC_BASE_URL` for claude, a provider in `models.yml` for omp, a provider in `models.json` for pi, a base-URL override for opencode, `MU_GATEWAY_URL` for mu. Configs that hold the server's URL are per session, so concurrent sessions do not read each other's. `mu-bench serve` prints every request a harness makes, to probe a new one.
 - A harness is found on `PATH`, else in `~/.cache/mu-bench-tools` (`$MU_BENCH_TOOLS`). pi is installed there with `npm install --prefix ~/.cache/mu-bench-tools @mariozechner/pi-coding-agent@0.73.1`, so nothing goes into the system.
+- **mu's gateway is not in these numbers.** `MU_GATEWAY_URL` bypasses the shared `omp auth-broker` + `omp auth-gateway` pair that mu normally uses. A run that started the real pair measured it at about 305 MB total and 275 MB private, shared by every mu session; that run could not complete because the gateway only serves models whose credentials are in the broker's store.
 - Not covered: codex (it needs the OpenAI Responses protocol), and harnesses that are not installed (gemini-cli, crush, aider).
 
 ## Not yet
 
-A pass/fail gate with baselines, scenarios for compaction, subagents and plugins, concurrent sessions, and the OpenAI protocol.
+A pass/fail gate with baselines, scenarios for compaction, subagents and plugins, mu through its real gateway, and the OpenAI protocol.
