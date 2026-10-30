@@ -163,7 +163,8 @@ mod tests {
     fn every_build_has_a_type() {
         let ps = presets(Path::new("/w"), none_set);
         for p in &ps {
-            let answers: Vec<String> = p.params.iter().map(|q| q.default.clone().unwrap_or_else(|| "x".into())).collect();
+            let answers: Vec<String> =
+                p.params.iter().map(|q| q.default.clone().unwrap_or_else(|| "x".into())).collect();
             let e = p.build(&answers);
             let t = e["type"].as_str().unwrap_or_else(|| panic!("{} has no type", p.id));
             assert!(t == "stdio" || t == "http", "{}", p.id);
@@ -236,7 +237,10 @@ mod tests {
         assert_eq!(d, None);
         assert!(!prompt.contains('['), "{prompt}");
         assert_eq!(token(|v| v == "GITHUB_TOKEN").0.as_deref(), Some("${GITHUB_TOKEN}"));
-        assert_eq!(token(|v| v == "GITHUB_PERSONAL_ACCESS_TOKEN").0.as_deref(), Some("${GITHUB_PERSONAL_ACCESS_TOKEN}"));
+        assert_eq!(
+            token(|v| v == "GITHUB_PERSONAL_ACCESS_TOKEN").0.as_deref(),
+            Some("${GITHUB_PERSONAL_ACCESS_TOKEN}")
+        );
         let (d, prompt) = token(|_| true);
         assert_eq!(d.as_deref(), Some("${GITHUB_PERSONAL_ACCESS_TOKEN}"));
         assert!(prompt.ends_with("[${GITHUB_PERSONAL_ACCESS_TOKEN}]"));

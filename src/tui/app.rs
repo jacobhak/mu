@@ -122,9 +122,17 @@ enum UiMsg {
     /// An MCP login finished: tool count and whether the tool set changed.
     McpLoggedIn(String, Result<(usize, bool), String>),
     /// An `/mcp` change was applied: what to tell the user, and whether the tool list changed.
-    McpApplied { lines: Vec<String>, refresh: bool },
+    McpApplied {
+        lines: Vec<String>,
+        refresh: bool,
+    },
     /// `/mcp reconnect` or `/mcp test` finished.
-    McpReconnected { name: String, verbose: bool, ms: u128, result: Result<(usize, bool), String> },
+    McpReconnected {
+        name: String,
+        verbose: bool,
+        ms: u128,
+        result: Result<(usize, bool), String>,
+    },
     ClipboardImage(Result<Option<Image>, String>),
     Ghost {
         seq: u64,

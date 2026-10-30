@@ -1237,9 +1237,10 @@ impl PluginHost {
     }
 
     pub async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
-        let slot = self.slots.borrow().iter().find(|s| s.manifest.provider.as_deref() == Some(kind)).cloned().ok_or_else(|| {
-            "no gateway: install the gateway plugin (~/.mu/plugins/gateway) or set MU_GATEWAY_URL".to_string()
-        })?;
+        let slot =
+            self.slots.borrow().iter().find(|s| s.manifest.provider.as_deref() == Some(kind)).cloned().ok_or_else(
+                || "no gateway: install the gateway plugin (~/.mu/plugins/gateway) or set MU_GATEWAY_URL".to_string(),
+            )?;
         let proc = self.ensure(&slot).await?;
         let v = proc
             .request("provider/endpoint", json!({"clientPid": std::process::id()}), Some(Duration::from_secs(45)))
