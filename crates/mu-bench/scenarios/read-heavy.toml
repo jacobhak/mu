@@ -1,0 +1,82 @@
+name = "read-heavy"
+
+[[files]]
+path = "src/a.rs"
+bytes = 90000
+[[files]]
+path = "src/b.rs"
+bytes = 90000
+[[files]]
+path = "src/c.rs"
+bytes = 90000
+[[files]]
+path = "src/d.rs"
+bytes = 90000
+[[files]]
+path = "notes/log.txt"
+bytes = 400000
+
+# Turn 1: explore the code base, reading files over several steps.
+[[turn]]
+prompt = "Read the source files and tell me how they fit together."
+[[turn.step]]
+thinking_bytes = 1500
+text_bytes = 240
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/a.rs" }
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/b.rs" }
+[[turn.step]]
+text_bytes = 160
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/c.rs" }
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/d.rs" }
+[[turn.step]]
+thinking_bytes = 800
+text_bytes = 2400
+
+# Turn 2: a plain follow-up with no tools.
+[[turn]]
+prompt = "Which of those is the riskiest to change, and why?"
+[[turn.step]]
+thinking_bytes = 600
+text_bytes = 1800
+
+# Turn 3: large tool output, then a short answer.
+[[turn]]
+prompt = "Check the log for anything unusual."
+[[turn.step]]
+text_bytes = 120
+[[turn.step.tool]]
+name = "read"
+args = { path = "notes/log.txt" }
+[[turn.step.tool]]
+name = "bash"
+args = { command = "seq 1 20000" }
+[[turn.step]]
+text_bytes = 900
+
+# Turn 4: the same exploration again, to show whether memory returns after a heavy turn.
+[[turn]]
+prompt = "Read the source files again and list the public functions."
+[[turn.step]]
+text_bytes = 100
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/a.rs" }
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/b.rs" }
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/c.rs" }
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/d.rs" }
+[[turn.step]]
+text_bytes = 2000

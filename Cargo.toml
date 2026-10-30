@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace]
-members = ["crates/mu-common", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
+members = ["crates/mu-common", "crates/mu-bench", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
 exclude = ["plugins/mcp-http"]
 resolver = "3"
 
