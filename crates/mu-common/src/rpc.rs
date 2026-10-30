@@ -8,6 +8,17 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
+/// Writer of the `serve_stdio` loop that is running, for `notify`.
+static OUTBOX: Mutex<Option<mpsc::UnboundedSender<String>>> = Mutex::new(None);
+
+/// Sends a notification (a request without id) to the host from any thread; a no-op outside `serve_stdio`.
+pub fn notify(method: &str, params: Value) {
+    let g = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = g.as_ref() {
+        let _ = tx.send(serde_json::to_string(&Request::new(None, method, params)).unwrap());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub jsonrpc: String,
@@ -169,6 +180,7 @@ where
     Fut: Future<Output = Result<Value, RpcError>> + Send + 'static,
 {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    OUTBOX.lock().unwrap_or_else(|e| e.into_inner()).replace(tx.clone());
     let writer = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(line) = rx.recv().await {
@@ -201,6 +213,7 @@ where
             break;
         }
     }
+    OUTBOX.lock().unwrap_or_else(|e| e.into_inner()).take();
     // dropping every sender lets the writer drain and finish
     drop(tx);
     let _ = writer.await;

@@ -133,11 +133,20 @@ All omp features outside the core become first-party plugins that load on use.
 | mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It keeps TLS and HTTP out of the core: it is built as a separate Cargo project outside the workspace (feature unification would otherwise give the core rustls), and `scripts/build-mcp-http.sh check` fails if `cargo tree -p mu` ever shows rustls. It answers any `core/*` request a server sends with -32601. |
 | web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway still needs verifying. |
 | memory | yes | Day one: wraps the `mnemopi` CLI against the user's existing store (a Bun process only during recall/retain). Later: Rust port on the same SQLite schema with `fastembed-rs`. |
+| prediction | yes | Rust; word n-gram by default, optional SmolLM2-135M. See Prediction below. |
 | debugger, eval, github, browser, ssh | later | — |
 | advisor, commit messages, export/share, usage display | later | Need `core/complete` / `turn_end` |
-| prediction, voice | later | Prediction needs a composer-keystroke hook, not in the table above |
+| voice | later | — |
 | agent hub, agent messaging, collab, live streaming | later | Need a session API beyond the hooks above |
 | vibe, autoresearch, autolearn, auto-thinking, compress, marketplace | later | — |
+
+### Prediction
+
+- `mu-predict` (`plugins/predict`) answers `predict/complete` for each composer keystroke (the host waits 300 ms) and takes `predict/observe` for each submitted prompt. `shutdown` saves SmolLM's recent prompts. It exits after 10 idle minutes.
+- Word engine: the n-gram by default, rebuilt at start from the omp, Claude Code and mu prompt histories. `[predict] engine = "smollm"` selects SmolLM2-135M instead (opt-in). `State::complete` order: whole-prompt repeat, word ghost at or above `threshold`, identifiers from the last reply.
+- Weights are never bundled. `mu predict setup smollm` downloads three pinned files into `<mu_home>/models/SmolLM2-135M/` through curl, into `.part` files, and checks SHA-256 before the rename. Startup checks sizes only. Missing or mis-sized weights leave the n-gram in place and send one `ui/notify` notice.
+- Loading runs on its own thread, so `initialize` returns at once. Requests made before the load finishes use the n-gram. `threads` narrows SmolLM's CPU pool by setting the affinity mask of the loading thread (Linux only).
+- Latest wins: one worker thread runs the engines in arrival order. A ghost request overtaken while it waits in the queue gets an empty ghost without being computed; the one already running finishes.
 
 ## Providers
 

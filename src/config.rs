@@ -271,17 +271,28 @@ pub enum Cards {
     Filled,
 }
 
-/// `[predict]`: ghost-text prediction in the composer.
+/// `[predict]`: ghost-text prediction in the composer. `engine` and `threads` are read by the predict plugin.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct MuPredict {
     pub enabled: bool,
     pub threshold: f32,
+    /// `ngram` (default) or `smollm`; other values warn and mean `ngram`.
+    pub engine: String,
+    /// CPU threads for SmolLM; 0 means all cores.
+    pub threads: usize,
 }
 
 impl Default for MuPredict {
     fn default() -> Self {
-        Self { enabled: true, threshold: 0.3 }
+        Self { enabled: true, threshold: 0.3, engine: "ngram".into(), threads: 4 }
+    }
+}
+
+/// Warns about a `[predict]` value the plugin would not understand; the section itself is kept.
+fn check_predict(p: &MuPredict, warn: &mut Vec<String>) {
+    if !matches!(p.engine.as_str(), "ngram" | "smollm") {
+        warn.push(format!("config.toml: [predict] engine {:?} is not \"ngram\" or \"smollm\"; using ngram", p.engine));
     }
 }
 
@@ -431,9 +442,11 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
             T::default()
         })
     }
+    let predict: MuPredict = parse(section("predict"), "predict", warn);
+    check_predict(&predict, warn);
     MuConfig {
         compaction: parse(section("compaction"), "compaction", warn),
-        predict: parse(section("predict"), "predict", warn),
+        predict,
         ask: parse(section("ask"), "ask", warn),
         theme: parse(section("theme"), "theme", warn),
         update: parse(section("update"), "update", warn),
@@ -512,6 +525,20 @@ impl Configs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn predict_engine_and_threads_parse_and_unknown_engine_warns() {
+        let p = toml::from_str::<MuPredict>("engine = \"smollm\"\nthreads = 2\n").unwrap();
+        assert_eq!((p.engine.as_str(), p.threads), ("smollm", 2));
+        let d = MuPredict::default();
+        assert_eq!((d.engine.as_str(), d.threads, d.threshold), ("ngram", 4, 0.3));
+        let mut w = Vec::new();
+        check_predict(&toml::from_str::<MuPredict>("engine = \"bogus\"").unwrap(), &mut w);
+        check_predict(&MuPredict::default(), &mut w);
+        check_predict(&p, &mut w);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("bogus"), "{}", w[0]);
+    }
 
     #[test]
     fn completion_notify_accepts_omp_spellings() {

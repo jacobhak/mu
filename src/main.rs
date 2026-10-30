@@ -22,6 +22,7 @@ mod notify;
 mod plans;
 mod plugin;
 mod policy;
+mod predict_setup;
 mod pricing;
 mod proc;
 mod provider;
@@ -96,6 +97,11 @@ enum Sub {
         /// Install this release tag instead of the latest.
         #[arg(long)]
         tag: Option<String>,
+    },
+    /// Ghost-text prediction. `mu predict setup smollm` downloads the opt-in SmolLM weights.
+    Predict {
+        #[command(subcommand)]
+        cmd: predict_setup::Cmd,
     },
     /// Review the changes against a base the way `/review` does, without the TUI. Exit codes: 0 pass
     /// or nothing to review, 1 fixes needed, 2 the review could not complete.
@@ -286,6 +292,9 @@ fn run() -> Result<i32> {
     }
     if let Some(Sub::Update { check, force, tag }) = cli.command {
         return update::run(check, force, tag);
+    }
+    if let Some(Sub::Predict { cmd }) = cli.command {
+        return predict_setup::run(cmd);
     }
     let plan_run = match cli.command {
         Some(Sub::Plan { cmd }) => match plans::plan_run(cmd) {

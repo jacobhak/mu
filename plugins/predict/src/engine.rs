@@ -1,4 +1,5 @@
-//! Ghost-text engine: whole-prompt repeats, word n-gram, and identifiers from the last reply.
+//! Ghost-text engine: whole-prompt repeats, word completion (SmolLM when attached, else the n-gram), and
+//! identifiers from the last reply.
 
 use pi_predict::{Config, Predictor, Query, Suggestion};
 use std::collections::HashMap;
@@ -8,6 +9,8 @@ const BEFORE_LIMIT: usize = 2000;
 
 pub struct State {
     ngram: Box<dyn Predictor>,
+    /// The word engine when SmolLM is selected and loaded; replaces the n-gram for word ghosts.
+    smollm: Option<Box<dyn Predictor>>,
     /// cwd -> prompt -> times submitted.
     lines: HashMap<String, HashMap<String, u32>>,
 }
@@ -17,7 +20,7 @@ impl State {
         // The model is rebuilt from the corpus on every start and never persisted.
         let cfg = Config { state_dir: state_dir.to_owned(), model_dir: None, show_threshold: Some(0.0) };
         let ngram = pi_predict::ngram::open(&cfg).map_err(|e| e.to_string())?;
-        Ok(Self { ngram, lines: HashMap::new() })
+        Ok(Self { ngram, smollm: None, lines: HashMap::new() })
     }
 
     pub fn observe(&mut self, text: &str, cwd: &str) {
@@ -27,6 +30,9 @@ impl State {
     /// Feeds the n-gram once and counts the prompt `n` times for whole-prompt ghosts.
     pub fn observe_n(&mut self, text: &str, cwd: &str, n: u32) {
         self.ngram.observe(text);
+        if let Some(p) = self.smollm.as_mut() {
+            p.observe(text);
+        }
         *self.lines.entry(cwd.to_owned()).or_default().entry(text.to_owned()).or_default() += n;
     }
 
@@ -57,10 +63,42 @@ impl State {
         Some(best[text.len()..].to_owned())
     }
 
-    /// The n-gram's best completion of the word ending `text`, with its confidence.
+    /// The word ghost for the word ending `text`, with its confidence, from SmolLM when it is loaded, else the n-gram.
+    /// SmolLM is asked from the first letter: gating it at two cost it more keystrokes than it saved in wrong ghosts.
     pub fn word_suggestion(&mut self, text: &str) -> Option<Suggestion> {
         let (before, prefix) = split_word(text)?;
-        self.ngram.complete(&Query { before, prefix })
+        let q = Query { before, prefix };
+        match self.smollm.as_mut() {
+            Some(p) => p.complete(&q),
+            None => self.ngram.complete(&q),
+        }
+    }
+
+    pub fn smollm_active(&self) -> bool {
+        self.smollm.is_some()
+    }
+
+    /// Runs a throwaway query so SmolLM re-scores its recent-prompt head now, not on the next keystroke.
+    pub fn warm(&mut self) {
+        if let Some(p) = self.smollm.as_mut() {
+            let _ = p.complete(&Query { before: "", prefix: "th" });
+        }
+    }
+
+    /// Makes SmolLM the word engine, after learning the prompts it missed while loading.
+    pub fn attach_smollm(&mut self, mut p: Box<dyn Predictor>, missed: &[String]) {
+        for prompt in missed {
+            p.observe(prompt);
+        }
+        self.smollm = Some(p);
+    }
+
+    /// Saves the state an engine keeps across runs (SmolLM's recent prompts). The n-gram is rebuilt from history.
+    pub fn persist(&mut self) -> Result<(), String> {
+        match self.smollm.as_mut() {
+            Some(p) => p.persist().map_err(|e| format!("{e:#}")),
+            None => Ok(()),
+        }
     }
 }
 
@@ -132,6 +170,31 @@ pub fn reply_ghost(text: &str, assistant: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A word engine that always offers "XYZ" at confidence 0.9.
+    struct Fake;
+
+    impl Predictor for Fake {
+        fn complete(&mut self, _: &Query<'_>) -> Option<Suggestion> {
+            Some(Suggestion { suffix: "XYZ".into(), confidence: 0.9 })
+        }
+        fn observe(&mut self, _: &str) {}
+        fn feedback(&mut self, _: &Query<'_>, _: &str, _: bool) {}
+        fn persist(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn smollm_replaces_the_word_ghost_from_the_first_letter() {
+        let mut s = state();
+        s.attach_smollm(Box::new(Fake), &[]);
+        assert!(s.smollm_active());
+        assert_eq!(s.complete("fix the pa", "/x", "", 0.3), "XYZ");
+        assert_eq!(s.complete("fix the pa", "/x", "", 0.95), "", "below the request threshold");
+        assert_eq!(s.complete("fix the p", "/x", "", 0.3), "XYZ", "one letter: SmolLM is asked");
+        assert_eq!(s.persist(), Ok(()));
+    }
 
     fn state() -> State {
         let dir = std::env::temp_dir().join(format!("mu-predict-test-{}", std::process::id()));
