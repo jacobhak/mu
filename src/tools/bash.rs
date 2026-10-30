@@ -42,17 +42,21 @@ struct Collector {
     spill_capped: bool,
     /// The first spill I/O error, reported once in the output.
     spill_error: Option<String>,
+    /// For redacting secrets in the spill; the result text is redacted by the agent.
+    cwd: std::path::PathBuf,
 }
 
 /// The spill file stops growing here.
 const SPILL_CAP: u64 = 128 * 1024 * 1024;
 
 impl Collector {
-    fn spill(&mut self, bytes: &[u8]) {
+    fn spill(&mut self, text: &str) {
         let Some((_, f)) = self.artifact.as_mut() else { return };
         if self.spill_capped || self.spill_error.is_some() {
             return;
         }
+        let redacted = crate::secrets::redact(text, &self.cwd).text;
+        let bytes = redacted.as_bytes();
         let room = SPILL_CAP.saturating_sub(self.spilled) as usize;
         let n = bytes.len().min(room);
         let mut cut = n;
@@ -73,7 +77,7 @@ impl Collector {
     }
 
     fn push(&mut self, mut s: &str, alloc: &dyn Fn() -> (u32, std::path::PathBuf)) {
-        self.spill(s.as_bytes());
+        self.spill(s);
         if self.tail.is_empty() && self.elided == 0 && self.head.len() < HEAD {
             let mut n = (HEAD - self.head.len()).min(s.len());
             while !s.is_char_boundary(n) {
@@ -97,8 +101,8 @@ impl Collector {
                     Ok(f) => {
                         self.artifact = Some((n, std::io::BufWriter::new(f)));
                         let (head, tail) = (std::mem::take(&mut self.head), std::mem::take(&mut self.tail));
-                        self.spill(head.as_bytes());
-                        self.spill(tail.as_bytes());
+                        self.spill(&head);
+                        self.spill(&tail);
                         self.head = head;
                         self.tail = tail;
                     }
@@ -250,7 +254,7 @@ impl Tools {
         let start = Instant::now();
         let mut decoder = OutputDecoder::new();
         let mut cleaner = crate::pty::Cleaner::default();
-        let mut collector = Collector::default();
+        let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
         let (mut cancelled, mut timed_out) = (false, false);
         let mut input_open = true;
         // Keystrokes waiting for the pty to accept them; writing never blocks reads, cancel or timeout.
@@ -363,6 +367,7 @@ impl Tools {
     }
 
     async fn bash_plain(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
+        let run_cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or_else(|| self.cwd.clone());
         let limits = Limits::new(a.timeout);
         let (secs, timeout_ms) = (limits.secs, limits.millis());
         let mut cancel = CancelToken::new(timeout_ms);
@@ -390,7 +395,7 @@ impl Tools {
             }
         };
         let drain = async {
-            let mut c = Collector::default();
+            let mut c = Collector { cwd: run_cwd.clone(), ..Default::default() };
             // The live tail shows cleaned text; only the pty view gets raw bytes.
             let mut cleaner = crate::pty::Cleaner::default();
             while let Ok(s) = rx.recv_async().await {
@@ -585,7 +590,7 @@ pub async fn run_background(
     let (mut out_dec, mut err_dec) =
         (pi_shell::output_decode::OutputDecoder::new(), pi_shell::output_decode::OutputDecoder::new());
     let (mut obuf, mut ebuf) = (vec![0u8; 8192], vec![0u8; 8192]);
-    let mut collector = Collector::default();
+    let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
     let mut status: Option<std::process::ExitStatus> = None;
     let (mut cancelled, mut timed_out, mut stopping) = (false, false, false);
     let timeout_sleep = tokio::time::sleep(limits.timeout.unwrap_or_default());

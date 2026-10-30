@@ -475,6 +475,7 @@ pub fn system_prompt(i: &PromptInput) -> String {
     } else {
         "- Surgical edits: `edit`. Copy `*** Find` text verbatim from a recent `read`, and give each `*** Find` exactly one of `*** Replace`, `*** Insert Before` or `*** Insert After`.\n"
     };
+    let redact_rule = "- `[REDACTED:NAME]` in output is a secret mu hid from you, not an error: use `\"$NAME\"` when NAME is an environment variable, and NEVER write a placeholder into a file or command.\n";
     let mut s = format!(
         "You are mu, a coding agent running in the user's terminal. Work in the current directory with the provided tools.\n\
 RFC 2119 keywords: MUST, SHOULD, MAY. `NEVER` = `MUST NOT`.\n\n\
@@ -485,6 +486,7 @@ MUST use the specialized tool over its shell equivalent:\n\
 - Create or overwrite a file: `write`. Use it only for new files or complete rewrites.\n\
 - Content search: `grep`, NEVER shell `grep`/`rg`/`awk`. File names and structure: `glob`, NEVER `find`/`fd`/`ls **/*.ext`.\n\
 - `bash`: real binaries (builds, tests, git, package managers) and short fact pipelines such as counts or checksums. NEVER specialized-tool work, and NEVER paging, moving or trimming bytes you could `read`.\n\
+{redact_rule}\
 <critical>\n\
 NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `bash` to change files, singly or in bulk; MUST use `edit` or `write`. If `edit` fails, read its error, fix the payload and retry with `edit`. A failed edit is NEVER a reason to switch to the shell.\n\
 </critical>\n\n\

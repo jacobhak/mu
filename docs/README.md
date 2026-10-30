@@ -11,6 +11,7 @@
 - [Agent Client Protocol](acp.md): `mu --acp`
 - [Custom agents](custom-agents.md)
 - [Memory](memory.md)
+- [Secrets](secrets.md): what mu redacts before storing or sending text, and what it does not protect against
 - [Config](config.md): `~/.mu/config.toml`
 
 Design and measurements: [`DESIGN.md`](../DESIGN.md). Ghost-text evaluation record: [`ghost-text/`](ghost-text/README.md).

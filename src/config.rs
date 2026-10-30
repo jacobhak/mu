@@ -202,6 +202,7 @@ pub struct MuConfig {
     pub update: MuUpdate,
     pub edit: MuEdit,
     pub mcp: MuMcp,
+    pub secrets: MuSecrets,
 }
 
 /// `[ask]`: `nudge = false` turns off the reminder to use `ask` when a turn ends with a decision question in prose.
@@ -242,6 +243,14 @@ impl Default for MuUpdate {
     fn default() -> Self {
         Self { check: true }
     }
+}
+
+/// `[secrets]`: `env` names extra environment variables whose values count as secrets. Redaction
+/// itself cannot be turned off.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MuSecrets {
+    pub env: Vec<String>,
 }
 
 /// `[theme]`: palette source, accent and card style.
@@ -452,6 +461,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         update: parse(section("update"), "update", warn),
         edit: parse(section("edit"), "edit", warn),
         mcp: parse(section("mcp"), "mcp", warn),
+        secrets: parse(section("secrets"), "secrets", warn),
     }
 }
 

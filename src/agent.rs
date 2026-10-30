@@ -17,8 +17,9 @@ use crate::pricing;
 use crate::provider::{ProviderError, Providers, Request, StreamEvent, ToolDef};
 use crate::quota::QuotaTracker;
 use crate::review;
+use crate::secrets;
 use crate::session::{self, CompactionState, SessionFile};
-use crate::tools::{ToolCtx, ToolOutput, Tools};
+use crate::tools::{ToolCtx, ToolMeta, ToolOutput, Tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -553,6 +554,8 @@ impl Agent {
     fn apply_plugin_context(&mut self, results: Vec<(String, Value)>) {
         for (plugin, v) in results {
             let Some(ctx) = v["context"].as_str() else { continue };
+            let r = secrets::redact(ctx, &self.cwd);
+            let ctx = r.text.as_str();
             let changed = match self.plugin_ctx.get(&plugin) {
                 Some(old) => old != ctx,
                 None => !ctx.is_empty(),
@@ -560,6 +563,7 @@ impl Agent {
             if !changed {
                 continue;
             }
+            self.log_redaction(&format!("plugin:{plugin}"), &r.hits);
             if ctx.is_empty() {
                 self.plugin_ctx.remove(&plugin);
             } else {
@@ -608,6 +612,12 @@ impl Agent {
     }
 
     pub fn push(&mut self, mut m: Message) {
+        let hits = self.redact_message(&mut m);
+        if !hits.is_empty() && matches!(m, Message::User { .. }) {
+            let names: Vec<String> = hits.iter().map(secrets::Hit::placeholder).collect();
+            self.notice(format!("secrets replaced before sending: {}", names.join(", ")));
+        }
+        self.log_redaction("message", &hits);
         if let Message::Assistant { usage, provider, model, .. } = &mut m {
             self.cost.record(provider, model, usage);
         }
@@ -633,6 +643,69 @@ impl Agent {
             timestamp: now_ms(),
             details: out.stored_details(),
         });
+    }
+
+    /// Replaces secrets in the text of a user message or tool result.
+    fn redact_message(&self, m: &mut Message) -> Vec<secrets::Hit> {
+        let (Message::User { content, .. } | Message::ToolResult { content, .. }) = m else { return Vec::new() };
+        let mut hits = Vec::new();
+        for b in content.iter_mut() {
+            if let Block::Text { text } = b {
+                let r = secrets::redact(text, &self.cwd);
+                if !r.hits.is_empty() {
+                    *text = r.text;
+                    secrets::merge(&mut hits, r.hits);
+                }
+            }
+        }
+        hits
+    }
+
+    /// Records what was replaced (names, never values), so how often the filter has to step in can
+    /// be measured per session.
+    fn log_redaction(&mut self, at: &str, hits: &[secrets::Hit]) {
+        if hits.is_empty() {
+            return;
+        }
+        if let Some(s) = self.session.as_mut() {
+            s.custom("secrets_redacted", json!({"at": at, "hits": hits}));
+        }
+    }
+
+    /// Replaces secrets in a tool's output before anyone sees it: the UI, plugins, the session and
+    /// the model. `note` tells the model what happened.
+    fn redact_output(&self, out: &mut ToolOutput, note: bool) -> Vec<secrets::Hit> {
+        let mut hits = Vec::new();
+        let mut red = |s: &mut String| {
+            let r = secrets::redact(s, &self.cwd);
+            if !r.hits.is_empty() {
+                *s = r.text;
+                secrets::merge(&mut hits, r.hits);
+            }
+        };
+        match &mut out.meta {
+            // Output and mu's notes are redacted apart, so `output_end` still splits them.
+            Some(ToolMeta::Bash(m)) if out.text.is_char_boundary(m.output_end.min(out.text.len())) => {
+                let end = m.output_end.min(out.text.len());
+                let (mut body, mut notes) = (out.text[..end].to_string(), out.text[end..].to_string());
+                red(&mut body);
+                red(&mut notes);
+                m.output_end = body.len();
+                out.text = body + &notes;
+            }
+            _ => red(&mut out.text),
+        }
+        if let Some(d) = out.display.as_mut() {
+            red(d);
+        }
+        if let Some(d) = out.details.as_mut() {
+            secrets::merge(&mut hits, secrets::redact_json(d, &self.cwd));
+        }
+        if note && !hits.is_empty() {
+            out.text.push_str("\n\n");
+            out.text.push_str(&secrets::feedback(&hits));
+        }
+        hits
     }
 
     fn reset_conversation(&mut self) {
@@ -771,8 +844,20 @@ impl Agent {
         }
         self.settle_prices();
         self.messages = loaded.messages;
+        // Sessions written before redaction, or with it off, may hold secrets.
+        let mut msgs = std::mem::take(&mut self.messages);
+        let mut resume_hits = Vec::new();
+        for m in msgs.iter_mut() {
+            secrets::merge(&mut resume_hits, self.redact_message(m));
+        }
+        self.messages = msgs;
         self.entry_ids = loaded.entry_ids;
         self.plugin_ctx = loaded.plugin_context;
+        for v in self.plugin_ctx.values_mut() {
+            let r = secrets::redact(v, &self.cwd);
+            *v = r.text;
+            secrets::merge(&mut resume_hits, r.hits);
+        }
         self.review_base = loaded.review_base.and_then(|v| serde_json::from_value(v).ok());
         let phases = loaded.todo.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
         self.tools.set_todo(phases);
@@ -784,6 +869,7 @@ impl Agent {
         self.since_compaction = self.messages.len();
         self.user_turn = self.messages.iter().filter(|m| matches!(m, Message::User { .. })).count() as u32;
         self.session = Some(s);
+        self.log_redaction("resume", &resume_hits);
         self.tools.set_session(&self.session_id(), self.session.as_ref().map(|s| s.path.clone()));
         if let Some((_, data)) = loaded.mode.as_ref().filter(|(m, _)| m == "plan") {
             // The model and thinking level in force before plan mode, so leaving it restores them.
@@ -1261,7 +1347,9 @@ impl Agent {
         let id = "user-bash".to_string();
         self.emit(AgentEvent::ToolStart { id: id.clone(), name: "bash".into(), args: args.clone() });
         let ctx = ToolCtx { events: self.events.clone(), cancel: cancel.clone(), call_id: id.clone() };
-        let out = self.tools.call("bash", &args, &ctx).await;
+        let mut out = self.tools.call("bash", &args, &ctx).await;
+        let hits = self.redact_output(&mut out, false);
+        self.log_redaction("user-bash", &hits);
         if include {
             self.push(Message::user(&format!("I ran `{cmd}`:\n```\n{}\n```", out.text)));
             self.turn_msgs.clear(); // not a model turn: no `turn_end` hook for it
@@ -1322,11 +1410,12 @@ impl Agent {
                         self.emit(AgentEvent::UserPrompt(i.text.clone()));
                     }
                     self.user_turn += 1;
+                    let prompt = secrets::redact(&i.text, &self.cwd).text;
                     let res = self
                         .plugins
                         .hook(
                             "prompt_submit",
-                            json!({"prompt": i.text, "userTurn": self.user_turn, "resumed": self.resumed}),
+                            json!({"prompt": prompt, "userTurn": self.user_turn, "resumed": self.resumed}),
                         )
                         .await;
                     self.apply_plugin_context(res);
@@ -1943,7 +2032,7 @@ impl Agent {
             }
         }
         self.emit(AgentEvent::ToolStart { id: id.into(), name: name.into(), args: args.clone() });
-        let denied = self.policy().check(name).err();
+        let denied = self.policy().check(name).err().or_else(|| secrets::guard(name, &args).err());
         let mut out = match blocked.or(denied) {
             Some(b) => ToolOutput::err(b),
             None => {
@@ -1962,6 +2051,8 @@ impl Agent {
                 }
             }
         };
+        let hits = self.redact_output(&mut out, true);
+        self.log_redaction(&format!("tool:{name}"), &hits);
         let sub = format!("tool_result:{name}");
         for (_, v) in self
             .plugins
@@ -2151,6 +2242,57 @@ mod loop_tests {
             });
             assert!(err.unwrap().contains("tool panicked: boom"));
             assert_eq!(a.messages.len(), 4, "the turn continued after the panic");
+        });
+    }
+
+    #[test]
+    fn secrets_are_replaced_explained_and_never_written_back() {
+        run(async {
+            let tok = format!("ghp_{}", "a1B2".repeat(9));
+            // The command prints the token without holding it whole.
+            let print = json!({"command": format!("printf '%s%s' ghp_ {}", &tok[4..])});
+            let write_back = json!({"command": "echo [REDACTED:github-token] > f"});
+            let script = vec![
+                Ok(assistant(
+                    vec![Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: print }],
+                    StopReason::ToolUse,
+                )),
+                Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+                Ok(assistant(
+                    vec![Block::ToolCall { id: "t2".into(), name: "bash".into(), arguments: write_back }],
+                    StopReason::ToolUse,
+                )),
+                Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+            ];
+            let (mut a, _rx) = agent(script);
+            a.turn(Some("go".to_string().into())).await;
+            a.turn(Some(format!("mine is {tok}").into())).await;
+            let texts: Vec<(bool, String)> = a
+                .messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::ToolResult { content, is_error, .. } => Some((*is_error, text_of(content))),
+                    Message::User { content, .. } => Some((false, text_of(content))),
+                    _ => None,
+                })
+                .collect();
+            assert!(texts.iter().all(|(_, t)| !t.contains(&tok)), "{texts:?}");
+            let printed = &texts[1].1;
+            assert!(printed.starts_with("[REDACTED:github-token]"), "{printed}");
+            assert!(printed.contains("(recognised key format)"), "the model is told: {printed}");
+            assert_eq!(texts[2].1, "mine is [REDACTED:github-token]");
+            let (refused, why) = &texts[3];
+            assert!(*refused && why.contains("placeholder"), "{why}");
+            // Each replacement is logged by name, never by value.
+            let file = std::fs::read_to_string(&a.session.as_ref().unwrap().path).unwrap();
+            assert!(!file.contains(&tok));
+            let logged: Vec<Value> = file
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter(|v| v["customType"] == "secrets_redacted")
+                .map(|v| v["data"]["at"].clone())
+                .collect();
+            assert_eq!(logged, [json!("tool:bash"), json!("message")]);
         });
     }
 

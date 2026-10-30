@@ -28,4 +28,7 @@ lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 
 [update]
 check = true          # daily release check at startup
+
+[secrets]
+env = []              # extra environment variables whose values count as secrets (redaction is always on; see secrets.md)
 ```
