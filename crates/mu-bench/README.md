@@ -23,6 +23,19 @@ Options: `--mu PATH` (default `target/release/mu`), `--runs N` (default 3, the t
 
 Replies stream in bursts by default (`chunk_bytes` every `chunk_delay_ms`, 24 KB/s). That is fine for memory but about 60 times faster than a real model, and a burst backs up mu's reveal queue and inflates first-token times. Latency scenarios set a model-like rate (`streaming.toml`: 400 B/s). Each report prints the rate it ran at.
 
+## Comparing harnesses
+
+```sh
+cargo build --release && cargo run --release -p mu-bench -- compare crates/mu-bench/scenarios/compare-agentic.toml
+```
+
+Runs one prompt headless in each of mu, claude, opencode and omp (`--harness` picks a subset, `--runs` sets the repeats, default 5, interleaved), all against the same fake model server. The table shows wall time, peak memory summed over the harness's whole process tree (sampled every 10 ms; total counts shared pages by their share, private is heap and stack), and how many model steps the harness got through. A harness that does not finish the scenario is reported with the tail of its output.
+
+- The fake model answers at once, so wall time is the harness's own cost: start-up and its tool loop. With a real model, model latency dominates.
+- The scenario names abstract tools (`read`, `bash`, `write`). The server rewrites each call into the tool and argument names the harness offered in its request (`Read`/`file_path`, `bash`/`description`, and so on), with absolute paths.
+- Each harness runs in a scratch `HOME` with its own config pointing at the fake server (`ANTHROPIC_BASE_URL` for claude, a provider in `models.yml` for omp, a base-URL override for opencode, `MU_GATEWAY_URL` for mu). `mu-bench serve` prints every request a harness makes, to probe a new one.
+- Not covered: codex (it needs the OpenAI Responses protocol), and harnesses that are not installed (pi, gemini-cli, crush, aider).
+
 ## Not yet
 
-A pass/fail gate with baselines, scenarios for compaction, subagents and plugins, concurrent sessions, and comparison with other harnesses.
+A pass/fail gate with baselines, scenarios for compaction, subagents and plugins, concurrent sessions, and the OpenAI protocol.

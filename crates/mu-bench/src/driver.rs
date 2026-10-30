@@ -190,7 +190,7 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn scratch() -> Result<PathBuf> {
+pub fn scratch() -> Result<PathBuf> {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let d = std::env::temp_dir().join(format!("mu-bench-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&d)?;
@@ -210,7 +210,7 @@ pub fn make_files(sc: &Scenario, work: &Path) -> Result<()> {
 
 /// A day-old-or-less price catalogue in mu's cache, as a normal session has. Without it mu starts
 /// `omp models ls` to build one, and that 170 MB process lands in the first samples.
-fn seed_caches(mu_home: &Path) -> Result<()> {
+pub fn seed_caches(mu_home: &Path) -> Result<()> {
     std::fs::create_dir_all(mu_home)?;
     let cat = serde_json::json!({"models":[{"provider":"anthropic","id":"bench-1","name":"Bench 1","pricingStatus":"fixed",
         "reasoning":false,"cost":{"input":3.0,"output":15.0,"cacheRead":0.3,"cacheWrite":3.75}}]});

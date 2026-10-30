@@ -1,0 +1,48 @@
+name = "agentic-run"
+# One prompt followed by a long tool loop: the shape of most real sessions (median 2 steps, p90 6, p99 45).
+# Results are small (median read 2 kB, median bash 0.5 kB), as in real use. Only read, bash and write are
+# used, so every harness runs the same operations; grep is a bash command and edits are writes.
+# No pacing: the fake model answers at once, so the numbers are the harness's own cost.
+chunk_bytes = 48
+chunk_delay_ms = 0
+
+[[files]]
+path = "src/f{i}.rs"
+count = 12
+sizes = [1500, 2500, 4000, 6000, 9000, 12000]
+
+[[turn]]
+prompt = "Go through the source files under src, tell me what they do and where `stream` is used, and leave short notes under out/."
+
+[[turn.step]]
+repeat = 10
+thinking_bytes = 200
+text_bytes = 60
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/f{i}.rs" }
+
+[[turn.step]]
+repeat = 8
+text_bytes = 60
+[[turn.step.tool]]
+name = "bash"
+args = { command = "head -n 20 src/f{i}.rs" }
+
+[[turn.step]]
+repeat = 5
+text_bytes = 60
+[[turn.step.tool]]
+name = "bash"
+args = { command = "grep -n stream src/f{i}.rs" }
+
+[[turn.step]]
+repeat = 4
+text_bytes = 60
+[[turn.step.tool]]
+name = "write"
+args = { path = "out/note{i}.md", content = "Notes on this file.\n\nIt parses input, keeps a buffer, and renders the result after each update. The stream state is reset when a session starts. Open question: whether the cache is shared between handlers.\n" }
+
+[[turn.step]]
+thinking_bytes = 800
+text_bytes = 1500

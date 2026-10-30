@@ -1,9 +1,10 @@
 //! Fake model server: the Anthropic Messages wire protocol mu speaks through the gateway, replaying a scenario.
 //! Subagent and compaction requests are not scripted yet; any request without tools gets a short canned reply.
-use crate::scenario::{self, Scenario, Step, gen_text};
+use crate::scenario::{self, Scenario, Step, ToolCall, gen_text};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,6 +60,8 @@ pub struct Server {
     pub addr: SocketAddr,
     pub log: Mutex<Log>,
     pub changed: Notify,
+    /// Where the harness runs; relative `path` arguments are made absolute against it.
+    workdir: Option<PathBuf>,
 }
 
 pub struct Frame {
@@ -270,9 +273,17 @@ async fn reply(sock: &mut TcpStream, status: &str, body: &str) -> Result<()> {
 
 impl Server {
     pub async fn start(scenario: Arc<Scenario>) -> Result<Arc<Server>> {
+        Self::start_in(scenario, None).await
+    }
+
+    pub async fn start_in(scenario: Arc<Scenario>, workdir: Option<PathBuf>) -> Result<Arc<Server>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let srv =
-            Arc::new(Server { addr: listener.local_addr()?, log: Mutex::new(Log::default()), changed: Notify::new() });
+        let srv = Arc::new(Server {
+            addr: listener.local_addr()?,
+            log: Mutex::new(Log::default()),
+            changed: Notify::new(),
+            workdir,
+        });
         let s = srv.clone();
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
@@ -365,7 +376,9 @@ impl Server {
         let input_tokens = raw.len() as u64 / 4;
         let (step, marker, id, seed) = match scripted {
             Some((t, s)) => {
-                let step = sc.turns[t].steps[s].clone();
+                let mut step = sc.turns[t].steps[s].clone();
+                step.tools =
+                    step.tools.iter().map(|c| adapt_call(c, &body["tools"], self.workdir.as_deref())).collect();
                 let marker = (step.text_bytes > 0).then(|| scenario::marker(t));
                 (step, marker, format!("msg_{t}_{s}"), (t * 100 + s) as u64)
             }
@@ -436,6 +449,48 @@ impl Server {
             let _ = tokio::time::timeout(left, notified).await;
         }
     }
+}
+
+const ARG_ALIASES: &[(&str, &[&str])] = &[
+    ("path", &["file_path", "filePath", "filepath", "file"]),
+    ("command", &["cmd"]),
+    ("pattern", &["query", "regex"]),
+    ("content", &["contents", "text"]),
+];
+
+/// The scenario's tool call in the vocabulary of the harness that sent `tools`: its own tool name (matched
+/// case-insensitively), its own argument names, absolute paths, and a placeholder for any other required
+/// string argument. A tool the harness does not offer is left as written.
+pub fn adapt_call(call: &ToolCall, tools: &Value, workdir: Option<&Path>) -> ToolCall {
+    let Some(tool) = tools
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&call.name))))
+    else {
+        return call.clone();
+    };
+    let props = tool["input_schema"]["properties"].as_object();
+    let mut args = serde_json::Map::new();
+    for (k, v) in call.args.as_object().into_iter().flatten() {
+        let key = props
+            .filter(|p| !p.contains_key(k))
+            .and_then(|p| {
+                ARG_ALIASES.iter().find(|(a, _)| a == k).and_then(|(_, alts)| alts.iter().find(|x| p.contains_key(**x)))
+            })
+            .map_or_else(|| k.clone(), |alt| (*alt).to_string());
+        let v = match (k.as_str(), v.as_str(), workdir) {
+            ("path", Some(p), Some(w)) if Path::new(p).is_relative() => json!(w.join(p).to_string_lossy()),
+            _ => v.clone(),
+        };
+        args.insert(key, v);
+    }
+    if let (Some(req), Some(p)) = (tool["input_schema"]["required"].as_array(), props) {
+        for r in req.iter().filter_map(Value::as_str) {
+            if !args.contains_key(r) && p.get(r).is_some_and(|s| s["type"] == "string") {
+                args.insert(r.to_string(), json!("bench"));
+            }
+        }
+    }
+    ToolCall { name: tool["name"].as_str().unwrap_or(&call.name).to_string(), args: Value::Object(args) }
 }
 
 #[cfg(test)]
@@ -638,5 +693,43 @@ mod chunked_tests {
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
         assert!(out.contains("200 OK") && out.contains("message_stop"));
+    }
+}
+
+#[cfg(test)]
+mod adapt_tests {
+    use super::*;
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall { name: name.into(), args }
+    }
+
+    #[test]
+    fn claude_style_names_and_absolute_paths() {
+        let tools = json!([{"name":"Read","input_schema":{"properties":{"file_path":{"type":"string"},"limit":{"type":"number"}},"required":["file_path"]}}]);
+        let got = adapt_call(&call("read", json!({"path":"src/a.rs"})), &tools, Some(Path::new("/w")));
+        assert_eq!(got.name, "Read");
+        assert_eq!(got.args, json!({"file_path":"/w/src/a.rs"}));
+        let abs = adapt_call(&call("read", json!({"path":"/etc/hosts"})), &tools, Some(Path::new("/w")));
+        assert_eq!(abs.args, json!({"file_path":"/etc/hosts"}));
+    }
+
+    #[test]
+    fn required_extras_get_a_placeholder() {
+        let tools = json!([{"name":"bash","input_schema":{"properties":{"command":{"type":"string"},"description":{"type":"string"},"timeout":{"type":"number"}},"required":["command","description"]}}]);
+        let got = adapt_call(&call("bash", json!({"command":"ls"})), &tools, None);
+        assert_eq!(got.args, json!({"command":"ls","description":"bench"}));
+    }
+
+    #[test]
+    fn unknown_tools_and_matching_names_are_left_alone() {
+        let tools =
+            json!([{"name":"read","input_schema":{"properties":{"path":{"type":"string"}},"required":["path"]}}]);
+        let own = adapt_call(&call("read", json!({"path":"a"})), &tools, None);
+        assert_eq!((own.name.as_str(), own.args), ("read", json!({"path":"a"})));
+        let missing = adapt_call(&call("grep", json!({"pattern":"x"})), &tools, None);
+        assert_eq!((missing.name.as_str(), missing.args), ("grep", json!({"pattern":"x"})));
+        let none = adapt_call(&call("read", json!({"path":"a"})), &json!(null), None);
+        assert_eq!(none.args, json!({"path":"a"}));
     }
 }
