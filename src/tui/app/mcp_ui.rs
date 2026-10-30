@@ -316,7 +316,8 @@ impl App {
         let (all, _) = config::load_all(&self.cwd, &paths::omp_agent_dir());
         let found = self.found_servers(&all);
         if import && found.is_empty() {
-            return self.notice("no servers to import: nothing new found in omp, pi, Claude, Codex, Gemini CLI or OpenCode");
+            return self
+                .notice("no servers to import: nothing new found in omp, pi, Claude, Codex, Gemini CLI or OpenCode");
         }
         let wizard =
             if import { Wizard::import(found, &self.cwd, env_set) } else { Wizard::new(found, &self.cwd, env_set) };
@@ -369,7 +370,9 @@ impl App {
             return true;
         }
         // An empty Enter picks the step's default, which the composer would swallow.
-        if k.code == KeyCode::Enter && self.composer.is_empty() && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        if k.code == KeyCode::Enter
+            && self.composer.is_empty()
+            && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
         {
             self.mcp_wizard_line("");
             return true;

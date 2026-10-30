@@ -62,7 +62,8 @@ pub fn scan(roots: &Roots, configured: &[Entry]) -> Vec<Found> {
                 Kind::Stdio { command, .. } => ("stdio", command.clone()),
                 Kind::Http { url, .. } => ("http", http_target(url)),
             };
-            found.push((src.group, Found { tool: src.tool.clone(), file: src.file.clone(), name, entry, kind, target }));
+            found
+                .push((src.group, Found { tool: src.tool.clone(), file: src.file.clone(), name, entry, kind, target }));
         }
     }
     found.sort_by(|a, b| (a.0, &a.1.tool, &a.1.name).cmp(&(b.0, &b.1.tool, &b.1.name)));
@@ -98,7 +99,14 @@ struct Collector {
 }
 
 impl Collector {
-    fn add(&mut self, group: u8, tool: &str, file: PathBuf, load: fn(&Path) -> Option<Value>, read: &dyn Fn(&Value) -> Servers) {
+    fn add(
+        &mut self,
+        group: u8,
+        tool: &str,
+        file: PathBuf,
+        load: fn(&Path) -> Option<Value>,
+        read: &dyn Fn(&Value) -> Servers,
+    ) {
         if same_file(&file, &self.own) {
             return;
         }
@@ -142,7 +150,9 @@ fn sources(roots: &Roots) -> Vec<Source> {
         map_servers(project, "mcpServers", std_entry)
     });
 
-    for rel in ["Library/Application Support/Claude/claude_desktop_config.json", ".config/Claude/claude_desktop_config.json"] {
+    for rel in
+        ["Library/Application Support/Claude/claude_desktop_config.json", ".config/Claude/claude_desktop_config.json"]
+    {
         c.add(5, "Claude Desktop", home.join(rel), load_json, &mcp_servers);
     }
     c.add(6, "Codex", home.join(".codex/config.toml"), load_toml, &|root| {
@@ -316,7 +326,11 @@ mod tests {
                 "fs":{"command":"npx","args":["-y","@x/fs"],"env":{"A":"1"}},
                 "remote":{"url":"https://api.example.com:8443/mcp/secret?k=1","headers":{"X":"y"}}}}"#,
         );
-        put(base, "home/.omp/profiles/work/agent/mcp.json", r#"{"mcpServers":{"work-db":{"type":"stdio","command":"db-mcp","enabled":false}}}"#);
+        put(
+            base,
+            "home/.omp/profiles/work/agent/mcp.json",
+            r#"{"mcpServers":{"work-db":{"type":"stdio","command":"db-mcp","enabled":false}}}"#,
+        );
         put(base, "home/.pi/agent/mcp.json", r#"{"mcpServers":{"pi-one":{"command":"pi-mcp"}}}"#);
         let mut projects = Map::new();
         projects.insert(
@@ -411,10 +425,7 @@ mod tests {
         assert_eq!(get(&found, "work-db").entry, json!({"type":"stdio","command":"db-mcp"}));
         assert_eq!(get(&found, "pi-one").entry, json!({"type":"stdio","command":"pi-mcp"}));
         assert_eq!(get(&found, "desk").entry["env"], json!({"N":"5","B":"true"}));
-        assert_eq!(
-            get(&found, "cx").entry,
-            json!({"type":"stdio","command":"cx","args":["a"],"env":{"K":"v"}})
-        );
+        assert_eq!(get(&found, "cx").entry, json!({"type":"stdio","command":"cx","args":["a"],"env":{"K":"v"}}));
         assert_eq!(
             get(&found, "cxweb").entry,
             json!({"type":"http","url":"https://cx.example.com/mcp",
@@ -466,7 +477,10 @@ mod tests {
         let cfg = [
             configured("fs", json!({"command":"other"})),
             configured("renamed", json!({"type":"stdio","command":"cc-mcp","args":["--token","sekret"]})),
-            configured("web", json!({"type":"http","url":"https://cx.example.com/mcp","headers":{"X-A":"b","Authorization":"Bearer ${CX_TOKEN}"}})),
+            configured(
+                "web",
+                json!({"type":"http","url":"https://cx.example.com/mcp","headers":{"X-A":"b","Authorization":"Bearer ${CX_TOKEN}"}}),
+            ),
         ];
         let found = scan(&r, &cfg);
         for gone in ["fs", "cc", "cxweb"] {
@@ -497,7 +511,8 @@ mod tests {
         let base = tmp();
         let r = roots(&base);
         let long = "a".repeat(60);
-        let cfg = json!({"mcpServers":{"my server!":{"command":"a"},"":{"command":"b"},(long.clone()):{"command":"c"}}});
+        let cfg =
+            json!({"mcpServers":{"my server!":{"command":"a"},"":{"command":"b"},(long.clone()):{"command":"c"}}});
         put(&base, "home/.pi/agent/mcp.json", &cfg.to_string());
         let found = scan(&r, &[]);
         assert_eq!(found.len(), 2);

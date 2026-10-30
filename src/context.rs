@@ -42,22 +42,29 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
 
 /// cwd-relative paths of AGENTS.md files 1–4 directories below cwd.
 fn nested_agents_md(cwd: &Path) -> Vec<String> {
-    use pi_walker::{WalkOptions, WalkRequest};
-    use std::time::{Duration, Instant};
-    let opts = WalkOptions { max_depth: 4, skip_node_modules: true, ..crate::tools::grep::walk_options() };
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let dirs = WalkRequest::from_options(cwd, opts)
-        .collect_dirs_with_heartbeat(|| if Instant::now() < deadline { Ok(()) } else { Err("timed out after 2s") });
+    use pi_walker::{FileType, Fs, walk};
+    use std::time::Duration;
+    let opts = walk::Options { max_depth: Some(4), skip_node_modules: true, ..crate::tools::grep::walk_options() };
+    let dirs = crate::tools::grep::block_on_walk(async {
+        let fs = Fs::native();
+        let collect = walk::collect(&fs, cwd, &opts, false, |_, e| {
+            if e.file_type == FileType::Dir { walk::Action::Continue } else { walk::Action::Skip }
+        });
+        match tokio::time::timeout(Duration::from_secs(2), collect).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(_) => Err("timed out after 2s".to_string()),
+        }
+    });
     match dirs {
         Err(e) => {
-            WARNINGS.with(|w| w.borrow_mut().push(format!("{}: nested AGENTS.md scan failed: {e:?}", cwd.display())));
+            WARNINGS.with(|w| w.borrow_mut().push(format!("{}: nested AGENTS.md scan failed: {e}", cwd.display())));
             vec![]
         }
         Ok(dirs) => {
             let mut v: Vec<String> = dirs
-                .into_iter()
-                .filter(|d| cwd.join(&d.path).join("AGENTS.md").is_file())
-                .map(|d| format!("{}/AGENTS.md", d.path))
+                .iter()
+                .filter(|d| cwd.join(d.rel_path()).join("AGENTS.md").is_file())
+                .map(|d| format!("{}/AGENTS.md", d.path_lossy()))
                 .collect();
             v.sort();
             v.truncate(200);

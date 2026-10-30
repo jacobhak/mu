@@ -23,10 +23,13 @@ pub fn file_for(level: Level, cwd: &Path, agent: &Path) -> PathBuf {
 
 /// Names become part of tool names (`mcp__<server>_<tool>`), so keep them plain.
 pub fn check_name(name: &str) -> Result<(), String> {
-    let ok = !name.is_empty()
-        && name.len() <= 48
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if ok { Ok(()) } else { Err(format!("`{name}` is not a valid server name (letters, digits, `_` and `-`, up to 48)")) }
+    let ok =
+        !name.is_empty() && name.len() <= 48 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("`{name}` is not a valid server name (letters, digits, `_` and `-`, up to 48)"))
+    }
 }
 
 /// The root object of a config file; a missing file is an empty one.
@@ -223,7 +226,9 @@ mod tests {
         assert!(text.ends_with("}\n") && text.find("zeta").unwrap() < text.find("mcpServers").unwrap(), "{text}");
         // The stale deny entry for the new name is gone, so the server is on.
         assert_eq!(state(&cwd, &agent), vec![("old".into(), true), ("new".into(), true)]);
-        assert!(add(Level::Project, &cwd, &agent, "old", json!({"command": "y"})).unwrap_err().contains("already defined"));
+        assert!(
+            add(Level::Project, &cwd, &agent, "old", json!({"command": "y"})).unwrap_err().contains("already defined")
+        );
         let p = add(Level::Project, &cwd, &agent, "proj", json!({"url": "http://h/mcp"})).unwrap();
         assert_eq!(p, cwd.join(".omp/mcp.json"));
         assert_eq!(state(&cwd, &agent).len(), 3);
@@ -247,7 +252,10 @@ mod tests {
         let d = tmp();
         let (cwd, agent) = (d.join("p"), d.join("a"));
         put(&cwd.join(".omp/mcp.json"), r#"{"mcpServers":{"s":{"command":"x"},"keep":{"command":"k"}}}"#);
-        put(&agent.join("mcp.json"), r#"{"mcpServers":{"s":{"command":"y"}},"disabledServers":["s","other"],"enabledServers":["s"]}"#);
+        put(
+            &agent.join("mcp.json"),
+            r#"{"mcpServers":{"s":{"command":"y"}},"disabledServers":["s","other"],"enabledServers":["s"]}"#,
+        );
         assert_eq!(remove(&cwd, &agent, "s").unwrap().len(), 2);
         assert_eq!(state(&cwd, &agent), vec![("keep".into(), true)]);
         let user: Value = serde_json::from_str(&std::fs::read_to_string(agent.join("mcp.json")).unwrap()).unwrap();
@@ -261,7 +269,10 @@ mod tests {
     fn enable_and_disable_round_trip() {
         let d = tmp();
         let (cwd, agent) = (d.join("p"), d.join("a"));
-        put(&cwd.join(".omp/mcp.json"), r#"{"mcpServers":{"on":{"command":"x"},"off":{"command":"y","enabled":false}}}"#);
+        put(
+            &cwd.join(".omp/mcp.json"),
+            r#"{"mcpServers":{"on":{"command":"x"},"off":{"command":"y","enabled":false}}}"#,
+        );
         assert_eq!(state(&cwd, &agent), vec![("on".into(), true), ("off".into(), false)]);
         assert!(set_enabled(&cwd, &agent, "on", false).unwrap());
         assert!(!set_enabled(&cwd, &agent, "on", false).unwrap(), "already off");

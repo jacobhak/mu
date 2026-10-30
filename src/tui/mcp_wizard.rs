@@ -151,10 +151,7 @@ impl Wizard {
             },
             Phase::Name => match &self.default_name {
                 Some(d) => Step::Text { prompt: format!("Server name [{d}]"), default: Some(d.clone()) },
-                None => Step::Text {
-                    prompt: "Server name (letters, digits, `_` and `-`)".into(),
-                    default: None,
-                },
+                None => Step::Text { prompt: "Server name (letters, digits, `_` and `-`)".into(), default: None },
             },
             Phase::Confirm => Step::Pick {
                 title: "Add this server?".into(),
@@ -172,10 +169,9 @@ impl Wizard {
     pub fn answer(&mut self, a: Answer) -> Result<(), String> {
         match (self.phase, a) {
             (Phase::Done | Phase::Cancelled, _) => Err("the wizard has finished".into()),
-            (
-                Phase::Source | Phase::Discovered | Phase::Popular | Phase::Level | Phase::Confirm,
-                Answer::Pick(i),
-            ) => self.pick(i),
+            (Phase::Source | Phase::Discovered | Phase::Popular | Phase::Level | Phase::Confirm, Answer::Pick(i)) => {
+                self.pick(i)
+            }
             (Phase::Source | Phase::Discovered | Phase::Popular | Phase::Level | Phase::Confirm, Answer::Text(_)) => {
                 Err("choose one of the options".into())
             }
@@ -635,11 +631,8 @@ mod tests {
 
     #[test]
     fn warning_counts_headers_and_env() {
-        let f = found(
-            "T",
-            "x",
-            json!({"type": "http", "url": "https://h", "headers": {"A": "1", "B": "${B}", "C": "3"}}),
-        );
+        let f =
+            found("T", "x", json!({"type": "http", "url": "https://h", "headers": {"A": "1", "B": "${B}", "C": "3"}}));
         let mut w = wiz(vec![f]);
         pick(&mut w, 0);
         pick(&mut w, 0);
@@ -679,10 +672,7 @@ mod tests {
         let mut w = wiz(vec![]);
         pick(&mut w, 0);
         pick(&mut w, 0);
-        assert_eq!(
-            prompt(&w),
-            ("Directory the server may access [/work/proj]".into(), Some("/work/proj".into()))
-        );
+        assert_eq!(prompt(&w), ("Directory the server may access [/work/proj]".into(), Some("/work/proj".into())));
         text(&mut w, "/srv/data");
         finish(&mut w, 1, "files");
         let d = done(&w);
