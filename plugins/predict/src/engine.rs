@@ -63,13 +63,13 @@ impl State {
         Some(best[text.len()..].to_owned())
     }
 
-    /// The word ghost for the word ending `text`, with its confidence. SmolLM needs two letters typed.
+    /// The word ghost for the word ending `text`, with its confidence, from SmolLM when it is loaded, else the n-gram.
+    /// SmolLM is asked from the first letter: gating it at two cost it more keystrokes than it saved in wrong ghosts.
     pub fn word_suggestion(&mut self, text: &str) -> Option<Suggestion> {
         let (before, prefix) = split_word(text)?;
         let q = Query { before, prefix };
         match self.smollm.as_mut() {
-            Some(p) if prefix.chars().count() >= 2 => p.complete(&q),
-            Some(_) => None,
+            Some(p) => p.complete(&q),
             None => self.ngram.complete(&q),
         }
     }
@@ -186,13 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn smollm_replaces_the_word_ghost_and_needs_two_letters() {
+    fn smollm_replaces_the_word_ghost_from_the_first_letter() {
         let mut s = state();
         s.attach_smollm(Box::new(Fake), &[]);
         assert!(s.smollm_active());
         assert_eq!(s.complete("fix the pa", "/x", "", 0.3), "XYZ");
         assert_eq!(s.complete("fix the pa", "/x", "", 0.95), "", "below the request threshold");
-        assert_eq!(s.complete("fix the p", "/x", "", 0.3), "", "one letter: SmolLM is not asked");
+        assert_eq!(s.complete("fix the p", "/x", "", 0.3), "XYZ", "one letter: SmolLM is asked");
         assert_eq!(s.persist(), Ok(()));
     }
 
