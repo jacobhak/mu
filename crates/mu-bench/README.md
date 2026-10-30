@@ -29,6 +29,8 @@ Replies stream in bursts by default (`chunk_bytes` every `chunk_delay_ms`, 24 KB
 cargo build --release && cargo run --release -p mu-bench -- compare crates/mu-bench/scenarios/compare-agentic.toml
 ```
 
+> **Read this before quoting any mu number.** mu is measured without its gateway. Normally mu reaches models through a shared `omp auth-broker` + `omp auth-gateway` pair (about 305 MB total and 275 MB private, shared by every mu session). That pair is not in the mu rows. With it, one mu session costs about what claude or omp do, and mu's advantage shows only with several sessions sharing one gateway. The other harnesses call their providers directly.
+
 Runs one prompt headless in each of mu, claude, opencode, omp and pi, all against the same fake model server. `--harness` picks a subset, `--runs` sets the rounds (default 5, harnesses interleaved), `--sessions` sets how many sessions of one harness run at once (default 3, 1 skips that part). Each round runs every harness alone and then as that many concurrent sessions that share one `HOME`, as several terminals of one user do.
 
 Each table row is the median over the runs. A harness that does not finish the scenario is reported with the tail of its output.
