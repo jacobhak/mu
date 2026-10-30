@@ -434,7 +434,11 @@ impl Doc {
     /// The blockquote for words `[lo, hi)`: every line prefixed `> `.
     fn block(&self, lo: usize, hi: usize) -> String {
         let lines = self.quote_text(lo, hi);
-        lines.lines().map(|l| if l.is_empty() { ">".to_string() } else { format!("> {l}") }).collect::<Vec<_>>().join("\n")
+        lines
+            .lines()
+            .map(|l| if l.is_empty() { ">".to_string() } else { format!("> {l}") })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
