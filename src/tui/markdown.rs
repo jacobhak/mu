@@ -125,24 +125,27 @@ pub fn links(text: &str) -> Vec<String> {
 /// Parses `buf` and returns the start of the last top-level block: everything before it is made of
 /// blocks that already have a successor, so later text cannot change them. A list or quote that is
 /// still open is the last block, so it is never cut in the middle, and an open code fence is too.
+/// A table is only final once a blank line follows it: a partial row (`|`) right after it parses
+/// as a paragraph, and would otherwise cut the table short.
 pub fn stable_prefix(buf: &str) -> usize {
     let mut depth = 0usize;
-    let mut starts: Vec<usize> = Vec::new();
+    let mut starts: Vec<(usize, bool)> = Vec::new();
     for (ev, range) in Parser::new_ext(buf, OPTS).into_offset_iter() {
         match ev {
-            Event::Start(_) => {
+            Event::Start(tag) => {
                 if depth == 0 {
-                    starts.push(range.start);
+                    starts.push((range.start, matches!(tag, Tag::Table(_))));
                 }
                 depth += 1;
             }
             Event::End(_) => depth = depth.saturating_sub(1),
-            _ if depth == 0 => starts.push(range.start),
+            _ if depth == 0 => starts.push((range.start, false)),
             _ => {}
         }
     }
     match starts.as_slice() {
-        [.., last] if starts.len() >= 2 => *last,
+        [.., (table, true), (last, _)] if !buf[..*last].trim_end_matches([' ', '\t']).ends_with("\n\n") => *table,
+        [.., (last, _)] if starts.len() >= 2 => *last,
         _ => 0,
     }
 }
@@ -802,6 +805,17 @@ mod tests {
     fn stable_prefix_two_paragraphs() {
         let b = "a\n\nb\n\nc";
         assert_eq!(stable_prefix(b), "a\n\nb\n\n".len());
+    }
+
+    #[test]
+    fn a_table_is_not_cut_by_a_partial_row() {
+        let full = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\nafter";
+        let cut = full.find("after").unwrap();
+        for i in (1..=full.len()).filter(|&i| full.is_char_boundary(i)) {
+            let n = stable_prefix(&full[..i]);
+            assert!(n == 0 || n == cut, "cut at {n} for {:?}", &full[..i]);
+        }
+        assert_eq!(stable_prefix(full), cut);
     }
 
     #[test]
