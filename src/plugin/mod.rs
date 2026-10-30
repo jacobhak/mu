@@ -99,12 +99,39 @@ struct Slot {
     start: tokio::sync::Mutex<()>,
 }
 
+/// What `PluginHost::mcp_sync` changed, by server name.
+#[derive(Debug, Default, PartialEq)]
+pub struct McpSync {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+}
+
+impl McpSync {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// The runtime state of one MCP server.
+#[derive(Debug, Clone, Default)]
+pub struct McpInfo {
+    pub running: bool,
+    /// The tool list is known this session.
+    pub listed: bool,
+    pub failed: bool,
+    pub needs_login: bool,
+    pub tools: Vec<String>,
+}
+
 pub struct PluginHost {
-    slots: Vec<Rc<Slot>>,
+    slots: RefCell<Vec<Rc<Slot>>>,
     shared: Rc<Shared>,
     pub warnings: Vec<String>,
     /// Every advertised MCP tool name, so a later listing can tell a clash.
     seen: RefCell<std::collections::HashSet<String>>,
+    /// The lifetime of an MCP server added after startup.
+    mcp_lifetime: Lifetime,
 }
 
 fn resolve_command(m: &Manifest) -> std::path::PathBuf {
@@ -524,24 +551,7 @@ impl PluginHost {
             })
             .collect();
         for s in servers {
-            let m = Manifest {
-                name: format!("mcp:{}", s.name),
-                command: vec![s.name.clone()],
-                lifetime: mcp_lifetime,
-                hooks: Vec::new(),
-                provider: None,
-                tools: Vec::new(),
-                dir: std::path::PathBuf::from(&init.cwd),
-            };
-            let ms = mcp::McpSlot::new(s, &init.cwd);
-            warnings.extend(ms.load_cache(&cache_dir, &mut seen));
-            slots.push(Rc::new(Slot {
-                skip_hooks_until: Cell::new(None),
-                manifest: m,
-                mcp: Some(ms),
-                proc: RefCell::new(None),
-                start: tokio::sync::Mutex::new(()),
-            }));
+            slots.push(Self::mcp_slot(s, mcp_lifetime, &init.cwd, &cache_dir, &mut seen, &mut warnings));
         }
         let gateway = slots.iter().find(|s| s.manifest.provider.is_some()).map(Rc::downgrade);
         let shared = Rc::new(Shared {
@@ -552,7 +562,36 @@ impl PluginHost {
             cache_dir,
             interactive: Cell::new(false),
         });
-        Rc::new(Self { slots, shared, warnings, seen: RefCell::new(seen) })
+        Rc::new(Self { slots: RefCell::new(slots), shared, warnings, seen: RefCell::new(seen), mcp_lifetime })
+    }
+
+    /// A slot for an MCP server, advertising its tools from the cache when there is one.
+    fn mcp_slot(
+        s: mcp::config::McpServer,
+        lifetime: Lifetime,
+        cwd: &str,
+        cache_dir: &std::path::Path,
+        seen: &mut std::collections::HashSet<String>,
+        warnings: &mut Vec<String>,
+    ) -> Rc<Slot> {
+        let m = Manifest {
+            name: format!("mcp:{}", s.name),
+            command: vec![s.name.clone()],
+            lifetime,
+            hooks: Vec::new(),
+            provider: None,
+            tools: Vec::new(),
+            dir: std::path::PathBuf::from(cwd),
+        };
+        let ms = mcp::McpSlot::new(s, cwd);
+        warnings.extend(ms.load_cache(cache_dir, seen));
+        Rc::new(Slot {
+            skip_hooks_until: Cell::new(None),
+            manifest: m,
+            mcp: Some(ms),
+            proc: RefCell::new(None),
+            start: tokio::sync::Mutex::new(()),
+        })
     }
 
     pub fn set_providers(&self, p: &Rc<Providers>) {
@@ -573,6 +612,7 @@ impl PluginHost {
 
     pub fn tool_defs(&self) -> Vec<ToolDef> {
         self.slots
+            .borrow()
             .iter()
             .flat_map(|s| Self::specs(s))
             .filter_map(|t| match t.schema() {
@@ -587,11 +627,15 @@ impl PluginHost {
             .collect()
     }
 
-    fn slot_for_tool(&self, name: &str) -> Option<&Rc<Slot>> {
-        self.slots.iter().find(|s| match &s.mcp {
-            Some(m) => m.tools.borrow().iter().any(|t| t.spec.name == name),
-            None => s.manifest.tools.iter().any(|t| t.name == name),
-        })
+    fn slot_for_tool(&self, name: &str) -> Option<Rc<Slot>> {
+        self.slots
+            .borrow()
+            .iter()
+            .find(|s| match &s.mcp {
+                Some(m) => m.tools.borrow().iter().any(|t| t.spec.name == name),
+                None => s.manifest.tools.iter().any(|t| t.name == name),
+            })
+            .cloned()
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
@@ -607,6 +651,7 @@ impl PluginHost {
     /// and lifetime, and its tool count as `extra`.
     pub fn status(&self) -> Vec<(String, String, bool, String)> {
         self.slots
+            .borrow()
             .iter()
             .map(|s| {
                 let (label, extra) = match &s.mcp {
@@ -625,13 +670,99 @@ impl PluginHost {
 
     /// Names of the configured MCP servers.
     pub fn mcp_names(&self) -> Vec<String> {
-        self.slots.iter().filter_map(|s| s.mcp.as_ref().map(|m| m.name())).collect()
+        self.slots.borrow().iter().filter_map(|s| s.mcp.as_ref().map(|m| m.name())).collect()
+    }
+
+    /// The runtime state of a configured MCP server.
+    pub fn mcp_info(&self, name: &str) -> Option<McpInfo> {
+        let slots = self.slots.borrow();
+        let s = slots.iter().find(|s| s.mcp.as_ref().is_some_and(|m| m.name() == name))?;
+        let m = s.mcp.as_ref()?;
+        Some(McpInfo {
+            running: s.proc.borrow().is_some(),
+            listed: m.listed.get(),
+            failed: m.failed.get(),
+            needs_login: m.needs_login.get(),
+            tools: m.tools.borrow().iter().map(|t| t.spec.name.clone()).collect(),
+        })
+    }
+
+    /// Brings the MCP servers in line with `servers`, the enabled ones from the config: a removed
+    /// server is dropped, a changed one stops and restarts on its new config, a new one is added.
+    /// Tools come from the cache; a server without a cached list is listed by the next
+    /// `list_missing_until`. The caller refreshes the agent's tool list when anything changed.
+    pub async fn mcp_sync(&self, servers: Vec<mcp::config::McpServer>) -> McpSync {
+        let cwd = self.shared.init.borrow().cwd.clone();
+        let mut out = McpSync::default();
+        let mut warnings = Vec::new();
+        let mut stop: Vec<Rc<Slot>> = Vec::new();
+        {
+            let mut slots = self.slots.borrow_mut();
+            let mut seen = self.seen.borrow_mut();
+            slots.retain(|s| {
+                let Some(m) = &s.mcp else { return true };
+                let name = m.name();
+                if servers.iter().any(|n| n.name == name) {
+                    return true;
+                }
+                for t in m.tools.borrow().iter() {
+                    seen.remove(&t.spec.name);
+                }
+                stop.push(s.clone());
+                out.removed.push(name);
+                false
+            });
+            for server in servers {
+                let found = slots.iter().find(|s| s.mcp.as_ref().is_some_and(|m| m.name() == server.name)).cloned();
+                let Some(slot) = found else {
+                    out.added.push(server.name.clone());
+                    let s = Self::mcp_slot(
+                        server,
+                        self.mcp_lifetime,
+                        &cwd,
+                        &self.shared.cache_dir,
+                        &mut seen,
+                        &mut warnings,
+                    );
+                    slots.push(s);
+                    continue;
+                };
+                let m = slot.mcp.as_ref().expect("an mcp slot");
+                let hash = mcp::cache::config_hash(&server, &cwd);
+                if hash == *m.hash.borrow() {
+                    continue;
+                }
+                out.changed.push(server.name.clone());
+                *m.hash.borrow_mut() = hash;
+                *m.server.borrow_mut() = server;
+                m.listed.set(false);
+                m.failed.set(false);
+                m.needs_login.set(false);
+                m.stale.set(false);
+                *m.instructions.borrow_mut() = None;
+                warnings.extend(m.set_tools(&[], &mut seen));
+                warnings.extend(m.load_cache(&self.shared.cache_dir, &mut seen));
+                stop.push(slot.clone());
+            }
+        }
+        for w in warnings {
+            let _ = self.shared.notices.send(w);
+        }
+        for s in stop {
+            let p = s.proc.borrow().clone();
+            if let Some(p) = p {
+                s.detach(&p);
+                p.shutdown().await;
+            }
+        }
+        out
     }
 
     /// MCP servers that need an OAuth login: configured for OAuth, or a token fetch failed.
     /// `(name, url or kind)`.
     pub fn needs_login(&self) -> Vec<(String, String)> {
         self.slots
+            .borrow()
             .iter()
             .filter_map(|s| {
                 let m = s.mcp.as_ref()?;
@@ -646,6 +777,7 @@ impl PluginHost {
     pub fn mcp_instructions(&self) -> Option<String> {
         mcp::render_instructions(
             self.slots
+                .borrow()
                 .iter()
                 .filter_map(|s| {
                     let m = s.mcp.as_ref()?;
@@ -668,6 +800,7 @@ impl PluginHost {
     pub async fn list_missing_until(&self, cancel: &CancellationToken) {
         let todo: Vec<Rc<Slot>> = self
             .slots
+            .borrow()
             .iter()
             .filter(|s| s.mcp.as_ref().is_some_and(|m| !m.listed.get() && !m.failed.get()))
             .cloned()
@@ -772,10 +905,21 @@ impl PluginHost {
     /// After an interactive login: reloads the server's config entry, restarts it on the new
     /// credential and lists its tools if the session has none yet. `Ok((tools, changed))`.
     pub async fn after_login(&self, name: &str) -> Result<(usize, bool), String> {
+        self.reconnect_slot(name, false).await
+    }
+
+    /// Restarts the server on its current config and lists its tools again. `Ok((tools, changed))`.
+    pub async fn mcp_reconnect(&self, name: &str) -> Result<(usize, bool), String> {
+        self.reconnect_slot(name, true).await
+    }
+
+    async fn reconnect_slot(&self, name: &str, force: bool) -> Result<(usize, bool), String> {
         let slot = self
             .slots
+            .borrow()
             .iter()
             .find(|s| s.mcp.as_ref().is_some_and(|m| m.name() == name))
+            .cloned()
             .ok_or_else(|| format!("no MCP server {name}"))?;
         let m = slot.mcp.as_ref().expect("an mcp slot");
         let cwd = self.shared.init.borrow().cwd.clone();
@@ -797,8 +941,8 @@ impl PluginHost {
         m.needs_login.set(false);
         m.failed.set(false);
         let before: Vec<String> = m.tools.borrow().iter().map(|t| t.spec.name.clone()).collect();
-        if relist || m.tools.borrow().is_empty() {
-            self.list_slot(slot).await?;
+        if force || relist || m.tools.borrow().is_empty() {
+            self.list_slot(&slot).await?;
         }
         let after: Vec<String> = m.tools.borrow().iter().map(|t| t.spec.name.clone()).collect();
         Ok((after.len(), before != after))
@@ -973,7 +1117,7 @@ impl PluginHost {
         let fail =
             |e: String| ToolResult { content: e, is_error: true, display: None, images: Vec::new(), details: None };
         let Some(slot) = self.slot_for_tool(name) else { return fail(format!("Unknown tool: {name}")) };
-        let proc = match self.ensure(slot).await {
+        let proc = match self.ensure(&slot).await {
             Ok(p) => p,
             Err(e) => return fail(e),
         };
@@ -1033,9 +1177,14 @@ impl PluginHost {
 
     /// One request to a named plugin, starting it if needed.
     pub async fn request(&self, plugin: &str, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-        let slot =
-            self.slots.iter().find(|s| s.manifest.name == plugin).ok_or_else(|| format!("no plugin {plugin}"))?;
-        let proc = self.ensure(slot).await?;
+        let slot = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|s| s.manifest.name == plugin)
+            .cloned()
+            .ok_or_else(|| format!("no plugin {plugin}"))?;
+        let proc = self.ensure(&slot).await?;
         proc.request(method, params, Some(timeout)).await
     }
 
@@ -1047,11 +1196,13 @@ impl PluginHost {
         let event = sub.split(':').next().unwrap_or(sub);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(if event == "session_end" { 10 } else { 30 });
         let now = Instant::now();
-        let slots: Vec<&Rc<Slot>> = self
+        let slots: Vec<Rc<Slot>> = self
             .slots
+            .borrow()
             .iter()
             .filter(|s| s.manifest.hooks.iter().any(|h| h == sub))
             .filter(|s| s.skip_hooks_until.get().is_none_or(|t| now >= t))
+            .cloned()
             .collect();
         let method = format!("hook/{event}");
         let futs = slots.iter().map(|slot| {
@@ -1086,10 +1237,10 @@ impl PluginHost {
     }
 
     pub async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
-        let slot = self.slots.iter().find(|s| s.manifest.provider.as_deref() == Some(kind)).ok_or_else(|| {
+        let slot = self.slots.borrow().iter().find(|s| s.manifest.provider.as_deref() == Some(kind)).cloned().ok_or_else(|| {
             "no gateway: install the gateway plugin (~/.mu/plugins/gateway) or set MU_GATEWAY_URL".to_string()
         })?;
-        let proc = self.ensure(slot).await?;
+        let proc = self.ensure(&slot).await?;
         let v = proc
             .request("provider/endpoint", json!({"clientPid": std::process::id()}), Some(Duration::from_secs(45)))
             .await?;
@@ -1100,13 +1251,19 @@ impl PluginHost {
     }
 
     pub async fn shutdown_all(&self) {
-        for s in &self.slots {
+        let slots = self.slots.borrow().clone();
+        for s in &slots {
             let p = s.proc.borrow().clone();
             if let Some(p) = p {
                 s.detach(&p);
                 p.shutdown().await;
             }
         }
+    }
+
+    #[cfg(test)]
+    fn slot(&self, i: usize) -> Rc<Slot> {
+        self.slots.borrow()[i].clone()
     }
 }
 
@@ -1160,7 +1317,7 @@ done
             });
             let r = h.call_tool("slow", &json!({}), &cancel).await;
             assert!(r.is_error && r.content.contains("aborted"), "{}", r.content);
-            let proc = h.slots[0].proc.borrow().clone().unwrap();
+            let proc = h.slot(0).proc.borrow().clone().unwrap();
             assert_eq!(proc.inflight.get(), 0);
             assert!(proc.pending.is_empty());
             h.shutdown_all().await;
@@ -1175,7 +1332,7 @@ done
             let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
             assert!(r.is_error, "{}", r.content);
             tokio::time::sleep(Duration::from_millis(300)).await;
-            assert!(h.slots[0].proc.borrow().is_none(), "slot cleared so the next call restarts it");
+            assert!(h.slot(0).proc.borrow().is_none(), "slot cleared so the next call restarts it");
             let _ = std::fs::remove_dir_all(dir);
         });
     }
@@ -1187,11 +1344,11 @@ done
                 host("printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":\"ok\"}}\\n' \"$id\"", "idle:1s");
             let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
             assert_eq!(r.content, "ok");
-            let first = h.slots[0].proc.borrow().clone().unwrap().pid;
+            let first = h.slot(0).proc.borrow().clone().unwrap().pid;
             tokio::time::sleep(Duration::from_millis(1600)).await;
             let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
             assert_eq!(r.content, "ok", "{}", r.content);
-            let second = h.slots[0].proc.borrow().clone().unwrap().pid;
+            let second = h.slot(0).proc.borrow().clone().unwrap().pid;
             assert_ne!(first, second);
             h.shutdown_all().await;
             let _ = std::fs::remove_dir_all(dir);
@@ -1292,7 +1449,7 @@ done
             // Same config: advertised from the cache, nothing is started.
             let (warm, _n) = fx.host("", "");
             assert_eq!(warm.tool_defs().len(), 2);
-            assert!(warm.slots[0].proc.borrow().is_none());
+            assert!(warm.slot(0).proc.borrow().is_none());
             warm.list_missing().await;
             assert_eq!(fx.log().matches(r#""method":"initialize""#).count(), 1, "no second start");
             assert!(warm.mcp_instructions().is_some());
@@ -1333,7 +1490,7 @@ done
             let (h, _n) = fx.host("", "");
             h.list_missing().await;
             // The script lists only echo and other; call `pinger` through the remote-name map.
-            let slot = h.slots[0].clone();
+            let slot = h.slot(0);
             let m = slot.mcp.as_ref().unwrap();
             let mut taken = std::collections::HashSet::new();
             let tools: Vec<_> = ["echo", "pinger", "pic"]
@@ -1363,7 +1520,8 @@ done
             let fx = McpFx::new();
             let (h, _n) = fx.host("", "");
             h.list_missing().await;
-            let m = h.slots[0].mcp.as_ref().unwrap();
+            let slot = h.slot(0);
+            let m = slot.mcp.as_ref().unwrap();
             let mut taken = std::collections::HashSet::new();
             let t = [mcp::cache::RemoteTool {
                 name: "tokener".into(),
@@ -1412,8 +1570,9 @@ done
             let t = Instant::now();
             h.list_missing_until(&cancel).await;
             assert!(t.elapsed() < Duration::from_secs(10), "returned promptly: {:?}", t.elapsed());
-            let m = h.slots[0].mcp.as_ref().unwrap();
-            assert!(h.slots[0].proc.borrow().is_none(), "the server was stopped");
+            let slot = h.slot(0);
+            let m = slot.mcp.as_ref().unwrap();
+            assert!(slot.proc.borrow().is_none(), "the server was stopped");
             assert!(!m.listed.get() && !m.failed.get(), "left unlisted so the next turn tries again");
         });
     }
@@ -1434,7 +1593,8 @@ done
         run(async {
             let fx = McpFx::new();
             let (h, _n) = fx.host("", "");
-            let m = h.slots[0].mcp.as_ref().unwrap();
+            let slot = h.slot(0);
+            let m = slot.mcp.as_ref().unwrap();
             m.failed.set(true);
             m.needs_login.set(true);
             h.list_missing().await;
@@ -1467,7 +1627,7 @@ done
             let fx = McpFx::new();
             let (h, _n) = fx.host("", "");
             h.list_missing().await;
-            let slot = h.slots[0].clone();
+            let slot = h.slot(0);
             let mut taken = std::collections::HashSet::new();
             let hang =
                 [mcp::cache::RemoteTool { name: "hang".into(), description: String::new(), input_schema: json!({}) }];
@@ -1487,6 +1647,56 @@ done
             tokio::time::sleep(Duration::from_millis(200)).await;
             // SAFETY: signal 0 only checks that the group exists.
             assert_eq!(unsafe { libc::kill(-pid, 0) }, -1, "the process group is gone");
+        });
+    }
+
+    #[test]
+    fn mcp_sync_adds_changes_and_removes_servers_live() {
+        run(async {
+            let fx = McpFx::new();
+            let (h, _n) = fx.host("", "");
+            h.list_missing().await;
+            assert_eq!(h.tool_defs().len(), 2);
+            let log = fx.dir.join("log").display().to_string();
+            let load = |servers: &[(&str, &str)]| {
+                let body: Vec<String> = servers
+                    .iter()
+                    .map(|(n, a)| {
+                        format!(r#""{n}":{{"command":"sh","args":["server.sh","{a}"],"env":{{"LOG":"{log}"}}}}"#)
+                    })
+                    .collect();
+                std::fs::write(fx.dir.join("agent/mcp.json"), format!(r#"{{"mcpServers":{{{}}}}}"#, body.join(",")))
+                    .unwrap();
+                mcp::config::load_with(&fx.dir, &fx.dir.join("agent"), &|_| None).0
+            };
+            let inits = || fx.log().matches(r#""method":"initialize""#).count();
+
+            assert!(h.mcp_sync(load(&[("srv", "")])).await.is_empty(), "same config changes nothing");
+
+            let r = h.mcp_sync(load(&[("srv", ""), ("two", "b")])).await;
+            assert_eq!(r, McpSync { added: vec!["two".into()], ..Default::default() });
+            assert_eq!(h.tool_defs().len(), 2, "the new server is advertised once it is listed");
+            h.list_missing().await;
+            assert_eq!(h.tool_defs().len(), 4);
+            assert_eq!(h.mcp_info("two").unwrap().tools, ["mcp__two_echo", "mcp__two_other"]);
+
+            let r = h.mcp_sync(load(&[("srv", "--x"), ("two", "b")])).await;
+            assert_eq!(r, McpSync { changed: vec!["srv".into()], ..Default::default() });
+            assert!(h.slot(0).proc.borrow().is_none(), "stopped, to restart on the new config");
+            assert_eq!(h.tool_defs().len(), 2, "the changed server is unlisted until listed again");
+            h.list_missing().await;
+            assert_eq!(h.tool_defs().len(), 4);
+
+            let r = h.mcp_sync(load(&[("two", "b")])).await;
+            assert_eq!(r, McpSync { removed: vec!["srv".into()], ..Default::default() });
+            assert_eq!(h.mcp_names(), ["two"]);
+            assert!(h.mcp_info("srv").is_none() && !h.has_tool("mcp__srv_echo"));
+
+            let before = inits();
+            assert_eq!(h.mcp_reconnect("two").await, Ok((2, false)));
+            assert_eq!(inits(), before + 1, "reconnect starts the server again");
+            assert!(h.mcp_reconnect("nope").await.is_err());
+            h.shutdown_all().await;
         });
     }
 }

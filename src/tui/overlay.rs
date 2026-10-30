@@ -21,6 +21,35 @@ pub enum LoginTarget {
     Mcp(String),
 }
 
+/// A row of the `/mcp` server list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum McpRow {
+    Server(String),
+    Add,
+    Import,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpAction {
+    Enable,
+    Disable,
+    Reconnect,
+    Test,
+    Login,
+    Remove,
+}
+
+/// Which `/mcp` picker this is, with what its rows stand for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum McpPick {
+    Servers(Vec<McpRow>),
+    Actions(String, Vec<McpAction>),
+    /// Remove this server? Row 0 confirms.
+    ConfirmRemove(String),
+    /// A step of the `/mcp add` wizard.
+    Wizard,
+}
+
 pub enum Overlay {
     Model {
         sel: Select,
@@ -37,6 +66,11 @@ pub enum Overlay {
     Login {
         sel: Select,
         targets: Vec<LoginTarget>,
+    },
+    /// A `/mcp` picker: the server list, a server's actions, or a wizard step.
+    Mcp {
+        sel: Select,
+        pick: McpPick,
     },
     Session {
         sel: Select,
@@ -79,6 +113,8 @@ pub enum OverlayEvent {
         model: String,
     },
     Login(LoginTarget),
+    /// A `/mcp` picker closed: the row chosen, or `None` when dismissed.
+    Mcp(McpPick, Option<usize>),
     Copy(Option<String>),
     /// Insert these blockquotes at the end of the composer.
     Quote(Vec<String>),
@@ -354,6 +390,7 @@ impl Overlay {
             Overlay::Model { sel, .. }
             | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
+            | Overlay::Mcp { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
@@ -367,6 +404,7 @@ impl Overlay {
             Overlay::Model { sel, .. }
             | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
+            | Overlay::Mcp { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
@@ -446,6 +484,11 @@ impl Overlay {
                     (None, i.first().and_then(|i| targets.get(*i)).cloned().map(OverlayEvent::Login))
                 }
                 _ => (None, None),
+            },
+            Overlay::Mcp { mut sel, pick } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Mcp { sel, pick }), None),
+                SelectResult::Chosen(i) => (None, Some(OverlayEvent::Mcp(pick, i.first().copied()))),
+                _ => (None, Some(OverlayEvent::Mcp(pick, None))),
             },
             Overlay::Copy { mut sel, texts } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Copy { sel, texts }), None),

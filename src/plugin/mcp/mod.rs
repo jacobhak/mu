@@ -6,6 +6,8 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod convert;
+pub mod discover;
+pub mod store;
 
 use super::manifest::ToolSpec;
 use cache::RemoteTool;
