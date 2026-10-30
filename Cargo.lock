@@ -2722,8 +2722,7 @@ dependencies = [
 [[package]]
 name = "grep-searcher"
 version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72348823a0eafc4bc2e9051064f28b5b42cc100b571b3a35d67918d711efcbc6"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "bstr",
  "encoding_rs",
