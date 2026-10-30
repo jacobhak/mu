@@ -1,0 +1,78 @@
+corpus: 3970 prompts, 4109 sightings; evaluating the last 100 single-line sightings (from sighting 4003)
+smollm: /home/jacob/.cache/mu-predict-bench/SmolLM2-135M; max words 4, p_ext 0.02, wrong ghost costs 1 keystroke(s), trailing-space ghosts on, free trailing space off
+evaluated 100 sightings: 4391 positions, 4081 with a SmolLM candidate, 697 after a space
+positions by words in the longest candidate: 1 word(s): 606, 2 word(s): 488, 3 word(s): 407, 4 word(s): 2580; none: 310
+raw probability of each extension word: median 0.148, p90 0.507, over 9042 extensions
+
+== headline: whole-ghost accept (no trailing space; the composer today) ==
+config                        gross      net  wrong/100w  accepts saved chars/acc keystrokes
+word τ=0.15                  26.76%   18.33%       46.42      685            1.72       3216
+word τ=0.3                   20.79%   15.51%       29.11      585            1.56       3478
+word τ=0.5                   13.30%   10.93%       13.05      409            1.43       3807
+2-word τ=0.15                 8.11%    4.81%       18.19       65            5.48       4035
+2-word τ=0.3                  4.40%    3.32%        5.90       36            5.36       4198
+2-word τ=0.5                  2.37%    2.10%        1.51       19            5.47       4287
+3-word τ=0.15                 1.16%    0.66%        2.76        5           10.20       4340
+3-word τ=0.3                  0.23%    0.07%        0.88        1           10.00       4381
+3-word τ=0.5                  0.00%   -0.07%        0.38        0            0.00       4391
+longest τ=0.15               28.26%   18.74%       52.45      527            2.35       3150
+longest τ=0.3                22.50%   16.62%       32.37      515            1.92       3403
+longest τ=0.5                14.26%   11.66%       14.30      380            1.65       3765
+ev gate=0.5                  28.85%   20.11%       48.18      392            3.23       3124
+ev gate=1                    24.57%   18.40%       34.00      330            3.27       3312
+ev gate=1.5                  21.68%   16.90%       26.35      288            3.31       3439
+word τ=0.15 +bnd             29.58%   18.24%       62.48      688            1.89       3092
+word τ=0.3 +bnd              22.77%   16.15%       36.51      586            1.71       3391
+word τ=0.5 +bnd              14.37%   11.55%       15.56      409            1.54       3760
+2-word τ=0.15 +bnd            8.31%    4.53%       20.83       65            5.62       4026
+2-word τ=0.3 +bnd             4.46%    3.23%        6.78       36            5.44       4195
+2-word τ=0.5 +bnd             2.41%    2.10%        1.76       19            5.58       4285
+3-word τ=0.15 +bnd            1.18%    0.52%        3.64        5           10.40       4339
+3-word τ=0.3 +bnd             0.23%    0.05%        1.00        1           10.00       4381
+3-word τ=0.5 +bnd             0.00%   -0.09%        0.50        0            0.00       4391
+longest τ=0.15 +bnd          29.49%   17.70%       64.99      534            2.43       3096
+longest τ=0.3 +bnd           23.46%   16.47%       38.52      521            1.98       3361
+longest τ=0.5 +bnd           15.01%   12.05%       16.31      383            1.72       3732
+ev gate=0.5 +bnd             29.97%   19.11%       59.85      400            3.29       3075
+ev gate=1 +bnd               25.32%   17.83%       41.28      334            3.33       3279
+ev gate=1.5 +bnd             22.23%   16.44%       31.87      292            3.34       3415
+
+== HYPOTHETICAL: word-wise accept (Tab takes one word of the ghost; no such key exists today) ==
+config                        gross      net  wrong/100w  accepts saved chars/acc keystrokes
+word τ=0.15                  26.76%   18.33%       46.42      685            1.72       3216
+word τ=0.3                   20.79%   15.51%       29.11      585            1.56       3478
+word τ=0.5                   13.30%   10.93%       13.05      409            1.43       3807
+2-word τ=0.15                11.20%    9.72%        8.16      157            3.13       3899
+2-word τ=0.3                  5.10%    4.69%        2.26       68            3.29       4167
+2-word τ=0.5                  2.60%    2.53%        0.38       28            4.07       4277
+3-word τ=0.15                 1.62%    1.55%        0.38       22            3.23       4320
+3-word τ=0.3                  0.39%    0.34%        0.25        5            3.40       4374
+3-word τ=0.5                  0.09%    0.07%        0.13        1            4.00       4387
+longest τ=0.15               31.38%   22.96%       46.42      618            2.23       3013
+longest τ=0.3                23.30%   18.01%       29.11      548            1.87       3368
+longest τ=0.5                14.58%   12.21%       13.05      390            1.64       3751
+ev gate=0.5                  30.56%   23.18%       40.65      488            2.75       3049
+ev gate=1                    26.08%   20.93%       28.36      391            2.93       3246
+ev gate=1.5                  22.93%   19.04%       21.46      333            3.02       3384
+word τ=0.15 +bnd             29.58%   18.24%       62.48      688            1.89       3092
+word τ=0.3 +bnd              22.77%   16.15%       36.51      586            1.71       3391
+word τ=0.5 +bnd              14.37%   11.55%       15.56      409            1.54       3760
+2-word τ=0.15 +bnd           11.46%    9.36%       11.54      158            3.18       3888
+2-word τ=0.3 +bnd             5.26%    4.67%        3.26       68            3.40       4160
+2-word τ=0.5 +bnd             2.64%    2.53%        0.63       28            4.14       4275
+3-word τ=0.15 +bnd            1.71%    1.48%        1.25       22            3.41       4316
+3-word τ=0.3 +bnd             0.41%    0.34%        0.38        5            3.60       4373
+3-word τ=0.5 +bnd             0.09%    0.05%        0.25        1            4.00       4387
+longest τ=0.15 +bnd          32.54%   21.20%       62.48      622            2.30       2962
+longest τ=0.3 +bnd           24.30%   17.67%       36.51      552            1.93       3324
+longest τ=0.5 +bnd           15.24%   12.41%       15.56      390            1.72       3722
+ev gate=0.5 +bnd             31.75%   21.79%       54.83      493            2.83       2997
+ev gate=1 +bnd               26.87%   20.25%       36.51      395            2.99       3211
+ev gate=1.5 +bnd             23.53%   18.52%       27.60      336            3.07       3358
+
+== latency per query, 500 real mid-word queries (3451 available), after 20 warm-up queries ==
+call                              p50 ms    p90 ms    p99 ms
+complete (word, as today)          56.12     99.98    138.71
+complete_phrase(max_words=4)      136.19    192.36    255.43
+threads: 7 (SmolLM CPU pool = available_parallelism) plus the calling thread
+VmRSS: before SmolLM 30036 kB, after attach 191920 kB, after evaluation pass 304572 kB, after latency run 304572 kB

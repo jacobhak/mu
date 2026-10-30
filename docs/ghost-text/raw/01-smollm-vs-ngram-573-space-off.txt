@@ -1,0 +1,25 @@
+corpus: 3933 prompts, 4072 sightings, 22 prompts seen more than once
+evaluated 573 sightings (30 repeats of an earlier prompt), wrong ghost costs 1 keystroke(s), gate cost None, free trailing space false
+phrase model: Params { order: 4, alpha: 8.0, p_ext: 0.5, max_words: 8 }
+config                KSR  net KSR  wrong/100 words keystrokes
+ngram τ=0.15       21.08%   10.49%            59.66      27082
+ngram τ=0.3        19.41%   12.52%            38.84      27655
+ngram τ=0.5        15.53%   12.30%            18.19      28985
+ngram τ=0.7        11.56%   10.21%             7.59      30347
+mu τ=0.15          21.63%   10.82%            60.91      26893
+mu τ=0.3           19.98%   12.74%            40.85      27457
+mu τ=0.5           16.23%   12.52%            20.93      28745
+mu τ=0.7           12.30%   10.45%            10.43      30094
+smollm τ=0.15      26.42%   18.87%            42.57      25248
+smollm τ=0.3       21.58%   16.72%            27.41      26909
+smollm τ=0.5       15.16%   13.12%            11.50      29112
+smollm τ=0.7        9.75%    9.01%             4.22      30967
+ev word            17.96%   12.90%            28.52      28151
+ev phrase           7.29%    4.69%            14.64      31813
+ev word+phrase     19.89%   13.68%            35.00      27490
+
+by ghost kind (accepted / chars saved / wrong)
+  ev word          word 2658/6163/1736
+  ev phrase        phrase 780/2501/891
+  ev word+phrase   word 2367/5394/1461   phrase 408/1430/669
+  mu τ=0.3         word 4926/6499/2307   line 97/358/179

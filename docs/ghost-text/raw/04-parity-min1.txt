@@ -1,0 +1,5 @@
+evaluated 94 prompts (replayed 4015 rows)
+config                              KSR      wrong/100 words keystrokes
+smollm τ=0.15                    40.76%                41.51       3235
+smollm τ=0.3                     33.66%                26.51       3623
+smollm τ=0.3 + lines             34.92%                28.30       3554

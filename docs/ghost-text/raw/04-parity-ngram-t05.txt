@@ -1,0 +1,5 @@
+evaluated 94 prompts (replayed 4015 rows)
+config                              KSR      wrong/100 words keystrokes
+ngram τ=0.15                     34.19%                56.01       3594
+ngram τ=0.5                      25.97%                18.07       4043
+ngram τ=0.5 + lines              26.88%                20.46       3993

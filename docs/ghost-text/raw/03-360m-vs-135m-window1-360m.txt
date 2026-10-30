@@ -1,0 +1,48 @@
+corpus: 3973 prompts, 4112 sightings; evaluating the last 60 single-line sightings (from sighting 4049)
+smollm: /home/jacob/.cache/mu-predict-bench/SmolLM2-360M; max words 4, p_ext 0.02, wrong ghost costs 1 keystroke(s), trailing-space ghosts off, free trailing space off
+evaluated 60 sightings: 2472 positions, 1933 with a SmolLM candidate, 396 after a space
+positions by words in the longest candidate: 1 word(s): 255, 2 word(s): 178, 3 word(s): 226, 4 word(s): 1274; none: 539
+raw probability of each extension word: median 0.152, p90 0.499, over 4452 extensions
+
+== headline: whole-ghost accept (no trailing space; the composer today) ==
+config                        gross      net  wrong/100w  accepts saved chars/acc keystrokes
+word τ=0.15                  27.27%   19.54%       41.89      403            1.67       1798
+word τ=0.3                   20.75%   15.94%       26.10      334            1.54       1959
+word τ=0.5                   15.13%   13.31%        9.87      256            1.46       2098
+2-word τ=0.15                 9.30%    5.22%       22.15       40            5.75       2242
+2-word τ=0.3                  5.74%    4.53%        6.58       26            5.46       2330
+2-word τ=0.5                  3.20%    2.79%        2.19       13            6.08       2393
+3-word τ=0.15                 1.62%    0.69%        5.04        4           10.00       2432
+3-word τ=0.3                  0.40%    0.16%        1.32        1           10.00       2462
+3-word τ=0.5                  0.00%   -0.20%        1.10        0            0.00       2472
+longest τ=0.15               28.32%   19.01%       50.44      291            2.41       1772
+longest τ=0.3                22.65%   17.07%       30.26      284            1.97       1912
+longest τ=0.5                16.10%   13.96%       11.62      235            1.69       2074
+ev gate=0.5                  29.89%   21.04%       48.03      221            3.34       1733
+ev gate=1                    27.27%   20.75%       35.31      199            3.39       1798
+ev gate=1.5                  23.54%   18.81%       25.66      171            3.40       1890
+
+== HYPOTHETICAL: word-wise accept (Tab takes one word of the ghost; no such key exists today) ==
+config                        gross      net  wrong/100w  accepts saved chars/acc keystrokes
+word τ=0.15                  27.27%   19.54%       41.89      403            1.67       1798
+word τ=0.3                   20.75%   15.94%       26.10      334            1.54       1959
+word τ=0.5                   15.13%   13.31%        9.87      256            1.46       2098
+2-word τ=0.15                13.11%   11.49%        8.77      111            2.92       2148
+2-word τ=0.3                  6.92%    6.51%        2.19       48            3.56       2301
+2-word τ=0.5                  3.60%    3.48%        0.66       20            4.45       2383
+3-word τ=0.15                 2.71%    2.51%        1.10       20            3.35       2405
+3-word τ=0.3                  0.69%    0.65%        0.22        5            3.40       2455
+3-word τ=0.5                  0.16%    0.12%        0.22        3            1.33       2468
+longest τ=0.15               32.36%   24.68%       41.67      360            2.22       1672
+longest τ=0.3                23.99%   19.17%       26.10      307            1.93       1879
+longest τ=0.5                16.67%   14.85%        9.87      243            1.70       2060
+ev gate=0.5                  31.80%   24.96%       37.06      295            2.66       1686
+ev gate=1                    29.05%   23.95%       27.63      244            2.94       1754
+ev gate=1.5                  24.80%   21.00%       20.61      196            3.13       1859
+
+== latency per query, 500 real mid-word queries (1934 available), after 20 warm-up queries ==
+call                              p50 ms    p90 ms    p99 ms
+complete (word, as today)          94.91    151.01    218.92
+complete_phrase(max_words=4)      239.51    392.63   6970.98
+threads: 7 (SmolLM CPU pool = available_parallelism) plus the calling thread
+VmRSS: before SmolLM 30152 kB, after attach 444016 kB, after evaluation pass 580996 kB, after latency run 580996 kB
