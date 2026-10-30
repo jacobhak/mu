@@ -1,5 +1,6 @@
 //! Aggregates repeated runs of one scenario and prints them.
 use crate::driver::RunResult;
+use crate::smaps;
 use serde::Serialize;
 
 pub fn median(v: &[f64]) -> f64 {
@@ -20,6 +21,15 @@ pub fn range(v: &[f64]) -> Option<(f64, f64)> {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RegionRow {
+    pub region: String,
+    /// Resident, shared pages counted by their share.
+    pub pss_kb: f64,
+    /// Private to mu: heap, stack, copy-on-write data.
+    pub private_kb: f64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Row {
     pub label: String,
     pub content_kb: f64,
@@ -31,6 +41,8 @@ pub struct Row {
     pub first_token_ms: Option<f64>,
     pub turn_ms: Option<f64>,
     pub procs: usize,
+    /// mu's memory by region, in `smaps::REGIONS` order.
+    pub regions: Vec<RegionRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +79,13 @@ pub fn summarize(scenario: &str, stream_bytes_per_sec: Option<u64>, runs: &[RunR
                 first_token_ms: (!tok.is_empty()).then(|| median(&tok)),
                 turn_ms: (!turn.is_empty()).then(|| median(&turn)),
                 procs: runs[0].samples[i].procs.len(),
+                regions: (0..smaps::REGIONS.len())
+                    .map(|k| RegionRow {
+                        region: smaps::REGIONS[k].into(),
+                        pss_kb: median(&at(&|s| s.regions.get(k).map_or(0.0, |p| p.pss_kb as f64))),
+                        private_kb: median(&at(&|s| s.regions.get(k).map_or(0.0, |p| p.anon_kb as f64))),
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -120,6 +139,23 @@ pub fn print(s: &Summary) {
             r.procs
         );
     }
+    println!("\nmu process by region, MB resident / private:");
+    print!("{:<16}", "");
+    for r in &s.rows {
+        print!("{:>14}", r.label);
+    }
+    println!();
+    for k in 0..smaps::REGIONS.len() {
+        if s.rows.iter().all(|r| r.regions.get(k).is_none_or(|x| x.pss_kb == 0.0)) {
+            continue;
+        }
+        print!("{:<16}", smaps::REGIONS[k]);
+        for r in &s.rows {
+            let x = &r.regions[k];
+            print!("{:>14}", format!("{} / {}", mb(x.pss_kb), mb(x.private_kb)));
+        }
+        println!();
+    }
     if s.tool_errors > 0 || s.overruns > 0 {
         println!(
             "WARNING: {} tool error(s) and {} unscripted main request(s): mu did not follow the script",
@@ -153,6 +189,7 @@ mod tests {
                     mu: Mem { pss_kb: a + 100, pss_anon_kb: *a },
                     tree: Mem { pss_kb: a + 200, pss_anon_kb: *a },
                     procs: vec!["mu".into()],
+                    regions: vec![],
                 })
                 .collect(),
             first_token_ms: vec![tok; anon.len().saturating_sub(1)],

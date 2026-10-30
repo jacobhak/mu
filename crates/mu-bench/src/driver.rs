@@ -161,6 +161,8 @@ pub struct Sample {
     pub mu: Mem,
     pub tree: Mem,
     pub procs: Vec<String>,
+    /// mu's own memory by region (code, data, heap, …).
+    pub regions: Vec<smaps::Part>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,6 +227,7 @@ fn take_sample(label: String, pid: i32, content: u64) -> Result<Sample> {
         mu: root.mem,
         tree: smaps::total(&procs),
         procs: procs.iter().map(|p| p.comm.clone()).collect(),
+        regions: smaps::breakdown(pid).unwrap_or_default(),
     })
 }
 

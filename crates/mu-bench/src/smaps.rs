@@ -94,6 +94,138 @@ pub fn total(procs: &[Proc]) -> Mem {
     t
 }
 
+/// Where a process's memory sits. `pss_kb` counts every resident page; `anon_kb` only the pages that are
+/// private to the process (heap, stack, copy-on-write data), as opposed to shared, file-backed ones.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Part {
+    pub region: String,
+    pub pss_kb: u64,
+    pub anon_kb: u64,
+}
+
+pub const REGIONS: [&str; 8] = ["code", "read-only data", "data", "libraries", "heap", "stack", "anonymous", "other"];
+
+/// The region a mapping belongs to. `exe` is the process's own binary: its executable mapping is code, its
+/// writable one data, the rest read-only data (which includes relocated data, private once the loader has
+/// patched it).
+pub fn classify(path: &str, perms: &str, exe: &str) -> &'static str {
+    match path {
+        "[heap]" => "heap",
+        "[stack]" => "stack",
+        "" => "anonymous",
+        p if p.starts_with('[') => "other",
+        p if p.trim_end_matches(" (deleted)") == exe => {
+            if perms.contains('x') {
+                "code"
+            } else if perms.contains('w') {
+                "data"
+            } else {
+                "read-only data"
+            }
+        }
+        _ => "libraries",
+    }
+}
+
+/// `/proc/<pid>/smaps` summed per region, in `REGIONS` order.
+pub fn parse_smaps(text: &str, exe: &str) -> Vec<Part> {
+    let mut parts: Vec<Part> = REGIONS.iter().map(|r| Part { region: (*r).into(), pss_kb: 0, anon_kb: 0 }).collect();
+    let mut cur = "other";
+    for line in text.lines() {
+        let mut tok = line.split_whitespace();
+        let Some(first) = tok.next() else { continue };
+        if let Some(key) = first.strip_suffix(':') {
+            let kb: u64 = tok.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let i = REGIONS.iter().position(|r| *r == cur).unwrap_or(REGIONS.len() - 1);
+            match key {
+                "Pss" => parts[i].pss_kb += kb,
+                "Anonymous" => parts[i].anon_kb += kb,
+                _ => {}
+            }
+        } else if first.contains('-') {
+            let perms = tok.next().unwrap_or("");
+            let path = tok.skip(3).collect::<Vec<_>>().join(" ");
+            cur = classify(&path, perms, exe);
+        }
+    }
+    parts
+}
+
+/// `None` when the process is gone or unreadable.
+pub fn breakdown(pid: i32) -> Option<Vec<Part>> {
+    let exe = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let text = fs::read_to_string(format!("/proc/{pid}/smaps")).ok()?;
+    Some(parse_smaps(&text, &exe.to_string_lossy()))
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    const SMAPS: &str = "\
+5000-6000 r--p 00000000 08:01 7 /opt/mu
+Pss:                 300 kB
+Anonymous:             0 kB
+6000-9000 r-xp 00001000 08:01 7 /opt/mu
+Pss:                1000 kB
+Anonymous:             0 kB
+9000-a000 r--p 00004000 08:01 7 /opt/mu
+Pss:                 100 kB
+Anonymous:           100 kB
+a000-b000 rw-p 00005000 08:01 7 /opt/mu
+Pss:                  20 kB
+Anonymous:            20 kB
+1000-2000 rw-p 00000000 00:00 0 [heap]
+Pss:                  60 kB
+Anonymous:            60 kB
+7f00-7f10 r-xp 00000000 08:01 9 /usr/lib/libc.so.6
+Pss:                  40 kB
+Anonymous:             0 kB
+7f20-7f30 rw-p 00000000 00:00 0 
+Pss:                  16 kB
+Anonymous:            16 kB
+7ff0-8000 rw-p 00000000 00:00 0 [stack]
+Pss:                  12 kB
+Anonymous:            12 kB
+7ffa-7ffb r-xp 00000000 00:00 0 [vdso]
+Pss:                   4 kB
+Anonymous:             0 kB
+";
+
+    #[test]
+    fn classifies_by_path_and_permissions() {
+        assert_eq!(classify("/opt/mu", "r-xp", "/opt/mu"), "code");
+        assert_eq!(classify("/opt/mu (deleted)", "r-xp", "/opt/mu"), "code");
+        assert_eq!(classify("/opt/mu", "rw-p", "/opt/mu"), "data");
+        assert_eq!(classify("/opt/mu", "r--p", "/opt/mu"), "read-only data");
+        assert_eq!(classify("/usr/lib/libc.so.6", "r-xp", "/opt/mu"), "libraries");
+        assert_eq!(classify("", "rw-p", "/opt/mu"), "anonymous");
+        assert_eq!(classify("[vdso]", "r-xp", "/opt/mu"), "other");
+    }
+
+    #[test]
+    fn sums_pss_and_private_pages_per_region() {
+        let p = parse_smaps(SMAPS, "/opt/mu");
+        let get = |r: &str| p.iter().find(|x| x.region == r).map(|x| (x.pss_kb, x.anon_kb)).unwrap();
+        assert_eq!(get("code"), (1000, 0));
+        assert_eq!(get("read-only data"), (400, 100));
+        assert_eq!(get("data"), (20, 20));
+        assert_eq!(get("libraries"), (40, 0));
+        assert_eq!(get("heap"), (60, 60));
+        assert_eq!(get("anonymous"), (16, 16));
+        assert_eq!(get("stack"), (12, 12));
+        assert_eq!(get("other"), (4, 0));
+        assert_eq!(p.iter().map(|x| x.pss_kb).sum::<u64>(), 1552);
+        assert_eq!(p.iter().map(|x| x.region.as_str()).collect::<Vec<_>>(), REGIONS);
+    }
+
+    #[test]
+    fn own_process_breaks_down() {
+        let parts = breakdown(std::process::id() as i32).unwrap();
+        let get = |r: &str| parts.iter().find(|x| x.region == r).unwrap().pss_kb;
+        assert!(get("code") > 0 && get("heap") + get("anonymous") > 0);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
