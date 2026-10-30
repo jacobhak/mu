@@ -504,6 +504,26 @@ struct View {
     word_row: Vec<usize>,
     /// Body rows of the last render.
     body_h: usize,
+    /// Vim count typed so far (`3j`); 0 when none.
+    count: usize,
+    /// A `g` was just pressed (`gg`).
+    pending_g: bool,
+}
+
+/// A cursor move; the `bool` extends the selection.
+#[derive(Clone, Copy)]
+enum Mv {
+    Up(bool),
+    Down(bool),
+    Left(bool),
+    Right(bool),
+    Page(isize, bool),
+    Half(isize),
+    Top(bool),
+    Bottom(bool),
+    UnitStart,
+    UnitEnd,
+    Block(isize),
 }
 
 /// What a key did to the picker.
@@ -528,6 +548,8 @@ impl View {
             unit_rows: Vec::new(),
             word_row: Vec::new(),
             body_h: 1,
+            count: 0,
+            pending_g: false,
         }
     }
 
@@ -544,48 +566,133 @@ impl View {
     }
 
     fn key(&mut self, k: KeyEvent) -> ReplyResult {
-        let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let plain = !ctrl && !alt;
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
-        match k.code {
+        let pending_g = std::mem::take(&mut self.pending_g);
+        if plain
+            && let KeyCode::Char(d @ '0'..='9') = k.code
+            && (d != '0' || self.count > 0)
+        {
+            self.count = (self.count * 10 + (d as usize - '0' as usize)).min(999);
+            return ReplyResult::Pending;
+        }
+        let had_count = self.count > 0;
+        let n = std::mem::take(&mut self.count).max(1);
+        let mv = match k.code {
             KeyCode::Esc => {
-                if self.anchor.take().is_none() {
-                    return ReplyResult::Close;
-                }
+                // Esc first drops a pending count or selection, then closes.
+                return if self.anchor.take().is_none() && !had_count {
+                    ReplyResult::Close
+                } else {
+                    ReplyResult::Pending
+                };
             }
-            KeyCode::Up => self.up(shift),
-            KeyCode::Char('k') if plain => self.up(false),
-            KeyCode::Char('K') if plain => self.up(true),
-            KeyCode::Down => self.down(shift),
-            KeyCode::Char('j') if plain => self.down(false),
-            KeyCode::Char('J') if plain => self.down(true),
-            KeyCode::Left => self.left(shift),
-            KeyCode::Char('h') if plain => self.left(false),
-            KeyCode::Char('H') if plain => self.left(true),
-            KeyCode::Right => self.right(shift),
-            KeyCode::Char('l') if plain => self.right(false),
-            KeyCode::Char('L') if plain => self.right(true),
-            KeyCode::PageUp => self.page(-1, shift),
-            KeyCode::PageDown => self.page(1, shift),
-            KeyCode::Home if plain => self.go(0, shift),
-            KeyCode::Char('g') if plain => self.go(0, false),
-            KeyCode::End if plain => self.go(self.words() - 1, shift),
-            KeyCode::Char('G') if plain => self.go(self.words() - 1, false),
-            KeyCode::Char(' ') if plain => {
-                if !self.take_selection() {
-                    self.toggle_unit();
-                }
+            KeyCode::Char('g') if ctrl && !alt => {
+                return if self.anchor.take().is_none() && !had_count {
+                    ReplyResult::Close
+                } else {
+                    ReplyResult::Pending
+                };
             }
+            KeyCode::Up => Mv::Up(shift),
+            KeyCode::Down => Mv::Down(shift),
+            KeyCode::Left => Mv::Left(shift),
+            KeyCode::Right => Mv::Right(shift),
+            KeyCode::PageUp => Mv::Page(-1, shift),
+            KeyCode::PageDown => Mv::Page(1, shift),
+            KeyCode::Home if plain => Mv::Top(shift),
+            KeyCode::End if plain => Mv::Bottom(shift),
             KeyCode::Enter => {
                 self.take_selection();
                 return ReplyResult::Quote(self.quotes());
             }
-            KeyCode::Char('c') if plain => {
-                self.marks.clear();
-                self.anchor = None;
-            }
-            _ => {}
+            KeyCode::Char(c) if plain => match c {
+                'k' => Mv::Up(false),
+                'K' => Mv::Up(true),
+                'j' => Mv::Down(false),
+                'J' => Mv::Down(true),
+                'h' | 'b' => Mv::Left(false),
+                'H' | 'B' => Mv::Left(true),
+                'l' | 'w' | 'e' => Mv::Right(false),
+                'L' | 'W' | 'E' => Mv::Right(true),
+                '0' | '^' => Mv::UnitStart,
+                '$' => Mv::UnitEnd,
+                '{' => Mv::Block(-1),
+                '}' => Mv::Block(1),
+                'G' => Mv::Bottom(false),
+                'g' if pending_g => Mv::Top(false),
+                'g' => {
+                    self.pending_g = true;
+                    return ReplyResult::Pending;
+                }
+                ' ' => {
+                    if !self.take_selection() {
+                        self.toggle_unit();
+                    }
+                    return ReplyResult::Pending;
+                }
+                'c' => {
+                    self.marks.clear();
+                    self.anchor = None;
+                    return ReplyResult::Pending;
+                }
+                'q' => return ReplyResult::Close,
+                _ => return ReplyResult::Pending,
+            },
+            KeyCode::Char(c) if ctrl && !alt => match c.to_ascii_lowercase() {
+                'n' => Mv::Down(false),
+                'p' => Mv::Up(false),
+                'f' => Mv::Right(false),
+                'b' => Mv::Left(false),
+                'a' => Mv::UnitStart,
+                'e' => Mv::UnitEnd,
+                'v' => Mv::Page(1, false),
+                'd' => Mv::Half(1),
+                'u' => Mv::Half(-1),
+                _ => return ReplyResult::Pending,
+            },
+            KeyCode::Char(c) if alt && !ctrl => match c {
+                'f' => Mv::Right(false),
+                'b' => Mv::Left(false),
+                'v' => Mv::Page(-1, false),
+                '<' => Mv::Top(false),
+                '>' => Mv::Bottom(false),
+                _ => return ReplyResult::Pending,
+            },
+            _ => return ReplyResult::Pending,
+        };
+        // A counted word move moves at once instead of first revealing the cursor word.
+        if n > 1 && matches!(mv, Mv::Left(false) | Mv::Right(false)) {
+            self.word_mode = true;
+        }
+        for _ in 0..n {
+            self.step(mv);
         }
         ReplyResult::Pending
+    }
+
+    fn step(&mut self, mv: Mv) {
+        match mv {
+            Mv::Up(x) => self.up(x),
+            Mv::Down(x) => self.down(x),
+            Mv::Left(x) => self.left(x),
+            Mv::Right(x) => self.right(x),
+            Mv::Page(d, x) => self.page(d, self.body_h, x),
+            Mv::Half(d) => self.page(d, (self.body_h / 2).max(1), false),
+            Mv::Top(x) => self.go(0, x),
+            Mv::Bottom(x) => self.go(self.words() - 1, x),
+            Mv::UnitStart => {
+                self.go(self.span(self.unit(self.cur)).0, false);
+                self.word_mode = true;
+            }
+            Mv::UnitEnd => {
+                self.go(self.span(self.unit(self.cur)).1 - 1, false);
+                self.word_mode = true;
+            }
+            Mv::Block(d) => self.block(d),
+        }
     }
 
     /// The selected words `[start, end)`, if a selection is active.
@@ -648,12 +755,12 @@ impl View {
         self.word_mode = true;
     }
 
-    /// Moves about one body height. Before the first render (no row map) it moves one unit.
-    fn page(&mut self, dir: isize, extend: bool) {
+    /// Moves about `rows` body rows. Before the first render (no row map) it moves one unit.
+    fn page(&mut self, dir: isize, rows: usize, extend: bool) {
         let units = self.doc.units.len();
         let from = self.unit(self.cur);
         let mut t = if self.unit_rows.len() == units {
-            let row = self.unit_rows[from].0 as isize + dir * self.body_h as isize;
+            let row = self.unit_rows[from].0 as isize + dir * rows as isize;
             let row = row.max(0) as usize;
             self.unit_rows.partition_point(|r| r.0 <= row).saturating_sub(1)
         } else {
@@ -667,6 +774,30 @@ impl View {
         }
         let (s, e) = self.span(t);
         self.go(if extend && dir > 0 { e - 1 } else { s }, extend);
+    }
+
+    /// The first unit of the block that unit `u` belongs to.
+    fn block_start(&self, u: usize) -> usize {
+        let b = self.doc.units[u].block;
+        (0..=u).find(|&i| self.doc.units[i].block == b).unwrap_or(u)
+    }
+
+    /// `{` and `}`: to the start of the block (the first unit when already there, for `{`), or of
+    /// the next one.
+    fn block(&mut self, dir: isize) {
+        let u = self.unit(self.cur);
+        let first = self.block_start(u);
+        let t = if dir > 0 {
+            let b = self.doc.units[u].block;
+            (u + 1..self.doc.units.len()).find(|&i| self.doc.units[i].block != b)
+        } else if self.cur > self.span(first).0 {
+            Some(first)
+        } else {
+            first.checked_sub(1).map(|p| self.block_start(p))
+        };
+        if let Some(t) = t {
+            self.go(self.span(t).0, false);
+        }
     }
 
     fn toggle_unit(&mut self) {
@@ -806,12 +937,14 @@ impl View {
         (wr.rows, wr.words)
     }
 
-    /// Renders the reply: header, the window of body rows that keeps the cursor's unit visible,
-    /// and a two-row footer when there is room. `which` is `(index, count)` for the header.
+    /// Renders the reply: a titled rule, the window of body rows that keeps the cursor's unit
+    /// visible, a closing rule and a two-row footer when there is room. `which` is
+    /// `(index, count)` for the title.
     fn render(&mut self, width: usize, max_rows: usize, which: (usize, usize)) -> (Vec<Line>, (usize, usize)) {
         let header = usize::from(max_rows >= 3);
-        let footer = if max_rows >= 8 { 2 } else { 0 };
-        let h = max_rows.saturating_sub(header + footer).max(1);
+        let bottom = usize::from(max_rows >= 5);
+        let footer = if max_rows >= 9 { 2 } else { 0 };
+        let h = max_rows.saturating_sub(header + bottom + footer).max(1);
         let w = width.saturating_sub(GUTTER).max(1);
         let n = self.doc.units.len();
 
@@ -877,20 +1010,21 @@ impl View {
         let mut out: Vec<Line> = Vec::new();
         if header == 1 {
             let selecting = if self.anchor.is_some() { " · selecting" } else { "" };
-            out.push(vec![span(
-                format!("reply {}/{} · {} marked{selecting}", which.0, which.1, self.marks.len()),
-                accent(),
-            )]);
+            let title = format!("reply {}/{} · {} marked{selecting}", which.0, which.1, self.marks.len());
+            out.push(rule(Some(&title), width));
         }
         let end = (self.top + h).min(total);
         out.extend(all[self.top..end].iter().cloned());
+        if bottom == 1 {
+            out.push(rule(None, width));
+        }
         if footer == 2 {
             let (a, b) = if self.anchor.is_some() {
                 ("Shift+←→ word · Shift+↑↓ unit · Space mark", "Enter quote · Esc drop selection · Ctrl+C close")
             } else {
                 (
-                    "↑↓ unit · ←→ word · Shift+arrows select · PgUp/PgDn · [ ] reply",
-                    "Space mark · c clear · Enter quote · Esc close",
+                    "↑↓ jk unit · ←→ hl word · Shift+move select · gg G { } ^D ^U ^N ^P ^F ^B",
+                    "Space mark · c clear · Enter quote · [ ] reply · Esc close",
                 )
             };
             out.push(line::styled(a, |_| dim()));
@@ -900,6 +1034,18 @@ impl View {
         let out = out.iter().map(|l| line::truncate(l, width)).collect();
         (out, (cursor_row, 0))
     }
+}
+
+/// A full-width rule, with the title set into its left end.
+fn rule(title: Option<&str>, width: usize) -> Line {
+    let edge = theme::get().fg(Role::Line);
+    let Some(t) = title else { return vec![span("─".repeat(width), edge)] };
+    let used = 4 + UnicodeWidthStr::width(t);
+    vec![
+        span("── ", edge),
+        span(t.to_string(), accent()),
+        span(format!(" {}", "─".repeat(width.saturating_sub(used))), edge),
+    ]
 }
 
 fn accent() -> ContentStyle {
@@ -1314,14 +1460,144 @@ mod tests {
         assert_eq!(press(&mut p, KeyCode::Char('[')), ReplyResult::Pending);
         assert_eq!(p.at, 0);
         let (lines, _) = p.render(60, 10);
-        assert!(line_text(&lines[0]).starts_with("reply 1/2 · 0 marked"), "{:?}", line_text(&lines[0]));
+        assert!(line_text(&lines[0]).starts_with("── reply 1/2 · 0 marked"), "{:?}", line_text(&lines[0]));
         press(&mut p, KeyCode::Char('['));
         assert_eq!(p.at, 0, "stops at the oldest");
         press(&mut p, KeyCode::Char(']'));
         press(&mut p, KeyCode::Char(']'));
         assert_eq!(p.at, 1, "stops at the newest");
         let (lines, _) = p.render(60, 10);
-        assert!(line_text(&lines[0]).starts_with("reply 2/2 · 1 marked"), "{:?}", line_text(&lines[0]));
+        assert!(line_text(&lines[0]).starts_with("── reply 2/2 · 1 marked"), "{:?}", line_text(&lines[0]));
         assert!(lines.iter().any(|l| line_text(l).contains("Enter quote")));
+    }
+
+    fn many() -> ReplyPicker {
+        picker("One. Two. Three.\n\nFour. Five.\n\nSix. Seven.")
+    }
+
+    fn ctrl(p: &mut ReplyPicker, c: char) -> ReplyResult {
+        p.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    fn alt(p: &mut ReplyPicker, c: char) -> ReplyResult {
+        p.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT))
+    }
+
+    fn ch(p: &mut ReplyPicker, c: char) -> ReplyResult {
+        press(p, KeyCode::Char(c))
+    }
+
+    fn at_unit(p: &ReplyPicker) -> usize {
+        view(p).unit(view(p).cur)
+    }
+
+    #[test]
+    fn emacs_keys_move_by_unit_word_and_edge() {
+        let mut p = many();
+        ctrl(&mut p, 'n');
+        ctrl(&mut p, 'n');
+        assert_eq!(at_unit(&p), 2);
+        ctrl(&mut p, 'p');
+        assert_eq!(at_unit(&p), 1);
+        ctrl(&mut p, 'f');
+        assert!(view(&p).word_mode && view(&p).cur == view(&p).span(1).0, "the first one reveals the word");
+        ctrl(&mut p, 'f');
+        assert_eq!(view(&p).cur, view(&p).span(1).0 + 1);
+        alt(&mut p, 'b');
+        assert_eq!(view(&p).cur, view(&p).span(1).0);
+        ctrl(&mut p, 'e');
+        assert_eq!(view(&p).cur, view(&p).span(1).1 - 1);
+        ctrl(&mut p, 'a');
+        assert_eq!(view(&p).cur, view(&p).span(1).0);
+        alt(&mut p, '>');
+        assert_eq!(view(&p).cur, view(&p).words() - 1);
+        alt(&mut p, '<');
+        assert_eq!(view(&p).cur, 0);
+    }
+
+    #[test]
+    fn vim_keys_word_edge_top_bottom_and_blocks() {
+        let mut p = many();
+        ch(&mut p, 'w');
+        ch(&mut p, 'w');
+        assert_eq!(view(&p).cur, 1, "the first w reveals the word, the next moves");
+        ch(&mut p, 'b');
+        assert_eq!(view(&p).cur, 0);
+        ch(&mut p, '$');
+        assert_eq!(view(&p).cur, view(&p).span(0).1 - 1);
+        ch(&mut p, '0');
+        assert_eq!(view(&p).cur, 0);
+        ch(&mut p, '}');
+        assert_eq!(at_unit(&p), 3, "the next block starts at its first unit");
+        ch(&mut p, '}');
+        assert_eq!(at_unit(&p), 5);
+        ch(&mut p, '{');
+        assert_eq!(at_unit(&p), 3);
+        ch(&mut p, 'G');
+        assert_eq!(view(&p).cur, view(&p).words() - 1);
+        ch(&mut p, 'g');
+        assert_eq!(view(&p).cur, view(&p).words() - 1, "a single g waits for the second");
+        ch(&mut p, 'g');
+        assert_eq!(view(&p).cur, 0);
+        ch(&mut p, 'g');
+        ch(&mut p, 'j');
+        assert_eq!(at_unit(&p), 1, "g then another key is not gg");
+    }
+
+    #[test]
+    fn counts_repeat_a_motion_and_zero_without_a_count_is_the_unit_start() {
+        let mut p = many();
+        ch(&mut p, '3');
+        ch(&mut p, 'j');
+        assert_eq!(at_unit(&p), 3);
+        ch(&mut p, '1');
+        ch(&mut p, '0');
+        ch(&mut p, 'k');
+        assert_eq!(at_unit(&p), 0, "clamped at the top");
+        ch(&mut p, '3');
+        ch(&mut p, 'l');
+        assert_eq!(view(&p).cur, 3, "a counted word move starts moving at once");
+        ch(&mut p, '2');
+        assert_eq!(press(&mut p, KeyCode::Esc), ReplyResult::Pending, "Esc drops a pending count first");
+        ch(&mut p, 'j');
+        assert_eq!(at_unit(&p), 4, "the dropped count does not apply");
+    }
+
+    #[test]
+    fn q_and_ctrl_g_close_and_ctrl_g_drops_a_selection_first() {
+        let mut p = many();
+        shift(&mut p, KeyCode::Right);
+        assert_eq!(ctrl(&mut p, 'g'), ReplyResult::Pending);
+        assert!(view(&p).sel().is_none());
+        assert_eq!(ctrl(&mut p, 'g'), ReplyResult::Close);
+        assert_eq!(ch(&mut many(), 'q'), ReplyResult::Close);
+    }
+
+    #[test]
+    fn half_and_full_pages_move_by_the_body_height() {
+        let md: String = (1..=30).map(|k| format!("Para {k} sentence.\n\n")).collect();
+        let mut p = picker(&md);
+        p.render(40, 12);
+        ctrl(&mut p, 'd');
+        let half = at_unit(&p);
+        assert!(half > 0, "{half}");
+        ctrl(&mut p, 'u');
+        assert_eq!(at_unit(&p), 0);
+        ctrl(&mut p, 'v');
+        assert!(at_unit(&p) > half);
+        alt(&mut p, 'v');
+        assert_eq!(at_unit(&p), 0);
+    }
+
+    #[test]
+    fn the_window_gets_a_rule_above_and_below_and_uses_all_the_rows_it_is_given() {
+        let md: String = (1..=40).map(|k| format!("Para {k} sentence.\n\n")).collect();
+        let mut p = picker(&md);
+        let (lines, _) = p.render(100, 30);
+        let t: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(t.len(), 30, "{t:?}");
+        assert!(t[0].starts_with("── reply 1/1") && t[0].ends_with('─'), "{:?}", t[0]);
+        assert!(t[27].chars().all(|c| c == '─'), "{:?}", t[27]);
+        assert!(t[29].contains("Esc close"), "{t:?}");
     }
 }

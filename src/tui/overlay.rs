@@ -422,8 +422,8 @@ impl Overlay {
                 review.render(w, avail.saturating_sub(1))
             }
             Overlay::Reply { st } => {
-                let budget = (rows / 2).max(6).saturating_sub(2);
-                st.render(w, budget)
+                let avail = rows.saturating_sub(1).saturating_sub(used);
+                st.render(w, avail.saturating_sub(1))
             }
             Overlay::Ask(a) => {
                 let avail = rows.saturating_sub(1).saturating_sub(used);
