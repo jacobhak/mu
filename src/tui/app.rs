@@ -421,6 +421,7 @@ impl App {
                 let w = self.width();
                 let mut l = vec![vec![]];
                 l.extend(blocks::user_prompt(&t, w));
+                l.push(vec![]);
                 self.commit(l);
             }
             AgentEvent::Text(s) => {

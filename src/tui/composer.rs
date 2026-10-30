@@ -588,8 +588,9 @@ impl Composer {
         self.buf.images = images;
     }
 
-    /// Appends quote blocks after the text (a blank line apart) and puts the cursor on the blank
-    /// line after the first one, ready for the comment.
+    /// Appends quote blocks after the text (a blank line apart) and puts the cursor on the row
+    /// right under the first one, ready for the comment. The transcript ends a quote at the first
+    /// line without `>` (see `blocks::end_quotes`), so the comment is not part of it.
     pub fn append_quotes(&mut self, quotes: &[String]) {
         let old = self.text();
         let mut text = if old.trim().is_empty() { String::new() } else { format!("{}\n\n", old.trim_end()) };
@@ -784,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn quotes_go_after_the_text_with_the_cursor_on_the_first_blank_line() {
+    fn quotes_go_after_the_text_with_the_cursor_right_under_the_first() {
         let mut c = Composer::new(None);
         c.set_text("hi");
         c.append_quotes(&["> a".to_string(), "> b\n> c".to_string()]);

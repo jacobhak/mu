@@ -391,8 +391,9 @@ impl Doc {
         Doc { units, word_unit, unit_span }
     }
 
-    /// The text of words `[lo, hi)`. Pieces of one paragraph join with a space, pieces of different
-    /// blocks and code lines join with a newline.
+    /// The markdown of words `[lo, hi)`. Pieces of one paragraph join with a space; list items
+    /// keep their marker and break lines; other blocks are separated by a blank line and
+    /// consecutive code lines sit in one fence, so the quote renders with its structure.
     fn quote_text(&self, lo: usize, hi: usize) -> String {
         let mut out = String::new();
         let mut prev: Option<&Unit> = None;
@@ -402,19 +403,38 @@ impl Doc {
             let (a, b) = (lo.max(ws), hi.min(we));
             let start = if a == ws { 0 } else { unit.words[a - ws].0 };
             let end = if b == we { unit.text.len() } else { unit.words[b - ws - 1].1 };
-            if let Some(p) = prev {
-                let joined = p.block == unit.block && p.kind != Kind::Code && unit.kind != Kind::Code;
-                out.push(if joined { ' ' } else { '\n' });
+            let code = unit.kind == Kind::Code;
+            match prev {
+                None if code => out.push_str("```\n"),
+                None => {}
+                Some(p) => {
+                    let pc = p.kind == Kind::Code;
+                    out.push_str(match (pc, code) {
+                        (true, true) => "\n",
+                        (true, false) => "\n```\n\n",
+                        (false, true) => "\n\n```\n",
+                        (false, false) if p.block == unit.block => " ",
+                        (false, false) if p.kind == Kind::Item && unit.kind == Kind::Item => "\n",
+                        (false, false) => "\n\n",
+                    });
+                }
+            }
+            if unit.kind == Kind::Item && a == ws && !unit.lead.trim().is_empty() {
+                out.push_str(&unit.lead.replace('•', "-").replace('☑', "- [x]").replace('☐', "- [ ]"));
             }
             out.push_str(&unit.text[start..end]);
             prev = Some(unit);
+        }
+        if prev.is_some_and(|p| p.kind == Kind::Code) {
+            out.push_str("\n```");
         }
         out
     }
 
     /// The blockquote for words `[lo, hi)`: every line prefixed `> `.
     fn block(&self, lo: usize, hi: usize) -> String {
-        self.quote_text(lo, hi).lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+        let lines = self.quote_text(lo, hi);
+        lines.lines().map(|l| if l.is_empty() { ">".to_string() } else { format!("> {l}") }).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -468,8 +488,11 @@ struct View {
     marks: Vec<(usize, usize)>,
     /// Cursor word.
     cur: usize,
-    /// Visual selection: `[start, end)` words, `start` fixed while `end` moves.
-    vis: Option<(usize, usize)>,
+    /// Selection anchor; the selection runs between it and the cursor word, both included.
+    anchor: Option<usize>,
+    /// Whether the cursor word is shown: only after a left/right move, so plain sentence
+    /// navigation highlights the unit, not a word.
+    word_mode: bool,
     /// First body row shown.
     top: usize,
     /// Body rows of each unit and the row of each word, from the last render.
@@ -495,7 +518,8 @@ impl View {
             doc: Doc::new(units),
             marks: Vec::new(),
             cur: 0,
-            vis: None,
+            anchor: None,
+            word_mode: false,
             top: 0,
             unit_rows: Vec::new(),
             word_row: Vec::new(),
@@ -517,135 +541,128 @@ impl View {
 
     fn key(&mut self, k: KeyEvent) -> ReplyResult {
         let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
             KeyCode::Esc => {
-                if self.vis.is_some() {
-                    self.vis = None;
-                } else {
+                if self.anchor.take().is_none() {
                     return ReplyResult::Close;
                 }
             }
-            KeyCode::Up => self.up(),
-            KeyCode::Char('k') if plain => self.up(),
-            KeyCode::Down => self.down(),
-            KeyCode::Char('j') if plain => self.down(),
-            KeyCode::Left => self.left(),
-            KeyCode::Char('h') if plain => self.left(),
-            KeyCode::Right => self.right(),
-            KeyCode::Char('l') if plain => self.right(),
-            KeyCode::PageUp => self.page(-1),
-            KeyCode::PageDown => self.page(1),
-            KeyCode::Home | KeyCode::Char('g') if plain => {
-                if self.vis.is_none() {
-                    self.cur = 0;
-                }
-            }
-            KeyCode::End | KeyCode::Char('G') if plain => {
-                if self.vis.is_none() {
-                    self.cur = self.words() - 1;
-                }
-            }
+            KeyCode::Up => self.up(shift),
+            KeyCode::Char('k') if plain => self.up(false),
+            KeyCode::Char('K') if plain => self.up(true),
+            KeyCode::Down => self.down(shift),
+            KeyCode::Char('j') if plain => self.down(false),
+            KeyCode::Char('J') if plain => self.down(true),
+            KeyCode::Left => self.left(shift),
+            KeyCode::Char('h') if plain => self.left(false),
+            KeyCode::Char('H') if plain => self.left(true),
+            KeyCode::Right => self.right(shift),
+            KeyCode::Char('l') if plain => self.right(false),
+            KeyCode::Char('L') if plain => self.right(true),
+            KeyCode::PageUp => self.page(-1, shift),
+            KeyCode::PageDown => self.page(1, shift),
+            KeyCode::Home if plain => self.go(0, shift),
+            KeyCode::Char('g') if plain => self.go(0, false),
+            KeyCode::End if plain => self.go(self.words() - 1, shift),
+            KeyCode::Char('G') if plain => self.go(self.words() - 1, false),
             KeyCode::Char(' ') if plain => {
-                if self.vis.is_some() {
-                    self.finish_visual();
-                } else {
+                if !self.take_selection() {
                     self.toggle_unit();
                 }
             }
             KeyCode::Enter => {
-                if self.vis.is_some() {
-                    self.finish_visual();
-                } else {
-                    return ReplyResult::Quote(self.quotes());
-                }
+                self.take_selection();
+                return ReplyResult::Quote(self.quotes());
             }
-            KeyCode::Char('v') if plain && self.vis.is_none() => self.start_visual(),
             KeyCode::Char('c') if plain => {
                 self.marks.clear();
-                self.vis = None;
+                self.anchor = None;
             }
             _ => {}
         }
         ReplyResult::Pending
     }
 
-    /// Up and Down go to the neighbouring unit; in visual mode they move the end by whole units.
-    fn up(&mut self) {
-        match self.vis {
-            None => {
-                let u = self.unit(self.cur);
-                if u > 0 {
-                    self.cur = self.span(u - 1).0;
-                }
-            }
-            Some((s, e)) => {
-                let u = self.unit(e - 1);
-                if u > 0 {
-                    self.vis = Some((s, self.span(u - 1).1.max(s + 1)));
-                }
-            }
+    /// The selected words `[start, end)`, if a selection is active.
+    fn sel(&self) -> Option<(usize, usize)> {
+        self.anchor.map(|a| (a.min(self.cur), a.max(self.cur) + 1))
+    }
+
+    /// Moves the cursor; `extend` keeps or starts a selection, otherwise it is dropped.
+    fn go(&mut self, to: usize, extend: bool) {
+        self.anchor = if extend { Some(self.anchor.unwrap_or(self.cur)) } else { None };
+        self.cur = to;
+        self.word_mode = false;
+    }
+
+    /// Turns the selection into a mark. Returns whether there was one.
+    fn take_selection(&mut self) -> bool {
+        let Some((s, e)) = self.sel() else { return false };
+        self.anchor = None;
+        add(&mut self.marks, s, e);
+        true
+    }
+
+    /// Up and Down go to the neighbouring unit. Extending first goes to the edge of the current
+    /// unit, then on by whole units.
+    fn up(&mut self, extend: bool) {
+        let u = self.unit(self.cur);
+        let (s, _) = self.span(u);
+        if extend && self.cur != s {
+            self.go(s, true);
+        } else if u > 0 {
+            self.go(self.span(u - 1).0, extend);
+        } else {
+            self.go(self.cur, extend);
         }
     }
 
-    fn down(&mut self) {
-        match self.vis {
-            None => {
-                let u = self.unit(self.cur);
-                if u + 1 < self.doc.units.len() {
-                    self.cur = self.span(u + 1).0;
-                }
-            }
-            Some((s, e)) => {
-                let u = self.unit(e - 1);
-                if u + 1 < self.doc.units.len() {
-                    self.vis = Some((s, self.span(u + 1).1));
-                }
-            }
+    fn down(&mut self, extend: bool) {
+        let u = self.unit(self.cur);
+        let (_, e) = self.span(u);
+        if extend && self.cur != e - 1 {
+            self.go(e - 1, true);
+        } else if u + 1 < self.doc.units.len() {
+            let (s, e) = self.span(u + 1);
+            self.go(if extend { e - 1 } else { s }, extend);
+        } else {
+            self.go(self.cur, extend);
         }
     }
 
-    fn left(&mut self) {
-        match self.vis {
-            None => self.cur = self.cur.saturating_sub(1),
-            Some((s, e)) => self.vis = Some((s, e.saturating_sub(1).max(s + 1))),
-        }
+    /// The first plain Left/Right only reveals the cursor word; later ones move it.
+    fn left(&mut self, extend: bool) {
+        let reveal = !extend && !self.word_mode;
+        self.go(if reveal { self.cur } else { self.cur.saturating_sub(1) }, extend);
+        self.word_mode = true;
     }
 
-    fn right(&mut self) {
-        let n = self.words();
-        match self.vis {
-            None => self.cur = (self.cur + 1).min(n - 1),
-            Some((s, e)) => self.vis = Some((s, (e + 1).min(n))),
-        }
+    fn right(&mut self, extend: bool) {
+        let reveal = !extend && !self.word_mode;
+        self.go(if reveal { self.cur } else { (self.cur + 1).min(self.words() - 1) }, extend);
+        self.word_mode = true;
     }
 
     /// Moves about one body height. Before the first render (no row map) it moves one unit.
-    fn page(&mut self, dir: isize) {
+    fn page(&mut self, dir: isize, extend: bool) {
         let units = self.doc.units.len();
-        let (anchor, s) = match self.vis {
-            None => (self.unit(self.cur), None),
-            Some((s, e)) => (self.unit(e - 1), Some(s)),
-        };
+        let from = self.unit(self.cur);
         let mut t = if self.unit_rows.len() == units {
-            let row = self.unit_rows[anchor].0 as isize + dir * self.body_h as isize;
+            let row = self.unit_rows[from].0 as isize + dir * self.body_h as isize;
             let row = row.max(0) as usize;
             self.unit_rows.partition_point(|r| r.0 <= row).saturating_sub(1)
         } else {
-            (anchor as isize + dir).clamp(0, units as isize - 1) as usize
+            (from as isize + dir).clamp(0, units as isize - 1) as usize
         };
-        if dir > 0 && t <= anchor {
-            t = (anchor + 1).min(units - 1);
+        if dir > 0 && t <= from {
+            t = (from + 1).min(units - 1);
         }
-        if dir < 0 && t >= anchor {
-            t = anchor.saturating_sub(1);
+        if dir < 0 && t >= from {
+            t = from.saturating_sub(1);
         }
-        match s {
-            None => self.cur = self.span(t).0,
-            Some(s) => {
-                let end = if dir > 0 { self.span(t).1 } else { self.span(t).1.max(s + 1) };
-                self.vis = Some((s, end));
-            }
-        }
+        let (s, e) = self.span(t);
+        self.go(if extend && dir > 0 { e - 1 } else { s }, extend);
     }
 
     fn toggle_unit(&mut self) {
@@ -653,18 +670,6 @@ impl View {
         if covered(&self.marks, s, e) {
             remove(&mut self.marks, s, e);
         } else {
-            add(&mut self.marks, s, e);
-        }
-    }
-
-    /// Anchored at the unit when the cursor is at its start, otherwise at the cursor word.
-    fn start_visual(&mut self) {
-        let (s, e) = self.span(self.unit(self.cur));
-        self.vis = Some(if self.cur == s { (s, e) } else { (self.cur, self.cur + 1) });
-    }
-
-    fn finish_visual(&mut self) {
-        if let Some((s, e)) = self.vis.take() {
             add(&mut self.marks, s, e);
         }
     }
@@ -685,11 +690,13 @@ impl View {
             s = theme::get().fg(Role::Accent);
             s.attributes.set(Attribute::Underlined);
         }
-        if self.vis.is_some_and(|(a, b)| a <= g && g < b) {
+        if self.sel().is_some_and(|(a, b)| a <= g && g < b) {
             s.attributes.set(Attribute::Reverse);
         }
-        if g == self.cur {
+        if self.word_mode && g == self.cur {
             s.attributes.set(Attribute::Reverse);
+            s.attributes.set(Attribute::Bold);
+        } else if !self.word_mode && self.unit(g) == self.unit(self.cur) {
             s.attributes.set(Attribute::Bold);
         }
         s
@@ -839,7 +846,7 @@ impl View {
                 span("❯ ", accent())
             } else if touches(&self.marks, s, e) {
                 span("▌ ", accent())
-            } else if self.vis.is_some_and(|(a, b)| a < e && s < b) {
+            } else if self.sel().is_some_and(|(a, b)| a < e && s < b) {
                 span("┃ ", dim())
             } else {
                 span("  ", ContentStyle::default())
@@ -865,21 +872,21 @@ impl View {
 
         let mut out: Vec<Line> = Vec::new();
         if header == 1 {
-            let visual = if self.vis.is_some() { " · VISUAL" } else { "" };
+            let selecting = if self.anchor.is_some() { " · selecting" } else { "" };
             out.push(vec![span(
-                format!("reply {}/{} · {} marked{visual}", which.0, which.1, self.marks.len()),
+                format!("reply {}/{} · {} marked{selecting}", which.0, which.1, self.marks.len()),
                 accent(),
             )]);
         }
         let end = (self.top + h).min(total);
         out.extend(all[self.top..end].iter().cloned());
         if footer == 2 {
-            let (a, b) = if self.vis.is_some() {
-                ("VISUAL  ←→ word · ↑↓ unit · Space/Enter mark", "Esc cancel visual · Ctrl+C close")
+            let (a, b) = if self.anchor.is_some() {
+                ("Shift+←→ word · Shift+↑↓ unit · Space mark", "Enter quote · Esc drop selection · Ctrl+C close")
             } else {
                 (
-                    "↑↓ unit · ←→ word · PgUp/PgDn · Home/End · [ ] reply",
-                    "Space mark · v visual · c clear · Enter quote · Esc close",
+                    "↑↓ unit · ←→ word · Shift+arrows select · PgUp/PgDn · [ ] reply",
+                    "Space mark · c clear · Enter quote · Esc close",
                 )
             };
             out.push(line::styled(a, |_| dim()));
@@ -959,7 +966,7 @@ impl ReplyPicker {
                 KeyCode::Char(']') => (self.at + 1).min(last),
                 _ => return self.views[self.at].key(k),
             };
-            self.views[self.at].vis = None;
+            self.views[self.at].anchor = None;
             self.at = to;
             return ReplyResult::Pending;
         }
@@ -985,6 +992,10 @@ mod tests {
 
     fn press(p: &mut ReplyPicker, c: KeyCode) -> ReplyResult {
         p.on_key(key(c))
+    }
+
+    fn shift(p: &mut ReplyPicker, c: KeyCode) -> ReplyResult {
+        p.on_key(KeyEvent::new(c, KeyModifiers::SHIFT))
     }
 
     fn picker(md: &str) -> ReplyPicker {
@@ -1093,7 +1104,11 @@ mod tests {
         press(&mut p, KeyCode::Char(' '));
         press(&mut p, KeyCode::Down);
         press(&mut p, KeyCode::Char(' '));
-        assert_eq!(press(&mut p, KeyCode::Enter), ReplyResult::Quote(vec!["> Beta two.\n> Gamma three.".into()]));
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            ReplyResult::Quote(vec!["> Beta two.\n>\n> Gamma three.".into()]),
+            "a blank quoted line keeps the paragraphs apart"
+        );
     }
 
     #[test]
@@ -1119,84 +1134,122 @@ mod tests {
 
     #[test]
     fn space_on_a_partly_marked_unit_completes_it_and_a_second_space_clears_it() {
-        let mut p = picker(ALPHA);
+        let mut p = picker("One two three.");
         press(&mut p, KeyCode::Right);
-        press(&mut p, KeyCode::Char('v'));
-        press(&mut p, KeyCode::Enter);
-        assert_eq!(view(&p).marks, [(1, 2)], "a word mark from the cursor word");
+        press(&mut p, KeyCode::Right);
+        shift(&mut p, KeyCode::Right);
+        press(&mut p, KeyCode::Char(' '));
+        assert_eq!(view(&p).marks, [(1, 3)], "a word mark from the selection");
         press(&mut p, KeyCode::Left);
         press(&mut p, KeyCode::Char(' '));
-        assert_eq!(view(&p).marks, [(0, 2)]);
+        assert_eq!(view(&p).marks, [(0, 3)]);
         press(&mut p, KeyCode::Char(' '));
         assert!(view(&p).marks.is_empty());
     }
 
     #[test]
-    fn visual_mode_grows_and_shrinks_by_word() {
+    fn shift_left_and_right_grow_and_shrink_the_selection_by_word() {
         let mut p = picker(ALPHA);
-        press(&mut p, KeyCode::Char('v'));
-        assert_eq!(view(&p).vis, Some((0, 2)), "starts with the whole current unit");
-        press(&mut p, KeyCode::Right);
-        assert_eq!(view(&p).vis, Some((0, 3)));
-        press(&mut p, KeyCode::Right);
-        assert_eq!(view(&p).vis, Some((0, 4)), "a word past the unit joins the next one");
-        press(&mut p, KeyCode::Left);
-        assert_eq!(view(&p).vis, Some((0, 3)));
-        press(&mut p, KeyCode::Left);
-        press(&mut p, KeyCode::Left);
-        assert_eq!(view(&p).vis, Some((0, 1)), "never shrinks below one word");
+        shift(&mut p, KeyCode::Right);
+        assert_eq!(view(&p).sel(), Some((0, 2)));
+        shift(&mut p, KeyCode::Right);
+        assert_eq!(view(&p).sel(), Some((0, 3)), "a word past the unit joins the next one");
+        shift(&mut p, KeyCode::Left);
+        assert_eq!(view(&p).sel(), Some((0, 2)));
+        shift(&mut p, KeyCode::Left);
+        shift(&mut p, KeyCode::Left);
+        assert_eq!(view(&p).sel(), Some((0, 1)), "never shrinks below one word");
     }
 
     #[test]
-    fn visual_starting_mid_unit_crosses_units_and_quotes_the_words() {
+    fn selecting_backwards_works_and_a_plain_arrow_drops_the_selection() {
         let mut p = picker(ALPHA);
         press(&mut p, KeyCode::Right);
-        press(&mut p, KeyCode::Char('v'));
-        assert_eq!(view(&p).vis, Some((1, 2)));
         press(&mut p, KeyCode::Right);
-        assert_eq!(press(&mut p, KeyCode::Enter), ReplyResult::Pending);
-        assert_eq!(view(&p).marks, [(1, 3)]);
+        press(&mut p, KeyCode::Right);
+        shift(&mut p, KeyCode::Left);
+        assert_eq!(view(&p).sel(), Some((1, 3)));
+        press(&mut p, KeyCode::Left);
+        assert!(view(&p).sel().is_none() && view(&p).marks.is_empty());
+    }
+
+    #[test]
+    fn a_selection_crossing_units_quotes_the_words() {
+        let mut p = picker(ALPHA);
+        press(&mut p, KeyCode::Right);
+        press(&mut p, KeyCode::Right);
+        shift(&mut p, KeyCode::Right);
         assert_eq!(press(&mut p, KeyCode::Enter), ReplyResult::Quote(vec!["> one. Beta".into()]));
     }
 
     #[test]
-    fn visual_up_and_down_move_the_end_by_whole_units() {
+    fn shift_up_and_down_go_to_the_unit_edge_then_by_whole_units() {
         let mut p = picker(ALPHA);
-        press(&mut p, KeyCode::Char('v'));
-        press(&mut p, KeyCode::Down);
-        assert_eq!(view(&p).vis, Some((0, 4)));
-        press(&mut p, KeyCode::Up);
-        assert_eq!(view(&p).vis, Some((0, 2)));
-        press(&mut p, KeyCode::Char(' '));
-        assert_eq!(view(&p).marks, [(0, 2)], "space finishes the selection into a mark");
-        assert!(view(&p).vis.is_none());
+        shift(&mut p, KeyCode::Down);
+        assert_eq!(view(&p).sel(), Some((0, 2)));
+        shift(&mut p, KeyCode::Down);
+        assert_eq!(view(&p).sel(), Some((0, 4)));
+        shift(&mut p, KeyCode::Up);
+        assert_eq!(view(&p).sel(), Some((0, 3)));
+        shift(&mut p, KeyCode::Up);
+        assert_eq!(view(&p).sel(), Some((0, 1)));
     }
 
     #[test]
-    fn esc_leaves_visual_without_marking_and_esc_again_closes() {
+    fn esc_drops_the_selection_without_marking_and_esc_again_closes() {
         let mut p = picker(ALPHA);
-        press(&mut p, KeyCode::Char('v'));
-        press(&mut p, KeyCode::Right);
+        shift(&mut p, KeyCode::Right);
         assert_eq!(press(&mut p, KeyCode::Esc), ReplyResult::Pending);
-        assert!(view(&p).vis.is_none() && view(&p).marks.is_empty());
+        assert!(view(&p).sel().is_none() && view(&p).marks.is_empty());
         assert_eq!(press(&mut p, KeyCode::Esc), ReplyResult::Close);
     }
 
     #[test]
     fn ctrl_c_closes_from_anywhere() {
         let mut p = picker(ALPHA);
-        press(&mut p, KeyCode::Char('v'));
+        shift(&mut p, KeyCode::Right);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(p.on_key(ctrl_c), ReplyResult::Close);
     }
 
     #[test]
-    fn enter_in_visual_marks_instead_of_quoting() {
+    fn enter_quotes_the_selection_together_with_the_marks() {
         let mut p = picker(ALPHA);
-        press(&mut p, KeyCode::Char('v'));
         press(&mut p, KeyCode::Down);
-        assert_eq!(press(&mut p, KeyCode::Enter), ReplyResult::Pending);
-        assert_eq!(view(&p).marks, [(0, 4)]);
+        press(&mut p, KeyCode::Down);
+        press(&mut p, KeyCode::Char(' '));
+        press(&mut p, KeyCode::Up);
+        press(&mut p, KeyCode::Up);
+        shift(&mut p, KeyCode::Down);
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            ReplyResult::Quote(vec!["> Alpha one.".into(), "> Gamma three.".into()])
+        );
+    }
+
+    #[test]
+    fn list_items_keep_their_markers_and_stay_on_separate_lines() {
+        let mut p = picker("Intro here.\n\n- first item\n- second item\n\nOutro.");
+        press(&mut p, KeyCode::Char('G'));
+        for _ in 0..4 {
+            shift(&mut p, KeyCode::Up);
+        }
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            ReplyResult::Quote(vec!["> Intro here.\n>\n> - first item\n> - second item\n>\n> Outro.".into()])
+        );
+    }
+
+    #[test]
+    fn code_lines_are_fenced_inside_the_quote() {
+        let mut p = picker("Run:\n\n```sh\nls -l\ncd x\n```\n");
+        shift(&mut p, KeyCode::Down);
+        shift(&mut p, KeyCode::Down);
+        shift(&mut p, KeyCode::Down);
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            ReplyResult::Quote(vec!["> Run:\n>\n> ```\n> ls -l\n> cd x\n> ```".into()])
+        );
     }
 
     #[test]

@@ -67,10 +67,33 @@ pub fn user_prompt(text: &str, width: usize) -> Vec<Line> {
     out
 }
 
+/// Ends every `>` quote at the first following line without `>`, as chat apps do, instead of
+/// markdown's lazy continuation: a blank line is inserted there. Fenced code is left alone.
+fn end_quotes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let (mut fence, mut prev_quote) = (false, false);
+    for (i, line) in text.split('\n').enumerate() {
+        let t = line.trim_start();
+        let quote = !fence && t.starts_with('>');
+        if !quote && (t.starts_with("```") || t.starts_with("~~~")) {
+            fence = !fence;
+        }
+        if prev_quote && !quote && !t.is_empty() {
+            out.push('\n');
+        }
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+        prev_quote = quote;
+    }
+    out
+}
+
 /// The rows of a user prompt's text, before the band is drawn around them.
 fn prompt_rows(text: &str, inner: usize) -> Vec<Line> {
     let Some(call) = skill_call(text) else {
-        return markdown::render(text, inner);
+        return markdown::render(&end_quotes(text), inner);
     };
     let home = std::env::var("HOME").ok();
     let head = vec![
@@ -897,6 +920,14 @@ mod tests {
         let row = text_of(&l[1]);
         assert!(row.starts_with("▎use x and l (http://u)"), "{row}");
         assert!(!row.contains('`'));
+    }
+
+    #[test]
+    fn a_comment_right_under_a_quote_is_not_part_of_it() {
+        let rows: Vec<String> = user_prompt("> quoted\ncool", 30).iter().map(text_of).collect();
+        assert!(rows.iter().any(|r| r.contains("▏ quoted")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.starts_with("▎cool")), "{rows:?}");
+        assert_eq!(end_quotes("> a\n> b\nc\n\n```\n> x\ny\n```"), "> a\n> b\n\nc\n\n```\n> x\ny\n```");
     }
 
     #[test]
