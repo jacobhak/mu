@@ -11,3 +11,5 @@ cargo test --workspace --locked
 ```
 
 PR checks run on the PR merged with `main`; if CI fails on files you didn't touch, merge `origin/main`, fix, and push.
+
+Enable the pre-commit fmt check once per clone: `git config core.hooksPath .githooks`.
