@@ -96,6 +96,18 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// The fake server alone, for pointing another harness at it. Every reply is a short text answer.
+async fn serve() -> Result<()> {
+    server::enable_probe();
+    let sc = scenario::Scenario::parse(
+        "name = \"probe\"\nchunk_delay_ms = 0\n[[turn]]\nprompt = \"p\"\n[[turn.step]]\ntext_bytes = 80\n",
+    )?;
+    let srv = server::Server::start(Arc::new(sc)).await?;
+    println!("{}", srv.url());
+    std::io::Write::flush(&mut std::io::stdout())?;
+    std::future::pending::<()>().await;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,17 +131,4 @@ mod tests {
         assert!(p(&["--nope", "a.toml"]).is_err());
         assert!(p(&["--runs", "x", "a.toml"]).is_err());
     }
-}
-
-/// The fake server alone, for pointing another harness at it. Every reply is a short text answer.
-async fn serve() -> Result<()> {
-    server::enable_probe();
-    let sc = scenario::Scenario::parse(
-        "name = \"probe\"\nchunk_delay_ms = 0\n[[turn]]\nprompt = \"p\"\n[[turn.step]]\ntext_bytes = 80\n",
-    )?;
-    let srv = server::Server::start(Arc::new(sc)).await?;
-    println!("{}", srv.url());
-    std::io::Write::flush(&mut std::io::stdout())?;
-    std::future::pending::<()>().await;
-    Ok(())
 }
