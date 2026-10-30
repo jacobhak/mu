@@ -358,7 +358,7 @@ dependencies = [
 [[package]]
 name = "brush-core"
 version = "0.5.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -400,7 +400,7 @@ dependencies = [
 [[package]]
 name = "brush-parser"
 version = "0.4.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "bon",
  "cached",
@@ -3819,6 +3819,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3851,6 +3860,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "md4"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da5ac363534dce5fabf69949225e174fbf111a498bf0ff794c8ea1fba9f3dda"
+dependencies = [
  "digest 0.10.7",
 ]
 
@@ -4420,16 +4438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "os_pipe"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4657,15 +4665,18 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "anyhow",
  "ast-grep-core",
- "globset",
- "ignore",
+ "futures",
  "phf 0.14.0",
+ "pi-vfs",
+ "pi-walker",
  "serde",
+ "tokio",
+ "tokio-util",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -4684,30 +4695,32 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "xutf",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "pi-builtins"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "ansi-width",
  "argmax",
+ "async-trait",
+ "base64 0.23.1",
  "bigdecimal",
  "binary-heap-plus",
  "brush-core",
  "brush-parser",
  "bstr",
  "bytecount",
- "cfg-if",
  "chrono",
  "clap",
  "codesnake",
  "compare",
  "dns-lookup",
  "fancy-regex",
- "filetime",
+ "flate2",
  "flume",
  "foldhash 0.2.0",
  "futures",
@@ -4735,6 +4748,9 @@ dependencies = [
  "jiff",
  "libc",
  "lscolors",
+ "lz4_flex",
+ "md-5",
+ "md4",
  "memchr",
  "nix 0.31.3",
  "nom 8.0.0",
@@ -4745,6 +4761,7 @@ dependencies = [
  "os_display",
  "parking_lot",
  "parse_datetime",
+ "pi-ast",
  "pi-iso",
  "pi-vfs",
  "pi-walker",
@@ -4758,6 +4775,8 @@ dependencies = [
  "rustix 1.1.5",
  "self_cell",
  "serde_json",
+ "sha1",
+ "sha2 0.10.9",
  "similar 3.2.0",
  "smallvec",
  "strum",
@@ -4771,18 +4790,20 @@ dependencies = [
  "uutils_term_grid",
  "windows-sys 0.61.2",
  "xutf",
+ "xxhash-rust",
  "yansi",
+ "zstd",
 ]
 
 [[package]]
 name = "pi-diff"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 
 [[package]]
 name = "pi-edit"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -4799,8 +4820,8 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "async-trait",
  "libc",
@@ -4831,8 +4852,8 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "anyhow",
  "brush-core",
@@ -4842,7 +4863,6 @@ dependencies = [
  "flume",
  "jiff",
  "libc",
- "os_pipe",
  "parking_lot",
  "pi-builtins",
  "pi-vcs",
@@ -4861,8 +4881,8 @@ dependencies = [
 
 [[package]]
 name = "pi-vcs"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "futures",
  "gix",
@@ -4877,8 +4897,8 @@ dependencies = [
 
 [[package]]
 name = "pi-vfs"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "async-trait",
  "libc",
@@ -4891,15 +4911,21 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "18.13.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+version = "18.14.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
- "globset",
- "ignore",
+ "flume",
+ "futures",
+ "grep-matcher",
+ "grep-pcre2",
+ "grep-regex",
+ "grep-searcher",
  "libc",
+ "memchr",
  "parking_lot",
  "pi-vfs",
- "rayon",
+ "regex",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 
@@ -6207,7 +6233,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.13.3#413d278a87a69b453efabf8d1fedb9940385e8c6"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.14.0#31147f9d1a76608549821c3759f8487b4d66c72d"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -6352,6 +6378,12 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "type-map"
