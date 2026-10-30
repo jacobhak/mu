@@ -26,7 +26,7 @@ use crate::models::{GatewayModel, Thinking};
 use crate::plugin::PluginHost;
 use crate::provider::Providers;
 use crate::tools::todo::{Phase, Status};
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use mu_common::paths;
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
@@ -36,9 +36,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
+mod mcp_ui;
+
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
-const BUILTIN_DESC: [(&str, &str, bool); 23] = [
+const BUILTIN_DESC: [(&str, &str, bool); 24] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -55,6 +57,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 23] = [
     ("todo", "Show the todo list", false),
     ("skills", "List skills", false),
     ("plugins", "List plugins", false),
+    ("mcp", "Manage MCP servers (picker; or add, import, remove, enable, test…)", true),
     ("hotkeys", "Show key bindings", false),
     ("copy", "Copy a reply, code block or command", false),
     ("reply", "Quote parts of the last reply into the composer", false),
@@ -62,6 +65,21 @@ const BUILTIN_DESC: [(&str, &str, bool); 23] = [
     ("jobs", "List or kill background jobs", false),
     ("plans", "Approve, refine or drop a parked plan", false),
     ("deliver", "Implement, review and commit a parked plan in a worktree [id]", false),
+];
+
+/// `/mcp` subcommands for the completion menu, with what each does. The names that need a server
+/// open the server picker when typed bare.
+const MCP_SUBCOMMANDS: [(&str, &str); 10] = [
+    ("add", "Add a server: discovered, popular or custom"),
+    ("import", "Copy servers other tools have configured"),
+    ("list", "Show servers and their state"),
+    ("enable", "Turn a server on"),
+    ("disable", "Turn a server off"),
+    ("remove", "Delete a server from the config"),
+    ("test", "Reconnect a server and list its tools"),
+    ("reconnect", "Restart a server and refresh its tools"),
+    ("reload", "Re-read the config files"),
+    ("help", "Show the syntax"),
 ];
 
 pub struct AppInit {
@@ -103,6 +121,10 @@ enum UiMsg {
     LoginProviders(Result<Vec<(usize, String)>, String>),
     /// An MCP login finished: tool count and whether the tool set changed.
     McpLoggedIn(String, Result<(usize, bool), String>),
+    /// An `/mcp` change was applied: what to tell the user, and whether the tool list changed.
+    McpApplied { lines: Vec<String>, refresh: bool },
+    /// `/mcp reconnect` or `/mcp test` finished.
+    McpReconnected { name: String, verbose: bool, ms: u128, result: Result<(usize, bool), String> },
     ClipboardImage(Result<Option<Image>, String>),
     Ghost {
         seq: u64,
@@ -173,6 +195,8 @@ struct App {
     child_busy: bool,
     last_draw: Instant,
     started: Instant,
+    /// An `/mcp add` wizard is collecting answers; the composer's lines go to it.
+    mcp_wizard: Option<super::mcp_wizard::Wizard>,
 }
 
 fn push_capped<T>(v: &mut Vec<T>, item: T) {
@@ -220,14 +244,15 @@ pub async fn run(init: AppInit) -> i32 {
     let mut commands: Vec<Entry> = BUILTIN_DESC
         .iter()
         .map(|&(name, desc, needs_arg)| {
-            let args: Vec<String> = match name {
-                "thinking" => Thinking::NAMES.iter().map(|s| s.to_string()).collect(),
-                "copy" => ["code", "cmd", "link"].map(String::from).to_vec(),
-                "jobs" => vec!["kill".to_string()],
-                "login" => plugins.mcp_names().iter().map(|n| format!("mcp:{n}")).collect(),
-                _ => vec![],
+            let (args, arg_descs): (Vec<String>, Vec<String>) = match name {
+                "thinking" => (Thinking::NAMES.iter().map(|s| s.to_string()).collect(), vec![]),
+                "copy" => (["code", "cmd", "link"].map(String::from).to_vec(), vec![]),
+                "jobs" => (vec!["kill".to_string()], vec![]),
+                "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
+                "login" => (plugins.mcp_names().iter().map(|n| format!("mcp:{n}")).collect(), vec![]),
+                _ => (vec![], vec![]),
             };
-            Entry { name: name.into(), desc: desc.into(), needs_arg, args }
+            Entry { name: name.into(), desc: desc.into(), needs_arg, args, arg_descs }
         })
         .collect();
     commands.extend(ctx.commands.iter().map(|c| Entry {
@@ -235,12 +260,14 @@ pub async fn run(init: AppInit) -> i32 {
         desc: c.description.clone(),
         needs_arg: false,
         args: vec![],
+        arg_descs: vec![],
     }));
     commands.extend(ctx.skills.iter().map(|s| Entry {
         name: format!("skill:{}", s.name),
         desc: s.description.clone(),
         needs_arg: false,
         args: vec![],
+        arg_descs: vec![],
     }));
     let show_thinking = !providers.cfg.omp.hide_thinking_block;
     let smooth = providers.cfg.omp.display.smooth_streaming;
@@ -281,6 +308,7 @@ pub async fn run(init: AppInit) -> i32 {
         child_busy: false,
         last_draw: Instant::now() - FRAME,
         started: Instant::now(),
+        mcp_wizard: None,
     };
     for w in theme_warnings.iter().chain(app.plugins.warnings.iter()) {
         app.tr.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
@@ -624,6 +652,13 @@ impl App {
                 }
                 Err(e) => self.error(&format!("mcp:{name}: logged in, but its tools could not be listed: {e}")),
             },
+            UiMsg::McpApplied { lines, refresh } => {
+                self.notice(&lines.join("\n"));
+                if refresh {
+                    self.send(Command::RefreshTools);
+                }
+            }
+            UiMsg::McpReconnected { name, verbose, ms, result } => self.on_mcp_reconnected(&name, verbose, ms, result),
             UiMsg::LoginProviders(r) => {
                 let (mut items, mut targets) = (Vec::new(), Vec::new());
                 match r {
@@ -818,7 +853,7 @@ impl App {
     /// Asks the predict plugin for a ghost when the composer wants one. Failures are silent.
     fn request_ghost(&mut self) {
         let cfg = &self.providers.cfg.mu.predict;
-        if !cfg.enabled || self.composer.has_ghost() {
+        if !cfg.enabled || self.composer.has_ghost() || self.mcp_wizard.is_some() {
             return;
         }
         let Some(q) = self.composer.predict_query() else { return };
@@ -860,6 +895,9 @@ impl App {
     fn on_key_inner(&mut self, k: KeyEvent) {
         if self.overlay.is_some() {
             return self.overlay_key(k);
+        }
+        if self.mcp_wizard.is_some() && self.mcp_wizard_key(k) {
+            return;
         }
         let action = self.composer.on_key(k, self.running, &self.commands);
         match action {
@@ -935,6 +973,7 @@ impl App {
             OverlayEvent::AssignRole { role: None, model } => self.send(Command::SetModel(model)),
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
+            OverlayEvent::Mcp(pick, row) => self.on_mcp_pick(pick, row),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
             OverlayEvent::Quote(q) => self.composer.append_quotes(&q),
             OverlayEvent::Resume(p) => self.send(Command::Resume(p)),
@@ -961,6 +1000,10 @@ impl App {
     }
 
     fn submit(&mut self, mut input: UserInput, follow_up: bool) {
+        if self.mcp_wizard.is_some() && input.images.is_empty() {
+            let line = input.text.trim().to_string();
+            return self.mcp_wizard_line(&line);
+        }
         input.text = input.text.trim().to_string();
         if input.text.is_empty() && input.images.is_empty() {
             return;
@@ -1027,6 +1070,7 @@ impl App {
             }
             "model" | "switch" => self.send(Command::SetModel(arg.into())),
             "login" => self.login(arg),
+            "mcp" => self.mcp_cmd(arg),
             "thinking" => match Thinking::parse(arg) {
                 Some(t) => self.send(Command::SetThinking(t)),
                 None => self.error("usage: /thinking off|low|medium|high|xhigh|max"),

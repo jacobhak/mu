@@ -92,7 +92,7 @@ fn expand_value(v: &Value, get: &dyn Fn(&str) -> Option<String>) -> Value {
     }
 }
 
-fn as_bool(v: &Value) -> Option<bool> {
+pub(super) fn as_bool(v: &Value) -> Option<bool> {
     match v {
         Value::Bool(b) => Some(*b),
         Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
@@ -136,7 +136,7 @@ fn scalar(v: &Value) -> Option<String> {
 }
 
 /// One entry, already expanded. `Ok(None)`: a legacy SSE server (skipped with a warning by the caller).
-fn parse_entry(name: &str, e: &Value) -> Result<Option<McpServer>, String> {
+pub(super) fn parse_entry(name: &str, e: &Value) -> Result<Option<McpServer>, String> {
     let Value::Object(o) = e else { return Err("not an object".into()) };
     let ty = o.get("type").and_then(Value::as_str);
     let command = o.get("command").and_then(Value::as_str).filter(|s| !s.is_empty());
@@ -181,7 +181,7 @@ fn parse_entry(name: &str, e: &Value) -> Result<Option<McpServer>, String> {
 }
 
 /// What makes two entries "the same connection" (omp's dedupe key).
-fn connection_key(s: &McpServer) -> Value {
+pub(super) fn connection_key(s: &McpServer) -> Value {
     let kind = match &s.kind {
         Kind::Stdio { command, args, env, cwd } => json!({"command": command, "args": args, "env": env, "cwd": cwd}),
         Kind::Http { url, headers } => json!({"url": url, "headers": headers}),
@@ -189,7 +189,7 @@ fn connection_key(s: &McpServer) -> Value {
     json!({"kind": kind, "auth": s.auth})
 }
 
-fn candidate_files(cwd: &Path, agent: &Path) -> Vec<PathBuf> {
+pub fn candidate_files(cwd: &Path, agent: &Path) -> Vec<PathBuf> {
     vec![
         cwd.join(".omp/mcp.json"),
         cwd.join(".omp/.mcp.json"),
@@ -207,8 +207,17 @@ fn names(v: Option<&Value>) -> Vec<String> {
     }
 }
 
-/// The servers for a project, in file order, plus warnings. `get_env` serves `${VAR}`.
-pub fn load_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<String>) -> (Vec<McpServer>, Vec<String>) {
+/// A configured server whether or not it is switched on, and the file that defines it.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub server: McpServer,
+    pub enabled: bool,
+    pub file: PathBuf,
+}
+
+/// Every server for a project, in file order, including the ones switched off, plus warnings.
+/// `get_env` serves `${VAR}`.
+pub fn load_all_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<String>) -> (Vec<Entry>, Vec<String>) {
     let mut warnings = Vec::new();
     let user_file = agent.join("mcp.json");
     let (mut disabled, mut enabled) = (Vec::new(), Vec::new());
@@ -217,7 +226,7 @@ pub fn load_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<Stri
         enabled = names(root.get("enabledServers"));
     }
     let mut claimed: Vec<String> = Vec::new();
-    let mut out: Vec<McpServer> = Vec::new();
+    let mut out: Vec<Entry> = Vec::new();
     let mut keys: Vec<Value> = Vec::new();
     for file in candidate_files(cwd, agent) {
         let Some(Value::Object(root)) = read_json(&file, &mut warnings) else { continue };
@@ -242,14 +251,22 @@ pub fn load_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<Stri
                         continue;
                     }
                     keys.push(key);
-                    if on {
-                        out.push(s);
-                    }
+                    out.push(Entry { server: s, enabled: on, file: file.clone() });
                 }
             }
         }
     }
     (out, warnings)
+}
+
+/// The servers that are switched on for a project, in file order, plus warnings.
+pub fn load_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<String>) -> (Vec<McpServer>, Vec<String>) {
+    let (all, warnings) = load_all_with(cwd, agent, get_env);
+    (all.into_iter().filter(|e| e.enabled).map(|e| e.server).collect(), warnings)
+}
+
+pub fn load_all(cwd: &Path, agent: &Path) -> (Vec<Entry>, Vec<String>) {
+    load_all_with(cwd, agent, &|k| std::env::var(k).ok())
 }
 
 pub fn load(cwd: &Path, agent: &Path) -> (Vec<McpServer>, Vec<String>) {

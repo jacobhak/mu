@@ -3946,6 +3946,8 @@ dependencies = [
  "jiff",
  "libc",
  "mu-common",
+ "objc2-app-kit",
+ "objc2-foundation",
  "pi-diff",
  "pi-edit",
  "pi-shell",

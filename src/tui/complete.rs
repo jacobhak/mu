@@ -8,6 +8,8 @@ pub struct Entry {
     pub desc: String,
     pub needs_arg: bool,
     pub args: Vec<String>,
+    /// What each of `args` does, parallel to it; may be empty.
+    pub arg_descs: Vec<String>,
 }
 
 /// Match quality of `cand` for `query` (higher is better); `None` when it does not match.
@@ -57,7 +59,7 @@ mod tests {
     use super::*;
 
     fn e(name: &str) -> Entry {
-        Entry { name: name.into(), desc: String::new(), needs_arg: false, args: vec![] }
+        Entry { name: name.into(), desc: String::new(), needs_arg: false, args: vec![], arg_descs: vec![] }
     }
 
     fn names(es: &[Entry], idx: Vec<usize>) -> Vec<&str> {

@@ -1,4 +1,5 @@
-//! System clipboard access: text out via tmux/OSC 52 plus local helpers, images in via local helpers.
+//! System clipboard access: text out via tmux/OSC 52 plus local helpers, images in via local helpers
+//! (`osascript` on macOS, `wl-paste`/`xclip` elsewhere).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -45,11 +46,14 @@ fn osc52(text: &str) -> Result<(), String> {
 /// Which local display server a clipboard helper can talk to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Display {
+    #[cfg(target_os = "macos")]
+    MacOs,
     Wayland,
     X11,
     None,
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn detect_display(wayland: Option<&std::ffi::OsStr>, x11: Option<&std::ffi::OsStr>) -> Display {
     let set = |v: Option<&std::ffi::OsStr>| v.is_some_and(|v| !v.is_empty());
     if set(wayland) {
@@ -65,6 +69,9 @@ fn detect_display(wayland: Option<&std::ffi::OsStr>, x11: Option<&std::ffi::OsSt
 fn display() -> Display {
     static D: std::sync::OnceLock<Display> = std::sync::OnceLock::new();
     *D.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        return Display::MacOs;
+        #[cfg(not(target_os = "macos"))]
         detect_display(std::env::var_os("WAYLAND_DISPLAY").as_deref(), std::env::var_os("DISPLAY").as_deref())
     })
 }
@@ -77,6 +84,8 @@ fn pipe_to_local(text: &str) {
             c.args(["-selection", "clipboard"]);
             c
         }
+        #[cfg(target_os = "macos")]
+        Display::MacOs => return,
         Display::None => return,
     };
     let Ok(mut child) = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
@@ -105,11 +114,42 @@ async fn run(bin: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(if out.status.success() { out.stdout } else { Vec::new() })
 }
 
-/// Reads an image from the local clipboard (`wl-paste` or `xclip`). `Ok(None)` when it holds none.
 type ReadArgs = fn(&str) -> Vec<String>;
 
+/// Reads the general pasteboard's image via NSPasteboard. TIFF, which many apps put on the pasteboard
+/// instead of PNG, is converted to PNG.
+#[cfg(target_os = "macos")]
+fn read_pasteboard_image() -> Result<Option<Vec<u8>>, String> {
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypeTIFF};
+    use objc2_foundation::{NSDictionary, NSString};
+
+    let pb = NSPasteboard::generalPasteboard();
+    for t in ["public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp"] {
+        if let Some(d) = pb.dataForType(&NSString::from_str(t)).filter(|d| !d.is_empty()) {
+            return Ok(Some(d.to_vec()));
+        }
+    }
+    let Some(tiff) = pb.dataForType(unsafe { NSPasteboardTypeTIFF }).filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    let rep = NSBitmapImageRep::imageRepWithData(&tiff).ok_or("clipboard image: unreadable TIFF")?;
+    // SAFETY: an empty properties dictionary is valid for PNG output.
+    let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }
+        .ok_or("clipboard image: PNG conversion failed")?;
+    Ok(Some(png.to_vec()))
+}
+
+#[cfg(target_os = "macos")]
+async fn read_image_macos() -> Result<Option<crate::message::Image>, String> {
+    let bytes = tokio::task::spawn_blocking(read_pasteboard_image).await.map_err(|e| e.to_string())??;
+    bytes.map(crate::image::from_bytes).transpose()
+}
+
+/// Reads an image from the local clipboard. `Ok(None)` when it holds none.
 pub async fn read_image() -> Result<Option<crate::message::Image>, String> {
     let (bin, list_args, read_args): (&str, &[&str], ReadArgs) = match display() {
+        #[cfg(target_os = "macos")]
+        Display::MacOs => return read_image_macos().await,
         Display::Wayland => ("wl-paste", &["--list-types"], |m| vec!["--type".into(), m.into()]),
         Display::X11 => ("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"], |m| {
             ["-selection", "clipboard", "-t", m, "-o"].map(String::from).to_vec()

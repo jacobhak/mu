@@ -166,7 +166,7 @@ Reads omp's files in place. Agent dir: `~/.omp/agent`, or `~/.omp/profiles/<name
 | Sticky rules | `<agent>/RULES.md`, `.omp/RULES.md` | Read; carried on every request |
 | Stream rules | omp rule files | Read |
 | Skills | `<root>/skills/<name>/SKILL.md`, one level deep | Read |
-| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. OAuth tokens come from `omp token`, and `/login mcp:<name>` runs omp's own flow; mu never reads omp's credential store |
+| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. `/mcp` is the one writer: add, remove and `disabledServers` / `enabledServers` edits to these files (nothing else in a file changes; an unparseable file is left alone) and a live sync of the running servers. OAuth tokens come from `omp token`, and `/login mcp:<name>` runs omp's own flow; mu never reads omp's credential store |
 | Sessions | `<agent>/sessions/<encoded-cwd>/<ts>_<id>.jsonl`, v3 tree; blobs `<agent>/blobs/<sha256>` | Written in omp's v3 format to mu's own directory; omp opens them with `--resume <path>` or `--session-dir` |
 
 Non-goal: running pi or omp TypeScript extensions.

@@ -47,6 +47,13 @@ fn tail_lines(path: &std::path::Path, n: usize) -> Vec<Vec<u8>> {
     lines
 }
 
+/// Lines that never go into the history file: `/mcp add` carries env values, headers and urls that
+/// can hold tokens.
+fn withheld(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    words.next() == Some("/mcp") && words.next() == Some("add")
+}
+
 fn slash_usage(history: &[String]) -> HashMap<String, u32> {
     let mut usage: HashMap<String, u32> = HashMap::new();
     for h in history {
@@ -164,6 +171,8 @@ pub struct Composer {
     menu: Option<Menu>,
     /// Text for which the user dismissed the menu with Esc.
     menu_closed_for: Option<String>,
+    /// Nothing submitted is recorded in the history (the `/mcp add` wizard is collecting answers).
+    private: bool,
 }
 
 /// Slash-command menu. `items` are completion tokens (command or argument names).
@@ -206,6 +215,7 @@ impl Composer {
             ghost: None,
             menu: None,
             menu_closed_for: None,
+            private: false,
         }
     }
 
@@ -213,6 +223,11 @@ impl Composer {
     pub fn with_cwd(mut self, cwd: &Path) -> Self {
         self.cwd = cwd.to_string_lossy().into_owned();
         self
+    }
+
+    /// While on, submitted text stays out of the history, in memory and on disk.
+    pub fn set_private(&mut self, on: bool) {
+        self.private = on;
     }
 
     pub fn on_key(&mut self, key: KeyEvent, running: bool, commands: &[Entry]) -> Action {
@@ -381,11 +396,14 @@ impl Composer {
                 }
                 let e = commands.iter().find(|c| c.name == name && !c.args.is_empty())?;
                 let lower = partial.to_lowercase();
-                let items: Vec<String> =
-                    e.args.iter().filter(|a| a.to_lowercase().starts_with(&lower)).cloned().collect();
+                let hits: Vec<usize> =
+                    (0..e.args.len()).filter(|&i| e.args[i].to_lowercase().starts_with(&lower)).collect();
+                let items: Vec<String> = hits.iter().map(|&i| e.args[i].clone()).collect();
+                let descs: Vec<String> =
+                    hits.iter().map(|&i| e.arg_descs.get(i).cloned().unwrap_or_default()).collect();
                 let n = items.len();
                 let exact = e.args.iter().any(|a| a == partial);
-                (items, vec![String::new(); n], vec![false; n], Some(name.to_owned()), exact)
+                (items, descs, vec![false; n], Some(name.to_owned()), exact)
             }
         };
         (!items.is_empty()).then_some(Menu { items, descs, needs_arg, sel: 0, arg, exact })
@@ -548,16 +566,14 @@ impl Composer {
             let n = m.items.len();
             let start = m.sel.saturating_sub(MENU_ROWS - 1).min(n.saturating_sub(MENU_ROWS));
             for i in start..n.min(start + MENU_ROWS) {
-                let mut row: Line = match &m.arg {
-                    Some(_) => vec![span(format!("{pad}  {}", m.items[i]), ContentStyle::default())],
-                    None => {
-                        let mut r = vec![span(format!("{pad}  /{}", m.items[i]), ContentStyle::default())];
-                        if !m.descs[i].is_empty() {
-                            r.push(span(format!("  {}", m.descs[i]), theme::get().fg(Role::Faint)));
-                        }
-                        r
-                    }
+                let (head, desc) = match &m.arg {
+                    Some(_) => (format!("{pad}  {}", m.items[i]), &m.descs[i]),
+                    None => (format!("{pad}  /{}", m.items[i]), &m.descs[i]),
                 };
+                let mut row: Line = vec![span(head, ContentStyle::default())];
+                if !desc.is_empty() {
+                    row.push(span(format!("  {desc}"), theme::get().fg(Role::Faint)));
+                }
                 row = line::truncate(&row, width);
                 if i == m.sel {
                     row = line::fill(&row, width, theme::get().color(Role::Selected));
@@ -690,7 +706,7 @@ impl Composer {
     }
 
     fn push_history(&mut self, text: &str) {
-        if text.trim().is_empty() || self.history.last().is_some_and(|h| h == text) {
+        if self.private || withheld(text) || text.trim().is_empty() || self.history.last().is_some_and(|h| h == text) {
             return;
         }
         if let Some(path) = &self.history_path {
@@ -809,6 +825,7 @@ mod tests {
             desc: format!("{name} desc"),
             needs_arg,
             args: args.iter().map(|s| s.to_string()).collect(),
+            arg_descs: vec![],
         }
     }
 
@@ -931,6 +948,28 @@ mod tests {
         assert!(c.is_empty());
         let c2 = Composer::new(Some(path));
         assert_eq!(c2.history, vec!["hello \"there\"".to_owned()]);
+    }
+
+    #[test]
+    fn secrets_stay_out_of_the_history() {
+        let path = temp_path("private");
+        let mut c = Composer::new(Some(path.clone()));
+        for line in ["/mcp add h --url http://x/mcp -H \"Authorization: Bearer s3cret\"", "  /mcp   add"] {
+            type_str(&mut c, line);
+            assert!(matches!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), Action::Submit(_)));
+        }
+        c.set_private(true);
+        type_str(&mut c, "Bearer s3cret");
+        assert!(matches!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), Action::Submit(_)));
+        c.set_private(false);
+        for line in ["/mcp list", "/mcp remove h", "hello"] {
+            type_str(&mut c, line);
+            press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+        }
+        assert_eq!(c.history, ["/mcp list", "/mcp remove h", "hello"]);
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(!file.contains("s3cret") && !file.contains("add"), "{file}");
+        assert_eq!(Composer::new(Some(path)).history.len(), 3);
     }
 
     #[test]
