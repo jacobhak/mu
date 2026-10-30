@@ -1,9 +1,10 @@
 use super::{ToolOutput, Tools};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::UTF8};
-use pi_walker::{WalkFilter, WalkOptions, WalkRequest};
+use pi_walker::{Detail, FileType, Fs, walk};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -16,8 +17,20 @@ const PER_FILE: usize = 20;
 const TOTAL: usize = 200;
 const MAX_COL: usize = 512;
 
-pub fn walk_options() -> WalkOptions {
-    WalkOptions { include_hidden: false, use_gitignore: true, skip_git: true, ..Default::default() }
+pub fn walk_options() -> walk::Options {
+    walk::Options { hidden: false, gitignore: true, skip_git: true, ..Default::default() }
+}
+
+/// pi-walker spawns its workers on the ambient runtime, and mu's is single-threaded. Walks get a
+/// multi-threaded runtime of their own, entered from a scoped thread so this works inside or outside a runtime.
+pub fn block_on_walk<F: Future + Send>(f: F) -> F::Output
+where
+    F::Output: Send,
+{
+    static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread().thread_name("mu-walk").enable_all().build().expect("walk runtime")
+    });
+    std::thread::scope(|s| s.spawn(|| RT.block_on(f)).join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
 }
 
 impl Tools {
@@ -43,16 +56,23 @@ fn grep_blocking(cwd: &std::path::Path, root: PathBuf, a: Args) -> ToolOutput {
     let files: Vec<(String, PathBuf)> = if root.is_file() {
         vec![(display(&root), root.clone())]
     } else {
-        let req =
-            WalkRequest::from_options(&root, walk_options()).filter(WalkFilter::files_only().max_file_size(4 << 20));
-        let mut v = match req.collect_files() {
-            Ok(v) => v,
-            Err(e) => return ToolOutput::err(format!("Walk failed: {e:?}")),
+        // Full detail so sizes are known for the 4 MiB cap.
+        let opts = walk::Options { detail: Detail::Full, ..walk_options() };
+        let found = block_on_walk(walk::collect(&Fs::native(), &root, &opts, true, |_, e| {
+            if e.file_type == FileType::File && e.size.is_none_or(|s| s <= 4 << 20) {
+                walk::Action::Continue
+            } else {
+                walk::Action::Skip
+            }
+        }));
+        let found = match found {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::err(format!("Walk failed: {e}")),
         };
-        v.sort_by(|a, b| a.path.cmp(&b.path));
-        v.into_iter()
+        found
+            .iter()
             .map(|e| {
-                let abs = root.join(&e.path);
+                let abs = root.join(e.rel_path());
                 (display(&abs), abs)
             })
             .collect()
@@ -101,4 +121,35 @@ fn grep_blocking(cwd: &std::path::Path, root: PathBuf, a: Args) -> ToolOutput {
         out.extend(notices);
     }
     ToolOutput::ok(out.join("\n"))
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    /// A git-like tree: `a.rs`, `sub/b.rs`, gitignored `sub/gen.rs`, hidden `.h/c.rs`, a 5 MiB `big.rs`.
+    pub fn tree() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-walk-{}", uuid::Uuid::new_v4()));
+        for dir in [".git", "sub", ".h"] {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+        }
+        std::fs::write(d.join(".gitignore"), "sub/gen.rs\n").unwrap();
+        for f in ["a.rs", "sub/b.rs", "sub/gen.rs", ".h/c.rs"] {
+            std::fs::write(d.join(f), "fn needle() {}\n").unwrap();
+        }
+        std::fs::write(d.join("big.rs"), format!("fn needle() {{}}\n{}", "x".repeat(5 << 20))).unwrap();
+        d
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn walks_honour_gitignore_hidden_and_size_cap() {
+        let d = tree();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.grep(Args { pattern: "needle".into(), path: None, case: None }).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert_eq!(o.text, "a.rs:1:fn needle() {}\nsub/b.rs:1:fn needle() {}");
+        let o = t.grep(Args { pattern: "needle".into(), path: Some("big.rs".into()), case: None }).await;
+        assert_eq!(o.text, "big.rs:1:fn needle() {}", "an explicit file is searched regardless of size");
+    }
 }

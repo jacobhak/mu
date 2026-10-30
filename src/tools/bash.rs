@@ -676,9 +676,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn background_processes_in_plain_mode() {
         // `pgrep`/`pkill -f` see every process on the machine, so the sleep durations carry this
-        // process's pid: concurrent test runs cannot match or kill each other's sleeps.
+        // process's pid: concurrent test runs cannot match or kill each other's sleeps. BSD `sleep`
+        // rejects more than i32::MAX seconds, so the durations stay below it for any pid.
         let pid = std::process::id();
-        let (quiet, kept) = (format!("31337{pid}"), format!("31338{pid}"));
+        let (quiet, kept) = (format!("2{pid:07}"), format!("3{pid:07}"));
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
