@@ -16,6 +16,13 @@ mu keeps most of what omp does and changes where the memory goes. A session hold
 
 The cost: features that live inside omp's runtime, such as TypeScript extensions, aren't available. The reasoning and measurements behind the design are in [`DESIGN.md`](DESIGN.md).
 
+## Beyond omp
+
+mu also adds a few things omp doesn't have:
+
+- **[Reply picker](docs/reply-picker.md).** `Ctrl+R` lets you move through the last reply by sentence, list item or code line, with vim or emacs keys, and mark parts of it. The marked parts are quoted into your answer, so you can reply point by point.
+- **[Durable plans](docs/durable-plans.md).** A plan doesn't have to be approved in the session that wrote it. You can park it, list it and refine it, then approve it later in the TUI or headless (`mu plan`), or hand it to `/deliver` to be implemented, reviewed and committed in its own worktree. When you open a parked plan, mu tells you which of the files it was based on have changed since.
+
 ## Status
 
 Early and experimental: started in October 2026 and changing quickly.
@@ -51,7 +58,7 @@ This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` a
 
 ```sh
 cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web,mu-predict,mu-memory}
-scripts/build-mcp-http.sh                # target/release/mu-mcp-http (see below)
+scripts/build-mcp-http.sh                # target/release/mu-mcp-http (see docs/mcp.md)
 mkdir -p ~/.mu/plugins
 for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
 (cd plugins/memory && bun install)       # dev checkout: the memory plugin runs under Bun
@@ -70,124 +77,15 @@ cargo build --release --no-default-features                                   # 
 
 Grammars load on first use of that language (about 1-2 MB resident each); idle memory is unaffected.
 
-## Use
+## Documentation
 
-```
-mu [--model SEL] [--thinking off|low|medium|high|xhigh|max] [--profile NAME] [--theme NAME] [-c] [--resume [ID|PATH]]
-mu -p PROMPT [--agent NAME] [--max-cost USD]
-mu --acp
-mu take <session|id>
-mu review [--base REF] [--plan FILE] [--focus TEXT] [--out FILE] [--markdown]
-mu update [--check] [--tag TAG] [--force]
-```
-
-`SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory; `--resume` takes a session id or path, or opens a picker. `--profile` picks an omp profile (sets `OMP_PROFILE`); `--theme` overrides `[theme] source` for one run. Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
-
-Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal` reads as `low`). `xhigh` and `max` send the matching `output_config.effort` through the gateway, which clamps an effort the model does not support to the nearest one it does. Thinking budgets: low 4096, medium 8192, high 16384, xhigh 32768, max 64000, always capped to leave room for the answer.
-
-`-p` runs one prompt and prints the answer. `--agent` runs it as a custom agent (see Custom agents); `--max-cost` aborts once the session has cost more than that many USD and always prints `mu: cost $X` to stderr.
-
-Ghost text predicts the rest of the word or a prompt you repeat here; Tab or → accepts. It is configured under `[predict]` (see Config). `mu-predict bench` replays your own prompt history to measure keystrokes saved. By default the word comes from an n-gram of your own history. `engine = "smollm"` switches to SmolLM2-135M, which first needs `mu predict setup smollm`: it downloads the 145 MB weights, checks each file's size and SHA-256, and keeps them under `~/.mu/models/SmolLM2-135M/` (`mu predict setup smollm --status` reports what is there). If the weights are missing or damaged, mu shows one notice and uses the n-gram.
-
-Typing `/` opens a command menu with descriptions and argument completion (↑/↓, Tab, Enter, Esc).
-
-Slash commands: `/new /resume /model /thinking /compact /plan /plans /deliver [id] /session /rename /todo /skills /plugins /mcp /login [provider|mcp:<name>] /copy /reply /image /jobs /hotkeys /exit`, plus prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts` and `/skill:<name>`. `/deliver` starts `mu deliver <id> --worktree` detached (a picker of parked plans without an id) and wakes the session when it finishes.
-
-While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
-
-`/copy` opens a picker of recent replies, code blocks and bash commands; `/copy code`, `/copy cmd` and `/copy link` copy the latest one directly. Under tmux the text goes through `tmux load-buffer -w`; otherwise via OSC 52, plus `wl-copy`/`xclip` when a local display exists.
-
-`Ctrl+R` or `/reply` opens a reply picker on the newest finished assistant text (it works during a turn and shows the last finished reply, not the streaming one). It uses all the height the screen leaves and is framed by a titled rule above and a plain rule below. `[` and `]` switch to older and newer replies. Up/Down move between sentences, list items, headings, table rows and code lines; Left/Right move word by word; PgUp/PgDn, Home/End jump. Vim and Emacs keys work too: `j k h l`, `w b e` (word), `0 ^ $` (start and end of the unit), `{ }` (previous and next block), `gg G`, Ctrl+D/Ctrl+U (half page), counts such as `5j`, `q` to close; Ctrl+N/P (unit), Ctrl+F/B and Alt+F/B (word), Ctrl+A/E (start and end of the unit), Ctrl+V/Alt+V (page), `Alt+<`/`Alt+>` (top and bottom), Ctrl+G (cancel). Space marks the current unit. Shift with an arrow (or H/J/K/L) selects: Shift+Left/Right by word, Shift+Up/Down to the edge of the unit and then by unit; Space turns the selection into a mark, Esc drops it, a plain move drops it too. `c` clears the marks. Enter quotes the marks plus any selection (or the current unit when there is neither) as `> ` blockquotes at the end of the composer and puts the cursor on the row right under the first quote; the quote keeps its structure (blank `>` lines between paragraphs, list markers, code lines in a fence) so it renders as markdown. As in chat apps, a quote ends at the first line without `>`: the transcript shows your comment under it, not inside it, though the model gets the plain text. Esc closes without a change.
-
-Images: paste an image file path, run `/image <path>`, press Ctrl+V (reads `wl-paste`/`xclip`), or paste an image from the terminal clipboard when it supports kitty's OSC 5522 (tmux needs `allow-passthrough on`). PNG, JPEG, GIF and WebP up to 5 MB; no resizing.
-
-`task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session. `wait` blocks until a job finishes; `/jobs` lists jobs and `/jobs kill <id|all>` cancels them. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
-
-`mu review` runs `/review` headlessly, for detached or scripted runs: the same request, `review-lead` and workers, with no TUI and no session. `--base` defaults to `HEAD` (uncommitted changes); `--plan` is the approved plan file. It prints the verdict as JSON (`verdict`: `pass`, `fail`, `nothing` or `error`; `findings` with a `blocking` flag per finding) to stdout or `--out`, and progress to stderr. Exit codes: 0 pass or nothing to review, 1 fixes needed, 2 the review did not complete. The reviewer runs with the configured `review` role.
-
-### Detached runs and taking them over
-
-`mu -p` prints `session: <path>` to stderr as soon as the session exists. Exit codes: 0 done, 1 error, abort or cost cap, 3 interrupted and resumable. `kill -USR1 <pid>` (never a process group) asks a `-p` run to stop: it finishes the running tool, skips the rest of that batch, ends the turn, releases the session and exits 3 with `mu: interrupted; resume with: mu --resume <path>`. A second `SIGUSR1` cancels the current step. Either way the session loads without repair. `mu take <session|id>` does this for you: it signals the run, waits until the session is free, changes to the session's directory and execs `mu --resume <path>`. It refuses unless stdin and stdout are terminals, and refuses a session open in an interactive mu or held by a process that left no owner record. Ctrl-C while waiting sends the second signal; a second Ctrl-C gives up waiting. Every open session is recorded in `$MU_HOME/run/<id>.json` (`pid`, `print_run`, `started`, `session`), held under `flock` by its owner, so a busy-lock error can name the pid; the files are safe to delete while no mu runs. The session file format is unchanged. A taken-over session loses `--max-cost` and a custom `--agent` prompt; `ask` and jobs come back.
-
-Stop details: a stop that arrives before the next tool starts skips every call of that batch, so the run ends at once; one that arrives during a tool lets that tool finish. Any second `SIGUSR1` cancels the current step, including one sent by `mu take` after a manual `kill -USR1` (or by two takes). A fatal error (such as a failed provider request) exits 1 even after a stop; non-fatal errors (a truncated reply, a failed auto-compaction) do not change exit 3. The pid in an owner record is only meaningful on the same host and pid namespace: `mu take` from another container or namespace that shares `MU_HOME` and the session directory can signal the wrong process or none, so run it where the `-p` run lives.
-
-`mu notify <session|id|path> [--from NAME] <text|->` leaves a message for a session and, if an interactive mu has it open, wakes it: that mu starts a turn by itself, shows `↳ mu notify from NAME: …` and the model sees the text in a `<system-notice>` user message (`-` reads the text from stdin; at most 64 KiB; `--from` defaults to `another process`). It prints one line: `delivered (pid N)` or `queued (<reason>)`, where the reason is `not running`, `pid N does not take messages`, `owner unknown`, `owner changed` or `cannot signal pid N: <error>`; exit 0 for delivered or queued, 1 for an error (unknown session, empty or oversized text). Messages are files in `$MU_HOME/inbox/<id>/` (directory mode 0700), written atomically before the owner is looked at, and removed once the notice is in the session file. Only an interactive mu installs the `SIGUSR2` handler and says so in its owner record (`inbox: true`); `-p`, subagents and ACP are never signalled (the signal would kill them), so a message for them waits until the session is opened again (`mu take`, `--resume`), which announces it (`N message(s) from mu notify waiting`) and sends it with the next prompt. A message that arrives mid-turn goes out after the current tool batch or reply, in the same turn. Every `mu notify` call deletes queued messages older than 30 days. A turn that began without user input (a `mu notify` message or a finished background job) rings the terminal when it ends or when it asks you something (`ask`, plan review): BEL, plus an OSC 9 notification under tmux (needs `allow-passthrough`) and in Ghostty, WezTerm, iTerm2 and Warp; omp's `completion: {notify: off}` in `config.yml` turns it off. Bash commands (and `!cmd`) get `PI_SESSION_FILE` and `PI_SESSION_ID` (empty without a session), as in omp.
-
-### MCP servers
-
-mu reads omp's MCP config unchanged: `<cwd>/.omp/mcp.json`, `<agentDir>/mcp.json` and the other files omp reads (`.mcp.json` variants, `./mcp.json`), merged the way omp merges them, with `${VAR}` / `${VAR:-default}` expansion, `disabledServers` / `enabledServers` and `enabled`/`timeout`/`instructions`/`requestIdFormat` fields. Tools are named `mcp__<server>_<tool>`, as in omp.
-
-- **stdio** servers run as a child process. **http** servers (`"type": "http"`, or a `url` with no type) run through `mu-mcp-http`, a small bridge plugin that keeps TLS out of the core. Legacy `"type": "sse"` servers are skipped with a warning. The bridge is its own Cargo project outside the workspace (`scripts/build-mcp-http.sh`), because building it with `mu` would unify features and give the core's HTTP client rustls without a crypto provider; `scripts/build-mcp-http.sh check` fails if the core ever depends on rustls.
-- Nothing starts at launch. A server's tool list is cached in `~/.mu/mcp/tools/` (keyed by a hash of its config), so its tools are advertised without starting it; it starts on the first call. The first session after a config change starts the server once to list its tools. A server's process lives for the session (`[mcp] lifetime = "idle:10m"` in `config.toml` changes that).
-- **OAuth** goes through omp: mu runs `omp token <credential>` (through the auth broker when the gateway is running), never reads omp's credential store and never holds a refresh token. A server that needs a login is reported as `needs login`; log in from interactive mu with `/login mcp:<name>` (or pick it in `/login`), which hands the terminal to omp's own flow (`omp -p --no-session '/mcp reauth <name>'`) and makes the server usable in the same session. Headless, ACP and subagent runs cannot log in. Over SSH the browser needs a port forward to omp's local callback port, as for omp itself.
-- **Project config can run commands and contact URLs**: a repository's `.omp/mcp.json` starts whatever it names, exactly as in omp. Only use mu in directories you trust.
-- **`/mcp` manages servers from inside mu**, live. Bare `/mcp` opens a picker: your servers with their state, then **Add a server…** and **Import from other tools…**; Enter on a server offers its actions (test, reconnect, enable/disable, log in, remove). Typing `/mcp ` in the slash menu lists the subcommands with descriptions: `add`, `import`, `list`, `enable`, `disable`, `remove`, `test`, `reconnect <name>`, `reload` and `help`; one that needs a server and gets none opens the picker. It edits the same `mcp.json` files omp reads, keeping everything else in them (other keys, key order; a file that does not parse is never overwritten), and applies the change to the running session: the tool list is rebuilt for the next request (one prompt-cache miss), and a newly added server connects at once and lists its tools. Not available while a turn is running.
-  - **Add wizard** (`/mcp add`, or the picker's Add row): pick a source — servers **discovered** on this machine, **popular** servers (Filesystem, Git, Fetch, Memory, Sequential Thinking, Playwright, Context7, GitHub) or a custom command or url — answer the few values it needs (an empty Enter takes the shown default; `${ENV_VAR}` references are accepted anywhere, and the GitHub token defaults to one when `GITHUB_PERSONAL_ACCESS_TOKEN` or `GITHUB_TOKEN` is set, which keeps the token out of the file), choose user or project level, and confirm a summary (env and header values masked). Esc cancels at any step.
-  - **Discovery** (`/mcp import`, or the wizard's first row) reads, never writes: omp (`~/.omp/agent` and every profile's `mcp.json`), pi (`~/.pi/agent/mcp.json`), Claude Code (`~/.claude.json`, global and this project's servers), Claude Desktop, Codex (`~/.codex/config.toml`), Gemini CLI (`~/.gemini/settings.json`) and OpenCode (`opencode.json`, global and project). Entries are converted to omp's format and copied into your `mcp.json` when picked; copies are independent of the source afterwards, and env or header values are copied as they are (the wizard warns when there are some). Servers you already have (by name or by connection) are not offered; legacy SSE servers are skipped. Cursor, Windsurf and VS Code configs are not read.
-  - Quick-add: `/mcp add <name> [--user|--project] [-e K=V]... [-H "K: V"]... [--timeout <ms>] [--] <command> [args...]` for a stdio server, `/mcp add <name> [flags] <url>` (or `--url`) for an http one. Flags come before the command, so `/mcp add fs npx -y @modelcontextprotocol/server-filesystem .` works as written. The default is the user file (`<agentDir>/mcp.json`, profile-aware); `--project` writes `<cwd>/.omp/mcp.json`. A name that any config file already defines is refused. New files are created with mode 0600 (headers and env can hold tokens); existing files keep their mode. Because those values can be tokens, `/mcp add` lines and every wizard answer are kept out of the prompt history (`history.jsonl` and ↑ recall), and ghost-text prediction is off while the wizard runs.
-  - `enable` and `disable` use omp's own switches, `disabledServers` / `enabledServers` in the user file, whichever file defines the server. `remove` deletes the definition from every file that has it, along with its switches; it does not clear OAuth credentials.
-  - `reload` re-reads the files and applies the difference by server name: removed servers stop, servers whose config changed restart and are listed again, new ones are added. Use it after editing a file by hand. `reconnect` restarts one server and lists its tools again; `test` does the same and prints the tools and the time taken.
-  - `/mcp list` shows each server's level, kind, host (or command) and state; it never prints env, headers, paths inside urls or query strings.
-- Not supported: MCP resources and prompts (and so `/mcp resources|prompts|notifications`), `/mcp reauth` and `unauth` (use `/login mcp:<name>`), Smithery, and importing Cursor, Windsurf or VS Code configs.
-- Notes: with a cold cache the first turn waits (up to 30 s per server, 60 s when `timeout` is 0) for servers to list their tools; Esc or Ctrl-C leaves it. The broker is used for token refresh only once the gateway plugin is already running, so the first listing of a session may fetch the token without it. Config warnings (a skipped SSE server, a bad entry) show in the TUI and on stderr for `-p`; ACP and subagents do not show them.
-
-### Agent Client Protocol
-
-`mu --acp` serves [ACP](https://agentclientprotocol.com) over stdio, so ACP clients such as [Paseo](https://paseo.sh) can drive it. In Paseo's `~/.paseo/config.json`:
-
-```json
-{"agents": {"providers": {"mu": {"extends": "acp", "label": "mu", "command": ["mu", "--acp"], "env": {"OMP_PROFILE": "private"}}}}}
-```
-
-Supported: `session/new`, `load` (replays history), `resume`, `close`, `prompt` (text, images, embedded resources), `cancel`, and `set_config_option` for `model` and `thinking`. `model` takes an advertised `provider/model` id or a role selector such as `@slow` or `@slow:high`, resolved as `--model` is (the advertised options list only concrete models); an unconfigured role fails with an invalid-params error. Updates cover message and thought chunks, tool calls, the todo list as a plan, context usage, and session titles. Each session runs its own agent in the `cwd` it was opened with.
-
-Not supported: `mcpServers` in `session/new` (ignored; mu uses its own plugins), the `ask` and `propose_plan` tools (hidden from the model), permission prompts (mu never asks), and streaming bash output (the full output arrives when the tool ends). Setting a config option while a prompt runs is rejected. A failed turn ends with `end_turn` plus an `**Error:**` message chunk, not a JSON-RPC error.
-
-### Custom agents
-
-Custom agents are omp-format `.md` files in `.omp/agents` and `<agentDir>/agents` (frontmatter `name`, `description`, `tools`, `model` as a list of `@role`/`provider/model`, `thinkingLevel`). `mu -p PROMPT --agent NAME` runs one; they also appear in the `task` tool.
-
-### Memory
-
-The memory plugin ships as two binaries: `mu-memory`, a small Rust shim that each `mu` session starts, and `mu-memory-daemon`, built by `bun build --compile`. The shim starts one shared daemon per `$MU_HOME` on demand (socket `$MU_HOME/memory/sock`, log `$MU_HOME/logs/memory-daemon.log`) and relays the session to it, so several `mu` sessions share one Bun runtime and embedder. The daemon exits after 10 idle minutes without a session (`MU_MEMORY_IDLE_SECS`).
-
-## Config
-
-`~/.mu/config.toml` is optional, and so is every key in it. Apart from the compaction example, the values below are the defaults.
-
-```toml
-[compaction.model_thresholds]   # same keys/values as omp's compaction.modelThresholds; overrides per key
-"anthropic/claude-haiku-5-5" = "f200000"
-
-[theme]
-source = "tokyo-night"  # default; or "terminal" (follow your terminal's palette), "omarchy", a bundled or ~/.mu/themes name, or a colors.toml path
-# accent = "blue"     # palette key or "#rrggbb"
-cards = "filled"      # or "outline"
-
-[predict]
-enabled = true
-threshold = 0.3       # minimum confidence for ghost text; 0.15 saves a few more keystrokes but shows about 55% more wrong ghosts
-engine = "ngram"     # or "smollm" (opt-in, see above); any other value warns and means "ngram"
-threads = 4          # CPU threads for SmolLM; 0 = all cores. Linux only: macOS runs SmolLM on the GPU
-
-[ask]
-nudge = true         # when a turn ends with a decision question in prose, remind the model to use `ask` instead
-
-[edit]
-mode = "hashline"     # or "sloppy": find/replace by text, no line tags
-
-[mcp]
-lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
-
-[update]
-check = true          # daily release check at startup
-```
+Usage, configuration and the individual features are documented in [`docs/`](docs/README.md).
 
 ## Development
 
 ### Tests
 
-`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see MCP servers). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
+`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see [MCP servers](docs/mcp.md)). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
 
 `cargo test --workspace --locked -- --ignored contract_` checks the pinned omp's output formats against mu's parsers (needs network and the omp from `MU_OMP`/`~/.mu/bin`).
 

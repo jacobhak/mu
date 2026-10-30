@@ -7,7 +7,8 @@ A plan does not have to be approved in the session that wrote it. It can be park
 - In the plan review, **Park plan** saves the plan and ends the turn. Plan mode turns off.
 - `/plans` lists the repository's pending plans. Choosing one opens the same review dialog as a live plan, with **Drop plan** in place of **Park plan**. Execute, compact, keep and refine apply to the current session. Esc leaves the plan parked.
 - Execute, compact and keep on a live plan also save it, so every approved plan is in the store. A failed save never blocks approval.
-- mu does not create worktrees: a plan runs in the directory mu runs in. There is no automatic review/fix loop; a run ends when the implementer's turn ends, and `/review` works against the approved plan as usual.
+- Approving in a session does not create a worktree: the plan runs in the directory mu runs in. There is no automatic review/fix loop; a run ends when the implementer's turn ends, and `/review` works against the approved plan as usual.
+- `/deliver [id]` hands a parked plan to `mu deliver <id> --worktree`, started detached (a picker of parked plans without an id): it implements the plan in a new worktree on branch `plan/<id>`, reviews it against the plan, sends blocking findings back to the implementer, then commits. The session wakes when it finishes.
 
 ## Store
 

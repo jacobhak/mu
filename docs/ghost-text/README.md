@@ -7,7 +7,7 @@ code lives. Written when the experiment worktrees were removed, so it can be pic
 
 - **Shipped:** SmolLM2-135M as an opt-in word engine (`[predict] engine = "smollm"`, `mu predict setup smollm`),
   asked from the first typed letter. The default stays omp's word n-gram. Code: `plugins/predict/src/{smollm,weights,worker,settings}.rs`,
-  `src/predict_setup.rs`; docs in the README config block and DESIGN.md.
+  `src/predict_setup.rs`; docs in `docs/ghost-text.md`, `docs/config.md` and DESIGN.md.
 - **Not shipped:** the phrase model, multi-word ghosts, the 360M model, tuned n-gram parameters, and every bench
   improvement listed below. All of it lives on the archived branches.
 - **Headline:** with mu's real accept rule SmolLM2-135M saves roughly 4-6 net keystroke points more than the n-gram
