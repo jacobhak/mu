@@ -292,7 +292,7 @@ impl Server {
         let (step, marker, id, seed) = match scripted {
             Some((t, s)) => {
                 let step = sc.turns[t].steps[s].clone();
-                let marker = (step.text_bytes > 0).then(|| scenario::marker(t, s));
+                let marker = (step.text_bytes > 0).then(|| scenario::marker(t));
                 (step, marker, format!("msg_{t}_{s}"), (t * 100 + s) as u64)
             }
             None => {
@@ -409,10 +409,10 @@ mod tests {
     #[test]
     fn frames_carry_exact_sizes_and_tool_arguments() {
         let s = step(500, 300, &[("read", json!({"path":"é/a.txt"})), ("bash", json!({"command":"ls"}))]);
-        let f = build_frames("m", 1, &s, Some("BMK00.00 "), 1000, 48);
+        let f = build_frames("m", 1, &s, Some("① "), 1000, 48);
         let (think, text, tools, stop) = assemble(&f);
         assert_eq!((think.len(), text.len()), (500, 300));
-        assert!(text.starts_with("BMK00.00 "));
+        assert!(text.starts_with("① "));
         assert_eq!(tools.len(), 2);
         assert_eq!(serde_json::from_str::<Value>(&tools[0].1).unwrap(), json!({"path":"é/a.txt"}));
         assert_eq!(stop, "tool_use");
@@ -486,7 +486,7 @@ text_bytes = 120
         assert!(a.contains("\"stop_reason\":\"tool_use\"") && a.contains("text/event-stream"));
         assert_eq!(srv.log.lock().unwrap().turns_done, 0);
         let b = post(&srv, &main).await;
-        assert!(b.contains("end_turn") && b.contains("BMK00.01"));
+        assert!(b.contains("end_turn") && b.contains(&scenario::marker(0)));
         srv.wait_turns(1, Duration::from_secs(1)).await.unwrap();
         let aux = post(&srv, &json!({"messages":[]})).await;
         assert!(aux.contains("end_turn"));

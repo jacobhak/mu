@@ -60,11 +60,18 @@ fn d_delay() -> u64 {
     2
 }
 
-/// Text step marker, found in the terminal output to time the first rendered token.
-pub const MARKER_LEN: usize = "BMK00.00 ".len();
+/// Each turn's text starts with one distinct character (①, ②, …), found in the terminal output to time the
+/// first visible text. One character, because mu reveals streamed text a few characters per frame.
+pub const MARKER_LEN: usize = 4;
+pub const MAX_TURNS: usize = 50;
 
-pub fn marker(turn: usize, step: usize) -> String {
-    format!("BMK{turn:02}.{step:02} ")
+pub fn marker(turn: usize) -> String {
+    let cp = match turn {
+        0..20 => 0x2460 + turn,
+        20..35 => 0x3251 + turn - 20,
+        _ => 0x32B1 + turn.min(MAX_TURNS - 1) - 35,
+    };
+    format!("{} ", char::from_u32(cp as u32).unwrap())
 }
 
 impl Scenario {
@@ -84,6 +91,9 @@ impl Scenario {
         }
         if self.chunk_bytes == 0 {
             bail!("chunk_bytes must be at least 1");
+        }
+        if self.turns.len() > MAX_TURNS {
+            bail!("at most {MAX_TURNS} turns per scenario");
         }
         for (t, turn) in self.turns.iter().enumerate() {
             let Some((last, rest)) = turn.steps.split_last() else {
@@ -181,8 +191,11 @@ text_bytes = 100
     }
 
     #[test]
-    fn marker_has_the_declared_length() {
-        assert_eq!(marker(3, 12).len(), MARKER_LEN);
+    fn markers_are_distinct_and_fixed_length() {
+        let all: std::collections::HashSet<_> = (0..MAX_TURNS).map(marker).collect();
+        assert_eq!(all.len(), MAX_TURNS);
+        assert!(all.iter().all(|m| m.len() == MARKER_LEN));
+        assert_eq!(marker(0), "① ");
     }
 
     #[test]
