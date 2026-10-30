@@ -32,7 +32,7 @@ pub fn asks_in_prose(text: &str) -> bool {
     let ends_with_question =
         prose.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | '`')).ends_with('?');
     let options = option_lines(tail(prose, OPTION_WINDOW)) >= 2 && tail(prose, QUESTION_WINDOW).contains('?');
-    let asks = ends_with_question || options || asks_in_last_paragraph(prose);
+    let asks = ends_with_question || options || asks_in_last_paragraph(prose) || offers_in_last_paragraph(prose);
     asks && !is_open_invitation(prose)
 }
 
@@ -42,6 +42,29 @@ pub fn asks_in_prose(text: &str) -> bool {
 fn asks_in_last_paragraph(prose: &str) -> bool {
     let clean = strip_quoted(last_paragraph(prose));
     questions(&clean).into_iter().any(|q| !is_open_question(q) && (has_word(q, &NAMES) || has_word(q, &["or"])))
+}
+
+/// Phrases that hand the user a yes/no or a pick without a `?`: "Say if you want me to ...".
+const OFFERS: [&str; 13] = [
+    "say if you",
+    "say whether you",
+    "say the word",
+    "tell me if you",
+    "tell me whether you",
+    "tell me which",
+    "let me know if you want",
+    "let me know if you'd like",
+    "let me know whether you",
+    "let me know which",
+    "if you want me to",
+    "if you'd like me to",
+    "if you would like me to",
+];
+
+/// The last paragraph offers the user a choice in the imperative ("Say if you want me to push.").
+fn offers_in_last_paragraph(prose: &str) -> bool {
+    let clean = strip_quoted(last_paragraph(prose)).to_lowercase().replace('’', "'");
+    OFFERS.iter().any(|p| clean.contains(p))
 }
 
 /// A short message whose questions all open with `what`, `how`, ... and offer no choice or
@@ -200,6 +223,11 @@ mod tests {
             ("Two paths are open.\n\nKeep the cache or drop it? Say which.", true),
             ("Tests are green. Should I also update the docs? Nothing else is pending.", true),
             ("The fix is in.\n\nFirst paragraph.\n\nThen: should we ship it? Tell me.", true),
+            // Fires: an offer or request for a pick phrased without a question mark.
+            ("Fixed and tested. Say if you want me to commit, push and reinstall it.", true),
+            ("Two ways to go.\n\nTell me which you prefer.", true),
+            ("Done.\n\nLet me know if you’d like me to update the docs.", true),
+            ("Done. If you want me to land it, say the word.", true),
             // Does not fire: empty, very short, or no question.
             ("", false),
             ("   \n", false),
