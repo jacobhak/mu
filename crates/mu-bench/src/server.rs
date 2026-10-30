@@ -13,6 +13,17 @@ use tokio::sync::Notify;
 pub const MODEL: &str = "anthropic/bench-1";
 pub const CONTEXT_WINDOW: u64 = 200_000;
 
+static PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print every request the server gets, to see what a harness calls (also `MU_BENCH_PROBE=1`).
+pub fn enable_probe() {
+    PROBE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn probing() -> bool {
+    PROBE.load(std::sync::atomic::Ordering::Relaxed) || std::env::var_os("MU_BENCH_PROBE").is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Main,
@@ -172,7 +183,33 @@ pub fn tool_results(body: &Value) -> (usize, usize) {
 struct Request {
     method: String,
     path: String,
+    /// Lower-case names.
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+}
+
+/// The body of a chunked request once all of it has arrived, else `None`.
+fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let eol = data.windows(2).position(|w| w == b"\r\n")?;
+        let size = usize::from_str_radix(std::str::from_utf8(&data[..eol]).ok()?.split(';').next()?.trim(), 16).ok()?;
+        data = &data[eol + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        if data.len() < size + 2 {
+            return None;
+        }
+        out.extend_from_slice(&data[..size]);
+        data = &data[size + 2..];
+    }
 }
 
 async fn read_request(sock: &mut TcpStream) -> Result<Request> {
@@ -193,19 +230,25 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
     let first = lines.next().context("empty request")?;
     let mut parts = first.split_whitespace();
     let (method, path) = (parts.next().context("no method")?.to_string(), parts.next().context("no path")?.to_string());
-    let mut len = 0;
-    for l in lines {
-        let Some((k, v)) = l.split_once(':') else { continue };
-        match k.trim().to_ascii_lowercase().as_str() {
-            "content-length" => len = v.trim().parse()?,
-            "transfer-encoding" if v.trim().eq_ignore_ascii_case("chunked") => {
-                bail!("chunked request bodies are not supported")
-            }
-            _ => {}
-        }
-    }
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())))
+        .collect();
+    let len: usize = headers.iter().find(|(k, _)| k == "content-length").map_or(Ok(0), |(_, v)| v.parse())?;
+    let chunked = headers.iter().any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
+    let expect = headers.iter().any(|(k, v)| k == "expect" && v.to_ascii_lowercase().contains("100-continue"));
     let mut body = buf[head_end + 4..].to_vec();
-    while body.len() < len {
+    if expect && body.is_empty() && (chunked || len > 0) {
+        sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+    }
+    loop {
+        if chunked {
+            if let Some(b) = dechunk(&body) {
+                return Ok(Request { method, path, headers, body: b });
+            }
+        } else if body.len() >= len {
+            body.truncate(len);
+            return Ok(Request { method, path, headers, body });
+        }
         let mut tmp = [0u8; 65536];
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
@@ -213,8 +256,6 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
         }
         body.extend_from_slice(&tmp[..n]);
     }
-    body.truncate(len);
-    Ok(Request { method, path, body })
 }
 
 async fn reply(sock: &mut TcpStream, status: &str, body: &str) -> Result<()> {
@@ -264,6 +305,22 @@ impl Server {
 
     async fn handle(&self, mut sock: TcpStream, sc: &Scenario) -> Result<()> {
         let req = read_request(&mut sock).await?;
+        if probing() {
+            let auth = if req.header("authorization").is_some() {
+                "bearer"
+            } else if req.header("x-api-key").is_some() {
+                "x-api-key"
+            } else {
+                "none"
+            };
+            eprintln!(
+                "[probe] {} {} auth={auth} ua={:?} bytes={}",
+                req.method,
+                req.path,
+                req.header("user-agent").unwrap_or(""),
+                req.body.len()
+            );
+        }
         match (req.method.as_str(), req.path.split('?').next().unwrap_or("")) {
             ("GET", "/v1/models") => {
                 let body = json!({"data":[{"id":MODEL,"context_length":CONTEXT_WINDOW,"max_output_tokens":32000}]});
@@ -271,6 +328,10 @@ impl Server {
             }
             ("POST", "/v1/messages") => self.messages(sock, &req.body, sc).await,
             (m, p) => {
+                if probing() && !req.body.is_empty() {
+                    let end = req.body.len().min(600);
+                    eprintln!("[probe]   body: {}", String::from_utf8_lossy(&req.body[..end]));
+                }
                 let route = format!("{m} {p}");
                 {
                     let mut log = self.log.lock().unwrap();
@@ -285,6 +346,19 @@ impl Server {
 
     async fn messages(&self, mut sock: TcpStream, raw: &[u8], sc: &Scenario) -> Result<()> {
         let body: Value = serde_json::from_slice(raw).map_err(|e| anyhow!("bad request json: {e}"))?;
+        if probing() {
+            let names: Vec<&str> = body["tools"]
+                .as_array()
+                .map(|t| t.iter().filter_map(|x| x["name"].as_str()).collect())
+                .unwrap_or_default();
+            eprintln!(
+                "[probe]   model={} stream={} messages={} system_bytes={} tools={names:?}",
+                body["model"],
+                body["stream"],
+                body["messages"].as_array().map_or(0, Vec::len),
+                body["system"].to_string().len()
+            );
+        }
         let main = body["tools"].as_array().is_some_and(|t| !t.is_empty());
         let scripted = if main { self.next_step(sc) } else { None };
         let (results, errors) = tool_results(&body);
@@ -376,6 +450,7 @@ mod tests {
                 .iter()
                 .map(|(n, a)| crate::scenario::ToolCall { name: (*n).into(), args: a.clone() })
                 .collect(),
+            repeat: 1,
         }
     }
 
@@ -526,5 +601,42 @@ text_bytes = 120
     async fn waiting_for_a_turn_times_out() {
         let srv = Server::start(scenario()).await.unwrap();
         assert!(srv.wait_turns(1, Duration::from_millis(50)).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+
+    #[test]
+    fn dechunk_joins_chunks_and_waits_for_the_last_one() {
+        assert_eq!(dechunk(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").unwrap(), b"hello world");
+        assert_eq!(dechunk(b"1;ext=1\r\na\r\n0\r\n\r\n").unwrap(), b"a");
+        assert!(dechunk(b"5\r\nhel").is_none());
+        assert!(dechunk(b"5\r\nhello\r\n").is_none());
+        assert!(dechunk(b"zz\r\n").is_none());
+    }
+
+    #[tokio::test]
+    async fn serves_a_chunked_request_with_expect_continue() {
+        let sc = Arc::new(
+            Scenario::parse(
+                "name = \"t\"\nchunk_delay_ms = 0\n[[turn]]\nprompt = \"p\"\n[[turn.step]]\ntext_bytes = 40\n",
+            )
+            .unwrap(),
+        );
+        let srv = Server::start(sc).await.unwrap();
+        let mut s = TcpStream::connect(srv.addr).await.unwrap();
+        let body = json!({"messages":[]}).to_string();
+        let head =
+            "POST /v1/messages HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\nexpect: 100-continue\r\n\r\n";
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut go = [0u8; 25];
+        s.read_exact(&mut go).await.unwrap();
+        assert_eq!(&go, b"HTTP/1.1 100 Continue\r\n\r\n");
+        s.write_all(format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains("200 OK") && out.contains("message_stop"));
     }
 }

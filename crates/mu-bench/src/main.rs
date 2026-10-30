@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const USAGE: &str = "usage: mu-bench [--mu PATH] [--runs N] [--settle-ms MS] [--out FILE.json] SCENARIO.toml...
+       mu-bench serve    run the fake model server alone, printing every request (to probe another harness)
 
   --mu PATH        the mu binary to measure (default: target/release/mu)
   --runs N         repeats per scenario; the table shows medians (default: 3)
@@ -65,6 +66,9 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        return serve().await;
+    }
     let a = parse_args(std::env::args().skip(1))?;
     let mu = std::fs::canonicalize(&a.mu).map_err(|e| anyhow::anyhow!("{}: {e}", a.mu.display()))?;
     let opts = driver::Opts { mu, settle: a.settle };
@@ -115,4 +119,17 @@ mod tests {
         assert!(p(&["--nope", "a.toml"]).is_err());
         assert!(p(&["--runs", "x", "a.toml"]).is_err());
     }
+}
+
+/// The fake server alone, for pointing another harness at it. Every reply is a short text answer.
+async fn serve() -> Result<()> {
+    server::enable_probe();
+    let sc = scenario::Scenario::parse(
+        "name = \"probe\"\nchunk_delay_ms = 0\n[[turn]]\nprompt = \"p\"\n[[turn.step]]\ntext_bytes = 80\n",
+    )?;
+    let srv = server::Server::start(Arc::new(sc)).await?;
+    println!("{}", srv.url());
+    std::io::Write::flush(&mut std::io::stdout())?;
+    std::future::pending::<()>().await;
+    Ok(())
 }

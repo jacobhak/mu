@@ -19,11 +19,18 @@ pub struct Scenario {
     pub turns: Vec<Turn>,
 }
 
+/// A generated file. `path` may contain `{i}`; with `count` > 1 that many files are made, numbered from 0,
+/// each `bytes` long or, when `sizes` is given, sized by cycling through it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileSpec {
     pub path: String,
+    #[serde(default)]
     pub bytes: usize,
+    #[serde(default)]
+    pub sizes: Vec<usize>,
+    #[serde(default = "one")]
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +51,9 @@ pub struct Step {
     pub text_bytes: usize,
     #[serde(default, rename = "tool")]
     pub tools: Vec<ToolCall>,
+    /// This step this many times in a row; `{i}` in tool arguments becomes the repetition number.
+    #[serde(default = "one")]
+    pub repeat: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +63,9 @@ pub struct ToolCall {
     pub args: Value,
 }
 
+fn one() -> usize {
+    1
+}
 fn d_chunk() -> usize {
     48
 }
@@ -81,9 +94,43 @@ impl Scenario {
     }
 
     pub fn parse(text: &str) -> Result<Scenario> {
-        let s: Scenario = toml::from_str(text)?;
+        let mut s: Scenario = toml::from_str(text)?;
+        s.expand()?;
         s.validate()?;
         Ok(s)
+    }
+
+    /// Turns `count`, `sizes` and `repeat` into plain files and steps.
+    fn expand(&mut self) -> Result<()> {
+        let mut files = Vec::new();
+        for f in &self.files {
+            if f.count == 0 || f.count > 10_000 {
+                bail!("file `{}`: count must be 1 to 10000", f.path);
+            }
+            for i in 0..f.count {
+                let bytes = if f.sizes.is_empty() { f.bytes } else { f.sizes[i % f.sizes.len()] };
+                if bytes == 0 {
+                    bail!("file `{}` needs bytes or sizes", f.path);
+                }
+                files.push(FileSpec { path: f.path.replace("{i}", &i.to_string()), bytes, sizes: vec![], count: 1 });
+            }
+        }
+        self.files = files;
+        for turn in &mut self.turns {
+            let mut steps = Vec::new();
+            for s in &turn.steps {
+                if s.repeat == 0 || s.repeat > 1000 {
+                    bail!("step repeat must be 1 to 1000");
+                }
+                for i in 0..s.repeat {
+                    let tools =
+                        s.tools.iter().map(|t| ToolCall { name: t.name.clone(), args: subst(&t.args, i) }).collect();
+                    steps.push(Step { thinking_bytes: s.thinking_bytes, text_bytes: s.text_bytes, tools, repeat: 1 });
+                }
+            }
+            turn.steps = steps;
+        }
+        Ok(())
     }
 
     pub fn load(path: &std::path::Path) -> Result<Scenario> {
@@ -117,6 +164,16 @@ impl Scenario {
             }
         }
         Ok(())
+    }
+}
+
+/// `v` with `{i}` replaced by `i` in every string.
+fn subst(v: &Value, i: usize) -> Value {
+    match v {
+        Value::String(s) => Value::String(s.replace("{i}", &i.to_string())),
+        Value::Array(a) => Value::Array(a.iter().map(|x| subst(x, i)).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), subst(x, i))).collect()),
+        other => other.clone(),
     }
 }
 
@@ -214,5 +271,55 @@ text_bytes = 100
         for p in found {
             Scenario::load(&p).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::*;
+
+    #[test]
+    fn repeat_numbers_the_tool_arguments() {
+        let s = Scenario::parse(
+            r#"
+name = "t"
+[[turn]]
+prompt = "p"
+[[turn.step]]
+repeat = 3
+[[turn.step.tool]]
+name = "read"
+args = { path = "src/f{i}.rs", range = ["{i}", 2] }
+[[turn.step]]
+text_bytes = 50
+"#,
+        )
+        .unwrap();
+        let steps = &s.turns[0].steps;
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[2].tools[0].args["path"], "src/f2.rs");
+        assert_eq!(steps[1].tools[0].args["range"][0], "1");
+        assert!(steps.iter().all(|s| s.repeat == 1));
+    }
+
+    #[test]
+    fn files_cycle_through_sizes() {
+        let s = Scenario::parse(
+            "name = \"t\"\n[[files]]\npath = \"a/f{i}.rs\"\ncount = 5\nsizes = [100, 200]\n[[files]]\npath = \"one.txt\"\nbytes = 7\n[[turn]]\nprompt = \"p\"\n[[turn.step]]\ntext_bytes = 20\n",
+        )
+        .unwrap();
+        let got: Vec<_> = s.files.iter().map(|f| (f.path.as_str(), f.bytes)).collect();
+        assert_eq!(
+            got,
+            [("a/f0.rs", 100), ("a/f1.rs", 200), ("a/f2.rs", 100), ("a/f3.rs", 200), ("a/f4.rs", 100), ("one.txt", 7)]
+        );
+    }
+
+    #[test]
+    fn bad_counts_are_refused() {
+        let base = "name = \"t\"\n[[turn]]\nprompt = \"p\"\n[[turn.step]]\ntext_bytes = 20\n";
+        assert!(Scenario::parse(&format!("name = \"t\"\n[[files]]\npath = \"a\"\n{}", &base[10..])).is_err());
+        assert!(Scenario::parse(&format!("{base}repeat = 0\n")).is_err());
+        assert!(Scenario::parse(&format!("{base}repeat = 5000\n")).is_err());
     }
 }
