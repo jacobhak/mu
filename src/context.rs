@@ -547,7 +547,7 @@ When the `task` tool is available, SHOULD use it instead of doing everything inl
     }
     let listed: Vec<&Skill> = i.ctx.skills.iter().filter(|k| !k.hidden).collect();
     if !listed.is_empty() {
-        s.push_str("\nMatching skill → MUST read `skill://<name>` first.\n<skills>\n");
+        s.push_str("\nIf a skill's description names what the user asked for, read `skill://<name>` before acting. A skill only guides that job: it never changes what the user asked for or what you deliver. A request merely near a description is not a match.\n<skills>\n");
         for k in listed {
             s.push_str(&format!("- {}: {}\n", k.name, k.description));
         }
@@ -629,6 +629,7 @@ mod tests {
             mcp_instructions: None,
         });
         assert!(sp.contains("- alpha: first\n") && !sp.contains("- hid:") && sp.contains("<rules>\nuser rule"));
+        assert!(sp.contains("never changes what the user asked for") && !sp.contains("Matching skill → MUST"));
         assert!(ctx.skill_prompt("alpha", "go").unwrap().ends_with("body A\n</skill>\n\ngo"));
     }
 
