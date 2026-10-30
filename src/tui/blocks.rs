@@ -521,9 +521,59 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
         "task" => lines.extend(text_rows(&out.text, expanded, |l| {
             if l.starts_with("## ") { name_style() } else { tfg(Role::Muted) }
         })),
+        "todo" => match todo_rows(out, width) {
+            Some((rows, count)) => {
+                lines[0].push(span(count, tfg(Role::Faint)));
+                lines[0] = truncate(&lines[0], width);
+                lines.extend(rows);
+            }
+            None => lines.extend(text_rows(&out.text, expanded, |_| tfg(Role::Muted))),
+        },
         _ => lines.extend(text_rows(&out.text, expanded, |_| tfg(Role::Muted))),
     }
     lines
+}
+
+/// A todo result as one checklist: a mark per task, phase names only when there are several.
+/// `None` when the result carries no tasks (a cleared list), so the plain text shows instead.
+fn todo_rows(out: &ToolOutput, width: usize) -> Option<(Vec<Line>, String)> {
+    use crate::tools::todo::{Phase, Status};
+    let phases: Vec<Phase> = serde_json::from_value(out.details.as_ref()?["phases"].clone()).ok()?;
+    let phases: Vec<&Phase> = phases.iter().filter(|p| !p.tasks.is_empty()).collect();
+    let total: usize = phases.iter().map(|p| p.tasks.len()).sum();
+    if total == 0 {
+        return None;
+    }
+    let done = phases
+        .iter()
+        .flat_map(|p| &p.tasks)
+        .filter(|t| matches!(t.status, Status::Completed | Status::Abandoned))
+        .count();
+    let multi = phases.len() > 1;
+    let indent = if multi { "    " } else { "  " };
+    let mut rows = Vec::new();
+    for p in &phases {
+        if multi {
+            rows.push(truncate(&vec![span(format!("  {}", p.name), tfg(Role::Muted))], width));
+        }
+        for t in &p.tasks {
+            let (mark, mark_style, text_style) = match t.status {
+                Status::Completed => ("✓", tfg(Role::Ok), tfg(Role::Faint)),
+                Status::InProgress => ("▸", tfg(Role::Warn), tfg(Role::Warn)),
+                Status::Pending => ("○", tfg(Role::Faint), tfg(Role::Muted)),
+                Status::Abandoned => ("–", tfg(Role::Faint), tfg(Role::Faint)),
+                Status::Blocked => ("!", tfg(Role::Err), tfg(Role::Muted)),
+            };
+            let mut row = vec![span(format!("{indent}{mark} "), mark_style), span(t.content.clone(), text_style)];
+            if t.status == Status::Blocked
+                && let Some(b) = &t.blocker
+            {
+                row.push(span(format!(" ({b})"), tfg(Role::Faint)));
+            }
+            rows.push(truncate(&row, width));
+        }
+    }
+    Some((rows, format!(" · {done}/{total}")))
 }
 
 /// An answered `ask`: each question's text, dim and wrapped, above the answer the tool returned for
@@ -747,6 +797,22 @@ mod tests {
         out.meta = Some(ToolMeta::File(FileMeta { path: "local://x-plan.md".into(), tag: None, plan: true }));
         let args = json!({"path": "local://x-plan.md", "content": "a\nb\nc\n"});
         assert_eq!(texts(&tool_result("write", &args, &out, false, 60)), ["● Write local://x-plan.md · 3 lines"]);
+    }
+
+    #[test]
+    fn todo_result_is_a_checklist() {
+        let mut out = ToolOutput::ok("Remaining items (1): ...");
+        out.details = Some(json!({"op": "done", "phases": [{"name": "Tasks", "tasks": [
+            {"content": "one", "status": "completed"},
+            {"content": "two", "status": "in_progress"},
+            {"content": "three", "status": "blocked", "blocker": "waiting"},
+            {"content": "four", "status": "pending"}]}]}));
+        let t = texts(&tool_result("todo", &json!({"op": "done"}), &out, false, 40));
+        assert_eq!(t, ["● Todo · 1/4", "  ✓ one", "  ▸ two", "  ! three (waiting)", "  ○ four"], "{t:?}");
+        let mut cleared = ToolOutput::ok("Todo list cleared.");
+        cleared.details = Some(json!({"op": "rm", "phases": []}));
+        let t = texts(&tool_result("todo", &json!({"op": "rm"}), &cleared, false, 40));
+        assert_eq!(t, ["● Todo", "  Todo list cleared."], "{t:?}");
     }
 
     #[test]

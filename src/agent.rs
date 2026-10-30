@@ -1868,7 +1868,7 @@ impl Agent {
                     todo_nags += 1;
                     let list = open.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
                     self.push(Message::user(&format!(
-                        "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work and keep the list current with `todo` (`done`/`start`, in the same response as your next action). If an item is finished or no longer needed, mark it `done` or `drop` it; if you are waiting on the user, `block` it. Do not reply to this reminder.\n</system-reminder>",
+                        "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work on them, marking each `done` only when you have actually finished it. Do not tick items off that you did not do. `drop` an item that is no longer needed; `block` it if you are waiting on the user. Do not reply to this reminder.\n</system-reminder>",
                         open.len()
                     )));
                     continue;
