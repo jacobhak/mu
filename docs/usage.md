@@ -11,7 +11,7 @@ mu update [--check] [--tag TAG] [--force]
 
 `SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory; `--resume` takes a session id or path, or opens a picker. `--profile` picks an omp profile (sets `OMP_PROFILE`); `--theme` overrides `[theme] source` for one run. Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
 
-Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal` reads as `low`). `xhigh` and `max` send the matching `output_config.effort` through the gateway, which clamps an effort the model does not support to the nearest one it does.
+Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal` reads as `low`). `xhigh` and `max` send the matching `output_config.effort` through the gateway. An effort the model does not serve goes to the tier the model maps it to, if any (a route serving only low/high/max takes `medium` as `high`), otherwise to the nearest lower tier it serves.
 
 `-p` runs one prompt and prints the answer. `--agent` runs it as a [custom agent](custom-agents.md); `--max-cost` aborts once the session has cost more than that many USD and always prints `mu: cost $X` to stderr. Exit codes, interrupting and taking over a `-p` run are in [Detached runs](detached-runs.md).
 
