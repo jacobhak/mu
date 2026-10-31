@@ -1,6 +1,6 @@
 # mu
 
-I love omp, but in the age of AI, RAM ain't cheap and every session being the equivalent of a chrome tab simply isn't sustainable.
+> I love omp, but in the age of AI, RAM ain't cheap and every session being the equivalent of a chrome tab simply isn't sustainable.
 
 mu is a terminal coding agent with a Rust core (agent loop, TUI, sessions) built on the crates, CLI and auth gateway of [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp), and borrowing many of its prompts and much of its behaviour. Credit for the design goes to the omp authors.
 
