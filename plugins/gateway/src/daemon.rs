@@ -193,6 +193,10 @@ impl Drop for Kids {
 fn spawn_omp(args: &[&str], env: &[(&str, &str)]) -> Result<(Child, String), String> {
     let mut cmd = Command::new(mu_common::paths::omp_bin());
     cmd.args(args).envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Bun's JIT costs ~36 MB private per process and buys nothing for a proxy waiting on upstream I/O.
+    if std::env::var_os("MU_GATEWAY_JIT").is_none() {
+        cmd.env("BUN_JSC_useJIT", "0");
+    }
     cmd.process_group(0);
     #[cfg(target_os = "linux")]
     unsafe {
