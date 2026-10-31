@@ -17,13 +17,14 @@ Status: early and experimental, changing quickly; no stable version (see README,
 
 ## Why
 
-Measured 2026-10-23 on this machine (method in the appendix).
+Measured 2026-10-23 on this machine (method in the appendix), except the mu row (2026-10-31). [`BENCHMARKS.md`](BENCHMARKS.md) has the current comparison on a scripted task.
 
 | Agent | Private RAM per idle session | Notes |
 |---|---|---|
 | omp 18.12.6 | 165 MB (133 MB with extensions, LSP, skills, rules off) | Disabled features stay resident; plus machine-wide helpers of 97 + 23 + 23 MB |
 | pi 1.4.0 | 72 MB | Node runtime floor |
 | Codex CLI (Rust) | 27 MB | 308 MB binary; everything bundled |
+| mu | 3 MB (17 MB total with the binary's shared pages) | Without its gateway pair, which is shared by all sessions: 210 MB private, 251 MB total idle |
 | Rust floor (HTTPS + TLS + async runtime) | 0.6 MB | 6.2 MB binary |
 
 ## Architecture
@@ -158,7 +159,7 @@ All omp features outside the core become first-party plugins that load on use.
 - **Lifecycle:** the plugin starts both processes when a model is first used, on loopback
   ports, passing `OMP_AUTH_BROKER_URL` only to the gateway process it spawns — the user's omp config is not
   changed. It authenticates with the bearer tokens omp keeps in its config dir. Lifetime `idle:<duration>`
-  stops both. One pair serves all mu sessions of the same omp profile (state in `$MU_HOME/gateway/`, or `gateway/profiles/<name>/` under a profile): the pair holds that profile's credentials and `models.yml`, so profiles never share one. The gateway alone measured 161 MB; the broker is unmeasured.
+  stops both. One pair serves all mu sessions of the same omp profile (state in `$MU_HOME/gateway/`, or `gateway/profiles/<name>/` under a profile): the pair holds that profile's credentials and `models.yml`, so profiles never share one. Idle, the pair measured 251 MB total and 210 MB private (gateway 179 / 154 MB, broker 72 / 56 MB), and about 305 / 275 MB with a request in flight (`BENCHMARKS.md`).
 - **What `serve` does not do** (unlike `stdio`): role selectors such as `@smol` and omp's fallback chains.
   The core resolves roles itself from omp's config and sends provider-qualified ids.
 - **Open risk:** the broker refreshes OAuth tokens in the same credential store that running omp
@@ -194,9 +195,9 @@ Non-goal: running pi or omp TypeScript extensions.
 | Large tool output, images | Spilled to files; read on expand |
 | Highlighting | No bulk-loaded syntax sets (`syntect` defaults measured at +6.5 MB); per-language, lazily |
 
-**Check:** `incidental = private RAM − bytes of content held`. A harness runs scripted sessions, measures after
-each turn at idle, and fails if `incidental` grows across turns or exceeds a constant set from earlier
-measurements.
+**Check:** `incidental = private RAM − bytes of content held`. Not enforced yet: nothing fails a build when it grows.
+`mu-bench` (`crates/mu-bench`) runs scripted sessions against a fake model and reports private memory after
+each turn, split by region, and compares other harnesses; a pass/fail gate with committed limits is not built.
 
 ## Technology
 
@@ -214,7 +215,8 @@ measurements.
 - Metric: `Pss_Anon` (private) and `Pss` (total, shared pages divided) from `/proc/<pid>/smaps_rollup`.
 - Idle sessions: each agent started in a pseudo-terminal in an empty directory, measured 10 s after launch.
   pi and Codex ran with an empty `HOME`; Codex likely sat at its login screen.
-- omp gateway: `omp auth-gateway stdio`, measured 6 s after start.
+- omp gateway: first measured with `omp auth-gateway stdio`, 6 s after start (161 MB). mu uses `serve`, which with
+  the broker was measured later in an empty `HOME` with no traffic, 8 s after start (`BENCHMARKS.md`).
 - Rust floor: single-threaded `tokio` + `reqwest`/`rustls` binary that sends one HTTPS request to
   `api.anthropic.com` (401), holds a synthetic conversation, then idles.
 

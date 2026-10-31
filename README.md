@@ -8,9 +8,9 @@ mu is a terminal coding agent with a Rust core (agent loop, TUI, sessions) built
 
 mu keeps most of what omp does and changes where the memory goes. A session holds your conversation, and anything else runs only while it's being used.
 
-- **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session uses about 2 MB.
+- **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3 MB of private memory (about 17 MB counting the binary's shared pages).
 - **Features start on use.** Web, memory, prediction and the model gateway are separate processes. Each starts on first use and exits after a few idle minutes. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
-- **Shared across sessions.** Sessions on one omp profile share one gateway (about 160 MB while it runs), and all sessions share one memory daemon.
+- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 250 MB while they run, idle), and all sessions share one memory daemon. [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
 - **Works with your omp setup.** mu uses omp's login, config, models, MCP setup, context files and skills. Sessions are in omp's format, so you can use both and switch either way.
 
