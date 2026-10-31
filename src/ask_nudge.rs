@@ -3,7 +3,7 @@
 //! alarm costs one extra request.
 
 /// Sent as a user message when `asks_in_prose` fires. `is_reminder` recognises it in the history.
-pub const REMINDER: &str = "<system-reminder>\nYour last message ends with a question or option list in prose. If it asks the user to decide something (scope, design, trade-offs, anything ambiguous, risky or hard to undo), call `ask` now with 2-5 options and a recommendation instead of repeating the question. If it was not a decision for the user, do not ask again: reply with just `.`\n</system-reminder>";
+pub const REMINDER: &str = "<system-reminder>\nYour last message ends with a question or option list in prose. If it asks the user to decide something (scope, design, trade-offs, anything ambiguous, risky or hard to undo), call `ask` now with 2-5 options and a recommendation instead of repeating the question; put the background from your message in `context`, since the dialog is all the user sees. If it was not a decision for the user, do not ask again: reply with just `.`\n</system-reminder>";
 
 pub fn is_reminder(text: &str) -> bool {
     text.trim() == REMINDER

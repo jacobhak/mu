@@ -126,6 +126,9 @@ pub struct AskOption {
 #[derive(Clone, Debug)]
 pub struct AskQuestion {
     pub question: String,
+    /// Why the question comes up and what hangs on it, so the dialog reads on its own. Shown above
+    /// the question, dimmed.
+    pub context: Option<String>,
     pub header: Option<String>,
     pub options: Vec<AskOption>,
     pub multi: bool,

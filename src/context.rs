@@ -508,6 +508,7 @@ NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `
         s.push_str(
             "\n# Decisions\n\
 - A decision that belongs to the user (scope, design, trade-offs, anything ambiguous, risky or hard to undo) MUST be asked with `ask`: 2-5 options, one recommended, each with its trade-off. NEVER end a turn with a decision question or an option list in prose.\n\
+- The user sees only the dialog, not your reasoning or earlier tool calls: put the background in `context` (what you found, why it needs their decision, what depends on it, with concrete names) and keep `question` to the decision itself.\n\
 - Informational and rhetorical questions are fine in prose. Do not ask what code, config or docs answer.\n",
         );
     }

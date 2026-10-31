@@ -163,6 +163,7 @@ fn ask_at(q: &AskQuestion, pos: Option<(usize, usize)>, prior: Option<&Answer>) 
     };
     let back = pos.is_some_and(|(k, _)| k > 1);
     let mut s = Select::new(&title, items)
+        .context(q.context.as_deref().unwrap_or(""))
         .free_text("Other (type your own)")
         .previews(previews)
         .preview_kinds(kinds)
@@ -586,6 +587,7 @@ mod tests {
     fn ask_walks_its_questions_and_replies_once() {
         let q = |text: &str| AskQuestion {
             question: text.into(),
+            context: None,
             header: None,
             options: vec![],
             multi: false,
@@ -611,6 +613,7 @@ mod tests {
         };
         let q = AskQuestion {
             question: "Which?".into(),
+            context: None,
             header: None,
             options: vec![opt("Yes", Some("apply the change now and run the tests afterwards")), opt("No", None)],
             multi: false,
@@ -629,6 +632,7 @@ mod tests {
     fn ask_picker_shows_a_multi_line_question_in_full() {
         let q = AskQuestion {
             question: "Deploy the canary?\nstatus: 3 services green\nerrors: none in the last hour".into(),
+            context: None,
             header: None,
             options: vec![
                 AskOption { label: "Yes".into(), description: None, preview: None, kind: None },
@@ -651,6 +655,32 @@ mod tests {
         assert!(lines.iter().all(|l| crate::tui::line::line_width(l) <= 30), "{t:?}");
     }
 
+    #[test]
+    fn ask_picker_shows_the_context_above_the_question() {
+        let q = AskQuestion {
+            question: "Keep the old API?".into(),
+            context: Some("Three callers in `src/ui` still use `Foo::old`; removing it breaks the build.".into()),
+            header: None,
+            options: vec![
+                AskOption { label: "Keep".into(), description: None, preview: None, kind: None },
+                AskOption { label: "Remove".into(), description: None, preview: None, kind: None },
+            ],
+            multi: false,
+            recommended: None,
+            confirm: false,
+        };
+        let (lines, cur) = ask_select(&q).render(30, 20);
+        let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
+        assert_eq!(t[0], "Three callers in `src/ui`", "{t:?}");
+        let q_at = t.iter().position(|l| l == "Keep the old API?").expect("question row");
+        assert!(q_at >= 3, "the context comes first: {t:?}");
+        assert_eq!(cur.0, q_at + 1, "{t:?}");
+        assert!(lines.iter().all(|l| crate::tui::line::line_width(l) <= 30), "{t:?}");
+        let (lines, _) = ask_select(&q).render(30, 4);
+        let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
+        assert!(t.iter().any(|l| l == "Keep the old API?"), "short screens keep the question: {t:?}");
+    }
+
     fn ask_ov(q: AskQuestion) -> (Overlay, oneshot::Receiver<Option<Vec<Answer>>>) {
         let (tx, rx) = oneshot::channel();
         (Overlay::new_ask(vec![q], tx), rx)
@@ -659,7 +689,15 @@ mod tests {
     fn ask_q(labels: &[&str], multi: bool, confirm: bool, recommended: Option<usize>) -> AskQuestion {
         let options =
             labels.iter().map(|l| AskOption { label: l.to_string(), description: None, preview: None, kind: None });
-        AskQuestion { question: "Q?".into(), header: None, options: options.collect(), multi, recommended, confirm }
+        AskQuestion {
+            question: "Q?".into(),
+            context: None,
+            header: None,
+            options: options.collect(),
+            multi,
+            recommended,
+            confirm,
+        }
     }
 
     /// Feeds keys to an open ask, which must stay open.

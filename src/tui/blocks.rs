@@ -590,6 +590,13 @@ fn ask_rows(args: &Value, text: &str, width: usize) -> Vec<Line> {
             Some(h) => format!("{h}: {question}"),
             None => question.to_string(),
         };
+        if let Some(c) = q["context"].as_str().map(str::trim).filter(|c| !c.is_empty()) {
+            for r in markdown::wrap_chs(&markdown::chs(c, tfg(Role::Muted)), inner) {
+                let mut row = vec![span("  ", line::dim())];
+                row.extend(markdown::chars_to_line(&r));
+                rows.push(row);
+            }
+        }
         for r in markdown::wrap_chs(&markdown::chs(&question, line::dim()), inner) {
             let mut row = vec![span("  ", line::dim())];
             row.extend(markdown::chars_to_line(&r));
@@ -837,6 +844,16 @@ mod tests {
             "{t:?}"
         );
         assert!(t.iter().all(|l| l.chars().count() <= 24), "{t:?}");
+    }
+
+    #[test]
+    fn answered_ask_shows_its_context_above_the_question() {
+        let args = json!({"questions": [
+            {"id": "api", "question": "Keep it?", "context": "Three callers still use it.", "options": []}
+        ]});
+        let out = ToolOutput::ok("User answers:\napi: Keep");
+        let t = texts(&tool_result("ask", &args, &out, false, 40));
+        assert_eq!(t[1..], ["  Three callers still use it.", "  Keep it?", "  api: Keep"], "{t:?}");
     }
 
     #[test]

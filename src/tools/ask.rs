@@ -14,6 +14,7 @@ struct Q {
     id: String,
     question: String,
     header: Option<String>,
+    context: Option<String>,
     options: Option<Vec<O>>,
     #[serde(default)]
     multi: bool,
@@ -37,8 +38,9 @@ pub fn description() -> &'static str {
 pub fn schema() -> Value {
     json!({"type":"object","properties":{"questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{
         "id":{"type":"string"},
-        "question":{"type":"string"},
-        "header":{"type":"string"},
+        "question":{"type":"string","description":"the decision, as one clear question"},
+        "header":{"type":"string","description":"2-3 word topic label"},
+        "context":{"type":"string","description":"the user may not have followed your work: say what you found or are doing, why this needs their decision, and what depends on it, in 1-4 sentences with concrete names (files, values, results); shown above the question"},
         "options":{"type":"array","minItems":2,"items":{"type":"object","properties":{
             "label":{"type":"string"},"description":{"type":"string"},"preview":{"type":"string"},
             "kind":{"type":"string","enum":["code","diff","layout","text"],"description":"what preview holds; guessed when omitted"}},"required":["label"]}},
@@ -79,6 +81,7 @@ fn question(q: &Q) -> AskQuestion {
     };
     AskQuestion {
         question: q.question.clone(),
+        context: q.context.clone().filter(|c| !c.trim().is_empty()),
         header: q.header.clone(),
         options,
         multi: q.multi,
@@ -206,5 +209,18 @@ mod tests {
         assert_eq!(format_answer(&a.questions[2], &note(&["No"], "because")), "c: no — note: \"because\"");
         assert_eq!(format_answer(&a.questions[2], &Answer::Options(vec!["Yes".into()])), "c: yes");
         assert_eq!(format_answer(&a.questions[2], &Answer::Custom("maybe".into())), "c: \"maybe\"");
+    }
+
+    #[test]
+    fn context_reaches_the_event_and_blank_context_is_dropped() {
+        let a = parse(json!({"questions": [
+            {"id": "a", "question": "?", "context": "why it matters", "confirm": true},
+            {"id": "b", "question": "?", "context": "  \n", "confirm": true},
+            {"id": "c", "question": "?", "confirm": true}
+        ]}));
+        let qs: Vec<AskQuestion> = a.questions.iter().map(question).collect();
+        assert_eq!(qs[0].context.as_deref(), Some("why it matters"));
+        assert!(qs[1].context.is_none() && qs[2].context.is_none());
+        assert!(schema()["properties"]["questions"]["items"]["properties"]["context"].is_object());
     }
 }

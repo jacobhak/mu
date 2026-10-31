@@ -24,6 +24,9 @@ const TITLE_MAX_LINES: usize = 6;
 /// Lines a description shows under its option, when the option is highlighted or the list fits.
 const DESC_MAX_LINES: usize = 6;
 
+/// Rows the context above the title may take.
+const CONTEXT_MAX_LINES: usize = 8;
+
 /// Columns a description or preview is indented under its option.
 const INDENT: usize = 4;
 
@@ -57,6 +60,8 @@ enum Row {
 
 pub struct Select {
     title: String,
+    /// Dim paragraph above the title: what the question is about.
+    context: String,
     items: Vec<Item>,
     multi: bool,
     free: Option<String>,
@@ -102,6 +107,7 @@ impl Select {
             haystacks,
             rows_cache: Default::default(),
             title: title.to_string(),
+            context: String::new(),
             items,
             multi: false,
             free: None,
@@ -131,6 +137,12 @@ impl Select {
     /// The ask layout (see `described`).
     pub fn described(mut self) -> Self {
         self.described = true;
+        self
+    }
+
+    /// A dim paragraph above the title that says what the question is about.
+    pub fn context(mut self, text: &str) -> Self {
+        self.context = text.trim().to_string();
         self
     }
 
@@ -432,7 +444,22 @@ impl Select {
                 *last = line::truncate(&row, width);
             }
         }
-        rows
+        let room = max_rows.saturating_sub(rows.len() + 2) / 2;
+        let ctx_cap = room.min(CONTEXT_MAX_LINES);
+        if self.context.is_empty() || ctx_cap == 0 {
+            return rows;
+        }
+        let mut ctx: Vec<Line> = wrap_chs(&chs(&self.context, dim()), width).iter().map(|r| chars_to_line(r)).collect();
+        if ctx.len() > ctx_cap {
+            ctx.truncate(ctx_cap);
+            if let Some(last) = ctx.last_mut() {
+                let mut row = last.clone();
+                row.push(span("…", dim()));
+                *last = line::truncate(&row, width);
+            }
+        }
+        ctx.extend(rows);
+        ctx
     }
 
     /// The rows for the current filter, recomputed only when the filter changed.

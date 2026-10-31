@@ -1233,6 +1233,7 @@ impl Agent {
         let Some(report) = report else {
             let q = AskQuestion {
                 question: "The reviewer returned an unstructured report.".into(),
+                context: None,
                 header: Some("Review".into()),
                 options: vec![opt("Send report to the implementer".into(), None), opt("Dismiss".into(), None)],
                 multi: false,
@@ -1267,6 +1268,7 @@ impl Agent {
         let recommended = if n > 0 { 0 } else { options.len() - 1 };
         let q = AskQuestion {
             question: "Send findings to the implementer?".into(),
+            context: None,
             header: Some("Review".into()),
             options,
             multi: false,
@@ -1297,6 +1299,7 @@ impl Agent {
                         .collect();
                     let q = AskQuestion {
                         question: "Which findings should be sent?".into(),
+                        context: None,
                         header: Some("Review".into()),
                         options,
                         multi: true,
