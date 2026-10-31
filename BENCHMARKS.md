@@ -1,70 +1,80 @@
-# Benchmarks: mu vs other open-source coding harnesses
+# Benchmarks: mu vs other coding harnesses
 
-Run 2026-10-25 on one Linux x86_64 machine. Small, informal measurements, not a rigorous study.
+Resource use of mu and four other harnesses on one scripted task, measured with [`mu-bench`](crates/mu-bench/README.md) against a fake model server. No real model is called, so every run costs nothing and repeats. Run 2026-10-31 at commit `afffef8` on one machine (AMD Ryzen 7 5800X, 7 CPUs available, 14 GB, Linux 7.0).
 
-Versions: mu (git 8bb3be2), omp 18.12.6, opencode 1.3.3, codex 0.150.1, claude 2.1.289, pi 0.73.1, gemini-cli 0.65.0, crush 0.98.2, aider 0.86.2.
+Versions: mu 0.1.0, claude 2.1.289, opencode 1.3.3, omp 18.12.6, pi 0.73.1.
 
-## 1. Idle memory
+## Read this first: mu's gateway is not in the mu rows
 
-Interactive TUI left at its start screen for 12 s, in a private tmux server. PSS summed over the tool's whole process tree.
+mu normally reaches models through a shared pair of processes, `omp auth-broker` and `omp auth-gateway`, one pair for all mu sessions. The mu rows below bypass it (`MU_GATEWAY_URL`) and are therefore **not** the cost of running mu as installed.
 
-| Harness | Idle PSS | Processes |
+| | total | private |
 |---|---|---|
-| **mu** | **7 MB** | 1 |
-| crush | 66 MB | 1 |
-| aider | 70 MB | 1 |
-| codex | 87 MB | 2 |
-| pi | 108 MB | 1 |
-| claude | 164 MB | 1 |
-| omp | 192 MB | 1 |
-| gemini | 341 MB | 2 |
-| opencode | 577 MB | 1 |
+| broker, idle | 72 MB | 56 MB |
+| gateway, idle | 179 MB | 154 MB |
+| **pair, idle** | **251 MB** | **210 MB** |
+| pair with a request in flight (one earlier run) | about 305 MB | about 275 MB |
 
-Caveats:
-- mu's plugins (gateway, web, memory) start on first use, so 7 MB is a best case. During a model call mu's own process peaked at about 11 MB PSS. The shared gateway and broker add about 300 MB PSS (see section 3).
-- A tool sitting on a first-run, login or trust prompt may be measured at that screen and not the full UI. The screens were not checked.
+The idle figures were measured in an empty `HOME` with no model traffic, 8 s after start. The in-flight figure comes from a run where the request was rejected, so a real model call may differ.
 
-## 2. Task: fix a failing test (agent harnesses)
+What this means, using the idle figure:
+- **One mu session, gateway included:** about 276 MB total (25 + 251). That is in the range of claude (293 MB) and omp (286 MB), well below opencode (476 MB) and above pi (158 MB).
+- **Three sessions:** the pair is paid once, so each session carries about 96 MB total (12 + 251 / 3). That is close to pi's 94 MB and well below claude (200 MB), omp (259 MB) and opencode (440 MB). With more sessions the share keeps falling.
+- mu's own process is small in every case. Its advantage grows with the number of sessions sharing one gateway, and it is not an advantage with a single session.
+- The other harnesses call their providers directly and have no such pair.
+- A complete mu run through the real gateway could not be measured against the fake model: the gateway serves only catalog models and ignores `models.yml` on purpose. These combined figures are sums of separate measurements, not a measured run.
 
-Fresh copy of a 3-function Python module (`slugify`, `truncate`, `word_count`) with 5 of 6 pytest tests failing. The prompt asks the agent to make the tests pass without editing them, then reply in one sentence. Model: `gpt-6-luna` via an OpenAI API key, for every tool. Pass means the tests pass and the test file is byte-identical.
+## The task
 
-Every run that completed passed, with the tests untouched.
+One prompt, then a tool loop of 28 model steps that the fake model scripts: 10 file reads, 13 shell commands (`head`, `grep`), 4 file writes, a final answer. The shape comes from the author's own sessions: most are one prompt followed by an agent loop, and tool results are small (median read 2 kB, median shell output 0.5 kB). 12 source files of 1.5 to 12 kB are created for the task. The server rewrites each scripted call into the tool and argument names the harness offered in its request, so every harness does the same operations.
 
-| Harness | Runs | Wall time, median (range) | Peak RSS (largest process) |
-|---|---|---|---|
-| pi | 4 | 14.2 s (11.7-17.2) | 175 MB |
-| crush | 4 | 14.2 s (13.3-16.4) | 92 MB |
-| **mu**, gateway already running | 5 | 17.9 s (12.4-31.0) | 11 MB core + ~300 MB shared |
-| **mu**, gateway started by the run | 3 | 20.0 s (18.5-33.4) | same |
-| omp | 1 | 30.2 s | 299 MB |
-| opencode | 1 | 54.4 s | 450 MB |
-| codex | 1 | 55.9 s | 127 MB |
+Every harness finished every run with 28 steps, no tool errors, 4 files written and 67 to 71 kB of tool output sent back, so the work is equal.
 
-Reading it:
-- pi, crush and mu are within noise of each other. Only the large gaps mean anything: those three against omp, opencode and codex.
-- mu's spread (12-31 s for the same task) is wide. Cold and warm gateway runs overlap, so gateway startup (about 1-2 s) is small next to model variance.
-- omp, opencode and codex have one run each, so treat their times as rough.
+## Results
 
-### Not compared on time: aider
+7 rounds, medians. The harnesses are interleaved within each round. One untimed warm-up run each comes first, so first-run setup (opencode's database, omp's native libraries) is not charged to the measured runs.
 
-aider passed in 8.7-9.7 s (4 runs, 244 MB peak RSS), but it is a single-shot editor, not a tool loop. It made one model request (2.7k tokens sent), applied the diff and never ran the tests. I named the files up front, which favors it on a task this small. Its time is not comparable with the agents above and is left out of the ranking. Its idle memory in section 1 is comparable.
+**One session at a time**
 
-## 3. mu and its shared gateway
+| harness | wall | CPU | private | total | peak total |
+|---|---|---|---|---|---|
+| **mu** (no gateway) | 0.04 s | 0.03 s | 4 MB | 25 MB | 25 MB |
+| pi | 0.82 s | 1.06 s | 120 MB | 158 MB | 164 MB |
+| claude | 1.02 s | 1.26 s | 195 MB | 293 MB | 293 MB |
+| omp | 1.54 s | 2.22 s | 225 MB | 286 MB | 300 MB |
+| opencode | 1.91 s | 2.85 s | 427 MB | 476 MB | 479 MB |
 
-mu gets its providers through one shared `mu-gateway daemon` (one `omp auth-broker` plus one `omp auth-gateway`) used by every mu process. It is guarded by a lock file, and clients keep lease files. The daemon exits after 30 minutes without a fresh lease (`MU_GATEWAY_IDLE_SECS`).
+**Three sessions of one harness at once, per session** (sharing one `HOME`, started together)
 
-- Four concurrent `mu -p` sessions against a running daemon all answered, and the process counts stayed at 1 daemon, 1 gateway and 1 broker with unchanged PIDs.
-- The shared pair costs about 280-300 MB PSS once (broker about 80 MB, gateway about 200 MB). Each extra session adds its own mu process (about 10 MB) and a small plugin shim.
-- One session is roughly the same as omp (about 300 MB). The saving starts with the second session. The multi-session saving was not measured against several omp sessions.
-- At the time of the benchmark the daemon was keyed by `~/.mu/gateway/` and not by profile, so the first session to start it decided which profile's credentials and `models.yml` it served, and a session in another profile could get a 401 or an "Unknown model" 404. That is fixed: each profile now gets its own daemon under `gateway/profiles/<name>/`. The profile-less default path is unchanged.
+| harness | wall | private | total | peak total |
+|---|---|---|---|---|
+| **mu** (no gateway) | 0.07 s | 4 MB | 12 MB | 12 MB |
+| pi | 1.03 s | 80 MB | 94 MB | 137 MB |
+| claude | 1.41 s | 153 MB | 200 MB | 206 MB |
+| omp | 1.91 s | 225 MB | 259 MB | 263 MB |
+| opencode | 2.74 s | 420 MB | 440 MB | 440 MB |
 
-## 4. Method and caveats
+Reading the columns:
+- **private and total** are what the harness's whole process tree still held in its last sample before it exited. Private is heap, stack and other memory only it holds. Total adds the shared pages (the binary, the runtime) divided among the processes that share them, so with three sessions it is each session's real share.
+- **peak total** is the total at its highest, sampled every 10 ms. The JSON output also has the kernel's peak RSS of the largest process, which counts shared pages in full.
+- **CPU** is user plus system time of the process and its children, from the kernel.
+- Wall times use a fake model that answers at once, so they are start-up plus the tool loop. With a real model, model latency dominates and these differences disappear into it.
 
-- **One task, one model, small n.** One trivial task and 1-5 runs per tool.
-- **Reasoning effort was not pinned.** Each tool used its own default, which affects every wall-time number.
-- **claude and gemini-cli** are in section 1 only. They cannot run an OpenAI model.
-- **codex** ran with `--dangerously-bypass-approvals-and-sandbox` and an API-key login in an isolated `CODEX_HOME`. Its default sandboxed mode may be slower.
-- **aider** needed `use_temperature: false` in its model settings, because `gpt-6-luna` rejects `temperature=0`.
-- **mu** reached the model through the omp gateway. The gateway only serves models whose credentials are in omp's credential store and ignores `OPENAI_API_KEY` in the environment, so the key was loaded into an isolated profile with `omp auth-broker migrate --from-local --include-env`.
-- **Peak RSS** comes from `/usr/bin/time` and is the largest single process. It is not comparable with the summed PSS in section 1. Its figure for mu (about 1 GB) counts shared pages and is not used.
-- pi, gemini-cli, crush and aider were installed into `/tmp/bench/tools` and not into the system.
+## What this does not show
+
+- **Long sessions.** These are 28-step headless runs. Memory after hours of use, after compaction, or with large tool output is not measured here.
+- **The interactive UI.** All harnesses ran headless. An idle interactive session, and any first-run or login screen, is not measured. mu's idle terminal UI measured about 17 MB total and 3 MB private on this machine with a separate script (`scripts/measure-idle.sh`); the other harnesses' idle figures were not re-measured.
+- **Quality and speed with a real model.** Task success, model latency and token cost are outside this benchmark.
+- **codex, gemini-cli, crush, aider.** codex needs the OpenAI Responses protocol, which the fake server does not speak; the others are not installed.
+- **One machine, one scenario.** 7 rounds. Ranges are in the JSON output; the wall-time ranges are narrow, but a different machine will give different absolute numbers.
+
+## Method
+
+- A fake model server speaks the Anthropic Messages protocol and replays the scenario. mu is pointed at it with `MU_GATEWAY_URL`; claude with `ANTHROPIC_BASE_URL`; omp and pi with a provider entry in their model config; opencode with a base-URL override. Each runs in a scratch `HOME`, with the config that names the server kept per session.
+- Memory is `Pss` and `Pss_Anon` from `/proc/<pid>/smaps_rollup`, summed over the process tree. CPU and peak RSS come from the kernel's resource accounting of the child.
+- pi was installed into `~/.cache/mu-bench-tools` with `npm install --prefix`, not into the system.
+- Reproduce: `cargo build --release -p mu-bench && ./target/release/mu-bench compare crates/mu-bench/scenarios/compare-agentic.toml`. Details, the scenario format and how to probe another harness are in [`crates/mu-bench/README.md`](crates/mu-bench/README.md).
+
+## History
+
+This file previously held an informal comparison from 2026-10-25 (one real-model task, 1 to 5 runs per tool, reasoning effort not pinned, an idle-memory table). It is replaced because its method was not repeatable, and its idle figure for mu (7 MB) did not reproduce: on this machine mu's idle terminal UI measures about 17 MB total. The old text is in the git history.
