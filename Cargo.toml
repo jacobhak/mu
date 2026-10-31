@@ -26,10 +26,10 @@ lang-markdown = ["highlight", "dep:tree-sitter-md"]
 
 [dependencies]
 mu-common = { path = "crates/mu-common" }
-pi-edit   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
-pi-shell  = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
-pi-diff   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
-pi-walker = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
+pi-edit   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
+pi-shell  = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
+pi-diff   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
+pi-walker = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "time", "sync", "process", "io-util", "io-std", "fs", "net"] }
 tokio-util = "0.7"
 serde_yaml_ng = "0.10"
@@ -74,10 +74,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSBitmapImageRep", "NSImageRep"] }
 
 [patch.crates-io]
-brush-core   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
-brush-parser = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
-tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
-grep-searcher = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0" }
+brush-core   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
+brush-parser = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
+tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
+grep-searcher = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.1" }
 
 [profile.release]
 strip = true
