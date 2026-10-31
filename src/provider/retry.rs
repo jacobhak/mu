@@ -40,8 +40,13 @@ pub fn too_long(retry_after: Option<Duration>) -> Option<ProviderError> {
     Some(ProviderError::Fatal(format!("rate limited; retry after {} min", d.as_secs().div_ceil(60))))
 }
 
+const LOGIN_HINT: &str = "\nIf you haven't logged in yet, run /login (or `omp login`) first.";
+
 pub fn classify_http(status: u16, retry_after: Option<Duration>, body: &str) -> ProviderError {
-    let msg = format!("HTTP {status}: {}", body.chars().take(2000).collect::<String>());
+    let mut msg = format!("HTTP {status}: {}", body.chars().take(2000).collect::<String>());
+    if matches!(status, 401 | 403) || (status == 404 && body.to_lowercase().contains("unknown model")) {
+        msg.push_str(LOGIN_HINT);
+    }
     match status {
         408 | 409 | 429 | 500 | 502 | 503 | 504 | 529 => ProviderError::Retryable { msg, retry_after },
         400 | 413 => {
@@ -79,5 +84,8 @@ mod tests {
         assert!(matches!(classify_http(400, None, "Prompt is too long: 300000 tokens"), ProviderError::Overflow(_)));
         assert!(matches!(classify_http(400, None, "bad field"), ProviderError::Fatal(_)));
         assert!(matches!(classify_http(401, None, "no"), ProviderError::Fatal(_)));
+        let e = classify_http(404, None, r#"{"message":"Unknown model: x/y"}"#).to_string();
+        assert!(e.contains("/login"), "{e}");
+        assert!(!classify_http(400, None, "bad field").to_string().contains("/login"));
     }
 }

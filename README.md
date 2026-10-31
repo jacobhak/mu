@@ -12,7 +12,7 @@ mu keeps most of what omp does and changes where the memory goes. A session hold
 - **Features start on use.** Web, memory, prediction and the model gateway are separate processes. Each starts on first use and exits after a few idle minutes. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
 - **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 250 MB while they run, idle), and all sessions share one memory daemon. [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
-- **Works with your omp setup.** mu uses omp's login, config, models, MCP setup, context files and skills. Sessions are in omp's format, so you can use both and switch either way.
+- **Works with your omp setup.** mu uses omp's login, config, models, MCP setup, context files and skills. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup: the installer bundles omp, and you log in once with `/login`.
 
 The cost: features that live inside omp's runtime, such as TypeScript extensions, aren't available. The reasoning and measurements behind the design are in [`DESIGN.md`](DESIGN.md).
 
@@ -28,7 +28,7 @@ mu also adds a few things omp doesn't have:
 Early and experimental: started in October 2026 and changing quickly.
 
 - No stable version. Releases are nightly builds of `main` (`mu-YYYYMMDD-<sha7>`); config, flags and plugin interfaces can change without notice.
-- Needs a working omp setup: mu uses omp's credentials, `models.yml` and model roles, and has no login of its own; `/login` hands off to omp.
+- Login, `models.yml` and model roles are omp's; mu has no login of its own, and `/login` hands off to omp.
 - Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
 - No support promised. Issues and PRs are welcome but may go unanswered.
 
@@ -44,7 +44,7 @@ scripts/install.sh --from-source .            # build and install a checkout
 
 If the repo is private (or you install from a private fork), the public URLs return 404. `install.sh` and `mu update` then fall back to an authenticated `gh`; fetch the script itself with `gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash`.
 
-This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Releases include the memory daemon as a compiled binary, so they need no Bun; installing `--from-source` needs Bun to build it and otherwise leaves the memory plugin out (keeping any installed one). `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
+This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Releases include the memory daemon as a compiled binary, so they need no Bun; installing `--from-source` needs Bun to build it and otherwise leaves the memory plugin out (keeping any installed one). `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`. Afterwards run `/login` in mu once (for `mu -p`, `~/.mu/bin/omp login`).
 
 ### Updating
 
