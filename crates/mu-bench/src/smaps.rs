@@ -219,6 +219,7 @@ Anonymous:             0 kB
         assert_eq!(p.iter().map(|x| x.region.as_str()).collect::<Vec<_>>(), REGIONS);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn own_process_breaks_down() {
         let parts = breakdown(std::process::id() as i32).unwrap();
@@ -252,6 +253,7 @@ mod tests {
         assert_eq!(descendants(99, &edges), [99]);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn own_process_is_sampled() {
         let me = std::process::id() as i32;
