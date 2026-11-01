@@ -361,6 +361,35 @@ mod tests {
         assert_eq!(joined, r#"{"path":"a"}"#);
     }
 
+    #[test]
+    fn gateway_stall_timeout_after_empty_deltas_is_retried() {
+        // omp's gateway no longer counts empty content deltas as upstream progress; a stall now ends
+        // as an in-stream api_error that must be retried, not a hang or a fatal turn error.
+        let ev = [
+            json!({"type":"message_start","message":{"id":"m1"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}),
+            json!({"type":"ping"}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}),
+            json!({"type":"error","error":{"type":"api_error","message":"Anthropic stream stalled while waiting for the next event"}}),
+        ];
+        let mut a = Assembler::new(&gw());
+        let mut text = String::new();
+        let mut res = Ok(None);
+        for e in ev {
+            res = a.feed(format!("event: x\ndata: {e}\n\n").as_bytes(), &mut |e| {
+                if let StreamEvent::Text(t) = e {
+                    text.push_str(t);
+                }
+            });
+            if res.is_err() {
+                break;
+            }
+        }
+        assert!(text.is_empty());
+        assert!(matches!(res, Err(ProviderError::Retryable { .. })));
+    }
+
     fn asst(blocks: Vec<Block>) -> Message {
         Message::Assistant {
             content: blocks,
