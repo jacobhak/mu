@@ -120,6 +120,22 @@ pub fn set_inbox() {
     INBOX.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+#[derive(Clone, Default)]
+struct RunInfo {
+    kind: Option<&'static str>,
+    agent: Option<String>,
+}
+
+static RUN_INFO: std::sync::Mutex<RunInfo> = std::sync::Mutex::new(RunInfo { kind: None, agent: None });
+
+/// What this process is, for its owner records: `tui`, `print`, `subagent` or `acp`, and the custom
+/// agent it runs as. Call it before any session is created.
+pub fn set_run_info(kind: &'static str, agent: Option<&str>) {
+    if let Ok(mut i) = RUN_INFO.lock() {
+        *i = RunInfo { kind: Some(kind), agent: agent.map(String::from) };
+    }
+}
+
 /// Who has a session open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Owner {
@@ -139,6 +155,11 @@ struct LiveRecord {
     print_run: bool,
     inbox: bool,
     started: String,
+    session: PathBuf,
+    kind: Option<String>,
+    agent: Option<String>,
+    cwd: Option<PathBuf>,
+    parent: Option<PathBuf>,
 }
 
 /// `--profile <name> ` (trailing space) when a profile is active, else empty: for resume hints.
@@ -169,24 +190,91 @@ fn try_flock(file: &File, op: i32) -> std::io::Result<()> {
     }
 }
 
-/// The owner record of `session`, trusted only while the record's own lock is held (so the
-/// writer is alive) and while it names this very file.
-fn live_record(session: &Path) -> Option<LiveRecord> {
-    let rec = record_path(session)?;
-    let f = File::open(&rec).ok()?;
+/// The owner record at `rec`, trusted only while the record's own lock is held (so the writer is
+/// alive). Records from before `kind`, `agent`, `cwd` and `parent` existed still read.
+fn read_record(rec: &Path) -> Option<LiveRecord> {
+    let f = File::open(rec).ok()?;
     match try_flock(&f, libc::LOCK_SH) {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         _ => return None,
     }
     let v: Value = serde_json::from_reader(&f).ok()?;
-    if !same_file(Path::new(v["session"].as_str()?), session) {
-        return None;
-    }
+    let text = |k: &str| v[k].as_str().filter(|s| !s.is_empty()).map(String::from);
     Some(LiveRecord {
         pid: u32::try_from(v["pid"].as_u64()?).ok()?,
         print_run: v["print_run"].as_bool()?,
         inbox: v["inbox"].as_bool().unwrap_or(false),
         started: v["started"].as_str()?.to_string(),
+        session: PathBuf::from(v["session"].as_str()?),
+        kind: text("kind"),
+        agent: text("agent"),
+        cwd: text("cwd").map(PathBuf::from),
+        parent: text("parent").map(PathBuf::from),
+    })
+}
+
+/// The owner record of `session`, trusted only while it names this very file.
+fn live_record(session: &Path) -> Option<LiveRecord> {
+    let r = read_record(&record_path(session)?)?;
+    same_file(&r.session, session).then_some(r)
+}
+
+/// A live mu process with a session open, from its owner record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSession {
+    pub path: PathBuf,
+    pub pid: u32,
+    pub print_run: bool,
+    pub inbox: bool,
+    pub started: String,
+    /// `tui`, `print`, `subagent` or `acp`; a record from an older mu is guessed from its flags.
+    pub kind: Option<String>,
+    pub agent: Option<String>,
+    pub cwd: Option<PathBuf>,
+    /// The session that spawned this one.
+    pub parent: Option<PathBuf>,
+}
+
+/// Every live owner record in `$MU_HOME/run`. A record whose writer is gone (its lock is free) or
+/// whose session file is missing is left out.
+pub fn live_sessions() -> Vec<LiveSession> {
+    let Ok(rd) = std::fs::read_dir(paths::mu_home().join("run")) else { return Vec::new() };
+    rd.flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            !n.starts_with('.') && n.ends_with(".json")
+        })
+        .filter_map(|e| read_record(&e.path()))
+        .filter(|r| r.session.is_file())
+        .map(|r| {
+            let parent = r.parent.clone().or_else(|| header_parent(&r.session));
+            let kind = r
+                .kind
+                .clone()
+                .or_else(|| if r.print_run { Some("print".to_string()) } else { r.inbox.then(|| "tui".to_string()) });
+            LiveSession {
+                path: r.session,
+                pid: r.pid,
+                print_run: r.print_run,
+                inbox: r.inbox,
+                started: r.started,
+                kind,
+                agent: r.agent,
+                cwd: r.cwd,
+                parent,
+            }
+        })
+        .collect()
+}
+
+/// `parentSession` from a session file's header, which sits in its first few lines.
+fn header_parent(session: &Path) -> Option<PathBuf> {
+    use std::io::BufRead;
+    let f = File::open(session).ok()?;
+    std::io::BufReader::new(f).lines().take(3).map_while(Result::ok).find_map(|l| {
+        let v: Value = serde_json::from_str(&l).ok()?;
+        (v["type"] == "session").then(|| v["parentSession"].as_str().map(PathBuf::from)).flatten()
     })
 }
 
@@ -253,17 +341,39 @@ struct OwnerRecord {
     file: File,
 }
 
+/// What an owner record says besides who holds the lock.
+#[derive(Default)]
+struct Extra {
+    kind: Option<&'static str>,
+    agent: Option<String>,
+    cwd: Option<PathBuf>,
+    parent: Option<PathBuf>,
+}
+
 impl OwnerRecord {
-    /// Call right after taking the session lock.
-    fn claim(session: &Path) -> Option<Self> {
-        Self::claim_as(
+    /// Call right after taking the session lock. `cwd` defaults to the process's.
+    fn claim(session: &Path, cwd: Option<&Path>, parent: Option<&Path>) -> Option<Self> {
+        let info = RUN_INFO.lock().map(|i| i.clone()).unwrap_or_default();
+        let extra = Extra {
+            kind: info.kind,
+            agent: info.agent,
+            cwd: cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()),
+            parent: parent.map(Path::to_path_buf),
+        };
+        Self::claim_with(
             session,
             PRINT_RUN.load(std::sync::atomic::Ordering::SeqCst),
             INBOX.load(std::sync::atomic::Ordering::SeqCst),
+            &extra,
         )
     }
 
+    #[cfg(test)]
     fn claim_as(session: &Path, print_run: bool, inbox: bool) -> Option<Self> {
+        Self::claim_with(session, print_run, inbox, &Extra::default())
+    }
+
+    fn claim_with(session: &Path, print_run: bool, inbox: bool, extra: &Extra) -> Option<Self> {
         let path = record_path(session)?;
         let dir = path.parent()?;
         std::fs::create_dir_all(dir).ok()?;
@@ -275,13 +385,25 @@ impl OwnerRecord {
         let done = (|| -> std::io::Result<()> {
             try_flock(&file, libc::LOCK_EX)?;
             let abs = std::fs::canonicalize(session).unwrap_or_else(|_| session.to_path_buf());
-            let rec = json!({
+            let mut rec = json!({
                 "pid": pid,
                 "print_run": print_run,
                 "inbox": inbox,
                 "started": iso_ms(),
                 "session": abs.to_string_lossy(),
             });
+            if let Some(k) = extra.kind {
+                rec["kind"] = json!(k);
+            }
+            if let Some(a) = &extra.agent {
+                rec["agent"] = json!(a);
+            }
+            if let Some(c) = &extra.cwd {
+                rec["cwd"] = json!(c.to_string_lossy());
+            }
+            if let Some(p) = &extra.parent {
+                rec["parent"] = json!(p.to_string_lossy());
+            }
             file.write_all(rec.to_string().as_bytes())?;
             // The lock follows the inode through the rename.
             std::fs::rename(&tmp, &path)
@@ -397,7 +519,7 @@ impl SessionFile {
         if let Some(p) = parent_session {
             header["parentSession"] = json!(p.to_string_lossy());
         }
-        let owner = OwnerRecord::claim(&path);
+        let owner = OwnerRecord::claim(&path, Some(cwd), parent_session);
         file.write_all(format!("{}{header}\n", title_slot("", None)).as_bytes())?;
         Ok(Self {
             path,
@@ -415,7 +537,7 @@ impl SessionFile {
     pub fn open_append(path: &Path) -> Result<Self> {
         let mut file = OpenOptions::new().append(true).read(true).open(path)?;
         lock(&file, path)?;
-        let owner = OwnerRecord::claim(path);
+        let owner = OwnerRecord::claim(path, None, None);
         let (_, leaf, ids) = parse(path)?;
         // A crash can leave the last line unterminated; the next entry must not join it.
         let torn = {
@@ -811,6 +933,11 @@ fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
     rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect()
 }
 
+/// `read_info` for other modules: title, working directory, first prompt and last write.
+pub fn info(path: &Path) -> Option<SessionInfo> {
+    read_info(path.to_path_buf())
+}
+
 /// Title, working directory and first prompt of one session file; reads only its first lines.
 fn read_info(path: PathBuf) -> Option<SessionInfo> {
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
@@ -1193,6 +1320,53 @@ mod tests {
         assert!(matches!(owner(&path), Owner::Live { print_run: true, inbox: false, .. }));
         let e = SessionFile::open_append(&path).err().unwrap().to_string();
         assert!(e.contains("mu take"), "{e}");
+    }
+
+    fn listed(path: &Path) -> Option<LiveSession> {
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        live_sessions().into_iter().find(|l| l.path == abs)
+    }
+
+    #[test]
+    fn a_created_session_records_where_it_runs_and_who_spawned_it() {
+        home();
+        let s = SessionFile::create(Path::new("/opt/rec-cwd"), Some(Path::new("/p/parent.jsonl"))).unwrap();
+        let l = listed(&s.path).expect("a live session is listed");
+        assert_eq!(l.pid, std::process::id());
+        assert_eq!(l.cwd.as_deref(), Some(Path::new("/opt/rec-cwd")));
+        assert_eq!(l.parent.as_deref(), Some(Path::new("/p/parent.jsonl")));
+        drop(s);
+    }
+
+    #[test]
+    fn a_record_from_before_the_new_fields_lists_with_a_guessed_kind_and_the_header_parent() {
+        home();
+        let d = tmp("old-record");
+        let path = d.join(format!("x_old-record-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"o\",\"parentSession\":\"/from/header.jsonl\"}\n",
+        )
+        .unwrap();
+        let _rec = OwnerRecord::claim_as(&path, true, false).unwrap();
+        let l = listed(&path).unwrap();
+        assert_eq!((l.kind.as_deref(), l.agent, l.cwd), (Some("print"), None, None));
+        assert_eq!(l.parent.as_deref(), Some(Path::new("/from/header.jsonl")));
+    }
+
+    #[test]
+    fn a_record_nobody_holds_is_not_listed() {
+        home();
+        let d = tmp("stale-record");
+        let id = format!("stale-{}", uuid::Uuid::new_v4());
+        let path = d.join(format!("x_{id}.jsonl"));
+        std::fs::write(&path, "{\"type\":\"session\"}\n").unwrap();
+        let dir = home().join("run");
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = std::fs::canonicalize(&path).unwrap();
+        let rec = json!({"pid": 1, "print_run": false, "started": iso_ms(), "session": abs.to_string_lossy()});
+        std::fs::write(dir.join(format!("{id}.json")), rec.to_string()).unwrap();
+        assert!(listed(&path).is_none());
     }
 
     #[test]

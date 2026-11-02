@@ -434,6 +434,16 @@ fn run() -> Result<i32> {
     if let Some(p) = resume {
         let _ = cmd_tx.send(events::Command::Resume(p));
     }
+    {
+        let kind = match (&task_payload, headless_run) {
+            (Some(_), _) => "subagent",
+            (None, true) => "print",
+            (None, false) => "tui",
+        };
+        let name =
+            task_payload.as_ref().and_then(|p| p["agent"].as_str()).or(agent_def.as_ref().map(|d| d.name.as_str()));
+        session::set_run_info(kind, name);
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();

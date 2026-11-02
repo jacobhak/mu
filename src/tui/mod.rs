@@ -23,6 +23,7 @@ pub mod render;
 pub mod reply;
 pub mod select;
 pub mod session_view;
+pub mod sessions_tab;
 pub mod status;
 pub mod term;
 pub mod theme;

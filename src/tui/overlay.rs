@@ -138,6 +138,20 @@ pub enum OverlayEvent {
     DeliverPlan(String),
     /// Cancel one running job by id, or all of them.
     KillJobs(Option<String>),
+    /// Message a live session (`mu notify`).
+    NotifySession {
+        session: PathBuf,
+        text: String,
+    },
+    /// Stop a live session; `pid` and `started` say which run the user saw.
+    StopSession {
+        session: PathBuf,
+        pid: u32,
+        started: String,
+        kind: String,
+    },
+    /// Take over a `-p` run: the panel closes and `mu take` runs on the terminal.
+    TakeSession(PathBuf),
 }
 
 /// The question as a picker: its options, a free-text row, multi-select, the recommended choice
@@ -454,6 +468,7 @@ impl Overlay {
     pub fn on_paste(&mut self, s: &str) {
         match self {
             Overlay::Review { review, .. } => review.on_paste(s),
+            Overlay::Jobs { st } => st.on_paste(s),
             other => {
                 if let Some(sel) = other.select_mut() {
                     sel.on_paste(s);
@@ -518,6 +533,13 @@ impl Overlay {
                 JobsResult::Pending => (Some(Overlay::Jobs { st }), None),
                 JobsResult::Close => (None, None),
                 JobsResult::Kill(id) => (Some(Overlay::Jobs { st }), Some(OverlayEvent::KillJobs(id))),
+                JobsResult::Notify { session, text } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::NotifySession { session, text }))
+                }
+                JobsResult::Stop { session, pid, started, kind } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::StopSession { session, pid, started, kind }))
+                }
+                JobsResult::Take { session } => (None, Some(OverlayEvent::TakeSession(session))),
             },
             Overlay::Session { mut sel, paths } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Session { sel, paths }), None),

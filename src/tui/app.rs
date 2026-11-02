@@ -108,6 +108,8 @@ enum ChildThen {
     ComposerEdit(std::path::PathBuf),
     /// The editor was run on the plan file shown in the review overlay.
     PlanEdit(std::path::PathBuf),
+    /// `mu take` ran on the terminal for a session picked in the jobs panel.
+    Take,
 }
 
 enum UiMsg {
@@ -1010,6 +1012,21 @@ impl App {
             OverlayEvent::OpenPlan(id) => self.send(Command::OpenPlan(id)),
             OverlayEvent::DeliverPlan(id) => self.send(Command::Deliver(id)),
             OverlayEvent::KillJobs(id) => self.send(Command::KillJobs(id)),
+            OverlayEvent::NotifySession { session, text } => {
+                let msg = match crate::notify::send(&session, Some("mu jobs panel"), &text, &self.cwd) {
+                    Ok(line) => format!("message to {}: {line}", crate::session::id_of(&session)),
+                    Err(e) => format!("message not sent: {e}"),
+                };
+                self.panel_status(msg);
+            }
+            OverlayEvent::StopSession { session, pid, started, kind } => {
+                let msg = match crate::take::stop_session(&session, pid, &started, &kind) {
+                    Ok(m) => m,
+                    Err(e) => format!("not stopped: {e}"),
+                };
+                self.panel_status(msg);
+            }
+            OverlayEvent::TakeSession(path) => self.take_session(path),
         }
     }
 
@@ -1174,13 +1191,47 @@ impl App {
         }
     }
 
-    /// Opens the jobs panel, or says there are no jobs.
+    /// The panel as this session sees it: its jobs, their output, and itself left out of the sessions.
+    fn jobs_panel(&self) -> JobsPanel {
+        JobsPanel::new(self.jobs.clone())
+            .with_outputs(self.job_out.clone())
+            .with_own_session(self.status.session_path.as_ref().map(PathBuf::from))
+    }
+
+    /// Opens the jobs panel: on the Jobs tab, or on the Sessions tab when there are no jobs.
     fn open_jobs(&mut self) {
-        if self.jobs.is_empty() {
-            return self.notice("no background jobs");
-        }
-        let panel = JobsPanel::new(self.jobs.clone()).with_outputs(self.job_out.clone());
+        let panel = if self.jobs.is_empty() { self.jobs_panel().on_sessions() } else { self.jobs_panel() };
         self.overlay = Some(Overlay::Jobs { st: Box::new(panel) });
+    }
+
+    fn open_sessions(&mut self) {
+        self.overlay = Some(Overlay::Jobs { st: Box::new(self.jobs_panel().on_sessions()) });
+    }
+
+    /// Says what a panel action did, in the panel when it is open.
+    fn panel_status(&mut self, msg: String) {
+        match &mut self.overlay {
+            Some(Overlay::Jobs { st }) => st.set_status(msg),
+            _ => self.notice(&msg),
+        }
+    }
+
+    /// Hands the terminal to `mu take <session>`, then comes back to the Sessions tab.
+    fn take_session(&mut self, path: PathBuf) {
+        let exe = match mu_common::paths::self_exe() {
+            Ok(e) => e,
+            Err(e) => return self.error(&format!("cannot locate mu: {e}")),
+        };
+        self.start_child(ChildThen::Take, move || {
+            extern "C" fn noop(_: libc::c_int) {}
+            // As in `run_login`: Ctrl-C reaches `mu take`, not this mu.
+            // SAFETY: installs a no-op handler; restored to the default below.
+            unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+            let status = std::process::Command::new(exe).arg("take").arg(&path).status();
+            // SAFETY: back to the default disposition.
+            unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+            status
+        });
     }
 
     fn image_cmd(&mut self, arg: &str) {
@@ -1376,6 +1427,14 @@ impl App {
                     Err(e) => self.error(&format!("editor failed: {e}")),
                 }
                 let _ = std::fs::remove_file(&path);
+            }
+            ChildThen::Take => {
+                match status {
+                    Ok(s) if s.success() => self.notice("back from mu take"),
+                    Ok(s) => self.error(&format!("mu take exited with {s}")),
+                    Err(e) => self.error(&format!("cannot run mu take: {e}")),
+                }
+                self.open_sessions();
             }
             ChildThen::PlanEdit(path) => {
                 if let Err(e) = status {

@@ -125,6 +125,48 @@ fn verify(now: Owner, pid: u32, started: &str) -> Recheck {
     }
 }
 
+/// `s` in the jobs panel: stops the run the user saw, without taking it over. A `-p` run gets
+/// SIGUSR1 and stops after its current step; a subagent's process group gets SIGTERM, which is how its
+/// parent cancels it. Nothing is signalled unless the session's owner is still that run (same pid and
+/// start time).
+pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<String, String> {
+    const GONE: &str = "it has already finished";
+    const CHANGED: &str = "the session changed hands; nothing was signalled";
+    match kind {
+        "print" => match verify(session::owner(path), pid, started) {
+            Recheck::Same => signal(pid)
+                .map(|()| format!("asked pid {pid} to stop after its current step"))
+                .map_err(|e| format!("cannot signal pid {pid}: {e}")),
+            Recheck::Free => Err(GONE.into()),
+            Recheck::Changed => Err(CHANGED.into()),
+        },
+        "subagent" => match session::owner(path) {
+            Owner::Live { pid: p, print_run: false, started: s, .. } if p == pid && s == started => {
+                terminate_leader(pid)
+            }
+            Owner::Free => Err(GONE.into()),
+            _ => Err(CHANGED.into()),
+        },
+        _ => Err("only -p runs and subagents can be stopped from here".into()),
+    }
+}
+
+/// SIGTERM to the process group `pid` leads. A pid that leads no group of its own is left alone: its
+/// group is someone else's.
+fn terminate_leader(pid: u32) -> Result<String, String> {
+    let p = libc::pid_t::try_from(pid).map_err(|_| "bad pid".to_string())?;
+    // SAFETY: plain syscalls on integers.
+    if unsafe { libc::getpgid(p) } != p {
+        return Err(format!("pid {pid} does not lead its own process group; nothing was signalled"));
+    }
+    // SAFETY: as above.
+    if unsafe { libc::kill(-p, libc::SIGTERM) } == 0 {
+        Ok(format!("asked pid {pid} to terminate"))
+    } else {
+        Err(format!("cannot signal pid {pid}: {}", std::io::Error::last_os_error()))
+    }
+}
+
 fn resume(path: &Path) -> anyhow::Result<i32> {
     use std::os::unix::process::CommandExt;
     if let Some(dir) = session::header_cwd(path) {
@@ -159,5 +201,32 @@ mod tests {
         assert_eq!(verify(live(7, false, t), 7, t), Recheck::Changed);
         assert_eq!(verify(Owner::Unknown, 7, t), Recheck::Changed);
         assert_eq!(verify(Owner::Free, 7, t), Recheck::Free);
+    }
+
+    #[test]
+    fn stopping_refuses_other_kinds_and_sessions_nobody_has() {
+        let t = "2026-01-01T00:00:00.000Z";
+        let missing = Path::new("/definitely/not/a/session_x.jsonl");
+        assert!(stop_session(missing, 7, t, "tui").unwrap_err().contains("only -p runs and subagents"));
+        assert!(stop_session(missing, 7, t, "print").unwrap_err().contains("already finished"));
+        assert!(stop_session(missing, 7, t, "subagent").unwrap_err().contains("already finished"));
+    }
+
+    #[test]
+    fn a_group_leader_is_terminated_and_anyone_else_is_left_alone() {
+        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::ExitStatusExt;
+        let mut leader = std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let msg = terminate_leader(leader.id()).unwrap();
+        assert!(msg.contains("terminate"), "{msg}");
+        assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGTERM));
+
+        // Shares this test's group, so it is not a leader.
+        let mut follower = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let err = terminate_leader(follower.id()).unwrap_err();
+        assert!(err.contains("does not lead its own process group"), "{err}");
+        assert!(follower.try_wait().unwrap().is_none(), "it was not signalled");
+        let _ = follower.kill();
+        let _ = follower.wait();
     }
 }

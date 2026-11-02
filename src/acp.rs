@@ -23,6 +23,7 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL: i64 = -32603;
 
 pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
+    crate::session::set_run_info("acp", None);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
