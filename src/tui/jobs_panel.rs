@@ -50,6 +50,8 @@ pub struct JobsPanel {
     totals: HashMap<PathBuf, Totals>,
     polled_totals: Option<Instant>,
     view: Option<View>,
+    /// The newest output of each bash job, as the app last sent it.
+    outputs: HashMap<String, String>,
 }
 
 /// A listed session's totals, and whether it can still change.
@@ -59,16 +61,17 @@ struct Totals {
     settled: bool,
 }
 
-/// The full-height transcript of one subagent's session.
+/// The full-height view of one job: a subagent's session transcript, or a bash job's output.
 struct View {
     /// The job it shows.
     name: String,
-    tail: Tail,
+    /// The session being followed; `None` for a bash job.
+    tail: Option<Tail>,
     settled: bool,
     polled: Option<Instant>,
     lines: Vec<Line>,
-    /// What `lines` was drawn from: messages seen, width, caught up.
-    built: Option<(usize, usize, bool)>,
+    /// What `lines` was drawn from (a content id) and at which width.
+    built: Option<(u64, usize)>,
     top: usize,
     follow: bool,
     /// From the last render, for scrolling.
@@ -83,20 +86,36 @@ impl View {
         self.follow = self.top == self.max_top;
     }
 
-    fn build(&mut self, width: usize) {
-        let seen = self.tail.messages().len() + self.tail.dropped();
-        let key = (seen, width, self.tail.caught_up());
-        if self.built == Some(key) {
+    fn build(&mut self, width: usize, output: Option<&str>) {
+        let content = match (&self.tail, output) {
+            (Some(t), _) => (((t.messages().len() + t.dropped()) as u64) << 1) | u64::from(t.caught_up()),
+            (None, o) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                o.hash(&mut h);
+                h.finish()
+            }
+        };
+        if self.built == Some((content, width)) {
             return;
         }
-        self.built = Some(key);
+        self.built = Some((content, width));
         let mut l: Vec<Line> = Vec::new();
-        if self.tail.dropped() > 0 {
-            l.push(line::styled(format!("  … {} earlier messages not shown", self.tail.dropped()), |_| dim()));
+        match &self.tail {
+            Some(t) => {
+                if t.dropped() > 0 {
+                    l.push(line::styled(format!("  … {} earlier messages not shown", t.dropped()), |_| dim()));
+                }
+                l.extend(session_view::lines(t.messages(), width));
+            }
+            None => l.extend(output_lines(output.unwrap_or(""), width)),
         }
-        l.extend(session_view::lines(self.tail.messages(), width));
         if l.is_empty() {
-            let why = if self.tail.caught_up() { "  nothing yet" } else { "  waiting for the session file…" };
+            let why = match &self.tail {
+                Some(t) if !t.caught_up() => "  waiting for the session file…",
+                Some(_) => "  nothing yet",
+                None => "  no output yet",
+            };
             l.push(line::styled(why, |_| dim()));
         }
         self.lines = l;
@@ -107,7 +126,27 @@ impl JobsPanel {
     pub fn new(jobs: Vec<SubagentStatus>) -> Self {
         // Open on the newest running job, else the newest job.
         let at = jobs.iter().rposition(|j| j.state == SubagentState::Running).unwrap_or(jobs.len().saturating_sub(1));
-        Self { jobs, at, top: 0, page: LIST_MAX, totals: HashMap::new(), polled_totals: None, view: None }
+        Self {
+            jobs,
+            at,
+            top: 0,
+            page: LIST_MAX,
+            totals: HashMap::new(),
+            polled_totals: None,
+            view: None,
+            outputs: HashMap::new(),
+        }
+    }
+
+    /// Starts with the output the app already has for its bash jobs.
+    pub fn with_outputs(mut self, outputs: HashMap<String, String>) -> Self {
+        self.outputs = outputs;
+        self
+    }
+
+    /// The newest output of a bash job.
+    pub fn set_output(&mut self, id: &str, tail: &str) {
+        self.outputs.insert(id.to_string(), tail.to_string());
     }
 
     /// A fresh snapshot: the selection stays on the same job when it is still there.
@@ -143,9 +182,11 @@ impl JobsPanel {
             self.view.as_ref().and_then(|v| self.jobs.iter().find(|j| j.name == v.name)).map(|j| j.state.clone());
         if let (Some(v), Some(state)) = (&mut self.view, state) {
             v.polled = Some(Instant::now());
-            if !v.settled {
-                v.tail.poll();
-                v.settled = state != SubagentState::Running && v.tail.caught_up();
+            if !v.settled
+                && let Some(t) = &mut v.tail
+            {
+                t.poll();
+                v.settled = state != SubagentState::Running && t.caught_up();
             }
         }
     }
@@ -153,7 +194,10 @@ impl JobsPanel {
     fn refresh_due(&mut self) {
         let now = Instant::now();
         let totals_due = self.polled_totals.is_none_or(|t| now.duration_since(t) >= TOTALS_POLL);
-        let view_due = self.view.as_ref().is_some_and(|v| v.polled.is_none_or(|t| now.duration_since(t) >= VIEW_POLL));
+        let view_due = self
+            .view
+            .as_ref()
+            .is_some_and(|v| v.tail.is_some() && v.polled.is_none_or(|t| now.duration_since(t) >= VIEW_POLL));
         if totals_due || view_due {
             self.refresh();
         }
@@ -172,13 +216,18 @@ impl JobsPanel {
         self.jobs.iter().filter(|j| j.state == SubagentState::Running).count()
     }
 
-    /// Opens the selected subagent's transcript, when it has a session file yet.
+    /// Opens the selected job's view: a subagent's transcript once it has a session file, or a bash
+    /// job's output.
     fn open_view(&mut self) {
         let Some(j) = self.jobs.get(self.at) else { return };
-        let Some(path) = j.session.clone() else { return };
+        let tail = match (&j.session, j.kind) {
+            (Some(path), _) => Some(Tail::new(path.clone(), VIEW_KEEP)),
+            (None, JobKind::Bash) => None,
+            (None, JobKind::Subagent) => return,
+        };
         self.view = Some(View {
             name: j.name.clone(),
-            tail: Tail::new(path, VIEW_KEEP),
+            tail,
             settled: false,
             polled: None,
             lines: Vec::new(),
@@ -335,8 +384,9 @@ impl JobsPanel {
         let h = max_rows.saturating_sub(header + footer).max(1);
         let job = self.view.as_ref().and_then(|v| self.jobs.iter().find(|j| j.name == v.name)).cloned();
         let cost = job.as_ref().map(|j| self.cost_cell(j)).unwrap_or_default();
+        let output = self.view.as_ref().and_then(|v| self.outputs.get(&v.name)).map(String::as_str);
         let Some(v) = self.view.as_mut() else { return (Vec::new(), (0, 0)) };
-        v.build(width);
+        v.build(width, output);
         v.body_h = h;
         v.max_top = v.lines.len().saturating_sub(h);
         let top = if v.follow { v.max_top } else { v.top.min(v.max_top) };
@@ -349,8 +399,8 @@ impl JobsPanel {
             if !cost.is_empty() {
                 title.push_str(&format!(" · {cost}"));
             }
-            if v.tail.tokens() > 0 {
-                title.push_str(&format!(" · {} tok", short_count(v.tail.tokens())));
+            if let Some(t) = v.tail.as_ref().filter(|t| t.tokens() > 0) {
+                title.push_str(&format!(" · {} tok", short_count(t.tokens())));
             }
             title.push_str(if v.follow { " · following" } else { " · paused" });
             out.push(rule(Some(&title), width));
@@ -375,6 +425,63 @@ fn mark(state: &SubagentState) -> (char, Role) {
         SubagentState::Done => ('✓', Role::Ok),
         SubagentState::Failed => ('✗', Role::Err),
     }
+}
+
+/// A bash job's output as rows: terminal escapes dropped, a carriage return keeping only what was
+/// written last on the line (progress bars), long lines split at `width`.
+fn output_lines(text: &str, width: usize) -> Vec<Line> {
+    let muted = theme::get().fg(Role::Muted);
+    let mut out: Vec<Line> = Vec::new();
+    for raw in strip_ansi(text).lines() {
+        let l = raw.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("");
+        if l.is_empty() {
+            out.push(Vec::new());
+            continue;
+        }
+        let chars: Vec<char> = l.chars().collect();
+        for c in chars.chunks(width.max(1)) {
+            out.push(vec![span(c.iter().collect::<String>(), muted)]);
+        }
+    }
+    out
+}
+
+/// `s` without CSI and OSC sequences and lone escapes.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match it.peek() {
+            Some('[') => {
+                it.next();
+                for n in it.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                it.next();
+                while let Some(n) = it.next() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        it.next();
+                        break;
+                    }
+                }
+            }
+            _ => {
+                it.next();
+            }
+        }
+    }
+    out
 }
 
 /// `950`, `12.3k`, `1.2M`.
@@ -497,10 +604,12 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, h: usize, now: SystemTim
     if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
         rows.push(vec![span(format!("   last {}", j.last), muted)]);
     }
-    if j.kind == JobKind::Subagent {
-        let hint = if j.session.is_some() { "Enter  read its transcript" } else { "no session file yet" };
-        rows.push(vec![span(format!("   {hint}"), t.fg(Role::Faint))]);
-    }
+    let hint = match (j.kind, &j.session) {
+        (JobKind::Subagent, Some(_)) => "Enter  read its transcript",
+        (JobKind::Subagent, None) => "no session file yet",
+        (JobKind::Bash, _) => "Enter  see its output",
+    };
+    rows.push(vec![span(format!("   {hint}"), t.fg(Role::Faint))]);
     rows.truncate(h);
     rows.resize(h, Vec::new());
     rows
@@ -769,6 +878,40 @@ mod tests {
         assert!(text(&mut p, 80, 20)[0].starts_with("── b ·"));
         p.set_jobs(vec![]);
         assert!(text(&mut p, 80, 20).iter().any(|r| r.contains("no background jobs")));
+    }
+
+    fn bash_job(name: &str, state: SubagentState) -> SubagentStatus {
+        SubagentStatus { kind: JobKind::Bash, agent: "bash".into(), task: "make all".into(), ..job(name, state) }
+    }
+
+    #[test]
+    fn a_bash_job_opens_its_output_and_follows_what_arrives() {
+        let out = HashMap::from([("bg_1".to_string(), "compiling\n\u{1b}[31mred\u{1b}[0m\n".to_string())]);
+        let mut p = JobsPanel::new(vec![bash_job("bg_1", SubagentState::Running)]).with_outputs(out);
+        let rows = text(&mut p, 80, 20);
+        assert!(rows.iter().any(|r| r.contains("Enter  see its output")), "{rows:?}");
+        p.on_key(key(KeyCode::Enter));
+        let rows = text(&mut p, 80, 20);
+        assert!(rows[0].starts_with("── bg_1 · bash") && rows[0].contains("following"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("compiling")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim() == "red"), "escapes are dropped: {rows:?}");
+        p.set_output("bg_1", "compiling\nred\nlinking\n");
+        let rows = text(&mut p, 80, 20);
+        assert!(rows.iter().any(|r| r.contains("linking")), "{rows:?}");
+        assert!(matches!(p.on_key(key(KeyCode::Char('x'))), JobsResult::Kill(Some(id)) if id == "bg_1"));
+
+        let mut quiet = JobsPanel::new(vec![bash_job("bg_2", SubagentState::Running)]);
+        quiet.on_key(key(KeyCode::Enter));
+        assert!(text(&mut quiet, 80, 20).iter().any(|r| r.contains("no output yet")));
+    }
+
+    #[test]
+    fn escapes_and_carriage_returns_are_cleaned_from_output() {
+        assert_eq!(strip_ansi("a\u{1b}[1;31mb\u{1b}[0mc\u{1b}]0;title\u{7}d\u{1b}Ze"), "abcde");
+        let rows: Vec<String> = output_lines("10%\r50%\r100%\nnext\n\nlast", 80).iter().map(line_text).collect();
+        assert_eq!(rows, ["100%", "next", "", "last"]);
+        let wrapped = output_lines(&"x".repeat(25), 10);
+        assert_eq!(wrapped.len(), 3);
     }
 
     #[test]

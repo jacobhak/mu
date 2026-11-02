@@ -30,7 +30,7 @@ use crate::tools::todo::{Phase, Status};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use mu_common::paths;
 use serde_json::{Value, json};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -183,6 +183,8 @@ struct App {
     /// Latest background-job snapshot, and finished jobs already printed to the transcript.
     jobs: Vec<SubagentStatus>,
     jobs_committed: HashSet<String>,
+    /// Newest output of each background bash job, for the jobs panel.
+    job_out: HashMap<String, String>,
     ghost_seq: u64,
     ghost_asked: String,
     /// Bash commands the user ran, for `/copy`.
@@ -303,6 +305,7 @@ pub async fn run(init: AppInit) -> i32 {
         tools: Vec::new(),
         jobs: Vec::new(),
         jobs_committed: HashSet::new(),
+        job_out: HashMap::new(),
         bash_cmds: Vec::new(),
         compacting: false,
         todo: Vec::new(),
@@ -562,10 +565,17 @@ impl App {
                         self.commit(blocks::subagent_rows(std::slice::from_ref(r), ' '));
                     }
                 }
+                self.job_out.retain(|id, _| v.iter().any(|j| &j.name == id));
                 if let Some(Overlay::Jobs { st }) = &mut self.overlay {
                     st.set_jobs(v.clone());
                 }
                 self.jobs = v;
+            }
+            AgentEvent::JobOutput { id, tail } => {
+                if let Some(Overlay::Jobs { st }) = &mut self.overlay {
+                    st.set_output(&id, &tail);
+                }
+                self.job_out.insert(id, tail);
             }
             AgentEvent::JobsDelivered(ids) => {
                 self.commit(vec![styled(format!("↳ job results delivered: {}", ids.join(", ")), |_| dim())]);
@@ -1169,7 +1179,8 @@ impl App {
         if self.jobs.is_empty() {
             return self.notice("no background jobs");
         }
-        self.overlay = Some(Overlay::Jobs { st: Box::new(JobsPanel::new(self.jobs.clone())) });
+        let panel = JobsPanel::new(self.jobs.clone()).with_outputs(self.job_out.clone());
+        self.overlay = Some(Overlay::Jobs { st: Box::new(panel) });
     }
 
     fn image_cmd(&mut self, arg: &str) {

@@ -212,8 +212,15 @@ Each phase ships alone.
    Deviation: `take_undelivered` now emits a snapshot so the panel's delivery state is current.
 2. **Status segment** `subagents` (implemented). Drawn only where the user's omp `statusLine` lists it; mu's
    fallback segment list is unchanged.
-3. **Child transcript and cost.** `session` NDJSON line, `events_for`, the tailing viewer, the running-total
-   cost reader (Jobs rows get a cost), bash output tail.
+3. **Child transcript and cost** (implemented). The headless child prints `{"type":"session","path":…}` once
+   its session exists; `run_child_observed` hands it to the job. `agent::history_events` is the resume
+   replay as a pure function; `tui/session_view.rs` draws its events with the live transcript's blocks;
+   `session_tail.rs` follows the file (byte offset, whole lines, at most 1 MiB per poll so a big file fills
+   in over several ticks on the UI thread instead of needing a worker). `Enter` opens the view. Cost is the
+   running total of each listed subagent's session, polled every 2 s while the panel is open.
+   Deviation for bash: output reaches the panel as `AgentEvent::JobOutput` (the newest 16 KiB, redacted,
+   throttled to 4 per second with a deferred final update), not through a `Command::JobOutput` request; the
+   app keeps the latest per job and drops it when the job leaves the snapshot.
 4. **Sessions tab.** Owner record fields (`kind`, `agent`, `cwd`, `parent`), the live list and tree with
    cost, read-only peek.
 5. **Actions on other sessions.** `n`, `s`, `t` (including `ChildThen::Take`).

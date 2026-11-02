@@ -273,6 +273,11 @@ pub enum AgentEvent {
     Jobs(Vec<SubagentStatus>),
     /// Finished jobs whose results were handed to the model.
     JobsDelivered(Vec<String>),
+    /// The newest output of a running `bash` job (redacted), at most a few times a second.
+    JobOutput {
+        id: String,
+        tail: String,
+    },
     Ask {
         questions: Vec<AskQuestion>,
         reply: oneshot::Sender<Option<Vec<Answer>>>,

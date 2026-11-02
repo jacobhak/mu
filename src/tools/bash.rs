@@ -206,8 +206,16 @@ impl Tools {
         let artifact_dir = self.artifact_dir();
         let (command, timeout) = (a.command.clone(), a.timeout);
         let job_cwd = cwd.clone();
-        let id = jobs.spawn_bash(a.command, job_cwd, move |cancel| {
-            run_background(command, cwd, env, timeout, cancel, move || Tools::next_artifact_in(&artifact_dir))
+        let id = jobs.spawn_bash(a.command, job_cwd, move |cancel, sink| {
+            run_background(
+                command,
+                cwd,
+                env,
+                timeout,
+                cancel,
+                move || Tools::next_artifact_in(&artifact_dir),
+                move |s| sink.push(s),
+            )
         });
         let note = if inherited {
             String::new()
@@ -562,6 +570,7 @@ pub async fn run_background(
     timeout: Option<f64>,
     cancel: CancellationToken,
     alloc: impl Fn() -> (u32, PathBuf),
+    on_output: impl Fn(&str),
 ) -> BackgroundResult {
     let limits = Limits::new(timeout);
     let start = Instant::now();
@@ -599,11 +608,19 @@ pub async fn run_background(
     loop {
         tokio::select! {
             r = read_or_pending(&mut stdout, &mut obuf) => match r {
-                Ok(n) if n > 0 => collector.push(&out_dec.push(&obuf[..n]), &alloc),
+                Ok(n) if n > 0 => {
+                    let text = out_dec.push(&obuf[..n]);
+                    on_output(&text);
+                    collector.push(&text, &alloc)
+                }
                 _ => stdout = None,
             },
             r = read_or_pending(&mut stderr, &mut ebuf) => match r {
-                Ok(n) if n > 0 => collector.push(&err_dec.push(&ebuf[..n]), &alloc),
+                Ok(n) if n > 0 => {
+                    let text = err_dec.push(&ebuf[..n]);
+                    on_output(&text);
+                    collector.push(&text, &alloc)
+                }
                 _ => stderr = None,
             },
             st = child.wait(), if status.is_none() => status = st.ok(),
@@ -658,6 +675,24 @@ mod tests {
         let out = tools.call("bash", &json!({"command":"echo hi","pty":true}), &ctx).await;
         assert!(out.text.contains("hi"), "{}", out.text);
         assert!(out.text.contains("[pty unavailable without the terminal UI; ran without a terminal]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_background_run_reports_its_output_as_it_arrives() {
+        let seen = std::cell::RefCell::new(String::new());
+        let r = run_background(
+            "echo first; echo second >&2".into(),
+            std::env::temp_dir(),
+            std::env::vars().collect(),
+            None,
+            CancellationToken::new(),
+            || (0, std::env::temp_dir()),
+            |s| seen.borrow_mut().push_str(s),
+        )
+        .await;
+        assert!(r.ok, "{}", r.text);
+        let seen = seen.into_inner();
+        assert!(seen.contains("first") && seen.contains("second"), "{seen:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

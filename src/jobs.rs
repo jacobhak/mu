@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -18,6 +18,88 @@ use crate::tools::task::{MAX_TASKS, run_child_observed};
 use crate::tui::line::truncate_text;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// Newest bytes of a running bash job's output kept for the jobs panel.
+const OUTPUT_KEEP: usize = 64 * 1024;
+/// How much of that goes to the UI per update, and how often at most.
+const OUTPUT_EMIT: usize = 16 * 1024;
+const OUTPUT_EVERY: Duration = Duration::from_millis(250);
+
+/// Where a running bash job's output goes: a bounded buffer whose newest part is sent to the UI as
+/// `AgentEvent::JobOutput` (redacted, throttled), so the panel can show a job while it runs.
+#[derive(Clone)]
+pub struct OutputSink(Rc<SinkInner>);
+
+struct SinkInner {
+    id: String,
+    cwd: PathBuf,
+    events: EventTx,
+    buf: RefCell<String>,
+    last: Cell<Option<Instant>>,
+    /// A deferred update is already waiting.
+    pending: Cell<bool>,
+}
+
+impl OutputSink {
+    fn new(id: String, cwd: PathBuf, events: EventTx) -> Self {
+        Self(Rc::new(SinkInner {
+            id,
+            cwd,
+            events,
+            buf: RefCell::default(),
+            last: Cell::new(None),
+            pending: Cell::new(false),
+        }))
+    }
+
+    /// Adds output. The first chunk after a quiet spell is sent at once; later ones wait for the
+    /// throttle, so the last chunk is never left unsent.
+    pub fn push(&self, s: &str) {
+        let i = &self.0;
+        {
+            let mut b = i.buf.borrow_mut();
+            b.push_str(s);
+            if b.len() > OUTPUT_KEEP {
+                let mut cut = b.len() - OUTPUT_KEEP;
+                while !b.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                b.drain(..cut);
+            }
+        }
+        if i.pending.get() {
+            return;
+        }
+        match i.last.get().map(|t| t.elapsed()) {
+            Some(since) if since < OUTPUT_EVERY => {
+                i.pending.set(true);
+                let me = self.clone();
+                let wait = OUTPUT_EVERY - since;
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(wait).await;
+                    me.0.pending.set(false);
+                    me.flush();
+                });
+            }
+            _ => self.flush(),
+        }
+    }
+
+    /// Sends the newest output now (nothing when there is none).
+    pub fn flush(&self) {
+        let i = &self.0;
+        let b = i.buf.borrow();
+        if b.is_empty() {
+            return;
+        }
+        let mut from = b.len().saturating_sub(OUTPUT_EMIT);
+        while !b.is_char_boundary(from) {
+            from += 1;
+        }
+        let tail = crate::secrets::redact(&b[from..], &i.cwd).text;
+        i.last.set(Some(Instant::now()));
+        let _ = i.events.send(AgentEvent::JobOutput { id: i.id.clone(), tail });
+    }
+}
 
 struct Job {
     /// Distinguishes a job from a later one that reuses its id after `clear`.
@@ -214,12 +296,12 @@ impl JobsHandle {
     }
 
     /// Starts a bash job and returns its id. `run` gets the job's cancel token, which `kill` and
-    /// `clear` fire.
+    /// `clear` fire, and the sink its output goes to.
     pub fn spawn_bash<F>(
         self: &Rc<Self>,
         command: String,
         cwd: PathBuf,
-        run: impl FnOnce(CancellationToken) -> F,
+        run: impl FnOnce(CancellationToken, OutputSink) -> F,
     ) -> String
     where
         F: Future<Output = BackgroundResult> + 'static,
@@ -227,6 +309,7 @@ impl JobsHandle {
         let id = self.unique_id(&format!("bg_{}", self.next_seq.get() + 1));
         let cancel = CancellationToken::new();
         let line = command_line(&command);
+        let sink = OutputSink::new(id.clone(), cwd.clone(), self.events.clone());
         let spec = Spec {
             id: id.clone(),
             agent: "bash".into(),
@@ -237,10 +320,11 @@ impl JobsHandle {
             command: Some(command),
         };
         let seq = self.start(spec, cancel.clone());
-        let fut = run(cancel);
+        let fut = run(cancel, sink.clone());
         let me = self.clone();
         tokio::task::spawn_local(async move {
             let r = fut.await;
+            sink.flush();
             me.complete(seq, r.ok, r.text, Some(r.note));
         });
         id
@@ -482,6 +566,60 @@ pub(crate) mod tests {
         assert_eq!(snap[0].task, "find x now", "the task is one line");
         assert_eq!((snap[0].cwd.as_path(), snap[0].state.clone()), (base.as_path(), SubagentState::Done));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn sink() -> (OutputSink, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        (OutputSink::new("bg_1".into(), PathBuf::from("/"), events), rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_goes_out_at_once_then_throttled_and_never_unsent() {
+        let (sink, mut rx) = sink();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                sink.push("one\n");
+                assert!(
+                    matches!(rx.try_recv(), Ok(AgentEvent::JobOutput { id, tail }) if id == "bg_1" && tail == "one\n")
+                );
+                sink.push("two\n");
+                sink.push("three\n");
+                assert!(rx.try_recv().is_err(), "chunks inside the window wait");
+                tokio::time::sleep(OUTPUT_EVERY + Duration::from_millis(150)).await;
+                match rx.try_recv() {
+                    Ok(AgentEvent::JobOutput { tail, .. }) => assert_eq!(tail, "one\ntwo\nthree\n"),
+                    _ => panic!("the deferred update never came"),
+                }
+                assert!(rx.try_recv().is_err(), "one update covers both chunks");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_is_bounded_and_flush_sends_what_is_left() {
+        let (sink, mut rx) = sink();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                sink.push(&"é".repeat(100 * 1024));
+                match rx.try_recv() {
+                    Ok(AgentEvent::JobOutput { tail, .. }) => {
+                        assert!(tail.len() <= OUTPUT_EMIT && tail.chars().all(|c| c == 'é'), "{}", tail.len());
+                    }
+                    _ => panic!("no update"),
+                }
+                assert!(sink.0.buf.borrow().len() <= OUTPUT_KEEP);
+                sink.push("last");
+                sink.flush();
+                let mut got = None;
+                while let Ok(AgentEvent::JobOutput { tail, .. }) = rx.try_recv() {
+                    got = Some(tail);
+                }
+                assert!(got.is_some_and(|t| t.ends_with("last")), "flush sends the end at once");
+            })
+            .await;
+        let (empty, mut rx) = self::sink();
+        empty.flush();
+        assert!(rx.try_recv().is_err(), "nothing to send");
     }
 
     #[test]
