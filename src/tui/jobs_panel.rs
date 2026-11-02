@@ -16,6 +16,9 @@ const LIST_MAX: usize = 8;
 const CHROME: usize = 4;
 /// Fewest detail rows worth splitting for; below this only the list is drawn.
 const DETAIL_MIN: usize = 3;
+/// Most detail rows: the facts, directory, task and last activity fit in this, and a tall screen
+/// keeps showing the transcript above the panel.
+const DETAIL_MAX: usize = 8;
 /// Widest name and agent columns in the list.
 const NAME_MAX: usize = 16;
 const AGENT_MAX: usize = 12;
@@ -91,7 +94,7 @@ impl JobsPanel {
         let (list_h, detail_h, tail) = if split {
             let body = max_rows - CHROME;
             let list_h = n.clamp(1, LIST_MAX).min(body - DETAIL_MIN);
-            (list_h, body - list_h, CHROME - 1)
+            (list_h, (body - list_h).min(DETAIL_MAX), CHROME - 1)
         } else {
             let footer = usize::from(max_rows >= 3);
             (max_rows.saturating_sub(header + footer).max(1), 0, footer)
@@ -338,6 +341,16 @@ mod tests {
         assert!(rows.iter().any(|r| r.starts_with("── review · scout")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("done · 0:41") && r.contains("result not delivered yet")), "{rows:?}");
         assert!(rows.last().unwrap().contains("x kill"));
+    }
+
+    #[test]
+    fn a_tall_screen_does_not_stretch_the_panel() {
+        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running), job("b", SubagentState::Done)]);
+        // rule + 2 jobs + rule + DETAIL_MAX + rule + keys
+        assert_eq!(text(&mut p, 80, 60).len(), 1 + 2 + 1 + DETAIL_MAX + 1 + 1);
+        let many: Vec<_> = (0..30).map(|i| job(&format!("j{i}"), SubagentState::Done)).collect();
+        let mut p = JobsPanel::new(many);
+        assert_eq!(text(&mut p, 80, 60).len(), 1 + LIST_MAX + 1 + DETAIL_MAX + 1 + 1);
     }
 
     #[test]
