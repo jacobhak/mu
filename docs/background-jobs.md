@@ -8,3 +8,5 @@ A turn that began this way rings the terminal; see [Detached runs](detached-runs
 
 `Alt+J` or `/jobs` opens the jobs panel: this session's subagents and `bash` jobs run with `async`, one row each (state, name, agent, tool count, elapsed time, last activity), with the selected job's details below: state and whether its result has been delivered to the model, working directory, the task prompt or command, and how a command ended. It follows the jobs live. `j`/`k` or the arrow keys move, `g`/`G` jump to the first and last job, `x` cancels the selected job, `X` cancels every running job, `q` or Esc closes. `/jobs kill <id|all>` cancels from the prompt.
 
+The `subagents` status-line segment (add it to omp's `statusLine` in `config.yml`) shows the job counts as `◌2 ✓1 ✗1` (running, done, failed); zero counts are left out, and with no jobs there is no segment.
+

@@ -1,9 +1,9 @@
 //! Footer: an optional quota line, then one status line built from the user's omp
-//! `statusLine` segments (`config.yml`). Segment ids mu cannot supply (e.g. `pr`, `subagents`) are skipped.
+//! `statusLine` segments (`config.yml`). Segment ids mu cannot supply (e.g. `pr`) are skipped.
 use super::line::{Line, line_width, span, truncate};
 use super::theme::{self, Role};
 use crate::config::OmpStatusLine;
-use crate::events::StatusSnapshot;
+use crate::events::{StatusSnapshot, SubagentState, SubagentStatus};
 use crate::gitinfo::GitInfo;
 use crate::quota::ProviderUsage;
 use crossterm::style::ContentStyle;
@@ -32,6 +32,27 @@ pub struct StatusEnv<'a> {
     pub expanded: bool,
     /// Elapsed time of the running turn; drives the spinner and timer in the `pi` segment.
     pub turn_elapsed: Option<Duration>,
+    /// Background jobs by state, for the `subagents` segment.
+    pub jobs: JobCounts,
+}
+
+/// How many background jobs are running, done and failed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobCounts {
+    pub running: usize,
+    pub done: usize,
+    pub failed: usize,
+}
+
+impl JobCounts {
+    pub fn of(jobs: &[SubagentStatus]) -> Self {
+        let count = |s: SubagentState| jobs.iter().filter(|j| j.state == s).count();
+        Self {
+            running: count(SubagentState::Running),
+            done: count(SubagentState::Done),
+            failed: count(SubagentState::Failed),
+        }
+    }
 }
 
 impl<'a> StatusEnv<'a> {
@@ -46,6 +67,7 @@ impl<'a> StatusEnv<'a> {
                 .filter(|p| !p.is_empty()),
             expanded: false,
             turn_elapsed: None,
+            jobs: JobCounts::default(),
         }
     }
 }
@@ -193,7 +215,7 @@ fn group(parts: &[Part]) -> Line {
 type Render = fn(&StatusSnapshot, &StatusEnv, usize) -> Option<Line>;
 
 /// A status segment: its omp id and how to draw it. The only list of segments; ids mu cannot
-/// supply (`pr`, `subagents`, …) are simply absent and skipped.
+/// supply (`pr`, …) are simply absent and skipped.
 struct Segment {
     id: &'static str,
     render: Render,
@@ -208,6 +230,7 @@ static SEGMENTS: &[Segment] = &[
     Segment { id: "context_pct", render: seg_context_pct },
     Segment { id: "context_total", render: seg_context_total },
     Segment { id: "cost", render: seg_cost },
+    Segment { id: "subagents", render: seg_subagents },
     Segment { id: "session_name", render: seg_session_name },
 ];
 
@@ -284,6 +307,23 @@ fn seg_cost(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
         (true, false) => format!("${:.2}", s.cost),
     };
     Some(vec![span(text, st(Role::SynType))])
+}
+
+/// `◌2 ✓1 ✗1`: running, done and failed background jobs; a count of zero is left out and no jobs at
+/// all leaves no segment.
+fn seg_subagents(_: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+    let c = env.jobs;
+    let mut line: Line = Vec::new();
+    for (mark, n, role) in [('◌', c.running, Role::Accent), ('✓', c.done, Role::Ok), ('✗', c.failed, Role::Err)] {
+        if n == 0 {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push(span(" ", ContentStyle::default()));
+        }
+        line.push(span(format!("{mark}{n}"), st(role)));
+    }
+    (!line.is_empty()).then_some(line)
 }
 
 fn seg_session_name(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
@@ -514,6 +554,7 @@ mod tests {
             profile: Some("private".into()),
             expanded: false,
             turn_elapsed: None,
+            jobs: JobCounts::default(),
         }
     }
 
@@ -561,6 +602,45 @@ mod tests {
         s.cost = 0.25;
         let c = cfg(&["mode", "cost"], &[]);
         assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " plan · $0.25 ");
+    }
+
+    #[test]
+    fn subagents_segment_counts_jobs_and_hides_zeros() {
+        let c = cfg(&["subagents"], &[]);
+        let cwd = Path::new("/home/u/x");
+        let mut s = snap();
+        s.usage = None;
+        s.title = None;
+        let mut e = env(&c, cwd);
+        assert_eq!(line_text(&render(&s, &e, 80)[0]), "", "no jobs, no segment");
+        e.jobs = JobCounts { running: 2, done: 1, failed: 1 };
+        assert_eq!(line_text(&render(&s, &e, 80)[0]).trim(), "◌2 ✓1 ✗1");
+        e.jobs = JobCounts { running: 0, done: 3, failed: 0 };
+        assert_eq!(line_text(&render(&s, &e, 80)[0]).trim(), "✓3");
+        let lines = render(&s, &e, 80);
+        assert!(line_width(&lines[0]) <= 80);
+    }
+
+    #[test]
+    fn job_counts_group_by_state() {
+        let mk = |state| SubagentStatus {
+            name: "a".into(),
+            agent: "scout".into(),
+            tools: 0,
+            last: String::new(),
+            state,
+            kind: crate::events::JobKind::Subagent,
+            cwd: PathBuf::new(),
+            task: String::new(),
+            started: std::time::SystemTime::UNIX_EPOCH,
+            ended: None,
+            delivered: false,
+            note: None,
+        };
+        let jobs =
+            [mk(SubagentState::Running), mk(SubagentState::Done), mk(SubagentState::Done), mk(SubagentState::Failed)];
+        assert_eq!(JobCounts::of(&jobs), JobCounts { running: 1, done: 2, failed: 1 });
+        assert_eq!(JobCounts::of(&[]), JobCounts::default());
     }
 
     #[test]

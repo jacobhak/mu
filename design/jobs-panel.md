@@ -210,7 +210,8 @@ Each phase ships alone.
 1. **Model + list** (implemented). The extra `SubagentStatus` fields, `src/tui/jobs_panel.rs`, `/jobs` and
    `Alt+J` open the panel, `x`/`X`. Detail is facts only (state, delivery, cwd, task or command, note).
    Deviation: `take_undelivered` now emits a snapshot so the panel's delivery state is current.
-2. **Status segment** `subagents`.
+2. **Status segment** `subagents` (implemented). Drawn only where the user's omp `statusLine` lists it; mu's
+   fallback segment list is unchanged.
 3. **Child transcript and cost.** `session` NDJSON line, `events_for`, the tailing viewer, the running-total
    cost reader (Jobs rows get a cost), bash output tail.
 4. **Sessions tab.** Owner record fields (`kind`, `agent`, `cwd`, `parent`), the live list and tree with

@@ -1555,6 +1555,7 @@ impl App {
         let mut env = status::StatusEnv::new(&self.cwd, &self.status_cfg);
         env.expanded = self.expanded;
         env.turn_elapsed = self.turn_started.map(|t| t.elapsed());
+        env.jobs = status::JobCounts::of(&self.jobs);
         let status_lines = status::render(&self.status, &env, w);
         let pty_open = self.pty.is_some();
         let (lines, cur) = match &mut self.overlay {
