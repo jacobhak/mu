@@ -63,7 +63,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 24] = [
     ("copy", "Copy a reply, code block or command", false),
     ("reply", "Quote parts of the last reply into the composer", false),
     ("image", "Attach an image file", true),
-    ("jobs", "Show background jobs, or kill them", false),
+    ("jobs", "Show background jobs and other mu sessions", false),
     ("plans", "Approve, refine or drop a parked plan", false),
     ("deliver", "Implement, review and commit a parked plan in a worktree [id]", false),
 ];
@@ -396,6 +396,8 @@ pub async fn run(init: AppInit) -> i32 {
 }
 
 impl App {
+    /// Whether the screen needs redrawing on a timer: something is running, or the jobs panel is open
+    /// (it follows sessions and clocks that change without any event).
     fn busy(&self) -> bool {
         self.running
             || self.compacting
@@ -403,6 +405,7 @@ impl App {
             || !self.tools.is_empty()
             || !self.calls.is_empty()
             || self.jobs.iter().any(|j| j.state == SubagentState::Running)
+            || matches!(self.overlay, Some(Overlay::Jobs { .. }))
     }
 
     fn width(&self) -> usize {

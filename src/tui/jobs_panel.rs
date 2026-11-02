@@ -213,6 +213,7 @@ impl JobsPanel {
     pub fn on_sessions(mut self) -> Self {
         self.tab = Tab::Sessions;
         self.refresh_sessions();
+        self.refresh();
         self
     }
 
@@ -384,6 +385,7 @@ impl JobsPanel {
         };
         if self.tab == Tab::Sessions {
             self.refresh_sessions();
+            self.refresh();
         }
     }
 

@@ -221,9 +221,21 @@ Each phase ships alone.
    Deviation for bash: output reaches the panel as `AgentEvent::JobOutput` (the newest 16 KiB, redacted,
    throttled to 4 per second with a deferred final update), not through a `Command::JobOutput` request; the
    app keeps the latest per job and drops it when the job leaves the snapshot.
-4. **Sessions tab.** Owner record fields (`kind`, `agent`, `cwd`, `parent`), the live list and tree with
-   cost, read-only peek.
-5. **Actions on other sessions.** `n`, `s`, `t` (including `ChildThen::Take`).
+4. **Sessions tab** (implemented). The headless child, `-p`, the TUI and ACP write `kind` (from
+   `session::set_run_info`), `agent`, `cwd` and, for a spawned session, `parent`. `session::live_sessions`
+   reads every record whose lock is held (as `owner()` does) and whose session file exists; a record without
+   `parent` takes it from the session header. `tui/sessions_tab.rs` builds the tree (roots oldest first,
+   this process and its own session left out, this session's subagents marked with their job). Rows show
+   cost from the same running-total reader as jobs. The list is re-read every 2 s while the tab is open; the
+   panel asks the app for a redraw tick while it is open, since nothing else would repaint an idle screen.
+   `Alt+J` and `/jobs` open on this tab when there are no jobs.
+5. **Actions on other sessions** (implemented). `n` types a one-line message in the footer and sends it
+   with `notify::send`; `s` is `take::stop_session`, which re-checks the owner (pid and start time) before
+   `SIGUSR1` (a `-p` run) or `SIGTERM` to the process group (a subagent, only if it leads its own group);
+   `t` closes the panel and runs `mu take <session>` through `App::start_child` (SIGINT caught as in
+   `run_login`), then reopens the Sessions tab. What an action did shows in the footer until the next key.
+   Deviations: the stop on a `-p` run is the first step of `mu take`, so pressing `s` twice cancels the
+   current step, as the design said for take; no key stops a session open in an interactive mu.
 
 ## Tests
 
