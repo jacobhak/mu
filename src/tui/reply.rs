@@ -1037,7 +1037,7 @@ impl View {
 }
 
 /// A full-width rule, with the title set into its left end.
-fn rule(title: Option<&str>, width: usize) -> Line {
+pub(super) fn rule(title: Option<&str>, width: usize) -> Line {
     let edge = theme::get().fg(Role::Line);
     let Some(t) = title else { return vec![span("─".repeat(width), edge)] };
     let used = 4 + UnicodeWidthStr::width(t);
@@ -1048,7 +1048,7 @@ fn rule(title: Option<&str>, width: usize) -> Line {
     ]
 }
 
-fn accent() -> ContentStyle {
+pub(super) fn accent() -> ContentStyle {
     let mut s = theme::get().fg(Role::Accent);
     s.attributes.set(Attribute::Bold);
     s

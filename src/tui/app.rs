@@ -4,6 +4,7 @@ use super::clipboard;
 use super::complete::Entry;
 use super::composer::{Action, Composer};
 use super::input::{self, Input};
+use super::jobs_panel::JobsPanel;
 use super::line::truncate_text as trunc;
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
@@ -62,7 +63,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 24] = [
     ("copy", "Copy a reply, code block or command", false),
     ("reply", "Quote parts of the last reply into the composer", false),
     ("image", "Attach an image file", true),
-    ("jobs", "List or kill background jobs", false),
+    ("jobs", "Show background jobs, or kill them", false),
     ("plans", "Approve, refine or drop a parked plan", false),
     ("deliver", "Implement, review and commit a parked plan in a worktree [id]", false),
 ];
@@ -561,6 +562,9 @@ impl App {
                         self.commit(blocks::subagent_rows(std::slice::from_ref(r), ' '));
                     }
                 }
+                if let Some(Overlay::Jobs { st }) = &mut self.overlay {
+                    st.set_jobs(v.clone());
+                }
                 self.jobs = v;
             }
             AgentEvent::JobsDelivered(ids) => {
@@ -911,6 +915,7 @@ impl App {
         match action {
             Action::None | Action::Redraw => {}
             Action::Reply => self.open_reply(),
+            Action::Jobs => self.open_jobs(),
             Action::Submit(t) => self.submit(t, false),
             Action::QueueFollowUp(t) => self.submit(t, true),
             Action::Abort => self.inbox.borrow().cancel.cancel(),
@@ -994,6 +999,7 @@ impl App {
             }
             OverlayEvent::OpenPlan(id) => self.send(Command::OpenPlan(id)),
             OverlayEvent::DeliverPlan(id) => self.send(Command::Deliver(id)),
+            OverlayEvent::KillJobs(id) => self.send(Command::KillJobs(id)),
         }
     }
 
@@ -1151,28 +1157,19 @@ impl App {
     fn jobs_cmd(&mut self, arg: &str) {
         let mut words = arg.split_whitespace();
         match (words.next(), words.next(), words.next()) {
-            (None, ..) => {
-                if self.jobs.is_empty() {
-                    return self.notice("no background jobs");
-                }
-                let rows: Vec<String> = self
-                    .jobs
-                    .iter()
-                    .map(|j| {
-                        let (mark, state) = match j.state {
-                            SubagentState::Running => ('◌', "running"),
-                            SubagentState::Done => ('✓', "done"),
-                            SubagentState::Failed => ('✗', "failed"),
-                        };
-                        format!("{mark} {} ({}) · {} tools · {state}", j.name, j.agent, j.tools)
-                    })
-                    .collect();
-                self.notice(&rows.join("\n"));
-            }
+            (None, ..) => self.open_jobs(),
             (Some("kill"), Some("all"), None) => self.send(Command::KillJobs(None)),
             (Some("kill"), Some(id), None) => self.send(Command::KillJobs(Some(id.into()))),
             _ => self.error("usage: /jobs [kill <id|all>]"),
         }
+    }
+
+    /// Opens the jobs panel, or says there are no jobs.
+    fn open_jobs(&mut self) {
+        if self.jobs.is_empty() {
+            return self.notice("no background jobs");
+        }
+        self.overlay = Some(Overlay::Jobs { st: Box::new(JobsPanel::new(self.jobs.clone())) });
     }
 
     fn image_cmd(&mut self, arg: &str) {
@@ -1586,7 +1583,7 @@ impl App {
 
 const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Alt+↑  edit last queued
 Shift+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn (in a pty command: sent to it)      Ctrl+C  clear · abort · exit (twice)
-Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model picker      Ctrl+R  quote parts of a reply
+Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model picker      Alt+J  background jobs      Ctrl+R  quote parts of a reply
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
 

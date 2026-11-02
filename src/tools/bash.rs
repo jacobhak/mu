@@ -205,7 +205,8 @@ impl Tools {
         let env = job_env(vars, &cwd, self.session_env());
         let artifact_dir = self.artifact_dir();
         let (command, timeout) = (a.command.clone(), a.timeout);
-        let id = jobs.spawn_bash(a.command, move |cancel| {
+        let job_cwd = cwd.clone();
+        let id = jobs.spawn_bash(a.command, job_cwd, move |cancel| {
             run_background(command, cwd, env, timeout, cancel, move || Tools::next_artifact_in(&artifact_dir))
         });
         let note = if inherited {

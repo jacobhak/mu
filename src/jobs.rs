@@ -5,14 +5,14 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::events::{AgentEvent, EventTx, SubagentState, SubagentStatus};
+use crate::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
 use crate::tools::bash::BackgroundResult;
 use crate::tools::task::{MAX_TASKS, run_child};
 use crate::tui::line::truncate_text;
@@ -24,6 +24,12 @@ struct Job {
     seq: u64,
     id: String,
     agent: String,
+    kind: JobKind,
+    cwd: PathBuf,
+    /// The task prompt or command, truncated; kept for the jobs panel.
+    task: String,
+    started: SystemTime,
+    ended: Option<SystemTime>,
     /// The command of a bash job; taken on delivery, like `text`.
     command: Option<String>,
     tools: u32,
@@ -34,6 +40,17 @@ struct Job {
     note: Option<String>,
     delivered: bool,
     cancel: CancellationToken,
+}
+
+/// What a new job is made of.
+struct Spec {
+    id: String,
+    agent: String,
+    kind: JobKind,
+    cwd: PathBuf,
+    task: String,
+    last: String,
+    command: Option<String>,
 }
 
 pub struct Done {
@@ -98,6 +115,13 @@ impl JobsHandle {
                 tools: j.tools,
                 last: j.last.clone(),
                 state: j.state.clone(),
+                kind: j.kind,
+                cwd: j.cwd.clone(),
+                task: j.task.clone(),
+                started: j.started,
+                ended: j.ended,
+                delivered: j.delivered,
+                note: j.note.clone(),
             })
             .collect()
     }
@@ -106,16 +130,21 @@ impl JobsHandle {
         let _ = self.events.send(AgentEvent::Jobs(self.snapshot()));
     }
 
-    fn start(&self, id: String, agent: &str, last: String, command: Option<String>, cancel: CancellationToken) -> u64 {
+    fn start(&self, spec: Spec, cancel: CancellationToken) -> u64 {
         let seq = self.next_seq.get();
         self.next_seq.set(seq + 1);
         self.inner.borrow_mut().push(Job {
             seq,
-            id,
-            agent: agent.into(),
-            command,
+            id: spec.id,
+            agent: spec.agent,
+            kind: spec.kind,
+            cwd: spec.cwd,
+            task: spec.task,
+            started: SystemTime::now(),
+            ended: None,
+            command: spec.command,
             tools: 0,
-            last,
+            last: spec.last,
             state: SubagentState::Running,
             text: String::new(),
             note: None,
@@ -130,6 +159,7 @@ impl JobsHandle {
     fn complete(&self, seq: u64, ok: bool, text: String, note: Option<String>) {
         if let Some(j) = self.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
             j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
+            j.ended = Some(SystemTime::now());
             j.text = text;
             j.note = note;
         }
@@ -140,7 +170,17 @@ impl JobsHandle {
 
     pub fn spawn(self: &Rc<Self>, id: String, agent: String, exe: PathBuf, cwd: PathBuf, payload: Value) {
         let cancel = CancellationToken::new();
-        let seq = self.start(id, &agent, String::new(), None, cancel.clone());
+        let task = command_line(payload["task"].as_str().unwrap_or(""));
+        let spec = Spec {
+            id,
+            agent: agent.clone(),
+            kind: JobKind::Subagent,
+            cwd: cwd.clone(),
+            task,
+            last: String::new(),
+            command: None,
+        };
+        let seq = self.start(spec, cancel.clone());
         let me = self.clone();
         tokio::task::spawn_local(async move {
             let out = run_child(&exe, &cwd, &payload, &cancel, |name, summary| {
@@ -159,13 +199,28 @@ impl JobsHandle {
 
     /// Starts a bash job and returns its id. `run` gets the job's cancel token, which `kill` and
     /// `clear` fire.
-    pub fn spawn_bash<F>(self: &Rc<Self>, command: String, run: impl FnOnce(CancellationToken) -> F) -> String
+    pub fn spawn_bash<F>(
+        self: &Rc<Self>,
+        command: String,
+        cwd: PathBuf,
+        run: impl FnOnce(CancellationToken) -> F,
+    ) -> String
     where
         F: Future<Output = BackgroundResult> + 'static,
     {
         let id = self.unique_id(&format!("bg_{}", self.next_seq.get() + 1));
         let cancel = CancellationToken::new();
-        let seq = self.start(id.clone(), "bash", command_line(&command), Some(command), cancel.clone());
+        let line = command_line(&command);
+        let spec = Spec {
+            id: id.clone(),
+            agent: "bash".into(),
+            kind: JobKind::Bash,
+            cwd,
+            task: line.clone(),
+            last: line,
+            command: Some(command),
+        };
+        let seq = self.start(spec, cancel.clone());
         let fut = run(cancel);
         let me = self.clone();
         tokio::task::spawn_local(async move {
@@ -177,7 +232,8 @@ impl JobsHandle {
 
     /// Finished, undelivered jobs (only `ids` when non-empty); marks them delivered.
     pub fn take_undelivered(&self, ids: &[String]) -> Vec<Done> {
-        self.inner
+        let done: Vec<Done> = self
+            .inner
             .borrow_mut()
             .iter_mut()
             .filter(|j| j.state != SubagentState::Running && !j.delivered && (ids.is_empty() || ids.contains(&j.id)))
@@ -190,10 +246,14 @@ impl JobsHandle {
                     // Delivered output is not kept: only the snapshot fields stay resident.
                     text: std::mem::take(&mut j.text),
                     command: j.command.take(),
-                    note: j.note.take(),
+                    note: j.note.clone(),
                 }
             })
-            .collect()
+            .collect();
+        if !done.is_empty() {
+            self.emit();
+        }
+        done
     }
 
     pub fn has_undelivered(&self) -> bool {
@@ -260,6 +320,11 @@ impl JobsHandle {
             seq: 0,
             id: id.into(),
             agent: "scout".into(),
+            kind: JobKind::Subagent,
+            cwd: PathBuf::new(),
+            task: String::new(),
+            started: SystemTime::now(),
+            ended: None,
             command: None,
             tools: 0,
             last: String::new(),
@@ -331,6 +396,11 @@ pub(crate) mod tests {
             seq: 0,
             id: "A".into(),
             agent: "scout".into(),
+            kind: JobKind::Bash,
+            cwd: PathBuf::from("/w"),
+            task: "echo".into(),
+            started: SystemTime::now(),
+            ended: Some(SystemTime::now()),
             command: Some("echo".into()),
             tools: 0,
             last: String::new(),
@@ -340,12 +410,37 @@ pub(crate) mod tests {
             delivered: false,
             cancel: CancellationToken::new(),
         });
+        let snap = h.snapshot();
+        assert_eq!(
+            (snap[0].delivered, snap[0].task.as_str(), snap[0].note.as_deref()),
+            (false, "echo", Some("exit 0"))
+        );
+        assert!(snap[0].ended.is_some());
         let got = h.take_undelivered(&[]);
         assert_eq!(got[0].text, "big output");
         assert_eq!((got[0].command.as_deref(), got[0].note.as_deref()), (Some("echo"), Some("exit 0")));
         assert!(h.inner.borrow()[0].text.is_empty());
         assert!(h.inner.borrow()[0].command.is_none());
         assert!(h.take_undelivered(&[]).is_empty());
+        let snap = h.snapshot();
+        assert!(snap[0].delivered, "the snapshot follows delivery");
+        assert_eq!(snap[0].note.as_deref(), Some("exit 0"), "the note stays for the panel");
+    }
+
+    #[test]
+    fn a_snapshot_event_follows_delivery() {
+        let (wake, _) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let h = JobsHandle::new(wake, events);
+        h.push_running("A");
+        h.finish("A", true, "x");
+        assert_eq!(h.take_undelivered(&[]).len(), 1);
+        match rx.try_recv() {
+            Ok(AgentEvent::Jobs(v)) => assert!(v[0].delivered),
+            _ => panic!("no snapshot after delivery"),
+        }
+        assert!(h.take_undelivered(&[]).is_empty());
+        assert!(rx.try_recv().is_err(), "nothing delivered, nothing emitted");
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod diffview;
 pub mod editor;
 pub mod highlight;
 pub mod input;
+pub mod jobs_panel;
 pub mod line;
 pub mod markdown;
 mod mcp_cmd;

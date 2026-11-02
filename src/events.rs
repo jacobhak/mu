@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -173,6 +173,13 @@ pub enum SubagentState {
     Failed,
 }
 
+/// What a background job runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    Subagent,
+    Bash,
+}
+
 #[derive(Clone, Debug)]
 pub struct SubagentStatus {
     pub name: String,
@@ -180,6 +187,17 @@ pub struct SubagentStatus {
     pub tools: u32,
     pub last: String,
     pub state: SubagentState,
+    pub kind: JobKind,
+    pub cwd: PathBuf,
+    /// The task prompt or the command, truncated.
+    pub task: String,
+    pub started: SystemTime,
+    /// Set once the job finished.
+    pub ended: Option<SystemTime>,
+    /// The model has been handed the result.
+    pub delivered: bool,
+    /// How a bash job ended ("exit 3", "timed out", …).
+    pub note: Option<String>,
 }
 
 /// Input from the TUI to a command running on a pseudo-terminal.

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::oneshot;
 
+use super::jobs_panel::{JobsPanel, JobsResult};
 use super::plan_review::{PlanReview, ReviewResult};
 use super::reply::{ReplyPicker, ReplyResult};
 use super::select::{Item, Select, SelectResult};
@@ -99,6 +100,10 @@ pub enum Overlay {
     Reply {
         st: Box<ReplyPicker>,
     },
+    /// This session's background jobs.
+    Jobs {
+        st: Box<JobsPanel>,
+    },
 }
 
 /// What the user chose; the app carries it out.
@@ -131,6 +136,8 @@ pub enum OverlayEvent {
     OpenPlan(String),
     /// A parked plan was chosen to be delivered.
     DeliverPlan(String),
+    /// Cancel one running job by id, or all of them.
+    KillJobs(Option<String>),
 }
 
 /// The question as a picker: its options, a free-text row, multi-select, the recommended choice
@@ -396,7 +403,7 @@ impl Overlay {
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
             Overlay::Ask(a) => Some(&a.sel),
-            Overlay::Review { .. } | Overlay::Reply { .. } => None,
+            Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
     }
 
@@ -410,7 +417,7 @@ impl Overlay {
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
             Overlay::Ask(a) => Some(&mut a.sel),
-            Overlay::Review { .. } | Overlay::Reply { .. } => None,
+            Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
     }
 
@@ -425,6 +432,10 @@ impl Overlay {
             Overlay::Reply { st } => {
                 let avail = rows.saturating_sub(1).saturating_sub(used);
                 st.render(w, avail.saturating_sub(1))
+            }
+            Overlay::Jobs { st } => {
+                let avail = rows.saturating_sub(1).saturating_sub(used);
+                st.render(w, avail.saturating_sub(1), std::time::SystemTime::now())
             }
             Overlay::Ask(a) => {
                 let avail = rows.saturating_sub(1).saturating_sub(used);
@@ -502,6 +513,11 @@ impl Overlay {
                 ReplyResult::Pending => (Some(Overlay::Reply { st }), None),
                 ReplyResult::Close => (None, None),
                 ReplyResult::Quote(q) => (None, Some(OverlayEvent::Quote(q))),
+            },
+            Overlay::Jobs { mut st } => match st.on_key(k) {
+                JobsResult::Pending => (Some(Overlay::Jobs { st }), None),
+                JobsResult::Close => (None, None),
+                JobsResult::Kill(id) => (Some(Overlay::Jobs { st }), Some(OverlayEvent::KillJobs(id))),
             },
             Overlay::Session { mut sel, paths } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Session { sel, paths }), None),

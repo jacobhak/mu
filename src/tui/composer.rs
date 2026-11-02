@@ -117,6 +117,7 @@ pub enum Action {
     ModelPicker,
     EditExternal,
     Reply,
+    Jobs,
     PopQueue,
     Redraw,
 }
@@ -451,6 +452,7 @@ impl Composer {
             KeyCode::Char('m') if alt => Action::ModelPicker,
             KeyCode::Char('g') if ctrl => Action::EditExternal,
             KeyCode::Char('r') if ctrl && self.menu.is_none() => Action::Reply,
+            KeyCode::Char('j') if alt && !ctrl => Action::Jobs,
             KeyCode::Up | KeyCode::Char('p') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
                 if self.buf.row == 0 {
                     self.history_prev();
@@ -798,6 +800,15 @@ mod tests {
 
     fn ctrl(c: &mut Composer, ch: char) -> Action {
         press(c, KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn alt_j_opens_the_jobs_panel_and_plain_or_ctrl_j_do_not() {
+        let mut c = Composer::new(None);
+        assert_eq!(press(&mut c, KeyCode::Char('j'), KeyModifiers::ALT), Action::Jobs);
+        assert_ne!(press(&mut c, KeyCode::Char('j'), KeyModifiers::CONTROL), Action::Jobs);
+        assert_ne!(press(&mut c, KeyCode::Char('j'), KeyModifiers::NONE), Action::Jobs);
+        assert_eq!(c.text(), "\nj", "Ctrl+J is still a newline");
     }
 
     #[test]

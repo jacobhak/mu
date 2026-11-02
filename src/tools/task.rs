@@ -1,5 +1,5 @@
 use super::{ToolCtx, ToolOutput, Tools};
-use crate::events::{SubagentState, SubagentStatus};
+use crate::events::{JobKind, SubagentState, SubagentStatus};
 use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -149,12 +149,19 @@ impl Tools {
         let rows = RefCell::new(
             specs
                 .iter()
-                .map(|(n, a, _, _)| SubagentStatus {
+                .map(|(n, a, t, c)| SubagentStatus {
                     name: n.clone(),
                     agent: a.clone(),
                     tools: 0,
                     last: String::new(),
                     state: SubagentState::Running,
+                    kind: JobKind::Subagent,
+                    cwd: c.clone(),
+                    task: t.clone(),
+                    started: std::time::SystemTime::now(),
+                    ended: None,
+                    delivered: true,
+                    note: None,
                 })
                 .collect::<Vec<_>>(),
         );
