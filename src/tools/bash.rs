@@ -772,6 +772,32 @@ mod tests {
         assert_eq!(quiet.text, "(no output)");
     }
 
+    /// Aborting a foreground command ends the call promptly and kills the command, also after
+    /// earlier calls have run in the persistent shell.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_ends_a_foreground_command_promptly() {
+        let arg = format!("6{}", std::process::id());
+        let tools = Tools::for_test();
+        for cmd in ["sleep 0.2; echo done", "date"] {
+            assert!(!tools.call("bash", &json!({"command": cmd}), &ctx()).await.is_error);
+        }
+        let c = ctx();
+        let cancel = c.cancel.clone();
+        let t = std::time::Instant::now();
+        let abort = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            cancel.cancel();
+        };
+        let cmd = json!({"command": format!("sleep {arg}")});
+        let (out, ()) = tokio::join!(tools.call("bash", &cmd, &c), abort);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "abort took {:?}", t.elapsed());
+        let Some(ToolMeta::Bash(m)) = &out.meta else { panic!("no meta: {:?}", out.text) };
+        assert!(m.cancelled, "{}", out.text);
+        assert!(!alive(&arg).await);
+        let next = tools.call("bash", &json!({"command": "echo after"}), &ctx()).await;
+        assert_eq!(next.text.trim(), "after");
+    }
+
     /// Tools with a jobs handle attached; background jobs are spawned on the current LocalSet.
     fn tools_with_jobs() -> (Tools, std::rc::Rc<crate::jobs::JobsHandle>) {
         let mut tools = Tools::for_test();
