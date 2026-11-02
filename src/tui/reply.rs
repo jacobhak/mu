@@ -1010,7 +1010,8 @@ impl View {
         let mut out: Vec<Line> = Vec::new();
         if header == 1 {
             let selecting = if self.anchor.is_some() { " · selecting" } else { "" };
-            let title = format!("reply {}/{} · {} marked{selecting}", which.0, which.1, self.marks.len());
+            let switch = if which.1 > 1 { " · [ ] Tab replies" } else { "" };
+            let title = format!("reply {}/{} · {} marked{selecting}{switch}", which.0, which.1, self.marks.len());
             out.push(rule(Some(&title), width));
         }
         let end = (self.top + h).min(total);
@@ -1024,7 +1025,7 @@ impl View {
             } else {
                 (
                     "↑↓ jk unit · ←→ hl word · Shift+move select · gg G { } ^D ^U ^N ^P ^F ^B",
-                    "Space mark · c clear · Enter quote · [ ] reply · Esc close",
+                    "Space mark · c clear · Enter quote · [ ] Tab reply (3[ jumps) · Esc close",
                 )
             };
             out.push(line::styled(a, |_| dim()));
@@ -1105,22 +1106,32 @@ impl ReplyPicker {
         if k.kind == KeyEventKind::Release {
             return ReplyResult::Pending;
         }
-        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+        let (ctrl, alt) = (k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT));
+        if ctrl && k.code == KeyCode::Char('c') {
             return ReplyResult::Close;
         }
-        let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        if plain {
-            let last = self.views.len() - 1;
-            let to = match k.code {
-                KeyCode::Char('[') => self.at.saturating_sub(1),
-                KeyCode::Char(']') => (self.at + 1).min(last),
-                _ => return self.views[self.at].key(k),
-            };
-            self.views[self.at].anchor = None;
-            self.at = to;
-            return ReplyResult::Pending;
-        }
-        self.views[self.at].key(k)
+        // Ctrl+Alt is how some terminals report AltGr, which is how `[` and `]` are typed on many layouts.
+        let bracket = (!ctrl && !alt) || (ctrl && alt);
+        let dir: isize = match k.code {
+            KeyCode::Char('[') if bracket => -1,
+            KeyCode::Char(']') if bracket => 1,
+            KeyCode::BackTab if !ctrl && !alt => -1,
+            KeyCode::Tab if !ctrl && !alt => {
+                if k.modifiers.contains(KeyModifiers::SHIFT) {
+                    -1
+                } else {
+                    1
+                }
+            }
+            _ => return self.views[self.at].key(k),
+        };
+        let view = &mut self.views[self.at];
+        // A count (`3[`) jumps that many replies.
+        let n = std::mem::take(&mut view.count).max(1) as isize;
+        view.anchor = None;
+        view.pending_g = false;
+        self.at = (self.at as isize + dir * n).clamp(0, self.views.len() as isize - 1) as usize;
+        ReplyResult::Pending
     }
 
     pub fn render(&mut self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
@@ -1469,6 +1480,57 @@ mod tests {
         let (lines, _) = p.render(60, 10);
         assert!(line_text(&lines[0]).starts_with("── reply 2/2 · 1 marked"), "{:?}", line_text(&lines[0]));
         assert!(lines.iter().any(|l| line_text(l).contains("Enter quote")));
+    }
+
+    fn five() -> ReplyPicker {
+        let r: Vec<String> = (1..=5).map(|i| format!("reply number {i}.")).collect();
+        ReplyPicker::open(&r).unwrap()
+    }
+
+    #[test]
+    fn tab_and_shift_tab_switch_replies() {
+        let mut p = five();
+        assert_eq!(p.at, 4);
+        press(&mut p, KeyCode::BackTab);
+        assert_eq!(p.at, 3);
+        shift(&mut p, KeyCode::Tab);
+        assert_eq!(p.at, 2);
+        press(&mut p, KeyCode::Tab);
+        assert_eq!(p.at, 3);
+    }
+
+    #[test]
+    fn a_count_jumps_that_many_replies_and_clamps() {
+        let mut p = five();
+        press(&mut p, KeyCode::Char('3'));
+        press(&mut p, KeyCode::Char('['));
+        assert_eq!(p.at, 1);
+        press(&mut p, KeyCode::Char('9'));
+        press(&mut p, KeyCode::Char('['));
+        assert_eq!(p.at, 0, "stops at the oldest");
+        press(&mut p, KeyCode::Char('2'));
+        press(&mut p, KeyCode::Char(']'));
+        assert_eq!(p.at, 2);
+        assert_eq!(view(&p).count, 0, "the count is spent");
+    }
+
+    #[test]
+    fn altgr_brackets_switch_replies_but_ctrl_or_alt_alone_do_not() {
+        let mut p = five();
+        let both = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        p.on_key(KeyEvent::new(KeyCode::Char('['), both));
+        assert_eq!(p.at, 3);
+        p.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT));
+        p.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL));
+        assert_eq!(p.at, 3);
+    }
+
+    #[test]
+    fn the_title_names_the_switch_keys_only_with_several_replies() {
+        let (lines, _) = five().render(80, 10);
+        assert!(line_text(&lines[0]).contains("[ ] Tab replies"), "{:?}", line_text(&lines[0]));
+        let (lines, _) = picker(ALPHA).render(80, 10);
+        assert!(!line_text(&lines[0]).contains("Tab"), "{:?}", line_text(&lines[0]));
     }
 
     fn many() -> ReplyPicker {
