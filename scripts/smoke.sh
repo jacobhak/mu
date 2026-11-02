@@ -62,7 +62,7 @@ check "steer shows in queue bar" wait_for "↳ steer: also run date" 5
 check "steer reaches the model" wait_for "\$ date" 60
 wait_for "FIN" 60
 
-tmux send-keys -t "$tm" 'run bash: sleep 60' Enter
+tmux send-keys -t "$tm" 'run bash (no pty, not async): sleep 60' Enter
 wait_for "● bash sleep 60" 30
 tmux send-keys -t "$tm" 'queued text' Enter
 tmux send-keys -t "$tm" Escape
