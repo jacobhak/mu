@@ -1,14 +1,19 @@
 //! The jobs panel (`Alt+J`, `/jobs`): this session's background jobs as a list with the selected
-//! job's details below. See `design/jobs-panel.md`.
+//! job's details below, and a full-height view of a subagent's session transcript that follows the
+//! file while the subagent runs. See `design/jobs-panel.md`.
 
-use std::time::SystemTime;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::line::{self, Line, dim, span};
 use super::reply::{accent, rule};
+use super::session_view;
 use super::theme::{self, Role};
 use crate::events::{JobKind, SubagentState, SubagentStatus};
+use crate::session_tail::Tail;
 
 /// Most list rows shown at once.
 const LIST_MAX: usize = 8;
@@ -22,6 +27,11 @@ const DETAIL_MAX: usize = 8;
 /// Widest name and agent columns in the list.
 const NAME_MAX: usize = 16;
 const AGENT_MAX: usize = 12;
+/// Newest messages the transcript view keeps; older ones are counted, not drawn.
+const VIEW_KEEP: usize = 500;
+/// How often the open transcript, and the cost of every listed session, are read again.
+const VIEW_POLL: Duration = Duration::from_millis(250);
+const TOTALS_POLL: Duration = Duration::from_secs(2);
 
 pub enum JobsResult {
     Pending,
@@ -36,13 +46,68 @@ pub struct JobsPanel {
     top: usize,
     /// Rows the list showed last, for paging.
     page: usize,
+    /// Running totals of each listed subagent's session, for the cost column.
+    totals: HashMap<PathBuf, Totals>,
+    polled_totals: Option<Instant>,
+    view: Option<View>,
+}
+
+/// A listed session's totals, and whether it can still change.
+struct Totals {
+    tail: Tail,
+    /// Read to the end after its job finished.
+    settled: bool,
+}
+
+/// The full-height transcript of one subagent's session.
+struct View {
+    /// The job it shows.
+    name: String,
+    tail: Tail,
+    settled: bool,
+    polled: Option<Instant>,
+    lines: Vec<Line>,
+    /// What `lines` was drawn from: messages seen, width, caught up.
+    built: Option<(usize, usize, bool)>,
+    top: usize,
+    follow: bool,
+    /// From the last render, for scrolling.
+    max_top: usize,
+    body_h: usize,
+}
+
+impl View {
+    fn scroll(&mut self, by: isize) {
+        let cur = if self.follow { self.max_top } else { self.top.min(self.max_top) };
+        self.top = (cur as isize + by).clamp(0, self.max_top as isize) as usize;
+        self.follow = self.top == self.max_top;
+    }
+
+    fn build(&mut self, width: usize) {
+        let seen = self.tail.messages().len() + self.tail.dropped();
+        let key = (seen, width, self.tail.caught_up());
+        if self.built == Some(key) {
+            return;
+        }
+        self.built = Some(key);
+        let mut l: Vec<Line> = Vec::new();
+        if self.tail.dropped() > 0 {
+            l.push(line::styled(format!("  … {} earlier messages not shown", self.tail.dropped()), |_| dim()));
+        }
+        l.extend(session_view::lines(self.tail.messages(), width));
+        if l.is_empty() {
+            let why = if self.tail.caught_up() { "  nothing yet" } else { "  waiting for the session file…" };
+            l.push(line::styled(why, |_| dim()));
+        }
+        self.lines = l;
+    }
 }
 
 impl JobsPanel {
     pub fn new(jobs: Vec<SubagentStatus>) -> Self {
         // Open on the newest running job, else the newest job.
         let at = jobs.iter().rposition(|j| j.state == SubagentState::Running).unwrap_or(jobs.len().saturating_sub(1));
-        Self { jobs, at, top: 0, page: LIST_MAX }
+        Self { jobs, at, top: 0, page: LIST_MAX, totals: HashMap::new(), polled_totals: None, view: None }
     }
 
     /// A fresh snapshot: the selection stays on the same job when it is still there.
@@ -52,15 +117,125 @@ impl JobsPanel {
         self.at = name
             .and_then(|n| self.jobs.iter().position(|j| j.name == n))
             .unwrap_or_else(|| self.at.min(self.jobs.len().saturating_sub(1)));
+        if self.view.as_ref().is_some_and(|v| !self.jobs.iter().any(|j| j.name == v.name)) {
+            self.view = None;
+        }
+        let live: Vec<&PathBuf> = self.jobs.iter().filter_map(|j| j.session.as_ref()).collect();
+        self.totals.retain(|p, _| live.contains(&p));
+    }
+
+    /// Reads what the sessions gained since the last read: the open transcript and the cost of every
+    /// listed subagent. `render` does this on a timer; tests and the first frame call it directly.
+    pub fn refresh(&mut self) {
+        self.polled_totals = Some(Instant::now());
+        for j in &self.jobs {
+            let Some(p) = &j.session else { continue };
+            let t = self
+                .totals
+                .entry(p.clone())
+                .or_insert_with(|| Totals { tail: Tail::new(p.clone(), 0), settled: false });
+            if !t.settled {
+                t.tail.poll();
+                t.settled = j.state != SubagentState::Running && t.tail.caught_up();
+            }
+        }
+        let state =
+            self.view.as_ref().and_then(|v| self.jobs.iter().find(|j| j.name == v.name)).map(|j| j.state.clone());
+        if let (Some(v), Some(state)) = (&mut self.view, state) {
+            v.polled = Some(Instant::now());
+            if !v.settled {
+                v.tail.poll();
+                v.settled = state != SubagentState::Running && v.tail.caught_up();
+            }
+        }
+    }
+
+    fn refresh_due(&mut self) {
+        let now = Instant::now();
+        let totals_due = self.polled_totals.is_none_or(|t| now.duration_since(t) >= TOTALS_POLL);
+        let view_due = self.view.as_ref().is_some_and(|v| v.polled.is_none_or(|t| now.duration_since(t) >= VIEW_POLL));
+        if totals_due || view_due {
+            self.refresh();
+        }
+    }
+
+    /// `$0.03`, `…` while the session is still being read, empty when there is no session.
+    fn cost_cell(&self, j: &SubagentStatus) -> String {
+        match j.session.as_ref().and_then(|p| self.totals.get(p)) {
+            Some(t) if t.tail.caught_up() => format!("${:.2}", t.tail.cost()),
+            Some(_) => "…".into(),
+            None => String::new(),
+        }
     }
 
     fn running(&self) -> usize {
         self.jobs.iter().filter(|j| j.state == SubagentState::Running).count()
     }
 
+    /// Opens the selected subagent's transcript, when it has a session file yet.
+    fn open_view(&mut self) {
+        let Some(j) = self.jobs.get(self.at) else { return };
+        let Some(path) = j.session.clone() else { return };
+        self.view = Some(View {
+            name: j.name.clone(),
+            tail: Tail::new(path, VIEW_KEEP),
+            settled: false,
+            polled: None,
+            lines: Vec::new(),
+            built: None,
+            top: 0,
+            follow: true,
+            max_top: 0,
+            body_h: 1,
+        });
+        self.refresh();
+    }
+
+    fn view_key(&mut self, k: KeyEvent) -> JobsResult {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(v) = self.view.as_mut() else { return JobsResult::Pending };
+        let page = v.body_h.max(1) as isize;
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view = None,
+            KeyCode::Char('c') if ctrl => return JobsResult::Close,
+            KeyCode::Down | KeyCode::Char('j') => v.scroll(1),
+            KeyCode::Char('n') if ctrl => v.scroll(1),
+            KeyCode::Up | KeyCode::Char('k') => v.scroll(-1),
+            KeyCode::Char('p') if ctrl => v.scroll(-1),
+            KeyCode::PageDown => v.scroll(page),
+            KeyCode::Char('f') if ctrl => v.scroll(page),
+            KeyCode::PageUp => v.scroll(-page),
+            KeyCode::Char('b') if ctrl => v.scroll(-page),
+            KeyCode::Char('d') if ctrl => v.scroll(page / 2),
+            KeyCode::Char('u') if ctrl => v.scroll(-(page / 2)),
+            KeyCode::Home | KeyCode::Char('g') => {
+                v.top = 0;
+                v.follow = v.max_top == 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => v.follow = true,
+            KeyCode::Char('f') => {
+                if v.follow {
+                    v.top = v.max_top;
+                }
+                v.follow = !v.follow;
+            }
+            KeyCode::Char('x') => {
+                let name = v.name.clone();
+                if self.jobs.iter().any(|j| j.name == name && j.state == SubagentState::Running) {
+                    return JobsResult::Kill(Some(name));
+                }
+            }
+            _ => {}
+        }
+        JobsResult::Pending
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) -> JobsResult {
         if k.kind == KeyEventKind::Release {
             return JobsResult::Pending;
+        }
+        if self.view.is_some() {
+            return self.view_key(k);
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let last = self.jobs.len().saturating_sub(1);
@@ -75,6 +250,7 @@ impl JobsPanel {
             KeyCode::End | KeyCode::Char('G') => self.at = last,
             KeyCode::PageDown => self.at = (self.at + self.page).min(last),
             KeyCode::PageUp => self.at = self.at.saturating_sub(self.page),
+            KeyCode::Enter => self.open_view(),
             KeyCode::Char('x') => {
                 if let Some(j) = self.jobs.get(self.at).filter(|j| j.state == SubagentState::Running) {
                     return JobsResult::Kill(Some(j.name.clone()));
@@ -88,6 +264,10 @@ impl JobsPanel {
 
     /// The panel's rows (at most `max_rows`) and the cursor within them. `now` times running jobs.
     pub fn render(&mut self, width: usize, max_rows: usize, now: SystemTime) -> (Vec<Line>, (usize, usize)) {
+        self.refresh_due();
+        if self.view.is_some() {
+            return self.render_view(width, max_rows, now);
+        }
         let n = self.jobs.len();
         let header = usize::from(max_rows >= 2);
         let split = max_rows >= CHROME + 1 + DETAIL_MIN;
@@ -120,7 +300,8 @@ impl JobsPanel {
         }
         let end = (self.top + list_h).min(n);
         for (i, j) in self.jobs.iter().enumerate().take(end).skip(self.top) {
-            out.push(list_row(j, i == self.at, (name_w, agent_w), width, now));
+            let cost = self.cost_cell(j);
+            out.push(list_row(j, i == self.at, (name_w, agent_w), &cost, width, now));
         }
         // Blank-pad the list so the details start on a fixed row.
         let shown = if n == 0 { 1 } else { end - self.top };
@@ -128,7 +309,7 @@ impl JobsPanel {
         if split {
             if let Some(j) = self.jobs.get(self.at) {
                 out.push(rule(Some(&format!("{} · {}", j.name, j.agent)), width));
-                out.extend(detail(j, width, detail_h, now));
+                out.extend(detail(j, &self.cost_cell(j), width, detail_h, now));
             } else {
                 out.push(rule(None, width));
                 out.extend(std::iter::repeat_n(Vec::new(), detail_h));
@@ -136,12 +317,55 @@ impl JobsPanel {
             out.push(rule(None, width));
         }
         if tail >= 1 {
-            out.push(line::styled("j/k move · x kill · X kill all · g/G first/last · q close", |_| dim()));
+            out.push(line::styled(
+                "j/k move · Enter transcript · x kill · X kill all · g/G first/last · q close",
+                |_| dim(),
+            ));
         }
         out.truncate(max_rows);
         let out: Vec<Line> = out.iter().map(|l| line::truncate(l, width)).collect();
         let cursor = header + self.at.saturating_sub(self.top).min(list_h.saturating_sub(1));
         (out, (cursor, 0))
+    }
+
+    /// The transcript of the open job: a titled rule, the window of lines, a closing rule and keys.
+    fn render_view(&mut self, width: usize, max_rows: usize, now: SystemTime) -> (Vec<Line>, (usize, usize)) {
+        let header = usize::from(max_rows >= 3);
+        let footer = if max_rows >= 5 { 2 } else { 0 };
+        let h = max_rows.saturating_sub(header + footer).max(1);
+        let job = self.view.as_ref().and_then(|v| self.jobs.iter().find(|j| j.name == v.name)).cloned();
+        let cost = job.as_ref().map(|j| self.cost_cell(j)).unwrap_or_default();
+        let Some(v) = self.view.as_mut() else { return (Vec::new(), (0, 0)) };
+        v.build(width);
+        v.body_h = h;
+        v.max_top = v.lines.len().saturating_sub(h);
+        let top = if v.follow { v.max_top } else { v.top.min(v.max_top) };
+        let mut out: Vec<Line> = Vec::new();
+        if header == 1 {
+            let mut title = v.name.clone();
+            if let Some(j) = &job {
+                title.push_str(&format!(" · {} · {} {}", j.agent, mark(&j.state).0, clock(elapsed(j, now))));
+            }
+            if !cost.is_empty() {
+                title.push_str(&format!(" · {cost}"));
+            }
+            if v.tail.tokens() > 0 {
+                title.push_str(&format!(" · {} tok", short_count(v.tail.tokens())));
+            }
+            title.push_str(if v.follow { " · following" } else { " · paused" });
+            out.push(rule(Some(&title), width));
+        }
+        let end = (top + h).min(v.lines.len());
+        out.extend(v.lines[top..end].iter().cloned());
+        out.extend(std::iter::repeat_n(Vec::new(), h - (end - top)));
+        if footer == 2 {
+            out.push(rule(None, width));
+            out.push(line::styled("j/k scroll · PgUp/PgDn · g/G top/bottom · f follow · x kill · q back", |_| {
+                dim()
+            }));
+        }
+        let out: Vec<Line> = out.iter().map(|l| line::truncate(l, width)).collect();
+        (out, (header, 0))
     }
 }
 
@@ -150,6 +374,15 @@ fn mark(state: &SubagentState) -> (char, Role) {
         SubagentState::Running => ('◌', Role::Accent),
         SubagentState::Done => ('✓', Role::Ok),
         SubagentState::Failed => ('✗', Role::Err),
+    }
+}
+
+/// `950`, `12.3k`, `1.2M`.
+fn short_count(n: u64) -> String {
+    match n {
+        0..1000 => n.to_string(),
+        1000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
     }
 }
 
@@ -177,6 +410,7 @@ fn list_row(
     j: &SubagentStatus,
     selected: bool,
     (name_w, agent_w): (usize, usize),
+    cost: &str,
     width: usize,
     now: SystemTime,
 ) -> Line {
@@ -186,7 +420,7 @@ fn list_row(
         JobKind::Subagent => format!("{:>3} tools", j.tools),
         JobKind::Bash => " ".repeat(9),
     };
-    let rest = format!(" {} {tools}  {:>7}  {}", pad(&j.agent, agent_w), clock(elapsed(j, now)), j.last);
+    let rest = format!(" {} {tools}  {:>7}  {cost:>6}  {}", pad(&j.agent, agent_w), clock(elapsed(j, now)), j.last);
     let mut name = t.fg(Role::Strong);
     if selected {
         name.attributes.set(crossterm::style::Attribute::Bold);
@@ -225,7 +459,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// What the panel knows about one job, cut to `h` rows.
-fn detail(j: &SubagentStatus, width: usize, h: usize, now: SystemTime) -> Vec<Line> {
+fn detail(j: &SubagentStatus, cost: &str, width: usize, h: usize, now: SystemTime) -> Vec<Line> {
     let t = theme::get();
     let (m, role) = mark(&j.state);
     let state = match j.state {
@@ -237,6 +471,9 @@ fn detail(j: &SubagentStatus, width: usize, h: usize, now: SystemTime) -> Vec<Li
     let mut facts = format!("{state} · {}", clock(elapsed(j, now)));
     if j.kind == JobKind::Subagent {
         facts.push_str(&format!(" · {} tool{}", j.tools, if j.tools == 1 { "" } else { "s" }));
+    }
+    if !cost.is_empty() {
+        facts.push_str(&format!(" · {cost}"));
     }
     if let Some(n) = j.note.as_deref().filter(|n| !n.is_empty()) {
         facts.push_str(&format!(" · {n}"));
@@ -259,6 +496,10 @@ fn detail(j: &SubagentStatus, width: usize, h: usize, now: SystemTime) -> Vec<Li
     }
     if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
         rows.push(vec![span(format!("   last {}", j.last), muted)]);
+    }
+    if j.kind == JobKind::Subagent {
+        let hint = if j.session.is_some() { "Enter  read its transcript" } else { "no session file yet" };
+        rows.push(vec![span(format!("   {hint}"), t.fg(Role::Faint))]);
     }
     rows.truncate(h);
     rows.resize(h, Vec::new());
@@ -287,6 +528,7 @@ mod tests {
             started,
             delivered: false,
             note: None,
+            session: None,
         }
     }
 
@@ -430,6 +672,115 @@ mod tests {
         let rows = text(&mut p, 80, 14);
         assert!(rows.iter().any(|r| r.contains("$ cargo test --workspace")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("failed") && r.contains("exit 101") && !r.contains("tool")), "{rows:?}");
+    }
+
+    fn session_path() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-panel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("child.jsonl")
+    }
+
+    fn append(p: &std::path::Path, entries: &[serde_json::Value]) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap();
+        for e in entries {
+            writeln!(f, "{e}").unwrap();
+        }
+    }
+
+    fn user_entry(t: &str) -> serde_json::Value {
+        serde_json::json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":t,"timestamp":1}})
+    }
+
+    fn reply_entry(t: &str, cost: f64) -> serde_json::Value {
+        serde_json::json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant",
+            "content":[{"type":"text","text":t}],"api":"a","provider":"p","model":"m",
+            "usage":{"input":1000,"output":200,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"total":cost}},
+            "stopReason":"stop","timestamp":2}})
+    }
+
+    fn with_session(name: &str, state: SubagentState, path: &std::path::Path) -> SubagentStatus {
+        SubagentStatus { session: Some(path.to_path_buf()), ..job(name, state) }
+    }
+
+    #[test]
+    fn enter_opens_the_transcript_and_it_follows_the_file() {
+        let path = session_path();
+        append(&path, &[user_entry("Find the bug"), reply_entry("Looking at it", 0.25)]);
+        let mut p = JobsPanel::new(vec![with_session("scout-1", SubagentState::Running, &path)]);
+        p.refresh();
+        let rows = text(&mut p, 80, 20);
+        assert!(rows.iter().any(|r| r.contains("scout-1") && r.contains("$0.25")), "cost in the list: {rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Enter  read its transcript")), "{rows:?}");
+
+        assert!(matches!(p.on_key(key(KeyCode::Enter)), JobsResult::Pending));
+        let rows = text(&mut p, 80, 20);
+        assert_eq!(rows.len(), 20, "the transcript takes the height");
+        assert!(rows[0].starts_with("── scout-1 · scout"), "{rows:?}");
+        assert!(rows[0].contains("$0.25") && rows[0].contains("1.2k tok") && rows[0].contains("following"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Find the bug")) && rows.iter().any(|r| r.contains("Looking at it")));
+
+        append(&path, &[reply_entry("Second thought", 0.5)]);
+        p.refresh();
+        let rows = text(&mut p, 80, 20);
+        assert!(rows.iter().any(|r| r.contains("Second thought")), "{rows:?}");
+        assert!(rows[0].contains("$0.75"), "{rows:?}");
+
+        assert!(matches!(p.on_key(key(KeyCode::Char('q'))), JobsResult::Pending));
+        assert!(text(&mut p, 80, 20)[0].starts_with("── jobs"), "q goes back to the list");
+        assert!(matches!(p.on_key(key(KeyCode::Esc)), JobsResult::Close), "and Esc then closes");
+    }
+
+    #[test]
+    fn scrolling_up_pauses_following_and_g_resumes_it() {
+        let path = session_path();
+        let entries: Vec<_> = (0..40).map(|i| reply_entry(&format!("message-{i:02}"), 0.0)).collect();
+        append(&path, &entries);
+        let mut p = JobsPanel::new(vec![with_session("a", SubagentState::Running, &path)]);
+        p.on_key(key(KeyCode::Enter));
+        let rows = text(&mut p, 80, 12);
+        assert!(rows[0].contains("following") && rows.iter().any(|r| r.contains("message-39")), "{rows:?}");
+        p.on_key(key(KeyCode::PageUp));
+        let rows = text(&mut p, 80, 12);
+        assert!(rows[0].contains("paused") && !rows.iter().any(|r| r.contains("message-39")), "{rows:?}");
+        append(&path, &[reply_entry("message-40", 0.0)]);
+        p.refresh();
+        assert!(text(&mut p, 80, 12)[0].contains("paused"), "new output does not pull a paused view down");
+        p.on_key(key(KeyCode::Char('G')));
+        let rows = text(&mut p, 80, 12);
+        assert!(rows[0].contains("following") && rows.iter().any(|r| r.contains("message-40")), "{rows:?}");
+        p.on_key(key(KeyCode::Char('g')));
+        let rows = text(&mut p, 80, 12);
+        assert!(rows[0].contains("paused") && rows.iter().any(|r| r.contains("message-00")), "{rows:?}");
+        p.on_key(key(KeyCode::Char('f')));
+        assert!(text(&mut p, 80, 12)[0].contains("following"), "f toggles");
+    }
+
+    #[test]
+    fn a_job_without_a_session_has_no_transcript_and_a_vanished_job_closes_it() {
+        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]);
+        p.on_key(key(KeyCode::Enter));
+        assert!(text(&mut p, 80, 20)[0].starts_with("── jobs"), "nothing to open");
+
+        let path = session_path();
+        append(&path, &[user_entry("hi")]);
+        let mut p = JobsPanel::new(vec![with_session("b", SubagentState::Done, &path)]);
+        p.on_key(key(KeyCode::Enter));
+        assert!(text(&mut p, 80, 20)[0].starts_with("── b ·"));
+        p.set_jobs(vec![]);
+        assert!(text(&mut p, 80, 20).iter().any(|r| r.contains("no background jobs")));
+    }
+
+    #[test]
+    fn a_missing_session_file_says_it_is_waiting_and_kill_works_from_the_view() {
+        let path = session_path();
+        let mut p = JobsPanel::new(vec![with_session("a", SubagentState::Running, &path)]);
+        p.on_key(key(KeyCode::Enter));
+        assert!(text(&mut p, 80, 12).iter().any(|r| r.contains("waiting for the session file")));
+        assert!(matches!(p.on_key(key(KeyCode::Char('x'))), JobsResult::Kill(Some(id)) if id == "a"));
+        assert!(text(&mut p, 80, 12).iter().any(|r| r.contains("waiting for the session file")), "the view stays");
+        p.set_jobs(vec![with_session("a", SubagentState::Failed, &path)]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('x'))), JobsResult::Pending), "a finished job is not killed");
     }
 
     #[test]

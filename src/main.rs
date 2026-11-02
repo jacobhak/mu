@@ -32,6 +32,7 @@ mod review;
 mod schema;
 mod secrets;
 mod session;
+mod session_tail;
 mod take;
 #[cfg(test)]
 mod testutil;

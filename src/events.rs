@@ -198,6 +198,8 @@ pub struct SubagentStatus {
     pub delivered: bool,
     /// How a bash job ended ("exit 3", "timed out", …).
     pub note: Option<String>,
+    /// A subagent's session file, once its process has opened it.
+    pub session: Option<PathBuf>,
 }
 
 /// Input from the TUI to a command running on a pseudo-terminal.

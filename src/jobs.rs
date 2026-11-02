@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
 use crate::tools::bash::BackgroundResult;
-use crate::tools::task::{MAX_TASKS, run_child};
+use crate::tools::task::{MAX_TASKS, run_child_observed};
 use crate::tui::line::truncate_text;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
@@ -38,6 +38,8 @@ struct Job {
     text: String,
     /// How a bash job ended ("exit 3", "timed out", …).
     note: Option<String>,
+    /// A subagent's session file, once the child has opened it.
+    session: Option<PathBuf>,
     delivered: bool,
     cancel: CancellationToken,
 }
@@ -122,6 +124,7 @@ impl JobsHandle {
                 ended: j.ended,
                 delivered: j.delivered,
                 note: j.note.clone(),
+                session: j.session.clone(),
             })
             .collect()
     }
@@ -148,6 +151,7 @@ impl JobsHandle {
             state: SubagentState::Running,
             text: String::new(),
             note: None,
+            session: None,
             delivered: false,
             cancel,
         });
@@ -183,13 +187,25 @@ impl JobsHandle {
         let seq = self.start(spec, cancel.clone());
         let me = self.clone();
         tokio::task::spawn_local(async move {
-            let out = run_child(&exe, &cwd, &payload, &cancel, |name, summary| {
-                if let Some(j) = me.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
-                    j.tools += 1;
-                    j.last = format!("{name} {summary}");
-                }
-                me.emit();
-            })
+            let out = run_child_observed(
+                &exe,
+                &cwd,
+                &payload,
+                &cancel,
+                |name, summary| {
+                    if let Some(j) = me.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
+                        j.tools += 1;
+                        j.last = format!("{name} {summary}");
+                    }
+                    me.emit();
+                },
+                |path| {
+                    if let Some(j) = me.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
+                        j.session = Some(PathBuf::from(path));
+                    }
+                    me.emit();
+                },
+            )
             .await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
@@ -331,6 +347,7 @@ impl JobsHandle {
             state: SubagentState::Running,
             text: String::new(),
             note: None,
+            session: None,
             delivered: false,
             cancel: CancellationToken::new(),
         });
@@ -407,6 +424,7 @@ pub(crate) mod tests {
             state: SubagentState::Done,
             text: "big output".into(),
             note: Some("exit 0".into()),
+            session: None,
             delivered: false,
             cancel: CancellationToken::new(),
         });
@@ -441,6 +459,29 @@ pub(crate) mod tests {
         }
         assert!(h.take_undelivered(&[]).is_empty());
         assert!(rx.try_recv().is_err(), "nothing delivered, nothing emitted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subagent_job_records_its_task_and_session_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-jobs-session-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        let script = "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"session\",\"path\":\"/s/child.jsonl\"}\n{\"type\":\"result\",\"text\":\"ok\"}\nEOF\n";
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let h = handle();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                h.spawn("A".into(), "scout".into(), exe, base.clone(), serde_json::json!({"task": "find  x\nnow"}));
+                assert!(matches!(h.wait(&[], &CancellationToken::new()).await, WaitResult::Done(_)));
+            })
+            .await;
+        let snap = h.snapshot();
+        assert_eq!(snap[0].session.as_deref(), Some(std::path::Path::new("/s/child.jsonl")));
+        assert_eq!(snap[0].task, "find x now", "the task is one line");
+        assert_eq!((snap[0].cwd.as_path(), snap[0].state.clone()), (base.as_path(), SubagentState::Done));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

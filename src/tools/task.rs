@@ -162,6 +162,7 @@ impl Tools {
                     ended: None,
                     delivered: true,
                     note: None,
+                    session: None,
                 })
                 .collect::<Vec<_>>(),
         );
@@ -206,7 +207,20 @@ pub async fn run_child(
     cwd: &Path,
     payload: &Value,
     cancel: &CancellationToken,
+    on_tool: impl FnMut(&str, &str),
+) -> Outcome {
+    run_child_observed(exe, cwd, payload, cancel, on_tool, |_| {}).await
+}
+
+/// `run_child` that also reports the child's session file to `on_session(path)` as soon as the child
+/// has opened it (older children never say, so the callback may not run).
+pub async fn run_child_observed(
+    exe: &Path,
+    cwd: &Path,
+    payload: &Value,
+    cancel: &CancellationToken,
     mut on_tool: impl FnMut(&str, &str),
+    mut on_session: impl FnMut(&str),
 ) -> Outcome {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--headless")
@@ -257,6 +271,7 @@ pub async fn run_child(
                     // Bytes, not `lines()`: a stray invalid UTF-8 byte must not end the read.
                     match serde_json::from_slice::<Value>(&line) {
                         Ok(v) if v["type"] == "tool" => on_tool(v["name"].as_str().unwrap_or(""), v["summary"].as_str().unwrap_or("")),
+                        Ok(v) if v["type"] == "session" => on_session(v["path"].as_str().unwrap_or("")),
                         Ok(v) if v["type"] == "result" => result = Some(v),
                         _ => {}
                     }
@@ -358,6 +373,31 @@ mod cwd_tests {
             .await;
         assert!(out.ok, "{}", out.text);
         assert_eq!(out.text, dir.canonicalize().unwrap().display().to_string());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_childs_session_line_reaches_the_observer_before_the_result() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-session-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        let script = "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"session\",\"path\":\"/s/child.jsonl\"}\n{\"type\":\"tool\",\"name\":\"read\",\"summary\":\"x\"}\n{\"type\":\"result\",\"text\":\"ok\"}\nEOF\n";
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let seen = RefCell::new(Vec::new());
+        let out = tokio::task::LocalSet::new()
+            .run_until(run_child_observed(
+                &exe,
+                &base,
+                &json!({}),
+                &CancellationToken::new(),
+                |n, _| seen.borrow_mut().push(format!("tool {n}")),
+                |p| seen.borrow_mut().push(format!("session {p}")),
+            ))
+            .await;
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(*seen.borrow(), ["session /s/child.jsonl", "tool read"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

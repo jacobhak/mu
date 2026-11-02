@@ -238,6 +238,51 @@ fn is_dismissal(m: &Message) -> bool {
     matches!(m, Message::Assistant { content, .. } if tool_calls(m).is_empty() && text_of(content).trim() == ".")
 }
 
+/// The UI events that show a stored conversation: what a resumed session replays and what the jobs
+/// panel renders for a subagent's session.
+pub fn history_events(messages: &[Message]) -> Vec<AgentEvent> {
+    let mut out = Vec::new();
+    let mut after_reminder = false;
+    for m in messages {
+        let reminded = std::mem::replace(
+            &mut after_reminder,
+            matches!(m, Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content))),
+        );
+        match m {
+            Message::User { synthetic: true, .. } => out.push(AgentEvent::Notice("▸ Plan approved".into())),
+            Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content)) => {}
+            Message::User { content, .. } => out.push(AgentEvent::UserPrompt(text_of(content))),
+            Message::Assistant { .. } if reminded && is_dismissal(m) => {}
+            Message::Assistant { content, .. } => {
+                for b in content {
+                    match b {
+                        Block::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                            out.push(AgentEvent::Thinking(thinking.clone()));
+                        }
+                        Block::Text { text } => {
+                            out.push(AgentEvent::Text(text.clone()));
+                            out.push(AgentEvent::BlockEnd);
+                        }
+                        Block::ToolCall { id, name, arguments } => {
+                            out.push(AgentEvent::ToolStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                                args: arguments.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::ToolResult { tool_call_id, tool_name, content, is_error, details, .. } => {
+                let output = ToolOutput::from_stored(text_of(content), *is_error, details.clone());
+                out.push(AgentEvent::ToolEnd { id: tool_call_id.clone(), name: tool_name.clone(), output });
+            }
+        }
+    }
+    out
+}
+
 impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let tools = Tools::new(i.cwd.clone(), i.plugins.clone());
@@ -749,43 +794,8 @@ impl Agent {
     /// Loads `path`, applying its model/thinking unless pinned by the command line.
     /// Re-emits the loaded conversation as UI events so a resumed session shows its history.
     fn replay_history(&self) {
-        let mut after_reminder = false;
-        for m in &self.messages {
-            let reminded = std::mem::replace(
-                &mut after_reminder,
-                matches!(m, Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content))),
-            );
-            match m {
-                Message::User { synthetic: true, .. } => self.notice("▸ Plan approved"),
-                Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content)) => {}
-                Message::User { content, .. } => self.emit(AgentEvent::UserPrompt(text_of(content))),
-                Message::Assistant { .. } if reminded && is_dismissal(m) => {}
-                Message::Assistant { content, .. } => {
-                    for b in content {
-                        match b {
-                            Block::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                                self.emit(AgentEvent::Thinking(thinking.clone()));
-                            }
-                            Block::Text { text } => {
-                                self.emit(AgentEvent::Text(text.clone()));
-                                self.emit(AgentEvent::BlockEnd);
-                            }
-                            Block::ToolCall { id, name, arguments } => {
-                                self.emit(AgentEvent::ToolStart {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    args: arguments.clone(),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Message::ToolResult { tool_call_id, tool_name, content, is_error, details, .. } => {
-                    let output = ToolOutput::from_stored(text_of(content), *is_error, details.clone());
-                    self.emit(AgentEvent::ToolEnd { id: tool_call_id.clone(), name: tool_name.clone(), output });
-                }
-            }
+        for e in history_events(&self.messages) {
+            self.emit(e);
         }
     }
 

@@ -150,7 +150,8 @@ fn session_line(seen: &mut Option<String>, path: Option<String>) -> Option<Strin
 /// Asked once when a turn ends without a result and the task has an output schema.
 const NUDGE: &str = "You have not submitted a result. Call the `yield` tool now with `data` matching the output schema (or `error` if you cannot).";
 
-/// `--headless`: one subagent run. NDJSON on stdout: a `tool` line per tool call, then one `result`.
+/// `--headless`: one subagent run. NDJSON on stdout: one `session` line when its session file exists,
+/// a `tool` line per tool call, then one `result`.
 /// With `output_schema` the run must end in a successful `yield` call; its validated `data` goes
 /// in the result as `data` with `schemaOk: true`, and anything else is an error.
 pub async fn subagent_mode(
@@ -201,6 +202,9 @@ pub(crate) async fn run_subagent(
                 }
             }
             AgentEvent::Status(s) => {
+                if let (Some(p), None) = (&s.session_path, &session) {
+                    out(json!({"type": "session", "path": p}));
+                }
                 session = s.session_path.or(session);
                 usage = (s.tokens_in, s.tokens_out);
             }
@@ -416,6 +420,28 @@ mod tests {
             cmds.push(c);
         }
         (r, code, cmds)
+    }
+
+    #[test]
+    fn the_session_line_is_emitted_once_when_the_session_first_appears() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (ctx, _crx) = unbounded_channel();
+        let (etx, erx) = unbounded_channel();
+        for e in [
+            status(0.0, None),
+            status(0.0, Some("/s/a.jsonl")),
+            AgentEvent::ToolStart { id: "1".into(), name: "read".into(), args: serde_json::json!({"path": "x"}) },
+            status(0.1, Some("/s/a.jsonl")),
+            AgentEvent::Exit,
+        ] {
+            etx.send(e).unwrap();
+        }
+        let lines = std::cell::RefCell::new(Vec::new());
+        rt.block_on(run_subagent("x".into(), false, ctx, erx, |l| lines.borrow_mut().push(l)));
+        let lines = lines.into_inner();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], serde_json::json!({"type": "session", "path": "/s/a.jsonl"}));
+        assert_eq!(lines[1]["type"], "tool");
     }
 
     fn yielded(details: serde_json::Value) -> AgentEvent {

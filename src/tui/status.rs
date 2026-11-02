@@ -636,6 +636,7 @@ mod tests {
             ended: None,
             delivered: false,
             note: None,
+            session: None,
         };
         let jobs =
             [mk(SubagentState::Running), mk(SubagentState::Done), mk(SubagentState::Done), mk(SubagentState::Failed)];
