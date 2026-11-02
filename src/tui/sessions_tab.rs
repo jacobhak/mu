@@ -34,9 +34,19 @@ impl Row {
         }
     }
 
-    /// `s` can stop it: a `-p` run stops after its step, a subagent is terminated.
+    /// `s` can stop it: a `-p` run stops after its step, a subagent is terminated, an interactive mu
+    /// that takes abort requests cancels its current turn.
     pub fn can_stop(&self) -> bool {
-        matches!(self.live.kind.as_deref(), Some("print" | "subagent"))
+        match self.live.kind.as_deref() {
+            Some("print" | "subagent") => true,
+            Some("tui") => self.live.abort,
+            _ => false,
+        }
+    }
+
+    /// `S` can terminate it: an interactive mu, after a confirmation.
+    pub fn can_terminate(&self) -> bool {
+        self.live.kind.as_deref() == Some("tui")
     }
 
     /// `t` can take it over: only a `-p` run hands its session over.
@@ -186,7 +196,14 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
     }
     let mut keys = vec!["Enter peek", "n message"];
     if r.can_stop() {
-        keys.push(if r.live.kind.as_deref() == Some("print") { "s stop after its step" } else { "s terminate" });
+        keys.push(match r.live.kind.as_deref() {
+            Some("print") => "s stop after its step",
+            Some("tui") => "s abort its turn",
+            _ => "s terminate",
+        });
+    }
+    if r.can_terminate() {
+        keys.push("S terminate");
     }
     if r.can_take() {
         keys.push("t take over");
@@ -211,6 +228,7 @@ mod tests {
             agent: None,
             cwd: Some(PathBuf::from("/work/proj")),
             parent: None,
+            abort: false,
         }
     }
 
@@ -293,8 +311,12 @@ mod tests {
         };
         assert!(row("print").can_stop() && row("print").can_take());
         assert!(row("subagent").can_stop() && !row("subagent").can_take());
-        assert!(!row("tui").can_stop() && !row("tui").can_take());
-        assert!(!row("acp").can_stop());
+        assert!(!row("tui").can_stop() && !row("tui").can_take(), "an older mu takes no abort");
+        assert!(row("tui").can_terminate() && !row("print").can_terminate() && !row("subagent").can_terminate());
+        let mut modern = row("tui");
+        modern.live.abort = true;
+        assert!(modern.can_stop() && !modern.can_take());
+        assert!(!row("acp").can_stop() && !row("acp").can_terminate());
         let mut r = row("subagent");
         r.live.agent = Some("review-lead".into());
         assert_eq!(r.label(), "subagent review-lead");

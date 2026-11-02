@@ -125,13 +125,15 @@ fn verify(now: Owner, pid: u32, started: &str) -> Recheck {
     }
 }
 
-/// `s` in the jobs panel: stops the run the user saw, without taking it over. A `-p` run gets
-/// SIGUSR1 and stops after its current step; a subagent's process group gets SIGTERM, which is how its
-/// parent cancels it. Nothing is signalled unless the session's owner is still that run (same pid and
-/// start time).
+const GONE: &str = "it has already finished";
+const CHANGED: &str = "the session changed hands; nothing was signalled";
+
+/// `s` in the jobs panel: stops the run the user saw, without taking it over. A `-p` run gets SIGUSR1
+/// and stops after its current step; a subagent's process group gets SIGTERM, which is how its parent
+/// cancels it; an interactive mu that said it handles SIGUSR1 cancels its current turn and keeps
+/// running. Nothing is signalled unless the session's owner is still that run (same pid and start
+/// time).
 pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<String, String> {
-    const GONE: &str = "it has already finished";
-    const CHANGED: &str = "the session changed hands; nothing was signalled";
     match kind {
         "print" => match verify(session::owner(path), pid, started) {
             Recheck::Same => signal(pid)
@@ -147,7 +149,38 @@ pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<
             Owner::Free => Err(GONE.into()),
             _ => Err(CHANGED.into()),
         },
-        _ => Err("only -p runs and subagents can be stopped from here".into()),
+        "tui" => {
+            let l = live_run(path, pid, started)?;
+            if l.kind.as_deref() != Some("tui") || !l.abort {
+                return Err("that mu does not take abort requests (an older version); use S to terminate it".into());
+            }
+            signal(pid)
+                .map(|()| format!("asked pid {pid} to abort its current turn"))
+                .map_err(|e| format!("cannot signal pid {pid}: {e}"))
+        }
+        _ => Err("only -p runs, subagents and interactive mu can be stopped from here".into()),
+    }
+}
+
+/// `S` in the jobs panel, after a confirmation: asks an interactive mu to exit (SIGTERM; it restores
+/// its terminal on the way out). Only for the run the user saw, and only an interactive mu.
+pub fn terminate_session(path: &Path, pid: u32, started: &str) -> Result<String, String> {
+    let l = live_run(path, pid, started)?;
+    if l.kind.as_deref() != Some("tui") {
+        return Err("only an interactive mu can be terminated from here".into());
+    }
+    crate::proc::signal_pid(pid, libc::SIGTERM)
+        .map(|()| format!("asked pid {pid} to exit"))
+        .map_err(|e| format!("cannot signal pid {pid}: {e}"))
+}
+
+/// The live owner record of `path`, if it is still the run (pid and start time) the caller saw.
+fn live_run(path: &Path, pid: u32, started: &str) -> Result<session::LiveSession, String> {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    match session::live_sessions().into_iter().find(|l| l.path == abs) {
+        Some(l) if l.pid == pid && l.started == started => Ok(l),
+        Some(_) => Err(CHANGED.into()),
+        None => Err(GONE.into()),
     }
 }
 
@@ -207,9 +240,24 @@ mod tests {
     fn stopping_refuses_other_kinds_and_sessions_nobody_has() {
         let t = "2026-01-01T00:00:00.000Z";
         let missing = Path::new("/definitely/not/a/session_x.jsonl");
-        assert!(stop_session(missing, 7, t, "tui").unwrap_err().contains("only -p runs and subagents"));
+        assert!(stop_session(missing, 7, t, "acp").unwrap_err().contains("can be stopped from here"));
+        assert!(stop_session(missing, 7, t, "tui").unwrap_err().contains("already finished"));
+        assert!(terminate_session(missing, 7, t).unwrap_err().contains("already finished"));
         assert!(stop_session(missing, 7, t, "print").unwrap_err().contains("already finished"));
         assert!(stop_session(missing, 7, t, "subagent").unwrap_err().contains("already finished"));
+    }
+
+    #[test]
+    fn an_interactive_run_is_only_signalled_while_it_is_the_one_listed() {
+        crate::testutil::home();
+        let s = session::SessionFile::create(Path::new("/opt/stop-tui"), None).unwrap();
+        let me = std::process::id();
+        // Another pid, or another start time: the record is somebody else's now. Never our own pid
+        // with the right start time here, which would signal this test process.
+        assert!(stop_session(&s.path, me + 1, "x", "tui").unwrap_err().contains("changed hands"));
+        assert!(terminate_session(&s.path, me + 1, "x").unwrap_err().contains("changed hands"));
+        assert!(stop_session(&s.path, me, "not the start time", "tui").unwrap_err().contains("changed hands"));
+        drop(s);
     }
 
     #[test]

@@ -120,6 +120,15 @@ pub fn set_inbox() {
     INBOX.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+static ABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as an interactive mu that cancels its current turn on SIGUSR1 (the jobs panel's
+/// `s`). Call it only once that handler is installed and before any session is locked: an owner record
+/// that says `abort` promises `kill -USR1` aborts the turn instead of killing the process.
+pub fn set_abort_signal() {
+    ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[derive(Clone, Default)]
 struct RunInfo {
     kind: Option<&'static str>,
@@ -160,6 +169,7 @@ struct LiveRecord {
     agent: Option<String>,
     cwd: Option<PathBuf>,
     parent: Option<PathBuf>,
+    abort: bool,
 }
 
 /// `--profile <name> ` (trailing space) when a profile is active, else empty: for resume hints.
@@ -210,6 +220,7 @@ fn read_record(rec: &Path) -> Option<LiveRecord> {
         agent: text("agent"),
         cwd: text("cwd").map(PathBuf::from),
         parent: text("parent").map(PathBuf::from),
+        abort: v["abort"].as_bool().unwrap_or(false),
     })
 }
 
@@ -233,6 +244,8 @@ pub struct LiveSession {
     pub cwd: Option<PathBuf>,
     /// The session that spawned this one.
     pub parent: Option<PathBuf>,
+    /// SIGUSR1 cancels the current turn (an interactive mu that said so).
+    pub abort: bool,
 }
 
 /// Every live owner record in `$MU_HOME/run`. A record whose writer is gone (its lock is free) or
@@ -263,6 +276,7 @@ pub fn live_sessions() -> Vec<LiveSession> {
                 agent: r.agent,
                 cwd: r.cwd,
                 parent,
+                abort: r.abort,
             }
         })
         .collect()
@@ -348,6 +362,7 @@ struct Extra {
     agent: Option<String>,
     cwd: Option<PathBuf>,
     parent: Option<PathBuf>,
+    abort: bool,
 }
 
 impl OwnerRecord {
@@ -359,6 +374,7 @@ impl OwnerRecord {
             agent: info.agent,
             cwd: cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()),
             parent: parent.map(Path::to_path_buf),
+            abort: ABORT.load(std::sync::atomic::Ordering::SeqCst),
         };
         Self::claim_with(
             session,
@@ -403,6 +419,9 @@ impl OwnerRecord {
             }
             if let Some(p) = &extra.parent {
                 rec["parent"] = json!(p.to_string_lossy());
+            }
+            if extra.abort {
+                rec["abort"] = json!(true);
             }
             file.write_all(rec.to_string().as_bytes())?;
             // The lock follows the inode through the rename.

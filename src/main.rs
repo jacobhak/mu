@@ -478,6 +478,24 @@ fn run() -> Result<i32> {
                 }
             }
         }
+        // Interactive: SIGUSR1 cancels the running turn, like Esc (the jobs panel's `s` on another
+        // session). The handler first, then the record flag, then the agent task.
+        if !headless_run && task_payload.is_none() {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+                Ok(mut sig) => {
+                    let inbox = inbox.clone();
+                    tokio::task::spawn_local(async move {
+                        while sig.recv().await.is_some() {
+                            inbox.borrow().cancel.cancel();
+                        }
+                    });
+                    session::set_abort_signal();
+                }
+                Err(e) => {
+                    eprintln!("mu: cannot install the SIGUSR1 handler ({e}); other sessions cannot abort this one")
+                }
+            }
+        }
         let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
         let (print, max_cost) = (cli.print, cli.max_cost);
         let mut printer = None;

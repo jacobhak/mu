@@ -235,7 +235,14 @@ Each phase ships alone.
    `t` closes the panel and runs `mu take <session>` through `App::start_child` (SIGINT caught as in
    `run_login`), then reopens the Sessions tab. What an action did shows in the footer until the next key.
    Deviations: the stop on a `-p` run is the first step of `mu take`, so pressing `s` twice cancels the
-   current step, as the design said for take; no key stops a session open in an interactive mu.
+   current step, as the design said for take.
+   Interactive sessions (decided after the first cut left them out): an interactive mu installs a
+   `SIGUSR1` handler that cancels the running turn like Esc and says so with `abort: true` in its owner
+   record (`session::set_abort_signal`), so `s` aborts a turn without ending the session, and only for a mu
+   that promised it. `S` (after `y`) sends `SIGTERM`, which the TUI already turns into a clean exit with
+   the terminal restored. Both re-check pid and start time against `live_sessions` first. Take over stays
+   unavailable: it would end somebody's open terminal. (The inbox + `SIGUSR2` route was not used for abort:
+   the agent reads it only between steps, so it could not interrupt a running tool.)
 
 ## Tests
 

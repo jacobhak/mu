@@ -150,6 +150,12 @@ pub enum OverlayEvent {
         started: String,
         kind: String,
     },
+    /// Ask an interactive mu to exit (confirmed in the panel).
+    TerminateSession {
+        session: PathBuf,
+        pid: u32,
+        started: String,
+    },
     /// Take over a `-p` run: the panel closes and `mu take` runs on the terminal.
     TakeSession(PathBuf),
 }
@@ -538,6 +544,9 @@ impl Overlay {
                 }
                 JobsResult::Stop { session, pid, started, kind } => {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::StopSession { session, pid, started, kind }))
+                }
+                JobsResult::Terminate { session, pid, started } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::TerminateSession { session, pid, started }))
                 }
                 JobsResult::Take { session } => (None, Some(OverlayEvent::TakeSession(session))),
             },

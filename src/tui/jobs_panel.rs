@@ -47,12 +47,18 @@ pub enum JobsResult {
         text: String,
     },
     /// Stop a live session. `pid` and `started` name the run the user saw, so a session that changed
-    /// hands since is left alone; `kind` is `print` or `subagent`.
+    /// hands since is left alone; `kind` is `print`, `subagent` or `tui` (an abort of its current turn).
     Stop {
         session: PathBuf,
         pid: u32,
         started: String,
         kind: String,
+    },
+    /// Ask an interactive mu to exit (`S`, confirmed).
+    Terminate {
+        session: PathBuf,
+        pid: u32,
+        started: String,
     },
     /// Take over a `-p` run (`mu take`).
     Take {
@@ -88,6 +94,8 @@ pub struct JobsPanel {
     view: Option<View>,
     /// A message being typed to a session.
     input: Option<Compose>,
+    /// A terminate waiting for `y`.
+    confirm: Option<Confirm>,
     /// What the last action did, shown in place of the key line until the next key.
     status: Option<String>,
     /// The newest output of each bash job, as the app last sent it.
@@ -106,6 +114,14 @@ struct Compose {
     session: PathBuf,
     label: String,
     text: String,
+}
+
+/// The run `S` was pressed on, until the user answers.
+struct Confirm {
+    session: PathBuf,
+    pid: u32,
+    started: String,
+    label: String,
 }
 
 /// The full-height view of one thing: a subagent's session transcript, another session's, or a bash
@@ -192,6 +208,7 @@ impl JobsPanel {
             polled_totals: None,
             view: None,
             input: None,
+            confirm: None,
             status: None,
             outputs: HashMap::new(),
         }
@@ -474,6 +491,9 @@ impl JobsPanel {
             return JobsResult::Pending;
         }
         self.status = None;
+        if self.confirm.is_some() {
+            return self.confirm_key(k);
+        }
         if self.input.is_some() {
             return self.input_key(k);
         }
@@ -551,7 +571,26 @@ impl JobsPanel {
                     return JobsResult::Take { session: r.live.path.clone() };
                 }
             }
+            KeyCode::Char('S') => {
+                if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_terminate()) {
+                    self.confirm = Some(Confirm {
+                        session: r.live.path.clone(),
+                        pid: r.live.pid,
+                        started: r.live.started.clone(),
+                        label: r.label(),
+                    });
+                }
+            }
             _ => {}
+        }
+        JobsResult::Pending
+    }
+
+    /// `y` terminates; any other key keeps the session.
+    fn confirm_key(&mut self, k: KeyEvent) -> JobsResult {
+        let Some(c) = self.confirm.take() else { return JobsResult::Pending };
+        if k.code == KeyCode::Char('y') {
+            return JobsResult::Terminate { session: c.session, pid: c.pid, started: c.started };
         }
         JobsResult::Pending
     }
@@ -619,15 +658,25 @@ impl JobsPanel {
             Some(r) => (Some(r.label()), sessions_tab::detail(r, &self.cost_of(Some(&r.live.path)), width, now)),
             None => (None, Vec::new()),
         };
-        let (footer, footer_cursor) = match &self.input {
-            Some(c) => {
+        let (footer, footer_cursor) = match (&self.confirm, &self.input) {
+            (Some(c), _) => (
+                vec![span(
+                    format!(
+                        "terminate {} (pid {})? it exits and its unsent input is lost · y to confirm, any other key cancels",
+                        c.label, c.pid
+                    ),
+                    accent(),
+                )],
+                None,
+            ),
+            (None, Some(c)) => {
                 let lead = format!("message to {} (Enter send, Esc cancel): ", c.label);
                 let col = lead.chars().count() + c.text.chars().count();
                 (vec![span(lead, dim()), span(c.text.clone(), Default::default())], Some(col))
             }
-            None => (
+            (None, None) => (
                 line::styled(
-                    "j/k move · Enter peek · n message · s stop · t take over · Tab jobs · q close",
+                    "Enter peek · n message · s stop · S terminate · t take over · Tab jobs · q close",
                     |_| dim(),
                 ),
                 None,
@@ -1267,6 +1316,47 @@ mod tests {
             agent: None,
             cwd: Some(PathBuf::from("/work/other")),
             parent: None,
+            abort: false,
+        }
+    }
+
+    #[test]
+    fn an_interactive_mu_aborts_if_it_says_it_can_and_terminates_only_after_y() {
+        let path = session_path();
+        let mut older = lived(&path, "tui", "2026-01-01T00:00:00Z");
+        let mut p = sessions_panel(vec![older.clone()]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('s'))), JobsResult::Pending), "no abort without the promise");
+        older.abort = true;
+        let mut p = sessions_panel(vec![older]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('s'))), JobsResult::Stop { kind, .. } if kind == "tui"));
+        let d = p.render(100, 14, now()).0.iter().map(line_text).collect::<Vec<_>>();
+        assert!(d.iter().any(|r| r.contains("s abort its turn") && r.contains("S terminate")), "{d:?}");
+
+        // S asks first; nothing but `y` goes through.
+        assert!(matches!(p.on_key(key(KeyCode::Char('S'))), JobsResult::Pending));
+        let rows = text(&mut p, 140, 14);
+        assert!(rows.last().unwrap().contains("terminate tui (pid 4242)?"), "{rows:?}");
+        assert!(matches!(p.on_key(key(KeyCode::Char('n'))), JobsResult::Pending), "another key cancels");
+        assert!(p.confirm.is_none() && p.input.is_none(), "and is not taken as `n`");
+        p.on_key(key(KeyCode::Char('S')));
+        assert!(
+            matches!(p.on_key(key(KeyCode::Char('y'))), JobsResult::Terminate { pid: 4242, session, .. } if session == path)
+        );
+        assert!(p.confirm.is_none());
+    }
+
+    #[test]
+    fn only_an_interactive_mu_can_be_terminated() {
+        let t = "2026-01-01T00:00:00Z";
+        let mut p = sessions_panel(vec![
+            lived(&session_path(), "print", t),
+            lived(&session_path(), "subagent", "2026-01-01T00:00:01Z"),
+            lived(&session_path(), "acp", "2026-01-01T00:00:02Z"),
+        ]);
+        for i in 0..3 {
+            p.s_at = i;
+            p.on_key(key(KeyCode::Char('S')));
+            assert!(p.confirm.is_none(), "row {i}");
         }
     }
 

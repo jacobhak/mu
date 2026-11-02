@@ -1029,6 +1029,13 @@ impl App {
                 };
                 self.panel_status(msg);
             }
+            OverlayEvent::TerminateSession { session, pid, started } => {
+                let msg = match crate::take::terminate_session(&session, pid, &started) {
+                    Ok(m) => m,
+                    Err(e) => format!("not terminated: {e}"),
+                };
+                self.panel_status(msg);
+            }
             OverlayEvent::TakeSession(path) => self.take_session(path),
         }
     }
