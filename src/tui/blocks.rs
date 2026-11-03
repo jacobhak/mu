@@ -669,10 +669,11 @@ pub fn subagent_rows(rows: &[SubagentStatus], spin: char) -> Vec<Line> {
                 SubagentState::Done => ('✓', tfg(Role::Ok)),
                 SubagentState::Failed => ('✗', tfg(Role::Err)),
             };
+            let model = r.model.as_deref().map(|m| format!(" · {m}")).unwrap_or_default();
             vec![
                 span(format!("  {mark} "), style),
                 span(r.name.clone(), ContentStyle::default()),
-                span(format!(" · {} tools · {}", r.tools, trunc(&r.last, 80)), tfg(Role::Muted)),
+                span(format!("{model} · {} tools · {}", r.tools, trunc(&r.last, 80)), tfg(Role::Muted)),
             ]
         })
         .collect()

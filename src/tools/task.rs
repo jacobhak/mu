@@ -163,6 +163,7 @@ impl Tools {
                     delivered: true,
                     note: None,
                     session: None,
+                    model: None,
                 })
                 .collect::<Vec<_>>(),
         );
@@ -170,11 +171,19 @@ impl Tools {
             let (rows, exe) = (&rows, &exe);
             let payload = payload(agent, task, schemas[i]);
             async move {
-                let out = run_child(exe, cwd, &payload, &ctx.cancel, |name, summary| {
-                    let mut r = rows.borrow_mut();
-                    r[i].tools += 1;
-                    r[i].last = format!("{name} {summary}");
-                })
+                let out = run_child_observed(
+                    exe,
+                    cwd,
+                    &payload,
+                    &ctx.cancel,
+                    |name, summary| {
+                        let mut r = rows.borrow_mut();
+                        r[i].tools += 1;
+                        r[i].last = format!("{name} {summary}");
+                    },
+                    |_| {},
+                    |model| rows.borrow_mut()[i].model = Some(model.to_string()),
+                )
                 .await;
                 rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
                 out
@@ -190,7 +199,7 @@ impl Tools {
             .join("\n\n");
         let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
         res.details = Some(json!({"subagents": rows.borrow().iter().zip(&outs).map(|(r, o)| {
-            let mut s = json!({"name": r.name, "agent": r.agent, "tools": r.tools});
+            let mut s = json!({"name": r.name, "agent": r.agent, "model": r.model, "tools": r.tools});
             if let Some(d) = &o.data {
                 s["data"] = d.clone();
             }
@@ -209,11 +218,11 @@ pub async fn run_child(
     cancel: &CancellationToken,
     on_tool: impl FnMut(&str, &str),
 ) -> Outcome {
-    run_child_observed(exe, cwd, payload, cancel, on_tool, |_| {}).await
+    run_child_observed(exe, cwd, payload, cancel, on_tool, |_| {}, |_| {}).await
 }
 
 /// `run_child` that also reports the child's session file to `on_session(path)` as soon as the child
-/// has opened it (older children never say, so the callback may not run).
+/// has opened it, and its model label to `on_model` (older children never say, so either may not run).
 pub async fn run_child_observed(
     exe: &Path,
     cwd: &Path,
@@ -221,6 +230,7 @@ pub async fn run_child_observed(
     cancel: &CancellationToken,
     mut on_tool: impl FnMut(&str, &str),
     mut on_session: impl FnMut(&str),
+    mut on_model: impl FnMut(&str),
 ) -> Outcome {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--headless")
@@ -272,6 +282,7 @@ pub async fn run_child_observed(
                     match serde_json::from_slice::<Value>(&line) {
                         Ok(v) if v["type"] == "tool" => on_tool(v["name"].as_str().unwrap_or(""), v["summary"].as_str().unwrap_or("")),
                         Ok(v) if v["type"] == "session" => on_session(v["path"].as_str().unwrap_or("")),
+                        Ok(v) if v["type"] == "model" => on_model(v["label"].as_str().unwrap_or("")),
                         Ok(v) if v["type"] == "result" => result = Some(v),
                         _ => {}
                     }
@@ -382,7 +393,7 @@ mod cwd_tests {
         let base = std::env::temp_dir().join(format!("mu-task-session-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         let exe = base.join("fake-mu");
-        let script = "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"session\",\"path\":\"/s/child.jsonl\"}\n{\"type\":\"tool\",\"name\":\"read\",\"summary\":\"x\"}\n{\"type\":\"result\",\"text\":\"ok\"}\nEOF\n";
+        let script = "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"model\",\"label\":\"smol · a/b\"}\n{\"type\":\"session\",\"path\":\"/s/child.jsonl\"}\n{\"type\":\"tool\",\"name\":\"read\",\"summary\":\"x\"}\n{\"type\":\"result\",\"text\":\"ok\"}\nEOF\n";
         std::fs::write(&exe, script).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let seen = RefCell::new(Vec::new());
@@ -394,10 +405,11 @@ mod cwd_tests {
                 &CancellationToken::new(),
                 |n, _| seen.borrow_mut().push(format!("tool {n}")),
                 |p| seen.borrow_mut().push(format!("session {p}")),
+                |m| seen.borrow_mut().push(format!("model {m}")),
             ))
             .await;
         assert!(out.ok, "{}", out.text);
-        assert_eq!(*seen.borrow(), ["session /s/child.jsonl", "tool read"]);
+        assert_eq!(*seen.borrow(), ["model smol · a/b", "session /s/child.jsonl", "tool read"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

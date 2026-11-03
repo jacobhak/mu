@@ -293,6 +293,7 @@ mod tests {
             delivered: false,
             note: None,
             session: Some(PathBuf::from("/s/sub.jsonl")),
+            model: None,
         };
         let rows = build(vec![mine, sub, other], &HashMap::new(), &[job], Some(Path::new("/s/mine.jsonl")));
         assert_eq!(names(&rows), [("/s/sub.jsonl".to_string(), 0), ("/s/other.jsonl".to_string(), 0)]);

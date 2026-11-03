@@ -200,6 +200,9 @@ pub struct SubagentStatus {
     pub note: Option<String>,
     /// A subagent's session file, once its process has opened it.
     pub session: Option<PathBuf>,
+    /// The model a subagent runs on, as `role · provider/model` (no role when named directly); known
+    /// once its process has resolved it.
+    pub model: Option<String>,
 }
 
 /// Input from the TUI to a command running on a pseudo-terminal.

@@ -247,6 +247,14 @@ fn agent_selector(def: &context::AgentDef, cfgs: &config::Configs) -> Option<Str
         .or_else(|| models::role_selector("task", cfgs))
 }
 
+/// `role · provider/model` when the model came from a `@role` selector, else just the model.
+fn model_label(sel: Option<&str>, model: &str) -> String {
+    match sel.and_then(|s| s.strip_prefix('@')) {
+        Some(role) => format!("{} · {model}", models::split_level(role).0),
+        None => model.to_string(),
+    }
+}
+
 fn apply_agent(agent: &mut agent::Agent, def: &context::AgentDef) {
     agent.allow = def.tools.clone();
     agent.excluded = vec!["ask", "propose_plan"];
@@ -363,7 +371,9 @@ fn run() -> Result<i32> {
         sel = agent_def.as_ref().and_then(|d| agent_selector(d, &cfgs));
     }
     let def_thinking = agent_def.as_ref().and_then(|d| d.thinking.as_deref()).and_then(models::Thinking::parse);
+    let role_sel = sel.clone();
     let (spec, thinking) = pick_model(&cfgs, &providers, sel, cli_thinking.or(def_thinking))?;
+    let model_label = model_label(role_sel.as_deref(), &spec.id);
 
     let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;
     let resume = match (&cli.resume, cli.continue_latest) {
@@ -506,6 +516,7 @@ fn run() -> Result<i32> {
                 let ctx = p["context"].as_str().filter(|c| !c.is_empty());
                 let task = p["task"].as_str().unwrap_or("");
                 let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
+                println!("{}", serde_json::json!({"type": "model", "label": model_label}));
                 headless::subagent_mode(prompt, output_schema, cmd_tx, ev_rx).await
             }
             (Some(prompt), None, _) => {
@@ -590,5 +601,12 @@ mod output_schema_tests {
         );
         assert_eq!(task_output_schema(&json!({"outputSchema":null}), Some(&def)), Some(json!({"type":"object"})));
         assert_eq!(task_output_schema(&json!({}), None), None);
+    }
+
+    #[test]
+    fn model_label_names_the_role_only_for_a_role_selector() {
+        assert_eq!(model_label(Some("@smol:high"), "a/b"), "smol · a/b");
+        assert_eq!(model_label(Some("a/b:low"), "a/b"), "a/b");
+        assert_eq!(model_label(None, "a/b"), "a/b");
     }
 }

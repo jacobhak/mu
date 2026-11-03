@@ -122,6 +122,7 @@ struct Job {
     note: Option<String>,
     /// A subagent's session file, once the child has opened it.
     session: Option<PathBuf>,
+    model: Option<String>,
     delivered: bool,
     cancel: CancellationToken,
 }
@@ -207,6 +208,7 @@ impl JobsHandle {
                 delivered: j.delivered,
                 note: j.note.clone(),
                 session: j.session.clone(),
+                model: j.model.clone(),
             })
             .collect()
     }
@@ -234,6 +236,7 @@ impl JobsHandle {
             text: String::new(),
             note: None,
             session: None,
+            model: None,
             delivered: false,
             cancel,
         });
@@ -284,6 +287,12 @@ impl JobsHandle {
                 |path| {
                     if let Some(j) = me.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
                         j.session = Some(PathBuf::from(path));
+                    }
+                    me.emit();
+                },
+                |model| {
+                    if let Some(j) = me.inner.borrow_mut().iter_mut().find(|j| j.seq == seq) {
+                        j.model = Some(model.to_string());
                     }
                     me.emit();
                 },
@@ -432,6 +441,7 @@ impl JobsHandle {
             text: String::new(),
             note: None,
             session: None,
+            model: None,
             delivered: false,
             cancel: CancellationToken::new(),
         });
@@ -509,6 +519,7 @@ pub(crate) mod tests {
             text: "big output".into(),
             note: Some("exit 0".into()),
             session: None,
+            model: None,
             delivered: false,
             cancel: CancellationToken::new(),
         });

@@ -969,6 +969,9 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
     };
     let muted = t.fg(Role::Muted);
     let mut facts = format!("{state} · {}", clock(elapsed(j, now)));
+    if let Some(m) = &j.model {
+        facts.push_str(&format!(" · {m}"));
+    }
     if j.kind == JobKind::Subagent {
         facts.push_str(&format!(" · {} tool{}", j.tools, if j.tools == 1 { "" } else { "s" }));
     }
@@ -1029,6 +1032,7 @@ mod tests {
             delivered: false,
             note: None,
             session: None,
+            model: None,
         }
     }
 
