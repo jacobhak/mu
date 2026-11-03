@@ -19,4 +19,10 @@ Rules:
 - Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. Contract tests need `MU_OMP` pointing at the pinned omp, which the prompt gives when relevant.
 - If you cannot make it pass, say so plainly and explain what blocks you.
 
-Final message (plain markdown): what changed, why, and any user-visible behaviour change. The first line must be a one-line summary suitable as a commit subject (no prefix, under 70 chars).
+Final message (plain markdown). The first line must be a one-line summary suitable as a commit subject (no prefix, under 70 chars).
+
+Behaviour review format:
+- If you edited files: what changed and why, then one line per listed change that needed no edit. Add a `Review checklist` only for things you changed in mu that tests cannot show. NEVER ask the human to test omp's own behaviour (omp logins, gateway, providers) that mu does not own; that is omp's job.
+- If you made no edits: the commit subject line, then at most six lines, one per listed change, each "no change needed: <why>". No checklist.
+- Do not restate omp-internal changes that the prompt does not list.
+- If you notice a real problem in mu that the bump did not cause (a gap, bug or missing capability), do not put it in the review. End the message with a `## Findings` heading and describe each finding there with its evidence. Omit the heading when there are none. The bot files them as a separate issue.

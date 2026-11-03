@@ -145,7 +145,7 @@ bump_flow() {
   "$here/check.sh" "$bwt" "$RUN/bump" 9>&- > "$RUN/bump/check.out" 2>&1 && green=1
 
   "$here/material.sh" "$pinned" "$latest" "$RUN/material"
-  local tprompt="$RUN/triage-prompt.md" tout="$RUN/triage.md" change=true summary="triage unavailable" risk=unknown
+  local tprompt="$RUN/triage-prompt.md" tout="$RUN/triage.md" change=true summary="triage unavailable" risk=unknown fyi=""
   cat > "$tprompt" <<P
 Triage the oh-my-pi upgrade v$pinned -> v$latest for mu. The material directory is $RUN/material. The mu checkout with the bump applied is the current directory.
 P
@@ -157,16 +157,17 @@ P
       change="$(echo "$lastline" | jq -r '.behaviour_change')"
       summary="$(echo "$lastline" | jq -r '.summary // ""')"
       risk="$(echo "$lastline" | jq -r '.risk // "unknown"')"
+      fyi="$(echo "$lastline" | jq -r '.fyi // ""')"
     fi
   fi
 
-  local labels sev fixout="" fixrc=0
+  local labels sev fixout="" fixrc=0 edited=0 review=0 findings="$RUN/fixer-findings.md"
   local fprompt="$RUN/fix-prompt.md" fout="$RUN/fixer.md"
   if [ "$green" = 1 ] && [ "$change" = false ]; then
     result=s2; sev="S2 — green bump, no behaviour change; auto-merged"; labels=(maint:bump maint:auto)
   else
     if [ "$green" = 1 ]; then
-      result=s2r; sev="S2r — green bump, behaviour change; needs review"; labels=(maint:bump maint:needs-review)
+      result=s2r; review=1; sev="S2r — green bump, behaviour change; needs review"; labels=(maint:bump maint:needs-review)
       cat > "$fprompt" <<P
 MODE: behaviour review (checks are GREEN; do not go looking for failures). Triage found these user-visible behaviour changes in oh-my-pi v$latest (bumped from v$pinned):
 
@@ -174,7 +175,7 @@ $summary
 
 Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
 
-For each listed change, decide whether mu must change to accommodate it (tool descriptions or prompts in src/, error handling, docs/README, tests or contract tests that should now cover the new behaviour). Make those changes. If a change needs no mu change, do not invent one. Your final message MUST list every change with a verdict: "adapted: <what>" or "no change needed: <why>", then a "Review checklist" of concrete things the human should verify by hand.
+For each listed change, decide whether mu must change to accommodate it (tool descriptions or prompts in src/, error handling, docs/README, tests or contract tests that should now cover the new behaviour). Make those changes. If a change needs no mu change, do not invent one. Follow the final-message format for behaviour review in your agent instructions.
 P
     else
       result=s1; sev="S1 — bump fails checks"; labels=(maint:bump maint:needs-review)
@@ -184,8 +185,11 @@ P
     fi
     rc=0; run_agent maint-fixer "$MU_MAINT_FIX_USD" "$bwt" "$fprompt" "$fout" || rc=$?
     fixrc=$rc
-    fixout="$(cat "$fout" 2>/dev/null || true)"
+    : > "$RUN/fixer-body.md"; : > "$findings"
+    [ ! -f "$fout" ] || awk -v b="$RUN/fixer-body.md" -v f="$findings" '/^## Findings[[:space:]]*$/ { inf = 1; next } { print > (inf ? f : b) }' "$fout"
+    fixout="$(cat "$RUN/fixer-body.md")"
     if [ "$rc" = 0 ] && tree_changed "$bwt"; then
+      edited=1
       git -C "$bwt" add -A
       git -C "$bwt" commit -q -m "Adapt to oh-my-pi v$latest" -m "$fixout"
       mkdir -p "$RUN/bump-fixed"
@@ -197,12 +201,17 @@ P
       cp "$RUN/bump-fixed/check.txt" "$RUN/bump/check.txt"
     fi
     [ "$green" = 1 ] || labels+=(maint:red)
+    if [ "$review" = 1 ] && [ "$green" = 1 ] && [ "$fixrc" = 0 ] && [ "$edited" = 0 ]; then
+      result=s2; sev="S2 — green bump; the fixer reviewed the behaviour changes and found no mu change needed; auto-merged"; labels=(maint:bump maint:auto)
+    fi
   fi
 
   {
     echo "## Severity"; echo "$sev"; echo
     echo "## Checks"; echo '```'; cat "$RUN/bump/check.txt"; echo '```'; echo
-    echo "## Upstream changes"; echo "$summary"; echo; echo "Risk: $risk"; echo
+    echo "## Upstream changes"; echo "$summary"; echo
+    [ -z "$fyi" ] || { echo "## Also in this release (inside omp, no mu change)"; echo "$fyi"; echo; }
+    echo "Risk: $risk"; echo
     if [ "$fixrc" != 0 ]; then
       echo "## Fixer"; echo "**The fixer did not finish (exit $fixrc; 10 = monthly budget, 124 = timeout). No adaptation was made; any partial edits were discarded.**"; echo
       [ -z "$fixout" ] || { echo "Partial output:"; echo; echo "$fixout"; echo; }
@@ -212,7 +221,13 @@ P
 
   echo "$result" > "$RUN/result"
   pushw "$bwt" push -f -u origin "$branch"
-  pr_create "$branch" "Bump oh-my-pi to v$latest" "$RUN/pr-body.md" "${labels[@]}"
+  local url
+  url="$(pr_create "$branch" "Bump oh-my-pi to v$latest" "$RUN/pr-body.md" "${labels[@]}")"
+  [ -z "$url" ] || echo "$url"
+  if [ -s "$findings" ]; then
+    { echo "Found by the maintenance bot while reviewing the bump to v$latest (${url:-$branch}). The bump did not cause it."; echo; cat "$findings"; } > "$RUN/finding.md"
+    ghw issue create -R "$REPO" --label maint:finding --title "maint finding (found while bumping omp to v$latest)" --body-file "$RUN/finding.md"
+  fi
   if [ "$result" = s2 ]; then
     ghw pr merge "$branch" -R "$REPO" --squash --delete-branch
   fi

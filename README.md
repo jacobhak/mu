@@ -101,9 +101,10 @@ A local systemd timer keeps mu current with oh-my-pi; everything is reported thr
 |---|---|---|
 | S0 | `scripts/maint/check.sh` fails on `origin/main` | issue `maint:s0`; fixer PR `maint:needs-review`; no bump or publish |
 | S1 | new omp release, bump fails checks | fixer adapts mu; PR `maint:bump` + `maint:needs-review` (+ `maint:red`) |
-| S2 | green bump, no behaviour change | PR `maint:bump` + `maint:auto`, squash-merged |
-| S2r | green bump, behaviour change | PR `maint:bump` + `maint:needs-review`, not merged |
+| S2 | green bump, no behaviour change reaching mu | PR `maint:bump` + `maint:auto`, squash-merged |
+| S2r | green bump, behaviour change reaching mu | fixer reviews it; PR `maint:bump` + `maint:needs-review`, not merged. If the fixer makes no edit the PR is merged as S2 |
 | S3 | weekly | issue `maint:digest` with omp changes worth porting |
+| finding | the fixer notices a problem in mu the bump did not cause | issue `maint:finding` |
 | publish | `origin/main` is green and newer than the last release | tag `mu-YYYYMMDD-<sha7>`; `.github/workflows/release.yml` builds and releases; the bot reinstalls unless a dev build is installed |
 
 Nightly runs at 03:30, the digest on Mondays 05:00. The bot never edits `.github/`.

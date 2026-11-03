@@ -40,6 +40,7 @@ mklabel maint:red "checks still failing" D93F0B
 mklabel maint:digest "weekly omp parity digest" 5319E7
 mklabel maint:budget "agent budget reached" 7057FF
 mklabel maint:bot-error "the bot itself failed" 000000
+mklabel maint:finding "problem in mu found by the bot, not caused by a bump" 1D76DB
 
 mkdir -p "$HOME/.config/systemd/user"
 cp "$here"/systemd/* "$HOME/.config/systemd/user/"
