@@ -1,4 +1,4 @@
 # The oh-my-pi release every omp artifact mu uses is pinned to: the Rust crates (Cargo.toml tags),
 # @oh-my-pi/pi-mnemopi (plugins/memory) and the omp binary installed to ~/.mu/bin/omp.
 # Bumped by scripts/maint/bump.sh.
-omp = "18.15.0"
+omp = "18.16.0"
