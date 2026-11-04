@@ -5,9 +5,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::panels::jobs_panel::{pad, wrap};
-use crate::panels::reply::accent;
 use crate::text::line::{self, Line, dim, span};
+use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
 use mu_base::events::SubagentStatus;
 use mu_session::session::LiveSession;

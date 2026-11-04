@@ -9,10 +9,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::panels::reply::{accent, rule};
+use crate::panels::reply::rule;
 use crate::panels::session_view;
 use crate::panels::sessions_tab::{self, Row};
 use crate::text::line::{self, Line, dim, span};
+use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_session::session::LiveSession;
@@ -286,8 +287,8 @@ impl JobsPanel {
     }
 
     /// Reads what the sessions gained since the last read: the open transcript and the cost of every
-    /// listed subagent and session. `render` does this on a timer; tests and the first frame call it
-    /// directly. (The list of live sessions is read by `refresh_sessions`, from `refresh_due`.)
+    /// listed subagent and session. `poll` calls it on a timer; tests call it directly. (The list of
+    /// live sessions is read by `refresh_sessions`, from `poll`.)
     pub fn refresh(&mut self) {
         self.polled_totals = Some(Instant::now());
         for j in &self.jobs {
@@ -326,7 +327,8 @@ impl JobsPanel {
         }
     }
 
-    fn refresh_due(&mut self) {
+    /// Called on the app's tick: reads what changed, at the polling intervals.
+    pub fn poll(&mut self) {
         let now = Instant::now();
         let totals_due = self.polled_totals.is_none_or(|t| now.duration_since(t) >= TOTALS_POLL);
         let view_due = self
@@ -597,7 +599,6 @@ impl JobsPanel {
 
     /// The panel's rows (at most `max_rows`) and the cursor within them. `now` times running jobs.
     pub fn render(&mut self, width: usize, max_rows: usize, now: SystemTime) -> (Vec<Line>, (usize, usize)) {
-        self.refresh_due();
         if self.view.is_some() {
             return self.render_view(width, max_rows, now);
         }
@@ -900,12 +901,6 @@ fn elapsed(j: &SubagentStatus, now: SystemTime) -> u64 {
     end.duration_since(j.started).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub(crate) fn pad(s: &str, w: usize) -> String {
-    let t = mu_base::text::truncate_text(s, w);
-    let used = t.chars().count();
-    format!("{t}{}", " ".repeat(w.saturating_sub(used)))
-}
-
 fn list_row(
     j: &SubagentStatus,
     selected: bool,
@@ -936,26 +931,6 @@ fn list_row(
         l = line::fill(&l, width, t.color(Role::Selected));
     }
     l
-}
-
-/// Wraps `text` to `width` columns on spaces; words longer than a row are cut by `truncate`.
-pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut rows = Vec::new();
-    let mut cur = String::new();
-    for w in text.split_whitespace() {
-        let fits = cur.is_empty() || cur.chars().count() + 1 + w.chars().count() <= width;
-        if !fits {
-            rows.push(std::mem::take(&mut cur));
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(w);
-    }
-    if !cur.is_empty() {
-        rows.push(cur);
-    }
-    rows
 }
 
 /// What the panel knows about one job, as many rows as it takes.

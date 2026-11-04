@@ -1,4 +1,5 @@
 use crate::status::format_number;
+use crate::text::accent;
 use crate::text::line::{self, Line, dim, span, styled};
 use crate::text::markdown;
 use crate::theme::{self, Role};
@@ -55,12 +56,6 @@ pub struct PlanReview {
     tier: usize,
     editing: bool,
     text: String,
-}
-
-fn accent_bold() -> ContentStyle {
-    let mut s = theme::get().fg(Role::Accent);
-    s.attributes.set(crossterm::style::Attribute::Bold);
-    s
 }
 
 impl PlanReview {
@@ -246,7 +241,7 @@ impl PlanReview {
         } else {
             format!(" · {} · {}–{}/{}", self.uri, self.scroll + 1, (self.scroll + self.body_h).min(n), n)
         };
-        let mut title = vec![span(format!("Plan review: {}", self.title), accent_bold())];
+        let mut title = vec![span(format!("Plan review: {}", self.title), accent())];
         title.push(span(pos, dim()));
         out.push(line::truncate(&title, width));
         if let Some(n) = &self.note {

@@ -10,6 +10,7 @@ use crossterm::style::{Attribute, ContentStyle};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::text::accent;
 use crate::text::line::{self, Line, dim, span};
 use crate::theme::{self, Role};
 
@@ -1047,12 +1048,6 @@ pub(crate) fn rule(title: Option<&str>, width: usize) -> Line {
         span(t.to_string(), accent()),
         span(format!(" {}", "─".repeat(width.saturating_sub(used))), edge),
     ]
-}
-
-pub(crate) fn accent() -> ContentStyle {
-    let mut s = theme::get().fg(Role::Accent);
-    s.attributes.set(Attribute::Bold);
-    s
 }
 
 /// A styled word or gap, before wrapping.

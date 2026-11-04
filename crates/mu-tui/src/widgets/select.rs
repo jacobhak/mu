@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use crate::text::accent;
 use crate::text::line::{self, Line, bold, dim, span};
 use crate::text::markdown::{chars_to_line, chs, wrap_chs};
 use crate::theme::{self, Role};
@@ -11,12 +12,6 @@ use crate::widgets::editor::{self, Editor};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::ContentStyle;
 use mu_base::events::PreviewKind;
-
-fn accent_bold() -> ContentStyle {
-    let mut s = theme::get().fg(Role::Accent);
-    s.attributes.set(crossterm::style::Attribute::Bold);
-    s
-}
 
 /// Rows the title may take; a longer one ends in `…`.
 const TITLE_MAX_LINES: usize = 6;
@@ -432,7 +427,7 @@ impl Select {
             return Vec::new();
         }
         let mut rows: Vec<Line> =
-            wrap_chs(&chs(&self.title, accent_bold()), width).iter().map(|r| chars_to_line(r)).collect();
+            wrap_chs(&chs(&self.title, accent()), width).iter().map(|r| chars_to_line(r)).collect();
         if rows.is_empty() {
             rows.push(Vec::new());
         }
@@ -440,7 +435,7 @@ impl Select {
             rows.truncate(cap);
             if let Some(last) = rows.last_mut() {
                 let mut row = last.clone();
-                row.push(span("…", accent_bold()));
+                row.push(span("…", accent()));
                 *last = line::truncate(&row, width);
             }
         }
