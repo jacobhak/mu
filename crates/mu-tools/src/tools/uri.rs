@@ -56,20 +56,20 @@ pub fn artifact_dir(session_id: &str) -> PathBuf {
 
 impl Tools {
     pub fn set_session(&self, id: &str, path: Option<PathBuf>) {
-        *self.session_id.borrow_mut() = id.into();
-        *self.session_path.borrow_mut() = path;
+        *self.session.id.borrow_mut() = id.into();
+        *self.session.path.borrow_mut() = path;
     }
 
     pub fn set_skills(&self, skills: Vec<(String, PathBuf)>) {
-        *self.skills.borrow_mut() = skills;
+        *self.session.skills.borrow_mut() = skills;
     }
 
     pub fn local_root(&self) -> PathBuf {
-        local_root(&self.session_id.borrow())
+        local_root(&self.session.id.borrow())
     }
 
     pub fn artifact_dir(&self) -> PathBuf {
-        artifact_dir(&self.session_id.borrow())
+        artifact_dir(&self.session.id.borrow())
     }
 
     /// Next unused artifact number for this session.
@@ -105,6 +105,7 @@ impl Tools {
             Scheme::Skill => {
                 let (name, rel) = rest.split_once('/').unwrap_or((rest, ""));
                 let dir = self
+                    .session
                     .skills
                     .borrow()
                     .iter()

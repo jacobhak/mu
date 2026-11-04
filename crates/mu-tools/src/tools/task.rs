@@ -101,7 +101,7 @@ impl Tools {
             Ok(s) => s,
             Err(e) => return ToolOutput::err(e),
         };
-        let parent = self.session_path.borrow().clone();
+        let parent = self.session.path.borrow().clone();
         let exe = match mu_common::paths::self_exe() {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),
@@ -130,68 +130,78 @@ impl Tools {
                 started.join(", ")
             ));
         }
-
-        let rows = RefCell::new(
-            specs
-                .iter()
-                .map(|(n, a, t, c)| SubagentStatus {
-                    name: n.clone(),
-                    agent: a.clone(),
-                    tools: 0,
-                    last: String::new(),
-                    state: SubagentState::Running,
-                    kind: JobKind::Subagent,
-                    cwd: c.clone(),
-                    task: t.clone(),
-                    started: std::time::SystemTime::now(),
-                    ended: None,
-                    delivered: true,
-                    note: None,
-                    session: None,
-                    model: None,
-                })
-                .collect::<Vec<_>>(),
-        );
-        let futs = specs.iter().enumerate().map(|(i, (_, agent, task, cwd))| {
-            let (rows, exe) = (&rows, &exe);
-            let payload = payload(agent, task, schemas[i]);
-            async move {
-                let out = run_child_observed(
-                    exe,
-                    cwd,
-                    &payload,
-                    &ctx.cancel,
-                    |name, summary| {
-                        let mut r = rows.borrow_mut();
-                        r[i].tools += 1;
-                        r[i].last = format!("{name} {summary}");
-                    },
-                    |_| {},
-                    |model| rows.borrow_mut()[i].model = Some(model.to_string()),
-                )
-                .await;
-                rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
-                out
-            }
-        });
-        let outs = join_all(futs).await;
-        let all_failed = outs.iter().all(|o| !o.ok);
-        let text = specs
-            .iter()
-            .zip(&outs)
-            .map(|((n, a, _, _), o)| format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, o.text))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
-        res.details = Some(json!({"subagents": rows.borrow().iter().zip(&outs).map(|(r, o)| {
-            let mut s = json!({"name": r.name, "agent": r.agent, "model": r.model, "tools": r.tools});
-            if let Some(d) = &o.data {
-                s["data"] = d.clone();
-            }
-            s
-        }).collect::<Vec<_>>()}));
-        res
+        run_foreground(&specs, &schemas, &exe, &payload, &ctx.cancel).await
     }
+}
+
+/// Runs every task to completion in this call; each row's progress is reported in `details`.
+async fn run_foreground(
+    specs: &[(String, String, String, PathBuf)],
+    schemas: &[Option<&Value>],
+    exe: &Path,
+    payload: &dyn Fn(&str, &str, Option<&Value>) -> Value,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> ToolOutput {
+    let rows = RefCell::new(
+        specs
+            .iter()
+            .map(|(n, a, t, c)| SubagentStatus {
+                name: n.clone(),
+                agent: a.clone(),
+                tools: 0,
+                last: String::new(),
+                state: SubagentState::Running,
+                kind: JobKind::Subagent,
+                cwd: c.clone(),
+                task: t.clone(),
+                started: std::time::SystemTime::now(),
+                ended: None,
+                delivered: true,
+                note: None,
+                session: None,
+                model: None,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let futs = specs.iter().enumerate().map(|(i, (_, agent, task, cwd))| {
+        let rows = &rows;
+        let payload = payload(agent, task, schemas[i]);
+        async move {
+            let out = run_child_observed(
+                exe,
+                cwd,
+                &payload,
+                cancel,
+                |name, summary| {
+                    let mut r = rows.borrow_mut();
+                    r[i].tools += 1;
+                    r[i].last = format!("{name} {summary}");
+                },
+                |_| {},
+                |model| rows.borrow_mut()[i].model = Some(model.to_string()),
+            )
+            .await;
+            rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
+            out
+        }
+    });
+    let outs = join_all(futs).await;
+    let all_failed = outs.iter().all(|o| !o.ok);
+    let text = specs
+        .iter()
+        .zip(&outs)
+        .map(|((n, a, _, _), o)| format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, o.text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
+    res.details = Some(json!({"subagents": rows.borrow().iter().zip(&outs).map(|(r, o)| {
+        let mut s = json!({"name": r.name, "agent": r.agent, "model": r.model, "tools": r.tools});
+        if let Some(d) = &o.data {
+            s["data"] = d.clone();
+        }
+        s
+    }).collect::<Vec<_>>()}));
+    res
 }
 
 #[cfg(test)]

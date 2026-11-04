@@ -1,11 +1,12 @@
 mod ask;
-pub mod bash;
 mod diff;
 pub mod edit;
 mod glob;
 pub mod grep;
 mod plan;
 mod read;
+pub mod shell;
+mod spill;
 pub mod subagent;
 pub mod task;
 pub mod todo;
@@ -15,7 +16,7 @@ mod write;
 mod yield_;
 
 use crate::jobs::JobsHandle;
-use crate::plugin::PluginHost;
+use crate::plugin::host::PluginHost;
 use mu_base::events::EventTx;
 use mu_base::text::truncate_text as trunc;
 use mu_base::tool::{ToolDef, ToolOutput};
@@ -32,15 +33,23 @@ pub struct ToolCtx {
     pub call_id: String,
 }
 
+/// The per-session state the tools share: the todo list, the session's ids and file, and its skills.
+#[derive(Default)]
+pub struct ToolSession {
+    todo: std::cell::RefCell<Vec<todo::Phase>>,
+    /// Names the session's artifact and local directories, and `PI_SESSION_ID`.
+    id: std::cell::RefCell<String>,
+    /// `PI_SESSION_FILE`, and the parent of a subagent's session.
+    path: std::cell::RefCell<Option<PathBuf>>,
+    skills: std::cell::RefCell<Vec<(String, PathBuf)>>,
+}
+
 pub struct Tools {
     pub cwd: PathBuf,
     pub plugins: Rc<PluginHost>,
     /// Set in interactive sessions: `task` then runs in the background.
     pub jobs: Option<Rc<JobsHandle>>,
-    todo: std::cell::RefCell<Vec<todo::Phase>>,
-    session_id: std::cell::RefCell<String>,
-    session_path: std::cell::RefCell<Option<PathBuf>>,
-    skills: std::cell::RefCell<Vec<(String, PathBuf)>>,
+    session: ToolSession,
     pub plan: std::cell::Cell<bool>,
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
@@ -60,10 +69,7 @@ impl Tools {
             cwd,
             plugins,
             jobs: None,
-            todo: Default::default(),
-            session_id: Default::default(),
-            session_path: Default::default(),
-            skills: Default::default(),
+            session: Default::default(),
             plan: Default::default(),
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
@@ -78,8 +84,8 @@ impl Tools {
     /// `PI_SESSION_FILE` / `PI_SESSION_ID` for bash commands (omp's names). Always both, empty
     /// without a session, so a value inherited from a parent mu or omp is overwritten.
     pub fn session_env(&self) -> Vec<(&'static str, String)> {
-        let file = self.session_path.borrow().as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        let id = if file.is_empty() { String::new() } else { self.session_id.borrow().clone() };
+        let file = self.session.path.borrow().as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let id = if file.is_empty() { String::new() } else { self.session.id.borrow().clone() };
         vec![("PI_SESSION_FILE", file), ("PI_SESSION_ID", id)]
     }
 
@@ -137,32 +143,11 @@ impl Tools {
             let mut out = self.plugins.call_tool(name, args, &ctx.cancel).await;
             // Only MCP results are capped here: native plugins size their own output (web caps fetches itself).
             if self.plugins.is_mcp_tool(name) {
-                out.text = self.cap_text(std::mem::take(&mut out.text));
+                out.text = spill::cap_text(std::mem::take(&mut out.text), &self.cwd, &|| self.next_artifact());
             }
             return out;
         }
         ToolOutput::err(format!("Unknown tool: {name}"))
-    }
-
-    /// Plugin output above 50 KB keeps its head; the whole text goes to an `artifact://` file.
-    fn cap_text(&self, text: String) -> String {
-        const CAP: usize = 50 * 1024;
-        if text.len() <= CAP {
-            return text;
-        }
-        let mut cut = CAP;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let (n, path) = self.next_artifact();
-        let saved = path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-            && std::fs::write(&path, mu_base::secrets::redact(&text, &self.cwd).text).is_ok();
-        let note = if saved {
-            format!("[Output truncated at {} KB of {} KB; full output: artifact://{n}]", CAP / 1024, text.len() / 1024)
-        } else {
-            format!("[Output truncated at {} KB of {} KB]", CAP / 1024, text.len() / 1024)
-        };
-        format!("{}\n\n{note}", &text[..cut])
     }
 }
 
@@ -268,7 +253,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
             )
         }),
-        call: dispatch!("bash", async |t, a: bash::Args, c| t.bash(a, c)),
+        call: dispatch!("bash", async |t, a: shell::bash::Args, c| t.bash(a, c)),
     },
     Builtin {
         name: "grep",

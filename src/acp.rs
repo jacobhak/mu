@@ -9,7 +9,7 @@ use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
 use mu_provider::model::pricing;
 use mu_session::session;
-use mu_tools::plugin::PluginHost;
+use mu_tools::plugin::host::PluginHost;
 use mu_tools::tools::summary;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        mu_tools::plugin::exit_on_signals();
+        mu_tools::plugin::process::exit_on_signals();
         serve(model, thinking).await
     });
     Ok(0)

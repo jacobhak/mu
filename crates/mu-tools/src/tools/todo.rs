@@ -369,20 +369,27 @@ pub fn format_summary(phases: &[Phase], errors: &[String], read_only: bool) -> S
 
 impl Tools {
     pub fn set_todo(&self, phases: Vec<Phase>) {
-        *self.todo.borrow_mut() = phases;
+        *self.session.todo.borrow_mut() = phases;
     }
 
     pub fn todo_json(&self) -> Value {
-        serde_json::to_value(&*self.todo.borrow()).unwrap_or(Value::Null)
+        serde_json::to_value(&*self.session.todo.borrow()).unwrap_or(Value::Null)
     }
 
     /// Contents of tasks still pending or in progress (blocked and closed ones excluded).
     pub fn todo_open(&self) -> Vec<String> {
-        self.todo.borrow().iter().flat_map(|p| p.tasks.iter()).filter(|t| open(t)).map(|t| t.content.clone()).collect()
+        self.session
+            .todo
+            .borrow()
+            .iter()
+            .flat_map(|p| p.tasks.iter())
+            .filter(|t| open(t))
+            .map(|t| t.content.clone())
+            .collect()
     }
 
     pub fn todo(&self, mut a: Args) -> ToolOutput {
-        let previous = self.todo.borrow().clone();
+        let previous = self.session.todo.borrow().clone();
         let op = match a.op.take() {
             Some(op) if OPS.contains(&op.as_str()) => op,
             Some(op) => return todo_err(&previous, format!("Invalid todo arguments: unknown op `{op}`")),

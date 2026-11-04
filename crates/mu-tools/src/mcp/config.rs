@@ -274,10 +274,10 @@ pub fn load(cwd: &Path, agent: &Path) -> (Vec<McpServer>, Vec<String>) {
 }
 
 fn read_json(path: &Path, warnings: &mut Vec<String>) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    match serde_json::from_str::<Value>(&text) {
+    match super::read_json(path) {
         Ok(v) => Some(v),
-        Err(e) => {
+        Err(super::JsonError::Io(_)) => None,
+        Err(super::JsonError::Blank(e) | super::JsonError::Parse(e)) => {
             warnings.push(format!("mcp: {}: {e}", path.display()));
             None
         }

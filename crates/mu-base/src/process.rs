@@ -34,6 +34,23 @@ pub async fn terminate_group(pgid: i32) {
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
+/// Spawns `cmd` as the leader of a new process group, so `terminate_group` reaches everything it
+/// starts. With `pdeathsig`, Linux also sends the child SIGTERM when mu dies.
+pub fn spawn_grouped(cmd: &mut tokio::process::Command, pdeathsig: bool) -> std::io::Result<tokio::process::Child> {
+    cmd.process_group(0);
+    if pdeathsig {
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn()
+}
+
 /// Runs `cmd` with its stdout captured. `None` on failure, timeout or a non-zero exit. The command
 /// runs in its own process group, which is terminated when `limit` passes, or when it has exited
 /// but a leftover child still holds the pipe open. Children that let go of stdout are left alone.
@@ -85,6 +102,19 @@ pub async fn run_capture(mut cmd: tokio::process::Command, limit: Duration) -> O
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn spawn_grouped_makes_the_child_its_own_group_leader() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        let mut child = rt.block_on(async { spawn_grouped(&mut cmd, true) }).unwrap();
+        let pid = child.id().unwrap() as i32;
+        // SAFETY: plain getpgid(2) on the test's own child.
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        rt.block_on(terminate_group(pid));
+        assert!(!rt.block_on(child.wait()).unwrap().success());
+    }
 
     #[test]
     fn terminates_a_stubborn_group() {

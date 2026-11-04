@@ -35,7 +35,7 @@ use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
 use mu_provider::provider::client::Providers;
 use mu_tools::context::Context;
-use mu_tools::plugin::PluginHost;
+use mu_tools::plugin::host::PluginHost;
 use serde_json::json;
 use std::path::PathBuf;
 use std::rc::Rc;

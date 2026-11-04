@@ -133,7 +133,7 @@ enum Sub {
 struct Setup {
     cfgs: Rc<config::Configs>,
     ctx: Rc<context::Context>,
-    host: Rc<plugin::PluginHost>,
+    host: Rc<plugin::host::PluginHost>,
     providers: Rc<mu_provider::provider::client::Providers>,
     notice_tx: tokio::sync::mpsc::UnboundedSender<String>,
     notice_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -188,14 +188,14 @@ fn setup(cwd: &std::path::Path) -> Setup {
             plugin::manifest::Lifetime::Session
         }
     };
-    let host = plugin::PluginHost::new_with_mcp(
+    let host = plugin::host::PluginHost::new_with_mcp(
         manifests,
         servers,
         mcp_lifetime,
         mu_tools::mcp::cache::dir(),
         warnings,
         notice_tx.clone(),
-        plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
+        plugin::host::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
         tools::is_builtin,
     );
     let providers = Rc::new(mu_provider::provider::client::Providers::new(
@@ -531,7 +531,7 @@ fn run() -> Result<i32> {
         let code = match (print, task_payload, plan_run) {
             (_, Some(p), _) => {
                 printer = Some(spawn_notice_printer(notice_rx));
-                plugin::exit_on_signals();
+                plugin::process::exit_on_signals();
                 let ctx = p["context"].as_str().filter(|c| !c.is_empty());
                 let task = p["task"].as_str().unwrap_or("");
                 let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
@@ -540,14 +540,14 @@ fn run() -> Result<i32> {
             }
             (Some(prompt), None, _) => {
                 printer = Some(spawn_notice_printer(notice_rx));
-                plugin::exit_on_signals();
+                plugin::process::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
                 let first = events::Command::Prompt(prompt.into());
                 headless::print_mode(first, false, cmd_tx, ev_rx, inbox.clone(), max_cost, stop_rx).await
             }
             (None, None, Some(r)) => {
                 printer = Some(spawn_notice_printer(notice_rx));
-                plugin::exit_on_signals();
+                plugin::process::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
                 headless::print_mode(r.first, r.expect_park, cmd_tx, ev_rx, inbox.clone(), None, stop_rx).await
             }

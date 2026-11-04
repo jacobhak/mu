@@ -168,7 +168,7 @@ fn sources(roots: &Roots) -> Vec<Source> {
 }
 
 fn load_json(path: &Path) -> Option<Value> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    super::read_json(path).ok()
 }
 
 fn load_toml(path: &Path) -> Option<Value> {

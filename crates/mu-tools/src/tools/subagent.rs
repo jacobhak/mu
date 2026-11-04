@@ -1,6 +1,7 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
 use super::task::depth;
+use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 use std::process::Stdio;
@@ -19,6 +20,38 @@ impl Outcome {
     fn failed(text: impl Into<String>) -> Self {
         Self { ok: false, text: text.into(), data: None }
     }
+}
+
+/// One line of a child's stdout: a progress event, or the final result.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ChildEvent {
+    Tool {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        summary: String,
+    },
+    Session {
+        #[serde(default)]
+        path: String,
+    },
+    Model {
+        #[serde(default)]
+        label: String,
+    },
+    Result(ChildResult),
+}
+
+#[derive(Deserialize)]
+struct ChildResult {
+    #[serde(default, rename = "isError")]
+    is_error: bool,
+    #[serde(default)]
+    text: String,
+    data: Option<Value>,
+    #[serde(rename = "schemaOk")]
+    schema_ok: Option<bool>,
 }
 
 /// Runs one `mu --headless` subagent in `cwd`, reporting each tool call to `on_tool(name, summary)`.
@@ -52,15 +85,7 @@ pub async fn run_child_observed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    cmd.process_group(0);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-    let mut child = match cmd.spawn() {
+    let mut child = match mu_base::process::spawn_grouped(&mut cmd, true) {
         Ok(c) => c,
         Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
     };
@@ -81,7 +106,7 @@ pub async fn run_child_observed(
         tail.into_iter().collect::<Vec<_>>().join("\n")
     });
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut result: Option<Value> = None;
+    let mut result: Option<ChildResult> = None;
     let mut cancelled = false;
     let mut line: Vec<u8> = Vec::new();
     loop {
@@ -91,12 +116,12 @@ pub async fn run_child_observed(
                 Ok(0) => break,
                 Ok(_) => {
                     // Bytes, not `lines()`: a stray invalid UTF-8 byte must not end the read.
-                    match serde_json::from_slice::<Value>(&line) {
-                        Ok(v) if v["type"] == "tool" => on_tool(v["name"].as_str().unwrap_or(""), v["summary"].as_str().unwrap_or("")),
-                        Ok(v) if v["type"] == "session" => on_session(v["path"].as_str().unwrap_or("")),
-                        Ok(v) if v["type"] == "model" => on_model(v["label"].as_str().unwrap_or("")),
-                        Ok(v) if v["type"] == "result" => result = Some(v),
-                        _ => {}
+                    match serde_json::from_slice::<ChildEvent>(&line) {
+                        Ok(ChildEvent::Tool { name, summary }) => on_tool(&name, &summary),
+                        Ok(ChildEvent::Session { path }) => on_session(&path),
+                        Ok(ChildEvent::Model { label }) => on_model(&label),
+                        Ok(ChildEvent::Result(r)) => result = Some(r),
+                        Err(_) => {}
                     }
                 }
                 Err(_) => {
@@ -123,13 +148,17 @@ pub async fn run_child_observed(
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
     }
     let stderr_tail = err_task.await.unwrap_or_default();
+    outcome(result, payload, cancelled, stderr_tail)
+}
+
+/// What the child's final result, or its lack of one, means to the caller.
+fn outcome(result: Option<ChildResult>, payload: &Value, cancelled: bool, stderr_tail: String) -> Outcome {
     match result {
-        Some(v) => {
-            let ok = !v["isError"].as_bool().unwrap_or(false);
-            let text = v["text"].as_str().unwrap_or("").to_string();
-            let data = v.get("data").filter(|d| !d.is_null()).cloned();
-            match data {
-                Some(d) if ok && v["schemaOk"] != false => {
+        Some(r) => {
+            let ok = !r.is_error;
+            let text = r.text;
+            match r.data {
+                Some(d) if ok && r.schema_ok != Some(false) => {
                     let pretty = serde_json::to_string_pretty(&d).unwrap_or_else(|_| d.to_string());
                     Outcome { ok: true, text: format!("```json\n{pretty}\n```"), data: Some(d) }
                 }

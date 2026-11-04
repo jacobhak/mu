@@ -1,6 +1,7 @@
-use super::subagent::BackgroundResult;
-use super::{ToolCtx, Tools};
 use crate::jobs::JobsHandle;
+use crate::tools::spill::{Collected, Collector};
+use crate::tools::subagent::BackgroundResult;
+use crate::tools::{ToolCtx, Tools};
 use mu_base::events::AgentEvent;
 use mu_base::tool::{BashMeta, ToolMeta, ToolOutput};
 use pi_shell::{
@@ -8,7 +9,6 @@ use pi_shell::{
     shell::ShellRunOptions,
 };
 use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
@@ -26,130 +26,6 @@ pub struct Args {
     /// Run as a background job (interactive sessions; not with `pty`).
     #[serde(default)]
     r#async: bool,
-}
-
-const HEAD: usize = 20 * 1024;
-const TAIL: usize = 30 * 1024;
-
-#[derive(Default)]
-struct Collector {
-    head: String,
-    tail: String,
-    elided: usize,
-    /// Full output spill, opened when the first byte is elided.
-    artifact: Option<(u32, std::io::BufWriter<std::fs::File>)>,
-    /// Bytes written to the spill so far.
-    spilled: u64,
-    /// The spill hit `SPILL_CAP`.
-    spill_capped: bool,
-    /// The first spill I/O error, reported once in the output.
-    spill_error: Option<String>,
-    /// For redacting secrets in the spill; the result text is redacted by the agent.
-    cwd: std::path::PathBuf,
-}
-
-/// The spill file stops growing here.
-const SPILL_CAP: u64 = 128 * 1024 * 1024;
-
-impl Collector {
-    fn spill(&mut self, text: &str) {
-        let Some((_, f)) = self.artifact.as_mut() else { return };
-        if self.spill_capped || self.spill_error.is_some() {
-            return;
-        }
-        let redacted = mu_base::secrets::redact(text, &self.cwd).text;
-        let bytes = redacted.as_bytes();
-        let room = SPILL_CAP.saturating_sub(self.spilled) as usize;
-        let n = bytes.len().min(room);
-        let mut cut = n;
-        // Never end the spill in the middle of a character.
-        while cut > 0 && cut < bytes.len() && (bytes[cut] & 0xC0) == 0x80 {
-            cut -= 1;
-        }
-        match f.write_all(&bytes[..cut]) {
-            Ok(()) => self.spilled += cut as u64,
-            Err(e) => self.spill_error = Some(e.to_string()),
-        }
-        if cut < bytes.len() {
-            self.spill_capped = true;
-            if let Err(e) = f.write_all(b"\n[spill truncated at 128 MB]\n") {
-                self.spill_error.get_or_insert(e.to_string());
-            }
-        }
-    }
-
-    fn push(&mut self, mut s: &str, alloc: &dyn Fn() -> (u32, std::path::PathBuf)) {
-        self.spill(s);
-        if self.tail.is_empty() && self.elided == 0 && self.head.len() < HEAD {
-            let mut n = (HEAD - self.head.len()).min(s.len());
-            while !s.is_char_boundary(n) {
-                n += 1;
-            }
-            self.head.push_str(&s[..n]);
-            s = &s[n..];
-        }
-        self.tail.push_str(s);
-        if self.tail.len() > TAIL {
-            let mut cut = self.tail.len() - TAIL;
-            while !self.tail.is_char_boundary(cut) {
-                cut += 1;
-            }
-            if self.artifact.is_none() {
-                let (n, path) = alloc();
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                match std::fs::File::create(&path) {
-                    Ok(f) => {
-                        self.artifact = Some((n, std::io::BufWriter::new(f)));
-                        let (head, tail) = (std::mem::take(&mut self.head), std::mem::take(&mut self.tail));
-                        self.spill(&head);
-                        self.spill(&tail);
-                        self.head = head;
-                        self.tail = tail;
-                    }
-                    Err(e) => self.spill_error = Some(e.to_string()),
-                }
-            }
-            self.elided += cut;
-            self.tail.drain(..cut);
-        }
-    }
-
-    fn finish(mut self) -> Collected {
-        let body = if self.elided > 0 {
-            format!("{}\n[…{}B elided…]\n{}", self.head, self.elided, self.tail)
-        } else {
-            std::mem::take(&mut self.head) + &self.tail
-        };
-        let mut notes = String::new();
-        let mut artifact = None;
-        if let Some((n, mut f)) = self.artifact.take() {
-            if let Err(e) = f.flush() {
-                self.spill_error.get_or_insert(e.to_string());
-            }
-            notes.push_str(&format!("\n[full output: artifact://{n}]"));
-            if self.spill_capped {
-                notes.push_str(" (truncated at 128 MB)");
-            }
-            artifact = Some(n);
-        }
-        let mut spill_note = self.spill_capped.then(|| "spill truncated at 128 MB".to_string());
-        if let Some(e) = &self.spill_error {
-            notes.push_str(&format!("\n[could not save the full output: {e}]"));
-            spill_note = Some(format!("could not save the full output: {e}"));
-        }
-        Collected { body, notes, artifact, spill_note }
-    }
-}
-
-/// What a command printed: the output itself, mu's notes about it (appended for the model), and
-/// the facts the UI shows instead of parsing those notes.
-struct Collected {
-    body: String,
-    notes: String,
-    artifact: Option<u32>,
-    spill_note: Option<String>,
 }
 
 /// The command's timeout, parsed once for both execution paths.
@@ -170,6 +46,148 @@ impl Limits {
 
     fn millis(&self) -> Option<u32> {
         self.timeout.map(|d| d.as_millis() as u32)
+    }
+}
+
+/// A foreground command in a pty: the child, its terminal side, the output so far and the
+/// termination state. Termination sends SIGTERM and a hangup, SIGKILL after `KILL_AFTER`, and gives
+/// the run up `GIVE_UP_AFTER` later.
+struct PtyRun {
+    child: tokio::process::Child,
+    io: std::rc::Rc<mu_base::pty::PtyIo>,
+    input: tokio::sync::mpsc::UnboundedReceiver<mu_base::events::PtyInput>,
+    input_open: bool,
+    /// Keystrokes waiting for the pty to accept them; writing never blocks reads, cancel or timeout.
+    pending_in: std::collections::VecDeque<u8>,
+    write_buf: Vec<u8>,
+    decoder: pi_shell::output_decode::OutputDecoder,
+    cleaner: mu_base::pty::Cleaner,
+    collector: Collector,
+    buf: Vec<u8>,
+    eof: bool,
+    status: Option<std::process::ExitStatus>,
+    cancelled: bool,
+    timed_out: bool,
+    term_at: Option<tokio::time::Instant>,
+    killed: bool,
+}
+
+/// Offers the pty at most 4 KB of the queued keystrokes; the queue itself is unbounded.
+async fn write_some(
+    io: &mu_base::pty::PtyIo,
+    pending: &std::collections::VecDeque<u8>,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    buf.clear();
+    buf.extend(pending.iter().take(4096));
+    io.write_some(buf).await
+}
+
+impl PtyRun {
+    /// Appends raw output: the UI gets it raw, the model gets it cleaned (and spilled when long).
+    fn emit(&mut self, raw: String, ctx: &ToolCtx, tools: &Tools) {
+        if !raw.is_empty() {
+            let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: raw.clone() });
+            let clean = self.cleaner.push(&raw);
+            self.collector.push(&clean, &|| tools.next_artifact());
+        }
+    }
+
+    /// Runs the command until it exits, or until it is cancelled or times out and has been terminated.
+    async fn pump(&mut self, tools: &Tools, ctx: &ToolCtx, timeout: Option<std::time::Duration>) {
+        let timeout_sleep = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(1)));
+        tokio::pin!(timeout_sleep);
+        loop {
+            let deadline = self.deadline();
+            let esc_sleep = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                r = self.io.read(&mut self.buf), if !self.eof => match r {
+                    Ok(0) | Err(_) => self.eof = true,
+                    Ok(n) => {
+                        let raw = self.decoder.push(&self.buf[..n]);
+                        self.emit(raw, ctx, tools);
+                    }
+                },
+                w = write_some(&self.io, &self.pending_in, &mut self.write_buf), if !self.pending_in.is_empty() && self.term_at.is_none() => match w {
+                    Ok(n) => { self.pending_in.drain(..n); }
+                    Err(_) => self.pending_in.clear(),
+                },
+                m = self.input.recv(), if self.input_open => match m {
+                    Some(mu_base::events::PtyInput::Bytes(b)) => self.pending_in.extend(b),
+                    Some(mu_base::events::PtyInput::Resize { cols, rows }) => self.io.resize(cols, rows),
+                    Some(mu_base::events::PtyInput::Kill) => {
+                        if self.term() {
+                            self.cancelled = true;
+                        }
+                    }
+                    None => self.input_open = false,
+                },
+                _ = ctx.cancel.cancelled(), if self.term_at.is_none() => {
+                    self.cancelled = true;
+                    self.term();
+                }
+                _ = &mut timeout_sleep, if timeout.is_some() && self.term_at.is_none() => {
+                    self.timed_out = true;
+                    self.term();
+                }
+                _ = esc_sleep => {
+                    if self.escalate() {
+                        break;
+                    }
+                }
+                st = self.child.wait() => {
+                    self.status = st.ok();
+                    break;
+                }
+            }
+        }
+        // Drain: until EOF, or 300 ms without data (a background descendant may hold the slave open).
+        while !self.eof {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), self.io.read(&mut self.buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let raw = self.decoder.push(&self.buf[..n]);
+                    self.emit(raw, ctx, tools);
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+const KILL_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
+const GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_millis(800);
+
+impl PtyRun {
+    /// Starts termination; false when it had already started.
+    fn term(&mut self) -> bool {
+        if self.term_at.is_some() {
+            return false;
+        }
+        self.term_at = Some(tokio::time::Instant::now());
+        self.io.signal(libc::SIGTERM);
+        self.io.hangup();
+        true
+    }
+
+    /// When the loop must wake for the next escalation step.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        let kill_at = self.term_at.map(|t| t + KILL_AFTER);
+        if self.killed { kill_at.map(|t| t + GIVE_UP_AFTER) } else { kill_at }
+    }
+
+    /// Takes the escalation step that is due; true when the run is to be given up.
+    fn escalate(&mut self) -> bool {
+        if self.killed {
+            return true;
+        }
+        self.killed = true;
+        self.io.signal(libc::SIGKILL);
+        false
     }
 }
 
@@ -246,135 +264,56 @@ impl Tools {
 
     async fn bash_pty(&self, a: &Args, ctx: &ToolCtx) -> Option<ToolOutput> {
         use mu_base::events::PtyInput;
-        use pi_shell::output_decode::OutputDecoder;
-        use std::time::Duration;
         use tokio::sync::{mpsc, oneshot};
 
-        let (input, mut input_rx) = mpsc::unbounded_channel::<PtyInput>();
+        let (input, input_rx) = mpsc::unbounded_channel::<PtyInput>();
         let (reply, rx) = oneshot::channel();
         ctx.events.send(AgentEvent::PtyOpen { id: ctx.call_id.clone(), input, reply }).ok()?;
         let (cols, rows) = rx.await.ok()?;
         let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or_else(|| self.cwd.clone());
         let limits = Limits::new(a.timeout);
-        let (secs, timeout) = (limits.secs, limits.timeout);
-        let mut pty = match mu_base::pty::spawn(&a.command, &cwd, cols, rows, &self.session_env()) {
+        let secs = limits.secs;
+        let pty = match mu_base::pty::spawn(&a.command, &cwd, cols, rows, &self.session_env()) {
             Ok(p) => p,
             Err(e) => return Some(ToolOutput::err(format!("PTY error: {e}"))),
         };
-        let io = pty.io.clone();
+        let mut run = PtyRun {
+            child: pty.child,
+            io: pty.io.clone(),
+            input: input_rx,
+            input_open: true,
+            pending_in: Default::default(),
+            write_buf: Vec::new(),
+            decoder: pi_shell::output_decode::OutputDecoder::new(),
+            cleaner: mu_base::pty::Cleaner::default(),
+            collector: Collector::new(cwd),
+            buf: vec![0u8; 64 * 1024],
+            eof: false,
+            status: None,
+            cancelled: false,
+            timed_out: false,
+            term_at: None,
+            killed: false,
+        };
         let start = Instant::now();
-        let mut decoder = OutputDecoder::new();
-        let mut cleaner = mu_base::pty::Cleaner::default();
-        let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
-        let (mut cancelled, mut timed_out) = (false, false);
-        let mut input_open = true;
-        // Keystrokes waiting for the pty to accept them; writing never blocks reads, cancel or timeout.
-        let mut pending_in: std::collections::VecDeque<u8> = Default::default();
-        let mut write_buf: Vec<u8> = Vec::new();
-        let mut status: Option<std::process::ExitStatus> = None;
-        let mut term_at: Option<tokio::time::Instant> = None; // when termination began
-        let mut killed = false;
-        let mut buf = vec![0u8; 64 * 1024];
-        let timeout_sleep = tokio::time::sleep(timeout.unwrap_or(Duration::from_secs(1)));
-        tokio::pin!(timeout_sleep);
-        let mut eof = false;
-
-        macro_rules! emit {
-            ($raw:expr) => {{
-                let raw: String = $raw;
-                if !raw.is_empty() {
-                    let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: raw.clone() });
-                    let clean = cleaner.push(&raw);
-                    collector.push(&clean, &|| self.next_artifact());
-                }
-            }};
-        }
-
-        loop {
-            // Escalate to SIGKILL 200 ms after SIGTERM; give up waiting 800 ms after that.
-            let kill_at = term_at.map(|t| t + Duration::from_millis(200));
-            let giveup_at = kill_at.map(|t| t + Duration::from_millis(800));
-            let deadline = if killed { giveup_at } else { kill_at };
-            let esc_sleep = async {
-                match deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                r = io.read(&mut buf), if !eof => match r {
-                    Ok(0) | Err(_) => eof = true,
-                    Ok(n) => emit!(decoder.push(&buf[..n])),
-                },
-                w = async {
-                    // Offer at most 4 KB at a time; the queue itself is unbounded.
-                    write_buf.clear();
-                    write_buf.extend(pending_in.iter().take(4096));
-                    io.write_some(&write_buf).await
-                }, if !pending_in.is_empty() && term_at.is_none() => match w {
-                    Ok(n) => { pending_in.drain(..n); }
-                    Err(_) => pending_in.clear(),
-                },
-                m = input_rx.recv(), if input_open => match m {
-                    Some(PtyInput::Bytes(b)) => pending_in.extend(b),
-                    Some(PtyInput::Resize { cols, rows }) => io.resize(cols, rows),
-                    Some(PtyInput::Kill) => {
-                        if term_at.is_none() {
-                            cancelled = true;
-                            term_at = Some(tokio::time::Instant::now());
-                            io.signal(libc::SIGTERM);
-                            io.hangup();
-                        }
-                    }
-                    None => input_open = false,
-                },
-                _ = ctx.cancel.cancelled(), if term_at.is_none() => {
-                    cancelled = true;
-                    term_at = Some(tokio::time::Instant::now());
-                    io.signal(libc::SIGTERM);
-                    io.hangup();
-                }
-                _ = &mut timeout_sleep, if timeout.is_some() && term_at.is_none() => {
-                    timed_out = true;
-                    term_at = Some(tokio::time::Instant::now());
-                    io.signal(libc::SIGTERM);
-                    io.hangup();
-                }
-                _ = esc_sleep => {
-                    if killed {
-                        break;
-                    }
-                    killed = true;
-                    io.signal(libc::SIGKILL);
-                }
-                st = pty.child.wait() => {
-                    status = st.ok();
-                    break;
-                }
-            }
-        }
-
-        // Drain: until EOF, or 300 ms without data (a background descendant may hold the slave open).
-        if !eof {
-            loop {
-                match tokio::time::timeout(Duration::from_millis(300), io.read(&mut buf)).await {
-                    Ok(Ok(n)) if n > 0 => emit!(decoder.push(&buf[..n])),
-                    _ => break,
-                }
-            }
-        }
+        run.pump(self, ctx, limits.timeout).await;
         // The command is over. Anything it left running in the background goes with it; the
         // group is gone once the leader is reaped only if nothing else is in it.
-        mu_base::process::terminate_group(pty.io.pid()).await;
-        emit!(decoder.finish());
-        let tail = cleaner.finish();
-        collector.push(&tail, &|| self.next_artifact());
-        let code = status.and_then(|s| {
-            use std::os::unix::process::ExitStatusExt;
-            s.code().or_else(|| s.signal().map(|g| 128 + g))
-        });
+        mu_base::process::terminate_group(run.io.pid()).await;
+        let raw = run.decoder.finish();
+        run.emit(raw, ctx, self);
+        let tail = run.cleaner.finish();
+        run.collector.push(&tail, &|| self.next_artifact());
         let wall = start.elapsed().as_secs_f64();
-        Some(finish(collector.finish(), wall, secs, cancelled, timed_out, code, false))
+        let end = RunEnd {
+            wall,
+            secs,
+            cancelled: run.cancelled,
+            timed_out: run.timed_out,
+            exit_code: exit_code(run.status),
+            quiet_wall: false,
+        };
+        Some(finish(run.collector.finish(), end))
     }
 
     async fn bash_plain(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
@@ -406,7 +345,7 @@ impl Tools {
             }
         };
         let drain = async {
-            let mut c = Collector { cwd: run_cwd.clone(), ..Default::default() };
+            let mut c = Collector::new(run_cwd.clone());
             // The live tail shows cleaned text; only the pty view gets raw bytes.
             let mut cleaner = mu_base::pty::Cleaner::default();
             while let Ok(s) = rx.recv_async().await {
@@ -426,7 +365,15 @@ impl Tools {
         let res = match res {
             Ok(r) => r,
             Err(_) if aborted.get() => {
-                return finish(output, start.elapsed().as_secs_f64(), secs, true, false, None, true);
+                let end = RunEnd {
+                    wall: start.elapsed().as_secs_f64(),
+                    secs,
+                    cancelled: true,
+                    timed_out: false,
+                    exit_code: None,
+                    quiet_wall: true,
+                };
+                return finish(output, end);
             }
             Err(e) => {
                 let end = output.body.len();
@@ -443,7 +390,15 @@ impl Tools {
             }
         };
         let wall = start.elapsed().as_secs_f64();
-        finish(output, wall, secs, res.cancelled, res.timed_out, res.exit_code, false)
+        let end = RunEnd {
+            wall,
+            secs,
+            cancelled: res.cancelled,
+            timed_out: res.timed_out,
+            exit_code: res.exit_code,
+            quiet_wall: false,
+        };
+        finish(output, end)
     }
 }
 
@@ -494,22 +449,31 @@ fn job_env(vars: Vec<(String, String)>, cwd: &Path, session: Vec<(&'static str, 
 
 /// `bash` on mu's `PATH`, the dialect of the foreground shell; `/bin/sh` when there is none.
 fn job_shell() -> PathBuf {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path).map(|d| d.join("bash")).find(|p| p.is_file()).unwrap_or_else(|| "/bin/sh".into())
+    mu_base::pty::bash_on_path().unwrap_or_else(|| "/bin/sh".into())
 }
 
-/// Builds the result: the same text the model has always seen, plus `meta` carrying the facts the
-/// UI shows (exit code, wall time, flags, artifact), so it never has to parse them back out.
-/// `quiet_wall`: a cancelled-by-user run reports no wall time.
-fn finish(
-    c: Collected,
+/// How a run ended: what `finish` words into the result.
+struct RunEnd {
     wall: f64,
+    /// The timeout as requested, for the timed-out note.
     secs: f64,
     cancelled: bool,
     timed_out: bool,
     exit_code: Option<i32>,
+    /// A cancelled-by-user run reports no wall time.
     quiet_wall: bool,
-) -> ToolOutput {
+}
+
+/// A finished command's exit code: a death by signal is 128 + the signal, as in a shell.
+fn exit_code(status: Option<std::process::ExitStatus>) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.and_then(|s| s.code().or_else(|| s.signal().map(|g| 128 + g)))
+}
+
+/// Builds the result: the same text the model has always seen, plus `meta` carrying the facts the
+/// UI shows (exit code, wall time, flags, artifact), so it never has to parse them back out.
+fn finish(c: Collected, end: RunEnd) -> ToolOutput {
+    let RunEnd { wall, secs, cancelled, timed_out, exit_code, quiet_wall } = end;
     let had_output = !c.body.is_empty();
     let mut text = if had_output { c.body } else { "(no output)".to_string() };
     let output_end = if had_output { text.len() } else { 0 };
@@ -577,9 +541,8 @@ pub async fn run_background(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
-    let mut child = match cmd.spawn() {
+    let mut child = match mu_base::process::spawn_grouped(&mut cmd, false) {
         Ok(c) => c,
         Err(e) => {
             return BackgroundResult {
@@ -594,7 +557,7 @@ pub async fn run_background(
     let (mut out_dec, mut err_dec) =
         (pi_shell::output_decode::OutputDecoder::new(), pi_shell::output_decode::OutputDecoder::new());
     let (mut obuf, mut ebuf) = (vec![0u8; 8192], vec![0u8; 8192]);
-    let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
+    let mut collector = Collector::new(cwd.clone());
     let mut status: Option<std::process::ExitStatus> = None;
     let (mut cancelled, mut timed_out, mut stopping) = (false, false, false);
     // Terminating takes `TERM_GRACE`; it runs beside the loop so output keeps draining meanwhile.
@@ -644,11 +607,16 @@ pub async fn run_background(
     }
     collector.push(&out_dec.finish(), &alloc);
     collector.push(&err_dec.finish(), &alloc);
-    let code = status.and_then(|s| {
-        use std::os::unix::process::ExitStatusExt;
-        s.code().or_else(|| s.signal().map(|g| 128 + g))
-    });
-    let out = finish(collector.finish(), start.elapsed().as_secs_f64(), limits.secs, cancelled, timed_out, code, false);
+    let code = exit_code(status);
+    let end = RunEnd {
+        wall: start.elapsed().as_secs_f64(),
+        secs: limits.secs,
+        cancelled,
+        timed_out,
+        exit_code: code,
+        quiet_wall: false,
+    };
+    let out = finish(collector.finish(), end);
     let failed = cancelled || timed_out || code.is_some_and(|c| c != 0);
     let note = if cancelled {
         "cancelled".to_string()

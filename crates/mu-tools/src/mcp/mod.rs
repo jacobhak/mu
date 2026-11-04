@@ -17,6 +17,20 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+/// Why a JSON file of the `mcp` layer did not load. `Blank` and `Parse` carry the parser's error.
+pub(crate) enum JsonError {
+    Io(std::io::Error),
+    Blank(serde_json::Error),
+    Parse(serde_json::Error),
+}
+
+/// The one reader of the `mcp` JSON files; each caller decides what a missing, blank or broken file means.
+pub(crate) fn read_json(path: &Path) -> Result<serde_json::Value, JsonError> {
+    let text = std::fs::read_to_string(path).map_err(JsonError::Io)?;
+    serde_json::from_str(&text)
+        .map_err(|e| if text.trim().is_empty() { JsonError::Blank(e) } else { JsonError::Parse(e) })
+}
+
 /// MCP protocol version sent at `initialize`, the same as omp.
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 

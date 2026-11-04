@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mu_base::events::Command;
 use mu_tools::mcp::config::{self, Entry, Kind};
 use mu_tools::mcp::discover::{self, Found, Roots};
-use mu_tools::plugin::McpInfo;
+use mu_tools::plugin::host::McpInfo;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
