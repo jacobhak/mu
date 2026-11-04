@@ -31,14 +31,73 @@ pub(super) struct Shared {
     pub(super) interactive: Cell<bool>,
 }
 
+/// What a slot runs: a native plugin from its manifest, or an MCP server with its own state.
+pub(super) enum Kind {
+    Native { manifest: Manifest },
+    Mcp(Box<mcp::McpSlot>),
+}
+
 pub(super) struct Slot {
     /// Hooks for this plugin are skipped until then (it timed out on one).
     pub(super) skip_hooks_until: Cell<Option<Instant>>,
-    pub(super) manifest: Manifest,
-    /// Set for an MCP server: its tools come from the config and the cache, not the manifest.
-    pub(super) mcp: Option<mcp::McpSlot>,
+    pub(super) kind: Kind,
     pub(super) proc: RefCell<Option<Rc<Proc>>>,
     pub(super) start: tokio::sync::Mutex<()>,
+}
+
+impl Slot {
+    /// `<plugin>`, or `mcp:<server>` for an MCP server.
+    pub(super) fn name(&self) -> String {
+        match &self.kind {
+            Kind::Native { manifest } => manifest.name.clone(),
+            Kind::Mcp(m) => format!("mcp:{}", m.name()),
+        }
+    }
+
+    /// What is started: the manifest's first command word, or the MCP server's name.
+    pub(super) fn program(&self) -> String {
+        match &self.kind {
+            Kind::Native { manifest } => manifest.command[0].clone(),
+            Kind::Mcp(m) => m.name(),
+        }
+    }
+
+    pub(super) fn native(&self) -> Option<&Manifest> {
+        match &self.kind {
+            Kind::Native { manifest } => Some(manifest),
+            Kind::Mcp(_) => None,
+        }
+    }
+
+    pub(super) fn as_mcp(&self) -> Option<&mcp::McpSlot> {
+        match &self.kind {
+            Kind::Mcp(m) => Some(m),
+            Kind::Native { .. } => None,
+        }
+    }
+
+    /// Hook subscriptions; an MCP server has none.
+    pub(super) fn hooks(&self) -> &[String] {
+        match &self.kind {
+            Kind::Native { manifest } => &manifest.hooks,
+            Kind::Mcp(_) => &[],
+        }
+    }
+
+    /// Forgets `proc` as this slot's process, so the next call starts a fresh one.
+    pub(super) fn detach(&self, proc: &Rc<Proc>) {
+        let mut cur = self.proc.borrow_mut();
+        if cur.as_ref().is_some_and(|c| Rc::ptr_eq(c, proc)) {
+            *cur = None;
+        }
+    }
+}
+
+/// Forgets `proc` as `slot`'s process and shuts it down. Detaching first means a call that arrives
+/// during the shutdown starts a fresh process.
+pub(super) async fn stop_slot(slot: &Slot, proc: &Rc<Proc>) {
+    slot.detach(proc);
+    proc.shutdown().await;
 }
 
 /// What `PluginHost::mcp_sync` changed, by server name.
@@ -76,16 +135,6 @@ pub struct PluginHost {
     pub(super) mcp_lifetime: Lifetime,
     /// Built-in tool names: a plugin or MCP tool may not take one.
     pub(super) reserved: fn(&str) -> bool,
-}
-
-impl Slot {
-    /// Forgets `proc` as this slot's process, so the next call starts a fresh one.
-    pub(super) fn detach(&self, proc: &Rc<Proc>) {
-        let mut cur = self.proc.borrow_mut();
-        if cur.as_ref().is_some_and(|c| Rc::ptr_eq(c, proc)) {
-            *cur = None;
-        }
-    }
 }
 
 impl PluginHost {
@@ -135,17 +184,16 @@ impl PluginHost {
                 });
                 Rc::new(Slot {
                     skip_hooks_until: Cell::new(None),
-                    manifest: m,
-                    mcp: None,
+                    kind: Kind::Native { manifest: m },
                     proc: RefCell::new(None),
                     start: tokio::sync::Mutex::new(()),
                 })
             })
             .collect();
         for s in servers {
-            slots.push(Self::mcp_slot(s, mcp_lifetime, &init.cwd, &cache_dir, &mut seen, &mut warnings, reserved));
+            slots.push(Self::mcp_slot(s, &init.cwd, &cache_dir, &mut seen, &mut warnings, reserved));
         }
-        let gateway = slots.iter().find(|s| s.manifest.provider.is_some()).map(Rc::downgrade);
+        let gateway = slots.iter().find(|s| s.native().is_some_and(|m| m.provider.is_some())).map(Rc::downgrade);
         let shared = Rc::new(Shared {
             providers: RefCell::new(Weak::new()),
             notices,
@@ -165,11 +213,19 @@ impl PluginHost {
         *self.shared.init.borrow_mut() = init;
     }
 
+    /// The lifetime a slot's process follows: the manifest's, or the configured one for MCP servers.
+    pub(super) fn lifetime_of(&self, slot: &Slot) -> Lifetime {
+        match &slot.kind {
+            Kind::Native { manifest } => manifest.lifetime,
+            Kind::Mcp(_) => self.mcp_lifetime,
+        }
+    }
+
     /// Every tool a slot offers: its manifest's, or an MCP server's listed ones.
     fn specs(slot: &Slot) -> Vec<manifest::ToolSpec> {
-        match &slot.mcp {
-            Some(m) => m.tools.borrow().iter().map(|t| t.spec.clone()).collect(),
-            None => slot.manifest.tools.clone(),
+        match &slot.kind {
+            Kind::Mcp(m) => m.tools.borrow().iter().map(|t| t.spec.clone()).collect(),
+            Kind::Native { manifest } => manifest.tools.clone(),
         }
     }
 
@@ -194,9 +250,9 @@ impl PluginHost {
         self.slots
             .borrow()
             .iter()
-            .find(|s| match &s.mcp {
-                Some(m) => m.tools.borrow().iter().any(|t| t.spec.name == name),
-                None => s.manifest.tools.iter().any(|t| t.name == name),
+            .find(|s| match &s.kind {
+                Kind::Mcp(m) => m.tools.borrow().iter().any(|t| t.spec.name == name),
+                Kind::Native { manifest } => manifest.tools.iter().any(|t| t.name == name),
             })
             .cloned()
     }
@@ -207,7 +263,7 @@ impl PluginHost {
 
     /// The tool belongs to an MCP server (as opposed to a native plugin).
     pub fn is_mcp_tool(&self, name: &str) -> bool {
-        self.slot_for_tool(name).is_some_and(|s| s.mcp.is_some())
+        self.slot_for_tool(name).is_some_and(|s| s.as_mcp().is_some())
     }
 
     /// `(name, description, running, extra)` per plugin; an MCP server is `mcp:<name>` with its kind
@@ -217,16 +273,16 @@ impl PluginHost {
             .borrow()
             .iter()
             .map(|s| {
-                let (label, extra) = match &s.mcp {
+                let (label, extra) = match s.as_mcp() {
                     Some(m) => {
                         let login = if m.needs_login.get() { " · needs login" } else { "" };
                         let label =
-                            format!("{} · {}{login}", m.server.borrow().kind_label(), s.manifest.lifetime.label());
+                            format!("{} · {}{login}", m.server.borrow().kind_label(), self.lifetime_of(s).label());
                         (label, format!("{} tools", m.tools.borrow().len()))
                     }
-                    None => (s.manifest.lifetime.label(), String::new()),
+                    None => (self.lifetime_of(s).label(), String::new()),
                 };
-                (s.manifest.name.clone(), label, s.proc.borrow().is_some(), extra)
+                (s.name(), label, s.proc.borrow().is_some(), extra)
             })
             .collect()
     }
@@ -238,8 +294,10 @@ impl PluginHost {
             Ok(p) => p,
             Err(e) => return fail(e),
         };
-        proc.used.set(true);
-        let mcp_call = slot.mcp.as_ref().and_then(|m| {
+        if let Some(w) = proc.mcp() {
+            w.used.set(true);
+        }
+        let mcp_call = slot.as_mcp().and_then(|m| {
             let tools = m.tools.borrow();
             let t = tools.iter().find(|t| t.spec.name == name)?;
             let schema = t.spec.schema().clone().unwrap_or_default();
@@ -255,9 +313,8 @@ impl PluginHost {
             Some((_, _, params, timeout)) => proc.request_c("tools/call", params.clone(), *timeout, Some(cancel)).await,
             None => proc.request_c("tool/call", json!({"name": name, "arguments": args}), None, Some(cancel)).await,
         };
-        if slot.manifest.lifetime == Lifetime::Call {
-            slot.detach(&proc);
-            proc.shutdown().await;
+        if self.lifetime_of(&slot) == Lifetime::Call {
+            stop_slot(&slot, &proc).await;
         }
         match (res, mcp_call) {
             (Ok(v), Some((server, remote, _, _))) => {
@@ -280,7 +337,7 @@ impl PluginHost {
                 images: Vec::new(),
             },
             (Err(e), call) => {
-                let msg = match &slot.mcp {
+                let msg = match slot.as_mcp() {
                     Some(m) if m.needs_login.get() => self.login_msg(&m.name()),
                     _ => e,
                 };
@@ -300,7 +357,7 @@ impl PluginHost {
             .slots
             .borrow()
             .iter()
-            .find(|s| s.manifest.name == plugin)
+            .find(|s| s.name() == plugin)
             .cloned()
             .ok_or_else(|| format!("no plugin {plugin}"))?;
         let proc = self.ensure(&slot).await?;
@@ -319,7 +376,7 @@ impl PluginHost {
             .slots
             .borrow()
             .iter()
-            .filter(|s| s.manifest.hooks.iter().any(|h| h == sub))
+            .filter(|s| s.hooks().iter().any(|h| h == sub))
             .filter(|s| s.skip_hooks_until.get().is_none_or(|t| now >= t))
             .cloned()
             .collect();
@@ -337,7 +394,7 @@ impl PluginHost {
         let results = futures_util::future::join_all(futs).await;
         let mut out = Vec::new();
         for (slot, r) in slots.into_iter().zip(results) {
-            let name = &slot.manifest.name;
+            let name = slot.name();
             match r {
                 Ok(Ok(v)) => out.push((name.clone(), v)),
                 Ok(Err(e)) => {
@@ -356,10 +413,15 @@ impl PluginHost {
     }
 
     pub async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
-        let slot =
-            self.slots.borrow().iter().find(|s| s.manifest.provider.as_deref() == Some(kind)).cloned().ok_or_else(
-                || "no gateway: install the gateway plugin (~/.mu/plugins/gateway) or set MU_GATEWAY_URL".to_string(),
-            )?;
+        let slot = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|s| s.native().and_then(|m| m.provider.as_deref()) == Some(kind))
+            .cloned()
+            .ok_or_else(|| {
+                "no gateway: install the gateway plugin (~/.mu/plugins/gateway) or set MU_GATEWAY_URL".to_string()
+            })?;
         let proc = self.ensure(&slot).await?;
         let v = proc
             .request("provider/endpoint", json!({"clientPid": std::process::id()}), Some(Duration::from_secs(45)))
@@ -389,8 +451,7 @@ impl PluginHost {
         for s in &slots {
             let p = s.proc.borrow().clone();
             if let Some(p) = p {
-                s.detach(&p);
-                p.shutdown().await;
+                stop_slot(s, &p).await;
             }
         }
     }

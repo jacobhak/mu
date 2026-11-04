@@ -1,7 +1,7 @@
 //! One plugin process: spawning it in its own group, JSON-RPC requests and replies, the read loop
 //! that serves the process's requests, and shutdown.
 
-use super::host::{PluginHost, Shared, Slot};
+use super::host::{Kind, PluginHost, Shared, Slot, stop_slot};
 use super::manifest::{Lifetime, Manifest};
 use super::mcp_runtime::{mcp_request, refresh_listing};
 use mu_common::rpc::{Frame, Framed, Line, Pending, Request, Response};
@@ -43,6 +43,23 @@ pub fn exit_on_signals() {
     });
 }
 
+/// The state only an MCP server's process has.
+pub(super) struct McpWire {
+    /// Requests go out with string ids (`requestIdFormat: "string"`).
+    pub(super) string_ids: bool,
+    /// The server reported the `tools` capability.
+    pub(super) tools_cap: Cell<bool>,
+    /// A tool has been called on this process (it was not started only to list tools).
+    pub(super) used: Cell<bool>,
+    /// The server's `instructions` from `initialize`.
+    pub(super) instructions: RefCell<Option<String>>,
+}
+
+pub(super) enum Dialect {
+    Native,
+    Mcp(McpWire),
+}
+
 pub(super) struct Proc {
     pub(super) name: String,
     pub(super) pid: u32,
@@ -51,16 +68,28 @@ pub(super) struct Proc {
     pub(super) inflight: Cell<u32>,
     pub(super) last: Cell<Instant>,
     pub(super) dead: watch::Sender<bool>,
-    /// An MCP server: `mcp` dialect, no `shutdown` request.
-    pub(super) mcp: bool,
-    /// Requests go out with string ids (`requestIdFormat: "string"`).
-    string_ids: bool,
-    /// The server reported the `tools` capability.
-    pub(super) tools_cap: Cell<bool>,
-    /// A tool has been called on this process (it was not started only to list tools).
-    pub(super) used: Cell<bool>,
-    /// The server's `instructions` from `initialize`.
-    pub(super) instructions: RefCell<Option<String>>,
+    pub(super) dialect: Dialect,
+}
+
+impl Proc {
+    pub(super) fn mcp(&self) -> Option<&McpWire> {
+        match &self.dialect {
+            Dialect::Mcp(w) => Some(w),
+            Dialect::Native => None,
+        }
+    }
+
+    pub(super) fn tools_cap(&self) -> bool {
+        self.mcp().is_some_and(|w| w.tools_cap.get())
+    }
+
+    pub(super) fn used(&self) -> bool {
+        self.mcp().is_some_and(|w| w.used.get())
+    }
+
+    pub(super) fn instructions(&self) -> Option<String> {
+        self.mcp().and_then(|w| w.instructions.borrow().clone())
+    }
 }
 
 fn resolve_command(m: &Manifest) -> std::path::PathBuf {
@@ -103,7 +132,10 @@ impl Proc {
     }
 
     fn wire_id(&self, id: u64) -> Value {
-        if self.string_ids { json!(id.to_string()) } else { json!(id) }
+        match self.mcp() {
+            Some(w) if w.string_ids => json!(id.to_string()),
+            _ => json!(id),
+        }
     }
 
     pub(super) async fn request(
@@ -159,7 +191,7 @@ impl Proc {
             End::Timeout => "timed out",
             End::Cancelled => "cancelled",
         };
-        if self.mcp {
+        if self.mcp().is_some() {
             let n =
                 Request::new(None, "notifications/cancelled", json!({"requestId": self.wire_id(id), "reason": why}));
             let _ = self.write_line(&serde_json::to_string(&n).unwrap()).await;
@@ -171,7 +203,7 @@ impl Proc {
     }
 
     pub(super) async fn shutdown(&self) {
-        if !self.mcp {
+        if self.mcp().is_none() {
             let _ = self.write_line(&serde_json::to_string(&Request::new(None, "shutdown", json!({}))).unwrap()).await;
         }
         self.stdin.lock().await.take();
@@ -245,45 +277,45 @@ async fn read_loop(
 
 async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared>, req: Request) {
     let p = &req.params;
-    let result: Result<Value, String> = match req.method.as_str() {
-        "notifications/tools/list_changed" if slot.mcp.is_some() => {
+    let result: Result<Value, String> = match slot.as_mcp() {
+        Some(m) if req.method == "notifications/tools/list_changed" => {
             // Re-list in the background and rewrite the cache; the change applies next session.
-            if let Some(m) = &slot.mcp
-                && m.listed.get()
-                && !m.stale.replace(true)
-            {
+            if m.listed.get() && !m.stale.replace(true) {
                 tokio::task::spawn_local(refresh_listing(slot.clone(), proc.clone(), shared.clone()));
             }
             Ok(Value::Null)
         }
-        _ if slot.mcp.is_some() => mcp_request(&proc, &slot, &shared, &req).await,
-        "core/complete" => {
-            let target = p["model"].as_str().or(p["role"].as_str()).unwrap_or("smol").to_string();
-            let providers = shared.providers.borrow().upgrade();
-            let text = match providers {
-                Some(pr) => tokio::time::timeout(
-                    Duration::from_secs(180),
-                    pr.complete(
-                        &target,
-                        p["system"].as_str().unwrap_or(""),
-                        p["prompt"].as_str().unwrap_or(""),
-                        p["maxTokens"].as_u64().unwrap_or(2048) as u32,
-                        &CancellationToken::new(),
-                    ),
-                )
-                .await
-                .ok()
-                .and_then(|r| r.ok()),
-                None => None,
-            };
-            Ok(json!({"text": text}))
-        }
-        "ui/notify" => {
-            let level = p["level"].as_str().unwrap_or("info");
-            let _ = shared.notices.send(format!("[{}] {level}: {}", proc.name, p["message"].as_str().unwrap_or("")));
-            Ok(Value::Null)
-        }
-        m => Err(format!("unknown method {m}")),
+        Some(m) => mcp_request(&proc, m, &shared, &req).await,
+        None => match req.method.as_str() {
+            "core/complete" => {
+                let target = p["model"].as_str().or(p["role"].as_str()).unwrap_or("smol").to_string();
+                let providers = shared.providers.borrow().upgrade();
+                let text = match providers {
+                    Some(pr) => tokio::time::timeout(
+                        Duration::from_secs(180),
+                        pr.complete(
+                            &target,
+                            p["system"].as_str().unwrap_or(""),
+                            p["prompt"].as_str().unwrap_or(""),
+                            p["maxTokens"].as_u64().unwrap_or(2048) as u32,
+                            &CancellationToken::new(),
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok()),
+                    None => None,
+                };
+                Ok(json!({"text": text}))
+            }
+            "ui/notify" => {
+                let level = p["level"].as_str().unwrap_or("info");
+                let _ =
+                    shared.notices.send(format!("[{}] {level}: {}", proc.name, p["message"].as_str().unwrap_or("")));
+                Ok(Value::Null)
+            }
+            m => Err(format!("unknown method {m}")),
+        },
     };
     if let Some(id) = req.id {
         let resp = match result {
@@ -312,25 +344,26 @@ pub(super) fn sibling_or_path(c: &str) -> std::path::PathBuf {
 }
 
 impl PluginHost {
+    /// Starts the slot's process if it is not running, and runs its handshake.
     pub(super) async fn ensure(&self, slot: &Rc<Slot>) -> Result<Rc<Proc>, String> {
         let _g = slot.start.lock().await;
         if let Some(p) = slot.proc.borrow().clone() {
             return Ok(p);
         }
-        let m = &slot.manifest;
+        let name = slot.name();
         let log_dir = mu_common::paths::mu_home().join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(log_dir.join(format!("plugin-{}.log", m.name)))
+            .open(log_dir.join(format!("plugin-{name}.log")))
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
-        let mut cmd = match &slot.mcp {
-            Some(_) => self.mcp_command(slot).await?,
-            None => {
-                let mut c = Command::new(resolve_command(m));
-                c.args(&m.command[1..]).current_dir(&m.dir);
+        let mut cmd = match &slot.kind {
+            Kind::Mcp(m) => self.mcp_command(m).await?,
+            Kind::Native { manifest } => {
+                let mut c = Command::new(resolve_command(manifest));
+                c.args(&manifest.command[1..]).current_dir(&manifest.dir);
                 c
             }
         };
@@ -343,33 +376,38 @@ impl PluginHost {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn().map_err(|e| format!("cannot start plugin {} ({}): {e}", m.name, m.command[0]))?;
+        let mut child = cmd.spawn().map_err(|e| format!("cannot start plugin {name} ({}): {e}", slot.program()))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (dead, _) = watch::channel(false);
+        let dialect = match &slot.kind {
+            Kind::Native { .. } => Dialect::Native,
+            Kind::Mcp(ms) => Dialect::Mcp(McpWire {
+                string_ids: ms.server.borrow().string_ids,
+                tools_cap: Cell::new(false),
+                used: Cell::new(false),
+                instructions: RefCell::new(None),
+            }),
+        };
         let proc = Rc::new(Proc {
-            name: m.name.clone(),
+            name: name.clone(),
             pid: child.id().unwrap_or(0),
             stdin: tokio::sync::Mutex::new(Some(stdin)),
             pending: Pending::default(),
             inflight: Cell::new(0),
             last: Cell::new(Instant::now()),
             dead,
-            mcp: slot.mcp.is_some(),
-            string_ids: slot.mcp.as_ref().is_some_and(|s| s.server.borrow().string_ids),
-            tools_cap: Cell::new(false),
-            used: Cell::new(false),
-            instructions: RefCell::new(None),
+            dialect,
         });
         live_groups().lock().unwrap().push(proc.pid as i32);
         *slot.proc.borrow_mut() = Some(proc.clone());
         tokio::task::spawn_local(read_loop(proc.clone(), slot.clone(), self.shared.clone(), stdout, child));
-        let handshake = match &slot.mcp {
-            Some(ms) => {
+        let handshake = match &slot.kind {
+            Kind::Mcp(ms) => {
                 let server = ms.server.borrow().clone();
                 self.mcp_handshake(&proc, &server).await
             }
-            None => {
+            Kind::Native { .. } => {
                 let init = self.shared.init.borrow().clone();
                 let params = json!({
                     "protocolVersion": 1,
@@ -383,20 +421,19 @@ impl PluginHost {
             }
         };
         if let Err(e) = handshake {
-            slot.detach(&proc);
-            proc.shutdown().await;
-            return Err(match &slot.mcp {
+            stop_slot(slot, &proc).await;
+            return Err(match slot.as_mcp() {
                 Some(ms) if ms.needs_login.get() => self.login_msg(&ms.name()),
-                _ => format!("plugin {} failed to start: {e}", m.name),
+                _ => format!("plugin {name} failed to start: {e}"),
             });
         }
-        if let Some(ms) = &slot.mcp
+        if let Some(ms) = slot.as_mcp()
             && ms.listed.get()
-            && proc.tools_cap.get()
+            && proc.tools_cap()
         {
             tokio::task::spawn_local(refresh_listing(slot.clone(), proc.clone(), self.shared.clone()));
         }
-        if let Lifetime::Idle(d) = m.lifetime {
+        if let Lifetime::Idle(d) = self.lifetime_of(slot) {
             let p = Rc::downgrade(&proc);
             let slot = slot.clone();
             tokio::task::spawn_local(async move {
@@ -411,8 +448,7 @@ impl PluginHost {
                     let Some(pr) = p.upgrade() else { return };
                     if pr.inflight.get() == 0 && pr.last.get().elapsed() >= d {
                         // Detach first: a call arriving during shutdown must start a fresh process.
-                        slot.detach(&pr);
-                        pr.shutdown().await;
+                        stop_slot(&slot, &pr).await;
                         return;
                     }
                 }

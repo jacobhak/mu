@@ -225,7 +225,7 @@ fn mcp_server_requests_during_a_call_are_answered() {
         h.list_missing().await;
         // The script lists only echo and other; call `pinger` through the remote-name map.
         let slot = h.slot(0);
-        let m = slot.mcp.as_ref().unwrap();
+        let m = slot.as_mcp().unwrap();
         let mut taken = std::collections::HashSet::new();
         let tools: Vec<_> = ["echo", "pinger", "pic"]
             .iter()
@@ -251,7 +251,7 @@ fn mcp_token_requests_are_refused_from_stdio_servers() {
         let (h, _n) = fx.host("", "");
         h.list_missing().await;
         let slot = h.slot(0);
-        let m = slot.mcp.as_ref().unwrap();
+        let m = slot.as_mcp().unwrap();
         let mut taken = std::collections::HashSet::new();
         let t =
             [mcp::cache::RemoteTool { name: "tokener".into(), description: String::new(), input_schema: json!({}) }];
@@ -299,7 +299,7 @@ fn cancelling_a_listing_stops_the_server_and_leaves_it_unlisted() {
         h.list_missing_until(&cancel).await;
         assert!(t.elapsed() < Duration::from_secs(10), "returned promptly: {:?}", t.elapsed());
         let slot = h.slot(0);
-        let m = slot.mcp.as_ref().unwrap();
+        let m = slot.as_mcp().unwrap();
         assert!(slot.proc.borrow().is_none(), "the server was stopped");
         assert!(!m.listed.get() && !m.failed.get(), "left unlisted so the next turn tries again");
     });
@@ -322,7 +322,7 @@ fn after_login_lists_a_server_whose_listing_failed() {
         let fx = McpFx::new();
         let (h, _n) = fx.host("", "");
         let slot = h.slot(0);
-        let m = slot.mcp.as_ref().unwrap();
+        let m = slot.as_mcp().unwrap();
         m.failed.set(true);
         m.needs_login.set(true);
         h.list_missing().await;
@@ -359,7 +359,7 @@ fn mcp_cancel_sends_notifications_cancelled_and_shutdown_leaves_no_process_group
         let mut taken = std::collections::HashSet::new();
         let hang =
             [mcp::cache::RemoteTool { name: "hang".into(), description: String::new(), input_schema: json!({}) }];
-        slot.mcp.as_ref().unwrap().set_tools(&hang, &mut taken, crate::tools::is_builtin);
+        slot.as_mcp().unwrap().set_tools(&hang, &mut taken, crate::tools::is_builtin);
         let cancel = CancellationToken::new();
         let c = cancel.clone();
         tokio::task::spawn_local(async move {
