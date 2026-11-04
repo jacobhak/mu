@@ -4,7 +4,7 @@
 //! (`inbox: true`) and drains the directory itself.
 //!
 //! (Not to be confused with `events::Inbox`, the steer/follow-up queue.)
-use crate::control::{self, Recheck, Want};
+use crate::session::control::{self, Recheck, Want};
 use crate::session::{self, Owner};
 use mu_common::paths;
 use serde_json::{Value, json};

@@ -1,3 +1,7 @@
+pub mod control;
+pub mod inbox;
+pub mod tail;
+
 use anyhow::{Context, Result, bail};
 use mu_base::message::Message;
 use mu_base::process::try_flock;

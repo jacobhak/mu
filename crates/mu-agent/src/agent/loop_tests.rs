@@ -5,8 +5,8 @@ use crate::testing::{
 };
 use mu_base::config::Configs;
 use mu_provider::provider::types::ProviderError;
-use mu_session::inbox;
-use mu_session::inbox::enqueue;
+use mu_session::session::inbox;
+use mu_session::session::inbox::enqueue;
 use mu_testutil::block_on_local as run;
 
 #[test]

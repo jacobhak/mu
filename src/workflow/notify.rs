@@ -1,6 +1,6 @@
 //! `mu notify <session|id> <text>`: the CLI sender. The queue, the wake-up and the message layout
-//! live in `mu_session::inbox`.
-use mu_session::inbox::{MAX_TEXT, send};
+//! live in `mu_session::session::inbox`.
+use mu_session::session::inbox::{MAX_TEXT, send};
 use std::io::Read;
 use std::path::Path;
 
@@ -30,8 +30,8 @@ pub fn run(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mu_session::inbox::has_pending;
     use mu_session::session;
+    use mu_session::session::inbox::has_pending;
     use mu_testutil::home;
 
     #[test]

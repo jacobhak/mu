@@ -1,5 +1,5 @@
 use super::*;
-use mu_session::{inbox, session};
+use mu_session::session::{self, inbox};
 
 impl Agent {
     pub fn session_id(&self) -> String {

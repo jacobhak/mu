@@ -1,5 +1,5 @@
 use super::*;
-use mu_session::inbox;
+use mu_session::session::inbox;
 
 impl Agent {
     /// Takes queued steering text and pushes it as user messages. Returns whether any was pending.

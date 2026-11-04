@@ -14,7 +14,7 @@ use mu_agent::agent;
 use mu_agent::handle::{AgentSetup, build_agent};
 use mu_base::{events, models, schema};
 use mu_common::paths;
-use mu_session::{inbox, session};
+use mu_session::session::{self, inbox};
 use mu_tools::{context, plugin};
 use serde_json::{Value, json};
 use setup::{Setup, spawn_notice_printer};

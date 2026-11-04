@@ -17,7 +17,7 @@ use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_session::session::LiveSession;
-use mu_session::tail::Tail;
+use mu_session::session::tail::Tail;
 
 /// Most list rows shown at once.
 const LIST_MAX: usize = 8;

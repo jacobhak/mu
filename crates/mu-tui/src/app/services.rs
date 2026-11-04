@@ -5,7 +5,7 @@ use mu_common::paths;
 use mu_provider::auth::store::Entry;
 use mu_provider::provider::client::Providers;
 use mu_provider::provider::providers::ProviderDef;
-use mu_session::{control, inbox};
+use mu_session::session::{control, inbox};
 use mu_tools::mcp::store::{self, Level};
 use serde_json::Value;
 use std::path::{Path, PathBuf};

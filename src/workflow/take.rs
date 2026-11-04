@@ -1,7 +1,7 @@
 //! `mu take <session|id>`: stop a running `mu -p` at its next tool boundary, then resume the
 //! session here, in the TUI. Only POSIX calls (`flock`, `kill`, `exec`), so it is portable.
 use mu_common::paths;
-use mu_session::control::{Recheck, Want, recheck, signal};
+use mu_session::session::control::{Recheck, Want, recheck, signal};
 use mu_session::session::{self, Owner};
 use std::io::IsTerminal;
 use std::path::Path;
