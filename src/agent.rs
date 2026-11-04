@@ -4,12 +4,12 @@ use crate::context::{self, Context, PromptInput};
 use crate::cost::CostLedger;
 use crate::events::{AgentEvent, Command, EventTx, GitInfo, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
 use crate::gitinfo;
+use crate::inbox;
 use crate::jobs::{self, JobsHandle};
 use crate::mem;
 use crate::message::UserInput;
 use crate::message::{Block, Message, StopReason, history_events, is_dismissal, now_ms, text_of, tool_calls};
 use crate::models::{ModelSpec, Thinking};
-use crate::notify;
 use crate::plans;
 use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
@@ -861,7 +861,7 @@ impl Agent {
         self.replay_history();
         self.notice(format!("resumed {}", path.display()));
         if self.notify {
-            let waiting = notify::pending(&self.session_id());
+            let waiting = inbox::pending(&self.session_id());
             if !waiting.is_empty() {
                 let mut from: Vec<&str> = Vec::new();
                 for n in &waiting {
@@ -1730,8 +1730,8 @@ impl Agent {
     fn notify_pending(&self, wake: bool) -> bool {
         self.notify
             && self.session.is_some()
-            && notify::has_pending(&self.session_id())
-            && notify::pending(&self.session_id())
+            && inbox::has_pending(&self.session_id())
+            && inbox::pending(&self.session_id())
                 .iter()
                 .any(|n| !self.notify_seen.contains(&n.name) && !(wake && self.notify_announced.contains(&n.name)))
     }
@@ -1739,12 +1739,12 @@ impl Agent {
     /// Hands queued `mu notify` messages to the model as one `<system-notice>` user message and
     /// deletes the files, but only once that message is in the session file.
     fn take_notify(&mut self) -> bool {
-        if !self.notify || self.session.is_none() || !notify::has_pending(&self.session_id()) {
+        if !self.notify || self.session.is_none() || !inbox::has_pending(&self.session_id()) {
             return false;
         }
         let id = self.session_id();
-        let notes: Vec<notify::Note> =
-            notify::pending(&id).into_iter().filter(|n| !self.notify_seen.contains(&n.name)).collect();
+        let notes: Vec<inbox::Note> =
+            inbox::pending(&id).into_iter().filter(|n| !self.notify_seen.contains(&n.name)).collect();
         if notes.is_empty() {
             return false;
         }
@@ -1752,13 +1752,13 @@ impl Agent {
             let line: String = n.text.lines().next().unwrap_or("").chars().take(80).collect();
             self.notice(format!("↳ mu notify from {}: {line}", n.from));
         }
-        self.push(Message::user(&notify::notice(&notes)));
+        self.push(Message::user(&inbox::notice(&notes)));
         let names: Vec<String> = notes.into_iter().map(|n| n.name).collect();
         if self.entry_ids.last().is_some_and(|e| !e.is_empty()) {
             if let Some(s) = &self.session {
                 s.sync();
             }
-            notify::remove(&id, &names);
+            inbox::remove(&id, &names);
         } else {
             // Not written: keep the files for the next open, but never deliver them twice here.
             self.notify_seen.extend(names);
@@ -2131,6 +2131,7 @@ mod loop_tests {
     use super::*;
     use crate::config::Configs;
     use crate::events::new_inbox;
+    use crate::notify;
     use crate::provider::ProviderError;
     use mu_testutil::block_on_local as run;
 
@@ -2849,7 +2850,7 @@ mod loop_tests {
                     .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("mu notify from steward: say PONG")))
             );
             assert!(session_text(&a).contains("Message from steward (via mu notify"));
-            assert!(!notify::has_pending(&id));
+            assert!(!inbox::has_pending(&id));
             assert!(a.providers.scripted.borrow().is_empty());
         });
     }
@@ -2880,7 +2881,7 @@ mod loop_tests {
             let notice = at(&|m| user_text(m).is_some_and(|t| t.contains("also HELLO")));
             let reply = at(&|m| matches!(m, Message::Assistant { content, .. } if text_of(content) == "one"));
             assert!(result < notice && notice < reply, "the notice goes out before the model's next reply");
-            assert!(!notify::has_pending(&a.session_id()));
+            assert!(!inbox::has_pending(&a.session_id()));
         });
     }
 
@@ -3075,14 +3076,14 @@ mod loop_tests {
                     .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("1 message(s) from mu notify waiting")))
             );
             assert!(!evs.iter().any(|e| matches!(e, AgentEvent::TurnStart)));
-            assert!(notify::has_pending(&id));
+            assert!(inbox::has_pending(&id));
             a.turn(None).await;
             assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::TurnStart)), "announced is not a wake");
             a.turn(Some("hi".to_string().into())).await;
             let users = user_texts(&a);
             assert_eq!(users.len(), 2, "{users:?}");
             assert!(users[0].contains("Message from steward") && users[1] == "hi", "{users:?}");
-            assert!(!notify::has_pending(&id));
+            assert!(!inbox::has_pending(&id));
         });
     }
 
@@ -3114,7 +3115,7 @@ mod loop_tests {
                 pos(&|e| matches!(e, AgentEvent::UserPrompt(t) if t == "earlier prompt")).expect("prompt replayed");
             let reply = pos(&|e| matches!(e, AgentEvent::Text(t) if t == "earlier reply")).expect("reply replayed");
             assert!(prompt < waiting[0] && reply < waiting[0], "notice follows the replayed history");
-            assert!(notify::has_pending(&id), "still delivered with the next prompt, not at open");
+            assert!(inbox::has_pending(&id), "still delivered with the next prompt, not at open");
         });
     }
 
@@ -3143,7 +3144,7 @@ mod loop_tests {
             drop(ctx);
             let _ = task.await;
             assert!(std::fs::read_to_string(path).unwrap().contains("Message from steward (via mu notify"));
-            assert!(!notify::has_pending(&id));
+            assert!(!inbox::has_pending(&id));
         });
     }
 
@@ -3212,7 +3213,7 @@ mod loop_tests {
             a.end_session().await;
             a.load_session(&path).await;
             assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::Notice(n) if n.contains("waiting"))));
-            assert!(notify::has_pending(&id));
+            assert!(inbox::has_pending(&id));
         });
     }
 }

@@ -14,6 +14,7 @@ mod gateway;
 mod gitinfo;
 mod headless;
 mod image;
+mod inbox;
 mod jobs;
 mod jsoncache;
 mod jtd;
@@ -524,7 +525,7 @@ fn run() -> Result<i32> {
         }
         // Same order as above: the handler first, then the record flag, then the agent task.
         if let Some(wake) = notify_wake {
-            match notify::forward_signal(wake) {
+            match inbox::forward_signal(wake) {
                 Ok(()) => session::set_inbox(),
                 Err(e) => {
                     eprintln!("mu: cannot install the SIGUSR2 handler ({e}); `mu notify` messages will only queue")
