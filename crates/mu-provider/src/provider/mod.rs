@@ -1155,6 +1155,18 @@ mod wire_contract_tests {
         }
     }
 
+    fn request<'a>(model: &'a ModelSpec, messages: &'a [Message]) -> Request<'a> {
+        Request {
+            model,
+            thinking: Rc::new(Cell::new(Thinking::High)),
+            system: "sys",
+            tools: &[],
+            messages,
+            max_tokens: None,
+            session_id: Some("s"),
+        }
+    }
+
     #[test]
     fn normalize_id_is_length_safe_and_stable() {
         assert_eq!(LONG_ID.len(), 65);
@@ -1200,5 +1212,45 @@ mod wire_contract_tests {
         let msgs = call("openai-completions", "baseten", "baseten/moonshotai/Kimi-K3");
         let wire = Value::Array(openai_completions::to_wire("", &msgs, &bt)).to_string();
         assert_eq!(wire.matches(&format!("\"{LONG_ID}\"")).count(), 2, "{wire}");
+    }
+
+    #[test]
+    fn an_omp_session_loads_and_replays_only_to_its_own_wire() {
+        let dir = std::env::temp_dir().join(format!("mu-omp-session-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, include_str!("testdata/omp_session.jsonl")).unwrap();
+        let loaded = mu_session::session::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let msgs = loaded.messages;
+        assert_eq!(msgs.len(), 11);
+
+        let anth = spec("anthropic/claude-sonnet-5-5", Api::AnthropicMessages, ThinkingMode::AnthropicAdaptive);
+        let resp = spec("openai/gpt-5.5", Api::OpenAiResponses, ThinkingMode::Effort);
+        let bt = spec("baseten/moonshotai/Kimi-K3", Api::OpenAiCompletions, ThinkingMode::Effort);
+
+        // Anthropic: its own signed thinking replays; no OpenAI reasoning item leaks, native or gateway.
+        let r = request(&anth, &msgs);
+        let native = anthropic_native::body(&r).0.to_string();
+        let gateway = anthropic::body(&r).to_string();
+        for body in [&native, &gateway] {
+            assert!(body.contains("EqQBCkYIARgCIiQ3Zm9vYmFyYmF6MTIzNDU2"), "own signature replays");
+            assert!(!body.contains("rs_0a1b2c3d4e5f") && !body.contains("gAAAAABfakeEncrypted"), "{body}");
+            assert!(!body.contains("Reading the file first") && !body.contains("Two files"), "{body}");
+        }
+
+        // Responses: its own reasoning item and the long call id replay; Anthropic and Chat
+        // Completions thinking never do.
+        let r = openai_responses::body(&request(&resp, &msgs)).to_string();
+        assert!(r.contains("rs_0a1b2c3d4e5f") && r.contains("gAAAAABfakeEncrypted"), "{r}");
+        assert!(r.contains("call_0123456789abcdefghijklmnopqr") && r.contains("fc_0123456789abcdef0123456789abcdef"));
+        assert!(!r.contains("EqQBCk") && !r.contains("The user wants") && !r.contains("Two files"), "{r}");
+
+        // Chat Completions: no reasoning item or signature; other models' thinking is demoted to
+        // plain text (as omp does), never sent as `reasoning_content`.
+        let c = Value::Array(openai_completions::to_wire("sys", &msgs, &bt)).to_string();
+        assert!(!c.contains("rs_0a1b2c3d4e5f") && !c.contains("EqQBCk") && !c.contains("gAAAAABfake"), "{c}");
+        assert!(c.contains("The user wants") && !c.contains("\"reasoning_content\":\"The user wants"), "{c}");
     }
 }

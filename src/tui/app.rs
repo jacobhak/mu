@@ -120,7 +120,7 @@ enum UiMsg {
         then: ChildThen,
         status: Result<std::process::ExitStatus, String>,
     },
-    Sessions(Vec<crate::session::SessionInfo>),
+    Sessions(Vec<mu_session::session::SessionInfo>),
     /// The result of a clipboard copy: the notice to show, or the error.
     Copied(Result<String, String>),
     Models(Result<Vec<GatewayModel>, String>),
@@ -420,7 +420,7 @@ pub async fn run(init: AppInit) -> i32 {
             .and_then(|s| s.to_str())
             .and_then(|s| s.rsplit_once('_'))
             .map_or(path, |(_, id)| id);
-        let profile = crate::session::profile_flag();
+        let profile = mu_session::session::profile_flag();
         eprint!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n");
     }
     0
@@ -845,14 +845,14 @@ impl App {
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths: vec![] });
         let (cwd, tx) = (self.cwd.clone(), self.ui_tx.clone());
         tokio::task::spawn_local(async move {
-            let list = tokio::task::spawn_blocking(move || crate::session::list_recent(&cwd, Some(&cwd), 200))
+            let list = tokio::task::spawn_blocking(move || mu_session::session::list_recent(&cwd, Some(&cwd), 200))
                 .await
                 .unwrap_or_default();
             let _ = tx.send(UiMsg::Sessions(list));
         });
     }
 
-    fn show_sessions(&mut self, list: Vec<crate::session::SessionInfo>) {
+    fn show_sessions(&mut self, list: Vec<mu_session::session::SessionInfo>) {
         // Only fill in a picker that is still the loading one.
         if !matches!(&self.overlay, Some(Overlay::Session { paths, .. }) if paths.is_empty()) {
             return;
@@ -1086,7 +1086,7 @@ impl App {
             OverlayEvent::KillJobs(id) => self.send(Command::KillJobs(id)),
             OverlayEvent::NotifySession { session, text } => {
                 let msg = match crate::notify::send(&session, Some("mu jobs panel"), &text, &self.cwd) {
-                    Ok(line) => format!("message to {}: {line}", crate::session::id_of(&session)),
+                    Ok(line) => format!("message to {}: {line}", mu_session::session::id_of(&session)),
                     Err(e) => format!("message not sent: {e}"),
                 };
                 self.panel_status(msg);

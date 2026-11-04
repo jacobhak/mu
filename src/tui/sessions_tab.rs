@@ -9,8 +9,8 @@ use super::jobs_panel::{pad, wrap};
 use super::line::{self, Line, dim, span};
 use super::reply::accent;
 use super::theme::{self, Role};
-use crate::session::LiveSession;
 use mu_base::events::SubagentStatus;
+use mu_session::session::LiveSession;
 
 pub struct Row {
     pub live: LiveSession,
@@ -56,7 +56,7 @@ impl Row {
 
     /// The session id that `mu notify` and `mu take` accept.
     pub fn id(&self) -> String {
-        crate::session::id_of(&self.live.path)
+        mu_session::session::id_of(&self.live.path)
     }
 }
 

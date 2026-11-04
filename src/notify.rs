@@ -1,9 +1,9 @@
 //! `mu notify <session|id> <text>`: the sender. It queues a message in the session's inbox (see
 //! `inbox.rs` for the layout and the reading side) and wakes the session's owner when an
 //! interactive mu has it open and promises a SIGUSR2 handler. Only POSIX calls (`kill`).
-use crate::control::{self, Recheck, Want};
-use crate::inbox::{DEFAULT_FROM, MAX_FROM, clean_line, ensure_dir, prune};
-use crate::session::{self, Owner};
+use mu_session::control::{self, Recheck, Want};
+use mu_session::inbox::{DEFAULT_FROM, MAX_FROM, clean_line, ensure_dir, prune};
+use mu_session::session::{self, Owner};
 use serde_json::json;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -117,7 +117,7 @@ pub fn run(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inbox::{dir, has_pending, make_private_dir, pending, remove, root};
+    use mu_session::inbox::{dir, has_pending, make_private_dir, pending, remove, root};
     use mu_testutil::home;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;

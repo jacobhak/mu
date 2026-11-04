@@ -4043,6 +4043,7 @@ dependencies = [
  "mu-base",
  "mu-common",
  "mu-provider",
+ "mu-session",
  "mu-testutil",
  "objc2-app-kit",
  "objc2-foundation",
@@ -4168,6 +4169,7 @@ dependencies = [
  "libc",
  "mu-base",
  "mu-common",
+ "mu-session",
  "mu-testutil",
  "reqwest",
  "rustls",
@@ -4176,6 +4178,22 @@ dependencies = [
  "serde_yaml_ng",
  "tokio",
  "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "mu-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jiff",
+ "libc",
+ "mu-base",
+ "mu-common",
+ "mu-testutil",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 

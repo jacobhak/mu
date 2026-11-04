@@ -43,7 +43,7 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
 
 /// The id as a single safe path component; anything else shares one `unnamed` directory.
 fn dir_id(session_id: &str) -> &str {
-    if crate::session::valid_id(session_id) { session_id } else { "unnamed" }
+    if mu_session::session::valid_id(session_id) { session_id } else { "unnamed" }
 }
 
 pub fn local_root(session_id: &str) -> PathBuf {

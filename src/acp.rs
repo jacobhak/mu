@@ -3,12 +3,13 @@
 
 use crate::plugin::PluginHost;
 use crate::tools::summary;
-use crate::{Setup, agent, pick_model, session, setup};
+use crate::{Setup, agent, pick_model, setup};
 use anyhow::{Result, anyhow};
 use mu_base::events::{self, AgentEvent, Command, SharedInbox};
 use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
 use mu_provider::model::pricing;
+use mu_session::session;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
@@ -24,7 +25,7 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL: i64 = -32603;
 
 pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
-    crate::session::set_run_info("acp", None);
+    mu_session::session::set_run_info("acp", None);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {

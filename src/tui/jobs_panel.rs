@@ -14,9 +14,9 @@ use super::reply::{accent, rule};
 use super::session_view;
 use super::sessions_tab::{self, Row};
 use super::theme::{self, Role};
-use crate::session::LiveSession;
-use crate::session_tail::Tail;
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+use mu_session::session::LiveSession;
+use mu_session::tail::Tail;
 
 /// Most list rows shown at once.
 const LIST_MAX: usize = 8;
@@ -254,7 +254,7 @@ impl JobsPanel {
 
     /// The live sessions, read now from the owner records.
     fn refresh_sessions(&mut self) {
-        self.set_sessions(crate::session::live_sessions());
+        self.set_sessions(mu_session::session::live_sessions());
     }
 
     /// A fresh list of live sessions: the selection stays on the same one when it is still there.
@@ -262,7 +262,7 @@ impl JobsPanel {
         self.polled_totals = Some(Instant::now());
         for l in &lives {
             if !self.titles.contains_key(&l.path)
-                && let Some(i) = crate::session::info(&l.path)
+                && let Some(i) = mu_session::session::info(&l.path)
             {
                 let t = i.title.filter(|t| !t.is_empty()).unwrap_or(i.first_prompt);
                 if !t.is_empty() {

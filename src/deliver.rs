@@ -1,8 +1,9 @@
 //! `mu deliver`: approve and implement a parked plan, review it against the plan, send blocking findings back to the implementer session, then have it commit.
 
 use crate::agent::DeliverFn;
-use crate::{notify, plans, review, session};
+use crate::{notify, plans, review};
 use mu_common::paths::{encode_cwd, mu_home, self_exe};
+use mu_session::session;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;

@@ -11,8 +11,8 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const MAX_FROM: usize = 64;
-pub(crate) const DEFAULT_FROM: &str = "another process";
+pub const MAX_FROM: usize = 64;
+pub const DEFAULT_FROM: &str = "another process";
 
 /// One queued message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,15 +24,15 @@ pub struct Note {
     pub at: String,
 }
 
-pub(crate) fn root() -> PathBuf {
+pub fn root() -> PathBuf {
     paths::mu_home().join("inbox")
 }
 
-pub(crate) fn dir(id: &str) -> Option<PathBuf> {
+pub fn dir(id: &str) -> Option<PathBuf> {
     session::valid_id(id).then(|| root().join(id))
 }
 
-pub(crate) fn make_private_dir(p: &Path) -> std::io::Result<()> {
+pub fn make_private_dir(p: &Path) -> std::io::Result<()> {
     match std::fs::DirBuilder::new().mode(0o700).create(p) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
@@ -42,14 +42,14 @@ pub(crate) fn make_private_dir(p: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))
 }
 
-pub(crate) fn ensure_dir(id: &str) -> std::io::Result<PathBuf> {
+pub fn ensure_dir(id: &str) -> std::io::Result<PathBuf> {
     let d = dir(id).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     make_private_dir(&root())?;
     make_private_dir(&d)?;
     Ok(d)
 }
 
-pub(crate) fn clean_line(s: &str, max: usize) -> String {
+pub fn clean_line(s: &str, max: usize) -> String {
     let one: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     one.trim().chars().take(max).collect()
 }
