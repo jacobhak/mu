@@ -1,7 +1,7 @@
 //! `mu review`: the `/review` pipeline without a session. It gathers the same facts and request as
-//! the in-session review (`review.rs`), runs `review-lead` and its workers as child processes, and
+//! the in-session review (`mu_agent::review`), runs `review-lead` and its workers as child processes, and
 //! prints the verdict as JSON or markdown.
-use crate::review::{
+use mu_agent::review::{
     Finding, Meta, PlanStep, Report, RequestInput, git, head_tree, is_blocking, numstat, render_markdown, repo_root,
     report_of, report_schema, request, snapshot_tree, split_excluded,
 };

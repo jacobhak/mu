@@ -1,0 +1,31 @@
+[package]
+name = "mu-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Exposes the scripted-agent builder in `testing` to other crates' tests.
+test-support = ["dep:mu-testutil", "mu-provider/test-support", "mu-tools/test-support"]
+
+[dependencies]
+mu-common.workspace = true
+mu-base.workspace = true
+mu-provider.workspace = true
+mu-session.workspace = true
+mu-tools.workspace = true
+mu-testutil = { workspace = true, optional = true }
+futures-util.workspace = true
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "process", "fs", "io-util"] }
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+mu-testutil.workspace = true
+mu-provider = { workspace = true, features = ["test-support"] }
+mu-tools = { workspace = true, features = ["test-support"] }

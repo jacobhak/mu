@@ -4036,6 +4036,7 @@ dependencies = [
  "futures-util",
  "jiff",
  "libc",
+ "mu-agent",
  "mu-base",
  "mu-common",
  "mu-provider",
@@ -4070,6 +4071,26 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vt100",
+]
+
+[[package]]
+name = "mu-agent"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "jiff",
+ "mu-base",
+ "mu-common",
+ "mu-provider",
+ "mu-session",
+ "mu-testutil",
+ "mu-tools",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

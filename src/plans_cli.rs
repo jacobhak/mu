@@ -1,6 +1,6 @@
-//! `mu plan ...`: the command line over the plan store in `plans.rs`. `new`, `refine` and `approve`
+//! `mu plan ...`: the command line over the plan store in `mu_agent::plans`. `new`, `refine` and `approve`
 //! run through headless mode (`plan_run`); `list`, `show` and `drop` print from the store (`run_cli`).
-use crate::plans::{drift, store_for};
+use mu_agent::plans::{drift, store_for};
 use std::path::Path;
 
 #[derive(clap::Subcommand)]
@@ -32,8 +32,6 @@ pub enum PlanCmd {
     Drop { id: String },
 }
 
-const HEADLESS_NOTE: &str = concat!("\n", include_str!("prompts/plan-headless.md"));
-
 /// How `mu plan new|refine|approve` runs through `headless::print_mode`.
 pub struct PlanRun {
     pub first: mu_base::events::Command,
@@ -46,12 +44,16 @@ pub struct PlanRun {
 pub fn plan_run(cmd: PlanCmd) -> Result<PlanRun, PlanCmd> {
     use mu_base::events::{Command, PlanDecision};
     match cmd {
-        PlanCmd::New { brief } => {
-            Ok(PlanRun { first: Command::TogglePlan(Some(brief)), expect_park: true, note: Some(HEADLESS_NOTE) })
-        }
-        PlanCmd::Refine { id, text } => {
-            Ok(PlanRun { first: Command::RefinePlan { id, text }, expect_park: true, note: Some(HEADLESS_NOTE) })
-        }
+        PlanCmd::New { brief } => Ok(PlanRun {
+            first: Command::TogglePlan(Some(brief)),
+            expect_park: true,
+            note: Some(mu_agent::prompt::HEADLESS_NOTE),
+        }),
+        PlanCmd::Refine { id, text } => Ok(PlanRun {
+            first: Command::RefinePlan { id, text },
+            expect_park: true,
+            note: Some(mu_agent::prompt::HEADLESS_NOTE),
+        }),
         PlanCmd::Approve { id, anyway } => Ok(PlanRun {
             first: Command::StartPlan { id, decision: PlanDecision::Keep { model: None }, anyway },
             expect_park: false,
@@ -101,8 +103,11 @@ async fn cli(cmd: PlanCmd, cwd: &Path) -> i32 {
                 v["drift"] = d.json();
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             } else {
-                let base =
-                    if meta.base.is_none() { "none".to_string() } else { crate::plans::base_label(&meta, cwd).await };
+                let base = if meta.base.is_none() {
+                    "none".to_string()
+                } else {
+                    mu_agent::plans::base_label(&meta, cwd).await
+                };
                 let n = store.root.as_deref().map_or(meta.read.len(), |r| meta.files_read(r).len());
                 println!("id: {}\ntitle: {}\nstatus: {}", meta.id, meta.title, meta.status.name());
                 println!("base: {base}\nread: {n} files\ndrift: {}\n", d.describe());

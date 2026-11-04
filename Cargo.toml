@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [workspace]
-members = ["crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-provider", "crates/mu-session", "crates/mu-testutil", "crates/mu-tools", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
+members = ["crates/mu-agent", "crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-provider", "crates/mu-session", "crates/mu-testutil", "crates/mu-tools", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
 exclude = ["plugins/mcp-http"]
 resolver = "3"
 
@@ -15,6 +15,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+mu-agent = { path = "crates/mu-agent" }
 mu-common = { path = "crates/mu-common" }
 mu-base = { path = "crates/mu-base" }
 mu-testutil = { path = "crates/mu-testutil" }
@@ -84,6 +85,7 @@ lang-markdown = ["highlight", "dep:tree-sitter-md"]
 
 [dependencies]
 mu-common.workspace = true
+mu-agent.workspace = true
 mu-base.workspace = true
 mu-provider.workspace = true
 mu-session.workspace = true
@@ -128,6 +130,7 @@ objc2-app-kit.workspace = true
 
 [dev-dependencies]
 mu-testutil.workspace = true
+mu-agent = { workspace = true, features = ["test-support"] }
 mu-provider = { workspace = true, features = ["test-support"] }
 mu-tools = { workspace = true, features = ["test-support"] }
 

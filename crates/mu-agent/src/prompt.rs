@@ -4,6 +4,9 @@
 use mu_tools::context::{Context, Skill};
 use std::path::Path;
 
+/// The note `mu plan` appends to a headless brief.
+pub const HEADLESS_NOTE: &str = concat!("\n", include_str!("prompts/plan-headless.md"));
+
 pub struct PromptInput<'a> {
     pub model: &'a str,
     pub cwd: &'a Path,

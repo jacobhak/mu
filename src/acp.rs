@@ -1,8 +1,9 @@
 //! `--acp`: Agent Client Protocol server over stdio (newline-delimited JSON-RPC).
 //! One mu `Agent` per ACP session, so each session keeps its own working directory.
 
-use crate::{Setup, agent, pick_model, setup};
+use crate::{Setup, pick_model, setup};
 use anyhow::{Result, anyhow};
+use mu_agent::agent;
 use mu_base::events::{self, AgentEvent, Command, SharedInbox};
 use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;

@@ -1,4 +1,4 @@
-use crate::agent::Agent;
+use super::Agent;
 use mu_base::config::Threshold;
 use mu_base::events::AgentEvent;
 use mu_base::message::{Block, Message, text_of};
@@ -7,10 +7,10 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
-const SUMMARY_PROMPT: &str = include_str!("prompts/compaction-summary.md");
-const UPDATE_PROMPT: &str = include_str!("prompts/compaction-update-summary.md");
-const SYSTEM_PROMPT: &str = include_str!("prompts/summarization-system.md");
-const CONTEXT_TEMPLATE: &str = include_str!("prompts/compaction-summary-context.md");
+const SUMMARY_PROMPT: &str = include_str!("../prompts/compaction-summary.md");
+const UPDATE_PROMPT: &str = include_str!("../prompts/compaction-update-summary.md");
+const SYSTEM_PROMPT: &str = include_str!("../prompts/summarization-system.md");
+const CONTEXT_TEMPLATE: &str = include_str!("../prompts/compaction-summary-context.md");
 const KEEP_TOKENS: u64 = 20_000;
 const SUMMARY_MAX_TOKENS: u32 = 13_107;
 const TOOL_RESULT_CHARS: usize = 2000;

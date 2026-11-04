@@ -1,16 +1,10 @@
 mod acp;
-mod agent;
 mod auth_cmd;
-mod compaction;
 mod deliver;
 mod headless;
 mod notify;
-mod plans;
 mod plans_cli;
-mod policy;
 mod predict_setup;
-mod prompt;
-mod review;
 mod review_cli;
 mod take;
 mod tui;
@@ -18,6 +12,7 @@ mod update;
 
 use anyhow::{Result, bail};
 use clap::Parser;
+use mu_agent::agent;
 use mu_base::{config, events, models, schema, secrets};
 use mu_common::paths;
 use mu_session::{inbox, session};

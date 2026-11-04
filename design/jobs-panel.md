@@ -142,7 +142,7 @@ Notes:
 
 ## Child session transcript
 
-Child sessions are already persisted with `parentSession` (`agent.rs`, `session::create`). Two gaps:
+Child sessions are already persisted with `parentSession` (`crates/mu-agent/src/agent/mod.rs`, `session::create`). Two gaps:
 
 1. The parent learns the child's session path only from the final `result` line. The child emits
    `{"type":"session","path":…}` as soon as its session exists (the `-p` path already does this with

@@ -1,4 +1,5 @@
-use crate::compaction::Outcome;
+mod compaction;
+use self::compaction::Outcome;
 use crate::plans;
 use crate::policy::ToolPolicy;
 use crate::prompt::{self, PromptInput};
@@ -142,8 +143,8 @@ enum Start {
     Plan(ExecPlan),
 }
 
-const PLAN_APPROVED: &str = include_str!("prompts/plan-approved.md");
-const PLAN_REFINE: &str = include_str!("prompts/plan-refine.md");
+const PLAN_APPROVED: &str = include_str!("../prompts/plan-approved.md");
+const PLAN_REFINE: &str = include_str!("../prompts/plan-refine.md");
 
 /// The hidden prompt that starts executing an approved plan.
 fn plan_prompt(p: &ExecPlan) -> String {
@@ -157,7 +158,7 @@ fn plan_prompt(p: &ExecPlan) -> String {
 
 const PLAN_COMPACT_FOCUS: &str = "The user approved an implementation plan; it will be supplied in full right after this summary. Preserve what implementing it needs: decisions, constraints, file paths, symbols, and findings from exploration. Omit the plan text itself.";
 
-const PLAN_PROMPT: &str = include_str!("prompts/plan-mode.md");
+const PLAN_PROMPT: &str = include_str!("../prompts/plan-mode.md");
 
 /// Starts a detached `mu deliver` for a plan, in `cwd`, for `session`. `Ok` is what it printed; `Err` is what to show.
 pub type DeliverFn =
@@ -1347,7 +1348,7 @@ impl Agent {
     }
 
     /// One turn. `first` is `None` for a wake-up that only delivers finished background jobs.
-    async fn turn(&mut self, first: Option<UserInput>) {
+    pub async fn turn(&mut self, first: Option<UserInput>) {
         self.turn_from(first.map_or(Start::Wake, Start::User)).await;
     }
 
@@ -2134,70 +2135,12 @@ impl Agent {
 #[cfg(test)]
 mod loop_tests {
     use super::*;
-    use crate::notify;
+    use crate::testing::{
+        agent, agent_with, assistant, call, drain, enqueue, git_repo, results, save_plan_in, tmp_dir, yield_call,
+    };
     use mu_base::config::Configs;
-    use mu_base::events::new_inbox;
     use mu_provider::provider::ProviderError;
     use mu_testutil::block_on_local as run;
-
-    fn assistant(blocks: Vec<Block>, stop: StopReason) -> Message {
-        Message::Assistant {
-            content: blocks,
-            api: mu_base::models::Api::AnthropicMessages.as_str().into(),
-            provider: "anthropic".into(),
-            model: "m".into(),
-            usage: Default::default(),
-            stop_reason: stop,
-            timestamp: 0,
-            response_id: None,
-            error_message: None,
-        }
-    }
-
-    fn call(id: &str, name: &str) -> Block {
-        Block::ToolCall { id: id.into(), name: name.into(), arguments: json!({}) }
-    }
-
-    fn agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
-        agent_with(script, Configs::default())
-    }
-
-    fn agent_with(
-        script: Vec<Result<Message, ProviderError>>,
-        cfg: Configs,
-    ) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
-        mu_testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
-        let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
-        let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
-        let providers = Rc::new(Providers::new(
-            Rc::new(cfg),
-            mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start()),
-        ));
-        providers.scripted.borrow_mut().extend(script);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = Rc::new(mu_tools::context::Context {
-            warnings: vec![],
-            files: vec![],
-            nested: vec![],
-            rules: vec![],
-            skills: vec![],
-            commands: vec![],
-            agents: vec![],
-        });
-        let model = ModelSpec::gateway("anthropic/m", 200_000, 8192);
-        let a = Agent::new(AgentInit {
-            providers,
-            plugins,
-            cwd: std::env::temp_dir(),
-            ctx,
-            model,
-            thinking: Thinking::parse("off").unwrap(),
-            events: tx,
-            inbox: new_inbox(),
-            deliver: crate::deliver::detached_starter(),
-        });
-        (a, rx)
-    }
 
     #[test]
     fn tool_panic_becomes_an_error_result() {
@@ -2342,73 +2285,6 @@ mod loop_tests {
         });
     }
 
-    fn yield_call(id: &str, args: serde_json::Value) -> Block {
-        Block::ToolCall { id: id.into(), name: "yield".into(), arguments: args }
-    }
-
-    /// Runs `a` as a `--headless` child would be driven: `run_subagent` on one side, the agent loop on the other.
-    async fn drive_subagent(
-        a: &mut Agent,
-        rx: UnboundedReceiver<AgentEvent>,
-        structured: bool,
-    ) -> (serde_json::Value, i32) {
-        let (ctx, mut crx) = tokio::sync::mpsc::unbounded_channel();
-        let agent_side = async {
-            while let Some(c) = crx.recv().await {
-                match c {
-                    Command::Prompt(t) => a.turn(Some(t)).await,
-                    Command::Exit => {
-                        a.emit(AgentEvent::Exit);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        };
-        let (_, r) = tokio::join!(agent_side, crate::headless::run_subagent("go".into(), structured, ctx, rx, |_| {}));
-        r
-    }
-
-    #[test]
-    fn structured_subagent_retries_invalid_yield_and_returns_data() {
-        mu_testutil::home();
-        run(async {
-            let script = vec![
-                Ok(assistant(vec![yield_call("y1", json!({"data":{"n":"x"}}))], StopReason::ToolUse)),
-                Ok(assistant(vec![yield_call("y2", json!({"data":{"n":2.0}}))], StopReason::ToolUse)),
-                Err(ProviderError::Fatal("requested after a successful yield".into())),
-            ];
-            let (mut a, rx) = agent(script);
-            *a.tools.output_schema.borrow_mut() =
-                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
-            a.allow = Some(vec!["read".into()]); // `yield` must still be allowed
-            let (r, code) = drive_subagent(&mut a, rx, true).await;
-            assert_eq!((code, &r["schemaOk"], &r["data"]), (0, &true.into(), &json!({"n":2})), "{r}");
-            assert_eq!(a.providers.scripted.borrow().len(), 1, "no request after a successful yield");
-            let res = results(&a);
-            assert_eq!(res.len(), 2, "{res:?}");
-            assert!(res[0].0 && res[0].1.contains("does not match the output schema") && res[0].1.contains("$.n"));
-            assert!(!res[1].0 && res[1].1.contains("Result submitted"), "{:?}", res[1]);
-        });
-    }
-
-    #[test]
-    fn structured_subagent_ends_after_a_yielded_error() {
-        mu_testutil::home();
-        run(async {
-            let script = vec![
-                Ok(assistant(vec![yield_call("y1", json!({"error":"cannot"}))], StopReason::ToolUse)),
-                Err(ProviderError::Fatal("requested after a successful yield".into())),
-            ];
-            let (mut a, rx) = agent(script);
-            *a.tools.output_schema.borrow_mut() =
-                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
-            let (r, code) = drive_subagent(&mut a, rx, true).await;
-            assert_eq!((code, r["text"].as_str(), &r["schemaOk"]), (1, Some("cannot"), &false.into()), "{r}");
-            assert_eq!(a.providers.scripted.borrow().len(), 1);
-        });
-    }
-
     #[test]
     fn calls_after_a_successful_yield_are_skipped() {
         run(async {
@@ -2441,16 +2317,6 @@ mod loop_tests {
             assert_eq!(ended, Some(false));
             assert_eq!(a.providers.scripted.borrow().len(), 1);
         });
-    }
-
-    fn results(a: &Agent) -> Vec<(bool, String)> {
-        a.messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::ToolResult { is_error, content, .. } => Some((*is_error, format!("{content:?}"))),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]
@@ -2511,24 +2377,6 @@ mod loop_tests {
             }
             assert_eq!(skipped, ["t2"], "the call that ran is not marked");
             assert_eq!(a.providers.scripted.borrow().len(), 1, "no second request");
-        });
-    }
-
-    #[test]
-    fn structured_subagent_fails_instead_of_hanging_when_the_session_cannot_be_created() {
-        let home = mu_testutil::home();
-        run(async {
-            let cwd = std::env::temp_dir().join(format!("mu-nosess-{}", uuid::Uuid::new_v4()));
-            let dir = crate::paths::session_dir(&cwd);
-            std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-            std::fs::write(&dir, "not a directory").unwrap(); // create_dir_all now fails
-            assert!(dir.starts_with(home));
-            let (mut a, rx) = agent(vec![]);
-            a.cwd = cwd;
-            *a.tools.output_schema.borrow_mut() = Some(json!({"type":"object"}));
-            let r = tokio::time::timeout(std::time::Duration::from_secs(10), drive_subagent(&mut a, rx, true)).await;
-            let (r, code) = r.expect("the run hung");
-            assert_eq!((code, &r["isError"]), (1, &true.into()), "{r}");
         });
     }
 
@@ -2611,10 +2459,6 @@ mod loop_tests {
         a.enable_jobs();
         a.enable_notify();
         (a, rx)
-    }
-
-    fn drain(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
     fn user_text(m: &Message) -> Option<String> {
@@ -2846,7 +2690,7 @@ mod loop_tests {
             let (mut a, mut rx) = notify_agent(vec![Ok(assistant(vec![Block::text("PONG")], StopReason::Stop))]);
             a.ensure_session().await;
             let id = a.session_id();
-            notify::enqueue(&id, "steward", "say PONG").unwrap();
+            enqueue(&id, "steward", "say PONG").unwrap();
             a.turn(None).await;
             let evs = drain(&mut rx);
             assert!(evs.iter().any(|e| matches!(e, AgentEvent::Woken)));
@@ -2874,7 +2718,7 @@ mod loop_tests {
             let id = a.session_id();
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                notify::enqueue(&id, "steward", "also HELLO").unwrap();
+                enqueue(&id, "steward", "also HELLO").unwrap();
             });
             a.turn(Some("go".to_string().into())).await;
             assert!(a.providers.scripted.borrow().is_empty(), "two requests in one turn");
@@ -2916,50 +2760,6 @@ mod loop_tests {
             }
             assert!(errored && exited && !sessions);
         });
-    }
-
-    fn tmp_dir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mu-agent-plans-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
-    }
-
-    fn git_repo() -> PathBuf {
-        let d = tmp_dir();
-        let sh = |args: &[&str]| {
-            let o = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(&d)
-                .output()
-                .unwrap();
-            assert!(o.status.success(), "{args:?}");
-        };
-        sh(&["init", "-q"]);
-        std::fs::write(d.join("a.txt"), "one\n").unwrap();
-        sh(&["add", "."]);
-        sh(&["commit", "-qm", "init"]);
-        d
-    }
-
-    async fn save_plan_in(cwd: &Path, read: &[&str]) -> plans::Store {
-        let store = plans::store_for(cwd).await;
-        let base = match store.root.as_deref() {
-            Some(r) => plans::base_now(r).await,
-            None => None,
-        };
-        store
-            .save(plans::Save {
-                slug: "t",
-                title: "T",
-                content: "do it\n",
-                read: read.iter().map(|s| s.to_string()).collect(),
-                session: None,
-                base,
-                adopt: None,
-            })
-            .unwrap();
-        store
     }
 
     #[test]
@@ -3031,39 +2831,6 @@ mod loop_tests {
         });
     }
 
-    /// Runs `first` through `print_mode` against a fresh git repo; returns the exit code and the session file count.
-    async fn headless_refusal(first: Command, prep: impl FnOnce(&Path, &plans::Store)) -> (i32, usize) {
-        let (mut a, rx) = agent(vec![]);
-        a.cwd = git_repo();
-        let store = save_plan_in(&a.cwd, &["a.txt"]).await;
-        prep(&a.cwd, &store);
-        let cwd = a.cwd.clone();
-        let inbox = a.inbox.clone();
-        let (tx, crx) = tokio::sync::mpsc::unbounded_channel();
-        let (_stop, srx) = tokio::sync::mpsc::unbounded_channel();
-        let (_, code) =
-            futures_util::future::join(a.run(crx), crate::headless::print_mode(first, false, tx, rx, inbox, None, srx))
-                .await;
-        let n = std::fs::read_dir(mu_common::paths::session_dir(&cwd)).map_or(0, |d| d.count());
-        (code, n)
-    }
-
-    #[test]
-    fn a_refused_headless_plan_creates_no_session() {
-        let keep = || PlanDecision::Keep { model: None };
-        run(async {
-            let stale = Command::StartPlan { id: "t".into(), decision: keep(), anyway: false };
-            let r = headless_refusal(stale, |cwd, _| std::fs::write(cwd.join("a.txt"), "two\n").unwrap()).await;
-            assert_eq!(r, (1, 0), "stale");
-            let missing = Command::StartPlan { id: "nope".into(), decision: keep(), anyway: false };
-            assert_eq!(headless_refusal(missing, |_, _| {}).await, (1, 0), "not found");
-            let dropped = Command::StartPlan { id: "t".into(), decision: keep(), anyway: false };
-            assert_eq!(headless_refusal(dropped, |_, s| s.drop("t").unwrap()).await, (1, 0), "not pending");
-            let refine = Command::RefinePlan { id: "nope".into(), text: None };
-            assert_eq!(headless_refusal(refine, |_, _| {}).await, (1, 0), "refine not found");
-        });
-    }
-
     #[test]
     fn messages_waiting_at_open_are_announced_and_go_out_with_the_next_prompt() {
         run(async {
@@ -3072,7 +2839,7 @@ mod loop_tests {
             let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
             a.end_session().await;
             a.reset_conversation();
-            notify::enqueue(&id, "steward", "later").unwrap();
+            enqueue(&id, "steward", "later").unwrap();
             drain(&mut rx);
             a.load_session(&path).await;
             let evs = drain(&mut rx);
@@ -3102,7 +2869,7 @@ mod loop_tests {
             let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
             a.end_session().await;
             a.reset_conversation();
-            notify::enqueue(&id, "steward", "later").unwrap();
+            enqueue(&id, "steward", "later").unwrap();
             drain(&mut rx);
             a.load_session(&path).await;
             let evs = drain(&mut rx);
@@ -3134,7 +2901,7 @@ mod loop_tests {
             let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
             let (ctx, crx) = tokio::sync::mpsc::unbounded_channel();
             let task = tokio::task::spawn_local(a.run(crx));
-            notify::enqueue(&id, "steward", "say PONG").unwrap();
+            enqueue(&id, "steward", "say PONG").unwrap();
             wake.send(()).unwrap();
             let waited = tokio::time::timeout(std::time::Duration::from_secs(20), async {
                 while let Some(e) = rx.recv().await {
@@ -3178,8 +2945,8 @@ mod loop_tests {
             let (mut a, _rx) = notify_agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
             a.ensure_session().await;
             let id = a.session_id();
-            notify::enqueue(&id, "a", "first").unwrap();
-            notify::enqueue(&id, "b", "second").unwrap();
+            enqueue(&id, "a", "first").unwrap();
+            enqueue(&id, "b", "second").unwrap();
             a.turn(None).await;
             let users = user_texts(&a);
             assert_eq!(users.len(), 1, "{users:?}");
@@ -3212,7 +2979,7 @@ mod loop_tests {
             a.enable_jobs(); // interactive-like, but `enable_notify` was never called (-p, ACP)
             a.ensure_session().await;
             let (id, path) = (a.session_id(), a.session.as_ref().unwrap().path.clone());
-            notify::enqueue(&id, "steward", "x").unwrap();
+            enqueue(&id, "steward", "x").unwrap();
             a.turn(None).await;
             assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::TurnStart)));
             a.end_session().await;

@@ -276,6 +276,14 @@ pub(crate) async fn run_subagent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_agent::agent::Agent;
+    use mu_agent::plans;
+    use mu_agent::testing::{agent, assistant, git_repo, results, save_plan_in, yield_call};
+    use mu_base::message::StopReason;
+    use mu_provider::provider::ProviderError;
+    use mu_testutil::block_on_local as block;
+    use serde_json::json;
+    use std::path::Path;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
@@ -506,5 +514,118 @@ mod tests {
         assert_eq!((code, r["text"].as_str()), (0, Some("hi")));
         assert!(r.get("data").is_none() && r.get("schemaOk").is_none());
         assert!(matches!(cmds.as_slice(), [Command::Prompt(_), Command::Exit]));
+    }
+
+    /// Runs `a` as a `--headless` child would be driven: `run_subagent` on one side, the agent loop on the other.
+    async fn drive_subagent(
+        a: &mut Agent,
+        rx: UnboundedReceiver<AgentEvent>,
+        structured: bool,
+    ) -> (serde_json::Value, i32) {
+        let (ctx, mut crx) = tokio::sync::mpsc::unbounded_channel();
+        let agent_side = async {
+            while let Some(c) = crx.recv().await {
+                match c {
+                    Command::Prompt(t) => a.turn(Some(t)).await,
+                    Command::Exit => {
+                        a.emit(AgentEvent::Exit);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let (_, r) = tokio::join!(agent_side, run_subagent("go".into(), structured, ctx, rx, |_| {}));
+        r
+    }
+
+    #[test]
+    fn structured_subagent_retries_invalid_yield_and_returns_data() {
+        mu_testutil::home();
+        block(async {
+            let script = vec![
+                Ok(assistant(vec![yield_call("y1", json!({"data":{"n":"x"}}))], StopReason::ToolUse)),
+                Ok(assistant(vec![yield_call("y2", json!({"data":{"n":2.0}}))], StopReason::ToolUse)),
+                Err(ProviderError::Fatal("requested after a successful yield".into())),
+            ];
+            let (mut a, rx) = agent(script);
+            *a.tools.output_schema.borrow_mut() =
+                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+            a.allow = Some(vec!["read".into()]); // `yield` must still be allowed
+            let (r, code) = drive_subagent(&mut a, rx, true).await;
+            assert_eq!((code, &r["schemaOk"], &r["data"]), (0, &true.into(), &json!({"n":2})), "{r}");
+            assert_eq!(a.providers.scripted.borrow().len(), 1, "no request after a successful yield");
+            let res = results(&a);
+            assert_eq!(res.len(), 2, "{res:?}");
+            assert!(res[0].0 && res[0].1.contains("does not match the output schema") && res[0].1.contains("$.n"));
+            assert!(!res[1].0 && res[1].1.contains("Result submitted"), "{:?}", res[1]);
+        });
+    }
+
+    #[test]
+    fn structured_subagent_ends_after_a_yielded_error() {
+        mu_testutil::home();
+        block(async {
+            let script = vec![
+                Ok(assistant(vec![yield_call("y1", json!({"error":"cannot"}))], StopReason::ToolUse)),
+                Err(ProviderError::Fatal("requested after a successful yield".into())),
+            ];
+            let (mut a, rx) = agent(script);
+            *a.tools.output_schema.borrow_mut() =
+                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+            let (r, code) = drive_subagent(&mut a, rx, true).await;
+            assert_eq!((code, r["text"].as_str(), &r["schemaOk"]), (1, Some("cannot"), &false.into()), "{r}");
+            assert_eq!(a.providers.scripted.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn structured_subagent_fails_instead_of_hanging_when_the_session_cannot_be_created() {
+        let home = mu_testutil::home();
+        block(async {
+            let cwd = std::env::temp_dir().join(format!("mu-nosess-{}", uuid::Uuid::new_v4()));
+            let dir = mu_common::paths::session_dir(&cwd);
+            std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+            std::fs::write(&dir, "not a directory").unwrap(); // create_dir_all now fails
+            assert!(dir.starts_with(home));
+            let (mut a, rx) = agent(vec![]);
+            a.cwd = cwd;
+            *a.tools.output_schema.borrow_mut() = Some(json!({"type":"object"}));
+            let r = tokio::time::timeout(std::time::Duration::from_secs(10), drive_subagent(&mut a, rx, true)).await;
+            let (r, code) = r.expect("the run hung");
+            assert_eq!((code, &r["isError"]), (1, &true.into()), "{r}");
+        });
+    }
+
+    /// Runs `first` through `print_mode` against a fresh git repo; returns the exit code and the session file count.
+    async fn headless_refusal(first: Command, prep: impl FnOnce(&Path, &plans::Store)) -> (i32, usize) {
+        let (mut a, rx) = agent(vec![]);
+        a.cwd = git_repo();
+        let store = save_plan_in(&a.cwd, &["a.txt"]).await;
+        prep(&a.cwd, &store);
+        let cwd = a.cwd.clone();
+        let inbox = a.inbox.clone();
+        let (tx, crx) = tokio::sync::mpsc::unbounded_channel();
+        let (_stop, srx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, code) =
+            futures_util::future::join(a.run(crx), print_mode(first, false, tx, rx, inbox, None, srx)).await;
+        let n = std::fs::read_dir(mu_common::paths::session_dir(&cwd)).map_or(0, |d| d.count());
+        (code, n)
+    }
+
+    #[test]
+    fn a_refused_headless_plan_creates_no_session() {
+        let keep = || PlanDecision::Keep { model: None };
+        block(async {
+            let stale = Command::StartPlan { id: "t".into(), decision: keep(), anyway: false };
+            let r = headless_refusal(stale, |cwd, _| std::fs::write(cwd.join("a.txt"), "two\n").unwrap()).await;
+            assert_eq!(r, (1, 0), "stale");
+            let missing = Command::StartPlan { id: "nope".into(), decision: keep(), anyway: false };
+            assert_eq!(headless_refusal(missing, |_, _| {}).await, (1, 0), "not found");
+            let dropped = Command::StartPlan { id: "t".into(), decision: keep(), anyway: false };
+            assert_eq!(headless_refusal(dropped, |_, s| s.drop("t").unwrap()).await, (1, 0), "not pending");
+            let refine = Command::RefinePlan { id: "nope".into(), text: None };
+            assert_eq!(headless_refusal(refine, |_, _| {}).await, (1, 0), "refine not found");
+        });
     }
 }
