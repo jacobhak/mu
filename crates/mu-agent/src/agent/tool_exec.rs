@@ -10,8 +10,8 @@ impl Agent {
         if self.plan.is_some() {
             v.push(Tools::plan_def());
         }
-        v.push(Tools::task_def(self.jobs.is_some(), &self.ctx.agents));
-        if self.jobs.is_some() {
+        v.push(Tools::task_def(self.tools.jobs.is_some(), &self.ctx.agents));
+        if self.tools.jobs.is_some() {
             v.push(Tools::wait_def());
         }
         if let Some(o) = self.tools.output_schema.borrow().as_ref() {
@@ -48,6 +48,14 @@ impl Agent {
             timestamp: now_ms(),
             details: out.stored_details(),
         });
+    }
+
+    /// Marks a call that will not run: it still gets a visible start, an end and a result.
+    pub(super) fn emit_skipped(&mut self, id: &str, name: &str, args: &Value, reason: &str) {
+        self.emit(AgentEvent::ToolSkipped { id: id.into() });
+        self.emit(AgentEvent::ToolStart { id: id.into(), name: name.into(), args: args.clone() });
+        self.emit(AgentEvent::ToolEnd { id: id.into(), name: name.into(), output: ToolOutput::err(reason) });
+        self.push_result(id, name, &ToolOutput::err(reason));
     }
 
     /// Replaces secrets in the text of a user message or tool result.
@@ -123,7 +131,12 @@ impl Agent {
         let args = json!({"command": cmd});
         let id = "user-bash".to_string();
         self.emit(AgentEvent::ToolStart { id: id.clone(), name: "bash".into(), args: args.clone() });
-        let ctx = ToolCtx { events: self.events.clone(), cancel: cancel.clone(), call_id: id.clone() };
+        let ctx = ToolCtx {
+            events: self.events.clone(),
+            cancel: cancel.clone(),
+            call_id: id.clone(),
+            plan: self.plan.is_some(),
+        };
         let mut out = self.tools.call("bash", &args, &ctx).await;
         let hits = self.redact_output(&mut out, false);
         self.log_redaction("user-bash", &hits);
@@ -157,7 +170,12 @@ impl Agent {
         let mut out = match blocked.or(denied) {
             Some(b) => ToolOutput::err(b),
             None => {
-                let ctx = ToolCtx { events: self.events.clone(), cancel: cancel.clone(), call_id: id.into() };
+                let ctx = ToolCtx {
+                    events: self.events.clone(),
+                    cancel: cancel.clone(),
+                    call_id: id.into(),
+                    plan: self.plan.is_some(),
+                };
                 use futures_util::FutureExt;
                 match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await {
                     Ok(o) => o,
@@ -187,14 +205,15 @@ impl Agent {
         }
         let details = out.details.clone();
         if let Some(d) = details.as_ref() {
-            let model = d["model"].as_str().map(String::from);
-            let kind = d["planDecision"].as_str();
-            let (base, now) = match kind {
-                Some("execute" | "compact" | "keep") => (review::snapshot_tree(&self.cwd).await.ok(), now_ms()),
+            let decision = plan_decision(d);
+            let (base, now) = match decision {
+                Some(PlanDecision::Execute { .. } | PlanDecision::Compact { .. } | PlanDecision::Keep { .. }) => {
+                    (review::snapshot_tree(&self.cwd).await.ok(), now_ms())
+                }
                 _ => (None, 0),
             };
-            match kind {
-                Some(k @ ("execute" | "compact")) => {
+            match decision {
+                Some(k @ (PlanDecision::Execute { .. } | PlanDecision::Compact { .. })) => {
                     let (_, saved) = self.save_plan(d).await;
                     let stored = match saved {
                         Ok(m) => Some(m.id),
@@ -207,19 +226,18 @@ impl Agent {
                         content: d["content"].as_str().unwrap_or_default().into(),
                         title: d["title"].as_str().unwrap_or_default().into(),
                         uri: d["uri"].as_str().unwrap_or_default().into(),
-                        mode: if k == "compact" { PlanMode::Compact } else { PlanMode::Fresh },
-                        model,
+                        decision: k,
                         base,
                         approved_at: now,
                         stored,
                     });
                 }
-                Some("keep") => {
+                Some(k @ PlanDecision::Keep { .. }) => {
                     let (store, saved) = self.save_plan(d).await;
                     match saved {
                         Ok(m) => {
                             let session = self.session.as_ref().map(|s| s.path.clone());
-                            if let Err(e) = store.approve(&m.id, "keep", session.as_deref()) {
+                            if let Err(e) = store.approve(&m.id, k.wire_name(), session.as_deref()) {
                                 self.error(format!("could not record the approval: {e}"));
                             }
                         }
@@ -231,11 +249,11 @@ impl Agent {
                         since: now,
                     });
                     self.exit_plan();
-                    if let Some(m) = model {
-                        self.continue_with(&m);
+                    if let Some(m) = k.model() {
+                        self.continue_with(m);
                     }
                 }
-                Some("park") => {
+                Some(PlanDecision::Park) => {
                     let (store, saved) = self.save_plan(d).await;
                     match saved {
                         Ok(m) => {
@@ -270,4 +288,16 @@ impl Agent {
         });
         out
     }
+}
+
+/// Reads the decision a `propose_plan` result records in its details: the tool boundary.
+fn plan_decision(d: &Value) -> Option<PlanDecision> {
+    let model = d["model"].as_str().map(String::from);
+    Some(match d["planDecision"].as_str()? {
+        "execute" => PlanDecision::Execute { model },
+        "compact" => PlanDecision::Compact { model },
+        "keep" => PlanDecision::Keep { model },
+        "park" => PlanDecision::Park,
+        _ => return None,
+    })
 }

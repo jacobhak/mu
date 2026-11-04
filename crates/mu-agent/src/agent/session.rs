@@ -98,7 +98,6 @@ impl Agent {
         self.title_cancel.cancel();
         self.title_cancel = CancellationToken::new();
         self.plan = None;
-        self.tools.plan.set(false);
         self.exec_plan = None;
         self.stored_plan = None;
         self.resumed = false;
@@ -107,7 +106,7 @@ impl Agent {
     }
 
     pub(super) async fn end_session(&mut self) {
-        if let Some(jobs) = &self.jobs {
+        if let Some(jobs) = &self.tools.jobs {
             jobs.clear();
         }
         if self.session.is_some() {
@@ -212,7 +211,6 @@ impl Agent {
             let prev_model = data["prevModel"].as_str().map(String::from);
             let prev_thinking = data["prevThinking"].as_str().and_then(Thinking::parse).unwrap_or(self.thinking);
             self.plan = Some(PlanState { prev_model, prev_thinking });
-            self.tools.plan.set(true);
         }
         self.resumed = true;
         self.sync_plugin_session();

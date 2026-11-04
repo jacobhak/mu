@@ -85,7 +85,7 @@ impl Tools {
             return ToolOutput::err(format!("task: {e}"));
         }
         let schemas: Vec<Option<&Value>> = a.tasks.iter().map(|t| t.output_schema.as_ref()).collect();
-        let plan = self.plan.get();
+        let plan = ctx.plan;
         // (name, agent, task, cwd)
         let specs: Vec<(String, String, String, PathBuf)> = match a
             .tasks
@@ -345,7 +345,7 @@ mod typed_tests {
     async fn bad_output_schema_is_rejected_before_spawning() {
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
         let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","outputSchema":{"type":"bogus"}}]})).unwrap();
         let out = t.task(a, &ctx).await;
         assert!(out.is_error && out.text.contains("outputSchema"), "{}", out.text);

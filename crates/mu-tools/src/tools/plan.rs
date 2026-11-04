@@ -50,7 +50,8 @@ impl Tools {
         };
         let content = std::fs::read_to_string(&path).unwrap_or(content);
         let title = a.title;
-        let approved = |text: &str, kind: &str, model: Option<String>, with_content: bool| {
+        let kind = decision.wire_name();
+        let approved = |text: &str, model: Option<String>, with_content: bool| {
             let mut o = ToolOutput::ok(text);
             let mut d = json!({"planDecision": kind, "model": model, "uri": uri, "title": title});
             if with_content {
@@ -60,20 +61,13 @@ impl Tools {
             o
         };
         match decision {
-            PlanDecision::Execute { model } => {
-                approved("Plan approved. Executing in a fresh session.", "execute", model, true)
+            PlanDecision::Execute { model } => approved("Plan approved. Executing in a fresh session.", model, true),
+            PlanDecision::Compact { model } => {
+                approved("Plan approved. Compacting context, then executing it in this session.", model, true)
             }
-            PlanDecision::Compact { model } => approved(
-                "Plan approved. Compacting context, then executing it in this session.",
-                "compact",
-                model,
-                true,
-            ),
-            PlanDecision::Keep { model } => approved("Plan approved. Implement it now.", "keep", model, false),
+            PlanDecision::Keep { model } => approved("Plan approved. Implement it now.", model, false),
             PlanDecision::Refine(t) => ToolOutput::ok(format!("User requested changes:\n{t}")),
-            PlanDecision::Park => {
-                approved("Plan parked. End your turn now; the user approves it later.", "park", None, true)
-            }
+            PlanDecision::Park => approved("Plan parked. End your turn now; the user approves it later.", None, true),
             PlanDecision::Drop => ToolOutput::err("Plan review was closed without a decision"),
         }
     }

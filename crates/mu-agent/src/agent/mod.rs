@@ -9,7 +9,7 @@ mod status;
 mod title;
 mod tool_exec;
 mod turn;
-use self::compaction::Outcome;
+use self::compaction::{Outcome, estimate_tokens};
 use crate::plans;
 use crate::policy::ToolPolicy;
 use crate::prompt::{self, PromptInput};
@@ -98,7 +98,6 @@ pub struct Agent {
     quota: QuotaTracker,
     pricing_checked: bool,
     turn_msgs: Vec<Value>,
-    jobs: Option<Rc<JobsHandle>>,
     wake_rx: Option<UnboundedReceiver<()>>,
     /// `-p --resume`: when the session cannot be opened, the run ends instead of starting a fresh one.
     pub exit_on_resume_failure: bool,
@@ -117,23 +116,12 @@ pub struct PlanState {
     prev_thinking: Thinking,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum PlanMode {
-    /// A new session (the Execute decision).
-    Fresh,
-    /// This session, compacted first.
-    Compact,
-    /// This session as it is.
-    Keep,
-}
-
 struct ExecPlan {
     content: String,
     title: String,
     /// `local://<slug>-plan.md`
     uri: String,
-    mode: PlanMode,
-    model: Option<String>,
+    decision: PlanDecision,
     /// Tree snapshot at approval, the base for `/review`.
     base: Option<String>,
     approved_at: i64,
@@ -152,12 +140,22 @@ enum Start {
     Plan(ExecPlan),
 }
 
+/// One pass of a turn: a prompt to run, or a wake-up that delivers what finished meanwhile.
+enum Step {
+    /// `synthetic`: a message mu sends itself, which the UI does not echo.
+    Prompt {
+        input: UserInput,
+        synthetic: bool,
+    },
+    Wake,
+}
+
 const PLAN_APPROVED: &str = include_str!("../prompts/plan-approved.md");
 const PLAN_REFINE: &str = include_str!("../prompts/plan-refine.md");
 
 /// The hidden prompt that starts executing an approved plan.
 fn plan_prompt(p: &ExecPlan) -> String {
-    let context = if p.mode != PlanMode::Fresh {
+    let context = if !matches!(p.decision, PlanDecision::Execute { .. }) {
         "- History usable; the plan below authoritative if it conflicts with earlier exploration.\n"
     } else {
         ""
@@ -191,6 +189,9 @@ const SKIP_STEER: &str = "Skipped: the user sent a new message";
 const SKIP_YIELDED: &str = "Skipped: the result was already submitted with `yield`";
 const SKIP_TRUNCATED: &str = "Tool call not executed: output was truncated (max_tokens)";
 
+/// Tools a headless front end never offers: nobody is there to answer `ask` or approve a plan.
+pub const HEADLESS_EXCLUDED: [&str; 2] = ["ask", "propose_plan"];
+
 /// How a loop pass ended.
 enum Flow {
     Done,
@@ -207,33 +208,35 @@ async fn recv_opt(rx: &mut Option<UnboundedReceiver<()>>) -> Option<()> {
     }
 }
 
-/// Runs `fut` (a turn) while still reading commands. Commands that are safe mid-turn (`KillJobs`)
-/// take effect at once, so `/jobs kill` works while `wait` blocks; the rest queue in `backlog`.
-async fn drive<F: std::future::Future<Output = ()>>(
-    fut: F,
-    rx: &mut UnboundedReceiver<Command>,
-    backlog: &mut std::collections::VecDeque<Command>,
+/// Commands read while a turn runs; see `drive`.
+struct Queue {
+    rx: UnboundedReceiver<Command>,
+    backlog: std::collections::VecDeque<Command>,
     jobs: Option<Rc<JobsHandle>>,
     events: EventTx,
     live: Rc<std::cell::Cell<Thinking>>,
-) {
+}
+
+/// Runs `fut` (a turn) while still reading commands. Commands that are safe mid-turn (`KillJobs`)
+/// take effect at once, so `/jobs kill` works while `wait` blocks; the rest queue in `backlog`.
+async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
     tokio::pin!(fut);
     let mut open = true;
     loop {
         tokio::select! {
             () = &mut fut => return,
-            c = rx.recv(), if open => match c {
+            c = q.rx.recv(), if open => match c {
                 Some(Command::KillJobs(id)) => {
-                    let n = jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
-                    let _ = events.send(AgentEvent::Notice(format!("killed {n} job(s)")));
+                    let n = q.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
+                    let _ = q.events.send(AgentEvent::Notice(format!("killed {n} job(s)")));
                 }
                 Some(Command::SetThinking(t)) => {
                     // Takes effect on the next request (including retries); also queued so the
                     // session records it once the turn ends.
-                    live.set(t);
-                    backlog.push_back(Command::SetThinking(t));
+                    q.live.set(t);
+                    q.backlog.push_back(Command::SetThinking(t));
                 }
-                Some(other) => backlog.push_back(other),
+                Some(other) => q.backlog.push_back(other),
                 None => open = false,
             },
         }
@@ -289,7 +292,6 @@ impl Agent {
             quota: QuotaTracker::default(),
             pricing_checked: false,
             turn_msgs: Vec::new(),
-            jobs: None,
             wake_rx: None,
             exit_on_resume_failure: false,
             wake_tx: None,
@@ -305,8 +307,7 @@ impl Agent {
         let (wake, wake_rx) = unbounded_channel();
         self.wake_tx = Some(wake.clone());
         let jobs = JobsHandle::new(wake, self.events.clone());
-        self.tools.jobs = Some(jobs.clone());
-        self.jobs = Some(jobs);
+        self.tools.jobs = Some(jobs);
         self.wake_rx = Some(wake_rx);
     }
 
@@ -329,6 +330,21 @@ impl Agent {
         self.emit(AgentEvent::Error(s.into()));
     }
 
+    /// A failed compaction is an error unless the run was cancelled.
+    fn report_compaction_failure(&self, e: impl std::fmt::Display, cancel: &CancellationToken) {
+        if !cancel.is_cancelled() {
+            self.error(format!("compaction failed: {e}"));
+        }
+    }
+
+    /// Writes a `local://` file, creating its directory. The error is the cause alone.
+    fn write_local_file(&self, uri: &str, content: &str) -> Result<(), String> {
+        let r = self.tools.resolve(uri)?;
+        std::fs::create_dir_all(r.path.parent().unwrap_or(&r.path))
+            .and_then(|()| std::fs::write(&r.path, content))
+            .map_err(|e| e.to_string())
+    }
+
     pub fn system(&self) -> String {
         let mcp = self.plugins.mcp_instructions();
         prompt::system_prompt(&PromptInput {
@@ -345,7 +361,7 @@ impl Agent {
         })
     }
 
-    pub async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
+    pub async fn run(mut self, rx: UnboundedReceiver<Command>) {
         self.quota.enabled = true;
         self.sync_model_state();
         let providers = self.providers.clone();
@@ -357,13 +373,19 @@ impl Agent {
         let mut title_rx = self.title_rx.take().expect("run once");
         let mut wake_rx = self.wake_rx.take();
         let mut quota_rx = self.quota.take_wake();
-        let mut backlog: std::collections::VecDeque<Command> = Default::default();
+        let mut q = Queue {
+            rx,
+            backlog: Default::default(),
+            jobs: self.tools.jobs.clone(),
+            events: self.events.clone(),
+            live: self.live_thinking.clone(),
+        };
         loop {
-            let cmd = if let Some(c) = backlog.pop_front() {
+            let cmd = if let Some(c) = q.backlog.pop_front() {
                 c
             } else {
                 tokio::select! {
-                c = rx.recv() => match c { Some(c) => c, None => break },
+                c = q.rx.recv() => match c { Some(c) => c, None => break },
                 () = tokio::time::sleep(self.quota.wait()) => {
                     self.tick_quota();
                     continue;
@@ -378,15 +400,13 @@ impl Agent {
                     continue;
                 }
                 Some(()) = recv_opt(&mut wake_rx) => {
-                    let (jobs, events, live) = (self.jobs.clone(), self.events.clone(), self.live_thinking.clone());
-                    drive(self.turn(None), &mut rx, &mut backlog, jobs, events, live).await;
+                    drive(self.turn(None), &mut q).await;
                     continue;
                 }
                 }
             };
-            let (jobs, events, live) = (self.jobs.clone(), self.events.clone(), self.live_thinking.clone());
             match cmd {
-                Command::Prompt(t) => drive(self.turn(Some(t)), &mut rx, &mut backlog, jobs, events, live).await,
+                Command::Prompt(t) => drive(self.turn(Some(t)), &mut q).await,
                 Command::EnsureSession => {
                     self.ensure_session().await;
                     self.emit_status();
@@ -413,16 +433,14 @@ impl Agent {
                     (false, p) => {
                         self.enter_plan().await;
                         if let Some(p) = p {
-                            drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events, live).await;
+                            drive(self.turn(Some(p.into())), &mut q).await;
                         }
                     }
-                    (true, Some(p)) => {
-                        drive(self.turn(Some(p.into())), &mut rx, &mut backlog, jobs, events, live).await
-                    }
+                    (true, Some(p)) => drive(self.turn(Some(p.into())), &mut q).await,
                     (true, None) => self.exit_plan(),
                 },
                 Command::Compact(focus) => self.manual_compact(focus).await,
-                Command::Review(focus) => drive(self.review(focus), &mut rx, &mut backlog, jobs, events, live).await,
+                Command::Review(focus) => drive(self.review(focus), &mut q).await,
                 Command::Rename(t) => {
                     self.ensure_session().await;
                     if let Some(s) = self.session.as_mut() {
@@ -433,25 +451,25 @@ impl Agent {
                 }
                 Command::Bash { cmd, include } => self.user_bash(cmd, include).await,
                 Command::KillJobs(id) => {
-                    let n = self.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
+                    let n = self.tools.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
                     self.notice(format!("killed {n} job(s)"));
                 }
                 Command::RefreshTools => self.refresh_tool_defs(),
                 Command::ListPlans => self.list_plans().await,
                 Command::OpenPlan(id) => {
                     if let Some(s) = self.open_plan(&id).await {
-                        drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
+                        drive(self.turn_from(s), &mut q).await;
                     }
                 }
                 Command::Deliver(id) => self.deliver(&id).await,
                 Command::StartPlan { id, decision, anyway } => {
                     if let Some(s) = self.start_plan(&id, decision, anyway).await {
-                        drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
+                        drive(self.turn_from(s), &mut q).await;
                     }
                 }
                 Command::RefinePlan { id, text } => {
                     if let Some(s) = self.refine_plan(&id, text).await {
-                        drive(self.turn_from(s), &mut rx, &mut backlog, jobs, events, live).await;
+                        drive(self.turn_from(s), &mut q).await;
                     }
                 }
                 Command::Exit => {

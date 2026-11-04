@@ -267,7 +267,7 @@ fn model_label(sel: Option<&str>, model: &str) -> String {
 
 fn apply_agent(agent: &mut agent::Agent, def: &context::AgentDef) {
     agent.allow = def.tools.clone();
-    agent.excluded = vec!["ask", "propose_plan"];
+    agent.excluded = agent::HEADLESS_EXCLUDED.to_vec();
     agent.agent_prompt = Some(format!(
         "\nYou are running as the custom agent `{0}`. Follow its instructions exactly; they override your defaults.\n<agent name=\"{0}\">\n{1}\n</agent>\n",
         def.name,
@@ -430,7 +430,7 @@ fn run() -> Result<i32> {
     agent.pin_thinking = cli_thinking.is_some() && resume.is_some();
     if let Some(p) = &task_payload {
         agent.subagent = true;
-        agent.excluded = vec!["ask", "propose_plan"];
+        agent.excluded = agent::HEADLESS_EXCLUDED.to_vec();
         agent.parent_session = p["parentSession"].as_str().map(PathBuf::from);
         if p["agent"] == "scout" {
             agent.allow = Some(["read", "grep", "glob", "web_search", "fetch"].map(String::from).to_vec());

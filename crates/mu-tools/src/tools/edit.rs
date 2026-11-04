@@ -79,14 +79,14 @@ impl EditWriter for FsWriter {
 }
 
 impl Tools {
-    pub async fn edit(&self, a: Args) -> ToolOutput {
+    pub async fn edit(&self, a: Args, plan: bool) -> ToolOutput {
         let policy = PathPolicy {
             cwd: self.cwd.clone(),
             home_dir: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
             url_schemes: vec!["local".into(), "artifact".into(), "skill".into()],
             url_alias_schemes: vec![],
             plan_writable_roots: vec![self.local_root()],
-            plan_active: self.plan.get(),
+            plan_active: plan,
             block_auto_generated: true,
         };
         let cfg = SessionConfig {

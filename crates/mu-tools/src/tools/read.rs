@@ -334,7 +334,7 @@ mod tests {
         // A plain read leaves the line unseen; the edit is refused and points at `:raw`.
         let tag = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
         let input = format!("[l.md#{tag}]\nPUT 2.=2:\n+short\n");
-        let o = t.edit(super::super::edit::Args::for_test(input.clone())).await;
+        let o = t.edit(super::super::edit::Args::for_test(input.clone()), false).await;
         assert!(o.is_error, "{}", o.text);
         assert!(o.text.contains(":raw"), "{}", o.text);
         for p in ["l.md:2:raw", "l.md:2-2:raw", "l.md:raw"] {
@@ -343,7 +343,7 @@ mod tests {
             assert!(o.text.contains(&format!("2:{long}")), "{p}");
         }
         // Same content, same tag: the raw read made the line seen.
-        let o = t.edit(super::super::edit::Args::for_test(input)).await;
+        let o = t.edit(super::super::edit::Args::for_test(input), false).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read_to_string(d.join("l.md")).unwrap(), "a\nshort\nb\n");
     }
@@ -360,7 +360,7 @@ mod tests {
         assert!(o.text.contains("l.md:2,6:raw"), "cut notice: {}", o.text);
         let tag = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
         let input = format!("[l.md#{tag}]\nPUT 2.=6:\n+short\n");
-        let o = t.edit(super::super::edit::Args::for_test(input.clone())).await;
+        let o = t.edit(super::super::edit::Args::for_test(input.clone()), false).await;
         assert!(o.is_error, "{}", o.text);
         let from = o.text.find("Read `").expect(&o.text) + "Read `".len();
         let path = &o.text[from..from + o.text[from..].find('`').unwrap()];
@@ -369,7 +369,7 @@ mod tests {
         assert!(!o.is_error, "{path}: {}", o.text);
         assert!(o.text.contains(&format!("2:{l1}\n")) && o.text.contains(&format!("6:{l2}")), "{}", o.text);
         assert!(o.text.contains("\n...\n"), "{}", o.text);
-        let o = t.edit(super::super::edit::Args::for_test(input)).await;
+        let o = t.edit(super::super::edit::Args::for_test(input), false).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read_to_string(d.join("l.md")).unwrap(), "a\nshort\ne\n");
         // Reversed alias.
@@ -390,12 +390,13 @@ mod tests {
         let o = t.read(Args { path: "c.txt".into() }).await;
         assert!(!o.text.contains(&wide));
         let tag0 = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
-        let o =
-            t.edit(super::super::edit::Args::for_test(format!("[c.txt#{tag0}]\nPUT <1:\n+head a\n+head b\n"))).await;
+        let o = t
+            .edit(super::super::edit::Args::for_test(format!("[c.txt#{tag0}]\nPUT <1:\n+head a\n+head b\n")), false)
+            .await;
         assert!(!o.is_error, "{}", o.text);
         let before = std::fs::read_to_string(d.join("c.txt")).unwrap();
         let stale = format!("[c.txt#{tag0}]\nPUT 1.=1:\n+NOTE: {}\n", &wide[6..768]);
-        let e = t.edit(super::super::edit::Args::for_test(stale)).await;
+        let e = t.edit(super::super::edit::Args::for_test(stale), false).await;
         assert!(e.is_error, "{}", e.text);
         assert_eq!(std::fs::read_to_string(d.join("c.txt")).unwrap(), before, "refused edits write nothing");
         let from = e.text.find("Read `").expect(&e.text) + "Read `".len();
@@ -407,7 +408,8 @@ mod tests {
         assert!(o.text.contains(&format!("[c.txt#{live}]")), "read tag differs from the reply's: {}", o.text);
         assert!(o.text.contains(&format!("3:{wide}")), "{}", o.text);
         let full = wide.replacen("note:", "NOTE:", 1);
-        let o = t.edit(super::super::edit::Args::for_test(format!("[c.txt#{live}]\nPUT 3.=3:\n+{full}\n"))).await;
+        let o =
+            t.edit(super::super::edit::Args::for_test(format!("[c.txt#{live}]\nPUT 3.=3:\n+{full}\n")), false).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read_to_string(d.join("c.txt")).unwrap(), format!("head a\nhead b\n{full}\ntwo\nthree\n"));
     }
@@ -433,7 +435,7 @@ mod tests {
         // Neither unshown line was recorded as seen, so an edit touching them is refused.
         let tag = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
         let input = format!("[w.md#{tag}]\nPUT 5.=5:\n+x\n");
-        let e = t.edit(super::super::edit::Args::for_test(input)).await;
+        let e = t.edit(super::super::edit::Args::for_test(input), false).await;
         assert!(e.is_error, "{}", e.text);
     }
 

@@ -20,7 +20,7 @@ impl Agent {
         match *memo {
             Some((k, t)) if k == key => t,
             _ => {
-                let t = self.system().len() as u64 / 4;
+                let t = estimate_tokens(&self.system());
                 *memo = Some((key, t));
                 t
             }

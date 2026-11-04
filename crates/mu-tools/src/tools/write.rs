@@ -11,7 +11,7 @@ pub struct Args {
 }
 
 impl Tools {
-    pub async fn write(&self, a: Args) -> ToolOutput {
+    pub async fn write(&self, a: Args, plan: bool) -> ToolOutput {
         let res = match self.resolve(&a.path) {
             Ok(r) => r,
             Err(e) => return ToolOutput::err(e),
@@ -19,7 +19,7 @@ impl Tools {
         if let Some(s @ (Scheme::Artifact | Scheme::Skill)) = res.scheme {
             return ToolOutput::err(format!("{}:// is read-only", s.name()));
         }
-        if self.plan.get() && res.scheme != Some(Scheme::Local) {
+        if plan && res.scheme != Some(Scheme::Local) {
             return ToolOutput::err(
                 "Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead.",
             );

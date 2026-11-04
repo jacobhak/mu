@@ -155,6 +155,11 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// The request-size heuristic: about 4 bytes per token.
+pub(super) fn estimate_tokens(text: &str) -> u64 {
+    text.len() as u64 / 4
+}
+
 impl Agent {
     pub fn thresholds(&self) -> (u64, u64) {
         let th = self.providers.cfg.thresholds();
@@ -167,7 +172,7 @@ impl Agent {
     pub fn estimate_tokens(&self) -> u64 {
         self.system_tokens()
             + self.messages_tokens()
-            + self.compaction.as_ref().map_or(0, |c| c.summary.len() as u64 / 4)
+            + self.compaction.as_ref().map_or(0, |c| estimate_tokens(&c.summary))
     }
 
     /// Newest usage if it postdates the last compaction, else an estimate.
@@ -229,7 +234,7 @@ impl Agent {
         self.messages.drain(..cut);
         self.entry_ids.drain(..cut);
         let after_est = self.system_tokens()
-            + summary.len() as u64 / 4
+            + estimate_tokens(&summary)
             + self.messages.iter().map(Message::estimate_tokens).sum::<u64>();
         if let Some(s) = self.session.as_mut() {
             s.compaction(&summary, &first_kept, before, after_est);
@@ -271,8 +276,7 @@ impl Agent {
         match self.compact(focus.as_deref(), &cancel).await {
             Outcome::Done => {}
             Outcome::Skipped(why) => self.notice(why),
-            Outcome::Failed(e) if !cancel.is_cancelled() => self.error(format!("compaction failed: {e}")),
-            Outcome::Failed(_) => {}
+            Outcome::Failed(e) => self.report_compaction_failure(e, &cancel),
         }
         self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
     }

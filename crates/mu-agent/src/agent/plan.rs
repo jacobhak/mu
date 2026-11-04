@@ -16,7 +16,6 @@ impl Agent {
             );
         }
         self.plan = Some(prev);
-        self.tools.plan.set(true);
         self.notice("plan mode on");
         self.emit_status();
     }
@@ -30,7 +29,6 @@ impl Agent {
         if let Some(s) = self.session.as_mut() {
             s.mode_change("none", json!({}));
         }
-        self.tools.plan.set(false);
         self.notice("plan mode off");
         self.emit_status();
     }
@@ -38,15 +36,8 @@ impl Agent {
     /// Gives a fresh session the approved plan as a `local://` file, so the path in the execution
     /// prompt resolves, and names the session after the plan.
     fn seed_plan(&mut self, p: &ExecPlan) {
-        match self.tools.resolve(&p.uri) {
-            Ok(r) => {
-                if let Err(e) = std::fs::create_dir_all(r.path.parent().unwrap_or(&r.path))
-                    .and_then(|_| std::fs::write(&r.path, &p.content))
-                {
-                    self.error(format!("cannot copy the plan to {}: {e}", p.uri));
-                }
-            }
-            Err(e) => self.error(format!("cannot copy the plan to {}: {e}", p.uri)),
+        if let Err(e) = self.write_local_file(&p.uri, &p.content) {
+            self.error(format!("cannot copy the plan to {}: {e}", p.uri));
         }
         if self.title.is_none() && !p.title.trim().is_empty() {
             if let Some(s) = self.session.as_mut() {
@@ -85,11 +76,11 @@ impl Agent {
     /// Starts the approved plan in this session. `None`: it could not start (already reported).
     pub(super) async fn begin_plan(&mut self, p: ExecPlan, cancel: &CancellationToken) -> Option<UserInput> {
         self.exit_plan();
-        if let Some(m) = &p.model {
+        if let Some(m) = p.decision.model() {
             self.continue_with(m);
         }
-        match p.mode {
-            PlanMode::Fresh => {
+        match p.decision {
+            PlanDecision::Execute { .. } => {
                 self.end_session().await;
                 self.reset_conversation();
                 self.notice("── new session");
@@ -97,26 +88,26 @@ impl Agent {
                     return None;
                 }
             }
-            PlanMode::Compact => {
+            PlanDecision::Compact { .. } => {
                 if !self.ensure_session().await {
                     return None;
                 }
                 match self.compact(Some(PLAN_COMPACT_FOCUS), cancel).await {
                     Outcome::Done => {}
                     Outcome::Skipped(why) => self.notice(why),
-                    Outcome::Failed(e) if !cancel.is_cancelled() => self.error(format!("compaction failed: {e}")),
-                    Outcome::Failed(_) => {}
+                    Outcome::Failed(e) => self.report_compaction_failure(e, cancel),
                 }
                 if cancel.is_cancelled() {
                     self.notice("Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.");
                     return None;
                 }
             }
-            PlanMode::Keep => {
+            PlanDecision::Keep { .. } => {
                 if !self.ensure_session().await {
                     return None;
                 }
             }
+            _ => return None,
         }
         self.seed_plan(&p);
         self.set_review_base(review::ReviewBase {
@@ -125,13 +116,8 @@ impl Agent {
             since: p.approved_at,
         });
         if let Some(id) = &p.stored {
-            let decision = match p.mode {
-                PlanMode::Fresh => "execute",
-                PlanMode::Compact => "compact",
-                PlanMode::Keep => "keep",
-            };
             let session = self.session.as_ref().map(|s| s.path.clone());
-            if let Err(e) = plans::store_for(&self.cwd).await.approve(id, decision, session.as_deref()) {
+            if let Err(e) = plans::store_for(&self.cwd).await.approve(id, p.decision.wire_name(), session.as_deref()) {
                 self.error(format!("could not record the approval: {e}"));
             }
         }
@@ -224,10 +210,7 @@ impl Agent {
     ) -> Option<Start> {
         let id = meta.id.as_str();
         let uri = format!("local://{id}-plan.md");
-        let (mode, model) = match decision {
-            PlanDecision::Execute { model } => (PlanMode::Fresh, model),
-            PlanDecision::Compact { model } => (PlanMode::Compact, model),
-            PlanDecision::Keep { model } => (PlanMode::Keep, model),
+        let decision = match decision {
             PlanDecision::Drop => {
                 match store.drop(id) {
                     Ok(()) => self.notice(format!("dropped plan {id}")),
@@ -240,12 +223,7 @@ impl Agent {
                     self.enter_plan().await;
                 }
                 self.stored_plan = Some(id.to_string());
-                let written = self.tools.resolve(&uri).and_then(|r| {
-                    std::fs::create_dir_all(r.path.parent().unwrap_or(&r.path))
-                        .and_then(|()| std::fs::write(&r.path, &content))
-                        .map_err(|e| e.to_string())
-                });
-                if let Err(e) = written {
+                if let Err(e) = self.write_local_file(&uri, &content) {
                     self.error(format!("cannot copy the plan to {uri}: {e}"));
                     return None;
                 }
@@ -257,13 +235,13 @@ impl Agent {
                 return Some(Start::Synthetic(prompt.into()));
             }
             PlanDecision::Park => return None,
+            approved => approved,
         };
         Some(Start::Plan(ExecPlan {
             content,
             title: meta.title.clone(),
             uri,
-            mode,
-            model,
+            decision,
             base: review::snapshot_tree(&self.cwd).await.ok(),
             approved_at: now_ms(),
             stored: Some(id.to_string()),

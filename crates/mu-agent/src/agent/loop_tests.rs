@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::review;
 use crate::testing::{agent, agent_with, assistant, call, drain, git_repo, results, save_plan_in, tmp_dir, yield_call};
@@ -100,8 +99,7 @@ fn plan_prompt_inlines_plan_and_path() {
         content: "do it\n".into(),
         title: "T".into(),
         uri: "local://t-plan.md".into(),
-        mode: PlanMode::Compact,
-        model: None,
+        decision: PlanDecision::Compact { model: None },
         base: None,
         approved_at: 0,
         stored: None,
@@ -119,8 +117,7 @@ fn failed_turn_clears_stale_exec_plan() {
             content: "plan".into(),
             title: String::new(),
             uri: String::new(),
-            mode: PlanMode::Fresh,
-            model: None,
+            decision: PlanDecision::Execute { model: None },
             base: None,
             approved_at: 0,
             stored: None,
@@ -281,16 +278,16 @@ fn stop_plus_cancel_is_an_abort_and_stays_paired() {
 #[test]
 fn kill_jobs_is_handled_mid_turn_and_other_commands_queue() {
     run(async {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-        let mut backlog = Default::default();
         tx.send(Command::KillJobs(None)).unwrap();
         tx.send(Command::NewSession).unwrap();
         let live = Rc::new(std::cell::Cell::new(Thinking::Off));
-        drive(tokio::time::sleep(std::time::Duration::from_millis(50)), &mut rx, &mut backlog, None, etx, live).await;
+        let mut q = Queue { rx, backlog: Default::default(), jobs: None, events: etx, live };
+        drive(tokio::time::sleep(std::time::Duration::from_millis(50)), &mut q).await;
         assert!(matches!(erx.try_recv(), Ok(AgentEvent::Notice(m)) if m.contains("killed")));
-        assert_eq!(backlog.len(), 1);
-        assert!(matches!(backlog.pop_front(), Some(Command::NewSession)));
+        assert_eq!(q.backlog.len(), 1);
+        assert!(matches!(q.backlog.pop_front(), Some(Command::NewSession)));
     });
 }
 
@@ -525,8 +522,7 @@ fn a_stop_skips_plan_dispatch_and_follow_ups() {
             content: "plan".into(),
             title: "T".into(),
             uri: "local://t-plan.md".into(),
-            mode: PlanMode::Fresh,
-            model: None,
+            decision: PlanDecision::Execute { model: None },
             base: None,
             approved_at: 0,
             stored: None,
@@ -669,8 +665,7 @@ fn a_stored_plan_starts_in_the_current_session() {
             content: "do it\n".into(),
             title: "T".into(),
             uri: "local://t-plan.md".into(),
-            mode: PlanMode::Keep,
-            model: None,
+            decision: PlanDecision::Keep { model: None },
             base: review::snapshot_tree(&a.cwd).await.ok(),
             approved_at: 1,
             stored: Some("t".into()),

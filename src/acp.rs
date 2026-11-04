@@ -537,7 +537,7 @@ async fn open_session(
     });
     agent.pin_model = model.is_some() && resume.is_some();
     agent.pin_thinking = thinking.is_some() && resume.is_some();
-    agent.excluded = vec!["ask", "propose_plan"];
+    agent.excluded = agent::HEADLESS_EXCLUDED.to_vec();
     agent.enable_jobs();
     let task = tokio::task::spawn_local(agent.run(cmd_rx));
     let known = resume.as_deref().map(session::id_of);

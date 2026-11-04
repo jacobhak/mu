@@ -31,6 +31,8 @@ pub struct ToolCtx {
     pub events: EventTx,
     pub cancel: CancellationToken,
     pub call_id: String,
+    /// Plan mode is on for this call. The agent owns the plan state and hands it in per call.
+    pub plan: bool,
 }
 
 /// The per-session state the tools share: the todo list, the session's ids and file, and its skills.
@@ -50,7 +52,6 @@ pub struct Tools {
     /// Set in interactive sessions: `task` then runs in the background.
     pub jobs: Option<Rc<JobsHandle>>,
     session: ToolSession,
-    pub plan: std::cell::Cell<bool>,
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
     pub edit_store: pi_edit::EditStore,
@@ -70,7 +71,6 @@ impl Tools {
             plugins,
             jobs: None,
             session: Default::default(),
-            plan: Default::default(),
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
             shell: OnceCell::new(),
@@ -225,7 +225,7 @@ pub static BUILTINS: &[Builtin] = &[
                 json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
             )
         }),
-        call: dispatch!("write", async |t, a: write::Args, _c| t.write(a)),
+        call: dispatch!("write", async |t, a: write::Args, c| t.write(a, c.plan)),
     },
     Builtin {
         name: "edit",
@@ -237,7 +237,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "input":{"type":"string","description":"The edit payload, in the format described above"}},"required":["input"]}),
             )
         }),
-        call: dispatch!("edit", async |t, a: edit::Args, _c| t.edit(a)),
+        call: dispatch!("edit", async |t, a: edit::Args, c| t.edit(a, c.plan)),
     },
     Builtin {
         name: "bash",
@@ -364,7 +364,7 @@ mod table_tests {
         // Every built-in dispatches (bad arguments are an argument error, never "Unknown tool").
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         for b in BUILTINS {
             let out = rt.block_on(t.call(b.name, &json!({"__nonsense": true}), &ctx));

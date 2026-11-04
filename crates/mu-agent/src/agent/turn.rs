@@ -29,7 +29,7 @@ impl Agent {
 
     pub(super) async fn turn_from(&mut self, start: Start) {
         if matches!(start, Start::Wake)
-            && !self.jobs.as_ref().is_some_and(|j| j.has_undelivered())
+            && !self.tools.jobs.as_ref().is_some_and(|j| j.has_undelivered())
             && !self.notify_pending(true)
         {
             return;
@@ -43,77 +43,23 @@ impl Agent {
         let cancel = CancellationToken::new();
         self.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
-        let wake = matches!(start, Start::Wake);
         let mut aborted = false;
-        let mut synthetic = false;
         let mut next = match start {
-            Start::User(i) => Some(Some(i)),
-            Start::Synthetic(i) => {
-                synthetic = true;
-                Some(Some(i))
-            }
-            Start::Wake => Some(None),
+            Start::User(input) => Some(Step::Prompt { input, synthetic: false }),
+            Start::Synthetic(input) => Some(Step::Prompt { input, synthetic: true }),
+            Start::Wake => Some(Step::Wake),
             Start::Plan(p) => match self.begin_plan(p, &cancel).await {
-                Some(i) => {
-                    synthetic = true;
-                    Some(Some(i))
-                }
+                Some(input) => Some(Step::Prompt { input, synthetic: true }),
                 None => {
                     aborted = true;
                     None
                 }
             },
         };
-        while let Some(input) = next.take() {
-            if !self.ensure_session().await {
+        while let Some(step) = next.take() {
+            if !self.begin_pass(step, &cancel).await {
                 break;
             }
-            let extra = match &input {
-                Some(i) => {
-                    if !synthetic {
-                        self.emit(AgentEvent::UserPrompt(i.text.clone()));
-                    }
-                    self.user_turn += 1;
-                    let prompt = secrets::redact(&i.text, &self.cwd).text;
-                    let res = self
-                        .plugins
-                        .hook(
-                            "prompt_submit",
-                            json!({"prompt": prompt, "userTurn": self.user_turn, "resumed": self.resumed}),
-                        )
-                        .await;
-                    self.apply_plugin_context(res);
-                    i.text.len() as u64 / 4 + 1600 * i.images.len() as u64
-                }
-                None => 0,
-            };
-            if self.needs_compaction(extra)
-                && let Outcome::Failed(e) = self.compact(None, &cancel).await
-                && !cancel.is_cancelled()
-            {
-                self.error(format!("compaction failed: {e}"));
-            }
-            match &input {
-                Some(i) => {
-                    self.take_notify();
-                    if synthetic {
-                        self.push(Message::synthetic_user(&i.text));
-                    } else {
-                        self.push(Message::user_input(i));
-                    }
-                }
-                None => {
-                    let jobs = self.take_jobs();
-                    if !(self.take_notify() | jobs) {
-                        break;
-                    }
-                    // Only a wake that delivered something is a woken turn (and rings at its end).
-                    if wake {
-                        self.emit(AgentEvent::Woken);
-                    }
-                }
-            }
-            synthetic = false;
             match self.run_loop(&cancel).await {
                 Flow::Aborted => {
                     aborted = true;
@@ -136,9 +82,8 @@ impl Agent {
             self.turn_end_hook().await;
             if let Some(p) = self.exec_plan.take() {
                 match self.begin_plan(p, &cancel).await {
-                    Some(i) => {
-                        synthetic = true;
-                        next = Some(Some(i));
+                    Some(input) => {
+                        next = Some(Step::Prompt { input, synthetic: true });
                         continue;
                     }
                     None => {
@@ -147,7 +92,7 @@ impl Agent {
                     }
                 }
             }
-            next = self.inbox.borrow_mut().follow_up.pop_front().map(Some);
+            next = self.inbox.borrow_mut().follow_up.pop_front().map(|input| Step::Prompt { input, synthetic: false });
         }
         // Failed and cancelled passes leave messages the hook has not seen; do not let them
         // leak into the next turn's `turn_end`.
@@ -162,6 +107,55 @@ impl Agent {
         self.refresh_external().await;
         self.emit_status();
         self.emit(AgentEvent::TurnEnd { aborted });
+    }
+
+    /// Readies one pass: the session, the prompt or wake-up messages, and compaction. `false` ends the turn.
+    async fn begin_pass(&mut self, step: Step, cancel: &CancellationToken) -> bool {
+        if !self.ensure_session().await {
+            return false;
+        }
+        let extra = match &step {
+            Step::Prompt { input, synthetic } => {
+                if !*synthetic {
+                    self.emit(AgentEvent::UserPrompt(input.text.clone()));
+                }
+                self.user_turn += 1;
+                let prompt = secrets::redact(&input.text, &self.cwd).text;
+                let res = self
+                    .plugins
+                    .hook(
+                        "prompt_submit",
+                        json!({"prompt": prompt, "userTurn": self.user_turn, "resumed": self.resumed}),
+                    )
+                    .await;
+                self.apply_plugin_context(res);
+                estimate_tokens(&input.text) + 1600 * input.images.len() as u64
+            }
+            Step::Wake => 0,
+        };
+        if self.needs_compaction(extra)
+            && let Outcome::Failed(e) = self.compact(None, cancel).await
+        {
+            self.report_compaction_failure(e, cancel);
+        }
+        match step {
+            Step::Prompt { input, synthetic } => {
+                self.take_notify();
+                if synthetic {
+                    self.push(Message::synthetic_user(&input.text));
+                } else {
+                    self.push(Message::user_input(&input));
+                }
+            }
+            Step::Wake => {
+                let jobs = self.take_jobs();
+                if !(self.take_notify() | jobs) {
+                    return false;
+                }
+                self.emit(AgentEvent::Woken);
+            }
+        }
+        true
     }
 
     /// Saves the plan a `propose_plan` result describes into the repository's store.
@@ -195,9 +189,8 @@ impl Agent {
             if !first
                 && self.needs_compaction(0)
                 && let Outcome::Failed(e) = self.compact(None, cancel).await
-                && !cancel.is_cancelled()
             {
-                self.error(format!("compaction failed: {e}"));
+                self.report_compaction_failure(e, cancel);
             }
             first = false;
             // MCP servers without a cached tool list are started and listed once, before the first request.
@@ -274,7 +267,7 @@ impl Agent {
                         }
                         Outcome::Failed(_) if cancel.is_cancelled() => return Flow::Aborted,
                         Outcome::Failed(e) => {
-                            self.error(format!("compaction failed: {e}"));
+                            self.report_compaction_failure(e, cancel);
                             return Flow::Failed;
                         }
                     }
@@ -308,16 +301,7 @@ impl Agent {
             if stop != StopReason::ToolUse && !calls.is_empty() {
                 // A truncated reply: its tool calls never run, but each still needs a result.
                 for (id, name, args) in &calls {
-                    let reason = SKIP_TRUNCATED;
-                    let out = ToolOutput::err(reason);
-                    self.emit(AgentEvent::ToolSkipped { id: id.clone() });
-                    self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                    self.emit(AgentEvent::ToolEnd {
-                        id: id.clone(),
-                        name: name.clone(),
-                        output: ToolOutput::err(reason),
-                    });
-                    self.push_result(id, name, &out);
+                    self.emit_skipped(id, name, args, SKIP_TRUNCATED);
                 }
             }
             if stop != StopReason::ToolUse || calls.is_empty() {
@@ -359,15 +343,7 @@ impl Agent {
                     }
                 }
                 if let Some(reason) = skip {
-                    let out = ToolOutput::err(reason);
-                    self.emit(AgentEvent::ToolSkipped { id: id.clone() });
-                    self.emit(AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                    self.emit(AgentEvent::ToolEnd {
-                        id: id.clone(),
-                        name: name.clone(),
-                        output: ToolOutput::err(reason),
-                    });
-                    self.push_result(&id, &name, &out);
+                    self.emit_skipped(&id, &name, &args, reason);
                     continue;
                 }
                 let out = self.run_tool(&id, &name, args, cancel).await;

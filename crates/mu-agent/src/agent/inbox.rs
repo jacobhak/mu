@@ -15,7 +15,7 @@ impl Agent {
     /// Hands finished background jobs to the model as one `<system-notice>` user message.
     /// Returns whether any were pending.
     pub(super) fn take_jobs(&mut self) -> bool {
-        let Some(jobs) = &self.jobs else { return false };
+        let Some(jobs) = &self.tools.jobs else { return false };
         let done = jobs.take_undelivered(&[]);
         if done.is_empty() {
             return false;

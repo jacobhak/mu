@@ -157,15 +157,8 @@ impl Agent {
             None => format!("reviewer returned an unstructured report\n\n{}", out.text),
         };
         let report_uri = review::report_uri();
-        match self.tools.resolve(&report_uri) {
-            Ok(r) => {
-                if let Err(e) = std::fs::create_dir_all(r.path.parent().unwrap_or(&r.path))
-                    .and_then(|_| std::fs::write(&r.path, &md))
-                {
-                    self.error(format!("cannot save the review to {report_uri}: {e}"));
-                }
-            }
-            Err(e) => self.error(format!("cannot save the review to {report_uri}: {e}")),
+        if let Err(e) = self.write_local_file(&report_uri, &md) {
+            self.error(format!("cannot save the review to {report_uri}: {e}"));
         }
         self.emit(AgentEvent::ToolEnd { id, name: "review".into(), output: ToolOutput::ok(md) });
 

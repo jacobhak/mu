@@ -254,6 +254,27 @@ pub enum PlanDecision {
     Drop,
 }
 
+impl PlanDecision {
+    /// The name the tool result records as `planDecision` and the plan store records as the approval.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Execute { .. } => "execute",
+            Self::Compact { .. } => "compact",
+            Self::Keep { .. } => "keep",
+            Self::Refine(_) => "refine",
+            Self::Park => "park",
+            Self::Drop => "drop",
+        }
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            Self::Execute { model } | Self::Compact { model } | Self::Keep { model } => model.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubagentState {
     Running,

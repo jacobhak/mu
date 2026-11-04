@@ -40,7 +40,7 @@ mod tests {
                 let mut tools = Tools::for_test();
                 tools.jobs = Some(crate::jobs::tests::handle());
                 let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-                let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into() };
+                let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
                 tools.call("bash", &json!({"command": "echo w", "async": true}), &ctx).await;
                 let out = tools.call("wait", &json!({}), &ctx).await;
                 assert!(out.text.contains("## bg_1 (bash: echo w) — ok, exit 0\nw"), "{}", out.text);
