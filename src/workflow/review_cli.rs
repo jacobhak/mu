@@ -1,10 +1,8 @@
 //! `mu review`: the `/review` pipeline without a session. It gathers the same facts and request as
 //! the in-session review (`mu_agent::review`), runs `review-lead` and its workers as child processes, and
 //! prints the verdict as JSON or markdown.
-use mu_agent::review::{
-    Finding, Meta, PlanStep, Report, RequestInput, git, head_tree, is_blocking, numstat, render_markdown, repo_root,
-    report_of, report_schema, request, snapshot_tree, split_excluded,
-};
+use mu_agent::review::facts::{Base, Gather, gather};
+use mu_agent::review::report::{Finding, Meta, PlanStep, Report, is_blocking, render_markdown, report_of, report_schema};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -78,54 +76,31 @@ async fn review_once(o: &CliOpts, cwd: &Path) -> (CliVerdict, Option<Report>) {
 }
 
 async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Option<Report>, String> {
-    let root = repo_root(cwd).await?;
-    let cur = snapshot_tree(&root).await?;
-    let (base, base_label) = if o.base == "HEAD" {
-        (head_tree(&root).await?, "HEAD".to_string())
-    } else {
-        let t = git(&root, &["rev-parse", "--verify", "--quiet", &format!("{}^{{tree}}", o.base)], None)
-            .await
-            .map_err(|_| format!("cannot resolve --base `{}` to a tree", o.base))?;
-        (t.trim().to_string(), format!("--base {}", o.base))
-    };
-    v.base = base.clone();
-    v.current = cur.clone();
-    let stats = numstat(&root, &base, &cur).await?;
-    let (files, excluded) = split_excluded(stats);
-    let (added, removed) =
-        files.iter().fold((0, 0), |(a, r), f| (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0)));
-    v.files = files.len();
-    v.added = added;
-    v.removed = removed;
-    if files.is_empty() {
-        v.verdict = "nothing";
-        v.summary = format!("nothing to review: no reviewable changes since {}", short(&base));
-        return Ok(None);
-    }
-    let plan_path = match &o.plan {
+    let base = if o.base == "HEAD" { Base::Head { label: "HEAD" } } else { Base::Rev(&o.base) };
+    let plan = match &o.plan {
         Some(p) => {
             Some(std::fs::canonicalize(cwd.join(p)).map_err(|e| format!("cannot read --plan {}: {e}", p.display()))?)
         }
         None => None,
     };
-    let prompt = request(&RequestInput {
-        root: &root,
-        base: &base,
-        cur: &cur,
-        base_label: &base_label,
-        plan_path,
-        files: &files,
-        excluded: &excluded,
-        notes: &[],
-        focus: o.focus.as_deref(),
-    });
+    let facts = gather(Gather { cwd, base, plan, notes: &[], focus: o.focus.as_deref() }).await?;
+    v.base = facts.base.clone();
+    v.current = facts.cur.clone();
+    v.files = facts.files.len();
+    v.added = facts.added;
+    v.removed = facts.removed;
+    if facts.files.is_empty() {
+        v.verdict = "nothing";
+        v.summary = format!("nothing to review: no reviewable changes since {}", short(&facts.base));
+        return Ok(None);
+    }
     let cfgs = mu_base::config::Configs::load();
     v.model = mu_base::models::role_selector("review", &cfgs).unwrap_or_else(|| "default".into());
     let exe = mu_common::paths::self_exe().map_err(|e| format!("cannot locate mu executable: {e}"))?;
     let payload =
-        serde_json::json!({"task": prompt, "agent": mu_tools::context::REVIEW_LEAD, "outputSchema": report_schema()});
+        serde_json::json!({"task": facts.request, "agent": mu_tools::context::REVIEW_LEAD, "outputSchema": report_schema()});
     let cancel = tokio_util::sync::CancellationToken::new();
-    let out = mu_tools::tools::subagent::run_child(&exe, &root, &payload, &cancel, |name, summary| {
+    let out = mu_tools::tools::subagent::run_child(&exe, &facts.root, &payload, &cancel, |name, summary| {
         eprintln!("  {name} {summary}");
     })
     .await;

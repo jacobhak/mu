@@ -1,7 +1,10 @@
 //! `mu deliver`: approve and implement a parked plan, review it against the plan, send blocking findings back to the implementer session, then have it commit.
 
 use mu_agent::agent::DeliverFn;
-use mu_agent::{plans, review};
+use mu_agent::plans;
+use mu_agent::review::facts::repo_root;
+use mu_agent::review::report::{Finding, fix_message, loc, raw_message};
+use mu_base::git::git;
 use mu_common::paths::{encode_cwd, mu_home, self_exe};
 use mu_session::inbox;
 use mu_session::session;
@@ -209,7 +212,7 @@ struct ReviewOut {
 #[derive(Deserialize)]
 struct ReviewFinding {
     #[serde(flatten)]
-    finding: review::Finding,
+    finding: Finding,
     #[serde(default)]
     blocking: bool,
 }
@@ -238,12 +241,12 @@ const COMMIT_PROMPT: &str = "Commit your work now. Stage only the files that bel
 fn fix_prompt(r: &ReviewOut, plan: Option<&Path>, report: &Path) -> String {
     let plan_uri = plan.map(|p| p.display().to_string());
     let report_uri = report.display().to_string();
-    let blocking: Vec<&review::Finding> = r.findings.iter().filter(|f| f.blocking).map(|f| &f.finding).collect();
+    let blocking: Vec<&Finding> = r.findings.iter().filter(|f| f.blocking).map(|f| &f.finding).collect();
     let picked = if blocking.is_empty() { r.findings.iter().map(|f| &f.finding).collect() } else { blocking };
     if picked.is_empty() {
-        review::raw_message(&format!("Reviewer summary: {}", r.summary), plan_uri.as_deref(), &report_uri)
+        raw_message(&format!("Reviewer summary: {}", r.summary), plan_uri.as_deref(), &report_uri)
     } else {
-        review::fix_message(&picked, plan_uri.as_deref(), &report_uri, None)
+        fix_message(&picked, plan_uri.as_deref(), &report_uri, None)
     }
 }
 
@@ -263,10 +266,10 @@ fn fail_with(rec: &mut Record, result: Outcome, e: String) {
 async fn body<S: Steps>(steps: &mut S, job: &Job, rec: &mut Record) {
     let dir = &job.dir;
     if let Some(branch) = &job.new_worktree {
-        let _ = review::git(&rec.repo, &["fetch", "-q"], None).await;
-        let base = match review::git(&rec.repo, &["rev-parse", "--verify", "-q", "origin/HEAD"], None).await {
+        let _ = git(&rec.repo, &["fetch", "-q"], None).await;
+        let base = match git(&rec.repo, &["rev-parse", "--verify", "-q", "origin/HEAD"], None).await {
             Ok(s) if !s.trim().is_empty() => s,
-            _ => match review::git(&rec.repo, &["rev-parse", "HEAD"], None).await {
+            _ => match git(&rec.repo, &["rev-parse", "HEAD"], None).await {
                 Ok(s) => s,
                 Err(e) => return fail_with(rec, Outcome::Error, e),
             },
@@ -274,7 +277,7 @@ async fn body<S: Steps>(steps: &mut S, job: &Job, rec: &mut Record) {
         let base = base.trim().to_string();
         let wt = rec.worktree.display().to_string();
         eprintln!("== worktree {wt} on {branch}");
-        if let Err(e) = review::git(&rec.repo, &["worktree", "add", "-q", "-b", branch, &wt, &base], None).await {
+        if let Err(e) = git(&rec.repo, &["worktree", "add", "-q", "-b", branch, &wt, &base], None).await {
             return fail_with(rec, Outcome::Error, e);
         }
         rec.base = base;
@@ -321,7 +324,7 @@ async fn body<S: Steps>(steps: &mut S, job: &Job, rec: &mut Record) {
         rec.last_report = Some(out);
         save(dir, rec);
     }
-    if review::git(&rec.worktree, &["status", "--porcelain"], None).await.is_ok_and(|s| !s.trim().is_empty()) {
+    if git(&rec.worktree, &["status", "--porcelain"], None).await.is_ok_and(|s| !s.trim().is_empty()) {
         eprintln!("== commit");
         if let Err(e) = steps.resume(&rec.worktree, &session, COMMIT_PROMPT, &dir.join("commit.md")).await {
             eprintln!("mu deliver: commit step: {e}");
@@ -347,14 +350,14 @@ pub(crate) async fn run_loop<S: Steps>(steps: &mut S, job: &Job, rec: &mut Recor
     body(steps, job, rec).await;
 
     let dir = &job.dir;
-    rec.leftovers = review::git(&rec.worktree, &["status", "--porcelain"], None)
+    rec.leftovers = git(&rec.worktree, &["status", "--porcelain"], None)
         .await
         .map(|s| s.trim_end_matches('\n').lines().filter(|l| !l.is_empty()).map(String::from).collect())
         .unwrap_or_default();
-    if let Ok(b) = review::git(&rec.worktree, &["branch", "--show-current"], None).await {
+    if let Ok(b) = git(&rec.worktree, &["branch", "--show-current"], None).await {
         rec.branch = b.trim().to_string();
     }
-    rec.head = review::git(&rec.worktree, &["rev-parse", "HEAD"], None).await.ok().map(|s| s.trim().to_string());
+    rec.head = git(&rec.worktree, &["rev-parse", "HEAD"], None).await.ok().map(|s| s.trim().to_string());
     rec.finished = Some(mu_common::time::iso_ms());
     save(dir, rec);
     if let Err(e) = std::fs::write(dir.join("summary.md"), summary(rec)) {
@@ -418,7 +421,7 @@ fn summary(r: &Record) -> String {
                     f.finding.priority,
                     if f.blocking { ", blocking" } else { "" },
                     f.finding.title,
-                    review::loc(&f.finding)
+                    loc(&f.finding)
                 );
             }
         }
@@ -459,11 +462,11 @@ fn running_error(id: &str, dir: &Path) -> String {
 }
 
 async fn current_branch(top: &Path) -> String {
-    review::git(top, &["branch", "--show-current"], None).await.map(|s| s.trim().to_string()).unwrap_or_default()
+    git(top, &["branch", "--show-current"], None).await.map(|s| s.trim().to_string()).unwrap_or_default()
 }
 
 async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
-    let top = review::repo_root(cwd).await.map_err(|_| "mu deliver needs a git repository".to_string())?;
+    let top = repo_root(cwd).await.map_err(|_| "mu deliver needs a git repository".to_string())?;
     let notify = match &a.notify {
         Some(p) => Some(session::find(cwd, p)?),
         None => std::env::var_os("PI_SESSION_FILE")
@@ -498,7 +501,7 @@ async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
                     return Err(format!("{} already exists", wt.display()));
                 }
                 let b = format!("plan/{id}");
-                if review::git(&top, &["rev-parse", "-q", "--verify", &format!("refs/heads/{b}")], None).await.is_ok() {
+                if git(&top, &["rev-parse", "-q", "--verify", &format!("refs/heads/{b}")], None).await.is_ok() {
                     return Err(format!("branch {b} already exists"));
                 }
                 worktree = wt;
@@ -506,12 +509,12 @@ async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
                 job.new_worktree = Some(b.clone());
                 branch = b;
             } else {
-                if review::git(&top, &["status", "--porcelain"], None).await.is_ok_and(|s| !s.trim().is_empty()) {
+                if git(&top, &["status", "--porcelain"], None).await.is_ok_and(|s| !s.trim().is_empty()) {
                     return Err(
                         "the working tree has uncommitted changes; commit or stash them, or use --worktree".into()
                     );
                 }
-                base = review::git(&top, &["rev-parse", "HEAD"], None)
+                base = git(&top, &["rev-parse", "HEAD"], None)
                     .await
                     .map(|s| s.trim().to_string())
                     .map_err(|e| format!("cannot resolve HEAD: {e}"))?;
@@ -551,7 +554,7 @@ async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
             };
             let session = session::find(cwd, s)?;
             let session = std::fs::canonicalize(&session).unwrap_or(session);
-            let base = review::git(&top, &["rev-parse", "--verify", "--quiet", &format!("{b}^{{commit}}")], None)
+            let base = git(&top, &["rev-parse", "--verify", "--quiet", &format!("{b}^{{commit}}")], None)
                 .await
                 .map(|s| s.trim().to_string())
                 .map_err(|_| format!("unknown base {b}"))?;

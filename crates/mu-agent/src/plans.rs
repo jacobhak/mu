@@ -1,7 +1,8 @@
 //! Durable plans: a plan written in plan mode can be parked and approved later, in another session.
 //! Each plan is `<id>.md` (the text as written) plus `<id>.json` (metadata) under
 //! `$MU_HOME/plans/<repo-key>/`. All worktrees of one clone share a store.
-use crate::review;
+use crate::review::facts::{numstat, repo_root, snapshot_tree};
+use mu_base::git::git;
 use mu_base::events::{Approval, Base, PlanMeta, Status};
 use mu_base::message::{Message, tool_calls};
 use mu_common::fs::write_atomic;
@@ -45,12 +46,12 @@ pub fn short(s: &str) -> &str {
 
 /// The main checkout of the clone `cwd` is in, or `cwd` outside git.
 pub async fn main_checkout(cwd: &Path) -> PathBuf {
-    let root = review::repo_root(cwd).await.ok();
-    let common = review::git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None).await;
+    let root = repo_root(cwd).await.ok();
+    let common = git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None).await;
     let common = match common {
         Ok(s) => Some(PathBuf::from(s.trim())),
         // Git older than 2.31: the common dir may come back relative.
-        Err(_) => review::git(cwd, &["rev-parse", "--git-common-dir"], None).await.ok().map(|s| cwd.join(s.trim())),
+        Err(_) => git(cwd, &["rev-parse", "--git-common-dir"], None).await.ok().map(|s| cwd.join(s.trim())),
     };
     match common {
         Some(c) if root.is_some() => {
@@ -67,13 +68,13 @@ pub async fn main_checkout(cwd: &Path) -> PathBuf {
 pub async fn store_for(cwd: &Path) -> Store {
     Store {
         dir: mu_home().join("plans").join(encode_cwd(&main_checkout(cwd).await)),
-        root: review::repo_root(cwd).await.ok(),
+        root: repo_root(cwd).await.ok(),
     }
 }
 
 pub async fn base_now(root: &Path) -> Option<Base> {
-    let tree = review::snapshot_tree(root).await.ok()?;
-    let commit = review::git(root, &["rev-parse", "HEAD"], None).await.ok().map(|s| s.trim().to_string());
+    let tree = snapshot_tree(root).await.ok()?;
+    let commit = git(root, &["rev-parse", "HEAD"], None).await.ok().map(|s| s.trim().to_string());
     Some(Base { tree, commit: commit.filter(|c| !c.is_empty()) })
 }
 
@@ -234,7 +235,7 @@ const DIRTY: &str = " plus uncommitted changes";
 /// The snapshot has changes its commit lacks: its tree is not the commit's tree.
 async fn dirty(dir: &Path, b: &Base) -> bool {
     let Some(c) = &b.commit else { return false };
-    match review::git(dir, &["rev-parse", "--verify", "--quiet", &format!("{c}^{{tree}}")], None).await {
+    match git(dir, &["rev-parse", "--verify", "--quiet", &format!("{c}^{{tree}}")], None).await {
         Ok(t) => t.trim() != b.tree,
         Err(_) => false, // commit gone: drift reports that separately
     }
@@ -282,11 +283,11 @@ impl Drift {
 }
 
 async fn object_exists(root: &Path, sha: &str) -> bool {
-    review::git(root, &["cat-file", "-e", sha], None).await.is_ok()
+    git(root, &["cat-file", "-e", sha], None).await.is_ok()
 }
 
 pub async fn drift(meta: &PlanMeta, cwd: &Path) -> Drift {
-    let Ok(root) = review::repo_root(cwd).await else {
+    let Ok(root) = repo_root(cwd).await else {
         return Drift::Unknown("not a git repository".into());
     };
     let Some(b) = &meta.base else { return Drift::Unknown("no base recorded".into()) };
@@ -304,8 +305,8 @@ pub async fn drift(meta: &PlanMeta, cwd: &Path) -> Drift {
         }
     };
     let label = short(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
-    let stats = match review::snapshot_tree(&root).await {
-        Ok(cur) => review::numstat(&root, base, &cur).await,
+    let stats = match snapshot_tree(&root).await {
+        Ok(cur) => numstat(&root, base, &cur).await,
         Err(e) => Err(e),
     };
     let stats = match stats {

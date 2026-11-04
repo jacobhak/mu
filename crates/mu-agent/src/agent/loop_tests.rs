@@ -1,6 +1,5 @@
 use super::*;
 use crate::agent::RunConfig;
-use crate::review;
 use crate::testing::{
     agent, agent_run, agent_with, assistant, call, drain, git_repo, results, save_plan_in, tmp_dir, yield_call,
 };
@@ -678,7 +677,7 @@ fn a_stored_plan_starts_in_the_current_session() {
             title: "T".into(),
             uri: "local://t-plan.md".into(),
             decision: PlanDecision::Keep { model: None },
-            base: review::snapshot_tree(&a.cwd).await.ok(),
+            base: crate::review::facts::snapshot_tree(&a.cwd).await.ok(),
             approved_at: 1,
             stored: Some("t".into()),
         }))

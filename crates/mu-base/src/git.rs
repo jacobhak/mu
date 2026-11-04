@@ -1,22 +1,55 @@
-//! Branch and working-tree counts from one `git status --porcelain=v2 --branch`.
+//! Git runner, and branch and working-tree counts from one `git status --porcelain=v2 --branch`.
 //! Runs off the draw path (the agent calls it after each turn).
 use crate::events::GitInfo;
 use std::path::Path;
 use std::time::Duration;
 
-const TIMEOUT: Duration = Duration::from_secs(2);
+const TIMEOUT: Duration = Duration::from_secs(60);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Runs git in `dir` with `GIT_INDEX_FILE` set to `index` when given. Stdout on success, git's
+/// first stderr line otherwise.
+pub async fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
+    git_for(dir, args, index, TIMEOUT).await
+}
+
+/// `git` with its own timeout.
+pub async fn git_for(dir: &Path, args: &[&str], index: Option<&Path>, timeout: Duration) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if let Some(i) = index {
+        cmd.env("GIT_INDEX_FILE", i);
+    }
+    let name = args.first().copied().unwrap_or("");
+    let out = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("git {name}: {e}")),
+        Err(_) => return Err(format!("git {name} timed out")),
+    };
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err.lines().next().unwrap_or("git failed").trim().to_string())
+    }
+}
+
+/// The first 7 characters of a sha.
+pub fn short_sha(sha: &str) -> &str {
+    let end = sha.char_indices().nth(7).map_or(sha.len(), |(i, _)| i);
+    &sha[..end]
+}
 
 /// `None` when `cwd` is not a repository, git is missing, or it does not finish in time.
 pub async fn git_status(cwd: &Path) -> Option<GitInfo> {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(["status", "--porcelain=v2", "--branch"])
-        .current_dir(cwd)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(TIMEOUT, cmd.output()).await.ok()?.ok()?;
-    out.status.success().then(|| parse_porcelain_v2(&String::from_utf8_lossy(&out.stdout)))
+    git_for(cwd, &["status", "--porcelain=v2", "--branch"], None, STATUS_TIMEOUT)
+        .await
+        .ok()
+        .map(|s| parse_porcelain_v2(&s))
 }
 
 pub fn parse_porcelain_v2(out: &str) -> GitInfo {

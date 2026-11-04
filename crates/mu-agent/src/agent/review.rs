@@ -56,11 +56,11 @@ impl Agent {
     async fn review_run(&mut self, focus: Option<String>, cancel: &CancellationToken) -> Option<String> {
         let scope = self.review_scope(focus).await?;
         let out = self.run_review(&scope, cancel).await?;
-        let report = review::report_of(&out);
+        let report = review::report::report_of(&out);
         let md = match &report {
-            Some(r) => review::render_markdown(
+            Some(r) => review::report::render_markdown(
                 r,
-                &review::Meta {
+                &review::report::Meta {
                     base_short: short(&scope.base),
                     cur_short: short(&scope.cur),
                     files: scope.files,
@@ -89,52 +89,15 @@ impl Agent {
 
     /// The changes `/review` covers. `None`, after a notice, when there is nothing to review.
     async fn review_scope(&mut self, focus: Option<String>) -> Option<ReviewScope> {
-        let root = match review::repo_root(&self.cwd).await {
-            Ok(r) => r,
-            Err(e) => {
-                self.error(e);
-                return None;
-            }
-        };
-        let cur = match review::snapshot_tree(&root).await {
-            Ok(c) => c,
-            Err(e) => {
-                self.error(format!("review: {e}"));
-                return None;
-            }
-        };
-        let (base, base_label) = match self.plan.review_base.as_ref().and_then(|b| b.tree.clone()) {
-            Some(t) => (t, "plan approval snapshot"),
+        let base = match self.plan.review_base.as_ref().and_then(|b| b.tree.clone()) {
+            Some(tree) => review::facts::Base::Tree { tree, label: "plan approval snapshot" },
             None => {
                 self.notice("no plan base recorded; reviewing uncommitted changes against HEAD");
-                match review::head_tree(&root).await {
-                    Ok(t) => (t, "HEAD (no plan approved in this session)"),
-                    Err(e) => {
-                        self.error(format!("review: {e}"));
-                        return None;
-                    }
-                }
+                review::facts::Base::Head { label: "HEAD (no plan approved in this session)" }
             }
         };
-        let since = self.plan.review_base.as_ref().map_or(0, |b| b.since);
-        let stats = match review::numstat(&root, &base, &cur).await {
-            Ok(s) => s,
-            Err(e) => {
-                self.error(format!("review: {e}"));
-                return None;
-            }
-        };
-        if stats.is_empty() {
-            self.notice(format!("nothing to review: no changes since {}", short(&base)));
-            return None;
-        }
-        let (files, excluded) = review::split_excluded(stats);
-        if files.is_empty() {
-            self.notice("nothing to review: only binary, generated or lock files changed");
-            return None;
-        }
         let plan_uri = self.plan.review_base.as_ref().and_then(|b| b.plan_uri.clone());
-        let plan_path = match &plan_uri {
+        let plan = match &plan_uri {
             Some(u) => match self.tools.resolve(u) {
                 Ok(r) if r.path.exists() => Some(r.path),
                 _ => {
@@ -144,25 +107,46 @@ impl Agent {
             },
             None => None,
         };
-        let plan_uri = plan_path.as_ref().and(plan_uri);
-        let notes = review::user_notes(&self.messages, since);
-        let request = review::request(&review::RequestInput {
-            root: &root,
-            base: &base,
-            cur: &cur,
-            base_label,
-            plan_path,
-            files: &files,
-            excluded: &excluded,
+        let plan_uri = plan.as_ref().and(plan_uri);
+        let since = self.plan.review_base.as_ref().map_or(0, |b| b.since);
+        let notes = review::facts::user_notes(&self.messages, since);
+        let facts = match review::facts::gather(review::facts::Gather {
+            cwd: &self.cwd,
+            base,
+            plan,
             notes: &notes,
             focus: focus.as_deref(),
-        });
+        })
+        .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.error(format!("review: {e}"));
+                return None;
+            }
+        };
+        if !facts.changed() {
+            self.notice(format!("nothing to review: no changes since {}", short(&facts.base)));
+            return None;
+        }
+        if facts.files.is_empty() {
+            self.notice("nothing to review: only binary, generated or lock files changed");
+            return None;
+        }
         let model = mu_base::models::role_selector("review", &self.ports.providers.cfg)
             .and_then(|s| self.ports.providers.resolve(&s).ok())
             .map_or_else(|| self.model.model.id.clone(), |(m, _)| m.id);
-        let (added, removed) =
-            files.iter().fold((0, 0), |(a, r), f| (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0)));
-        Some(ReviewScope { root, base, cur, files: files.len(), added, removed, model, plan_uri, request })
+        Some(ReviewScope {
+            root: facts.root,
+            base: facts.base,
+            cur: facts.cur,
+            files: facts.files.len(),
+            added: facts.added,
+            removed: facts.removed,
+            model,
+            plan_uri,
+            request: facts.request,
+        })
     }
 
     /// Runs the review child over `scope`. `None` when it fails or the run is cancelled.
@@ -181,7 +165,7 @@ impl Agent {
         let payload = json!({
             "task": scope.request,
             "agent": context::REVIEW_LEAD,
-            "outputSchema": review::report_schema(),
+            "outputSchema": review::report::report_schema(),
             "parentSession": self.session.as_ref().map(|s| s.path.clone()),
         });
         self.emit(AgentEvent::ToolStart {
@@ -245,7 +229,7 @@ impl Agent {
         };
         match self.review_ask(q, cancel).await {
             Answer::Options(o) | Answer::Noted { picks: o, .. } if o.first().is_some_and(|l| l.starts_with("Send")) => {
-                Some(review::raw_message(text, plan_uri, report_uri))
+                Some(review::report::raw_message(text, plan_uri, report_uri))
             }
             _ => None,
         }
@@ -254,14 +238,14 @@ impl Agent {
     /// The user picks which findings of the report go to the implementer. `None` when none do.
     async fn pick_findings(
         &mut self,
-        report: &review::Report,
+        report: &review::report::Report,
         plan_uri: Option<&str>,
         report_uri: &str,
         cancel: &CancellationToken,
     ) -> Option<String> {
         use mu_base::events::{Answer, AskQuestion};
         let all = &report.findings;
-        let blocking: Vec<usize> = (0..all.len()).filter(|&i| review::is_blocking(&all[i])).collect();
+        let blocking: Vec<usize> = (0..all.len()).filter(|&i| review::report::is_blocking(&all[i])).collect();
         let (n, m) = (blocking.len(), all.len());
         let mut options = Vec::new();
         if n > 0 {
@@ -338,8 +322,8 @@ impl Agent {
         if chosen.is_empty() {
             return None;
         }
-        let picked: Vec<&review::Finding> = chosen.iter().map(|&i| &all[i]).collect();
-        Some(review::fix_message(&picked, plan_uri, report_uri, note.as_deref()))
+        let picked: Vec<&review::report::Finding> = chosen.iter().map(|&i| &all[i]).collect();
+        Some(review::report::fix_message(&picked, plan_uri, report_uri, note.as_deref()))
     }
 
     pub(super) fn set_review_base(&mut self, b: review::ReviewBase) {
