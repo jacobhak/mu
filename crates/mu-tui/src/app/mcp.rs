@@ -3,13 +3,17 @@
 //! brought in line with them.
 
 use super::*;
+use crate::app::ui_msgs::UiMsg;
 use crate::mcp::mcp_cmd::{self, Draft, McpCmd};
 use crate::mcp::mcp_wizard::{Answer, Step, Wizard};
-use crate::widgets::overlay::{McpAction, McpPick, McpRow};
+use crate::widgets::overlay::{McpAction, McpPick, McpRow, Overlay};
+use crate::widgets::select::{Item, Select};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use mu_base::events::Command;
 use mu_tools::mcp::config::{self, Entry, Kind};
 use mu_tools::mcp::discover::{self, Found, Roots};
-use mu_tools::mcp::store;
 use mu_tools::plugin::McpInfo;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// `scheme://host` of a url: paths, queries and credentials may carry secrets.
@@ -29,10 +33,6 @@ fn describe(info: &McpInfo, name: &str) -> String {
     } else {
         "not connected yet; its tools are listed on first use".into()
     }
-}
-
-fn env_set(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|v| !v.is_empty())
 }
 
 /// The tool names under a server's status line, as many as fit.
@@ -218,14 +218,14 @@ impl App {
     // ---- changes -----------------------------------------------------------------------------
 
     fn mcp_add(&mut self, d: Draft) {
-        match store::add(d.level, &self.cwd, &paths::omp_agent_dir(), &d.name, d.entry) {
+        match self.services.mcp_add(d.level, &self.cwd, &d.name, d.entry) {
             Ok(path) => self.mcp_apply(format!("added mcp:{} to {}", d.name, path.display()), false),
             Err(e) => self.error(&e),
         }
     }
 
     fn mcp_remove(&mut self, name: &str) {
-        match store::remove(&self.cwd, &paths::omp_agent_dir(), name) {
+        match self.services.mcp_remove(&self.cwd, name) {
             Ok(files) => {
                 let at: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
                 self.mcp_apply(format!("removed mcp:{name} from {}", at.join(", ")), false);
@@ -236,7 +236,7 @@ impl App {
 
     fn mcp_switch(&mut self, name: &str, on: bool) {
         let verb = if on { "enabled" } else { "disabled" };
-        match store::set_enabled(&self.cwd, &paths::omp_agent_dir(), name, on) {
+        match self.services.mcp_set_enabled(&self.cwd, name, on) {
             Ok(true) => self.mcp_apply(format!("{verb} mcp:{name}"), false),
             Ok(false) => self.notice(&format!("mcp:{name} is already {verb}")),
             Err(e) => self.error(&e),
@@ -319,16 +319,19 @@ impl App {
             return self
                 .notice("no servers to import: nothing new found in omp, pi, Claude, Codex, Gemini CLI or OpenCode");
         }
-        let wizard =
-            if import { Wizard::import(found, &self.cwd, env_set) } else { Wizard::new(found, &self.cwd, env_set) };
-        self.mcp_wizard = Some(wizard);
-        self.composer.set_private(true);
+        let wizard = if import {
+            Wizard::import(found, &self.cwd, env_is_set)
+        } else {
+            Wizard::new(found, &self.cwd, env_is_set)
+        };
+        self.flows.mcp_wizard = Some(wizard);
+        self.prompt.composer.set_private(true);
         self.mcp_wizard_show();
     }
 
     /// Prints what the wizard has to say, then shows its current step.
     fn mcp_wizard_show(&mut self) {
-        let Some(w) = self.mcp_wizard.as_mut() else { return };
+        let Some(w) = self.flows.mcp_wizard.as_mut() else { return };
         let notes = w.take_notes();
         let step = w.step();
         if !notes.is_empty() {
@@ -349,7 +352,7 @@ impl App {
     }
 
     fn mcp_wizard_answer(&mut self, a: Answer) {
-        let Some(w) = self.mcp_wizard.as_mut() else { return };
+        let Some(w) = self.flows.mcp_wizard.as_mut() else { return };
         if let Err(e) = w.answer(a) {
             self.error(&e);
         }
@@ -358,20 +361,20 @@ impl App {
 
     fn mcp_wizard_cancel(&mut self) {
         self.end_mcp_wizard();
-        self.composer.set_text("");
+        self.prompt.composer.set_text("");
         self.notice("cancelled; nothing was added");
     }
 
     /// Keys the wizard takes before the composer sees them. True when the key was handled.
     pub(super) fn mcp_wizard_key(&mut self, k: KeyEvent) -> bool {
         let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-        if k.code == KeyCode::Esc || (ctrl_c && self.composer.is_empty()) {
+        if k.code == KeyCode::Esc || (ctrl_c && self.prompt.composer.is_empty()) {
             self.mcp_wizard_cancel();
             return true;
         }
         // An empty Enter picks the step's default, which the composer would swallow.
         if k.code == KeyCode::Enter
-            && self.composer.is_empty()
+            && self.prompt.composer.is_empty()
             && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
         {
             self.mcp_wizard_line("");
@@ -386,7 +389,7 @@ impl App {
 
     /// Answers may be tokens: the composer keeps them out of the history while a wizard runs.
     fn end_mcp_wizard(&mut self) {
-        self.mcp_wizard = None;
-        self.composer.set_private(false);
+        self.flows.mcp_wizard = None;
+        self.prompt.composer.set_private(false);
     }
 }

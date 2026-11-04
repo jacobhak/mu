@@ -1,0 +1,684 @@
+//! The agent's side of the screen: the transcript, running tools, streaming tool calls, background
+//! jobs and the todo list. `AgentView::on_event` reduces agent events into it without an `App`;
+//! what it cannot do alone (overlays, the inbox, the bell) comes back as an `Effect` for `App`.
+
+use super::App;
+use crate::chat::blocks;
+use crate::chat::partial_json::Partial;
+use crate::chat::transcript::{Stream, Transcript};
+use crate::panels::ptyview::PtyView;
+use crate::term::bell::WokenBell;
+use crate::text::line::{Line, dim, styled};
+use crate::theme::{self, Role};
+use crate::widgets::overlay::Overlay;
+use mu_base::events::{AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, StatusSnapshot};
+use mu_base::events::{SubagentState, SubagentStatus};
+use mu_base::message::UserInput;
+use mu_base::text::truncate_text as trunc;
+use mu_base::tool::ToolOutput;
+use mu_tools::tools::todo::{Phase, Status};
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::time::Instant;
+use tokio::sync::oneshot;
+
+/// Most lines of a running tool's output shown under its header.
+const TAIL_MAX: usize = 10;
+
+/// Bash commands kept for `/copy`.
+const BASH_CMDS_MAX: usize = 50;
+
+pub(super) struct RunningTool {
+    pub(super) id: String,
+    name: String,
+    args: Value,
+    started: Instant,
+    /// The last complete lines of output.
+    tail: VecDeque<String>,
+    /// Output after the last newline.
+    partial: String,
+}
+
+pub(super) struct StreamingCall {
+    id: String,
+    name: String,
+    json: Partial,
+    args: Value,
+    /// New bytes arrived since `args` was last computed.
+    stale: bool,
+}
+
+/// What the reducer leaves for `App`: the parts that need an overlay, the inbox or the bell.
+pub(super) enum Effect {
+    /// The turn is waiting for the user: ring the terminal, if the setting is on.
+    Ring,
+    Ask {
+        questions: Vec<AskQuestion>,
+        reply: oneshot::Sender<Option<Vec<Answer>>>,
+    },
+    PlanReview {
+        title: String,
+        uri: String,
+        file: PathBuf,
+        content: String,
+        stored: bool,
+        note: Option<String>,
+        reply: oneshot::Sender<PlanDecision>,
+    },
+    PlanList(Vec<PlanMeta>),
+    /// The job snapshot changed: an open jobs panel takes it.
+    JobsChanged,
+    /// A bash job's output changed: an open jobs panel takes it from `AgentView::job_out`.
+    JobOutput(String),
+    /// The turn ended: what is still queued goes back to the composer.
+    TurnEnded {
+        aborted: bool,
+    },
+}
+
+pub(super) struct AgentView {
+    /// The streamed conversation: committed lines, open text and thinking, smooth reveal.
+    pub(super) tr: Transcript,
+    pub(super) tools: Vec<RunningTool>,
+    /// Tool calls whose arguments are still streaming or that are not yet executing.
+    pub(super) calls: Vec<StreamingCall>,
+    /// Latest background-job snapshot, and finished jobs already printed to the transcript.
+    pub(super) jobs: Vec<SubagentStatus>,
+    jobs_committed: HashSet<String>,
+    /// Newest output of each background bash job, for the jobs panel.
+    pub(super) job_out: HashMap<String, String>,
+    pub(super) todo: Vec<Phase>,
+    pub(super) status: StatusSnapshot,
+    /// Bash commands run, for `/copy`.
+    pub(super) bash_cmds: Vec<String>,
+    /// Embedded terminal of a running `bash` call with `pty: true`.
+    pub(super) pty: Option<PtyView>,
+    pub(super) running: bool,
+    pub(super) compacting: bool,
+    pub(super) turn_started: Option<Instant>,
+    pub(super) expanded: bool,
+    bell: WokenBell,
+}
+
+impl AgentView {
+    pub(super) fn new(show_thinking: bool, smooth: bool) -> Self {
+        Self {
+            tr: Transcript::new(show_thinking, smooth),
+            tools: Vec::new(),
+            calls: Vec::new(),
+            jobs: Vec::new(),
+            jobs_committed: HashSet::new(),
+            job_out: HashMap::new(),
+            todo: Vec::new(),
+            status: StatusSnapshot::default(),
+            bash_cmds: Vec::new(),
+            pty: None,
+            running: false,
+            compacting: false,
+            turn_started: None,
+            expanded: false,
+            bell: WokenBell::default(),
+        }
+    }
+
+    /// Whether the screen needs redrawing on a timer: something is running or streaming.
+    pub(super) fn busy(&self) -> bool {
+        self.running
+            || self.compacting
+            || self.tr.thinking_active()
+            || !self.tools.is_empty()
+            || !self.calls.is_empty()
+            || self.jobs.iter().any(|j| j.state == SubagentState::Running)
+    }
+
+    /// Recomputes the arguments of streaming calls that got new bytes; at most once per frame,
+    /// since deltas arrive far more often than frames are drawn.
+    pub(super) fn refresh_call_args(&mut self) {
+        for c in &mut self.calls {
+            if c.stale {
+                if let Some(v) = c.json.value() {
+                    c.args = v;
+                }
+                c.stale = false;
+            }
+        }
+    }
+
+    /// Applies one agent event. `size` is the screen's (columns, rows).
+    pub(super) fn on_event(&mut self, e: AgentEvent, size: (usize, usize)) -> Vec<Effect> {
+        let w = size.0;
+        if !matches!(
+            e,
+            AgentEvent::Text(_)
+                | AgentEvent::Thinking(_)
+                | AgentEvent::ToolCallDelta { .. }
+                | AgentEvent::ToolOutput { .. }
+                | AgentEvent::Status(_)
+                | AgentEvent::Jobs(_)
+                | AgentEvent::Todo(_)
+                | AgentEvent::TurnStart
+                | AgentEvent::Retry { .. }
+        ) {
+            self.tr.flush_reveal(w);
+        }
+        let mut fx = Vec::new();
+        match e {
+            AgentEvent::TurnStart => {
+                self.running = true;
+                self.turn_started = Some(Instant::now());
+            }
+            AgentEvent::Woken => self.bell.on_woken(),
+            AgentEvent::UserPrompt(t) => {
+                let mut l = vec![vec![]];
+                l.extend(blocks::user_prompt(&t, w));
+                l.push(vec![]);
+                self.tr.commit(l);
+            }
+            AgentEvent::Text(s) => self.tr.queue_reveal(Stream::Text, s, w),
+            AgentEvent::Thinking(s) => self.tr.queue_reveal(Stream::Thinking, s, w),
+            AgentEvent::ToolCallStart { id, name } => {
+                self.tr.finish_thinking(w);
+                self.calls.push(StreamingCall { id, name, json: Default::default(), args: json!({}), stale: false });
+            }
+            AgentEvent::ToolCallDelta { id, json } => {
+                if let Some(c) = self.calls.iter_mut().find(|c| c.id == id) {
+                    c.json.push(&json);
+                    c.stale = true;
+                }
+            }
+            AgentEvent::BlockEnd => self.tr.end_block(w),
+            AgentEvent::ToolStart { id, name, args } => {
+                self.calls.retain(|c| c.id != id);
+                self.tr.finish_thinking(w);
+                if name == "bash"
+                    && let Some(c) = args["command"].as_str()
+                {
+                    push_capped(&mut self.bash_cmds, c.to_string());
+                }
+                self.tools.push(RunningTool {
+                    id,
+                    name,
+                    args,
+                    started: Instant::now(),
+                    tail: VecDeque::new(),
+                    partial: String::new(),
+                });
+            }
+            AgentEvent::PtyOpen { id, input, reply } => {
+                // A pty is already open: dropping `reply` makes the tool fall back.
+                if self.pty.is_none() {
+                    let cells = PtyView::size_for(size.0, size.1);
+                    self.pty = Some(PtyView::new(id, input, cells));
+                    let _ = reply.send(cells);
+                }
+            }
+            AgentEvent::ToolOutput { id, chunk } => {
+                if let Some(p) = self.pty.as_mut().filter(|p| p.id == id) {
+                    p.feed(&chunk);
+                } else if let Some(t) = self.tools.iter_mut().find(|t| t.id == id) {
+                    t.partial.push_str(&chunk);
+                    while let Some(i) = t.partial.find('\n') {
+                        let line: String = t.partial.drain(..=i).collect();
+                        t.tail.push_back(line.trim_end_matches(['\n', '\r']).to_string());
+                        if t.tail.len() > TAIL_MAX {
+                            t.tail.pop_front();
+                        }
+                    }
+                }
+            }
+            AgentEvent::ToolEnd { id, name, output } => {
+                if self.pty.as_ref().is_some_and(|p| p.id == id) {
+                    self.pty = None;
+                }
+                let args = self
+                    .tools
+                    .iter()
+                    .position(|t| t.id == id)
+                    .map(|i| self.tools.remove(i).args)
+                    .unwrap_or(Value::Null);
+                self.commit_tool_result(&name, &args, &output, w);
+            }
+            AgentEvent::Retry { attempt, delay, reason } => {
+                self.tr.reset_stream();
+                self.calls.clear();
+                let msg = format!("↻ retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs());
+                self.tr.commit(notice_lines(&msg));
+            }
+            AgentEvent::Notice(s) => self.tr.commit(notice_lines(&s)),
+            AgentEvent::Error(s) => self.tr.commit(error_lines(&s)),
+            AgentEvent::Compacting => self.compacting = true,
+            AgentEvent::Compacted { before, after } => {
+                self.compacting = false;
+                self.tr.commit(notice_lines(&format!("── compacted {before}→{after} tokens")));
+            }
+            AgentEvent::Jobs(v) => {
+                if v.is_empty() {
+                    self.jobs_committed.clear();
+                }
+                for r in v.iter().filter(|r| r.state != SubagentState::Running) {
+                    if self.jobs_committed.insert(r.name.clone()) {
+                        self.tr.commit(blocks::subagent_rows(std::slice::from_ref(r), ' '));
+                    }
+                }
+                self.job_out.retain(|id, _| v.iter().any(|j| &j.name == id));
+                self.jobs = v;
+                fx.push(Effect::JobsChanged);
+            }
+            AgentEvent::JobOutput { id, tail } => {
+                self.job_out.insert(id.clone(), tail);
+                fx.push(Effect::JobOutput(id));
+            }
+            AgentEvent::JobsDelivered(ids) => {
+                self.tr.commit(vec![styled(format!("↳ job results delivered: {}", ids.join(", ")), |_| dim())]);
+            }
+            AgentEvent::Ask { questions, reply } => {
+                self.ring_if_attention(&mut fx);
+                fx.push(Effect::Ask { questions, reply });
+            }
+            AgentEvent::PlanReview { title, uri, file, content, stored, note, reply } => {
+                self.ring_if_attention(&mut fx);
+                fx.push(Effect::PlanReview { title, uri, file, content, stored, note, reply });
+            }
+            AgentEvent::PlanParked { id, path } => {
+                self.tr.commit(notice_lines(&format!("plan parked: {id} · {}", path.display())));
+            }
+            AgentEvent::PlanList(list) => fx.push(Effect::PlanList(list)),
+            AgentEvent::Status(s) => self.status = s,
+            AgentEvent::Todo(v) => self.todo = serde_json::from_value(v).unwrap_or_default(),
+            AgentEvent::TurnEnd { aborted } => {
+                self.pty = None;
+                self.calls.clear();
+                self.tr.end_turn(w);
+                self.tools.clear();
+                self.compacting = false;
+                self.running = false;
+                self.turn_started = None;
+                if self.bell.on_turn_end(aborted) {
+                    fx.push(Effect::Ring);
+                }
+                if aborted {
+                    self.tr.commit(notice_lines("[aborted]"));
+                }
+                fx.push(Effect::TurnEnded { aborted });
+            }
+            AgentEvent::Exit | AgentEvent::TurnFailed | AgentEvent::ToolSkipped { .. } => {}
+        }
+        fx
+    }
+
+    fn ring_if_attention(&mut self, fx: &mut Vec<Effect>) {
+        if self.bell.on_attention() {
+            fx.push(Effect::Ring);
+        }
+    }
+
+    fn commit_tool_result(&mut self, name: &str, args: &Value, output: &ToolOutput, w: usize) {
+        let mut l = blocks::tool_result(name, args, output, self.expanded, w);
+        // Breathing room: a blank row after every tool block, as text blocks have.
+        l.push(vec![]);
+        self.tr.commit(l);
+    }
+
+    /// The rows of what is happening now: open text, running tools, streaming calls and running
+    /// jobs. Also returns where the pty's cursor is, when a pty is open.
+    pub(super) fn live_lines(&self, w: usize, spin: char) -> (Vec<Line>, Option<(usize, usize)>) {
+        let mut pty_cursor = None;
+        let mut out: Vec<Line> = Vec::new();
+        out.extend(self.tr.live_lines(w, spin));
+        for t in &self.tools {
+            if let Some(p) = self.pty.as_ref().filter(|p| p.id == t.id) {
+                let (rows, cur) = p.screen();
+                let (lines, c) = blocks::pty_live(&t.args, &rows, cur, t.started.elapsed().as_secs(), w);
+                pty_cursor = c.map(|c| (out.len() + c.0, c.1));
+                out.extend(lines);
+                continue;
+            }
+            let mut tail: Vec<String> = t.tail.iter().cloned().collect();
+            if !t.partial.is_empty() {
+                tail.push(t.partial.clone());
+            }
+            let tail = &tail[tail.len().saturating_sub(TAIL_MAX)..];
+            out.extend(blocks::tool_live(&t.name, &t.args, tail, spin, t.started.elapsed().as_secs(), w));
+        }
+        for c in &self.calls {
+            out.extend(blocks::tool_streaming(&c.name, &c.args, spin, w));
+        }
+        let running: Vec<SubagentStatus> =
+            self.jobs.iter().filter(|j| j.state == SubagentState::Running).cloned().collect();
+        out.extend(blocks::subagent_rows(&running, spin));
+        if self.compacting {
+            out.push(styled(format!("{spin} Compacting context…"), |_| theme::get().fg(Role::Warn)));
+        }
+        (out, pty_cursor)
+    }
+
+    /// The todo list in a few rows above the composer: the counts, the task in progress and the next ones.
+    pub(super) fn todo_hud(&self, w: usize) -> Vec<Line> {
+        let all: Vec<&mu_tools::tools::todo::Task> = self.todo.iter().flat_map(|p| p.tasks.iter()).collect();
+        if all.is_empty() {
+            return vec![];
+        }
+        let open = |t: &mu_tools::tools::todo::Task| matches!(t.status, Status::Pending | Status::InProgress);
+        let Some(phase) = self.todo.iter().find(|p| p.tasks.iter().any(open)) else { return vec![] };
+        let done = all.iter().filter(|t| matches!(t.status, Status::Completed | Status::Abandoned)).count();
+        let mut out = vec![styled(trunc(&format!("todo {done}/{} · {}", all.len(), phase.name), w), |_| dim())];
+        for t in phase.tasks.iter().filter(|t| t.status == Status::InProgress).take(1) {
+            out.push(styled(trunc(&format!("  ▸ {}", t.content), w), |_| theme::get().fg(Role::Warn)));
+        }
+        for t in phase.tasks.iter().filter(|t| t.status == Status::Pending).take(3) {
+            out.push(styled(trunc(&format!("  ○ {}", t.content), w), |_| dim()));
+        }
+        out.truncate(6);
+        out
+    }
+}
+
+impl App {
+    /// Streamed text and thinking go to the transcript; this applies one agent event to the
+    /// view and carries out the effects it leaves.
+    pub(super) fn on_agent(&mut self, e: AgentEvent) {
+        self.screen.dirty = true;
+        let fx = self.agent.on_event(e, self.screen.renderer.size());
+        for effect in fx {
+            self.apply(effect);
+        }
+    }
+
+    fn apply(&mut self, effect: Effect) {
+        match effect {
+            Effect::Ring => self.ring(),
+            Effect::Ask { questions, reply } => self.start_ask(questions, reply),
+            Effect::PlanReview { title, uri, file, content, stored, note, reply } => {
+                let context = self
+                    .agent
+                    .status
+                    .context_tokens
+                    .filter(|_| self.agent.status.context_window > 0)
+                    .map(|t| (t, self.agent.status.context_window as u64));
+                let tiers = self.plan_tiers();
+                let review = crate::panels::plan_review::PlanReview::new(
+                    title, uri, file, content, context, tiers, stored, note,
+                );
+                self.overlay = Some(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
+            }
+            Effect::PlanList(list) => self.show_plans(list),
+            Effect::JobsChanged => {
+                if let Some(Overlay::Jobs { st }) = &mut self.overlay {
+                    st.set_jobs(self.agent.jobs.clone());
+                }
+            }
+            Effect::JobOutput(id) => {
+                if let (Some(Overlay::Jobs { st }), Some(tail)) = (&mut self.overlay, self.agent.job_out.get(&id)) {
+                    st.set_output(&id, tail);
+                }
+            }
+            Effect::TurnEnded { aborted } => {
+                // Whatever is still queued when a turn ends (it was aborted or failed) was written for
+                // that turn; it comes back as editable text instead of leaking into the next one.
+                let queued: Vec<UserInput> = {
+                    let mut ib = self.link.inbox.borrow_mut();
+                    let mut q: Vec<UserInput> = ib.steer.drain(..).collect();
+                    q.extend(ib.follow_up.drain(..));
+                    q
+                };
+                if !queued.is_empty() {
+                    if !aborted {
+                        self.notice("queued messages were not sent; they are back in the composer");
+                    }
+                    self.restore_queued(queued);
+                }
+            }
+        }
+    }
+}
+
+/// Newest entries win once the list holds `BASH_CMDS_MAX`.
+fn push_capped<T>(v: &mut Vec<T>, item: T) {
+    if v.len() == BASH_CMDS_MAX {
+        v.remove(0);
+    }
+    v.push(item);
+}
+
+/// Lines of a notice: dim.
+pub(super) fn notice_lines(s: &str) -> Vec<Line> {
+    s.lines().map(|l| styled(l.to_string(), |_| dim())).collect()
+}
+
+/// Lines of an error: the error colour.
+pub(super) fn error_lines(s: &str) -> Vec<Line> {
+    s.lines().map(|l| styled(l.to_string(), |_| theme::get().fg(Role::Err))).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::line::line_text;
+    use mu_base::events::{JobKind, StatusSnapshot};
+    use std::time::{Duration, SystemTime};
+
+    const SIZE: (usize, usize) = (80, 24);
+
+    fn view() -> AgentView {
+        AgentView::new(true, false)
+    }
+
+    fn pending(v: &AgentView) -> String {
+        v.tr.pending.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    fn job(name: &str, state: SubagentState, kind: JobKind) -> SubagentStatus {
+        SubagentStatus {
+            name: name.into(),
+            agent: "task".into(),
+            tools: 0,
+            last: String::new(),
+            state,
+            kind,
+            cwd: PathBuf::from("/"),
+            task: "do it".into(),
+            started: SystemTime::now(),
+            ended: None,
+            delivered: false,
+            note: None,
+            session: None,
+            model: None,
+        }
+    }
+
+    fn output(text: &str) -> ToolOutput {
+        ToolOutput { text: text.into(), is_error: false, display: None, details: None, meta: None, images: vec![] }
+    }
+
+    #[test]
+    fn text_streams_into_the_open_block() {
+        let mut v = view();
+        assert!(v.on_event(AgentEvent::Text("Hello".into()), SIZE).is_empty());
+        let open: Vec<String> = v.tr.live_lines(80, ' ').iter().map(line_text).collect();
+        assert!(open.iter().any(|l| l.contains("Hello")), "{open:?}");
+        v.on_event(AgentEvent::Notice("done".into()), SIZE);
+        assert!(pending(&v).contains("done"));
+    }
+
+    #[test]
+    fn thinking_is_active_until_the_turn_ends() {
+        let mut v = view();
+        v.on_event(AgentEvent::Thinking("pondering".into()), SIZE);
+        assert!(v.tr.thinking_active());
+        v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert!(!v.tr.thinking_active());
+    }
+
+    #[test]
+    fn a_tool_runs_from_start_through_output_to_end() {
+        let mut v = view();
+        v.on_event(
+            AgentEvent::ToolStart { id: "t1".into(), name: "bash".into(), args: json!({"command": "ls -l"}) },
+            SIZE,
+        );
+        assert_eq!(v.bash_cmds, ["ls -l"]);
+        assert_eq!(v.tools.len(), 1);
+        v.on_event(AgentEvent::ToolOutput { id: "t1".into(), chunk: "one\ntwo\npart".into() }, SIZE);
+        let t = &v.tools[0];
+        assert_eq!(t.tail.iter().map(String::as_str).collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(t.partial, "part");
+        v.on_event(AgentEvent::ToolEnd { id: "t1".into(), name: "bash".into(), output: output("ok") }, SIZE);
+        assert!(v.tools.is_empty());
+        assert!(!pending(&v).is_empty());
+    }
+
+    #[test]
+    fn a_streaming_call_is_dropped_when_its_tool_starts() {
+        let mut v = view();
+        v.on_event(AgentEvent::ToolCallStart { id: "c1".into(), name: "write".into() }, SIZE);
+        v.on_event(AgentEvent::ToolCallDelta { id: "c1".into(), json: "{\"path\"".into() }, SIZE);
+        assert!(v.calls[0].stale);
+        v.on_event(AgentEvent::ToolStart { id: "c1".into(), name: "write".into(), args: json!({}) }, SIZE);
+        assert!(v.calls.is_empty());
+    }
+
+    #[test]
+    fn todo_updates_replace_the_list() {
+        use mu_tools::tools::todo::Task;
+        let phase = Phase {
+            name: "Build".into(),
+            tasks: vec![Task { content: "compile".into(), status: Status::InProgress, blocker: None }],
+        };
+        let mut v = view();
+        v.on_event(AgentEvent::Todo(serde_json::to_value(vec![phase]).unwrap()), SIZE);
+        assert_eq!(v.todo.len(), 1);
+        assert_eq!(v.todo[0].tasks.len(), 1);
+        assert!(v.todo_hud(80).iter().any(|l| line_text(l).contains("compile")));
+        v.on_event(AgentEvent::Todo(json!([])), SIZE);
+        assert!(v.todo.is_empty());
+    }
+
+    #[test]
+    fn a_turn_tracks_running_and_reports_its_end() {
+        let mut v = view();
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        assert!(v.running && v.turn_started.is_some());
+        let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert!(!v.running && v.turn_started.is_none());
+        assert!(matches!(fx.as_slice(), [Effect::TurnEnded { aborted: false }]));
+        assert!(!pending(&v).contains("[aborted]"));
+    }
+
+    #[test]
+    fn an_aborted_turn_says_so() {
+        let mut v = view();
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        let fx = v.on_event(AgentEvent::TurnEnd { aborted: true }, SIZE);
+        assert!(pending(&v).contains("[aborted]"));
+        assert!(matches!(fx.as_slice(), [Effect::TurnEnded { aborted: true }]));
+    }
+
+    #[test]
+    fn errors_and_retries_are_printed() {
+        let mut v = view();
+        v.calls.push(StreamingCall {
+            id: "c".into(),
+            name: "x".into(),
+            json: Default::default(),
+            args: json!({}),
+            stale: false,
+        });
+        v.on_event(AgentEvent::Error("boom".into()), SIZE);
+        assert!(pending(&v).contains("boom"));
+        v.on_event(AgentEvent::Retry { attempt: 2, delay: Duration::from_secs(4), reason: "timeout".into() }, SIZE);
+        assert!(pending(&v).contains("retrying in 4s (timeout) [attempt 2/5]"));
+        assert!(v.calls.is_empty());
+    }
+
+    #[test]
+    fn compaction_is_reported_and_ends() {
+        let mut v = view();
+        v.on_event(AgentEvent::Compacting, SIZE);
+        assert!(v.compacting && v.busy());
+        v.on_event(AgentEvent::Compacted { before: 100, after: 40 }, SIZE);
+        assert!(!v.compacting);
+        assert!(pending(&v).contains("compacted 100→40 tokens"));
+    }
+
+    #[test]
+    fn a_finished_job_is_printed_once_until_the_list_empties() {
+        let mut v = view();
+        let done = vec![job("j1", SubagentState::Done, JobKind::Subagent)];
+        let fx = v.on_event(AgentEvent::Jobs(done.clone()), SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::JobsChanged]));
+        let once = v.tr.pending.len();
+        assert!(once > 0);
+        v.on_event(AgentEvent::Jobs(done.clone()), SIZE);
+        assert_eq!(v.tr.pending.len(), once, "the same finished job is not printed again");
+        v.on_event(AgentEvent::Jobs(vec![]), SIZE);
+        v.on_event(AgentEvent::Jobs(done), SIZE);
+        assert_eq!(v.tr.pending.len(), 2 * once, "after an empty snapshot it is printed again");
+    }
+
+    #[test]
+    fn a_running_job_is_listed_not_printed() {
+        let mut v = view();
+        v.on_event(AgentEvent::Jobs(vec![job("j2", SubagentState::Running, JobKind::Subagent)]), SIZE);
+        assert!(v.tr.pending.is_empty());
+        assert!(v.busy(), "a running job keeps the screen busy");
+        assert!(v.live_lines(80, ' ').0.iter().any(|l| line_text(l).contains("j2")));
+    }
+
+    #[test]
+    fn job_output_is_kept_and_pruned_with_its_job() {
+        let mut v = view();
+        v.on_event(AgentEvent::Jobs(vec![job("b1", SubagentState::Running, JobKind::Bash)]), SIZE);
+        let fx = v.on_event(AgentEvent::JobOutput { id: "b1".into(), tail: "line".into() }, SIZE);
+        assert_eq!(v.job_out.get("b1").map(String::as_str), Some("line"));
+        assert!(matches!(fx.as_slice(), [Effect::JobOutput(id)] if id == "b1"));
+        v.on_event(AgentEvent::Jobs(vec![]), SIZE);
+        assert!(v.job_out.is_empty());
+    }
+
+    #[test]
+    fn delivered_jobs_are_announced() {
+        let mut v = view();
+        v.on_event(AgentEvent::JobsDelivered(vec!["j1".into(), "j2".into()]), SIZE);
+        assert!(pending(&v).contains("job results delivered: j1, j2"));
+    }
+
+    #[test]
+    fn a_question_rings_only_in_a_turn_the_user_did_not_start() {
+        let (tx, _rx) = oneshot::channel::<Option<Vec<Answer>>>();
+        let mut v = view();
+        let fx = v.on_event(AgentEvent::Ask { questions: vec![], reply: tx }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Ask { .. }]));
+
+        let (tx, _rx) = oneshot::channel::<Option<Vec<Answer>>>();
+        let mut v = view();
+        v.on_event(AgentEvent::Woken, SIZE);
+        let fx = v.on_event(AgentEvent::Ask { questions: vec![], reply: tx }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::Ask { .. }]));
+    }
+
+    #[test]
+    fn a_woken_turn_rings_once_when_it_ends() {
+        let mut v = view();
+        v.on_event(AgentEvent::Woken, SIZE);
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::TurnEnded { aborted: false }]));
+        let aborted = {
+            v.on_event(AgentEvent::Woken, SIZE);
+            v.on_event(AgentEvent::TurnStart, SIZE);
+            v.on_event(AgentEvent::TurnEnd { aborted: true }, SIZE)
+        };
+        assert!(matches!(aborted.as_slice(), [Effect::TurnEnded { aborted: true }]), "an aborted turn does not ring");
+    }
+
+    #[test]
+    fn plan_lists_and_status_updates_are_handed_over_or_kept() {
+        let mut v = view();
+        let fx = v.on_event(AgentEvent::PlanList(vec![]), SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::PlanList(l)] if l.is_empty()));
+        let fx = v.on_event(AgentEvent::Status(StatusSnapshot { context_window: 9, ..Default::default() }), SIZE);
+        assert!(fx.is_empty());
+        assert_eq!(v.status.context_window, 9);
+    }
+}
