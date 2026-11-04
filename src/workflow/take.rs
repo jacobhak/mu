@@ -45,7 +45,7 @@ pub fn run(arg: &Path, cwd: &Path) -> anyhow::Result<i32> {
 
 /// `Ok(None)`: the session is free, go on. `Ok(Some(code))`: stop with that exit code.
 fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<i32>> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = mu_base::runtime::current_thread_runtime()?;
     // Registered before signalling, so a Ctrl-C right after is not lost.
     let mut int = {
         let _g = rt.enter();

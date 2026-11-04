@@ -56,7 +56,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             };
             let entry = Entry { base_url, ..entry };
             if !no_validate {
-                match runtime()?.block_on(check_entry(def, &entry)) {
+                match mu_base::runtime::current_thread_runtime()?.block_on(check_entry(def, &entry)) {
                     Check::Valid => {}
                     Check::Rejected(m) => bail!("{m}; nothing saved"),
                     Check::Unreachable(m) => {
@@ -84,7 +84,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             let entry = store
                 .get(def.id)
                 .ok_or_else(|| anyhow!("no {} key is stored; run `mu auth add {}`", def.label, def.id))?;
-            match runtime()?.block_on(check_entry(def, &entry)) {
+            match mu_base::runtime::current_thread_runtime()?.block_on(check_entry(def, &entry)) {
                 Check::Valid => {
                     writeln!(out, "{}: the key works", def.label)?;
                     Ok(0)
@@ -109,10 +109,6 @@ fn provider_def(id: &str) -> Result<&'static ProviderDef> {
         let known: Vec<&str> = PROVIDERS.iter().map(|d| d.id).collect();
         anyhow!("unknown provider `{id}`; mu can use keys for: {}", known.join(", "))
     })
-}
-
-fn runtime() -> Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
 }
 
 async fn check_entry(def: &ProviderDef, entry: &Entry) -> Check {

@@ -13,6 +13,7 @@ pub mod message;
 pub mod models;
 pub mod process;
 pub mod pty;
+pub mod runtime;
 pub mod schema;
 pub mod secrets;
 pub mod text;

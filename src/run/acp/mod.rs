@@ -29,7 +29,7 @@ const INTERNAL: i64 = -32603;
 
 pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
     mu_session::session::set_run_info("acp", None);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = mu_base::runtime::current_thread_runtime()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         mu_tools::plugin::process::exit_on_signals();

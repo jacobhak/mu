@@ -147,7 +147,7 @@ fn cli_markdown(v: &CliVerdict, report: Option<&Report>) -> String {
 /// `mu review`: runs the review in `cwd` and prints the verdict as JSON (or markdown) to `--out` or
 /// stdout. Returns the exit code, see `exit_code`.
 pub fn run_cli(o: CliOpts, cwd: &Path) -> i32 {
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match mu_base::runtime::current_thread_runtime() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("mu review: {e}");

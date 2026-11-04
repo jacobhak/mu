@@ -125,7 +125,7 @@ async fn cli(cmd: PlanCmd, cwd: &Path) -> i32 {
 
 /// `mu plan list|show|drop`; returns the exit code.
 pub fn run_cli(cmd: PlanCmd, cwd: &Path) -> i32 {
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match mu_base::runtime::current_thread_runtime() {
         Ok(r) => r,
         Err(e) => return fail(e.to_string()),
     };

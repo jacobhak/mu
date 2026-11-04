@@ -587,7 +587,7 @@ async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
 }
 
 pub fn run_cli(a: DeliverArgs, cwd: &Path) -> i32 {
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match mu_base::runtime::current_thread_runtime() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("mu deliver: {e}");

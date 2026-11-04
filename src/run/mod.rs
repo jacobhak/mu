@@ -170,7 +170,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     session::set_run_info(mode.run_kind(), name);
 
     let (print, max_cost) = (cli.print.clone(), cli.max_cost);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = mu_base::runtime::current_thread_runtime()?;
     let local = tokio::task::LocalSet::new();
     let code = local.block_on(&rt, async move {
         // Before the agent task can create or lock a session: an owner record that says
