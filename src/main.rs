@@ -1,7 +1,6 @@
 mod acp;
 mod agent;
 mod ask_nudge;
-mod at_imports;
 mod auth_cmd;
 mod auth_store;
 mod compaction;
@@ -30,6 +29,7 @@ mod policy;
 mod predict_setup;
 mod pricing;
 mod proc;
+mod prompt;
 mod provider;
 mod pty;
 mod quota;

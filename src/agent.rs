@@ -1,6 +1,6 @@
 use crate::ask_nudge;
 use crate::compaction::Outcome;
-use crate::context::{self, Context, PromptInput};
+use crate::context::{self, Context};
 use crate::cost::CostLedger;
 use crate::events::{AgentEvent, Command, EventTx, GitInfo, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
 use crate::gitinfo;
@@ -14,6 +14,7 @@ use crate::plans;
 use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
 use crate::pricing;
+use crate::prompt::{self, PromptInput};
 use crate::provider::{ProviderError, Providers, Request, StreamEvent};
 use crate::quota::QuotaTracker;
 use crate::review;
@@ -382,7 +383,7 @@ impl Agent {
 
     pub fn system(&self) -> String {
         let mcp = self.plugins.mcp_instructions();
-        context::system_prompt(&PromptInput {
+        prompt::system_prompt(&PromptInput {
             model: &self.model.id,
             cwd: &self.cwd,
             ctx: &self.ctx,
