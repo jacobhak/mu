@@ -28,7 +28,7 @@ use mu_common::paths;
 use mu_provider::provider::Providers;
 use mu_provider::provider::native;
 use mu_tools::context::Context;
-use mu_tools::plugin::PluginHost;
+use mu_tools::plugin::host::PluginHost;
 use mu_tools::tools::todo::{Phase, Status};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};

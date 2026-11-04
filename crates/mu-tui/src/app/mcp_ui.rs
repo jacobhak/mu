@@ -9,7 +9,7 @@ use crate::widgets::overlay::{McpAction, McpPick, McpRow};
 use mu_tools::mcp::config::{self, Entry, Kind};
 use mu_tools::mcp::discover::{self, Found, Roots};
 use mu_tools::mcp::store;
-use mu_tools::plugin::McpInfo;
+use mu_tools::plugin::host::McpInfo;
 use tokio_util::sync::CancellationToken;
 
 /// `scheme://host` of a url: paths, queries and credentials may carry secrets.

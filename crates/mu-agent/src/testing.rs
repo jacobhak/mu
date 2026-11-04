@@ -8,7 +8,7 @@ use mu_base::events::{AgentEvent, new_inbox};
 use mu_base::message::{Block, Message, StopReason};
 use mu_base::models::{ModelSpec, Thinking};
 use mu_provider::provider::{ProviderError, Providers};
-use mu_tools::plugin::PluginHost;
+use mu_tools::plugin::host::PluginHost;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;

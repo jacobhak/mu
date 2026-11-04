@@ -15,7 +15,7 @@ mod write;
 mod yield_;
 
 use crate::jobs::JobsHandle;
-use crate::plugin::PluginHost;
+use crate::plugin::host::PluginHost;
 use mu_base::events::EventTx;
 use mu_base::text::truncate_text as trunc;
 use mu_base::tool::{ToolDef, ToolOutput};

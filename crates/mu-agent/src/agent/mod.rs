@@ -21,7 +21,7 @@ use mu_session::inbox;
 use mu_session::session::{self, CompactionState, SessionFile};
 use mu_tools::context::{self, Context};
 use mu_tools::jobs::{self, JobsHandle};
-use mu_tools::plugin::{InitParams, PluginHost};
+use mu_tools::plugin::host::{InitParams, PluginHost};
 use mu_tools::tools::{ToolCtx, Tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
