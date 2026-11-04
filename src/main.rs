@@ -24,6 +24,7 @@ mod models;
 mod net;
 mod notify;
 mod plans;
+mod plans_cli;
 mod plugin;
 mod policy;
 mod predict_setup;
@@ -143,7 +144,7 @@ enum Sub {
     /// Durable plans: park a plan, then refine and approve it later (see `mu plan --help`).
     Plan {
         #[command(subcommand)]
-        cmd: plans::PlanCmd,
+        cmd: plans_cli::PlanCmd,
     },
     /// Leave a message for a session; an interactive mu with it open wakes up and reads it.
     Notify {
@@ -352,9 +353,9 @@ fn run() -> Result<i32> {
         return predict_setup::run(cmd);
     }
     let plan_run = match cli.command {
-        Some(Sub::Plan { cmd }) => match plans::plan_run(cmd) {
+        Some(Sub::Plan { cmd }) => match plans_cli::plan_run(cmd) {
             Ok(r) => Some(r),
-            Err(other) => return Ok(plans::run_cli(other, &std::env::current_dir()?)),
+            Err(other) => return Ok(plans_cli::run_cli(other, &std::env::current_dir()?)),
         },
         _ => None,
     };
