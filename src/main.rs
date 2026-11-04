@@ -1,11 +1,20 @@
+#[path = "run/acp/mod.rs"]
 mod acp;
+#[path = "cli/auth.rs"]
 mod auth_cmd;
+#[path = "workflow/deliver.rs"]
 mod deliver;
+#[path = "run/headless.rs"]
 mod headless;
+#[path = "workflow/notify.rs"]
 mod notify;
+#[path = "workflow/plans_cli.rs"]
 mod plans_cli;
+#[path = "cli/predict.rs"]
 mod predict_setup;
+#[path = "workflow/review_cli.rs"]
 mod review_cli;
+#[path = "workflow/take.rs"]
 mod take;
 mod update;
 
