@@ -253,7 +253,7 @@ impl AgentView {
             AgentEvent::Retry { attempt, delay, reason } => {
                 self.tr.reset_stream();
                 self.calls.clear();
-                let msg = format!("↻ retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs());
+                let msg = format!("↻ {}", mu_base::events::retry_notice(attempt, delay, &reason));
                 self.tr.commit(notice_lines(&msg));
             }
             AgentEvent::Notice(s) => self.tr.commit(notice_lines(&s)),

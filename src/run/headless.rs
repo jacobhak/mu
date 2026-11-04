@@ -1,6 +1,42 @@
-use mu_base::events::{AgentEvent, Command, PlanDecision};
+use mu_base::events::{AgentEvent, Command, PlanDecision, retry_notice};
 use mu_tools::tools::summary;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+/// What both headless modes fold from the agent's events the same way.
+#[derive(Default)]
+struct Accum {
+    /// The text block in progress.
+    buf: String,
+    /// The last finished text block.
+    last: String,
+    cost: f64,
+    usage: (u64, u64),
+    exited: bool,
+}
+
+impl Accum {
+    fn fold(&mut self, e: &AgentEvent) {
+        match e {
+            AgentEvent::Text(t) => self.buf.push_str(t),
+            AgentEvent::BlockEnd => {
+                if !self.buf.is_empty() {
+                    self.last = std::mem::take(&mut self.buf);
+                }
+            }
+            AgentEvent::Status(s) => {
+                self.cost = s.cost;
+                self.usage = (s.tokens_in, s.tokens_out);
+            }
+            AgentEvent::Exit => self.exited = true,
+            _ => {}
+        }
+    }
+
+    /// The final text: a block still open, else the last one that finished.
+    fn text(self) -> String {
+        if self.buf.is_empty() { self.last } else { self.buf }
+    }
+}
 
 /// `-p`: runs one prompt to completion. Final assistant text goes to stdout, progress to stderr.
 /// Each message on `stop` is a request to hand the session over: the first ends the turn at the
@@ -21,8 +57,8 @@ pub async fn print_mode(
     }
     let _ = cmd.send(first);
     let _ = cmd.send(Command::Exit);
-    let (mut buf, mut last, mut code) = (String::new(), String::new(), 0);
-    let (mut cost, mut capped, mut exited, mut errored, mut parked) = (0.0f64, false, false, false, false);
+    let mut acc = Accum::default();
+    let (mut code, mut capped, mut errored, mut parked) = (0, false, false, false);
     let (mut session, mut stops) = (None::<String>, 0u32);
     let mut skipped = None::<(String, String)>;
     loop {
@@ -52,25 +88,19 @@ pub async fn print_mode(
                 continue;
             }
         };
+        acc.fold(&e);
         match e {
             AgentEvent::Status(s) => {
-                cost = s.cost;
                 if let Some(p) = session_line(&mut session, s.session_path) {
                     eprintln!("{p}");
                 }
-                if let Some(max) = max_cost.filter(|m| s.cost > *m)
+                if let Some(max) = max_cost.filter(|m| acc.cost > *m)
                     && !capped
                 {
                     capped = true;
                     let _ = cmd.send(Command::Cancel);
                     eprintln!("mu: cost cap ${max:.2} exceeded");
                     code = 1;
-                }
-            }
-            AgentEvent::Text(t) => buf.push_str(&t),
-            AgentEvent::BlockEnd => {
-                if !buf.is_empty() {
-                    last = std::mem::take(&mut buf);
                 }
             }
             AgentEvent::ToolSkipped { id } => skipped = Some((id, String::new())),
@@ -84,7 +114,7 @@ pub async fn print_mode(
                 eprintln!("○ {head} (not run: {})", output.text)
             }
             AgentEvent::Retry { attempt, delay, reason } => {
-                eprintln!("↻ retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs())
+                eprintln!("↻ {}", retry_notice(attempt, delay, &reason))
             }
             AgentEvent::Compacted { before, after } => eprintln!("── compacted {before}→{after} tokens"),
             AgentEvent::Notice(s) => eprintln!("{s}"),
@@ -94,10 +124,7 @@ pub async fn print_mode(
             }
             AgentEvent::TurnFailed => errored = true,
             AgentEvent::TurnEnd { aborted: true } => code = 1,
-            AgentEvent::Exit => {
-                exited = true;
-                break;
-            }
+            AgentEvent::Exit => break,
             // Nobody is there to approve: a plan that reaches review is parked for later.
             AgentEvent::PlanReview { reply, .. } => {
                 let _ = reply.send(PlanDecision::Park);
@@ -109,12 +136,11 @@ pub async fn print_mode(
             _ => {}
         }
     }
+    let (cost, exited) = (acc.cost, acc.exited);
+    let last = acc.text();
     if !exited {
         eprintln!("mu: agent stopped unexpectedly");
         code = 1;
-    }
-    if !buf.is_empty() {
-        last = buf;
     }
     if expect_park && !parked && code == 0 && stops == 0 {
         eprintln!("mu: no plan was parked");
@@ -180,18 +206,12 @@ pub(crate) async fn run_subagent(
     if !structured {
         let _ = cmd.send(Command::Exit);
     }
-    let (mut buf, mut last) = (String::new(), String::new());
-    let (mut is_error, mut session, mut usage) = (false, None::<String>, (0u64, 0u64));
+    let mut acc = Accum::default();
+    let (mut is_error, mut session) = (false, None::<String>);
     let (mut data, mut yield_error, mut nudged) = (None::<serde_json::Value>, None::<String>, false);
-    let mut exited = false;
     while let Some(e) = ev.recv().await {
+        acc.fold(&e);
         match e {
-            AgentEvent::Text(t) => buf.push_str(&t),
-            AgentEvent::BlockEnd => {
-                if !buf.is_empty() {
-                    last = std::mem::take(&mut buf);
-                }
-            }
             AgentEvent::ToolStart { name, args, .. } => {
                 out(json!({"type": "tool", "name": name, "summary": summary(&name, &args)}));
             }
@@ -207,17 +227,16 @@ pub(crate) async fn run_subagent(
                     out(json!({"type": "session", "path": p}));
                 }
                 session = s.session_path.or(session);
-                usage = (s.tokens_in, s.tokens_out);
             }
             AgentEvent::Retry { attempt, delay, reason } => {
-                eprintln!("retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs())
+                eprintln!("{}", retry_notice(attempt, delay, &reason))
             }
             AgentEvent::Notice(s) => eprintln!("{s}"),
             AgentEvent::Error(s) => {
                 eprintln!("{s}");
                 is_error = true;
-                if last.is_empty() {
-                    last = s;
+                if acc.last.is_empty() {
+                    acc.last = s;
                 }
             }
             AgentEvent::TurnEnd { aborted } => {
@@ -232,22 +251,18 @@ pub(crate) async fn run_subagent(
                     }
                 }
             }
-            AgentEvent::Exit => {
-                exited = true;
-                break;
-            }
+            AgentEvent::Exit => break,
             _ => {}
         }
     }
-    if !exited {
+    if !acc.exited {
         is_error = true;
-        if last.is_empty() && buf.is_empty() {
-            last = "agent stopped unexpectedly".into();
+        if acc.last.is_empty() && acc.buf.is_empty() {
+            acc.last = "agent stopped unexpectedly".into();
         }
     }
-    if !buf.is_empty() {
-        last = buf;
-    }
+    let usage = acc.usage;
+    let last = acc.text();
     let mut result = json!({"type": "result", "text": last.trim_end(), "isError": is_error, "session": session, "usage": {"input": usage.0, "output": usage.1}});
     if structured {
         match (&data, &yield_error) {

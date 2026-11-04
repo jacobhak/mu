@@ -480,12 +480,9 @@ impl Server {
                 }
             }
             AgentEvent::Notice(m) => notice(notices, sid, "info", m),
-            AgentEvent::Retry { attempt, delay, reason } => notice(
-                notices,
-                sid,
-                "warning",
-                format!("retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs()),
-            ),
+            AgentEvent::Retry { attempt, delay, reason } => {
+                notice(notices, sid, "warning", mu_base::events::retry_notice(attempt, delay, &reason))
+            }
             AgentEvent::Compacted { before, after } => {
                 notice(notices, sid, "info", format!("compacted {before}→{after} tokens"))
             }

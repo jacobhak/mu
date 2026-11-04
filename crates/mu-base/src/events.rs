@@ -6,6 +6,11 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 
+/// The retry notice every front end shows: `retrying in 4s (timeout) [attempt 2/5]`.
+pub fn retry_notice(attempt: u32, delay: Duration, reason: &str) -> String {
+    format!("retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs())
+}
+
 pub enum Command {
     Prompt(UserInput),
     /// Creates the session file now, so its id is known before the first prompt.
