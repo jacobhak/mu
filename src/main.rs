@@ -37,8 +37,6 @@ mod secrets;
 mod session;
 mod session_tail;
 mod take;
-#[cfg(test)]
-mod testutil;
 mod text;
 mod tools;
 mod tui;

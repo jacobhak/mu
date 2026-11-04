@@ -1,0 +1,10 @@
+[package]
+name = "mu-testutil"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }

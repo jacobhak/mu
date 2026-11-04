@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace]
-members = ["crates/mu-common", "crates/mu-bench", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
+members = ["crates/mu-common", "crates/mu-bench", "crates/mu-testutil", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
 exclude = ["plugins/mcp-http"]
 resolver = "3"
 
@@ -73,6 +73,9 @@ sha2 = "0.11.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary", "NSString"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSBitmapImageRep", "NSImageRep"] }
+
+[dev-dependencies]
+mu-testutil = { path = "crates/mu-testutil" }
 
 [patch.crates-io]
 brush-core   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }

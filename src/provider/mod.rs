@@ -262,7 +262,7 @@ fn default_store() -> crate::auth_store::Store {
 
 #[cfg(test)]
 fn default_store() -> crate::auth_store::Store {
-    crate::auth_store::Store::at(crate::testutil::home().join("auth.json"))
+    crate::auth_store::Store::at(mu_testutil::home().join("auth.json"))
 }
 
 pub struct Providers {
@@ -711,7 +711,7 @@ mod route_tests {
 mod native_route_tests {
     use super::*;
     use crate::auth_store::{Entry, Store};
-    use crate::testutil::{Reply, fake_server};
+    use mu_testutil::{Reply, fake_server};
     use std::path::PathBuf;
 
     const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\"}}\n\n\
@@ -1018,7 +1018,7 @@ mod contract_native_anthropic_tests {
 mod other_native_route_tests {
     use super::*;
     use crate::auth_store::{Entry, Store};
-    use crate::testutil::{Reply, fake_server};
+    use mu_testutil::{Reply, fake_server};
 
     fn providers(provider: &str, key: &str, base: &str) -> (Providers, std::path::PathBuf) {
         let d = std::env::temp_dir().join(format!("mu-route2-{}", uuid::Uuid::new_v4()));

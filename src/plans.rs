@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn round_trip_collision_and_update_in_place() {
-        crate::testutil::home();
+        mu_testutil::home();
         let s = store_in(tmp());
         let (s1, s2) = (PathBuf::from("/s/1"), PathBuf::from("/s/2"));
         let a = save(&s, "x", Some(&s1), None, &["b"]);
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn status_rules_and_list() {
-        crate::testutil::home();
+        mu_testutil::home();
         let s = store_in(tmp());
         save(&s, "p", None, None, &[]);
         save(&s, "q", None, None, &[]);
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn worktrees_share_a_store() {
-        crate::testutil::home();
+        mu_testutil::home();
         let d = repo();
         let wt = tmp().join("wt");
         sh(&d, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "other"]);
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn drift_cases() {
-        crate::testutil::home();
+        mu_testutil::home();
         let d = repo();
         let rt = rt();
         let mk = |read: &[&str], base: Option<Base>| meta(&d, read, base);
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn dirty_base_is_named() {
-        crate::testutil::home();
+        mu_testutil::home();
         let d = repo();
         let rt = rt();
         std::fs::write(d.join("c.txt"), "new\n").unwrap();

@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn an_interactive_run_is_only_signalled_while_it_is_the_one_listed() {
-        crate::testutil::home();
+        mu_testutil::home();
         let s = session::SessionFile::create(Path::new("/opt/stop-tui"), None).unwrap();
         let me = std::process::id();
         // Another pid, or another start time: the record is somebody else's now. Never our own pid

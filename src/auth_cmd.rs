@@ -352,7 +352,7 @@ mod tests {
 #[cfg(test)]
 mod validate_tests {
     use super::*;
-    use crate::testutil::{Reply, fake_server};
+    use mu_testutil::{Reply, fake_server};
 
     fn rt<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)

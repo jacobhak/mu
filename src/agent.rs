@@ -2159,7 +2159,7 @@ mod loop_tests {
         script: Vec<Result<Message, ProviderError>>,
         cfg: Configs,
     ) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
-        crate::testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
+        mu_testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
         let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
         let providers = Rc::new(Providers::new(
@@ -2372,7 +2372,7 @@ mod loop_tests {
 
     #[test]
     fn structured_subagent_retries_invalid_yield_and_returns_data() {
-        crate::testutil::home();
+        mu_testutil::home();
         run(async {
             let script = vec![
                 Ok(assistant(vec![yield_call("y1", json!({"data":{"n":"x"}}))], StopReason::ToolUse)),
@@ -2395,7 +2395,7 @@ mod loop_tests {
 
     #[test]
     fn structured_subagent_ends_after_a_yielded_error() {
-        crate::testutil::home();
+        mu_testutil::home();
         run(async {
             let script = vec![
                 Ok(assistant(vec![yield_call("y1", json!({"error":"cannot"}))], StopReason::ToolUse)),
@@ -2517,7 +2517,7 @@ mod loop_tests {
 
     #[test]
     fn structured_subagent_fails_instead_of_hanging_when_the_session_cannot_be_created() {
-        let home = crate::testutil::home();
+        let home = mu_testutil::home();
         run(async {
             let cwd = std::env::temp_dir().join(format!("mu-nosess-{}", uuid::Uuid::new_v4()));
             let dir = crate::paths::session_dir(&cwd);
@@ -2893,7 +2893,7 @@ mod loop_tests {
 
     #[test]
     fn a_print_run_does_not_fall_back_to_a_fresh_session_when_resume_fails() {
-        crate::testutil::home();
+        mu_testutil::home();
         run(async {
             let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("hi")], StopReason::Stop))]);
             a.exit_on_resume_failure = true;

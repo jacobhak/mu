@@ -788,7 +788,7 @@ mod tests {
     }
 
     fn setup(plan: bool) -> (Job, Record, PathBuf) {
-        crate::testutil::home();
+        mu_testutil::home();
         let repo = repo();
         let plan_file = tmp().join("plan.md");
         std::fs::write(&plan_file, "# plan\n").unwrap();
@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn mu_steps_argv() {
-        crate::testutil::home();
+        mu_testutil::home();
         let repo = repo();
         let script = tmp().join("fake.sh");
         std::fs::write(
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn prepare_refusals() {
-        crate::testutil::home();
+        mu_testutil::home();
         let repo = repo();
         assert!(refusal(&args(Some("nope")), &repo).starts_with("plan 'nope' not found in "));
 

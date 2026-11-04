@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn images_are_kept_as_references_and_read_back_for_requests() {
-        crate::testutil::home();
+        mu_testutil::home();
         let mut png = PNG.to_vec();
         png.extend(std::iter::repeat_n(7u8, 200_000));
         let img = from_bytes(png.clone()).unwrap();

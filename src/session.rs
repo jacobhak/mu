@@ -1022,7 +1022,7 @@ mod tests {
     use super::*;
 
     fn home() -> &'static Path {
-        crate::testutil::home()
+        mu_testutil::home()
     }
 
     fn tmp(name: &str) -> PathBuf {

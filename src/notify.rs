@@ -261,7 +261,7 @@ pub fn run(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::home;
+    use mu_testutil::home;
     use std::os::unix::process::ExitStatusExt;
 
     fn uid(tag: &str) -> String {

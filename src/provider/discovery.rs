@@ -284,12 +284,12 @@ mod tests {
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
-    use crate::testutil::{Reply, fake_server};
+    use mu_testutil::{Reply, fake_server};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn a_refresh_is_cached_and_reaches_resolution_pricing_and_the_picker() {
-        crate::testutil::home();
+        mu_testutil::home();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let body = r#"{"data":[
