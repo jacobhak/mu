@@ -1,7 +1,7 @@
 //! `mu take <session|id>`: stop a running `mu -p` at its next tool boundary, then resume the
 //! session here, in the TUI. Only POSIX calls (`flock`, `kill`, `exec`), so it is portable.
 use mu_common::paths;
-use mu_session::control::{Recheck, signal, verify};
+use mu_session::control::{Recheck, Want, recheck, signal};
 use mu_session::session::{self, Owner};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -52,7 +52,7 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?
     };
     // The record was read a moment ago; make sure it is still the same live run before the first kill.
-    match verify(session::owner(path), pid, started) {
+    match recheck(session::owner(path), pid, started, Want::PrintRun) {
         Recheck::Same => {}
         Recheck::Free => return Ok(None),
         Recheck::Changed => {
@@ -91,7 +91,7 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
                     }
                     // Only signal again while it is still the same live run: the pid may have
                     // been reused after it exited.
-                    if verify(session::owner(path), pid, started) == Recheck::Same {
+                    if recheck(session::owner(path), pid, started, Want::PrintRun) == Recheck::Same {
                         let _ = signal(pid);
                         eprintln!("asked pid {pid} to stop now");
                     }

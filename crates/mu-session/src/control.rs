@@ -11,6 +11,8 @@ pub enum Want {
     PrintRun,
     /// An interactive owner that installed the SIGUSR2 handler (`inbox: true`).
     Inbox,
+    /// Any run that is not `-p` (a subagent's process group gets SIGTERM, which is how its parent cancels it).
+    NotPrint,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +35,7 @@ pub fn recheck(now: Owner, pid: u32, started: &str, want: Want) -> Recheck {
                 && match want {
                     Want::PrintRun => print_run,
                     Want::Inbox => inbox,
+                    Want::NotPrint => !print_run,
                 } =>
         {
             Recheck::Same
@@ -46,11 +49,6 @@ pub fn signal(pid: u32) -> Result<(), std::io::Error> {
     mu_base::process::signal_pid(pid, libc::SIGUSR1)
 }
 
-/// Compares a fresh owner lookup with the `-p` run `mu take` decided to stop.
-pub fn verify(now: Owner, pid: u32, started: &str) -> Recheck {
-    recheck(now, pid, started, Want::PrintRun)
-}
-
 const GONE: &str = "it has already finished";
 const CHANGED: &str = "the session changed hands; nothing was signalled";
 
@@ -61,19 +59,17 @@ const CHANGED: &str = "the session changed hands; nothing was signalled";
 /// time).
 pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<String, String> {
     match kind {
-        "print" => match verify(session::owner(path), pid, started) {
+        "print" => match recheck(session::owner(path), pid, started, Want::PrintRun) {
             Recheck::Same => signal(pid)
                 .map(|()| format!("asked pid {pid} to stop after its current step"))
                 .map_err(|e| format!("cannot signal pid {pid}: {e}")),
             Recheck::Free => Err(GONE.into()),
             Recheck::Changed => Err(CHANGED.into()),
         },
-        "subagent" => match session::owner(path) {
-            Owner::Live { pid: p, print_run: false, started: s, .. } if p == pid && s == started => {
-                terminate_leader(pid)
-            }
-            Owner::Free => Err(GONE.into()),
-            _ => Err(CHANGED.into()),
+        "subagent" => match recheck(session::owner(path), pid, started, Want::NotPrint) {
+            Recheck::Same => terminate_leader(pid),
+            Recheck::Free => Err(GONE.into()),
+            Recheck::Changed => Err(CHANGED.into()),
         },
         "tui" => {
             let l = live_run(path, pid, started)?;
@@ -148,14 +144,14 @@ mod tests {
     #[test]
     fn only_the_same_print_run_may_be_signalled() {
         let t = "2026-01-01T00:00:00.000Z";
-        assert_eq!(verify(live(7, true, t), 7, t), Recheck::Same);
+        assert_eq!(recheck(live(7, true, t), 7, t, Want::PrintRun), Recheck::Same);
         // A reused pid starts later.
-        assert_eq!(verify(live(7, true, "2026-01-01T00:00:01.000Z"), 7, t), Recheck::Changed);
-        assert_eq!(verify(live(8, true, t), 7, t), Recheck::Changed);
+        assert_eq!(recheck(live(7, true, "2026-01-01T00:00:01.000Z"), 7, t, Want::PrintRun), Recheck::Changed);
+        assert_eq!(recheck(live(8, true, t), 7, t, Want::PrintRun), Recheck::Changed);
         // The same pid reopened by an interactive mu.
-        assert_eq!(verify(live(7, false, t), 7, t), Recheck::Changed);
-        assert_eq!(verify(Owner::Unknown, 7, t), Recheck::Changed);
-        assert_eq!(verify(Owner::Free, 7, t), Recheck::Free);
+        assert_eq!(recheck(live(7, false, t), 7, t, Want::PrintRun), Recheck::Changed);
+        assert_eq!(recheck(Owner::Unknown, 7, t, Want::PrintRun), Recheck::Changed);
+        assert_eq!(recheck(Owner::Free, 7, t, Want::PrintRun), Recheck::Free);
     }
 
     #[test]
