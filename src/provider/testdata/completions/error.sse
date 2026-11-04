@@ -1,0 +1,6 @@
+data: {"id":"e1","choices":[{"index":0,"delta":{"role":"assistant","content":"Partial "},"finish_reason":null}]}
+
+data: {"id":"e1","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}
+
+data: {"error":{"message":"Rate limit reached for model, please retry","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+

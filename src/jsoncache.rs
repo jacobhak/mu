@@ -28,6 +28,14 @@ impl JsonCache {
         }
         mu_common::fs::write_atomic(&self.path, text.as_bytes()).is_ok()
     }
+
+    /// As `save`, for data tied to an account: the file is written 0600 and its directory 0700.
+    pub fn save_private(&self, text: &str) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
+        mu_common::fs::write_private(&self.path, text.as_bytes()).is_ok()
+    }
 }
 
 #[cfg(test)]

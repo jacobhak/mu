@@ -2,25 +2,10 @@
 //! `omp token`. mu never reads omp's credential store or holds a refresh token.
 
 use super::config::{Kind, McpServer};
+use crate::proc::run_capture;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-
-/// Runs `cmd` with its stdout captured, killing it after `limit`. `None` on failure, timeout or a non-zero exit.
-async fn run_capture(mut cmd: Command, limit: Duration) -> Option<String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
-    let mut child = cmd.spawn().ok()?;
-    let mut out = child.stdout.take()?;
-    let run = async {
-        let mut buf = Vec::new();
-        out.read_to_end(&mut buf).await.ok()?;
-        let st = child.wait().await.ok()?;
-        st.success().then(|| String::from_utf8_lossy(&buf).into_owned())
-    };
-    tokio::time::timeout(limit, run).await.ok().flatten()
-}
 
 /// omp's rule: `!cmd` runs in `dir` (10 s cap), else an env var of that name, else the literal.
 /// An empty result is `None`, which drops the key.
@@ -102,6 +87,7 @@ async fn fetch_token_with(
 mod tests {
     use super::*;
     use crate::plugin::mcp::config::load_with;
+    use std::process::Stdio;
 
     fn rt<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)

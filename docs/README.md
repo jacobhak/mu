@@ -9,6 +9,7 @@
 - [Ghost text](ghost-text.md): prompt prediction and the opt-in SmolLM engine
 - [MCP servers](mcp.md)
 - [Agent Client Protocol](acp.md): `mu --acp`
+- [Providers](providers.md): API keys for Anthropic, OpenAI and Baseten, `mu auth`, `/login`, routing and thinking per provider, what still needs omp
 - [Custom agents](custom-agents.md)
 - [Memory](memory.md)
 - [Secrets](secrets.md): what mu redacts before storing or sending text, and what it does not protect against

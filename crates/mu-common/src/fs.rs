@@ -24,6 +24,144 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Creates `dir` and any missing parents with mode 0700. `dir` itself is set to 0700 even if it
+/// already existed; existing parents are left alone.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Like `write_atomic`, for secrets: the temp file is created with mode 0600, so the contents
+/// are never readable by others, not even briefly; the result keeps that mode.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_private_dir(dir)?;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
+    let result = (|| {
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        sync_dir(path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Makes renames inside `dir` durable.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// An exclusive advisory lock (`flock`) on a file, released on drop. Works on Linux and macOS.
+pub struct FileLock(std::fs::File);
+
+impl FileLock {
+    /// Blocks until the lock on `path` (created 0600 if missing) is held.
+    pub fn exclusive(path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            create_private_dir(dir)?;
+        }
+        let f =
+            std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)?;
+        loop {
+            // SAFETY: `f` owns a valid descriptor for the duration of the call.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Self(f));
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: as above; closing the file would release the lock too.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+mod private_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-fs-private-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn private_files_are_0600_after_create_and_rewrite() {
+        let d = dir("mode");
+        let p = d.join("sub/auth.json");
+        write_private(&p, b"one").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        write_private(&p, b"two").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1, "no temp file left");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_existing_private_dir_is_chmodded_but_its_parents_are_not() {
+        let d = dir("chmod");
+        let (parent, child) = (d.join("p"), d.join("p/c"));
+        std::fs::create_dir_all(&child).unwrap();
+        for p in [&parent, &child] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        create_private_dir(&child).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&child), 0o700);
+        assert_eq!(mode(&parent), 0o755);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_lock_serialises_writers() {
+        let d = dir("lock");
+        let lock = d.join("x.lock");
+        let counter = d.join("n");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(&counter, "0").unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (lock, counter) = (lock.clone(), counter.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _g = FileLock::exclusive(&lock).unwrap();
+                        let n: u32 = std::fs::read_to_string(&counter).unwrap().parse().unwrap();
+                        std::thread::yield_now();
+                        std::fs::write(&counter, (n + 1).to_string()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "160");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

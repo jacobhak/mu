@@ -17,6 +17,8 @@ pub enum Command {
     /// Creates the session file now, so its id is known before the first prompt.
     EnsureSession,
     SetModel(String),
+    /// Re-resolve the current model: a key was added or removed, so its route may have changed.
+    RefreshModel,
     SetThinking(Thinking),
     NewSession,
     Compact(Option<String>),
@@ -85,6 +87,8 @@ pub struct StatusSnapshot {
     pub thinking: String,
     /// Served through the gateway, so spend is subscription-billed (shown as `S`, not `$`).
     pub subscription: bool,
+    /// Routed to the provider's own API with a key mu holds (shown as `· key`).
+    pub native: bool,
     pub plan: bool,
     /// Estimated context tokens of the next request: the last response's usage plus an estimate for
     /// what was added since. `None` only when a producer cannot estimate.

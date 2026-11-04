@@ -14,3 +14,76 @@ pub fn home() -> &'static Path {
         d
     })
 }
+
+/// One canned HTTP response of a `fake_server`.
+pub struct Reply {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl Reply {
+    pub fn new(status: u16, body: &str) -> Self {
+        Self { status, headers: Vec::new(), body: body.into() }
+    }
+
+    pub fn header(mut self, k: &str, v: &str) -> Self {
+        self.headers.push((k.into(), v.into()));
+        self
+    }
+}
+
+/// A local HTTP server answering each request with the next reply (the last one repeats).
+/// Returns its base URL (`http://127.0.0.1:<port>`) and the raw text of every request received,
+/// headers and body, in order.
+pub async fn fake_server(replies: Vec<Reply>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        let mut i = 0;
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let (head_end, want) = loop {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break (buf.len(), buf.len());
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                        .unwrap_or(0);
+                    break (p + 4, p + 4 + len);
+                }
+            };
+            while buf.len() < want {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let _ = head_end;
+            log.lock().unwrap().push(String::from_utf8_lossy(&buf).into_owned());
+            let r = &replies[i.min(replies.len() - 1)];
+            i += 1;
+            let mut out =
+                format!("HTTP/1.1 {} X\r\ncontent-length: {}\r\nconnection: close\r\n", r.status, r.body.len());
+            for (k, v) in &r.headers {
+                out.push_str(&format!("{k}: {v}\r\n"));
+            }
+            out.push_str("\r\n");
+            out.push_str(&r.body);
+            let _ = sock.write_all(out.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (base, seen)
+}

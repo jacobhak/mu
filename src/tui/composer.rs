@@ -174,6 +174,8 @@ pub struct Composer {
     menu_closed_for: Option<String>,
     /// Nothing submitted is recorded in the history (the `/mcp add` wizard is collecting answers).
     private: bool,
+    /// A command is being typed (see `set_closed`).
+    closed: bool,
 }
 
 /// Slash-command menu. `items` are completion tokens (command or argument names).
@@ -217,6 +219,7 @@ impl Composer {
             menu: None,
             menu_closed_for: None,
             private: false,
+            closed: false,
         }
     }
 
@@ -229,6 +232,45 @@ impl Composer {
     /// While on, submitted text stays out of the history, in memory and on disk.
     pub fn set_private(&mut self, on: bool) {
         self.private = on;
+    }
+
+    /// A command is being typed: its text stays out of history and prediction (see `set_private`), and
+    /// the keys that send it elsewhere (external editor, clipboard, reply search, completion) are off.
+    pub fn set_closed(&mut self, on: bool) {
+        self.clear();
+        self.closed = on;
+        self.menu = None;
+        self.menu_closed_for = None;
+    }
+
+    /// A key or command is being typed: the buffer must not take text from elsewhere.
+    fn locked(&self) -> bool {
+        self.buf.masked || self.closed
+    }
+
+    /// A secret is being typed: the buffer is drawn as bullets and nothing typed leaves the composer
+    /// (no history, prediction, completion, external editor, clipboard or image paste).
+    pub fn set_masked(&mut self, on: bool) {
+        self.clear();
+        self.buf.masked = on;
+        self.menu = None;
+        self.menu_closed_for = None;
+    }
+
+    /// The typed text with paste markers expanded (a secret is never a marker; a command may be).
+    pub fn secret_text(&self) -> String {
+        let mut text = self.buf.text();
+        for p in &self.buf.pastes {
+            text = text.replace(&p.marker, &p.content);
+        }
+        text
+    }
+
+    /// The typed text, cleared from the buffer without going to the history.
+    pub fn take_secret(&mut self) -> String {
+        let text = self.secret_text();
+        self.clear();
+        text
     }
 
     pub fn on_key(&mut self, key: KeyEvent, running: bool, commands: &[Entry]) -> Action {
@@ -281,7 +323,7 @@ impl Composer {
 
     /// Stores a prediction for `text_for` if the buffer still holds exactly that with the cursor at its end.
     pub fn set_ghost(&mut self, text_for: &str, g: String) {
-        if !g.is_empty() && self.menu.is_none() && self.at_end() && self.text() == text_for {
+        if !g.is_empty() && self.menu.is_none() && !self.locked() && self.at_end() && self.text() == text_for {
             self.ghost = Some(g);
         }
     }
@@ -294,7 +336,8 @@ impl Composer {
             && !t.starts_with('/')
             && !t.starts_with('!')
             && self.browse.is_none()
-            && self.menu.is_none();
+            && self.menu.is_none()
+            && !self.locked();
         ok.then_some(t)
     }
 
@@ -374,7 +417,11 @@ impl Composer {
     }
 
     fn build_menu(&self, text: &str, commands: &[Entry]) -> Option<Menu> {
-        if self.buf.lines.len() != 1 || self.browse.is_some() || self.menu_closed_for.as_deref() == Some(text) {
+        if self.buf.lines.len() != 1
+            || self.browse.is_some()
+            || self.locked()
+            || self.menu_closed_for.as_deref() == Some(text)
+        {
             return None;
         }
         let body = text.strip_prefix('/')?;
@@ -433,12 +480,16 @@ impl Composer {
                 }
             }
             KeyCode::Char('d') if ctrl && self.is_empty() => Action::None,
-            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !self.buf.masked => {
                 self.edit(|b| b.newline())
             }
             KeyCode::Enter => self.submit(false),
             KeyCode::Char('q') if ctrl => self.submit(running),
             KeyCode::Up if alt => Action::PopQueue,
+            KeyCode::Esc if self.buf.masked => {
+                self.clear();
+                Action::Redraw
+            }
             KeyCode::Esc => {
                 if running {
                     Action::Abort
@@ -450,8 +501,8 @@ impl Composer {
             KeyCode::Char('t') if ctrl => Action::ToggleThinking,
             KeyCode::Char('o') if ctrl => Action::ToggleExpanded,
             KeyCode::Char('m') if alt => Action::ModelPicker,
-            KeyCode::Char('g') if ctrl => Action::EditExternal,
-            KeyCode::Char('r') if ctrl && self.menu.is_none() => Action::Reply,
+            KeyCode::Char('g') if ctrl && !self.locked() => Action::EditExternal,
+            KeyCode::Char('r') if ctrl && self.menu.is_none() && !self.locked() => Action::Reply,
             KeyCode::Char('j') if alt && !ctrl => Action::Jobs,
             KeyCode::Up | KeyCode::Char('p') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
                 if self.buf.row == 0 {
@@ -469,7 +520,7 @@ impl Composer {
                 }
                 Action::Redraw
             }
-            KeyCode::Char('v') if ctrl => Action::PasteImage,
+            KeyCode::Char('v') if ctrl && !self.locked() => Action::PasteImage,
             _ => match self.buf.key(key, true) {
                 Edit::Changed => self.edit(|_| {}),
                 Edit::Moved => Action::Redraw,
@@ -489,6 +540,10 @@ impl Composer {
         self.ghost = None;
         self.ctrl_c_armed = false;
         self.browse = None;
+        if self.locked() {
+            self.buf.insert_str(&normalize_paste(s));
+            return Ok(());
+        }
         if let Some(paths) = image::paths_in_paste(s) {
             // Load everything first: a failure part-way must not leave some of the paste attached.
             let imgs = paths.iter().map(|p| image::load(p)).collect::<Result<Vec<_>, _>>()?;
@@ -601,7 +656,9 @@ impl Composer {
         self.ghost = None;
         let pastes = std::mem::take(&mut self.buf.pastes);
         let images = std::mem::take(&mut self.buf.images);
+        let masked = self.buf.masked;
         self.buf = Buf::from_text(s);
+        self.buf.masked = masked;
         self.buf.pastes = pastes;
         self.buf.images = images;
     }
@@ -657,8 +714,11 @@ impl Composer {
 
     /// Appends queued inputs back into the buffer (blank-line separated), re-attaching their images
     /// under fresh markers. Images pair with the markers in each item's text in order, as
-    /// `take_for_submit` produced them.
-    pub fn restore(&mut self, items: Vec<UserInput>) {
+    /// `take_for_submit` produced them. Handed back, untouched, while the buffer is locked.
+    pub fn restore(&mut self, items: Vec<UserInput>) -> Result<(), Vec<UserInput>> {
+        if self.locked() {
+            return Err(items);
+        }
         let mut text = self.buf.text();
         let mut attached = Vec::new();
         for item in items {
@@ -683,11 +743,14 @@ impl Composer {
         }
         self.set_text(&text);
         self.buf.images.extend(attached);
+        Ok(())
     }
 
     fn clear(&mut self) {
         self.ghost = None;
+        let masked = self.buf.masked;
         self.buf = Buf::default();
+        self.buf.masked = masked;
         self.browse = None;
         self.image_count = 0;
     }
@@ -700,6 +763,9 @@ impl Composer {
     }
 
     fn submit(&mut self, queue: bool) -> Action {
+        if self.locked() {
+            return Action::None;
+        }
         if self.is_empty() {
             return Action::None;
         }
@@ -730,6 +796,9 @@ impl Composer {
     }
 
     fn history_prev(&mut self) {
+        if self.locked() {
+            return;
+        }
         self.ghost = None;
         match self.browse.take() {
             None => {
@@ -747,6 +816,9 @@ impl Composer {
     }
 
     fn history_next(&mut self) {
+        if self.locked() {
+            return;
+        }
         let Some((i, draft)) = self.browse.take() else { return };
         if i + 1 < self.history.len() {
             self.browse = Some((i + 1, draft));
@@ -1087,6 +1159,30 @@ mod tests {
     }
 
     #[test]
+    fn masked_input_draws_bullets_and_never_leaves_the_composer() {
+        let mut c = Composer::new(None);
+        c.set_masked(true);
+        type_str(&mut c, "sk-secret");
+        let (lines, _) = c.render(60);
+        let drawn: String = lines.iter().map(crate::tui::line::line_text).collect();
+        assert!(drawn.contains(&"•".repeat(9)), "{drawn}");
+        assert!(!drawn.contains("secret"), "{drawn}");
+        assert_eq!(c.text(), "sk-secret", "the buffer keeps the text");
+        assert_eq!(c.predict_query(), None, "nothing reaches the predict plugin");
+        c.set_ghost("sk-secret", "x".into());
+        assert!(!c.has_ghost());
+        press(&mut c, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(c.text(), "sk-secret", "no history browsing");
+        assert_eq!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), Action::None, "submitting is the app's");
+        assert_eq!(ctrl(&mut c, 'g'), Action::None, "no external editor");
+        assert_eq!(press(&mut c, KeyCode::Esc, KeyModifiers::NONE), Action::Redraw);
+        assert!(c.is_empty(), "Esc clears the secret");
+        type_str(&mut c, "k2");
+        assert_eq!(c.take_secret(), "k2");
+        assert!(c.is_empty());
+    }
+
+    #[test]
     fn history_loads_both_formats() {
         let path = temp_path("formats");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1241,10 +1337,42 @@ mod tests {
         other.data = "REVG".into();
         let queued =
             UserInput { text: "see [Image #1] and [Image #2]".into(), images: vec![other.clone(), other.clone()] };
-        c.restore(vec![queued]);
+        c.restore(vec![queued]).unwrap();
         assert_eq!(c.text(), "[Image #1]\n\nsee [Image #2] and [Image #3]");
         let input = c.take_for_submit();
         assert_eq!(input.images, vec![png(), other.clone(), other]);
+    }
+
+    #[test]
+    fn restore_is_refused_while_a_key_or_command_is_typed() {
+        let mut c = Composer::new(None);
+        c.set_masked(true);
+        type_str(&mut c, "sk-1");
+        let back = c.restore(vec![UserInput::from("queued prompt")]).unwrap_err();
+        assert_eq!(back[0].text, "queued prompt");
+        assert_eq!(c.text(), "sk-1", "the typed key is untouched");
+        c.set_masked(false);
+        c.restore(back).unwrap();
+        assert_eq!(c.text(), "queued prompt");
+    }
+
+    #[test]
+    fn command_entry_takes_no_editor_clipboard_reply_completion_or_prediction() {
+        let mut c = Composer::new(None);
+        c.set_private(true);
+        c.set_closed(true);
+        type_str(&mut c, "!op read");
+        assert_eq!(ctrl(&mut c, 'g'), Action::None, "no external editor");
+        assert_eq!(ctrl(&mut c, 'r'), Action::None, "no reply search");
+        assert_eq!(ctrl(&mut c, 'v'), Action::None, "no clipboard image");
+        assert_eq!(ctrl(&mut c, 'q'), Action::None, "not submitted");
+        press(&mut c, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(c.text(), "!op read", "no history browsing");
+        assert_eq!(c.predict_query(), None);
+        assert!(c.on_paste("/no/such/file.png", &[]).is_ok());
+        assert_eq!(c.text(), "!op read/no/such/file.png", "pasted paths stay text");
+        assert_eq!(c.take_secret(), "!op read/no/such/file.png");
+        assert!(c.is_empty());
     }
 
     #[test]

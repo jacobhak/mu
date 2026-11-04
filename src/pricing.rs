@@ -115,26 +115,29 @@ impl Table {
     }
 
     fn cost_with(&self, model_id: &str, usage: &Usage) -> Option<Cost> {
-        let entry = self.entries.get(model_id)?;
-        let base = entry.rates?;
-        // omp prices the whole prompt (fresh + cached) against the long-context threshold.
-        let prompt = (usage.input + usage.cache_read + usage.cache_write) as f64;
-        let r = match &entry.long_context {
-            Some(l) if prompt > l.threshold => l.rates,
-            _ => base,
-        };
-        let million = 1_000_000.0;
-        let input = usage.input as f64 * r.input / million;
-        let output = usage.output as f64 * r.output / million;
-        let cache_read = usage.cache_read as f64 * r.cache_read / million;
-        let cache_write = usage.cache_write as f64 * r.cache_write / million;
-        Some(Cost { input, output, cache_read, cache_write, total: input + output + cache_read + cache_write })
+        price(self.entries.get(model_id)?, usage)
     }
 
     fn display_name_with(&self, model_id: &str) -> Option<String> {
         let name = self.entries.get(model_id)?.name.as_deref()?;
         Some(name.strip_prefix("Claude ").unwrap_or(name).to_string())
     }
+}
+
+fn price(entry: &Entry, usage: &Usage) -> Option<Cost> {
+    let base = entry.rates?;
+    // omp prices the whole prompt (fresh + cached) against the long-context threshold.
+    let prompt = (usage.input + usage.cache_read + usage.cache_write) as f64;
+    let r = match &entry.long_context {
+        Some(l) if prompt > l.threshold => l.rates,
+        _ => base,
+    };
+    let million = 1_000_000.0;
+    let input = usage.input as f64 * r.input / million;
+    let output = usage.output as f64 * r.output / million;
+    let cache_read = usage.cache_read as f64 * r.cache_read / million;
+    let cache_write = usage.cache_write as f64 * r.cache_write / million;
+    Some(Cost { input, output, cache_read, cache_write, total: input + output + cache_read + cache_write })
 }
 
 static TABLE: RwLock<Option<Arc<Table>>> = RwLock::new(None);
@@ -156,24 +159,100 @@ fn table() -> Arc<Table> {
     t
 }
 
-/// Priced usage for `model_id` (`provider/model`), or `None` when omp has no fixed price for it.
+/// The snapshot row of a provider mu drives natively: prices and names without omp.
+fn snapshot_entry(model_id: &str) -> Option<Entry> {
+    let (provider, id) = model_id.split_once('/')?;
+    let Some(row) = crate::provider::catalog::row(provider, id) else {
+        // Not in the snapshot: a model the provider lists live (Baseten).
+        let d = crate::provider::discovery::find(provider, id)?;
+        let priced = d.input_cost > 0.0 || d.output_cost > 0.0;
+        return Some(Entry {
+            name: d.name,
+            reasoning: false,
+            rates: priced.then_some(Rates {
+                input: d.input_cost,
+                output: d.output_cost,
+                cache_read: d.cache_read_cost,
+                cache_write: 0.0,
+            }),
+            long_context: None,
+        });
+    };
+    let to_rates = |r: &crate::provider::catalog::Cost| Rates {
+        input: r.input,
+        output: r.output,
+        cache_read: r.cache_read,
+        cache_write: r.cache_write,
+    };
+    let cost = row.cost.filter(|c| c.input != 0.0 || c.output != 0.0);
+    let found = crate::provider::discovery::find(provider, id);
+    let (rates, listed) = with_listed_prices(cost.as_ref().map(to_rates), found.as_ref());
+    Some(Entry {
+        name: row.name.clone(),
+        reasoning: row.reasoning,
+        rates,
+        long_context: if listed {
+            None
+        } else {
+            cost.and_then(|c| c.long_context).map(|l| LongContext {
+                threshold: l.input_threshold,
+                rates: Rates { input: l.input, output: l.output, cache_read: l.cache_read, cache_write: l.cache_write },
+            })
+        },
+    })
+}
+
+/// A discovered listing is the provider's current price list: its positive prices replace the
+/// snapshot's field by field. Listings carry no long-context tier, so an override drops the snapshot's.
+fn with_listed_prices(
+    snap: Option<Rates>,
+    d: Option<&crate::provider::discovery::Discovered>,
+) -> (Option<Rates>, bool) {
+    let Some(d) = d.filter(|d| d.input_cost > 0.0 || d.output_cost > 0.0) else { return (snap, false) };
+    let base = snap.unwrap_or(Rates { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 });
+    let pick = |live: f64, snapshot: f64| if live > 0.0 { live } else { snapshot };
+    let rates = Rates {
+        input: pick(d.input_cost, base.input),
+        output: pick(d.output_cost, base.output),
+        cache_read: pick(d.cache_read_cost, base.cache_read),
+        cache_write: base.cache_write,
+    };
+    (Some(rates), true)
+}
+
+/// Priced usage for `model_id` (`provider/model`), or `None` when there is no fixed price: omp's
+/// catalogue first, else mu's snapshot (the providers it drives natively, which need no omp).
 pub fn cost(model_id: &str, usage: &Usage) -> Option<Cost> {
-    table().cost_with(model_id, usage)
+    cost_in(&table(), model_id, usage)
 }
 
-/// Whether omp lists the model as reasoning-capable; `None` when unknown.
+fn cost_in(t: &Table, model_id: &str, usage: &Usage) -> Option<Cost> {
+    // An omp entry without a fixed price falls through to the snapshot.
+    if let Some(c) = t.cost_with(model_id, usage) {
+        return Some(c);
+    }
+    price(&snapshot_entry(model_id)?, usage)
+}
+
+/// Whether the model is reasoning-capable; `None` when unknown.
 pub fn reasoning(model_id: &str) -> Option<bool> {
-    table().entries.get(model_id).map(|e| e.reasoning)
+    table().entries.get(model_id).map(|e| e.reasoning).or_else(|| snapshot_entry(model_id).map(|e| e.reasoning))
 }
 
-/// Whether the catalogue has an entry for the model, priced or not.
+/// Whether a catalogue has an entry for the model, priced or not.
 pub fn known(model_id: &str) -> bool {
-    table().entries.contains_key(model_id)
+    table().entries.contains_key(model_id) || snapshot_entry(model_id).is_some()
 }
 
 /// Catalogue name without the `Claude ` prefix, else a name derived from the model id.
 pub fn display_name(model_id: &str) -> String {
-    table().display_name_with(model_id).unwrap_or_else(|| heuristic_name(model_id))
+    table()
+        .display_name_with(model_id)
+        .or_else(|| {
+            let n = snapshot_entry(model_id)?.name?;
+            Some(n.strip_prefix("Claude ").unwrap_or(&n).to_string())
+        })
+        .unwrap_or_else(|| heuristic_name(model_id))
 }
 
 fn heuristic_name(model_id: &str) -> String {
@@ -283,6 +362,41 @@ mod tests {
         let t = Table::from_json(CATALOGUE).unwrap();
         assert!(t.cost_with("anthropic/claude-x", &usage(1, 1, 0, 0)).is_none());
         assert!(t.cost_with("unknown/model", &usage(1, 1, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn an_unpriced_omp_entry_falls_through_to_the_snapshot() {
+        let snap = cost_in(&Table::default(), "anthropic/claude-sonnet-5-5", &usage(1000, 1000, 0, 0));
+        assert!(snap.is_some(), "the snapshot prices sonnet");
+        let t = Table::from_json(
+            r#"{"models":[{"provider":"anthropic","id":"claude-sonnet-5-5","pricingStatus":"unknown"}]}"#,
+        )
+        .unwrap();
+        let priced = |c: Option<Cost>| c.map(|c| c.total);
+        assert_eq!(priced(cost_in(&t, "anthropic/claude-sonnet-5-5", &usage(1000, 1000, 0, 0))), priced(snap));
+    }
+
+    #[test]
+    fn a_listing_overrides_the_snapshot_field_by_field() {
+        let snap = Rates { input: 1.0, output: 2.0, cache_read: 0.1, cache_write: 0.5 };
+        let listed = crate::provider::discovery::Discovered {
+            id: "moonshotai/Kimi-K3".into(),
+            name: None,
+            context_length: None,
+            max_completion_tokens: None,
+            input_cost: 3.0,
+            output_cost: 0.0,
+            cache_read_cost: 0.3,
+            tools: true,
+            images: false,
+        };
+        let (r, listed_ok) = with_listed_prices(Some(snap), Some(&listed));
+        assert!(listed_ok);
+        assert_eq!(r, Some(Rates { input: 3.0, output: 2.0, cache_read: 0.3, cache_write: 0.5 }));
+        let (r, listed_ok) = with_listed_prices(Some(snap), None);
+        assert!(!listed_ok && r == Some(snap), "no listing: the snapshot stands");
+        let unpriced = crate::provider::discovery::Discovered { input_cost: 0.0, output_cost: 0.0, ..listed };
+        assert_eq!(with_listed_prices(Some(snap), Some(&unpriced)), (Some(snap), false));
     }
 
     #[test]

@@ -2,6 +2,8 @@ mod acp;
 mod agent;
 mod ask_nudge;
 mod at_imports;
+mod auth_cmd;
+mod auth_store;
 mod compaction;
 mod config;
 mod context;
@@ -99,6 +101,12 @@ enum Sub {
         /// Install this release tag instead of the latest.
         #[arg(long)]
         tag: Option<String>,
+    },
+    /// Provider API keys: `mu auth add|list|rm|test`. A provider with a key is used directly,
+    /// without omp.
+    Auth {
+        #[command(subcommand)]
+        cmd: auth_cmd::Cmd,
     },
     /// Ghost-text prediction. `mu predict setup smollm` downloads the opt-in SmolLM weights.
     Predict {
@@ -230,9 +238,35 @@ fn pick_model(
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
     let (cfg_model, cfg_level) = cfgs.role("default").map(|v| models::split_level(&v)).unzip();
-    let sel = sel.or(cfg_model).unwrap_or_else(|| DEFAULT_MODEL.into());
+    let sel = sel.or(cfg_model).unwrap_or_else(|| default_model(providers));
     let (spec, role_level) = providers.resolve(&sel)?;
     Ok((spec, cli_thinking.or(role_level).or(cfg_level.flatten()).unwrap_or(models::Thinking::Medium)))
+}
+
+/// The model used when nothing names one: omp's default while omp can run, else the first native
+/// provider with a key, else omp's default (which then says what is missing).
+fn default_model(providers: &provider::Providers) -> String {
+    default_model_for(omp_installed(), |p| providers.is_native(p))
+}
+
+/// `default_model` with the two facts it depends on passed in.
+fn default_model_for(omp: bool, native: impl Fn(&str) -> bool) -> String {
+    if omp {
+        return DEFAULT_MODEL.into();
+    }
+    provider::native::PROVIDERS
+        .iter()
+        .find(|d| native(d.id))
+        .map_or_else(|| DEFAULT_MODEL.into(), |d| format!("{}/{}", d.id, d.default_model))
+}
+
+/// Whether omp can run: `$MU_OMP`, else mu's own copy, else `omp` on `$PATH`.
+fn omp_installed() -> bool {
+    let bin = paths::omp_bin();
+    if bin.components().count() > 1 {
+        return bin.is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&bin).is_file()))
 }
 
 /// First `provider/model[:level]` or configured `@role` in the agent's model list, else the `task` role chain.
@@ -281,6 +315,7 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
+    provider::install_crypto();
     let cli = Cli::parse();
     if let Some(p) = &cli.profile {
         // Single-threaded here: no runtime or plugin has started yet.
@@ -303,6 +338,9 @@ fn run() -> Result<i32> {
     }
     if let Some(Sub::Update { check, force, tag }) = cli.command {
         return update::run(check, force, tag);
+    }
+    if let Some(Sub::Auth { cmd }) = cli.command {
+        return auth_cmd::run(cmd);
     }
     if let Some(Sub::Predict { cmd }) = cli.command {
         return predict_setup::run(cmd);
@@ -608,5 +646,23 @@ mod output_schema_tests {
         assert_eq!(model_label(Some("@smol:high"), "a/b"), "smol · a/b");
         assert_eq!(model_label(Some("a/b:low"), "a/b"), "a/b");
         assert_eq!(model_label(None, "a/b"), "a/b");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_model_is_omps_while_omp_can_run() {
+        assert_eq!(default_model_for(true, |_| false), DEFAULT_MODEL);
+        assert_eq!(default_model_for(true, |_| true), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn without_omp_the_first_native_key_provides_the_default() {
+        let first = &provider::native::PROVIDERS[0];
+        assert_eq!(default_model_for(false, |p| p == first.id), format!("{}/{}", first.id, first.default_model));
+        assert_eq!(default_model_for(false, |_| false), DEFAULT_MODEL, "no key: omp's default says what is missing");
     }
 }

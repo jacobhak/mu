@@ -22,7 +22,6 @@ jobs:
       - run: scripts/build-mcp-http.sh test
       - run: cargo build --release --workspace --locked
       - run: scripts/build-mcp-http.sh build
-      - run: scripts/build-mcp-http.sh check
       - run: scripts/package.sh ${{ matrix.plat }}
       - uses: actions/upload-artifact@v4
         with:

@@ -18,6 +18,7 @@ pub enum Source {
     Env,
     DotEnv,
     Shape,
+    Stored,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
@@ -54,6 +55,22 @@ static DOTENV: Mutex<Option<DotEnvCache>> = Mutex::new(None);
 const DOTENV_RECHECK: Duration = Duration::from_secs(2);
 /// Placeholders handed out in this process; `guard` refuses to write them back.
 static EMITTED: Mutex<BTreeSet<Hit>> = Mutex::new(BTreeSet::new());
+/// Provider API keys mu stores or resolves, registered under the provider's variable name.
+static STORED: Mutex<Vec<Known>> = Mutex::new(Vec::new());
+
+/// Redacts `value` (a provider key) from now on as `[REDACTED:<label>]`. Values under 8 bytes are
+/// ignored: they would match ordinary text.
+pub fn register_stored(label: &str, value: &str) {
+    let value = value.trim();
+    if value.len() < 8 {
+        return;
+    }
+    if let Ok(mut s) = STORED.lock()
+        && !s.iter().any(|k| k.value == value)
+    {
+        s.push(Known { value: value.to_string(), hit: Hit { label: label.to_string(), source: Source::Stored } });
+    }
+}
 
 /// `[secrets]` from config. Unconfigured (tests, early errors) means no extra variables.
 pub fn configure(extra_env: Vec<String>) {
@@ -70,13 +87,24 @@ pub fn redact(text: &str, cwd: &Path) -> Redacted {
     }
     let env = ENV.get_or_init(|| known_from(std::env::vars(), Source::Env, extra_env()));
     let dot = dotenv_for(cwd);
-    let r = apply(text, env.iter().chain(dot.iter()));
+    crate::auth_store::sync_redaction();
+    let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
+    let r = apply(text, env.iter().chain(dot.iter()).chain(stored.iter()));
     if !r.hits.is_empty()
         && let Ok(mut e) = EMITTED.lock()
     {
         e.extend(r.hits.iter().cloned());
     }
     r
+}
+
+/// `text` with environment and stored keys (and recognisable key formats) replaced; for text
+/// that did not come from a tool, such as a provider's error body.
+pub fn redact_keys(text: &str) -> String {
+    let env = ENV.get_or_init(|| known_from(std::env::vars(), Source::Env, extra_env()));
+    crate::auth_store::sync_redaction();
+    let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
+    apply(text, env.iter().chain(stored.iter())).text
 }
 
 /// Every string in `v`, in place. Returns the distinct hits.
@@ -118,6 +146,7 @@ pub fn feedback(hits: &[Hit]) -> String {
             Source::Env => format!("{} (environment variable)", h.placeholder()),
             Source::DotEnv => format!("{} (from a .env file)", h.placeholder()),
             Source::Shape => format!("{} (recognised key format)", h.placeholder()),
+            Source::Stored => format!("{} (an API key stored by mu)", h.placeholder()),
         })
         .collect();
     let mut s = format!(
@@ -480,6 +509,13 @@ mod tests {
         for s in ["task-abcdefghijklmnopqrstuvwxyz", "ghp_short", "AKIAABCDEFGHIJKLMNOPQ", "the sk- prefix"] {
             assert_eq!(shapes(s).0, s, "{s}");
         }
+    }
+
+    #[test]
+    fn redact_keys_applies_the_key_formats_too() {
+        let gh = format!("ghp_{}", "a1B2".repeat(9));
+        let body = format!("{{\"error\": \"bad token {gh}\"}}");
+        assert_eq!(redact_keys(&body), "{\"error\": \"bad token [REDACTED:github-token]\"}");
     }
 
     #[test]

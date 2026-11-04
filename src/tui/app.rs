@@ -26,6 +26,7 @@ use crate::message::{Image, UserInput};
 use crate::models::{GatewayModel, Thinking};
 use crate::plugin::PluginHost;
 use crate::provider::Providers;
+use crate::provider::native;
 use crate::tools::todo::{Phase, Status};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use mu_common::paths;
@@ -37,18 +38,20 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
+mod keys_ui;
 mod mcp_ui;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
-const BUILTIN_DESC: [(&str, &str, bool); 24] = [
+const BUILTIN_DESC: [(&str, &str, bool); 25] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
     ("resume", "Resume a session from this directory", false),
     ("model", "Pick a model and assign a role", false),
     ("switch", "Switch this session's model", false),
-    ("login", "Log in to a provider or MCP server", false),
+    ("login", "Add an API key, or log in to a provider or MCP server", false),
+    ("logout", "Remove a stored API key", false),
     ("thinking", "Set the thinking level", false),
     ("compact", "Compact the context [focus]", false),
     ("plan", "Toggle plan mode", false),
@@ -142,6 +145,13 @@ enum UiMsg {
         text: String,
         ghost: String,
     },
+    /// An API key was checked: the outcome, and the entry to save when it holds.
+    KeyChecked {
+        flow: u64,
+        def: &'static native::ProviderDef,
+        entry: crate::auth_store::Entry,
+        r: Result<native::Check, String>,
+    },
 }
 
 struct RunningTool {
@@ -210,6 +220,11 @@ struct App {
     started: Instant,
     /// An `/mcp add` wizard is collecting answers; the composer's lines go to it.
     mcp_wizard: Option<super::mcp_wizard::Wizard>,
+    /// An API-key flow in progress; while it types, the composer takes its text.
+    key_flow: Option<keys_ui::KeyFlow>,
+    key_flow_seq: u64,
+    /// Queued inputs that could not go back into the composer while a key was typed.
+    held_back: Vec<UserInput>,
 }
 
 fn push_capped<T>(v: &mut Vec<T>, item: T) {
@@ -262,7 +277,15 @@ pub async fn run(init: AppInit) -> i32 {
                 "copy" => (["code", "cmd", "link"].map(String::from).to_vec(), vec![]),
                 "jobs" => (vec!["kill".to_string()], vec![]),
                 "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
-                "login" => (plugins.mcp_names().iter().map(|n| format!("mcp:{n}")).collect(), vec![]),
+                "login" => (
+                    native::PROVIDERS
+                        .iter()
+                        .map(|d| d.id.to_string())
+                        .chain(plugins.mcp_names().iter().map(|n| format!("mcp:{n}")))
+                        .collect(),
+                    vec![],
+                ),
+                "logout" => (native::PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
                 _ => (vec![], vec![]),
             };
             Entry { name: name.into(), desc: desc.into(), needs_arg, args, arg_descs }
@@ -323,8 +346,15 @@ pub async fn run(init: AppInit) -> i32 {
         last_draw: Instant::now() - FRAME,
         started: Instant::now(),
         mcp_wizard: None,
+        key_flow: None,
+        key_flow_seq: 0,
+        held_back: Vec::new(),
     };
-    for w in theme_warnings.iter().chain(app.plugins.warnings.iter()) {
+    let store_warning = app.providers.store().permission_warning();
+    let store_check = app.providers.store().check().err().map(|e| e.to_string());
+    for w in
+        theme_warnings.iter().chain(app.plugins.warnings.iter()).chain(store_warning.iter()).chain(store_check.iter())
+    {
         app.tr.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
     }
     if pick_session {
@@ -378,6 +408,7 @@ pub async fn run(init: AppInit) -> i32 {
             _ = tick.tick(), if app.busy() => app.dirty = true,
             _ = tokio::time::sleep_until(due.into()), if app.dirty => {}
         }
+        app.sync_key_flow();
     }
     // Lines committed in the last moments (a final reply, the exit notice) are drawn before the
     // terminal is handed back.
@@ -633,7 +664,7 @@ impl App {
                     if !aborted {
                         self.notice("queued messages were not sent; they are back in the composer");
                     }
-                    self.composer.restore(queued);
+                    self.restore_queued(queued);
                 }
             }
             AgentEvent::Exit | AgentEvent::TurnFailed | AgentEvent::ToolSkipped { .. } => {}
@@ -664,7 +695,12 @@ impl App {
                 let gw = match r {
                     Ok(g) => g,
                     Err(e) => {
-                        self.error(&format!("could not fetch gateway models: {e}"));
+                        // Native models are listed either way; only a session without any says why.
+                        if self.providers.native_models().is_empty() {
+                            self.error(&format!("could not fetch gateway models: {e}"));
+                        } else {
+                            self.notice(&format!("gateway models unavailable: {e}"));
+                        }
                         vec![]
                     }
                 };
@@ -686,28 +722,27 @@ impl App {
                 }
             }
             UiMsg::McpReconnected { name, verbose, ms, result } => self.on_mcp_reconnected(&name, verbose, ms, result),
+            UiMsg::KeyChecked { flow, def, entry, r } => self.on_key_checked(flow, def, entry, r),
             UiMsg::LoginProviders(r) => {
-                let (mut items, mut targets) = (Vec::new(), Vec::new());
+                let (mut items, mut targets) = self.api_key_rows();
                 match r {
                     Ok(list) => {
-                        for (n, name) in list {
+                        for (n, name) in list.into_iter().filter(|(_, name)| !is_baseten(name)) {
                             items.push(Item { label: name, detail: String::new() });
                             targets.push(LoginTarget::Provider(n));
                         }
                     }
-                    Err(e) => self.error(&format!("cannot list login providers: {e}")),
+                    // The API-key rows and MCP servers stay usable without omp.
+                    Err(e) => self.error(&format!("cannot list omp's login providers: {e}")),
                 }
                 for (name, url) in self.plugins.needs_login() {
                     items.push(Item { label: format!("mcp:{name}"), detail: url });
                     targets.push(LoginTarget::Mcp(name));
                 }
-                if items.is_empty() {
-                    self.error("omp login listed no providers");
-                } else {
-                    self.overlay = Some(Overlay::Login { sel: Select::new("Log in", items), targets });
-                }
+                self.overlay = Some(Overlay::Login { sel: Select::new("Log in", items), targets });
             }
             UiMsg::ClipboardImage(r) => match r {
+                Ok(Some(_)) if self.typing() => self.notice("image paste ignored while typing"),
                 Ok(Some(img)) if self.overlay.is_none() => self.composer.attach_image(img),
                 Ok(Some(_)) => self.notice("image paste ignored in picker"),
                 Ok(None) => self.notice("clipboard has no image"),
@@ -752,11 +787,20 @@ impl App {
                 ids.push(format!("@{r}"));
             }
         }
-        for g in &gateway {
-            items.push(Item {
-                label: g.id.clone(),
-                detail: g.context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000)),
-            });
+        for m in self.providers.native_models() {
+            items.push(Item { label: m.id.clone(), detail: "key".into() });
+            ids.push(m.id);
+        }
+        let known = ids.clone();
+        for g in gateway.iter().filter(|g| !known.contains(&g.id)) {
+            // A gateway id of a native provider with a key is routed natively: it shows the key marker.
+            let native = g.id.split_once('/').is_some_and(|(p, _)| self.providers.is_native(p));
+            let detail = if native {
+                "key".into()
+            } else {
+                g.context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000))
+            };
+            items.push(Item { label: g.id.clone(), detail });
             ids.push(g.id.clone());
         }
         for (p, pc) in &self.providers.cfg.models.providers {
@@ -864,15 +908,19 @@ impl App {
                 }
             }
             Event::Key(k) => self.on_key(k),
-            Event::Paste(s) => match self.overlay.as_mut() {
-                Some(ov) => ov.on_paste(&s),
-                None => {
-                    if let Err(e) = self.composer.on_paste(&s, &self.commands) {
-                        self.error(&format!("image: {e}"));
+            Event::Paste(s) => {
+                // A key being typed takes the paste even when an overlay is open.
+                let typing = self.typing();
+                match self.overlay.as_mut() {
+                    Some(ov) if !typing => ov.on_paste(&s),
+                    _ => {
+                        if let Err(e) = self.composer.on_paste(&s, &self.commands) {
+                            self.error(&format!("image: {e}"));
+                        }
+                        self.request_ghost();
                     }
-                    self.request_ghost();
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -880,7 +928,7 @@ impl App {
     /// Asks the predict plugin for a ghost when the composer wants one. Failures are silent.
     fn request_ghost(&mut self) {
         let cfg = &self.providers.cfg.mu.predict;
-        if !cfg.enabled || self.composer.has_ghost() || self.mcp_wizard.is_some() {
+        if !cfg.enabled || self.composer.has_ghost() || self.mcp_wizard.is_some() || self.key_flow_pending() {
             return;
         }
         let Some(q) = self.composer.predict_query() else { return };
@@ -920,13 +968,27 @@ impl App {
     }
 
     fn on_key_inner(&mut self, k: KeyEvent) {
-        if self.overlay.is_some() {
-            return self.overlay_key(k);
-        }
-        if self.mcp_wizard.is_some() && self.mcp_wizard_key(k) {
-            return;
+        // While a key is typed, every key goes to the masked composer, even past an open overlay.
+        let typing = self.typing();
+        if typing {
+            if self.key_flow_key(k) {
+                return;
+            }
+        } else {
+            if self.overlay.is_some() {
+                return self.overlay_key(k);
+            }
+            if self.mcp_wizard.is_some() && self.mcp_wizard_key(k) {
+                return;
+            }
         }
         let action = self.composer.on_key(k, self.running, &self.commands);
+        // Only actions that stay in the composer may run while a key or command is typed.
+        if typing
+            && !matches!(action, Action::None | Action::Redraw | Action::Abort | Action::Exit | Action::ToggleExpanded)
+        {
+            return;
+        }
         match action {
             Action::None | Action::Redraw => {}
             Action::Reply => self.open_reply(),
@@ -958,7 +1020,7 @@ impl App {
                     ib.steer.pop_back().or_else(|| ib.follow_up.pop_back())
                 };
                 if let Some(p) = popped {
-                    self.composer.restore(vec![p]);
+                    self.restore_queued(vec![p]);
                 }
             }
         }
@@ -1001,6 +1063,13 @@ impl App {
             OverlayEvent::AssignRole { role: None, model } => self.send(Command::SetModel(model)),
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
+            OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
+                if let Some(def) = native::def(&id) {
+                    self.start_key_flow(def);
+                }
+            }
+            OverlayEvent::Key { provider, choice } => self.on_key_choice(&provider, choice),
+            OverlayEvent::Logout(provider) => self.logout(&provider),
             OverlayEvent::Mcp(pick, row) => self.on_mcp_pick(pick, row),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
             OverlayEvent::Quote(q) => self.composer.append_quotes(&q),
@@ -1121,6 +1190,7 @@ impl App {
             }
             "model" | "switch" => self.send(Command::SetModel(arg.into())),
             "login" => self.login(arg),
+            "logout" => self.logout_cmd(arg),
             "mcp" => self.mcp_cmd(arg),
             "thinking" => match Thinking::parse(arg) {
                 Some(t) => self.send(Command::SetThinking(t)),
@@ -1365,6 +1435,9 @@ impl App {
     /// `/login`: with a provider id run `omp login <id>`, with `mcp:<name>` log in to that MCP server;
     /// otherwise list omp's providers and the MCP servers that need auth in a picker.
     fn login(&mut self, provider: &str) {
+        if let Some(def) = native::def(provider) {
+            return self.start_key_flow(def);
+        }
         if let Some(name) = provider.strip_prefix("mcp:") {
             return self.run_mcp_login(name);
         }
@@ -1720,6 +1793,13 @@ fn relay_login(child: &mut std::process::Child, pick: usize) -> std::io::Result<
     child.wait()
 }
 
+/// omp's login menu names Baseten too; mu owns that provider's key, so the omp row is dropped.
+fn is_baseten(name: &str) -> bool {
+    name.split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .is_some_and(|w| w.eq_ignore_ascii_case("baseten"))
+}
+
 /// Provider menu of `omp login`, scraped from its numbered prompt (omp has no machine-readable list).
 async fn list_login_providers() -> Result<Vec<(usize, String)>, String> {
     let out = tokio::process::Command::new(mu_common::paths::omp_bin())
@@ -1766,6 +1846,15 @@ mod login_tests {
             parse_login_menu(t),
             vec![(1, "ChatGPT Plus/Pro (Codex)".into()), (12, "Z.AI (GLM · Sign in)".into())]
         );
+    }
+
+    #[test]
+    fn baseten_is_the_only_omp_row_mu_drops() {
+        use super::is_baseten;
+        assert!(is_baseten("Baseten"));
+        assert!(is_baseten(" Baseten (API key)"));
+        assert!(!is_baseten("Basetenx"));
+        assert!(!is_baseten("Z.AI (GLM · Sign in)"));
     }
 
     #[test]

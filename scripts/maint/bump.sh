@@ -18,3 +18,4 @@ sed -i -E "/can1357\/oh-my-pi/ s/(rev|tag) = \"[^\"]*\"/tag = \"v$ver\"/" Cargo.
 sed -i -E "s|(\"@oh-my-pi/pi-mnemopi\": *\")[^\"]*\"|\1$ver\"|" plugins/memory/package.json
 CARGO_NET_GIT_FETCH_WITH_CLI=true timeout 600 cargo fetch
 (cd plugins/memory && timeout 600 bun install)
+"$wt/scripts/maint/gen-catalog.sh" "$ver"

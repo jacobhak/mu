@@ -8,6 +8,7 @@ What counts as a secret:
 - The same for `.env` and `.env.*` files in the working directory (not `.env.example`, `.sample`, `.template`). Changes to them are picked up.
 - The password in any `scheme://user:password@host` value of those variables.
 - Keys in an unambiguous format, wherever they appear: GitHub (`ghp_`, `github_pat_`, …), Anthropic (`sk-ant-`), OpenAI (`sk-`), AWS access key ids, Google API keys (`AIza`), Slack (`xox?-`), Stripe live keys and private key blocks.
+- Provider API keys you added to mu's key store (`mu auth`, `/login`), whatever their format (Baseten keys have none): the literal keys in `auth.json`, and the values of `$NAME` and `!command` references once resolved. They show as `[REDACTED:ANTHROPIC_API_KEY]`, `[REDACTED:OPENAI_API_KEY]` or `[REDACTED:BASETEN_API_KEY]`, so `cat ~/.mu/auth.json` run by the model comes back redacted. Provider error bodies pass through the same filter before they are shown or stored.
 
 Known values are matched exactly; there is no guessing from randomness, so hashes and ids are left alone.
 

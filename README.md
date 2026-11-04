@@ -8,11 +8,11 @@ mu is a terminal coding agent with a Rust core (agent loop, TUI, sessions) built
 
 mu keeps most of what omp does and changes where the memory goes. A session holds your conversation, and anything else runs only while it's being used.
 
-- **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3 MB of private memory (about 17 MB counting the binary's shared pages).
-- **Features start on use.** Web, memory, prediction and the model gateway are separate processes. Each starts on first use and exits after a few idle minutes. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
+- **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3.5 MB of private memory (about 19 MB counting the binary's shared pages).
+- **Features start on use.** Web, memory and prediction are separate processes, and so is the model gateway, which only providers without an API key in mu need. Each starts on first use and exits after a few idle minutes. A session that talks only to Anthropic, OpenAI or Baseten with your own key starts no omp process at all. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
 - **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 250 MB while they run, idle), and all sessions share one memory daemon. [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
-- **Works with your omp setup.** mu uses omp's login, config, models, MCP setup, context files and skills. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup: the installer bundles omp, and you log in once with `/login`.
+- **Works with your omp setup.** mu uses omp's config, models, MCP setup, context files and skills, and its login for OAuth providers. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup: the installer bundles omp for the providers that need it, and Anthropic, OpenAI and Baseten work with just an API key.
 
 The cost: features that live inside omp's runtime, such as TypeScript extensions, aren't available. The reasoning and measurements behind the design are in [`DESIGN.md`](DESIGN.md).
 
@@ -28,7 +28,7 @@ mu also adds a few things omp doesn't have:
 Early and experimental: started in October 2026 and changing quickly.
 
 - No stable version. Releases are nightly builds of `main` (`mu-YYYYMMDD-<sha7>`); config, flags and plugin interfaces can change without notice.
-- Login, `models.yml` and model roles are omp's; mu has no login of its own, and `/login` hands off to omp.
+- Model roles and `models.yml` are omp's. Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth`), with no omp involved; every other provider, and subscription logins, go through omp (see [Providers](docs/providers.md)).
 - Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
 - No support promised. Issues and PRs are welcome but may go unanswered.
 
@@ -44,7 +44,9 @@ scripts/install.sh --from-source .            # build and install a checkout
 
 If the repo is private (or you install from a private fork), the public URLs return 404. `install.sh` and `mu update` then fall back to an authenticated `gh`; fetch the script itself with `gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash`.
 
-This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Releases include the memory daemon as a compiled binary, so they need no Bun; installing `--from-source` needs Bun to build it and otherwise leaves the memory plugin out (keeping any installed one). `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`. Afterwards run `/login` in mu once (for `mu -p`, `~/.mu/bin/omp login`).
+This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Releases include the memory daemon as a compiled binary, so they need no Bun; installing `--from-source` needs Bun to build it and otherwise leaves the memory plugin out (keeping any installed one). `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
+
+Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu auth add <provider>`; those models then run without omp. omp is only needed for subscription (OAuth) logins, the other providers, web search and fetch, and MCP OAuth: log in with `/login` for those, or `~/.mu/bin/omp login` for `mu -p`.
 
 ### Updating
 
@@ -85,7 +87,7 @@ Usage, configuration and the individual features are documented in [`docs/`](doc
 
 ### Tests
 
-`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see [MCP servers](docs/mcp.md)). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/measure-idle.sh target/release/mu` reports idle memory.
+`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see [MCP servers](docs/mcp.md)). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction); `scripts/smoke-native.sh` checks a native API-key provider offline against a loopback fake API; `scripts/measure-idle.sh target/release/mu` reports idle memory.
 
 `cargo test --workspace --locked -- --ignored contract_` checks the pinned omp's output formats against mu's parsers (needs network and the omp from `MU_OMP`/`~/.mu/bin`).
 

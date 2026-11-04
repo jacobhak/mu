@@ -71,6 +71,7 @@ pub enum Fetch {
 pub async fn fetch(provider: &str) -> Fetch {
     let Some((url, token)) = crate::gateway::running_endpoint() else { return Fetch::NoGateway };
     let body = async {
+        crate::provider::install_crypto();
         let client = reqwest::Client::builder().timeout(TIMEOUT).build().ok()?;
         client
             .get(format!("{url}/v1/usage"))
@@ -116,6 +117,8 @@ pub struct QuotaTracker {
     /// The last fetch found no running gateway (cheap to re-check, so retried on a short fixed interval).
     no_gateway: bool,
     inflight: bool,
+    /// Native models are metered by API key: nothing to fetch, and nothing to wake for.
+    paused: bool,
     /// Quota is fetched only for the top-level interactive agent.
     pub enabled: bool,
     /// The background fetch writes its result here and pings `wake`.
@@ -133,6 +136,7 @@ impl Default for QuotaTracker {
             failures: 0,
             no_gateway: false,
             inflight: false,
+            paused: false,
             enabled: false,
             slot: Rc::new(RefCell::new(None)),
             wake,
@@ -165,9 +169,21 @@ impl QuotaTracker {
         self.failures = 0;
     }
 
+    /// Pausing (a native model) stops fetching and makes `wait` long, so the run loop idles. Resuming
+    /// fetches at once.
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        self.paused = paused;
+        if !paused {
+            self.at = None;
+        }
+    }
+
     /// Time until the next fetch is due. Long while one is in flight: its completion wakes the run loop.
     pub fn wait(&self) -> Duration {
-        if !self.enabled || self.inflight {
+        if !self.enabled || self.paused || self.inflight {
             return Duration::from_secs(3600);
         }
         let Some(at) = self.at else { return Duration::ZERO };
@@ -177,7 +193,7 @@ impl QuotaTracker {
 
     /// Applies a finished fetch, then starts the next one if due.
     pub fn tick(&mut self, provider: &str) {
-        if !self.enabled {
+        if !self.enabled || self.paused {
             return;
         }
         if let Some((fetched_for, got)) = self.slot.borrow_mut().take() {
@@ -210,6 +226,11 @@ impl QuotaTracker {
             *slot.borrow_mut() = Some((provider, got));
             let _ = wake.send(());
         });
+    }
+
+    #[cfg(test)]
+    pub fn set_usage(&mut self, usage: ProviderUsage) {
+        self.usage = Some(usage);
     }
 }
 
@@ -266,5 +287,17 @@ mod tests {
         q.provider_changed();
         assert!(q.is_subscription("openai"));
         assert_eq!(q.wait(), Duration::from_secs(3600), "disabled: nothing to wait for");
+    }
+
+    #[test]
+    fn a_paused_tracker_sleeps_and_fetches_nothing() {
+        let mut q = QuotaTracker { enabled: true, ..Default::default() };
+        assert_eq!(q.wait(), Duration::ZERO, "unpaused and due: fetch now");
+        q.set_paused(true);
+        assert!(q.wait() >= Duration::from_secs(3600), "paused: the run loop must not spin");
+        q.tick("anthropic");
+        assert!(!q.inflight, "paused: no fetch is started, so no task is spawned");
+        q.set_paused(false);
+        assert_eq!(q.wait(), Duration::ZERO, "resuming fetches at once");
     }
 }

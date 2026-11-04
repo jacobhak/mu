@@ -13,7 +13,7 @@ Status: early and experimental, changing quickly; no stable version (see README,
    reads, allocator retention — must go to zero.
 2. **Load on use.** Nothing starts, parses or allocates until the user or the model needs it.
 3. **omp-compatible files.** Context files, skills, rules, MCP config and sessions work unchanged.
-4. **Reuse before rewrite.** omp's MIT-licensed Rust crates for tools; omp's own gateway for providers.
+4. **Reuse before rewrite.** omp's MIT-licensed Rust crates for tools; omp's own gateway for OAuth and other providers; native clients only for API keys.
 
 ## Why
 
@@ -24,7 +24,7 @@ Measured 2026-10-23 on this machine (method in the appendix), except the mu row 
 | omp 18.12.6 | 165 MB (133 MB with extensions, LSP, skills, rules off) | Disabled features stay resident; plus machine-wide helpers of 97 + 23 + 23 MB |
 | pi 1.4.0 | 72 MB | Node runtime floor |
 | Codex CLI (Rust) | 27 MB | 308 MB binary; everything bundled |
-| mu | 3 MB (17 MB total with the binary's shared pages) | Without its gateway pair, which is shared by all sessions: 210 MB private, 251 MB total idle |
+| mu | 3.5 MB (19 MB total with the binary's shared pages) | Without its gateway pair, which is shared by all sessions and only needed for providers without an API key in mu: 210 MB private, 251 MB total idle |
 | Rust floor (HTTPS + TLS + async runtime) | 0.6 MB | 6.2 MB binary |
 
 ## Architecture
@@ -50,7 +50,7 @@ flowchart LR
 | Component | Responsibility | Reuse |
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
-| Provider client | Anthropic Messages requests to the omp gateway: streaming, retries, thinking budgets, usage | — |
+| Provider client | Streaming requests, retries, thinking mapping and usage, over three wire formats (Anthropic Messages, OpenAI Responses, Chat Completions) to a provider's own API with the user's key, or Anthropic Messages to the omp gateway | — |
 | Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `$MU_HOME/run/` (pid, kind, agent, cwd, parent; the jobs panel's Sessions tab lists the live ones); a per-session inbox in `$MU_HOME/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
@@ -130,8 +130,8 @@ All omp features outside the core become first-party plugins that load on use.
 
 | Plugin | Day one | Implementation |
 |---|---|---|
-| gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider, OAuth logins, account pools, quota. See Providers. |
-| mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It keeps TLS and HTTP out of the core: it is built as a separate Cargo project outside the workspace (feature unification would otherwise give the core rustls), and `scripts/build-mcp-http.sh check` fails if `cargo tree -p mu` ever shows rustls. It answers any `core/*` request a server sends with -32601. |
+| gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider without a native API key in mu, OAuth logins, account pools, quota. See Providers. |
+| mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It is a separate Cargo project outside the workspace so that the core does not build `rmcp`; it installs its own rustls crypto provider. It answers any `core/*` request a server sends with -32601. |
 | web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway still needs verifying. |
 | memory | yes | Day one: wraps the `mnemopi` CLI against the user's existing store (a Bun process only during recall/retain). Later: Rust port on the same SQLite schema with `fastembed-rs`. |
 | prediction | yes | Rust; word n-gram by default, optional SmolLM2-135M. See Prediction below. |
@@ -151,8 +151,17 @@ All omp features outside the core become first-party plugins that load on use.
 
 ## Providers
 
-- **Gateway:** every model is served through `omp auth-gateway serve`, backed by `omp auth-broker serve`. The
-  core speaks one wire protocol, Anthropic Messages, and holds no provider credentials or API keys.
+- **Native providers:** Anthropic, OpenAI and Baseten are called directly with an API key the user adds in mu
+  (`auth.json` per profile, `mu auth`, `/login`; see `docs/providers.md`). Routing is explicit: a provider is
+  native only when mu's key store has an entry for it, so an environment variable alone never moves
+  `anthropic/*` from a subscription to per-token billing. Three wire formats sit behind one seam
+  (`provider::wire`): Anthropic Messages, OpenAI Responses and Chat Completions (Baseten is a preset of the
+  generic client). Model limits, prices, reasoning ladders and Chat Completions quirks come from a snapshot of
+  omp's catalog regenerated on every bump (`src/provider/catalog.json`), plus live discovery for Baseten. A
+  session that uses only native providers starts no omp process.
+- **Gateway:** every other model, and every provider without a key in mu, is served through `omp auth-gateway
+  serve`, backed by `omp auth-broker serve`. The
+  core speaks one wire protocol, Anthropic Messages, to it and holds no credentials for those providers.
   (`auth-gateway stdio` was rejected: it returns a streamed reply as one string after the stream ends.) The
   gateway also accepts OpenAI Chat/Responses and pi-native stream requests, dispatches through omp's
   provider layer with the broker's credentials, and lists usable models at `GET /v1/models`.
@@ -205,7 +214,7 @@ each turn, split by region, and compares other harnesses; a pass/fail gate with 
 | Need | Choice | Reason |
 |---|---|---|
 | Async | `tokio`, current-thread runtime | Measured floor 0.6 MB private |
-| HTTP / TLS | `reqwest` + `rustls` | Same measurement |
+| HTTP / TLS | `reqwest` + `rustls` (ring) | Same measurement; in the core since native providers (+2 MB binary, +0.2 MB private, `BENCHMARKS.md`) |
 | Terminal | `crossterm` | Inline rendering, no alternate screen |
 | Markdown | `pulldown-cmark` | Streaming-friendly, no global state |
 | Highlighting | tree-sitter grammars, loaded per language on first use | Avoids the `syntect` bulk load |

@@ -1,0 +1,12 @@
+data: {"id":"l1","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"Thinking hard"},"finish_reason":null}]}
+
+data: {"id":"l1","choices":[{"index":0,"delta":{"reasoning":" about it"},"finish_reason":null}]}
+
+data: {"id":"l1","choices":[{"index":0,"delta":{"content":"The answer is"},"finish_reason":null}]}
+
+data: {"id":"l1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: {"id":"l1","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":1000,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]
+

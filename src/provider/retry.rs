@@ -42,10 +42,57 @@ pub fn too_long(retry_after: Option<Duration>) -> Option<ProviderError> {
 
 const LOGIN_HINT: &str = "\nIf you haven't logged in yet, run /login (or `omp login`) first.";
 
-pub fn classify_http(status: u16, retry_after: Option<Duration>, body: &str) -> ProviderError {
+/// `retry-after-ms` (else `retry-after` in seconds) and `x-should-retry`.
+pub fn headers(h: &reqwest::header::HeaderMap) -> (Option<Duration>, Option<bool>) {
+    let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
+    let after = get("retry-after-ms")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .or_else(|| get("retry-after").and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs));
+    let should = match get("x-should-retry") {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
+    (after, should)
+}
+
+/// A provider that says not to retry is believed. Only native routes honour it: the gateway's
+/// behaviour stays as it was.
+pub fn honour_should_retry(e: ProviderError, should_retry: Option<bool>) -> ProviderError {
+    match (e, should_retry) {
+        (ProviderError::Retryable { msg, .. }, Some(false)) => ProviderError::Fatal(msg),
+        (e, _) => e,
+    }
+}
+
+/// The error for a non-2xx response. `native` is the provider's label when the request went to its
+/// own API (see `classify_http`).
+pub fn http_error(
+    status: u16,
+    retry_after: Option<Duration>,
+    should_retry: Option<bool>,
+    body: &str,
+    native: Option<&str>,
+) -> ProviderError {
+    let e = classify_http(status, retry_after, body, native);
+    if native.is_some() { honour_should_retry(e, should_retry) } else { e }
+}
+
+/// `native` is the provider's label when the request went to its own API: a rejected key then
+/// says so, instead of pointing at omp's login.
+pub fn classify_http(status: u16, retry_after: Option<Duration>, body: &str, native: Option<&str>) -> ProviderError {
     let mut msg = format!("HTTP {status}: {}", body.chars().take(2000).collect::<String>());
-    if matches!(status, 401 | 403) || (status == 404 && body.to_lowercase().contains("unknown model")) {
-        msg.push_str(LOGIN_HINT);
+    match native {
+        None => {
+            if matches!(status, 401 | 403) || (status == 404 && body.to_lowercase().contains("unknown model")) {
+                msg.push_str(LOGIN_HINT);
+            }
+        }
+        Some(label) if matches!(status, 401 | 403) => {
+            msg.push_str(&format!("\n{label} rejected the API key; run /login to replace it"));
+        }
+        Some(_) => {}
     }
     match status {
         408 | 409 | 429 | 500 | 502 | 503 | 504 | 529 => ProviderError::Retryable { msg, retry_after },
@@ -78,14 +125,72 @@ mod tests {
         assert!(too_long(Some(Duration::from_secs(120))).is_none());
     }
 
+    fn gw(status: u16, body: &str) -> ProviderError {
+        classify_http(status, None, body, None)
+    }
+
     #[test]
     fn classification() {
-        assert!(matches!(classify_http(529, None, "x"), ProviderError::Retryable { .. }));
-        assert!(matches!(classify_http(400, None, "Prompt is too long: 300000 tokens"), ProviderError::Overflow(_)));
-        assert!(matches!(classify_http(400, None, "bad field"), ProviderError::Fatal(_)));
-        assert!(matches!(classify_http(401, None, "no"), ProviderError::Fatal(_)));
-        let e = classify_http(404, None, r#"{"message":"Unknown model: x/y"}"#).to_string();
+        assert!(matches!(gw(529, "x"), ProviderError::Retryable { .. }));
+        assert!(matches!(gw(400, "Prompt is too long: 300000 tokens"), ProviderError::Overflow(_)));
+        assert!(matches!(gw(400, "bad field"), ProviderError::Fatal(_)));
+        assert!(matches!(gw(401, "no"), ProviderError::Fatal(_)));
+        let e = gw(404, r#"{"message":"Unknown model: x/y"}"#).to_string();
         assert!(e.contains("/login"), "{e}");
-        assert!(!classify_http(400, None, "bad field").to_string().contains("/login"));
+        assert!(!gw(400, "bad field").to_string().contains("/login"));
+    }
+
+    #[test]
+    fn the_login_hint_depends_on_the_route() {
+        let e = classify_http(401, None, "invalid x-api-key", Some("Anthropic")).to_string();
+        assert!(e.contains("Anthropic rejected the API key; run /login to replace it"), "{e}");
+        assert!(!e.contains("omp login"), "{e}");
+        let e = classify_http(403, None, "", Some("Baseten")).to_string();
+        assert!(e.contains("Baseten rejected the API key"), "{e}");
+        assert!(gw(401, "no").to_string().contains("omp login"));
+        // a native 404 is a missing model, not a login problem
+        assert!(
+            !classify_http(404, None, r#"{"message":"Unknown model"}"#, Some("OpenAI")).to_string().contains("/login")
+        );
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut m = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn retry_headers() {
+        let (d, s) = headers(&map(&[("retry-after", "7")]));
+        assert_eq!((d, s), (Some(Duration::from_secs(7)), None));
+        // retry-after-ms is more precise and wins
+        let (d, _) = headers(&map(&[("retry-after", "7"), ("retry-after-ms", "1500")]));
+        assert_eq!(d, Some(Duration::from_millis(1500)));
+        let (d, s) = headers(&map(&[("x-should-retry", "false")]));
+        assert_eq!((d, s), (None, Some(false)));
+        assert_eq!(headers(&map(&[("x-should-retry", "true")])).1, Some(true));
+        assert_eq!(headers(&map(&[("retry-after", "soon")])).0, None);
+    }
+
+    #[test]
+    fn x_should_retry_false_stops_retries() {
+        let e = classify_http(529, None, "busy", Some("Anthropic"));
+        assert!(matches!(e, ProviderError::Retryable { .. }));
+        assert!(matches!(honour_should_retry(e, Some(false)), ProviderError::Fatal(_)));
+        let e = classify_http(529, None, "busy", Some("Anthropic"));
+        assert!(matches!(honour_should_retry(e, Some(true)), ProviderError::Retryable { .. }));
+        assert!(matches!(honour_should_retry(gw(400, "x"), Some(false)), ProviderError::Fatal(_)));
+    }
+
+    #[test]
+    fn only_the_native_route_honours_x_should_retry() {
+        let gateway = http_error(529, None, Some(false), "busy", None);
+        assert!(matches!(gateway, ProviderError::Retryable { .. }), "{gateway:?}");
+        let native = http_error(529, None, Some(false), "busy", Some("Anthropic"));
+        assert!(matches!(native, ProviderError::Fatal(_)), "{native:?}");
+        assert!(matches!(http_error(529, None, None, "busy", Some("Anthropic")), ProviderError::Retryable { .. }));
     }
 }

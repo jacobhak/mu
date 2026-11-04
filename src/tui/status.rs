@@ -272,6 +272,9 @@ fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
     if let Some(l) = thinking_label(s, env) {
         line.push(span(format!(" ({l})"), st(Role::Muted)));
     }
+    if s.native {
+        line.push(span(" · key", st(Role::Muted)));
+    }
     Some(line)
 }
 

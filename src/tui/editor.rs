@@ -24,11 +24,13 @@ pub struct Editor {
     pub(super) row: usize,
     pub(super) col: usize,
     kill: String,
+    /// Drawn as one `•` per char (a secret being typed). The text is kept as typed.
+    pub masked: bool,
 }
 
 impl Default for Editor {
     fn default() -> Self {
-        Editor { lines: vec![String::new()], row: 0, col: 0, kill: String::new() }
+        Editor { lines: vec![String::new()], row: 0, col: 0, kill: String::new(), masked: false }
     }
 }
 
@@ -136,7 +138,7 @@ impl Editor {
         let lines: Vec<String> = s.split('\n').map(str::to_owned).collect();
         let row = lines.len() - 1;
         let col = nch(&lines[row]);
-        Editor { lines, row, col, kill: String::new() }
+        Editor { lines, row, col, kill: String::new(), masked: false }
     }
 
     pub fn text(&self) -> String {
@@ -363,19 +365,29 @@ impl Editor {
         }
     }
 
+    /// The text as drawn: a masked buffer shows one `•` per char, so columns stay char indices.
+    fn drawn(&self) -> std::borrow::Cow<'_, Editor> {
+        if !self.masked {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let lines = self.lines.iter().map(|l| "•".repeat(l.chars().count())).collect();
+        std::borrow::Cow::Owned(Editor { lines, row: self.row, col: self.col, kill: String::new(), masked: false })
+    }
+
     /// The text wrapped to `avail` columns, and the cursor (row, col) among the rows. A cursor past
     /// a full row takes a row of its own, so it always has a cell.
     pub fn wrap(&self, avail: usize) -> (Vec<String>, (usize, usize)) {
         let avail = avail.max(1);
         let mut rows: Vec<String> = Vec::new();
         let mut cursor = (0, 0);
-        for (r, text) in self.lines.iter().enumerate() {
+        let d = self.drawn();
+        for (r, text) in d.lines.iter().enumerate() {
             let start = rows.len();
             let lay = line::layout(&plain(text.as_str()), avail);
             let mut wrapped: Vec<String> = lay.rows.iter().map(line::line_text).collect();
-            if r == self.row {
-                cursor = lay.locate_char(self.col);
-                if self.col >= lay.chars && cursor.1 >= avail {
+            if r == d.row {
+                cursor = lay.locate_char(d.col);
+                if d.col >= lay.chars && cursor.1 >= avail {
                     wrapped.push(String::new());
                     cursor = (cursor.0 + 1, 0);
                 }
@@ -409,8 +421,9 @@ impl Editor {
     pub fn view_line(&self, first: &str, width: usize) -> (Line, usize) {
         let pw = UnicodeWidthStr::width(first).min(width.saturating_sub(1));
         let avail = width.saturating_sub(pw).max(1);
-        let text = self.lines[0].as_str();
-        let cur = line::layout(&plain(text), usize::MAX).locate_char(self.col).1;
+        let d = self.drawn();
+        let text = d.lines[0].as_str();
+        let cur = line::layout(&plain(text), usize::MAX).locate_char(d.col).1;
         let scroll_from = (cur + 1).saturating_sub(avail);
         let mut disp = 0;
         let mut base = None;
@@ -647,5 +660,18 @@ mod tests {
         let e = at("字字字字");
         let (line, col) = e.view_line("› ", 6);
         assert!(col < 6 && line::line_width(&line) <= 6, "{col} {:?}", line::line_text(&line));
+    }
+
+    #[test]
+    fn masked_buffer_draws_bullets_and_keeps_the_text() {
+        let mut e = at("sk-ant-123");
+        e.masked = true;
+        let (rows, cur) = e.wrap(40);
+        assert_eq!(rows, ["•".repeat(10)], "one bullet per char");
+        assert_eq!(cur, (0, 10));
+        let (line, col) = e.view_line("› ", 40);
+        assert_eq!(line::line_text(&line), format!("› {}", "•".repeat(10)));
+        assert_eq!(col, 12);
+        assert_eq!(e.text(), "sk-ant-123", "the buffer keeps the text");
     }
 }

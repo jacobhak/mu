@@ -17,6 +17,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: scripts/build-mcp-http.sh test
-      - run: scripts/build-mcp-http.sh check
+      - run: node --test scripts/maint/gen-catalog.test.mjs
       - run: bun test content.test.ts
         working-directory: plugins/memory

@@ -20,6 +20,22 @@ pub enum LoginTarget {
     Provider(usize),
     /// An MCP server, by its name in `mcp.json`.
     Mcp(String),
+    /// A native API-key provider, by id (`provider::native::PROVIDERS`).
+    ApiKey(String),
+}
+
+/// What the user does next in the API-key picker.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyOption {
+    /// Type or paste the key (masked).
+    Paste,
+    /// Use `$NAME`, the variable the user already has set.
+    Env(String),
+    /// Type a `!command` that prints the key.
+    Command,
+    /// Validation could not reach the provider: keep the key anyway.
+    SaveAnyway,
+    Cancel,
 }
 
 /// A row of the `/mcp` server list.
@@ -67,6 +83,17 @@ pub enum Overlay {
     Login {
         sel: Select,
         targets: Vec<LoginTarget>,
+    },
+    /// The API-key picker for `provider`: the options it offers.
+    KeyChoice {
+        sel: Select,
+        provider: String,
+        options: Vec<KeyOption>,
+    },
+    /// `/logout`: the stored API keys that can be removed.
+    Logout {
+        sel: Select,
+        providers: Vec<String>,
     },
     /// A `/mcp` picker: the server list, a server's actions, or a wizard step.
     Mcp {
@@ -118,6 +145,13 @@ pub enum OverlayEvent {
         model: String,
     },
     Login(LoginTarget),
+    /// The API-key picker chose this for `provider` (`Cancel` when it was dismissed).
+    Key {
+        provider: String,
+        choice: KeyOption,
+    },
+    /// Remove the stored API key of this provider.
+    Logout(String),
     /// A `/mcp` picker closed: the row chosen, or `None` when dismissed.
     Mcp(McpPick, Option<usize>),
     Copy(Option<String>),
@@ -418,6 +452,8 @@ impl Overlay {
             Overlay::Model { sel, .. }
             | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
+            | Overlay::KeyChoice { sel, .. }
+            | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
@@ -432,6 +468,8 @@ impl Overlay {
             Overlay::Model { sel, .. }
             | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
+            | Overlay::KeyChoice { sel, .. }
+            | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
@@ -515,6 +553,21 @@ impl Overlay {
                 SelectResult::Pending => (Some(Overlay::Login { sel, targets }), None),
                 SelectResult::Chosen(i) => {
                     (None, i.first().and_then(|i| targets.get(*i)).cloned().map(OverlayEvent::Login))
+                }
+                _ => (None, None),
+            },
+            Overlay::KeyChoice { mut sel, provider, options } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::KeyChoice { sel, provider, options }), None),
+                SelectResult::Chosen(i) => {
+                    let choice = i.first().and_then(|i| options.get(*i)).cloned().unwrap_or(KeyOption::Cancel);
+                    (None, Some(OverlayEvent::Key { provider, choice }))
+                }
+                _ => (None, Some(OverlayEvent::Key { provider, choice: KeyOption::Cancel })),
+            },
+            Overlay::Logout { mut sel, providers } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Logout { sel, providers }), None),
+                SelectResult::Chosen(i) => {
+                    (None, i.first().and_then(|i| providers.get(*i)).cloned().map(OverlayEvent::Logout))
                 }
                 _ => (None, None),
             },

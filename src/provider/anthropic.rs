@@ -1,5 +1,5 @@
 use super::sse::SseDecoder;
-use super::{ProviderError, Request, StreamEvent, normalize_id, same_origin, stream_error};
+use super::{Decoder, ProviderError, Request, Route, StreamEvent, Wire, normalize_id, same_origin, stream_error};
 use crate::message::{Block, Message, StopReason, Usage, now_ms};
 use crate::models::{ModelSpec, Thinking};
 use serde_json::{Value, json};
@@ -7,6 +7,27 @@ use std::collections::BTreeMap;
 
 pub fn url(base: &str) -> String {
     format!("{base}/v1/messages")
+}
+
+/// The gateway route sends `body`; a native one the API-key body with its betas.
+pub fn wire(req: &Request, route: &Route) -> Wire {
+    let mut headers = vec![("anthropic-version", "2023-06-01".to_string())];
+    let body = if route.is_native() {
+        let (body, betas) = super::anthropic_native::body(req);
+        if !betas.is_empty() {
+            headers.push(("anthropic-beta", betas.join(",")));
+        }
+        body
+    } else {
+        body(req)
+    };
+    Wire { url: url(&route.base), headers, body, decoder: Box::new(Assembler::new(req.model)) }
+}
+
+impl Decoder for Assembler {
+    fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
+        Assembler::feed(self, chunk, ev)
+    }
 }
 
 /// The thinking budget must leave room for the answer: at most `max_tokens - 1024`, and
@@ -136,6 +157,7 @@ enum Open {
 pub struct Assembler {
     model: String,
     provider: String,
+    api: &'static str,
     sse: SseDecoder,
     blocks: BTreeMap<u64, Open>,
     done: Vec<Block>,
@@ -149,6 +171,7 @@ impl Assembler {
         Self {
             model: model.id.clone(),
             provider: model.provider.clone(),
+            api: model.api.as_str(),
             sse: SseDecoder::default(),
             blocks: BTreeMap::new(),
             done: Vec::new(),
@@ -243,7 +266,7 @@ impl Assembler {
             "message_stop" => {
                 return Ok(Some(Message::Assistant {
                     content: std::mem::take(&mut self.done),
-                    api: crate::models::API.into(),
+                    api: self.api.into(),
                     provider: self.provider.clone(),
                     model: self.model.clone(),
                     usage: self.usage.clone(),
@@ -285,7 +308,7 @@ mod tests {
     use super::*;
 
     fn spec(provider: &str) -> ModelSpec {
-        ModelSpec { id: format!("{provider}/m"), provider: provider.into(), context_window: 1000, max_output: 100 }
+        ModelSpec::gateway(&format!("{provider}/m"), 1000, 100)
     }
 
     fn gw() -> ModelSpec {
@@ -393,7 +416,7 @@ mod tests {
     fn asst(blocks: Vec<Block>) -> Message {
         Message::Assistant {
             content: blocks,
-            api: crate::models::API.into(),
+            api: crate::models::Api::AnthropicMessages.as_str().into(),
             provider: "anthropic".into(),
             model: "m".into(),
             usage: Usage::default(),
@@ -489,8 +512,7 @@ mod effort_tests {
     use std::rc::Rc;
 
     fn wire(level: Thinking, max_tokens: u32) -> Value {
-        let model =
-            ModelSpec { id: "anthropic/m".into(), provider: "anthropic".into(), context_window: 1000, max_output: 100 };
+        let model = ModelSpec::gateway("anthropic/m", 1000, 100);
         let req = Request {
             model: &model,
             thinking: Rc::new(Cell::new(level)),
@@ -498,6 +520,7 @@ mod effort_tests {
             tools: &[],
             messages: &[],
             max_tokens: Some(max_tokens),
+            session_id: None,
         };
         body(&req)
     }
@@ -528,8 +551,7 @@ mod redacted_tests {
 
     #[test]
     fn redacted_thinking_round_trips_and_image_only_prompts_have_no_empty_text() {
-        let model =
-            ModelSpec { id: "anthropic/m".into(), provider: "anthropic".into(), context_window: 1, max_output: 1 };
+        let model = ModelSpec::gateway("anthropic/m", 1, 1);
         let mut asm = Assembler::new(&model);
         let mut ev = |_: StreamEvent| {};
         let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"abc\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_stop\"}\n\n";

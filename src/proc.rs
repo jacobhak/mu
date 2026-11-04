@@ -4,6 +4,8 @@ use std::time::Duration;
 
 /// Time between SIGTERM and SIGKILL.
 pub const TERM_GRACE: Duration = Duration::from_millis(200);
+/// How long a command's leftover children may keep its stdout open after it exits.
+const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
 
 /// Sends `kill(pid, sig)` to that one pid (never a group). `Err` carries the errno.
 pub fn signal_pid(pid: u32, sig: libc::c_int) -> std::io::Result<()> {
@@ -32,6 +34,53 @@ pub async fn terminate_group(pgid: i32) {
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
+/// Runs `cmd` with its stdout captured. `None` on failure, timeout or a non-zero exit. The command
+/// runs in its own process group, which is terminated when `limit` passes, or when it has exited
+/// but a leftover child still holds the pipe open. Children that let go of stdout are left alone.
+pub async fn run_capture(mut cmd: tokio::process::Command, limit: Duration) -> Option<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+    let mut child = cmd.spawn().ok()?;
+    // The group id is the leader's pid; read it now, before `wait` reaps the leader.
+    let pgid = child.id().map(|p| p as i32)?;
+    let mut out = child.stdout.take()?;
+    let run = async {
+        let mut buf = Vec::new();
+        let (read, st) = {
+            let read = out.read_to_end(&mut buf);
+            tokio::pin!(read);
+            let mut done = None;
+            let st = loop {
+                tokio::select! {
+                    r = &mut read, if done.is_none() => done = Some(r),
+                    st = child.wait() => break st,
+                }
+            };
+            let read = match done {
+                Some(r) => r,
+                None => match tokio::time::timeout(LEFTOVER_GRACE, &mut read).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        terminate_group(pgid).await;
+                        read.await
+                    }
+                },
+            };
+            (read, st)
+        };
+        read.ok()?;
+        st.ok()?.success().then(|| String::from_utf8_lossy(&buf).into_owned())
+    };
+    match tokio::time::timeout(limit, run).await {
+        Ok(out) => out,
+        Err(_) => {
+            terminate_group(pgid).await;
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +98,58 @@ mod tests {
         rt.block_on(terminate_group(child.id() as i32));
         let st = child.wait().unwrap();
         assert!(!st.success());
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only asks whether the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn a_timed_out_command_takes_its_grandchildren_with_it() {
+        let dir = std::env::temp_dir().join(format!("mu-proc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()));
+        assert!(runtime().block_on(run_capture(c, Duration::from_millis(500))).is_none());
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let gone = (0..50).any(|_| {
+            let dead = !alive(pid);
+            if !dead {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            dead
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "grandchild {pid} survived the timeout");
+    }
+
+    #[test]
+    fn a_leftover_child_holding_stdout_does_not_hold_the_read() {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg("sleep 30 & echo ok");
+        let started = std::time::Instant::now();
+        let out = runtime().block_on(run_capture(c, Duration::from_secs(5)));
+        assert_eq!(out.as_deref(), Some("ok\n"));
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    }
+
+    /// A daemon a command starts (an agent it talks to) outlives it once it lets go of stdout.
+    #[test]
+    fn a_child_that_released_stdout_is_left_running() {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg("sleep 30 >/dev/null & echo $!");
+        let out = runtime().block_on(run_capture(c, Duration::from_secs(5))).unwrap();
+        let pid: i32 = out.trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        let survived = alive(pid);
+        // SAFETY: plain kill(2) on the test's own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(survived, "the released child {pid} was killed");
     }
 }

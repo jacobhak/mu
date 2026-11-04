@@ -1,0 +1,26 @@
+data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me "},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"check the file."},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a1","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":" Two files."},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b2","type":"function","function":{"name":"grep","arguments":"{\"pat"}}]},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"tern\":\"fn\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Reading "},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"content":"both."},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"c1","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":34,"total_tokens":154,"prompt_tokens_details":{"cached_tokens":100}}}
+
+data: [DONE]
+

@@ -24,6 +24,21 @@ What this means, using the idle figure:
 - The other harnesses call their providers directly and have no such pair.
 - A complete mu run through the real gateway could not be measured against the fake model: the gateway serves only catalog models and ignores `models.yml` on purpose. These combined figures are sums of separate measurements, not a measured run.
 
+## With an API key in mu, there is no gateway
+
+Since native providers, a session that talks to Anthropic, OpenAI or Baseten with a key added in mu starts no omp process, so the pair above is not part of its cost. Measured 2026-11-04 on the same machine with the release binary, interactive TUI, `--model anthropic/claude-sonnet-5-5`, one `say pong` prompt, against a local fake Anthropic server holding the stream open for 15 s (`Pss` and `Pss_Anon` from `/proc/<pid>/smaps_rollup`, the `mu` process only, 9 s after start, then 6 s into the request). One run each: expect a MB or so of noise.
+
+| | idle total | idle private | request in flight, total | in flight, private |
+|---|---|---|---|---|
+| before native providers, through a bypassed gateway (`MU_GATEWAY_URL`) | 18.7 MB | 5.1 MB | 19.6 MB | 5.4 MB |
+| after, through a bypassed gateway | 21.2 MB | 5.5 MB | 22.2 MB | 5.8 MB |
+| **after, native Anthropic key** | **19.0 MB** | **5.2 MB** | **21.5 MB** | **5.7 MB** |
+
+What this means:
+- **One native session:** about 22 MB total while a request runs, against about 276 MB for one session through the gateway pair (25 + 251, above). With several sessions the gateway share falls, but a native session never pays it.
+- **Cost of the change in the core:** linking rustls and the model catalog snapshot makes the binary 2.1 MB larger (61.9 to 64.1 MB; 64.5 MB with the key store, TLS and the three wires). Bare idle TUI with no model selected: 17.0 to 18.6 MB total, 3.2 to 3.5 MB private. The differences between the rows above are within the run-to-run noise of one measurement, so no private-memory regression can be claimed or ruled out below about 0.5 MB.
+- This is a fake model on loopback: it measures mu's memory, not TLS handshakes, real latency or what a real stream buffers.
+
 ## The task
 
 One prompt, then a tool loop of 28 model steps that the fake model scripts: 10 file reads, 13 shell commands (`head`, `grep`), 4 file writes, a final answer. The shape comes from the author's own sessions: most are one prompt followed by an agent loop, and tool results are small (median read 2 kB, median shell output 0.5 kB). 12 source files of 1.5 to 12 kB are created for the task. The server rewrites each scripted call into the tool and argument names the harness offered in its request, so every harness does the same operations.

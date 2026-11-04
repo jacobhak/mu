@@ -83,6 +83,7 @@ pub struct Agent {
     messages_memo: std::cell::RefCell<Option<((usize, i64), u64)>>,
     git: Option<GitInfo>,
     quota: QuotaTracker,
+    pricing_checked: bool,
     turn_msgs: Vec<Value>,
     jobs: Option<Rc<JobsHandle>>,
     wake_rx: Option<UnboundedReceiver<()>>,
@@ -330,6 +331,7 @@ impl Agent {
             messages_memo: Default::default(),
             git: None,
             quota: QuotaTracker::default(),
+            pricing_checked: false,
             turn_msgs: Vec::new(),
             jobs: None,
             wake_rx: None,
@@ -502,7 +504,8 @@ impl Agent {
             model_name: pricing::display_name(&self.model.id),
             reasoning: pricing::reasoning(&self.model.id).unwrap_or(true),
             thinking: self.thinking.as_str().into(),
-            subscription: self.quota.is_subscription(&self.model.provider),
+            subscription: !self.model.native && self.quota.is_subscription(&self.model.provider),
+            native: self.model.native,
             plan: self.plan.is_some(),
             context_tokens: Some(self.context_tokens()),
             context_window: self.model.context_window,
@@ -512,7 +515,7 @@ impl Agent {
             title: self.title.clone(),
             session_path: self.session.as_ref().map(|s| s.path.to_string_lossy().into_owned()),
             git: self.git.clone(),
-            usage: self.quota.usage_for(&self.model.provider),
+            usage: if self.model.native { None } else { self.quota.usage_for(&self.model.provider) },
         }
     }
 
@@ -523,7 +526,11 @@ impl Agent {
         self.settle_prices();
     }
 
+    /// Native models are metered by API key: there is no subscription quota to poll.
     fn tick_quota(&mut self) {
+        if self.model.native {
+            return;
+        }
         let provider = self.model.provider.clone();
         self.quota.tick(&provider);
     }
@@ -531,7 +538,7 @@ impl Agent {
     /// Prices usage recorded before the table knew its model. A model the table does not list forces
     /// one catalogue refresh per process.
     fn settle_prices(&mut self) {
-        if self.cost.settle() && self.quota.enabled {
+        if self.cost.settle() && self.quota.enabled && !self.model.native {
             tokio::task::spawn_local(pricing::refresh_missing());
         }
     }
@@ -540,6 +547,17 @@ impl Agent {
     fn refresh_model_meta(&mut self) {
         if let Ok((spec, _)) = self.providers.resolve(&self.model.id) {
             self.model = spec;
+            self.sync_model_state();
+        }
+    }
+
+    /// Native models pause quota polling. omp's catalogue is read only once a gateway model is in use,
+    /// so a native-only session never starts omp.
+    fn sync_model_state(&mut self) {
+        self.quota.set_paused(self.model.native);
+        if !self.model.native && !self.pricing_checked {
+            self.pricing_checked = true;
+            tokio::task::spawn_local(pricing::refresh());
         }
     }
 
@@ -638,6 +656,7 @@ impl Agent {
                     self.quota.provider_changed();
                 }
                 self.model = spec;
+                self.sync_model_state();
                 if let Some(l) = level {
                     self.set_thinking(l);
                 }
@@ -917,7 +936,11 @@ impl Agent {
 
     pub async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
         self.quota.enabled = true;
-        tokio::task::spawn_local(pricing::refresh());
+        self.sync_model_state();
+        let providers = self.providers.clone();
+        tokio::task::spawn_local(async move {
+            providers.refresh_native_models(false).await;
+        });
         self.refresh_external().await;
         self.emit_status();
         let mut title_rx = self.title_rx.take().expect("run once");
@@ -958,6 +981,10 @@ impl Agent {
                     self.emit_status();
                 }
                 Command::SetModel(sel) => self.set_model(&sel),
+                Command::RefreshModel => {
+                    self.refresh_model_meta();
+                    self.emit_status();
+                }
                 Command::SetThinking(t) => self.set_thinking(t),
                 Command::NewSession => {
                     self.end_session().await;
@@ -1845,6 +1872,7 @@ impl Agent {
                 return Flow::Aborted;
             }
             let system = self.system();
+            let sid = self.session_id();
             let wire = self.wire_messages();
             // Every tool call in the history has its result and vice versa (`to_wire` also repairs).
             debug_assert!(crate::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
@@ -1860,6 +1888,7 @@ impl Agent {
                     tools: &defs,
                     messages: &wire,
                     max_tokens: None,
+                    session_id: Some(&sid),
                 };
                 let tx = self.events.clone();
                 let mut ev = |e: StreamEvent| {
@@ -2174,7 +2203,7 @@ mod loop_tests {
     fn assistant(blocks: Vec<Block>, stop: StopReason) -> Message {
         Message::Assistant {
             content: blocks,
-            api: crate::models::API.into(),
+            api: crate::models::Api::AnthropicMessages.as_str().into(),
             provider: "anthropic".into(),
             model: "m".into(),
             usage: Default::default(),
@@ -2212,12 +2241,7 @@ mod loop_tests {
             commands: vec![],
             agents: vec![],
         });
-        let model = ModelSpec {
-            id: "anthropic/m".into(),
-            provider: "anthropic".into(),
-            context_window: 200_000,
-            max_output: 8192,
-        };
+        let model = ModelSpec::gateway("anthropic/m", 200_000, 8192);
         let a = Agent::new(AgentInit {
             providers,
             plugins,
@@ -3224,6 +3248,24 @@ mod loop_tests {
             let users = user_texts(&a);
             assert_eq!(users.len(), 1, "{users:?}");
             assert!(users[0].contains("Message from a") && users[0].contains("Message from b"));
+        });
+    }
+
+    #[test]
+    fn a_native_model_pauses_the_quota_and_shows_no_windows() {
+        run(async {
+            let (mut a, _rx) = agent(vec![]);
+            a.quota.enabled = true;
+            a.quota.set_usage(crate::quota::ProviderUsage { provider: "anthropic".into(), windows: vec![] });
+            a.model = ModelSpec::gateway("anthropic/m", 200_000, 8192);
+            a.model.native = true;
+            a.sync_model_state();
+            assert!(a.quota.wait() >= std::time::Duration::from_secs(3600), "the run loop must not spin");
+            assert!(a.snapshot().usage.is_none(), "subscription windows never show under a per-token model");
+            assert!(!a.pricing_checked, "a native-only session never starts omp");
+            a.model.native = false;
+            a.sync_model_state();
+            assert!(a.pricing_checked, "the first gateway model reads omp's catalogue, once");
         });
     }
 

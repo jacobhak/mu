@@ -26,7 +26,7 @@ impl GatewaySource {
 /// over plain HTTP to anywhere else.
 pub fn validate_url(url: &str) -> Result<String> {
     let url = url.trim().trim_end_matches('/');
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("gateway URL `{url}` has no scheme"))?;
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("URL `{url}` has no scheme"))?;
     let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
     let host = match auth.strip_prefix('[') {
@@ -34,15 +34,15 @@ pub fn validate_url(url: &str) -> Result<String> {
         None => auth.split(':').next().unwrap_or_default(),
     };
     if host.is_empty() {
-        return Err(anyhow!("gateway URL `{url}` has no host"));
+        return Err(anyhow!("URL `{url}` has no host"));
     }
     let loopback =
         host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     match scheme.to_ascii_lowercase().as_str() {
         "https" => Ok(url.to_string()),
         "http" if loopback => Ok(url.to_string()),
-        "http" => Err(anyhow!("refusing gateway URL `{url}`: http is only allowed to loopback; use https")),
-        other => Err(anyhow!("refusing gateway URL `{url}`: unsupported scheme `{other}`")),
+        "http" => Err(anyhow!("refusing URL `{url}`: http is only allowed to loopback; use https")),
+        other => Err(anyhow!("refusing URL `{url}`: unsupported scheme `{other}`")),
     }
 }
 
