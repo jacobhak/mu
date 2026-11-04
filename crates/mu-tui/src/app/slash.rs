@@ -5,7 +5,8 @@ use super::*;
 use crate::term::clipboard;
 use crate::text::markdown;
 use mu_base::image;
-use mu_base::models::{self, Thinking};
+use mu_base::models::Thinking;
+use mu_provider::provider::providers::PROVIDERS;
 use mu_tools::tools::todo::Status;
 
 const BUILTIN_DESC: [(&str, &str, bool); 25] = [
@@ -69,14 +70,14 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context) -> Vec<Entry>
                 "jobs" => (vec!["kill".to_string()], vec![]),
                 "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
                 "login" => (
-                    models::PROVIDERS
+                    PROVIDERS
                         .iter()
                         .map(|d| d.id.to_string())
                         .chain(plugins.mcp_names().iter().map(|n| format!("mcp:{n}")))
                         .collect(),
                     vec![],
                 ),
-                "logout" => (models::PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
+                "logout" => (PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
                 _ => (vec![], vec![]),
             };
             Entry { name: name.into(), desc: desc.into(), needs_arg, args, arg_descs }

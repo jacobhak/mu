@@ -6,9 +6,10 @@ use super::*;
 use crate::widgets::overlay::LoginTarget;
 use crate::widgets::select::{Item, Select};
 use mu_base::message::Image;
-use mu_base::models::{self, GatewayModel};
+use mu_base::models::GatewayModel;
+use mu_provider::auth::check::Check;
 use mu_provider::auth::store::Entry;
-use mu_provider::provider::native;
+use mu_provider::provider::providers::ProviderDef;
 
 pub(super) enum UiMsg {
     ChildDone {
@@ -43,9 +44,9 @@ pub(super) enum UiMsg {
     /// An API key was checked: the outcome, and the entry to save when it holds.
     KeyChecked {
         flow: u64,
-        def: &'static models::ProviderDef,
+        def: &'static ProviderDef,
         entry: Entry,
-        r: Result<native::Check, String>,
+        r: Result<Check, String>,
     },
 }
 
@@ -64,7 +65,7 @@ impl App {
                     Ok(g) => g,
                     Err(e) => {
                         // Native models are listed either way; only a session without any says why.
-                        if self.services.providers.native_models().is_empty() {
+                        if self.services.providers.direct_models().is_empty() {
                             self.error(&format!("could not fetch gateway models: {e}"));
                         } else {
                             self.notice(&format!("gateway models unavailable: {e}"));

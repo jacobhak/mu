@@ -33,7 +33,7 @@ use mu_base::events::{AgentEvent, Command, SharedInbox};
 use mu_base::message::UserInput;
 use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
-use mu_provider::provider::Providers;
+use mu_provider::provider::client::Providers;
 use mu_tools::context::Context;
 use mu_tools::plugin::PluginHost;
 use serde_json::json;

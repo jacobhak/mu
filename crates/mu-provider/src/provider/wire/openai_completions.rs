@@ -1,9 +1,12 @@
 //! OpenAI-compatible Chat Completions wire (`POST {base}/chat/completions`), used by Baseten.
 //! Conventions follow omp's `openai-completions.ts` so sessions move between the two.
 
-use super::sse::SseDecoder;
-use super::{Decoder, ProviderError, Request, Route, StreamEvent, Wire, normalize_id};
-use mu_base::message::{Block, Image, Message, StopReason, Usage, now_ms};
+use super::convert::{normalize_id, paired, tool_list, unavailable};
+use super::usage;
+use super::{SseFrames, WireFormat};
+use crate::provider::sse::SseDecoder;
+use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
+use mu_base::message::{Block, Image, Message, Usage, now_ms};
 use mu_base::models::{self, CompletionsCompat, ModelSpec, Thinking, ThinkingMode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -11,17 +14,24 @@ use std::collections::HashMap;
 /// Field names a reasoning delta may arrive under, in the order they are tried.
 const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
-pub fn url(base: &str) -> String {
-    format!("{base}/chat/completions")
-}
+pub struct Completions;
 
-pub fn wire(req: &Request, route: &Route) -> Result<Wire, ProviderError> {
-    Ok(Wire {
-        url: url(&route.base),
-        headers: Vec::new(),
-        body: body(req),
-        decoder: Box::new(Assembler::new(req.model)),
-    })
+impl WireFormat for Completions {
+    fn url(&self, base: &str) -> String {
+        format!("{base}/chat/completions")
+    }
+
+    fn body(&self, req: &Request) -> Value {
+        body(req)
+    }
+
+    fn decoder(&self, req: &Request) -> Box<dyn Decoder> {
+        Box::new(Assembler::new(req.model))
+    }
+
+    fn classify(&self, error: &Value) -> ProviderError {
+        stream_failure(error)
+    }
 }
 
 impl Decoder for Assembler {
@@ -48,12 +58,10 @@ pub fn body(req: &Request) -> Value {
         body["stream_options"] = json!({"include_usage": true});
     }
     if !req.tools.is_empty() {
-        body["tools"] = Value::Array(
-            req.tools
-                .iter()
-                .map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.schema}}))
-                .collect(),
-        );
+        body["tools"] = Value::Array(tool_list(
+            req.tools,
+            |name, description, schema| json!({"type":"function","function":{"name":name,"description":description,"parameters":schema}}),
+        ));
     }
     if model.thinking.mode == ThinkingMode::Effort
         && let Some(e) = reasoning_effort(req.thinking.get(), &model.thinking.efforts, &compat)
@@ -78,15 +86,7 @@ fn reasoning_effort(level: Thinking, efforts: &[String], compat: &CompletionsCom
 
 pub fn to_wire(system: &str, messages: &[Message], model: &ModelSpec) -> Vec<Value> {
     let compat = model.compat.clone().unwrap_or_default();
-    // Backstop: never send unpaired tool calls/results, whatever the history holds.
-    let mut repaired;
-    let messages = if mu_base::message::check_tool_pairs(messages).is_err() {
-        repaired = messages.to_vec();
-        mu_base::message::repair_tool_pairs(&mut repaired);
-        &repaired[..]
-    } else {
-        messages
-    };
+    let messages = paired(messages);
     let images = model.images && !compat.strip_image_input;
     let mut out = Vec::new();
     if !system.trim().is_empty() {
@@ -98,7 +98,7 @@ pub fn to_wire(system: &str, messages: &[Message], model: &ModelSpec) -> Vec<Val
     // Tool-call ids the assistant turns sent, so the results that follow use the same ids.
     let mut ids: HashMap<String, String> = HashMap::new();
     let mut pending: Vec<Value> = Vec::new();
-    for m in messages {
+    for m in messages.iter() {
         if !matches!(m, Message::ToolResult { .. }) {
             flush_images(&mut out, &mut pending);
         }
@@ -274,7 +274,7 @@ fn image_part(i: &Image, supported: bool) -> Value {
     }
     match mu_base::image::resolve(&i.data) {
         Some(data) => json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{data}", i.mime_type)}}),
-        None => json!({"type":"text","text":format!("[image unavailable: {}]", i.mime_type)}),
+        None => json!({"type":"text","text":unavailable(i)}),
     }
 }
 
@@ -323,16 +323,7 @@ impl Assembler {
     }
 
     pub fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
-        let frames = self.sse.push(chunk);
-        if self.sse.overflow {
-            return Err(ProviderError::Fatal("stream frame larger than 16 MB".into()));
-        }
-        for (_, data) in frames {
-            if let Some(m) = self.frame(&data, ev)? {
-                return Ok(Some(m));
-            }
-        }
-        Ok(None)
+        super::feed(self, chunk, ev)
     }
 
     fn frame(&mut self, data: &str, ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
@@ -350,7 +341,7 @@ impl Assembler {
             self.response_id = Some(id.into());
         }
         if v["usage"].is_object() {
-            self.usage = usage_of(&v["usage"]);
+            self.usage = usage::completions_usage(&v["usage"]);
         }
         let choice = &v["choices"][0];
         if let Some(r) = choice["finish_reason"].as_str() {
@@ -457,7 +448,7 @@ impl Assembler {
             };
             content.push(Block::ToolCall { id, name: c.name, arguments });
         }
-        let (stop_reason, error_message) = stop_of(self.finish_reason.as_deref(), has_calls);
+        let (stop_reason, error_message) = usage::chat_stop(self.finish_reason.as_deref(), has_calls);
         Message::Assistant {
             content,
             api: self.api.into(),
@@ -472,22 +463,14 @@ impl Assembler {
     }
 }
 
-/// A `finish_reason` as mu's stop reason. A stop that carries tool calls is a tool turn.
-fn stop_of(reason: Option<&str>, has_calls: bool) -> (StopReason, Option<String>) {
-    match reason {
-        None | Some("stop" | "end") => (if has_calls { StopReason::ToolUse } else { StopReason::Stop }, None),
-        Some("length" | "max_tokens") => (StopReason::Length, None),
-        Some("tool_calls" | "function_call") => (if has_calls { StopReason::ToolUse } else { StopReason::Stop }, None),
-        Some(other) => (StopReason::Error, Some(format!("Provider finish_reason: {other}"))),
+impl SseFrames for Assembler {
+    fn sse(&mut self) -> &mut SseDecoder {
+        &mut self.sse
     }
-}
 
-/// `prompt_tokens` includes the cached ones, which are reported apart as `cache_read`.
-fn usage_of(u: &Value) -> Usage {
-    let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
-    let output = u["completion_tokens"].as_u64().unwrap_or(0);
-    let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0).min(prompt);
-    Usage { input: prompt - cached, output, cache_read: cached, total_tokens: prompt + output, ..Usage::default() }
+    fn frame(&mut self, data: &str, ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
+        Assembler::frame(self, data, ev)
+    }
 }
 
 /// An in-stream `error` object: rate limits, overload and server faults retry; a context overflow
@@ -520,10 +503,23 @@ fn stream_failure(e: &Value) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Auth;
+    use crate::provider::client::Route;
+    use crate::provider::types::Auth;
+    use mu_base::message::StopReason;
     use mu_base::tool::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    /// The parts a request is built from, as the tests read them.
+    struct Built {
+        url: String,
+        body: Value,
+        decoder: Box<dyn Decoder>,
+    }
+
+    fn wire(req: &Request, route: &Route) -> Result<Built, ProviderError> {
+        Ok(Built { url: Completions.url(&route.base), body: Completions.body(req), decoder: Completions.decoder(req) })
+    }
 
     const INTERLEAVED: &[u8] = include_bytes!("testdata/completions/interleaved.sse");
     const LENGTH: &[u8] = include_bytes!("testdata/completions/length.sse");
@@ -1166,14 +1162,14 @@ data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}
             eprintln!("skipped: BASETEN_API_KEY is not set");
             return;
         };
-        crate::provider::install_crypto();
+        crate::net::install_crypto();
         let m = spec("moonshotai/Kimi-K3");
         let msgs = [Message::user("Reply with the single word: pong")];
         let req = Request { max_tokens: Some(256), ..request(&m, Thinking::Low, &[], &msgs) };
         let route = Route {
             base: "https://inference.baseten.co/v1".into(),
             auth: Auth::Bearer(key.clone()),
-            def: mu_base::models::native_def("baseten"),
+            def: crate::provider::providers::native_def("baseten"),
         };
         let mut w = wire(&req, &route).unwrap();
         let resp = reqwest::Client::new()

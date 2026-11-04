@@ -4,7 +4,8 @@
 //! snapshot row gets reasoning off (an unknown family's reasoning shape is never guessed).
 //! Cached per profile in `native-models.json`, refreshed at most daily.
 
-use mu_base::models::{self, Api, CompletionsCompat, ModelSpec, ProviderDef, ThinkingMode, ThinkingSpec};
+use crate::provider::providers::{ProviderDef, native_def};
+use mu_base::models::{Api, CompletionsCompat, ModelSpec, ThinkingMode, ThinkingSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -172,16 +173,10 @@ pub async fn refresh(def: &ProviderDef, key: &str, base_url: Option<&str>) -> an
 }
 
 async fn fetch(def: &ProviderDef, key: &str, base_url: Option<&str>) -> anyhow::Result<Vec<Discovered>> {
-    crate::provider::install_crypto();
     let base = base_url.unwrap_or(def.base_url);
-    // The chat client's connect timeout and no redirects: the key never follows a redirect.
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
-        .build()?;
-    let rb = crate::provider::Auth::for_def(def, key)
-        .apply(client.get(format!("{base}/models")))
+    let client = crate::net::http_client()?;
+    let rb = crate::provider::types::Auth::for_def(def, key)
+        .apply(client.get(format!("{base}/models")).timeout(Duration::from_secs(20)))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let resp = rb.send().await.map_err(|e| anyhow::anyhow!("{}", mu_base::secrets::redact_keys(&e.to_string())))?;
     if !resp.status().is_success() {
@@ -197,7 +192,7 @@ async fn fetch(def: &ProviderDef, key: &str, base_url: Option<&str>) -> anyhow::
 /// A Chat Completions spec for a model the snapshot does not list: no reasoning, the snapshot's
 /// provider-wide request quirks, limits from the listing.
 pub fn spec(provider: &str, d: &Discovered, default_window: u32, default_max: u32) -> Option<ModelSpec> {
-    let def = models::native_def(provider)?;
+    let def = native_def(provider)?;
     let mut compat =
         super::catalog::rows(provider).iter().find_map(|r| r.compat.clone()).unwrap_or_else(CompletionsCompat::default);
     compat.reasoning_content_field = None;
@@ -298,7 +293,7 @@ mod refresh_tests {
               {"id":"acme/NoTools","supported_features":["json_mode"]},
               {"id":"moonshotai/Kimi-K3","context_length":999000,"supported_features":["tools","reasoning_effort"]}]}"#;
             let (base, seen) = fake_server(vec![Reply::new(200, body)]).await;
-            let def = models::native_def("baseten").unwrap();
+            let def = native_def("baseten").unwrap();
             assert_eq!(refresh(def, "bt-key-0123456789", Some(&base)).await.unwrap(), 3);
             let req = seen.lock().unwrap()[0].to_lowercase();
             assert!(req.starts_with("get /models "), "{req}");
@@ -310,7 +305,7 @@ mod refresh_tests {
                 "baseten/acme/Chat-9",
                 &Default::default(),
                 None,
-                &crate::provider::native::native_spec,
+                &crate::provider::providers::direct_spec,
             )
             .unwrap();
             assert_eq!((m.context_window, m.max_output, m.thinking.mode), (64_000, 8_000, ThinkingMode::None));
@@ -319,7 +314,7 @@ mod refresh_tests {
                 "baseten/moonshotai/Kimi-K3",
                 &Default::default(),
                 None,
-                &crate::provider::native::native_spec,
+                &crate::provider::providers::direct_spec,
             )
             .unwrap();
             assert_eq!((k.context_window, k.thinking.mode), (999_000, ThinkingMode::Effort));

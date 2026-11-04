@@ -10,7 +10,8 @@ use crate::widgets::overlay::{LoginTarget, OverlayEvent};
 use crate::widgets::select::{Item, Select};
 use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
-use mu_base::models::{self, GatewayModel};
+use mu_base::models::GatewayModel;
+use mu_provider::provider::providers::native_def;
 use tokio::sync::oneshot;
 
 /// How long ago `t` was, in words for the session picker.
@@ -53,14 +54,14 @@ impl App {
                 ids.push(format!("@{r}"));
             }
         }
-        for m in providers.native_models() {
+        for m in providers.direct_models() {
             items.push(Item { label: m.id.clone(), detail: "key".into() });
             ids.push(m.id);
         }
         let known = ids.clone();
         for g in gateway.iter().filter(|g| !known.contains(&g.id)) {
             // A gateway id of a native provider with a key is routed natively: it shows the key marker.
-            let native = g.id.split_once('/').is_some_and(|(p, _)| providers.is_native(p));
+            let native = g.id.split_once('/').is_some_and(|(p, _)| providers.is_direct(p));
             let detail = if native {
                 "key".into()
             } else {
@@ -267,7 +268,7 @@ impl App {
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
-                if let Some(def) = models::native_def(&id) {
+                if let Some(def) = native_def(&id) {
                     self.start_key_flow(def);
                 }
             }

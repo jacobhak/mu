@@ -2,7 +2,8 @@
 //! omp builds it for API-key accounts. The gateway route keeps `anthropic::body`: the gateway
 //! adapts thinking and adds prompt caching itself.
 
-use super::Request;
+use super::{base_body, clamp_budget, output_cap, to_wire, tools_json};
+use crate::provider::types::Request;
 use mu_base::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort};
 use serde_json::{Value, json};
 
@@ -50,7 +51,7 @@ pub fn thinking_params(m: &ModelSpec, level: Thinking, max_tokens: u32) -> Think
         return ThinkingParams { thinking: Some(t), effort, keep_thinking: true, interleaved: false };
     }
     // A forced budget is omp's default when no budget is given.
-    let budget = if forced { Some(1024) } else { super::anthropic::clamp_budget(level.budget(), max_tokens) };
+    let budget = if forced { Some(1024) } else { clamp_budget(level.budget(), max_tokens) };
     match budget {
         Some(b) => {
             let mut t = json!({"type":"enabled","budget_tokens":b});
@@ -133,26 +134,17 @@ fn mark_last_message(messages: &mut [Value]) {
 /// ephemeral) sit on the last tool, the last system block and the last message: three of the four allowed.
 pub fn body(req: &Request) -> (Value, Vec<&'static str>) {
     let m = req.model;
-    let max_tokens = req.max_tokens.unwrap_or(m.max_output);
+    let max_tokens = output_cap(req);
     let tp = thinking_params(m, req.thinking.get(), max_tokens);
-    let mut messages = super::anthropic::to_wire(req.messages, m);
+    let mut messages = to_wire(req.messages, m);
     mark_last_message(&mut messages);
-    let mut body = json!({
-        "model": m.wire_id,
-        "max_tokens": max_tokens,
-        "stream": true,
-        "messages": messages,
-    });
+    let mut body = base_body(&m.wire_id, max_tokens, messages);
     if !req.system.is_empty() {
         body["system"] = json!([{"type":"text","text":req.system,"cache_control":{"type":"ephemeral"}}]);
     }
     let mut betas = Vec::new();
     if !req.tools.is_empty() {
-        let mut tools: Vec<Value> = req
-            .tools
-            .iter()
-            .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.schema}))
-            .collect();
+        let mut tools = tools_json(req.tools);
         if let Some(last) = tools.last_mut() {
             last["cache_control"] = json!({"type":"ephemeral"});
         }
@@ -449,7 +441,7 @@ mod tests {
             "anthropic/claude-future-9",
             &Default::default(),
             None,
-            &crate::provider::native::native_spec,
+            &crate::provider::providers::direct_spec,
         )
         .unwrap()
         .0;
@@ -471,7 +463,7 @@ mod tests {
             max_tokens: Some(20_000),
             session_id: None,
         };
-        let b = super::super::anthropic::body(&req);
+        let b = super::super::body(&req);
         assert_eq!(b["model"], "anthropic/claude-sonnet-5-5");
         assert_eq!(b["thinking"], json!({"type":"enabled","budget_tokens":16384}));
         assert_eq!(b["output_config"], json!({"effort":"high"}));

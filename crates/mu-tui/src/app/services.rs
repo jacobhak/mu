@@ -1,10 +1,10 @@
 //! The writes `App` makes outside the screen: omp's config roles, stored API keys, MCP server
 //! definitions and session control. Reads stay with their callers.
 
-use mu_base::models::ProviderDef;
 use mu_common::paths;
 use mu_provider::auth::store::Entry;
-use mu_provider::provider::Providers;
+use mu_provider::provider::client::Providers;
+use mu_provider::provider::providers::ProviderDef;
 use mu_session::{control, inbox};
 use mu_tools::mcp::store::{self, Level};
 use serde_json::Value;

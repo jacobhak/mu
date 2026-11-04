@@ -1,32 +1,73 @@
-use super::sse::SseDecoder;
-use super::{Decoder, ProviderError, Request, Route, StreamEvent, Wire, normalize_id, same_origin, stream_error};
+pub mod native;
+
+use super::convert::{normalize_id, paired, same_origin, tool_list, unavailable};
+use super::usage;
+use super::{SseFrames, WireFormat};
+use crate::provider::sse::SseDecoder;
+use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
 use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
 use mu_base::models::{ModelSpec, Thinking};
+use mu_base::tool::ToolDef;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub fn url(base: &str) -> String {
-    format!("{base}/v1/messages")
+/// The gateway route sends `body`; a direct one the API-key body with its betas.
+pub struct Anthropic {
+    pub direct: bool,
 }
 
-/// The gateway route sends `body`; a native one the API-key body with its betas.
-pub fn wire(req: &Request, route: &Route) -> Wire {
-    let mut headers = vec![("anthropic-version", "2023-06-01".to_string())];
-    let body = if route.is_native() {
-        let (body, betas) = super::anthropic_native::body(req);
-        if !betas.is_empty() {
-            headers.push(("anthropic-beta", betas.join(",")));
+impl WireFormat for Anthropic {
+    fn url(&self, base: &str) -> String {
+        format!("{base}/v1/messages")
+    }
+
+    fn headers(&self, req: &Request) -> Vec<(&'static str, String)> {
+        let mut headers = vec![("anthropic-version", "2023-06-01".to_string())];
+        if self.direct {
+            let betas = native::body(req).1;
+            if !betas.is_empty() {
+                headers.push(("anthropic-beta", betas.join(",")));
+            }
         }
-        body
-    } else {
-        body(req)
-    };
-    Wire { url: url(&route.base), headers, body, decoder: Box::new(Assembler::new(req.model)) }
+        headers
+    }
+
+    fn body(&self, req: &Request) -> Value {
+        if self.direct { native::body(req).0 } else { body(req) }
+    }
+
+    fn decoder(&self, req: &Request) -> Box<dyn Decoder> {
+        Box::new(Assembler::new(req.model))
+    }
+
+    fn classify(&self, error: &Value) -> ProviderError {
+        stream_error(error["type"].as_str().unwrap_or(""), error["message"].as_str().unwrap_or("unknown stream error"))
+    }
 }
 
 impl Decoder for Assembler {
     fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
         Assembler::feed(self, chunk, ev)
+    }
+}
+
+/// The gateway surfaces thrown pre-flight errors (an unsupported effort, an unknown model, ...)
+/// as in-stream `api_error` events. Those are permanent: retrying only burns the backoff budget.
+fn permanent(kind: &str, msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    kind == "api_error" && (m.contains("not supported") || m.contains("unsupported"))
+}
+
+/// Maps an in-stream error event to a retry class by its error type name.
+pub fn stream_error(kind: &str, msg: &str) -> ProviderError {
+    if permanent(kind, msg) {
+        return ProviderError::Fatal(msg.into());
+    }
+    match kind {
+        "overloaded_error" | "rate_limit_error" | "api_error" | "upstream_error" => {
+            ProviderError::Retryable { msg: msg.into(), retry_after: None }
+        }
+        _ => ProviderError::Fatal(msg.into()),
     }
 }
 
@@ -37,25 +78,37 @@ pub fn clamp_budget(budget: Option<u32>, max_tokens: u32) -> Option<u32> {
     (b >= 1024).then_some(b)
 }
 
+/// The output cap: the request's, else the model's maximum.
+pub(super) fn output_cap(req: &Request) -> u32 {
+    req.max_tokens.unwrap_or(req.model.max_output)
+}
+
+/// The fields both flavours send. A direct request names the model by its wire id.
+pub(super) fn base_body(model: &str, max_tokens: u32, messages: Vec<Value>) -> Value {
+    json!({"model": model, "max_tokens": max_tokens, "stream": true, "messages": messages})
+}
+
+/// The tools in Anthropic's shape.
+pub(super) fn tools_json(tools: &[ToolDef]) -> Vec<Value> {
+    tool_list(
+        tools,
+        |name, description, schema| json!({"name": name, "description": description, "input_schema": schema}),
+    )
+}
+
 /// The gateway takes the full `provider/model` id and adds prompt caching itself.
 pub fn body(req: &Request) -> Value {
-    let max_tokens = req.max_tokens.unwrap_or(req.model.max_output);
+    let max_tokens = output_cap(req);
     let level = req.thinking.get();
     let budget = clamp_budget(level.budget(), max_tokens);
     let th = match budget {
         Some(b) => json!({"type":"enabled","budget_tokens":b}),
         None => json!({"type":"disabled"}),
     };
-    let tools: Vec<Value> =
-        req.tools.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.schema})).collect();
-    let mut body = json!({
-        "model": req.model.id,
-        "max_tokens": max_tokens,
-        "stream": true,
-        "system": [{"type":"text","text":req.system}],
-        "thinking": th,
-        "messages": to_wire(req.messages, req.model),
-    });
+    let tools = tools_json(req.tools);
+    let mut body = base_body(&req.model.id, max_tokens, to_wire(req.messages, req.model));
+    body["system"] = json!([{"type":"text","text":req.system}]);
+    body["thinking"] = th;
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
@@ -66,21 +119,13 @@ pub fn body(req: &Request) -> Value {
 }
 
 pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
-    // Backstop: never send unpaired tool calls/results, whatever the history holds.
-    let mut repaired;
-    let messages = if mu_base::message::check_tool_pairs(messages).is_err() {
-        repaired = messages.to_vec();
-        mu_base::message::repair_tool_pairs(&mut repaired);
-        &repaired[..]
-    } else {
-        messages
-    };
+    let messages = paired(messages);
     let mut out: Vec<(String, Vec<Value>)> = Vec::new();
     let mut push = |role: &str, blocks: Vec<Value>| match out.last_mut() {
         Some((r, c)) if r == role => c.extend(blocks),
         _ => out.push((role.to_string(), blocks)),
     };
-    for m in messages {
+    for m in messages.iter() {
         match m {
             Message::User { content, .. } => {
                 let b: Vec<Value> = content
@@ -142,7 +187,7 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
 fn image_json(i: &mu_base::message::Image) -> Value {
     match mu_base::image::resolve(&i.data) {
         Some(data) => json!({"type":"image","source":{"type":"base64","media_type":i.mime_type,"data":data}}),
-        None => json!({"type":"text","text":format!("[image unavailable: {}]", i.mime_type)}),
+        None => json!({"type":"text","text":unavailable(i)}),
     }
 }
 
@@ -240,28 +285,9 @@ impl Assembler {
             },
             "message_delta" => {
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
-                    self.stop = match r {
-                        "tool_use" => StopReason::ToolUse,
-                        "max_tokens" => StopReason::Length,
-                        _ => StopReason::Stop,
-                    };
+                    self.stop = usage::anthropic_stop(r);
                 }
-                let u = &v["usage"];
-                let g = |k: &str| u[k].as_u64();
-                if let Some(x) = g("input_tokens") {
-                    self.usage.input = x;
-                }
-                if let Some(x) = g("output_tokens") {
-                    self.usage.output = x;
-                }
-                if let Some(x) = g("cache_read_input_tokens") {
-                    self.usage.cache_read = x;
-                }
-                if let Some(x) = g("cache_creation_input_tokens") {
-                    self.usage.cache_write = x;
-                }
-                let u = &mut self.usage;
-                u.total_tokens = u.input + u.output + u.cache_read + u.cache_write;
+                usage::anthropic_usage(&mut self.usage, &v["usage"]);
             }
             "message_stop" => {
                 return Ok(Some(Message::Assistant {
@@ -290,16 +316,17 @@ impl Assembler {
 
 impl Assembler {
     pub fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
-        let frames = self.sse.push(chunk);
-        if self.sse.overflow {
-            return Err(ProviderError::Fatal("stream frame larger than 16 MB".into()));
-        }
-        for (_, data) in frames {
-            if let Some(m) = self.frame(&data, ev)? {
-                return Ok(Some(m));
-            }
-        }
-        Ok(None)
+        super::feed(self, chunk, ev)
+    }
+}
+
+impl SseFrames for Assembler {
+    fn sse(&mut self) -> &mut SseDecoder {
+        &mut self.sse
+    }
+
+    fn frame(&mut self, data: &str, ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
+        Assembler::frame(self, data, ev)
     }
 }
 
@@ -489,6 +516,20 @@ mod tests {
         assert_eq!(c[0]["type"], "text");
         assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
     }
+
+    #[test]
+    fn gateway_wrapped_permanent_errors_fail_fast() {
+        // omp's auth-gateway reports thrown validation errors (here: an unsupported effort) as
+        // in-stream `api_error`; retrying those five times just delays the visible failure.
+        let e = stream_error(
+            "api_error",
+            "Thinking effort medium is not supported by baseten/zai-org/GLM-5.3-Flash. Supported efforts: low, high, max",
+        );
+        assert!(matches!(e, ProviderError::Fatal(_)));
+        assert!(matches!(stream_error("api_error", "upstream disconnected"), ProviderError::Retryable { .. }));
+        assert!(matches!(stream_error("overloaded_error", "busy"), ProviderError::Retryable { .. }));
+        assert!(matches!(stream_error("invalid_request_error", "not supported"), ProviderError::Fatal(_)));
+    }
 }
 
 #[cfg(test)]
@@ -507,7 +548,7 @@ mod budget_tests {
 #[cfg(test)]
 mod effort_tests {
     use super::*;
-    use crate::provider::Request;
+    use crate::provider::types::Request;
     use std::cell::Cell;
     use std::rc::Rc;
 

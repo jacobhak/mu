@@ -1,4 +1,4 @@
-use super::ProviderError;
+use super::types::ProviderError;
 use std::time::Duration;
 
 pub const MAX_ATTEMPTS: u32 = 5;

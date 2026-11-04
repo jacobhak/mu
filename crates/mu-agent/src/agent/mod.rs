@@ -16,7 +16,8 @@ use mu_base::tool::{ToolDef, ToolMeta, ToolOutput};
 use mu_provider::gateway::quota::QuotaTracker;
 use mu_provider::model::cost::CostLedger;
 use mu_provider::model::pricing;
-use mu_provider::provider::{ProviderError, Providers, Request, StreamEvent};
+use mu_provider::provider::client::Providers;
+use mu_provider::provider::types::{ProviderError, Request, StreamEvent};
 use mu_session::inbox;
 use mu_session::session::{self, CompactionState, SessionFile};
 use mu_tools::context::{self, Context};
@@ -888,7 +889,7 @@ impl Agent {
         self.sync_model_state();
         let providers = self.providers.clone();
         tokio::task::spawn_local(async move {
-            providers.refresh_native_models(false).await;
+            providers.refresh_direct_models(false).await;
         });
         self.refresh_external().await;
         self.emit_status();
@@ -2139,7 +2140,7 @@ mod loop_tests {
         agent, agent_with, assistant, call, drain, git_repo, results, save_plan_in, tmp_dir, yield_call,
     };
     use mu_base::config::Configs;
-    use mu_provider::provider::ProviderError;
+    use mu_provider::provider::types::ProviderError;
     use mu_session::inbox::enqueue;
     use mu_testutil::block_on_local as run;
 

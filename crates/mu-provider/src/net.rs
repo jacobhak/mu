@@ -1,4 +1,29 @@
 use anyhow::{Result, anyhow};
+use std::time::Duration;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Installs rustls' process-default crypto provider (ring). reqwest is built with
+/// `rustls-no-provider`, so a client built before this call panics. Idempotent.
+pub fn install_crypto() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// The HTTP client every provider request uses: a connect timeout and no redirects, so a request
+/// that carries a key never follows one to another host. Callers set their own overall timeout.
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    install_crypto();
+    reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).redirect(reqwest::redirect::Policy::none()).build()
+}
+
+/// The host (and port) of a URL, for naming a peer in errors.
+pub fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
+}
 
 /// Accepts `https://…`, or `http://` only to a loopback host. The bearer token must never go
 /// over plain HTTP to anywhere else.

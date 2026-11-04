@@ -280,7 +280,7 @@ mod tests {
     use mu_agent::plans;
     use mu_agent::testing::{agent, assistant, git_repo, results, save_plan_in, yield_call};
     use mu_base::message::StopReason;
-    use mu_provider::provider::ProviderError;
+    use mu_provider::provider::types::ProviderError;
     use mu_testutil::block_on_local as block;
     use serde_json::json;
     use std::path::Path;
