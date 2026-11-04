@@ -1,7 +1,7 @@
+use crate::jobs::JobsHandle;
 use crate::tools::spill::{Collected, Collector};
 use crate::tools::subagent::BackgroundResult;
 use crate::tools::{ToolCtx, Tools};
-use crate::jobs::JobsHandle;
 use mu_base::events::AgentEvent;
 use mu_base::tool::{BashMeta, ToolMeta, ToolOutput};
 use pi_shell::{

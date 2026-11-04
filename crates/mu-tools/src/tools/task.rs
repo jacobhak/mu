@@ -101,7 +101,7 @@ impl Tools {
             Ok(s) => s,
             Err(e) => return ToolOutput::err(e),
         };
-        let parent = self.session_path.borrow().clone();
+        let parent = self.session.path.borrow().clone();
         let exe = match mu_common::paths::self_exe() {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),

@@ -1,8 +1,8 @@
 //! Pseudo-terminal child processes for `bash` with `pty: true` (Unix only).
+use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::raw::c_int;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::unix::AsyncFd;

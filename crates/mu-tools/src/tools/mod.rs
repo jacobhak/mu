@@ -1,13 +1,13 @@
 mod ask;
-pub mod shell;
 mod diff;
 pub mod edit;
 mod glob;
 pub mod grep;
 mod plan;
 mod read;
-pub mod subagent;
+pub mod shell;
 mod spill;
+pub mod subagent;
 pub mod task;
 pub mod todo;
 pub mod uri;
@@ -33,15 +33,23 @@ pub struct ToolCtx {
     pub call_id: String,
 }
 
+/// The per-session state the tools share: the todo list, the session's ids and file, and its skills.
+#[derive(Default)]
+pub struct ToolSession {
+    todo: std::cell::RefCell<Vec<todo::Phase>>,
+    /// Names the session's artifact and local directories, and `PI_SESSION_ID`.
+    id: std::cell::RefCell<String>,
+    /// `PI_SESSION_FILE`, and the parent of a subagent's session.
+    path: std::cell::RefCell<Option<PathBuf>>,
+    skills: std::cell::RefCell<Vec<(String, PathBuf)>>,
+}
+
 pub struct Tools {
     pub cwd: PathBuf,
     pub plugins: Rc<PluginHost>,
     /// Set in interactive sessions: `task` then runs in the background.
     pub jobs: Option<Rc<JobsHandle>>,
-    todo: std::cell::RefCell<Vec<todo::Phase>>,
-    session_id: std::cell::RefCell<String>,
-    session_path: std::cell::RefCell<Option<PathBuf>>,
-    skills: std::cell::RefCell<Vec<(String, PathBuf)>>,
+    session: ToolSession,
     pub plan: std::cell::Cell<bool>,
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
@@ -61,10 +69,7 @@ impl Tools {
             cwd,
             plugins,
             jobs: None,
-            todo: Default::default(),
-            session_id: Default::default(),
-            session_path: Default::default(),
-            skills: Default::default(),
+            session: Default::default(),
             plan: Default::default(),
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
@@ -79,8 +84,8 @@ impl Tools {
     /// `PI_SESSION_FILE` / `PI_SESSION_ID` for bash commands (omp's names). Always both, empty
     /// without a session, so a value inherited from a parent mu or omp is overwritten.
     pub fn session_env(&self) -> Vec<(&'static str, String)> {
-        let file = self.session_path.borrow().as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        let id = if file.is_empty() { String::new() } else { self.session_id.borrow().clone() };
+        let file = self.session.path.borrow().as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let id = if file.is_empty() { String::new() } else { self.session.id.borrow().clone() };
         vec![("PI_SESSION_FILE", file), ("PI_SESSION_ID", id)]
     }
 
