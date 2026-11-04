@@ -1,5 +1,5 @@
 //! mu's own store of provider API keys: `<profile cache dir>/auth.json`, mode 0600, one entry per
-//! provider (see `provider::native`). An entry holds a literal key or a reference to one:
+//! provider (see `provider::providers`). An entry holds a literal key or a reference to one:
 //! `$NAME` (an environment variable) or `!command` (run through `sh -c`). A provider has an entry
 //! exactly when mu routes its models natively; omp's own credentials are never read.
 //!
@@ -340,7 +340,7 @@ impl Default for Store {
 
 /// The name a provider's key is redacted under.
 fn label(provider: &str) -> String {
-    mu_base::models::native_def(provider).map_or_else(
+    crate::provider::providers::native_def(provider).map_or_else(
         || format!("{}_API_KEY", provider.to_ascii_uppercase().replace('-', "_")),
         |d| d.env_hint.to_string(),
     )

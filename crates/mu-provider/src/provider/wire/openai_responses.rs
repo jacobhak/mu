@@ -3,24 +3,37 @@
 //! Replay follows omp so sessions move between the two tools: a reasoning item is kept as the
 //! thinking signature (its JSON, verbatim), a tool call id is `call_id|item_id`.
 
-use super::sse::SseDecoder;
-use super::{Decoder, ProviderError, Request, Route, StreamEvent, Wire, normalize_id, same_origin};
+use super::convert::{normalize_id, paired, same_origin, tool_list, unavailable};
+use super::usage;
+use super::{SseFrames, WireFormat};
+use crate::provider::sse::SseDecoder;
+use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
 use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
 use mu_base::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub fn url(base: &str) -> String {
-    format!("{base}/responses")
-}
+pub struct Responses;
 
-pub fn wire(req: &Request, route: &Route) -> Result<Wire, ProviderError> {
-    Ok(Wire {
-        url: url(&route.base),
-        headers: Vec::new(),
-        body: body(req),
-        decoder: Box::new(Assembler::new(req.model)),
-    })
+impl WireFormat for Responses {
+    fn url(&self, base: &str) -> String {
+        format!("{base}/responses")
+    }
+
+    fn body(&self, req: &Request) -> Value {
+        body(req)
+    }
+
+    fn decoder(&self, req: &Request) -> Box<dyn Decoder> {
+        Box::new(Assembler::new(req.model))
+    }
+
+    fn classify(&self, error: &Value) -> ProviderError {
+        stream_failure(
+            error["code"].as_str().unwrap_or(""),
+            error["message"].as_str().unwrap_or("unknown stream error"),
+        )
+    }
 }
 
 /// Only reasoning models take `reasoning`. `off` sends none, as omp does.
@@ -32,11 +45,10 @@ fn reasoning_effort(model: &ModelSpec, level: Thinking) -> Option<&str> {
 }
 
 pub fn body(req: &Request) -> Value {
-    let tools: Vec<Value> = req
-        .tools
-        .iter()
-        .map(|t| json!({"type":"function","name":t.name,"description":t.description,"parameters":t.schema,"strict":false}))
-        .collect();
+    let tools = tool_list(
+        req.tools,
+        |name, description, schema| json!({"type":"function","name":name,"description":description,"parameters":schema,"strict":false}),
+    );
     let mut body = json!({
         "model": req.model.wire_id,
         "input": to_wire(req.messages, req.model),
@@ -64,15 +76,7 @@ pub fn body(req: &Request) -> Value {
 }
 
 pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
-    // Backstop: never send unpaired tool calls/results, whatever the history holds.
-    let mut repaired;
-    let messages = if mu_base::message::check_tool_pairs(messages).is_err() {
-        repaired = messages.to_vec();
-        mu_base::message::repair_tool_pairs(&mut repaired);
-        &repaired[..]
-    } else {
-        messages
-    };
+    let messages = paired(messages);
     let mut out = Vec::new();
     for (idx, m) in messages.iter().enumerate() {
         match m {
@@ -175,7 +179,7 @@ fn input_image(i: &mu_base::message::Image) -> Value {
         Some(data) => {
             json!({"type":"input_image","detail":"auto","image_url":format!("data:{};base64,{data}", i.mime_type)})
         }
-        None => json!({"type":"input_text","text":format!("[image unavailable: {}]", i.mime_type)}),
+        None => json!({"type":"input_text","text":unavailable(i)}),
     }
 }
 
@@ -239,16 +243,7 @@ impl Assembler {
     }
 
     pub fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
-        let frames = self.sse.push(chunk);
-        if self.sse.overflow {
-            return Err(ProviderError::Fatal("stream frame larger than 16 MB".into()));
-        }
-        for (_, data) in frames {
-            if let Some(m) = self.frame(&data, ev)? {
-                return Ok(Some(m));
-            }
-        }
-        Ok(None)
+        super::feed(self, chunk, ev)
     }
 
     fn frame(&mut self, data: &str, ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
@@ -346,7 +341,7 @@ impl Assembler {
             self.response_id = Some(id.into());
         }
         if !r["usage"].is_null() {
-            self.usage = usage_of(&r["usage"]);
+            self.usage = usage::responses_usage(&r["usage"]);
         }
         let has_calls = self.done.iter().any(|b| matches!(b, Block::ToolCall { .. }));
         let calls_parse = !self
@@ -381,6 +376,16 @@ impl Assembler {
 impl Decoder for Assembler {
     fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
         Assembler::feed(self, chunk, ev)
+    }
+}
+
+impl SseFrames for Assembler {
+    fn sse(&mut self) -> &mut SseDecoder {
+        &mut self.sse
+    }
+
+    fn frame(&mut self, data: &str, ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
+        Assembler::frame(self, data, ev)
     }
 }
 
@@ -469,29 +474,32 @@ fn failed_response(r: &Value) -> ProviderError {
     }
 }
 
-/// `input_tokens` includes the cached part, which is reported apart as `cache_read`. Reasoning
-/// tokens are already inside `output_tokens`.
-fn usage_of(u: &Value) -> Usage {
-    let input = u["input_tokens"].as_u64().unwrap_or(0);
-    let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0).min(input);
-    let mut usage = Usage {
-        input: input - cache_read,
-        output: u["output_tokens"].as_u64().unwrap_or(0),
-        cache_read,
-        ..Usage::default()
-    };
-    usage.total_tokens = usage.input + usage.output + usage.cache_read;
-    usage
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Auth;
+    use crate::provider::client::Route;
+    use crate::provider::types::Auth;
     use mu_base::models::{Api, Thinking, ThinkingSpec};
     use mu_base::tool::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    /// The parts a request is built from, as the tests read them.
+    struct Built {
+        url: String,
+        headers: Vec<(&'static str, String)>,
+        body: Value,
+        decoder: Box<dyn Decoder>,
+    }
+
+    fn wire(req: &Request, route: &Route) -> Result<Built, ProviderError> {
+        Ok(Built {
+            url: Responses.url(&route.base),
+            headers: Responses.headers(req),
+            body: Responses.body(req),
+            decoder: Responses.decoder(req),
+        })
+    }
 
     const REASONING: &str = r#"{"type":"reasoning","id":"rs_0a1b2c","summary":[{"type":"summary_text","text":"Need to read the file."}],"encrypted_content":"gAAAAABfakeEncryptedReasoning","status":"completed"}"#;
 
@@ -749,7 +757,7 @@ mod tests {
         let route = Route {
             base: "https://api.openai.com/v1".into(),
             auth: Auth::Bearer("k".into()),
-            def: mu_base::models::native_def("openai"),
+            def: crate::provider::providers::native_def("openai"),
         };
         let w = wire(&request(&m, Thinking::Off, &msgs, &[]), &route).unwrap();
         assert_eq!(w.url, "https://api.openai.com/v1/responses");
@@ -1056,7 +1064,7 @@ mod tests {
             eprintln!("skipped contract_native_openai: OPENAI_API_KEY is not set");
             return;
         };
-        crate::provider::install_crypto();
+        crate::net::install_crypto();
         let wire_id = std::env::var("OPENAI_CONTRACT_MODEL").unwrap_or_else(|_| "gpt-5.5".into());
         let mut spec = model(true);
         spec.id = format!("openai/{wire_id}");
@@ -1064,7 +1072,7 @@ mod tests {
         let route = Route {
             base: "https://api.openai.com/v1".into(),
             auth: Auth::Bearer(key.clone()),
-            def: mu_base::models::native_def("openai"),
+            def: crate::provider::providers::native_def("openai"),
         };
         let tools = [read_tool()];
         let mut msgs = vec![Message::user("Call read on a.txt, then tell me the word it returned.")];

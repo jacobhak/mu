@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::widgets::overlay::KeyOption;
-use mu_base::models::{self, ProviderDef};
+use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::Entry;
-use mu_provider::provider::native::{self, Check};
+use mu_provider::provider::providers::{self, PROVIDERS, ProviderDef, native_def};
 
 /// What the composer holds while a key flow waits for text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +46,7 @@ fn key_status(stored: bool, env_set: bool, env_name: &str) -> String {
 
 /// The API-key rows of `/login`, one per provider, with the target each opens.
 fn api_key_items(stored: impl Fn(&str) -> bool, env_set: impl Fn(&str) -> bool) -> (Vec<Item>, Vec<LoginTarget>) {
-    models::PROVIDERS
+    PROVIDERS
         .iter()
         .map(|d| {
             let detail = key_status(stored(d.id), env_set(d.env_hint), d.env_hint);
@@ -84,7 +84,7 @@ impl App {
 
     /// What the picker chose for `provider`, or `Cancel` when it was dismissed.
     pub(super) fn on_key_choice(&mut self, provider: &str, choice: KeyOption) {
-        let Some(def) = models::native_def(provider) else { return };
+        let Some(def) = native_def(provider) else { return };
         match choice {
             KeyOption::Paste => {
                 self.set_typing(Some(Typing::Key));
@@ -206,10 +206,7 @@ impl App {
         self.notice(&format!("checking the key with {}…", def.label));
         let tx = self.ui_tx.clone();
         tokio::task::spawn_local(async move {
-            let r = match mu_provider::auth::store::resolve_entry(def.id, &entry).await {
-                Ok(resolved) => Ok(native::validate(def, &resolved.key, None).await),
-                Err(e) => Err(e.to_string()),
-            };
+            let r = check::check_entry(def, &entry).await;
             let _ = tx.send(UiMsg::KeyChecked { flow, def, entry, r });
         });
     }
@@ -258,7 +255,7 @@ impl App {
         self.key_flow = None;
         match self.providers.store().set(def.id, entry) {
             Ok(()) => {
-                self.notice(&native::saved_notice(def));
+                self.notice(&providers::saved_notice(def));
                 self.send(Command::RefreshModel);
             }
             Err(e) => self.error(&format!("could not save the {} key: {e}", def.label)),
@@ -270,21 +267,15 @@ impl App {
         if !arg.is_empty() {
             return self.logout(arg);
         }
-        let providers: Vec<String> = self
-            .providers
-            .store()
-            .list()
-            .into_iter()
-            .map(|(p, _)| p)
-            .filter(|p| models::native_def(p).is_some())
-            .collect();
+        let providers: Vec<String> =
+            self.providers.store().list().into_iter().map(|(p, _)| p).filter(|p| native_def(p).is_some()).collect();
         if providers.is_empty() {
             return self.notice("no API keys are stored; /login adds one");
         }
         let items = providers
             .iter()
             .map(|p| Item {
-                label: models::native_def(p).map_or_else(|| p.clone(), |d| d.label.to_string()),
+                label: native_def(p).map_or_else(|| p.clone(), |d| d.label.to_string()),
                 detail: "remove this key".into(),
             })
             .collect();
@@ -292,7 +283,7 @@ impl App {
     }
 
     pub(super) fn logout(&mut self, provider: &str) {
-        let Some(def) = models::native_def(provider) else {
+        let Some(def) = native_def(provider) else {
             return self.error(&format!("no API key support for `{provider}`"));
         };
         match self.providers.store().remove(def.id) {
@@ -402,7 +393,7 @@ mod tests {
         let hist = std::env::temp_dir().join(format!("mu-keyflow-{}", uuid::Uuid::new_v4())).join("history.jsonl");
         let mut app = test_app(hist.clone());
         in_local(async {
-            app.start_key_flow(models::native_def("anthropic").unwrap());
+            app.start_key_flow(native_def("anthropic").unwrap());
             app.on_key_choice("anthropic", KeyOption::Paste);
             app.overlay = None;
             for c in "sk-ab".chars() {
@@ -442,7 +433,7 @@ mod tests {
     #[test]
     fn a_late_check_result_of_an_old_flow_is_ignored() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let def = models::native_def("anthropic").unwrap();
+        let def = native_def("anthropic").unwrap();
         app.start_key_flow(def);
         app.key_flow = None;
         app.start_key_flow(def);
@@ -453,7 +444,7 @@ mod tests {
     #[test]
     fn a_flow_whose_overlay_was_replaced_is_dropped() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        app.start_key_flow(models::native_def("anthropic").unwrap());
+        app.start_key_flow(native_def("anthropic").unwrap());
         app.sync_key_flow();
         assert!(app.key_flow.is_some(), "the key choice is still open");
         app.overlay = Some(Overlay::Logout { sel: Select::new("t", vec![]), providers: vec![] });

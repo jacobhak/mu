@@ -1,9 +1,10 @@
 //! `mu auth`: manage provider API keys without the TUI (see `mu_provider::auth::store`).
 
 use anyhow::{Result, anyhow, bail};
-use mu_base::models::{self, PROVIDERS, ProviderDef};
+use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::{Entry, Origin, Store};
-use mu_provider::provider::native::{self, Check};
+use mu_provider::provider::providers;
+use mu_provider::provider::providers::{PROVIDERS, ProviderDef, native_def};
 use std::io::{IsTerminal, Read, Write};
 
 #[derive(clap::Subcommand)]
@@ -65,7 +66,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             }
             store.set(def.id, entry)?;
             writeln!(out, "saved the {} key to {}", def.label, store.path().display())?;
-            writeln!(out, "{}", native::saved_notice(def))?;
+            writeln!(out, "{}", providers::saved_notice(def))?;
             Ok(0)
         }
         Cmd::Rm { provider } => {
@@ -104,7 +105,7 @@ fn parse_base_url(raw: Option<String>) -> Result<Option<String>> {
 }
 
 fn provider_def(id: &str) -> Result<&'static ProviderDef> {
-    models::native_def(id).ok_or_else(|| {
+    native_def(id).ok_or_else(|| {
         let known: Vec<&str> = PROVIDERS.iter().map(|d| d.id).collect();
         anyhow!("unknown provider `{id}`; mu can use keys for: {}", known.join(", "))
     })
@@ -115,10 +116,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 async fn check_entry(def: &ProviderDef, entry: &Entry) -> Check {
-    match mu_provider::auth::store::resolve_entry(def.id, entry).await {
-        Ok(r) => native::validate(def, &r.key, entry.base_url.as_deref()).await,
-        Err(e) => Check::Rejected(e.to_string()),
-    }
+    check::check_entry(def, entry).await.unwrap_or_else(Check::Rejected)
 }
 
 fn list(store: &Store, out: &mut impl Write) -> Result<i32> {
@@ -365,7 +363,7 @@ mod validate_tests {
     fn a_good_key_is_validated_with_the_providers_auth_header() {
         rt(async {
             let (base, seen) = fake_server(vec![Reply::new(200, r#"{"data":[]}"#)]).await;
-            let anthropic = models::native_def("anthropic").unwrap();
+            let anthropic = native_def("anthropic").unwrap();
             let r = check_entry(anthropic, &entry("ant-key-0123456789", &base)).await;
             assert_eq!(r, Check::Valid);
             let req = seen.lock().unwrap()[0].to_lowercase();
@@ -374,7 +372,7 @@ mod validate_tests {
             assert!(!req.contains("authorization"), "{req}");
 
             let (base, seen) = fake_server(vec![Reply::new(200, "{}")]).await;
-            let baseten = models::native_def("baseten").unwrap();
+            let baseten = native_def("baseten").unwrap();
             assert_eq!(check_entry(baseten, &entry("bt-key-0123456789", &base)).await, Check::Valid);
             let req = seen.lock().unwrap()[0].to_lowercase();
             assert!(req.starts_with("get /models "), "{req}");
@@ -387,7 +385,7 @@ mod validate_tests {
     fn rejection_and_outages_are_told_apart() {
         rt(async {
             let (base, _) = fake_server(vec![Reply::new(401, "nope")]).await;
-            let openai = models::native_def("openai").unwrap();
+            let openai = native_def("openai").unwrap();
             assert!(
                 matches!(check_entry(openai, &entry("k-0123456789", &base)).await, Check::Rejected(m) if m.contains("rejected"))
             );
@@ -402,7 +400,7 @@ mod validate_tests {
     #[test]
     fn an_unset_reference_is_not_validated_as_text() {
         rt(async {
-            let openai = models::native_def("openai").unwrap();
+            let openai = native_def("openai").unwrap();
             let e = Entry::reference("$MU_TEST_SURELY_UNSET_VAR").unwrap();
             assert!(matches!(check_entry(openai, &e).await, Check::Rejected(m) if m.contains("not set")));
         });

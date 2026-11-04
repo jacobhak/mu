@@ -112,7 +112,7 @@ struct Session {
     title: Option<String>,
     /// Distinguishes reopened sessions that share an id, so a closed agent's late events are dropped.
     epoch: u64,
-    providers: Rc<mu_provider::provider::Providers>,
+    providers: Rc<mu_provider::provider::client::Providers>,
 }
 
 impl Session {
@@ -163,7 +163,7 @@ struct Opened {
     session: Session,
     ev_rx: UnboundedReceiver<AgentEvent>,
     notice_rx: UnboundedReceiver<String>,
-    providers: Rc<mu_provider::provider::Providers>,
+    providers: Rc<mu_provider::provider::client::Providers>,
 }
 
 async fn serve(model: Option<String>, thinking: Option<Thinking>) {

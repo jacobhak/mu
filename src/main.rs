@@ -14,6 +14,7 @@ use clap::Parser;
 use mu_agent::agent;
 use mu_base::{config, events, models, schema, secrets};
 use mu_common::paths;
+use mu_provider::provider::providers::PROVIDERS;
 use mu_session::{inbox, session};
 use mu_tools::{context, plugin, tools};
 use std::path::PathBuf;
@@ -133,7 +134,7 @@ struct Setup {
     cfgs: Rc<config::Configs>,
     ctx: Rc<context::Context>,
     host: Rc<plugin::PluginHost>,
-    providers: Rc<mu_provider::provider::Providers>,
+    providers: Rc<mu_provider::provider::client::Providers>,
     notice_tx: tokio::sync::mpsc::UnboundedSender<String>,
     notice_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
@@ -197,7 +198,7 @@ fn setup(cwd: &std::path::Path) -> Setup {
         plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
         tools::is_builtin,
     );
-    let providers = Rc::new(mu_provider::provider::Providers::new(
+    let providers = Rc::new(mu_provider::provider::client::Providers::new(
         cfgs.clone(),
         mu_provider::provider::endpoint::GatewaySource::new(host.gateway_start()),
     ));
@@ -208,7 +209,7 @@ fn setup(cwd: &std::path::Path) -> Setup {
 /// Model and thinking level for a new agent: `sel` (command line or headless role) beats the `default` role.
 fn pick_model(
     cfgs: &config::Configs,
-    providers: &mu_provider::provider::Providers,
+    providers: &mu_provider::provider::client::Providers,
     sel: Option<String>,
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
@@ -220,8 +221,8 @@ fn pick_model(
 
 /// The model used when nothing names one: omp's default while omp can run, else the first native
 /// provider with a key, else omp's default (which then says what is missing).
-fn default_model(providers: &mu_provider::provider::Providers) -> String {
-    default_model_for(omp_installed(), |p| providers.is_native(p))
+fn default_model(providers: &mu_provider::provider::client::Providers) -> String {
+    default_model_for(omp_installed(), |p| providers.is_direct(p))
 }
 
 /// `default_model` with the two facts it depends on passed in.
@@ -229,7 +230,7 @@ fn default_model_for(omp: bool, native: impl Fn(&str) -> bool) -> String {
     if omp {
         return DEFAULT_MODEL.into();
     }
-    models::PROVIDERS
+    PROVIDERS
         .iter()
         .find(|d| native(d.id))
         .map_or_else(|| DEFAULT_MODEL.into(), |d| format!("{}/{}", d.id, d.default_model))
@@ -290,7 +291,7 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    mu_provider::provider::install_crypto();
+    mu_provider::net::install_crypto();
     secrets::set_stored_refresh(mu_provider::auth::store::sync_redaction);
     let cli = Cli::parse();
     if let Some(p) = &cli.profile {
@@ -641,7 +642,7 @@ mod tests {
 
     #[test]
     fn without_omp_the_first_native_key_provides_the_default() {
-        let first = &models::PROVIDERS[0];
+        let first = &PROVIDERS[0];
         assert_eq!(default_model_for(false, |p| p == first.id), format!("{}/{}", first.id, first.default_model));
         assert_eq!(default_model_for(false, |_| false), DEFAULT_MODEL, "no key: omp's default says what is missing");
     }

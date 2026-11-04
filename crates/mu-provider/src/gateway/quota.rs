@@ -58,7 +58,7 @@ pub enum Fetch {
 pub async fn fetch(provider: &str) -> Fetch {
     let Some((url, token)) = crate::gateway::running_endpoint() else { return Fetch::NoGateway };
     let body = async {
-        crate::provider::install_crypto();
+        crate::net::install_crypto();
         let client = reqwest::Client::builder().timeout(TIMEOUT).build().ok()?;
         client
             .get(format!("{url}/v1/usage"))

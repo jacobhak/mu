@@ -4,7 +4,7 @@ use crate::mcp;
 use manifest::{Lifetime, Manifest};
 use mu_base::tool::{ToolDef, ToolOutput};
 use mu_common::rpc::{Frame, Framed, Line, Pending, Request, Response};
-use mu_provider::provider::Providers;
+use mu_provider::provider::client::Providers;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::process::Stdio;

@@ -22,11 +22,12 @@ use mu_base::events::{AgentEvent, Answer, AskQuestion, StatusSnapshot, SubagentS
 use mu_base::events::{Command, SharedInbox};
 use mu_base::image;
 use mu_base::message::{Image, UserInput};
-use mu_base::models::{self, GatewayModel, Thinking};
+use mu_base::models::{GatewayModel, Thinking};
 use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
-use mu_provider::provider::Providers;
-use mu_provider::provider::native;
+use mu_provider::auth::check::Check;
+use mu_provider::provider::client::Providers;
+use mu_provider::provider::providers::{PROVIDERS, ProviderDef, native_def};
 use mu_tools::context::Context;
 use mu_tools::plugin::PluginHost;
 use mu_tools::tools::todo::{Phase, Status};
@@ -148,9 +149,9 @@ enum UiMsg {
     /// An API key was checked: the outcome, and the entry to save when it holds.
     KeyChecked {
         flow: u64,
-        def: &'static models::ProviderDef,
+        def: &'static ProviderDef,
         entry: mu_provider::auth::store::Entry,
-        r: Result<native::Check, String>,
+        r: Result<Check, String>,
     },
 }
 
@@ -278,14 +279,14 @@ pub async fn run(init: AppInit) -> i32 {
                 "jobs" => (vec!["kill".to_string()], vec![]),
                 "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
                 "login" => (
-                    models::PROVIDERS
+                    PROVIDERS
                         .iter()
                         .map(|d| d.id.to_string())
                         .chain(plugins.mcp_names().iter().map(|n| format!("mcp:{n}")))
                         .collect(),
                     vec![],
                 ),
-                "logout" => (models::PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
+                "logout" => (PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
                 _ => (vec![], vec![]),
             };
             Entry { name: name.into(), desc: desc.into(), needs_arg, args, arg_descs }
@@ -696,7 +697,7 @@ impl App {
                     Ok(g) => g,
                     Err(e) => {
                         // Native models are listed either way; only a session without any says why.
-                        if self.providers.native_models().is_empty() {
+                        if self.providers.direct_models().is_empty() {
                             self.error(&format!("could not fetch gateway models: {e}"));
                         } else {
                             self.notice(&format!("gateway models unavailable: {e}"));
@@ -787,14 +788,14 @@ impl App {
                 ids.push(format!("@{r}"));
             }
         }
-        for m in self.providers.native_models() {
+        for m in self.providers.direct_models() {
             items.push(Item { label: m.id.clone(), detail: "key".into() });
             ids.push(m.id);
         }
         let known = ids.clone();
         for g in gateway.iter().filter(|g| !known.contains(&g.id)) {
             // A gateway id of a native provider with a key is routed natively: it shows the key marker.
-            let native = g.id.split_once('/').is_some_and(|(p, _)| self.providers.is_native(p));
+            let native = g.id.split_once('/').is_some_and(|(p, _)| self.providers.is_direct(p));
             let detail = if native {
                 "key".into()
             } else {
@@ -1064,7 +1065,7 @@ impl App {
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
-                if let Some(def) = models::native_def(&id) {
+                if let Some(def) = native_def(&id) {
                     self.start_key_flow(def);
                 }
             }
@@ -1435,7 +1436,7 @@ impl App {
     /// `/login`: with a provider id run `omp login <id>`, with `mcp:<name>` log in to that MCP server;
     /// otherwise list omp's providers and the MCP servers that need auth in a picker.
     fn login(&mut self, provider: &str) {
-        if let Some(def) = models::native_def(provider) {
+        if let Some(def) = native_def(provider) {
             return self.start_key_flow(def);
         }
         if let Some(name) = provider.strip_prefix("mcp:") {

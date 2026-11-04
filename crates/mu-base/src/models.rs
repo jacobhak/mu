@@ -338,79 +338,10 @@ pub enum AuthStyle {
     Bearer,
 }
 
-#[derive(Debug)]
-pub struct ProviderDef {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub api: Api,
-    /// Without a trailing slash; each wire appends its own path.
-    pub base_url: &'static str,
-    pub auth: AuthStyle,
-    /// Path (after `base_url`) of a cheap authenticated GET that checks a key.
-    pub validate: &'static str,
-    /// Where the user creates a key.
-    pub key_url: &'static str,
-    /// The conventional environment variable; also the redaction label of a stored key.
-    pub env_hint: &'static str,
-    /// Model id (without the provider prefix) used when nothing else is configured.
-    pub default_model: &'static str,
-}
-
-/// Providers mu talks to directly with an API key. Everything else goes through the gateway.
-pub const PROVIDERS: [ProviderDef; 3] = [
-    ProviderDef {
-        id: "anthropic",
-        label: "Anthropic",
-        api: Api::AnthropicMessages,
-        base_url: "https://api.anthropic.com",
-        auth: AuthStyle::XApiKey,
-        validate: "/v1/models?limit=1",
-        key_url: "https://console.anthropic.com/settings/keys",
-        env_hint: "ANTHROPIC_API_KEY",
-        default_model: "claude-sonnet-5-5",
-    },
-    ProviderDef {
-        id: "openai",
-        label: "OpenAI",
-        api: Api::OpenAiResponses,
-        base_url: "https://api.openai.com/v1",
-        auth: AuthStyle::Bearer,
-        validate: "/models",
-        key_url: "https://platform.openai.com/api-keys",
-        env_hint: "OPENAI_API_KEY",
-        default_model: "gpt-5.5",
-    },
-    ProviderDef {
-        id: "baseten",
-        label: "Baseten",
-        api: Api::OpenAiCompletions,
-        base_url: "https://inference.baseten.co/v1",
-        auth: AuthStyle::Bearer,
-        validate: "/models",
-        key_url: "https://app.baseten.co/settings/api_keys",
-        env_hint: "BASETEN_API_KEY",
-        default_model: "moonshotai/Kimi-K3",
-    },
-];
-
-pub fn native_def(provider: &str) -> Option<&'static ProviderDef> {
-    PROVIDERS.iter().find(|d| d.id == provider)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::*;
-
-    #[test]
-    fn table_is_consistent() {
-        for d in &PROVIDERS {
-            assert!(d.base_url.starts_with("https://") && !d.base_url.ends_with('/'), "{}", d.id);
-            assert!(d.validate.starts_with('/'), "{}", d.id);
-            assert_eq!(native_def(d.id).map(|x| x.id), Some(d.id));
-        }
-        assert!(native_def("nope").is_none());
-    }
 
     fn cfg() -> Configs {
         let omp: OmpConfig = serde_yaml_ng::from_str(
