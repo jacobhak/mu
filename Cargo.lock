@@ -4030,14 +4030,10 @@ name = "mu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "base64 0.22.1",
  "clap",
  "crossterm",
- "flume",
  "futures-util",
- "grep-regex",
- "grep-searcher",
  "jiff",
  "libc",
  "mu-base",
@@ -4045,12 +4041,9 @@ dependencies = [
  "mu-provider",
  "mu-session",
  "mu-testutil",
+ "mu-tools",
  "objc2-app-kit",
  "objc2-foundation",
- "pi-diff",
- "pi-edit",
- "pi-shell",
- "pi-walker",
  "pulldown-cmark",
  "serde",
  "serde_json",
@@ -4203,6 +4196,35 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "mu-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flume",
+ "futures-util",
+ "grep-regex",
+ "grep-searcher",
+ "libc",
+ "mu-base",
+ "mu-common",
+ "mu-provider",
+ "mu-session",
+ "mu-testutil",
+ "pi-diff",
+ "pi-edit",
+ "pi-shell",
+ "pi-walker",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.1",
+ "tokio",
+ "tokio-util",
+ "toml",
  "uuid",
 ]
 

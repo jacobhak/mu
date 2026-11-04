@@ -80,7 +80,7 @@ pub fn save(dir: &Path, hash: &str, server: &str, tools: &[RemoteTool], instruct
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::mcp::config::load_with;
+    use crate::mcp::config::load_with;
 
     fn server(entry: &str) -> McpServer {
         let d = std::env::temp_dir().join(format!("mu-mcpcache-{}", uuid::Uuid::new_v4()));

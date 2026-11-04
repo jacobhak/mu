@@ -171,7 +171,7 @@ fn summary(name: &str, args: &Value, meta: Option<&ToolMeta>) -> String {
             return path.to_string();
         }
     }
-    crate::tools::summary(name, args)
+    mu_tools::tools::summary(name, args)
 }
 
 fn header_line(
@@ -537,7 +537,7 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
 /// A todo result as one checklist: a mark per task, phase names only when there are several.
 /// `None` when the result carries no tasks (a cleared list), so the plain text shows instead.
 fn todo_rows(out: &ToolOutput, width: usize) -> Option<(Vec<Line>, String)> {
-    use crate::tools::todo::{Phase, Status};
+    use mu_tools::tools::todo::{Phase, Status};
     let phases: Vec<Phase> = serde_json::from_value(out.details.as_ref()?["phases"].clone()).ok()?;
     let phases: Vec<&Phase> = phases.iter().filter(|p| !p.tasks.is_empty()).collect();
     let total: usize = phases.iter().map(|p| p.tasks.len()).sum();

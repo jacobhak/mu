@@ -1,0 +1,38 @@
+[package]
+name = "mu-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Exposes the plugin host constructor to other crates' tests.
+test-support = []
+
+[dependencies]
+mu-common.workspace = true
+mu-base.workspace = true
+mu-provider.workspace = true
+mu-session.workspace = true
+pi-edit.workspace = true
+pi-shell.workspace = true
+pi-diff.workspace = true
+pi-walker.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+serde_yaml_ng.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "time", "sync", "process", "io-util", "io-std", "fs", "net"] }
+tokio-util.workspace = true
+toml.workspace = true
+futures-util.workspace = true
+flume.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+mu-testutil.workspace = true
+mu-provider = { workspace = true, features = ["test-support"] }

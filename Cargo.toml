@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [workspace]
-members = ["crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-provider", "crates/mu-session", "crates/mu-testutil", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
+members = ["crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-provider", "crates/mu-session", "crates/mu-testutil", "crates/mu-tools", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
 exclude = ["plugins/mcp-http"]
 resolver = "3"
 
@@ -20,6 +20,7 @@ mu-base = { path = "crates/mu-base" }
 mu-testutil = { path = "crates/mu-testutil" }
 mu-provider = { path = "crates/mu-provider" }
 mu-session = { path = "crates/mu-session" }
+mu-tools = { path = "crates/mu-tools" }
 pi-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-diff = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
@@ -86,10 +87,7 @@ mu-common.workspace = true
 mu-base.workspace = true
 mu-provider.workspace = true
 mu-session.workspace = true
-pi-edit.workspace = true
-pi-shell.workspace = true
-pi-diff.workspace = true
-pi-walker.workspace = true
+mu-tools.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "time", "sync", "process", "io-util", "io-std", "fs", "net"] }
 tokio-util.workspace = true
 serde_yaml_ng.workspace = true
@@ -115,10 +113,6 @@ terminput-crossterm.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-flume.workspace = true
-async-trait.workspace = true
-grep-regex.workspace = true
-grep-searcher.workspace = true
 clap.workspace = true
 uuid.workspace = true
 jiff.workspace = true
@@ -135,6 +129,7 @@ objc2-app-kit.workspace = true
 [dev-dependencies]
 mu-testutil.workspace = true
 mu-provider = { workspace = true, features = ["test-support"] }
+mu-tools = { workspace = true, features = ["test-support"] }
 
 [patch.crates-io]
 brush-core   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }

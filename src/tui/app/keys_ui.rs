@@ -336,7 +336,7 @@ mod tests {
         let (cmd_tx, _cmd_rx) = unbounded_channel();
         let (ui_tx, _ui_rx) = unbounded_channel();
         let (ntx, _nrx) = unbounded_channel();
-        let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
+        let plugins = mu_tools::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
         App {
             tr: Transcript::new(true, false),

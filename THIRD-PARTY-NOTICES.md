@@ -7,9 +7,9 @@ mu is MIT licensed (see `LICENSE`). It includes material from these projects.
 <https://github.com/can1357/oh-my-pi>, release v18.12.6 (commit 45c35e4). mu reimplements much of omp's
 behaviour in Rust and copies or adapts this material from it:
 
-- `src/prompts/*.md`: compaction, summarisation, plan-mode, `ask` and `todo` prompts
+- `src/prompts/*.md`: compaction, summarisation and plan-mode prompts; `crates/mu-tools/src/prompts/*.md`: `ask` and `todo` prompts
 - `plugins/memory/prompts/*.md`: memory extraction and Mnemopi instructions
-- parts of the tool descriptions in `src/tools/`
+- parts of the tool descriptions in `crates/mu-tools/src/tools/`
 - `design/theme/omp-dark-tokyo-night.json`: an omp theme, kept as a design reference
 
 mu also depends on omp's Rust crates (`pi-edit`, `pi-shell`, `pi-diff`, `pi-walker`), the

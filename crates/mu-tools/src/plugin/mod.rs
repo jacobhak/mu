@@ -1,5 +1,5 @@
 pub mod manifest;
-pub mod mcp;
+use crate::mcp;
 
 use manifest::{Lifetime, Manifest};
 use mu_base::tool::{ToolDef, ToolOutput};
@@ -500,7 +500,7 @@ async fn refresh_listing(slot: Rc<Slot>, proc: Rc<Proc>, shared: Rc<Shared>) {
 }
 
 impl PluginHost {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         manifests: Vec<Manifest>,
         warnings: Vec<String>,

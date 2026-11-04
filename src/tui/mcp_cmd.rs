@@ -1,6 +1,6 @@
 //! Parsing for `/mcp`. Pure: no I/O. The interactive `add` flow is in `mcp_wizard`.
 
-use crate::plugin::mcp::store::{Level, check_name};
+use mu_tools::mcp::store::{Level, check_name};
 use serde_json::{Map, Value};
 
 /// A server ready to be written to a config file.

@@ -188,7 +188,7 @@ pub fn set_enabled(cwd: &Path, agent: &Path, name: &str, on: bool) -> Result<boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::mcp::config::load_all_with;
+    use crate::mcp::config::load_all_with;
     use mu_testutil::tmp;
     use serde_json::json;
 

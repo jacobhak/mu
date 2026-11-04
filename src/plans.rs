@@ -351,7 +351,7 @@ pub fn reads_from(messages: &[Message], cwd: &Path, root: &Path) -> Vec<String> 
             if p.contains("://") {
                 continue;
             }
-            let t = crate::tools::uri::read_target(p, |q| cwd.join(q).exists());
+            let t = mu_tools::tools::uri::read_target(p, |q| cwd.join(q).exists());
             let abs = normalize(&cwd.join(&t.path));
             if !abs.is_file() {
                 continue;

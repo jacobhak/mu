@@ -1,15 +1,15 @@
 //! `/mcp`: a server picker with per-server actions, the add/import wizard, and the typed
-//! subcommands. The config files are edited (`plugin::mcp::store`) and the running host is
+//! subcommands. The config files are edited (`mu_tools::mcp::store`) and the running host is
 //! brought in line with them.
 
 use super::*;
-use crate::plugin::McpInfo;
-use crate::plugin::mcp::config::{self, Entry, Kind};
-use crate::plugin::mcp::discover::{self, Found, Roots};
-use crate::plugin::mcp::store;
 use crate::tui::mcp_cmd::{self, Draft, McpCmd};
 use crate::tui::mcp_wizard::{Answer, Step, Wizard};
 use crate::tui::overlay::{McpAction, McpPick, McpRow};
+use mu_tools::mcp::config::{self, Entry, Kind};
+use mu_tools::mcp::discover::{self, Found, Roots};
+use mu_tools::mcp::store;
+use mu_tools::plugin::McpInfo;
 use tokio_util::sync::CancellationToken;
 
 /// `scheme://host` of a url: paths, queries and credentials may carry secrets.

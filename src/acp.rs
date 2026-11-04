@@ -1,8 +1,6 @@
 //! `--acp`: Agent Client Protocol server over stdio (newline-delimited JSON-RPC).
 //! One mu `Agent` per ACP session, so each session keeps its own working directory.
 
-use crate::plugin::PluginHost;
-use crate::tools::summary;
 use crate::{Setup, agent, pick_model, setup};
 use anyhow::{Result, anyhow};
 use mu_base::events::{self, AgentEvent, Command, SharedInbox};
@@ -10,6 +8,8 @@ use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
 use mu_provider::model::pricing;
 use mu_session::session;
+use mu_tools::plugin::PluginHost;
+use mu_tools::tools::summary;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
@@ -29,7 +29,7 @@ pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        crate::plugin::exit_on_signals();
+        mu_tools::plugin::exit_on_signals();
         serve(model, thinking).await
     });
     Ok(0)

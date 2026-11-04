@@ -1,10 +1,10 @@
 //! The interactive `/mcp add` flow as a state machine: arrow-key pickers for choices, text lines
 //! for values. Pure: the app shows each `Step` and feeds back an `Answer`.
 
-use crate::plugin::mcp::discover::Found;
-use crate::plugin::mcp::store::{Level, check_name};
 use crate::tui::mcp_cmd::{Draft, check_url, http_entry, parse_env, parse_header, split_words, stdio_entry};
 use crate::tui::mcp_presets::{Preset, presets};
+use mu_tools::mcp::discover::Found;
+use mu_tools::mcp::store::{Level, check_name};
 use serde_json::{Map, Value};
 use std::path::Path;
 

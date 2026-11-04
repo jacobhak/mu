@@ -1,7 +1,7 @@
 //! The system prompt: mu's built-in rules and workstation facts, then the context files, rules,
 //! skills and per-run blocks that a `Context` and the run supply. Builds on the `context` types;
 //! `context` never imports this module.
-use crate::context::{Context, Skill};
+use mu_tools::context::{Context, Skill};
 use std::path::Path;
 
 pub struct PromptInput<'a> {
@@ -130,6 +130,77 @@ When the `task` tool is available, SHOULD use it instead of doing everything inl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn skills_commands_and_templates() {
+        let root = std::env::temp_dir().join(format!("mu-ctx2-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        let agent = root.join("agent");
+        let w = |p: PathBuf, c: &str| {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, c).unwrap();
+        };
+        w(proj.join(".omp/skills/a/SKILL.md"), "---\nname: alpha\ndescription: first\n---\nbody A");
+        w(agent.join("skills/alpha/SKILL.md"), "---\ndescription: shadowed\n---\nx");
+        w(agent.join("skills/hid/SKILL.md"), "---\ndescription: d\nhide: true\n---\nx");
+        w(agent.join("skills/nodesc/SKILL.md"), "---\nname: nodesc\n---\nx");
+        w(agent.join("skills/off/SKILL.md"), "---\ndescription: d\nenabled: false\n---\nx");
+        w(proj.join(".omp/commands/greet.md"), "---\nargument-hint: <who>\n---\nSay hi to $1 ($@)");
+        w(proj.join(".omp/commands/plain.md"), "Do the thing");
+        w(agent.join("RULES.md"), "user rule");
+        let ctx = Context::load_all(&proj, &home, &agent, false);
+        let names: Vec<_> = ctx.skills.iter().map(|s| (s.name.as_str(), s.description.as_str(), s.hidden)).collect();
+        assert_eq!(names, [("alpha", "first", false), ("hid", "d", true)]);
+        let greet = ctx.commands.iter().find(|c| c.name == "greet").unwrap();
+        assert_eq!(greet.expand("Bob \"a b\""), "Say hi to Bob (Bob a b)");
+        let plain = ctx.commands.iter().find(|c| c.name == "plain").unwrap();
+        assert_eq!(plain.expand("extra"), "Do the thing\n\nextra");
+        let sp = system_prompt(&PromptInput {
+            model: "m",
+            hashline: true,
+            cwd: &proj,
+            ctx: &ctx,
+            plan: None,
+            subagent: false,
+            ask: false,
+            agent_prompt: None,
+            plugin_ctx: &Default::default(),
+            mcp_instructions: None,
+        });
+        assert!(sp.contains("- alpha: first\n") && !sp.contains("- hid:") && sp.contains("<rules>\nuser rule"));
+        assert!(sp.contains("never changes what the user asked for") && !sp.contains("Matching skill → MUST"));
+        assert!(ctx.skill_prompt("alpha", "go").unwrap().ends_with("body A\n</skill>\n\ngo"));
+    }
+
+    #[test]
+    fn nested_agents_md_listed() {
+        let root = std::env::temp_dir().join(format!("mu-ctx-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let proj = home.join("p");
+        for d in ["", "a", "a/b/c/d", "a/b/c/d/e", ".hidden", "node_modules/x"] {
+            let dir = proj.join(d);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("AGENTS.md"), "x").unwrap();
+        }
+        let ctx = Context::load_all(&proj, &home, &root.join("agent"), false);
+        assert_eq!(ctx.nested, ["a/AGENTS.md", "a/b/c/d/AGENTS.md"]);
+        let sp = system_prompt(&PromptInput {
+            model: "m",
+            hashline: true,
+            cwd: &proj,
+            ctx: &ctx,
+            plan: None,
+            subagent: false,
+            ask: false,
+            agent_prompt: None,
+            plugin_ctx: &Default::default(),
+            mcp_instructions: None,
+        });
+        assert!(sp.contains("<dir-context>\nSome directories may have rules; deeper rules override higher ones.\nBefore changes in these directories, MUST read:\n- a/AGENTS.md\n- a/b/c/d/AGENTS.md\n</dir-context>"));
+    }
 
     #[test]
     fn system_prompt_forbids_shell_file_edits_and_tracks_edit_mode() {

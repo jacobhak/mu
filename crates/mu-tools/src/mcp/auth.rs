@@ -86,7 +86,7 @@ async fn fetch_token_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::mcp::config::load_with;
+    use crate::mcp::config::load_with;
     use mu_testutil::block_on as rt;
     use std::process::Stdio;
 
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn tokens_come_from_omp_with_the_broker_env_and_force_flag() {
-        let script = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/plugin/mcp/testdata/fake-omp.sh"));
+        let script = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp/testdata/fake-omp.sh"));
         let ids = vec!["nosuch".to_string(), "good".to_string()];
         let broker = ("http://127.0.0.1:9".to_string(), "bt".to_string());
         rt(async {

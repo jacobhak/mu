@@ -123,9 +123,9 @@ async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Opt
     v.model = mu_base::models::role_selector("review", &cfgs).unwrap_or_else(|| "default".into());
     let exe = mu_common::paths::self_exe().map_err(|e| format!("cannot locate mu executable: {e}"))?;
     let payload =
-        serde_json::json!({"task": prompt, "agent": crate::context::REVIEW_LEAD, "outputSchema": report_schema()});
+        serde_json::json!({"task": prompt, "agent": mu_tools::context::REVIEW_LEAD, "outputSchema": report_schema()});
     let cancel = tokio_util::sync::CancellationToken::new();
-    let out = crate::tools::subagent::run_child(&exe, &root, &payload, &cancel, |name, summary| {
+    let out = mu_tools::tools::subagent::run_child(&exe, &root, &payload, &cancel, |name, summary| {
         eprintln!("  {name} {summary}");
     })
     .await;

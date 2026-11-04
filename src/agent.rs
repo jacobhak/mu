@@ -1,12 +1,8 @@
 use crate::compaction::Outcome;
-use crate::context::{self, Context};
-use crate::jobs::{self, JobsHandle};
 use crate::plans;
-use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
 use crate::prompt::{self, PromptInput};
 use crate::review;
-use crate::tools::{ToolCtx, Tools};
 use mu_base::ask_nudge;
 use mu_base::events::{AgentEvent, Command, EventTx, GitInfo, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
 use mu_base::git;
@@ -22,6 +18,10 @@ use mu_provider::model::pricing;
 use mu_provider::provider::{ProviderError, Providers, Request, StreamEvent};
 use mu_session::inbox;
 use mu_session::session::{self, CompactionState, SessionFile};
+use mu_tools::context::{self, Context};
+use mu_tools::jobs::{self, JobsHandle};
+use mu_tools::plugin::{InitParams, PluginHost};
+use mu_tools::tools::{ToolCtx, Tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -332,7 +332,7 @@ impl Agent {
         ToolPolicy {
             allow: self.allow.clone(),
             excluded: self.excluded.clone(),
-            depth: crate::tools::task::depth(),
+            depth: mu_tools::tools::task::depth(),
             plan: self.plan.is_some(),
         }
     }
@@ -393,7 +393,7 @@ impl Agent {
             agent_prompt: self.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),
-            hashline: crate::tools::edit::is_hashline(),
+            hashline: mu_tools::tools::edit::is_hashline(),
         })
     }
 
@@ -1172,7 +1172,7 @@ impl Agent {
         });
         let out = {
             let (events, id) = (self.events.clone(), id.clone());
-            crate::tools::subagent::run_child(&exe, &root, &payload, cancel, move |name, summary| {
+            mu_tools::tools::subagent::run_child(&exe, &root, &payload, cancel, move |name, summary| {
                 let _ = events.send(AgentEvent::ToolOutput { id: id.clone(), chunk: format!("{name} {summary}\n") });
             })
             .await
@@ -2175,7 +2175,7 @@ mod loop_tests {
         ));
         providers.scripted.borrow_mut().extend(script);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = Rc::new(crate::context::Context {
+        let ctx = Rc::new(mu_tools::context::Context {
             warnings: vec![],
             files: vec![],
             nested: vec![],
@@ -2645,7 +2645,7 @@ mod loop_tests {
 
     #[test]
     fn a_stop_with_no_calls_skips_the_todo_reminder() {
-        use crate::tools::todo::{Phase, Status, Task};
+        use mu_tools::tools::todo::{Phase, Status, Task};
         run(async {
             let script = vec![
                 Ok(assistant(vec![Block::text("hi")], StopReason::Stop)),

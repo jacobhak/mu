@@ -2,30 +2,26 @@ mod acp;
 mod agent;
 mod auth_cmd;
 mod compaction;
-mod context;
 mod deliver;
 mod headless;
-mod jobs;
 mod notify;
 mod plans;
 mod plans_cli;
-mod plugin;
 mod policy;
 mod predict_setup;
 mod prompt;
 mod review;
 mod review_cli;
 mod take;
-mod tools;
 mod tui;
 mod update;
-mod walk;
 
 use anyhow::{Result, bail};
 use clap::Parser;
 use mu_base::{config, events, models, schema, secrets};
 use mu_common::paths;
 use mu_session::{inbox, session};
+use mu_tools::{context, plugin, tools};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -186,7 +182,7 @@ fn setup(cwd: &std::path::Path) -> Setup {
         let _ = notice_tx.send(format!("warning: {w}"));
     }
     let (manifests, mut warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
-    let (servers, mcp_warnings) = plugin::mcp::config::load(cwd, &paths::omp_agent_dir());
+    let (servers, mcp_warnings) = mu_tools::mcp::config::load(cwd, &paths::omp_agent_dir());
     warnings.extend(mcp_warnings);
     let mcp_lifetime = match plugin::manifest::Lifetime::parse(&cfgs.mu.mcp.lifetime) {
         Some(l) => l,
@@ -201,7 +197,7 @@ fn setup(cwd: &std::path::Path) -> Setup {
         manifests,
         servers,
         mcp_lifetime,
-        plugin::mcp::cache::dir(),
+        mu_tools::mcp::cache::dir(),
         warnings,
         notice_tx.clone(),
         plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },

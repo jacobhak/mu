@@ -126,7 +126,7 @@ impl Tools {
         if let Some(raw) = args.get("__invalid_json") {
             return ToolOutput::err(format!("Invalid arguments for {name}: arguments were not valid JSON: {raw}"));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if name == "__panic" {
             panic!("boom");
         }

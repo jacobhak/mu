@@ -17,9 +17,6 @@ use super::status;
 use super::term::{self, Term};
 use super::theme::{self, Role};
 use super::transcript::{Stream, Transcript};
-use crate::context::Context;
-use crate::plugin::PluginHost;
-use crate::tools::todo::{Phase, Status};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use mu_base::events::{AgentEvent, Answer, AskQuestion, StatusSnapshot, SubagentState, SubagentStatus};
 use mu_base::events::{Command, SharedInbox};
@@ -30,6 +27,9 @@ use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
 use mu_provider::provider::Providers;
 use mu_provider::provider::native;
+use mu_tools::context::Context;
+use mu_tools::plugin::PluginHost;
+use mu_tools::tools::todo::{Phase, Status};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -1651,11 +1651,11 @@ impl App {
     }
 
     fn todo_hud(&self, w: usize) -> Vec<Line> {
-        let all: Vec<&crate::tools::todo::Task> = self.todo.iter().flat_map(|p| p.tasks.iter()).collect();
+        let all: Vec<&mu_tools::tools::todo::Task> = self.todo.iter().flat_map(|p| p.tasks.iter()).collect();
         if all.is_empty() {
             return vec![];
         }
-        let open = |t: &crate::tools::todo::Task| matches!(t.status, Status::Pending | Status::InProgress);
+        let open = |t: &mu_tools::tools::todo::Task| matches!(t.status, Status::Pending | Status::InProgress);
         let Some(phase) = self.todo.iter().find(|p| p.tasks.iter().any(open)) else { return vec![] };
         let done = all.iter().filter(|t| matches!(t.status, Status::Completed | Status::Abandoned)).count();
         let mut out = vec![styled(trunc(&format!("todo {done}/{} · {}", all.len(), phase.name), w), |_| dim())];

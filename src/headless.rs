@@ -1,5 +1,5 @@
-use crate::tools::summary;
 use mu_base::events::{AgentEvent, Command, PlanDecision};
+use mu_tools::tools::summary;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// `-p`: runs one prompt to completion. Final assistant text goes to stdout, progress to stderr.

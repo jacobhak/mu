@@ -137,7 +137,7 @@ pub fn presets(cwd: &Path, env_set: fn(&str) -> bool) -> Vec<Preset> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::mcp::store::check_name;
+    use mu_tools::mcp::store::check_name;
     use serde_json::json;
 
     fn none_set(_: &str) -> bool {

@@ -1,5 +1,5 @@
 //! MCP servers as plugins that only provide tools. The plugin host runs the process and the
-//! JSON-RPC traffic (`super`); this module holds what is specific to the `mcp` dialect: the
+//! JSON-RPC traffic (`crate::plugin`); this module holds what is specific to the `mcp` dialect: the
 //! per-server state, the tool list and the prompt instructions.
 
 pub mod auth;
@@ -9,7 +9,7 @@ pub mod convert;
 pub mod discover;
 pub mod store;
 
-use super::manifest::ToolSpec;
+use crate::plugin::manifest::ToolSpec;
 use cache::RemoteTool;
 use config::McpServer;
 use std::cell::{Cell, RefCell};
