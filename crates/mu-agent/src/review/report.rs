@@ -187,4 +187,3 @@ pub fn raw_message(text: &str, plan_uri: Option<&str>, report_uri: &str) -> Stri
     fix_tail(&mut o, report_uri, None);
     o
 }
-

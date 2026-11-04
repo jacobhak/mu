@@ -2,8 +2,8 @@
 //! Each plan is `<id>.md` (the text as written) plus `<id>.json` (metadata) under
 //! `$MU_HOME/plans/<repo-key>/`. All worktrees of one clone share a store.
 use crate::review::facts::{numstat, repo_root, snapshot_tree};
-use mu_base::git::git;
 use mu_base::events::{Approval, Base, PlanMeta, Status};
+use mu_base::git::git;
 use mu_base::message::{Message, tool_calls};
 use mu_common::fs::write_atomic;
 use mu_common::paths::{encode_cwd, mu_home};
@@ -66,10 +66,7 @@ pub async fn main_checkout(cwd: &Path) -> PathBuf {
 }
 
 pub async fn store_for(cwd: &Path) -> Store {
-    Store {
-        dir: mu_home().join("plans").join(encode_cwd(&main_checkout(cwd).await)),
-        root: repo_root(cwd).await.ok(),
-    }
+    Store { dir: mu_home().join("plans").join(encode_cwd(&main_checkout(cwd).await)), root: repo_root(cwd).await.ok() }
 }
 
 pub async fn base_now(root: &Path) -> Option<Base> {

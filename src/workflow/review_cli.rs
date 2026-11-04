@@ -2,7 +2,9 @@
 //! the in-session review (`mu_agent::review`), runs `review-lead` and its workers as child processes, and
 //! prints the verdict as JSON or markdown.
 use mu_agent::review::facts::{Base, Gather, gather};
-use mu_agent::review::report::{Finding, Meta, PlanStep, Report, is_blocking, render_markdown, report_of, report_schema};
+use mu_agent::review::report::{
+    Finding, Meta, PlanStep, Report, is_blocking, render_markdown, report_of, report_schema,
+};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -97,8 +99,7 @@ async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Opt
     let cfgs = mu_base::config::Configs::load();
     v.model = mu_base::models::role_selector("review", &cfgs).unwrap_or_else(|| "default".into());
     let exe = mu_common::paths::self_exe().map_err(|e| format!("cannot locate mu executable: {e}"))?;
-    let payload =
-        serde_json::json!({"task": facts.request, "agent": mu_tools::context::REVIEW_LEAD, "outputSchema": report_schema()});
+    let payload = serde_json::json!({"task": facts.request, "agent": mu_tools::context::REVIEW_LEAD, "outputSchema": report_schema()});
     let cancel = tokio_util::sync::CancellationToken::new();
     let out = mu_tools::tools::subagent::run_child(&exe, &facts.root, &payload, &cancel, |name, summary| {
         eprintln!("  {name} {summary}");

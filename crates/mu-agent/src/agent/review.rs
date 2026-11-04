@@ -155,12 +155,15 @@ impl Agent {
         scope: &ReviewScope,
         cancel: &CancellationToken,
     ) -> Option<mu_tools::tools::subagent::Outcome> {
-        let exe = match mu_common::paths::self_exe() {
-            Ok(e) => e,
-            Err(e) => {
-                self.error(format!("cannot locate mu executable: {e}"));
-                return None;
-            }
+        let exe = match &self.review_child {
+            Some(e) => e.clone(),
+            None => match mu_common::paths::self_exe() {
+                Ok(e) => e,
+                Err(e) => {
+                    self.error(format!("cannot locate mu executable: {e}"));
+                    return None;
+                }
+            },
         };
         let payload = json!({
             "task": scope.request,
@@ -331,5 +334,77 @@ impl Agent {
             s.custom("review_base", serde_json::to_value(&b).unwrap_or_default());
         }
         self.plan.review_base = Some(b);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{agent_in, drain, git_repo};
+    use mu_base::config::Configs;
+    use mu_testutil::block_on_local as run;
+    use std::os::unix::fs::PermissionsExt;
+
+    const RESULT: &str =
+        r#"{"type":"result","isError":false,"text":"","data":{"verdict":"pass","summary":"all good","findings":[]}}"#;
+
+    async fn review_cmd(a: &mut Agent) {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        let live = Rc::new(std::cell::Cell::new(Thinking::Off));
+        let mut q = Queue { rx, inbox: new_inbox(), backlog: Default::default(), jobs: None, events: etx, live };
+        a.command(Command::Review(None), &mut q).await;
+    }
+
+    #[test]
+    fn review_reports_a_child_that_cannot_start() {
+        run(async {
+            let dir = git_repo();
+            std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+            let (mut a, mut rx) = agent_in(vec![], Configs::default(), RunConfig::default(), dir.clone());
+            a.review_child = Some(dir.join("no-such-mu"));
+            review_cmd(&mut a).await;
+            let ev = drain(&mut rx);
+            assert!(ev.iter().any(|e| matches!(e, AgentEvent::Notice(m) if m.contains("no plan base recorded"))));
+            assert!(ev.iter().any(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "review")));
+            let end = ev.iter().find_map(|e| match e {
+                AgentEvent::ToolEnd { name, output, .. } if name == "review" => {
+                    Some((output.is_error, output.text.clone()))
+                }
+                _ => None,
+            });
+            let (is_error, text) = end.expect("the review ends");
+            assert!(is_error && text.contains("cannot start subagent"), "{text}");
+            assert!(!ev.iter().any(|e| matches!(e, AgentEvent::Ask { .. })));
+            assert!(ev.iter().any(|e| matches!(e, AgentEvent::TurnEnd { aborted: false })));
+        });
+    }
+
+    #[test]
+    fn review_sends_the_gathered_request_to_the_child() {
+        run(async {
+            let dir = git_repo();
+            std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+            let payload = dir.join("payload.json");
+            let child = dir.join("fake-mu");
+            let script = format!("#!/bin/sh\ncat > '{}'\necho '{RESULT}'\n", payload.display());
+            std::fs::write(&child, script).unwrap();
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (mut a, mut rx) = agent_in(vec![], Configs::default(), RunConfig::default(), dir.clone());
+            a.review_child = Some(child);
+            review_cmd(&mut a).await;
+            let sent: Value = serde_json::from_str(&std::fs::read_to_string(&payload).unwrap()).unwrap();
+            assert_eq!(sent["agent"], context::REVIEW_LEAD);
+            let task = sent["task"].as_str().unwrap();
+            assert!(task.contains("HEAD (no plan approved in this session)"), "{task}");
+            assert!(task.contains("| a.txt | +1/-1 |"), "{task}");
+            let ev = drain(&mut rx);
+            assert!(ev.iter().any(|e| matches!(e, AgentEvent::Notice(m) if m == "review: no findings")));
+            assert!(ev.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolEnd { name, output, .. }
+                    if name == "review" && !output.is_error && output.text.contains("## Review: PASS")
+            )));
+        });
     }
 }

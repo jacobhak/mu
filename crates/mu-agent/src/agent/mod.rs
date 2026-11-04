@@ -69,6 +69,8 @@ pub struct Agent {
     resumed: bool,
     user_turn: u32,
     turn_msgs: Vec<Value>,
+    /// The executable `/review` runs as its child; `None` is this mu.
+    review_child: Option<PathBuf>,
 }
 
 pub struct PlanState {
@@ -257,6 +259,7 @@ impl Agent {
             resumed: false,
             user_turn: 0,
             turn_msgs: Vec::new(),
+            review_child: None,
         }
     }
 
