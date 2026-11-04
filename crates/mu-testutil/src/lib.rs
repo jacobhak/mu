@@ -10,7 +10,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub fn home() -> &'static Path {
     static H: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     H.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("mu-test-home-{}", uuid::Uuid::new_v4()));
+        // A spawned test binary (tests/modes.rs) is given its home by the test that starts it.
+        let d = match std::env::var_os("MU_TEST_HOME") {
+            Some(d) => PathBuf::from(d),
+            None => std::env::temp_dir().join(format!("mu-test-home-{}", uuid::Uuid::new_v4())),
+        };
         std::fs::create_dir_all(&d).unwrap();
         // SAFETY: set once, before any test in this process reads it through `home()`.
         unsafe { std::env::set_var("MU_HOME", &d) };
