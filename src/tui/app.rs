@@ -1085,21 +1085,21 @@ impl App {
             OverlayEvent::DeliverPlan(id) => self.send(Command::Deliver(id)),
             OverlayEvent::KillJobs(id) => self.send(Command::KillJobs(id)),
             OverlayEvent::NotifySession { session, text } => {
-                let msg = match crate::notify::send(&session, Some("mu jobs panel"), &text, &self.cwd) {
+                let msg = match mu_session::inbox::send(&session, Some("mu jobs panel"), &text, &self.cwd) {
                     Ok(line) => format!("message to {}: {line}", mu_session::session::id_of(&session)),
                     Err(e) => format!("message not sent: {e}"),
                 };
                 self.panel_status(msg);
             }
             OverlayEvent::StopSession { session, pid, started, kind } => {
-                let msg = match crate::take::stop_session(&session, pid, &started, &kind) {
+                let msg = match mu_session::control::stop_session(&session, pid, &started, &kind) {
                     Ok(m) => m,
                     Err(e) => format!("not stopped: {e}"),
                 };
                 self.panel_status(msg);
             }
             OverlayEvent::TerminateSession { session, pid, started } => {
-                let msg = match crate::take::terminate_session(&session, pid, &started) {
+                let msg = match mu_session::control::terminate_session(&session, pid, &started) {
                     Ok(m) => m,
                     Err(e) => format!("not terminated: {e}"),
                 };

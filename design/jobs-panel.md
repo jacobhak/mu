@@ -230,7 +230,7 @@ Each phase ships alone.
    panel asks the app for a redraw tick while it is open, since nothing else would repaint an idle screen.
    `Alt+J` and `/jobs` open on this tab when there are no jobs.
 5. **Actions on other sessions** (implemented). `n` types a one-line message in the footer and sends it
-   with `notify::send`; `s` is `take::stop_session`, which re-checks the owner (pid and start time) before
+   with `mu_session::inbox::send`; `s` is `mu_session::control::stop_session`, which re-checks the owner (pid and start time) before
    `SIGUSR1` (a `-p` run) or `SIGTERM` to the process group (a subagent, only if it leads its own group);
    `t` closes the panel and runs `mu take <session>` through `App::start_child` (SIGINT caught as in
    `run_login`), then reopens the Sessions tab. What an action did shows in the footer until the next key.

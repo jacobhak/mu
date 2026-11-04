@@ -1,9 +1,9 @@
 //! `mu deliver`: approve and implement a parked plan, review it against the plan, send blocking findings back to the implementer session, then have it commit.
 
-use crate::notify;
 use mu_agent::agent::DeliverFn;
 use mu_agent::{plans, review};
 use mu_common::paths::{encode_cwd, mu_home, self_exe};
+use mu_session::inbox;
 use mu_session::session;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
@@ -190,7 +190,7 @@ impl Steps for MuSteps {
     }
 
     async fn notify(&mut self, dir: &Path, session: &Path, text: &str) -> String {
-        match notify::send(session, Some("mu deliver"), text, dir) {
+        match inbox::send(session, Some("mu deliver"), text, dir) {
             Ok(l) => l,
             Err(e) => format!("not sent: {e}"),
         }

@@ -13,7 +13,6 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 pub fn assistant(blocks: Vec<Block>, stop: StopReason) -> Message {
@@ -140,17 +139,4 @@ pub async fn save_plan_in(cwd: &Path, read: &[&str]) -> plans::Store {
         })
         .unwrap();
     store
-}
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Queues a `mu notify`-style message for session `id`, in the same layout the binary's sender writes.
-pub fn enqueue(id: &str, from: &str, text: &str) -> std::io::Result<PathBuf> {
-    let ts = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%S%.9fZ").to_string();
-    let name = format!("{ts}-{}-{:06}.json", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
-    let body = json!({"from": from, "text": text, "at": mu_common::time::iso_ms()}).to_string();
-    let d = mu_session::inbox::ensure_dir(id)?;
-    let path = d.join(name);
-    mu_common::fs::write_atomic(&path, body.as_bytes())?;
-    Ok(path)
 }

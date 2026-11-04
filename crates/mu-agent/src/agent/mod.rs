@@ -2136,10 +2136,11 @@ impl Agent {
 mod loop_tests {
     use super::*;
     use crate::testing::{
-        agent, agent_with, assistant, call, drain, enqueue, git_repo, results, save_plan_in, tmp_dir, yield_call,
+        agent, agent_with, assistant, call, drain, git_repo, results, save_plan_in, tmp_dir, yield_call,
     };
     use mu_base::config::Configs;
     use mu_provider::provider::ProviderError;
+    use mu_session::inbox::enqueue;
     use mu_testutil::block_on_local as run;
 
     #[test]
