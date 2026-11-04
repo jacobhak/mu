@@ -1,5 +1,4 @@
 //! Pseudo-terminal child processes for `bash` with `pty: true` (Unix only).
-use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::raw::c_int;
@@ -14,17 +13,16 @@ pub fn login_shell() -> String {
     {
         return sh;
     }
-    if let Some(path) = std::env::var_os("PATH")
-        && let Some(bash) = bash_in(&path)
-    {
+    if let Some(bash) = bash_on_path() {
         return bash.to_string_lossy().into_owned();
     }
     "/bin/sh".into()
 }
 
-/// The first `bash` in the `PATH`-style list `path`.
-pub fn bash_in(path: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path).map(|d| d.join("bash")).find(|p| p.is_file())
+/// The first `bash` on `PATH`; `None` when there is none, or `PATH` is unset.
+pub fn bash_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join("bash")).find(|p| p.is_file())
 }
 
 /// The terminal side of a pty: I/O and signalling. Shared so reads can run while `child` is awaited.

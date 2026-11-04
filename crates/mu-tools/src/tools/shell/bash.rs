@@ -49,6 +49,46 @@ impl Limits {
     }
 }
 
+/// Termination of a foreground pty command: SIGTERM and hangup, SIGKILL after `KILL_AFTER`, and the
+/// run is given up `GIVE_UP_AFTER` later.
+struct PtyRun {
+    io: std::rc::Rc<mu_base::pty::PtyIo>,
+    term_at: Option<tokio::time::Instant>,
+    killed: bool,
+}
+
+const KILL_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
+const GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_millis(800);
+
+impl PtyRun {
+    /// Starts termination; false when it had already started.
+    fn term(&mut self) -> bool {
+        if self.term_at.is_some() {
+            return false;
+        }
+        self.term_at = Some(tokio::time::Instant::now());
+        self.io.signal(libc::SIGTERM);
+        self.io.hangup();
+        true
+    }
+
+    /// When the loop must wake for the next escalation step.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        let kill_at = self.term_at.map(|t| t + KILL_AFTER);
+        if self.killed { kill_at.map(|t| t + GIVE_UP_AFTER) } else { kill_at }
+    }
+
+    /// Takes the escalation step that is due; true when the run is to be given up.
+    fn escalate(&mut self) -> bool {
+        if self.killed {
+            return true;
+        }
+        self.killed = true;
+        self.io.signal(libc::SIGKILL);
+        false
+    }
+}
+
 impl Tools {
     pub async fn bash(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
         if let Some(jobs) = &self.jobs
@@ -138,6 +178,7 @@ impl Tools {
             Err(e) => return Some(ToolOutput::err(format!("PTY error: {e}"))),
         };
         let io = pty.io.clone();
+        let mut run = PtyRun { io: io.clone(), term_at: None, killed: false };
         let start = Instant::now();
         let mut decoder = OutputDecoder::new();
         let mut cleaner = mu_base::pty::Cleaner::default();
@@ -148,8 +189,6 @@ impl Tools {
         let mut pending_in: std::collections::VecDeque<u8> = Default::default();
         let mut write_buf: Vec<u8> = Vec::new();
         let mut status: Option<std::process::ExitStatus> = None;
-        let mut term_at: Option<tokio::time::Instant> = None; // when termination began
-        let mut killed = false;
         let mut buf = vec![0u8; 64 * 1024];
         let timeout_sleep = tokio::time::sleep(timeout.unwrap_or(Duration::from_secs(1)));
         tokio::pin!(timeout_sleep);
@@ -167,10 +206,7 @@ impl Tools {
         }
 
         loop {
-            // Escalate to SIGKILL 200 ms after SIGTERM; give up waiting 800 ms after that.
-            let kill_at = term_at.map(|t| t + Duration::from_millis(200));
-            let giveup_at = kill_at.map(|t| t + Duration::from_millis(800));
-            let deadline = if killed { giveup_at } else { kill_at };
+            let deadline = run.deadline();
             let esc_sleep = async {
                 match deadline {
                     Some(d) => tokio::time::sleep_until(d).await,
@@ -187,7 +223,7 @@ impl Tools {
                     write_buf.clear();
                     write_buf.extend(pending_in.iter().take(4096));
                     io.write_some(&write_buf).await
-                }, if !pending_in.is_empty() && term_at.is_none() => match w {
+                }, if !pending_in.is_empty() && run.term_at.is_none() => match w {
                     Ok(n) => { pending_in.drain(..n); }
                     Err(_) => pending_in.clear(),
                 },
@@ -195,33 +231,24 @@ impl Tools {
                     Some(PtyInput::Bytes(b)) => pending_in.extend(b),
                     Some(PtyInput::Resize { cols, rows }) => io.resize(cols, rows),
                     Some(PtyInput::Kill) => {
-                        if term_at.is_none() {
+                        if run.term() {
                             cancelled = true;
-                            term_at = Some(tokio::time::Instant::now());
-                            io.signal(libc::SIGTERM);
-                            io.hangup();
                         }
                     }
                     None => input_open = false,
                 },
-                _ = ctx.cancel.cancelled(), if term_at.is_none() => {
+                _ = ctx.cancel.cancelled(), if run.term_at.is_none() => {
                     cancelled = true;
-                    term_at = Some(tokio::time::Instant::now());
-                    io.signal(libc::SIGTERM);
-                    io.hangup();
+                    run.term();
                 }
-                _ = &mut timeout_sleep, if timeout.is_some() && term_at.is_none() => {
+                _ = &mut timeout_sleep, if timeout.is_some() && run.term_at.is_none() => {
                     timed_out = true;
-                    term_at = Some(tokio::time::Instant::now());
-                    io.signal(libc::SIGTERM);
-                    io.hangup();
+                    run.term();
                 }
                 _ = esc_sleep => {
-                    if killed {
+                    if run.escalate() {
                         break;
                     }
-                    killed = true;
-                    io.signal(libc::SIGKILL);
                 }
                 st = pty.child.wait() => {
                     status = st.ok();
@@ -245,12 +272,9 @@ impl Tools {
         emit!(decoder.finish());
         let tail = cleaner.finish();
         collector.push(&tail, &|| self.next_artifact());
-        let code = status.and_then(|s| {
-            use std::os::unix::process::ExitStatusExt;
-            s.code().or_else(|| s.signal().map(|g| 128 + g))
-        });
         let wall = start.elapsed().as_secs_f64();
-        Some(finish(collector.finish(), wall, secs, cancelled, timed_out, code, false))
+        let end = RunEnd { wall, secs, cancelled, timed_out, exit_code: exit_code(status), quiet_wall: false };
+        Some(finish(collector.finish(), end))
     }
 
     async fn bash_plain(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
@@ -302,7 +326,15 @@ impl Tools {
         let res = match res {
             Ok(r) => r,
             Err(_) if aborted.get() => {
-                return finish(output, start.elapsed().as_secs_f64(), secs, true, false, None, true);
+                let end = RunEnd {
+                    wall: start.elapsed().as_secs_f64(),
+                    secs,
+                    cancelled: true,
+                    timed_out: false,
+                    exit_code: None,
+                    quiet_wall: true,
+                };
+                return finish(output, end);
             }
             Err(e) => {
                 let end = output.body.len();
@@ -319,7 +351,15 @@ impl Tools {
             }
         };
         let wall = start.elapsed().as_secs_f64();
-        finish(output, wall, secs, res.cancelled, res.timed_out, res.exit_code, false)
+        let end = RunEnd {
+            wall,
+            secs,
+            cancelled: res.cancelled,
+            timed_out: res.timed_out,
+            exit_code: res.exit_code,
+            quiet_wall: false,
+        };
+        finish(output, end)
     }
 }
 
@@ -370,22 +410,31 @@ fn job_env(vars: Vec<(String, String)>, cwd: &Path, session: Vec<(&'static str, 
 
 /// `bash` on mu's `PATH`, the dialect of the foreground shell; `/bin/sh` when there is none.
 fn job_shell() -> PathBuf {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path).map(|d| d.join("bash")).find(|p| p.is_file()).unwrap_or_else(|| "/bin/sh".into())
+    mu_base::pty::bash_on_path().unwrap_or_else(|| "/bin/sh".into())
 }
 
-/// Builds the result: the same text the model has always seen, plus `meta` carrying the facts the
-/// UI shows (exit code, wall time, flags, artifact), so it never has to parse them back out.
-/// `quiet_wall`: a cancelled-by-user run reports no wall time.
-fn finish(
-    c: Collected,
+/// How a run ended: what `finish` words into the result.
+struct RunEnd {
     wall: f64,
+    /// The timeout as requested, for the timed-out note.
     secs: f64,
     cancelled: bool,
     timed_out: bool,
     exit_code: Option<i32>,
+    /// A cancelled-by-user run reports no wall time.
     quiet_wall: bool,
-) -> ToolOutput {
+}
+
+/// A finished command's exit code: a death by signal is 128 + the signal, as in a shell.
+fn exit_code(status: Option<std::process::ExitStatus>) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.and_then(|s| s.code().or_else(|| s.signal().map(|g| 128 + g)))
+}
+
+/// Builds the result: the same text the model has always seen, plus `meta` carrying the facts the
+/// UI shows (exit code, wall time, flags, artifact), so it never has to parse them back out.
+fn finish(c: Collected, end: RunEnd) -> ToolOutput {
+    let RunEnd { wall, secs, cancelled, timed_out, exit_code, quiet_wall } = end;
     let had_output = !c.body.is_empty();
     let mut text = if had_output { c.body } else { "(no output)".to_string() };
     let output_end = if had_output { text.len() } else { 0 };
@@ -519,11 +568,16 @@ pub async fn run_background(
     }
     collector.push(&out_dec.finish(), &alloc);
     collector.push(&err_dec.finish(), &alloc);
-    let code = status.and_then(|s| {
-        use std::os::unix::process::ExitStatusExt;
-        s.code().or_else(|| s.signal().map(|g| 128 + g))
-    });
-    let out = finish(collector.finish(), start.elapsed().as_secs_f64(), limits.secs, cancelled, timed_out, code, false);
+    let code = exit_code(status);
+    let end = RunEnd {
+        wall: start.elapsed().as_secs_f64(),
+        secs: limits.secs,
+        cancelled,
+        timed_out,
+        exit_code: code,
+        quiet_wall: false,
+    };
+    let out = finish(collector.finish(), end);
     let failed = cancelled || timed_out || code.is_some_and(|c| c != 0);
     let note = if cancelled {
         "cancelled".to_string()
