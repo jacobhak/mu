@@ -85,9 +85,7 @@ pub fn spawn(command: &str, cwd: &Path, cols: u16, rows: u16, env: &[(&str, Stri
     // SAFETY: only async-signal-safe calls (setsid, ioctl) between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            crate::process::new_session()?;
             if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }

@@ -11,7 +11,6 @@ use mu_session::session;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -443,15 +442,10 @@ fn try_lock(path: &Path) -> Result<Option<File>, String> {
         .write(true)
         .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    // SAFETY: plain flock on a descriptor we own.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(f));
-    }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(None)
-    } else {
-        Err(format!("cannot lock {}: {e}", path.display()))
+    match mu_base::process::try_flock(&f, libc::LOCK_EX) {
+        Ok(()) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(format!("cannot lock {}: {e}", path.display())),
     }
 }
 
@@ -660,9 +654,9 @@ fn detach(exe: &Path, dir: &Path, cwd: &Path) -> i32 {
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
-    // SAFETY: only setsid between fork and exec.
+    // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
-        cmd.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+        cmd.pre_exec(mu_base::process::new_session);
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,

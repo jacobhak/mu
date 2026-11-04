@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use mu_base::message::Message;
+use mu_base::process::try_flock;
 use mu_common::paths;
 use mu_common::time::iso_ms;
 use serde_json::{Value, json};
@@ -75,14 +76,12 @@ const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Takes an exclusive, non-blocking `flock` that lives as long as `file`.
 fn lock(file: &File, path: &Path) -> Result<()> {
-    use std::os::fd::AsRawFd;
     let deadline = std::time::Instant::now() + LOCK_RETRY;
     loop {
-        // SAFETY: the fd is valid for the duration of the call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
+        let e = match try_flock(file, libc::LOCK_EX) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
         if e.kind() != std::io::ErrorKind::WouldBlock {
             return Err(e).with_context(|| format!("lock {}", path.display()));
         }
@@ -188,16 +187,6 @@ fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
-    }
-}
-
-fn try_flock(file: &File, op: i32) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: the fd is valid for the duration of the call.
-    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
     }
 }
 

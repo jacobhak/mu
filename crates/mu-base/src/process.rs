@@ -16,6 +16,23 @@ pub fn signal_pid(pid: u32, sig: libc::c_int) -> std::io::Result<()> {
     if unsafe { libc::kill(pid, sig) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
+/// Starts a new session with no controlling terminal. For `pre_exec`: only async-signal-safe calls.
+pub fn new_session() -> std::io::Result<()> {
+    // SAFETY: plain syscall, no memory involved.
+    if unsafe { libc::setsid() } < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// Non-blocking `flock(op)` on `file`: `WouldBlock` when another holder has the lock.
+pub fn try_flock(file: &std::fs::File, op: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the fd is valid for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Terminates a whole process group: SIGTERM, then SIGKILL after `TERM_GRACE`.
 /// `pgid` must be a group the caller created (a child spawned with `process_group(0)` or `setsid`).
 pub async fn terminate_group(pgid: i32) {
