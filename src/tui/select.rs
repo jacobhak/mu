@@ -797,7 +797,10 @@ fn preview_box(text: &str, hint: Option<PreviewKind>, width: usize, cap: usize, 
         })
         .collect();
     if keep < src.len() {
-        body.push(line::styled(crate::text::truncate_text(&format!("… {} more lines", src.len() - keep), inner), |_| dim()));
+        body.push(line::styled(
+            crate::text::truncate_text(&format!("… {} more lines", src.len() - keep), inner),
+            |_| dim(),
+        ));
     }
     let title = format!(" {label} ");
     let top = if title.len() + 3 <= width {

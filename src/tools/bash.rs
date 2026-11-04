@@ -1,4 +1,5 @@
 use super::output::{BashMeta, ToolMeta, ToolOutput};
+use super::subagent::BackgroundResult;
 use super::{ToolCtx, Tools};
 use crate::events::AgentEvent;
 use crate::jobs::JobsHandle;
@@ -539,14 +540,6 @@ fn finish(
         spill_note: c.spill_note,
     }));
     out
-}
-
-/// A background command's finished result: the text the model sees, and how it ended.
-pub struct BackgroundResult {
-    pub ok: bool,
-    pub text: String,
-    /// "exit 3", "timed out", "cancelled", …
-    pub note: String,
 }
 
 /// Quiet time after the command exits before its pipes are given up: a background descendant

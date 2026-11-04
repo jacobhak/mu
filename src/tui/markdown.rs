@@ -8,8 +8,8 @@ use unicode_width::UnicodeWidthChar;
 
 use super::highlight;
 use super::line::{Line, bold, line_text, span, wrap};
-use crate::text::sanitize;
 use super::theme::{self, Role};
+use crate::text::sanitize;
 
 /// Role `r` as a foreground style.
 fn key(r: Role) -> ContentStyle {

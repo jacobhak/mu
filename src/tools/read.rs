@@ -1,5 +1,5 @@
-use super::output::{FileMeta, ToolMeta, ToolOutput};
 use super::Tools;
+use super::output::{FileMeta, ToolMeta, ToolOutput};
 use pi_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
 use std::fmt::Write;

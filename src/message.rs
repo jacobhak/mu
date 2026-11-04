@@ -1,6 +1,6 @@
 use crate::ask_nudge;
 use crate::events::AgentEvent;
-use crate::tools::ToolOutput;
+use crate::tools::output::ToolOutput;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 

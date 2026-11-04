@@ -44,8 +44,8 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
 fn nested_agents_md(cwd: &Path) -> Vec<String> {
     use pi_walker::{FileType, Fs, walk};
     use std::time::Duration;
-    let opts = walk::Options { max_depth: Some(4), skip_node_modules: true, ..crate::tools::grep::walk_options() };
-    let dirs = crate::tools::grep::block_on_walk(async {
+    let opts = walk::Options { max_depth: Some(4), skip_node_modules: true, ..crate::walk::walk_options() };
+    let dirs = crate::walk::block_on_walk(async {
         let fs = Fs::native();
         let collect = walk::collect(&fs, cwd, &opts, false, |_, e| {
             if e.file_type == FileType::Dir { walk::Action::Continue } else { walk::Action::Skip }
@@ -463,6 +463,8 @@ pub struct PromptInput<'a> {
     pub plugin_ctx: &'a std::collections::BTreeMap<String, String>,
     /// The MCP servers' instructions block (`PluginHost::mcp_instructions`).
     pub mcp_instructions: Option<&'a str>,
+    /// The edit tool takes `[path#TAG]` hashline edits (`edit` in hashline mode) rather than `*** Find` blocks.
+    pub hashline: bool,
 }
 
 pub fn system_prompt(i: &PromptInput) -> String {
@@ -470,7 +472,7 @@ pub fn system_prompt(i: &PromptInput) -> String {
     static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let os = OS.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
     let date = jiff::Zoned::now().strftime("%Y-%m-%d");
-    let edit_rule = if crate::tools::edit::is_hashline() {
+    let edit_rule = if i.hashline {
         "- Surgical edits: `edit`, with the `[path#TAG]` header from your latest `read`, `write` or `edit` of that file. Every edit changes the tag and shifts line numbers: put all changes to one file in a single call, or re-read the affected window before editing it again.\n"
     } else {
         "- Surgical edits: `edit`. Copy `*** Find` text verbatim from a recent `read`, and give each `*** Find` exactly one of `*** Replace`, `*** Insert Before` or `*** Insert After`.\n"
@@ -620,6 +622,7 @@ mod tests {
         assert_eq!(plain.expand("extra"), "Do the thing\n\nextra");
         let sp = system_prompt(&PromptInput {
             model: "m",
+            hashline: true,
             cwd: &proj,
             ctx: &ctx,
             plan: None,
@@ -638,6 +641,7 @@ mod tests {
     fn system_prompt_forbids_shell_file_edits_and_tracks_edit_mode() {
         let sp = system_prompt(&PromptInput {
             model: "m",
+            hashline: true,
             cwd: Path::new("/tmp"),
             ctx: &Context::default(),
             plan: None,
@@ -657,6 +661,7 @@ mod tests {
         let plugins = std::collections::BTreeMap::new();
         let input = |ask| PromptInput {
             model: "m",
+            hashline: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -746,6 +751,7 @@ mod tests {
         let block = "\n<agent name=\"x\">\nDo it.\n</agent>\n";
         let sp = system_prompt(&PromptInput {
             model: "m",
+            hashline: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -799,6 +805,7 @@ mod tests {
         assert_eq!(ctx.nested, ["a/AGENTS.md", "a/b/c/d/AGENTS.md"]);
         let sp = system_prompt(&PromptInput {
             model: "m",
+            hashline: true,
             cwd: &proj,
             ctx: &ctx,
             plan: None,

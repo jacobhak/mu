@@ -1,7 +1,7 @@
+use crate::text::{grapheme_width, sanitize};
 use crossterm::style::{Attribute, Color, ContentStyle, StyledContent};
 use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
-use crate::text::{grapheme_width, sanitize};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Span {

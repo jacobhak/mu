@@ -1,7 +1,8 @@
 pub mod manifest;
 pub mod mcp;
 
-use crate::provider::{Providers, ToolDef};
+use crate::provider::Providers;
+use crate::tools::output::{ToolDef, ToolOutput};
 use manifest::{Lifetime, Manifest};
 use mu_common::rpc::{Frame, Framed, Line, Pending, Request, Response};
 use serde_json::{Value, json};
@@ -40,14 +41,6 @@ pub fn exit_on_signals() {
         kill_all_groups();
         std::process::exit(128 + n);
     });
-}
-
-pub struct ToolResult {
-    pub content: String,
-    pub is_error: bool,
-    pub display: Option<String>,
-    pub images: Vec<crate::message::Image>,
-    pub details: Option<Value>,
 }
 
 #[derive(Clone, Default)]
@@ -132,6 +125,8 @@ pub struct PluginHost {
     seen: RefCell<std::collections::HashSet<String>>,
     /// The lifetime of an MCP server added after startup.
     mcp_lifetime: Lifetime,
+    /// Built-in tool names: a plugin or MCP tool may not take one.
+    reserved: fn(&str) -> bool,
 }
 
 fn resolve_command(m: &Manifest) -> std::path::PathBuf {
@@ -512,11 +507,21 @@ impl PluginHost {
         notices: mpsc::UnboundedSender<String>,
         init: InitParams,
     ) -> Rc<Self> {
-        Self::new_with_mcp(manifests, Vec::new(), Lifetime::Session, mcp::cache::dir(), warnings, notices, init)
+        Self::new_with_mcp(
+            manifests,
+            Vec::new(),
+            Lifetime::Session,
+            mcp::cache::dir(),
+            warnings,
+            notices,
+            init,
+            crate::tools::is_builtin,
+        )
     }
 
     /// Native manifests, then MCP servers (each a plugin that only provides tools, advertised
     /// from the cache in `cache_dir` when it has them).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_mcp(
         manifests: Vec<Manifest>,
         servers: Vec<mcp::config::McpServer>,
@@ -525,6 +530,7 @@ impl PluginHost {
         warnings: Vec<String>,
         notices: mpsc::UnboundedSender<String>,
         init: InitParams,
+        reserved: fn(&str) -> bool,
     ) -> Rc<Self> {
         let mut warnings = warnings;
         let mut seen = std::collections::HashSet::new();
@@ -532,7 +538,7 @@ impl PluginHost {
             .into_iter()
             .map(|mut m| {
                 m.tools.retain(|t| {
-                    let clash = crate::tools::is_builtin(&t.name) || !seen.insert(t.name.clone());
+                    let clash = reserved(&t.name) || !seen.insert(t.name.clone());
                     if clash {
                         warnings.push(format!("plugin {}: tool `{}` skipped (name collision)", m.name, t.name));
                     }
@@ -548,7 +554,7 @@ impl PluginHost {
             })
             .collect();
         for s in servers {
-            slots.push(Self::mcp_slot(s, mcp_lifetime, &init.cwd, &cache_dir, &mut seen, &mut warnings));
+            slots.push(Self::mcp_slot(s, mcp_lifetime, &init.cwd, &cache_dir, &mut seen, &mut warnings, reserved));
         }
         let gateway = slots.iter().find(|s| s.manifest.provider.is_some()).map(Rc::downgrade);
         let shared = Rc::new(Shared {
@@ -559,7 +565,7 @@ impl PluginHost {
             cache_dir,
             interactive: Cell::new(false),
         });
-        Rc::new(Self { slots: RefCell::new(slots), shared, warnings, seen: RefCell::new(seen), mcp_lifetime })
+        Rc::new(Self { slots: RefCell::new(slots), shared, warnings, seen: RefCell::new(seen), mcp_lifetime, reserved })
     }
 
     /// A slot for an MCP server, advertising its tools from the cache when there is one.
@@ -570,6 +576,7 @@ impl PluginHost {
         cache_dir: &std::path::Path,
         seen: &mut std::collections::HashSet<String>,
         warnings: &mut Vec<String>,
+        reserved: fn(&str) -> bool,
     ) -> Rc<Slot> {
         let m = Manifest {
             name: format!("mcp:{}", s.name),
@@ -581,7 +588,7 @@ impl PluginHost {
             dir: std::path::PathBuf::from(cwd),
         };
         let ms = mcp::McpSlot::new(s, cwd);
-        warnings.extend(ms.load_cache(cache_dir, seen));
+        warnings.extend(ms.load_cache(cache_dir, seen, reserved));
         Rc::new(Slot {
             skip_hooks_until: Cell::new(None),
             manifest: m,
@@ -720,6 +727,7 @@ impl PluginHost {
                         &self.shared.cache_dir,
                         &mut seen,
                         &mut warnings,
+                        self.reserved,
                     );
                     slots.push(s);
                     continue;
@@ -737,8 +745,8 @@ impl PluginHost {
                 m.needs_login.set(false);
                 m.stale.set(false);
                 *m.instructions.borrow_mut() = None;
-                warnings.extend(m.set_tools(&[], &mut seen));
-                warnings.extend(m.load_cache(&self.shared.cache_dir, &mut seen));
+                warnings.extend(m.set_tools(&[], &mut seen, self.reserved));
+                warnings.extend(m.load_cache(&self.shared.cache_dir, &mut seen, self.reserved));
                 stop.push(slot.clone());
             }
         }
@@ -876,7 +884,7 @@ impl PluginHost {
             }
         };
         let instructions = if server.instructions { proc.instructions.borrow().clone() } else { None };
-        let warnings = m.set_tools(&tools, &mut self.seen.borrow_mut());
+        let warnings = m.set_tools(&tools, &mut self.seen.borrow_mut(), self.reserved);
         for w in warnings {
             let _ = self.shared.notices.send(w);
         }
@@ -1110,9 +1118,8 @@ impl PluginHost {
         proc.write_line(&serde_json::to_string(&n).unwrap()).await
     }
 
-    pub async fn call_tool(&self, name: &str, args: &Value, cancel: &CancellationToken) -> ToolResult {
-        let fail =
-            |e: String| ToolResult { content: e, is_error: true, display: None, images: Vec::new(), details: None };
+    pub async fn call_tool(&self, name: &str, args: &Value, cancel: &CancellationToken) -> ToolOutput {
+        let fail = |e: String| ToolOutput::err(e);
         let Some(slot) = self.slot_for_tool(name) else { return fail(format!("Unknown tool: {name}")) };
         let proc = match self.ensure(&slot).await {
             Ok(p) => p,
@@ -1142,20 +1149,22 @@ impl PluginHost {
         match (res, mcp_call) {
             (Ok(v), Some((server, remote, _, _))) => {
                 let c = mcp::convert::convert_result(&server, &remote, &v);
-                ToolResult {
-                    content: c.text,
+                ToolOutput {
+                    text: c.text,
                     is_error: c.is_error,
                     display: None,
-                    images: c.images,
                     details: Some(c.details),
+                    meta: None,
+                    images: c.images,
                 }
             }
-            (Ok(v), None) => ToolResult {
-                content: v["content"].as_str().unwrap_or_default().into(),
+            (Ok(v), None) => ToolOutput {
+                text: v["content"].as_str().unwrap_or_default().into(),
                 is_error: v["isError"].as_bool().unwrap_or(false),
                 display: v["display"].as_str().map(String::from),
-                images: Vec::new(),
                 details: None,
+                meta: None,
+                images: Vec::new(),
             },
             (Err(e), call) => {
                 let msg = match &slot.mcp {
@@ -1314,7 +1323,7 @@ done
                 c.cancel();
             });
             let r = h.call_tool("slow", &json!({}), &cancel).await;
-            assert!(r.is_error && r.content.contains("aborted"), "{}", r.content);
+            assert!(r.is_error && r.text.contains("aborted"), "{}", r.text);
             let proc = h.slot(0).proc.borrow().clone().unwrap();
             assert_eq!(proc.inflight.get(), 0);
             assert!(proc.pending.is_empty());
@@ -1328,7 +1337,7 @@ done
         run(async {
             let (h, dir) = host("exit 3", "session");
             let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
-            assert!(r.is_error, "{}", r.content);
+            assert!(r.is_error, "{}", r.text);
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(h.slot(0).proc.borrow().is_none(), "slot cleared so the next call restarts it");
             let _ = std::fs::remove_dir_all(dir);
@@ -1341,11 +1350,11 @@ done
             let (h, dir) =
                 host("printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":\"ok\"}}\\n' \"$id\"", "idle:1s");
             let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
-            assert_eq!(r.content, "ok");
+            assert_eq!(r.text, "ok");
             let first = h.slot(0).proc.borrow().clone().unwrap().pid;
             tokio::time::sleep(Duration::from_millis(1600)).await;
             let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
-            assert_eq!(r.content, "ok", "{}", r.content);
+            assert_eq!(r.text, "ok", "{}", r.text);
             let second = h.slot(0).proc.borrow().clone().unwrap().pid;
             assert_ne!(first, second);
             h.shutdown_all().await;
@@ -1415,6 +1424,7 @@ done
                     vec![],
                     ntx,
                     init,
+                    crate::tools::is_builtin,
                 ),
                 nrx,
             )
@@ -1470,11 +1480,11 @@ done
             h.list_missing().await;
             let c = CancellationToken::new();
             let r = h.call_tool("mcp__srv_echo", &json!({"t": "", "extra": {}}), &c).await;
-            assert_eq!((r.content.as_str(), r.is_error), ("hi", false));
+            assert_eq!((r.text.as_str(), r.is_error), ("hi", false));
             assert_eq!(r.details.unwrap(), json!({"serverName":"srv","mcpToolName":"echo","isError":false}));
             assert!(fx.log().contains(r#""arguments":{}"#), "empty optional values are dropped: {}", fx.log());
             let r = h.call_tool("mcp__srv_other", &json!({}), &c).await;
-            assert_eq!((r.content.as_str(), r.is_error), ("Error: boom", true));
+            assert_eq!((r.text.as_str(), r.is_error), ("Error: boom", true));
             // `pic` is not in the listing, so only the ones listed can be called.
             assert!(h.call_tool("mcp__srv_pic", &json!({}), &c).await.is_error);
             h.shutdown_all().await;
@@ -1499,9 +1509,9 @@ done
                     input_schema: json!({}),
                 })
                 .collect();
-            m.set_tools(&tools, &mut taken);
+            m.set_tools(&tools, &mut taken, crate::tools::is_builtin);
             let r = h.call_tool("mcp__srv_pinger", &json!({}), &CancellationToken::new()).await;
-            assert_eq!(r.content, "pong", "{}", r.content);
+            assert_eq!(r.text, "pong", "{}", r.text);
             let log = fx.log();
             assert!(log.contains(r#""id":98,"result":{}"#), "ping answered: {log}");
             assert!(log.contains(r#""id":99,"result":{"roots":[{"uri":"file://"#), "roots answered: {log}");
@@ -1526,9 +1536,9 @@ done
                 description: String::new(),
                 input_schema: json!({}),
             }];
-            m.set_tools(&t, &mut taken);
+            m.set_tools(&t, &mut taken, crate::tools::is_builtin);
             let r = h.call_tool("mcp__srv_tokener", &json!({}), &CancellationToken::new()).await;
-            assert_eq!(r.content, "done", "{}", r.content);
+            assert_eq!(r.text, "done", "{}", r.text);
             let log = fx.log();
             assert!(log.contains(r#""id":97,"error":{"code":-32601"#), "method not found for the server: {log}");
             assert!(h.needs_login().is_empty(), "no token was fetched, so no login state changed");
@@ -1558,6 +1568,7 @@ done
                 vec![],
                 ntx,
                 init,
+                crate::tools::is_builtin,
             );
             let cancel = CancellationToken::new();
             let c = cancel.clone();
@@ -1613,7 +1624,7 @@ done
             h.list_missing().await;
             assert_eq!(h.tool_defs().len(), 2, "{}", fx.log());
             let r = h.call_tool("mcp__srv_echo", &json!({}), &CancellationToken::new()).await;
-            assert_eq!(r.content, "hi");
+            assert_eq!(r.text, "hi");
             assert!(fx.log().contains(r#""id":"1""#), "{}", fx.log());
             h.shutdown_all().await;
         });
@@ -1629,7 +1640,7 @@ done
             let mut taken = std::collections::HashSet::new();
             let hang =
                 [mcp::cache::RemoteTool { name: "hang".into(), description: String::new(), input_schema: json!({}) }];
-            slot.mcp.as_ref().unwrap().set_tools(&hang, &mut taken);
+            slot.mcp.as_ref().unwrap().set_tools(&hang, &mut taken, crate::tools::is_builtin);
             let cancel = CancellationToken::new();
             let c = cancel.clone();
             tokio::task::spawn_local(async move {
@@ -1637,7 +1648,7 @@ done
                 c.cancel();
             });
             let r = h.call_tool("mcp__srv_hang", &json!({}), &cancel).await;
-            assert!(r.is_error && r.content.contains("aborted"), "{}", r.content);
+            assert!(r.is_error && r.text.contains("aborted"), "{}", r.text);
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(fx.log().contains(r#""method":"notifications/cancelled""#), "{}", fx.log());
             let pid = slot.proc.borrow().clone().unwrap().pid as i32;

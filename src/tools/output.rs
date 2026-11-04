@@ -9,7 +9,6 @@ pub struct ToolDef {
     pub schema: Value,
 }
 
-
 /// Facts about a tool result that the UI needs, recorded by the tool itself so the UI never has
 /// to recover them by parsing the text the model sees. The model gets the same text as before.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

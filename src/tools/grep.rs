@@ -1,5 +1,6 @@
-use super::output::ToolOutput;
 use super::Tools;
+use super::output::ToolOutput;
+use crate::walk::{block_on_walk, walk_options};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::UTF8};
 use pi_walker::{Detail, FileType, Fs, walk};
@@ -16,33 +17,6 @@ pub struct Args {
 const PER_FILE: usize = 20;
 const TOTAL: usize = 200;
 const MAX_COL: usize = 512;
-
-pub fn walk_options() -> walk::Options {
-    walk::Options { hidden: false, gitignore: true, skip_git: true, ..Default::default() }
-}
-
-/// pi-walker spawns its workers on the ambient runtime, and mu's is single-threaded. Each walk gets a
-/// multi-threaded runtime of its own, entered from a scoped thread so this works inside or outside a runtime,
-/// and gone when the walk ends: an idle mu keeps no worker threads (one per CPU).
-pub fn block_on_walk<F: Future + Send>(f: F) -> F::Output
-where
-    F::Output: Send,
-{
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .thread_name("mu-walk")
-                .enable_all()
-                .build()
-                .expect("walk runtime");
-            let out = rt.block_on(f);
-            rt.shutdown_background();
-            out
-        })
-        .join()
-        .unwrap_or_else(|e| std::panic::resume_unwind(e))
-    })
-}
 
 impl Tools {
     /// The filesystem walk and search run on a blocking thread so the event loop keeps turning.

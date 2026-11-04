@@ -287,7 +287,7 @@ fn clamp(mut r: Report) -> Option<Report> {
 }
 
 /// The lead's report: its schema-validated `data`. A run without `data` has no report.
-pub fn report_of(out: &crate::tools::task::Outcome) -> Option<Report> {
+pub fn report_of(out: &crate::tools::subagent::Outcome) -> Option<Report> {
     clamp(serde_json::from_value(out.data.clone()?).ok()?)
 }
 
@@ -549,7 +549,7 @@ async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Opt
     let payload =
         serde_json::json!({"task": prompt, "agent": crate::context::REVIEW_LEAD, "outputSchema": report_schema()});
     let cancel = tokio_util::sync::CancellationToken::new();
-    let out = crate::tools::task::run_child(&exe, &root, &payload, &cancel, |name, summary| {
+    let out = crate::tools::subagent::run_child(&exe, &root, &payload, &cancel, |name, summary| {
         eprintln!("  {name} {summary}");
     })
     .await;
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn report_schema_accepts_a_report_and_report_of_prefers_data() {
-        use crate::tools::task::Outcome;
+        use crate::tools::subagent::Outcome;
         let data = serde_json::json!({"verdict":"fail","summary":"s","findings":[{"title":"t","body":"b","file":"a.rs","priority":1,"confidence":0.9}]});
         assert!(crate::schema::check_schema(&report_schema()).is_ok());
         assert!(crate::schema::validate(&report_schema(), &data).is_ok());
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn report_schema_caps_line_end_line_and_dropped() {
-        use crate::tools::task::Outcome;
+        use crate::tools::subagent::Outcome;
         use serde_json::json;
         let base = json!({"verdict":"fail","summary":"s","dropped":3,"findings":[{"title":"t","body":"b","file":"a.rs","line":12,"end_line":14,"priority":1,"confidence":0.9}]});
         assert!(crate::schema::validate(&report_schema(), &base).is_ok());
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn report_of_clamps() {
-        use crate::tools::task::Outcome;
+        use crate::tools::subagent::Outcome;
         let d = serde_json::json!({"verdict":"fail","findings":[{"title":"a","priority":7,"confidence":3.0},{}]});
         let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(d) }).unwrap();
         assert_eq!((r.findings[0].priority, r.findings[0].confidence), (3, 1.0));

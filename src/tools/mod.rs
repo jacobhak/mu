@@ -1,12 +1,13 @@
-pub mod output;
 mod ask;
 pub mod bash;
 mod diff;
 pub mod edit;
 mod glob;
 pub mod grep;
+pub mod output;
 mod plan;
 mod read;
+pub mod subagent;
 pub mod task;
 pub mod todo;
 pub mod uri;
@@ -17,15 +18,14 @@ mod yield_;
 use crate::events::EventTx;
 use crate::jobs::JobsHandle;
 use crate::plugin::PluginHost;
-use output::{ToolDef, ToolOutput};
 use crate::text::truncate_text as trunc;
+use output::{ToolDef, ToolOutput};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tokio_util::sync::CancellationToken;
-
 
 pub struct ToolCtx {
     pub events: EventTx,
@@ -135,13 +135,11 @@ impl Tools {
             return (b.call)(self, args, ctx).await;
         }
         if self.plugins.has_tool(name) {
-            let r = self.plugins.call_tool(name, args, &ctx.cancel).await;
+            let mut out = self.plugins.call_tool(name, args, &ctx.cancel).await;
             // Only MCP results are capped here: native plugins size their own output (web caps fetches itself).
-            let text = if self.plugins.is_mcp_tool(name) { self.cap_text(r.content) } else { r.content };
-            let mut out = if r.is_error { ToolOutput::err(text) } else { ToolOutput::ok(text) };
-            out.display = r.display;
-            out.details = r.details;
-            out.images = r.images;
+            if self.plugins.is_mcp_tool(name) {
+                out.text = self.cap_text(std::mem::take(&mut out.text));
+            }
             return out;
         }
         ToolOutput::err(format!("Unknown tool: {name}"))

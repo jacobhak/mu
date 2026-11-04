@@ -1,6 +1,6 @@
-use super::uri::Scheme;
-use super::output::{FileMeta, ToolMeta, ToolOutput};
 use super::Tools;
+use super::output::{FileMeta, ToolMeta, ToolOutput};
+use super::uri::Scheme;
 use async_trait::async_trait;
 use pi_edit::{
     ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, UrlResolution, WriteRequest,

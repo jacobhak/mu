@@ -36,12 +36,13 @@ mod secrets;
 mod session;
 mod session_tail;
 mod take;
-mod text;
 #[cfg(test)]
 mod testutil;
+mod text;
 mod tools;
 mod tui;
 mod update;
+mod walk;
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -225,6 +226,7 @@ fn setup(cwd: &std::path::Path) -> Setup {
         warnings,
         notice_tx.clone(),
         plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
+        tools::is_builtin,
     );
     let providers = Rc::new(provider::Providers::new(cfgs.clone(), gateway::GatewaySource::new(host.clone())));
     host.set_providers(&providers);

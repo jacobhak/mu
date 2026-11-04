@@ -13,9 +13,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
-use crate::tools::bash::BackgroundResult;
-use crate::tools::task::{MAX_TASKS, run_child_observed};
 use crate::text::truncate_text;
+use crate::tools::subagent::{BackgroundResult, run_child_observed};
+use crate::tools::task::MAX_TASKS;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// Newest bytes of a running bash job's output kept for the jobs panel.

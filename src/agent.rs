@@ -222,7 +222,6 @@ async fn drive<F: std::future::Future<Output = ()>>(
     }
 }
 
-
 impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let tools = Tools::new(i.cwd.clone(), i.plugins.clone());
@@ -385,6 +384,7 @@ impl Agent {
             agent_prompt: self.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),
+            hashline: crate::tools::edit::is_hashline(),
         })
     }
 
@@ -1163,7 +1163,7 @@ impl Agent {
         });
         let out = {
             let (events, id) = (self.events.clone(), id.clone());
-            crate::tools::task::run_child(&exe, &root, &payload, cancel, move |name, summary| {
+            crate::tools::subagent::run_child(&exe, &root, &payload, cancel, move |name, summary| {
                 let _ = events.send(AgentEvent::ToolOutput { id: id.clone(), chunk: format!("{name} {summary}\n") });
             })
             .await

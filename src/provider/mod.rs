@@ -9,8 +9,8 @@ pub mod retry;
 pub mod sse;
 
 use crate::message::Message;
-use crate::tools::output::ToolDef;
 use crate::models::{self, GatewayModel, ModelSpec, Thinking};
+use crate::tools::output::ToolDef;
 use serde_json::{Value, json};
 use std::io::Write;
 /// A model a native provider offers, for pickers.

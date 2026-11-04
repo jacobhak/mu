@@ -1,11 +1,11 @@
 //! Transcript blocks: user prompts, tool headers and framed tool cards, thinking markers, subagent rows.
 use super::diffview;
-use crate::text::truncate_text as trunc;
 use super::line::{self, Line, fill, span, truncate, wrap};
 use super::markdown;
 use super::theme::{self, Role};
 use crate::config::Cards;
 use crate::events::{SubagentState, SubagentStatus};
+use crate::text::truncate_text as trunc;
 use crate::tools::output::{BashMeta, FileMeta, ToolMeta, ToolOutput};
 use crossterm::style::{Attribute, Color, ContentStyle};
 use serde_json::Value;

@@ -60,17 +60,22 @@ impl McpSlot {
     }
 
     /// Takes the cached tool list for the current config, if there is one.
-    pub fn load_cache(&self, dir: &Path, taken: &mut HashSet<String>) -> Vec<String> {
+    pub fn load_cache(&self, dir: &Path, taken: &mut HashSet<String>, reserved: fn(&str) -> bool) -> Vec<String> {
         let Some(c) = cache::load(dir, &self.hash.borrow()) else { return Vec::new() };
         *self.instructions.borrow_mut() = c.instructions;
-        let w = self.set_tools(&c.tools, taken);
+        let w = self.set_tools(&c.tools, taken, reserved);
         self.listed.set(true);
         w
     }
 
     /// Replaces the advertised tools. `taken` holds every advertised name in the host; names that
     /// clash with another tool are skipped with a warning.
-    pub fn set_tools(&self, remote: &[RemoteTool], taken: &mut HashSet<String>) -> Vec<String> {
+    pub fn set_tools(
+        &self,
+        remote: &[RemoteTool],
+        taken: &mut HashSet<String>,
+        reserved: fn(&str) -> bool,
+    ) -> Vec<String> {
         for t in self.tools.borrow().iter() {
             taken.remove(&t.spec.name);
         }
@@ -79,7 +84,7 @@ impl McpSlot {
         let mut warnings = Vec::new();
         for r in remote {
             let name = convert::tool_name(&server, &r.name);
-            if crate::tools::is_builtin(&name) || !taken.insert(name.clone()) {
+            if reserved(&name) || !taken.insert(name.clone()) {
                 warnings.push(format!("mcp {server}: tool `{}` skipped (name collision)", r.name));
                 continue;
             }
