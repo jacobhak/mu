@@ -70,7 +70,7 @@ pub fn enqueue(id: &str, from: &str, text: &str) -> std::io::Result<PathBuf> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%S%.9fZ").to_string();
     let name = format!("{ts}-{}-{:06}.json", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
-    let body = json!({"from": from, "text": text, "at": session::iso_ms()}).to_string();
+    let body = json!({"from": from, "text": text, "at": mu_common::time::iso_ms()}).to_string();
     let d = ensure_dir(id)?;
     let path = d.join(name);
     match mu_common::fs::write_atomic(&path, body.as_bytes()) {

@@ -1,21 +1,10 @@
 //! Branch and working-tree counts from one `git status --porcelain=v2 --branch`.
 //! Runs off the draw path (the agent calls it after each turn).
+use crate::events::GitInfo;
 use std::path::Path;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GitInfo {
-    pub branch: Option<String>,
-    /// Entries with a staged (index) change.
-    pub staged: u32,
-    /// Entries with an unstaged (worktree) change, unmerged entries included.
-    pub dirty: u32,
-    pub untracked: u32,
-    pub ahead: u32,
-    pub behind: u32,
-}
 
 /// `None` when `cwd` is not a repository, git is missing, or it does not finish in time.
 pub async fn git_status(cwd: &Path) -> Option<GitInfo> {

@@ -443,6 +443,7 @@ fn run() -> Result<i32> {
         thinking,
         events: ev_tx,
         inbox: inbox.clone(),
+        deliver: deliver::detached_starter(),
     });
     agent.exit_on_resume_failure = cli.print.is_some();
     agent.pin_model = cli.model.is_some() && resume.is_some();

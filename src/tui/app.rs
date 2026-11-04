@@ -873,7 +873,7 @@ impl App {
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths });
     }
 
-    fn show_plans(&mut self, list: Vec<crate::plans::PlanMeta>) {
+    fn show_plans(&mut self, list: Vec<crate::events::PlanMeta>) {
         let deliver = std::mem::take(&mut self.pick_deliver);
         if list.is_empty() {
             self.notice("no parked plans for this repository");

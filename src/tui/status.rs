@@ -3,9 +3,7 @@
 use super::line::{Line, line_width, span, truncate};
 use super::theme::{self, Role};
 use crate::config::OmpStatusLine;
-use crate::events::{StatusSnapshot, SubagentState, SubagentStatus};
-use crate::gitinfo::GitInfo;
-use crate::quota::ProviderUsage;
+use crate::events::{GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus};
 use crossterm::style::ContentStyle;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -510,7 +508,7 @@ fn clamp_left(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::QuotaWindow;
+    use crate::events::QuotaWindow;
     use crate::tui::line::line_text;
     use std::collections::BTreeMap;
 
