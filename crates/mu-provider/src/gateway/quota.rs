@@ -215,7 +215,7 @@ impl QuotaTracker {
         });
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_usage(&mut self, usage: ProviderUsage) {
         self.usage = Some(usage);
     }

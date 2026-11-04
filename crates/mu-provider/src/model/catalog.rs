@@ -109,7 +109,7 @@ impl Row {
 
 fn all() -> &'static HashMap<String, Vec<Row>> {
     static ALL: OnceLock<HashMap<String, Vec<Row>>> = OnceLock::new();
-    ALL.get_or_init(|| serde_json::from_str(SNAPSHOT).expect("src/provider/catalog.json is valid"))
+    ALL.get_or_init(|| serde_json::from_str(SNAPSHOT).expect("crates/mu-provider/src/model/catalog.json is valid"))
 }
 
 /// The provider's rows, sorted by id; empty for a provider the snapshot does not cover.

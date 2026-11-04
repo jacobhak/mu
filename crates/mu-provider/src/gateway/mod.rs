@@ -1,3 +1,5 @@
+pub mod quota;
+
 use anyhow::{Result, anyhow};
 use mu_common::paths;
 use serde_json::Value;

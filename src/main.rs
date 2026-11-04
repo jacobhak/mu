@@ -1,27 +1,20 @@
 mod acp;
 mod agent;
 mod auth_cmd;
-mod auth_store;
 mod compaction;
 mod context;
 mod control;
-mod cost;
 mod deliver;
-mod gateway;
 mod headless;
 mod inbox;
 mod jobs;
-mod net;
 mod notify;
 mod plans;
 mod plans_cli;
 mod plugin;
 mod policy;
 mod predict_setup;
-mod pricing;
 mod prompt;
-mod provider;
-mod quota;
 mod review;
 mod review_cli;
 mod session;
@@ -153,7 +146,7 @@ struct Setup {
     cfgs: Rc<config::Configs>,
     ctx: Rc<context::Context>,
     host: Rc<plugin::PluginHost>,
-    providers: Rc<provider::Providers>,
+    providers: Rc<mu_provider::provider::Providers>,
     notice_tx: tokio::sync::mpsc::UnboundedSender<String>,
     notice_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
@@ -217,8 +210,10 @@ fn setup(cwd: &std::path::Path) -> Setup {
         plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
         tools::is_builtin,
     );
-    let providers =
-        Rc::new(provider::Providers::new(cfgs.clone(), provider::endpoint::GatewaySource::new(host.gateway_start())));
+    let providers = Rc::new(mu_provider::provider::Providers::new(
+        cfgs.clone(),
+        mu_provider::provider::endpoint::GatewaySource::new(host.gateway_start()),
+    ));
     host.set_providers(&providers);
     Setup { cfgs, ctx, host, providers, notice_tx, notice_rx }
 }
@@ -226,7 +221,7 @@ fn setup(cwd: &std::path::Path) -> Setup {
 /// Model and thinking level for a new agent: `sel` (command line or headless role) beats the `default` role.
 fn pick_model(
     cfgs: &config::Configs,
-    providers: &provider::Providers,
+    providers: &mu_provider::provider::Providers,
     sel: Option<String>,
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
@@ -238,7 +233,7 @@ fn pick_model(
 
 /// The model used when nothing names one: omp's default while omp can run, else the first native
 /// provider with a key, else omp's default (which then says what is missing).
-fn default_model(providers: &provider::Providers) -> String {
+fn default_model(providers: &mu_provider::provider::Providers) -> String {
     default_model_for(omp_installed(), |p| providers.is_native(p))
 }
 
@@ -308,8 +303,8 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    provider::install_crypto();
-    secrets::set_stored_refresh(auth_store::sync_redaction);
+    mu_provider::provider::install_crypto();
+    secrets::set_stored_refresh(mu_provider::auth::store::sync_redaction);
     let cli = Cli::parse();
     if let Some(p) = &cli.profile {
         // Single-threaded here: no runtime or plugin has started yet.

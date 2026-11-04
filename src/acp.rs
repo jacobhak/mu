@@ -3,11 +3,12 @@
 
 use crate::plugin::PluginHost;
 use crate::tools::summary;
-use crate::{Setup, agent, pick_model, pricing, session, setup};
+use crate::{Setup, agent, pick_model, session, setup};
 use anyhow::{Result, anyhow};
 use mu_base::events::{self, AgentEvent, Command, SharedInbox};
 use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
+use mu_provider::model::pricing;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
@@ -109,7 +110,7 @@ struct Session {
     title: Option<String>,
     /// Distinguishes reopened sessions that share an id, so a closed agent's late events are dropped.
     epoch: u64,
-    providers: Rc<crate::provider::Providers>,
+    providers: Rc<mu_provider::provider::Providers>,
 }
 
 impl Session {
@@ -160,7 +161,7 @@ struct Opened {
     session: Session,
     ev_rx: UnboundedReceiver<AgentEvent>,
     notice_rx: UnboundedReceiver<String>,
-    providers: Rc<crate::provider::Providers>,
+    providers: Rc<mu_provider::provider::Providers>,
 }
 
 async fn serve(model: Option<String>, thinking: Option<Thinking>) {

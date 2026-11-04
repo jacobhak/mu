@@ -1,10 +1,10 @@
 pub mod manifest;
 pub mod mcp;
 
-use crate::provider::Providers;
 use manifest::{Lifetime, Manifest};
 use mu_base::tool::{ToolDef, ToolOutput};
 use mu_common::rpc::{Frame, Framed, Line, Pending, Request, Response};
+use mu_provider::provider::Providers;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::process::Stdio;
@@ -1258,12 +1258,12 @@ impl PluginHost {
     }
 
     /// The gateway endpoint `GatewaySource` resolves: `MU_GATEWAY_URL` if set, else the gateway plugin.
-    pub fn gateway_start(self: &Rc<Self>) -> crate::provider::endpoint::StartFn {
+    pub fn gateway_start(self: &Rc<Self>) -> mu_provider::provider::endpoint::StartFn {
         let host = self.clone();
-        crate::provider::endpoint::start_fn(move || {
+        mu_provider::provider::endpoint::start_fn(move || {
             let host = host.clone();
             async move {
-                match crate::gateway::env_endpoint() {
+                match mu_provider::gateway::env_endpoint() {
                     Some(r) => r.map_err(|e| e.to_string()),
                     None => host.provider_endpoint("gateway").await,
                 }

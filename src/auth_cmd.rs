@@ -1,9 +1,9 @@
-//! `mu auth`: manage provider API keys without the TUI (see `auth_store`).
+//! `mu auth`: manage provider API keys without the TUI (see `mu_provider::auth::store`).
 
-use crate::auth_store::{self, Entry, Origin, Store};
-use crate::provider::native::{self, Check};
 use anyhow::{Result, anyhow, bail};
 use mu_base::models::{self, PROVIDERS, ProviderDef};
+use mu_provider::auth::store::{Entry, Origin, Store};
+use mu_provider::provider::native::{self, Check};
 use std::io::{IsTerminal, Read, Write};
 
 #[derive(clap::Subcommand)]
@@ -97,10 +97,10 @@ pub fn run(cmd: Cmd) -> Result<i32> {
     }
 }
 
-/// `--base-url` as stored: blank means none. Anything else must pass `auth_store::check_base_url`
+/// `--base-url` as stored: blank means none. Anything else must pass `mu_provider::auth::store::check_base_url`
 /// before the key is sent anywhere.
 fn parse_base_url(raw: Option<String>) -> Result<Option<String>> {
-    raw.filter(|u| !u.trim().is_empty()).map(|u| auth_store::check_base_url(&u)).transpose()
+    raw.filter(|u| !u.trim().is_empty()).map(|u| mu_provider::auth::store::check_base_url(&u)).transpose()
 }
 
 fn provider_def(id: &str) -> Result<&'static ProviderDef> {
@@ -115,7 +115,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 async fn check_entry(def: &ProviderDef, entry: &Entry) -> Check {
-    match auth_store::resolve_entry(def.id, entry).await {
+    match mu_provider::auth::store::resolve_entry(def.id, entry).await {
         Ok(r) => native::validate(def, &r.key, entry.base_url.as_deref()).await,
         Err(e) => Check::Rejected(e.to_string()),
     }
@@ -148,12 +148,14 @@ pub fn render(rows: &[(String, Entry)]) -> String {
     rows.iter()
         .filter_map(|(p, e)| {
             let (src, detail) = match e.origin()? {
-                Origin::Stored => ("stored".to_string(), auth_store::mask(e.key.as_deref().unwrap_or(""))),
+                Origin::Stored => {
+                    ("stored".to_string(), mu_provider::auth::store::mask(e.key.as_deref().unwrap_or("")))
+                }
                 Origin::Env(n) => {
                     let set = std::env::var(&n).is_ok_and(|v| !v.trim().is_empty());
                     (format!("${n}"), if set { "set".into() } else { "not set".into() })
                 }
-                Origin::Cmd(c) => (auth_store::cmd_label(&c), String::new()),
+                Origin::Cmd(c) => (mu_provider::auth::store::cmd_label(&c), String::new()),
             };
             let url = e.base_url.as_deref().map(|u| format!("  {u}")).unwrap_or_default();
             Some(format!("{p:<w$}  {src}  {detail}{url}").trim_end().to_string())

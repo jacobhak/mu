@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [workspace]
-members = ["crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-testutil", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
+members = ["crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-provider", "crates/mu-testutil", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
 exclude = ["plugins/mcp-http"]
 resolver = "3"
 
@@ -18,6 +18,7 @@ license = "MIT"
 mu-common = { path = "crates/mu-common" }
 mu-base = { path = "crates/mu-base" }
 mu-testutil = { path = "crates/mu-testutil" }
+mu-provider = { path = "crates/mu-provider" }
 pi-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-diff = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
@@ -82,6 +83,7 @@ lang-markdown = ["highlight", "dep:tree-sitter-md"]
 [dependencies]
 mu-common.workspace = true
 mu-base.workspace = true
+mu-provider.workspace = true
 pi-edit.workspace = true
 pi-shell.workspace = true
 pi-diff.workspace = true
@@ -121,8 +123,6 @@ jiff.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 vt100.workspace = true
-reqwest.workspace = true
-rustls.workspace = true
 unicode-segmentation.workspace = true
 sha2.workspace = true
 
@@ -132,6 +132,7 @@ objc2-app-kit.workspace = true
 
 [dev-dependencies]
 mu-testutil.workspace = true
+mu-provider = { workspace = true, features = ["test-support"] }
 
 [patch.crates-io]
 brush-core   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }

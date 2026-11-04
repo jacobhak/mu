@@ -157,7 +157,7 @@ All omp features outside the core become first-party plugins that load on use.
   `anthropic/*` from a subscription to per-token billing. Three wire formats sit behind one seam
   (`provider::wire`): Anthropic Messages, OpenAI Responses and Chat Completions (Baseten is a preset of the
   generic client). Model limits, prices, reasoning ladders and Chat Completions quirks come from a snapshot of
-  omp's catalog regenerated on every bump (`src/provider/catalog.json`), plus live discovery for Baseten. A
+  omp's catalog regenerated on every bump (`crates/mu-provider/src/model/catalog.json`), plus live discovery for Baseten. A
   session that uses only native providers starts no omp process.
 - **Gateway:** every other model, and every provider without a key in mu, is served through `omp auth-gateway
   serve`, backed by `omp auth-broker serve`. The

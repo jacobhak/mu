@@ -172,7 +172,7 @@ pub async fn refresh(def: &ProviderDef, key: &str, base_url: Option<&str>) -> an
 }
 
 async fn fetch(def: &ProviderDef, key: &str, base_url: Option<&str>) -> anyhow::Result<Vec<Discovered>> {
-    super::install_crypto();
+    crate::provider::install_crypto();
     let base = base_url.unwrap_or(def.base_url);
     // The chat client's connect timeout and no redirects: the key never follows a redirect.
     let client = reqwest::Client::builder()
@@ -180,7 +180,7 @@ async fn fetch(def: &ProviderDef, key: &str, base_url: Option<&str>) -> anyhow::
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
         .build()?;
-    let rb = super::Auth::for_def(def, key)
+    let rb = crate::provider::Auth::for_def(def, key)
         .apply(client.get(format!("{base}/models")))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let resp = rb.send().await.map_err(|e| anyhow::anyhow!("{}", mu_base::secrets::redact_keys(&e.to_string())))?;
@@ -326,7 +326,7 @@ mod refresh_tests {
             assert!(k.compat.unwrap().requires_reasoning_content_for_tool_calls);
             // Priced from the listing.
             let u = mu_base::message::Usage { input: 1_000_000, output: 1_000_000, ..Default::default() };
-            let c = crate::pricing::cost("baseten/acme/Chat-9", &u).unwrap();
+            let c = crate::model::pricing::cost("baseten/acme/Chat-9", &u).unwrap();
             assert!((c.total - 6.0).abs() < 1e-9, "{c:?}");
 
             // The picker lists tools-capable discovered ids that the snapshot lacks.

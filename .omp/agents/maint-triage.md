@@ -18,7 +18,7 @@ It is a user-visible change that reaches mu if, for example:
 - stored data written by one version can no longer be read by the other (a mnemopi storage format change, token store changes), or memory recall results change
 
 These are NOT user-visible, even though they show up in mu:
-- catalog data: models added, removed or re-priced, changed default or role models, new capability axes (a change only if the JSON shape mu parses in `src/pricing.rs` changes)
+- catalog data: models added, removed or re-priced, changed default or role models, new capability axes (a change only if the JSON shape mu parses in `crates/mu-provider/src/model/pricing.rs` changes)
 - API or signature changes, new private fields, new enum variants, new flags mu does not use, internal refactors, docs, TUI and ACP/RPC changes, features mu does not call
 
 Decide from evidence, and do the work: never answer "not confirmed". For every change in a coupled surface, read the diff and grep mu's source (and `plugins/memory`) to establish whether mu reaches that code path and whether a user could see a difference. For mnemopi, read the changed files and decide concretely whether the on-disk schema, file layout or serialized format changed (new or altered tables, columns, keys, versions, migrations), and whether mu's plugin reads or writes it; changes to retrieval or ranking logic that alter recall results are user-visible, pure refactors are not. Use `false` when you have verified there is no user-visible effect. Use `true` only for a concrete visible effect you can name, and name it in the summary. If after real investigation one specific item is still undecidable, say which one and why, and use `true` for that item only.

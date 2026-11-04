@@ -3,10 +3,10 @@
 //! out of the transcript, the prompt history, the session file and predict's corpus.
 
 use super::*;
-use crate::auth_store::Entry;
-use crate::provider::native::{self, Check};
 use crate::tui::overlay::KeyOption;
 use mu_base::models::{self, ProviderDef};
+use mu_provider::auth::store::Entry;
+use mu_provider::provider::native::{self, Check};
 
 /// What the composer holds while a key flow waits for text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,7 +206,7 @@ impl App {
         self.notice(&format!("checking the key with {}…", def.label));
         let tx = self.ui_tx.clone();
         tokio::task::spawn_local(async move {
-            let r = match crate::auth_store::resolve_entry(def.id, &entry).await {
+            let r = match mu_provider::auth::store::resolve_entry(def.id, &entry).await {
                 Ok(resolved) => Ok(native::validate(def, &resolved.key, None).await),
                 Err(e) => Err(e.to_string()),
             };
@@ -337,7 +337,7 @@ mod tests {
         let (ui_tx, _ui_rx) = unbounded_channel();
         let (ntx, _nrx) = unbounded_channel();
         let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
-        let gateway = crate::provider::endpoint::GatewaySource::new(plugins.gateway_start());
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
         App {
             tr: Transcript::new(true, false),
             cmd_tx,

@@ -4042,6 +4042,7 @@ dependencies = [
  "libc",
  "mu-base",
  "mu-common",
+ "mu-provider",
  "mu-testutil",
  "objc2-app-kit",
  "objc2-foundation",
@@ -4050,8 +4051,6 @@ dependencies = [
  "pi-shell",
  "pi-walker",
  "pulldown-cmark",
- "reqwest",
- "rustls",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -4157,6 +4156,27 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "mu-provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "jiff",
+ "libc",
+ "mu-base",
+ "mu-common",
+ "mu-testutil",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

@@ -1,7 +1,6 @@
 pub mod anthropic;
 mod anthropic_native;
-pub mod catalog;
-pub mod discovery;
+use crate::model::{catalog, discovery};
 pub mod endpoint;
 pub mod native;
 pub mod openai_completions;
@@ -254,15 +253,22 @@ const STREAM_IDLE: Duration = Duration::from_secs(90);
 /// Ceiling for one-shot completions (titles, summaries use their own cancel token as well).
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The active profile's key store; tests get one inside their private `MU_HOME`.
-#[cfg(not(test))]
-fn default_store() -> crate::auth_store::Store {
-    crate::auth_store::Store::new()
+/// The active profile's key store; tests and `test-support` builds use one inside `MU_HOME`.
+#[cfg(not(any(test, feature = "test-support")))]
+fn default_store() -> crate::auth::store::Store {
+    crate::auth::store::Store::new()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn default_store() -> crate::auth::store::Store {
+    crate::auth::store::Store::at(mu_testutil::home().join("auth.json"))
 }
 
 #[cfg(test)]
-fn default_store() -> crate::auth_store::Store {
-    crate::auth_store::Store::at(mu_testutil::home().join("auth.json"))
+fn no_gateway() -> endpoint::GatewaySource {
+    endpoint::GatewaySource::new(endpoint::start_fn(|| async {
+        Err::<(String, String), String>("no gateway in tests".into())
+    }))
 }
 
 pub struct Providers {
@@ -272,9 +278,9 @@ pub struct Providers {
     /// `gw_models` came from the running gateway, not the on-disk cache.
     gw_fresh: std::cell::Cell<bool>,
     gateway: endpoint::GatewaySource,
-    store: crate::auth_store::Store,
+    store: crate::auth::store::Store,
     /// Test seam: scripted replies, popped in order by `stream`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub scripted: RefCell<std::collections::VecDeque<Result<Message, ProviderError>>>,
 }
 
@@ -287,7 +293,7 @@ impl Providers {
             gw_fresh: std::cell::Cell::new(false),
             gateway,
             store: default_store(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             scripted: Default::default(),
         }
     }
@@ -312,7 +318,7 @@ impl Providers {
         models::native_def(provider).is_some() && self.store.has(provider)
     }
 
-    pub fn store(&self) -> &crate::auth_store::Store {
+    pub fn store(&self) -> &crate::auth::store::Store {
         &self.store
     }
 
@@ -435,7 +441,7 @@ impl Providers {
         cancel: &CancellationToken,
         ev: &mut dyn FnMut(StreamEvent),
     ) -> Result<Message, ProviderError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(r) = self.scripted.borrow_mut().pop_front() {
             // Streams text blocks as the real provider does, so rendering can be tested.
             if let Ok(Message::Assistant { content, .. }) = &r {
@@ -503,7 +509,7 @@ impl Providers {
             if let Some(def) = route.def
                 && status.as_u16() == 401
                 && !*rekeyed
-                && crate::auth_store::forget_cached(def.id)
+                && crate::auth::store::forget_cached(def.id)
             {
                 // A `!command` key may have rotated: run it once more before giving up.
                 *rekeyed = true;
@@ -710,7 +716,7 @@ mod route_tests {
 #[cfg(test)]
 mod native_route_tests {
     use super::*;
-    use crate::auth_store::{Entry, Store};
+    use crate::auth::store::{Entry, Store};
     use mu_testutil::{Reply, fake_server};
     use std::path::PathBuf;
 
@@ -737,9 +743,7 @@ mod native_route_tests {
         let d = std::env::temp_dir().join(format!("mu-route-{}", uuid::Uuid::new_v4()));
         let store = Store::at(d.join("auth.json"));
         store.set("anthropic", entry).unwrap();
-        let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
-        let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
-        let mut p = Providers::new(Rc::new(Configs::default()), endpoint::GatewaySource::new(plugins.gateway_start()));
+        let mut p = Providers::new(Rc::new(Configs::default()), no_gateway());
         p.store = store;
         (p, d)
     }
@@ -933,7 +937,7 @@ mod native_route_tests {
 #[cfg(test)]
 mod contract_native_anthropic_tests {
     use super::*;
-    use crate::auth_store::{Entry, Store};
+    use crate::auth::store::{Entry, Store};
 
     /// Two turns against the real API: thinking with a tool call, then the tool result with the
     /// thinking block replayed. Needs `ANTHROPIC_API_KEY`; `ANTHROPIC_CONTRACT_MODEL` picks the model.
@@ -948,9 +952,7 @@ mod contract_native_anthropic_tests {
         let d = std::env::temp_dir().join(format!("mu-contract-{}", uuid::Uuid::new_v4()));
         let store = Store::at(d.join("auth.json"));
         store.set("anthropic", Entry::reference("$ANTHROPIC_API_KEY").unwrap()).unwrap();
-        let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
-        let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
-        let mut p = Providers::new(Rc::new(Configs::default()), endpoint::GatewaySource::new(plugins.gateway_start()));
+        let mut p = Providers::new(Rc::new(Configs::default()), no_gateway());
         p.store = store;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
@@ -1017,7 +1019,7 @@ mod contract_native_anthropic_tests {
 #[cfg(test)]
 mod other_native_route_tests {
     use super::*;
-    use crate::auth_store::{Entry, Store};
+    use crate::auth::store::{Entry, Store};
     use mu_testutil::block_on as rt;
     use mu_testutil::{Reply, fake_server};
 
@@ -1025,9 +1027,7 @@ mod other_native_route_tests {
         let d = std::env::temp_dir().join(format!("mu-route2-{}", uuid::Uuid::new_v4()));
         let store = Store::at(d.join("auth.json"));
         store.set(provider, Entry { base_url: Some(base.into()), ..Entry::literal(key) }).unwrap();
-        let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
-        let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
-        let mut p = Providers::new(Rc::new(Configs::default()), endpoint::GatewaySource::new(plugins.gateway_start()));
+        let mut p = Providers::new(Rc::new(Configs::default()), no_gateway());
         p.store = store;
         (p, d)
     }
@@ -1155,18 +1155,6 @@ mod wire_contract_tests {
         }
     }
 
-    fn request<'a>(model: &'a ModelSpec, messages: &'a [Message]) -> Request<'a> {
-        Request {
-            model,
-            thinking: Rc::new(Cell::new(Thinking::High)),
-            system: "sys",
-            tools: &[],
-            messages,
-            max_tokens: None,
-            session_id: Some("s"),
-        }
-    }
-
     #[test]
     fn normalize_id_is_length_safe_and_stable() {
         assert_eq!(LONG_ID.len(), 65);
@@ -1212,45 +1200,5 @@ mod wire_contract_tests {
         let msgs = call("openai-completions", "baseten", "baseten/moonshotai/Kimi-K3");
         let wire = Value::Array(openai_completions::to_wire("", &msgs, &bt)).to_string();
         assert_eq!(wire.matches(&format!("\"{LONG_ID}\"")).count(), 2, "{wire}");
-    }
-
-    #[test]
-    fn an_omp_session_loads_and_replays_only_to_its_own_wire() {
-        let dir = std::env::temp_dir().join(format!("mu-omp-session-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.jsonl");
-        std::fs::write(&path, include_str!("testdata/omp_session.jsonl")).unwrap();
-        let loaded = crate::session::load(&path).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
-        let msgs = loaded.messages;
-        assert_eq!(msgs.len(), 11);
-
-        let anth = spec("anthropic/claude-sonnet-5-5", Api::AnthropicMessages, ThinkingMode::AnthropicAdaptive);
-        let resp = spec("openai/gpt-5.5", Api::OpenAiResponses, ThinkingMode::Effort);
-        let bt = spec("baseten/moonshotai/Kimi-K3", Api::OpenAiCompletions, ThinkingMode::Effort);
-
-        // Anthropic: its own signed thinking replays; no OpenAI reasoning item leaks, native or gateway.
-        let r = request(&anth, &msgs);
-        let native = anthropic_native::body(&r).0.to_string();
-        let gateway = anthropic::body(&r).to_string();
-        for body in [&native, &gateway] {
-            assert!(body.contains("EqQBCkYIARgCIiQ3Zm9vYmFyYmF6MTIzNDU2"), "own signature replays");
-            assert!(!body.contains("rs_0a1b2c3d4e5f") && !body.contains("gAAAAABfakeEncrypted"), "{body}");
-            assert!(!body.contains("Reading the file first") && !body.contains("Two files"), "{body}");
-        }
-
-        // Responses: its own reasoning item and the long call id replay; Anthropic and Chat
-        // Completions thinking never do.
-        let r = openai_responses::body(&request(&resp, &msgs)).to_string();
-        assert!(r.contains("rs_0a1b2c3d4e5f") && r.contains("gAAAAABfakeEncrypted"), "{r}");
-        assert!(r.contains("call_0123456789abcdefghijklmnopqr") && r.contains("fc_0123456789abcdef0123456789abcdef"));
-        assert!(!r.contains("EqQBCk") && !r.contains("The user wants") && !r.contains("Two files"), "{r}");
-
-        // Chat Completions: no reasoning item or signature; other models' thinking is demoted to
-        // plain text (as omp does), never sent as `reasoning_content`.
-        let c = Value::Array(openai_completions::to_wire("sys", &msgs, &bt)).to_string();
-        assert!(!c.contains("rs_0a1b2c3d4e5f") && !c.contains("EqQBCk") && !c.contains("gAAAAABfake"), "{c}");
-        assert!(c.contains("The user wants") && !c.contains("\"reasoning_content\":\"The user wants"), "{c}");
     }
 }

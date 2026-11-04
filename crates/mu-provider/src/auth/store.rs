@@ -151,7 +151,7 @@ impl Store {
         Self { path: mu_common::paths::profile_cache_dir().join("auth.json") }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn at(path: PathBuf) -> Self {
         Self { path }
     }

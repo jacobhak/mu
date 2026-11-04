@@ -66,7 +66,7 @@ Anthropic requests also carry 5-minute prompt-cache breakpoints on the last tool
 
 ## Models and prices
 
-Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`src/provider/catalog.json`), regenerated on every omp bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.yml` entries and overrides still win over both.
+Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`crates/mu-provider/src/model/catalog.json`), regenerated on every omp bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.yml` entries and overrides still win over both.
 
 `/model` marks native models `key`. Without a configured model, mu starts on omp's default while omp can run; with no omp installed, on the first native provider that has a key (its default model). A gateway model whose provider is native is routed natively and is marked `key` too.
 

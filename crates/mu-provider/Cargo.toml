@@ -1,0 +1,30 @@
+[package]
+name = "mu-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Exposes the scripted-reply and fixed-store seams to other crates' tests.
+test-support = ["dep:mu-testutil"]
+
+[dependencies]
+mu-common.workspace = true
+mu-base.workspace = true
+mu-testutil = { workspace = true, optional = true }
+anyhow.workspace = true
+futures-util.workspace = true
+jiff.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "sync", "time", "net", "fs"] }
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+mu-testutil.workspace = true
+serde_yaml_ng.workspace = true

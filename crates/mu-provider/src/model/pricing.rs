@@ -162,9 +162,9 @@ fn table() -> Arc<Table> {
 /// The snapshot row of a provider mu drives natively: prices and names without omp.
 fn snapshot_entry(model_id: &str) -> Option<Entry> {
     let (provider, id) = model_id.split_once('/')?;
-    let Some(row) = crate::provider::catalog::row(provider, id) else {
+    let Some(row) = crate::model::catalog::row(provider, id) else {
         // Not in the snapshot: a model the provider lists live (Baseten).
-        let d = crate::provider::discovery::find(provider, id)?;
+        let d = crate::model::discovery::find(provider, id)?;
         let priced = d.input_cost > 0.0 || d.output_cost > 0.0;
         return Some(Entry {
             name: d.name,
@@ -178,14 +178,14 @@ fn snapshot_entry(model_id: &str) -> Option<Entry> {
             long_context: None,
         });
     };
-    let to_rates = |r: &crate::provider::catalog::Cost| Rates {
+    let to_rates = |r: &crate::model::catalog::Cost| Rates {
         input: r.input,
         output: r.output,
         cache_read: r.cache_read,
         cache_write: r.cache_write,
     };
     let cost = row.cost.filter(|c| c.input != 0.0 || c.output != 0.0);
-    let found = crate::provider::discovery::find(provider, id);
+    let found = crate::model::discovery::find(provider, id);
     let (rates, listed) = with_listed_prices(cost.as_ref().map(to_rates), found.as_ref());
     Some(Entry {
         name: row.name.clone(),
@@ -204,10 +204,7 @@ fn snapshot_entry(model_id: &str) -> Option<Entry> {
 
 /// A discovered listing is the provider's current price list: its positive prices replace the
 /// snapshot's field by field. Listings carry no long-context tier, so an override drops the snapshot's.
-fn with_listed_prices(
-    snap: Option<Rates>,
-    d: Option<&crate::provider::discovery::Discovered>,
-) -> (Option<Rates>, bool) {
+fn with_listed_prices(snap: Option<Rates>, d: Option<&crate::model::discovery::Discovered>) -> (Option<Rates>, bool) {
     let Some(d) = d.filter(|d| d.input_cost > 0.0 || d.output_cost > 0.0) else { return (snap, false) };
     let base = snap.unwrap_or(Rates { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 });
     let pick = |live: f64, snapshot: f64| if live > 0.0 { live } else { snapshot };
@@ -379,7 +376,7 @@ mod tests {
     #[test]
     fn a_listing_overrides_the_snapshot_field_by_field() {
         let snap = Rates { input: 1.0, output: 2.0, cache_read: 0.1, cache_write: 0.5 };
-        let listed = crate::provider::discovery::Discovered {
+        let listed = crate::model::discovery::Discovered {
             id: "moonshotai/Kimi-K3".into(),
             name: None,
             context_length: None,
@@ -395,7 +392,7 @@ mod tests {
         assert_eq!(r, Some(Rates { input: 3.0, output: 2.0, cache_read: 0.3, cache_write: 0.5 }));
         let (r, listed_ok) = with_listed_prices(Some(snap), None);
         assert!(!listed_ok && r == Some(snap), "no listing: the snapshot stands");
-        let unpriced = crate::provider::discovery::Discovered { input_cost: 0.0, output_cost: 0.0, ..listed };
+        let unpriced = crate::model::discovery::Discovered { input_cost: 0.0, output_cost: 0.0, ..listed };
         assert_eq!(with_listed_prices(Some(snap), Some(&unpriced)), (Some(snap), false));
     }
 

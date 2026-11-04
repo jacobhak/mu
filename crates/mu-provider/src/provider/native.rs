@@ -1,6 +1,6 @@
 //! Providers mu talks to directly with an API key. Everything else goes through the gateway.
 
-use super::{catalog, discovery};
+use crate::model::{catalog, discovery};
 use mu_base::models::{self, Api, CompletionsCompat, ModelSpec, ProviderDef, ThinkingMode};
 
 /// The outcome of asking a provider whether a key works.
@@ -18,7 +18,7 @@ const VALIDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)
 /// One cheap authenticated GET against the provider (`def.validate`), 15 s at most.
 pub async fn validate(def: &ProviderDef, key: &str, base_url: Option<&str>) -> Check {
     super::install_crypto();
-    let base = match base_url.map(crate::auth_store::check_base_url).transpose() {
+    let base = match base_url.map(crate::auth::store::check_base_url).transpose() {
         Ok(b) => b.unwrap_or_else(|| def.base_url.to_string()),
         Err(e) => return Check::Rejected(e.to_string()),
     };

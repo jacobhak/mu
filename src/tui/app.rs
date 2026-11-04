@@ -19,8 +19,6 @@ use super::theme::{self, Role};
 use super::transcript::{Stream, Transcript};
 use crate::context::Context;
 use crate::plugin::PluginHost;
-use crate::provider::Providers;
-use crate::provider::native;
 use crate::tools::todo::{Phase, Status};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use mu_base::events::{AgentEvent, Answer, AskQuestion, StatusSnapshot, SubagentState, SubagentStatus};
@@ -30,6 +28,8 @@ use mu_base::message::{Image, UserInput};
 use mu_base::models::{self, GatewayModel, Thinking};
 use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
+use mu_provider::provider::Providers;
+use mu_provider::provider::native;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -149,7 +149,7 @@ enum UiMsg {
     KeyChecked {
         flow: u64,
         def: &'static models::ProviderDef,
-        entry: crate::auth_store::Entry,
+        entry: mu_provider::auth::store::Entry,
         r: Result<native::Check, String>,
     },
 }

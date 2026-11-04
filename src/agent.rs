@@ -1,15 +1,11 @@
 use crate::compaction::Outcome;
 use crate::context::{self, Context};
-use crate::cost::CostLedger;
 use crate::inbox;
 use crate::jobs::{self, JobsHandle};
 use crate::plans;
 use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
-use crate::pricing;
 use crate::prompt::{self, PromptInput};
-use crate::provider::{ProviderError, Providers, Request, StreamEvent};
-use crate::quota::QuotaTracker;
 use crate::review;
 use crate::session::{self, CompactionState, SessionFile};
 use crate::tools::{ToolCtx, Tools};
@@ -22,6 +18,10 @@ use mu_base::message::{Block, Message, StopReason, history_events, is_dismissal,
 use mu_base::models::{ModelSpec, Thinking};
 use mu_base::secrets;
 use mu_base::tool::{ToolDef, ToolMeta, ToolOutput};
+use mu_provider::gateway::quota::QuotaTracker;
+use mu_provider::model::cost::CostLedger;
+use mu_provider::model::pricing;
+use mu_provider::provider::{ProviderError, Providers, Request, StreamEvent};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2135,9 +2135,9 @@ impl Agent {
 mod loop_tests {
     use super::*;
     use crate::notify;
-    use crate::provider::ProviderError;
     use mu_base::config::Configs;
     use mu_base::events::new_inbox;
+    use mu_provider::provider::ProviderError;
     use mu_testutil::block_on_local as run;
 
     fn assistant(blocks: Vec<Block>, stop: StopReason) -> Message {
@@ -2171,7 +2171,7 @@ mod loop_tests {
         let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
         let providers = Rc::new(Providers::new(
             Rc::new(cfg),
-            crate::provider::endpoint::GatewaySource::new(plugins.gateway_start()),
+            mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start()),
         ));
         providers.scripted.borrow_mut().extend(script);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

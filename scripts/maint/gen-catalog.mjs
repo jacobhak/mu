@@ -1,5 +1,5 @@
 // Reads omp's compact packages/catalog/src/models.json on stdin and prints mu's catalog snapshot
-// (src/provider/catalog.json): the anthropic, openai and baseten rows mu can drive natively.
+// (crates/mu-provider/src/model/catalog.json): the anthropic, openai and baseten rows mu can drive natively.
 //   git -C "$OMPSRC" show "v$ver:packages/catalog/src/models.json" | node scripts/maint/gen-catalog.mjs
 // The decoder mirrors packages/catalog/src/model-catalog-format.ts (`getCatalogProvider`).
 import { readFileSync } from "node:fs";

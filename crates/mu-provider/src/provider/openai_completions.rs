@@ -530,7 +530,7 @@ mod tests {
     const ERROR: &[u8] = include_bytes!("testdata/completions/error.sse");
 
     fn spec(id: &str) -> ModelSpec {
-        crate::provider::catalog::row("baseten", id).unwrap().spec("baseten", 1_000_000, 262_144).unwrap()
+        crate::model::catalog::row("baseten", id).unwrap().spec("baseten", 1_000_000, 262_144).unwrap()
     }
 
     fn kimi() -> ModelSpec {

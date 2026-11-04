@@ -185,7 +185,7 @@ mod tests {
     use std::rc::Rc;
 
     fn spec(id: &str) -> ModelSpec {
-        crate::provider::catalog::row("anthropic", id).unwrap().spec("anthropic", 1, 1).unwrap()
+        crate::model::catalog::row("anthropic", id).unwrap().spec("anthropic", 1, 1).unwrap()
     }
 
     fn build(m: &ModelSpec, level: Thinking, messages: &[Message], tools: &[ToolDef]) -> (Value, Vec<&'static str>) {

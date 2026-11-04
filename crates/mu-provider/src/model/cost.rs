@@ -1,6 +1,6 @@
 //! What a session has spent: dollars, tokens, and usage the price table could not price yet.
 
-use crate::pricing;
+use crate::model::pricing;
 use mu_base::message::Usage;
 
 /// `provider/model` as the price table keys it. Assistant messages from mu carry the full id; omp's carry
