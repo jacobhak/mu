@@ -222,7 +222,7 @@ Each phase ships alone.
    throttled to 4 per second with a deferred final update), not through a `Command::JobOutput` request; the
    app keeps the latest per job and drops it when the job leaves the snapshot.
 4. **Sessions tab** (implemented). The headless child, `-p`, the TUI and ACP write `kind` (from
-   `session::set_run_info`), `agent`, `cwd` and, for a spawned session, `parent`. `session::live_sessions`
+   `owner::set_run_info`), `agent`, `cwd` and, for a spawned session, `parent`. `owner::live_sessions`
    reads every record whose lock is held (as `owner()` does) and whose session file exists; a record without
    `parent` takes it from the session header. `panels/sessions_tab.rs` builds the tree (roots oldest first,
    this process and its own session left out, this session's subagents marked with their job). Rows show
@@ -230,7 +230,7 @@ Each phase ships alone.
    panel asks the app for a redraw tick while it is open, since nothing else would repaint an idle screen.
    `Alt+J` and `/jobs` open on this tab when there are no jobs.
 5. **Actions on other sessions** (implemented). `n` types a one-line message in the footer and sends it
-   with `mu_session::inbox::send`; `s` is `mu_session::control::stop_session`, which re-checks the owner (pid and start time) before
+   with `mu_session::session::inbox::send`; `s` is `mu_session::session::control::stop_session`, which re-checks the owner (pid and start time) before
    `SIGUSR1` (a `-p` run) or `SIGTERM` to the process group (a subagent, only if it leads its own group);
    `t` closes the panel and runs `mu take <session>` through `App::start_child` (SIGINT caught as in
    `run_login`), then reopens the Sessions tab. What an action did shows in the footer until the next key.

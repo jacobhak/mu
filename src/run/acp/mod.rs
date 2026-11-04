@@ -28,7 +28,7 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL: i64 = -32603;
 
 pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
-    mu_session::session::owner::set_run_info("acp", None);
+    mu_session::session::owner::set_run_info(mu_session::session::owner::RunKind::Acp, None);
     let rt = mu_base::runtime::current_thread_runtime()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {

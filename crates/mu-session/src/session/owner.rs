@@ -41,17 +41,37 @@ pub fn set_abort_signal() {
     ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// What a process is, as its owner records name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunKind {
+    Tui,
+    Print,
+    Subagent,
+    Acp,
+}
+
+impl RunKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Print => "print",
+            Self::Subagent => "subagent",
+            Self::Acp => "acp",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct RunInfo {
-    kind: Option<&'static str>,
+    kind: Option<RunKind>,
     agent: Option<String>,
 }
 
 static RUN_INFO: std::sync::Mutex<RunInfo> = std::sync::Mutex::new(RunInfo { kind: None, agent: None });
 
-/// What this process is, for its owner records: `tui`, `print`, `subagent` or `acp`, and the custom
-/// agent it runs as. Call it before any session is created.
-pub fn set_run_info(kind: &'static str, agent: Option<&str>) {
+/// What this process is, for its owner records, and the custom agent it runs as. Call it before
+/// any session is created.
+pub fn set_run_info(kind: RunKind, agent: Option<&str>) {
     if let Ok(mut i) = RUN_INFO.lock() {
         *i = RunInfo { kind: Some(kind), agent: agent.map(String::from) };
     }
@@ -255,7 +275,7 @@ pub(super) struct OwnerRecord {
 /// What an owner record says besides who holds the lock.
 #[derive(Default)]
 struct Extra {
-    kind: Option<&'static str>,
+    kind: Option<RunKind>,
     agent: Option<String>,
     cwd: Option<PathBuf>,
     parent: Option<PathBuf>,
@@ -306,7 +326,7 @@ impl OwnerRecord {
                 "session": abs.to_string_lossy(),
             });
             if let Some(k) = extra.kind {
-                rec["kind"] = json!(k);
+                rec["kind"] = json!(k.as_str());
             }
             if let Some(a) = &extra.agent {
                 rec["agent"] = json!(a);
@@ -462,6 +482,21 @@ mod tests {
         let l = listed(&path).unwrap();
         assert_eq!((l.kind.as_deref(), l.agent, l.cwd), (Some("print"), None, None));
         assert_eq!(l.parent.as_deref(), Some(Path::new("/from/header.jsonl")));
+    }
+
+    #[test]
+    fn the_run_kind_is_recorded_by_name() {
+        home();
+        for (kind, name) in
+            [(RunKind::Tui, "tui"), (RunKind::Print, "print"), (RunKind::Subagent, "subagent"), (RunKind::Acp, "acp")]
+        {
+            let d = tmp("run-kind");
+            let path = d.join(format!("x_run-kind-{}.jsonl", uuid::Uuid::new_v4()));
+            std::fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"k\"}\n").unwrap();
+            let extra = Extra { kind: Some(kind), ..Default::default() };
+            let _rec = OwnerRecord::claim_with(&path, false, false, &extra).unwrap();
+            assert_eq!(listed(&path).unwrap().kind.as_deref(), Some(name));
+        }
     }
 
     #[test]

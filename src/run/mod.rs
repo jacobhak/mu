@@ -55,11 +55,11 @@ impl Mode {
     }
 
     /// The kind the session's owner record names.
-    fn run_kind(self) -> &'static str {
+    fn run_kind(self) -> owner::RunKind {
         match self {
-            Self::Tui => "tui",
-            Self::Subagent => "subagent",
-            Self::Print | Self::Plan => "print",
+            Self::Tui => owner::RunKind::Tui,
+            Self::Subagent => owner::RunKind::Subagent,
+            Self::Print | Self::Plan => owner::RunKind::Print,
         }
     }
 }
