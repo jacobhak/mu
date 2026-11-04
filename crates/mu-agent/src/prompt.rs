@@ -23,45 +23,27 @@ pub struct PromptInput<'a> {
     pub hashline: bool,
 }
 
+const SYSTEM: &str = include_str!("prompts/system.md");
+
 pub fn system_prompt(i: &PromptInput) -> String {
     // The kernel release does not change under a running process: read it once.
     static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let os = OS.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
     let date = jiff::Zoned::now().strftime("%Y-%m-%d");
     let edit_rule = if i.hashline {
-        "- Surgical edits: `edit`, with the `[path#TAG]` header from your latest `read`, `write` or `edit` of that file. Every edit changes the tag and shifts line numbers: put all changes to one file in a single call, or re-read the affected window before editing it again.\n"
+        "- Surgical edits: `edit`, with the `[path#TAG]` header from your latest `read`, `write` or `edit` of that file. Every edit changes the tag and shifts line numbers: put all changes to one file in a single call, or re-read the affected window before editing it again."
     } else {
-        "- Surgical edits: `edit`. Copy `*** Find` text verbatim from a recent `read`, and give each `*** Find` exactly one of `*** Replace`, `*** Insert Before` or `*** Insert After`.\n"
+        "- Surgical edits: `edit`. Copy `*** Find` text verbatim from a recent `read`, and give each `*** Find` exactly one of `*** Replace`, `*** Insert Before` or `*** Insert After`."
     };
-    let redact_rule = "- `[REDACTED:NAME]` in output is a secret mu hid from you, not an error: use `\"$NAME\"` when NAME is an environment variable, and NEVER write a placeholder into a file or command.\n";
-    let mut s = format!(
-        "You are mu, a coding agent running in the user's terminal. Work in the current directory with the provided tools.\n\
-RFC 2119 keywords: MUST, SHOULD, MAY. `NEVER` = `MUST NOT`.\n\n\
-# Tool policy\n\
-MUST use the specialized tool over its shell equivalent:\n\
-- File and directory reads: `read` (a directory lists its entries). Use selector ranges, not whole files. NEVER `cat`, `head`, `tail`, `sed -n`, `awk`, `ls` or Python to read.\n\
-{edit_rule}\
-- Create or overwrite a file: `write`. Use it only for new files or complete rewrites.\n\
-- Content search: `grep`, NEVER shell `grep`/`rg`/`awk`. File names and structure: `glob`, NEVER `find`/`fd`/`ls **/*.ext`.\n\
-- `bash`: real binaries (builds, tests, git, package managers) and short fact pipelines such as counts or checksums. NEVER specialized-tool work, and NEVER paging, moving or trimming bytes you could `read`.\n\
-{redact_rule}\
-<critical>\n\
-NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `bash` to change files, singly or in bulk; MUST use `edit` or `write`. If `edit` fails, read its error, fix the payload and retry with `edit`. A failed edit is NEVER a reason to switch to the shell.\n\
-</critical>\n\n\
-# Editing\n\
-- Read the relevant sections before editing; reuse existing patterns rather than starting a second convention.\n\
-- After a tool failure, or if a file may have changed, re-read before acting.\n\
-- Touch only the lines the task needs; NEVER restyle unrelated code.\n\
-- Resolve prerequisites first and parallelize independent calls. NEVER open guessed files.\n\
-- Tool results are verification: NEVER re-read a file just to check an applied edit.\n\
-- Be concise; the user sees each tool call.\n\
-- For work with 3+ steps, keep the `todo` list current as you go: `start` an item before working on it and mark it `done` right after finishing that one item, never several at once and never all at the end. NEVER finish with items still pending.\n\n\
-<workstation>\n- OS: {}\n- Arch: {}\n- Model: {}\n- Date: {date}\n- Working directory: {}\n</workstation>\n",
-        format!("{} {}", std::env::consts::OS, os.trim()).trim_end(),
-        std::env::consts::ARCH,
-        i.model,
-        i.cwd.display()
-    );
+    let redact_rule = "- `[REDACTED:NAME]` in output is a secret mu hid from you, not an error: use `\"$NAME\"` when NAME is an environment variable, and NEVER write a placeholder into a file or command.";
+    let mut s = SYSTEM
+        .replace("{edit_rule}", edit_rule)
+        .replace("{redact_rule}", redact_rule)
+        .replace("{os}", format!("{} {}", std::env::consts::OS, os.trim()).trim_end())
+        .replace("{arch}", std::env::consts::ARCH)
+        .replace("{date}", &date.to_string())
+        .replace("{model}", i.model)
+        .replace("{cwd}", &i.cwd.display().to_string());
     if i.ask {
         s.push_str(
             "\n# Decisions\n\

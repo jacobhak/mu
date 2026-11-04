@@ -62,6 +62,23 @@ flowchart LR
 
 Stream rules stay in the core because they run on every streamed token; a process hop there buys nothing.
 
+## Crates and layers
+
+The core is a workspace of crates. Each depends only on the ones above it in this table, and the compiler rejects a cycle; a new edge is a `Cargo.toml` change that shows up in review. `mu-common` is shared with the plugins; `mu-testutil` is a dev-dependency only.
+
+| Crate | Holds | Depends on |
+|---|---|---|
+| `mu-common` | paths, fs, rpc, time | — |
+| `mu-base` | protocol and foundation: messages, the agent event protocol, the tool contract (`tool`), text helpers, process and pty handling, `jsoncache`, schema validation, secrets redaction, config, model types and roles, git, `mem` | mu-common |
+| `mu-provider` | provider client and wire formats, model catalog, discovery and pricing, the API-key store, the gateway source and quota | mu-base |
+| `mu-session` | session files, tail reader, the notify inbox and sender, run control (stop, terminate, live-run check) | mu-base |
+| `mu-tools` | built-in tools (`tools/`, with the shell), background jobs, the plugin host, the MCP data layer, context discovery | mu-base, mu-provider, mu-session |
+| `mu-agent` | the agent loop, compaction, the system prompt, plans, review core, `AgentHandle` and `build_agent` | mu-base, mu-provider, mu-session, mu-tools |
+| `mu-tui` | the terminal UI, themes, the tree-sitter `lang-*` features | mu-base, mu-provider, mu-session, mu-tools |
+| `mu` (root) | `main.rs`, `cli/`, `run/` (modes, setup, signals, headless, ACP), `workflow/` (deliver, plan and review commands, notify, take), `update.rs` | everything |
+
+The tools-to-provider edge exists because the plugin host serves `core/complete` through the provider client. Nothing depends on `mu-tui` or `mu`. Test-only hooks sit behind a `test-support` feature of the crate that owns them, enabled from `[dev-dependencies]` so release builds never contain them.
+
 ## Plugins
 
 ### Protocol

@@ -1,6 +1,6 @@
 # Restructure: break up the god-objects, split `src/` into layered crates
 
-Status: all decisions agreed (Jacob, 2026-11-04).
+Status: all decisions agreed (Jacob, 2026-11-04). Implemented on branch `feat/restructure`; see "Implementation notes" at the end.
 
 ## Context
 
@@ -302,3 +302,16 @@ Done when: DESIGN.md matches `cargo tree`.
   event handling.
 - Splitting `read.rs` selector parsing and `todo::apply` per op.
 - Splitting `mu-base` further.
+
+## Implementation notes
+
+Deviations from the plan, and what to know:
+- `ask_nudge` lives in `mu-base`, not `mu-agent`: `message::history_events` uses `is_reminder`.
+- The provider table (`PROVIDERS`, `native_def`) moved to `mu-provider`'s `provider/providers.rs` in Phase 6 (see the commit for the check on `mu-base`).
+- `mu-tui` does not depend on `mu-agent` (nothing in it needs it). `notify::send` and the session-control functions the jobs panel calls moved down into `mu-session` (`inbox`, `control`), so the TUI does not import binary modules.
+- `an_omp_session_loads_and_replays_only_to_its_own_wire` stays in `mu-provider`, with `mu-session` as a dev-dependency only.
+- `mu-testutil::home()` honours `MU_TEST_HOME` so `tests/modes.rs` can spawn the real binary against a fake API.
+- Phase 5: jobs-panel polling is in `App::on_tick` (the run-loop tick), not `on_ui`. The MCP wizard's env check now trims blanks like the key flow's did (the two copies differed slightly).
+- Phase 0 tests: the sibling-binary test exercises `sibling_of` (the extracted lookup); the other two fail on `main` and pass now.
+- Phase 1 restored the auth-store redaction refresh through `secrets::set_stored_refresh` (registered in `run()`), since dropping it changed behaviour.
+- Release binary after Phase 2: 66.94 MB vs 64.21 MB (+4.3%); idle Pss 19.6 MB vs 18.7 MB (+4.8%), Pss_Anon 3.7 vs 3.6 MB.
