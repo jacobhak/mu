@@ -1,5 +1,5 @@
 mod ask;
-pub mod bash;
+pub mod shell;
 mod diff;
 pub mod edit;
 mod glob;
@@ -7,6 +7,7 @@ pub mod grep;
 mod plan;
 mod read;
 pub mod subagent;
+mod spill;
 pub mod task;
 pub mod todo;
 pub mod uri;
@@ -137,32 +138,11 @@ impl Tools {
             let mut out = self.plugins.call_tool(name, args, &ctx.cancel).await;
             // Only MCP results are capped here: native plugins size their own output (web caps fetches itself).
             if self.plugins.is_mcp_tool(name) {
-                out.text = self.cap_text(std::mem::take(&mut out.text));
+                out.text = spill::cap_text(std::mem::take(&mut out.text), &self.cwd, &|| self.next_artifact());
             }
             return out;
         }
         ToolOutput::err(format!("Unknown tool: {name}"))
-    }
-
-    /// Plugin output above 50 KB keeps its head; the whole text goes to an `artifact://` file.
-    fn cap_text(&self, text: String) -> String {
-        const CAP: usize = 50 * 1024;
-        if text.len() <= CAP {
-            return text;
-        }
-        let mut cut = CAP;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let (n, path) = self.next_artifact();
-        let saved = path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-            && std::fs::write(&path, mu_base::secrets::redact(&text, &self.cwd).text).is_ok();
-        let note = if saved {
-            format!("[Output truncated at {} KB of {} KB; full output: artifact://{n}]", CAP / 1024, text.len() / 1024)
-        } else {
-            format!("[Output truncated at {} KB of {} KB]", CAP / 1024, text.len() / 1024)
-        };
-        format!("{}\n\n{note}", &text[..cut])
     }
 }
 
@@ -268,7 +248,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
             )
         }),
-        call: dispatch!("bash", async |t, a: bash::Args, c| t.bash(a, c)),
+        call: dispatch!("bash", async |t, a: shell::bash::Args, c| t.bash(a, c)),
     },
     Builtin {
         name: "grep",

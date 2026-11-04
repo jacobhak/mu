@@ -1,5 +1,6 @@
-use super::subagent::BackgroundResult;
-use super::{ToolCtx, Tools};
+use crate::tools::spill::{Collected, Collector};
+use crate::tools::subagent::BackgroundResult;
+use crate::tools::{ToolCtx, Tools};
 use crate::jobs::JobsHandle;
 use mu_base::events::AgentEvent;
 use mu_base::tool::{BashMeta, ToolMeta, ToolOutput};
@@ -8,7 +9,6 @@ use pi_shell::{
     shell::ShellRunOptions,
 };
 use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
@@ -26,130 +26,6 @@ pub struct Args {
     /// Run as a background job (interactive sessions; not with `pty`).
     #[serde(default)]
     r#async: bool,
-}
-
-const HEAD: usize = 20 * 1024;
-const TAIL: usize = 30 * 1024;
-
-#[derive(Default)]
-struct Collector {
-    head: String,
-    tail: String,
-    elided: usize,
-    /// Full output spill, opened when the first byte is elided.
-    artifact: Option<(u32, std::io::BufWriter<std::fs::File>)>,
-    /// Bytes written to the spill so far.
-    spilled: u64,
-    /// The spill hit `SPILL_CAP`.
-    spill_capped: bool,
-    /// The first spill I/O error, reported once in the output.
-    spill_error: Option<String>,
-    /// For redacting secrets in the spill; the result text is redacted by the agent.
-    cwd: std::path::PathBuf,
-}
-
-/// The spill file stops growing here.
-const SPILL_CAP: u64 = 128 * 1024 * 1024;
-
-impl Collector {
-    fn spill(&mut self, text: &str) {
-        let Some((_, f)) = self.artifact.as_mut() else { return };
-        if self.spill_capped || self.spill_error.is_some() {
-            return;
-        }
-        let redacted = mu_base::secrets::redact(text, &self.cwd).text;
-        let bytes = redacted.as_bytes();
-        let room = SPILL_CAP.saturating_sub(self.spilled) as usize;
-        let n = bytes.len().min(room);
-        let mut cut = n;
-        // Never end the spill in the middle of a character.
-        while cut > 0 && cut < bytes.len() && (bytes[cut] & 0xC0) == 0x80 {
-            cut -= 1;
-        }
-        match f.write_all(&bytes[..cut]) {
-            Ok(()) => self.spilled += cut as u64,
-            Err(e) => self.spill_error = Some(e.to_string()),
-        }
-        if cut < bytes.len() {
-            self.spill_capped = true;
-            if let Err(e) = f.write_all(b"\n[spill truncated at 128 MB]\n") {
-                self.spill_error.get_or_insert(e.to_string());
-            }
-        }
-    }
-
-    fn push(&mut self, mut s: &str, alloc: &dyn Fn() -> (u32, std::path::PathBuf)) {
-        self.spill(s);
-        if self.tail.is_empty() && self.elided == 0 && self.head.len() < HEAD {
-            let mut n = (HEAD - self.head.len()).min(s.len());
-            while !s.is_char_boundary(n) {
-                n += 1;
-            }
-            self.head.push_str(&s[..n]);
-            s = &s[n..];
-        }
-        self.tail.push_str(s);
-        if self.tail.len() > TAIL {
-            let mut cut = self.tail.len() - TAIL;
-            while !self.tail.is_char_boundary(cut) {
-                cut += 1;
-            }
-            if self.artifact.is_none() {
-                let (n, path) = alloc();
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                match std::fs::File::create(&path) {
-                    Ok(f) => {
-                        self.artifact = Some((n, std::io::BufWriter::new(f)));
-                        let (head, tail) = (std::mem::take(&mut self.head), std::mem::take(&mut self.tail));
-                        self.spill(&head);
-                        self.spill(&tail);
-                        self.head = head;
-                        self.tail = tail;
-                    }
-                    Err(e) => self.spill_error = Some(e.to_string()),
-                }
-            }
-            self.elided += cut;
-            self.tail.drain(..cut);
-        }
-    }
-
-    fn finish(mut self) -> Collected {
-        let body = if self.elided > 0 {
-            format!("{}\n[…{}B elided…]\n{}", self.head, self.elided, self.tail)
-        } else {
-            std::mem::take(&mut self.head) + &self.tail
-        };
-        let mut notes = String::new();
-        let mut artifact = None;
-        if let Some((n, mut f)) = self.artifact.take() {
-            if let Err(e) = f.flush() {
-                self.spill_error.get_or_insert(e.to_string());
-            }
-            notes.push_str(&format!("\n[full output: artifact://{n}]"));
-            if self.spill_capped {
-                notes.push_str(" (truncated at 128 MB)");
-            }
-            artifact = Some(n);
-        }
-        let mut spill_note = self.spill_capped.then(|| "spill truncated at 128 MB".to_string());
-        if let Some(e) = &self.spill_error {
-            notes.push_str(&format!("\n[could not save the full output: {e}]"));
-            spill_note = Some(format!("could not save the full output: {e}"));
-        }
-        Collected { body, notes, artifact, spill_note }
-    }
-}
-
-/// What a command printed: the output itself, mu's notes about it (appended for the model), and
-/// the facts the UI shows instead of parsing those notes.
-struct Collected {
-    body: String,
-    notes: String,
-    artifact: Option<u32>,
-    spill_note: Option<String>,
 }
 
 /// The command's timeout, parsed once for both execution paths.
@@ -265,7 +141,7 @@ impl Tools {
         let start = Instant::now();
         let mut decoder = OutputDecoder::new();
         let mut cleaner = mu_base::pty::Cleaner::default();
-        let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
+        let mut collector = Collector::new(cwd.clone());
         let (mut cancelled, mut timed_out) = (false, false);
         let mut input_open = true;
         // Keystrokes waiting for the pty to accept them; writing never blocks reads, cancel or timeout.
@@ -406,7 +282,7 @@ impl Tools {
             }
         };
         let drain = async {
-            let mut c = Collector { cwd: run_cwd.clone(), ..Default::default() };
+            let mut c = Collector::new(run_cwd.clone());
             // The live tail shows cleaned text; only the pty view gets raw bytes.
             let mut cleaner = mu_base::pty::Cleaner::default();
             while let Ok(s) = rx.recv_async().await {
@@ -593,7 +469,7 @@ pub async fn run_background(
     let (mut out_dec, mut err_dec) =
         (pi_shell::output_decode::OutputDecoder::new(), pi_shell::output_decode::OutputDecoder::new());
     let (mut obuf, mut ebuf) = (vec![0u8; 8192], vec![0u8; 8192]);
-    let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
+    let mut collector = Collector::new(cwd.clone());
     let mut status: Option<std::process::ExitStatus> = None;
     let (mut cancelled, mut timed_out, mut stopping) = (false, false, false);
     // Terminating takes `TERM_GRACE`; it runs beside the loop so output keeps draining meanwhile.
