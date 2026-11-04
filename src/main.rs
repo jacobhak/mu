@@ -35,6 +35,7 @@ mod provider;
 mod pty;
 mod quota;
 mod review;
+mod review_cli;
 mod schema;
 mod secrets;
 mod session;
@@ -338,7 +339,10 @@ fn run() -> Result<i32> {
         return notify::run(&session, from.as_deref(), &text, &std::env::current_dir()?);
     }
     if let Some(Sub::Review { base, plan, focus, out, markdown }) = cli.command {
-        return Ok(review::run_cli(review::CliOpts { base, plan, focus, out, markdown }, &std::env::current_dir()?));
+        return Ok(review_cli::run_cli(
+            review_cli::CliOpts { base, plan, focus, out, markdown },
+            &std::env::current_dir()?,
+        ));
     }
     if let Some(Sub::Deliver(a)) = cli.command {
         return Ok(deliver::run_cli(a, &std::env::current_dir()?));
