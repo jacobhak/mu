@@ -1,7 +1,7 @@
 //! Scripted agents for tests: the agent loop's tests here and the binary's headless tests build on
 //! the same builder, so a scripted run behaves the same wherever it is driven from.
 
-use crate::agent::{Agent, AgentInit, DeliverFn};
+use crate::agent::{Agent, AgentInit, DeliverFn, RunConfig};
 use crate::plans;
 use mu_base::config::Configs;
 use mu_base::events::{AgentEvent, new_inbox};
@@ -44,6 +44,25 @@ pub fn agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, UnboundedRe
 }
 
 pub fn agent_with(script: Vec<Result<Message, ProviderError>>, cfg: Configs) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    agent_run(script, cfg, RunConfig::default())
+}
+
+/// `agent_with` for a run configured the way a front end configures one.
+pub fn agent_run(
+    script: Vec<Result<Message, ProviderError>>,
+    cfg: Configs,
+    run: RunConfig,
+) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    agent_in(script, cfg, run, std::env::temp_dir())
+}
+
+/// `agent_run` working in `cwd`.
+pub fn agent_in(
+    script: Vec<Result<Message, ProviderError>>,
+    cfg: Configs,
+    run: RunConfig,
+    cwd: PathBuf,
+) -> (Agent, UnboundedReceiver<AgentEvent>) {
     mu_testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
     let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
     let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
@@ -70,13 +89,14 @@ pub fn agent_with(script: Vec<Result<Message, ProviderError>>, cfg: Configs) -> 
     let a = Agent::new(AgentInit {
         providers,
         plugins,
-        cwd: std::env::temp_dir(),
+        cwd,
         ctx,
         model,
         thinking: Thinking::parse("off").unwrap(),
         events: tx,
         inbox: new_inbox(),
         deliver,
+        run,
     });
     (a, rx)
 }

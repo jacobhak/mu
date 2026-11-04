@@ -1,6 +1,28 @@
 use super::*;
 use crate::review;
 
+/// What `/review` covers: the snapshots compared, the review model and its totals, and the request.
+struct ReviewScope {
+    root: PathBuf,
+    base: String,
+    cur: String,
+    /// Changed files that are reviewed; excluded ones are not counted.
+    files: usize,
+    added: u32,
+    removed: u32,
+    model: String,
+    plan_uri: Option<String>,
+    request: String,
+}
+
+fn short(s: &str) -> String {
+    s.chars().take(7).collect()
+}
+
+fn ask_option(label: String, description: Option<String>) -> mu_base::events::AskOption {
+    mu_base::events::AskOption { label, description, preview: None, kind: None }
+}
+
 impl Agent {
     /// One single-answer question to the user; a cancel or a closed dialog is `Cancelled`.
     async fn review_ask(&self, q: mu_base::events::AskQuestion, cancel: &CancellationToken) -> mu_base::events::Answer {
@@ -21,7 +43,7 @@ impl Agent {
             return;
         }
         let cancel = CancellationToken::new();
-        self.inbox.borrow_mut().cancel = cancel.clone();
+        self.ports.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
         let sent = self.review_run(focus, &cancel).await;
         self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
@@ -32,8 +54,41 @@ impl Agent {
 
     /// Runs the review and the selection dialog. Returns the message to send to the implementer.
     async fn review_run(&mut self, focus: Option<String>, cancel: &CancellationToken) -> Option<String> {
-        use mu_base::events::{Answer, AskOption, AskQuestion};
-        let short = |s: &str| s.chars().take(7).collect::<String>();
+        let scope = self.review_scope(focus).await?;
+        let out = self.run_review(&scope, cancel).await?;
+        let report = review::report_of(&out);
+        let md = match &report {
+            Some(r) => review::render_markdown(
+                r,
+                &review::Meta {
+                    base_short: short(&scope.base),
+                    cur_short: short(&scope.cur),
+                    files: scope.files,
+                    added: scope.added,
+                    removed: scope.removed,
+                    model: scope.model.clone(),
+                },
+            ),
+            None => format!("reviewer returned an unstructured report\n\n{}", out.text),
+        };
+        let report_uri = review::report_uri();
+        if let Err(e) = self.write_local_file(&report_uri, &md) {
+            self.error(format!("cannot save the review to {report_uri}: {e}"));
+        }
+        self.emit(AgentEvent::ToolEnd { id: "review".into(), name: "review".into(), output: ToolOutput::ok(md) });
+        let plan_uri = scope.plan_uri.as_deref();
+        let Some(report) = report else {
+            return self.ask_unstructured(&out.text, plan_uri, &report_uri, cancel).await;
+        };
+        if report.findings.is_empty() {
+            self.notice("review: no findings");
+            return None;
+        }
+        self.pick_findings(&report, plan_uri, &report_uri, cancel).await
+    }
+
+    /// The changes `/review` covers. `None`, after a notice, when there is nothing to review.
+    async fn review_scope(&mut self, focus: Option<String>) -> Option<ReviewScope> {
         let root = match review::repo_root(&self.cwd).await {
             Ok(r) => r,
             Err(e) => {
@@ -48,7 +103,7 @@ impl Agent {
                 return None;
             }
         };
-        let (base, base_label) = match self.review_base.as_ref().and_then(|b| b.tree.clone()) {
+        let (base, base_label) = match self.plan.review_base.as_ref().and_then(|b| b.tree.clone()) {
             Some(t) => (t, "plan approval snapshot"),
             None => {
                 self.notice("no plan base recorded; reviewing uncommitted changes against HEAD");
@@ -61,7 +116,7 @@ impl Agent {
                 }
             }
         };
-        let since = self.review_base.as_ref().map_or(0, |b| b.since);
+        let since = self.plan.review_base.as_ref().map_or(0, |b| b.since);
         let stats = match review::numstat(&root, &base, &cur).await {
             Ok(s) => s,
             Err(e) => {
@@ -78,7 +133,7 @@ impl Agent {
             self.notice("nothing to review: only binary, generated or lock files changed");
             return None;
         }
-        let plan_uri = self.review_base.as_ref().and_then(|b| b.plan_uri.clone());
+        let plan_uri = self.plan.review_base.as_ref().and_then(|b| b.plan_uri.clone());
         let plan_path = match &plan_uri {
             Some(u) => match self.tools.resolve(u) {
                 Ok(r) if r.path.exists() => Some(r.path),
@@ -102,11 +157,20 @@ impl Agent {
             notes: &notes,
             focus: focus.as_deref(),
         });
-        let model = mu_base::models::role_selector("review", &self.providers.cfg)
-            .and_then(|s| self.providers.resolve(&s).ok())
-            .map_or_else(|| self.model.id.clone(), |(m, _)| m.id);
+        let model = mu_base::models::role_selector("review", &self.ports.providers.cfg)
+            .and_then(|s| self.ports.providers.resolve(&s).ok())
+            .map_or_else(|| self.model.model.id.clone(), |(m, _)| m.id);
         let (added, removed) =
             files.iter().fold((0, 0), |(a, r), f| (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0)));
+        Some(ReviewScope { root, base, cur, files: files.len(), added, removed, model, plan_uri, request })
+    }
+
+    /// Runs the review child over `scope`. `None` when it fails or the run is cancelled.
+    async fn run_review(
+        &mut self,
+        scope: &ReviewScope,
+        cancel: &CancellationToken,
+    ) -> Option<mu_tools::tools::subagent::Outcome> {
         let exe = match mu_common::paths::self_exe() {
             Ok(e) => e,
             Err(e) => {
@@ -115,90 +179,99 @@ impl Agent {
             }
         };
         let payload = json!({
-            "task": request,
+            "task": scope.request,
             "agent": context::REVIEW_LEAD,
             "outputSchema": review::report_schema(),
             "parentSession": self.session.as_ref().map(|s| s.path.clone()),
         });
-        let id = "review".to_string();
         self.emit(AgentEvent::ToolStart {
-            id: id.clone(),
+            id: "review".into(),
             name: "review".into(),
-            args: json!({"scope": format!("{} files +{added}/−{removed} vs {} · {model}", files.len(), short(&base))}),
+            args: json!({"scope": format!(
+                "{} files +{}/−{} vs {} · {}",
+                scope.files,
+                scope.added,
+                scope.removed,
+                short(&scope.base),
+                scope.model
+            )}),
         });
         let out = {
-            let (events, id) = (self.events.clone(), id.clone());
-            mu_tools::tools::subagent::run_child(&exe, &root, &payload, cancel, move |name, summary| {
+            let (events, id) = (self.ports.events.clone(), "review".to_string());
+            mu_tools::tools::subagent::run_child(&exe, &scope.root, &payload, cancel, move |name, summary| {
                 let _ = events.send(AgentEvent::ToolOutput { id: id.clone(), chunk: format!("{name} {summary}\n") });
             })
             .await
         };
         if cancel.is_cancelled() {
-            self.emit(AgentEvent::ToolEnd { id, name: "review".into(), output: ToolOutput::err("review cancelled") });
+            self.emit(AgentEvent::ToolEnd {
+                id: "review".into(),
+                name: "review".into(),
+                output: ToolOutput::err("review cancelled"),
+            });
             return None;
         }
         if !out.ok {
-            self.emit(AgentEvent::ToolEnd { id, name: "review".into(), output: ToolOutput::err(out.text) });
+            self.emit(AgentEvent::ToolEnd {
+                id: "review".into(),
+                name: "review".into(),
+                output: ToolOutput::err(out.text),
+            });
             return None;
         }
-        let report = review::report_of(&out);
-        let md = match &report {
-            Some(r) => review::render_markdown(
-                r,
-                &review::Meta {
-                    base_short: short(&base),
-                    cur_short: short(&cur),
-                    files: files.len(),
-                    added,
-                    removed,
-                    model,
-                },
-            ),
-            None => format!("reviewer returned an unstructured report\n\n{}", out.text),
-        };
-        let report_uri = review::report_uri();
-        if let Err(e) = self.write_local_file(&report_uri, &md) {
-            self.error(format!("cannot save the review to {report_uri}: {e}"));
-        }
-        self.emit(AgentEvent::ToolEnd { id, name: "review".into(), output: ToolOutput::ok(md) });
+        Some(out)
+    }
 
-        let opt =
-            |label: String, description: Option<String>| AskOption { label, description, preview: None, kind: None };
-        let Some(report) = report else {
-            let q = AskQuestion {
-                question: "The reviewer returned an unstructured report.".into(),
-                context: None,
-                header: Some("Review".into()),
-                options: vec![opt("Send report to the implementer".into(), None), opt("Dismiss".into(), None)],
-                multi: false,
-                recommended: Some(1),
-                confirm: false,
-            };
-            return match self.review_ask(q, cancel).await {
-                Answer::Options(o) | Answer::Noted { picks: o, .. }
-                    if o.first().is_some_and(|l| l.starts_with("Send")) =>
-                {
-                    Some(review::raw_message(&out.text, plan_uri.as_deref(), &report_uri))
-                }
-                _ => None,
-            };
+    /// The reviewer's report did not parse: asks whether its raw text goes to the implementer.
+    async fn ask_unstructured(
+        &mut self,
+        text: &str,
+        plan_uri: Option<&str>,
+        report_uri: &str,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
+        use mu_base::events::{Answer, AskQuestion};
+        let q = AskQuestion {
+            question: "The reviewer returned an unstructured report.".into(),
+            context: None,
+            header: Some("Review".into()),
+            options: vec![
+                ask_option("Send report to the implementer".into(), None),
+                ask_option("Dismiss".into(), None),
+            ],
+            multi: false,
+            recommended: Some(1),
+            confirm: false,
         };
-        if report.findings.is_empty() {
-            self.notice("review: no findings");
-            return None;
+        match self.review_ask(q, cancel).await {
+            Answer::Options(o) | Answer::Noted { picks: o, .. } if o.first().is_some_and(|l| l.starts_with("Send")) => {
+                Some(review::raw_message(text, plan_uri, report_uri))
+            }
+            _ => None,
         }
+    }
+
+    /// The user picks which findings of the report go to the implementer. `None` when none do.
+    async fn pick_findings(
+        &mut self,
+        report: &review::Report,
+        plan_uri: Option<&str>,
+        report_uri: &str,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
+        use mu_base::events::{Answer, AskQuestion};
         let all = &report.findings;
         let blocking: Vec<usize> = (0..all.len()).filter(|&i| review::is_blocking(&all[i])).collect();
         let (n, m) = (blocking.len(), all.len());
         let mut options = Vec::new();
         if n > 0 {
-            options.push(opt(format!("Send {n} blocking findings"), None));
+            options.push(ask_option(format!("Send {n} blocking findings"), None));
         }
         if m > n {
-            options.push(opt(format!("Send all {m} findings"), None));
+            options.push(ask_option(format!("Send all {m} findings"), None));
         }
-        options.push(opt("Choose findings…".into(), None));
-        options.push(opt("Dismiss".into(), None));
+        options.push(ask_option("Choose findings…".into(), None));
+        options.push(ask_option("Dismiss".into(), None));
         let recommended = if n > 0 { 0 } else { options.len() - 1 };
         let q = AskQuestion {
             question: "Send findings to the implementer?".into(),
@@ -228,7 +301,10 @@ impl Agent {
                                 Some(l) => format!("{}:{l}", f.file),
                                 None => f.file.clone(),
                             };
-                            opt(format!("{}. [P{}] {}", i + 1, f.priority, f.title), Some(format!("{at} — {first}")))
+                            ask_option(
+                                format!("{}. [P{}] {}", i + 1, f.priority, f.title),
+                                Some(format!("{at} — {first}")),
+                            )
                         })
                         .collect();
                     let q = AskQuestion {
@@ -263,13 +339,13 @@ impl Agent {
             return None;
         }
         let picked: Vec<&review::Finding> = chosen.iter().map(|&i| &all[i]).collect();
-        Some(review::fix_message(&picked, plan_uri.as_deref(), &report_uri, note.as_deref()))
+        Some(review::fix_message(&picked, plan_uri, report_uri, note.as_deref()))
     }
 
     pub(super) fn set_review_base(&mut self, b: review::ReviewBase) {
         if let Some(s) = self.session.as_mut() {
             s.custom("review_base", serde_json::to_value(&b).unwrap_or_default());
         }
-        self.review_base = Some(b);
+        self.plan.review_base = Some(b);
     }
 }

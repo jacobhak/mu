@@ -265,10 +265,10 @@ fn model_label(sel: Option<&str>, model: &str) -> String {
     }
 }
 
-fn apply_agent(agent: &mut agent::Agent, def: &context::AgentDef) {
-    agent.allow = def.tools.clone();
-    agent.excluded = agent::HEADLESS_EXCLUDED.to_vec();
-    agent.agent_prompt = Some(format!(
+fn apply_agent(run: &mut agent::RunConfig, def: &context::AgentDef) {
+    run.allow = def.tools.clone();
+    run.excluded = agent::HEADLESS_EXCLUDED.to_vec();
+    run.agent_prompt = Some(format!(
         "\nYou are running as the custom agent `{0}`. Follow its instructions exactly; they override your defaults.\n<agent name=\"{0}\">\n{1}\n</agent>\n",
         def.name,
         def.prompt.trim()
@@ -414,6 +414,38 @@ fn run() -> Result<i32> {
     let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let inbox = events::new_inbox();
+    let mut run = agent::RunConfig {
+        exit_on_resume_failure: cli.print.is_some(),
+        pin_model: cli.model.is_some() && resume.is_some(),
+        pin_thinking: cli_thinking.is_some() && resume.is_some(),
+        ..Default::default()
+    };
+    if let Some(p) = &task_payload {
+        run.subagent = true;
+        run.excluded = agent::HEADLESS_EXCLUDED.to_vec();
+        run.parent_session = p["parentSession"].as_str().map(PathBuf::from);
+        if p["agent"] == "scout" {
+            run.allow = Some(["read", "grep", "glob", "web_search", "fetch"].map(String::from).to_vec());
+        }
+    }
+    if let Some(d) = &agent_def {
+        apply_agent(&mut run, d);
+    }
+    let output_schema = task_payload.as_ref().and_then(|p| task_output_schema(p, agent_def.as_ref()));
+    if let Some(s) = &output_schema {
+        if let Err(e) = schema::check_schema(s) {
+            bail!("bad subagent input: {e}");
+        }
+        let note = "\nThis task has an output schema. Finish by calling the `yield` tool with `data` matching it; a plain final message is not a result.\n";
+        run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + note);
+    }
+    if headless_run && !run.excluded.contains(&"ask") {
+        // No one can answer in `-p` mode.
+        run.excluded.push("ask");
+    }
+    if let Some(n) = plan_run.as_ref().and_then(|r| r.note) {
+        run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + n);
+    }
     let mut agent = agent::Agent::new(agent::AgentInit {
         providers,
         plugins: host.clone(),
@@ -424,37 +456,9 @@ fn run() -> Result<i32> {
         events: ev_tx,
         inbox: inbox.clone(),
         deliver: deliver::detached_starter(),
+        run,
     });
-    agent.exit_on_resume_failure = cli.print.is_some();
-    agent.pin_model = cli.model.is_some() && resume.is_some();
-    agent.pin_thinking = cli_thinking.is_some() && resume.is_some();
-    if let Some(p) = &task_payload {
-        agent.subagent = true;
-        agent.excluded = agent::HEADLESS_EXCLUDED.to_vec();
-        agent.parent_session = p["parentSession"].as_str().map(PathBuf::from);
-        if p["agent"] == "scout" {
-            agent.allow = Some(["read", "grep", "glob", "web_search", "fetch"].map(String::from).to_vec());
-        }
-    }
-    if let Some(d) = &agent_def {
-        apply_agent(&mut agent, d);
-    }
-    let output_schema = task_payload.as_ref().and_then(|p| task_output_schema(p, agent_def.as_ref()));
-    if let Some(s) = &output_schema {
-        if let Err(e) = schema::check_schema(s) {
-            bail!("bad subagent input: {e}");
-        }
-        *agent.tools.output_schema.borrow_mut() = Some(s.clone());
-        let note = "\nThis task has an output schema. Finish by calling the `yield` tool with `data` matching it; a plain final message is not a result.\n";
-        agent.agent_prompt = Some(agent.agent_prompt.take().unwrap_or_default() + note);
-    }
-    if headless_run && !agent.excluded.contains(&"ask") {
-        // No one can answer in `-p` mode.
-        agent.excluded.push("ask");
-    }
-    if let Some(n) = plan_run.as_ref().and_then(|r| r.note) {
-        agent.agent_prompt = Some(agent.agent_prompt.take().unwrap_or_default() + n);
-    }
+    agent.set_output_schema(output_schema.clone());
     let mut notify_wake = None;
     if !headless_run && task_payload.is_none() {
         agent.enable_jobs();

@@ -4,7 +4,7 @@ use mu_session::inbox;
 impl Agent {
     /// Takes queued steering text and pushes it as user messages. Returns whether any was pending.
     pub(super) fn take_steer(&mut self) -> bool {
-        let steer: Vec<UserInput> = self.inbox.borrow_mut().steer.drain(..).collect();
+        let steer: Vec<UserInput> = self.ports.inbox.borrow_mut().steer.drain(..).collect();
         for s in &steer {
             self.emit(AgentEvent::UserPrompt(s.text.clone()));
             self.push(Message::user_input(s));
@@ -28,23 +28,23 @@ impl Agent {
     /// Is there a `mu notify` message to deliver? `wake`: for a turn nobody asked for, so
     /// messages announced at open (which wait for the next prompt) do not count.
     pub(super) fn notify_pending(&self, wake: bool) -> bool {
-        self.notify
+        self.mail.notify
             && self.session.is_some()
             && inbox::has_pending(&self.session_id())
             && inbox::pending(&self.session_id())
                 .iter()
-                .any(|n| !self.notify_seen.contains(&n.name) && !(wake && self.notify_announced.contains(&n.name)))
+                .any(|n| !self.mail.seen.contains(&n.name) && !(wake && self.mail.announced.contains(&n.name)))
     }
 
     /// Hands queued `mu notify` messages to the model as one `<system-notice>` user message and
     /// deletes the files, but only once that message is in the session file.
     pub(super) fn take_notify(&mut self) -> bool {
-        if !self.notify || self.session.is_none() || !inbox::has_pending(&self.session_id()) {
+        if !self.mail.notify || self.session.is_none() || !inbox::has_pending(&self.session_id()) {
             return false;
         }
         let id = self.session_id();
         let notes: Vec<inbox::Note> =
-            inbox::pending(&id).into_iter().filter(|n| !self.notify_seen.contains(&n.name)).collect();
+            inbox::pending(&id).into_iter().filter(|n| !self.mail.seen.contains(&n.name)).collect();
         if notes.is_empty() {
             return false;
         }
@@ -61,7 +61,7 @@ impl Agent {
             inbox::remove(&id, &names);
         } else {
             // Not written: keep the files for the next open, but never deliver them twice here.
-            self.notify_seen.extend(names);
+            self.mail.seen.extend(names);
         }
         true
     }

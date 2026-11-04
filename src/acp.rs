@@ -524,6 +524,12 @@ async fn open_session(
     let (ev_tx, mut ev_rx) = unbounded_channel();
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let inbox = events::new_inbox();
+    let run = agent::RunConfig {
+        pin_model: model.is_some() && resume.is_some(),
+        pin_thinking: thinking.is_some() && resume.is_some(),
+        excluded: agent::HEADLESS_EXCLUDED.to_vec(),
+        ..Default::default()
+    };
     let mut agent = agent::Agent::new(agent::AgentInit {
         providers: providers.clone(),
         plugins: host.clone(),
@@ -534,10 +540,8 @@ async fn open_session(
         events: ev_tx,
         inbox: inbox.clone(),
         deliver: crate::deliver::detached_starter(),
+        run,
     });
-    agent.pin_model = model.is_some() && resume.is_some();
-    agent.pin_thinking = thinking.is_some() && resume.is_some();
-    agent.excluded = agent::HEADLESS_EXCLUDED.to_vec();
     agent.enable_jobs();
     let task = tokio::task::spawn_local(agent.run(cmd_rx));
     let known = resume.as_deref().map(session::id_of);

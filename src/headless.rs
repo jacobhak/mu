@@ -277,8 +277,10 @@ pub(crate) async fn run_subagent(
 mod tests {
     use super::*;
     use mu_agent::agent::Agent;
+    use mu_agent::agent::RunConfig;
     use mu_agent::plans;
-    use mu_agent::testing::{agent, assistant, git_repo, results, save_plan_in, yield_call};
+    use mu_agent::testing::{agent, agent_in, agent_run, assistant, git_repo, results, save_plan_in, yield_call};
+    use mu_base::config::Configs;
     use mu_base::message::StopReason;
     use mu_provider::provider::types::ProviderError;
     use mu_testutil::block_on_local as block;
@@ -548,13 +550,16 @@ mod tests {
                 Ok(assistant(vec![yield_call("y2", json!({"data":{"n":2.0}}))], StopReason::ToolUse)),
                 Err(ProviderError::Fatal("requested after a successful yield".into())),
             ];
-            let (mut a, rx) = agent(script);
-            *a.tools.output_schema.borrow_mut() =
-                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
-            a.allow = Some(vec!["read".into()]); // `yield` must still be allowed
+            // `yield` must still be allowed
+            let (mut a, rx) = agent_run(
+                script,
+                Configs::default(),
+                RunConfig { allow: Some(vec!["read".into()]), ..Default::default() },
+            );
+            a.set_output_schema(Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}})));
             let (r, code) = drive_subagent(&mut a, rx, true).await;
             assert_eq!((code, &r["schemaOk"], &r["data"]), (0, &true.into(), &json!({"n":2})), "{r}");
-            assert_eq!(a.providers.scripted.borrow().len(), 1, "no request after a successful yield");
+            assert_eq!(a.providers().scripted.borrow().len(), 1, "no request after a successful yield");
             let res = results(&a);
             assert_eq!(res.len(), 2, "{res:?}");
             assert!(res[0].0 && res[0].1.contains("does not match the output schema") && res[0].1.contains("$.n"));
@@ -571,11 +576,10 @@ mod tests {
                 Err(ProviderError::Fatal("requested after a successful yield".into())),
             ];
             let (mut a, rx) = agent(script);
-            *a.tools.output_schema.borrow_mut() =
-                Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+            a.set_output_schema(Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}})));
             let (r, code) = drive_subagent(&mut a, rx, true).await;
             assert_eq!((code, r["text"].as_str(), &r["schemaOk"]), (1, Some("cannot"), &false.into()), "{r}");
-            assert_eq!(a.providers.scripted.borrow().len(), 1);
+            assert_eq!(a.providers().scripted.borrow().len(), 1);
         });
     }
 
@@ -588,9 +592,8 @@ mod tests {
             std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
             std::fs::write(&dir, "not a directory").unwrap(); // create_dir_all now fails
             assert!(dir.starts_with(home));
-            let (mut a, rx) = agent(vec![]);
-            a.cwd = cwd;
-            *a.tools.output_schema.borrow_mut() = Some(json!({"type":"object"}));
+            let (mut a, rx) = agent_in(vec![], Configs::default(), RunConfig::default(), cwd);
+            a.set_output_schema(Some(json!({"type":"object"})));
             let r = tokio::time::timeout(std::time::Duration::from_secs(10), drive_subagent(&mut a, rx, true)).await;
             let (r, code) = r.expect("the run hung");
             assert_eq!((code, &r["isError"]), (1, &true.into()), "{r}");
@@ -599,12 +602,11 @@ mod tests {
 
     /// Runs `first` through `print_mode` against a fresh git repo; returns the exit code and the session file count.
     async fn headless_refusal(first: Command, prep: impl FnOnce(&Path, &plans::Store)) -> (i32, usize) {
-        let (mut a, rx) = agent(vec![]);
-        a.cwd = git_repo();
-        let store = save_plan_in(&a.cwd, &["a.txt"]).await;
-        prep(&a.cwd, &store);
-        let cwd = a.cwd.clone();
-        let inbox = a.inbox.clone();
+        let cwd = git_repo();
+        let (a, rx) = agent_in(vec![], Configs::default(), RunConfig::default(), cwd.clone());
+        let store = save_plan_in(&cwd, &["a.txt"]).await;
+        prep(&cwd, &store);
+        let inbox = a.inbox();
         let (tx, crx) = tokio::sync::mpsc::unbounded_channel();
         let (_stop, srx) = tokio::sync::mpsc::unbounded_channel();
         let (_, code) =

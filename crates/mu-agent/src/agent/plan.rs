@@ -5,8 +5,8 @@ use mu_session::session;
 impl Agent {
     pub(super) async fn enter_plan(&mut self) {
         self.ensure_session().await;
-        let prev = PlanState { prev_model: Some(self.model.id.clone()), prev_thinking: self.thinking };
-        if self.providers.cfg.role("plan").is_some() {
+        let prev = PlanState { prev_model: Some(self.model.model.id.clone()), prev_thinking: self.model.thinking };
+        if self.ports.providers.cfg.role("plan").is_some() {
             self.set_model("@plan");
         }
         if let Some(s) = self.session.as_mut() {
@@ -15,13 +15,13 @@ impl Agent {
                 json!({"planFilePath": "local://", "prevModel": prev.prev_model, "prevThinking": prev.prev_thinking.as_str()}),
             );
         }
-        self.plan = Some(prev);
+        self.plan.plan = Some(prev);
         self.notice("plan mode on");
         self.emit_status();
     }
 
     pub(super) fn exit_plan(&mut self) {
-        let Some(p) = self.plan.take() else { return };
+        let Some(p) = self.plan.plan.take() else { return };
         if let Some(m) = p.prev_model {
             self.set_model(&m);
         }
@@ -39,11 +39,11 @@ impl Agent {
         if let Err(e) = self.write_local_file(&p.uri, &p.content) {
             self.error(format!("cannot copy the plan to {}: {e}", p.uri));
         }
-        if self.title.is_none() && !p.title.trim().is_empty() {
+        if self.title.text.is_none() && !p.title.trim().is_empty() {
             if let Some(s) = self.session.as_mut() {
                 s.set_title(&p.title, session::TitleSource::Auto);
             }
-            self.title = Some(p.title.clone());
+            self.title.text = Some(p.title.clone());
             self.emit_status();
         }
     }
@@ -68,7 +68,7 @@ impl Agent {
             read,
             session: session.as_deref(),
             base,
-            adopt: self.stored_plan.as_deref(),
+            adopt: self.plan.stored_plan.as_deref(),
         });
         (store, saved)
     }
@@ -137,7 +137,7 @@ impl Agent {
         }
         let Some(session) = self.session.as_ref().map(|s| s.path.clone()) else { return };
         self.notice(format!("starting delivery of plan {id}…"));
-        match (self.deliver)(id.to_string(), session, self.cwd.clone()).await {
+        match (self.ports.deliver)(id.to_string(), session, self.cwd.clone()).await {
             Ok(out) => self.notice(format!("▸ {out}")),
             Err(e) => self.error(e),
         }
@@ -219,10 +219,10 @@ impl Agent {
                 return None;
             }
             PlanDecision::Refine(text) => {
-                if self.plan.is_none() {
+                if self.plan.plan.is_none() {
                     self.enter_plan().await;
                 }
-                self.stored_plan = Some(id.to_string());
+                self.plan.stored_plan = Some(id.to_string());
                 if let Err(e) = self.write_local_file(&uri, &content) {
                     self.error(format!("cannot copy the plan to {uri}: {e}"));
                     return None;

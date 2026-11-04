@@ -1,4 +1,8 @@
 mod compaction;
+mod state;
+pub use state::RunConfig;
+use state::{CompactionFlow, Costs, Mailbox, Memo, ModelState, PlanFlow, Ports, TitleState};
+use std::cell::Cell;
 mod inbox;
 #[cfg(test)]
 mod loop_tests;
@@ -14,7 +18,7 @@ use crate::plans;
 use crate::policy::ToolPolicy;
 use crate::prompt::{self, PromptInput};
 use mu_base::ask_nudge;
-use mu_base::events::{AgentEvent, Command, EventTx, GitInfo, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
+use mu_base::events::{AgentEvent, Command, EventTx, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
 use mu_base::git;
 use mu_base::mem;
 use mu_base::message::UserInput;
@@ -27,7 +31,7 @@ use mu_provider::model::cost::CostLedger;
 use mu_provider::model::pricing;
 use mu_provider::provider::client::Providers;
 use mu_provider::provider::types::{ProviderError, Request, StreamEvent};
-use mu_session::session::{CompactionState, SessionFile, TitleSource};
+use mu_session::session::{SessionFile, TitleSource};
 use mu_tools::context::{self, Context};
 use mu_tools::jobs::{self, JobsHandle};
 use mu_tools::plugin::host::{InitParams, PluginHost};
@@ -42,73 +46,26 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 pub struct Agent {
-    pub providers: Rc<Providers>,
-    pub plugins: Rc<PluginHost>,
-    pub tools: Tools,
-    pub session: Option<SessionFile>,
-    pub messages: Vec<Message>,
+    tools: Tools,
+    cwd: PathBuf,
+    ctx: Rc<Context>,
+    session: Option<SessionFile>,
+    pub(crate) messages: Vec<Message>,
     /// Parallel to `messages`.
-    pub entry_ids: Vec<String>,
-    pub model: ModelSpec,
-    pub thinking: Thinking,
-    /// Mirror of `thinking` that the request reads, so a level set mid-turn (or during retries)
-    /// applies to the next attempt.
-    live_thinking: Rc<std::cell::Cell<Thinking>>,
-    pub title: Option<String>,
-    pub events: EventTx,
-    pub inbox: SharedInbox,
-    pub cwd: PathBuf,
-    pub ctx: Rc<Context>,
-    pub subagent: bool,
-    pub plugin_ctx: BTreeMap<String, String>,
-    /// Built-in and plugin tool definitions, built on the first request: plugin schemas are not
-    /// read at startup.
-    base_defs: std::cell::OnceCell<Vec<ToolDef>>,
-    /// Tool names hidden from the model (e.g. `ask` when headless).
-    pub excluded: Vec<&'static str>,
-    pub plan: Option<PlanState>,
-    /// Only these tools are offered when set.
-    pub allow: Option<Vec<String>>,
-    /// Custom-agent instructions, appended verbatim to the system prompt.
-    pub agent_prompt: Option<String>,
-    pub parent_session: Option<PathBuf>,
-    exec_plan: Option<ExecPlan>,
-    /// The stored plan being revised in plan mode; `propose_plan` updates it in place.
-    stored_plan: Option<String>,
-    pub review_base: Option<crate::review::ReviewBase>,
-    pub pin_model: bool,
-    pub pin_thinking: bool,
-    pub compaction: Option<CompactionState>,
-    /// Index into `messages` from which assistant usage reflects the current context.
-    pub fresh_from: usize,
-    pub since_compaction: usize,
-    pub title_requested: bool,
-    /// Cancels an in-flight title request when the session ends.
-    pub title_cancel: CancellationToken,
-    pub title_tx: UnboundedSender<(String, String)>,
-    title_rx: Option<UnboundedReceiver<(String, String)>>,
+    entry_ids: Vec<String>,
+    ports: Ports,
+    model: ModelState,
+    title: TitleState,
+    plan: PlanFlow,
+    mail: Mailbox,
+    run: RunConfig,
+    costs: Costs,
+    compaction: CompactionFlow,
+    memo: Memo,
+    plugin_ctx: BTreeMap<String, String>,
     resumed: bool,
     user_turn: u32,
-    cost: CostLedger,
-    /// `(inputs hash, tokens)` of the system prompt, see `system_tokens`.
-    system_memo: std::cell::RefCell<Option<(u64, u64)>>,
-    /// `((message count, last timestamp), tokens)`, see `messages_tokens`.
-    messages_memo: std::cell::RefCell<Option<((usize, i64), u64)>>,
-    git: Option<GitInfo>,
-    quota: QuotaTracker,
-    pricing_checked: bool,
     turn_msgs: Vec<Value>,
-    wake_rx: Option<UnboundedReceiver<()>>,
-    /// `-p --resume`: when the session cannot be opened, the run ends instead of starting a fresh one.
-    pub exit_on_resume_failure: bool,
-    wake_tx: Option<UnboundedSender<()>>,
-    /// Interactive only: drain `mu notify` messages (the SIGUSR2 handler is installed).
-    notify: bool,
-    /// Inbox files that were handed over but could not be deleted (session write failed).
-    notify_seen: HashSet<String>,
-    /// Inbox files announced when the session was opened; they wait for the next prompt.
-    notify_announced: HashSet<String>,
-    deliver: DeliverFn,
 }
 
 pub struct PlanState {
@@ -181,6 +138,7 @@ pub struct AgentInit {
     pub events: EventTx,
     pub inbox: SharedInbox,
     pub deliver: DeliverFn,
+    pub run: RunConfig,
 }
 
 const SKIP_STOPPED: &str = "Skipped: the run was stopped so the user can take over";
@@ -250,76 +208,81 @@ impl Agent {
         let (title_tx, title_rx) = unbounded_channel();
         Self {
             tools,
-            providers: i.providers,
-            plugins: i.plugins,
+            cwd: i.cwd,
+            ctx: i.ctx,
             session: None,
             messages: Vec::new(),
             entry_ids: Vec::new(),
-            model: i.model,
-            thinking: i.thinking,
-            live_thinking: Rc::new(std::cell::Cell::new(i.thinking)),
-            title: None,
-            events: i.events,
-            inbox: i.inbox,
-            cwd: i.cwd,
-            ctx: i.ctx,
-            subagent: false,
+            ports: Ports {
+                providers: i.providers,
+                plugins: i.plugins,
+                events: i.events,
+                inbox: i.inbox,
+                deliver: i.deliver,
+            },
+            model: ModelState {
+                model: i.model,
+                thinking: i.thinking,
+                live_thinking: Rc::new(Cell::new(i.thinking)),
+                pricing_checked: false,
+            },
+            title: TitleState {
+                text: None,
+                requested: false,
+                cancel: CancellationToken::new(),
+                tx: title_tx,
+                rx: Some(title_rx),
+            },
+            plan: PlanFlow { plan: None, exec_plan: None, stored_plan: None, review_base: None },
+            mail: Mailbox {
+                wake_rx: None,
+                wake_tx: None,
+                notify: false,
+                seen: HashSet::new(),
+                announced: HashSet::new(),
+            },
+            run: i.run,
+            costs: Costs { cost: CostLedger::default(), quota: QuotaTracker::default(), git: None },
+            compaction: CompactionFlow { state: None, fresh_from: 0, since: 0 },
+            memo: Memo::default(),
             plugin_ctx: BTreeMap::new(),
-            base_defs: Default::default(),
-            excluded: Vec::new(),
-            plan: None,
-            allow: None,
-            agent_prompt: None,
-            parent_session: None,
-            exec_plan: None,
-            stored_plan: None,
-            review_base: None,
-            pin_model: false,
-            pin_thinking: false,
-            compaction: None,
-            fresh_from: 0,
-            since_compaction: 0,
-            title_requested: false,
-            title_cancel: CancellationToken::new(),
-            title_tx,
-            title_rx: Some(title_rx),
             resumed: false,
             user_turn: 0,
-            cost: CostLedger::default(),
-            system_memo: Default::default(),
-            messages_memo: Default::default(),
-            git: None,
-            quota: QuotaTracker::default(),
-            pricing_checked: false,
             turn_msgs: Vec::new(),
-            wake_rx: None,
-            exit_on_resume_failure: false,
-            wake_tx: None,
-            notify: false,
-            notify_seen: HashSet::new(),
-            notify_announced: HashSet::new(),
-            deliver: i.deliver,
         }
     }
 
     /// Interactive sessions only: `task` runs in the background and finished jobs wake the agent.
     pub fn enable_jobs(&mut self) {
         let (wake, wake_rx) = unbounded_channel();
-        self.wake_tx = Some(wake.clone());
-        let jobs = JobsHandle::new(wake, self.events.clone());
+        self.mail.wake_tx = Some(wake.clone());
+        let jobs = JobsHandle::new(wake, self.ports.events.clone());
         self.tools.jobs = Some(jobs);
-        self.wake_rx = Some(wake_rx);
+        self.mail.wake_rx = Some(wake_rx);
     }
 
     /// Interactive sessions only: `mu notify` messages are delivered. Returns the sender the
     /// SIGUSR2 handler uses to wake the agent (the jobs wake channel), `None` without jobs.
     pub fn enable_notify(&mut self) -> Option<UnboundedSender<()>> {
-        self.notify = true;
-        self.wake_tx.clone()
+        self.mail.notify = true;
+        self.mail.wake_tx.clone()
+    }
+
+    /// Structured-output schema for `yield`; set by a front end before the run starts.
+    pub fn set_output_schema(&self, schema: Option<serde_json::Value>) {
+        *self.tools.output_schema.borrow_mut() = schema;
+    }
+
+    pub fn providers(&self) -> Rc<Providers> {
+        self.ports.providers.clone()
+    }
+
+    pub fn inbox(&self) -> SharedInbox {
+        self.ports.inbox.clone()
     }
 
     pub fn emit(&self, e: AgentEvent) {
-        let _ = self.events.send(e);
+        let _ = self.ports.events.send(e);
     }
 
     pub fn notice(&self, s: impl Into<String>) {
@@ -346,15 +309,15 @@ impl Agent {
     }
 
     pub fn system(&self) -> String {
-        let mcp = self.plugins.mcp_instructions();
+        let mcp = self.ports.plugins.mcp_instructions();
         prompt::system_prompt(&PromptInput {
-            model: &self.model.id,
+            model: &self.model.model.id,
             cwd: &self.cwd,
             ctx: &self.ctx,
-            plan: self.plan.as_ref().map(|_| PLAN_PROMPT),
-            subagent: self.subagent,
+            plan: self.plan.plan.as_ref().map(|_| PLAN_PROMPT),
+            subagent: self.run.subagent,
             ask: self.policy().permits("ask"),
-            agent_prompt: self.agent_prompt.as_deref(),
+            agent_prompt: self.run.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),
             hashline: mu_tools::tools::edit::is_hashline(),
@@ -362,23 +325,23 @@ impl Agent {
     }
 
     pub async fn run(mut self, rx: UnboundedReceiver<Command>) {
-        self.quota.enabled = true;
+        self.costs.quota.enabled = true;
         self.sync_model_state();
-        let providers = self.providers.clone();
+        let providers = self.ports.providers.clone();
         tokio::task::spawn_local(async move {
             providers.refresh_direct_models(false).await;
         });
         self.refresh_external().await;
         self.emit_status();
-        let mut title_rx = self.title_rx.take().expect("run once");
-        let mut wake_rx = self.wake_rx.take();
-        let mut quota_rx = self.quota.take_wake();
+        let mut title_rx = self.title.rx.take().expect("run once");
+        let mut wake_rx = self.mail.wake_rx.take();
+        let mut quota_rx = self.costs.quota.take_wake();
         let mut q = Queue {
             rx,
             backlog: Default::default(),
             jobs: self.tools.jobs.clone(),
-            events: self.events.clone(),
-            live: self.live_thinking.clone(),
+            events: self.ports.events.clone(),
+            live: self.model.live_thinking.clone(),
         };
         loop {
             let cmd = if let Some(c) = q.backlog.pop_front() {
@@ -386,7 +349,7 @@ impl Agent {
             } else {
                 tokio::select! {
                 c = q.rx.recv() => match c { Some(c) => c, None => break },
-                () = tokio::time::sleep(self.quota.wait()) => {
+                () = tokio::time::sleep(self.costs.quota.wait()) => {
                     self.tick_quota();
                     continue;
                 }
@@ -405,79 +368,87 @@ impl Agent {
                 }
                 }
             };
-            match cmd {
-                Command::Prompt(t) => drive(self.turn(Some(t)), &mut q).await,
-                Command::EnsureSession => {
-                    self.ensure_session().await;
-                    self.emit_status();
-                }
-                Command::SetModel(sel) => self.set_model(&sel),
-                Command::RefreshModel => {
-                    self.refresh_model_meta();
-                    self.emit_status();
-                }
-                Command::SetThinking(t) => self.set_thinking(t),
-                Command::NewSession => {
-                    self.end_session().await;
-                    self.reset_conversation();
-                    self.notice("new session");
-                    self.emit_status();
-                }
-                Command::Resume(p) => {
-                    // A `-p` run that asked for a session must not quietly run in another one.
-                    if !self.load_session(&p).await && self.exit_on_resume_failure {
-                        break;
-                    }
-                }
-                Command::TogglePlan(prompt) => match (self.plan.is_some(), prompt) {
-                    (false, p) => {
-                        self.enter_plan().await;
-                        if let Some(p) = p {
-                            drive(self.turn(Some(p.into())), &mut q).await;
-                        }
-                    }
-                    (true, Some(p)) => drive(self.turn(Some(p.into())), &mut q).await,
-                    (true, None) => self.exit_plan(),
-                },
-                Command::Compact(focus) => self.manual_compact(focus).await,
-                Command::Review(focus) => drive(self.review(focus), &mut q).await,
-                Command::Rename(t) => {
-                    self.ensure_session().await;
-                    if let Some(s) = self.session.as_mut() {
-                        s.set_title(&t, TitleSource::User);
-                    }
-                    self.title = Some(t);
-                    self.emit_status();
-                }
-                Command::Bash { cmd, include } => self.user_bash(cmd, include).await,
-                Command::KillJobs(id) => {
-                    let n = self.tools.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
-                    self.notice(format!("killed {n} job(s)"));
-                }
-                Command::RefreshTools => self.refresh_tool_defs(),
-                Command::ListPlans => self.list_plans().await,
-                Command::OpenPlan(id) => {
-                    if let Some(s) = self.open_plan(&id).await {
-                        drive(self.turn_from(s), &mut q).await;
-                    }
-                }
-                Command::Deliver(id) => self.deliver(&id).await,
-                Command::StartPlan { id, decision, anyway } => {
-                    if let Some(s) = self.start_plan(&id, decision, anyway).await {
-                        drive(self.turn_from(s), &mut q).await;
-                    }
-                }
-                Command::RefinePlan { id, text } => {
-                    if let Some(s) = self.refine_plan(&id, text).await {
-                        drive(self.turn_from(s), &mut q).await;
-                    }
-                }
-                Command::Exit => {
-                    self.end_session().await;
-                    break;
-                }
+            if !self.command(cmd, &mut q).await {
+                break;
             }
         }
         self.emit(AgentEvent::Exit);
+    }
+
+    /// Runs one command. `false` ends the run loop.
+    async fn command(&mut self, cmd: Command, q: &mut Queue) -> bool {
+        match cmd {
+            Command::Prompt(t) => drive(self.turn(Some(t)), q).await,
+            Command::EnsureSession => {
+                self.ensure_session().await;
+                self.emit_status();
+            }
+            Command::SetModel(sel) => self.set_model(&sel),
+            Command::RefreshModel => {
+                self.refresh_model_meta();
+                self.emit_status();
+            }
+            Command::SetThinking(t) => self.set_thinking(t),
+            Command::NewSession => {
+                self.end_session().await;
+                self.reset_conversation();
+                self.notice("new session");
+                self.emit_status();
+            }
+            Command::Resume(p) => {
+                // A `-p` run that asked for a session must not quietly run in another one.
+                if !self.load_session(&p).await && self.run.exit_on_resume_failure {
+                    return false;
+                }
+            }
+            Command::TogglePlan(prompt) => match (self.plan.plan.is_some(), prompt) {
+                (false, p) => {
+                    self.enter_plan().await;
+                    if let Some(p) = p {
+                        drive(self.turn(Some(p.into())), q).await;
+                    }
+                }
+                (true, Some(p)) => drive(self.turn(Some(p.into())), q).await,
+                (true, None) => self.exit_plan(),
+            },
+            Command::Compact(focus) => self.manual_compact(focus).await,
+            Command::Review(focus) => drive(self.review(focus), q).await,
+            Command::Rename(t) => {
+                self.ensure_session().await;
+                if let Some(s) = self.session.as_mut() {
+                    s.set_title(&t, TitleSource::User);
+                }
+                self.title.text = Some(t);
+                self.emit_status();
+            }
+            Command::Bash { cmd, include } => self.user_bash(cmd, include).await,
+            Command::KillJobs(id) => {
+                let n = self.tools.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
+                self.notice(format!("killed {n} job(s)"));
+            }
+            Command::RefreshTools => self.refresh_tool_defs(),
+            Command::ListPlans => self.list_plans().await,
+            Command::OpenPlan(id) => {
+                if let Some(s) = self.open_plan(&id).await {
+                    drive(self.turn_from(s), q).await;
+                }
+            }
+            Command::Deliver(id) => self.deliver(&id).await,
+            Command::StartPlan { id, decision, anyway } => {
+                if let Some(s) = self.start_plan(&id, decision, anyway).await {
+                    drive(self.turn_from(s), q).await;
+                }
+            }
+            Command::RefinePlan { id, text } => {
+                if let Some(s) = self.refine_plan(&id, text).await {
+                    drive(self.turn_from(s), q).await;
+                }
+            }
+            Command::Exit => {
+                self.end_session().await;
+                return false;
+            }
+        }
+        true
     }
 }

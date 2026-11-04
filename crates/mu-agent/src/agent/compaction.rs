@@ -162,8 +162,8 @@ pub(super) fn estimate_tokens(text: &str) -> u64 {
 
 impl Agent {
     pub fn thresholds(&self) -> (u64, u64) {
-        let th = self.providers.cfg.thresholds();
-        window_and_threshold(self.model.context_window, lookup(&th, &self.model.id))
+        let th = self.ports.providers.cfg.thresholds();
+        window_and_threshold(self.model.model.context_window, lookup(&th, &self.model.model.id))
     }
 
     /// Estimated tokens of the next request: system prompt, summary context and messages. The
@@ -172,7 +172,7 @@ impl Agent {
     pub fn estimate_tokens(&self) -> u64 {
         self.system_tokens()
             + self.messages_tokens()
-            + self.compaction.as_ref().map_or(0, |c| estimate_tokens(&c.summary))
+            + self.compaction.state.as_ref().map_or(0, |c| estimate_tokens(&c.summary))
     }
 
     /// Newest usage if it postdates the last compaction, else an estimate.
@@ -187,7 +187,7 @@ impl Agent {
     /// Messages as sent to the provider: the summary context first when compacted.
     pub fn wire_messages(&self) -> Vec<Message> {
         let mut v = Vec::with_capacity(self.messages.len() + 1);
-        if let Some(c) = &self.compaction {
+        if let Some(c) = &self.compaction.state {
             v.push(context_message(&c.summary));
         }
         v.extend(self.messages.iter().cloned());
@@ -198,7 +198,7 @@ impl Agent {
         if self.messages.len() < 2 {
             return Outcome::Skipped("Nothing to compact");
         }
-        if self.since_compaction == 0 {
+        if self.compaction.since == 0 {
             return Outcome::Skipped("Already compacted");
         }
         let cut = cut_point(&self.messages);
@@ -208,6 +208,7 @@ impl Agent {
         self.emit(AgentEvent::Compacting);
         let before = self.context_tokens();
         let extra: Vec<String> = self
+            .ports
             .plugins
             .hook("pre_compaction", json!({}))
             .await
@@ -215,17 +216,21 @@ impl Agent {
             .filter_map(|(_, v)| v["context"].as_str().filter(|c| !c.is_empty()).map(String::from))
             .collect();
         let prompt = summary_prompt(
-            &serialize_within(&self.messages[..cut], summary_input_chars(self.model.context_window)),
-            self.compaction.as_ref().map(|c| c.summary.as_str()),
+            &serialize_within(&self.messages[..cut], summary_input_chars(self.model.model.context_window)),
+            self.compaction.state.as_ref().map(|c| c.summary.as_str()),
             focus,
             &extra,
         );
-        let summary =
-            match self.providers.complete(&self.model.id, SYSTEM_PROMPT, &prompt, SUMMARY_MAX_TOKENS, cancel).await {
-                Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
-                Ok(_) => return Outcome::Failed("empty summary".into()),
-                Err(e) => return Outcome::Failed(e.to_string()),
-            };
+        let summary = match self
+            .ports
+            .providers
+            .complete(&self.model.model.id, SYSTEM_PROMPT, &prompt, SUMMARY_MAX_TOKENS, cancel)
+            .await
+        {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            Ok(_) => return Outcome::Failed("empty summary".into()),
+            Err(e) => return Outcome::Failed(e.to_string()),
+        };
         let first_kept = self.entry_ids.get(cut).cloned().unwrap_or_default();
         if self.session.is_some() && first_kept.is_empty() {
             // The entry the summary would point at was never written; cutting there would corrupt the chain.
@@ -239,9 +244,9 @@ impl Agent {
         if let Some(s) = self.session.as_mut() {
             s.compaction(&summary, &first_kept, before, after_est);
         }
-        self.compaction = Some(CompactionState { summary });
-        self.fresh_from = self.messages.len();
-        self.since_compaction = 0;
+        self.compaction.state = Some(CompactionState { summary });
+        self.compaction.fresh_from = self.messages.len();
+        self.compaction.since = 0;
         self.emit(AgentEvent::Compacted { before, after: after_est });
         self.emit_status();
         Outcome::Done
@@ -249,7 +254,7 @@ impl Agent {
 
     /// Fire-and-forget title for the first exchange of a new session.
     pub fn request_title(&mut self) {
-        if self.title.is_some() || self.title_requested {
+        if self.title.text.is_some() || self.title.requested {
             return;
         }
         let Some(Message::User { content, .. }) =
@@ -258,9 +263,9 @@ impl Agent {
             return;
         };
         let prompt: String = text_of(content).chars().take(2000).collect();
-        self.title_requested = true;
-        let (providers, tx, sid) = (self.providers.clone(), self.title_tx.clone(), self.session_id());
-        let cancel = self.title_cancel.clone();
+        self.title.requested = true;
+        let (providers, tx, sid) = (self.ports.providers.clone(), self.title.tx.clone(), self.session_id());
+        let cancel = self.title.cancel.clone();
         tokio::task::spawn_local(async move {
             let r = providers.complete("smol", TITLE_SYSTEM, &prompt, 64, &cancel).await;
             if let Some(t) = r.ok().and_then(|s| extract_title(&s)) {
@@ -271,7 +276,7 @@ impl Agent {
 
     pub(super) async fn manual_compact(&mut self, focus: Option<String>) {
         let cancel = CancellationToken::new();
-        self.inbox.borrow_mut().cancel = cancel.clone();
+        self.ports.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
         match self.compact(focus.as_deref(), &cancel).await {
             Outcome::Done => {}

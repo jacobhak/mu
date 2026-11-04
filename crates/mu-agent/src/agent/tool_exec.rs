@@ -4,10 +4,11 @@ use crate::review;
 impl Agent {
     pub fn tool_defs(&self) -> Vec<ToolDef> {
         let mut v = self
+            .memo
             .base_defs
-            .get_or_init(|| Tools::definitions().into_iter().chain(self.plugins.tool_defs()).collect())
+            .get_or_init(|| Tools::definitions().into_iter().chain(self.ports.plugins.tool_defs()).collect())
             .clone();
-        if self.plan.is_some() {
+        if self.plan.plan.is_some() {
             v.push(Tools::plan_def());
         }
         v.push(Tools::task_def(self.tools.jobs.is_some(), &self.ctx.agents));
@@ -25,16 +26,16 @@ impl Agent {
     /// The tool limits for this run; enforced in `run_tool` and used to build the advertised list.
     pub fn policy(&self) -> ToolPolicy {
         ToolPolicy {
-            allow: self.allow.clone(),
-            excluded: self.excluded.clone(),
+            allow: self.run.allow.clone(),
+            excluded: self.run.excluded.clone(),
             depth: mu_tools::tools::task::depth(),
-            plan: self.plan.is_some(),
+            plan: self.plan.plan.is_some(),
         }
     }
 
     /// Drops the cached tool list so the next request rebuilds it (after an MCP login added tools).
     pub fn refresh_tool_defs(&mut self) {
-        self.base_defs.take();
+        self.memo.base_defs.take();
     }
 
     pub(super) fn push_result(&mut self, id: &str, name: &str, out: &ToolOutput) {
@@ -126,16 +127,16 @@ impl Agent {
             return;
         }
         let cancel = CancellationToken::new();
-        self.inbox.borrow_mut().cancel = cancel.clone();
+        self.ports.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::TurnStart);
         let args = json!({"command": cmd});
         let id = "user-bash".to_string();
         self.emit(AgentEvent::ToolStart { id: id.clone(), name: "bash".into(), args: args.clone() });
         let ctx = ToolCtx {
-            events: self.events.clone(),
+            events: self.ports.events.clone(),
             cancel: cancel.clone(),
             call_id: id.clone(),
-            plan: self.plan.is_some(),
+            plan: self.plan.plan.is_some(),
         };
         let mut out = self.tools.call("bash", &args, &ctx).await;
         let hits = self.redact_output(&mut out, false);
@@ -156,7 +157,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> ToolOutput {
         let mut blocked = None;
-        for (plugin, v) in self.plugins.hook("tool_call", json!({"name": name, "arguments": args})).await {
+        for (plugin, v) in self.ports.plugins.hook("tool_call", json!({"name": name, "arguments": args})).await {
             if let Some(b) = v["block"].as_str() {
                 blocked = Some(format!("Blocked by plugin {plugin}: {b}"));
                 break;
@@ -171,10 +172,10 @@ impl Agent {
             Some(b) => ToolOutput::err(b),
             None => {
                 let ctx = ToolCtx {
-                    events: self.events.clone(),
+                    events: self.ports.events.clone(),
                     cancel: cancel.clone(),
                     call_id: id.into(),
-                    plan: self.plan.is_some(),
+                    plan: self.plan.plan.is_some(),
                 };
                 use futures_util::FutureExt;
                 match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await {
@@ -194,6 +195,7 @@ impl Agent {
         self.log_redaction(&format!("tool:{name}"), &hits);
         let sub = format!("tool_result:{name}");
         for (_, v) in self
+            .ports
             .plugins
             .hook(&sub, json!({"name": name, "arguments": args, "content": out.text, "isError": out.is_error}))
             .await
@@ -205,71 +207,7 @@ impl Agent {
         }
         let details = out.details.clone();
         if let Some(d) = details.as_ref() {
-            let decision = plan_decision(d);
-            let (base, now) = match decision {
-                Some(PlanDecision::Execute { .. } | PlanDecision::Compact { .. } | PlanDecision::Keep { .. }) => {
-                    (review::snapshot_tree(&self.cwd).await.ok(), now_ms())
-                }
-                _ => (None, 0),
-            };
-            match decision {
-                Some(k @ (PlanDecision::Execute { .. } | PlanDecision::Compact { .. })) => {
-                    let (_, saved) = self.save_plan(d).await;
-                    let stored = match saved {
-                        Ok(m) => Some(m.id),
-                        Err(e) => {
-                            self.error(format!("could not save the plan: {e}"));
-                            None
-                        }
-                    };
-                    self.exec_plan = Some(ExecPlan {
-                        content: d["content"].as_str().unwrap_or_default().into(),
-                        title: d["title"].as_str().unwrap_or_default().into(),
-                        uri: d["uri"].as_str().unwrap_or_default().into(),
-                        decision: k,
-                        base,
-                        approved_at: now,
-                        stored,
-                    });
-                }
-                Some(k @ PlanDecision::Keep { .. }) => {
-                    let (store, saved) = self.save_plan(d).await;
-                    match saved {
-                        Ok(m) => {
-                            let session = self.session.as_ref().map(|s| s.path.clone());
-                            if let Err(e) = store.approve(&m.id, k.wire_name(), session.as_deref()) {
-                                self.error(format!("could not record the approval: {e}"));
-                            }
-                        }
-                        Err(e) => self.error(format!("could not save the plan: {e}")),
-                    }
-                    self.set_review_base(review::ReviewBase {
-                        tree: base,
-                        plan_uri: d["uri"].as_str().map(String::from),
-                        since: now,
-                    });
-                    self.exit_plan();
-                    if let Some(m) = k.model() {
-                        self.continue_with(m);
-                    }
-                }
-                Some(PlanDecision::Park) => {
-                    let (store, saved) = self.save_plan(d).await;
-                    match saved {
-                        Ok(m) => {
-                            self.exit_plan();
-                            self.stored_plan = None;
-                            self.emit(AgentEvent::PlanParked { id: m.id.clone(), path: store.md_path(&m.id) });
-                            out.text.push_str(&format!(
-                                " Parked as `{0}`; approve it with /plans or `mu plan approve {0}`.",
-                                m.id
-                            ));
-                        }
-                        Err(e) => out = ToolOutput::err(format!("Could not park the plan: {e}")),
-                    }
-                }
-                _ => {}
-            }
+            self.apply_plan_decision(d, &mut out).await;
         }
         if name == "todo" && !out.is_error {
             self.emit(AgentEvent::Todo(self.tools.todo_json()));
@@ -287,6 +225,75 @@ impl Agent {
             },
         });
         out
+    }
+
+    /// Acts on a `propose_plan` result: the plan is started, kept as the review base, or parked.
+    async fn apply_plan_decision(&mut self, d: &Value, out: &mut ToolOutput) {
+        let decision = plan_decision(d);
+        let (base, now) = match decision {
+            Some(PlanDecision::Execute { .. } | PlanDecision::Compact { .. } | PlanDecision::Keep { .. }) => {
+                (review::snapshot_tree(&self.cwd).await.ok(), now_ms())
+            }
+            _ => (None, 0),
+        };
+        match decision {
+            Some(k @ (PlanDecision::Execute { .. } | PlanDecision::Compact { .. })) => {
+                let (_, saved) = self.save_plan(d).await;
+                let stored = match saved {
+                    Ok(m) => Some(m.id),
+                    Err(e) => {
+                        self.error(format!("could not save the plan: {e}"));
+                        None
+                    }
+                };
+                self.plan.exec_plan = Some(ExecPlan {
+                    content: d["content"].as_str().unwrap_or_default().into(),
+                    title: d["title"].as_str().unwrap_or_default().into(),
+                    uri: d["uri"].as_str().unwrap_or_default().into(),
+                    decision: k,
+                    base,
+                    approved_at: now,
+                    stored,
+                });
+            }
+            Some(k @ PlanDecision::Keep { .. }) => {
+                let (store, saved) = self.save_plan(d).await;
+                match saved {
+                    Ok(m) => {
+                        let session = self.session.as_ref().map(|s| s.path.clone());
+                        if let Err(e) = store.approve(&m.id, k.wire_name(), session.as_deref()) {
+                            self.error(format!("could not record the approval: {e}"));
+                        }
+                    }
+                    Err(e) => self.error(format!("could not save the plan: {e}")),
+                }
+                self.set_review_base(review::ReviewBase {
+                    tree: base,
+                    plan_uri: d["uri"].as_str().map(String::from),
+                    since: now,
+                });
+                self.exit_plan();
+                if let Some(m) = k.model() {
+                    self.continue_with(m);
+                }
+            }
+            Some(PlanDecision::Park) => {
+                let (store, saved) = self.save_plan(d).await;
+                match saved {
+                    Ok(m) => {
+                        self.exit_plan();
+                        self.plan.stored_plan = None;
+                        self.emit(AgentEvent::PlanParked { id: m.id.clone(), path: store.md_path(&m.id) });
+                        out.text.push_str(&format!(
+                            " Parked as `{0}`; approve it with /plans or `mu plan approve {0}`.",
+                            m.id
+                        ));
+                    }
+                    Err(e) => *out = ToolOutput::err(format!("Could not park the plan: {e}")),
+                }
+            }
+            _ => {}
+        }
     }
 }
 
