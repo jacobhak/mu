@@ -35,6 +35,11 @@ pub(super) struct KeyFlow {
     pub(super) checking: bool,
 }
 
+/// Whether `name` is set to a value other than blanks.
+fn env_is_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
+}
+
 /// The status of a provider's key in `/login`.
 fn key_status(stored: bool, env_set: bool, env_name: &str) -> String {
     if stored {
@@ -571,7 +576,7 @@ mod tests {
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
         App {
             agent: AgentView::new(true, false),
-            services: Services { providers: Rc::new(Providers::new(Rc::new(Configs::default()), gateway)) },
+            services: Services { providers: Rc::new(Providers::for_tests(Rc::new(Configs::default()), gateway)) },
             link: Link { cmd_tx },
             ctx: Rc::new(Context::default()),
             plugins,

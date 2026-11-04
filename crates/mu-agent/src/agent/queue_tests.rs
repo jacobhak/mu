@@ -113,6 +113,61 @@ fn a_steer_sent_to_an_idle_agent_goes_back_to_the_composer() {
     });
 }
 
+/// Runs `cmd` on a fresh agent, sends Cancel once `started` matches an event, then Exit, and
+/// returns the events up to Exit. Fails if the command ignores Cancel.
+fn cancel_after(cmd: Command, started: fn(&AgentEvent) -> bool) -> Vec<AgentEvent> {
+    run(async {
+        let (a, mut ev) = crate::testing::agent(vec![]);
+        let (tx, cmd_rx) = unbounded_channel();
+        let task = tokio::task::spawn_local(a.run(cmd_rx));
+        tx.send(cmd).unwrap();
+        let mut evs = Vec::new();
+        let collect = async {
+            while let Some(e) = ev.recv().await {
+                if started(&e) {
+                    tx.send(Command::Cancel).unwrap();
+                    tx.send(Command::Exit).unwrap();
+                }
+                let exit = matches!(e, AgentEvent::Exit);
+                evs.push(e);
+                if exit {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), collect).await.expect("Cancel did not abort the command");
+        task.await.unwrap();
+        evs
+    })
+}
+
+#[test]
+fn cancel_aborts_a_running_user_bash() {
+    let evs = cancel_after(
+        Command::Bash { cmd: "sleep 600".into(), include: false },
+        |e| matches!(e, AgentEvent::ToolStart { id, .. } if id == "user-bash"),
+    );
+    assert!(evs.iter().any(|e| matches!(e, AgentEvent::TurnEnd { aborted: true })));
+}
+
+#[test]
+fn a_follow_up_that_starts_running_leaves_the_published_queue() {
+    use crate::testing::assistant;
+    use mu_base::message::{Block, StopReason};
+    run(async {
+        let (mut a, mut rx) = crate::testing::agent(vec![
+            Ok(assistant(vec![Block::text("one")], StopReason::Stop)),
+            Ok(assistant(vec![Block::text("two")], StopReason::Stop)),
+        ]);
+        a.ports.inbox.borrow_mut().follow_up.push_back("later".to_string().into());
+        a.turn(Some("go".to_string().into())).await;
+        let evs = drain(&mut rx);
+        let published = evs.iter().position(|e| matches!(e, AgentEvent::Queue(q) if q.follow_up.is_empty()));
+        let prompt = evs.iter().position(|e| matches!(e, AgentEvent::UserPrompt(t) if t == "later"));
+        assert!(published.is_some() && published < prompt, "the queue bar drops the follow-up before it runs");
+    });
+}
+
 #[test]
 fn handle_methods_send_the_matching_commands() {
     run(async {

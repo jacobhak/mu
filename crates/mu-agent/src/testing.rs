@@ -66,7 +66,7 @@ pub fn agent_in(
     mu_testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
     let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
     let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
-    let providers = Rc::new(Providers::new(
+    let providers = Rc::new(Providers::for_tests(
         Rc::new(cfg),
         mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start()),
     ));
@@ -97,6 +97,7 @@ pub fn agent_in(
         deliver,
         run,
     });
+    a.enable_panic_tool();
     (a, rx)
 }
 

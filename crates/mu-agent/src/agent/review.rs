@@ -44,6 +44,8 @@ impl Agent {
         self.emit(AgentEvent::TurnStart);
         let sent = self.review_run(focus, &cancel).await;
         self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
+        // Input typed while the reviewer ran goes back to the composer, not into the fix turn.
+        report_dropped(&self.ports.inbox, &self.ports.events);
         if let Some(msg) = sent {
             self.turn(Some(msg.into())).await;
         }
@@ -86,36 +88,29 @@ impl Agent {
 
     /// The changes `/review` covers. `None`, after a notice, when there is nothing to review.
     async fn review_scope(&mut self, focus: Option<String>) -> Option<ReviewScope> {
-        let base = match self.plan.review_base.as_ref().and_then(|b| b.tree.clone()) {
-            Some(tree) => review::facts::Base::Tree { tree, label: "plan approval snapshot" },
-            None => {
-                self.notice("no plan base recorded; reviewing uncommitted changes against HEAD");
-                review::facts::Base::Head { label: "HEAD (no plan approved in this session)" }
+        use review::facts::{Base, Worktree, repo_root};
+        let root = match repo_root(&self.cwd).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.error(e);
+                return None;
             }
         };
-        let plan_uri = self.plan.review_base.as_ref().and_then(|b| b.plan_uri.clone());
-        let plan = match &plan_uri {
-            Some(u) => match self.tools.resolve(u) {
-                Ok(r) if r.path.exists() => Some(r.path),
-                _ => {
-                    self.notice(format!("plan file {u} not found; reviewing without it"));
-                    None
-                }
-            },
-            None => None,
+        let wt = match Worktree::snapshot(root).await {
+            Ok(w) => w,
+            Err(e) => {
+                self.error(format!("review: {e}"));
+                return None;
+            }
         };
-        let plan_uri = plan.as_ref().and(plan_uri);
-        let since = self.plan.review_base.as_ref().map_or(0, |b| b.since);
-        let notes = review::facts::user_notes(&self.messages, since);
-        let facts = match review::facts::gather(review::facts::Gather {
-            cwd: &self.cwd,
-            base,
-            plan,
-            notes: &notes,
-            focus: focus.as_deref(),
-        })
-        .await
-        {
+        let base = match self.plan.review_base.as_ref().and_then(|b| b.tree.clone()) {
+            Some(tree) => Base::Tree { tree, label: "plan approval snapshot" },
+            None => {
+                self.notice("no plan base recorded; reviewing uncommitted changes against HEAD");
+                Base::Head { label: "HEAD (no plan approved in this session)" }
+            }
+        };
+        let facts = match wt.gather(base).await {
             Ok(f) => f,
             Err(e) => {
                 self.error(format!("review: {e}"));
@@ -130,6 +125,21 @@ impl Agent {
             self.notice("nothing to review: only binary, generated or lock files changed");
             return None;
         }
+        let plan_uri = self.plan.review_base.as_ref().and_then(|b| b.plan_uri.clone());
+        let plan = match &plan_uri {
+            Some(u) => match self.tools.resolve(u) {
+                Ok(r) if r.path.exists() => Some(r.path),
+                _ => {
+                    self.notice(format!("plan file {u} not found; reviewing without it"));
+                    None
+                }
+            },
+            None => None,
+        };
+        let plan_uri = plan.as_ref().and(plan_uri);
+        let since = self.plan.review_base.as_ref().map_or(0, |b| b.since);
+        let notes = review::facts::user_notes(&self.messages, since);
+        let request = facts.request(plan, &notes, focus.as_deref());
         let model = mu_base::models::role_selector("review", &self.ports.providers.cfg)
             .and_then(|s| self.ports.providers.resolve(&s).ok())
             .map_or_else(|| self.model.model.id.clone(), |(m, _)| m.id);
@@ -142,7 +152,7 @@ impl Agent {
             removed: facts.removed,
             model,
             plan_uri,
-            request: facts.request,
+            request,
         })
     }
 
@@ -152,15 +162,16 @@ impl Agent {
         scope: &ReviewScope,
         cancel: &CancellationToken,
     ) -> Option<mu_tools::tools::subagent::Outcome> {
-        let exe = match &self.review_child {
-            Some(e) => e.clone(),
-            None => match mu_common::paths::self_exe() {
-                Ok(e) => e,
-                Err(e) => {
-                    self.error(format!("cannot locate mu executable: {e}"));
-                    return None;
-                }
-            },
+        #[cfg(test)]
+        let exe = self.review_child.clone().map_or_else(mu_common::paths::self_exe, Ok);
+        #[cfg(not(test))]
+        let exe = mu_common::paths::self_exe();
+        let exe = match exe {
+            Ok(e) => e,
+            Err(e) => {
+                self.error(format!("cannot locate mu executable: {e}"));
+                return None;
+            }
         };
         let payload = json!({
             "task": scope.request,
@@ -353,6 +364,42 @@ mod tests {
         a.command(Command::Review(None), &mut q).await;
     }
 
+    fn notices(ev: &[AgentEvent]) -> Vec<&str> {
+        ev.iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(m) | AgentEvent::Error(m) => Some(m.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn review_outside_a_repo_reports_only_the_bare_git_error() {
+        run(async {
+            let dir = crate::testing::tmp_dir();
+            let (mut a, mut rx) = agent_in(vec![], Configs::default(), RunConfig::default(), dir);
+            review_cmd(&mut a).await;
+            let ev = drain(&mut rx);
+            let n = notices(&ev);
+            assert!(n.len() == 1 && n[0].starts_with("review needs a git repository: "), "{n:?}");
+        });
+    }
+
+    #[test]
+    fn review_checks_the_plan_file_only_when_there_is_something_to_review() {
+        run(async {
+            let dir = git_repo();
+            let (mut a, mut rx) = agent_in(vec![], Configs::default(), RunConfig::default(), dir);
+            a.plan.review_base =
+                Some(review::ReviewBase { tree: None, plan_uri: Some("local://missing-plan.md".into()), since: 0 });
+            review_cmd(&mut a).await;
+            let ev = drain(&mut rx);
+            let n = notices(&ev);
+            assert_eq!(n.len(), 2, "{n:?}");
+            assert!(n[0].starts_with("no plan base recorded") && n[1].starts_with("nothing to review"), "{n:?}");
+        });
+    }
+
     #[test]
     fn review_reports_a_child_that_cannot_start() {
         run(async {
@@ -402,6 +449,47 @@ mod tests {
                 AgentEvent::ToolEnd { name, output, .. }
                     if name == "review" && !output.is_error && output.text.contains("## Review: PASS")
             )));
+        });
+    }
+
+    #[test]
+    fn input_typed_during_the_review_goes_back_before_the_fix_turn() {
+        use crate::testing::assistant;
+        use mu_base::events::Answer;
+        use mu_base::message::{Block, StopReason};
+        run(async {
+            let dir = git_repo();
+            std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+            let child = dir.join("fake-mu");
+            let result = r#"{"type":"result","isError":false,"text":"","data":{"verdict":"fail","summary":"s","findings":[{"title":"t","body":"b","file":"a.txt","priority":1,"confidence":1}]}}"#;
+            std::fs::write(&child, format!("#!/bin/sh\ncat > /dev/null\necho '{result}'\n")).unwrap();
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let fixed = Ok(assistant(vec![Block::text("fixed")], StopReason::Stop));
+            let (mut a, mut rx) = agent_in(vec![fixed], Configs::default(), RunConfig::default(), dir.clone());
+            a.review_child = Some(child);
+            a.ports.inbox.borrow_mut().steer.push_back("typed".to_string().into());
+            let mut ev = Vec::new();
+            let answer = async {
+                let mut ends = 0;
+                while ends < 2 {
+                    let Some(e) = rx.recv().await else { break };
+                    match e {
+                        AgentEvent::Ask { reply, .. } => {
+                            let _ = reply.send(Some(vec![Answer::Options(vec!["Send 1 blocking findings".into()])]));
+                        }
+                        e => {
+                            ends += usize::from(matches!(e, AgentEvent::TurnEnd { .. }));
+                            ev.push(e);
+                        }
+                    }
+                }
+            };
+            tokio::join!(review_cmd(&mut a), answer);
+            let first_end = ev.iter().position(|e| matches!(e, AgentEvent::TurnEnd { .. })).unwrap();
+            let dropped = ev.iter().position(|e| matches!(e, AgentEvent::QueuedDropped(d) if d[0].text == "typed"));
+            let fix_start = ev.iter().rposition(|e| matches!(e, AgentEvent::TurnStart)).unwrap();
+            assert!(dropped.is_some_and(|d| first_end < d && d < fix_start), "returned between the two turns");
+            assert!(!ev.iter().any(|e| matches!(e, AgentEvent::UserPrompt(t) if t == "typed")));
         });
     }
 }

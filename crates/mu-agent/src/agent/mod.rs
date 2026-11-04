@@ -69,7 +69,8 @@ pub struct Agent {
     resumed: bool,
     user_turn: u32,
     turn_msgs: Vec<Value>,
-    /// The executable `/review` runs as its child; `None` is this mu.
+    /// Test seam: the executable `/review` runs as its child instead of this mu.
+    #[cfg(test)]
     review_child: Option<PathBuf>,
 }
 
@@ -259,6 +260,7 @@ impl Agent {
             resumed: false,
             user_turn: 0,
             turn_msgs: Vec::new(),
+            #[cfg(test)]
             review_child: None,
         }
     }
@@ -284,8 +286,15 @@ impl Agent {
         *self.tools.output_schema.borrow_mut() = schema;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn providers(&self) -> Rc<Providers> {
         self.ports.providers.clone()
+    }
+
+    /// Test seam: lets scripted replies call the panicking `__panic` tool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn enable_panic_tool(&self) {
+        self.tools.panic_tool.set(true);
     }
 
     pub fn emit(&self, e: AgentEvent) {
@@ -433,7 +442,7 @@ impl Agent {
                 (true, Some(p)) => drive(self.turn(Some(p.into())), q).await,
                 (true, None) => self.exit_plan(),
             },
-            Command::Compact(focus) => self.manual_compact(focus).await,
+            Command::Compact(focus) => drive(self.manual_compact(focus), q).await,
             Command::Review(focus) => drive(self.review(focus), q).await,
             Command::Rename(t) => {
                 self.ensure_session().await;
@@ -443,7 +452,7 @@ impl Agent {
                 self.title.text = Some(t);
                 self.emit_status();
             }
-            Command::Bash { cmd, include } => self.user_bash(cmd, include).await,
+            Command::Bash { cmd, include } => drive(self.user_bash(cmd, include), q).await,
             Command::KillJobs(id) => {
                 let n = self.tools.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
                 self.notice(format!("killed {n} job(s)"));

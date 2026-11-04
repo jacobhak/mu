@@ -226,27 +226,46 @@ pub enum Base<'a> {
     Rev(&'a str),
 }
 
-/// Inputs of `gather`.
-pub struct Gather<'a> {
-    pub cwd: &'a Path,
-    pub base: Base<'a>,
-    /// The plan file, already checked to exist.
-    pub plan: Option<PathBuf>,
-    pub notes: &'a [String],
-    pub focus: Option<&'a str>,
+/// A repository's working tree, snapshotted as a tree.
+pub struct Worktree {
+    pub root: PathBuf,
+    pub cur: String,
 }
 
-/// What a review runs on: the snapshots compared, the changed files and the request text.
+impl Worktree {
+    /// Snapshots the working tree of the repository at `root` (see `repo_root`).
+    pub async fn snapshot(root: PathBuf) -> Result<Self, String> {
+        let cur = snapshot_tree(&root).await?;
+        Ok(Self { root, cur })
+    }
+
+    /// Gathers the changes from `base` to the snapshot. Errors are bare messages for the caller to show.
+    pub async fn gather(self, base: Base<'_>) -> Result<Facts, String> {
+        let Worktree { root, cur } = self;
+        let (base, base_label) = match base {
+            Base::Tree { tree, label } => (tree, label.to_string()),
+            Base::Head { label } => (head_tree(&root).await?, label.to_string()),
+            Base::Rev(r) => (rev_tree(&root, r).await?, format!("--base {r}")),
+        };
+        let stats = numstat(&root, &base, &cur).await?;
+        let (files, excluded) = split_excluded(stats);
+        let (added, removed) =
+            files.iter().fold((0, 0), |(a, r), f| (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0)));
+        Ok(Facts { root, base, base_label, cur, files, excluded, added, removed })
+    }
+}
+
+/// What a review runs on: the snapshots compared and the changed files.
 pub struct Facts {
     pub root: PathBuf,
     pub base: String,
+    base_label: String,
     pub cur: String,
     /// Reviewable files. Excluded ones are listed apart and not counted in `added`/`removed`.
     pub files: Vec<FileStat>,
     pub excluded: Vec<(FileStat, &'static str)>,
     pub added: u32,
     pub removed: u32,
-    pub request: String,
 }
 
 impl Facts {
@@ -254,32 +273,19 @@ impl Facts {
     pub fn changed(&self) -> bool {
         !self.files.is_empty() || !self.excluded.is_empty()
     }
-}
 
-/// Gathers the facts of one review: the repository root, the snapshot of the working tree, the
-/// base tree, the changed files and the request. Errors are bare messages for the caller to show.
-pub async fn gather(g: Gather<'_>) -> Result<Facts, String> {
-    let root = repo_root(g.cwd).await?;
-    let cur = snapshot_tree(&root).await?;
-    let (base, base_label) = match g.base {
-        Base::Tree { tree, label } => (tree, label.to_string()),
-        Base::Head { label } => (head_tree(&root).await?, label.to_string()),
-        Base::Rev(r) => (rev_tree(&root, r).await?, format!("--base {r}")),
-    };
-    let stats = numstat(&root, &base, &cur).await?;
-    let (files, excluded) = split_excluded(stats);
-    let (added, removed) =
-        files.iter().fold((0, 0), |(a, r), f| (a + f.added.unwrap_or(0), r + f.removed.unwrap_or(0)));
-    let request = request(&RequestInput {
-        root: &root,
-        base: &base,
-        cur: &cur,
-        base_label: &base_label,
-        plan_path: g.plan,
-        files: &files,
-        excluded: &excluded,
-        notes: g.notes,
-        focus: g.focus,
-    });
-    Ok(Facts { root, base, cur, files, excluded, added, removed, request })
+    /// The lead reviewer's request. `plan` is the plan file, already checked to exist.
+    pub fn request(&self, plan: Option<PathBuf>, notes: &[String], focus: Option<&str>) -> String {
+        request(&RequestInput {
+            root: &self.root,
+            base: &self.base,
+            cur: &self.cur,
+            base_label: &self.base_label,
+            plan_path: plan,
+            files: &self.files,
+            excluded: &self.excluded,
+            notes,
+            focus,
+        })
+    }
 }

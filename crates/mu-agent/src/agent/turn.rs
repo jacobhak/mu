@@ -92,13 +92,11 @@ impl Agent {
                     }
                 }
             }
-            next = self
-                .ports
-                .inbox
-                .borrow_mut()
-                .follow_up
-                .pop_front()
-                .map(|input| Step::Prompt { input, synthetic: false });
+            let follow_up = self.ports.inbox.borrow_mut().follow_up.pop_front();
+            if follow_up.is_some() {
+                inbox::publish(&self.ports.inbox, &self.ports.events);
+            }
+            next = follow_up.map(|input| Step::Prompt { input, synthetic: false });
         }
         // Failed and cancelled passes leave messages the hook has not seen; do not let them
         // leak into the next turn's `turn_end`.

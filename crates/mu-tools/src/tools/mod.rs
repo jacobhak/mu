@@ -56,6 +56,9 @@ pub struct Tools {
     pub output_schema: std::cell::RefCell<Option<Value>>,
     pub edit_store: pi_edit::EditStore,
     shell: OnceCell<pi_shell::shell::Shell>,
+    /// Test seam: the `__panic` tool panics. Only test builders turn it on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub panic_tool: std::cell::Cell<bool>,
 }
 
 impl Tools {
@@ -74,6 +77,8 @@ impl Tools {
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
             shell: OnceCell::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            panic_tool: Default::default(),
         }
     }
 
@@ -133,7 +138,7 @@ impl Tools {
             return ToolOutput::err(format!("Invalid arguments for {name}: arguments were not valid JSON: {raw}"));
         }
         #[cfg(any(test, feature = "test-support"))]
-        if name == "__panic" {
+        if self.panic_tool.get() && name == "__panic" {
             panic!("boom");
         }
         if let Some(b) = BUILTINS.iter().find(|b| b.name == name) {

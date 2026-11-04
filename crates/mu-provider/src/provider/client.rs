@@ -76,17 +76,6 @@ pub(super) struct Endpoint {
 /// No bytes for this long on a response stream: treat the connection as dead and retry.
 const STREAM_IDLE: Duration = Duration::from_secs(90);
 
-/// The active profile's key store; tests and `test-support` builds use one inside `MU_HOME`.
-#[cfg(not(any(test, feature = "test-support")))]
-fn default_store() -> crate::auth::store::Store {
-    crate::auth::store::Store::new()
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn default_store() -> crate::auth::store::Store {
-    crate::auth::store::Store::at(mu_testutil::home().join("auth.json"))
-}
-
 #[cfg(test)]
 fn no_gateway() -> endpoint::GatewaySource {
     endpoint::GatewaySource::new(endpoint::start_fn(|| async {
@@ -109,13 +98,23 @@ pub struct Providers {
 
 impl Providers {
     pub fn new(cfg: Rc<Configs>, gateway: endpoint::GatewaySource) -> Self {
+        Self::with_store(cfg, gateway, crate::auth::store::Store::new())
+    }
+
+    /// `new` with the key store inside the test `MU_HOME`, never the real profile's.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests(cfg: Rc<Configs>, gateway: endpoint::GatewaySource) -> Self {
+        Self::with_store(cfg, gateway, crate::auth::store::Store::at(mu_testutil::home().join("auth.json")))
+    }
+
+    fn with_store(cfg: Rc<Configs>, gateway: endpoint::GatewaySource, store: crate::auth::store::Store) -> Self {
         Self {
             cfg,
             client: OnceCell::new(),
             gw_models: RefCell::new(load_cache()),
             gw_fresh: std::cell::Cell::new(false),
             gateway,
-            store: default_store(),
+            store,
             #[cfg(any(test, feature = "test-support"))]
             scripted: Default::default(),
         }
@@ -381,8 +380,7 @@ mod native_route_tests {
         let d = std::env::temp_dir().join(format!("mu-route-{}", uuid::Uuid::new_v4()));
         let store = Store::at(d.join("auth.json"));
         store.set("anthropic", entry).unwrap();
-        let mut p = Providers::new(Rc::new(Configs::default()), no_gateway());
-        p.store = store;
+        let p = Providers::with_store(Rc::new(Configs::default()), no_gateway(), store);
         (p, d)
     }
 
@@ -591,8 +589,7 @@ mod contract_native_anthropic_tests {
         let d = std::env::temp_dir().join(format!("mu-contract-{}", uuid::Uuid::new_v4()));
         let store = Store::at(d.join("auth.json"));
         store.set("anthropic", Entry::reference("$ANTHROPIC_API_KEY").unwrap()).unwrap();
-        let mut p = Providers::new(Rc::new(Configs::default()), no_gateway());
-        p.store = store;
+        let p = Providers::with_store(Rc::new(Configs::default()), no_gateway(), store);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let (spec, _) = p.resolve(&format!("anthropic/{model}")).unwrap();
@@ -668,8 +665,7 @@ mod other_native_route_tests {
         let d = std::env::temp_dir().join(format!("mu-route2-{}", uuid::Uuid::new_v4()));
         let store = Store::at(d.join("auth.json"));
         store.set(provider, Entry { base_url: Some(base.into()), ..Entry::literal(key) }).unwrap();
-        let mut p = Providers::new(Rc::new(Configs::default()), no_gateway());
-        p.store = store;
+        let p = Providers::with_store(Rc::new(Configs::default()), no_gateway(), store);
         (p, d)
     }
 
