@@ -1248,6 +1248,20 @@ impl PluginHost {
         }
     }
 
+    /// The gateway endpoint `GatewaySource` resolves: `MU_GATEWAY_URL` if set, else the gateway plugin.
+    pub fn gateway_start(self: &Rc<Self>) -> crate::provider::endpoint::StartFn {
+        let host = self.clone();
+        crate::provider::endpoint::start_fn(move || {
+            let host = host.clone();
+            async move {
+                match crate::gateway::env_endpoint() {
+                    Some(r) => r.map_err(|e| e.to_string()),
+                    None => host.provider_endpoint("gateway").await,
+                }
+            }
+        })
+    }
+
     pub async fn shutdown_all(&self) {
         let slots = self.slots.borrow().clone();
         for s in &slots {

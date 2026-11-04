@@ -2229,7 +2229,10 @@ mod loop_tests {
         crate::testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
         let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
-        let providers = Rc::new(Providers::new(Rc::new(cfg), crate::gateway::GatewaySource::new(plugins.clone())));
+        let providers = Rc::new(Providers::new(
+            Rc::new(cfg),
+            crate::provider::endpoint::GatewaySource::new(plugins.gateway_start()),
+        ));
         providers.scripted.borrow_mut().extend(script);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = Rc::new(crate::context::Context {

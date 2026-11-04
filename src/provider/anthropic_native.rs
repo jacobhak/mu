@@ -445,7 +445,14 @@ mod tests {
 
     #[test]
     fn unknown_ids_get_a_plain_budget() {
-        let m = crate::models::resolve("anthropic/claude-future-9", &Default::default(), None, &|_| true).unwrap().0;
+        let m = crate::models::resolve(
+            "anthropic/claude-future-9",
+            &Default::default(),
+            None,
+            &crate::provider::native::native_spec,
+        )
+        .unwrap()
+        .0;
         let (b, _) = build(&m, Thinking::High, &conversation(), &[]);
         assert_eq!(b["model"], "claude-future-9");
         assert_eq!(b["thinking"]["type"], "enabled");

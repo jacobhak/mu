@@ -4,8 +4,7 @@
 //! snapshot row gets reasoning off (an unknown family's reasoning shape is never guessed).
 //! Cached per profile in `native-models.json`, refreshed at most daily.
 
-use super::native::{self, ProviderDef};
-use crate::models::{Api, CompletionsCompat, ModelSpec, ThinkingMode, ThinkingSpec};
+use crate::models::{self, Api, CompletionsCompat, ModelSpec, ProviderDef, ThinkingMode, ThinkingSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -198,7 +197,7 @@ async fn fetch(def: &ProviderDef, key: &str, base_url: Option<&str>) -> anyhow::
 /// A Chat Completions spec for a model the snapshot does not list: no reasoning, the snapshot's
 /// provider-wide request quirks, limits from the listing.
 pub fn spec(provider: &str, d: &Discovered, default_window: u32, default_max: u32) -> Option<ModelSpec> {
-    let def = native::def(provider)?;
+    let def = models::native_def(provider)?;
     let mut compat =
         super::catalog::rows(provider).iter().find_map(|r| r.compat.clone()).unwrap_or_else(CompletionsCompat::default);
     compat.reasoning_content_field = None;
@@ -299,7 +298,7 @@ mod refresh_tests {
               {"id":"acme/NoTools","supported_features":["json_mode"]},
               {"id":"moonshotai/Kimi-K3","context_length":999000,"supported_features":["tools","reasoning_effort"]}]}"#;
             let (base, seen) = fake_server(vec![Reply::new(200, body)]).await;
-            let def = native::def("baseten").unwrap();
+            let def = models::native_def("baseten").unwrap();
             assert_eq!(refresh(def, "bt-key-0123456789", Some(&base)).await.unwrap(), 3);
             let req = seen.lock().unwrap()[0].to_lowercase();
             assert!(req.starts_with("get /models "), "{req}");
@@ -307,13 +306,22 @@ mod refresh_tests {
             assert!(!stale("baseten"));
 
             // A discovered id resolves natively with its limits and no reasoning.
-            let (m, _) =
-                crate::models::resolve("baseten/acme/Chat-9", &Default::default(), None, &|p| p == "baseten").unwrap();
+            let (m, _) = crate::models::resolve(
+                "baseten/acme/Chat-9",
+                &Default::default(),
+                None,
+                &crate::provider::native::native_spec,
+            )
+            .unwrap();
             assert_eq!((m.context_window, m.max_output, m.thinking.mode), (64_000, 8_000, ThinkingMode::None));
             // A snapshot row keeps its thinking and quirks but takes the fresher limits.
-            let (k, _) =
-                crate::models::resolve("baseten/moonshotai/Kimi-K3", &Default::default(), None, &|p| p == "baseten")
-                    .unwrap();
+            let (k, _) = crate::models::resolve(
+                "baseten/moonshotai/Kimi-K3",
+                &Default::default(),
+                None,
+                &crate::provider::native::native_spec,
+            )
+            .unwrap();
             assert_eq!((k.context_window, k.thinking.mode), (999_000, ThinkingMode::Effort));
             assert!(k.compat.unwrap().requires_reasoning_content_for_tool_calls);
             // Priced from the listing.

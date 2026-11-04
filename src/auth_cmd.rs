@@ -1,7 +1,8 @@
 //! `mu auth`: manage provider API keys without the TUI (see `auth_store`).
 
 use crate::auth_store::{self, Entry, Origin, Store};
-use crate::provider::native::{self, Check, PROVIDERS, ProviderDef};
+use crate::models::{self, PROVIDERS, ProviderDef};
+use crate::provider::native::{self, Check};
 use anyhow::{Result, anyhow, bail};
 use std::io::{IsTerminal, Read, Write};
 
@@ -103,7 +104,7 @@ fn parse_base_url(raw: Option<String>) -> Result<Option<String>> {
 }
 
 fn provider_def(id: &str) -> Result<&'static ProviderDef> {
-    native::def(id).ok_or_else(|| {
+    models::native_def(id).ok_or_else(|| {
         let known: Vec<&str> = PROVIDERS.iter().map(|d| d.id).collect();
         anyhow!("unknown provider `{id}`; mu can use keys for: {}", known.join(", "))
     })
@@ -365,7 +366,7 @@ mod validate_tests {
     fn a_good_key_is_validated_with_the_providers_auth_header() {
         rt(async {
             let (base, seen) = fake_server(vec![Reply::new(200, r#"{"data":[]}"#)]).await;
-            let anthropic = native::def("anthropic").unwrap();
+            let anthropic = models::native_def("anthropic").unwrap();
             let r = check_entry(anthropic, &entry("ant-key-0123456789", &base)).await;
             assert_eq!(r, Check::Valid);
             let req = seen.lock().unwrap()[0].to_lowercase();
@@ -374,7 +375,7 @@ mod validate_tests {
             assert!(!req.contains("authorization"), "{req}");
 
             let (base, seen) = fake_server(vec![Reply::new(200, "{}")]).await;
-            let baseten = native::def("baseten").unwrap();
+            let baseten = models::native_def("baseten").unwrap();
             assert_eq!(check_entry(baseten, &entry("bt-key-0123456789", &base)).await, Check::Valid);
             let req = seen.lock().unwrap()[0].to_lowercase();
             assert!(req.starts_with("get /models "), "{req}");
@@ -387,7 +388,7 @@ mod validate_tests {
     fn rejection_and_outages_are_told_apart() {
         rt(async {
             let (base, _) = fake_server(vec![Reply::new(401, "nope")]).await;
-            let openai = native::def("openai").unwrap();
+            let openai = models::native_def("openai").unwrap();
             assert!(
                 matches!(check_entry(openai, &entry("k-0123456789", &base)).await, Check::Rejected(m) if m.contains("rejected"))
             );
@@ -402,7 +403,7 @@ mod validate_tests {
     #[test]
     fn an_unset_reference_is_not_validated_as_text() {
         rt(async {
-            let openai = native::def("openai").unwrap();
+            let openai = models::native_def("openai").unwrap();
             let e = Entry::reference("$MU_TEST_SURELY_UNSET_VAR").unwrap();
             assert!(matches!(check_entry(openai, &e).await, Check::Rejected(m) if m.contains("not set")));
         });

@@ -2,6 +2,7 @@ pub mod anthropic;
 mod anthropic_native;
 pub mod catalog;
 pub mod discovery;
+pub mod endpoint;
 pub mod native;
 pub mod openai_completions;
 pub mod openai_responses;
@@ -129,10 +130,10 @@ pub enum Auth {
 }
 
 impl Auth {
-    pub fn for_def(def: &native::ProviderDef, key: &str) -> Self {
+    pub fn for_def(def: &models::ProviderDef, key: &str) -> Self {
         match def.auth {
-            native::AuthStyle::XApiKey => Self::XApiKey(key.into()),
-            native::AuthStyle::Bearer => Self::Bearer(key.into()),
+            models::AuthStyle::XApiKey => Self::XApiKey(key.into()),
+            models::AuthStyle::Bearer => Self::Bearer(key.into()),
         }
     }
 
@@ -156,7 +157,7 @@ pub struct Route {
     pub base: String,
     pub auth: Auth,
     /// The provider whose own API this is; `None` for the gateway.
-    pub def: Option<&'static native::ProviderDef>,
+    pub def: Option<&'static models::ProviderDef>,
 }
 
 impl Route {
@@ -276,7 +277,7 @@ pub struct Providers {
     gw_models: RefCell<Option<Vec<GatewayModel>>>,
     /// `gw_models` came from the running gateway, not the on-disk cache.
     gw_fresh: std::cell::Cell<bool>,
-    gateway: crate::gateway::GatewaySource,
+    gateway: endpoint::GatewaySource,
     store: crate::auth_store::Store,
     /// Test seam: scripted replies, popped in order by `stream`.
     #[cfg(test)]
@@ -284,7 +285,7 @@ pub struct Providers {
 }
 
 impl Providers {
-    pub fn new(cfg: Rc<Configs>, gateway: crate::gateway::GatewaySource) -> Self {
+    pub fn new(cfg: Rc<Configs>, gateway: endpoint::GatewaySource) -> Self {
         Self {
             cfg,
             client: OnceCell::new(),
@@ -314,7 +315,7 @@ impl Providers {
     /// Whether `provider`'s models go to its own API with the user's key: the provider is one
     /// mu speaks natively and the key store has an entry for it.
     pub fn is_native(&self, provider: &str) -> bool {
-        native::def(provider).is_some() && self.store.has(provider)
+        models::native_def(provider).is_some() && self.store.has(provider)
     }
 
     pub fn store(&self) -> &crate::auth_store::Store {
@@ -325,7 +326,7 @@ impl Providers {
     /// the last discovered ones). Never touches the network. Sorted by provider, then id.
     pub fn native_models(&self) -> Vec<NativeModel> {
         let mut out = Vec::new();
-        for def in native::PROVIDERS.iter().filter(|d| self.is_native(d.id)) {
+        for def in models::PROVIDERS.iter().filter(|d| self.is_native(d.id)) {
             for r in catalog::rows(def.id).iter().filter(|r| models::Api::parse(&r.api).is_some()) {
                 out.push(NativeModel {
                     id: format!("{}/{}", def.id, r.id),
@@ -353,7 +354,7 @@ impl Providers {
     /// models were fetched.
     pub async fn refresh_native_models(&self, force: bool) -> usize {
         let mut n = 0;
-        for def in native::PROVIDERS.iter().filter(|d| discovery::discovers(d) && self.is_native(d.id)) {
+        for def in models::PROVIDERS.iter().filter(|d| discovery::discovers(d) && self.is_native(d.id)) {
             if !force && !discovery::stale(def.id) {
                 continue;
             }
@@ -366,7 +367,8 @@ impl Providers {
     }
 
     pub fn resolve(&self, sel: &str) -> Result<(ModelSpec, Option<Thinking>)> {
-        models::resolve(sel, &self.cfg, self.gw_models.borrow().as_deref(), &|p| self.is_native(p))
+        let native_spec = |p: &str, m: &str| self.is_native(p).then(|| native::native_spec(p, m)).flatten();
+        models::resolve(sel, &self.cfg, self.gw_models.borrow().as_deref(), &native_spec)
     }
 
     async fn endpoint(&self) -> Result<Endpoint, ProviderError> {
@@ -377,7 +379,7 @@ impl Providers {
     /// Where a request for `m` goes.
     async fn route(&self, m: &ModelSpec) -> Result<Route, ProviderError> {
         if m.native {
-            let def = native::def(&m.provider)
+            let def = models::native_def(&m.provider)
                 .ok_or_else(|| ProviderError::Fatal(format!("{} is not a native provider", m.provider)))?;
             let r = self.store.resolve(&m.provider).await.map_err(|e| ProviderError::Fatal(e.to_string()))?;
             let base = r.base_url.unwrap_or_else(|| def.base_url.to_string());
@@ -705,7 +707,7 @@ mod route_tests {
         let n = Route {
             base: "https://api.anthropic.com/v1".into(),
             auth: Auth::XApiKey("k".into()),
-            def: native::def("anthropic"),
+            def: models::native_def("anthropic"),
         };
         assert_eq!((n.peer().as_str(), n.idle_peer().as_str()), ("api.anthropic.com", "api.anthropic.com"));
     }
@@ -743,7 +745,7 @@ mod native_route_tests {
         store.set("anthropic", entry).unwrap();
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
         let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
-        let mut p = Providers::new(Rc::new(Configs::default()), crate::gateway::GatewaySource::new(plugins));
+        let mut p = Providers::new(Rc::new(Configs::default()), endpoint::GatewaySource::new(plugins.gateway_start()));
         p.store = store;
         (p, d)
     }
@@ -954,7 +956,7 @@ mod contract_native_anthropic_tests {
         store.set("anthropic", Entry::reference("$ANTHROPIC_API_KEY").unwrap()).unwrap();
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
         let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
-        let mut p = Providers::new(Rc::new(Configs::default()), crate::gateway::GatewaySource::new(plugins));
+        let mut p = Providers::new(Rc::new(Configs::default()), endpoint::GatewaySource::new(plugins.gateway_start()));
         p.store = store;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
@@ -1030,7 +1032,7 @@ mod other_native_route_tests {
         store.set(provider, Entry { base_url: Some(base.into()), ..Entry::literal(key) }).unwrap();
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
         let plugins = crate::plugin::PluginHost::new(vec![], vec![], ntx, Default::default());
-        let mut p = Providers::new(Rc::new(Configs::default()), crate::gateway::GatewaySource::new(plugins));
+        let mut p = Providers::new(Rc::new(Configs::default()), endpoint::GatewaySource::new(plugins.gateway_start()));
         p.store = store;
         (p, d)
     }

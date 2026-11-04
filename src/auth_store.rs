@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const VERSION: u32 = 1;
 /// A `!command` reference gets this long to print the key.
@@ -97,7 +97,7 @@ pub fn cmd_label(cmd: &str) -> String {
     crate::secrets::redact_keys(&format!("!{prog} …"))
 }
 
-/// A base URL a stored entry or `--base-url` may use: `gateway::validate_url`, and no credentials
+/// A base URL a stored entry or `--base-url` may use: `net::validate_url`, and no credentials
 /// (a password in the URL would sit in the file and show in `mu auth list`).
 pub fn check_base_url(url: &str) -> Result<String> {
     let url = url.trim();
@@ -105,7 +105,7 @@ pub fn check_base_url(url: &str) -> Result<String> {
     if rest.split(['/', '?', '#']).next().unwrap_or_default().contains('@') {
         bail!("a base URL must not contain a user name or password");
     }
-    crate::gateway::validate_url(url)
+    crate::net::validate_url(url)
 }
 
 fn valid_env_name(n: &str) -> bool {
@@ -340,7 +340,7 @@ impl Default for Store {
 
 /// The name a provider's key is redacted under.
 fn label(provider: &str) -> String {
-    crate::provider::native::def(provider).map_or_else(
+    crate::models::native_def(provider).map_or_else(
         || format!("{}_API_KEY", provider.to_ascii_uppercase().replace('-', "_")),
         |d| d.env_hint.to_string(),
     )
@@ -375,18 +375,6 @@ async fn run_cmd(provider: &str, cmd: &str, limit: Duration) -> Result<String> {
 /// knows a second try (after a 401) can produce a different key.
 pub fn forget_cached(provider: &str) -> bool {
     CMD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|m| m.remove(provider).is_some())
-}
-
-/// Registers every stored key for redaction; re-reads the file at most once a second.
-pub fn sync_redaction() {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
-        return;
-    }
-    *last = Some(Instant::now());
-    drop(last);
-    Store::new().snapshot();
 }
 
 /// `…` and the last four characters; shorter keys show nothing.

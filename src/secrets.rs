@@ -87,7 +87,6 @@ pub fn redact(text: &str, cwd: &Path) -> Redacted {
     }
     let env = ENV.get_or_init(|| known_from(std::env::vars(), Source::Env, extra_env()));
     let dot = dotenv_for(cwd);
-    crate::auth_store::sync_redaction();
     let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
     let r = apply(text, env.iter().chain(dot.iter()).chain(stored.iter()));
     if !r.hits.is_empty()
@@ -102,7 +101,6 @@ pub fn redact(text: &str, cwd: &Path) -> Redacted {
 /// that did not come from a tool, such as a provider's error body.
 pub fn redact_keys(text: &str) -> String {
     let env = ENV.get_or_init(|| known_from(std::env::vars(), Source::Env, extra_env()));
-    crate::auth_store::sync_redaction();
     let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
     apply(text, env.iter().chain(stored.iter())).text
 }
