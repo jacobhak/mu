@@ -5,7 +5,7 @@ use super::complete::Entry;
 use super::composer::{Action, Composer};
 use super::input::{self, Input};
 use super::jobs_panel::JobsPanel;
-use super::line::truncate_text as trunc;
+use crate::text::truncate_text as trunc;
 use super::line::{Line, dim, line_text, span, styled};
 use super::markdown;
 use super::overlay::{LoginTarget, Overlay, OverlayEvent};

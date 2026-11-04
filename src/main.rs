@@ -36,6 +36,7 @@ mod secrets;
 mod session;
 mod session_tail;
 mod take;
+mod text;
 #[cfg(test)]
 mod testutil;
 mod tools;

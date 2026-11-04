@@ -7,7 +7,8 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagE
 use unicode_width::UnicodeWidthChar;
 
 use super::highlight;
-use super::line::{Line, bold, line_text, sanitize, span, wrap};
+use super::line::{Line, bold, line_text, span, wrap};
+use crate::text::sanitize;
 use super::theme::{self, Role};
 
 /// Role `r` as a foreground style.

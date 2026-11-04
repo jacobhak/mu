@@ -1,6 +1,6 @@
 //! Transcript blocks: user prompts, tool headers and framed tool cards, thinking markers, subagent rows.
 use super::diffview;
-use super::line::truncate_text as trunc;
+use crate::text::truncate_text as trunc;
 use super::line::{self, Line, fill, span, truncate, wrap};
 use super::markdown;
 use super::theme::{self, Role};

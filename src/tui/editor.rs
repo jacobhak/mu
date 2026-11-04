@@ -5,7 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::line::{self, Line, grapheme_width, plain};
+use super::line::{self, Line, plain};
+use crate::text::grapheme_width;
 
 /// What a key did to the text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

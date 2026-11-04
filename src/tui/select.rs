@@ -779,7 +779,7 @@ fn preview_box(text: &str, hint: Option<PreviewKind>, width: usize, cap: usize, 
         border.attributes.set(crossterm::style::Attribute::Bold);
     }
     let inner = width - 4;
-    let clean = line::sanitize(text.trim_end_matches('\n'));
+    let clean = crate::text::sanitize(text.trim_end_matches('\n'));
     let src: Vec<&str> = clean.split('\n').collect();
     let max = cap - 2;
     let keep = if src.len() > max { max - 1 } else { src.len() };
@@ -793,11 +793,11 @@ fn preview_box(text: &str, hint: Option<PreviewKind>, width: usize, cap: usize, 
         .enumerate()
         .map(|(i, r)| match &hl {
             Some(h) => line::truncate(&h[i], inner),
-            None => vec![span(line::truncate_text(r, inner), preview_row_style(kind, r))],
+            None => vec![span(crate::text::truncate_text(r, inner), preview_row_style(kind, r))],
         })
         .collect();
     if keep < src.len() {
-        body.push(line::styled(line::truncate_text(&format!("… {} more lines", src.len() - keep), inner), |_| dim()));
+        body.push(line::styled(crate::text::truncate_text(&format!("… {} more lines", src.len() - keep), inner), |_| dim()));
     }
     let title = format!(" {label} ");
     let top = if title.len() + 3 <= width {

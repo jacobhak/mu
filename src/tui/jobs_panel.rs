@@ -901,7 +901,7 @@ fn elapsed(j: &SubagentStatus, now: SystemTime) -> u64 {
 }
 
 pub(super) fn pad(s: &str, w: usize) -> String {
-    let t = line::truncate_text(s, w);
+    let t = crate::text::truncate_text(s, w);
     let used = t.chars().count();
     format!("{t}{}", " ".repeat(w.saturating_sub(used)))
 }

@@ -1,7 +1,7 @@
 use crossterm::style::{Attribute, Color, ContentStyle, StyledContent};
 use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
+use crate::text::{grapheme_width, sanitize};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Span {
@@ -10,46 +10,6 @@ pub struct Span {
 }
 
 pub type Line = Vec<Span>;
-
-/// Makes text safe to print: C0/C1 controls other than `\n` become a visible glyph (`\x1b` → `␛`),
-/// and tabs expand to the next 4-column stop. Nothing the terminal could act on gets through.
-pub fn sanitize(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(|c| c != '\n' && (c.is_control())) {
-        return Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    let mut col = 0;
-    for c in s.chars() {
-        match c {
-            '\n' => {
-                out.push('\n');
-                col = 0;
-            }
-            '\t' => {
-                let n = 4 - col % 4;
-                out.extend(std::iter::repeat_n(' ', n));
-                col += n;
-            }
-            '\u{7f}' => {
-                out.push('\u{2421}');
-                col += 1;
-            }
-            c if (c as u32) < 0x20 => {
-                out.push(char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'));
-                col += 1;
-            }
-            c if c.is_control() => {
-                out.push('\u{fffd}');
-                col += 1;
-            }
-            c => {
-                out.push(c);
-                col += c.width().unwrap_or(0);
-            }
-        }
-    }
-    Cow::Owned(out)
-}
 
 pub fn span(text: impl Into<String>, style: ContentStyle) -> Span {
     let text: String = text.into();
@@ -78,11 +38,6 @@ pub fn bold() -> ContentStyle {
     let mut s = ContentStyle::default();
     s.attributes.set(Attribute::Bold);
     s
-}
-
-/// Display width of one grapheme cluster (a combining sequence or emoji counts as one cell run).
-pub fn grapheme_width(g: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(g)
 }
 
 pub fn line_width(l: &Line) -> usize {
@@ -198,11 +153,6 @@ pub fn truncate(l: &Line, width: usize) -> Line {
         out.push(span(cur, s.style));
     }
     out
-}
-
-/// `s` cut to `width` columns, ending with `…` when cut.
-pub fn truncate_text(s: &str, width: usize) -> String {
-    line_text(&truncate(&plain(s), width))
 }
 
 /// Background-only style; `None` is the terminal default.
