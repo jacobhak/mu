@@ -148,6 +148,11 @@ pub async fn run_child_observed(
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
     }
     let stderr_tail = err_task.await.unwrap_or_default();
+    outcome(result, payload, cancelled, stderr_tail)
+}
+
+/// What the child's final result, or its lack of one, means to the caller.
+fn outcome(result: Option<ChildResult>, payload: &Value, cancelled: bool, stderr_tail: String) -> Outcome {
     match result {
         Some(r) => {
             let ok = !r.is_error;
