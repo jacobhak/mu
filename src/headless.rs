@@ -11,7 +11,6 @@ pub async fn print_mode(
     expect_park: bool,
     cmd: UnboundedSender<Command>,
     mut ev: UnboundedReceiver<AgentEvent>,
-    inbox: mu_base::events::SharedInbox,
     max_cost: Option<f64>,
     stop: UnboundedReceiver<()>,
 ) -> i32 {
@@ -44,10 +43,10 @@ pub async fn print_mode(
                 }
                 stops += 1;
                 if stops == 1 {
-                    inbox.borrow_mut().stop = true;
+                    let _ = cmd.send(Command::Stop);
                     eprintln!("mu: stop requested; stopping at the next boundary");
                 } else {
-                    inbox.borrow().cancel.cancel();
+                    let _ = cmd.send(Command::Cancel);
                     eprintln!("mu: stopping now");
                 }
                 continue;
@@ -63,7 +62,7 @@ pub async fn print_mode(
                     && !capped
                 {
                     capped = true;
-                    inbox.borrow().cancel.cancel();
+                    let _ = cmd.send(Command::Cancel);
                     eprintln!("mu: cost cap ${max:.2} exceeded");
                     code = 1;
                 }
@@ -298,9 +297,8 @@ mod tests {
         let (ctx, _crx) = unbounded_channel();
         let (etx, erx) = unbounded_channel();
         drop(etx);
-        let inbox = mu_base::events::new_inbox();
         let (_stx, srx) = unbounded_channel();
-        assert_eq!(rt.block_on(print_mode(Command::Prompt("x".into()), false, ctx, erx, inbox, None, srx)), 1);
+        assert_eq!(rt.block_on(print_mode(Command::Prompt("x".into()), false, ctx, erx, None, srx)), 1);
     }
 
     fn status(cost: f64, path: Option<&str>) -> AgentEvent {
@@ -320,8 +318,7 @@ mod tests {
         for _ in 0..stops {
             stx.send(()).unwrap();
         }
-        let inbox = mu_base::events::new_inbox();
-        let i2 = inbox.clone();
+
         // Events are fed only after a yield, so the queued stops are handled first.
         let code = rt.block_on(async {
             let feeder = async {
@@ -332,11 +329,11 @@ mod tests {
                 }
             };
             let (code, _) =
-                tokio::join!(print_mode(Command::Prompt("x".into()), false, ctx, erx, i2, max_cost, srx), feeder);
+                tokio::join!(print_mode(Command::Prompt("x".into()), false, ctx, erx, max_cost, srx), feeder);
             code
         });
         assert!(matches!(crx.try_recv(), Ok(Command::EnsureSession)));
-        let stop = inbox.borrow().stop;
+        let stop = std::iter::from_fn(|| crx.try_recv().ok()).any(|c| matches!(c, Command::Stop));
         (code, stop)
     }
 
@@ -373,8 +370,7 @@ mod tests {
             for e in events {
                 etx.send(e).unwrap();
             }
-            let inbox = mu_base::events::new_inbox();
-            rt.block_on(print_mode(Command::TogglePlan(None), expect_park, ctx, erx, inbox, None, srx))
+            rt.block_on(print_mode(Command::TogglePlan(None), expect_park, ctx, erx, None, srx))
         };
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let review = AgentEvent::PlanReview {
@@ -606,11 +602,9 @@ mod tests {
         let (a, rx) = agent_in(vec![], Configs::default(), RunConfig::default(), cwd.clone());
         let store = save_plan_in(&cwd, &["a.txt"]).await;
         prep(&cwd, &store);
-        let inbox = a.inbox();
         let (tx, crx) = tokio::sync::mpsc::unbounded_channel();
         let (_stop, srx) = tokio::sync::mpsc::unbounded_channel();
-        let (_, code) =
-            futures_util::future::join(a.run(crx), print_mode(first, false, tx, rx, inbox, None, srx)).await;
+        let (_, code) = futures_util::future::join(a.run(crx), print_mode(first, false, tx, rx, None, srx)).await;
         let n = std::fs::read_dir(mu_common::paths::session_dir(&cwd)).map_or(0, |d| d.count());
         (code, n)
     }

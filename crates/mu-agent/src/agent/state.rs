@@ -1,7 +1,8 @@
 //! The agent's state, grouped by concern. Fields are visible to the `agent` module tree only.
 
 use super::{DeliverFn, ExecPlan, PlanState};
-use mu_base::events::{EventTx, GitInfo, SharedInbox};
+use mu_base::events::{EventTx, GitInfo};
+use mu_base::message::UserInput;
 use mu_base::models::{ModelSpec, Thinking};
 use mu_base::tool::ToolDef;
 use mu_provider::gateway::quota::QuotaTracker;
@@ -11,6 +12,7 @@ use mu_session::session::CompactionState;
 use mu_tools::plugin::host::PluginHost;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -35,6 +37,27 @@ pub struct RunConfig {
     pub pin_model: bool,
     /// `--resume` with an explicit `--thinking`: the resumed session keeps the flag's level.
     pub pin_thinking: bool,
+}
+
+/// Messages queued while a turn runs, plus the turn's cancellation token. Only the agent loop touches it;
+/// front ends queue through `Command`.
+pub(super) struct Inbox {
+    pub(super) steer: VecDeque<UserInput>,
+    pub(super) follow_up: VecDeque<UserInput>,
+    pub(super) cancel: CancellationToken,
+    /// Set by a headless run when asked to stop: finish at the next tool/turn boundary.
+    pub(super) stop: bool,
+}
+
+pub(super) type SharedInbox = Rc<RefCell<Inbox>>;
+
+pub(super) fn new_inbox() -> SharedInbox {
+    Rc::new(RefCell::new(Inbox {
+        steer: VecDeque::new(),
+        follow_up: VecDeque::new(),
+        cancel: CancellationToken::new(),
+        stop: false,
+    }))
 }
 
 /// Wiring to the outside world: providers, plugins, the event channel, the inbox and the `mu deliver` starter.

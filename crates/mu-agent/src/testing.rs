@@ -4,7 +4,7 @@
 use crate::agent::{Agent, AgentInit, DeliverFn, RunConfig};
 use crate::plans;
 use mu_base::config::Configs;
-use mu_base::events::{AgentEvent, new_inbox};
+use mu_base::events::AgentEvent;
 use mu_base::message::{Block, Message, StopReason};
 use mu_base::models::{ModelSpec, Thinking};
 use mu_provider::provider::client::Providers;
@@ -94,7 +94,6 @@ pub fn agent_in(
         model,
         thinking: Thinking::parse("off").unwrap(),
         events: tx,
-        inbox: new_inbox(),
         deliver,
         run,
     });

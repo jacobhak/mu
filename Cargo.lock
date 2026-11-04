@@ -4083,7 +4083,6 @@ dependencies = [
  "serde_yaml_ng",
  "sha2 0.11.1",
  "tokio",
- "tokio-util",
  "toml",
  "unicode-segmentation",
  "unicode-width",

@@ -289,7 +289,7 @@ fn kill_jobs_is_handled_mid_turn_and_other_commands_queue() {
         tx.send(Command::KillJobs(None)).unwrap();
         tx.send(Command::NewSession).unwrap();
         let live = Rc::new(std::cell::Cell::new(Thinking::Off));
-        let mut q = Queue { rx, backlog: Default::default(), jobs: None, events: etx, live };
+        let mut q = Queue { rx, inbox: new_inbox(), backlog: Default::default(), jobs: None, events: etx, live };
         drive(tokio::time::sleep(std::time::Duration::from_millis(50)), &mut q).await;
         assert!(matches!(erx.try_recv(), Ok(AgentEvent::Notice(m)) if m.contains("killed")));
         assert_eq!(q.backlog.len(), 1);

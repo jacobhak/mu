@@ -29,7 +29,7 @@ use crate::theme::{self, Role};
 use crate::widgets::complete::Entry;
 use crate::widgets::overlay::Overlay;
 use crossterm::event::Event;
-use mu_base::events::{AgentEvent, Command, SharedInbox};
+use mu_base::events::{AgentEvent, Command};
 use mu_base::message::UserInput;
 use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
@@ -48,7 +48,6 @@ const FRAME: Duration = Duration::from_millis(33);
 pub struct AppInit {
     pub cmd_tx: UnboundedSender<Command>,
     pub ev_rx: UnboundedReceiver<AgentEvent>,
-    pub inbox: SharedInbox,
     pub providers: Rc<Providers>,
     pub ctx: Rc<Context>,
     pub plugins: Rc<PluginHost>,
@@ -79,7 +78,6 @@ struct App {
 /// The channels to the agent.
 struct Link {
     cmd_tx: UnboundedSender<Command>,
-    inbox: SharedInbox,
 }
 
 /// The terminal: what is drawn, when, and whether a child program owns it.
@@ -136,7 +134,6 @@ pub async fn run(init: AppInit) -> i32 {
     let AppInit {
         cmd_tx,
         mut ev_rx,
-        inbox,
         providers,
         ctx,
         plugins,
@@ -155,7 +152,7 @@ pub async fn run(init: AppInit) -> i32 {
     let mut app = App {
         agent: AgentView::new(show_thinking, smooth),
         services: Services { providers },
-        link: Link { cmd_tx, inbox },
+        link: Link { cmd_tx },
         ctx,
         plugins,
         ui_tx,
@@ -304,14 +301,14 @@ impl App {
             return;
         }
         self.quitting = true;
-        self.link.inbox.borrow().cancel.cancel();
+        self.send(Command::Cancel);
         self.notice("exiting…");
         self.send(Command::Exit);
     }
 
     /// Queued inputs waiting for the agent, one row each; the newest gets a hint to edit it.
     fn queue_bar(&self, w: usize) -> Vec<Line> {
-        let ib = self.link.inbox.borrow();
+        let ib = &self.agent.queued;
         let mut out: Vec<Line> = ib
             .steer
             .iter()

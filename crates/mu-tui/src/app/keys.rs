@@ -165,7 +165,7 @@ impl App {
             Action::Jobs => self.open_jobs(),
             Action::Submit(t) => self.submit(t, false),
             Action::QueueFollowUp(t) => self.submit(t, true),
-            Action::Abort => self.link.inbox.borrow().cancel.cancel(),
+            Action::Abort => self.send(Command::Cancel),
             Action::Exit => self.quit(),
             Action::CycleThinking => {
                 let cur = Thinking::parse(&self.agent.status.thinking).unwrap_or(Thinking::Medium);
@@ -184,15 +184,7 @@ impl App {
                     let _ = tx.send(UiMsg::ClipboardImage(clipboard::read_image().await));
                 });
             }
-            Action::PopQueue => {
-                let popped = {
-                    let mut ib = self.link.inbox.borrow_mut();
-                    ib.steer.pop_back().or_else(|| ib.follow_up.pop_back())
-                };
-                if let Some(p) = popped {
-                    self.restore_queued(vec![p]);
-                }
-            }
+            Action::PopQueue => self.send(Command::PopQueue),
         }
     }
 
@@ -580,7 +572,7 @@ mod tests {
         App {
             agent: AgentView::new(true, false),
             services: Services { providers: Rc::new(Providers::new(Rc::new(Configs::default()), gateway)) },
-            link: Link { cmd_tx, inbox: mu_base::events::new_inbox() },
+            link: Link { cmd_tx },
             ctx: Rc::new(Context::default()),
             plugins,
             ui_tx,

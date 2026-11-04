@@ -141,8 +141,7 @@ impl App {
     pub(super) fn send_prompt(&mut self, input: impl Into<UserInput>, follow_up: bool) {
         let input = input.into();
         if self.agent.running {
-            let mut ib = self.link.inbox.borrow_mut();
-            if follow_up { ib.follow_up.push_back(input) } else { ib.steer.push_back(input) }
+            self.send(if follow_up { Command::FollowUp(input) } else { Command::Steer(input) });
         } else {
             self.agent.running = true;
             self.send(Command::Prompt(input));

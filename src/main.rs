@@ -12,6 +12,7 @@ mod update;
 use anyhow::{Result, bail};
 use clap::Parser;
 use mu_agent::agent;
+use mu_agent::handle::{AgentSetup, Mode, build_agent};
 use mu_base::{config, events, models, schema, secrets};
 use mu_common::paths;
 use mu_provider::provider::providers::PROVIDERS;
@@ -411,9 +412,6 @@ fn run() -> Result<i32> {
 
     let cfgs_ui = cfgs.clone();
     let (providers_ui, ctx_ui, cwd_ui) = (providers.clone(), ctx.clone(), cwd.clone());
-    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    let inbox = events::new_inbox();
     let mut run = agent::RunConfig {
         exit_on_resume_failure: cli.print.is_some(),
         pin_model: cli.model.is_some() && resume.is_some(),
@@ -445,27 +443,6 @@ fn run() -> Result<i32> {
     }
     if let Some(n) = plan_run.as_ref().and_then(|r| r.note) {
         run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + n);
-    }
-    let mut agent = agent::Agent::new(agent::AgentInit {
-        providers,
-        plugins: host.clone(),
-        cwd,
-        ctx: ctx.clone(),
-        model: spec,
-        thinking,
-        events: ev_tx,
-        inbox: inbox.clone(),
-        deliver: deliver::detached_starter(),
-        run,
-    });
-    agent.set_output_schema(output_schema.clone());
-    let mut notify_wake = None;
-    if !headless_run && task_payload.is_none() {
-        agent.enable_jobs();
-        notify_wake = agent.enable_notify();
-    }
-    if let Some(p) = resume {
-        let _ = cmd_tx.send(events::Command::Resume(p));
     }
     {
         let kind = match (&task_payload, headless_run) {
@@ -502,6 +479,24 @@ fn run() -> Result<i32> {
                 }
             });
         }
+        let mut handle = build_agent(
+            AgentSetup {
+                providers,
+                plugins: host.clone(),
+                ctx: ctx.clone(),
+                model: spec,
+                thinking,
+                deliver: deliver::detached_starter(),
+                run,
+                output_schema: output_schema.clone(),
+            },
+            cwd,
+            if !headless_run && task_payload.is_none() { Mode::Tui } else { Mode::Headless },
+        );
+        if let Some(p) = resume {
+            let _ = handle.cmd.send(events::Command::Resume(p));
+        }
+        let notify_wake = handle.wake.take();
         // Same order as above: the handler first, then the record flag, then the agent task.
         if let Some(wake) = notify_wake {
             match inbox::forward_signal(wake) {
@@ -516,10 +511,10 @@ fn run() -> Result<i32> {
         if !headless_run && task_payload.is_none() {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
                 Ok(mut sig) => {
-                    let inbox = inbox.clone();
+                    let cmd = handle.cmd.clone();
                     tokio::task::spawn_local(async move {
                         while sig.recv().await.is_some() {
-                            inbox.borrow().cancel.cancel();
+                            let _ = cmd.send(events::Command::Cancel);
                         }
                     });
                     session::set_abort_signal();
@@ -529,7 +524,7 @@ fn run() -> Result<i32> {
                 }
             }
         }
-        let agent_task = tokio::task::spawn_local(agent.run(cmd_rx));
+        let agent_task = handle.task;
         let (print, max_cost) = (cli.print, cli.max_cost);
         let mut printer = None;
         let code = match (print, task_payload, plan_run) {
@@ -540,27 +535,26 @@ fn run() -> Result<i32> {
                 let task = p["task"].as_str().unwrap_or("");
                 let prompt = ctx.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
                 println!("{}", serde_json::json!({"type": "model", "label": model_label}));
-                headless::subagent_mode(prompt, output_schema, cmd_tx, ev_rx).await
+                headless::subagent_mode(prompt, output_schema, handle.cmd, handle.ev).await
             }
             (Some(prompt), None, _) => {
                 printer = Some(spawn_notice_printer(notice_rx));
                 plugin::process::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
                 let first = events::Command::Prompt(prompt.into());
-                headless::print_mode(first, false, cmd_tx, ev_rx, inbox.clone(), max_cost, stop_rx).await
+                headless::print_mode(first, false, handle.cmd, handle.ev, max_cost, stop_rx).await
             }
             (None, None, Some(r)) => {
                 printer = Some(spawn_notice_printer(notice_rx));
                 plugin::process::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
-                headless::print_mode(r.first, r.expect_park, cmd_tx, ev_rx, inbox.clone(), None, stop_rx).await
+                headless::print_mode(r.first, r.expect_park, handle.cmd, handle.ev, None, stop_rx).await
             }
             (None, None, None) => {
                 host.set_interactive();
                 mu_tui::app::run(mu_tui::app::AppInit {
-                    cmd_tx,
-                    ev_rx,
-                    inbox,
+                    cmd_tx: handle.cmd,
+                    ev_rx: handle.ev,
                     providers: providers_ui,
                     ctx: ctx_ui,
                     plugins: host.clone(),

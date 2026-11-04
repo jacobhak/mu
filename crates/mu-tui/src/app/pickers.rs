@@ -282,7 +282,7 @@ impl App {
             OverlayEvent::EditPlan(file) => self.run_editor(&file.clone(), ChildThen::PlanEdit(file)),
             OverlayEvent::PlanCancelled { stored: true } => self.notice("plan left parked"),
             OverlayEvent::PlanCancelled { stored: false } => {
-                self.link.inbox.borrow().cancel.cancel();
+                self.send(Command::Cancel);
                 self.notice("plan review cancelled; plan mode stays on");
             }
             OverlayEvent::OpenPlan(id) => self.send(Command::OpenPlan(id)),

@@ -1,12 +1,15 @@
 mod compaction;
 mod state;
 pub use state::RunConfig;
-use state::{CompactionFlow, Costs, Mailbox, Memo, ModelState, PlanFlow, Ports, TitleState};
+use state::{CompactionFlow, Costs, Mailbox, Memo, ModelState, PlanFlow, Ports, SharedInbox, TitleState, new_inbox};
 use std::cell::Cell;
 mod inbox;
+use inbox::{inbox_cmd, report_dropped};
 #[cfg(test)]
 mod loop_tests;
 mod plan;
+#[cfg(test)]
+mod queue_tests;
 mod review;
 mod session;
 mod status;
@@ -18,7 +21,7 @@ use crate::plans;
 use crate::policy::ToolPolicy;
 use crate::prompt::{self, PromptInput};
 use mu_base::ask_nudge;
-use mu_base::events::{AgentEvent, Command, EventTx, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
+use mu_base::events::{AgentEvent, Command, EventTx, PlanDecision, PlanMeta, QueueState, StatusSnapshot};
 use mu_base::git;
 use mu_base::mem;
 use mu_base::message::UserInput;
@@ -136,7 +139,6 @@ pub struct AgentInit {
     pub model: ModelSpec,
     pub thinking: Thinking,
     pub events: EventTx,
-    pub inbox: SharedInbox,
     pub deliver: DeliverFn,
     pub run: RunConfig,
 }
@@ -169,6 +171,7 @@ async fn recv_opt(rx: &mut Option<UnboundedReceiver<()>>) -> Option<()> {
 /// Commands read while a turn runs; see `drive`.
 struct Queue {
     rx: UnboundedReceiver<Command>,
+    inbox: SharedInbox,
     backlog: std::collections::VecDeque<Command>,
     jobs: Option<Rc<JobsHandle>>,
     events: EventTx,
@@ -182,7 +185,7 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
     let mut open = true;
     loop {
         tokio::select! {
-            () = &mut fut => return,
+            () = &mut fut => break,
             c = q.rx.recv(), if open => match c {
                 Some(Command::KillJobs(id)) => {
                     let n = q.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
@@ -194,11 +197,16 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
                     q.live.set(t);
                     q.backlog.push_back(Command::SetThinking(t));
                 }
-                Some(other) => q.backlog.push_back(other),
+                Some(other) => {
+                    if let Err(c) = inbox_cmd(other, &q.inbox, &q.events) {
+                        q.backlog.push_back(c);
+                    }
+                }
                 None => open = false,
             },
         }
     }
+    report_dropped(&q.inbox, &q.events);
 }
 
 impl Agent {
@@ -217,7 +225,7 @@ impl Agent {
                 providers: i.providers,
                 plugins: i.plugins,
                 events: i.events,
-                inbox: i.inbox,
+                inbox: new_inbox(),
                 deliver: i.deliver,
             },
             model: ModelState {
@@ -275,10 +283,6 @@ impl Agent {
 
     pub fn providers(&self) -> Rc<Providers> {
         self.ports.providers.clone()
-    }
-
-    pub fn inbox(&self) -> SharedInbox {
-        self.ports.inbox.clone()
     }
 
     pub fn emit(&self, e: AgentEvent) {
@@ -342,6 +346,7 @@ impl Agent {
             jobs: self.tools.jobs.clone(),
             events: self.ports.events.clone(),
             live: self.model.live_thinking.clone(),
+            inbox: self.ports.inbox.clone(),
         };
         loop {
             let cmd = if let Some(c) = q.backlog.pop_front() {
@@ -377,7 +382,21 @@ impl Agent {
 
     /// Runs one command. `false` ends the run loop.
     async fn command(&mut self, cmd: Command, q: &mut Queue) -> bool {
+        let cmd = match cmd {
+            Command::Steer(i) | Command::FollowUp(i) => {
+                // Only a running turn takes queued input; an idle one goes back to the composer.
+                self.emit(AgentEvent::QueuedDropped(vec![i]));
+                return true;
+            }
+            other => match inbox_cmd(other, &self.ports.inbox, &self.ports.events) {
+                Ok(()) => return true,
+                Err(c) => c,
+            },
+        };
         match cmd {
+            Command::Steer(_) | Command::FollowUp(_) | Command::PopQueue | Command::Cancel | Command::Stop => {
+                unreachable!("queue and stop commands are handled above")
+            }
             Command::Prompt(t) => drive(self.turn(Some(t)), q).await,
             Command::EnsureSession => {
                 self.ensure_session().await;

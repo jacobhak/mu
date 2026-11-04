@@ -4,7 +4,8 @@
 use crate::{Setup, pick_model, setup};
 use anyhow::{Result, anyhow};
 use mu_agent::agent;
-use mu_base::events::{self, AgentEvent, Command, SharedInbox};
+use mu_agent::handle::{AgentHandle, AgentSetup, Mode, build_agent};
+use mu_base::events::{AgentEvent, Command};
 use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
 use mu_provider::model::pricing;
@@ -98,7 +99,6 @@ struct Pending {
 
 struct Session {
     cmd: UnboundedSender<Command>,
-    inbox: SharedInbox,
     cwd: PathBuf,
     host: Rc<PluginHost>,
     task: tokio::task::JoinHandle<()>,
@@ -277,7 +277,7 @@ impl Server {
             }
             ("session/cancel", _) => {
                 if let Some(s) = self.sessions.get(sid) {
-                    s.inbox.borrow().cancel.cancel();
+                    let _ = s.cmd.send(Command::Cancel);
                 }
             }
             ("session/set_config_option", Some(id)) => {
@@ -311,7 +311,7 @@ impl Server {
             }
             ("session/close", Some(id)) => match self.sessions.remove(sid) {
                 Some(mut s) => {
-                    s.inbox.borrow().cancel.cancel();
+                    let _ = s.cmd.send(Command::Cancel);
                     let _ = s.cmd.send(Command::Exit);
                     if let Some(pid) = s.prompt.take() {
                         respond(&pid, json!({"stopReason": "cancelled"}));
@@ -499,7 +499,7 @@ impl Server {
     async fn shutdown(&mut self) {
         let sessions: Vec<Session> = self.sessions.drain().map(|(_, s)| s).collect();
         for s in &sessions {
-            s.inbox.borrow().cancel.cancel();
+            let _ = s.cmd.send(Command::Cancel);
             let _ = s.cmd.send(Command::Exit);
         }
         for s in sessions {
@@ -521,29 +521,26 @@ async fn open_session(
 ) -> Result<Box<Opened>> {
     let Setup { cfgs, ctx, host, providers, notice_rx, .. } = setup(&cwd);
     let (spec, level) = pick_model(&cfgs, &providers, model.clone(), thinking)?;
-    let (ev_tx, mut ev_rx) = unbounded_channel();
-    let (cmd_tx, cmd_rx) = unbounded_channel();
-    let inbox = events::new_inbox();
     let run = agent::RunConfig {
         pin_model: model.is_some() && resume.is_some(),
         pin_thinking: thinking.is_some() && resume.is_some(),
         excluded: agent::HEADLESS_EXCLUDED.to_vec(),
         ..Default::default()
     };
-    let mut agent = agent::Agent::new(agent::AgentInit {
-        providers: providers.clone(),
-        plugins: host.clone(),
-        cwd: cwd.clone(),
-        ctx,
-        model: spec,
-        thinking: level,
-        events: ev_tx,
-        inbox: inbox.clone(),
-        deliver: crate::deliver::detached_starter(),
-        run,
-    });
-    agent.enable_jobs();
-    let task = tokio::task::spawn_local(agent.run(cmd_rx));
+    let AgentHandle { cmd: cmd_tx, ev: mut ev_rx, task, .. } = build_agent(
+        AgentSetup {
+            providers: providers.clone(),
+            plugins: host.clone(),
+            ctx,
+            model: spec,
+            thinking: level,
+            deliver: crate::deliver::detached_starter(),
+            run,
+            output_schema: None,
+        },
+        cwd.clone(),
+        Mode::Acp,
+    );
     let known = resume.as_deref().map(session::id_of);
     let _ = cmd_tx.send(match resume {
         Some(p) => Command::Resume(p),
@@ -581,7 +578,6 @@ async fn open_session(
     }
     let session = Session {
         cmd: cmd_tx,
-        inbox,
         cwd,
         host,
         task,

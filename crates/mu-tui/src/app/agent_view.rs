@@ -11,7 +11,7 @@ use crate::term::bell::WokenBell;
 use crate::text::line::{Line, dim, styled};
 use crate::theme::{self, Role};
 use crate::widgets::overlay::Overlay;
-use mu_base::events::{AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, StatusSnapshot};
+use mu_base::events::{AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, QueueState, StatusSnapshot};
 use mu_base::events::{SubagentState, SubagentStatus};
 use mu_base::message::UserInput;
 use mu_base::text::truncate_text as trunc;
@@ -71,9 +71,15 @@ pub(super) enum Effect {
     JobsChanged,
     /// A bash job's output changed: an open jobs panel takes it from `AgentView::job_out`.
     JobOutput(String),
-    /// The turn ended: what is still queued goes back to the composer.
+    /// The turn ended.
     TurnEnded {
         aborted: bool,
+    },
+    /// A queued message taken back by `PopQueue`: it goes to the composer.
+    Popped(UserInput),
+    /// Queued input the turn did not take, back to the composer.
+    Restore {
+        queued: Vec<UserInput>,
     },
 }
 
@@ -98,6 +104,9 @@ pub(super) struct AgentView {
     pub(super) compacting: bool,
     pub(super) turn_started: Option<Instant>,
     pub(super) expanded: bool,
+    pub(super) queued: QueueState,
+    /// The last turn was aborted: input it leaves queued goes back to the composer without a notice.
+    pub(super) turn_aborted: bool,
     bell: WokenBell,
 }
 
@@ -118,6 +127,8 @@ impl AgentView {
             compacting: false,
             turn_started: None,
             expanded: false,
+            queued: QueueState::default(),
+            turn_aborted: false,
             bell: WokenBell::default(),
         }
     }
@@ -302,6 +313,9 @@ impl AgentView {
                 }
                 fx.push(Effect::TurnEnded { aborted });
             }
+            AgentEvent::Queue(q) => self.queued = q,
+            AgentEvent::QueuedDropped(queued) => fx.push(Effect::Restore { queued }),
+            AgentEvent::QueuePopped(p) => fx.push(Effect::Popped(p)),
             AgentEvent::Exit | AgentEvent::TurnFailed | AgentEvent::ToolSkipped { .. } => {}
         }
         fx
@@ -413,22 +427,14 @@ impl App {
                     st.set_output(&id, tail);
                 }
             }
-            Effect::TurnEnded { aborted } => {
-                // Whatever is still queued when a turn ends (it was aborted or failed) was written for
-                // that turn; it comes back as editable text instead of leaking into the next one.
-                let queued: Vec<UserInput> = {
-                    let mut ib = self.link.inbox.borrow_mut();
-                    let mut q: Vec<UserInput> = ib.steer.drain(..).collect();
-                    q.extend(ib.follow_up.drain(..));
-                    q
-                };
-                if !queued.is_empty() {
-                    if !aborted {
-                        self.notice("queued messages were not sent; they are back in the composer");
-                    }
-                    self.restore_queued(queued);
+            Effect::TurnEnded { aborted } => self.agent.turn_aborted = aborted,
+            Effect::Restore { queued } => {
+                if !self.agent.turn_aborted {
+                    self.notice("queued messages were not sent; they are back in the composer");
                 }
+                self.restore_queued(queued);
             }
+            Effect::Popped(p) => self.restore_queued(vec![p]),
         }
     }
 }

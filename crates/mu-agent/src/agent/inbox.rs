@@ -5,6 +5,9 @@ impl Agent {
     /// Takes queued steering text and pushes it as user messages. Returns whether any was pending.
     pub(super) fn take_steer(&mut self) -> bool {
         let steer: Vec<UserInput> = self.ports.inbox.borrow_mut().steer.drain(..).collect();
+        if !steer.is_empty() {
+            publish(&self.ports.inbox, &self.ports.events);
+        }
         for s in &steer {
             self.emit(AgentEvent::UserPrompt(s.text.clone()));
             self.push(Message::user_input(s));
@@ -64,5 +67,59 @@ impl Agent {
             self.mail.seen.extend(names);
         }
         true
+    }
+}
+
+/// Drains steer and follow-up, steer first.
+fn take_queue(inbox: &SharedInbox) -> Vec<UserInput> {
+    let mut ib = inbox.borrow_mut();
+    let mut q: Vec<UserInput> = ib.steer.drain(..).collect();
+    q.extend(ib.follow_up.drain(..));
+    q
+}
+
+/// Sends the queue's current contents to the front end.
+pub(super) fn publish(inbox: &SharedInbox, events: &EventTx) {
+    let ib = inbox.borrow();
+    let state =
+        QueueState { steer: ib.steer.iter().cloned().collect(), follow_up: ib.follow_up.iter().cloned().collect() };
+    let _ = events.send(AgentEvent::Queue(state));
+}
+
+/// Queue and stop commands act on the inbox at once, mid-turn or between turns. Any other command is handed back.
+pub(super) fn inbox_cmd(c: Command, inbox: &SharedInbox, events: &EventTx) -> Result<(), Command> {
+    match c {
+        Command::Steer(i) => inbox.borrow_mut().steer.push_back(i),
+        Command::FollowUp(i) => inbox.borrow_mut().follow_up.push_back(i),
+        Command::PopQueue => {
+            let popped = {
+                let mut ib = inbox.borrow_mut();
+                ib.steer.pop_back().or_else(|| ib.follow_up.pop_back())
+            };
+            if let Some(p) = popped {
+                let _ = events.send(AgentEvent::QueuePopped(p));
+            }
+        }
+        Command::Cancel => {
+            inbox.borrow().cancel.cancel();
+            return Ok(());
+        }
+        Command::Stop => {
+            inbox.borrow_mut().stop = true;
+            return Ok(());
+        }
+        other => return Err(other),
+    }
+    publish(inbox, events);
+    Ok(())
+}
+
+/// Hands what a finished turn did not take to the front end, after its `TurnEnd`; the front end
+/// restores it to the composer.
+pub(super) fn report_dropped(inbox: &SharedInbox, events: &EventTx) {
+    let queued = take_queue(inbox);
+    if !queued.is_empty() {
+        publish(inbox, events);
+        let _ = events.send(AgentEvent::QueuedDropped(queued));
     }
 }

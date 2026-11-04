@@ -15,7 +15,6 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "sync", "time", "net", "fs", "signal"] }
-tokio-util.workspace = true
 toml.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true

@@ -2,13 +2,9 @@ use crate::message::UserInput;
 use crate::models::Thinking;
 use crate::tool::ToolOutput;
 use serde_json::Value;
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 
 pub enum Command {
     Prompt(UserInput),
@@ -51,26 +47,23 @@ pub enum Command {
         id: String,
         text: Option<String>,
     },
+    /// Deliver between tool calls of the running turn; when idle, the message goes back to the composer.
+    Steer(UserInput),
+    /// Run after the running turn; when idle, the message goes back to the composer.
+    FollowUp(UserInput),
+    /// Take the newest queued message back as `QueuePopped`.
+    PopQueue,
+    /// Abort the in-flight turn (Esc, quit, plan review cancel, ACP cancel, SIGUSR1).
+    Cancel,
+    /// Finish at the next tool/turn boundary, leaving the session resumable (headless first Ctrl-C).
+    Stop,
 }
 
-/// Messages the UI queues while a turn runs, plus the turn's cancellation token.
-pub struct Inbox {
-    pub steer: VecDeque<UserInput>,
-    pub follow_up: VecDeque<UserInput>,
-    pub cancel: CancellationToken,
-    /// Set by a headless run when asked to stop: finish at the next tool/turn boundary.
-    pub stop: bool,
-}
-
-pub type SharedInbox = Rc<RefCell<Inbox>>;
-
-pub fn new_inbox() -> SharedInbox {
-    Rc::new(RefCell::new(Inbox {
-        steer: VecDeque::new(),
-        follow_up: VecDeque::new(),
-        cancel: CancellationToken::new(),
-        stop: false,
-    }))
+/// Messages queued for the agent: steered into the running turn, or held until it ends.
+#[derive(Clone, Debug, Default)]
+pub struct QueueState {
+    pub steer: Vec<UserInput>,
+    pub follow_up: Vec<UserInput>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -421,6 +414,12 @@ pub enum AgentEvent {
     /// aborted or stopped. A `-p` run that sees it exits 1 even if a stop was requested, so a
     /// failure is not reported as "interrupted, resume with …".
     TurnFailed,
+    /// What is queued for the agent; sent whenever it changes.
+    Queue(QueueState),
+    /// A queued message taken back by `Command::PopQueue`.
+    QueuePopped(UserInput),
+    /// Queued input a finished turn did not take. Sent after its `TurnEnd`; the front end restores it.
+    QueuedDropped(Vec<UserInput>),
     Exit,
 }
 

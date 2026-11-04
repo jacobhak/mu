@@ -3,6 +3,7 @@
 //! `agent::Agent`; the process-level commands live in the binary.
 
 pub mod agent;
+pub mod handle;
 pub mod plans;
 pub mod policy;
 pub mod prompt;
