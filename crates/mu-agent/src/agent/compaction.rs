@@ -263,6 +263,19 @@ impl Agent {
             }
         });
     }
+
+    pub(super) async fn manual_compact(&mut self, focus: Option<String>) {
+        let cancel = CancellationToken::new();
+        self.inbox.borrow_mut().cancel = cancel.clone();
+        self.emit(AgentEvent::TurnStart);
+        match self.compact(focus.as_deref(), &cancel).await {
+            Outcome::Done => {}
+            Outcome::Skipped(why) => self.notice(why),
+            Outcome::Failed(e) if !cancel.is_cancelled() => self.error(format!("compaction failed: {e}")),
+            Outcome::Failed(_) => {}
+        }
+        self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
+    }
 }
 
 #[cfg(test)]
