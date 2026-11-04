@@ -1,7 +1,8 @@
 //! `--acp`: Agent Client Protocol server over stdio (newline-delimited JSON-RPC).
 //! One mu `Agent` per ACP session, so each session keeps its own working directory.
 
-use crate::{Setup, pick_model, setup};
+use crate::cli::select::pick_model;
+use crate::run::setup::{Setup, setup};
 use anyhow::{Result, anyhow};
 use mu_agent::agent;
 use mu_agent::handle::{AgentHandle, AgentSetup, Mode, build_agent};
@@ -534,7 +535,7 @@ async fn open_session(
             ctx,
             model: spec,
             thinking: level,
-            deliver: crate::deliver::detached_starter(),
+            deliver: crate::workflow::deliver::detached_starter(),
             run,
             output_schema: None,
         },
