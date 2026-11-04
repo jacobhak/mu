@@ -3,6 +3,7 @@
 //! overwritten.
 
 use super::config::{as_bool, candidate_files};
+use super::{JsonError, read_json};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -34,39 +35,25 @@ pub fn check_name(name: &str) -> Result<(), String> {
 
 /// The root object of a config file; a missing file is an empty one.
 fn read_root(path: &Path) -> Result<Map<String, Value>, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    if text.trim().is_empty() {
-        return Ok(Map::new());
-    }
-    match serde_json::from_str::<Value>(&text) {
+    match read_json(path) {
         Ok(Value::Object(m)) => Ok(m),
         Ok(_) => Err(format!("{}: not a JSON object; left unchanged", path.display())),
-        Err(e) => Err(format!("{}: {e}; left unchanged", path.display())),
+        Err(JsonError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(JsonError::Io(e)) => Err(format!("{}: {e}", path.display())),
+        Err(JsonError::Blank(_)) => Ok(Map::new()),
+        Err(JsonError::Parse(e)) => Err(format!("{}: {e}; left unchanged", path.display())),
     }
 }
 
-/// Writes through a temporary file in the same directory, keeping the file's permissions (a new
-/// file is private: headers and env may hold tokens).
+/// Writes through `write_atomic_with`: an existing file keeps its permissions, a new one is private
+/// (headers and env may hold tokens).
 fn write_root(path: &Path, root: &Map<String, Value>) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(err)?;
     let mut text = serde_json::to_string_pretty(root).map_err(|e| e.to_string())?;
     text.push('\n');
-    let tmp = dir.join(format!(".mcp-{}.tmp", uuid::Uuid::new_v4()));
-    let mode = std::fs::metadata(path).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o600);
-    let res = std::fs::write(&tmp, text)
-        .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)))
-        .and_then(|_| std::fs::rename(&tmp, path));
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    res.map_err(err)
+    mu_common::fs::write_atomic_with(path, text.as_bytes(), 0o600).map_err(err)
 }
 
 fn list(root: &Map<String, Value>, key: &str) -> Vec<String> {

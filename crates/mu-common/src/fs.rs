@@ -7,10 +7,17 @@ use std::path::Path;
 /// renames. A crash leaves either the old file or the new one, never a torn mix. An existing
 /// file's permissions are kept.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, bytes, 0o666)
+}
+
+/// `write_atomic` with the mode a new file is created with (before the umask), for files that must
+/// not be readable by others even briefly.
+pub fn write_atomic_with(path: &Path, bytes: &[u8], new_mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
     let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(new_mode).open(&tmp)?;
         if let Ok(meta) = std::fs::metadata(path) {
             let _ = f.set_permissions(meta.permissions());
         }
@@ -175,6 +182,21 @@ mod tests {
         write_atomic(&p, b"two").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_file_gets_the_given_mode_and_an_existing_one_keeps_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("mu-fs-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("m.json");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        write_atomic_with(&p, b"one", 0o600).unwrap();
+        assert_eq!(mode(&p), 0o600);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic_with(&p, b"two", 0o600).unwrap();
+        assert_eq!(mode(&p), 0o644);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
