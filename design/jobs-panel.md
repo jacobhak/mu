@@ -207,14 +207,14 @@ delivery. Each listed session adds a running `(offset, cost, tokens)`, tens of b
 
 Each phase ships alone.
 
-1. **Model + list** (implemented). The extra `SubagentStatus` fields, `src/tui/jobs_panel.rs`, `/jobs` and
+1. **Model + list** (implemented). The extra `SubagentStatus` fields, `crates/mu-tui/src/panels/jobs_panel.rs`, `/jobs` and
    `Alt+J` open the panel, `x`/`X`. Detail is facts only (state, delivery, cwd, task or command, note).
    Deviation: `take_undelivered` now emits a snapshot so the panel's delivery state is current.
 2. **Status segment** `subagents` (implemented). Drawn only where the user's omp `statusLine` lists it; mu's
    fallback segment list is unchanged.
 3. **Child transcript and cost** (implemented). The headless child prints `{"type":"session","path":…}` once
    its session exists; `run_child_observed` hands it to the job. `agent::history_events` is the resume
-   replay as a pure function; `tui/session_view.rs` draws its events with the live transcript's blocks;
+   replay as a pure function; `panels/session_view.rs` draws its events with the live transcript's blocks;
    `session_tail.rs` follows the file (byte offset, whole lines, at most 1 MiB per poll so a big file fills
    in over several ticks on the UI thread instead of needing a worker). `Enter` opens the view. Cost is the
    running total of each listed subagent's session, polled every 2 s while the panel is open.
@@ -224,7 +224,7 @@ Each phase ships alone.
 4. **Sessions tab** (implemented). The headless child, `-p`, the TUI and ACP write `kind` (from
    `session::set_run_info`), `agent`, `cwd` and, for a spawned session, `parent`. `session::live_sessions`
    reads every record whose lock is held (as `owner()` does) and whose session file exists; a record without
-   `parent` takes it from the session header. `tui/sessions_tab.rs` builds the tree (roots oldest first,
+   `parent` takes it from the session header. `panels/sessions_tab.rs` builds the tree (roots oldest first,
    this process and its own session left out, this session's subagents marked with their job). Rows show
    cost from the same running-total reader as jobs. The list is re-read every 2 s while the tab is open; the
    panel asks the app for a redraw tick while it is open, since nothing else would repaint an idle screen.
@@ -261,7 +261,7 @@ Each phase ships alone.
 ## Docs to update when built
 
 `docs/background-jobs.md` (panel, keys, status segment), `docs/detached-runs.md` (Sessions tab, owner
-fields), `HOTKEYS` in `src/tui/app.rs`, the Subagents and Sessions rows in `DESIGN.md`.
+fields), `HOTKEYS` in `crates/mu-tui/src/app/mod.rs`, the Subagents and Sessions rows in `DESIGN.md`.
 
 ## Decisions
 

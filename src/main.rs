@@ -7,7 +7,6 @@ mod plans_cli;
 mod predict_setup;
 mod review_cli;
 mod take;
-mod tui;
 mod update;
 
 use anyhow::{Result, bail};
@@ -553,7 +552,7 @@ fn run() -> Result<i32> {
             }
             (None, None, None) => {
                 host.set_interactive();
-                tui::app::run(tui::app::AppInit {
+                mu_tui::app::run(mu_tui::app::AppInit {
                     cmd_tx,
                     ev_rx,
                     inbox,

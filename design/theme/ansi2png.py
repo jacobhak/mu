@@ -14,7 +14,7 @@ import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PALETTES = HERE.parent.parent / "src/tui/palettes"
+PALETTES = HERE.parent.parent / "crates/mu-tui/src/palettes"
 
 # Ghostty's built-in TokyoNight: what a tokyo-night terminal answers for the 16 slots.
 GHOSTTY_TOKYO = {

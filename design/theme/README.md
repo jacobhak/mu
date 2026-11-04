@@ -1,6 +1,6 @@
 # Theme redesign
 
-Design reference for mu's palette-derived theme (implemented in `src/tui/theme.rs`).
+Design reference for mu's palette-derived theme (implemented in `crates/mu-tui/src/theme.rs`).
 
 ```sh
 python3 design/theme/mock.py --side                 # mu as you see it today vs the proposal

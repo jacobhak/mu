@@ -117,7 +117,7 @@ def fill(line: Line, w: int, bg: Color | None) -> Line:
 def load_palette(name_or_path: str) -> dict[str, str]:
     p = Path(name_or_path)
     if not p.exists():
-        p = REPO / "src/tui/palettes" / f"{name_or_path}.toml"
+        p = REPO / "crates/mu-tui/src/palettes" / f"{name_or_path}.toml"
     pal = tomllib.loads(p.read_text())
     pal.setdefault("orange", pal.get("bright_yellow", pal["yellow"]))
     pal["_name"] = p.stem

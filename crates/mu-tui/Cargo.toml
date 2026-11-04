@@ -1,0 +1,65 @@
+[package]
+name = "mu-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+all-langs = ["lang-rust", "lang-json", "lang-bash", "lang-toml", "lang-yaml", "lang-python", "lang-javascript", "lang-typescript", "lang-diff", "lang-markdown"]
+highlight = ["dep:tree-sitter", "dep:tree-sitter-highlight"]
+lang-rust = ["highlight", "dep:tree-sitter-rust"]
+lang-json = ["highlight", "dep:tree-sitter-json"]
+lang-bash = ["highlight", "dep:tree-sitter-bash"]
+lang-toml = ["highlight", "dep:tree-sitter-toml-ng"]
+lang-yaml = ["highlight", "dep:tree-sitter-yaml"]
+lang-python = ["highlight", "dep:tree-sitter-python"]
+lang-javascript = ["highlight", "dep:tree-sitter-javascript"]
+lang-typescript = ["lang-javascript", "dep:tree-sitter-typescript"]
+lang-diff = ["highlight", "dep:tree-sitter-diff"]
+lang-markdown = ["highlight", "dep:tree-sitter-md"]
+
+[dependencies]
+mu-common.workspace = true
+mu-base.workspace = true
+mu-provider.workspace = true
+mu-session.workspace = true
+mu-tools.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "time", "sync", "process", "io-util", "io-std", "fs", "net"] }
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+toml.workspace = true
+crossterm.workspace = true
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-highlight = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-json = { workspace = true, optional = true }
+tree-sitter-bash = { workspace = true, optional = true }
+tree-sitter-toml-ng = { workspace = true, optional = true }
+tree-sitter-yaml = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-diff = { workspace = true, optional = true }
+tree-sitter-md = { workspace = true, optional = true }
+base64.workspace = true
+terminput.workspace = true
+terminput-crossterm.workspace = true
+jiff.workspace = true
+libc.workspace = true
+uuid.workspace = true
+unicode-segmentation.workspace = true
+vt100.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+
+[dev-dependencies]
+mu-testutil.workspace = true
+mu-provider = { workspace = true, features = ["test-support"] }
+mu-tools = { workspace = true, features = ["test-support"] }

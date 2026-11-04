@@ -43,8 +43,8 @@ SOFTWARE.
 
 ## omarchy
 
-<https://github.com/basecamp/omarchy>. The colour palettes in `src/tui/palettes/*.toml` are copied from
-omarchy's `themes/*/colors.toml`. Their license is in `src/tui/palettes/LICENSE`.
+<https://github.com/basecamp/omarchy>. The colour palettes in `crates/mu-tui/src/palettes/*.toml` are copied from
+omarchy's `themes/*/colors.toml`. Their license is in `crates/mu-tui/src/palettes/LICENSE`.
 
 ## rmcp
 
