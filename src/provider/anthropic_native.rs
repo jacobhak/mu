@@ -180,7 +180,7 @@ pub fn body(req: &Request) -> (Value, Vec<&'static str>) {
 mod tests {
     use super::*;
     use crate::message::{Block, Message};
-    use crate::provider::ToolDef;
+    use crate::tools::output::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
 

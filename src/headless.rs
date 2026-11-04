@@ -445,7 +445,7 @@ mod tests {
     }
 
     fn yielded(details: serde_json::Value) -> AgentEvent {
-        let mut output = crate::tools::ToolOutput::ok("Result submitted.");
+        let mut output = crate::tools::output::ToolOutput::ok("Result submitted.");
         output.details = Some(details);
         AgentEvent::ToolEnd { id: "1".into(), name: "yield".into(), output }
     }

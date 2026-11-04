@@ -6,7 +6,7 @@ use super::markdown;
 use super::theme::{self, Role};
 use crate::config::Cards;
 use crate::events::{SubagentState, SubagentStatus};
-use crate::tools::{BashMeta, FileMeta, ToolMeta, ToolOutput};
+use crate::tools::output::{BashMeta, FileMeta, ToolMeta, ToolOutput};
 use crossterm::style::{Attribute, Color, ContentStyle};
 use serde_json::Value;
 

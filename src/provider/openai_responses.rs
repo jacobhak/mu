@@ -488,7 +488,8 @@ fn usage_of(u: &Value) -> Usage {
 mod tests {
     use super::*;
     use crate::models::{Api, Thinking, ThinkingSpec};
-    use crate::provider::{Auth, ToolDef};
+    use crate::provider::Auth;
+    use crate::tools::output::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
 

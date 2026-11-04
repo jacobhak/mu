@@ -1,4 +1,5 @@
-use super::{ToolOutput, Tools};
+use super::output::ToolOutput;
+use super::Tools;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

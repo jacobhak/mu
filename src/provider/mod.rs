@@ -9,6 +9,7 @@ pub mod retry;
 pub mod sse;
 
 use crate::message::Message;
+use crate::tools::output::ToolDef;
 use crate::models::{self, GatewayModel, ModelSpec, Thinking};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -22,13 +23,6 @@ pub struct NativeModel {
 }
 
 use std::time::Duration;
-
-#[derive(Debug, Clone)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    pub schema: Value,
-}
 
 pub struct Request<'a> {
     pub model: &'a ModelSpec,

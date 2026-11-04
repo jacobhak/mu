@@ -1,4 +1,5 @@
-use super::{BashMeta, ToolCtx, ToolMeta, ToolOutput, Tools};
+use super::output::{BashMeta, ToolMeta, ToolOutput};
+use super::{ToolCtx, Tools};
 use crate::events::AgentEvent;
 use crate::jobs::JobsHandle;
 use pi_shell::{

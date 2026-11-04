@@ -2,7 +2,7 @@ use crate::gitinfo::GitInfo;
 use crate::message::UserInput;
 use crate::models::Thinking;
 use crate::quota::ProviderUsage;
-use crate::tools::ToolOutput;
+use crate::tools::output::ToolOutput;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::VecDeque;

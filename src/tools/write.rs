@@ -1,5 +1,6 @@
 use super::uri::Scheme;
-use super::{FileMeta, ToolMeta, ToolOutput, Tools, diff};
+use super::output::{FileMeta, ToolMeta, ToolOutput};
+use super::{Tools, diff};
 use pi_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
 

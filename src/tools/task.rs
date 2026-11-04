@@ -1,4 +1,5 @@
-use super::{ToolCtx, ToolOutput, Tools};
+use super::output::ToolOutput;
+use super::{ToolCtx, Tools};
 use crate::events::{JobKind, SubagentState, SubagentStatus};
 use futures_util::future::join_all;
 use serde::Deserialize;

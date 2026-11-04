@@ -1,7 +1,7 @@
 //! Durable plans: a plan written in plan mode can be parked and approved later, in another session.
 //! Each plan is `<id>.md` (the text as written) plus `<id>.json` (metadata) under
 //! `$MU_HOME/plans/<repo-key>/`. All worktrees of one clone share a store.
-use crate::message::Message;
+use crate::message::{Message, tool_calls};
 use crate::review;
 use mu_common::fs::write_atomic;
 use mu_common::paths::{encode_cwd, mu_home};
@@ -429,7 +429,7 @@ pub fn reads_from(messages: &[Message], cwd: &Path, root: &Path) -> Vec<String> 
     let root = normalize(root);
     let mut out = Vec::new();
     for m in messages {
-        for (_, name, args) in crate::agent::tool_calls(m) {
+        for (_, name, args) in tool_calls(m) {
             if name != "read" {
                 continue;
             }

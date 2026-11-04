@@ -7,19 +7,20 @@ use crate::gitinfo::{self, GitInfo};
 use crate::jobs::{self, JobsHandle};
 use crate::mem;
 use crate::message::UserInput;
-use crate::message::{Block, Message, StopReason, now_ms, text_of};
+use crate::message::{Block, Message, StopReason, history_events, is_dismissal, now_ms, text_of, tool_calls};
 use crate::models::{ModelSpec, Thinking};
 use crate::notify;
 use crate::plans;
 use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
 use crate::pricing;
-use crate::provider::{ProviderError, Providers, Request, StreamEvent, ToolDef};
+use crate::provider::{ProviderError, Providers, Request, StreamEvent};
 use crate::quota::QuotaTracker;
 use crate::review;
 use crate::secrets;
 use crate::session::{self, CompactionState, SessionFile};
-use crate::tools::{ToolCtx, ToolMeta, ToolOutput, Tools};
+use crate::tools::output::{ToolDef, ToolMeta, ToolOutput};
+use crate::tools::{ToolCtx, Tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -221,68 +222,6 @@ async fn drive<F: std::future::Future<Output = ()>>(
     }
 }
 
-pub(crate) fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
-    match m {
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|b| match b {
-                Block::ToolCall { id, name, arguments } => Some((id.clone(), name.clone(), arguments.clone())),
-                _ => None,
-            })
-            .collect(),
-        _ => vec![],
-    }
-}
-
-/// A reply that is only `.` (declining a reminder): kept in the session, never rendered.
-fn is_dismissal(m: &Message) -> bool {
-    matches!(m, Message::Assistant { content, .. } if tool_calls(m).is_empty() && text_of(content).trim() == ".")
-}
-
-/// The UI events that show a stored conversation: what a resumed session replays and what the jobs
-/// panel renders for a subagent's session.
-pub fn history_events(messages: &[Message]) -> Vec<AgentEvent> {
-    let mut out = Vec::new();
-    let mut after_reminder = false;
-    for m in messages {
-        let reminded = std::mem::replace(
-            &mut after_reminder,
-            matches!(m, Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content))),
-        );
-        match m {
-            Message::User { synthetic: true, .. } => out.push(AgentEvent::Notice("▸ Plan approved".into())),
-            Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content)) => {}
-            Message::User { content, .. } => out.push(AgentEvent::UserPrompt(text_of(content))),
-            Message::Assistant { .. } if reminded && is_dismissal(m) => {}
-            Message::Assistant { content, .. } => {
-                for b in content {
-                    match b {
-                        Block::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                            out.push(AgentEvent::Thinking(thinking.clone()));
-                        }
-                        Block::Text { text } => {
-                            out.push(AgentEvent::Text(text.clone()));
-                            out.push(AgentEvent::BlockEnd);
-                        }
-                        Block::ToolCall { id, name, arguments } => {
-                            out.push(AgentEvent::ToolStart {
-                                id: id.clone(),
-                                name: name.clone(),
-                                args: arguments.clone(),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Message::ToolResult { tool_call_id, tool_name, content, is_error, details, .. } => {
-                let output = ToolOutput::from_stored(text_of(content), *is_error, details.clone());
-                out.push(AgentEvent::ToolEnd { id: tool_call_id.clone(), name: tool_name.clone(), output });
-            }
-        }
-    }
-    out
-}
 
 impl Agent {
     pub fn new(i: AgentInit) -> Self {

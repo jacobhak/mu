@@ -1,4 +1,5 @@
-use super::{ToolOutput, Tools};
+use super::output::ToolOutput;
+use super::Tools;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::UTF8};
 use pi_walker::{Detail, FileType, Fs, walk};

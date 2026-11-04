@@ -1,4 +1,5 @@
-use super::{ToolCtx, ToolOutput, Tools};
+use super::output::ToolOutput;
+use super::{ToolCtx, Tools};
 use crate::events::{AgentEvent, PlanDecision};
 use serde::Deserialize;
 use serde_json::{Value, json};

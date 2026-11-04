@@ -1,5 +1,6 @@
 use super::grep::{block_on_walk, walk_options};
-use super::{ToolOutput, Tools};
+use super::output::ToolOutput;
+use super::Tools;
 use pi_walker::glob::{GlobError, GlobOptions, glob};
 use pi_walker::{FileType, Fs};
 use serde::Deserialize;

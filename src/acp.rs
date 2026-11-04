@@ -718,7 +718,7 @@ fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolOutput;
+    use crate::tools::output::ToolOutput;
 
     fn kinds(v: &[Value]) -> Vec<&str> {
         v.iter().map(|u| u["sessionUpdate"].as_str().unwrap()).collect()

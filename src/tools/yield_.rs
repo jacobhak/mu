@@ -2,7 +2,8 @@
 //! same name: `{data}` for success, `{error}` for failure. A `data` that does not match the
 //! schema is returned to the model as a tool error so it can retry.
 
-use super::{ToolOutput, Tools};
+use super::output::ToolOutput;
+use super::Tools;
 use serde::Deserialize;
 use serde_json::{Value, json};
 

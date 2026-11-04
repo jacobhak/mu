@@ -520,7 +520,8 @@ fn stream_failure(e: &Value) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Auth, ToolDef};
+    use crate::provider::Auth;
+    use crate::tools::output::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
 
