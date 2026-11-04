@@ -139,14 +139,8 @@ fn resolve_command(m: &Manifest) -> std::path::PathBuf {
     if c.contains('/') {
         return m.dir.join(c);
     }
-    // After a reinstall replaces the binary, Linux reports the running exe as ".../mu (deleted)", which
-    // canonicalize rejects; its parent directory is still the right one, so don't require it to resolve.
-    if let Some(sib) = std::env::current_exe()
-        .ok()
-        .map(|e| std::fs::canonicalize(&e).unwrap_or(e))
-        .and_then(|e| e.parent().map(|d| d.join(c)))
-        .filter(|p| p.exists())
-    {
+    // `current_exe` may read "... (deleted)" after a reinstall; `sibling_of` copes with that.
+    if let Some(sib) = std::env::current_exe().ok().and_then(|e| sibling_of(&e, c)) {
         return sib;
     }
     c.into()
@@ -267,7 +261,7 @@ impl Proc {
         })
         .await;
         if exited.is_err() {
-            unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+            crate::proc::terminate_group(self.pid as i32).await;
         }
     }
 }
@@ -439,14 +433,17 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
     }
 }
 
+/// `name` next to `exe`, if it exists there. After a reinstall replaces the binary, Linux reports the
+/// running exe as ".../mu (deleted)", which canonicalize rejects; its parent directory is still the
+/// right one, so don't require it to resolve.
+fn sibling_of(exe: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    exe.parent().map(|d| d.join(name)).filter(|p| p.exists())
+}
+
 /// Where a first-party binary lives: next to the mu binary, else on PATH.
 fn sibling_or_path(c: &str) -> std::path::PathBuf {
-    std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join(c)))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| c.into())
+    std::env::current_exe().ok().and_then(|e| sibling_of(&e, c)).unwrap_or_else(|| c.into())
 }
 
 /// `tools/list` with `nextCursor` paging.
@@ -1698,6 +1695,56 @@ done
             assert_eq!(inits(), before + 1, "reconnect starts the server again");
             assert!(h.mcp_reconnect("nope").await.is_err());
             h.shutdown_all().await;
+        });
+    }
+
+    #[test]
+    fn a_sibling_binary_is_found_when_the_running_exe_was_replaced() {
+        let dir = std::env::temp_dir().join(format!("mu-sib-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mu-mcp-http"), "").unwrap();
+        let exe = dir.join("mu (deleted)");
+        assert!(std::fs::canonicalize(&exe).is_err());
+        assert_eq!(sibling_of(&exe, "mu-mcp-http"), Some(dir.join("mu-mcp-http")));
+        assert_eq!(sibling_of(&exe, "nope"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shutdown_terminates_a_stuck_plugin_group_before_killing_it() {
+        run(async {
+            let dir = std::env::temp_dir().join(format!("mu-plug-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join("term");
+            let script = format!(
+                r#"trap 'echo term > "{}"' TERM
+read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+while :; do sleep 100 & wait; done
+"#,
+                marker.display()
+            );
+            std::fs::write(dir.join("p.sh"), script).unwrap();
+            let m = Manifest {
+                name: "stuck".into(),
+                command: vec!["sh".into(), "p.sh".into()],
+                lifetime: manifest::Lifetime::parse("session").unwrap(),
+                hooks: vec![],
+                provider: None,
+                tools: vec![manifest::ToolSpec::with_schema("slow", json!({}))],
+                dir: dir.clone(),
+            };
+            let (ntx, _nrx) = mpsc::unbounded_channel();
+            let h = PluginHost::new(vec![m], vec![], ntx, Default::default());
+            let proc = h.ensure(&h.slot(0)).await.unwrap();
+            let pid = proc.pid as i32;
+            proc.shutdown().await;
+            assert!(marker.exists(), "the group got SIGTERM before SIGKILL");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // SAFETY: signal 0 only checks that the group exists.
+            assert_eq!(unsafe { libc::kill(-pid, 0) }, -1, "the process group is gone");
+            let _ = std::fs::remove_dir_all(dir);
         });
     }
 }

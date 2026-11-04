@@ -603,6 +603,8 @@ pub async fn run_background(
     let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
     let mut status: Option<std::process::ExitStatus> = None;
     let (mut cancelled, mut timed_out, mut stopping) = (false, false, false);
+    // Terminating takes `TERM_GRACE`; it runs beside the loop so output keeps draining meanwhile.
+    let mut terminating: Option<tokio::task::JoinHandle<()>> = None;
     let timeout_sleep = tokio::time::sleep(limits.timeout.unwrap_or_default());
     tokio::pin!(timeout_sleep);
     loop {
@@ -627,12 +629,12 @@ pub async fn run_background(
             _ = cancel.cancelled(), if !stopping => {
                 cancelled = true;
                 stopping = true;
-                crate::proc::terminate_group(pid).await;
+                terminating = Some(tokio::spawn(crate::proc::terminate_group(pid)));
             }
             _ = &mut timeout_sleep, if !stopping && limits.timeout.is_some() => {
                 timed_out = true;
                 stopping = true;
-                crate::proc::terminate_group(pid).await;
+                terminating = Some(tokio::spawn(crate::proc::terminate_group(pid)));
             }
             _ = tokio::time::sleep(IDLE), if status.is_some() => break,
         }
@@ -640,8 +642,11 @@ pub async fn run_background(
             break;
         }
     }
-    if !stopping {
-        crate::proc::terminate_group(pid).await;
+    match terminating {
+        Some(t) => {
+            let _ = t.await;
+        }
+        None => crate::proc::terminate_group(pid).await,
     }
     collector.push(&out_dec.finish(), &alloc);
     collector.push(&err_dec.finish(), &alloc);
@@ -665,6 +670,7 @@ pub async fn run_background(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     #[tokio::test(flavor = "current_thread")]
     async fn pty_falls_back_without_ui() {
@@ -693,6 +699,33 @@ mod tests {
         assert!(r.ok, "{}", r.text);
         let seen = seen.into_inner();
         assert!(seen.contains("first") && seen.contains("second"), "{seen:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_keeps_draining_while_a_cancelled_background_run_is_terminated() {
+        let cancel = CancellationToken::new();
+        let cancelled_at = std::cell::Cell::new(None);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let canceller = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancelled_at.set(Some(Instant::now()));
+            cancel.cancel();
+        };
+        let run = run_background(
+            "trap '' TERM; while :; do echo tick; sleep 0.02; done".into(),
+            std::env::temp_dir(),
+            std::env::vars().collect(),
+            None,
+            cancel.clone(),
+            || (0, std::env::temp_dir()),
+            |_| seen.borrow_mut().push(Instant::now()),
+        );
+        let (r, ()) = tokio::join!(run, canceller);
+        assert!(!r.ok);
+        let t0 = cancelled_at.get().unwrap();
+        let (from, to) = (t0 + Duration::from_millis(50), t0 + Duration::from_millis(180));
+        let during_grace = seen.borrow().iter().filter(|t| **t > from && **t < to).count();
+        assert!(during_grace > 0, "no output was read during the SIGTERM grace");
     }
 
     #[tokio::test(flavor = "current_thread")]
