@@ -1,6 +1,9 @@
-//! Helpers shared by tests.
+//! Helpers shared by mu's test suites. Dev-only: nothing here ships in the binary.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A private `MU_HOME` for this test process, created once. Tests that touch mu's state
 /// (sessions, blobs) call it first so they never write to the real `~/.mu`.
@@ -86,4 +89,58 @@ pub async fn fake_server(replies: Vec<Reply>) -> (String, std::sync::Arc<std::sy
         }
     });
     (base, seen)
+}
+
+/// A fresh, empty, canonical temp dir.
+pub fn tmp() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("mu-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&d).unwrap();
+    d.canonicalize().unwrap()
+}
+
+/// Runs `git` in `dir` with a fixed identity, panics on failure, returns stdout.
+pub fn sh(dir: &Path, args: &[&str]) -> String {
+    let o = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// A fresh git repo whose initial commit holds `a.txt` and `b.txt`, both `one\n`.
+pub fn repo() -> PathBuf {
+    let d = tmp();
+    sh(&d, &["init", "-q"]);
+    std::fs::write(d.join("a.txt"), "one\n").unwrap();
+    std::fs::write(d.join("b.txt"), "one\n").unwrap();
+    sh(&d, &["add", "."]);
+    sh(&d, &["commit", "-qm", "init"]);
+    d
+}
+
+/// A current-thread runtime with all drivers enabled.
+pub fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+/// Runs `f` to completion on a fresh current-thread runtime.
+pub fn block_on<F: Future>(f: F) -> F::Output {
+    rt().block_on(f)
+}
+
+/// Like `block_on`, but inside a `LocalSet` so `spawn_local` works.
+pub fn block_on_local<F: Future>(f: F) -> F::Output {
+    rt().block_on(tokio::task::LocalSet::new().run_until(f))
+}
+
+/// A key press with no modifiers.
+pub fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+pub fn key_mods(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, mods)
 }

@@ -1291,6 +1291,7 @@ impl PluginHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_testutil::block_on_local as run;
 
     /// A plugin script: answers `initialize`, then hangs on `tool/call` or exits, per `on_call`.
     fn host(on_call: &str, lifetime: &str) -> (Rc<PluginHost>, std::path::PathBuf) {
@@ -1319,11 +1320,6 @@ done
         };
         let (ntx, _nrx) = mpsc::unbounded_channel();
         (PluginHost::new(vec![m], vec![], ntx, Default::default()), dir)
-    }
-
-    fn run<F: std::future::Future>(f: F) -> F::Output {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(tokio::task::LocalSet::new().run_until(f))
     }
 
     #[test]

@@ -1013,6 +1013,7 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
 mod tests {
     use super::*;
     use crate::tui::line::line_text;
+    use mu_testutil::key;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1034,10 +1035,6 @@ mod tests {
             session: None,
             model: None,
         }
-    }
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
     }
 
     fn now() -> SystemTime {

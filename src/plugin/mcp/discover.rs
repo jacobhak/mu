@@ -294,13 +294,8 @@ fn opencode_entry(e: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_testutil::tmp;
     use serde_json::json;
-
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mu-mcpdisc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
 
     fn put(base: &Path, rel: &str, content: &str) {
         let p = base.join(rel);

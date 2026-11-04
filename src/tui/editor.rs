@@ -453,10 +453,7 @@ impl Editor {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
-
-    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, mods)
-    }
+    use mu_testutil::key_mods as key;
 
     fn ctrl(c: char) -> KeyEvent {
         key(KeyCode::Char(c), KeyModifiers::CONTROL)

@@ -860,11 +860,7 @@ fn image_marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
-
-    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, mods)
-    }
+    use mu_testutil::key_mods as key;
 
     fn press(c: &mut Composer, code: KeyCode, mods: KeyModifiers) -> Action {
         c.on_key(key(code, mods), false, &[])

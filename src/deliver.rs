@@ -709,38 +709,9 @@ async fn start_detached(id: String, session: PathBuf, cwd: PathBuf) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_testutil::{repo, rt, sh, tmp};
     use serde_json::{Value, json};
     use std::collections::VecDeque;
-
-    fn sh(dir: &Path, args: &[&str]) -> String {
-        let o = std::process::Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
-        String::from_utf8_lossy(&o.stdout).into_owned()
-    }
-
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mu-deliver-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
-    }
-
-    fn repo() -> PathBuf {
-        let d = tmp();
-        sh(&d, &["init", "-q"]);
-        std::fs::write(d.join("a.txt"), "one\n").unwrap();
-        sh(&d, &["add", "."]);
-        sh(&d, &["commit", "-qm", "init"]);
-        d
-    }
-
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-    }
 
     #[derive(Default)]
     struct Fake {

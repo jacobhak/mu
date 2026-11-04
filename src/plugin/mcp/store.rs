@@ -189,13 +189,8 @@ pub fn set_enabled(cwd: &Path, agent: &Path, name: &str, on: bool) -> Result<boo
 mod tests {
     use super::*;
     use crate::plugin::mcp::config::load_all_with;
+    use mu_testutil::tmp;
     use serde_json::json;
-
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mu-mcpstore-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
 
     fn put(p: &Path, text: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

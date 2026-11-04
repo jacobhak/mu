@@ -287,12 +287,7 @@ fn read_json(path: &Path, warnings: &mut Vec<String>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mu-mcpcfg-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
+    use mu_testutil::tmp;
 
     fn write(p: &Path, text: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

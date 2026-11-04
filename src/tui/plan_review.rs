@@ -333,10 +333,7 @@ const REFINE_LABEL: &str = "Refine plan";
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use mu_testutil::key;
 
     fn review(content: &str, ctx: Option<(u64, u64)>, tiers: Vec<Tier>) -> PlanReview {
         PlanReview::new("T".into(), "local://t-plan.md".into(), PathBuf::new(), content.into(), ctx, tiers, false, None)

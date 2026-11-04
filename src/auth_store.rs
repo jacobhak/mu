@@ -398,6 +398,7 @@ pub fn mask(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_testutil::block_on as rt;
     use std::os::unix::fs::PermissionsExt;
 
     fn store(tag: &str) -> (Store, PathBuf) {
@@ -411,10 +412,6 @@ mod tests {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text).unwrap();
         std::fs::rename(&tmp, path).unwrap();
-    }
-
-    fn rt<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
     }
 
     #[test]

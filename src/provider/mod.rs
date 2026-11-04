@@ -729,7 +729,7 @@ mod native_route_tests {
     fn rt<F: std::future::Future>(f: F) -> F::Output {
         static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+        mu_testutil::block_on(f)
     }
 
     /// Providers over a private store whose `anthropic` entry points at `base`, with no gateway.
@@ -1018,6 +1018,7 @@ mod contract_native_anthropic_tests {
 mod other_native_route_tests {
     use super::*;
     use crate::auth_store::{Entry, Store};
+    use mu_testutil::block_on as rt;
     use mu_testutil::{Reply, fake_server};
 
     fn providers(provider: &str, key: &str, base: &str) -> (Providers, std::path::PathBuf) {
@@ -1046,10 +1047,6 @@ mod other_native_route_tests {
             session_id: Some("sess-1"),
         };
         p.stream(&req, &CancellationToken::new(), &mut |_| {}).await
-    }
-
-    fn rt<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
     }
 
     #[test]

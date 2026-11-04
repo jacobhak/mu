@@ -1020,10 +1020,7 @@ pub fn list_recent(cwd: &Path, only_cwd: Option<&Path>, limit: usize) -> Vec<Ses
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn home() -> &'static Path {
-        mu_testutil::home()
-    }
+    use mu_testutil::home;
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("mu-test-{name}-{}", uuid::Uuid::new_v4()));

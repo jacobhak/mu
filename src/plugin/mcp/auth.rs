@@ -87,11 +87,8 @@ async fn fetch_token_with(
 mod tests {
     use super::*;
     use crate::plugin::mcp::config::load_with;
+    use mu_testutil::block_on as rt;
     use std::process::Stdio;
-
-    fn rt<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
-    }
 
     #[test]
     fn values() {

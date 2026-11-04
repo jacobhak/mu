@@ -833,6 +833,7 @@ pub fn clean_paste(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_testutil::key;
 
     #[test]
     fn code_previews_are_syntax_highlighted() {
@@ -842,10 +843,6 @@ mod tests {
         let row = lines.iter().find(|l| line::line_text(l).contains("fn main")).expect("code row");
         assert!(row.iter().any(|sp| sp.text.contains("fn") && sp.style.foreground_color == kw), "{row:?}");
         assert!(lines.iter().all(|l| line::line_width(l) <= 40));
-    }
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
     }
 
     fn ctrl(c: char) -> KeyEvent {

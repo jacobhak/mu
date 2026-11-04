@@ -636,6 +636,7 @@ pub fn run_cli(o: CliOpts, cwd: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_testutil::sh;
 
     #[test]
     fn report_schema_accepts_a_report_and_report_of_prefers_data() {
@@ -777,17 +778,6 @@ mod tests {
         let m = fix_message(&[&f], Some("local://p-plan.md"), "local://r.md", Some("careful"));
         assert!(m.starts_with("A reviewer checked your implementation against the plan at `local://p-plan.md`."));
         assert!(m.contains("1. [P1] t (a.rs:3)") && m.contains("User note: careful") && m.ends_with("local://r.md"));
-    }
-
-    fn sh(dir: &Path, args: &[&str]) -> String {
-        let o = std::process::Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
-        String::from_utf8_lossy(&o.stdout).into_owned()
     }
 
     #[test]

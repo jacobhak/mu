@@ -2132,6 +2132,7 @@ mod loop_tests {
     use crate::config::Configs;
     use crate::events::new_inbox;
     use crate::provider::ProviderError;
+    use mu_testutil::block_on_local as run;
 
     fn assistant(blocks: Vec<Block>, stop: StopReason) -> Message {
         Message::Assistant {
@@ -2190,14 +2191,6 @@ mod loop_tests {
             deliver: crate::deliver::detached_starter(),
         });
         (a, rx)
-    }
-
-    fn run<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(tokio::task::LocalSet::new().run_until(f))
     }
 
     #[test]

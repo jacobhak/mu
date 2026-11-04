@@ -649,10 +649,7 @@ mod tests {
     use super::*;
     use crate::events::AskOption;
     use crossterm::event::{KeyCode, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use mu_testutil::key;
 
     fn items(labels: &[&str]) -> Vec<Item> {
         labels.iter().map(|l| Item { label: l.to_string(), detail: String::new() }).collect()

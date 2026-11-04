@@ -352,11 +352,8 @@ mod tests {
 #[cfg(test)]
 mod validate_tests {
     use super::*;
+    use mu_testutil::block_on as rt;
     use mu_testutil::{Reply, fake_server};
-
-    fn rt<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
-    }
 
     fn entry(key: &str, base: &str) -> Entry {
         Entry { base_url: Some(base.into()), ..Entry::literal(key) }

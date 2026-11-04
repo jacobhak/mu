@@ -150,12 +150,8 @@ fn expand_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_testutil::tmp;
 
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mu-at-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
     fn w(p: &Path, s: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, s).unwrap();

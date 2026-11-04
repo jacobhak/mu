@@ -1146,10 +1146,7 @@ mod tests {
     use super::*;
     use crate::tui::line::line_text;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use mu_testutil::key;
 
     fn press(p: &mut ReplyPicker, c: KeyCode) -> ReplyResult {
         p.on_key(key(c))
