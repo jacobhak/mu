@@ -52,15 +52,7 @@ pub async fn run_child_observed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    cmd.process_group(0);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-    let mut child = match cmd.spawn() {
+    let mut child = match mu_base::process::spawn_grouped(&mut cmd, true) {
         Ok(c) => c,
         Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
     };

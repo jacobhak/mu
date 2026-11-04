@@ -577,9 +577,8 @@ pub async fn run_background(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
-    let mut child = match cmd.spawn() {
+    let mut child = match mu_base::process::spawn_grouped(&mut cmd, false) {
         Ok(c) => c,
         Err(e) => {
             return BackgroundResult {

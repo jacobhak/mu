@@ -368,15 +368,8 @@ impl PluginHost {
             }
         };
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log);
-        cmd.process_group(0);
-        #[cfg(target_os = "linux")]
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().map_err(|e| format!("cannot start plugin {name} ({}): {e}", slot.program()))?;
+        let mut child = mu_base::process::spawn_grouped(&mut cmd, true)
+            .map_err(|e| format!("cannot start plugin {name} ({}): {e}", slot.program()))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (dead, _) = watch::channel(false);
