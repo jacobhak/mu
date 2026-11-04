@@ -79,7 +79,7 @@ pub fn parse_porcelain_v2(out: &str) -> GitInfo {
         }
     }
     if detached {
-        info.branch = oid.map(|o| o.chars().take(7).collect());
+        info.branch = oid.map(|o| short_sha(&o).to_string());
     }
     info
 }

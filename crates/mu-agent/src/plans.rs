@@ -3,7 +3,7 @@
 //! `$MU_HOME/plans/<repo-key>/`. All worktrees of one clone share a store.
 use crate::review::facts::{numstat, repo_root, snapshot_tree};
 use mu_base::events::{Approval, Base, PlanMeta, Status};
-use mu_base::git::git;
+use mu_base::git::{git, short_sha};
 use mu_base::message::{Message, tool_calls};
 use mu_common::fs::write_atomic;
 use mu_common::paths::{encode_cwd, mu_home};
@@ -33,15 +33,11 @@ fn hash_of(text: &str) -> String {
 /// The short commit (or tree) the plan was written against, plus a note when the snapshot had uncommitted changes.
 pub async fn base_label(meta: &PlanMeta, cwd: &Path) -> String {
     let Some(b) = &meta.base else { return "unknown".to_string() };
-    let mut s = short(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
+    let mut s = short_sha(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
     if dirty(cwd, b).await {
         s.push_str(DIRTY);
     }
     s
-}
-
-pub fn short(s: &str) -> &str {
-    &s[..s.len().min(7)]
 }
 
 /// The main checkout of the clone `cwd` is in, or `cwd` outside git.
@@ -296,12 +292,12 @@ pub async fn drift(meta: &PlanMeta, cwd: &Path) -> Drift {
             _ => {
                 return Drift::Unknown(format!(
                     "base {} no longer exists",
-                    short(b.commit.as_deref().unwrap_or(&b.tree))
+                    short_sha(b.commit.as_deref().unwrap_or(&b.tree))
                 ));
             }
         }
     };
-    let label = short(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
+    let label = short_sha(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
     let stats = match snapshot_tree(&root).await {
         Ok(cur) => numstat(&root, base, &cur).await,
         Err(e) => Err(e),
@@ -477,7 +473,7 @@ mod tests {
         assert!(matches!(rt.block_on(drift(&mk(&[""], base.clone()), &d)), Drift::Changed { .. }));
         assert!(matches!(rt.block_on(drift(&mk(&["", "b.txt"], base.clone()), &d)), Drift::Clean { other: 1, .. }));
         let commit = base.as_ref().unwrap().commit.clone().unwrap();
-        assert_eq!(rt.block_on(base_label(&mk(&[], base.clone()), &d)), short(&commit));
+        assert_eq!(rt.block_on(base_label(&mk(&[], base.clone()), &d)), short_sha(&commit));
         let stale = Base { tree: "0".repeat(40), commit: base.unwrap().commit };
         assert!(matches!(rt.block_on(drift(&mk(&["a.txt"], Some(stale)), &d)), Drift::Changed { .. }));
         assert_eq!(rt.block_on(drift(&mk(&[], None), &d)), Drift::Unknown("no base recorded".into()));
@@ -556,7 +552,7 @@ mod tests {
         let rt = rt();
         std::fs::write(d.join("c.txt"), "new\n").unwrap();
         let base = rt.block_on(base_now(&d));
-        let sha = short(base.as_ref().unwrap().commit.as_deref().unwrap()).to_string();
+        let sha = short_sha(base.as_ref().unwrap().commit.as_deref().unwrap()).to_string();
         let m = meta(&d, &["a.txt"], base);
         assert_eq!(rt.block_on(base_label(&m, &d)), format!("{sha} plus uncommitted changes"));
         let dr = rt.block_on(drift(&m, &d));

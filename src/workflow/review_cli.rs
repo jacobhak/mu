@@ -5,6 +5,7 @@ use mu_agent::review::facts::{Base, Gather, gather};
 use mu_agent::review::report::{
     Finding, Meta, PlanStep, Report, is_blocking, render_markdown, report_of, report_schema,
 };
+use mu_base::git::short_sha;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -60,10 +61,6 @@ pub fn exit_code(verdict: &str) -> i32 {
     }
 }
 
-fn short(sha: &str) -> String {
-    sha.chars().take(7).collect()
-}
-
 /// The `/review` pipeline without a session: the same facts, request, `review-lead` and workers.
 /// Returns the verdict and the parsed report (absent unless the reviewer returned one).
 async fn review_once(o: &CliOpts, cwd: &Path) -> (CliVerdict, Option<Report>) {
@@ -93,7 +90,7 @@ async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Opt
     v.removed = facts.removed;
     if facts.files.is_empty() {
         v.verdict = "nothing";
-        v.summary = format!("nothing to review: no reviewable changes since {}", short(&facts.base));
+        v.summary = format!("nothing to review: no reviewable changes since {}", short_sha(&facts.base));
         return Ok(None);
     }
     let cfgs = mu_base::config::Configs::load();
@@ -126,8 +123,8 @@ fn cli_markdown(v: &CliVerdict, report: Option<&Report>) -> String {
         Some(r) => render_markdown(
             r,
             &Meta {
-                base_short: short(&v.base),
-                cur_short: short(&v.current),
+                base_short: short_sha(&v.base).to_string(),
+                cur_short: short_sha(&v.current).to_string(),
                 files: v.files,
                 added: v.added,
                 removed: v.removed,

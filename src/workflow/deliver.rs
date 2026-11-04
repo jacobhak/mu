@@ -4,7 +4,7 @@ use mu_agent::agent::DeliverFn;
 use mu_agent::plans;
 use mu_agent::review::facts::repo_root;
 use mu_agent::review::report::{Finding, fix_message, loc, raw_message};
-use mu_base::git::git;
+use mu_base::git::{git, short_sha};
 use mu_common::paths::{encode_cwd, mu_home, self_exe};
 use mu_session::inbox;
 use mu_session::session;
@@ -378,7 +378,6 @@ pub(crate) async fn run_loop<S: Steps>(steps: &mut S, job: &Job, rec: &mut Recor
 
 fn summary(r: &Record) -> String {
     use std::fmt::Write;
-    let short = |s: &str| s[..s.len().min(7)].to_string();
     let mut o = String::new();
     let _ = writeln!(o, "# {}\n", if r.title.is_empty() { &r.id } else { &r.title });
     let _ = writeln!(
@@ -393,9 +392,9 @@ fn summary(r: &Record) -> String {
         o,
         "- branch: `{}` at `{}`, worktree `{}`, base `{}`",
         r.branch,
-        short(r.head.as_deref().unwrap_or("")),
+        short_sha(r.head.as_deref().unwrap_or("")),
         r.worktree.display(),
-        short(&r.base)
+        short_sha(&r.base)
     );
     let _ = writeln!(o, "- session: `{}`", r.session.as_ref().map_or("none".into(), |s| s.display().to_string()));
     if let Some(e) = &r.error {

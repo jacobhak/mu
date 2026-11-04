@@ -1,5 +1,6 @@
 use super::*;
 use crate::review;
+use mu_base::git::short_sha;
 
 /// What `/review` covers: the snapshots compared, the review model and its totals, and the request.
 struct ReviewScope {
@@ -13,10 +14,6 @@ struct ReviewScope {
     model: String,
     plan_uri: Option<String>,
     request: String,
-}
-
-fn short(s: &str) -> String {
-    s.chars().take(7).collect()
 }
 
 fn ask_option(label: String, description: Option<String>) -> mu_base::events::AskOption {
@@ -61,8 +58,8 @@ impl Agent {
             Some(r) => review::report::render_markdown(
                 r,
                 &review::report::Meta {
-                    base_short: short(&scope.base),
-                    cur_short: short(&scope.cur),
+                    base_short: short_sha(&scope.base).to_string(),
+                    cur_short: short_sha(&scope.cur).to_string(),
                     files: scope.files,
                     added: scope.added,
                     removed: scope.removed,
@@ -126,7 +123,7 @@ impl Agent {
             }
         };
         if !facts.changed() {
-            self.notice(format!("nothing to review: no changes since {}", short(&facts.base)));
+            self.notice(format!("nothing to review: no changes since {}", short_sha(&facts.base)));
             return None;
         }
         if facts.files.is_empty() {
@@ -179,7 +176,7 @@ impl Agent {
                 scope.files,
                 scope.added,
                 scope.removed,
-                short(&scope.base),
+                short_sha(&scope.base),
                 scope.model
             )}),
         });
