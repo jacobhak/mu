@@ -4,6 +4,7 @@
 //! refreshing never starts one. State lives in `$MU_HOME/gateway/` (`profiles/<name>/` under an omp profile).
 //! The gateway caches each account's usage for 5 minutes and fetches it upstream on a miss, so a call can
 //! take seconds; callers run it off the agent loop.
+use crate::events::{ProviderUsage, QuotaWindow};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,20 +13,6 @@ use std::time::Instant;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct QuotaWindow {
-    /// `5h`, `1d` or `7d`.
-    pub label: String,
-    pub used_percent: f64,
-    pub resets_in: Duration,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProviderUsage {
-    pub provider: String,
-    pub windows: Vec<QuotaWindow>,
-}
 
 /// The windows reported for `provider`. Tiered (per-model) limits are skipped.
 pub fn parse_usage(body: &str, provider: &str, now_ms: i64) -> Option<ProviderUsage> {

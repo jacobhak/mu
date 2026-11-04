@@ -1,5 +1,6 @@
 //! `mu deliver`: approve and implement a parked plan, review it against the plan, send blocking findings back to the implementer session, then have it commit.
 
+use crate::agent::DeliverFn;
 use crate::{notify, plans, review, session};
 use mu_common::paths::{encode_cwd, mu_home, self_exe};
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,9 @@ use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
+use std::rc::Rc;
 
 #[derive(clap::Args)]
 pub struct DeliverArgs {
@@ -332,7 +335,7 @@ async fn body<S: Steps>(steps: &mut S, job: &Job, rec: &mut Record) {
 pub(crate) async fn run_loop<S: Steps>(steps: &mut S, job: &Job, rec: &mut Record) {
     rec.result = Outcome::Running;
     rec.pid = std::process::id();
-    rec.started = session::iso_ms();
+    rec.started = mu_common::time::iso_ms();
     rec.finished = None;
     rec.error = None;
     rec.notified = None;
@@ -350,7 +353,7 @@ pub(crate) async fn run_loop<S: Steps>(steps: &mut S, job: &Job, rec: &mut Recor
         rec.branch = b.trim().to_string();
     }
     rec.head = review::git(&rec.worktree, &["rev-parse", "HEAD"], None).await.ok().map(|s| s.trim().to_string());
-    rec.finished = Some(session::iso_ms());
+    rec.finished = Some(mu_common::time::iso_ms());
     save(dir, rec);
     if let Err(e) = std::fs::write(dir.join("summary.md"), summary(rec)) {
         eprintln!("mu deliver: cannot write {}: {e}", dir.join("summary.md").display());
@@ -677,6 +680,30 @@ fn detach(exe: &Path, dir: &Path, cwd: &Path) -> i32 {
     }
     println!("started: pid {} · log {} · record {}/delivery.json", child.id(), log.display(), dir.display());
     0
+}
+
+/// The `DeliverFn` the binary passes to the agent: `/deliver` starts `mu deliver` through it.
+pub fn detached_starter() -> DeliverFn {
+    Rc::new(|id: String, session: PathBuf, cwd: PathBuf| {
+        Box::pin(start_detached(id, session, cwd)) as Pin<Box<dyn std::future::Future<Output = Result<String, String>>>>
+    })
+}
+
+/// Starts `mu deliver <id> --worktree --detach --notify` for `session`, detached. `Ok` is its stdout.
+async fn start_detached(id: String, session: PathBuf, cwd: PathBuf) -> Result<String, String> {
+    let exe = self_exe().map_err(|e| format!("cannot find the mu binary: {e}"))?;
+    let out = tokio::process::Command::new(exe)
+        .args(["deliver", &id, "--worktree", "--detach", "--notify"])
+        .arg(session)
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(format!("cannot start mu deliver: {e}")),
+    }
 }
 
 #[cfg(test)]

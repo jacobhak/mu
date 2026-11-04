@@ -530,6 +530,7 @@ async fn open_session(
         thinking: level,
         events: ev_tx,
         inbox: inbox.clone(),
+        deliver: crate::deliver::detached_starter(),
     });
     agent.pin_model = model.is_some() && resume.is_some();
     agent.pin_thinking = thinking.is_some() && resume.is_some();

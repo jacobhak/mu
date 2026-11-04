@@ -2,8 +2,8 @@ use crate::ask_nudge;
 use crate::compaction::Outcome;
 use crate::context::{self, Context, PromptInput};
 use crate::cost::CostLedger;
-use crate::events::{AgentEvent, Command, EventTx, PlanDecision, SharedInbox, StatusSnapshot};
-use crate::gitinfo::{self, GitInfo};
+use crate::events::{AgentEvent, Command, EventTx, GitInfo, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
+use crate::gitinfo;
 use crate::jobs::{self, JobsHandle};
 use crate::mem;
 use crate::message::UserInput;
@@ -24,6 +24,7 @@ use crate::tools::{ToolCtx, Tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -97,6 +98,7 @@ pub struct Agent {
     notify_seen: HashSet<String>,
     /// Inbox files announced when the session was opened; they wait for the next prompt.
     notify_announced: HashSet<String>,
+    deliver: DeliverFn,
 }
 
 pub struct PlanState {
@@ -156,6 +158,10 @@ const PLAN_COMPACT_FOCUS: &str = "The user approved an implementation plan; it w
 
 const PLAN_PROMPT: &str = include_str!("prompts/plan-mode.md");
 
+/// Starts a detached `mu deliver` for a plan, in `cwd`, for `session`. `Ok` is what it printed; `Err` is what to show.
+pub type DeliverFn =
+    Rc<dyn Fn(String, PathBuf, PathBuf) -> Pin<Box<dyn std::future::Future<Output = Result<String, String>>>>>;
+
 pub struct AgentInit {
     pub providers: Rc<Providers>,
     pub plugins: Rc<PluginHost>,
@@ -165,6 +171,7 @@ pub struct AgentInit {
     pub thinking: Thinking,
     pub events: EventTx,
     pub inbox: SharedInbox,
+    pub deliver: DeliverFn,
 }
 
 const SKIP_STOPPED: &str = "Skipped: the run was stopped so the user can take over";
@@ -278,6 +285,7 @@ impl Agent {
             notify: false,
             notify_seen: HashSet::new(),
             notify_announced: HashSet::new(),
+            deliver: i.deliver,
         }
     }
 
@@ -1480,7 +1488,7 @@ impl Agent {
     }
 
     /// Saves the plan a `propose_plan` result describes into the repository's store.
-    async fn save_plan(&self, d: &Value) -> (plans::Store, Result<plans::PlanMeta, String>) {
+    async fn save_plan(&self, d: &Value) -> (plans::Store, Result<PlanMeta, String>) {
         let store = plans::store_for(&self.cwd).await;
         let uri = d["uri"].as_str().unwrap_or_default();
         let slug = uri.strip_prefix("local://").and_then(|u| u.strip_suffix("-plan.md")).unwrap_or_default();
@@ -1567,35 +1575,21 @@ impl Agent {
         self.emit(AgentEvent::PlanList(store.list(false)));
     }
 
-    /// `/deliver`: detached `mu deliver`, which wakes this session when it finishes.
+    /// `/deliver`: runs the injected `DeliverFn`, which wakes this session when the delivery finishes.
     async fn deliver(&mut self, id: &str) {
         if !self.ensure_session().await {
             return;
         }
         let Some(session) = self.session.as_ref().map(|s| s.path.clone()) else { return };
-        let exe = match mu_common::paths::self_exe() {
-            Ok(e) => e,
-            Err(e) => return self.error(format!("cannot find the mu binary: {e}")),
-        };
         self.notice(format!("starting delivery of plan {id}…"));
-        let out = tokio::process::Command::new(exe)
-            .args(["deliver", id, "--worktree", "--detach", "--notify"])
-            .arg(session)
-            .current_dir(&self.cwd)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => {
-                self.notice(format!("▸ {}", String::from_utf8_lossy(&o.stdout).trim()));
-            }
-            Ok(o) => self.error(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Err(e) => self.error(format!("cannot start mu deliver: {e}")),
+        match (self.deliver)(id.to_string(), session, self.cwd.clone()).await {
+            Ok(out) => self.notice(format!("▸ {out}")),
+            Err(e) => self.error(e),
         }
     }
 
     /// A pending plan from the store with its drift; failures are reported and give `None`.
-    async fn pending_plan(&self, id: &str) -> Option<(plans::Store, plans::PlanMeta, String, plans::Drift)> {
+    async fn pending_plan(&self, id: &str) -> Option<(plans::Store, PlanMeta, String, plans::Drift)> {
         let store = plans::store_for(&self.cwd).await;
         match store.load_pending(id) {
             Ok((meta, text)) => {
@@ -1650,7 +1644,7 @@ impl Agent {
     async fn apply_stored(
         &mut self,
         store: &plans::Store,
-        meta: &plans::PlanMeta,
+        meta: &PlanMeta,
         content: String,
         drift: String,
         decision: PlanDecision,
@@ -2193,6 +2187,7 @@ mod loop_tests {
             thinking: Thinking::parse("off").unwrap(),
             events: tx,
             inbox: new_inbox(),
+            deliver: crate::deliver::detached_starter(),
         });
         (a, rx)
     }
@@ -3002,7 +2997,7 @@ mod loop_tests {
             assert!(a.plan.is_none());
             let store = plans::store_for(&a.cwd).await;
             let (meta, text) = store.load("t").unwrap();
-            assert_eq!((meta.status, text.as_str()), (plans::Status::Pending, "do it\n"));
+            assert_eq!((meta.status, text.as_str()), (crate::events::Status::Pending, "do it\n"));
         });
     }
 
@@ -3030,7 +3025,7 @@ mod loop_tests {
             });
             assert!(plan_msg.unwrap().contains("<plan path=\"local://t-plan.md\">"));
             let (meta, _) = store.load("t").unwrap();
-            assert_eq!(meta.status, plans::Status::Approved);
+            assert_eq!(meta.status, crate::events::Status::Approved);
             let session = a.session.as_ref().map(|s| s.path.clone());
             assert!(session.is_some() && meta.approved.unwrap().session == session);
             assert_eq!(a.review_base.unwrap().plan_uri.as_deref(), Some("local://t-plan.md"));
@@ -3198,7 +3193,7 @@ mod loop_tests {
         run(async {
             let (mut a, _rx) = agent(vec![]);
             a.quota.enabled = true;
-            a.quota.set_usage(crate::quota::ProviderUsage { provider: "anthropic".into(), windows: vec![] });
+            a.quota.set_usage(crate::events::ProviderUsage { provider: "anthropic".into(), windows: vec![] });
             a.model = ModelSpec::gateway("anthropic/m", 200_000, 8192);
             a.model.native = true;
             a.sync_model_state();

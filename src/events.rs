@@ -1,7 +1,5 @@
-use crate::gitinfo::GitInfo;
 use crate::message::UserInput;
 use crate::models::Thinking;
-use crate::quota::ProviderUsage;
 use crate::tools::output::ToolOutput;
 use serde_json::Value;
 use std::cell::RefCell;
@@ -104,6 +102,75 @@ pub struct StatusSnapshot {
     pub git: Option<GitInfo>,
     /// Quota windows of the current provider, when the gateway reports them.
     pub usage: Option<ProviderUsage>,
+}
+
+/// A plan's state in the plan store.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Pending,
+    Approved,
+    Dropped,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Base {
+    pub tree: String,
+    pub commit: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Approval {
+    pub at: String,
+    pub decision: String,
+    pub session: Option<PathBuf>,
+    pub hash: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanMeta {
+    pub id: String,
+    pub title: String,
+    pub status: Status,
+    pub repo: PathBuf,
+    pub base: Option<Base>,
+    pub read: Vec<String>,
+    pub session: Option<PathBuf>,
+    pub created: String,
+    pub updated: String,
+    pub hash: String,
+    pub approved: Option<Approval>,
+}
+
+/// Branch and working-tree counts of a repository (`gitinfo`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitInfo {
+    pub branch: Option<String>,
+    /// Entries with a staged (index) change.
+    pub staged: u32,
+    /// Entries with an unstaged (worktree) change, unmerged entries included.
+    pub dirty: u32,
+    pub untracked: u32,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuotaWindow {
+    /// `5h`, `1d` or `7d`.
+    pub label: String,
+    pub used_percent: f64,
+    pub resets_in: Duration,
+}
+
+/// Subscription usage windows of one provider (`quota`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderUsage {
+    pub provider: String,
+    pub windows: Vec<QuotaWindow>,
 }
 
 /// What an ask preview shows; a frontend styles its box by it.
@@ -306,7 +373,7 @@ pub enum AgentEvent {
         path: PathBuf,
     },
     /// The repository's pending plans, newest first.
-    PlanList(Vec<crate::plans::PlanMeta>),
+    PlanList(Vec<PlanMeta>),
     Status(StatusSnapshot),
     TurnEnd {
         aborted: bool,

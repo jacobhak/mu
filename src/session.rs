@@ -1,6 +1,7 @@
 use crate::message::Message;
 use anyhow::{Context, Result, bail};
 use mu_common::paths;
+use mu_common::time::iso_ms;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -484,10 +485,6 @@ pub struct SessionInfo {
     pub modified: std::time::SystemTime,
     /// Working directory recorded in the session header.
     pub cwd: Option<PathBuf>,
-}
-
-pub fn iso_ms() -> String {
-    jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 fn slot_line(title: &str, source: Option<&str>, updated_at: &str, pad: &str) -> String {

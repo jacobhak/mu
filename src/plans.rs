@@ -1,11 +1,11 @@
 //! Durable plans: a plan written in plan mode can be parked and approved later, in another session.
 //! Each plan is `<id>.md` (the text as written) plus `<id>.json` (metadata) under
 //! `$MU_HOME/plans/<repo-key>/`. All worktrees of one clone share a store.
+use crate::events::{Approval, Base, PlanMeta, Status};
 use crate::message::{Message, tool_calls};
 use crate::review;
 use mu_common::fs::write_atomic;
 use mu_common::paths::{encode_cwd, mu_home};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(clap::Subcommand)]
@@ -37,14 +37,6 @@ pub enum PlanCmd {
     Drop { id: String },
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Pending,
-    Approved,
-    Dropped,
-}
-
 impl Status {
     fn name(self) -> &'static str {
         match self {
@@ -53,38 +45,6 @@ impl Status {
             Status::Dropped => "dropped",
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Base {
-    pub tree: String,
-    pub commit: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Approval {
-    pub at: String,
-    pub decision: String,
-    pub session: Option<PathBuf>,
-    pub hash: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanMeta {
-    pub id: String,
-    pub title: String,
-    pub status: Status,
-    pub repo: PathBuf,
-    pub base: Option<Base>,
-    pub read: Vec<String>,
-    pub session: Option<PathBuf>,
-    pub created: String,
-    pub updated: String,
-    pub hash: String,
-    pub approved: Option<Approval>,
 }
 
 pub struct Store {
@@ -226,7 +186,7 @@ impl Store {
 
     pub fn save(&self, s: Save) -> Result<PlanMeta, String> {
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("cannot create {}: {e}", self.dir.display()))?;
-        let now = crate::session::iso_ms();
+        let now = mu_common::time::iso_ms();
         let session = s.session.map(Path::to_path_buf);
         let existing = self.read_meta(s.slug).ok();
         let update = existing.filter(|m| s.adopt == Some(s.slug) || (session.is_some() && m.session == session));
@@ -293,7 +253,7 @@ impl Store {
         let text = std::fs::read_to_string(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
         m.status = Status::Approved;
         m.approved = Some(Approval {
-            at: crate::session::iso_ms(),
+            at: mu_common::time::iso_ms(),
             decision: decision.into(),
             session: session.map(Path::to_path_buf),
             hash: hash_of(&text),
