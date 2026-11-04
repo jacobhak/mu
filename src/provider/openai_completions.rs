@@ -1173,7 +1173,7 @@ data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}
         let route = Route {
             base: "https://inference.baseten.co/v1".into(),
             auth: Auth::Bearer(key.clone()),
-            def: crate::provider::native::def("baseten"),
+            def: crate::models::native_def("baseten"),
         };
         let mut w = wire(&req, &route).unwrap();
         let resp = reqwest::Client::new()

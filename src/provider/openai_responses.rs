@@ -749,7 +749,7 @@ mod tests {
         let route = Route {
             base: "https://api.openai.com/v1".into(),
             auth: Auth::Bearer("k".into()),
-            def: crate::provider::native::def("openai"),
+            def: crate::models::native_def("openai"),
         };
         let w = wire(&request(&m, Thinking::Off, &msgs, &[]), &route).unwrap();
         assert_eq!(w.url, "https://api.openai.com/v1/responses");
@@ -1064,7 +1064,7 @@ mod tests {
         let route = Route {
             base: "https://api.openai.com/v1".into(),
             auth: Auth::Bearer(key.clone()),
-            def: crate::provider::native::def("openai"),
+            def: crate::models::native_def("openai"),
         };
         let tools = [read_tool()];
         let mut msgs = vec![Message::user("Call read on a.txt, then tell me the word it returned.")];

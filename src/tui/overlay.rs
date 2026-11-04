@@ -20,7 +20,7 @@ pub enum LoginTarget {
     Provider(usize),
     /// An MCP server, by its name in `mcp.json`.
     Mcp(String),
-    /// A native API-key provider, by id (`provider::native::PROVIDERS`).
+    /// A native API-key provider, by id (`models::PROVIDERS`).
     ApiKey(String),
 }
 

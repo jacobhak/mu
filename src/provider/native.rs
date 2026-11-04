@@ -1,68 +1,7 @@
 //! Providers mu talks to directly with an API key. Everything else goes through the gateway.
 
-use crate::models::Api;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthStyle {
-    /// `x-api-key: <key>`
-    XApiKey,
-    /// `Authorization: Bearer <key>`
-    Bearer,
-}
-
-#[derive(Debug)]
-pub struct ProviderDef {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub api: Api,
-    /// Without a trailing slash; each wire appends its own path.
-    pub base_url: &'static str,
-    pub auth: AuthStyle,
-    /// Path (after `base_url`) of a cheap authenticated GET that checks a key.
-    pub validate: &'static str,
-    /// Where the user creates a key.
-    pub key_url: &'static str,
-    /// The conventional environment variable; also the redaction label of a stored key.
-    pub env_hint: &'static str,
-    /// Model id (without the provider prefix) used when nothing else is configured.
-    pub default_model: &'static str,
-}
-
-pub const PROVIDERS: [ProviderDef; 3] = [
-    ProviderDef {
-        id: "anthropic",
-        label: "Anthropic",
-        api: Api::AnthropicMessages,
-        base_url: "https://api.anthropic.com",
-        auth: AuthStyle::XApiKey,
-        validate: "/v1/models?limit=1",
-        key_url: "https://console.anthropic.com/settings/keys",
-        env_hint: "ANTHROPIC_API_KEY",
-        default_model: "claude-sonnet-5-5",
-    },
-    ProviderDef {
-        id: "openai",
-        label: "OpenAI",
-        api: Api::OpenAiResponses,
-        base_url: "https://api.openai.com/v1",
-        auth: AuthStyle::Bearer,
-        validate: "/models",
-        key_url: "https://platform.openai.com/api-keys",
-        env_hint: "OPENAI_API_KEY",
-        default_model: "gpt-5.5",
-    },
-    ProviderDef {
-        id: "baseten",
-        label: "Baseten",
-        api: Api::OpenAiCompletions,
-        base_url: "https://inference.baseten.co/v1",
-        auth: AuthStyle::Bearer,
-        validate: "/models",
-        key_url: "https://app.baseten.co/settings/api_keys",
-        env_hint: "BASETEN_API_KEY",
-        default_model: "moonshotai/Kimi-K3",
-    },
-];
+use super::{catalog, discovery};
+use crate::models::{self, Api, CompletionsCompat, ModelSpec, ProviderDef, ThinkingMode};
 
 /// The outcome of asking a provider whether a key works.
 #[derive(Debug, PartialEq)]
@@ -110,8 +49,34 @@ pub fn saved_notice(def: &ProviderDef) -> String {
     format!("{}/* models now use your API key (billed per token) instead of omp.", def.id)
 }
 
-pub fn def(provider: &str) -> Option<&'static ProviderDef> {
-    PROVIDERS.iter().find(|d| d.id == provider)
+/// A natively routed model: its catalog row, else a conservative spec for the provider's wire
+/// (Anthropic gets a plain thinking budget; reasoning is never guessed for other unknown ids).
+pub fn native_spec(provider: &str, model: &str) -> Option<ModelSpec> {
+    let def = models::native_def(provider)?;
+    // A discovered listing is fresher than the snapshot's numbers; the snapshot row still decides
+    // thinking and request quirks.
+    let found = discovery::find(provider, model);
+    if let Some(mut spec) =
+        catalog::row(provider, model).and_then(|r| r.spec(provider, models::DEFAULT_WINDOW, models::DEFAULT_MAX_OUT))
+    {
+        if let Some(d) = &found {
+            spec.context_window = d.context_length.unwrap_or(spec.context_window);
+            spec.max_output = d.max_completion_tokens.unwrap_or(spec.max_output);
+        }
+        return Some(spec);
+    }
+    if let Some(d) = &found
+        && let Some(spec) = discovery::spec(provider, d, models::DEFAULT_WINDOW, models::DEFAULT_MAX_OUT)
+    {
+        return Some(spec);
+    }
+    let mut spec = ModelSpec::gateway(&format!("{provider}/{model}"), models::DEFAULT_WINDOW, models::DEFAULT_MAX_OUT);
+    spec.api = def.api;
+    spec.native = true;
+    spec.images = def.api != Api::OpenAiCompletions;
+    spec.compat = (def.api == Api::OpenAiCompletions).then(CompletionsCompat::default);
+    spec.thinking.mode = if def.api == Api::AnthropicMessages { ThinkingMode::Budget } else { ThinkingMode::None };
+    Some(spec)
 }
 
 #[cfg(test)]
@@ -119,18 +84,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_is_consistent() {
-        for d in &PROVIDERS {
-            assert!(d.base_url.starts_with("https://") && !d.base_url.ends_with('/'), "{}", d.id);
-            assert!(d.validate.starts_with('/'), "{}", d.id);
-            assert_eq!(def(d.id).map(|x| x.id), Some(d.id));
-        }
-        assert!(def("nope").is_none());
-    }
-
-    #[test]
     fn an_unsafe_base_url_is_refused_before_any_request() {
-        let p = def("openai").unwrap();
+        let p = models::native_def("openai").unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         for base in ["http://example.com", "https://user:pw@example.com"] {
             let c = rt.block_on(validate(p, "k-0123456789", Some(base)));

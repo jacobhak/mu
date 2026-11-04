@@ -22,7 +22,7 @@ use crate::events::{AgentEvent, Answer, AskQuestion, StatusSnapshot, SubagentSta
 use crate::events::{Command, SharedInbox};
 use crate::image;
 use crate::message::{Image, UserInput};
-use crate::models::{GatewayModel, Thinking};
+use crate::models::{self, GatewayModel, Thinking};
 use crate::plugin::PluginHost;
 use crate::provider::Providers;
 use crate::provider::native;
@@ -148,7 +148,7 @@ enum UiMsg {
     /// An API key was checked: the outcome, and the entry to save when it holds.
     KeyChecked {
         flow: u64,
-        def: &'static native::ProviderDef,
+        def: &'static models::ProviderDef,
         entry: crate::auth_store::Entry,
         r: Result<native::Check, String>,
     },
@@ -278,14 +278,14 @@ pub async fn run(init: AppInit) -> i32 {
                 "jobs" => (vec!["kill".to_string()], vec![]),
                 "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
                 "login" => (
-                    native::PROVIDERS
+                    models::PROVIDERS
                         .iter()
                         .map(|d| d.id.to_string())
                         .chain(plugins.mcp_names().iter().map(|n| format!("mcp:{n}")))
                         .collect(),
                     vec![],
                 ),
-                "logout" => (native::PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
+                "logout" => (models::PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
                 _ => (vec![], vec![]),
             };
             Entry { name: name.into(), desc: desc.into(), needs_arg, args, arg_descs }
@@ -1064,7 +1064,7 @@ impl App {
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
-                if let Some(def) = native::def(&id) {
+                if let Some(def) = models::native_def(&id) {
                     self.start_key_flow(def);
                 }
             }
@@ -1435,7 +1435,7 @@ impl App {
     /// `/login`: with a provider id run `omp login <id>`, with `mcp:<name>` log in to that MCP server;
     /// otherwise list omp's providers and the MCP servers that need auth in a picker.
     fn login(&mut self, provider: &str) {
-        if let Some(def) = native::def(provider) {
+        if let Some(def) = models::native_def(provider) {
             return self.start_key_flow(def);
         }
         if let Some(name) = provider.strip_prefix("mcp:") {

@@ -20,6 +20,7 @@ mod jtd;
 mod mem;
 mod message;
 mod models;
+mod net;
 mod notify;
 mod plans;
 mod plugin;
@@ -228,7 +229,8 @@ fn setup(cwd: &std::path::Path) -> Setup {
         plugin::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
         tools::is_builtin,
     );
-    let providers = Rc::new(provider::Providers::new(cfgs.clone(), gateway::GatewaySource::new(host.clone())));
+    let providers =
+        Rc::new(provider::Providers::new(cfgs.clone(), provider::endpoint::GatewaySource::new(host.gateway_start())));
     host.set_providers(&providers);
     Setup { cfgs, ctx, host, providers, notice_tx, notice_rx }
 }
@@ -257,7 +259,7 @@ fn default_model_for(omp: bool, native: impl Fn(&str) -> bool) -> String {
     if omp {
         return DEFAULT_MODEL.into();
     }
-    provider::native::PROVIDERS
+    models::PROVIDERS
         .iter()
         .find(|d| native(d.id))
         .map_or_else(|| DEFAULT_MODEL.into(), |d| format!("{}/{}", d.id, d.default_model))
@@ -664,7 +666,7 @@ mod tests {
 
     #[test]
     fn without_omp_the_first_native_key_provides_the_default() {
-        let first = &provider::native::PROVIDERS[0];
+        let first = &models::PROVIDERS[0];
         assert_eq!(default_model_for(false, |p| p == first.id), format!("{}/{}", first.id, first.default_model));
         assert_eq!(default_model_for(false, |_| false), DEFAULT_MODEL, "no key: omp's default says what is missing");
     }

@@ -251,8 +251,8 @@ pub struct GatewayModel {
     pub max_output_tokens: Option<u32>,
 }
 
-const DEFAULT_WINDOW: u32 = 200_000;
-const DEFAULT_MAX_OUT: u32 = 32_000;
+pub const DEFAULT_WINDOW: u32 = 200_000;
+pub const DEFAULT_MAX_OUT: u32 = 32_000;
 
 /// Splits a trailing `:level`. `auto`/`inherit` mean "no level".
 pub fn split_level(v: &str) -> (String, Option<Thinking>) {
@@ -284,12 +284,13 @@ pub fn role_selector(role: &str, cfg: &Configs) -> Option<String> {
     role_chain(role).into_iter().find(|r| cfg.role(r).is_some()).map(|r| format!("@{r}"))
 }
 
-/// `native(provider)` says whether the provider is routed natively (the user has a key for it).
+/// `native_spec(provider, model)` is the spec of a natively routed model (the user has a key for
+/// its provider), or `None` when the gateway serves it.
 pub fn resolve(
     sel: &str,
     cfg: &Configs,
     gateway_models: Option<&[GatewayModel]>,
-    native: &dyn Fn(&str) -> bool,
+    native_spec: &dyn Fn(&str, &str) -> Option<ModelSpec>,
 ) -> Result<(ModelSpec, Option<Thinking>)> {
     let (base, mut level) = split_level(sel);
     let base = match base.strip_prefix('@') {
@@ -308,7 +309,7 @@ pub fn resolve(
     let entry = pc.and_then(|p| p.models.iter().find(|m| m.id == model));
     let ov = pc.and_then(|p| p.model_overrides.get(model));
     let gw = gateway_models.and_then(|g| g.iter().find(|m| m.id == base));
-    let mut spec = match native(provider).then(|| native_spec(provider, model)).flatten() {
+    let mut spec = match native_spec(provider, model) {
         Some(s) => s,
         None => ModelSpec::gateway(&base, DEFAULT_WINDOW, DEFAULT_MAX_OUT),
     };
@@ -329,40 +330,87 @@ pub fn resolve(
     Ok((spec, level))
 }
 
-/// A natively routed model: its catalog row, else a conservative spec for the provider's wire
-/// (Anthropic gets a plain thinking budget; reasoning is never guessed for other unknown ids).
-fn native_spec(provider: &str, model: &str) -> Option<ModelSpec> {
-    let def = crate::provider::native::def(provider)?;
-    // A discovered listing is fresher than the snapshot's numbers; the snapshot row still decides
-    // thinking and request quirks.
-    let found = crate::provider::discovery::find(provider, model);
-    if let Some(mut spec) =
-        crate::provider::catalog::row(provider, model).and_then(|r| r.spec(provider, DEFAULT_WINDOW, DEFAULT_MAX_OUT))
-    {
-        if let Some(d) = &found {
-            spec.context_window = d.context_length.unwrap_or(spec.context_window);
-            spec.max_output = d.max_completion_tokens.unwrap_or(spec.max_output);
-        }
-        return Some(spec);
-    }
-    if let Some(d) = &found
-        && let Some(spec) = crate::provider::discovery::spec(provider, d, DEFAULT_WINDOW, DEFAULT_MAX_OUT)
-    {
-        return Some(spec);
-    }
-    let mut spec = ModelSpec::gateway(&format!("{provider}/{model}"), DEFAULT_WINDOW, DEFAULT_MAX_OUT);
-    spec.api = def.api;
-    spec.native = true;
-    spec.images = def.api != Api::OpenAiCompletions;
-    spec.compat = (def.api == Api::OpenAiCompletions).then(CompletionsCompat::default);
-    spec.thinking.mode = if def.api == Api::AnthropicMessages { ThinkingMode::Budget } else { ThinkingMode::None };
-    Some(spec)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStyle {
+    /// `x-api-key: <key>`
+    XApiKey,
+    /// `Authorization: Bearer <key>`
+    Bearer,
+}
+
+#[derive(Debug)]
+pub struct ProviderDef {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub api: Api,
+    /// Without a trailing slash; each wire appends its own path.
+    pub base_url: &'static str,
+    pub auth: AuthStyle,
+    /// Path (after `base_url`) of a cheap authenticated GET that checks a key.
+    pub validate: &'static str,
+    /// Where the user creates a key.
+    pub key_url: &'static str,
+    /// The conventional environment variable; also the redaction label of a stored key.
+    pub env_hint: &'static str,
+    /// Model id (without the provider prefix) used when nothing else is configured.
+    pub default_model: &'static str,
+}
+
+/// Providers mu talks to directly with an API key. Everything else goes through the gateway.
+pub const PROVIDERS: [ProviderDef; 3] = [
+    ProviderDef {
+        id: "anthropic",
+        label: "Anthropic",
+        api: Api::AnthropicMessages,
+        base_url: "https://api.anthropic.com",
+        auth: AuthStyle::XApiKey,
+        validate: "/v1/models?limit=1",
+        key_url: "https://console.anthropic.com/settings/keys",
+        env_hint: "ANTHROPIC_API_KEY",
+        default_model: "claude-sonnet-5-5",
+    },
+    ProviderDef {
+        id: "openai",
+        label: "OpenAI",
+        api: Api::OpenAiResponses,
+        base_url: "https://api.openai.com/v1",
+        auth: AuthStyle::Bearer,
+        validate: "/models",
+        key_url: "https://platform.openai.com/api-keys",
+        env_hint: "OPENAI_API_KEY",
+        default_model: "gpt-5.5",
+    },
+    ProviderDef {
+        id: "baseten",
+        label: "Baseten",
+        api: Api::OpenAiCompletions,
+        base_url: "https://inference.baseten.co/v1",
+        auth: AuthStyle::Bearer,
+        validate: "/models",
+        key_url: "https://app.baseten.co/settings/api_keys",
+        env_hint: "BASETEN_API_KEY",
+        default_model: "moonshotai/Kimi-K3",
+    },
+];
+
+pub fn native_def(provider: &str) -> Option<&'static ProviderDef> {
+    PROVIDERS.iter().find(|d| d.id == provider)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::*;
+
+    #[test]
+    fn table_is_consistent() {
+        for d in &PROVIDERS {
+            assert!(d.base_url.starts_with("https://") && !d.base_url.ends_with('/'), "{}", d.id);
+            assert!(d.validate.starts_with('/'), "{}", d.id);
+            assert_eq!(native_def(d.id).map(|x| x.id), Some(d.id));
+        }
+        assert!(native_def("nope").is_none());
+    }
 
     fn cfg() -> Configs {
         let omp: OmpConfig = serde_yaml_ng::from_str(
@@ -402,8 +450,8 @@ mod tests {
         assert_eq!((Thinking::XHigh.budget(), Thinking::Max.budget()), (Some(32768), Some(64000)));
     }
 
-    fn no_native(_: &str) -> bool {
-        false
+    fn no_native(_: &str, _: &str) -> Option<ModelSpec> {
+        None
     }
 
     #[test]
@@ -429,7 +477,9 @@ mod tests {
 
     #[test]
     fn native_models_use_the_catalog_below_models_yml() {
-        let native = |p: &str| p == "anthropic" || p == "baseten";
+        let native = |p: &str, m: &str| {
+            (p == "anthropic" || p == "baseten").then(|| crate::provider::native::native_spec(p, m)).flatten()
+        };
         let c = cfg();
         // The catalog row beats the gateway's figures.
         let gw = [GatewayModel {
