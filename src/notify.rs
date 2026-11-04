@@ -1,6 +1,7 @@
 //! `mu notify <session|id> <text>`: the sender. It queues a message in the session's inbox (see
 //! `inbox.rs` for the layout and the reading side) and wakes the session's owner when an
 //! interactive mu has it open and promises a SIGUSR2 handler. Only POSIX calls (`kill`).
+use crate::control::{self, Recheck, Want};
 use crate::inbox::{DEFAULT_FROM, MAX_FROM, clean_line, ensure_dir, prune};
 use crate::session::{self, Owner};
 use serde_json::json;
@@ -55,10 +56,10 @@ pub fn deliver(path: &Path) -> Delivery {
         Owner::Live { pid, inbox: false, .. } => Delivery::Queued(format!("pid {pid} does not take messages")),
         Owner::Live { pid, inbox: true, started, .. } => {
             // As `mu take`: the same live run must still own it right before the kill.
-            match session::owner(path) {
-                Owner::Live { pid: p, inbox: true, started: s, .. } if p == pid && s == started => {}
-                Owner::Free => return Delivery::Queued("not running".into()),
-                _ => return Delivery::Queued("owner changed".into()),
+            match control::recheck(session::owner(path), pid, &started, Want::Inbox) {
+                Recheck::Same => {}
+                Recheck::Free => return Delivery::Queued("not running".into()),
+                Recheck::Changed => return Delivery::Queued("owner changed".into()),
             }
             match crate::proc::signal_pid(pid, libc::SIGUSR2) {
                 Ok(()) => Delivery::Signalled(pid),

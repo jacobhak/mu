@@ -1,5 +1,6 @@
 //! `mu take <session|id>`: stop a running `mu -p` at its next tool boundary, then resume the
 //! session here, in the TUI. Only POSIX calls (`flock`, `kill`, `exec`), so it is portable.
+use crate::control::{self, Recheck, Want};
 use crate::session::{self, Owner};
 use mu_common::paths;
 use std::io::IsTerminal;
@@ -106,23 +107,9 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
     Ok(code)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Recheck {
-    /// Still the same `-p` run (pid and start time): safe to signal.
-    Same,
-    /// Nobody has the session any more.
-    Free,
-    /// Someone else (another pid, a reused pid, an interactive owner, no record): never signal.
-    Changed,
-}
-
-/// Compares a fresh owner lookup with the run `mu take` decided to stop.
+/// Compares a fresh owner lookup with the `-p` run `mu take` decided to stop.
 fn verify(now: Owner, pid: u32, started: &str) -> Recheck {
-    match now {
-        Owner::Live { pid: p, print_run: true, started: s, .. } if p == pid && s == started => Recheck::Same,
-        Owner::Free => Recheck::Free,
-        _ => Recheck::Changed,
-    }
+    control::recheck(now, pid, started, Want::PrintRun)
 }
 
 const GONE: &str = "it has already finished";

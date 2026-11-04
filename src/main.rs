@@ -7,6 +7,7 @@ mod auth_store;
 mod compaction;
 mod config;
 mod context;
+mod control;
 mod cost;
 mod deliver;
 mod events;
