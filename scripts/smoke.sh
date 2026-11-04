@@ -41,7 +41,7 @@ check "artifact spill + read selector" test "$(echo "$out" | tr -d ' \n')" = "39
 
 # headless: auto-compaction fires mid-turn under a low fixed threshold
 printf '[compaction.model_thresholds]\n"anthropic/claude-haiku-5-5" = "f24000"\n' > "$MU_HOME/config.toml"
-files=$(ls -S "$root"/src/*.rs "$root"/src/*/*.rs | head -8 | tr '\n' ' ')
+files=$(ls -S "$root"/src/*.rs "$root"/crates/*/src/*.rs "$root"/crates/*/src/*/*.rs | head -8 | tr '\n' ' ')
 "$mu" -p "Read each of these files in separate read calls, then say DONE: $files" --model @smol >/dev/null 2>"$work/err"
 check "auto-compaction" grep -q "compacted" "$work/err"
 has_compaction() { jq -e -s 'any(.[]; .type == "compaction")' "$(session_file)" >/dev/null; }
