@@ -2,7 +2,8 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::raw::c_int;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::unix::AsyncFd;
 
@@ -13,15 +14,17 @@ pub fn login_shell() -> String {
     {
         return sh;
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let p = dir.join("bash");
-            if p.is_file() {
-                return p.to_string_lossy().into_owned();
-            }
-        }
+    if let Some(path) = std::env::var_os("PATH")
+        && let Some(bash) = bash_in(&path)
+    {
+        return bash.to_string_lossy().into_owned();
     }
     "/bin/sh".into()
+}
+
+/// The first `bash` in the `PATH`-style list `path`.
+pub fn bash_in(path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path).map(|d| d.join("bash")).find(|p| p.is_file())
 }
 
 /// The terminal side of a pty: I/O and signalling. Shared so reads can run while `child` is awaited.
