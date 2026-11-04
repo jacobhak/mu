@@ -23,9 +23,8 @@ pub trait WireFormat {
         Vec::new()
     }
     fn body(&self, req: &Request) -> Value;
+    /// The stream decoder. It maps in-stream error frames to their retry class itself.
     fn decoder(&self, req: &Request) -> Box<dyn Decoder>;
-    /// Maps an in-stream error object to its retry class.
-    fn classify(&self, error: &Value) -> ProviderError;
 }
 
 /// The wire for `model` over `route`. Only anthropic depends on the route: a direct request sends

@@ -117,11 +117,6 @@ struct Flows {
     key_flow_seq: u64,
 }
 
-/// Whether `name` is set to a value other than blanks.
-fn env_is_set(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
-}
-
 pub async fn run(init: AppInit) -> i32 {
     let _term = match Term::enter() {
         Ok(t) => t,

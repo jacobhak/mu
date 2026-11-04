@@ -130,40 +130,56 @@ fn mark_last_message(messages: &mut [Value]) {
     }
 }
 
+/// The `anthropic-beta` values a request needs, without building its body.
+pub fn betas(req: &Request) -> Vec<&'static str> {
+    betas_for(req, &thinking_params(req.model, req.thinking.get(), output_cap(req)))
+}
+
+fn betas_for(req: &Request, tp: &ThinkingParams) -> Vec<&'static str> {
+    let mut betas = Vec::new();
+    if !req.tools.is_empty() {
+        betas.push(FINE_GRAINED_TOOLS_BETA);
+    }
+    if tp.effort.is_some() {
+        betas.push(EFFORT_BETA);
+    }
+    if tp.keep_thinking && req.model.anthropic.supports_context_management != Some(false) {
+        betas.push(CONTEXT_MANAGEMENT_BETA);
+    }
+    if tp.interleaved {
+        betas.push(INTERLEAVED_BETA);
+    }
+    betas
+}
+
 /// The JSON body and the `anthropic-beta` values it needs. Prompt-cache breakpoints (5-minute
 /// ephemeral) sit on the last tool, the last system block and the last message: three of the four allowed.
 pub fn body(req: &Request) -> (Value, Vec<&'static str>) {
     let m = req.model;
     let max_tokens = output_cap(req);
     let tp = thinking_params(m, req.thinking.get(), max_tokens);
+    let betas = betas_for(req, &tp);
     let mut messages = to_wire(req.messages, m);
     mark_last_message(&mut messages);
     let mut body = base_body(&m.wire_id, max_tokens, messages);
     if !req.system.is_empty() {
         body["system"] = json!([{"type":"text","text":req.system,"cache_control":{"type":"ephemeral"}}]);
     }
-    let mut betas = Vec::new();
     if !req.tools.is_empty() {
         let mut tools = tools_json(req.tools);
         if let Some(last) = tools.last_mut() {
             last["cache_control"] = json!({"type":"ephemeral"});
         }
         body["tools"] = json!(tools);
-        betas.push(FINE_GRAINED_TOOLS_BETA);
     }
     if let Some(t) = tp.thinking {
         body["thinking"] = t;
     }
     if let Some(e) = tp.effort {
         body["output_config"] = json!({"effort": e});
-        betas.push(EFFORT_BETA);
     }
     if tp.keep_thinking && m.anthropic.supports_context_management != Some(false) {
         body["context_management"] = json!({"edits":[{"type":"clear_thinking_20251015","keep":"all"}]});
-        betas.push(CONTEXT_MANAGEMENT_BETA);
-    }
-    if tp.interleaved {
-        betas.push(INTERLEAVED_BETA);
     }
     (body, betas)
 }
@@ -190,7 +206,9 @@ mod tests {
             max_tokens: Some(20_000),
             session_id: None,
         };
-        body(&req)
+        let built = body(&req);
+        assert_eq!(betas(&req), built.1, "the header betas match the body's");
+        built
     }
 
     fn tool() -> ToolDef {

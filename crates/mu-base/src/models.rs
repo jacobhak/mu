@@ -330,14 +330,6 @@ pub fn resolve(
     Ok((spec, level))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthStyle {
-    /// `x-api-key: <key>`
-    XApiKey,
-    /// `Authorization: Bearer <key>`
-    Bearer,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

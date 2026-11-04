@@ -24,13 +24,14 @@ pub async fn validate(def: &ProviderDef, key: &str, base_url: Option<&str>) -> C
         Ok(b) => b.unwrap_or_else(|| def.base_url.to_string()),
         Err(e) => return Check::Rejected(e.to_string()),
     };
-    let Ok(client) = net::http_client() else {
+    // Not `net::http_client`: validation has only its overall timeout, no separate connect timeout.
+    net::install_crypto();
+    let Ok(client) =
+        reqwest::Client::builder().timeout(VALIDATE_TIMEOUT).redirect(reqwest::redirect::Policy::none()).build()
+    else {
         return Check::Unreachable("cannot build an HTTP client".into());
     };
-    let rb = client
-        .get(format!("{base}{}", def.validate))
-        .timeout(VALIDATE_TIMEOUT)
-        .header("anthropic-version", "2023-06-01");
+    let rb = client.get(format!("{base}{}", def.validate)).header("anthropic-version", "2023-06-01");
     let rb = match Auth::for_def(def, key).apply(rb) {
         Ok(rb) => rb,
         Err(e) => return Check::Rejected(e.to_string()),

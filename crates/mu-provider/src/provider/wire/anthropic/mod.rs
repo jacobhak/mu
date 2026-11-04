@@ -24,7 +24,7 @@ impl WireFormat for Anthropic {
     fn headers(&self, req: &Request) -> Vec<(&'static str, String)> {
         let mut headers = vec![("anthropic-version", "2023-06-01".to_string())];
         if self.direct {
-            let betas = native::body(req).1;
+            let betas = native::betas(req);
             if !betas.is_empty() {
                 headers.push(("anthropic-beta", betas.join(",")));
             }
@@ -38,10 +38,6 @@ impl WireFormat for Anthropic {
 
     fn decoder(&self, req: &Request) -> Box<dyn Decoder> {
         Box::new(Assembler::new(req.model))
-    }
-
-    fn classify(&self, error: &Value) -> ProviderError {
-        stream_error(error["type"].as_str().unwrap_or(""), error["message"].as_str().unwrap_or("unknown stream error"))
     }
 }
 

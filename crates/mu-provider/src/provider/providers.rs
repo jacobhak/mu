@@ -2,7 +2,15 @@
 
 use super::client::Providers;
 use crate::model::{catalog, discovery};
-use mu_base::models::{self, Api, AuthStyle, CompletionsCompat, ModelSpec, ThinkingMode};
+use mu_base::models::{self, Api, CompletionsCompat, ModelSpec, ThinkingMode};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStyle {
+    /// `x-api-key: <key>`
+    XApiKey,
+    /// `Authorization: Bearer <key>`
+    Bearer,
+}
 
 #[derive(Debug)]
 pub struct ProviderDef {

@@ -27,13 +27,6 @@ impl WireFormat for Responses {
     fn decoder(&self, req: &Request) -> Box<dyn Decoder> {
         Box::new(Assembler::new(req.model))
     }
-
-    fn classify(&self, error: &Value) -> ProviderError {
-        stream_failure(
-            error["code"].as_str().unwrap_or(""),
-            error["message"].as_str().unwrap_or("unknown stream error"),
-        )
-    }
 }
 
 /// Only reasoning models take `reasoning`. `off` sends none, as omp does.

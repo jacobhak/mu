@@ -28,10 +28,6 @@ impl WireFormat for Completions {
     fn decoder(&self, req: &Request) -> Box<dyn Decoder> {
         Box::new(Assembler::new(req.model))
     }
-
-    fn classify(&self, error: &Value) -> ProviderError {
-        stream_failure(error)
-    }
 }
 
 impl Decoder for Assembler {

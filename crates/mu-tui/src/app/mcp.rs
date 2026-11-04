@@ -16,6 +16,11 @@ use mu_tools::plugin::host::McpInfo;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+/// Whether `name` is set and non-empty. Unlike the key flow's check, blanks and non-UTF-8 count.
+fn env_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
 /// `scheme://host` of a url: paths, queries and credentials may carry secrets.
 fn origin(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else { return String::new() };
@@ -319,11 +324,8 @@ impl App {
             return self
                 .notice("no servers to import: nothing new found in omp, pi, Claude, Codex, Gemini CLI or OpenCode");
         }
-        let wizard = if import {
-            Wizard::import(found, &self.cwd, env_is_set)
-        } else {
-            Wizard::new(found, &self.cwd, env_is_set)
-        };
+        let wizard =
+            if import { Wizard::import(found, &self.cwd, env_set) } else { Wizard::new(found, &self.cwd, env_set) };
         self.flows.mcp_wizard = Some(wizard);
         self.prompt.composer.set_private(true);
         self.mcp_wizard_show();

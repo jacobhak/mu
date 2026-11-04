@@ -1,9 +1,9 @@
 //! The provider contract: the request and stream types, errors, how a route authenticates, and
 //! the decoder a wire hands its response bytes to.
 
-use super::providers::ProviderDef;
+use super::providers::{AuthStyle, ProviderDef};
 use mu_base::message::Message;
-use mu_base::models::{AuthStyle, ModelSpec, Thinking};
+use mu_base::models::{ModelSpec, Thinking};
 use mu_base::tool::ToolDef;
 use std::cell::Cell;
 use std::rc::Rc;

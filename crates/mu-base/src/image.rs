@@ -183,20 +183,9 @@ mod tests {
         let _ = std::fs::remove_file(&f);
     }
 
-    /// A private `MU_HOME` so blobs never land in the real `~/.mu` (mirrors `mu_testutil::home`).
-    fn home() {
-        static H: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        H.get_or_init(|| {
-            let d = std::env::temp_dir().join(format!("mu-test-home-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&d).unwrap();
-            // SAFETY: set once, before any test in this process reads it.
-            unsafe { std::env::set_var("MU_HOME", &d) };
-        });
-    }
-
     #[test]
     fn images_are_kept_as_references_and_read_back_for_requests() {
-        home();
+        mu_testutil::home();
         let mut png = PNG.to_vec();
         png.extend(std::iter::repeat_n(7u8, 200_000));
         let img = from_bytes(png.clone()).unwrap();

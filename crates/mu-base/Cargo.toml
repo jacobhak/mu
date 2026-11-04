@@ -20,4 +20,5 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+mu-testutil.workspace = true
 uuid.workspace = true
