@@ -1,7 +1,7 @@
 //! What a session has spent: dollars, tokens, and usage the price table could not price yet.
 
-use crate::message::Usage;
 use crate::pricing;
+use mu_base::message::Usage;
 
 /// `provider/model` as the price table keys it. Assistant messages from mu carry the full id; omp's carry
 /// the bare model id next to the provider.
@@ -104,8 +104,11 @@ mod tests {
     #[test]
     fn stored_unpriced_turns_wait_and_priced_ones_add_up() {
         let mut l = CostLedger::default();
-        let priced =
-            Usage { input: 1, cost: crate::message::Cost { total: 0.25, ..Default::default() }, ..Default::default() };
+        let priced = Usage {
+            input: 1,
+            cost: mu_base::message::Cost { total: 0.25, ..Default::default() },
+            ..Default::default()
+        };
         let unpriced = Usage { input: 4, ..Default::default() };
         l.add_stored("p", "m", &priced);
         l.add_stored("p", "m", &unpriced);

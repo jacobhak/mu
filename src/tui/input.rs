@@ -12,8 +12,8 @@ use tokio::io::unix::AsyncFd;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use super::term;
-use crate::image;
-use crate::message::Image;
+use mu_base::image;
+use mu_base::message::Image;
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";

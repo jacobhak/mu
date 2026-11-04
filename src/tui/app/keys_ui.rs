@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::auth_store::Entry;
-use crate::models::{self, ProviderDef};
 use crate::provider::native::{self, Check};
 use crate::tui::overlay::KeyOption;
+use mu_base::models::{self, ProviderDef};
 
 /// What the composer holds while a key flow waits for text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,7 +332,7 @@ mod tests {
     }
 
     fn test_app(history: std::path::PathBuf) -> App {
-        use crate::config::Configs;
+        use mu_base::config::Configs;
         let (cmd_tx, _cmd_rx) = unbounded_channel();
         let (ui_tx, _ui_rx) = unbounded_channel();
         let (ntx, _nrx) = unbounded_channel();
@@ -341,7 +341,7 @@ mod tests {
         App {
             tr: Transcript::new(true, false),
             cmd_tx,
-            inbox: crate::events::new_inbox(),
+            inbox: mu_base::events::new_inbox(),
             providers: Rc::new(Providers::new(Rc::new(Configs::default()), gateway)),
             ctx: Rc::new(Context::default()),
             plugins,

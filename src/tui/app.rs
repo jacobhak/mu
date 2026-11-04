@@ -18,17 +18,17 @@ use super::term::{self, Term};
 use super::theme::{self, Role};
 use super::transcript::{Stream, Transcript};
 use crate::context::Context;
-use crate::events::{AgentEvent, Answer, AskQuestion, StatusSnapshot, SubagentState, SubagentStatus};
-use crate::events::{Command, SharedInbox};
-use crate::image;
-use crate::message::{Image, UserInput};
-use crate::models::{self, GatewayModel, Thinking};
 use crate::plugin::PluginHost;
 use crate::provider::Providers;
 use crate::provider::native;
-use crate::text::truncate_text as trunc;
 use crate::tools::todo::{Phase, Status};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use mu_base::events::{AgentEvent, Answer, AskQuestion, StatusSnapshot, SubagentState, SubagentStatus};
+use mu_base::events::{Command, SharedInbox};
+use mu_base::image;
+use mu_base::message::{Image, UserInput};
+use mu_base::models::{self, GatewayModel, Thinking};
+use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -96,8 +96,8 @@ pub struct AppInit {
     pub notice_rx: UnboundedReceiver<String>,
     pub cwd: PathBuf,
     pub pick_session: bool,
-    pub status_cfg: crate::config::OmpStatusLine,
-    pub theme: crate::config::MuTheme,
+    pub status_cfg: mu_base::config::OmpStatusLine,
+    pub theme: mu_base::config::MuTheme,
     /// Ring the terminal at the end of a turn nobody typed (omp's `completion.notify`).
     pub notify: bool,
 }
@@ -181,7 +181,7 @@ struct App {
     plugins: Rc<PluginHost>,
     ui_tx: UnboundedSender<UiMsg>,
     cwd: PathBuf,
-    status_cfg: crate::config::OmpStatusLine,
+    status_cfg: mu_base::config::OmpStatusLine,
     bell: WokenBell,
     notify: bool,
     turn_started: Option<Instant>,
@@ -873,7 +873,7 @@ impl App {
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths });
     }
 
-    fn show_plans(&mut self, list: Vec<crate::events::PlanMeta>) {
+    fn show_plans(&mut self, list: Vec<mu_base::events::PlanMeta>) {
         let deliver = std::mem::take(&mut self.pick_deliver);
         if list.is_empty() {
             self.notice("no parked plans for this repository");

@@ -3,7 +3,7 @@
 //! Source: `omp models ls --json` (per-million rates, `pricingStatus`). It lists only models the active
 //! profile can use, so its output is cached per profile (`paths::profile_cache_dir()/pricing.json`) and
 //! refreshed at most once a day, off the draw path. A model missing from the cache forces one refresh.
-use crate::message::{Cost, Usage};
+use mu_base::message::{Cost, Usage};
 use mu_common::paths;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -144,8 +144,8 @@ static TABLE: RwLock<Option<Arc<Table>>> = RwLock::new(None);
 /// A forced refresh (for a model missing from the cache) already ran or is running in this process.
 static FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn cache() -> crate::jsoncache::JsonCache {
-    crate::jsoncache::JsonCache::new(paths::profile_cache_dir().join("pricing.json"))
+fn cache() -> mu_base::jsoncache::JsonCache {
+    mu_base::jsoncache::JsonCache::new(paths::profile_cache_dir().join("pricing.json"))
 }
 
 fn table() -> Arc<Table> {

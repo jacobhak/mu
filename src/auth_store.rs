@@ -94,7 +94,7 @@ impl fmt::Debug for Entry {
 /// A `!command` as shown to a user: its program name only, since the arguments can hold a key.
 pub fn cmd_label(cmd: &str) -> String {
     let prog = cmd.split_whitespace().next().unwrap_or_default();
-    crate::secrets::redact_keys(&format!("!{prog} …"))
+    mu_base::secrets::redact_keys(&format!("!{prog} …"))
 }
 
 /// A base URL a stored entry or `--base-url` may use: `net::validate_url`, and no credentials
@@ -205,7 +205,7 @@ impl Store {
         let data = Arc::new(self.read_fresh().unwrap_or_default());
         for (provider, e) in &data.providers {
             if let Some(k) = &e.key {
-                crate::secrets::register_stored(&label(provider), k);
+                mu_base::secrets::register_stored(&label(provider), k);
             }
         }
         cache.insert(self.path.clone(), (stamp, data.clone()));
@@ -287,7 +287,7 @@ impl Store {
             check_base_url(u).with_context(|| format!("base URL for {provider}"))?;
         }
         if let Some(k) = &entry.key {
-            crate::secrets::register_stored(&label(provider), k);
+            mu_base::secrets::register_stored(&label(provider), k);
         }
         forget_cached(provider);
         self.modify(|d| {
@@ -328,7 +328,7 @@ pub async fn resolve_entry(provider: &str, entry: &Entry) -> Result<Resolved> {
         Some(Origin::Cmd(c)) => run_cmd(provider, &c, CMD_TIMEOUT).await?,
         None => bail!("no API key stored for {provider}"),
     };
-    crate::secrets::register_stored(&label(provider), &key);
+    mu_base::secrets::register_stored(&label(provider), &key);
     Ok(Resolved { key, base_url })
 }
 
@@ -340,7 +340,7 @@ impl Default for Store {
 
 /// The name a provider's key is redacted under.
 fn label(provider: &str) -> String {
-    crate::models::native_def(provider).map_or_else(
+    mu_base::models::native_def(provider).map_or_else(
         || format!("{}_API_KEY", provider.to_ascii_uppercase().replace('-', "_")),
         |d| d.env_hint.to_string(),
     )
@@ -356,7 +356,7 @@ async fn run_cmd(provider: &str, cmd: &str, limit: Duration) -> Result<String> {
     let label = cmd_label(cmd);
     let mut c = tokio::process::Command::new("sh");
     c.arg("-c").arg(cmd);
-    let out = crate::proc::run_capture(c, limit)
+    let out = mu_base::process::run_capture(c, limit)
         .await
         .ok_or_else(|| anyhow!("{label} (the key for {provider}) failed or took longer than {}s", limit.as_secs()))?;
     let out = out.trim().to_string();
@@ -636,10 +636,10 @@ mod tests {
         let key = format!("bt-{}", uuid::Uuid::new_v4().simple());
         s.set("baseten", Entry::literal(&key)).unwrap();
         let out =
-            crate::secrets::redact(&format!("cat auth.json -> {{\"key\": \"{key}\"}}"), Path::new("/nonexistent"));
+            mu_base::secrets::redact(&format!("cat auth.json -> {{\"key\": \"{key}\"}}"), Path::new("/nonexistent"));
         assert!(!out.text.contains(&key), "{}", out.text);
         assert!(out.text.contains("[REDACTED:BASETEN_API_KEY]"), "{}", out.text);
-        assert!(out.hits.iter().any(|h| h.source == crate::secrets::Source::Stored));
+        assert!(out.hits.iter().any(|h| h.source == mu_base::secrets::Source::Stored));
         let _ = std::fs::remove_dir_all(d);
     }
 }

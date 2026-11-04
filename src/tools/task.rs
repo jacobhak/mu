@@ -1,8 +1,8 @@
-use super::output::ToolOutput;
 use super::subagent::run_child_observed;
 use super::{ToolCtx, Tools};
-use crate::events::{JobKind, SubagentState, SubagentStatus};
 use futures_util::future::join_all;
+use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -80,7 +80,7 @@ impl Tools {
             return ToolOutput::err("task: provide 1-8 tasks");
         }
         if let Some(e) =
-            a.tasks.iter().filter_map(|t| t.output_schema.as_ref()).find_map(|s| crate::schema::check_schema(s).err())
+            a.tasks.iter().filter_map(|t| t.output_schema.as_ref()).find_map(|s| mu_base::schema::check_schema(s).err())
         {
             return ToolOutput::err(format!("task: {e}"));
         }

@@ -1,22 +1,12 @@
 //! Durable plans: a plan written in plan mode can be parked and approved later, in another session.
 //! Each plan is `<id>.md` (the text as written) plus `<id>.json` (metadata) under
 //! `$MU_HOME/plans/<repo-key>/`. All worktrees of one clone share a store.
-use crate::events::{Approval, Base, PlanMeta, Status};
-use crate::message::{Message, tool_calls};
 use crate::review;
+use mu_base::events::{Approval, Base, PlanMeta, Status};
+use mu_base::message::{Message, tool_calls};
 use mu_common::fs::write_atomic;
 use mu_common::paths::{encode_cwd, mu_home};
 use std::path::{Path, PathBuf};
-
-impl Status {
-    pub fn name(self) -> &'static str {
-        match self {
-            Status::Pending => "pending",
-            Status::Approved => "approved",
-            Status::Dropped => "dropped",
-        }
-    }
-}
 
 pub struct Store {
     pub dir: PathBuf,
@@ -39,21 +29,14 @@ fn hash_of(text: &str) -> String {
     Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-impl PlanMeta {
-    /// The short commit (or tree) the plan was written against, plus a note when the snapshot had uncommitted changes.
-    pub async fn base_label(&self, cwd: &Path) -> String {
-        let Some(b) = &self.base else { return "unknown".to_string() };
-        let mut s = short(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
-        if dirty(cwd, b).await {
-            s.push_str(DIRTY);
-        }
-        s
+/// The short commit (or tree) the plan was written against, plus a note when the snapshot had uncommitted changes.
+pub async fn base_label(meta: &PlanMeta, cwd: &Path) -> String {
+    let Some(b) = &meta.base else { return "unknown".to_string() };
+    let mut s = short(b.commit.as_deref().unwrap_or(&b.tree)).to_string();
+    if dirty(cwd, b).await {
+        s.push_str(DIRTY);
     }
-
-    /// `read` minus entries that are directories now; plans saved before directory reads were skipped list them (the root as "").
-    pub fn files_read(&self, root: &Path) -> Vec<&String> {
-        self.read.iter().filter(|r| !root.join(r).is_dir()).collect()
-    }
+    s
 }
 
 pub fn short(s: &str) -> &str {
@@ -496,7 +479,7 @@ mod tests {
         assert!(matches!(rt.block_on(drift(&mk(&[""], base.clone()), &d)), Drift::Changed { .. }));
         assert!(matches!(rt.block_on(drift(&mk(&["", "b.txt"], base.clone()), &d)), Drift::Clean { other: 1, .. }));
         let commit = base.as_ref().unwrap().commit.clone().unwrap();
-        assert_eq!(rt.block_on(mk(&[], base.clone()).base_label(&d)), short(&commit));
+        assert_eq!(rt.block_on(base_label(&mk(&[], base.clone()), &d)), short(&commit));
         let stale = Base { tree: "0".repeat(40), commit: base.unwrap().commit };
         assert!(matches!(rt.block_on(drift(&mk(&["a.txt"], Some(stale)), &d)), Drift::Changed { .. }));
         assert_eq!(rt.block_on(drift(&mk(&[], None), &d)), Drift::Unknown("no base recorded".into()));
@@ -522,7 +505,7 @@ mod tests {
     #[test]
     fn reads_from_keeps_files_only() {
         let call = |p: &str| Message::Assistant {
-            content: vec![crate::message::Block::ToolCall {
+            content: vec![mu_base::message::Block::ToolCall {
                 id: "i".into(),
                 name: "read".into(),
                 arguments: json!({"path": p}),
@@ -531,7 +514,7 @@ mod tests {
             provider: String::new(),
             model: String::new(),
             usage: Default::default(),
-            stop_reason: crate::message::StopReason::ToolUse,
+            stop_reason: mu_base::message::StopReason::ToolUse,
             timestamp: 0,
             response_id: None,
             error_message: None,
@@ -577,7 +560,7 @@ mod tests {
         let base = rt.block_on(base_now(&d));
         let sha = short(base.as_ref().unwrap().commit.as_deref().unwrap()).to_string();
         let m = meta(&d, &["a.txt"], base);
-        assert_eq!(rt.block_on(m.base_label(&d)), format!("{sha} plus uncommitted changes"));
+        assert_eq!(rt.block_on(base_label(&m, &d)), format!("{sha} plus uncommitted changes"));
         let dr = rt.block_on(drift(&m, &d));
         assert!(matches!(dr, Drift::Clean { dirty: true, other: 0, .. }), "{dr:?}");
         assert_eq!(dr.describe(), format!("none of the files it read changed since {sha} plus uncommitted changes"));

@@ -1,7 +1,7 @@
 //! Between MCP and mu's tool model: tool names, schemas, call arguments and call results,
 //! following omp so sessions read the same in both.
 
-use crate::message::Image;
+use mu_base::message::Image;
 use serde_json::{Value, json};
 
 /// Zig's `std.hash.Wyhash` with seed 0, which is what omp's `Bun.hash` computes (the 64-char name
@@ -187,7 +187,7 @@ pub fn convert_result(server: &str, tool: &str, result: &Value) -> Converted {
             }
             Some("image") => {
                 if let (Some(data), Some(mime)) = (item["data"].as_str(), item["mimeType"].as_str()) {
-                    images.push(crate::image::externalize(Image { data: data.into(), mime_type: mime.into() }));
+                    images.push(mu_base::image::externalize(Image { data: data.into(), mime_type: mime.into() }));
                 }
             }
             Some("audio") => parts.push(format!("[audio: {}]", item["mimeType"].as_str().unwrap_or("unknown"))),

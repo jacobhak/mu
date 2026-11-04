@@ -1,8 +1,8 @@
 use super::Tools;
-use super::output::ToolOutput;
 use crate::walk::{block_on_walk, walk_options};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::UTF8};
+use mu_base::tool::ToolOutput;
 use pi_walker::{Detail, FileType, Fs, walk};
 use serde::Deserialize;
 use std::path::PathBuf;

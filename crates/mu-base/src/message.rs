@@ -1,6 +1,6 @@
 use crate::ask_nudge;
 use crate::events::AgentEvent;
-use crate::tools::output::ToolOutput;
+use crate::tool::ToolOutput;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -271,7 +271,7 @@ impl Message {
     }
 }
 
-pub(crate) fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
+pub fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
     match m {
         Message::Assistant { content, .. } => content
             .iter()
@@ -285,7 +285,7 @@ pub(crate) fn tool_calls(m: &Message) -> Vec<(String, String, Value)> {
 }
 
 /// A reply that is only `.` (declining a reminder): kept in the session, never rendered.
-pub(crate) fn is_dismissal(m: &Message) -> bool {
+pub fn is_dismissal(m: &Message) -> bool {
     matches!(m, Message::Assistant { content, .. } if tool_calls(m).is_empty() && text_of(content).trim() == ".")
 }
 

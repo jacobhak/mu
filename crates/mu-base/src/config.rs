@@ -1,4 +1,4 @@
-use crate::paths;
+use mu_common::paths;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 

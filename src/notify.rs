@@ -61,7 +61,7 @@ pub fn deliver(path: &Path) -> Delivery {
                 Recheck::Free => return Delivery::Queued("not running".into()),
                 Recheck::Changed => return Delivery::Queued("owner changed".into()),
             }
-            match crate::proc::signal_pid(pid, libc::SIGUSR2) {
+            match mu_base::process::signal_pid(pid, libc::SIGUSR2) {
                 Ok(()) => Delivery::Signalled(pid),
                 Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Delivery::Queued("not running".into()),
                 Err(e) => Delivery::Queued(format!("cannot signal pid {pid}: {e}")),

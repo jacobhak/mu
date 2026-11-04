@@ -3,8 +3,8 @@
 
 use super::sse::SseDecoder;
 use super::{Decoder, ProviderError, Request, Route, StreamEvent, Wire, normalize_id};
-use crate::message::{Block, Image, Message, StopReason, Usage, now_ms};
-use crate::models::{self, CompletionsCompat, ModelSpec, Thinking, ThinkingMode};
+use mu_base::message::{Block, Image, Message, StopReason, Usage, now_ms};
+use mu_base::models::{self, CompletionsCompat, ModelSpec, Thinking, ThinkingMode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -80,9 +80,9 @@ pub fn to_wire(system: &str, messages: &[Message], model: &ModelSpec) -> Vec<Val
     let compat = model.compat.clone().unwrap_or_default();
     // Backstop: never send unpaired tool calls/results, whatever the history holds.
     let mut repaired;
-    let messages = if crate::message::check_tool_pairs(messages).is_err() {
+    let messages = if mu_base::message::check_tool_pairs(messages).is_err() {
         repaired = messages.to_vec();
-        crate::message::repair_tool_pairs(&mut repaired);
+        mu_base::message::repair_tool_pairs(&mut repaired);
         &repaired[..]
     } else {
         messages
@@ -272,7 +272,7 @@ fn image_part(i: &Image, supported: bool) -> Value {
     if !supported {
         return json!({"type":"text","text":"[image omitted: this model takes no image input]"});
     }
-    match crate::image::resolve(&i.data) {
+    match mu_base::image::resolve(&i.data) {
         Some(data) => json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{data}", i.mime_type)}}),
         None => json!({"type":"text","text":format!("[image unavailable: {}]", i.mime_type)}),
     }
@@ -521,7 +521,7 @@ fn stream_failure(e: &Value) -> ProviderError {
 mod tests {
     use super::*;
     use crate::provider::Auth;
-    use crate::tools::output::ToolDef;
+    use mu_base::tool::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -1173,7 +1173,7 @@ data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}
         let route = Route {
             base: "https://inference.baseten.co/v1".into(),
             auth: Auth::Bearer(key.clone()),
-            def: crate::models::native_def("baseten"),
+            def: mu_base::models::native_def("baseten"),
         };
         let mut w = wire(&req, &route).unwrap();
         let resp = reqwest::Client::new()

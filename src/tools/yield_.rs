@@ -3,7 +3,7 @@
 //! schema is returned to the model as a tool error so it can retry.
 
 use super::Tools;
-use super::output::ToolOutput;
+use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -52,7 +52,7 @@ impl Tools {
                 out.details = Some(json!({"status": "aborted", "error": e}));
                 out
             }
-            (Some(mut d), None) => match crate::schema::validate(&output, &d) {
+            (Some(mut d), None) => match mu_base::schema::validate(&output, &d) {
                 Ok(()) => {
                     whole_floats_to_ints(&mut d);
                     let mut out = ToolOutput::ok("Result submitted.");

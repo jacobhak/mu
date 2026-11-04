@@ -1,5 +1,5 @@
 use super::Tools;
-use super::output::ToolOutput;
+use mu_base::tool::ToolOutput;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

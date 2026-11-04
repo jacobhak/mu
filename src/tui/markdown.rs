@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthChar;
 use super::highlight;
 use super::line::{Line, bold, line_text, span, wrap};
 use super::theme::{self, Role};
-use crate::text::sanitize;
+use mu_base::text::sanitize;
 
 /// Role `r` as a foreground style.
 fn key(r: Role) -> ContentStyle {

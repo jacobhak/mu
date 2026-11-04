@@ -6,7 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::line::{self, Line, plain};
-use crate::text::grapheme_width;
+use mu_base::text::grapheme_width;
 
 /// What a key did to the text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

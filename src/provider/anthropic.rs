@@ -1,7 +1,7 @@
 use super::sse::SseDecoder;
 use super::{Decoder, ProviderError, Request, Route, StreamEvent, Wire, normalize_id, same_origin, stream_error};
-use crate::message::{Block, Message, StopReason, Usage, now_ms};
-use crate::models::{ModelSpec, Thinking};
+use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
+use mu_base::models::{ModelSpec, Thinking};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -68,9 +68,9 @@ pub fn body(req: &Request) -> Value {
 pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
     // Backstop: never send unpaired tool calls/results, whatever the history holds.
     let mut repaired;
-    let messages = if crate::message::check_tool_pairs(messages).is_err() {
+    let messages = if mu_base::message::check_tool_pairs(messages).is_err() {
         repaired = messages.to_vec();
-        crate::message::repair_tool_pairs(&mut repaired);
+        mu_base::message::repair_tool_pairs(&mut repaired);
         &repaired[..]
     } else {
         messages
@@ -139,8 +139,8 @@ pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
 }
 
 /// An image block, its bytes read back from the blob store; a text note if they are gone.
-fn image_json(i: &crate::message::Image) -> Value {
-    match crate::image::resolve(&i.data) {
+fn image_json(i: &mu_base::message::Image) -> Value {
+    match mu_base::image::resolve(&i.data) {
         Some(data) => json!({"type":"image","source":{"type":"base64","media_type":i.mime_type,"data":data}}),
         None => json!({"type":"text","text":format!("[image unavailable: {}]", i.mime_type)}),
     }
@@ -416,7 +416,7 @@ mod tests {
     fn asst(blocks: Vec<Block>) -> Message {
         Message::Assistant {
             content: blocks,
-            api: crate::models::Api::AnthropicMessages.as_str().into(),
+            api: mu_base::models::Api::AnthropicMessages.as_str().into(),
             provider: "anthropic".into(),
             model: "m".into(),
             usage: Usage::default(),
@@ -458,10 +458,10 @@ mod tests {
 
     #[test]
     fn user_image_follows_text_block() {
-        use crate::message::UserInput;
+        use mu_base::message::UserInput;
         let input = UserInput {
             text: "look".into(),
-            images: vec![crate::message::Image { data: "QUJD".into(), mime_type: "image/png".into() }],
+            images: vec![mu_base::message::Image { data: "QUJD".into(), mime_type: "image/png".into() }],
         };
         let w = to_wire(&[Message::user_input(&input)], &gw());
         let c = w[0]["content"].as_array().unwrap();
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn tool_result_carries_its_images() {
-        let img = crate::message::Image { data: "QUJD".into(), mime_type: "image/png".into() };
+        let img = mu_base::message::Image { data: "QUJD".into(), mime_type: "image/png".into() };
         let msgs = vec![
             asst(vec![Block::ToolCall { id: "a".into(), name: "read".into(), arguments: json!({}) }]),
             Message::ToolResult {
@@ -560,9 +560,9 @@ mod redacted_tests {
         assert!(matches!(&content[0], Block::RedactedThinking { data } if data == "abc"));
         let w = to_wire(&[Message::user("hi"), msg], &model);
         assert_eq!(w[1]["content"][0], json!({"type":"redacted_thinking","data":"abc"}));
-        let img = crate::message::UserInput {
+        let img = mu_base::message::UserInput {
             text: String::new(),
-            images: vec![crate::message::Image { data: "x".into(), mime_type: "image/png".into() }],
+            images: vec![mu_base::message::Image { data: "x".into(), mime_type: "image/png".into() }],
         };
         let w = to_wire(&[Message::user_input(&img)], &model);
         assert_eq!(w[0]["content"].as_array().unwrap().len(), 1);

@@ -3,7 +3,7 @@
 //! adapts thinking and adds prompt caching itself.
 
 use super::Request;
-use crate::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort};
+use mu_base::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort};
 use serde_json::{Value, json};
 
 const EFFORT_BETA: &str = "effort-2025-11-24";
@@ -179,8 +179,8 @@ pub fn body(req: &Request) -> (Value, Vec<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Block, Message};
-    use crate::tools::output::ToolDef;
+    use mu_base::message::{Block, Message};
+    use mu_base::tool::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -293,7 +293,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "anthropic/claude-sonnet-5-5".into(),
                 usage: Default::default(),
-                stop_reason: crate::message::StopReason::ToolUse,
+                stop_reason: mu_base::message::StopReason::ToolUse,
                 timestamp: 0,
                 response_id: None,
                 error_message: None,
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn unknown_ids_get_a_plain_budget() {
-        let m = crate::models::resolve(
+        let m = mu_base::models::resolve(
             "anthropic/claude-future-9",
             &Default::default(),
             None,

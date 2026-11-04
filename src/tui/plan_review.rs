@@ -3,9 +3,9 @@ use super::markdown;
 use super::select::clean_paste;
 use super::status::format_number;
 use super::theme::{self, Role};
-use crate::events::PlanDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::ContentStyle;
+use mu_base::events::PlanDecision;
 use std::path::PathBuf;
 
 pub struct Tier {

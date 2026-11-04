@@ -1,7 +1,7 @@
 use super::Tools;
-use super::output::{FileMeta, ToolMeta, ToolOutput};
 use super::uri::Scheme;
 use async_trait::async_trait;
+use mu_base::tool::{FileMeta, ToolMeta, ToolOutput};
 use pi_edit::{
     ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, UrlResolution, WriteRequest,
     WriteResponse, engine::FileOp, session::SessionConfig,

@@ -13,9 +13,9 @@ use super::complete::{self, Entry};
 use super::editor::{Edit, Editor, normalize_paste};
 use super::line::{self, Line, plain, span};
 use super::theme::{self, Role};
-use crate::image;
-use crate::message::{Image, UserInput};
 use crossterm::style::ContentStyle;
+use mu_base::image;
+use mu_base::message::{Image, UserInput};
 
 const HISTORY_MAX: usize = 1000;
 /// The history file is rewritten down to `HISTORY_MAX` lines once it passes this many.

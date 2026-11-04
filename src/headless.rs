@@ -1,5 +1,5 @@
-use crate::events::{AgentEvent, Command, PlanDecision};
 use crate::tools::summary;
+use mu_base::events::{AgentEvent, Command, PlanDecision};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// `-p`: runs one prompt to completion. Final assistant text goes to stdout, progress to stderr.
@@ -11,7 +11,7 @@ pub async fn print_mode(
     expect_park: bool,
     cmd: UnboundedSender<Command>,
     mut ev: UnboundedReceiver<AgentEvent>,
-    inbox: crate::events::SharedInbox,
+    inbox: mu_base::events::SharedInbox,
     max_cost: Option<f64>,
     stop: UnboundedReceiver<()>,
 ) -> i32 {
@@ -286,13 +286,13 @@ mod tests {
         let (ctx, _crx) = unbounded_channel();
         let (etx, erx) = unbounded_channel();
         drop(etx);
-        let inbox = crate::events::new_inbox();
+        let inbox = mu_base::events::new_inbox();
         let (_stx, srx) = unbounded_channel();
         assert_eq!(rt.block_on(print_mode(Command::Prompt("x".into()), false, ctx, erx, inbox, None, srx)), 1);
     }
 
     fn status(cost: f64, path: Option<&str>) -> AgentEvent {
-        AgentEvent::Status(crate::events::StatusSnapshot {
+        AgentEvent::Status(mu_base::events::StatusSnapshot {
             cost,
             session_path: path.map(String::from),
             ..Default::default()
@@ -308,7 +308,7 @@ mod tests {
         for _ in 0..stops {
             stx.send(()).unwrap();
         }
-        let inbox = crate::events::new_inbox();
+        let inbox = mu_base::events::new_inbox();
         let i2 = inbox.clone();
         // Events are fed only after a yield, so the queued stops are handled first.
         let code = rt.block_on(async {
@@ -361,7 +361,7 @@ mod tests {
             for e in events {
                 etx.send(e).unwrap();
             }
-            let inbox = crate::events::new_inbox();
+            let inbox = mu_base::events::new_inbox();
             rt.block_on(print_mode(Command::TogglePlan(None), expect_park, ctx, erx, inbox, None, srx))
         };
         let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -445,7 +445,7 @@ mod tests {
     }
 
     fn yielded(details: serde_json::Value) -> AgentEvent {
-        let mut output = crate::tools::output::ToolOutput::ok("Result submitted.");
+        let mut output = mu_base::tool::ToolOutput::ok("Result submitted.");
         output.details = Some(details);
         AgentEvent::ToolEnd { id: "1".into(), name: "yield".into(), output }
     }

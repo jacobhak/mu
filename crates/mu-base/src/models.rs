@@ -476,41 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn native_models_use_the_catalog_below_models_yml() {
-        let native = |p: &str, m: &str| {
-            (p == "anthropic" || p == "baseten").then(|| crate::provider::native::native_spec(p, m)).flatten()
-        };
-        let c = cfg();
-        // The catalog row beats the gateway's figures.
-        let gw = [GatewayModel {
-            id: "anthropic/claude-sonnet-5-5".into(),
-            context_length: Some(500),
-            max_output_tokens: Some(9),
-        }];
-        let (m, _) = resolve("anthropic/claude-sonnet-5-5", &c, Some(&gw), &native).unwrap();
-        assert!(m.native && m.context_window > 500 && m.max_output > 9, "{m:?}");
-        assert_eq!((m.wire_id.as_str(), m.thinking.mode), ("claude-sonnet-5-5", ThinkingMode::AnthropicAdaptive));
-        // An explicit models.yml entry beats the catalog.
-        let models: ModelsYml = serde_yaml_ng::from_str(
-            "providers:\n  anthropic:\n    modelOverrides:\n      claude-sonnet-5-5:\n        contextWindow: 123\n",
-        )
-        .unwrap();
-        let c2 = Configs { models, ..Default::default() };
-        let (m, _) = resolve("anthropic/claude-sonnet-5-5", &c2, None, &native).unwrap();
-        assert_eq!(m.context_window, 123);
-        // A provider without a key stays on the gateway; an unknown native id gets a safe spec.
-        let (m, _) = resolve("openai/gpt-5.5", &c, None, &native).unwrap();
-        assert!(!m.native && m.api == Api::AnthropicMessages);
-        let (m, _) = resolve("anthropic/claude-future-9", &c, None, &native).unwrap();
-        assert_eq!((m.native, m.thinking.mode), (true, ThinkingMode::Budget));
-        let (m, _) = resolve("baseten/acme/New-1", &c, None, &native).unwrap();
-        assert_eq!(
-            (m.api, m.wire_id.as_str(), m.thinking.mode),
-            (Api::OpenAiCompletions, "acme/New-1", ThinkingMode::None)
-        );
-    }
-
-    #[test]
     fn efforts_clamp_to_the_ladder() {
         let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let ladder = l(&["low", "high", "max"]);

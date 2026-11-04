@@ -36,7 +36,7 @@ const HEADLESS_NOTE: &str = concat!("\n", include_str!("prompts/plan-headless.md
 
 /// How `mu plan new|refine|approve` runs through `headless::print_mode`.
 pub struct PlanRun {
-    pub first: crate::events::Command,
+    pub first: mu_base::events::Command,
     pub expect_park: bool,
     /// Appended to the system prompt.
     pub note: Option<&'static str>,
@@ -44,7 +44,7 @@ pub struct PlanRun {
 
 /// `Err` gives back the store commands (`list`, `show`, `drop`) for `run_cli`.
 pub fn plan_run(cmd: PlanCmd) -> Result<PlanRun, PlanCmd> {
-    use crate::events::{Command, PlanDecision};
+    use mu_base::events::{Command, PlanDecision};
     match cmd {
         PlanCmd::New { brief } => {
             Ok(PlanRun { first: Command::TogglePlan(Some(brief)), expect_park: true, note: Some(HEADLESS_NOTE) })
@@ -101,7 +101,8 @@ async fn cli(cmd: PlanCmd, cwd: &Path) -> i32 {
                 v["drift"] = d.json();
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             } else {
-                let base = if meta.base.is_none() { "none".to_string() } else { meta.base_label(cwd).await };
+                let base =
+                    if meta.base.is_none() { "none".to_string() } else { crate::plans::base_label(&meta, cwd).await };
                 let n = store.root.as_deref().map_or(meta.read.len(), |r| meta.files_read(r).len());
                 println!("id: {}\ntitle: {}\nstatus: {}", meta.id, meta.title, meta.status.name());
                 println!("base: {base}\nread: {n} files\ndrift: {}\n", d.describe());

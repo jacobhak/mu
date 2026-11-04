@@ -1,6 +1,6 @@
 //! `/review`: git facts for the lead reviewer, plus report parsing and rendering.
 //! Rust gathers facts only; the lead model decides how to slice the diff.
-use crate::message::{Message, text_of};
+use mu_base::message::{Message, text_of};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -441,9 +441,9 @@ mod tests {
     fn report_schema_accepts_a_report_and_report_of_prefers_data() {
         use crate::tools::subagent::Outcome;
         let data = serde_json::json!({"verdict":"fail","summary":"s","findings":[{"title":"t","body":"b","file":"a.rs","priority":1,"confidence":0.9}]});
-        assert!(crate::schema::check_schema(&report_schema()).is_ok());
-        assert!(crate::schema::validate(&report_schema(), &data).is_ok());
-        assert!(crate::schema::validate(&report_schema(), &serde_json::json!({"verdict":"maybe"})).is_err());
+        assert!(mu_base::schema::check_schema(&report_schema()).is_ok());
+        assert!(mu_base::schema::validate(&report_schema(), &data).is_ok());
+        assert!(mu_base::schema::validate(&report_schema(), &serde_json::json!({"verdict":"maybe"})).is_err());
         let with_data = Outcome { ok: true, text: "```json\n{\"verdict\":\"pass\"}\n```".into(), data: Some(data) };
         assert_eq!(report_of(&with_data).unwrap().verdict, "fail");
         let scraped = Outcome { ok: true, text: "x\n```json\n{\"verdict\":\"pass\"}\n```".into(), data: None };
@@ -455,14 +455,14 @@ mod tests {
         use crate::tools::subagent::Outcome;
         use serde_json::json;
         let base = json!({"verdict":"fail","summary":"s","dropped":3,"findings":[{"title":"t","body":"b","file":"a.rs","line":12,"end_line":14,"priority":1,"confidence":0.9}]});
-        assert!(crate::schema::validate(&report_schema(), &base).is_ok());
+        assert!(mu_base::schema::validate(&report_schema(), &base).is_ok());
         let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(base.clone()) }).unwrap();
         assert_eq!(r.findings[0].line, Some(12));
         assert_eq!(r.dropped, 3);
         let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
             let mut v = base.clone();
             f(&mut v);
-            crate::schema::validate(&report_schema(), &v)
+            mu_base::schema::validate(&report_schema(), &v)
         };
         assert!(mutate(&|v| v["findings"][0]["line"] = json!(-5)).is_err());
         assert!(mutate(&|v| v["findings"][0]["line"] = json!(0)).is_err());

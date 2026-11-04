@@ -7,8 +7,8 @@ use serde_json::Value;
 use super::blocks;
 use super::line::{Line, dim, styled};
 use super::markdown;
-use crate::events::AgentEvent;
-use crate::message::{Message, history_events};
+use mu_base::events::AgentEvent;
+use mu_base::message::{Message, history_events};
 
 /// `messages` drawn at `width` columns. A tool call without a result yet (the subagent is still
 /// running it) shows as a call in progress.

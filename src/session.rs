@@ -1,5 +1,5 @@
-use crate::message::Message;
 use anyhow::{Context, Result, bail};
+use mu_base::message::Message;
 use mu_common::paths;
 use mu_common::time::iso_ms;
 use serde_json::{Value, json};
@@ -872,7 +872,7 @@ fn parse(path: &Path) -> Result<Parsed> {
         }
     }
     loaded.plugin_context.retain(|_, c| !c.is_empty());
-    let notes = crate::message::repair_tool_pairs_with_ids(&mut loaded.messages, Some(&mut loaded.entry_ids));
+    let notes = mu_base::message::repair_tool_pairs_with_ids(&mut loaded.messages, Some(&mut loaded.entry_ids));
     loaded.warnings.extend(notes);
     Ok((loaded, index.last().map(|e| e.id.clone()), by_id.into_keys().collect()))
 }
@@ -972,7 +972,7 @@ fn read_info(path: PathBuf) -> Option<SessionInfo> {
                     first_prompt = content
                         .iter()
                         .find_map(|b| match b {
-                            crate::message::Block::Text { text } => Some(text.replace('\n', " ")),
+                            mu_base::message::Block::Text { text } => Some(text.replace('\n', " ")),
                             _ => None,
                         })
                         .unwrap_or_default()
@@ -1068,7 +1068,7 @@ mod tests {
             .iter()
             .map(|m| match m {
                 Message::User { content, .. } => match &content[0] {
-                    crate::message::Block::Text { text } => text.clone(),
+                    mu_base::message::Block::Text { text } => text.clone(),
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
@@ -1115,7 +1115,7 @@ mod tests {
             .iter()
             .map(|m| match m {
                 Message::User { content, .. } => match &content[0] {
-                    crate::message::Block::Text { text } => text.clone(),
+                    mu_base::message::Block::Text { text } => text.clone(),
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
@@ -1148,7 +1148,7 @@ mod tests {
         let mut s = SessionFile::create(Path::new("/opt/repair"), None).unwrap();
         s.message(&Message::user("run it"));
         let call = Message::Assistant {
-            content: vec![crate::message::Block::ToolCall {
+            content: vec![mu_base::message::Block::ToolCall {
                 id: "t1".into(),
                 name: "bash".into(),
                 arguments: json!({}),
@@ -1157,7 +1157,7 @@ mod tests {
             provider: "p".into(),
             model: "m".into(),
             usage: Default::default(),
-            stop_reason: crate::message::StopReason::ToolUse,
+            stop_reason: mu_base::message::StopReason::ToolUse,
             timestamp: 0,
             response_id: None,
             error_message: None,
@@ -1166,7 +1166,7 @@ mod tests {
         // A tool result entry that no longer parses (missing required fields).
         s.append(EntryKind::Message, json!({"message":{"role":"toolResult","toolCallId":"t1"}}));
         let l = load(&s.path).unwrap();
-        assert!(crate::message::check_tool_pairs(&l.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&l.messages).is_ok());
         assert_eq!(l.messages.len(), 3);
         assert_eq!(l.messages.len(), l.entry_ids.len());
         assert!(!l.warnings.is_empty());
@@ -1178,14 +1178,14 @@ mod tests {
         let mut s = SessionFile::create(Path::new("/opt/stopped"), None).unwrap();
         s.message(&Message::user("run it"));
         let call =
-            |id: &str| crate::message::Block::ToolCall { id: id.into(), name: "bash".into(), arguments: json!({}) };
+            |id: &str| mu_base::message::Block::ToolCall { id: id.into(), name: "bash".into(), arguments: json!({}) };
         s.message(&Message::Assistant {
             content: vec![call("t1"), call("t2")],
             api: "a".into(),
             provider: "p".into(),
             model: "m".into(),
             usage: Default::default(),
-            stop_reason: crate::message::StopReason::ToolUse,
+            stop_reason: mu_base::message::StopReason::ToolUse,
             timestamp: 0,
             response_id: None,
             error_message: None,
@@ -1194,7 +1194,7 @@ mod tests {
             s.message(&Message::ToolResult {
                 tool_call_id: id.into(),
                 tool_name: "bash".into(),
-                content: vec![crate::message::Block::text(text)],
+                content: vec![mu_base::message::Block::text(text)],
                 is_error: id == "t2",
                 timestamp: 0,
                 details: None,

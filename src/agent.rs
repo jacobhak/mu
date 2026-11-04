@@ -1,15 +1,8 @@
-use crate::ask_nudge;
 use crate::compaction::Outcome;
 use crate::context::{self, Context};
 use crate::cost::CostLedger;
-use crate::events::{AgentEvent, Command, EventTx, GitInfo, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
-use crate::gitinfo;
 use crate::inbox;
 use crate::jobs::{self, JobsHandle};
-use crate::mem;
-use crate::message::UserInput;
-use crate::message::{Block, Message, StopReason, history_events, is_dismissal, now_ms, text_of, tool_calls};
-use crate::models::{ModelSpec, Thinking};
 use crate::plans;
 use crate::plugin::{InitParams, PluginHost};
 use crate::policy::ToolPolicy;
@@ -18,10 +11,17 @@ use crate::prompt::{self, PromptInput};
 use crate::provider::{ProviderError, Providers, Request, StreamEvent};
 use crate::quota::QuotaTracker;
 use crate::review;
-use crate::secrets;
 use crate::session::{self, CompactionState, SessionFile};
-use crate::tools::output::{ToolDef, ToolMeta, ToolOutput};
 use crate::tools::{ToolCtx, Tools};
+use mu_base::ask_nudge;
+use mu_base::events::{AgentEvent, Command, EventTx, GitInfo, PlanDecision, PlanMeta, SharedInbox, StatusSnapshot};
+use mu_base::git;
+use mu_base::mem;
+use mu_base::message::UserInput;
+use mu_base::message::{Block, Message, StopReason, history_events, is_dismissal, now_ms, text_of, tool_calls};
+use mu_base::models::{ModelSpec, Thinking};
+use mu_base::secrets;
+use mu_base::tool::{ToolDef, ToolMeta, ToolOutput};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -469,7 +469,7 @@ impl Agent {
 
     /// Git state for the status line. Runs between turns, never from the draw path.
     async fn refresh_external(&mut self) {
-        self.git = gitinfo::git_status(&self.cwd).await;
+        self.git = git::git_status(&self.cwd).await;
         self.tick_quota();
         self.settle_prices();
     }
@@ -1047,8 +1047,8 @@ impl Agent {
     }
 
     /// One single-answer question to the user; a cancel or a closed dialog is `Cancelled`.
-    async fn review_ask(&self, q: crate::events::AskQuestion, cancel: &CancellationToken) -> crate::events::Answer {
-        use crate::events::Answer;
+    async fn review_ask(&self, q: mu_base::events::AskQuestion, cancel: &CancellationToken) -> mu_base::events::Answer {
+        use mu_base::events::Answer;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.emit(AgentEvent::Ask { questions: vec![q], reply: tx });
         tokio::select! {
@@ -1076,7 +1076,7 @@ impl Agent {
 
     /// Runs the review and the selection dialog. Returns the message to send to the implementer.
     async fn review_run(&mut self, focus: Option<String>, cancel: &CancellationToken) -> Option<String> {
-        use crate::events::{Answer, AskOption, AskQuestion};
+        use mu_base::events::{Answer, AskOption, AskQuestion};
         let short = |s: &str| s.chars().take(7).collect::<String>();
         let root = match review::repo_root(&self.cwd).await {
             Ok(r) => r,
@@ -1146,7 +1146,7 @@ impl Agent {
             notes: &notes,
             focus: focus.as_deref(),
         });
-        let model = crate::models::role_selector("review", &self.providers.cfg)
+        let model = mu_base::models::role_selector("review", &self.providers.cfg)
             .and_then(|s| self.providers.resolve(&s).ok())
             .map_or_else(|| self.model.id.clone(), |(m, _)| m.id);
         let (added, removed) =
@@ -1614,7 +1614,11 @@ impl Agent {
             file: store.md_path(id),
             content: shown.clone(),
             stored: true,
-            note: Some(format!("written against {} · {}", meta.base_label(&self.cwd).await, drift.describe())),
+            note: Some(format!(
+                "written against {} · {}",
+                crate::plans::base_label(&meta, &self.cwd).await,
+                drift.describe()
+            )),
             reply: tx,
         });
         let decision = rx.await.ok()?;
@@ -1809,7 +1813,7 @@ impl Agent {
             let sid = self.session_id();
             let wire = self.wire_messages();
             // Every tool call in the history has its result and vice versa (`to_wire` also repairs).
-            debug_assert!(crate::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
+            debug_assert!(mu_base::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
             let defs = self.tool_defs();
             // Held until the reply ends: a reply that turns out to be a dismissal is never shown.
             let answering_reminder = matches!(self.messages.last(), Some(Message::User { content, .. }) if ask_nudge::is_reminder(&text_of(content)));
@@ -2130,16 +2134,16 @@ impl Agent {
 #[cfg(test)]
 mod loop_tests {
     use super::*;
-    use crate::config::Configs;
-    use crate::events::new_inbox;
     use crate::notify;
     use crate::provider::ProviderError;
+    use mu_base::config::Configs;
+    use mu_base::events::new_inbox;
     use mu_testutil::block_on_local as run;
 
     fn assistant(blocks: Vec<Block>, stop: StopReason) -> Message {
         Message::Assistant {
             content: blocks,
-            api: crate::models::Api::AnthropicMessages.as_str().into(),
+            api: mu_base::models::Api::AnthropicMessages.as_str().into(),
             provider: "anthropic".into(),
             model: "m".into(),
             usage: Default::default(),
@@ -2204,7 +2208,7 @@ mod loop_tests {
             ];
             let (mut a, _rx) = agent(script);
             a.turn(Some("go".to_string().into())).await;
-            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
             let err = a.messages.iter().find_map(|m| match m {
                 Message::ToolResult { is_error: true, content, .. } => Some(format!("{content:?}")),
                 _ => None,
@@ -2274,9 +2278,9 @@ mod loop_tests {
             ];
             let (mut a, _rx) = agent(script);
             a.turn(Some("go".to_string().into())).await;
-            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
             a.turn(Some("again".to_string().into())).await;
-            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
             assert!(a.messages.iter().any(|m| matches!(m, Message::ToolResult { is_error: true, .. })));
         });
     }
@@ -2419,7 +2423,7 @@ mod loop_tests {
             *a.tools.output_schema.borrow_mut() =
                 Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
             a.turn(Some("go".to_string().into())).await;
-            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
             let r = results(&a);
             assert_eq!(r.len(), 2, "{r:?}");
             assert!(!r[0].0 && r[0].1.contains("Result submitted"), "{:?}", r[0]);
@@ -2459,7 +2463,7 @@ mod loop_tests {
             let (mut a, mut rx) = agent(script);
             a.inbox.borrow_mut().stop = true;
             a.turn(Some("go".to_string().into())).await;
-            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
             let r = results(&a);
             assert_eq!(r.len(), 2);
             assert!(r.iter().all(|x| x.0 && x.1.contains("the run was stopped")), "{r:?}");
@@ -2494,7 +2498,7 @@ mod loop_tests {
                 inbox.borrow_mut().stop = true;
             });
             a.turn(Some("go".to_string().into())).await;
-            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
             let r = results(&a);
             assert_eq!(r.len(), 2);
             assert!(!r[0].0, "the running tool finished: {:?}", r[0]);
@@ -2554,7 +2558,7 @@ mod loop_tests {
                 inbox.borrow().cancel.cancel();
             });
             a.turn(Some("go".to_string().into())).await;
-            assert!(crate::message::check_tool_pairs(&a.messages).is_ok());
+            assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
             let mut ended = None;
             while let Ok(e) = rx.try_recv() {
                 if let AgentEvent::TurnEnd { aborted } = e {
@@ -2680,7 +2684,7 @@ mod loop_tests {
             a.turn(Some("go".to_string().into())).await;
             assert_eq!(a.messages.len(), 4);
             assert!(
-                matches!(&a.messages[2], Message::User { content, .. } if text_of(content) == crate::ask_nudge::REMINDER)
+                matches!(&a.messages[2], Message::User { content, .. } if text_of(content) == mu_base::ask_nudge::REMINDER)
             );
             assert!(a.providers.scripted.borrow().is_empty(), "the loop continued once");
         });
@@ -2766,7 +2770,7 @@ mod loop_tests {
     fn the_nudge_is_not_echoed_on_resume() {
         run(async {
             let (mut a, mut rx) = agent(vec![]);
-            a.messages.push(Message::user(crate::ask_nudge::REMINDER));
+            a.messages.push(Message::user(mu_base::ask_nudge::REMINDER));
             a.replay_history();
             assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::UserPrompt(_))));
         });
@@ -2797,7 +2801,7 @@ mod loop_tests {
             let (mut a, mut rx) = agent(vec![]);
             a.messages.push(Message::user("go"));
             a.messages.push(assistant(vec![Block::text("Keep it or drop it?")], StopReason::Stop));
-            a.messages.push(Message::user(crate::ask_nudge::REMINDER));
+            a.messages.push(Message::user(mu_base::ask_nudge::REMINDER));
             a.messages.push(assistant(vec![Block::text(".")], StopReason::Stop));
             a.replay_history();
             let events = drain(&mut rx);
@@ -2992,7 +2996,7 @@ mod loop_tests {
             assert!(a.plan.is_none());
             let store = plans::store_for(&a.cwd).await;
             let (meta, text) = store.load("t").unwrap();
-            assert_eq!((meta.status, text.as_str()), (crate::events::Status::Pending, "do it\n"));
+            assert_eq!((meta.status, text.as_str()), (mu_base::events::Status::Pending, "do it\n"));
         });
     }
 
@@ -3020,7 +3024,7 @@ mod loop_tests {
             });
             assert!(plan_msg.unwrap().contains("<plan path=\"local://t-plan.md\">"));
             let (meta, _) = store.load("t").unwrap();
-            assert_eq!(meta.status, crate::events::Status::Approved);
+            assert_eq!(meta.status, mu_base::events::Status::Approved);
             let session = a.session.as_ref().map(|s| s.path.clone());
             assert!(session.is_some() && meta.approved.unwrap().session == session);
             assert_eq!(a.review_base.unwrap().plan_uri.as_deref(), Some("local://t-plan.md"));
@@ -3188,7 +3192,7 @@ mod loop_tests {
         run(async {
             let (mut a, _rx) = agent(vec![]);
             a.quota.enabled = true;
-            a.quota.set_usage(crate::events::ProviderUsage { provider: "anthropic".into(), windows: vec![] });
+            a.quota.set_usage(mu_base::events::ProviderUsage { provider: "anthropic".into(), windows: vec![] });
             a.model = ModelSpec::gateway("anthropic/m", 200_000, 8192);
             a.model.native = true;
             a.sync_model_state();

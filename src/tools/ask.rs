@@ -1,6 +1,6 @@
-use super::output::ToolOutput;
 use super::{ToolCtx, Tools};
-use crate::events::{AgentEvent, Answer, AskOption, AskQuestion, PreviewKind};
+use mu_base::events::{AgentEvent, Answer, AskOption, AskQuestion, PreviewKind};
+use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;

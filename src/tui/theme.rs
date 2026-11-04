@@ -1,7 +1,7 @@
 //! Semantic colour roles derived from a palette: the terminal's own (OSC probe) or an omarchy-style `colors.toml`.
 use super::probe::{self, Answers, Rgb};
-use crate::config::{Cards, MuTheme};
 use crossterm::style::{Attribute, Color, ContentStyle};
+use mu_base::config::{Cards, MuTheme};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;

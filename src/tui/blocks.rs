@@ -3,11 +3,11 @@ use super::diffview;
 use super::line::{self, Line, fill, span, truncate, wrap};
 use super::markdown;
 use super::theme::{self, Role};
-use crate::config::Cards;
-use crate::events::{SubagentState, SubagentStatus};
-use crate::text::truncate_text as trunc;
-use crate::tools::output::{BashMeta, FileMeta, ToolMeta, ToolOutput};
 use crossterm::style::{Attribute, Color, ContentStyle};
+use mu_base::config::Cards;
+use mu_base::events::{SubagentState, SubagentStatus};
+use mu_base::text::truncate_text as trunc;
+use mu_base::tool::{BashMeta, FileMeta, ToolMeta, ToolOutput};
 use serde_json::Value;
 
 const BASH_TAIL: usize = 10;

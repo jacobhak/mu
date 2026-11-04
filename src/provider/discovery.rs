@@ -4,7 +4,7 @@
 //! snapshot row gets reasoning off (an unknown family's reasoning shape is never guessed).
 //! Cached per profile in `native-models.json`, refreshed at most daily.
 
-use crate::models::{self, Api, CompletionsCompat, ModelSpec, ProviderDef, ThinkingMode, ThinkingSpec};
+use mu_base::models::{self, Api, CompletionsCompat, ModelSpec, ProviderDef, ThinkingMode, ThinkingSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -42,8 +42,8 @@ pub fn discovers(def: &ProviderDef) -> bool {
     def.id == "baseten"
 }
 
-fn cache() -> crate::jsoncache::JsonCache {
-    crate::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("native-models.json"))
+fn cache() -> mu_base::jsoncache::JsonCache {
+    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("native-models.json"))
 }
 
 fn num(v: &serde_json::Value) -> f64 {
@@ -121,7 +121,7 @@ pub fn find(provider: &str, id: &str) -> Option<Discovered> {
 pub fn stale(provider: &str) -> bool {
     let f = load();
     let old = |at: i64, max: Duration| {
-        let age = crate::message::now_ms().saturating_sub(at);
+        let age = mu_base::message::now_ms().saturating_sub(at);
         age < 0 || age as u128 > max.as_millis()
     };
     let last_ok = f.fetched_at.get(provider).copied();
@@ -143,7 +143,7 @@ fn update(change: impl FnOnce(&mut File)) -> bool {
 
 fn store(provider: &str, rows: Vec<Discovered>) -> bool {
     update(|f| {
-        f.fetched_at.insert(provider.to_string(), crate::message::now_ms());
+        f.fetched_at.insert(provider.to_string(), mu_base::message::now_ms());
         f.failed_at.remove(provider);
         f.models.insert(provider.to_string(), rows);
     })
@@ -151,7 +151,7 @@ fn store(provider: &str, rows: Vec<Discovered>) -> bool {
 
 fn record_failure(provider: &str) {
     update(|f| {
-        f.failed_at.insert(provider.to_string(), crate::message::now_ms());
+        f.failed_at.insert(provider.to_string(), mu_base::message::now_ms());
     });
 }
 
@@ -183,7 +183,7 @@ async fn fetch(def: &ProviderDef, key: &str, base_url: Option<&str>) -> anyhow::
     let rb = super::Auth::for_def(def, key)
         .apply(client.get(format!("{base}/models")))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let resp = rb.send().await.map_err(|e| anyhow::anyhow!("{}", crate::secrets::redact_keys(&e.to_string())))?;
+    let resp = rb.send().await.map_err(|e| anyhow::anyhow!("{}", mu_base::secrets::redact_keys(&e.to_string())))?;
     if !resp.status().is_success() {
         anyhow::bail!("{} answered HTTP {}", def.label, resp.status().as_u16());
     }
@@ -306,7 +306,7 @@ mod refresh_tests {
             assert!(!stale("baseten"));
 
             // A discovered id resolves natively with its limits and no reasoning.
-            let (m, _) = crate::models::resolve(
+            let (m, _) = mu_base::models::resolve(
                 "baseten/acme/Chat-9",
                 &Default::default(),
                 None,
@@ -315,7 +315,7 @@ mod refresh_tests {
             .unwrap();
             assert_eq!((m.context_window, m.max_output, m.thinking.mode), (64_000, 8_000, ThinkingMode::None));
             // A snapshot row keeps its thinking and quirks but takes the fresher limits.
-            let (k, _) = crate::models::resolve(
+            let (k, _) = mu_base::models::resolve(
                 "baseten/moonshotai/Kimi-K3",
                 &Default::default(),
                 None,
@@ -325,7 +325,7 @@ mod refresh_tests {
             assert_eq!((k.context_window, k.thinking.mode), (999_000, ThinkingMode::Effort));
             assert!(k.compat.unwrap().requires_reasoning_content_for_tool_calls);
             // Priced from the listing.
-            let u = crate::message::Usage { input: 1_000_000, output: 1_000_000, ..Default::default() };
+            let u = mu_base::message::Usage { input: 1_000_000, output: 1_000_000, ..Default::default() };
             let c = crate::pricing::cost("baseten/acme/Chat-9", &u).unwrap();
             assert!((c.total - 6.0).abs() < 1e-9, "{c:?}");
 
@@ -347,13 +347,13 @@ mod refresh_tests {
             // A failure is retried after an hour, not on every start; the cache file is private.
             assert!(!stale("baseten"), "a failure just now is not retried yet");
             update(|f| {
-                let now = crate::message::now_ms();
+                let now = mu_base::message::now_ms();
                 f.fetched_at.insert("baseten".into(), now - 3 * 3_600_000);
                 f.failed_at.insert("baseten".into(), now - 2 * 3_600_000);
             });
             assert!(stale("baseten"));
             update(|f| {
-                f.fetched_at.insert("baseten".into(), crate::message::now_ms() - 25 * 3_600_000);
+                f.fetched_at.insert("baseten".into(), mu_base::message::now_ms() - 25 * 3_600_000);
                 f.failed_at.clear();
             });
             assert!(stale("baseten"));

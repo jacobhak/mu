@@ -11,7 +11,7 @@ use super::jobs_panel::{JobsPanel, JobsResult};
 use super::plan_review::{PlanReview, ReviewResult};
 use super::reply::{ReplyPicker, ReplyResult};
 use super::select::{Item, Select, SelectResult};
-use crate::events::{Answer, AskQuestion, PlanDecision};
+use mu_base::events::{Answer, AskQuestion, PlanDecision};
 
 /// One entry of the `/login` picker.
 #[derive(Clone, Debug, PartialEq)]
@@ -647,8 +647,8 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::AskOption;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use mu_base::events::AskOption;
     use mu_testutil::key;
 
     fn items(labels: &[&str]) -> Vec<Item> {
@@ -901,7 +901,7 @@ mod tests {
         let mut q = ask_q(&["A", "B"], false, false, None);
         q.options[0].preview = Some("fn a() {}".into());
         q.options[1].preview = Some("plain words".into());
-        q.options[1].kind = Some(crate::events::PreviewKind::Diff);
+        q.options[1].kind = Some(mu_base::events::PreviewKind::Diff);
         let (lines, _) = ask_select(&q).render(40, 30);
         let t: Vec<String> = lines.iter().map(crate::tui::line::line_text).collect();
         assert!(t[3].contains("┌─ code ─") && t[4].contains("fn a() {}"), "{t:?}");

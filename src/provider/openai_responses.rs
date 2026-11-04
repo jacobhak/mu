@@ -5,8 +5,8 @@
 
 use super::sse::SseDecoder;
 use super::{Decoder, ProviderError, Request, Route, StreamEvent, Wire, normalize_id, same_origin};
-use crate::message::{Block, Message, StopReason, Usage, now_ms};
-use crate::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort};
+use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
+use mu_base::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -66,9 +66,9 @@ pub fn body(req: &Request) -> Value {
 pub fn to_wire(messages: &[Message], model: &ModelSpec) -> Vec<Value> {
     // Backstop: never send unpaired tool calls/results, whatever the history holds.
     let mut repaired;
-    let messages = if crate::message::check_tool_pairs(messages).is_err() {
+    let messages = if mu_base::message::check_tool_pairs(messages).is_err() {
         repaired = messages.to_vec();
-        crate::message::repair_tool_pairs(&mut repaired);
+        mu_base::message::repair_tool_pairs(&mut repaired);
         &repaired[..]
     } else {
         messages
@@ -170,8 +170,8 @@ fn arguments_json(arguments: &Value) -> String {
     }
 }
 
-fn input_image(i: &crate::message::Image) -> Value {
-    match crate::image::resolve(&i.data) {
+fn input_image(i: &mu_base::message::Image) -> Value {
+    match mu_base::image::resolve(&i.data) {
         Some(data) => {
             json!({"type":"input_image","detail":"auto","image_url":format!("data:{};base64,{data}", i.mime_type)})
         }
@@ -487,9 +487,9 @@ fn usage_of(u: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Api, Thinking, ThinkingSpec};
     use crate::provider::Auth;
-    use crate::tools::output::ToolDef;
+    use mu_base::models::{Api, Thinking, ThinkingSpec};
+    use mu_base::tool::ToolDef;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -616,9 +616,9 @@ mod tests {
 
     #[test]
     fn golden_body_images_in_user_and_tool_output() {
-        let img = crate::message::Image { data: "iVBORw0KGgo=".into(), mime_type: "image/png".into() };
+        let img = mu_base::message::Image { data: "iVBORw0KGgo=".into(), mime_type: "image/png".into() };
         let msgs = [
-            Message::user_input(&crate::message::UserInput { text: "look".into(), images: vec![img.clone()] }),
+            Message::user_input(&mu_base::message::UserInput { text: "look".into(), images: vec![img.clone()] }),
             assistant(
                 vec![Block::ToolCall { id: "call_1|fc_1".into(), name: "read".into(), arguments: json!({"path":"a"}) }],
                 "openai-responses",
@@ -749,7 +749,7 @@ mod tests {
         let route = Route {
             base: "https://api.openai.com/v1".into(),
             auth: Auth::Bearer("k".into()),
-            def: crate::models::native_def("openai"),
+            def: mu_base::models::native_def("openai"),
         };
         let w = wire(&request(&m, Thinking::Off, &msgs, &[]), &route).unwrap();
         assert_eq!(w.url, "https://api.openai.com/v1/responses");
@@ -1064,7 +1064,7 @@ mod tests {
         let route = Route {
             base: "https://api.openai.com/v1".into(),
             auth: Auth::Bearer(key.clone()),
-            def: crate::models::native_def("openai"),
+            def: mu_base::models::native_def("openai"),
         };
         let tools = [read_tool()];
         let mut msgs = vec![Message::user("Call read on a.txt, then tell me the word it returned.")];

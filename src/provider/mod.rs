@@ -9,9 +9,9 @@ pub mod openai_responses;
 pub mod retry;
 pub mod sse;
 
-use crate::message::Message;
-use crate::models::{self, GatewayModel, ModelSpec, Thinking};
-use crate::tools::output::ToolDef;
+use mu_base::message::Message;
+use mu_base::models::{self, GatewayModel, ModelSpec, Thinking};
+use mu_base::tool::ToolDef;
 use serde_json::{Value, json};
 use std::io::Write;
 /// A model a native provider offers, for pickers.
@@ -206,7 +206,7 @@ fn wire(req: &Request, route: &Route) -> Result<Wire, ProviderError> {
 fn dump_request(req: &Request, body: &Value) {
     let Some(path) = std::env::var_os("MU_DUMP_REQUESTS").filter(|p| !p.is_empty()) else { return };
     let mut line = json!({
-        "ts": crate::message::now_ms(),
+        "ts": mu_base::message::now_ms(),
         "model": req.model.id,
         "max_tokens": body["max_tokens"],
         "thinking": body["thinking"],
@@ -225,11 +225,11 @@ fn dump_request(req: &Request, body: &Value) {
     }
 }
 
-use crate::config::Configs;
-use crate::message::Block;
-use crate::models::Api;
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
+use mu_base::config::Configs;
+use mu_base::message::Block;
+use mu_base::models::Api;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 use tokio_util::sync::CancellationToken;
@@ -499,7 +499,7 @@ impl Providers {
             if let Some(e) = retry::too_long(retry_after) {
                 return Err(e);
             }
-            let text = crate::secrets::redact_keys(&resp.text().await.unwrap_or_default());
+            let text = mu_base::secrets::redact_keys(&resp.text().await.unwrap_or_default());
             if let Some(def) = route.def
                 && status.as_u16() == 401
                 && !*rekeyed
@@ -623,8 +623,8 @@ impl Providers {
 
 /// Last gateway model metadata, so the first status line shows real context windows
 /// without starting the gateway. Per profile: each profile's gateway serves its own models.
-fn cache() -> crate::jsoncache::JsonCache {
-    crate::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("gateway-models.json"))
+fn cache() -> mu_base::jsoncache::JsonCache {
+    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("gateway-models.json"))
 }
 
 fn load_cache() -> Option<Vec<GatewayModel>> {
@@ -1003,7 +1003,7 @@ mod contract_native_anthropic_tests {
                 }
             }
             let (stop, content) = last.unwrap();
-            assert_eq!(stop, crate::message::StopReason::Stop);
+            assert_eq!(stop, mu_base::message::StopReason::Stop);
             let text: String = content
                 .iter()
                 .filter_map(|b| if let Block::Text { text } = b { Some(text.as_str()) } else { None })
@@ -1109,8 +1109,8 @@ mod other_native_route_tests {
 #[cfg(test)]
 mod wire_contract_tests {
     use super::*;
-    use crate::message::{Block, StopReason, Usage};
-    use crate::models::{Api, ThinkingMode, ThinkingSpec};
+    use mu_base::message::{Block, StopReason, Usage};
+    use mu_base::models::{Api, ThinkingMode, ThinkingSpec};
     const LONG_ID: &str = "call_0123456789abcdefghijklmn|fc_0123456789abcdef0123456789abcdef";
 
     fn spec(id: &str, api: Api, mode: ThinkingMode) -> ModelSpec {

@@ -1,13 +1,13 @@
 //! `--acp`: Agent Client Protocol server over stdio (newline-delimited JSON-RPC).
 //! One mu `Agent` per ACP session, so each session keeps its own working directory.
 
-use crate::events::{self, AgentEvent, Command, SharedInbox};
-use crate::message::{Image, UserInput};
-use crate::models::Thinking;
 use crate::plugin::PluginHost;
 use crate::tools::summary;
 use crate::{Setup, agent, pick_model, pricing, session, setup};
 use anyhow::{Result, anyhow};
+use mu_base::events::{self, AgentEvent, Command, SharedInbox};
+use mu_base::message::{Image, UserInput};
+use mu_base::models::Thinking;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
@@ -610,7 +610,7 @@ fn user_input(blocks: &Value) -> UserInput {
     for b in blocks.as_array().into_iter().flatten() {
         match b["type"].as_str() {
             Some("text") => parts.push(b["text"].as_str().unwrap_or("").into()),
-            Some("image") => images.push(crate::image::externalize(Image {
+            Some("image") => images.push(mu_base::image::externalize(Image {
                 data: b["data"].as_str().unwrap_or("").into(),
                 mime_type: b["mimeType"].as_str().unwrap_or("").into(),
             })),
@@ -719,7 +719,7 @@ fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::output::ToolOutput;
+    use mu_base::tool::ToolOutput;
 
     fn kinds(v: &[Value]) -> Vec<&str> {
         v.iter().map(|u| u["sessionUpdate"].as_str().unwrap()).collect()

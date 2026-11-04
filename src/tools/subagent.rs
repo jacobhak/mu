@@ -102,7 +102,7 @@ pub async fn run_child_observed(
                 Err(_) => {
                     // The pipe is broken: stop the child instead of leaving it running unobserved.
                     if pid > 0 {
-                        tokio::task::spawn_local(crate::proc::terminate_group(pid));
+                        tokio::task::spawn_local(mu_base::process::terminate_group(pid));
                     }
                     break;
                 }
@@ -110,7 +110,7 @@ pub async fn run_child_observed(
             _ = cancel.cancelled(), if !cancelled => {
                 cancelled = true;
                 if pid > 0 {
-                    tokio::task::spawn_local(crate::proc::terminate_group(pid));
+                    tokio::task::spawn_local(mu_base::process::terminate_group(pid));
                 }
             }
         }

@@ -9,8 +9,8 @@ use super::jobs_panel::{pad, wrap};
 use super::line::{self, Line, dim, span};
 use super::reply::accent;
 use super::theme::{self, Role};
-use crate::events::SubagentStatus;
 use crate::session::LiveSession;
+use mu_base::events::SubagentStatus;
 
 pub struct Row {
     pub live: LiveSession,
@@ -284,8 +284,8 @@ mod tests {
             agent: "scout".into(),
             tools: 0,
             last: String::new(),
-            state: crate::events::SubagentState::Running,
-            kind: crate::events::JobKind::Subagent,
+            state: mu_base::events::SubagentState::Running,
+            kind: mu_base::events::JobKind::Subagent,
             cwd: PathBuf::new(),
             task: String::new(),
             started: SystemTime::UNIX_EPOCH,

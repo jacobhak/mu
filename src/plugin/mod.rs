@@ -2,8 +2,8 @@ pub mod manifest;
 pub mod mcp;
 
 use crate::provider::Providers;
-use crate::tools::output::{ToolDef, ToolOutput};
 use manifest::{Lifetime, Manifest};
+use mu_base::tool::{ToolDef, ToolOutput};
 use mu_common::rpc::{Frame, Framed, Line, Pending, Request, Response};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
@@ -256,7 +256,7 @@ impl Proc {
         })
         .await;
         if exited.is_err() {
-            crate::proc::terminate_group(self.pid as i32).await;
+            mu_base::process::terminate_group(self.pid as i32).await;
         }
     }
 }

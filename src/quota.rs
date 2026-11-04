@@ -4,7 +4,7 @@
 //! refreshing never starts one. State lives in `$MU_HOME/gateway/` (`profiles/<name>/` under an omp profile).
 //! The gateway caches each account's usage for 5 minutes and fetches it upstream on a miss, so a call can
 //! take seconds; callers run it off the agent loop.
-use crate::events::{ProviderUsage, QuotaWindow};
+use mu_base::events::{ProviderUsage, QuotaWindow};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::rc::Rc;

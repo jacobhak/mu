@@ -12,10 +12,10 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
-use crate::text::truncate_text;
 use crate::tools::subagent::{BackgroundResult, run_child_observed};
 use crate::tools::task::MAX_TASKS;
+use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
+use mu_base::text::truncate_text;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// Newest bytes of a running bash job's output kept for the jobs panel.
@@ -95,7 +95,7 @@ impl OutputSink {
         while !b.is_char_boundary(from) {
             from += 1;
         }
-        let tail = crate::secrets::redact(&b[from..], &i.cwd).text;
+        let tail = mu_base::secrets::redact(&b[from..], &i.cwd).text;
         i.last.set(Some(Instant::now()));
         let _ = i.events.send(AgentEvent::JobOutput { id: i.id.clone(), tail });
     }

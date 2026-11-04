@@ -1,5 +1,5 @@
 use super::Tools;
-use super::output::{FileMeta, ToolMeta, ToolOutput};
+use mu_base::tool::{FileMeta, ToolMeta, ToolOutput};
 use pi_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
 use std::fmt::Write;
@@ -112,9 +112,9 @@ impl Tools {
             Err(e) => return ToolOutput::err(format!("read failed: {e}")),
         };
         // Images go to the model as image blocks; the text names what it is looking at.
-        if let Some(mime) = crate::image::sniff(&raw) {
+        if let Some(mime) = mu_base::image::sniff(&raw) {
             let n = raw.len();
-            return match crate::image::from_bytes(raw) {
+            return match mu_base::image::from_bytes(raw) {
                 Ok(img) => {
                     ToolOutput { images: vec![img], ..ToolOutput::ok(format!("Image: {disp} ({mime}, {n} bytes)")) }
                 }

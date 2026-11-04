@@ -1,8 +1,8 @@
 use crate::agent::Agent;
-use crate::config::Threshold;
-use crate::events::AgentEvent;
-use crate::message::{Block, Message, text_of};
 use crate::session::CompactionState;
+use mu_base::config::Threshold;
+use mu_base::events::AgentEvent;
+use mu_base::message::{Block, Message, text_of};
 use serde_json::json;
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;

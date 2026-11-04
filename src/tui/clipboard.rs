@@ -140,13 +140,13 @@ fn read_pasteboard_image() -> Result<Option<Vec<u8>>, String> {
 }
 
 #[cfg(target_os = "macos")]
-async fn read_image_macos() -> Result<Option<crate::message::Image>, String> {
+async fn read_image_macos() -> Result<Option<mu_base::message::Image>, String> {
     let bytes = tokio::task::spawn_blocking(read_pasteboard_image).await.map_err(|e| e.to_string())??;
-    bytes.map(crate::image::from_bytes).transpose()
+    bytes.map(mu_base::image::from_bytes).transpose()
 }
 
 /// Reads an image from the local clipboard. `Ok(None)` when it holds none.
-pub async fn read_image() -> Result<Option<crate::message::Image>, String> {
+pub async fn read_image() -> Result<Option<mu_base::message::Image>, String> {
     let (bin, list_args, read_args): (&str, &[&str], ReadArgs) = match display() {
         #[cfg(target_os = "macos")]
         Display::MacOs => return read_image_macos().await,
@@ -169,7 +169,7 @@ pub async fn read_image() -> Result<Option<crate::message::Image>, String> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    crate::image::from_bytes(bytes).map(Some)
+    mu_base::image::from_bytes(bytes).map(Some)
 }
 
 #[cfg(test)]

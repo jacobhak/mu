@@ -1,8 +1,8 @@
-use super::output::{BashMeta, ToolMeta, ToolOutput};
 use super::subagent::BackgroundResult;
 use super::{ToolCtx, Tools};
-use crate::events::AgentEvent;
 use crate::jobs::JobsHandle;
+use mu_base::events::AgentEvent;
+use mu_base::tool::{BashMeta, ToolMeta, ToolOutput};
 use pi_shell::{
     cancel::{AbortReason, CancelToken},
     shell::ShellRunOptions,
@@ -57,7 +57,7 @@ impl Collector {
         if self.spill_capped || self.spill_error.is_some() {
             return;
         }
-        let redacted = crate::secrets::redact(text, &self.cwd).text;
+        let redacted = mu_base::secrets::redact(text, &self.cwd).text;
         let bytes = redacted.as_bytes();
         let room = SPILL_CAP.saturating_sub(self.spilled) as usize;
         let n = bytes.len().min(room);
@@ -245,7 +245,7 @@ impl Tools {
     }
 
     async fn bash_pty(&self, a: &Args, ctx: &ToolCtx) -> Option<ToolOutput> {
-        use crate::events::PtyInput;
+        use mu_base::events::PtyInput;
         use pi_shell::output_decode::OutputDecoder;
         use std::time::Duration;
         use tokio::sync::{mpsc, oneshot};
@@ -257,14 +257,14 @@ impl Tools {
         let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or_else(|| self.cwd.clone());
         let limits = Limits::new(a.timeout);
         let (secs, timeout) = (limits.secs, limits.timeout);
-        let mut pty = match crate::pty::spawn(&a.command, &cwd, cols, rows, &self.session_env()) {
+        let mut pty = match mu_base::pty::spawn(&a.command, &cwd, cols, rows, &self.session_env()) {
             Ok(p) => p,
             Err(e) => return Some(ToolOutput::err(format!("PTY error: {e}"))),
         };
         let io = pty.io.clone();
         let start = Instant::now();
         let mut decoder = OutputDecoder::new();
-        let mut cleaner = crate::pty::Cleaner::default();
+        let mut cleaner = mu_base::pty::Cleaner::default();
         let mut collector = Collector { cwd: cwd.clone(), ..Default::default() };
         let (mut cancelled, mut timed_out) = (false, false);
         let mut input_open = true;
@@ -365,7 +365,7 @@ impl Tools {
         }
         // The command is over. Anything it left running in the background goes with it; the
         // group is gone once the leader is reaped only if nothing else is in it.
-        crate::proc::terminate_group(pty.io.pid()).await;
+        mu_base::process::terminate_group(pty.io.pid()).await;
         emit!(decoder.finish());
         let tail = cleaner.finish();
         collector.push(&tail, &|| self.next_artifact());
@@ -408,7 +408,7 @@ impl Tools {
         let drain = async {
             let mut c = Collector { cwd: run_cwd.clone(), ..Default::default() };
             // The live tail shows cleaned text; only the pty view gets raw bytes.
-            let mut cleaner = crate::pty::Cleaner::default();
+            let mut cleaner = mu_base::pty::Cleaner::default();
             while let Ok(s) = rx.recv_async().await {
                 let clean = cleaner.push(&s);
                 if !clean.is_empty() {
@@ -623,12 +623,12 @@ pub async fn run_background(
             _ = cancel.cancelled(), if !stopping => {
                 cancelled = true;
                 stopping = true;
-                terminating = Some(tokio::spawn(crate::proc::terminate_group(pid)));
+                terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
             }
             _ = &mut timeout_sleep, if !stopping && limits.timeout.is_some() => {
                 timed_out = true;
                 stopping = true;
-                terminating = Some(tokio::spawn(crate::proc::terminate_group(pid)));
+                terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
             }
             _ = tokio::time::sleep(IDLE), if status.is_some() => break,
         }
@@ -640,7 +640,7 @@ pub async fn run_background(
         Some(t) => {
             let _ = t.await;
         }
-        None => crate::proc::terminate_group(pid).await,
+        None => mu_base::process::terminate_group(pid).await,
     }
     collector.push(&out_dec.finish(), &alloc);
     collector.push(&err_dec.finish(), &alloc);
@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn pty_input_queue_does_not_block_exit() {
-        use crate::events::PtyInput;
+        use mu_base::events::PtyInput;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(tokio::task::LocalSet::new().run_until(async {
             let tools = Tools::for_test();

@@ -14,9 +14,9 @@ use super::reply::{accent, rule};
 use super::session_view;
 use super::sessions_tab::{self, Row};
 use super::theme::{self, Role};
-use crate::events::{JobKind, SubagentState, SubagentStatus};
 use crate::session::LiveSession;
 use crate::session_tail::Tail;
+use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 
 /// Most list rows shown at once.
 const LIST_MAX: usize = 8;
@@ -901,7 +901,7 @@ fn elapsed(j: &SubagentStatus, now: SystemTime) -> u64 {
 }
 
 pub(super) fn pad(s: &str, w: usize) -> String {
-    let t = crate::text::truncate_text(s, w);
+    let t = mu_base::text::truncate_text(s, w);
     let used = t.chars().count();
     format!("{t}{}", " ".repeat(w.saturating_sub(used)))
 }

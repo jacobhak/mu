@@ -2,7 +2,7 @@
 //! `omp token`. mu never reads omp's credential store or holds a refresh token.
 
 use super::config::{Kind, McpServer};
-use crate::proc::run_capture;
+use mu_base::process::run_capture;
 use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;

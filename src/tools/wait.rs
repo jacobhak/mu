@@ -1,6 +1,6 @@
-use super::output::ToolOutput;
 use super::{ToolCtx, Tools};
 use crate::jobs::{WaitResult, result_text};
+use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 

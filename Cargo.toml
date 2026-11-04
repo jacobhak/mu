@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [workspace]
-members = ["crates/mu-common", "crates/mu-bench", "crates/mu-testutil", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
+members = ["crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-testutil", "plugins/gateway", "plugins/memory-shim", "plugins/predict", "plugins/web"]
 exclude = ["plugins/mcp-http"]
 resolver = "3"
 
@@ -16,6 +16,7 @@ license = "MIT"
 
 [workspace.dependencies]
 mu-common = { path = "crates/mu-common" }
+mu-base = { path = "crates/mu-base" }
 mu-testutil = { path = "crates/mu-testutil" }
 pi-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
@@ -80,6 +81,7 @@ lang-markdown = ["highlight", "dep:tree-sitter-md"]
 
 [dependencies]
 mu-common.workspace = true
+mu-base.workspace = true
 pi-edit.workspace = true
 pi-shell.workspace = true
 pi-diff.workspace = true

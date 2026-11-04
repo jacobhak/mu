@@ -1,6 +1,6 @@
-use super::output::ToolOutput;
 use super::{ToolCtx, Tools};
-use crate::events::{AgentEvent, PlanDecision};
+use mu_base::events::{AgentEvent, PlanDecision};
+use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;

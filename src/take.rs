@@ -44,7 +44,7 @@ pub fn run(arg: &Path, cwd: &Path) -> anyhow::Result<i32> {
 }
 
 fn signal(pid: u32) -> Result<(), std::io::Error> {
-    crate::proc::signal_pid(pid, libc::SIGUSR1)
+    mu_base::process::signal_pid(pid, libc::SIGUSR1)
 }
 
 /// `Ok(None)`: the session is free, go on. `Ok(Some(code))`: stop with that exit code.
@@ -156,7 +156,7 @@ pub fn terminate_session(path: &Path, pid: u32, started: &str) -> Result<String,
     if l.kind.as_deref() != Some("tui") {
         return Err("only an interactive mu can be terminated from here".into());
     }
-    crate::proc::signal_pid(pid, libc::SIGTERM)
+    mu_base::process::signal_pid(pid, libc::SIGTERM)
         .map(|()| format!("asked pid {pid} to exit"))
         .map_err(|e| format!("cannot signal pid {pid}: {e}"))
 }

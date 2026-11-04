@@ -4040,6 +4040,7 @@ dependencies = [
  "grep-searcher",
  "jiff",
  "libc",
+ "mu-base",
  "mu-common",
  "mu-testutil",
  "objc2-app-kit",
@@ -4076,6 +4077,27 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vt100",
+]
+
+[[package]]
+name = "mu-base"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "jiff",
+ "libc",
+ "mu-common",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.1",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "unicode-segmentation",
+ "unicode-width",
+ "uuid",
 ]
 
 [[package]]

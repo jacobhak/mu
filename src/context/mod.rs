@@ -214,7 +214,7 @@ pub const REVIEW_WORKER: &str = "review-worker";
 /// Agents mu ships. They are not in `Context::agents`, so the main agent's `task` tool never offers them.
 pub fn builtin_agent(name: &str) -> Option<AgentDef> {
     let tools = |t: &[&str]| Some(t.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-    let model: Vec<String> = crate::models::role_chain("review").iter().map(|r| format!("@{r}")).collect();
+    let model: Vec<String> = mu_base::models::role_chain("review").iter().map(|r| format!("@{r}")).collect();
     let (description, tools, prompt) = match name {
         REVIEW_LEAD => (
             "Lead code reviewer",
@@ -290,7 +290,7 @@ pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDe
             {
                 continue;
             }
-            let output = match f.output.as_ref().map(crate::jtd::output_schema) {
+            let output = match f.output.as_ref().map(mu_base::jtd::output_schema) {
                 None => None,
                 Some(Ok(s)) => Some(s),
                 Some(Err(e)) => {

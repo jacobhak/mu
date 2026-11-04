@@ -1,6 +1,6 @@
 use crate::message::UserInput;
 use crate::models::Thinking;
-use crate::tools::output::ToolOutput;
+use crate::tool::ToolOutput;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -143,6 +143,23 @@ pub struct PlanMeta {
     pub updated: String,
     pub hash: String,
     pub approved: Option<Approval>,
+}
+
+impl Status {
+    pub fn name(self) -> &'static str {
+        match self {
+            Status::Pending => "pending",
+            Status::Approved => "approved",
+            Status::Dropped => "dropped",
+        }
+    }
+}
+
+impl PlanMeta {
+    /// `read` minus entries that are directories now; plans saved before directory reads were skipped list them (the root as "").
+    pub fn files_read(&self, root: &std::path::Path) -> Vec<&String> {
+        self.read.iter().filter(|r| !root.join(r).is_dir()).collect()
+    }
 }
 
 /// Branch and working-tree counts of a repository (`gitinfo`).

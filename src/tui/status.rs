@@ -2,9 +2,9 @@
 //! `statusLine` segments (`config.yml`). Segment ids mu cannot supply (e.g. `pr`) are skipped.
 use super::line::{Line, line_width, span, truncate};
 use super::theme::{self, Role};
-use crate::config::OmpStatusLine;
-use crate::events::{GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus};
 use crossterm::style::ContentStyle;
+use mu_base::config::OmpStatusLine;
+use mu_base::events::{GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -508,8 +508,8 @@ fn clamp_left(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::QuotaWindow;
     use crate::tui::line::line_text;
+    use mu_base::events::QuotaWindow;
     use std::collections::BTreeMap;
 
     fn cfg(left: &[&str], right: &[&str]) -> OmpStatusLine {
@@ -630,7 +630,7 @@ mod tests {
             tools: 0,
             last: String::new(),
             state,
-            kind: crate::events::JobKind::Subagent,
+            kind: mu_base::events::JobKind::Subagent,
             cwd: PathBuf::new(),
             task: String::new(),
             started: std::time::SystemTime::UNIX_EPOCH,

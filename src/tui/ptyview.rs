@@ -1,6 +1,6 @@
 //! Embedded terminal screen for a bash call running on a pty.
-use crate::events::PtyInput;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use mu_base::events::PtyInput;
 use std::num::NonZeroU16;
 use tokio::sync::mpsc::UnboundedSender;
 

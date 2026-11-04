@@ -1,9 +1,9 @@
 //! `mu auth`: manage provider API keys without the TUI (see `auth_store`).
 
 use crate::auth_store::{self, Entry, Origin, Store};
-use crate::models::{self, PROVIDERS, ProviderDef};
 use crate::provider::native::{self, Check};
 use anyhow::{Result, anyhow, bail};
+use mu_base::models::{self, PROVIDERS, ProviderDef};
 use std::io::{IsTerminal, Read, Write};
 
 #[derive(clap::Subcommand)]

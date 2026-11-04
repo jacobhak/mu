@@ -1,5 +1,5 @@
-use crate::text::{grapheme_width, sanitize};
 use crossterm::style::{Attribute, Color, ContentStyle, StyledContent};
+use mu_base::text::{grapheme_width, sanitize};
 use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
 

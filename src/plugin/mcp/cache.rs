@@ -2,7 +2,7 @@
 //! without starting the server. Holds no secrets: only what `tools/list` and `initialize` returned.
 
 use super::config::McpServer;
-use crate::jsoncache::JsonCache;
+use mu_base::jsoncache::JsonCache;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

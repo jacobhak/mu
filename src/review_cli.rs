@@ -119,8 +119,8 @@ async fn review_steps(o: &CliOpts, cwd: &Path, v: &mut CliVerdict) -> Result<Opt
         notes: &[],
         focus: o.focus.as_deref(),
     });
-    let cfgs = crate::config::Configs::load();
-    v.model = crate::models::role_selector("review", &cfgs).unwrap_or_else(|| "default".into());
+    let cfgs = mu_base::config::Configs::load();
+    v.model = mu_base::models::role_selector("review", &cfgs).unwrap_or_else(|| "default".into());
     let exe = mu_common::paths::self_exe().map_err(|e| format!("cannot locate mu executable: {e}"))?;
     let payload =
         serde_json::json!({"task": prompt, "agent": crate::context::REVIEW_LEAD, "outputSchema": report_schema()});

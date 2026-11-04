@@ -4,7 +4,6 @@ mod diff;
 pub mod edit;
 mod glob;
 pub mod grep;
-pub mod output;
 mod plan;
 mod read;
 pub mod subagent;
@@ -15,11 +14,11 @@ mod wait;
 mod write;
 mod yield_;
 
-use crate::events::EventTx;
 use crate::jobs::JobsHandle;
 use crate::plugin::PluginHost;
-use crate::text::truncate_text as trunc;
-use output::{ToolDef, ToolOutput};
+use mu_base::events::EventTx;
+use mu_base::text::truncate_text as trunc;
+use mu_base::tool::{ToolDef, ToolOutput};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::cell::OnceCell;
@@ -157,7 +156,7 @@ impl Tools {
         }
         let (n, path) = self.next_artifact();
         let saved = path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-            && std::fs::write(&path, crate::secrets::redact(&text, &self.cwd).text).is_ok();
+            && std::fs::write(&path, mu_base::secrets::redact(&text, &self.cwd).text).is_ok();
         let note = if saved {
             format!("[Output truncated at {} KB of {} KB; full output: artifact://{n}]", CAP / 1024, text.len() / 1024)
         } else {

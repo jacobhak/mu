@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::message::Message;
+use mu_base::message::Message;
 
 /// Most bytes read per poll, so a huge session fills in over several ticks instead of stalling one.
 const MAX_READ: u64 = 1 << 20;
@@ -222,7 +222,7 @@ mod tests {
         assert!(t.messages().len() <= 8 && !t.messages().is_empty());
         assert_eq!(t.messages().len() + t.dropped(), 40);
         assert!(matches!(t.messages().last(), Some(Message::Assistant { content, .. })
-            if matches!(&content[0], crate::message::Block::Text { text } if text == "m39")));
+            if matches!(&content[0], mu_base::message::Block::Text { text } if text == "m39")));
         assert!((t.cost() - 0.40).abs() < 1e-9);
         assert_eq!(t.tokens(), 80);
         let mut totals_only = Tail::new(&p, 0);
