@@ -14,7 +14,7 @@ use mu_agent::agent;
 use mu_agent::handle::{AgentSetup, build_agent};
 use mu_base::{events, models, schema};
 use mu_common::paths;
-use mu_session::session::{self, inbox};
+use mu_session::session::{inbox, list, owner};
 use mu_tools::{context, plugin};
 use serde_json::{Value, json};
 use setup::{Setup, spawn_notice_printer};
@@ -118,11 +118,11 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
 
     let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;
     let resume = match (&cli.resume, cli.continue_latest) {
-        (Some(Some(p)), _) => match session::find(&cwd, p) {
+        (Some(Some(p)), _) => match list::find(&cwd, p) {
             Ok(f) => Some(f),
             Err(e) => bail!("{e}"),
         },
-        (_, true) => match session::latest_for(&cwd) {
+        (_, true) => match list::latest_for(&cwd) {
             Some(p) => Some(p),
             None => bail!("no sessions for {} in {}", cwd.display(), paths::session_dir(&cwd).display()),
         },
@@ -167,7 +167,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + n);
     }
     let name = task_payload.as_ref().and_then(|p| p["agent"].as_str()).or(agent_def.as_ref().map(|d| d.name.as_str()));
-    session::set_run_info(mode.run_kind(), name);
+    owner::set_run_info(mode.run_kind(), name);
 
     let (print, max_cost) = (cli.print.clone(), cli.max_cost);
     let rt = mu_base::runtime::current_thread_runtime()?;
@@ -205,7 +205,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         // Same order as above: the handler first, then the record flag, then the agent task.
         if let Some(wake) = handle.wake.take() {
             match inbox::forward_signal(wake) {
-                Ok(()) => session::set_inbox(),
+                Ok(()) => owner::set_inbox(),
                 Err(e) => {
                     eprintln!("mu: cannot install the SIGUSR2 handler ({e}); `mu notify` messages will only queue")
                 }

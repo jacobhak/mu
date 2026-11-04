@@ -30,8 +30,9 @@ pub fn run(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mu_session::session;
+    use mu_session::session::file::SessionFile;
     use mu_session::session::inbox::has_pending;
+    use mu_session::session::list::id_of;
     use mu_testutil::home;
 
     #[test]
@@ -39,9 +40,9 @@ mod tests {
         home();
         let d = std::env::temp_dir();
         assert_eq!(run(Path::new("no-such-session-zzz"), None, "x", &d).unwrap(), 1);
-        let s = session::SessionFile::create(Path::new("/opt/notify-run"), None).unwrap();
+        let s = SessionFile::create(Path::new("/opt/notify-run"), None).unwrap();
         assert_eq!(run(&s.path, None, "  ", &d).unwrap(), 1);
         assert_eq!(run(&s.path, None, &"x".repeat(MAX_TEXT + 1), &d).unwrap(), 1);
-        assert!(!has_pending(&session::id_of(&s.path)));
+        assert!(!has_pending(&id_of(&s.path)));
     }
 }

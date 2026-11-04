@@ -180,7 +180,7 @@ mod wire_contract_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.jsonl");
         std::fs::write(&path, include_str!("testdata/omp_session.jsonl")).unwrap();
-        let loaded = mu_session::session::load(&path).unwrap();
+        let loaded = mu_session::session::format::load(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         let msgs = loaded.messages;

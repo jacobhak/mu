@@ -8,7 +8,7 @@ use mu_base::tool::ToolDef;
 use mu_provider::gateway::quota::QuotaTracker;
 use mu_provider::model::cost::CostLedger;
 use mu_provider::provider::client::Providers;
-use mu_session::session::CompactionState;
+use mu_session::session::format::CompactionState;
 use mu_tools::plugin::host::PluginHost;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashSet;

@@ -4,8 +4,9 @@
 //! (`inbox: true`) and drains the directory itself.
 //!
 //! (Not to be confused with `events::Inbox`, the steer/follow-up queue.)
-use crate::session::control::{self, Recheck, Want};
-use crate::session::{self, Owner};
+use super::control::{self, Recheck, Want};
+use super::list::{find, id_of, valid_id};
+use super::owner::{Owner, owner};
 use mu_common::paths;
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -34,7 +35,7 @@ pub fn root() -> PathBuf {
 }
 
 pub fn dir(id: &str) -> Option<PathBuf> {
-    session::valid_id(id).then(|| root().join(id))
+    valid_id(id).then(|| root().join(id))
 }
 
 pub fn make_private_dir(p: &Path) -> std::io::Result<()> {
@@ -195,13 +196,13 @@ pub enum Delivery {
 
 /// Wakes the session's owner if, and only if, its record promises a SIGUSR2 handler.
 pub fn deliver(path: &Path) -> Delivery {
-    match session::owner(path) {
+    match owner(path) {
         Owner::Free => Delivery::Queued("not running".into()),
         Owner::Unknown => Delivery::Queued("owner unknown".into()),
         Owner::Live { pid, inbox: false, .. } => Delivery::Queued(format!("pid {pid} does not take messages")),
         Owner::Live { pid, inbox: true, started, .. } => {
             // As `mu take`: the same live run must still own it right before the kill.
-            match control::recheck(session::owner(path), pid, &started, Want::Inbox) {
+            match control::recheck(owner(path), pid, &started, Want::Inbox) {
                 Recheck::Same => {}
                 Recheck::Free => return Delivery::Queued("not running".into()),
                 Recheck::Changed => return Delivery::Queued("owner changed".into()),
@@ -217,14 +218,14 @@ pub fn deliver(path: &Path) -> Delivery {
 
 /// Queues `text` for the session at `arg` and wakes it when it is live. Returns the outcome line.
 pub fn send(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> Result<String, String> {
-    let path = session::find(cwd, arg).map(|p| std::fs::canonicalize(&p).unwrap_or(p))?;
+    let path = find(cwd, arg).map(|p| std::fs::canonicalize(&p).unwrap_or(p))?;
     if text.trim().is_empty() {
         return Err("empty message".into());
     }
     if text.len() > MAX_TEXT {
         return Err(format!("message too long ({} bytes, at most {MAX_TEXT})", text.len()));
     }
-    let id = session::id_of(&path);
+    let id = id_of(&path);
     // Queue first, then look at the owner: a session opened in between scans the inbox after it
     // locks, and one that is already live gets the signal.
     enqueue(&id, &sanitize_from(from), text).map_err(|e| format!("cannot queue the message: {e}"))?;

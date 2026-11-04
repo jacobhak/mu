@@ -16,7 +16,7 @@ pub(super) enum UiMsg {
         then: ChildThen,
         status: Result<std::process::ExitStatus, String>,
     },
-    Sessions(Vec<mu_session::session::SessionInfo>),
+    Sessions(Vec<mu_session::session::list::SessionInfo>),
     /// The result of a clipboard copy: the notice to show, or the error.
     Copied(Result<String, String>),
     Models(Result<Vec<GatewayModel>, String>),

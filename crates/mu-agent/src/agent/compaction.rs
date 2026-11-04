@@ -2,7 +2,7 @@ use super::Agent;
 use mu_base::config::Threshold;
 use mu_base::events::AgentEvent;
 use mu_base::message::{Block, Message, text_of};
-use mu_session::session::CompactionState;
+use mu_session::session::format::CompactionState;
 use serde_json::json;
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;

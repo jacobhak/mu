@@ -1,5 +1,6 @@
 use super::*;
-use mu_session::session::{self, inbox};
+use mu_session::session::format::{self, Loaded};
+use mu_session::session::inbox;
 
 impl Agent {
     pub fn session_id(&self) -> String {
@@ -126,7 +127,7 @@ impl Agent {
 
     /// `false` (with an error shown) when the session could not be loaded or opened.
     pub async fn load_session(&mut self, path: &Path) -> bool {
-        let loaded = match session::load(path) {
+        let loaded = match format::load(path) {
             Ok(l) => l,
             Err(e) => {
                 self.error(e.to_string());
@@ -181,7 +182,7 @@ impl Agent {
     }
 
     /// Model, thinking level and stored costs of a loaded session; a pinned flag wins over the file.
-    fn apply_loaded_settings(&mut self, loaded: &session::Loaded, s: &mut SessionFile) {
+    fn apply_loaded_settings(&mut self, loaded: &Loaded, s: &mut SessionFile) {
         if let Some(m) = loaded.model.as_deref().filter(|_| !self.run.pin_model) {
             match self.ports.providers.resolve(m) {
                 Ok((spec, _)) => self.model.model = spec,
@@ -207,7 +208,7 @@ impl Agent {
 
     /// Messages, ids, plugin context, review base, todo and title of a loaded session. Returns the
     /// secrets redacted on the way in, to be logged once the session file is open.
-    fn restore_history(&mut self, loaded: session::Loaded) -> Vec<secrets::Hit> {
+    fn restore_history(&mut self, loaded: Loaded) -> Vec<secrets::Hit> {
         self.messages = loaded.messages;
         // Sessions written before redaction, or with it off, may hold secrets.
         let mut msgs = std::mem::take(&mut self.messages);

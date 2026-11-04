@@ -16,7 +16,7 @@ use crate::text::line::{self, Line, dim, span};
 use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
-use mu_session::session::LiveSession;
+use mu_session::session::owner::LiveSession;
 use mu_session::session::tail::Tail;
 
 /// Most list rows shown at once.
@@ -255,7 +255,7 @@ impl JobsPanel {
 
     /// The live sessions, read now from the owner records.
     fn refresh_sessions(&mut self) {
-        self.set_sessions(mu_session::session::live_sessions());
+        self.set_sessions(mu_session::session::owner::live_sessions());
     }
 
     /// A fresh list of live sessions: the selection stays on the same one when it is still there.
@@ -263,7 +263,7 @@ impl JobsPanel {
         self.polled_totals = Some(Instant::now());
         for l in &lives {
             if !self.titles.contains_key(&l.path)
-                && let Some(i) = mu_session::session::info(&l.path)
+                && let Some(i) = mu_session::session::list::info(&l.path)
             {
                 let t = i.title.filter(|t| !t.is_empty()).unwrap_or(i.first_prompt);
                 if !t.is_empty() {

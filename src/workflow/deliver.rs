@@ -6,7 +6,7 @@ use mu_agent::review::facts::repo_root;
 use mu_agent::review::report::{Finding, fix_message, loc, raw_message};
 use mu_base::git::{git, short_sha};
 use mu_common::paths::{encode_cwd, mu_home, self_exe};
-use mu_session::session::{self, inbox};
+use mu_session::session::{inbox, list};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -460,10 +460,10 @@ async fn current_branch(top: &Path) -> String {
 async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
     let top = repo_root(cwd).await.map_err(|_| "mu deliver needs a git repository".to_string())?;
     let notify = match &a.notify {
-        Some(p) => Some(session::find(cwd, p)?),
+        Some(p) => Some(list::find(cwd, p)?),
         None => std::env::var_os("PI_SESSION_FILE")
             .filter(|v| !v.is_empty())
-            .and_then(|v| session::find(cwd, Path::new(&v)).ok()),
+            .and_then(|v| list::find(cwd, Path::new(&v)).ok()),
     };
     let ddir = deliveries_dir(cwd).await;
     let mut job = Job { dir: PathBuf::new(), plan: None, new_worktree: None, max_fix: a.max_fix, notify };
@@ -544,7 +544,7 @@ async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
             let (Some(s), Some(b)) = (&a.session, &a.base) else {
                 return Err("--loop without a delivery id needs --session and --base".into());
             };
-            let session = session::find(cwd, s)?;
+            let session = list::find(cwd, s)?;
             let session = std::fs::canonicalize(&session).unwrap_or(session);
             let base = git(&top, &["rev-parse", "--verify", "--quiet", &format!("{b}^{{commit}}")], None)
                 .await
@@ -557,7 +557,7 @@ async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
                 ),
                 None => None,
             };
-            let id = session::id_of(&session);
+            let id = list::id_of(&session);
             let dir = ddir.join(&id);
             let mut r = if dir.join("delivery.json").exists() {
                 load(&dir)?

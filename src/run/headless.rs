@@ -152,7 +152,7 @@ pub async fn print_mode(
     if stops > 0 && exited && !capped && !errored {
         match &session {
             Some(p) => {
-                eprintln!("mu: interrupted; resume with: mu {}--resume {p}", mu_session::session::profile_flag())
+                eprintln!("mu: interrupted; resume with: mu {}--resume {p}", mu_session::session::list::profile_flag())
             }
             None => eprintln!("mu: interrupted"),
         }

@@ -9,7 +9,7 @@ use crate::text::line::{self, Line, dim, span};
 use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
 use mu_base::events::SubagentStatus;
-use mu_session::session::LiveSession;
+use mu_session::session::owner::LiveSession;
 
 pub struct Row {
     pub live: LiveSession,
@@ -55,7 +55,7 @@ impl Row {
 
     /// The session id that `mu notify` and `mu take` accept.
     pub fn id(&self) -> String {
-        mu_session::session::id_of(&self.live.path)
+        mu_session::session::list::id_of(&self.live.path)
     }
 }
 

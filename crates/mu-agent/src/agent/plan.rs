@@ -1,6 +1,5 @@
 use super::*;
 use crate::review;
-use mu_session::session;
 
 impl Agent {
     pub(super) async fn enter_plan(&mut self) {
@@ -41,7 +40,7 @@ impl Agent {
         }
         if self.title.text.is_none() && !p.title.trim().is_empty() {
             if let Some(s) = self.session.as_mut() {
-                s.set_title(&p.title, session::TitleSource::Auto);
+                s.set_title(&p.title, TitleSource::Auto);
             }
             self.title.text = Some(p.title.clone());
             self.emit_status();

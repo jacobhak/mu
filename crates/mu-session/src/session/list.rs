@@ -1,0 +1,216 @@
+//! Finding session files: ids, lookup by id or prefix, and the list of recent sessions.
+use super::format::slot_title;
+use mu_base::message::Message;
+use mu_common::paths;
+use serde_json::Value;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+/// `--profile <name> ` (trailing space) when a profile is active, else empty: for resume hints.
+pub fn profile_flag() -> String {
+    std::env::var("OMP_PROFILE").ok().filter(|p| !p.is_empty()).map(|p| format!("--profile {p} ")).unwrap_or_default()
+}
+
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub title: Option<String>,
+    pub first_prompt: String,
+    pub modified: std::time::SystemTime,
+    /// Working directory recorded in the session header.
+    pub cwd: Option<PathBuf>,
+}
+
+/// Session id from a file named `<timestamp>_<id>.jsonl`.
+pub fn id_of(path: &Path) -> String {
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    name.rsplit_once('_').map_or(name.clone(), |(_, id)| id.to_string())
+}
+
+pub fn latest_for(cwd: &Path) -> Option<PathBuf> {
+    let dir = paths::session_dir(cwd);
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .max_by(|a, b| a.file_name().cmp(&b.file_name()))
+}
+
+/// A session id is `[A-Za-z0-9-]+`: nothing that could name a path.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Session file for `arg`: an existing `.jsonl` file, else a session id (or id prefix).
+pub fn find(cwd: &Path, arg: &Path) -> Result<PathBuf, String> {
+    let Some(s) = arg.to_str().filter(|s| !s.trim().is_empty()) else {
+        return Err("empty session argument".into());
+    };
+    if arg.is_file() && arg.extension().is_some_and(|x| x == "jsonl") {
+        return Ok(arg.to_path_buf());
+    }
+    find_id(cwd, s)
+}
+
+/// Session file for an id or unique id prefix, searched in `cwd`'s sessions first and then in
+/// every other project's. Never treats `id` as a path.
+pub fn find_id(cwd: &Path, id: &str) -> Result<PathBuf, String> {
+    if !valid_id(id) {
+        return Err(format!("invalid session id `{id}`"));
+    }
+    let own = paths::session_dir(cwd);
+    let root = own.parent().ok_or("no session directory")?;
+    let matches_in = |d: &Path| -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(d) else { return vec![] };
+        let mut v: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                p.extension().is_some_and(|x| x == "jsonl")
+                    && stem.rsplit_once('_').is_some_and(|(_, sid)| sid.starts_with(id))
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let mut found = matches_in(&own);
+    if found.is_empty() {
+        let others = std::fs::read_dir(root).map_err(|e| e.to_string())?;
+        for d in others.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| *p != own && p.is_dir()) {
+            found.extend(matches_in(&d));
+        }
+    }
+    match found.len() {
+        0 => Err(format!("session {id} not found")),
+        1 => Ok(found.remove(0)),
+        _ => {
+            let list: Vec<String> = found.iter().map(|p| id_of(p)).collect();
+            Err(format!("session id `{id}` is ambiguous; matches: {}", list.join(", ")))
+        }
+    }
+}
+
+fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+    rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect()
+}
+
+/// `read_info` for other modules: title, working directory, first prompt and last write.
+pub fn info(path: &Path) -> Option<SessionInfo> {
+    read_info(path.to_path_buf())
+}
+
+/// Title, working directory and first prompt of one session file; reads only its first lines.
+fn read_info(path: PathBuf) -> Option<SessionInfo> {
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let f = std::io::BufReader::new(File::open(&path).ok()?);
+    let mut title = None;
+    let mut cwd = None;
+    let mut first_prompt = String::new();
+    for (i, l) in std::io::BufRead::lines(f).map_while(Result::ok).enumerate() {
+        let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
+        match v["type"].as_str() {
+            Some("title") if i == 0 => title = slot_title(&v),
+            Some("session") => cwd = v["cwd"].as_str().map(PathBuf::from),
+            Some("title_change") => title = v["title"].as_str().filter(|t| !t.is_empty()).map(String::from),
+            Some("message") if first_prompt.is_empty() && v["message"]["role"] == "user" => {
+                if let Ok(Message::User { content, .. }) = serde_json::from_value(v["message"].clone()) {
+                    first_prompt = content
+                        .iter()
+                        .find_map(|b| match b {
+                            mu_base::message::Block::Text { text } => Some(text.replace('\n', " ")),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                        .chars()
+                        .take(80)
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+        if title.is_some() && !first_prompt.is_empty() {
+            break;
+        }
+    }
+    Some(SessionInfo { path, title, first_prompt, modified, cwd })
+}
+
+/// Working directory recorded in a session's header.
+pub fn header_cwd(path: &Path) -> Option<PathBuf> {
+    read_info(path.to_path_buf())?.cwd
+}
+
+/// The newest `limit` sessions (of `only_cwd`'s project, or of every project), newest first.
+/// File names start with a timestamp, so they are sorted without opening anything; only the
+/// files that make the cut are read.
+pub fn list_recent(cwd: &Path, only_cwd: Option<&Path>, limit: usize) -> Vec<SessionInfo> {
+    let own = paths::session_dir(cwd);
+    let dirs: Vec<PathBuf> = match only_cwd {
+        Some(c) => vec![paths::session_dir(c)],
+        None => match own.parent().and_then(|r| std::fs::read_dir(r).ok()) {
+            Some(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect(),
+            None => return vec![],
+        },
+    };
+    let mut files: Vec<PathBuf> = dirs.iter().flat_map(|d| jsonl_files(d)).collect();
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    files
+        .into_iter()
+        .filter_map(read_info)
+        .filter(|s| only_cwd.is_none_or(|w| s.cwd.as_deref() == Some(w)))
+        .take(limit)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::file::SessionFile;
+    use mu_testutil::home;
+
+    #[test]
+    fn id_validation_and_lookup() {
+        assert!(valid_id("0198-abc"));
+        for bad in ["", ".", "..", "a/b", "a.b", "a_b", "a b"] {
+            assert!(!valid_id(bad), "{bad:?}");
+        }
+        home();
+        let cwd = Path::new("/opt/find");
+        let a = SessionFile::create(cwd, None).unwrap();
+        let id = id_of(&a.path);
+        assert_eq!(find(cwd, Path::new(&id)).unwrap(), a.path);
+        assert!(find(cwd, Path::new("")).is_err());
+        assert!(find(cwd, Path::new("..")).is_err());
+        assert!(find(cwd, Path::new(&a.path.parent().unwrap().to_path_buf())).is_err(), "a directory is not a session");
+        assert_eq!(find(cwd, &a.path).unwrap(), a.path);
+        // Two sessions sharing a prefix are ambiguous.
+        let b = SessionFile::create(cwd, None).unwrap();
+        let (ia, ib) = (id_of(&a.path), id_of(&b.path));
+        let common = ia.chars().zip(ib.chars()).take_while(|(x, y)| x == y).count();
+        if common > 0 {
+            let e = find_id(cwd, &ia[..common]).unwrap_err();
+            assert!(e.contains("ambiguous"), "{e}");
+        }
+    }
+
+    #[test]
+    fn list_recent_reads_only_what_it_returns() {
+        home();
+        let cwd = Path::new("/opt/recent");
+        let mut made = Vec::new();
+        for _ in 0..6 {
+            let mut s = SessionFile::create(cwd, None).unwrap();
+            s.message(&Message::user("hello"));
+            made.push(s.path.clone());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let got = list_recent(cwd, Some(cwd), 3);
+        assert_eq!(got.len(), 3);
+        // Newest first, by file name.
+        assert_eq!(got[0].path, made[5]);
+        assert_eq!(got[2].path, made[3]);
+        assert_eq!(got[0].cwd.as_deref(), Some(cwd));
+        assert!(list_recent(cwd, Some(Path::new("/opt/other")), 3).is_empty());
+        assert!(list_recent(cwd, None, 100).len() >= 6);
+    }
+}

@@ -242,7 +242,7 @@ pub async fn run(init: AppInit) -> i32 {
             .and_then(|s| s.to_str())
             .and_then(|s| s.rsplit_once('_'))
             .map_or(path, |(_, id)| id);
-        let profile = mu_session::session::profile_flag();
+        let profile = mu_session::session::list::profile_flag();
         eprint!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n");
     }
     0

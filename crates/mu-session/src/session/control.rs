@@ -1,7 +1,7 @@
 //! Signalling a session's run only while it is still the run the caller saw: same pid and start
 //! time, and the owner record still promises the signal. Used by `mu take` (stop a `-p` run),
 //! `mu notify` (wake an interactive owner) and the jobs panel (stop or terminate a run).
-use crate::session::{self, Owner};
+use super::owner::{LiveSession, Owner, live_sessions, owner};
 use std::path::Path;
 
 /// What the owner record must promise before a signal is sent.
@@ -59,14 +59,14 @@ const CHANGED: &str = "the session changed hands; nothing was signalled";
 /// time).
 pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<String, String> {
     match kind {
-        "print" => match recheck(session::owner(path), pid, started, Want::PrintRun) {
+        "print" => match recheck(owner(path), pid, started, Want::PrintRun) {
             Recheck::Same => signal(pid)
                 .map(|()| format!("asked pid {pid} to stop after its current step"))
                 .map_err(|e| format!("cannot signal pid {pid}: {e}")),
             Recheck::Free => Err(GONE.into()),
             Recheck::Changed => Err(CHANGED.into()),
         },
-        "subagent" => match recheck(session::owner(path), pid, started, Want::NotPrint) {
+        "subagent" => match recheck(owner(path), pid, started, Want::NotPrint) {
             Recheck::Same => terminate_leader(pid),
             Recheck::Free => Err(GONE.into()),
             Recheck::Changed => Err(CHANGED.into()),
@@ -97,9 +97,9 @@ pub fn terminate_session(path: &Path, pid: u32, started: &str) -> Result<String,
 }
 
 /// The live owner record of `path`, if it is still the run (pid and start time) the caller saw.
-fn live_run(path: &Path, pid: u32, started: &str) -> Result<session::LiveSession, String> {
+fn live_run(path: &Path, pid: u32, started: &str) -> Result<LiveSession, String> {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    match session::live_sessions().into_iter().find(|l| l.path == abs) {
+    match live_sessions().into_iter().find(|l| l.path == abs) {
         Some(l) if l.pid == pid && l.started == started => Ok(l),
         Some(_) => Err(CHANGED.into()),
         None => Err(GONE.into()),
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn an_interactive_run_is_only_signalled_while_it_is_the_one_listed() {
         mu_testutil::home();
-        let s = session::SessionFile::create(Path::new("/opt/stop-tui"), None).unwrap();
+        let s = crate::session::file::SessionFile::create(Path::new("/opt/stop-tui"), None).unwrap();
         let me = std::process::id();
         // Another pid, or another start time: the record is somebody else's now. Never our own pid
         // with the right start time here, which would signal this test process.

@@ -10,7 +10,7 @@ use mu_base::events::{AgentEvent, Command};
 use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
 use mu_provider::model::pricing;
-use mu_session::session;
+use mu_session::session::list;
 use mu_tools::plugin::host::PluginHost;
 use mu_tools::tools::summary;
 use serde_json::{Value, json};
@@ -28,7 +28,7 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL: i64 = -32603;
 
 pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
-    mu_session::session::set_run_info("acp", None);
+    mu_session::session::owner::set_run_info("acp", None);
     let rt = mu_base::runtime::current_thread_runtime()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
@@ -236,14 +236,14 @@ impl Server {
                 let done = self.done_tx.clone();
                 // Sorted by file name and capped before any file is read; off the request loop.
                 let work = tokio::task::spawn_blocking(move || {
-                    let sessions: Vec<Value> = session::list_recent(&home, want.as_deref(), 500)
+                    let sessions: Vec<Value> = list::list_recent(&home, want.as_deref(), 500)
                         .into_iter()
                         .filter_map(|s| {
                             let cwd = s.cwd.clone().filter(|c| c.is_absolute())?;
                             let updated =
                                 jiff::Timestamp::try_from(s.modified).ok()?.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
                             let title = s.title.or_else(|| Some(s.first_prompt.clone()).filter(|t| !t.is_empty()));
-                            Some(json!({"sessionId": session::id_of(&s.path), "cwd": cwd, "title": title, "updatedAt": updated}))
+                            Some(json!({"sessionId": list::id_of(&s.path), "cwd": cwd, "title": title, "updatedAt": updated}))
                         })
                         .collect();
                     sessions
@@ -259,11 +259,11 @@ impl Server {
             }
             ("session/load" | "session/resume", Some(id)) => {
                 let Some(cwd) = self.cwd_param(&id, p) else { return };
-                let path = match session::find_id(&cwd, sid) {
+                let path = match list::find_id(&cwd, sid) {
                     Ok(p) => p,
                     Err(e) => return fail(&id, INVALID_PARAMS, e),
                 };
-                if self.sessions.contains_key(&session::id_of(&path)) {
+                if self.sessions.contains_key(&list::id_of(&path)) {
                     return fail(&id, INVALID_REQUEST, "session is already open");
                 }
                 self.spawn_open(id, cwd, Some(path), method == "session/load", false);
@@ -539,7 +539,7 @@ async fn open_session(
         cwd.clone(),
         Mode::Acp,
     );
-    let known = resume.as_deref().map(session::id_of);
+    let known = resume.as_deref().map(list::id_of);
     let _ = cmd_tx.send(match resume {
         Some(p) => Command::Resume(p),
         None => Command::EnsureSession,
@@ -568,7 +568,7 @@ async fn open_session(
             return Err(e);
         }
     };
-    let sid = known.unwrap_or_else(|| session::id_of(Path::new(st.session_path.as_deref().unwrap_or(""))));
+    let sid = known.unwrap_or_else(|| list::id_of(Path::new(st.session_path.as_deref().unwrap_or(""))));
     // Start from the cached list: no network wait before the session is usable.
     let mut models: Vec<String> = providers.cached_models().into_iter().map(|m| m.id).collect();
     if !models.contains(&st.model_id) {
@@ -794,9 +794,9 @@ mod tests {
 
     #[test]
     fn session_ids_cannot_escape_the_session_dir() {
-        assert!(session::valid_id("0198abcd"));
-        assert!(!session::valid_id(""));
-        assert!(!session::valid_id("../x"));
+        assert!(list::valid_id("0198abcd"));
+        assert!(!list::valid_id(""));
+        assert!(!list::valid_id("../x"));
     }
 
     #[test]

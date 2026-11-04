@@ -112,14 +112,15 @@ impl App {
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths: vec![] });
         let (cwd, tx) = (self.cwd.clone(), self.ui_tx.clone());
         tokio::task::spawn_local(async move {
-            let list = tokio::task::spawn_blocking(move || mu_session::session::list_recent(&cwd, Some(&cwd), 200))
-                .await
-                .unwrap_or_default();
+            let list =
+                tokio::task::spawn_blocking(move || mu_session::session::list::list_recent(&cwd, Some(&cwd), 200))
+                    .await
+                    .unwrap_or_default();
             let _ = tx.send(UiMsg::Sessions(list));
         });
     }
 
-    pub(super) fn show_sessions(&mut self, list: Vec<mu_session::session::SessionInfo>) {
+    pub(super) fn show_sessions(&mut self, list: Vec<mu_session::session::list::SessionInfo>) {
         // Only fill in a picker that is still the loading one.
         if !matches!(&self.overlay, Some(Overlay::Session { paths, .. }) if paths.is_empty()) {
             return;
@@ -290,7 +291,7 @@ impl App {
             OverlayEvent::KillJobs(id) => self.send(Command::KillJobs(id)),
             OverlayEvent::NotifySession { session, text } => {
                 let msg = match self.services.send_message(&session, &self.cwd, &text) {
-                    Ok(line) => format!("message to {}: {line}", mu_session::session::id_of(&session)),
+                    Ok(line) => format!("message to {}: {line}", mu_session::session::list::id_of(&session)),
                     Err(e) => format!("message not sent: {e}"),
                 };
                 self.panel_status(msg);

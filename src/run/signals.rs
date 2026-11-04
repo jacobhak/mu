@@ -2,7 +2,7 @@
 //! the session record is told it exists, then the agent task starts.
 
 use mu_base::events::Command;
-use mu_session::session;
+use mu_session::session::owner;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 pub fn print_run_stop() -> std::io::Result<UnboundedReceiver<()>> {
     let mut sig = signal(SignalKind::user_defined1())?;
     let (stop_tx, stop_rx) = unbounded_channel::<()>();
-    session::set_print_run();
+    owner::set_print_run();
     tokio::task::spawn_local(async move {
         while sig.recv().await.is_some() {
             if stop_tx.send(()).is_err() {
@@ -31,7 +31,7 @@ pub fn cancel_turn_on_sigusr1(cmd: UnboundedSender<Command>) {
                     let _ = cmd.send(Command::Cancel);
                 }
             });
-            session::set_abort_signal();
+            owner::set_abort_signal();
         }
         Err(e) => {
             eprintln!("mu: cannot install the SIGUSR1 handler ({e}); other sessions cannot abort this one")
