@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VERSION: u32 = 1;
 /// A `!command` reference gets this long to print the key.
@@ -375,6 +375,18 @@ async fn run_cmd(provider: &str, cmd: &str, limit: Duration) -> Result<String> {
 /// knows a second try (after a 401) can produce a different key.
 pub fn forget_cached(provider: &str) -> bool {
     CMD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|m| m.remove(provider).is_some())
+}
+
+/// Registers every stored key for redaction; re-reads the file at most once a second.
+pub fn sync_redaction() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+        return;
+    }
+    *last = Some(Instant::now());
+    drop(last);
+    Store::new().snapshot();
 }
 
 /// `…` and the last four characters; shorter keys show nothing.

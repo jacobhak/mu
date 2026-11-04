@@ -72,6 +72,20 @@ pub fn register_stored(label: &str, value: &str) {
     }
 }
 
+static REFRESH_STORED: OnceLock<fn()> = OnceLock::new();
+
+/// Sets the function `redact` calls first to bring `register_stored` up to date; the auth store
+/// sits above this module, so it cannot be called directly.
+pub fn set_stored_refresh(f: fn()) {
+    let _ = REFRESH_STORED.set(f);
+}
+
+fn refresh_stored() {
+    if let Some(f) = REFRESH_STORED.get() {
+        f();
+    }
+}
+
 /// `[secrets]` from config. Unconfigured (tests, early errors) means no extra variables.
 pub fn configure(extra_env: Vec<String>) {
     let _ = EXTRA_ENV.set(extra_env);
@@ -87,6 +101,7 @@ pub fn redact(text: &str, cwd: &Path) -> Redacted {
     }
     let env = ENV.get_or_init(|| known_from(std::env::vars(), Source::Env, extra_env()));
     let dot = dotenv_for(cwd);
+    refresh_stored();
     let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
     let r = apply(text, env.iter().chain(dot.iter()).chain(stored.iter()));
     if !r.hits.is_empty()
@@ -101,6 +116,7 @@ pub fn redact(text: &str, cwd: &Path) -> Redacted {
 /// that did not come from a tool, such as a provider's error body.
 pub fn redact_keys(text: &str) -> String {
     let env = ENV.get_or_init(|| known_from(std::env::vars(), Source::Env, extra_env()));
+    refresh_stored();
     let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
     apply(text, env.iter().chain(stored.iter())).text
 }

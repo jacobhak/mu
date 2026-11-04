@@ -321,6 +321,7 @@ fn main() {
 
 fn run() -> Result<i32> {
     provider::install_crypto();
+    secrets::set_stored_refresh(auth_store::sync_redaction);
     let cli = Cli::parse();
     if let Some(p) = &cli.profile {
         // Single-threaded here: no runtime or plugin has started yet.
