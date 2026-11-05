@@ -34,7 +34,7 @@ impl Agent {
     }
 
     /// Drops the cached tool list so the next request rebuilds it (after an MCP login added tools).
-    pub fn refresh_tool_defs(&mut self) {
+    pub(crate) fn refresh_tool_defs(&mut self) {
         self.memo.base_defs.take();
     }
 

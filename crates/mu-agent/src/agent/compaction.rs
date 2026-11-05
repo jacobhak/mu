@@ -34,7 +34,7 @@ fn lookup(th: &BTreeMap<String, Threshold>, id: &str) -> Option<Threshold> {
 }
 
 /// Effective window and compaction threshold in tokens.
-pub fn window_and_threshold(window: u32, th: Option<Threshold>) -> (u64, u64) {
+pub(crate) fn window_and_threshold(window: u32, th: Option<Threshold>) -> (u64, u64) {
     let mut w = window as u64;
     let mut fixed = None;
     match th {
@@ -50,7 +50,7 @@ pub fn window_and_threshold(window: u32, th: Option<Threshold>) -> (u64, u64) {
 
 /// Index of the first kept message: the smallest user/assistant index whose suffix fits `KEEP_TOKENS`,
 /// but never past the last user/assistant message.
-pub fn cut_point(messages: &[Message]) -> usize {
+pub(crate) fn cut_point(messages: &[Message]) -> usize {
     let Some(last) = messages.iter().rposition(|m| !matches!(m, Message::ToolResult { .. })) else { return 0 };
     let mut sum = 0;
     let mut chosen = last;
@@ -67,7 +67,7 @@ pub fn cut_point(messages: &[Message]) -> usize {
 }
 
 /// Keeps the head and tail of `t` when it is longer than `max` chars, with an elision marker between.
-pub fn cap_chars(t: &str, max: usize) -> String {
+pub(crate) fn cap_chars(t: &str, max: usize) -> String {
     let n = t.chars().count();
     if n <= max {
         return t.to_string();
@@ -108,7 +108,7 @@ fn serialize_one(m: &Message) -> Vec<String> {
 }
 
 /// Serializes `messages` into at most about `max_chars` characters, dropping the oldest first.
-pub fn serialize_within(messages: &[Message], max_chars: usize) -> String {
+pub(crate) fn serialize_within(messages: &[Message], max_chars: usize) -> String {
     let parts: Vec<Vec<String>> = messages.iter().map(serialize_one).collect();
     let size = |p: &Vec<String>| p.iter().map(|s| s.len() + 2).sum::<usize>();
     let mut total: usize = parts.iter().map(size).sum();
@@ -125,7 +125,7 @@ pub fn serialize_within(messages: &[Message], max_chars: usize) -> String {
     out.join("\n\n")
 }
 
-pub fn summary_prompt(serialized: &str, prev: Option<&str>, focus: Option<&str>, extra: &[String]) -> String {
+pub(crate) fn summary_prompt(serialized: &str, prev: Option<&str>, focus: Option<&str>, extra: &[String]) -> String {
     let mut p = format!("<conversation>\n{serialized}\n</conversation>\n\n");
     if let Some(prev) = prev {
         p.push_str(&format!("<previous-summary>\n{prev}\n</previous-summary>\n\n"));
@@ -140,7 +140,7 @@ pub fn summary_prompt(serialized: &str, prev: Option<&str>, focus: Option<&str>,
     p
 }
 
-pub fn context_message(summary: &str) -> Message {
+pub(crate) fn context_message(summary: &str) -> Message {
     Message::user(&CONTEXT_TEMPLATE.replace("{{summary}}", summary))
 }
 
@@ -169,7 +169,7 @@ impl Agent {
     /// Estimated tokens of the next request: system prompt, summary context and messages. The
     /// system prompt is only measured when its inputs change, and the messages' sum is reused until
     /// a message is added or removed, so frequent status updates do not recompute either.
-    pub fn estimate_tokens(&self) -> u64 {
+    pub(crate) fn estimate_tokens(&self) -> u64 {
         self.system_tokens()
             + self.messages_tokens()
             + self.compaction.state.as_ref().map_or(0, |c| estimate_tokens(&c.summary))
@@ -180,12 +180,12 @@ impl Agent {
         self.fresh_usage_tokens().unwrap_or_else(|| self.estimate_tokens())
     }
 
-    pub fn needs_compaction(&self, extra: u64) -> bool {
+    pub(crate) fn needs_compaction(&self, extra: u64) -> bool {
         self.context_tokens() + extra > self.thresholds().1
     }
 
     /// Messages as sent to the provider: the summary context first when compacted.
-    pub fn wire_messages(&self) -> Vec<Message> {
+    pub(crate) fn wire_messages(&self) -> Vec<Message> {
         let mut v = Vec::with_capacity(self.messages.len() + 1);
         if let Some(c) = &self.compaction.state {
             v.push(context_message(&c.summary));
@@ -253,7 +253,7 @@ impl Agent {
     }
 
     /// Fire-and-forget title for the first exchange of a new session.
-    pub fn request_title(&mut self) {
+    pub(crate) fn request_title(&mut self) {
         if self.title.text.is_some() || self.title.requested {
             return;
         }

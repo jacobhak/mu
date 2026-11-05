@@ -257,12 +257,12 @@ impl PluginHost {
             .cloned()
     }
 
-    pub fn has_tool(&self, name: &str) -> bool {
+    pub(crate) fn has_tool(&self, name: &str) -> bool {
         self.slot_for_tool(name).is_some()
     }
 
     /// The tool belongs to an MCP server (as opposed to a native plugin).
-    pub fn is_mcp_tool(&self, name: &str) -> bool {
+    pub(crate) fn is_mcp_tool(&self, name: &str) -> bool {
         self.slot_for_tool(name).is_some_and(|s| s.as_mcp().is_some())
     }
 
@@ -287,7 +287,7 @@ impl PluginHost {
             .collect()
     }
 
-    pub async fn call_tool(&self, name: &str, args: &Value, cancel: &CancellationToken) -> ToolOutput {
+    pub(crate) async fn call_tool(&self, name: &str, args: &Value, cancel: &CancellationToken) -> ToolOutput {
         let fail = |e: String| ToolOutput::err(e);
         let Some(slot) = self.slot_for_tool(name) else { return fail(format!("Unknown tool: {name}")) };
         let proc = match self.ensure(&slot).await {
@@ -412,7 +412,7 @@ impl PluginHost {
         out
     }
 
-    pub async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
+    pub(crate) async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
         let slot = self
             .slots
             .borrow()

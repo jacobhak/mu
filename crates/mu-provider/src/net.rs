@@ -14,20 +14,20 @@ pub fn install_crypto() {
 
 /// The HTTP client every provider request uses: a connect timeout and no redirects, so a request
 /// that carries a key never follows one to another host. Callers set their own overall timeout.
-pub fn http_client() -> reqwest::Result<reqwest::Client> {
+pub(crate) fn http_client() -> reqwest::Result<reqwest::Client> {
     install_crypto();
     reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).redirect(reqwest::redirect::Policy::none()).build()
 }
 
 /// The host (and port) of a URL, for naming a peer in errors.
-pub fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
 }
 
 /// Accepts `https://…`, or `http://` only to a loopback host. The bearer token must never go
 /// over plain HTTP to anywhere else.
-pub fn validate_url(url: &str) -> Result<String> {
+pub(crate) fn validate_url(url: &str) -> Result<String> {
     let url = url.trim().trim_end_matches('/');
     let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("URL `{url}` has no scheme"))?;
     let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();

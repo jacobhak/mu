@@ -1,1 +1,1 @@
-pub mod bash;
+pub(crate) mod bash;

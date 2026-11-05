@@ -2,10 +2,10 @@ mod ask;
 mod diff;
 pub mod edit;
 mod glob;
-pub mod grep;
+pub(crate) mod grep;
 mod plan;
 mod read;
-pub mod shell;
+pub(crate) mod shell;
 mod spill;
 pub mod subagent;
 pub mod task;
@@ -37,7 +37,7 @@ pub struct ToolCtx {
 
 /// The per-session state the tools share: the todo list, the session's ids and file, and its skills.
 #[derive(Default)]
-pub struct ToolSession {
+pub(crate) struct ToolSession {
     todo: std::cell::RefCell<Vec<todo::Phase>>,
     /// Names the session's artifact and local directories, and `PI_SESSION_ID`.
     id: std::cell::RefCell<String>,

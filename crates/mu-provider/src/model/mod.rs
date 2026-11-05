@@ -1,4 +1,4 @@
-pub mod catalog;
+pub(crate) mod catalog;
 pub mod cost;
-pub mod discovery;
+pub(crate) mod discovery;
 pub mod pricing;

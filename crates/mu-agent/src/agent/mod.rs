@@ -267,7 +267,7 @@ impl Agent {
     }
 
     /// Interactive sessions only: `task` runs in the background and finished jobs wake the agent.
-    pub fn enable_jobs(&mut self) {
+    pub(crate) fn enable_jobs(&mut self) {
         let (wake, wake_rx) = unbounded_channel();
         self.mail.wake_tx = Some(wake.clone());
         let jobs = JobsHandle::new(wake, self.ports.events.clone());
@@ -277,7 +277,7 @@ impl Agent {
 
     /// Interactive sessions only: `mu notify` messages are delivered. Returns the sender the
     /// SIGUSR2 handler uses to wake the agent (the jobs wake channel), `None` without jobs.
-    pub fn enable_notify(&mut self) -> Option<UnboundedSender<()>> {
+    pub(crate) fn enable_notify(&mut self) -> Option<UnboundedSender<()>> {
         self.mail.notify = true;
         self.mail.wake_tx.clone()
     }

@@ -7,4 +7,4 @@ pub mod jobs;
 pub mod mcp;
 pub mod plugin;
 pub mod tools;
-pub mod walk;
+pub(crate) mod walk;

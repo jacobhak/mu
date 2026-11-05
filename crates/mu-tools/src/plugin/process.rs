@@ -24,7 +24,7 @@ fn live_groups() -> &'static Mutex<Vec<i32>> {
 }
 
 /// SIGKILLs every running plugin's process group.
-pub fn kill_all_groups() {
+pub(crate) fn kill_all_groups() {
     for g in live_groups().lock().unwrap().iter().filter(|g| **g > 1) {
         // SAFETY: each plugin runs in its own process group (`process_group(0)`).
         unsafe { libc::kill(-*g, libc::SIGKILL) };

@@ -4,11 +4,11 @@
 //! (`wire`).
 
 pub mod client;
-pub mod complete;
+pub(crate) mod complete;
 pub mod endpoint;
-pub mod gateway_models;
+pub(crate) mod gateway_models;
 pub mod providers;
-pub mod retry;
-pub mod sse;
+pub(crate) mod retry;
+pub(crate) mod sse;
 pub mod types;
-pub mod wire;
+pub(crate) mod wire;

@@ -2,7 +2,7 @@ use super::*;
 
 impl Agent {
     /// Tokens of the system prompt, measured again only when what it is built from changes.
-    pub fn system_tokens(&self) -> u64 {
+    pub(crate) fn system_tokens(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (
@@ -28,7 +28,7 @@ impl Agent {
     }
 
     /// Sum of the messages' estimates, kept until the message list changes.
-    pub fn messages_tokens(&self) -> u64 {
+    pub(crate) fn messages_tokens(&self) -> u64 {
         let key = (self.messages.len(), self.messages.last().map_or(0, Message::timestamp));
         let mut memo = self.memo.messages.borrow_mut();
         match *memo {
@@ -104,11 +104,11 @@ impl Agent {
         }
     }
 
-    pub fn emit_status(&self) {
+    pub(crate) fn emit_status(&self) {
         self.emit(AgentEvent::Status(self.snapshot()));
     }
 
-    pub fn fresh_usage_tokens(&self) -> Option<u64> {
+    pub(crate) fn fresh_usage_tokens(&self) -> Option<u64> {
         let msgs = self.messages.get(self.compaction.fresh_from..)?;
         let i = msgs.iter().rposition(|m| matches!(m, Message::Assistant { .. }))?;
         let Message::Assistant { usage, .. } = &msgs[i] else { return None };
@@ -116,7 +116,7 @@ impl Agent {
         Some(usage.input + usage.cache_read + usage.cache_write + usage.output + trailing)
     }
 
-    pub fn set_model(&mut self, sel: &str) {
+    pub(crate) fn set_model(&mut self, sel: &str) {
         match self.ports.providers.resolve(sel) {
             Ok((spec, level)) => {
                 if let Some(s) = self.session.as_mut() {
@@ -136,7 +136,7 @@ impl Agent {
         }
     }
 
-    pub fn set_thinking(&mut self, t: Thinking) {
+    pub(crate) fn set_thinking(&mut self, t: Thinking) {
         self.model.thinking = t;
         self.model.live_thinking.set(t);
         if let Some(s) = self.session.as_mut() {

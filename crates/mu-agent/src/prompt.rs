@@ -25,7 +25,7 @@ pub struct PromptInput<'a> {
 
 const SYSTEM: &str = include_str!("prompts/system.md");
 
-pub fn system_prompt(i: &PromptInput) -> String {
+pub(crate) fn system_prompt(i: &PromptInput) -> String {
     // The kernel release does not change under a running process: read it once.
     static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let os = OS.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());

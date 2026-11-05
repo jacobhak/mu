@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 /// How a request authenticates.
-pub enum Auth {
+pub(crate) enum Auth {
     Bearer(String),
     XApiKey(String),
 }
@@ -89,7 +89,7 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 /// Turns the bytes of one response stream into events and, at the end, the assistant message.
-pub trait Decoder {
+pub(crate) trait Decoder {
     fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError>;
     /// The message when the stream ended without its own end marker, if the content is complete enough.
     fn finish(&mut self) -> Option<Message> {

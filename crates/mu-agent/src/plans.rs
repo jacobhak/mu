@@ -65,7 +65,7 @@ pub async fn store_for(cwd: &Path) -> Store {
     Store { dir: mu_home().join("plans").join(encode_cwd(&main_checkout(cwd).await)), root: repo_root(cwd).await.ok() }
 }
 
-pub async fn base_now(root: &Path) -> Option<Base> {
+pub(crate) async fn base_now(root: &Path) -> Option<Base> {
     let tree = snapshot_tree(root).await.ok()?;
     let commit = git(root, &["rev-parse", "HEAD"], None).await.ok().map(|s| s.trim().to_string());
     Some(Base { tree, commit: commit.filter(|c| !c.is_empty()) })
@@ -333,7 +333,7 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 /// Repo-relative paths of the files the session read, selectors and `:raw` stripped. Directory listings are skipped: they show names, not contents; so are paths that do not exist.
-pub fn reads_from(messages: &[Message], cwd: &Path, root: &Path) -> Vec<String> {
+pub(crate) fn reads_from(messages: &[Message], cwd: &Path, root: &Path) -> Vec<String> {
     let root = normalize(root);
     let mut out = Vec::new();
     for m in messages {

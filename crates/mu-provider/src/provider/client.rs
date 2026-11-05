@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Where one request goes: the gateway on loopback, or a provider's own API.
-pub struct Route {
+pub(crate) struct Route {
     pub base: String,
     pub auth: Auth,
     /// The provider whose own API this is; `None` for the gateway.

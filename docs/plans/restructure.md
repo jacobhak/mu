@@ -324,3 +324,4 @@ Deviations from the plan, and what to know:
   - Key validation builds its own client again (15 s overall, no separate connect timeout), as on `main`.
   - `AuthStyle` lives in `mu-provider`'s `providers.rs`.
   - `mu-session` is `session/` with `file`, `format`, `list`, `owner` (with `RunKind`), `tail`, `inbox` and `control`. `profile_flag` sits in `list` (it builds resume hints). `LiveSession.kind` stays a string: it is read from records other mu versions may have written.
+  - Visibility: modules and items that no other crate uses are `pub(crate)` in every library crate (`mu-agent`'s `policy`, `mu-provider`'s `wire`, `sse`, `retry`, `complete`, `gateway_models`, `catalog`, `discovery`, `mu-tools`' `walk`, `shell`, `grep`, `mcp::{auth, convert}`, and the individual helpers inside the modules that stay `pub`). The compiler reported no new dead code afterwards. `mu-tui` already had its modules narrowed.

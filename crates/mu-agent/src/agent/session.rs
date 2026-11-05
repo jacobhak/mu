@@ -126,7 +126,7 @@ impl Agent {
     }
 
     /// `false` (with an error shown) when the session could not be loaded or opened.
-    pub async fn load_session(&mut self, path: &Path) -> bool {
+    pub(crate) async fn load_session(&mut self, path: &Path) -> bool {
         let loaded = match format::load(path) {
             Ok(l) => l,
             Err(e) => {

@@ -2,10 +2,10 @@
 //! JSON-RPC traffic (`crate::plugin`); this module holds what is specific to the `mcp` dialect: the
 //! per-server state, the tool list and the prompt instructions.
 
-pub mod auth;
+pub(crate) mod auth;
 pub mod cache;
 pub mod config;
-pub mod convert;
+pub(crate) mod convert;
 pub mod discover;
 pub mod store;
 

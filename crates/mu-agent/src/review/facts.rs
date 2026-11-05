@@ -18,7 +18,7 @@ pub async fn repo_root(cwd: &Path) -> Result<PathBuf, String> {
 
 /// A tree sha of the whole working tree, untracked non-ignored files included. Uses a copy of the
 /// index, so neither the real index nor the working tree is touched.
-pub async fn snapshot_tree(cwd: &Path) -> Result<String, String> {
+pub(crate) async fn snapshot_tree(cwd: &Path) -> Result<String, String> {
     let real = git(cwd, &["rev-parse", "--git-path", "index"], None).await?;
     let real = cwd.join(real.trim());
     let tmp = std::env::temp_dir().join(format!("mu-review-index-{}", uuid::Uuid::new_v4()));
@@ -43,7 +43,7 @@ pub async fn snapshot_tree(cwd: &Path) -> Result<String, String> {
     res.map(|s| s.trim().to_string())
 }
 
-pub async fn head_tree(cwd: &Path) -> Result<String, String> {
+pub(crate) async fn head_tree(cwd: &Path) -> Result<String, String> {
     match git(cwd, &["rev-parse", "HEAD^{tree}"], None).await {
         Ok(s) => Ok(s.trim().to_string()),
         Err(_) => git(cwd, &["hash-object", "-t", "tree", "/dev/null"], None).await.map(|s| s.trim().to_string()),
@@ -64,11 +64,11 @@ impl FileStat {
     }
 }
 
-pub async fn numstat(root: &Path, base: &str, cur: &str) -> Result<Vec<FileStat>, String> {
+pub(crate) async fn numstat(root: &Path, base: &str, cur: &str) -> Result<Vec<FileStat>, String> {
     git(root, &["diff", "--numstat", "-z", "--no-renames", base, cur], None).await.map(|s| parse_numstat(&s))
 }
 
-pub fn parse_numstat(raw: &str) -> Vec<FileStat> {
+pub(crate) fn parse_numstat(raw: &str) -> Vec<FileStat> {
     raw.split('\0')
         .filter_map(|rec| {
             let mut it = rec.trim_start_matches('\n').splitn(3, '\t');
@@ -78,7 +78,7 @@ pub fn parse_numstat(raw: &str) -> Vec<FileStat> {
         .collect()
 }
 
-pub fn excluded_reason(path: &str, binary: bool) -> Option<&'static str> {
+pub(crate) fn excluded_reason(path: &str, binary: bool) -> Option<&'static str> {
     if binary {
         return Some("binary");
     }
@@ -111,7 +111,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// What the user told the implementer since the plan was approved.
-pub fn user_notes(messages: &[Message], since: i64) -> Vec<String> {
+pub(crate) fn user_notes(messages: &[Message], since: i64) -> Vec<String> {
     let mut out: Vec<String> = messages
         .iter()
         .filter_map(|m| match m {
@@ -197,7 +197,7 @@ pub fn request(r: &RequestInput) -> String {
 }
 
 /// Splits changed files into the reviewable ones and `(file, reason)` exclusions.
-pub fn split_excluded(stats: Vec<FileStat>) -> (Vec<FileStat>, Vec<(FileStat, &'static str)>) {
+pub(crate) fn split_excluded(stats: Vec<FileStat>) -> (Vec<FileStat>, Vec<(FileStat, &'static str)>) {
     let (mut files, mut excluded) = (Vec::new(), Vec::new());
     for f in stats {
         match excluded_reason(&f.path, f.added.is_none()) {
@@ -209,7 +209,7 @@ pub fn split_excluded(stats: Vec<FileStat>) -> (Vec<FileStat>, Vec<(FileStat, &'
 }
 
 /// The tree of a git ref.
-pub async fn rev_tree(root: &Path, rev: &str) -> Result<String, String> {
+pub(crate) async fn rev_tree(root: &Path, rev: &str) -> Result<String, String> {
     git(root, &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{tree}}")], None)
         .await
         .map(|t| t.trim().to_string())
