@@ -5,7 +5,7 @@
 pub mod agent;
 pub mod handle;
 pub mod plans;
-pub mod policy;
+pub(crate) mod policy;
 pub mod prompt;
 pub mod review;
 
