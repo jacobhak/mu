@@ -728,7 +728,7 @@ mod tests {
         app.open_model_picker(vec![], None);
         let Some(Overlay::Model { ids, target: None, .. }) = &app.overlay else { panic!("no model picker") };
         let roles: Vec<&str> = ids.iter().map(String::as_str).take_while(|i| i.starts_with('@')).collect();
-        assert_eq!(roles, ["@default", "@plan", "@task", "@review", "@smol", "@memory", "@slow"]);
+        assert_eq!(roles, ["@default", "@plan", "@task", "@scout", "@review", "@smol", "@memory", "@slow"]);
 
         // /switch lists only the roles that have a model.
         app.flows.pick_assign = false;

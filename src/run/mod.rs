@@ -101,7 +101,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
             agent_def = def;
         }
         if cli.model.is_none() {
-            let role = if p["agent"] == "scout" { "smol" } else { "task" };
+            let role = if p["agent"] == "scout" { "scout" } else { "task" };
             sel = match &agent_def {
                 Some(d) => agent_selector(d, &cfgs),
                 None => models::role_selector(role, &cfgs),

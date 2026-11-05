@@ -48,7 +48,8 @@ fn omp_installed() -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&bin).is_file()))
 }
 
-/// First `provider/model[:level]` or configured `@role` in the agent's model list, else the `task` role chain.
+/// First `provider/model[:level]` or configured `@role` in the agent's model list, else the role chain of
+/// `scout` for an agent of that name and of `task` for any other.
 pub(crate) fn agent_selector(def: &context::AgentDef, cfgs: &config::Configs) -> Option<String> {
     def.model
         .iter()
@@ -57,7 +58,7 @@ pub(crate) fn agent_selector(def: &context::AgentDef, cfgs: &config::Configs) ->
             None => m.contains('/'),
         })
         .cloned()
-        .or_else(|| models::role_selector("task", cfgs))
+        .or_else(|| models::role_selector(if def.name == "scout" { "scout" } else { "task" }, cfgs))
 }
 
 /// `role · provider/model` when the model came from a `@role` selector, else just the model.
@@ -90,5 +91,25 @@ mod tests {
         assert_eq!(model_label(Some("@smol:high"), "a/b"), "smol · a/b");
         assert_eq!(model_label(Some("a/b:low"), "a/b"), "a/b");
         assert_eq!(model_label(None, "a/b"), "a/b");
+    }
+
+    #[test]
+    fn an_agent_with_no_usable_model_takes_the_role_of_its_kind() {
+        let mut cfgs = config::Configs::default();
+        for (role, model) in [("default", "a/d"), ("task", "a/t"), ("scout", "a/s")] {
+            cfgs.omp.model_roles.insert(role.into(), model.into());
+        }
+        let def = |name: &str, model: &[&str]| context::AgentDef {
+            name: name.into(),
+            description: String::new(),
+            tools: None,
+            model: model.iter().map(|m| m.to_string()).collect(),
+            thinking: None,
+            prompt: String::new(),
+            output: None,
+        };
+        assert_eq!(agent_selector(&def("scout", &[]), &cfgs).as_deref(), Some("@scout"));
+        assert_eq!(agent_selector(&def("docs", &["@nope"]), &cfgs).as_deref(), Some("@task"));
+        assert_eq!(agent_selector(&def("docs", &["@scout"]), &cfgs).as_deref(), Some("@scout"));
     }
 }

@@ -271,7 +271,7 @@ pub fn split_level(v: &str) -> (String, Option<Thinking>) {
 /// Roles tried in order for an internal call.
 pub fn role_chain(role: &str) -> Vec<String> {
     let rest: &[&str] = match role {
-        "memory" => &["smol", "default"],
+        "memory" | "scout" => &["smol", "default"],
         "smol" | "task" | "plan" => &["default"],
         "review" => &["plan", "default"],
         _ => &[],
@@ -414,6 +414,7 @@ mod tests {
     #[test]
     fn chains() {
         assert_eq!(role_chain("memory"), ["memory", "smol", "default"]);
+        assert_eq!(role_chain("scout"), ["scout", "smol", "default"]);
         assert_eq!(role_selector("task", &cfg()).as_deref(), Some("@default"));
     }
 }

@@ -13,7 +13,7 @@ struct Doc {
     unset: &'static str,
 }
 
-const DOCS: [Doc; 7] = [
+const DOCS: [Doc; 8] = [
     Doc {
         name: "default",
         purpose: "main session",
@@ -29,13 +29,19 @@ const DOCS: [Doc; 7] = [
     Doc {
         name: "task",
         purpose: "subagents",
-        used_by: "`task` and `scout` subagents, and any agent whose `model:` names no model or role you have set.",
+        used_by: "`task` subagents, which can edit and run commands, and any other agent whose `model:` names no model or role you have set.",
         unset: "subagents use the session's model",
+    },
+    Doc {
+        name: "scout",
+        purpose: "read-only scouts",
+        used_by: "`scout` subagents: read-only research, everything `task` does in plan mode, and the scouts of /review.",
+        unset: "scouts use the session's model",
     },
     Doc {
         name: "review",
         purpose: "/review lead",
-        used_by: "The lead of /review and `mu review`. Its scouts run on @task.",
+        used_by: "The lead of /review and `mu review`. Its scouts run on @scout.",
         unset: "the review uses the session's model",
     },
     Doc {
@@ -186,13 +192,16 @@ mod tests {
     fn every_role_mu_uses_is_listed_set_or_not_with_its_fallback() {
         let v = views(&cfg("modelRoles:\n  default: a/b\n  commit: c/d\n"), &[]);
         let names: Vec<&str> = v.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["default", "plan", "task", "review", "smol", "memory", "slow"], "commit is omp's");
+        assert_eq!(names, ["default", "plan", "task", "scout", "review", "smol", "memory", "slow"], "commit is omp's");
         assert_eq!(find(&v, "default").row(), "a/b · main session");
         assert_eq!(find(&v, "review").row(), "(unset → @default) · /review lead");
         assert_eq!(find(&v, "slow").row(), "(unset) · plan execution");
         let d = find(&v, "review").detail();
         assert!(d.contains("Not set: uses @default (a/b)") && d.contains("Enter assigns"), "{d}");
         assert!(find(&v, "slow").detail().contains("not offered when you approve a plan"));
+        let v = views(&cfg("modelRoles:\n  default: a/b\n  smol: s/m\n"), &[]);
+        assert_eq!(find(&v, "scout").row(), "(unset → @smol) · read-only scouts");
+        assert_eq!(find(&v, "task").row(), "(unset → @default) · subagents");
     }
 
     #[test]

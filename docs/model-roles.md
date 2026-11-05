@@ -8,8 +8,9 @@ A role is a name for a model, set in omp's `config.yml` (`modelRoles:`) and shar
 |---|---|---|
 | `default` | The model a session starts with; the keep-this-model choice when you approve a plan | mu picks a model itself |
 | `plan` | Plan mode | `@default` |
-| `task` | `task` and `scout` subagents, and agents whose `model:` names nothing you have set | `@default` |
-| `review` | The `/review` lead (its scouts run on `@task`) | `@plan`, then `@default` |
+| `task` | `task` subagents (they can edit and run commands), and agents whose `model:` names nothing you have set | `@default` |
+| `scout` | `scout` subagents: read-only research, plan-mode research, the `/review` scouts | `@smol`, then `@default` |
+| `review` | The `/review` lead (its scouts run on `@scout`) | `@plan`, then `@default` |
 | `smol` | Session titles, plugins that ask for a model, a cheap choice when you approve a plan | `@default` |
 | `memory` | The memory plugin | `@smol`, then `@default` |
 | `slow` | A stronger model offered when you approve a plan | not offered |
