@@ -278,7 +278,15 @@ impl App {
             OverlayEvent::Mcp(pick, row) => self.on_mcp_pick(pick, row),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
             OverlayEvent::Quote(q) => self.prompt.composer.append_quotes(&q),
-            OverlayEvent::Resume(p) => self.send(Command::Resume(p)),
+            OverlayEvent::Resume(p) => {
+                use mu_session::session::owner::{Owner, owner};
+                // A live `-p` run is stopped first, as `mu --resume` does outside the TUI.
+                if matches!(owner(&p), Owner::Live { print_run: true, .. }) {
+                    self.take_session(p);
+                } else {
+                    self.send(Command::Resume(p));
+                }
+            }
             OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
             OverlayEvent::EditPlan(file) => self.run_editor(&file.clone(), ChildThen::PlanEdit(file)),
             OverlayEvent::PlanCancelled { stored: true } => self.notice("plan left parked"),

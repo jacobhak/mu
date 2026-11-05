@@ -45,7 +45,7 @@ fn lock(file: &File, path: &Path) -> Result<()> {
                 msg.push_str(&format!(" (pid {})", o.pid));
                 if o.print_run {
                     msg.push_str(&format!(
-                        ": a running `mu -p`; `mu take {}` stops it after its current step and opens it here",
+                        ": a running `mu -p`; `mu --resume {}` stops it after its current step and opens it here",
                         id_of(path)
                     ));
                 }

@@ -131,6 +131,12 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     if mode == Mode::Tui && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("mu: interactive mode needs a terminal; use -p");
     }
+    if let (Mode::Tui, Some(p)) = (mode, &resume) {
+        // As `mu take`: a `-p` run that has the session is stopped after its current step, then it is ours.
+        if let Some(code) = crate::workflow::take::release(p, "mu")? {
+            return Ok(code);
+        }
+    }
 
     let cfgs_ui = cfgs.clone();
     let (providers_ui, ctx_ui, cwd_ui) = (providers.clone(), ctx.clone(), cwd.clone());

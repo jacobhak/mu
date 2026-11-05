@@ -449,7 +449,7 @@ mod tests {
         let _rec = OwnerRecord::claim_as(&path, true, false).unwrap();
         assert!(matches!(owner(&path), Owner::Live { print_run: true, inbox: false, .. }));
         let e = SessionFile::open_append(&path).err().unwrap().to_string();
-        assert!(e.contains("mu take"), "{e}");
+        assert!(e.contains("mu --resume"), "{e}");
     }
 
     fn listed(path: &Path) -> Option<LiveSession> {

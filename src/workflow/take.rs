@@ -1,5 +1,6 @@
-//! `mu take <session|id>`: stop a running `mu -p` at its next tool boundary, then resume the
-//! session here, in the TUI. Only POSIX calls (`flock`, `kill`, `exec`), so it is portable.
+//! `mu take <session|id>`, and `mu --resume` / `mu -c`: stop a running `mu -p` at its next tool
+//! boundary, then resume the session here, in the TUI. Only POSIX calls (`flock`, `kill`, `exec`),
+//! so it is portable.
 use mu_common::paths;
 use mu_session::session::control::{Recheck, Want, recheck, signal};
 use mu_session::session::list::{find, header_cwd};
@@ -23,25 +24,29 @@ pub fn run(arg: &Path, cwd: &Path) -> anyhow::Result<i32> {
         eprintln!("mu take: needs a terminal on stdin and stdout; nothing was signalled");
         return Ok(1);
     }
-    match owner(&path) {
-        Owner::Free => eprintln!("not running; resuming"),
+    if let Some(code) = release(&path, "mu take")? {
+        return Ok(code);
+    }
+    resume(&path)
+}
+
+/// Makes `path` free to open: a running `-p` is stopped after its current step and waited for.
+/// `Ok(Some(code))`: stop with that exit code (the reason is printed, prefixed with `who`).
+pub fn release(path: &Path, who: &str) -> anyhow::Result<Option<i32>> {
+    match owner(path) {
+        Owner::Free => Ok(None),
         Owner::Live { pid, print_run: false, .. } => {
-            eprintln!("mu take: pid {pid} has it open in an interactive mu (or a subagent/ACP); close it there");
-            return Ok(1);
+            eprintln!("{who}: pid {pid} has it open in an interactive mu (or a subagent/ACP); close it there");
+            Ok(Some(1))
         }
         Owner::Unknown => {
             eprintln!(
-                "mu take: the session is locked by a process that left no owner record (an older mu, or another MU_HOME); stop it yourself"
+                "{who}: the session is locked by a process that left no owner record (an older mu, or another MU_HOME); stop it yourself"
             );
-            return Ok(1);
+            Ok(Some(1))
         }
-        Owner::Live { pid, print_run: true, started, .. } => {
-            if let Some(code) = stop_and_wait(&path, pid, &started)? {
-                return Ok(code);
-            }
-        }
+        Owner::Live { pid, print_run: true, started, .. } => stop_and_wait(path, pid, &started),
     }
-    resume(&path)
 }
 
 /// `Ok(None)`: the session is free, go on. `Ok(Some(code))`: stop with that exit code.
@@ -57,7 +62,7 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
         Recheck::Same => {}
         Recheck::Free => return Ok(None),
         Recheck::Changed => {
-            eprintln!("mu take: the session changed hands while starting; nothing was signalled, try again");
+            eprintln!("mu: the session changed hands while starting; nothing was signalled, try again");
             return Ok(Some(1));
         }
     }
@@ -65,7 +70,7 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
         Ok(()) => eprintln!("asked pid {pid} to stop after its current step; Ctrl-C to stop now"),
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
         Err(e) => {
-            eprintln!("mu take: cannot signal pid {pid}: {e}");
+            eprintln!("mu: cannot signal pid {pid}: {e}");
             return Ok(Some(1));
         }
     }

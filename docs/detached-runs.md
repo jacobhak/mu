@@ -6,9 +6,9 @@
 
 Stop details: a stop that arrives before the next tool starts skips every call of that batch, so the run ends at once; one that arrives during a tool lets that tool finish. Any second `SIGUSR1` cancels the current step, including one sent by `mu take` after a manual `kill -USR1` (or by two takes). A fatal error (such as a failed provider request) exits 1 even after a stop; non-fatal errors (a truncated reply, a failed auto-compaction) do not change exit 3.
 
-## Taking over: `mu take`
+## Taking over: `--resume` and `mu take`
 
-`mu take <session|id>` does the above for you: it signals the run, waits until the session is free, changes to the session's directory and execs `mu --resume <path>`. It refuses unless stdin and stdout are terminals, and refuses a session open in an interactive mu or held by a process that left no owner record. Ctrl-C while waiting sends the second signal; a second Ctrl-C gives up waiting.
+`mu --resume <session|id>` (and `-c`, and the `/resume` picker) takes over a session a `-p` run still has: it signals the run, waits until the session is free, then opens it. `mu take <session|id>` is the same thing for a terminal that is not yet running mu: it also changes to the session's directory and execs `mu --resume <path>`, and refuses unless stdin and stdout are terminals. Either way, a session open in an interactive mu (or a subagent or ACP run) or held by a process that left no owner record is refused. Ctrl-C while waiting sends the second signal; a second Ctrl-C gives up waiting.
 
 Every open session is recorded in `$MU_HOME/run/<id>.json` (`pid`, `print_run`, `inbox`, `started`, `session`, and since the jobs panel `kind`: `tui`, `print`, `subagent` or `acp`; `agent`, the custom agent it runs as; `cwd`; `parent`, the session that spawned it; `abort`, set by an interactive mu that cancels its current turn on `SIGUSR1`), held under `flock` by its owner, so a busy-lock error can name the pid; the files are safe to delete while no mu runs. Records without the newer fields still read (the kind is guessed from `print_run` and `inbox`, the parent from the session header). The [jobs panel](background-jobs.md#sessions-tab) lists the live records. The session file format is unchanged. A taken-over session loses `--max-cost` and a custom `--agent` prompt; `ask` and jobs come back.
 
