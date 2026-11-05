@@ -2,6 +2,8 @@
 
 `task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session, so a turn that has nothing else to do just ends. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
 
+`/review` runs its `review-lead` as a job too (the card says `job review`): it is listed here, Enter opens its transcript and `x` cancels it, but its result goes to the findings dialog, never to the model as a notice.
+
 A turn that began this way rings the terminal; see [Detached runs](detached-runs.md#terminal-bell).
 
 ## Jobs panel

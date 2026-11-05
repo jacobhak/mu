@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell, RefMut};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::subagent::{BackgroundResult, run_child_observed};
+use crate::tools::subagent::{BackgroundResult, Outcome, run_child_observed};
 use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
@@ -288,36 +288,86 @@ impl JobsHandle {
         };
         let me = self.clone();
         self.spawn_job(spec, String::new(), cancel, move |seq| async move {
-            let out = run_child_observed(
-                &exe,
-                &cwd,
-                &payload,
-                &child_cancel,
-                |name, summary| {
-                    if let Some(mut j) = me.job_mut(seq) {
-                        j.tools += 1;
-                        j.last = format!("{name} {summary}");
-                    }
-                    me.emit();
-                },
-                |path| {
-                    if let Some(mut j) = me.job_mut(seq) {
-                        j.session = Some(PathBuf::from(path));
-                    }
-                    me.emit();
-                },
-                |model| {
-                    if let Some(mut j) = me.job_mut(seq) {
-                        j.model = Some(model.to_string());
-                    }
-                    me.emit();
-                },
-            )
-            .await;
+            let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}).await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
             Finished { ok: out.ok, text: out.text, note: None }
         });
+    }
+
+    /// Runs a subagent as a job the caller waits for: listed in the jobs panel, cancellable there,
+    /// and finished as delivered, so its result never reaches the model as a notice. Cancelling
+    /// `cancel` cancels the job too. `on_tool` sees each tool call, as for `run_child`. `id` is
+    /// made unique if it is taken.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_owned(
+        self: &Rc<Self>,
+        id: &str,
+        agent: &str,
+        exe: &Path,
+        cwd: &Path,
+        payload: &Value,
+        cancel: &CancellationToken,
+        on_tool: impl FnMut(&str, &str),
+    ) -> Outcome {
+        let id = self.unique_id(id);
+        let own = cancel.child_token();
+        let spec = Spec {
+            id,
+            agent: agent.into(),
+            kind: JobKind::Subagent,
+            cwd: cwd.to_path_buf(),
+            task: command_line(payload["task"].as_str().unwrap_or("")),
+            command: None,
+        };
+        let seq = self.start(spec, String::new(), own.clone());
+        let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool).await;
+        if let Some(mut j) = self.job_mut(seq) {
+            j.state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
+            j.ended = Some(SystemTime::now());
+            j.delivered = true;
+        }
+        self.emit();
+        out
+    }
+
+    /// Runs the child of job `seq`, keeping its tool count, last activity, session and model current.
+    async fn run_subagent(
+        &self,
+        seq: u64,
+        exe: &Path,
+        cwd: &Path,
+        payload: &Value,
+        cancel: &CancellationToken,
+        mut on_tool: impl FnMut(&str, &str),
+    ) -> Outcome {
+        run_child_observed(
+            exe,
+            cwd,
+            payload,
+            cancel,
+            |name, summary| {
+                if let Some(mut j) = self.job_mut(seq) {
+                    j.tools += 1;
+                    j.last = format!("{name} {summary}");
+                }
+                on_tool(name, summary);
+                self.emit();
+            },
+            |path| {
+                if let Some(mut j) = self.job_mut(seq) {
+                    j.session = Some(PathBuf::from(path));
+                }
+                self.emit();
+            },
+            |model| {
+                if let Some(mut j) = self.job_mut(seq) {
+                    j.model = Some(model.to_string());
+                }
+                self.emit();
+            },
+        )
+        .await
     }
 
     /// Starts a bash job and returns its id. `run` gets the job's cancel token, which `kill` and
@@ -584,6 +634,85 @@ pub(crate) mod tests {
         assert_eq!(snap[0].session.as_deref(), Some(std::path::Path::new("/s/child.jsonl")));
         assert_eq!(snap[0].task, "find x now", "the task is one line");
         assert_eq!((snap[0].cwd.as_path(), snap[0].state.clone()), (base.as_path(), SubagentState::Done));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn fake_child(script_body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-jobs-owned-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, format!("#!/bin/sh\n{script_body}")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (base, exe)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owned_job_is_listed_and_finishes_delivered_without_waking() {
+        let (base, exe) = fake_child(
+            "cat <<'EOF'\n{\"type\":\"session\",\"path\":\"/s/r.jsonl\"}\n{\"type\":\"tool\",\"name\":\"read\",\"summary\":\"a.rs\"}\n{\"type\":\"result\",\"text\":\"report\"}\nEOF\n",
+        );
+        let (wake, mut woken) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let h = JobsHandle::new(wake, events);
+        let mut seen = Vec::new();
+        let out = tokio::task::LocalSet::new()
+            .run_until(h.run_owned(
+                "review",
+                "review-lead",
+                &exe,
+                &base,
+                &serde_json::json!({"task": "review it"}),
+                &CancellationToken::new(),
+                |n, s| seen.push(format!("{n} {s}")),
+            ))
+            .await;
+        assert_eq!((out.ok, out.text.as_str()), (true, "report"));
+        assert_eq!(seen, ["read a.rs"]);
+        let snap = h.snapshot();
+        assert_eq!((snap[0].name.as_str(), snap[0].agent.as_str()), ("review", "review-lead"));
+        assert_eq!((snap[0].state.clone(), snap[0].tools, snap[0].delivered), (SubagentState::Done, 1, true));
+        assert_eq!(snap[0].session.as_deref(), Some(std::path::Path::new("/s/r.jsonl")));
+        assert!(!h.has_undelivered() && woken.try_recv().is_err(), "the model is not told");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owned_job_is_cancelled_from_the_panel_or_by_its_owner() {
+        let (base, exe) = fake_child("sleep 30\n");
+        let h = handle();
+        let payload = serde_json::json!({"task": "t"});
+        let owner = CancellationToken::new();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let killer = async {
+                    while h.running() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(h.kill(Some("review")), 1);
+                };
+                let (out, ()) = tokio::join!(
+                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}),
+                    killer
+                );
+                assert!(!out.ok && out.text == "cancelled", "{}", out.text);
+                assert!(!owner.is_cancelled(), "killing the job does not cancel its owner");
+                assert_eq!(h.snapshot()[0].state, SubagentState::Failed);
+
+                let canceller = async {
+                    while h.running() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    owner.cancel();
+                };
+                let (out, ()) = tokio::join!(
+                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}),
+                    canceller
+                );
+                assert!(!out.ok);
+                assert_eq!(h.snapshot()[1].name, "review-2");
+            })
+            .await;
         let _ = std::fs::remove_dir_all(&base);
     }
 

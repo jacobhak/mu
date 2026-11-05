@@ -179,11 +179,15 @@ impl Agent {
             "outputSchema": review::report::report_schema(),
             "parentSession": self.session.as_ref().map(|s| s.path.clone()),
         });
+        // A job when the UI keeps them: listed in the jobs panel, which opens its transcript and
+        // cancels it with `x`.
+        let job = self.tools.jobs.as_ref().map(|j| j.unique_id("review"));
+        let hint = job.as_deref().map(|id| format!(" · job {id} (Alt+J)")).unwrap_or_default();
         self.emit(AgentEvent::ToolStart {
             id: "review".into(),
             name: "review".into(),
             args: json!({"scope": format!(
-                "{} files +{}/−{} vs {} · {}",
+                "{} files +{}/−{} vs {} · {}{hint}",
                 scope.files,
                 scope.added,
                 scope.removed,
@@ -191,12 +195,17 @@ impl Agent {
                 scope.model
             )}),
         });
-        let out = {
+        let progress = {
             let (events, id) = (self.ports.events.clone(), "review".to_string());
-            mu_tools::tools::subagent::run_child(&exe, &scope.root, &payload, cancel, move |name, summary| {
+            move |name: &str, summary: &str| {
                 let _ = events.send(AgentEvent::ToolOutput { id: id.clone(), chunk: format!("{name} {summary}\n") });
-            })
-            .await
+            }
+        };
+        let out = match (&self.tools.jobs, &job) {
+            (Some(jobs), Some(id)) => {
+                jobs.run_owned(id, context::REVIEW_LEAD, &exe, &scope.root, &payload, cancel, progress).await
+            }
+            _ => mu_tools::tools::subagent::run_child(&exe, &scope.root, &payload, cancel, progress).await,
         };
         if cancel.is_cancelled() {
             self.emit(AgentEvent::ToolEnd {
