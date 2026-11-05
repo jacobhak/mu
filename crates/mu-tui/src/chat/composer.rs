@@ -92,6 +92,12 @@ fn load_history(path: &std::path::Path) -> Vec<Vec<u8>> {
     }
     lines
 }
+
+/// ASCII punctuation plus the general-punctuation dashes, quotes and ellipsis.
+fn is_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation() || ('\u{2010}'..='\u{2027}').contains(&c)
+}
+
 const PASTE_MAX_LINES: usize = 10;
 const PASTE_MAX_CHARS: usize = 1000;
 const PROMPT: &str = "μ ❯ ";
@@ -169,6 +175,8 @@ pub struct Composer {
     ctrl_c_armed: bool,
     cwd: String,
     ghost: Option<String>,
+    /// Tab completion just appended a space after the cursor; punctuation or Enter typed next removes it.
+    magic_space: bool,
     menu: Option<Menu>,
     /// Text for which the user dismissed the menu with Esc.
     menu_closed_for: Option<String>,
@@ -216,6 +224,7 @@ impl Composer {
             ctrl_c_armed: false,
             cwd: String::new(),
             ghost: None,
+            magic_space: false,
             menu: None,
             menu_closed_for: None,
             private: false,
@@ -279,7 +288,11 @@ impl Composer {
         }
         let plain_mods = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
         let ctrl_only = key.modifiers == KeyModifiers::CONTROL;
-        let ghost = self.ghost.take();
+        let mut ghost = self.ghost.take();
+        if std::mem::take(&mut self.magic_space) && self.takes_magic_space_back(&key) {
+            self.buf.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), true);
+            ghost = None;
+        }
         let action = 'act: {
             if self.menu.is_some() {
                 if let Some(a) = self.menu_key(&key, plain_mods, ctrl_only) {
@@ -288,7 +301,14 @@ impl Composer {
             } else if key.code == KeyCode::Tab {
                 self.ctrl_c_armed = false;
                 break 'act match ghost {
-                    Some(g) => self.accept_ghost(&g),
+                    Some(g) => {
+                        let a = self.accept_ghost(&g);
+                        if !g.ends_with(char::is_whitespace) {
+                            self.buf.insert_str(" ");
+                            self.magic_space = true;
+                        }
+                        a
+                    }
                     None => Action::None,
                 };
             } else if let (KeyCode::Right, Some(g)) = (key.code, ghost.as_deref())
@@ -309,6 +329,19 @@ impl Composer {
         };
         self.refresh_menu(commands);
         action
+    }
+
+    /// Whether `key` should first remove the space a Tab completion appended: punctuation or a
+    /// submit/newline, with the cursor still right after that space.
+    fn takes_magic_space_back(&self, key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let takes = match key.code {
+            KeyCode::Char(c) => (!ctrl && !alt && is_punctuation(c)) || (ctrl && c == 'q'),
+            KeyCode::Enter => self.menu.is_none(),
+            _ => false,
+        };
+        takes && self.at_end() && self.buf.lines[self.buf.row].ends_with(' ')
     }
 
     fn at_end(&self) -> bool {
@@ -355,9 +388,9 @@ impl Composer {
             KeyCode::Char('p') if ctrl_only => m.sel = (m.sel + n - 1) % n,
             KeyCode::Char('n') if ctrl_only => m.sel = (m.sel + 1) % n,
             KeyCode::Tab => {
-                let text = self.menu_text(false);
+                let text = self.menu_text(true);
                 self.set_text(&text);
-                self.menu_closed_for = Some(text);
+                self.magic_space = true;
             }
             KeyCode::Enter if plain_mods => {
                 let (exact, arg, needs) = (m.exact, m.arg.is_some(), m.needs_arg[m.sel]);
@@ -538,6 +571,7 @@ impl Composer {
 
     fn paste_inner(&mut self, s: &str) -> Result<(), String> {
         self.ghost = None;
+        self.magic_space = false;
         self.ctrl_c_armed = false;
         self.browse = None;
         if self.locked() {
@@ -654,6 +688,7 @@ impl Composer {
     pub fn set_text(&mut self, s: &str) {
         self.browse = None;
         self.ghost = None;
+        self.magic_space = false;
         let pastes = std::mem::take(&mut self.buf.pastes);
         let images = std::mem::take(&mut self.buf.images);
         let masked = self.buf.masked;
@@ -748,6 +783,7 @@ impl Composer {
 
     fn clear(&mut self) {
         self.ghost = None;
+        self.magic_space = false;
         let masked = self.buf.masked;
         self.buf = Buf::default();
         self.buf.masked = masked;
@@ -1070,15 +1106,13 @@ mod tests {
         let mut c = Composer::new(None);
         typ(&mut c, "/thinking h");
         tab(&mut c);
-        assert_eq!(c.text(), "/thinking high");
+        assert_eq!(c.text(), "/thinking high ");
         assert!(c.menu.is_none());
 
         let mut c = Composer::new(None);
         typ(&mut c, "/thin");
         tab(&mut c);
-        assert_eq!(c.text(), "/thinking");
-        assert!(c.menu.is_none());
-        typ(&mut c, " ");
+        assert_eq!(c.text(), "/thinking ");
         assert_eq!(c.menu.as_ref().and_then(|m| m.arg.as_deref()), Some("thinking"));
 
         let mut c = Composer::new(None);
@@ -1126,7 +1160,7 @@ mod tests {
         c.set_text("please com");
         c.set_ghost("please com", "mit".into());
         tab(&mut c);
-        assert_eq!(c.text(), "please commit");
+        assert_eq!(c.text(), "please commit ");
 
         c.set_text("please com");
         c.set_ghost("please com", "mit".into());
@@ -1138,7 +1172,7 @@ mod tests {
         let (lines, _) = c.render(40);
         assert!(crate::text::line::line_text(&lines[1]).ends_with("a b c d"));
         tab(&mut c);
-        assert_eq!(c.text(), "a b c d");
+        assert_eq!(c.text(), "a b c d ");
 
         let mut c = Composer::new(None);
         c.history = vec!["old".into()];
@@ -1152,6 +1186,60 @@ mod tests {
         assert_eq!(c.predict_query().as_deref(), Some("hi"));
         c.set_text("/x");
         assert_eq!(c.predict_query(), None);
+    }
+
+    #[test]
+    fn tab_completion_adds_a_space_that_punctuation_takes_back() {
+        let ghost_tab = |text: &str, g: &str| {
+            let mut c = Composer::new(None);
+            c.set_text(text);
+            c.set_ghost(text, g.into());
+            tab(&mut c);
+            c
+        };
+        let mut c = ghost_tab("please com", "mit");
+        assert_eq!(c.text(), "please commit ");
+        typ(&mut c, ",");
+        assert_eq!(c.text(), "please commit,");
+        typ(&mut c, " ok");
+        assert_eq!(c.text(), "please commit, ok");
+
+        let mut c = ghost_tab("please com", "mit");
+        typ(&mut c, "x");
+        assert_eq!(c.text(), "please commit x", "a letter keeps the space");
+        typ(&mut c, ".");
+        assert_eq!(c.text(), "please commit x.", "only the completion's space is magic");
+
+        let mut c = ghost_tab("please com", "mit");
+        typ(&mut c, " ");
+        typ(&mut c, ".");
+        assert_eq!(c.text(), "please commit  .", "a typed space is not taken back");
+
+        let mut c = ghost_tab("please com", "mit");
+        pr(&mut c, KeyCode::Left);
+        pr(&mut c, KeyCode::Right);
+        typ(&mut c, "!");
+        assert_eq!(c.text(), "please commit !", "moving the cursor ends the magic");
+
+        let mut c = ghost_tab("a b", " c ");
+        assert_eq!(c.text(), "a b c ", "no second space when the ghost ends in one");
+        typ(&mut c, ".");
+        assert_eq!(c.text(), "a b c .");
+
+        let mut c = ghost_tab("please com", "mit");
+        assert_eq!(pr(&mut c, KeyCode::Enter), Action::Submit("please commit".into()));
+
+        let mut c = Composer::new(None);
+        c.set_text("please com");
+        c.set_ghost("please com", "mit".into());
+        pr(&mut c, KeyCode::Right);
+        assert_eq!(c.text(), "please commit", "→ adds no space");
+
+        let mut c = Composer::new(None);
+        typ(&mut c, "/thin");
+        tab(&mut c);
+        typ(&mut c, "?");
+        assert_eq!(c.text(), "/thinking?");
     }
 
     #[test]
