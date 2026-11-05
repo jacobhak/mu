@@ -209,7 +209,6 @@ pub struct AgentDef {
 }
 
 pub const REVIEW_LEAD: &str = "review-lead";
-pub const REVIEW_WORKER: &str = "review-worker";
 
 /// Agents mu ships. They are not in `Context::agents`, so the main agent's `task` tool never offers them.
 pub fn builtin_agent(name: &str) -> Option<AgentDef> {
@@ -220,11 +219,6 @@ pub fn builtin_agent(name: &str) -> Option<AgentDef> {
             "Lead code reviewer",
             tools(&["read", "grep", "glob", "bash", "task"]),
             include_str!("../prompts/review-lead.md"),
-        ),
-        REVIEW_WORKER => (
-            "Reviews an assigned slice of a diff; read-only; returns findings as JSON",
-            tools(&["read", "grep", "glob", "bash"]),
-            include_str!("../prompts/review-worker.md"),
         ),
         _ => return None,
     };
@@ -285,7 +279,7 @@ pub fn discover_agents(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<AgentDe
                 continue;
             }
             let lower = name.to_lowercase();
-            if ["main", "sub", "task", "scout", REVIEW_LEAD, REVIEW_WORKER].contains(&lower.as_str())
+            if ["main", "sub", "task", "scout", REVIEW_LEAD].contains(&lower.as_str())
                 || out.iter().any(|a| a.name == name)
             {
                 continue;

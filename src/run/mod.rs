@@ -72,7 +72,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     }
     let mode = Mode::of(cli, plan.is_some());
     let cwd = std::env::current_dir()?;
-    let Setup { cfgs, mut ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
+    let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
     if mode == Mode::Tui && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
         let tx = notice_tx.clone();
@@ -96,7 +96,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     let mut sel = cli.model.clone();
     let mut task_payload: Option<Value> = None;
     if mode == Mode::Subagent {
-        let (p, def) = read_task(&mut ctx)?;
+        let (p, def) = read_task(&ctx)?;
         if def.is_some() {
             agent_def = def;
         }
@@ -310,7 +310,7 @@ async fn subagent(
 }
 
 /// The subagent task on stdin, and the agent it names (`task` and `scout` are the built-in roles).
-fn read_task(ctx: &mut Rc<context::Context>) -> Result<(Value, Option<context::AgentDef>)> {
+fn read_task(ctx: &context::Context) -> Result<(Value, Option<context::AgentDef>)> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
     let p: Value = serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
@@ -319,11 +319,6 @@ fn read_task(ctx: &mut Rc<context::Context>) -> Result<(Value, Option<context::A
         match ctx.agents.iter().find(|a| a.name == name).cloned().or_else(|| context::builtin_agent(name)) {
             Some(d) => def = Some(d),
             None => bail!("unknown agent `{name}`"),
-        }
-        if name == context::REVIEW_LEAD {
-            // Only the lead's `task` schema lists the worker; its children resolve it by the same fallback.
-            let w = context::builtin_agent(context::REVIEW_WORKER).expect("builtin");
-            Rc::get_mut(ctx).expect("context not shared yet").agents.push(w);
         }
     }
     Ok((p, def))
