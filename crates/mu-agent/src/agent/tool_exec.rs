@@ -219,6 +219,7 @@ impl Agent {
                 details: out.details.clone(),
                 meta: out.meta.clone(),
                 images: Vec::new(),
+                changes: std::mem::take(&mut out.changes),
             },
         });
         out

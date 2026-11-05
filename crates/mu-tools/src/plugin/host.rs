@@ -326,6 +326,7 @@ impl PluginHost {
                     details: Some(c.details),
                     meta: None,
                     images: c.images,
+                    changes: Vec::new(),
                 }
             }
             (Ok(v), None) => ToolOutput {
@@ -335,6 +336,7 @@ impl PluginHost {
                 details: None,
                 meta: None,
                 images: Vec::new(),
+                changes: Vec::new(),
             },
             (Err(e), call) => {
                 let msg = match slot.as_mcp() {

@@ -1,9 +1,15 @@
 //! `--acp`: Agent Client Protocol server over stdio (newline-delimited JSON-RPC).
 //! One mu `Agent` per ACP session, so each session keeps its own working directory.
 
+mod client;
+mod commands;
+mod updates;
+
 use crate::cli::select::pick_model;
 use crate::run::setup::{Setup, setup};
 use anyhow::{Result, anyhow};
+use client::Rpc;
+use commands::Parsed;
 use mu_agent::agent;
 use mu_agent::handle::{AgentHandle, AgentSetup, Mode, build_agent};
 use mu_base::events::{AgentEvent, Command};
@@ -11,15 +17,16 @@ use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
 use mu_provider::model::pricing;
 use mu_session::session::list;
+use mu_tools::context::Context;
 use mu_tools::plugin::host::PluginHost;
-use mu_tools::tools::summary;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use updates::{Jobs, Stream, translate};
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -92,25 +99,53 @@ fn model_target(
     }
 }
 
+/// A `session/set_config_option` or `session/set_mode` waiting for the agent to confirm.
 struct Pending {
     id: Value,
+    /// `model`, `thinking`, `mode` (answers with the options) or `set_mode` (answers with `{}`).
     config: String,
     value: String,
+}
+
+/// The modes a session offers: plan mode is the only one that is not the default behaviour.
+const MODES: [(&str, &str, &str); 2] = [
+    ("default", "Default", "Read, edit and run commands"),
+    ("plan", "Plan", "Explore read-only, then propose a plan for your approval"),
+];
+
+fn mode_id(plan: bool) -> &'static str {
+    if plan { "plan" } else { "default" }
+}
+
+/// What the client was last told about the session.
+#[derive(Clone, PartialEq)]
+struct Advertised {
+    model: String,
+    thinking: String,
+    plan: bool,
 }
 
 struct Session {
     cmd: UnboundedSender<Command>,
     cwd: PathBuf,
+    ctx: Rc<Context>,
     host: Rc<PluginHost>,
     task: tokio::task::JoinHandle<()>,
     /// Request id of the `session/prompt` in flight.
     prompt: Option<Value>,
+    /// The turn ended on a fatal error, and the message of the last error.
+    failed: bool,
+    last_error: Option<String>,
     pending_cfg: Option<Pending>,
     models: Vec<String>,
-    /// `(model, thinking)` as last sent to the client.
-    advertised: (String, String),
+    advertised: Advertised,
     used: Option<u64>,
     title: Option<String>,
+    /// Output of running tools and jobs, and the jobs the client has been told about.
+    stream: Stream,
+    jobs: Jobs,
+    /// The `propose_plan` call in flight, which the plan approval request refers to.
+    plan_call: Option<String>,
     /// Distinguishes reopened sessions that share an id, so a closed agent's late events are dropped.
     epoch: u64,
     providers: Rc<mu_provider::provider::client::Providers>,
@@ -121,10 +156,23 @@ impl Session {
         let models: Vec<Value> =
             self.models.iter().map(|m| json!({"value": m, "name": pricing::display_name(m)})).collect();
         let levels: Vec<Value> = Thinking::NAMES.iter().map(|n| json!({"value": n, "name": n})).collect();
+        let modes: Vec<Value> =
+            MODES.iter().map(|(id, name, d)| json!({"value": id, "name": name, "description": d})).collect();
         json!([
-            {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": self.advertised.0, "options": models},
-            {"id": "thinking", "name": "Thinking", "category": "thought_level", "type": "select", "currentValue": self.advertised.1, "options": levels},
+            {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": mode_id(self.advertised.plan), "options": modes},
+            {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": self.advertised.model, "options": models},
+            {"id": "thinking", "name": "Thinking", "category": "thought_level", "type": "select", "currentValue": self.advertised.thinking, "options": levels},
         ])
+    }
+
+    fn modes(&self) -> Value {
+        let available: Vec<Value> =
+            MODES.iter().map(|(id, name, d)| json!({"id": id, "name": name, "description": d})).collect();
+        json!({"currentModeId": mode_id(self.advertised.plan), "availableModes": available})
+    }
+
+    fn command_list(&self) -> Value {
+        json!({"sessionUpdate": "available_commands_update", "availableCommands": commands::available(&self.ctx)})
     }
 }
 
@@ -133,11 +181,15 @@ struct Server {
     thinking: Option<Thinking>,
     /// The client advertised `session.notices`.
     notices: bool,
+    /// The client can show an `elicitation/create` form, so the model may use `ask`.
+    elicit: bool,
     sessions: HashMap<String, Session>,
     ev_tx: UnboundedSender<(String, u64, AgentEvent)>,
     next_epoch: u64,
     /// Results of work that runs off the request loop (opening sessions, listing, model lists).
     done_tx: UnboundedSender<Done>,
+    /// Requests the agent makes of the client.
+    rpc: Rpc,
 }
 
 /// What a background task hands back to the request loop.
@@ -171,8 +223,19 @@ async fn serve(model: Option<String>, thinking: Option<Thinking>) {
     let mut input = spawn_stdin();
     let (ev_tx, mut ev_rx) = unbounded_channel();
     let (done_tx, mut done_rx) = unbounded_channel();
-    let mut srv = Server { model, thinking, notices: false, sessions: HashMap::new(), ev_tx, next_epoch: 0, done_tx };
+    let mut srv = Server {
+        model,
+        thinking,
+        notices: false,
+        elicit: false,
+        sessions: HashMap::new(),
+        ev_tx,
+        next_epoch: 0,
+        done_tx,
+        rpc: Rpc::new(Rc::new(send)),
+    };
     loop {
+        let due = srv.next_flush();
         tokio::select! {
             m = input.recv() => match m {
                 Some(v) => srv.handle(v).await,
@@ -180,16 +243,31 @@ async fn serve(model: Option<String>, thinking: Option<Thinking>) {
             },
             Some((sid, epoch, e)) = ev_rx.recv() => srv.on_event(&sid, epoch, e),
             Some(d) = done_rx.recv() => srv.on_done(d),
+            () = async {
+                match due {
+                    Some(t) => tokio::time::sleep_until(t.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => srv.flush_due(),
         }
     }
     srv.shutdown().await;
 }
 
-fn notice(enabled: bool, sid: &str, severity: &str, msg: String) {
+/// A notice to the user. A client that takes `notice` updates gets one; any other gets the text
+/// as an italic line of the reply while a prompt runs (a notice must not be lost, and outside a
+/// prompt there is no reply to put it in), and stderr always.
+fn notice(enabled: bool, in_turn: bool, sid: &str, severity: &str, msg: String) {
     if enabled {
         update(sid, json!({"sessionUpdate": "notice", "severity": severity, "title": msg}));
-    } else {
-        eprintln!("{msg}");
+        return;
+    }
+    eprintln!("{msg}");
+    if in_turn {
+        update(
+            sid,
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": format!("\n\n*{msg}*\n\n")}}),
+        );
     }
 }
 
@@ -197,13 +275,18 @@ impl Server {
     async fn handle(&mut self, msg: Value) {
         let id = msg.get("id").filter(|v| !v.is_null()).cloned();
         let Some(method) = msg["method"].as_str() else {
-            // A response to something we asked has an id and no method; we ask nothing, so it is
-            // ignored. Anything else with an id is a malformed request and gets an answer.
-            if let Some(id) = id
-                && msg.get("result").is_none()
-                && msg.get("error").is_none()
-            {
-                fail(&id, INVALID_REQUEST, "request has no method");
+            // A response to a request of ours (plan approval, a question) has an id and no method.
+            // Anything else with an id is a malformed request and gets an answer.
+            if let Some(id) = id {
+                if msg.get("result").is_some() || msg.get("error").is_some() {
+                    let reply = match msg.get("result") {
+                        Some(r) => Ok(r.clone()),
+                        None => Err(msg["error"].clone()),
+                    };
+                    self.rpc.resolve(&id, reply);
+                } else {
+                    fail(&id, INVALID_REQUEST, "request has no method");
+                }
             }
             return;
         };
@@ -212,6 +295,7 @@ impl Server {
         match (method, id) {
             ("initialize", Some(id)) => {
                 self.notices = p["clientCapabilities"]["session"]["notices"].is_object();
+                self.elicit = p["clientCapabilities"]["elicitation"]["form"].is_object();
                 respond(
                     &id,
                     json!({
@@ -219,7 +303,7 @@ impl Server {
                         "agentCapabilities": {
                             "loadSession": true,
                             "promptCapabilities": {"image": true, "embeddedContext": true},
-                            "sessionCapabilities": {"list": {}, "resume": {}, "close": {}},
+                            "sessionCapabilities": {"list": {}, "resume": {}, "close": {}, "delete": {}},
                         },
                         "agentInfo": {"name": "mu", "title": "mu", "version": env!("CARGO_PKG_VERSION")},
                         "authMethods": [],
@@ -268,66 +352,44 @@ impl Server {
                 }
                 self.spawn_open(id, cwd, Some(path), method == "session/load", false);
             }
-            ("session/prompt", Some(id)) => {
-                let Some(s) = self.sessions.get_mut(sid) else { return fail(&id, INVALID_PARAMS, "unknown session") };
-                if s.prompt.is_some() {
-                    return fail(&id, INVALID_REQUEST, "a prompt is already running");
-                }
-                s.prompt = Some(id);
-                let _ = s.cmd.send(Command::Prompt(user_input(&p["prompt"])));
-            }
+            ("session/prompt", Some(id)) => self.prompt(id, sid, &p["prompt"]),
             ("session/cancel", _) => {
                 if let Some(s) = self.sessions.get(sid) {
                     let _ = s.cmd.send(Command::Cancel);
                 }
             }
-            ("session/set_config_option", Some(id)) => {
-                let Some(s) = self.sessions.get_mut(sid) else { return fail(&id, INVALID_PARAMS, "unknown session") };
-                if s.prompt.is_some() || s.pending_cfg.is_some() {
-                    return fail(&id, INVALID_REQUEST, "session is busy");
-                }
-                let (config, value) = (p["configId"].as_str().unwrap_or(""), p["value"].as_str().unwrap_or(""));
-                let cmd = match config {
-                    "model" => {
-                        let providers = s.providers.clone();
-                        match model_target(value, &s.models, |v| {
-                            providers.resolve(v).map(|(m, _)| m.id).map_err(|e| e.to_string())
-                        }) {
-                            Ok(target) => {
-                                s.pending_cfg = Some(Pending { id, config: config.into(), value: target });
-                                let _ = s.cmd.send(Command::SetModel(value.into()));
-                                return;
-                            }
-                            Err(e) => return fail(&id, INVALID_PARAMS, e),
-                        }
-                    }
-                    "thinking" => match Thinking::parse(value) {
-                        Some(t) => Command::SetThinking(t),
-                        None => return fail(&id, INVALID_PARAMS, format!("unknown thinking level {value}")),
-                    },
-                    _ => return fail(&id, INVALID_PARAMS, format!("unknown config option {config}")),
-                };
-                s.pending_cfg = Some(Pending { id, config: config.into(), value: value.into() });
-                let _ = s.cmd.send(cmd);
-            }
-            ("session/close", Some(id)) => match self.sessions.remove(sid) {
-                Some(mut s) => {
+            // The prompt answers with `cancelled`, which a cancelled request may do.
+            ("$/cancel_request", _) => {
+                if let Some(s) = self.sessions.values().find(|s| s.prompt.as_ref() == p.get("requestId")) {
                     let _ = s.cmd.send(Command::Cancel);
-                    let _ = s.cmd.send(Command::Exit);
-                    if let Some(pid) = s.prompt.take() {
-                        respond(&pid, json!({"stopReason": "cancelled"}));
-                    }
-                    if let Some(p) = s.pending_cfg.take() {
-                        fail(&p.id, INTERNAL, "session closed");
-                    }
-                    tokio::task::spawn_local(async move {
-                        let _ = s.task.await;
-                        s.host.shutdown_all().await;
-                    });
-                    respond(&id, json!({}));
                 }
-                None => fail(&id, INVALID_PARAMS, "unknown session"),
-            },
+            }
+            ("session/set_config_option", Some(id)) => {
+                let (config, value) = (p["configId"].as_str().unwrap_or(""), p["value"].as_str().unwrap_or(""));
+                self.set_config(id, sid, config, value, config);
+            }
+            ("session/set_mode", Some(id)) => {
+                self.set_config(id, sid, "mode", p["modeId"].as_str().unwrap_or(""), "set_mode");
+            }
+            ("session/close", Some(id)) => {
+                if self.close(sid) {
+                    respond(&id, json!({}));
+                } else {
+                    fail(&id, INVALID_PARAMS, "unknown session");
+                }
+            }
+            // Gone from `session/list`: the file is removed. A session that is not there is deleted already.
+            ("session/delete", Some(id)) => {
+                self.close(sid);
+                let cwd = std::env::current_dir().unwrap_or_default();
+                match list::find_id(&cwd, sid) {
+                    Ok(path) => match std::fs::remove_file(&path) {
+                        Ok(()) => respond(&id, json!({})),
+                        Err(e) => fail(&id, INTERNAL, format!("cannot delete the session: {e}")),
+                    },
+                    Err(_) => respond(&id, json!({})),
+                }
+            }
             (m, Some(id)) => fail(&id, METHOD_NOT_FOUND, format!("method not found: {m}")),
             _ => {}
         }
@@ -343,13 +405,121 @@ impl Server {
         }
     }
 
+    /// `session/prompt`: a command at the start of the text runs as one, anything else goes to the model.
+    fn prompt(&mut self, id: Value, sid: &str, blocks: &Value) {
+        let Some(s) = self.sessions.get_mut(sid) else { return fail(&id, INVALID_PARAMS, "unknown session") };
+        if s.prompt.is_some() {
+            return fail(&id, INVALID_REQUEST, "a prompt is already running");
+        }
+        let input = user_input(blocks);
+        let end_turn = |id: &Value| respond(id, json!({"stopReason": "end_turn"}));
+        match commands::parse(&s.ctx, &input.text) {
+            Parsed::Plain => {
+                s.prompt = Some(id);
+                let _ = s.cmd.send(Command::Prompt(input));
+            }
+            Parsed::Prompt(text) => {
+                s.prompt = Some(id);
+                let _ = s.cmd.send(Command::Prompt(UserInput { text, images: input.images }));
+            }
+            Parsed::Compact(focus) => {
+                s.prompt = Some(id);
+                let _ = s.cmd.send(Command::Compact(focus));
+            }
+            Parsed::Review(focus) => {
+                s.prompt = Some(id);
+                let _ = s.cmd.send(Command::Review(focus));
+            }
+            Parsed::Plan(Some(text)) => {
+                s.prompt = Some(id);
+                let _ = s.cmd.send(Command::TogglePlan(Some(text)));
+            }
+            Parsed::Plan(None) => {
+                let _ = s.cmd.send(Command::TogglePlan(None));
+                end_turn(&id);
+            }
+            Parsed::Rename(title) => {
+                let _ = s.cmd.send(Command::Rename(title));
+                end_turn(&id);
+            }
+            Parsed::Reply(text) => {
+                update(
+                    sid,
+                    json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": format!("{text}\n")}}),
+                );
+                end_turn(&id);
+            }
+        }
+    }
+
+    /// `session/set_config_option` (and `session/set_mode`, as `mode`): applies the option, and answers
+    /// once the agent reports it. `reply` is the pending request kind.
+    fn set_config(&mut self, id: Value, sid: &str, config: &str, value: &str, reply: &str) {
+        let Some(s) = self.sessions.get_mut(sid) else { return fail(&id, INVALID_PARAMS, "unknown session") };
+        if s.prompt.is_some() || s.pending_cfg.is_some() {
+            return fail(&id, INVALID_REQUEST, "session is busy");
+        }
+        let cmd = match config {
+            "model" => {
+                let providers = s.providers.clone();
+                match model_target(value, &s.models, |v| {
+                    providers.resolve(v).map(|(m, _)| m.id).map_err(|e| e.to_string())
+                }) {
+                    Ok(target) => {
+                        s.pending_cfg = Some(Pending { id, config: reply.into(), value: target });
+                        let _ = s.cmd.send(Command::SetModel(value.into()));
+                        return;
+                    }
+                    Err(e) => return fail(&id, INVALID_PARAMS, e),
+                }
+            }
+            "thinking" => match Thinking::parse(value) {
+                Some(t) => Command::SetThinking(t),
+                None => return fail(&id, INVALID_PARAMS, format!("unknown thinking level {value}")),
+            },
+            "mode" => {
+                let Some((mode, ..)) = MODES.iter().find(|m| m.0 == value) else {
+                    return fail(&id, INVALID_PARAMS, format!("unknown mode {value}"));
+                };
+                if *mode == mode_id(s.advertised.plan) {
+                    return respond(
+                        &id,
+                        if reply == "set_mode" { json!({}) } else { json!({"configOptions": s.config_options()}) },
+                    );
+                }
+                Command::TogglePlan(None)
+            }
+            _ => return fail(&id, INVALID_PARAMS, format!("unknown config option {config}")),
+        };
+        s.pending_cfg = Some(Pending { id, config: reply.into(), value: value.into() });
+        let _ = s.cmd.send(cmd);
+    }
+
+    /// Ends a session this server has open. `false` when there is none by that id.
+    fn close(&mut self, sid: &str) -> bool {
+        let Some(mut s) = self.sessions.remove(sid) else { return false };
+        let _ = s.cmd.send(Command::Cancel);
+        let _ = s.cmd.send(Command::Exit);
+        if let Some(pid) = s.prompt.take() {
+            respond(&pid, json!({"stopReason": "cancelled"}));
+        }
+        if let Some(p) = s.pending_cfg.take() {
+            fail(&p.id, INTERNAL, "session closed");
+        }
+        tokio::task::spawn_local(async move {
+            let _ = s.task.await;
+            s.host.shutdown_all().await;
+        });
+        true
+    }
+
     /// Starts opening a session in the background; the reply goes out from `on_done`.
     fn spawn_open(&mut self, id: Value, cwd: PathBuf, resume: Option<PathBuf>, replay: bool, new: bool) {
         self.next_epoch += 1;
         let epoch = self.next_epoch;
-        let (model, thinking, done) = (self.model.clone(), self.thinking, self.done_tx.clone());
+        let (model, thinking, done, elicit) = (self.model.clone(), self.thinking, self.done_tx.clone(), self.elicit);
         tokio::task::spawn_local(async move {
-            let result = open_session(model, thinking, epoch, cwd, resume, replay).await;
+            let result = open_session(model, thinking, epoch, cwd, resume, replay, elicit).await;
             let _ = done.send(Done::Opened { id, new, result });
         });
     }
@@ -394,11 +564,17 @@ impl Server {
                     AgentEvent::Notice,
                 ));
                 self.sessions.insert(sid.clone(), session);
-                let opts = self.sessions[&sid].config_options();
+                let s = &self.sessions[&sid];
+                let (opts, modes) = (s.config_options(), s.modes());
                 respond(
                     &id,
-                    if new { json!({"sessionId": sid, "configOptions": opts}) } else { json!({"configOptions": opts}) },
+                    if new {
+                        json!({"sessionId": sid, "configOptions": opts, "modes": modes})
+                    } else {
+                        json!({"configOptions": opts, "modes": modes})
+                    },
                 );
+                update(&sid, s.command_list());
                 // The full model list comes from the gateway, which can be slow: fetch it now that
                 // the session is usable, and add to the cached list the session started with.
                 let done = self.done_tx.clone();
@@ -429,26 +605,38 @@ impl Server {
             }
             return;
         }
-        let notices = self.notices;
+        let (notices, rpc, elicit) = (self.notices, self.rpc.clone(), self.elicit);
         let Some(s) = self.sessions.get_mut(sid) else { return };
         match e {
             AgentEvent::Status(st) => {
                 if !s.models.contains(&st.model_id) {
                     s.models.push(st.model_id.clone());
                 }
-                let cur = (st.model_id.clone(), st.thinking.clone());
+                let cur = Advertised { model: st.model_id.clone(), thinking: st.thinking.clone(), plan: st.plan };
                 let changed = s.advertised != cur;
-                let satisfied = s.pending_cfg.as_ref().is_some_and(|p| {
+                let mode_changed = s.advertised.plan != cur.plan;
+                let satisfied = s.pending_cfg.as_ref().is_some_and(|p| match p.config.as_str() {
                     // A model request may resolve to a different id than the one asked for (an alias),
                     // so a model change also answers it; otherwise the request would never be answered.
-                    if p.config == "model" { cur.0 == p.value || s.advertised.0 != cur.0 } else { cur.1 == p.value }
+                    "model" => cur.model == p.value || s.advertised.model != cur.model,
+                    "thinking" => cur.thinking == p.value,
+                    _ => mode_id(cur.plan) == p.value,
                 });
                 s.advertised = cur;
                 if satisfied {
                     let p = s.pending_cfg.take().expect("checked above");
-                    respond(&p.id, json!({"configOptions": s.config_options()}));
+                    respond(
+                        &p.id,
+                        if p.config == "set_mode" { json!({}) } else { json!({"configOptions": s.config_options()}) },
+                    );
                 } else if changed {
                     update(sid, json!({"sessionUpdate": "config_option_update", "configOptions": s.config_options()}));
+                }
+                if mode_changed {
+                    update(
+                        sid,
+                        json!({"sessionUpdate": "current_mode_update", "currentModeId": mode_id(s.advertised.plan)}),
+                    );
                 }
                 if let Some(used) = st.context_tokens.filter(|_| st.context_window > 0)
                     && s.used != Some(used)
@@ -463,12 +651,22 @@ impl Server {
                     s.title = st.title;
                 }
             }
+            AgentEvent::TurnFailed => s.failed = true,
             AgentEvent::TurnEnd { aborted } => {
+                s.stream.clear();
+                s.plan_call = None;
+                let failed = std::mem::take(&mut s.failed);
+                let reason = s.last_error.take();
                 if let Some(id) = s.prompt.take() {
-                    respond(&id, json!({"stopReason": if aborted { "cancelled" } else { "end_turn" }}));
+                    if failed {
+                        fail(&id, INTERNAL, reason.unwrap_or_else(|| "the turn failed".into()));
+                    } else {
+                        respond(&id, json!({"stopReason": if aborted { "cancelled" } else { "end_turn" }}));
+                    }
                 }
             }
             AgentEvent::Error(m) => {
+                s.last_error = Some(m.clone());
                 if let Some(p) = s.pending_cfg.take() {
                     fail(&p.id, INVALID_PARAMS, m);
                 } else {
@@ -479,17 +677,75 @@ impl Server {
                     );
                 }
             }
-            AgentEvent::Notice(m) => notice(notices, sid, "info", m),
-            AgentEvent::Retry { attempt, delay, reason } => {
-                notice(notices, sid, "warning", mu_base::events::retry_notice(attempt, delay, &reason))
-            }
+            AgentEvent::Notice(m) => notice(notices, s.prompt.is_some(), sid, "info", m),
+            AgentEvent::Retry { attempt, delay, reason } => notice(
+                notices,
+                s.prompt.is_some(),
+                sid,
+                "warning",
+                mu_base::events::retry_notice(attempt, delay, &reason),
+            ),
             AgentEvent::Compacted { before, after } => {
-                notice(notices, sid, "info", format!("compacted {before}→{after} tokens"))
+                notice(notices, s.prompt.is_some(), sid, "info", format!("compacted {before}→{after} tokens"))
+            }
+            AgentEvent::ToolOutput { id, chunk } => {
+                if let Some(u) = s.stream.append(&id, &chunk, &s.cwd) {
+                    update(sid, u);
+                }
+            }
+            AgentEvent::ToolStart { id, name, args } => {
+                if name == "propose_plan" {
+                    s.plan_call = Some(id.clone());
+                }
+                for u in translate(&s.cwd, AgentEvent::ToolStart { id, name, args }, true) {
+                    update(sid, u);
+                }
+            }
+            AgentEvent::ToolEnd { id, name, output } => {
+                s.stream.end(&id);
+                for u in translate(&s.cwd, AgentEvent::ToolEnd { id, name, output }, true) {
+                    update(sid, u);
+                }
+            }
+            AgentEvent::Jobs(list) => {
+                for u in s.jobs.update(&list, &mut s.stream, &s.cwd) {
+                    update(sid, u);
+                }
+            }
+            AgentEvent::JobOutput { id, tail } => {
+                if let Some(u) = s.jobs.output(&id, tail, &mut s.stream, &s.cwd) {
+                    update(sid, u);
+                }
+            }
+            AgentEvent::Ask { questions, reply } => {
+                // `ask` is only offered when the client takes forms, so this is the form case; a
+                // dropped reply is a cancelled question.
+                if elicit {
+                    tokio::task::spawn_local(client::ask_user(rpc, sid.to_string(), questions, reply));
+                }
+            }
+            AgentEvent::PlanReview { title, content, reply, .. } => {
+                let call = s.plan_call.take().unwrap_or_else(|| "plan-review".to_string());
+                tokio::task::spawn_local(client::review_plan(rpc, sid.to_string(), call, title, content, reply));
             }
             e => {
                 for u in translate(&s.cwd, e, true) {
                     update(sid, u);
                 }
+            }
+        }
+    }
+
+    /// When the next held-back tool output falls due.
+    fn next_flush(&self) -> Option<Instant> {
+        self.sessions.values().filter_map(|s| s.stream.next_due()).min()
+    }
+
+    fn flush_due(&mut self) {
+        let now = Instant::now();
+        for (sid, s) in &mut self.sessions {
+            for u in s.stream.due(now, &s.cwd) {
+                update(sid, u);
             }
         }
     }
@@ -508,7 +764,8 @@ impl Server {
 }
 
 /// Starts an agent for `cwd` and waits until its session file exists. Replayed history, if
-/// requested, is streamed before this returns. Runs off the request loop.
+/// requested, is streamed before this returns. Runs off the request loop. `elicit`: the client
+/// can ask the user a form, so the model may use `ask`.
 async fn open_session(
     model: Option<String>,
     thinking: Option<Thinking>,
@@ -516,20 +773,22 @@ async fn open_session(
     cwd: PathBuf,
     resume: Option<PathBuf>,
     replay: bool,
+    elicit: bool,
 ) -> Result<Box<Opened>> {
     let Setup { cfgs, ctx, host, providers, notice_rx, .. } = setup(&cwd);
     let (spec, level) = pick_model(&cfgs, &providers, model.clone(), thinking)?;
     let run = agent::RunConfig {
         pin_model: model.is_some() && resume.is_some(),
         pin_thinking: thinking.is_some() && resume.is_some(),
-        excluded: agent::HEADLESS_EXCLUDED.to_vec(),
+        // Plans are approved through `session/request_permission`, which every client has.
+        excluded: if elicit { vec![] } else { vec!["ask"] },
         ..Default::default()
     };
     let AgentHandle { cmd: cmd_tx, ev: mut ev_rx, task, .. } = build_agent(
         AgentSetup {
             providers: providers.clone(),
             plugins: host.clone(),
-            ctx,
+            ctx: ctx.clone(),
             model: spec,
             thinking: level,
             deliver: crate::workflow::deliver::detached_starter(),
@@ -577,15 +836,21 @@ async fn open_session(
     let session = Session {
         cmd: cmd_tx,
         cwd,
+        ctx,
         host,
         task,
         prompt: None,
+        failed: false,
+        last_error: None,
         pending_cfg: None,
         models,
-        advertised: (st.model_id, st.thinking),
+        advertised: Advertised { model: st.model_id, thinking: st.thinking, plan: st.plan },
         providers: providers.clone(),
         used: st.context_tokens,
         title: st.title,
+        stream: Stream::default(),
+        jobs: Jobs::default(),
+        plan_call: None,
         epoch,
     };
     Ok(Box::new(Opened { sid, session, ev_rx, notice_rx, providers }))
@@ -633,152 +898,9 @@ fn user_input(blocks: &Value) -> UserInput {
     UserInput { text: parts.join("\n\n"), images }
 }
 
-fn tool_kind(name: &str) -> &'static str {
-    match name {
-        "read" => "read",
-        "grep" | "glob" => "search",
-        "edit" | "write" => "edit",
-        "bash" => "execute",
-        "fetch" | "web_search" => "fetch",
-        _ => "other",
-    }
-}
-
-fn plan_entries(phases: &Value) -> Vec<Value> {
-    let phases = phases.as_array().map(Vec::as_slice).unwrap_or_default();
-    let mut out = Vec::new();
-    for ph in phases {
-        for t in ph["tasks"].as_array().into_iter().flatten() {
-            let mut content = t["content"].as_str().unwrap_or("").to_string();
-            if phases.len() > 1 {
-                content = format!("{}: {content}", ph["name"].as_str().unwrap_or(""));
-            }
-            let status = match t["status"].as_str() {
-                Some("in_progress") => "in_progress",
-                Some("completed") => "completed",
-                Some("abandoned") => {
-                    content.push_str(" (abandoned)");
-                    "completed"
-                }
-                Some("blocked") => {
-                    match t["blocker"].as_str() {
-                        Some(b) => content.push_str(&format!(" (blocked: {b})")),
-                        None => content.push_str(" (blocked)"),
-                    }
-                    "pending"
-                }
-                _ => "pending",
-            };
-            out.push(json!({"content": content, "priority": "medium", "status": status}));
-        }
-    }
-    out
-}
-
-/// ACP `session/update` payloads for one agent event. `live` is false while replaying history.
-fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
-    let text = |kind: &str, t: String| json!({"sessionUpdate": kind, "content": {"type": "text", "text": t}});
-    match e {
-        AgentEvent::UserPrompt(t) if !live => vec![text("user_message_chunk", t)],
-        AgentEvent::Text(t) => vec![text("agent_message_chunk", t)],
-        AgentEvent::Thinking(t) => vec![text("agent_thought_chunk", t)],
-        AgentEvent::ToolStart { id, name, args } => {
-            let s = summary(&name, &args);
-            let title = if s.is_empty() { name.clone() } else { format!("{name}: {s}") };
-            let mut call = json!({
-                "sessionUpdate": "tool_call",
-                "toolCallId": id,
-                "title": title,
-                "kind": tool_kind(&name),
-                "status": "in_progress",
-                "rawInput": args,
-            });
-            if let (true, Some(p)) = (matches!(name.as_str(), "read" | "write"), args["path"].as_str()) {
-                call["locations"] = json!([{"path": cwd.join(p)}]);
-            }
-            vec![call]
-        }
-        AgentEvent::ToolEnd { id, output, .. } => {
-            let mut u = json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "status": if output.is_error { "failed" } else { "completed" }});
-            if !output.text.is_empty() {
-                u["content"] = json!([{"type": "content", "content": {"type": "text", "text": output.text}}]);
-            }
-            vec![u]
-        }
-        AgentEvent::Todo(v) => {
-            let entries = plan_entries(&v);
-            if entries.is_empty() && !live {
-                vec![]
-            } else {
-                vec![json!({"sessionUpdate": "plan", "entries": entries})]
-            }
-        }
-        _ => vec![],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mu_base::tool::ToolOutput;
-
-    fn kinds(v: &[Value]) -> Vec<&str> {
-        v.iter().map(|u| u["sessionUpdate"].as_str().unwrap()).collect()
-    }
-
-    #[test]
-    fn history_replays_user_text_but_live_prompts_are_not_echoed() {
-        let cwd = Path::new("/w");
-        assert_eq!(kinds(&translate(cwd, AgentEvent::UserPrompt("hi".into()), false)), ["user_message_chunk"]);
-        assert!(translate(cwd, AgentEvent::UserPrompt("hi".into()), true).is_empty());
-    }
-
-    #[test]
-    fn tool_call_carries_kind_title_and_absolute_location() {
-        let u = translate(
-            Path::new("/w"),
-            AgentEvent::ToolStart { id: "c1".into(), name: "read".into(), args: json!({"path": "a/b.rs"}) },
-            true,
-        );
-        assert_eq!(u[0]["kind"], "read");
-        assert_eq!(u[0]["title"], "read: a/b.rs");
-        assert_eq!(u[0]["locations"][0]["path"], "/w/a/b.rs");
-        let u = translate(
-            Path::new("/w"),
-            AgentEvent::ToolStart { id: "c2".into(), name: "bash".into(), args: json!({"command": "ls"}) },
-            true,
-        );
-        assert_eq!((u[0]["kind"].as_str(), u[0].get("locations")), (Some("execute"), None));
-    }
-
-    #[test]
-    fn failed_tool_maps_to_failed_status() {
-        let out = ToolOutput::err("boom");
-        let u =
-            translate(Path::new("/w"), AgentEvent::ToolEnd { id: "c1".into(), name: "bash".into(), output: out }, true);
-        assert_eq!(
-            (u[0]["status"].as_str(), u[0]["content"][0]["content"]["text"].as_str()),
-            (Some("failed"), Some("boom"))
-        );
-    }
-
-    #[test]
-    fn todo_becomes_plan_and_empty_replay_is_skipped() {
-        let phases = json!([
-            {"name": "A", "tasks": [{"content": "x", "status": "in_progress"}, {"content": "y", "status": "blocked", "blocker": "dep"}]},
-            {"name": "B", "tasks": [{"content": "z", "status": "abandoned"}]},
-        ]);
-        let u = translate(Path::new("/w"), AgentEvent::Todo(phases), true);
-        let e = u[0]["entries"].as_array().unwrap();
-        let got: Vec<(&str, &str)> =
-            e.iter().map(|x| (x["content"].as_str().unwrap(), x["status"].as_str().unwrap())).collect();
-        assert_eq!(
-            got,
-            [("A: x", "in_progress"), ("A: y (blocked: dep)", "pending"), ("B: z (abandoned)", "completed")]
-        );
-        assert!(translate(Path::new("/w"), AgentEvent::Todo(json!([])), false).is_empty());
-        assert_eq!(translate(Path::new("/w"), AgentEvent::Todo(json!([])), true).len(), 1);
-    }
 
     #[test]
     fn prompt_blocks_flatten_to_text_and_images() {
@@ -811,5 +933,11 @@ mod tests {
         assert_eq!(model_target("@slow:high", &models, resolve), Ok("b/n".into()));
         assert!(model_target("@nope", &models, resolve).unwrap_err().contains("not configured"));
         assert_eq!(model_target("x/y", &models, resolve), Err("unknown model x/y".into()));
+    }
+
+    #[test]
+    fn modes_are_default_and_plan() {
+        assert_eq!((mode_id(false), mode_id(true)), ("default", "plan"));
+        assert!(MODES.iter().all(|m| m.0 == "default" || m.0 == "plan"));
     }
 }

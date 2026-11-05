@@ -102,11 +102,11 @@ impl Tools {
         // Directory listing and file reading run on a blocking thread.
         let path = abs.clone();
         let source = tokio::task::spawn_blocking(move || {
-            if path.is_dir() { Source::Dir(list_dir(&path)) } else { Source::File(std::fs::read(&path)) }
+            if path.is_dir() { Source::Dir(Box::new(list_dir(&path))) } else { Source::File(std::fs::read(&path)) }
         })
         .await;
         let raw = match source {
-            Ok(Source::Dir(out)) => return out,
+            Ok(Source::Dir(out)) => return *out,
             Ok(Source::File(Ok(raw))) => raw,
             Ok(Source::File(Err(e))) => return ToolOutput::err(format!("Cannot read {disp}: {e}")),
             Err(e) => return ToolOutput::err(format!("read failed: {e}")),
@@ -242,7 +242,7 @@ impl Tools {
 }
 
 enum Source {
-    Dir(ToolOutput),
+    Dir(Box<ToolOutput>),
     File(std::io::Result<Vec<u8>>),
 }
 
@@ -346,6 +346,24 @@ mod tests {
         let o = t.edit(super::super::edit::Args::for_test(input), false).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read_to_string(d.join("l.md")).unwrap(), "a\nshort\nb\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_edit_reports_the_text_of_the_file_before_and_after() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nb\n").unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "f.txt".into() }).await;
+        let tag = o.text[o.text.find('#').unwrap() + 1..o.text.find(']').unwrap()].to_string();
+        let input = format!("[f.txt#{tag}]\nPUT 2.=2:\n+B\n");
+        let o = t.edit(super::super::edit::Args::for_test(input), false).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert_eq!(o.changes.len(), 1);
+        let c = &o.changes[0];
+        assert!(c.path.ends_with("f.txt") && c.path.is_absolute(), "{:?}", c.path);
+        assert_eq!((c.old.as_deref(), c.new.as_deref()), (Some("a\nb\n"), Some("a\nB\n")));
     }
 
     #[tokio::test(flavor = "current_thread")]

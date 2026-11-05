@@ -1,7 +1,7 @@
 use super::Tools;
 use super::uri::Scheme;
 use async_trait::async_trait;
-use mu_base::tool::{FileMeta, ToolMeta, ToolOutput};
+use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
 use pi_edit::{
     ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, UrlResolution, WriteRequest,
     WriteResponse, engine::FileOp, session::SessionConfig,
@@ -44,10 +44,35 @@ pub fn is_hashline() -> bool {
     mode() == EditMode::Hashline
 }
 
-struct FsWriter;
+/// Writes the files an edit changes and keeps each file's text before and after.
+#[derive(Default)]
+struct FsWriter {
+    changes: std::sync::Mutex<Vec<FileChange>>,
+}
 
 fn werr(e: impl std::fmt::Display) -> EditError {
     EditError::Writer(e.to_string())
+}
+
+/// A file's text: `Some(None)` when it does not exist, `None` when it cannot be kept (binary or large).
+async fn snapshot(p: &std::path::Path) -> Option<Option<String>> {
+    match tokio::fs::metadata(p).await {
+        Err(_) => Some(None),
+        Ok(m) if m.len() as usize > CHANGE_TEXT_MAX => None,
+        Ok(_) => tokio::fs::read_to_string(p).await.ok().map(Some),
+    }
+}
+
+impl FsWriter {
+    fn record(&self, path: &std::path::Path, old: Option<Option<String>>, new: Option<&str>) {
+        let Some(old) = old else { return };
+        if new.is_some_and(|n| n.len() > CHANGE_TEXT_MAX) {
+            return;
+        }
+        if let Ok(mut c) = self.changes.lock() {
+            c.push(FileChange { path: path.to_path_buf(), old, new: new.map(String::from) });
+        }
+    }
 }
 
 #[async_trait]
@@ -55,13 +80,16 @@ impl EditWriter for FsWriter {
     async fn write(&self, r: WriteRequest) -> EditResult<WriteResponse> {
         match r.op {
             FileOp::Delete => {
+                let old = snapshot(&r.absolute).await;
                 tokio::fs::remove_file(&r.absolute).await.map_err(werr)?;
+                self.record(&r.absolute, old, None);
                 Ok(WriteResponse::default())
             }
             FileOp::Noop => Ok(WriteResponse::default()),
             FileOp::Create | FileOp::Update => {
                 let content = r.content.ok_or_else(|| werr("edit request omitted content"))?;
                 let dest = r.move_to.as_deref().unwrap_or(&r.absolute);
+                let old = snapshot(&r.absolute).await;
                 if let Some(p) = dest.parent() {
                     tokio::fs::create_dir_all(p).await.map_err(werr)?;
                 }
@@ -72,6 +100,7 @@ impl EditWriter for FsWriter {
                     }
                     tokio::fs::remove_file(&r.absolute).await.map_err(werr)?;
                 }
+                self.record(dest, old, Some(&content));
                 Ok(WriteResponse { written: content, ..Default::default() })
             }
         }
@@ -116,7 +145,8 @@ impl Tools {
             };
             s.provide(url, r);
         }
-        match s.apply(ApplyRequest::default(), &FsWriter).await {
+        let writer = FsWriter::default();
+        match s.apply(ApplyRequest::default(), &writer).await {
             Ok(o) => {
                 let mut out = ToolOutput::ok(o.text);
                 out.meta = o
@@ -127,6 +157,7 @@ impl Tools {
                 if !diffs.is_empty() {
                     out.display = Some(diffs.join("\n"));
                 }
+                out.changes = writer.changes.into_inner().unwrap_or_default();
                 out
             }
             Err(e) => ToolOutput::err(e.to_string()),

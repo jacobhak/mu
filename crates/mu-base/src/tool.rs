@@ -53,6 +53,21 @@ pub struct FileMeta {
     pub plan: bool,
 }
 
+/// One file a tool wrote, with its text before and after, for front ends that show a real diff.
+/// Not stored in the session.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileChange {
+    /// Absolute.
+    pub path: std::path::PathBuf,
+    /// `None` for a file that did not exist.
+    pub old: Option<String>,
+    /// `None` for a deleted file.
+    pub new: Option<String>,
+}
+
+/// Texts over this size are left out of a `FileChange`; the change is then not reported.
+pub const CHANGE_TEXT_MAX: usize = 512 * 1024;
+
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
@@ -62,6 +77,8 @@ pub struct ToolOutput {
     pub meta: Option<ToolMeta>,
     /// Images the model sees after the text (e.g. `read` of a png). Not shown in the transcript.
     pub images: Vec<crate::message::Image>,
+    /// Files the call wrote (`write`, `edit`).
+    pub changes: Vec<FileChange>,
 }
 
 /// Key under which `meta` is stored in a persisted tool result's `details`.
@@ -71,10 +88,26 @@ const STORED_DIFF_MAX: usize = 64 * 1024;
 
 impl ToolOutput {
     pub fn ok(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false, display: None, details: None, meta: None, images: Vec::new() }
+        Self {
+            text: text.into(),
+            is_error: false,
+            display: None,
+            details: None,
+            meta: None,
+            images: Vec::new(),
+            changes: Vec::new(),
+        }
     }
     pub fn err(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true, display: None, details: None, meta: None, images: Vec::new() }
+        Self {
+            text: text.into(),
+            is_error: true,
+            display: None,
+            details: None,
+            meta: None,
+            images: Vec::new(),
+            changes: Vec::new(),
+        }
     }
 
     /// `details` as stored in the session: the tool's own details plus `meta`, and the display diff
@@ -104,6 +137,6 @@ impl ToolOutput {
     pub fn from_stored(text: String, is_error: bool, details: Option<Value>) -> Self {
         let meta = details.as_ref().and_then(|d| d.get(META_KEY)).and_then(|m| serde_json::from_value(m.clone()).ok());
         let display = details.as_ref().and_then(|d| d.get("diff")).and_then(Value::as_str).map(str::to_string);
-        Self { text, is_error, display, details, meta, images: Vec::new() }
+        Self { text, is_error, display, details, meta, images: Vec::new(), changes: Vec::new() }
     }
 }

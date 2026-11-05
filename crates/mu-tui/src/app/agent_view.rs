@@ -507,7 +507,7 @@ mod tests {
     }
 
     fn output(text: &str) -> ToolOutput {
-        ToolOutput { text: text.into(), is_error: false, display: None, details: None, meta: None, images: vec![] }
+        ToolOutput::ok(text)
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::uri::Scheme;
 use super::{Tools, diff};
-use mu_base::tool::{FileMeta, ToolMeta, ToolOutput};
+use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
 use pi_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
 
@@ -28,11 +28,11 @@ impl Tools {
         let disp = if res.scheme.is_some() { a.path.clone() } else { self.display(&abs) };
         // The filesystem work runs on a blocking thread; `content` moves in and comes back.
         let (path, content) = (abs.clone(), a.content);
-        let done = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
+        let done = tokio::task::spawn_blocking(move || -> Result<(Option<String>, String), String> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
             }
-            let old = std::fs::read_to_string(&path).unwrap_or_default();
+            let old = std::fs::read_to_string(&path).ok();
             std::fs::write(&path, &content).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
             Ok((old, content))
         })
@@ -48,9 +48,12 @@ impl Tools {
         let mut out = ToolOutput::ok(format!("[{disp}#{tag}]\nSuccessfully wrote {} bytes to {disp}", a.content.len()));
         let plan = a.path.starts_with("local://") && a.path.ends_with("-plan.md");
         out.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag: Some(tag), plan }));
-        let d = diff::unified(&old, &a.content);
+        let d = diff::unified(old.as_deref().unwrap_or_default(), &a.content);
         if !d.is_empty() {
             out.display = Some(d);
+        }
+        if old.as_ref().is_none_or(|o| o.len() <= CHANGE_TEXT_MAX) && a.content.len() <= CHANGE_TEXT_MAX {
+            out.changes = vec![FileChange { path: abs, old, new: Some(a.content) }];
         }
         out
     }
