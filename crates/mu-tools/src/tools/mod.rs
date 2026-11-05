@@ -11,7 +11,6 @@ pub mod subagent;
 pub mod task;
 pub mod todo;
 pub mod uri;
-mod wait;
 mod write;
 mod yield_;
 
@@ -103,8 +102,8 @@ impl Tools {
         display_in(&self.cwd, abs)
     }
 
-    /// Tool definitions that do not depend on the session (the rest are built by `task_def`,
-    /// `wait_def` and `plan_def`).
+    /// Tool definitions that do not depend on the session (the rest are built by `task_def` and
+    /// `plan_def`).
     pub fn definitions() -> Vec<ToolDef> {
         BUILTINS.iter().filter_map(|b| b.def.map(|d| d())).collect()
     }
@@ -119,10 +118,6 @@ impl Tools {
         }
         let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
         ToolDef { name: "task".into(), description, schema: task::schema(&names) }
-    }
-
-    pub fn wait_def() -> ToolDef {
-        ToolDef { name: "wait".into(), description: wait::DESCRIPTION.into(), schema: wait::schema() }
     }
 
     pub fn yield_def(output: &Value) -> ToolDef {
@@ -302,7 +297,6 @@ pub static BUILTINS: &[Builtin] = &[
         call: dispatch!("propose_plan", async |t, a: plan::Args, c| t.propose_plan(a, c)),
     },
     Builtin { name: "task", def: None, call: dispatch!("task", async |t, a: task::Args, c| t.task(a, c)) },
-    Builtin { name: "wait", def: None, call: dispatch!("wait", async |t, a: wait::Args, c| t.wait(a, c)) },
     Builtin { name: "yield", def: None, call: dispatch!("yield", |t, a: yield_::Args| t.yield_result(a)) },
 ];
 
@@ -342,11 +336,6 @@ pub fn summary(name: &str, args: &Value) -> String {
         "web_search" => first("query"),
         "fetch" => first("url"),
         "review" => first("scope"),
-        "wait" => {
-            let ids: Vec<&str> =
-                args["ids"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-            return if ids.is_empty() { "any".into() } else { ids.join(", ") };
-        }
         "task" => {
             let n = args["tasks"].as_array().map_or(0, |t| t.len());
             return format!("{n} subagent{}", if n == 1 { "" } else { "s" });
@@ -364,7 +353,7 @@ mod table_tests {
     fn one_table_drives_names_definitions_and_dispatch() {
         let names: Vec<String> = Tools::definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "todo", "ask"]);
-        assert!(is_builtin("task") && is_builtin("wait") && is_builtin("propose_plan"));
+        assert!(is_builtin("task") && is_builtin("propose_plan") && !is_builtin("wait"));
         assert!(!is_builtin("web_search"));
         // Every built-in dispatches (bad arguments are an argument error, never "Unknown tool").
         let t = Tools::for_test();

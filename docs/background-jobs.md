@@ -1,6 +1,6 @@
 # Background jobs
 
-`task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session. `wait` blocks until a job finishes. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
+`task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session, so a turn that has nothing else to do just ends. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
 
 A turn that began this way rings the terminal; see [Detached runs](detached-runs.md#terminal-bell).
 

@@ -19,7 +19,7 @@ impl Agent {
     /// Returns whether any were pending.
     pub(super) fn take_jobs(&mut self) -> bool {
         let Some(jobs) = &self.tools.jobs else { return false };
-        let done = jobs.take_undelivered(&[]);
+        let done = jobs.take_undelivered();
         if done.is_empty() {
             return false;
         }

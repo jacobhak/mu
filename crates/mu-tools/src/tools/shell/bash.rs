@@ -843,10 +843,7 @@ mod tests {
     }
 
     async fn finished(jobs: &crate::jobs::JobsHandle) -> Vec<crate::jobs::Done> {
-        match jobs.wait(&[], &tokio_util::sync::CancellationToken::new()).await {
-            crate::jobs::WaitResult::Done(d) => d,
-            _ => panic!("no background job finished"),
-        }
+        jobs.finished().await
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -860,7 +857,7 @@ mod tests {
                 assert_eq!(done.len(), 1);
                 assert!(!done[0].ok && done[0].note.as_deref() == Some("exit 3"), "{:?}", done[0].note);
                 assert!(done[0].text.starts_with("hi"), "{}", done[0].text);
-                assert!(jobs.take_undelivered(&[]).is_empty() && !jobs.has_undelivered());
+                assert!(jobs.take_undelivered().is_empty() && !jobs.has_undelivered());
                 let msg = crate::jobs::notice(&done);
                 assert!(msg.contains("## bg_1 (bash: echo hi; exit 3) — failed, exit 3\nhi"), "{msg}");
             })

@@ -1,5 +1,5 @@
 //! Background jobs: `task` (subagents) and `bash` with `async` return ids at once; finished results
-//! are delivered to the model as a `<system-notice>` message, and `wait` blocks until a job finishes.
+//! are delivered to the model as a `<system-notice>` message.
 
 use std::cell::{Cell, RefCell, RefMut};
 use std::future::Future;
@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
+#[cfg(test)]
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +18,6 @@ use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
 
-const WAIT_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// Newest bytes of a running bash job's output kept for the jobs panel.
 const OUTPUT_KEEP: usize = 64 * 1024;
 /// How much of that goes to the UI per update, and how often at most.
@@ -148,16 +148,10 @@ pub struct Done {
     pub note: Option<String>,
 }
 
-pub enum WaitResult {
-    Done(Vec<Done>),
-    Nothing,
-    Cancelled,
-    Timeout(Vec<String>),
-}
-
 pub struct JobsHandle {
     inner: RefCell<Vec<Job>>,
     next_seq: Cell<u64>,
+    #[cfg(test)]
     notify: Notify,
     wake: UnboundedSender<()>,
     events: EventTx,
@@ -165,7 +159,14 @@ pub struct JobsHandle {
 
 impl JobsHandle {
     pub fn new(wake: UnboundedSender<()>, events: EventTx) -> Rc<Self> {
-        Rc::new(Self { inner: RefCell::default(), next_seq: Cell::new(0), notify: Notify::new(), wake, events })
+        Rc::new(Self {
+            inner: RefCell::default(),
+            next_seq: Cell::new(0),
+            #[cfg(test)]
+            notify: Notify::new(),
+            wake,
+            events,
+        })
     }
 
     /// `base`, or `base-2`, `base-3`, … when taken this session.
@@ -253,6 +254,7 @@ impl JobsHandle {
             j.text = text;
             j.note = note;
         }
+        #[cfg(test)]
         self.notify.notify_waiters();
         let _ = self.wake.send(());
         self.emit();
@@ -353,15 +355,13 @@ impl JobsHandle {
         id
     }
 
-    /// Finished, undelivered jobs (only `ids` when non-empty); marks them delivered.
-    pub fn take_undelivered(&self, ids: &[String]) -> Vec<Done> {
+    /// Finished, undelivered jobs; marks them delivered.
+    pub fn take_undelivered(&self) -> Vec<Done> {
         let done: Vec<Done> = self
             .inner
             .borrow_mut()
             .iter_mut()
-            .filter(|j| {
-                j.state != SubagentState::Running && !j.delivered && (ids.is_empty() || ids.contains(&j.spec.id))
-            })
+            .filter(|j| j.state != SubagentState::Running && !j.delivered)
             .map(|j| {
                 j.delivered = true;
                 Done {
@@ -403,30 +403,18 @@ impl JobsHandle {
         self.emit();
     }
 
-    pub async fn wait(&self, ids: &[String], cancel: &CancellationToken) -> WaitResult {
+    /// Resolves with the first finished jobs, delivering them; for tests to wait on a job.
+    #[cfg(test)]
+    pub(crate) async fn finished(&self) -> Vec<Done> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let done = self.take_undelivered(ids);
+            let done = self.take_undelivered();
             if !done.is_empty() {
-                return WaitResult::Done(done);
+                return done;
             }
-            let running: Vec<String> = self
-                .inner
-                .borrow()
-                .iter()
-                .filter(|j| j.state == SubagentState::Running && (ids.is_empty() || ids.contains(&j.spec.id)))
-                .map(|j| j.spec.id.clone())
-                .collect();
-            if running.is_empty() {
-                return WaitResult::Nothing;
-            }
-            tokio::select! {
-                _ = &mut notified => {}
-                _ = cancel.cancelled() => return WaitResult::Cancelled,
-                _ = tokio::time::sleep(WAIT_LIMIT) => return WaitResult::Timeout(running),
-            }
+            notified.await;
         }
     }
 
@@ -549,12 +537,12 @@ pub(crate) mod tests {
             (false, "echo", Some("exit 0"))
         );
         assert!(snap[0].ended.is_some());
-        let got = h.take_undelivered(&[]);
+        let got = h.take_undelivered();
         assert_eq!(got[0].text, "big output");
         assert_eq!((got[0].command.as_deref(), got[0].note.as_deref()), (Some("echo"), Some("exit 0")));
         assert!(h.inner.borrow()[0].text.is_empty());
         assert!(h.inner.borrow()[0].spec.command.is_none());
-        assert!(h.take_undelivered(&[]).is_empty());
+        assert!(h.take_undelivered().is_empty());
         let snap = h.snapshot();
         assert!(snap[0].delivered, "the snapshot follows delivery");
         assert_eq!(snap[0].note.as_deref(), Some("exit 0"), "the note stays for the panel");
@@ -567,12 +555,12 @@ pub(crate) mod tests {
         let h = JobsHandle::new(wake, events);
         h.push_running("A");
         h.finish("A", true, "x");
-        assert_eq!(h.take_undelivered(&[]).len(), 1);
+        assert_eq!(h.take_undelivered().len(), 1);
         match rx.try_recv() {
             Ok(AgentEvent::Jobs(v)) => assert!(v[0].delivered),
             _ => panic!("no snapshot after delivery"),
         }
-        assert!(h.take_undelivered(&[]).is_empty());
+        assert!(h.take_undelivered().is_empty());
         assert!(rx.try_recv().is_err(), "nothing delivered, nothing emitted");
     }
 
@@ -589,7 +577,7 @@ pub(crate) mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 h.spawn("A".into(), "scout".into(), exe, base.clone(), serde_json::json!({"task": "find  x\nnow"}));
-                assert!(matches!(h.wait(&[], &CancellationToken::new()).await, WaitResult::Done(_)));
+                assert_eq!(h.finished().await.len(), 1);
             })
             .await;
         let snap = h.snapshot();
@@ -690,36 +678,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn wait_returns_nothing_without_jobs_and_done_once() {
+    async fn a_finished_job_is_handed_over_once() {
         let h = handle();
-        let cancel = CancellationToken::new();
-        assert!(matches!(h.wait(&[], &cancel).await, WaitResult::Nothing));
         h.push_running("A");
         h.finish("A", true, "ALPHA");
-        match h.wait(&[], &cancel).await {
-            WaitResult::Done(d) => assert_eq!((d[0].id.as_str(), d[0].text.as_str(), d[0].ok), ("A", "ALPHA", true)),
-            _ => panic!("expected Done"),
-        }
-        assert!(h.take_undelivered(&[]).is_empty());
+        let d = h.finished().await;
+        assert_eq!((d[0].id.as_str(), d[0].text.as_str(), d[0].ok), ("A", "ALPHA", true));
+        assert!(h.take_undelivered().is_empty());
         assert!(!h.has_undelivered());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn wait_wakes_when_a_running_job_finishes_and_honours_cancel() {
+    async fn finished_wakes_when_a_running_job_ends() {
         let h = handle();
         h.push_running("A");
-        let cancel = CancellationToken::new();
-        let ids = ["A".to_string()];
-        let waiter = h.wait(&ids, &cancel);
         let finisher = async {
             tokio::task::yield_now().await;
             h.finish("A", false, "boom");
         };
-        let (res, ()) = tokio::join!(waiter, finisher);
-        assert!(matches!(res, WaitResult::Done(d) if !d[0].ok));
-
-        h.push_running("B");
-        cancel.cancel();
-        assert!(matches!(h.wait(&[], &cancel).await, WaitResult::Cancelled));
+        let (d, ()) = tokio::join!(h.finished(), finisher);
+        assert!(!d[0].ok);
     }
 }

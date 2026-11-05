@@ -12,9 +12,6 @@ impl Agent {
             v.push(Tools::plan_def());
         }
         v.push(Tools::task_def(self.tools.jobs.is_some(), &self.ctx.agents));
-        if self.tools.jobs.is_some() {
-            v.push(Tools::wait_def());
-        }
         if let Some(o) = self.tools.output_schema.borrow().as_ref() {
             v.push(Tools::yield_def(o));
         }

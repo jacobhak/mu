@@ -183,7 +183,7 @@ struct Queue {
 }
 
 /// Runs `fut` (a turn) while still reading commands. Commands that are safe mid-turn (`KillJobs`)
-/// take effect at once, so `/jobs kill` works while `wait` blocks; the rest queue in `backlog`.
+/// take effect at once, so `/jobs kill` works mid-turn; the rest queue in `backlog`.
 async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
     tokio::pin!(fut);
     let mut open = true;
