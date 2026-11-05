@@ -415,15 +415,18 @@ impl PluginHost {
     }
 
     pub(crate) async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
-        let slot = self
-            .slots
-            .borrow()
-            .iter()
-            .find(|s| s.native().and_then(|m| m.provider.as_deref()) == Some(kind))
-            .cloned()
-            .ok_or_else(|| {
-                "no gateway: install the gateway plugin (~/.mu/plugins/gateway) or set MU_GATEWAY_URL".to_string()
-            })?;
+        let slot =
+            self.slots.borrow().iter().find(|s| s.native().and_then(|m| m.provider.as_deref()) == Some(kind)).cloned();
+        let Some(slot) = slot else {
+            let dir = mu_common::paths::mu_home().join("plugins");
+            let found: Vec<String> =
+                self.slots.borrow().iter().filter(|s| s.native().is_some()).map(|s| s.name()).collect();
+            let found = if found.is_empty() { "no plugins".to_string() } else { found.join(", ") };
+            return Err(format!(
+                "no gateway: no plugin in {} provides `{kind}` (loaded: {found}); install the gateway plugin there or set MU_GATEWAY_URL",
+                dir.display()
+            ));
+        };
         let proc = self.ensure(&slot).await?;
         let v = proc
             .request("provider/endpoint", json!({"clientPid": std::process::id()}), Some(Duration::from_secs(45)))
