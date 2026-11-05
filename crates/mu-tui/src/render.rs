@@ -6,7 +6,7 @@
 
 use std::io::{self, Write};
 
-use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
+use crossterm::cursor::{Hide, MoveDown, MoveToColumn, MoveUp, Show};
 use crossterm::queue;
 use crossterm::terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 
@@ -18,6 +18,43 @@ pub struct Renderer {
     drawn: Vec<usize>,
     /// Cursor as (row index into `drawn`, column) as last placed.
     cursor: (usize, usize),
+    /// What the last draw put on screen, to skip a redraw that would write the same thing.
+    last: Option<Frame>,
+}
+
+/// The viewport as last drawn: one entry per physical row (wrapped to the width), as ANSI text.
+#[derive(PartialEq)]
+struct Frame {
+    size: (usize, usize),
+    rows: Vec<Vec<u8>>,
+    cursor: (usize, usize),
+}
+
+/// Rewrites only the rows of `new` that differ from `old` (same length), starting with the cursor
+/// on row `from`, and ends with it at `to`. Moves stay inside the viewport.
+fn diff_bytes(old: &[Vec<u8>], new: &[Vec<u8>], from: usize, to: (usize, usize)) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut at = from;
+    let go = |buf: &mut Vec<u8>, row: usize, at: &mut usize| -> io::Result<()> {
+        if row < *at {
+            queue!(buf, MoveUp(u16_of(*at - row)))?;
+        } else if row > *at {
+            queue!(buf, MoveDown(u16_of(row - *at)))?;
+        }
+        *at = row;
+        Ok(())
+    };
+    for (i, (o, n)) in old.iter().zip(new).enumerate() {
+        if o != n {
+            go(&mut buf, i, &mut at)?;
+            buf.push(b'\r');
+            queue!(buf, Clear(ClearType::CurrentLine))?;
+            buf.extend_from_slice(n);
+        }
+    }
+    go(&mut buf, to.0, &mut at)?;
+    queue!(buf, MoveToColumn(to.1 as u16))?;
+    Ok(buf)
 }
 
 impl Renderer {
@@ -35,18 +72,12 @@ impl Renderer {
     /// placed at `cursor` = (viewport row, display column) in the given viewport coordinates.
     pub fn draw(&mut self, committed: &[Line], viewport: &[Line], cursor: (usize, usize)) -> io::Result<()> {
         let (cols, rows) = self.size();
-        let (up, _) = self.positions(cols);
-        let mut buf = Vec::new();
-        queue!(buf, BeginSynchronizedUpdate)?;
-        if up > 0 {
-            queue!(buf, MoveUp(u16_of(up)))?;
-        }
-        buf.push(b'\r');
+        let mut head = Vec::new();
         for l in committed {
             for w in line::wrap(l, cols) {
-                queue!(buf, Clear(ClearType::CurrentLine))?;
-                buf.extend_from_slice(line::to_ansi(&w).as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                queue!(head, Clear(ClearType::CurrentLine))?;
+                head.extend_from_slice(line::to_ansi(&w).as_bytes());
+                head.extend_from_slice(b"\r\n");
             }
         }
 
@@ -79,19 +110,60 @@ impl Renderer {
             _ => (shown.len().saturating_sub(1), 0),
         };
 
-        self.drawn.clear();
-        for (i, l) in shown.iter().enumerate() {
+        let widths: Vec<usize> = shown.iter().map(line::line_width).collect();
+        let frame = Frame {
+            size: (cols, rows),
+            rows: shown.iter().map(|l| line::to_ansi(l).into_bytes()).collect(),
+            cursor: (crow, ccol.min(cols - 1)),
+        };
+
+        // Nothing is scrolling into scrollback and the viewport has the same shape: touch only the
+        // rows that changed (a running spinner is one row), or nothing at all.
+        if head.is_empty()
+            && let Some(prev) = self.last.as_ref().filter(|p| p.size == frame.size && p.rows.len() == frame.rows.len())
+        {
+            if *prev == frame {
+                return Ok(());
+            }
+            let (cur, _) = self.positions(cols);
+            let mut buf = Vec::new();
+            queue!(buf, BeginSynchronizedUpdate, Hide)?;
+            buf.extend(diff_bytes(&prev.rows, &frame.rows, cur, frame.cursor)?);
+            queue!(buf, Show, EndSynchronizedUpdate)?;
+            self.drawn = widths;
+            self.cursor = frame.cursor;
+            crate::term::term::set_rows_below(frame.rows.len().saturating_sub(1).saturating_sub(frame.cursor.0));
+            self.last = None;
+            let mut out = io::stdout().lock();
+            out.write_all(&buf)?;
+            out.flush()?;
+            self.last = Some(frame);
+            return Ok(());
+        }
+
+        let (up, _) = self.positions(cols);
+        let mut buf = Vec::new();
+        queue!(buf, BeginSynchronizedUpdate)?;
+        // The cursor travels through the viewport; hidden so a terminal that does not batch
+        // synchronized updates (or draws cursor trails) never shows it moving.
+        queue!(buf, Hide)?;
+        if up > 0 {
+            queue!(buf, MoveUp(u16_of(up)))?;
+        }
+        buf.push(b'\r');
+        buf.extend_from_slice(&head);
+        for (i, row) in frame.rows.iter().enumerate() {
             if i > 0 {
                 buf.extend_from_slice(b"\r\n");
             }
             queue!(buf, Clear(ClearType::CurrentLine))?;
-            buf.extend_from_slice(line::to_ansi(l).as_bytes());
-            self.drawn.push(line::line_width(l));
+            buf.extend_from_slice(row);
         }
+        self.drawn = widths;
         // Erase leftovers of a taller previous viewport. Per-line clears above avoid ED at the
         // top-left, which some terminals (tmux) treat as a full clear and archive to scrollback.
         queue!(buf, Clear(ClearType::FromCursorDown))?;
-        self.cursor = (crow, ccol.min(cols - 1));
+        self.cursor = frame.cursor;
 
         // The last viewport row has no trailing newline, so the cursor is on it now.
         let (cur, total) = self.positions(cols);
@@ -99,12 +171,16 @@ impl Renderer {
             queue!(buf, MoveUp(u16_of(total - 1 - cur)))?;
         }
         queue!(buf, MoveToColumn(self.cursor.1 as u16))?;
+        queue!(buf, Show)?;
         queue!(buf, EndSynchronizedUpdate)?;
         crate::term::term::set_rows_below(total.saturating_sub(1).saturating_sub(cur));
 
+        self.last = None;
         let mut out = io::stdout().lock();
         out.write_all(&buf)?;
-        out.flush()
+        out.flush()?;
+        self.last = Some(frame);
+        Ok(())
     }
 
     /// Moves below the viewport and ends the line so the shell prompt resumes cleanly.
@@ -125,6 +201,7 @@ impl Renderer {
         out.flush()?;
         self.drawn.clear();
         self.cursor = (0, 0);
+        self.last = None;
         Ok(())
     }
 
@@ -165,8 +242,19 @@ mod tests {
     }
 
     #[test]
+    fn diff_rewrites_only_changed_rows() {
+        let row = |s: &str| s.as_bytes().to_vec();
+        let old = [row("a"), row("b"), row("c"), row("d")];
+        let new = [row("a"), row("B"), row("c"), row("D")];
+        let out = String::from_utf8(diff_bytes(&old, &new, 3, (3, 2)).unwrap()).unwrap();
+        assert_eq!(out, "\x1b[2A\r\x1b[2KB\x1b[2B\r\x1b[2KD\x1b[3G");
+        let same = diff_bytes(&old, &old, 2, (2, 0)).unwrap();
+        assert_eq!(String::from_utf8(same).unwrap(), "\x1b[1G");
+    }
+
+    #[test]
     fn positions_account_for_reflow_on_shrink() {
-        let r = Renderer { drawn: vec![10, 3], cursor: (1, 2) };
+        let r = Renderer { drawn: vec![10, 3], cursor: (1, 2), last: None };
         // At 4 cols the 10-wide row takes 3 physical rows; cursor row starts after it.
         assert_eq!(r.positions(4), (3, 4));
         assert_eq!(r.positions(20), (1, 2));
