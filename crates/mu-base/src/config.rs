@@ -14,7 +14,7 @@ pub enum Threshold {
 }
 
 /// Largest token count accepted in a threshold (100M); bigger values are clamped with a warning.
-pub const MAX_THRESHOLD: u32 = 100_000_000;
+pub(crate) const MAX_THRESHOLD: u32 = 100_000_000;
 
 /// Converts to `u32`, clamping to `MAX_THRESHOLD` and noting it in `warn`.
 fn clamp_tokens(n: u64, key: &str, warn: &mut Vec<String>) -> u32 {

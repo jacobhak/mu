@@ -65,7 +65,7 @@ pub struct ToolOutput {
 }
 
 /// Key under which `meta` is stored in a persisted tool result's `details`.
-pub const META_KEY: &str = "muMeta";
+pub(crate) const META_KEY: &str = "muMeta";
 /// Larger display diffs are not persisted; a resumed session shows the result text instead.
 const STORED_DIFF_MAX: usize = 64 * 1024;
 

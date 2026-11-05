@@ -8,7 +8,7 @@
 use serde_json::Value;
 
 /// Largest accepted schema, serialized: it travels in every task call.
-pub const MAX_SCHEMA_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_SCHEMA_BYTES: usize = 32 * 1024;
 /// Nesting depth bound for schemas and values.
 const MAX_DEPTH: usize = 64;
 /// Errors reported to the model per submission.

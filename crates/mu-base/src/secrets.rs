@@ -23,7 +23,7 @@ pub enum Source {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct Hit {
-    pub label: String,
+    pub(crate) label: String,
     pub source: Source,
 }
 
@@ -175,7 +175,7 @@ pub fn feedback(hits: &[Hit]) -> String {
 }
 
 /// Placeholders this process handed out that appear in `text`.
-pub fn placeholders_in(text: &str) -> Vec<Hit> {
+pub(crate) fn placeholders_in(text: &str) -> Vec<Hit> {
     if !text.contains("[REDACTED:") {
         return Vec::new();
     }

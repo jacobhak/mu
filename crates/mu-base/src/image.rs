@@ -32,7 +32,7 @@ fn blob_dir() -> PathBuf {
 }
 
 /// Whether `data` is a blob reference rather than inline base64.
-pub fn is_ref(data: &str) -> bool {
+pub(crate) fn is_ref(data: &str) -> bool {
     data.strip_prefix(BLOB_PREFIX)
         .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }

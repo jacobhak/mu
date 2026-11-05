@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub const MAX_FROM: usize = 64;
-pub const DEFAULT_FROM: &str = "another process";
+pub(crate) const MAX_FROM: usize = 64;
+pub(crate) const DEFAULT_FROM: &str = "another process";
 
 pub const MAX_TEXT: usize = 64 * 1024;
 const PRUNE_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -27,18 +27,18 @@ pub struct Note {
     pub name: String,
     pub from: String,
     pub text: String,
-    pub at: String,
+    pub(crate) at: String,
 }
 
-pub fn root() -> PathBuf {
+pub(crate) fn root() -> PathBuf {
     paths::mu_home().join("inbox")
 }
 
-pub fn dir(id: &str) -> Option<PathBuf> {
+pub(crate) fn dir(id: &str) -> Option<PathBuf> {
     valid_id(id).then(|| root().join(id))
 }
 
-pub fn make_private_dir(p: &Path) -> std::io::Result<()> {
+pub(crate) fn make_private_dir(p: &Path) -> std::io::Result<()> {
     match std::fs::DirBuilder::new().mode(0o700).create(p) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
@@ -48,14 +48,14 @@ pub fn make_private_dir(p: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))
 }
 
-pub fn ensure_dir(id: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn ensure_dir(id: &str) -> std::io::Result<PathBuf> {
     let d = dir(id).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     make_private_dir(&root())?;
     make_private_dir(&d)?;
     Ok(d)
 }
 
-pub fn clean_line(s: &str, max: usize) -> String {
+pub(crate) fn clean_line(s: &str, max: usize) -> String {
     let one: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     one.trim().chars().take(max).collect()
 }
@@ -127,7 +127,7 @@ pub fn notice(notes: &[Note]) -> String {
 }
 
 /// Deletes message files older than `max_age` and empty inbox directories. Best effort.
-pub fn prune(max_age: Duration) {
+pub(crate) fn prune(max_age: Duration) {
     let Ok(rd) = std::fs::read_dir(root()) else { return };
     let now = std::time::SystemTime::now();
     for d in rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()) {
@@ -160,7 +160,7 @@ pub fn forward_signal(wake: tokio::sync::mpsc::UnboundedSender<()>) -> std::io::
 }
 
 /// The sender name: one line, at most 64 characters, `another process` when empty.
-pub fn sanitize_from(from: Option<&str>) -> String {
+pub(crate) fn sanitize_from(from: Option<&str>) -> String {
     let f = clean_line(from.unwrap_or(""), MAX_FROM);
     if f.is_empty() { DEFAULT_FROM.into() } else { f }
 }
@@ -187,7 +187,7 @@ pub fn enqueue(id: &str, from: &str, text: &str) -> std::io::Result<PathBuf> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Delivery {
+pub(crate) enum Delivery {
     /// SIGUSR2 sent to this pid.
     Signalled(u32),
     /// Left in the queue; the reason is shown to the sender.
@@ -195,7 +195,7 @@ pub enum Delivery {
 }
 
 /// Wakes the session's owner if, and only if, its record promises a SIGUSR2 handler.
-pub fn deliver(path: &Path) -> Delivery {
+pub(crate) fn deliver(path: &Path) -> Delivery {
     match owner(path) {
         Owner::Free => Delivery::Queued("not running".into()),
         Owner::Unknown => Delivery::Queued("owner unknown".into()),

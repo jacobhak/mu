@@ -311,7 +311,16 @@ Deviations from the plan, and what to know:
 - `mu-tui` does not depend on `mu-agent` (nothing in it needs it). `notify::send` and the session-control functions the jobs panel calls moved down into `mu-session` (`inbox`, `control`), so the TUI does not import binary modules.
 - `an_omp_session_loads_and_replays_only_to_its_own_wire` stays in `mu-provider`, with `mu-session` as a dev-dependency only.
 - `mu-testutil::home()` honours `MU_TEST_HOME` so `tests/modes.rs` can spawn the real binary against a fake API.
-- Phase 5: jobs-panel polling is in `App::on_tick` (the run-loop tick), not `on_ui`. The MCP wizard's env check now trims blanks like the key flow's did (the two copies differed slightly).
+- Phase 5: jobs-panel polling is in `App::on_tick` (the run-loop tick), not `on_ui`. `env_is_set` is not deduplicated: the key flow (`var`, blanks count as unset) and the MCP wizard (`var_os`, only empty counts as unset) differ, and merging them would change the wizard's GitHub preset, so each keeps its own check.
 - Phase 0 tests: the sibling-binary test exercises `sibling_of` (the extracted lookup); the other two fail on `main` and pass now.
 - Phase 1 restored the auth-store redaction refresh through `secrets::set_stored_refresh` (registered in `run()`), since dropping it changed behaviour.
 - Release binary after Phase 2: 66.94 MB vs 64.21 MB (+4.3%); idle Pss 19.6 MB vs 18.7 MB (+4.8%), Pss_Anon 3.7 vs 3.6 MB.
+- Review fixes (after the first review):
+  - `Command::Bash` and `Command::Compact` run under `drive`, so `Cancel` (Esc, quit, SIGUSR1) aborts them mid-run again. A follow-up that `turn_from` starts is published, so it leaves the queue bar. `/review` returns input typed during the review at its `TurnEnd`, before the fix turn.
+  - `review::facts` is two steps: `Worktree::snapshot` + `Worktree::gather(base)` collect the git facts, and `Facts::request(plan, notes, focus)` builds the request. Each front end resolves the plan between the two, in `main`'s order: no plan check or plan notice when there is nothing to review, and the bare "review needs a git repository" error.
+  - `test-support` only adds constructors and inert seams, so the `target/debug/mu` that `cargo test` builds behaves like a normal build: `Providers::new` always opens the real key store (tests use `Providers::for_tests`), and `__panic` panics only when `Tools::panic_tool` is set by `mu_agent::testing`. `Agent.review_child` is `cfg(test)`, `Agent::providers()` is test-support only.
+  - `WireFormat` has no `classify`: nothing called it, and each decoder maps its own in-stream error frames.
+  - The direct Anthropic headers use `native::betas(req)`, so the body is built once per attempt.
+  - Key validation builds its own client again (15 s overall, no separate connect timeout), as on `main`.
+  - `AuthStyle` lives in `mu-provider`'s `providers.rs`.
+  - `mu-session` is `session/` with `file`, `format`, `list`, `owner` (with `RunKind`), `tail`, `inbox` and `control`. `profile_flag` sits in `list` (it builds resume hints). `LiveSession.kind` stays a string: it is read from records other mu versions may have written.

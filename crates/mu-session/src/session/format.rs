@@ -12,7 +12,7 @@ pub(super) const TITLE_SLOT_BYTES: usize = 256;
 
 /// The `type` of a session entry. Serialized to the same strings omp uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EntryKind {
+pub(crate) enum EntryKind {
     Message,
     Compaction,
     ModelChange,
@@ -23,7 +23,7 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Message => "message",
             Self::Compaction => "compaction",
@@ -44,7 +44,7 @@ pub enum TitleSource {
 }
 
 impl TitleSource {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Auto => "auto",

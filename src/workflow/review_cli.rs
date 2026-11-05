@@ -213,6 +213,7 @@ mod tests {
         assert_eq!(exit_code("fail"), 1);
         assert_eq!(exit_code("error"), 2);
         // A missing --plan does not matter when there is nothing to review.
+        let _ = std::fs::remove_file(&out); // the earlier verdict is an untracked change in the repo
         let missing_plan = CliOpts { plan: Some(dir.join("no-such-plan.md")), ..opts("HEAD") };
         assert_eq!(run_cli(missing_plan, &dir), 0);
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();

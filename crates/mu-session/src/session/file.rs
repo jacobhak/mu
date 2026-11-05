@@ -124,7 +124,7 @@ impl SessionFile {
     }
 
     /// Appends an entry and returns its id, or `None` when nothing was written.
-    pub fn append(&mut self, kind: EntryKind, payload: Value) -> Option<String> {
+    pub(crate) fn append(&mut self, kind: EntryKind, payload: Value) -> Option<String> {
         self.file.as_ref()?;
         let id = loop {
             let u = uuid::Uuid::new_v4().simple().to_string();

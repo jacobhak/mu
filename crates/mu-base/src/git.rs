@@ -14,7 +14,12 @@ pub async fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<Stri
 }
 
 /// `git` with its own timeout.
-pub async fn git_for(dir: &Path, args: &[&str], index: Option<&Path>, timeout: Duration) -> Result<String, String> {
+pub(crate) async fn git_for(
+    dir: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args)
         .current_dir(dir)
@@ -52,7 +57,7 @@ pub async fn git_status(cwd: &Path) -> Option<GitInfo> {
         .map(|s| parse_porcelain_v2(&s))
 }
 
-pub fn parse_porcelain_v2(out: &str) -> GitInfo {
+pub(crate) fn parse_porcelain_v2(out: &str) -> GitInfo {
     let mut info = GitInfo::default();
     let mut oid = None;
     let mut detached = false;

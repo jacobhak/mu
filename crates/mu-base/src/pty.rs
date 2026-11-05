@@ -7,7 +7,7 @@ use std::process::Stdio;
 use tokio::io::unix::AsyncFd;
 
 /// `$SHELL` when it is bash or zsh, else the first `bash` on `PATH`, else `/bin/sh`.
-pub fn login_shell() -> String {
+pub(crate) fn login_shell() -> String {
     if let Ok(sh) = std::env::var("SHELL")
         && matches!(Path::new(&sh).file_name().and_then(|n| n.to_str()), Some("bash" | "zsh"))
     {
@@ -180,7 +180,7 @@ enum State {
 #[derive(Default)]
 pub struct Cleaner {
     state: State,
-    pub line: String,
+    pub(crate) line: String,
 }
 
 const MAX_LINE: usize = 16 * 1024;

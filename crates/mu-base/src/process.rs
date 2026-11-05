@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 /// Time between SIGTERM and SIGKILL.
-pub const TERM_GRACE: Duration = Duration::from_millis(200);
+pub(crate) const TERM_GRACE: Duration = Duration::from_millis(200);
 /// How long a command's leftover children may keep its stdout open after it exits.
 const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
 
