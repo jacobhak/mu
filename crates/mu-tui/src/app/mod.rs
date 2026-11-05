@@ -109,6 +109,8 @@ struct Prompt {
 struct Flows {
     /// `/model` assigns roles; `/switch` only changes this session.
     pick_assign: bool,
+    /// A role without a model that the model being picked is for.
+    assign_role: Option<String>,
     pick_deliver: bool,
     /// An `/mcp add` wizard is collecting answers; the composer's lines go to it.
     mcp_wizard: Option<Wizard>,
@@ -169,7 +171,14 @@ pub async fn run(init: AppInit) -> i32 {
             held_back: Vec::new(),
         },
         overlay: None,
-        flows: Flows { pick_assign: false, pick_deliver: false, mcp_wizard: None, key_flow: None, key_flow_seq: 0 },
+        flows: Flows {
+            pick_assign: false,
+            assign_role: None,
+            pick_deliver: false,
+            mcp_wizard: None,
+            key_flow: None,
+            key_flow_seq: 0,
+        },
         quitting: false,
     };
     let store_warning = app.services.providers.store().permission_warning();

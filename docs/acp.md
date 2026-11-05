@@ -16,7 +16,7 @@ A prompt that fails (a provider error, a rejected key) answers with a JSON-RPC e
 
 ## Options and modes
 
-Config options: `model` (an advertised `provider/model` id, or a role selector such as `@slow` or `@slow:high`, resolved as `--model` is; an unconfigured role fails with an invalid-params error), `thinking`, and `mode`. The modes are `default` and `plan`: plan mode is read-only exploration that ends with a proposed plan. `session/set_mode` and the `mode` option are the same switch, and `current_mode_update` reports changes the agent makes itself (a plan being approved or parked).
+Config options: `model` (the roles you have set, each with what it is for ([Model roles](model-roles.md)), then the advertised `provider/model` ids; a role selector such as `@slow:high` is also accepted, resolved as `--model` is; an unconfigured role fails with an invalid-params error that names what the role is for and its fallback), `thinking`, and `mode`. The modes are `default` and `plan`: plan mode is read-only exploration that ends with a proposed plan. `session/set_mode` and the `mode` option are the same switch, and `current_mode_update` reports changes the agent makes itself (a plan being approved or parked).
 
 ## Slash commands
 

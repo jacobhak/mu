@@ -295,7 +295,7 @@ pub fn resolve(
     let (base, mut level) = split_level(sel);
     let base = match base.strip_prefix('@') {
         Some(role) => {
-            let v = cfg.role(role).ok_or_else(|| anyhow!("model role @{role} is not configured"))?;
+            let v = cfg.role(role).ok_or_else(|| anyhow!(crate::roles::not_configured(role)))?;
             let (m, l) = split_level(&v);
             level = level.or(l);
             m

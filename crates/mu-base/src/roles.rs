@@ -1,0 +1,224 @@
+//! What each model role is for, shown wherever a role is picked or assigned. The fallback chains
+//! come from `models::role_chain`, so what is shown is what mu does.
+
+use crate::config::Configs;
+use crate::models::{role_chain, split_level};
+
+struct Doc {
+    name: &'static str,
+    /// A few words, shown beside the role.
+    purpose: &'static str,
+    used_by: &'static str,
+    /// What happens when neither the role nor its fallbacks are set.
+    unset: &'static str,
+}
+
+const DOCS: [Doc; 7] = [
+    Doc {
+        name: "default",
+        purpose: "main session",
+        used_by: "The model a session starts with, and the keep-this-model choice when you approve a plan.",
+        unset: "mu picks a model itself",
+    },
+    Doc {
+        name: "plan",
+        purpose: "plan mode",
+        used_by: "The model while plan mode is on.",
+        unset: "plan mode keeps the session's model",
+    },
+    Doc {
+        name: "task",
+        purpose: "subagents",
+        used_by: "`task` and `scout` subagents, and any agent whose `model:` names no model or role you have set.",
+        unset: "subagents use the session's model",
+    },
+    Doc {
+        name: "review",
+        purpose: "/review lead",
+        used_by: "The lead of /review and `mu review`. Its scouts run on @task.",
+        unset: "the review uses the session's model",
+    },
+    Doc {
+        name: "smol",
+        purpose: "titles, plugins",
+        used_by: "Session titles, plugins that ask for a model, and a cheap choice when you approve a plan.",
+        unset: "titles and plugin calls are skipped",
+    },
+    Doc {
+        name: "memory",
+        purpose: "memory plugin",
+        used_by: "The memory plugin's model calls.",
+        unset: "the memory plugin cannot ask a model",
+    },
+    Doc {
+        name: "slow",
+        purpose: "plan execution",
+        used_by: "A stronger model offered when you approve a plan (omp's `cycleOrder` lists the offered roles).",
+        unset: "not offered when you approve a plan",
+    },
+];
+
+/// The role an agent's `model:` entry names (`@slow`, `@slow:high`), if it is a role.
+pub fn agent_role(entry: &str) -> Option<String> {
+    entry.strip_prefix('@').map(|r| split_level(r).0)
+}
+
+/// A role as shown to the user.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleView {
+    pub name: String,
+    pub purpose: String,
+    pub used_by: String,
+    /// The configured `provider/model[:level]`.
+    pub value: Option<String>,
+    /// When unset: the role mu uses instead, with its value.
+    pub fallback: Option<(String, String)>,
+    /// What happens when nothing in the chain is set.
+    pub unset: String,
+    /// Agents that list the role in `model:`.
+    pub agents: Vec<String>,
+}
+
+impl RoleView {
+    /// One line beside the role name.
+    pub fn row(&self) -> String {
+        let state = match (&self.value, &self.fallback) {
+            (Some(v), _) => v.clone(),
+            (None, Some((f, _))) => format!("(unset → @{f})"),
+            (None, None) => "(unset)".into(),
+        };
+        format!("{state} · {}", self.purpose)
+    }
+
+    /// What the role does and what it is now.
+    pub fn detail(&self) -> String {
+        let mut out = format!("Used by: {}", self.used_by);
+        if !self.agents.is_empty() {
+            out.push_str(&format!("\nAgents: {}", self.agents.join(", ")));
+        }
+        out.push_str(&match (&self.value, &self.fallback) {
+            (Some(v), _) => format!("\nSet to {v}"),
+            (None, Some((f, v))) => format!("\nNot set: uses @{f} ({v}). Enter assigns a model."),
+            (None, None) => format!("\nNot set: {}. Enter assigns a model.", self.unset),
+        });
+        out
+    }
+}
+
+/// The roles mu uses, then the others your agents or `cycleOrder` name. Roles that only exist in
+/// `config.yml` and that nothing refers to are left out.
+pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
+    let cycle = cfg.omp.role_cycle();
+    let using = |role: &str| -> Vec<String> {
+        agents
+            .iter()
+            .filter(|(_, models)| models.iter().any(|m| agent_role(m).as_deref() == Some(role)))
+            .map(|(name, _)| name.to_string())
+            .collect()
+    };
+    let view = |name: &str, purpose: &str, used_by: String, unset: &str, chain: Vec<String>| {
+        let fallback = chain.into_iter().skip(1).find_map(|r| cfg.role(&r).map(|v| (r, v)));
+        RoleView {
+            name: name.into(),
+            purpose: purpose.into(),
+            used_by,
+            value: cfg.role(name),
+            fallback,
+            unset: unset.into(),
+            agents: using(name),
+        }
+    };
+    let mut out: Vec<RoleView> =
+        DOCS.iter().map(|d| view(d.name, d.purpose, d.used_by.into(), d.unset, role_chain(d.name))).collect();
+    let mut custom: Vec<String> = agents
+        .iter()
+        .flat_map(|(_, models)| models.iter())
+        .filter_map(|m| agent_role(m))
+        .chain(cycle.iter().cloned())
+        .filter(|r| !DOCS.iter().any(|d| d.name == r))
+        .collect();
+    custom.sort_unstable();
+    custom.dedup();
+    for name in custom {
+        let mut parts = Vec::new();
+        if cycle.contains(&name) {
+            parts.push("offered when you approve a plan (`cycleOrder`)");
+        }
+        if !using(&name).is_empty() {
+            parts.push("agents that list it in `model:`");
+        }
+        let used_by = format!("{}.", parts.join("; "));
+        // An agent whose role is unset takes the `task` model.
+        let chain = std::iter::once(name.clone()).chain(role_chain("task")).collect();
+        out.push(view(&name, "custom role", used_by, "agents use @task", chain));
+    }
+    out
+}
+
+/// `@role` has no model: what it is for, and where mu goes instead.
+pub fn not_configured(role: &str) -> String {
+    let mut s = format!("model role @{role} is not configured");
+    if let Some(d) = DOCS.iter().find(|d| d.name == role) {
+        let chain = role_chain(role);
+        s.push_str(&format!(" ({}", d.purpose));
+        if chain.len() > 1 {
+            let rest: Vec<String> = chain[1..].iter().map(|r| format!("@{r}")).collect();
+            s.push_str(&format!("; when unset mu falls back to {}", rest.join(" then ")));
+        }
+        s.push(')');
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(roles: &str) -> Configs {
+        Configs { omp: serde_yaml_ng::from_str(roles).unwrap(), ..Default::default() }
+    }
+
+    fn find<'a>(v: &'a [RoleView], name: &str) -> &'a RoleView {
+        v.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("no {name} in {v:?}"))
+    }
+
+    #[test]
+    fn every_role_mu_uses_is_listed_set_or_not_with_its_fallback() {
+        let v = views(&cfg("modelRoles:\n  default: a/b\n  commit: c/d\n"), &[]);
+        let names: Vec<&str> = v.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["default", "plan", "task", "review", "smol", "memory", "slow"], "commit is omp's");
+        assert_eq!(find(&v, "default").row(), "a/b · main session");
+        assert_eq!(find(&v, "review").row(), "(unset → @default) · /review lead");
+        assert_eq!(find(&v, "slow").row(), "(unset) · plan execution");
+        let d = find(&v, "review").detail();
+        assert!(d.contains("Not set: uses @default (a/b)") && d.contains("Enter assigns"), "{d}");
+        assert!(find(&v, "slow").detail().contains("not offered when you approve a plan"));
+    }
+
+    #[test]
+    fn agents_and_cycle_order_bring_in_custom_roles() {
+        let agents = [
+            ("docs", &["@writer:high".to_string(), "a/b".to_string()][..]),
+            ("lint", &["@writer".to_string(), "@smol".to_string()][..]),
+        ];
+        let v = views(&cfg("modelRoles:\n  smol: a/b\n  writer: c/d\ncycleOrder: [smol, fast]\n"), &agents);
+        assert_eq!(find(&v, "smol").agents, ["lint"]);
+        let w = find(&v, "writer");
+        assert_eq!((w.agents.clone(), w.value.as_deref()), (vec!["docs".into(), "lint".into()], Some("c/d")));
+        assert_eq!(w.purpose, "custom role");
+        let f = find(&v, "fast");
+        assert!(f.used_by.contains("cycleOrder") && f.agents.is_empty(), "{f:?}");
+        assert_eq!(f.row(), "(unset) · custom role");
+        assert!(f.detail().contains("agents use @task"));
+    }
+
+    #[test]
+    fn the_error_names_what_the_role_is_for_and_its_chain() {
+        assert_eq!(
+            not_configured("review"),
+            "model role @review is not configured (/review lead; when unset mu falls back to @plan then @default)"
+        );
+        assert_eq!(not_configured("slow"), "model role @slow is not configured (plan execution)");
+        assert_eq!(not_configured("mine"), "model role @mine is not configured");
+    }
+}

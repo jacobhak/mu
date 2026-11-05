@@ -10,6 +10,7 @@
 - [MCP servers](mcp.md)
 - [Agent Client Protocol](acp.md): `mu --acp`
 - [Providers](providers.md): API keys for Anthropic, OpenAI and Baseten, `mu auth`, `/login`, routing and thinking per provider, what still needs omp
+- [Model roles](model-roles.md): what each role is for, and where to see and set them
 - [Custom agents](custom-agents.md)
 - [Memory](memory.md)
 - [Secrets](secrets.md): what mu redacts before storing or sending text, and what it does not protect against

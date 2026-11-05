@@ -61,6 +61,7 @@ impl App {
                 Err(e) => self.error(&format!("copy failed: {e}")),
             },
             UiMsg::Models(r) => {
+                let target = self.flows.assign_role.take();
                 let gw = match r {
                     Ok(g) => g,
                     Err(e) => {
@@ -73,7 +74,7 @@ impl App {
                         vec![]
                     }
                 };
-                self.open_model_picker(gw);
+                self.open_model_picker(gw, target);
             }
             UiMsg::McpLoggedIn(name, r) => match r {
                 Ok((n, changed)) => {

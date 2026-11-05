@@ -10,7 +10,8 @@ use crate::widgets::overlay::{LoginTarget, OverlayEvent};
 use crate::widgets::select::{Item, Select};
 use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
-use mu_base::models::GatewayModel;
+use mu_base::models::{GatewayModel, split_level};
+use mu_base::roles::{self, RoleView};
 use mu_provider::provider::providers::native_def;
 use tokio::sync::oneshot;
 
@@ -44,14 +45,29 @@ impl App {
         });
     }
 
-    pub(super) fn open_model_picker(&mut self, gateway: Vec<GatewayModel>) {
+    /// The model roles as they are shown: what each is for, and what it is set to.
+    fn role_views(&self) -> Vec<RoleView> {
+        let agents: Vec<(&str, &[String])> =
+            self.ctx.agents.iter().map(|a| (a.name.as_str(), a.model.as_slice())).collect();
+        roles::views(&self.services.providers.cfg, &agents)
+    }
+
+    /// `target` is a role without a model that the picked model is for.
+    pub(super) fn open_model_picker(&mut self, gateway: Vec<GatewayModel>, target: Option<String>) {
         let providers = self.services.providers.clone();
         let mut items = Vec::new();
         let mut ids = Vec::new();
-        for r in ["default", "smol", "slow", "plan", "task", "commit"] {
-            if let Some(v) = providers.cfg.role(r) {
-                items.push(Item { label: format!("@{r}"), detail: v });
-                ids.push(format!("@{r}"));
+        let mut details = Vec::new();
+        if target.is_none() {
+            for r in self.role_views() {
+                // `/switch` only changes this session, so it lists the roles that have a model.
+                if r.value.is_none() && !self.flows.pick_assign {
+                    continue;
+                }
+                items.push(Item { label: format!("@{}", r.name), detail: r.row() });
+                ids.push(format!("@{}", r.name));
+                let enter = if r.value.is_some() { "\nEnter switches this session to it." } else { "" };
+                details.push(Some(format!("{}{enter}", r.detail())));
             }
         }
         for m in providers.direct_models() {
@@ -79,28 +95,28 @@ impl App {
                 }
             }
         }
-        let title = if self.flows.pick_assign {
-            "Select model (then choose where it applies)"
-        } else {
-            "Switch model (this session)"
+        details.resize(items.len(), None);
+        let title = match (&target, self.flows.pick_assign) {
+            (Some(role), _) => format!("Choose a model for @{role}"),
+            (None, true) => "Select model (then choose where it applies)".to_string(),
+            (None, false) => "Switch model (this session)".to_string(),
         };
-        self.overlay = Some(Overlay::Model { sel: Select::new(title, items), ids, assign: self.flows.pick_assign });
+        let assign = self.flows.pick_assign || target.is_some();
+        self.overlay = Some(Overlay::Model { sel: Select::new(&title, items).details(details), ids, assign, target });
     }
 
     pub(super) fn open_role_picker(&mut self, model: String) {
-        const COMMON: [&str; 6] = ["default", "smol", "slow", "plan", "task", "commit"];
-        let cfg = &self.services.providers.cfg;
-        let mut names: Vec<String> = COMMON.iter().map(|s| s.to_string()).collect();
-        names.extend(cfg.omp.model_roles.keys().filter(|k| !COMMON.contains(&k.as_str())).cloned());
         let mut items = vec![Item { label: "This session only".into(), detail: model.clone() }];
         let mut roles = vec![None];
-        for n in names {
-            let detail = cfg.role(&n).map_or("(unset)".to_string(), |v| format!("now {v}"));
-            items.push(Item {
-                label: if n == "default" { "Set as @default (and switch now)".into() } else { format!("Set as @{n}") },
-                detail,
-            });
-            roles.push(Some(n));
+        for r in self.role_views() {
+            let now = r.value.as_ref().map_or("unset".to_string(), |v| format!("now {v}"));
+            let label = if r.name == "default" {
+                "Set as @default (and switch now)".into()
+            } else {
+                format!("Set as @{}", r.name)
+            };
+            items.push(Item { label, detail: format!("{} · {now}", r.purpose) });
+            roles.push(Some(r.name));
         }
         self.overlay = Some(Overlay::Role { sel: Select::new(&format!("Use {model}"), items), model, roles });
     }
@@ -252,9 +268,17 @@ impl App {
     }
 
     /// Carries out what the user chose in an overlay.
-    fn on_overlay_event(&mut self, e: OverlayEvent) {
+    pub(super) fn on_overlay_event(&mut self, e: OverlayEvent) {
         match e {
-            OverlayEvent::SetModel(id) => self.send(Command::SetModel(id)),
+            OverlayEvent::SetModel(id) => match id.strip_prefix('@') {
+                // A role with no model has nothing to switch to: pick one for it instead.
+                Some(role) if self.services.providers.cfg.role(&split_level(role).0).is_none() => {
+                    self.flows.pick_assign = true;
+                    self.flows.assign_role = Some(role.to_string());
+                    self.request_models();
+                }
+                _ => self.send(Command::SetModel(id)),
+            },
             OverlayEvent::PickRole(model) => self.open_role_picker(model),
             OverlayEvent::AssignRole { role: Some(role), model } => match self.services.set_role(&role, &model) {
                 Ok(v) => {

@@ -15,6 +15,7 @@ use mu_agent::handle::{AgentHandle, AgentSetup, Mode, build_agent};
 use mu_base::events::{AgentEvent, Command};
 use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
+use mu_base::roles;
 use mu_provider::model::pricing;
 use mu_session::session::list;
 use mu_tools::context::Context;
@@ -153,8 +154,19 @@ struct Session {
 
 impl Session {
     fn config_options(&self) -> Value {
-        let models: Vec<Value> =
-            self.models.iter().map(|m| json!({"value": m, "name": pricing::display_name(m)})).collect();
+        // The configured roles come first, each saying what it is for; choosing one switches to
+        // the model it names, as `--model @role` does.
+        let agents: Vec<(&str, &[String])> =
+            self.ctx.agents.iter().map(|a| (a.name.as_str(), a.model.as_slice())).collect();
+        let mut models: Vec<Value> = roles::views(&self.providers.cfg, &agents)
+            .into_iter()
+            .filter_map(|r| {
+                let v = r.value.as_ref()?;
+                let name = format!("@{}", r.name);
+                Some(json!({"value": name, "name": name, "description": format!("{} · {v}", r.purpose)}))
+            })
+            .collect();
+        models.extend(self.models.iter().map(|m| json!({"value": m, "name": pricing::display_name(m)})));
         let levels: Vec<Value> = Thinking::NAMES.iter().map(|n| json!({"value": n, "name": n})).collect();
         let modes: Vec<Value> =
             MODES.iter().map(|(id, name, d)| json!({"value": id, "name": name, "description": d})).collect();

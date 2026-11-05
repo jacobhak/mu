@@ -599,7 +599,14 @@ mod tests {
                 held_back: vec![],
             },
             overlay: None,
-            flows: Flows { pick_assign: false, pick_deliver: false, mcp_wizard: None, key_flow: None, key_flow_seq: 0 },
+            flows: Flows {
+                pick_assign: false,
+                assign_role: None,
+                pick_deliver: false,
+                mcp_wizard: None,
+                key_flow: None,
+                key_flow_seq: 0,
+            },
             quitting: false,
         }
     }
@@ -704,5 +711,41 @@ mod tests {
         } else {
             assert!(matches!(&app.overlay, Some(Overlay::Logout { providers, .. }) if !providers.is_empty()));
         }
+    }
+
+    #[test]
+    fn model_lists_every_role_and_a_role_without_a_model_gets_one_picked() {
+        use mu_base::config::Configs;
+        let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Configs {
+            omp: serde_yaml_ng::from_str("modelRoles:\n  default: a/b\n  commit: c/d\n").unwrap(),
+            ..Default::default()
+        };
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
+        app.services = Services { providers: Rc::new(Providers::for_tests(Rc::new(cfg), gateway)) };
+
+        app.flows.pick_assign = true;
+        app.open_model_picker(vec![], None);
+        let Some(Overlay::Model { ids, target: None, .. }) = &app.overlay else { panic!("no model picker") };
+        let roles: Vec<&str> = ids.iter().map(String::as_str).take_while(|i| i.starts_with('@')).collect();
+        assert_eq!(roles, ["@default", "@plan", "@task", "@review", "@smol", "@memory", "@slow"]);
+
+        // /switch lists only the roles that have a model.
+        app.flows.pick_assign = false;
+        app.open_model_picker(vec![], None);
+        let Some(Overlay::Model { ids, .. }) = &app.overlay else { panic!("no model picker") };
+        assert_eq!(ids, &["@default"]);
+
+        // Enter on an unset role asks for a model for it, and the picked model goes to that role.
+        app.flows.pick_assign = true;
+        mu_testutil::block_on_local(async { app.on_overlay_event(OverlayEvent::SetModel("@review".into())) });
+        assert_eq!(app.flows.assign_role.as_deref(), Some("review"));
+        let target = app.flows.assign_role.take();
+        app.open_model_picker(vec![], target);
+        let Some(Overlay::Model { ids, assign: true, target: Some(role), .. }) = &app.overlay else {
+            panic!("no picker for the role")
+        };
+        assert_eq!(role, "review");
+        assert!(ids.iter().all(|i| !i.starts_with('@')), "no roles to pick from: {ids:?}");
     }
 }

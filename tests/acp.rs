@@ -247,6 +247,32 @@ fn a_session_offers_modes_and_commands_and_a_prompt_streams_its_reply() {
 }
 
 #[test]
+fn model_roles_are_offered_with_what_they_are_for() {
+    let (base, _) = serve(vec![]);
+    let home = home_with_key(&base);
+    let agent_dir = home.join(".omp/agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("config.yml"),
+        "modelRoles:\n  default: anthropic/claude-sonnet-5-5\n  plan: anthropic/claude-sonnet-5-5:high\n  commit: anthropic/claude-haiku-5-5\n",
+    )
+    .unwrap();
+    let cwd = mu_testutil::tmp();
+    let mut acp = Acp::start(&home, &cwd);
+    acp.init(json!({}));
+    let (sid, res) = acp.new_session(&cwd);
+    let model = res["configOptions"].as_array().unwrap().iter().find(|o| o["category"] == "model").unwrap();
+    let options = model["options"].as_array().unwrap();
+    let role = |v: &str| options.iter().find(|o| o["value"] == v);
+    let plan = role("@plan").unwrap_or_else(|| panic!("{options:?}"));
+    assert_eq!(plan["description"], "plan mode · anthropic/claude-sonnet-5-5:high");
+    assert!(role("@default").is_some());
+    assert!(role("@review").is_none() && role("@commit").is_none(), "unset and unused roles are left out");
+    let r = acp.call("session/set_config_option", json!({"sessionId": sid, "configId": "model", "value": "@plan"}));
+    assert!(r["error"].is_null(), "{r}");
+}
+
+#[test]
 fn a_failed_turn_is_an_error_response_not_end_turn() {
     let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
     let (mut acp, cwd, _) = setup(vec![Reply::new(401, body)]);

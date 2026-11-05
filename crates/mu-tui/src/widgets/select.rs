@@ -27,6 +27,8 @@ const INDENT: usize = 4;
 
 /// Rows a highlighted option's preview may take, the truncation marker included.
 const PREVIEW_MAX_LINES: usize = 16;
+/// Rows a highlighted item's detail text may take under the list.
+const DETAIL_MAX_LINES: usize = 6;
 
 const TEXT_HINT: &str = "Enter submit · Alt-Enter newline · Esc to options";
 
@@ -89,6 +91,8 @@ pub struct Select {
     previews: Vec<Option<String>>,
     /// The content kind the model declared for each preview; `None` is guessed from the text.
     kinds: Vec<Option<PreviewKind>>,
+    /// One entry per item: dim lines under the list while that item is highlighted (compact layout).
+    details: Vec<Option<String>>,
     /// Ask layout: each option's description under its label, then its note and preview box. Otherwise a description sits inline after its label.
     described: bool,
     /// Left (with the filter empty) and Shift-Tab return `SelectResult::Back`.
@@ -119,6 +123,7 @@ impl Select {
             hint: None,
             previews: Vec::new(),
             kinds: Vec::new(),
+            details: Vec::new(),
             described: false,
             back: false,
         }
@@ -204,6 +209,12 @@ impl Select {
 
     pub fn previews(mut self, previews: Vec<Option<String>>) -> Self {
         self.previews = previews;
+        self
+    }
+
+    /// Text shown under the list while the item at the same index is highlighted.
+    pub fn details(mut self, details: Vec<Option<String>>) -> Self {
+        self.details = details;
         self
     }
 
@@ -388,6 +399,8 @@ impl Select {
             let list_room = room - 1;
             let hint = self.hint.as_ref().filter(|_| list_room >= 2);
             let avail = list_room - usize::from(hint.is_some());
+            let detail = self.detail_rows(rows.get(sel).copied(), width, avail.saturating_sub(3));
+            let avail = avail - detail.len();
             if rows.is_empty() {
                 if avail > 0 {
                     out.push(line::styled("  no matches", |_| dim()));
@@ -409,6 +422,7 @@ impl Select {
                     }
                 }
             }
+            out.extend(detail);
             if let Some(h) = hint {
                 out.push(line::styled(format!("  {h}"), |_| dim()));
             }
@@ -416,6 +430,31 @@ impl Select {
         cursor.1 = cursor.1.min(width - 1);
         let out = out.iter().map(|l| line::truncate(l, width)).collect();
         (out, cursor)
+    }
+
+    /// The highlighted item's detail text, wrapped to `width` and cut to `cap` rows (at most
+    /// `DETAIL_MAX_LINES`).
+    fn detail_rows(&self, row: Option<Row>, width: usize, cap: usize) -> Vec<Line> {
+        let Some(Row::Item(i)) = row else { return Vec::new() };
+        let Some(Some(text)) = self.details.get(i) else { return Vec::new() };
+        let cap = cap.min(DETAIL_MAX_LINES);
+        if cap == 0 {
+            return Vec::new();
+        }
+        let mut rows: Vec<Line> =
+            wrap_chs(&chs(text, dim()), width.saturating_sub(2)).iter().map(|r| chars_to_line(r)).collect();
+        if rows.len() > cap {
+            rows.truncate(cap);
+            if let Some(last) = rows.last_mut() {
+                last.push(span("…", dim()));
+            }
+        }
+        rows.into_iter()
+            .map(|mut l| {
+                l.insert(0, span("  ", dim()));
+                l
+            })
+            .collect()
     }
 
     /// The title wrapped to `width`, honouring its newlines. It takes at most half of `max_rows`
@@ -1040,6 +1079,22 @@ mod tests {
         let (lines, cur) = s.render(40, 10);
         assert_eq!(texts(&lines), ["Pick a model", "› gpt", "❯ openai/gpt"]);
         assert_eq!(cur, (1, 5));
+    }
+
+    #[test]
+    fn the_highlighted_items_details_show_under_the_list_and_give_way_to_it() {
+        let mut s =
+            Select::new("Pick", items(&["a", "b"])).details(vec![Some("Used by: x\nNot set: uses @y".into()), None]);
+        let (lines, _) = s.render(40, 10);
+        assert_eq!(texts(&lines), ["Pick", "›", "❯ a", "  b", "  Used by: x", "  Not set: uses @y"]);
+        s.on_key(key(KeyCode::Down));
+        let (lines, _) = s.render(40, 10);
+        assert_eq!(texts(&lines), ["Pick", "›", "  a", "❯ b"], "an item without details shows none");
+        s.on_key(key(KeyCode::Up));
+        let (lines, _) = s.render(40, 6);
+        assert_eq!(texts(&lines), ["Pick", "›", "❯ a", "  b", "  Used by: x…"], "cut to the room");
+        let (lines, _) = s.render(14, 20);
+        assert!(texts(&lines).iter().all(|l| l.chars().count() <= 14), "wrapped to the width");
     }
 
     #[test]

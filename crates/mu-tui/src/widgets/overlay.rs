@@ -72,6 +72,8 @@ pub enum Overlay {
         sel: Select,
         ids: Vec<String>,
         assign: bool,
+        /// The role the model is for, when the picker was opened from a role that has none.
+        target: Option<String>,
     },
     /// Where a picked model goes: this session, or a role in omp's config.
     Role {
@@ -524,12 +526,15 @@ impl Overlay {
     /// Handles one key. Returns the overlay if it stays open, and what the user chose, if anything.
     pub fn on_key(self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
         match self {
-            Overlay::Model { mut sel, ids, assign } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Model { sel, ids, assign }), None),
+            Overlay::Model { mut sel, ids, assign, target } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Model { sel, ids, assign, target }), None),
                 SelectResult::Chosen(i) => {
                     let ev = i.first().and_then(|i| ids.get(*i)).map(|id| {
                         if assign && !id.starts_with('@') {
-                            OverlayEvent::PickRole(id.clone())
+                            match target {
+                                Some(role) => OverlayEvent::AssignRole { role: Some(role), model: id.clone() },
+                                None => OverlayEvent::PickRole(id.clone()),
+                            }
                         } else {
                             OverlayEvent::SetModel(id.clone())
                         }
@@ -661,12 +666,28 @@ mod tests {
             sel: Select::new("m", items(&["a/x", "@smol"])),
             ids: vec!["a/x".into(), "@smol".into()],
             assign: true,
+            target: None,
         };
         let (rest, ev) = ov.on_key(key(KeyCode::Enter));
         assert!(rest.is_none());
         assert!(matches!(ev, Some(OverlayEvent::PickRole(m)) if m == "a/x"), "a concrete model asks for a role");
-        let ov = Overlay::Model { sel: Select::new("m", items(&["@smol"])), ids: vec!["@smol".into()], assign: true };
+        let ov = Overlay::Model {
+            sel: Select::new("m", items(&["@smol"])),
+            ids: vec!["@smol".into()],
+            assign: true,
+            target: None,
+        };
         assert!(matches!(ov.on_key(key(KeyCode::Enter)).1, Some(OverlayEvent::SetModel(m)) if m == "@smol"));
+        let ov = Overlay::Model {
+            sel: Select::new("m", items(&["a/x"])),
+            ids: vec!["a/x".into()],
+            assign: true,
+            target: Some("review".into()),
+        };
+        assert!(
+            matches!(ov.on_key(key(KeyCode::Enter)).1, Some(OverlayEvent::AssignRole { role: Some(r), model }) if r == "review" && model == "a/x"),
+            "a picker opened for a role assigns it without asking again"
+        );
     }
 
     #[test]
