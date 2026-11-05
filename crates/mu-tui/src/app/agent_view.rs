@@ -29,6 +29,9 @@ const TAIL_MAX: usize = 10;
 /// Bash commands kept for `/copy`.
 const BASH_CMDS_MAX: usize = 50;
 
+/// A retry wait at least this long counts down in the viewport; a shorter one only gets the notice.
+const RETRY_COUNTDOWN_FROM: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(super) struct RunningTool {
     pub(super) id: String,
     name: String,
@@ -102,6 +105,8 @@ pub(super) struct AgentView {
     pub(super) pty: Option<PtyView>,
     pub(super) running: bool,
     pub(super) compacting: bool,
+    /// A retry wait long enough to count down in the viewport: its end and the attempt that failed.
+    retry_wait: Option<(Instant, u32)>,
     pub(super) turn_started: Option<Instant>,
     pub(super) expanded: bool,
     pub(super) queued: QueueState,
@@ -125,6 +130,7 @@ impl AgentView {
             pty: None,
             running: false,
             compacting: false,
+            retry_wait: None,
             turn_started: None,
             expanded: false,
             queued: QueueState::default(),
@@ -255,6 +261,7 @@ impl AgentView {
                 self.calls.clear();
                 let msg = format!("↻ {}", mu_base::events::retry_notice(attempt, delay, &reason));
                 self.tr.commit(notice_lines(&msg));
+                self.retry_wait = (delay >= RETRY_COUNTDOWN_FROM).then(|| (Instant::now() + delay, attempt));
             }
             AgentEvent::Notice(s) => self.tr.commit(notice_lines(&s)),
             AgentEvent::Error(s) => self.tr.commit(error_lines(&s)),
@@ -303,6 +310,7 @@ impl AgentView {
                 self.tr.end_turn(w);
                 self.tools.clear();
                 self.compacting = false;
+                self.retry_wait = None;
                 self.running = false;
                 self.turn_started = None;
                 if self.bell.on_turn_end(aborted) {
@@ -363,6 +371,11 @@ impl AgentView {
         out.extend(blocks::subagent_rows(&running, spin));
         if self.compacting {
             out.push(styled(format!("{spin} Compacting context…"), |_| theme::get().fg(Role::Warn)));
+        }
+        if let Some((until, attempt)) = self.retry_wait.filter(|(u, _)| *u > Instant::now()) {
+            let left = mu_base::events::wait_text(until - Instant::now());
+            let text = format!("{spin} Retrying in {left} (attempt {attempt}/5) · Esc cancels");
+            out.push(styled(trunc(&text, w), |_| theme::get().fg(Role::Warn)));
         }
         (out, pty_cursor)
     }
@@ -595,6 +608,20 @@ mod tests {
         v.on_event(AgentEvent::Retry { attempt: 2, delay: Duration::from_secs(4), reason: "timeout".into() }, SIZE);
         assert!(pending(&v).contains("retrying in 4s (timeout) [attempt 2/5]"));
         assert!(v.calls.is_empty());
+    }
+
+    #[test]
+    fn a_long_retry_wait_counts_down_until_it_ends() {
+        let mut v = view();
+        v.on_event(AgentEvent::Retry { attempt: 1, delay: Duration::from_secs(3600), reason: "429".into() }, SIZE);
+        assert!(pending(&v).contains("retrying in 1h"));
+        let rows = |v: &AgentView| v.live_lines(80, '*').0.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rows(&v).contains("Retrying in 59m") && rows(&v).contains("Esc cancels"), "{}", rows(&v));
+        v.on_event(AgentEvent::TurnEnd { aborted: true }, SIZE);
+        assert!(!rows(&v).contains("Retrying"));
+        // A short wait only gets the notice.
+        v.on_event(AgentEvent::Retry { attempt: 1, delay: Duration::from_secs(4), reason: "x".into() }, SIZE);
+        assert!(!rows(&v).contains("Retrying"));
     }
 
     #[test]

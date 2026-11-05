@@ -208,7 +208,13 @@ impl Providers {
         dump_request(req, &body);
         let rb = self.build(req, &route, format.as_ref(), &body)?;
         let resp = send(rb, &route, cancel).await?;
-        let resp = check_status(resp, &route, rekeyed).await?;
+        // Decided per request: the policy of this provider, and how full the context is right now.
+        let limit = if resp.status().is_success() {
+            Duration::ZERO
+        } else {
+            self.cfg.mu.retry.policy(&req.model.provider).limit(retry::context_fill(req))
+        };
+        let resp = check_status(resp, &route, rekeyed, limit).await?;
         pump_sse(resp, format.decoder(req), &route, cancel, ev).await
     }
 
@@ -249,13 +255,14 @@ async fn check_status(
     resp: reqwest::Response,
     route: &Route,
     rekeyed: &mut bool,
+    wait_limit: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
     let (retry_after, should_retry) = retry::headers(resp.headers());
-    if let Some(e) = retry::too_long(retry_after) {
+    if let Some(e) = retry::too_long(retry_after, wait_limit) {
         return Err(e);
     }
     let text = mu_base::secrets::redact_keys(&resp.text().await.unwrap_or_default());
@@ -353,6 +360,7 @@ mod route_tests {
 mod native_route_tests {
     use super::*;
     use crate::auth::store::{Entry, Store};
+    use mu_base::config::{MuConfig, MuRetry, RetryRule};
     use mu_base::tool::ToolDef;
     use mu_testutil::{Reply, fake_server};
     use std::path::PathBuf;
@@ -519,6 +527,57 @@ mod native_route_tests {
             for x in [d, d2] {
                 let _ = std::fs::remove_dir_all(x);
             }
+        });
+    }
+
+    /// A 429 asking for an hour: refused under the default limit, waited out under a configured one.
+    #[test]
+    fn the_retry_config_decides_how_long_a_wait_is_worth_it() {
+        rt(async {
+            let reply = || Reply::new(429, "slow down").header("retry-after", "3600");
+            let (base, seen) = fake_server(vec![reply()]).await;
+            let (p, d) = providers(entry("test-key", &base));
+            let e = turn(&p, Thinking::Off, &mut Vec::new()).await.unwrap_err();
+            assert!(matches!(&e, ProviderError::Fatal(m) if m.contains("retry after 1h")), "{e:?}");
+            assert_eq!(seen.lock().unwrap().len(), 1);
+
+            let own = RetryRule { max_wait: Some("2h".into()), context_below: None };
+            let configs = [
+                (
+                    "a longer max_wait for the provider",
+                    MuRetry { providers: [("anthropic".into(), own)].into(), ..Default::default() },
+                ),
+                ("a small context", MuRetry { context_below: Some(50.0), ..Default::default() }),
+            ];
+            for (toml, retry) in configs {
+                let (base, _) = fake_server(vec![reply()]).await;
+                let (mut p, d2) = providers(entry("test-key", &base));
+                p.cfg = Rc::new(Configs { mu: MuConfig { retry, ..Default::default() }, ..Default::default() });
+                let (spec, _) = p.resolve("anthropic/claude-sonnet-5-5").unwrap();
+                let msgs = [Message::user("ping")];
+                let req = Request {
+                    model: &spec,
+                    thinking: Rc::new(Cell::new(Thinking::Off)),
+                    system: "",
+                    tools: &[],
+                    messages: &msgs,
+                    max_tokens: Some(100),
+                    session_id: None,
+                };
+                let cancel = CancellationToken::new();
+                let (c2, mut waits) = (cancel.clone(), Vec::new());
+                let mut ev = |e: StreamEvent| {
+                    if let StreamEvent::Retry { delay, .. } = e {
+                        waits.push(delay);
+                        c2.cancel();
+                    }
+                };
+                let r = p.stream(&req, &cancel, &mut ev).await;
+                assert!(matches!(r, Err(ProviderError::Aborted)), "{toml}: {r:?}");
+                assert_eq!(waits, [Duration::from_secs(3600)], "{toml}");
+                let _ = std::fs::remove_dir_all(d2);
+            }
+            let _ = std::fs::remove_dir_all(d);
         });
     }
 

@@ -201,6 +201,7 @@ pub struct MuConfig {
     pub theme: MuTheme,
     pub update: MuUpdate,
     pub edit: MuEdit,
+    pub retry: MuRetry,
     pub mcp: MuMcp,
     pub secrets: MuSecrets,
 }
@@ -230,6 +231,98 @@ pub struct MuMcp {
 #[serde(default)]
 pub struct MuEdit {
     pub mode: String,
+}
+
+/// How long a retryable error with a `Retry-After` is waited out when it is a request's turn to be
+/// retried: `Retry-After` up to this is waited for, anything longer fails at once.
+pub const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `[retry]`: when to wait out a provider's `Retry-After` (a 429, mostly). A request is retried when
+/// the wait is at most `max_wait` (`"90s"`, `"30m"`, `"2h"`, `"1d"`; default `"2m"`) or when its
+/// context is less than `context_below` percent full (default: never). `[retry.providers.<id>]`
+/// overrides both for one provider.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MuRetry {
+    pub max_wait: Option<String>,
+    pub context_below: Option<f64>,
+    pub providers: BTreeMap<String, RetryRule>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RetryRule {
+    pub max_wait: Option<String>,
+    pub context_below: Option<f64>,
+}
+
+/// A `[retry]` section resolved for one provider.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetryPolicy {
+    pub max_wait: std::time::Duration,
+    /// Percent of the context window.
+    pub context_below: Option<f64>,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self { max_wait: DEFAULT_MAX_WAIT, context_below: None }
+    }
+}
+
+impl RetryPolicy {
+    /// The longest `Retry-After` worth waiting for a request whose context is `fill` percent full.
+    pub fn limit(&self, fill: f64) -> std::time::Duration {
+        match self.context_below {
+            Some(below) if fill < below => std::time::Duration::MAX,
+            _ => self.max_wait,
+        }
+    }
+}
+
+impl MuRetry {
+    pub fn policy(&self, provider: &str) -> RetryPolicy {
+        let own = self.providers.get(provider);
+        let max_wait = own
+            .and_then(|r| r.max_wait.as_deref())
+            .or(self.max_wait.as_deref())
+            .and_then(parse_duration)
+            .unwrap_or(DEFAULT_MAX_WAIT);
+        let context_below =
+            own.and_then(|r| r.context_below).or(self.context_below).filter(|b| b.is_finite() && *b > 0.0);
+        RetryPolicy { max_wait, context_below }
+    }
+}
+
+/// `"90s"`, `"30m"`, `"2h"` or `"1d"`: a whole number and one unit.
+pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    let unit = s.chars().last()?;
+    let n: u64 = s[..s.len() - unit.len_utf8()].parse().ok()?;
+    let secs = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        _ => return None,
+    };
+    n.checked_mul(secs).map(std::time::Duration::from_secs)
+}
+
+fn check_retry(r: &MuRetry, warn: &mut Vec<String>) {
+    let rules = std::iter::once(("[retry]".to_string(), r.max_wait.as_deref(), r.context_below)).chain(
+        r.providers.iter().map(|(p, v)| (format!("[retry.providers.{p}]"), v.max_wait.as_deref(), v.context_below)),
+    );
+    for (name, wait, below) in rules {
+        if let Some(w) = wait.filter(|w| parse_duration(w).is_none()) {
+            warn.push(format!(
+                "config.toml: {name} max_wait {w:?} is not a number and a unit (s, m, h, d); using the default"
+            ));
+        }
+        if let Some(b) = below.filter(|b| !(b.is_finite() && *b > 0.0 && *b <= 100.0)) {
+            warn.push(format!("config.toml: {name} context_below {b} is not a percentage above 0 and up to 100"));
+        }
+    }
 }
 
 /// `[update]`: `check = false` turns off the daily release check at startup.
@@ -453,6 +546,8 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
     }
     let predict: MuPredict = parse(section("predict"), "predict", warn);
     check_predict(&predict, warn);
+    let retry: MuRetry = parse(section("retry"), "retry", warn);
+    check_retry(&retry, warn);
     MuConfig {
         compaction: parse(section("compaction"), "compaction", warn),
         predict,
@@ -460,6 +555,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         theme: parse(section("theme"), "theme", warn),
         update: parse(section("update"), "update", warn),
         edit: parse(section("edit"), "edit", warn),
+        retry,
         mcp: parse(section("mcp"), "mcp", warn),
         secrets: parse(section("secrets"), "secrets", warn),
     }
@@ -568,6 +664,41 @@ mod tests {
         assert_eq!((c.theme.source.as_str(), c.theme.cards), ("gruvbox", Cards::Outline));
         let d = toml::from_str::<MuConfig>("").unwrap();
         assert_eq!((d.theme.source.as_str(), d.theme.accent, d.theme.cards), ("tokyo-night", None, Cards::Filled));
+    }
+
+    #[test]
+    fn retry_policy_resolves_per_provider_and_decides_by_context() {
+        use std::time::Duration;
+        let c = toml::from_str::<MuConfig>(
+            "[retry]\nmax_wait = \"10m\"\n[retry.providers.anthropic]\nmax_wait = \"3h\"\ncontext_below = 40\n",
+        )
+        .unwrap();
+        let a = c.retry.policy("anthropic");
+        assert_eq!((a.max_wait, a.context_below), (Duration::from_secs(3 * 3600), Some(40.0)));
+        assert_eq!(c.retry.policy("openai").max_wait, Duration::from_secs(600));
+        assert_eq!(MuConfig::default().retry.policy("x"), RetryPolicy::default());
+        // Either condition retries: a long wait with a small context, or a long context with a short wait.
+        assert_eq!(a.limit(10.0), Duration::MAX);
+        assert_eq!(a.limit(60.0), Duration::from_secs(3 * 3600));
+        assert_eq!(RetryPolicy::default().limit(0.0), DEFAULT_MAX_WAIT);
+    }
+
+    #[test]
+    fn durations_need_a_number_and_one_unit() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("90s"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_duration("30m"), Some(Duration::from_secs(1800)));
+        assert_eq!(parse_duration(" 2h "), Some(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("1d"), Some(Duration::from_secs(86400)));
+        for bad in ["", "5", "m", "1.5h", "-1m", "2x", "1h30m", "5é"] {
+            assert_eq!(parse_duration(bad), None, "{bad}");
+        }
+        let r = toml::from_str::<MuRetry>("max_wait = \"soon\"\ncontext_below = 150\n[providers.x]\nmax_wait = \"1h\"")
+            .unwrap();
+        let mut w = Vec::new();
+        check_retry(&r, &mut w);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(r.policy("y").max_wait, DEFAULT_MAX_WAIT);
     }
 
     #[test]

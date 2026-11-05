@@ -1,4 +1,5 @@
 use super::types::ProviderError;
+use mu_base::events::wait_text;
 use std::time::Duration;
 
 pub const MAX_ATTEMPTS: u32 = 5;
@@ -12,14 +13,11 @@ const OVERFLOW: [&str; 6] = [
     "too many tokens",
 ];
 
-/// Longest `Retry-After` we wait out; anything above fails at once.
-pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
-
-/// Delay before attempt `attempt + 1`: `retry-after` when given (≤ 120 s), else 2^attempt s
-/// capped at 60 s, with ±20% jitter on the computed backoff.
+/// Delay before attempt `attempt + 1`: `retry-after` when given (already within the user's limit,
+/// see `too_long`), else 2^attempt s capped at 60 s, with ±20% jitter on the computed backoff.
 pub fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
     match retry_after {
-        Some(d) => d.min(MAX_RETRY_AFTER),
+        Some(d) => d,
         None => jitter(Duration::from_secs(1u64 << attempt.min(6)).min(Duration::from_secs(60)), unit_random()),
     }
 }
@@ -34,10 +32,24 @@ fn unit_random() -> f64 {
     (b >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// `Retry-After` beyond the cap: not worth waiting for. Returns the fatal error to show.
-pub fn too_long(retry_after: Option<Duration>) -> Option<ProviderError> {
-    let d = retry_after.filter(|d| *d > MAX_RETRY_AFTER)?;
-    Some(ProviderError::Fatal(format!("rate limited; retry after {} min", d.as_secs().div_ceil(60))))
+/// `Retry-After` beyond `limit`: not worth waiting for. Returns the fatal error to show.
+pub fn too_long(retry_after: Option<Duration>, limit: Duration) -> Option<ProviderError> {
+    let d = retry_after.filter(|d| *d > limit)?;
+    Some(ProviderError::Fatal(format!(
+        "rate limited; retry after {} (waits up to {} are retried; see [retry] in config.toml)",
+        wait_text(d),
+        wait_text(limit)
+    )))
+}
+
+/// Percent of the model's context window a request is estimated to fill.
+pub fn context_fill(req: &super::types::Request<'_>) -> f64 {
+    let window = u64::from(req.model.context_window);
+    if window == 0 {
+        return 100.0;
+    }
+    let tokens = req.system.len() as u64 / 4 + req.messages.iter().map(|m| m.estimate_tokens()).sum::<u64>();
+    tokens as f64 * 100.0 / window as f64
 }
 
 const LOGIN_HINT: &str = "\nIf you haven't logged in yet, run /login (or `omp login`) first.";
@@ -121,8 +133,11 @@ mod tests {
         assert_eq!(jitter(Duration::from_secs(10), 0.0), Duration::from_secs(8));
         assert_eq!(jitter(Duration::from_secs(10), 1.0), Duration::from_secs(12));
         assert_eq!(backoff(1, Some(Duration::from_secs(7))).as_secs(), 7);
-        assert!(too_long(Some(Duration::from_secs(900))).is_some_and(|e| e.to_string().contains("15 min")));
-        assert!(too_long(Some(Duration::from_secs(120))).is_none());
+        let limit = Duration::from_secs(120);
+        let e = too_long(Some(Duration::from_secs(900)), limit).unwrap().to_string();
+        assert!(e.contains("retry after 15m") && e.contains("up to 2m"), "{e}");
+        assert!(too_long(Some(limit), limit).is_none());
+        assert!(too_long(Some(Duration::from_secs(7200)), Duration::MAX).is_none());
     }
 
     fn gw(status: u16, body: &str) -> ProviderError {

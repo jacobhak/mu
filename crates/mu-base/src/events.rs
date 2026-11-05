@@ -6,9 +6,23 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 
+/// `45s`, `3m 20s`, `1h 12m`, `2d 3h`: the two most significant units of a wait.
+pub fn wait_text(d: Duration) -> String {
+    let s = d.as_secs();
+    let part = |big: u64, bu: &str, small: u64, su: &str| {
+        if small == 0 { format!("{big}{bu}") } else { format!("{big}{bu} {small}{su}") }
+    };
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => part(s / 60, "m", s % 60, "s"),
+        3600..=86399 => part(s / 3600, "h", s % 3600 / 60, "m"),
+        _ => part(s / 86400, "d", s % 86400 / 3600, "h"),
+    }
+}
+
 /// The retry notice every front end shows: `retrying in 4s (timeout) [attempt 2/5]`.
 pub fn retry_notice(attempt: u32, delay: Duration, reason: &str) -> String {
-    format!("retrying in {}s ({reason}) [attempt {attempt}/5]", delay.as_secs())
+    format!("retrying in {} ({reason}) [attempt {attempt}/5]", wait_text(delay))
 }
 
 pub enum Command {
