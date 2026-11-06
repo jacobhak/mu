@@ -53,6 +53,17 @@ Each table row is the median over the runs. A harness that does not finish the s
 
 `mu-bench` runs mu headless in a pseudo-terminal and has no notion of several interactive sessions or of the real gateway. Two scripts cover that (Linux, `tmux`, `python3`; the second also `omp` and the network): `scripts/measure-sessions.sh` runs N interactive mu sessions against `scripts/fake-anthropic.py`, with a native key or through `MU_GATEWAY_URL`, and `scripts/measure-gateway.sh` measures the omp broker + gateway pair idle and with requests in flight. Method and results are in [`BENCHMARKS.md`](../../BENCHMARKS.md).
 
+## Memory gate
+
+```sh
+cargo build --release && cargo run --release -p mu-bench -- check crates/mu-bench/scenarios/read-heavy.toml
+cargo run --release -p mu-bench -- check --update crates/mu-bench/scenarios/read-heavy.toml
+```
+
+`check` runs the scenario as the default command does (`--runs`, default 3; the medians are compared). For each row it takes incidental memory, `mu_anon_kB − content kB`, and compares it with the committed baseline `crates/mu-bench/baselines/<scenario>.json`. A row fails when it is above `baseline × (1 + P/100) + 1 MB`, with `P` from `--tolerance-pct` (default 20). It prints every row and exits 1 listing the ones over. A row the baseline does not have is an error: run with `--update`. `--update` writes the measured values to the baseline and exits 0.
+
+CI runs the gate in the `memory` job of `ci.yml` (on `ubuntu-24.04`, on every PR and push) and uploads `memory.json`. The baseline is measured on one machine, so a deliberate change that moves memory updates the committed baseline in the same commit. If the CI runner measures differently from the machine that wrote the baseline, copy its `incidental_kb` values from the `memory.json` artifact.
+
 ## Not yet
 
-A pass/fail gate with baselines, scenarios for compaction, subagents and plugins, mu through its real gateway, and the OpenAI protocol.
+Scenarios for compaction, subagents and plugins, mu through its real gateway, and the OpenAI protocol.

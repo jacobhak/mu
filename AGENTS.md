@@ -2,15 +2,13 @@
 
 Rust coding agent. Toolchain (with rustfmt and clippy) is pinned in `rust-toolchain.toml`; formatting in `rustfmt.toml`.
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy `-D warnings`, tests and the plugin scripts. Run the same before pushing:
+CI (`.github/workflows/ci.yml`) runs `scripts/ci-checks.sh` before pushing: fmt check, clippy `-D warnings`, the workspace tests, the MCP bridge's tests and the catalog generator's tests. Run the same before pushing:
 
 ```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+scripts/ci-checks.sh
 ```
 
-Never report a `-p <crate>` failure as pre-existing: run the commands above, or fix it.
+Never report a `-p <crate>` failure as pre-existing: run the script, or fix it.
 
 `scripts/ship.sh [--no-install] [--keep] [--no-checks]` ships committed work to `main`: fetch and rebase onto `origin/main`, the checks above, push (redone when main moved meanwhile), install from source, then remove the worktree and branch. `/ship` (`.agents/commands/ship.md`) has the agent commit and squash first and fix what the script reports.
 

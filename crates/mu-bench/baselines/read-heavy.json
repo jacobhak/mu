@@ -1,0 +1,25 @@
+{
+  "scenario": "read-heavy",
+  "rows": [
+    {
+      "label": "start",
+      "incidental_kb": 2816.0
+    },
+    {
+      "label": "turn 1",
+      "incidental_kb": 3536.0
+    },
+    {
+      "label": "turn 2",
+      "incidental_kb": 3586.0
+    },
+    {
+      "label": "turn 3",
+      "incidental_kb": 4084.0
+    },
+    {
+      "label": "turn 4",
+      "incidental_kb": 4303.0
+    }
+  ]
+}

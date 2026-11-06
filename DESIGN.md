@@ -51,10 +51,10 @@ flowchart LR
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
 | Provider client | Streaming requests, retries, thinking mapping and usage, over three wire formats (Anthropic Messages, OpenAI Responses, Chat Completions) to a provider's own API with the user's key or ChatGPT sign-in, or Anthropic Messages to the omp gateway | — |
-| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `<profile home>/run/` (pid, kind, agent, cwd, parent; the jobs panel's Sessions tab lists the live ones); a per-session inbox in `<profile home>/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
+| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `<profile home>/run/` (pid, kind, agent, cwd, parent; the jobs panel's Sessions tab lists the live ones); a per-session inbox in `<profile home>/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching (`/fork`) and checkpoint/rewind (`/rewind`) are implemented | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
-| Built-in tools | read, write, edit (hash-anchored), bash, grep, glob, find, todo, ask | `pi-edit`, `pi-shell`, `pi-walker`, `pi-diff`, `pi-vcs` |
+| Built-in tools | read, write, edit (hash-anchored), bash, grep, glob, todo, ask | `pi-edit`, `pi-shell`, `pi-walker`, `pi-diff`, `pi-vcs` |
 | Output spill | Tool output above a threshold goes to `artifact://` files, not the heap. Images are stored once as content-addressed blob files (`<profile home>/blobs/<sha256>`) and messages keep only omp's `blob:sha256:<hash>` reference; the bytes are read back when a request is built. mu also reads blobs from omp's own store, so omp sessions with images load; omp does not read mu's store | — |
 | Subagents | Spawn `mu --headless` with a task; receive a schema-validated result. A `task` item may carry `outputSchema` (omp's name); the child then gets omp's `yield` tool (`{data}` or `{error}`; `data` is checked against the schema and a mismatch comes back as a tool error to retry). The `result` NDJSON line gains `data` and `schemaOk`; `text` and `isError` stay. A schema task with no valid `yield` fails (one nudge turn first). Validation is a small in-tree validator (no `$ref`), not a crate. | — |
 | Plugin host | Manifests, lazy start, lifetimes, hooks, MCP client | — |
@@ -93,6 +93,7 @@ The tools-to-provider edge exists because the plugin host serves `core/complete`
   command = ["mu-web"]
   lifetime = "idle:10m"           # session | idle:<duration> | call
   hooks = []                      # e.g. ["tool_result:write"]
+  timeout = "300s"                # native tool calls; default 300s
 
   [[tools]]
   name = "fetch"
@@ -137,6 +138,7 @@ The tools-to-provider edge exists because the plugin host serves `core/complete`
 | plugin → core | `core/tool` | Invoke a built-in tool. *Not yet implemented; add it when a plugin needs it.* |
 | plugin → core | `ui/notify`, `ui/confirm`, `ui/select`, `ui/input` | User interaction (the subset pi's RPC extension UI proves workable). Only `ui/notify` is implemented; `ui/confirm`, `ui/select` and `ui/input` are *not yet implemented* — add them when a plugin needs them. |
 | plugin → core | `core/mcpToken` | Only from an MCP http bridge: an OAuth access token for its server, fetched with `omp token` (through the auth broker when the gateway is running) |
+| plugin → core | `core/webSearch` | Web plugin only (other plugins get an error): the chosen search backend and the one key it needs, for a `web_search` call |
 | core → plugin | `tool/call`, `command/run`, `hook/<name>` | Dispatch |
 
 Tool results carry `content` for the model and optional `display` for the user, as in pi.
@@ -149,7 +151,7 @@ All omp features outside the core become first-party plugins that load on use.
 |---|---|---|
 | gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider without a native API key in mu, OAuth logins, account pools, quota. See Providers. |
 | mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It is a separate Cargo project outside the workspace so that the core does not build `rmcp`; it installs its own rustls crypto provider. It answers any `core/*` request a server sends with -32601. |
-| web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway still needs verifying. |
+| web | yes | Rust; fetch. Search goes only through the backend the user chose (`/web`, see `docs/web.md`): Parallel or Exa, keyless or with a key, or Anthropic's or OpenAI's own search tool with that provider's key. Until a backend is chosen, no search contacts anything. |
 | memory | yes | Rust; curated markdown memory per repository plus a user file, versioned in git, reviewed in the background by the `memory` role, with FTS5 search over past sessions. See docs/memory.md. |
 | prediction | yes | Rust; word n-gram by default, optional SmolLM2-135M. See Prediction below. |
 | debugger, eval, github, browser, ssh | later | — |
@@ -204,7 +206,7 @@ Reads omp's files in place. Agent dir: `~/.omp/agent`, or `~/.omp/profiles/<name
 | Sticky rules | `<agent>/RULES.md`, `.omp/RULES.md` | Read; carried on every request |
 | Stream rules | omp rule files | Read |
 | Skills | `<root>/skills/<name>/SKILL.md`, one level deep | Read |
-| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. `/mcp` is the one writer: add, remove and `disabledServers` / `enabledServers` edits to these files (nothing else in a file changes; an unparseable file is left alone) and a live sync of the running servers. OAuth tokens come from `omp token`, and `/login mcp:<name>` runs omp's own flow; mu never reads omp's credential store |
+| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. Project files (in the working directory) need trust: their servers start only after `/mcp trust` (or **Trust** in the startup dialog), and again when the file's servers change. Unlike omp, which does not gate them. Agent-dir files are always trusted. `/mcp` is the one writer: add, remove and `disabledServers` / `enabledServers` edits to these files (nothing else in a file changes; an unparseable file is left alone) and a live sync of the running servers. OAuth tokens come from `omp token`, and `/login mcp:<name>` runs omp's own flow; mu never reads omp's credential store |
 | Sessions | `<agent>/sessions/<encoded-cwd>/<ts>_<id>.jsonl`, v3 tree; blobs `<agent>/blobs/<sha256>` | Written in omp's v3 format to mu's own directory; omp opens them with `--resume <path>` or `--session-dir` |
 
 Non-goal: running pi or omp TypeScript extensions.
@@ -223,9 +225,9 @@ Non-goal: running pi or omp TypeScript extensions.
 | Large tool output, images | Spilled to files; read on expand |
 | Highlighting | No bulk-loaded syntax sets (`syntect` defaults measured at +6.5 MB); per-language, lazily |
 
-**Check:** `incidental = private RAM − bytes of content held`. Not enforced yet: nothing fails a build when it grows.
+**Check:** `incidental = private RAM − bytes of content held`. `mu-bench check` enforces it in CI (the `memory` job of `ci.yml`): each row of the read-heavy scenario must stay within 20% plus 1 MB of its committed baseline (`crates/mu-bench/baselines/read-heavy.json`).
 `mu-bench` (`crates/mu-bench`) runs scripted sessions against a fake model and reports private memory after
-each turn, split by region, and compares other harnesses; a pass/fail gate with committed limits is not built.
+each turn, split by region, and compares other harnesses; `check` is its pass/fail gate (`crates/mu-bench/README.md`).
 
 ## Technology
 

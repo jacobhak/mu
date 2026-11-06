@@ -25,9 +25,7 @@ branch="$(git symbolic-ref --quiet --short HEAD)" || die "detached HEAD; check o
 
 ci_checks() {
   [ "$checks" = 1 ] || return 0
-  cargo fmt --all --check || die "cargo fmt --all --check failed"
-  cargo clippy --workspace --all-targets --locked -- -D warnings || die "clippy failed"
-  cargo test --workspace --locked || die "tests failed"
+  scripts/ci-checks.sh || die "checks failed"
 }
 
 # Another agent may push while the checks run: refetch and redo, a few times.

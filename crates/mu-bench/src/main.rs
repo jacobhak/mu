@@ -1,5 +1,6 @@
 //! `mu-bench`: runs mu in a terminal against a fake model server and measures resource use.
 //! No real model is involved, so a run costs nothing and repeats.
+mod check;
 mod compare;
 mod driver;
 mod report;
@@ -15,6 +16,8 @@ use std::time::Duration;
 const USAGE: &str = "usage: mu-bench [--mu PATH] [--runs N] [--settle-ms MS] [--out FILE.json] SCENARIO.toml...
        mu-bench compare [--mu PATH] [--runs N] [--harness mu,claude,opencode,omp] [--out FILE.json] SCENARIO.toml
                          the same one-prompt scenario run headless by each harness, one table
+       mu-bench check [--mu PATH] [--runs N] [--baseline FILE] [--tolerance-pct P] [--update] [--out FILE.json] SCENARIO.toml
+                         the memory gate: fails when a row's incidental memory is over its committed baseline
        mu-bench serve    run the fake model server alone, printing every request (to probe another harness)
 
   --mu PATH        the mu binary to measure (default: target/release/mu)
@@ -72,6 +75,12 @@ async fn run() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => return serve().await,
         Some("compare") => return compare::main(std::env::args().skip(2)).await,
+        Some("check") => {
+            if !check::main(std::env::args().skip(2)).await? {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         _ => {}
     }
     let a = parse_args(std::env::args().skip(1))?;

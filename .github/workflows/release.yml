@@ -5,12 +5,31 @@ on:
 permissions:
   contents: write
 jobs:
+  # The Linux build runs in ubuntu:22.04, so the binary's glibc floor is 2.35.
+  build-linux:
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    steps:
+      - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git pkg-config python3 nodejs
+      - run: curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - run: scripts/build-mcp-http.sh test
+      - run: cargo build --release --workspace --locked
+      - run: scripts/build-mcp-http.sh build
+      - run: scripts/package.sh linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mu-linux-x64
+          path: dist/mu-linux-x64.tar.gz
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, plat: linux-x64 }
           - { os: macos-15, plat: darwin-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
@@ -27,7 +46,7 @@ jobs:
           name: mu-${{ matrix.plat }}
           path: dist/mu-${{ matrix.plat }}.tar.gz
   release:
-    needs: build
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
