@@ -45,6 +45,10 @@ impl Decoder for Assembler {
     fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
         Assembler::feed(self, chunk, ev)
     }
+
+    fn usage(&self) -> Usage {
+        self.usage.clone()
+    }
 }
 
 /// The gateway surfaces thrown pre-flight errors (an unsupported effort, an unknown model, ...)
@@ -226,7 +230,10 @@ impl Assembler {
         let v: Value = serde_json::from_str(data).map_err(|e| ProviderError::Fatal(format!("bad stream json: {e}")))?;
         let idx = v["index"].as_u64().unwrap_or(0);
         match v["type"].as_str().unwrap_or("") {
-            "message_start" => self.response_id = v["message"]["id"].as_str().map(String::from),
+            "message_start" => {
+                self.response_id = v["message"]["id"].as_str().map(String::from);
+                usage::anthropic_usage(&mut self.usage, &v["message"]["usage"]);
+            }
             "content_block_start" => {
                 let cb = &v["content_block"];
                 let open = match cb["type"].as_str() {
@@ -282,6 +289,9 @@ impl Assembler {
             "message_delta" => {
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     self.stop = usage::anthropic_stop(r);
+                    if r == "refusal" {
+                        ev(StreamEvent::Notice("the model declined to continue (stop reason: refusal)".into()));
+                    }
                 }
                 usage::anthropic_usage(&mut self.usage, &v["usage"]);
             }
@@ -511,6 +521,34 @@ mod tests {
         let c = w[1]["content"][0]["content"].as_array().unwrap();
         assert_eq!(c[0]["type"], "text");
         assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}));
+    }
+
+    #[test]
+    fn message_start_usage_survives_a_sparse_message_delta() {
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":800,\"output_tokens\":1}}}\n\n\
+            event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+            event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+            event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n\
+            event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let m = run(&[sse.as_bytes()]);
+        let Message::Assistant { usage, .. } = &m else { panic!() };
+        assert_eq!((usage.input, usage.cache_read, usage.output), (1200, 800, 15));
+    }
+
+    #[test]
+    fn a_refusal_emits_a_notice() {
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\"}}\n\n\
+            event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":2}}\n\n\
+            event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let mut notices = Vec::new();
+        let mut a = Assembler::new(&gw());
+        a.feed(sse.as_bytes(), &mut |e| {
+            if let StreamEvent::Notice(n) = e {
+                notices.push(n);
+            }
+        })
+        .unwrap();
+        assert_eq!(notices, ["the model declined to continue (stop reason: refusal)"]);
     }
 
     #[test]

@@ -376,6 +376,10 @@ impl Decoder for Assembler {
     fn feed(&mut self, chunk: &[u8], ev: &mut dyn FnMut(StreamEvent)) -> Result<Option<Message>, ProviderError> {
         Assembler::feed(self, chunk, ev)
     }
+
+    fn usage(&self) -> Usage {
+        self.usage.clone()
+    }
 }
 
 impl SseFrames for Assembler {
@@ -810,6 +814,7 @@ mod tests {
             StreamEvent::ToolCallStart { id, name } => format!("start:{id}:{name}"),
             StreamEvent::ToolCallDelta { id, json } => format!("delta:{id}:{json}"),
             StreamEvent::Retry { .. } => "retry".into(),
+            StreamEvent::Notice(_) | StreamEvent::FailedAttemptUsage(_) => "other".into(),
         }
     }
 

@@ -1,9 +1,7 @@
 use super::types::ProviderError;
 use crate::auth::chatgpt;
 use mu_base::events::wait_text;
-use std::time::Duration;
-
-pub const MAX_ATTEMPTS: u32 = 5;
+use std::time::{Duration, SystemTime};
 
 const OVERFLOW: [&str; 6] = [
     "prompt is too long",
@@ -132,19 +130,28 @@ pub(crate) fn append(e: ProviderError, tail: &str) -> ProviderError {
     }
 }
 
-/// `retry-after-ms` (else `retry-after` in seconds) and `x-should-retry`.
+/// `retry-after-ms` (else `retry-after`, in seconds or as an HTTP date) and `x-should-retry`.
 pub fn headers(h: &reqwest::header::HeaderMap) -> (Option<Duration>, Option<bool>) {
     let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
     let after = get("retry-after-ms")
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
-        .or_else(|| get("retry-after").and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs));
+        .or_else(|| get("retry-after").and_then(retry_after_value));
     let should = match get("x-should-retry") {
         Some("true") => Some(true),
         Some("false") => Some(false),
         _ => None,
     };
     (after, should)
+}
+
+/// A `Retry-After` value: delay seconds, or an HTTP date measured from now (already past: no wait).
+fn retry_after_value(v: &str) -> Option<Duration> {
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = httpdate::parse_http_date(v).ok()?;
+    Some(at.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO))
 }
 
 /// A provider that says not to retry is believed. Only native routes honour it: the gateway's
@@ -287,6 +294,17 @@ mod tests {
             m.insert(reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
         }
         m
+    }
+
+    #[test]
+    fn a_date_retry_after_is_the_wait_from_now() {
+        let at = SystemTime::now() + Duration::from_secs(30);
+        let future = httpdate::fmt_http_date(at);
+        let (d, _) = headers(&map(&[("retry-after", future.as_str())]));
+        let d = d.expect("a date parses");
+        assert!((25..=31).contains(&d.as_secs()), "{d:?}");
+        let past = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(60));
+        assert_eq!(headers(&map(&[("retry-after", past.as_str())])).0, Some(Duration::ZERO));
     }
 
     #[test]

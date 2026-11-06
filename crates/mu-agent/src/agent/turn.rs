@@ -299,6 +299,7 @@ impl Agent {
         debug_assert!(mu_base::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
         let defs = self.tool_defs();
         let mut held = Vec::new();
+        let mut failed = Vec::new();
         let reply = {
             let req = Request {
                 model: &self.model.model,
@@ -321,6 +322,11 @@ impl Agent {
                         AgentEvent::ToolCallDelta { id: id.into(), json: json.into() }
                     }
                     StreamEvent::Retry { attempt, delay, reason } => AgentEvent::Retry { attempt, delay, reason },
+                    StreamEvent::Notice(m) => AgentEvent::Notice(m),
+                    StreamEvent::FailedAttemptUsage(u) => {
+                        failed.push(u);
+                        return;
+                    }
                 };
                 if answering_reminder {
                     held.push(e);
@@ -330,6 +336,12 @@ impl Agent {
             };
             self.ports.providers.stream(&req, cancel, &mut ev).await
         };
+        if !failed.is_empty() {
+            for mut u in failed {
+                self.costs.cost.record(&self.model.model.provider, &self.model.model.id, &mut u);
+            }
+            self.emit_status();
+        }
         let dismissed = answering_reminder && matches!(&reply, Ok(m) if is_dismissal(m));
         if !dismissed {
             for e in held {

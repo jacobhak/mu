@@ -38,6 +38,10 @@ impl Decoder for Assembler {
     fn finish(&mut self) -> Option<Message> {
         Assembler::finish(self)
     }
+
+    fn usage(&self) -> Usage {
+        self.usage.clone()
+    }
 }
 
 pub fn body(req: &Request) -> Value {
@@ -959,7 +963,7 @@ mod tests {
             StreamEvent::Thinking(t) => Seen::Thinking(t.into()),
             StreamEvent::ToolCallStart { id, name } => Seen::Start(id.into(), name.into()),
             StreamEvent::ToolCallDelta { id, json } => Seen::Delta(id.into(), json.into()),
-            StreamEvent::Retry { .. } => return None,
+            StreamEvent::Retry { .. } | StreamEvent::Notice(_) | StreamEvent::FailedAttemptUsage(_) => return None,
         })
     }
 

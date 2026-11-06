@@ -206,11 +206,12 @@ impl Providers {
                 _ = cancel.cancelled() => return Err(ProviderError::Aborted),
             }
         }
+        let max_attempts = self.cfg.mu.retry.max_attempts();
         let mut attempt = 1;
         let mut rekeyed = false;
         loop {
             match self.attempt(req, cancel, ev, &mut rekeyed).await {
-                Err(ProviderError::Retryable { msg, retry_after }) if attempt < retry::MAX_ATTEMPTS => {
+                Err(ProviderError::Retryable { msg, retry_after }) if attempt < max_attempts => {
                     let delay = retry::backoff(attempt, retry_after);
                     ev(StreamEvent::Retry { attempt, delay, reason: msg });
                     tokio::select! {
@@ -231,7 +232,10 @@ impl Providers {
         ev: &mut dyn FnMut(StreamEvent),
         rekeyed: &mut bool,
     ) -> Result<Message, ProviderError> {
-        let route = self.route(req.model, *rekeyed).await?;
+        let route = tokio::select! {
+            r = self.route(req.model, *rekeyed) => r?,
+            _ = cancel.cancelled() => return Err(ProviderError::Aborted),
+        };
         let format = wire::select(req.model, &route);
         let body = format.body(req);
         dump_request(req, &body);
@@ -243,7 +247,7 @@ impl Providers {
         } else {
             self.cfg.mu.retry.policy(&req.model.provider).limit(retry::context_fill(req))
         };
-        let resp = check_status(resp, &route, rekeyed, limit).await?;
+        let resp = check_status(resp, &route, rekeyed, limit, cancel).await?;
         pump_sse(resp, format.decoder(req), &route, cancel, ev).await
     }
 
@@ -271,16 +275,20 @@ fn route_error(e: anyhow::Error) -> ProviderError {
     }
 }
 
-/// Sends `rb`, or gives up when `cancel` fires. A failed connect is retried and names the peer.
+/// Sends `rb`, or gives up when `cancel` fires. A failed connect is retried and names the peer; a
+/// request that could not be built (a malformed URL) never succeeds, so it is not retried.
 async fn send(
     rb: reqwest::RequestBuilder,
     route: &Route,
     cancel: &CancellationToken,
 ) -> Result<reqwest::Response, ProviderError> {
     tokio::select! {
-        r = rb.send() => r.map_err(|e| ProviderError::Retryable {
-            msg: format!("cannot reach {}: {e}", route.peer()),
-            retry_after: None,
+        r = rb.send() => r.map_err(|e| {
+            if e.is_builder() {
+                ProviderError::Fatal(format!("bad request to {}: {e}", route.peer()))
+            } else {
+                ProviderError::Retryable { msg: format!("cannot reach {}: {e}", route.peer()), retry_after: None }
+            }
         }),
         _ = cancel.cancelled() => Err(ProviderError::Aborted),
     }
@@ -293,6 +301,7 @@ async fn check_status(
     route: &Route,
     rekeyed: &mut bool,
     wait_limit: Duration,
+    cancel: &CancellationToken,
 ) -> Result<reqwest::Response, ProviderError> {
     let status = resp.status();
     if status.is_success() {
@@ -303,7 +312,11 @@ async fn check_status(
         return Err(e);
     }
     let request_id = resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let text = mu_base::secrets::redact_keys(&resp.text().await.unwrap_or_default());
+    let body = tokio::select! {
+        r = tokio::time::timeout(STREAM_IDLE, resp.text()) => r.ok().and_then(Result::ok).unwrap_or_default(),
+        _ = cancel.cancelled() => return Err(ProviderError::Aborted),
+    };
+    let text = mu_base::secrets::redact_keys(&body);
     if let Some(def) = route.def
         && def.kind == Credential::ChatgptPlan
     {
@@ -333,10 +346,27 @@ async fn check_status(
 }
 
 /// Feeds the response's bytes to `dec` until it completes the message. Silence for `STREAM_IDLE`
-/// or a cancel ends the turn.
+/// or a cancel ends the turn. A failed attempt reports the usage it was billed for first.
 async fn pump_sse(
     resp: reqwest::Response,
     mut dec: Box<dyn Decoder>,
+    route: &Route,
+    cancel: &CancellationToken,
+    ev: &mut dyn FnMut(StreamEvent),
+) -> Result<Message, ProviderError> {
+    let r = pump(resp, dec.as_mut(), route, cancel, ev).await;
+    if r.is_err() {
+        let u = dec.usage();
+        if u.input + u.output + u.cache_read + u.cache_write > 0 {
+            ev(StreamEvent::FailedAttemptUsage(u));
+        }
+    }
+    r
+}
+
+async fn pump(
+    resp: reqwest::Response,
+    dec: &mut dyn Decoder,
     route: &Route,
     cancel: &CancellationToken,
     ev: &mut dyn FnMut(StreamEvent),
@@ -812,6 +842,50 @@ mod native_route_tests {
             let _ = p.stream(&req, &cancel, &mut ev).await;
             assert!(events[0].starts_with("cannot reach 127.0.0.1:1"), "{events:?}");
             assert!(!events[0].contains("gateway"), "{events:?}");
+            let _ = std::fs::remove_dir_all(d);
+        });
+    }
+
+    /// A request that cannot be built (a malformed URL) fails at once: a retry cannot fix it.
+    #[test]
+    fn a_request_that_cannot_be_built_is_fatal() {
+        let route = Route { base: "http://bad host".into(), auth: Auth::Bearer("t".into()), def: None };
+        let rb = reqwest::Client::new().post("http://bad host/v1/messages");
+        let e = mu_testutil::block_on(send(rb, &route, &CancellationToken::new())).unwrap_err();
+        assert!(
+            matches!(&e, ProviderError::Fatal(m) if m.starts_with("bad request to gateway at http://bad host")),
+            "{e:?}"
+        );
+    }
+
+    /// A stream that breaks after its opening usage reports that usage before the retry.
+    #[test]
+    fn a_failed_attempt_reports_the_usage_it_was_billed() {
+        rt(async {
+            let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":800,\"output_tokens\":1}}}\n\n";
+            let (base, _) = fake_server(vec![Reply::new(200, sse).header("content-type", "text/event-stream")]).await;
+            let (p, d) = providers(entry("test-key", &base));
+            let (spec, _) = p.resolve("anthropic/claude-sonnet-5-5").unwrap();
+            let msgs = [Message::user("ping")];
+            let req = Request {
+                model: &spec,
+                thinking: Rc::new(Cell::new(Thinking::Off)),
+                system: "",
+                tools: &[],
+                messages: &msgs,
+                max_tokens: Some(100),
+                session_id: None,
+            };
+            let cancel = CancellationToken::new();
+            let (c2, mut billed) = (cancel.clone(), Vec::new());
+            let mut ev = |e: StreamEvent| match e {
+                StreamEvent::FailedAttemptUsage(u) => billed.push(u.input),
+                StreamEvent::Retry { .. } => c2.cancel(),
+                _ => {}
+            };
+            let r = p.stream(&req, &cancel, &mut ev).await;
+            assert!(matches!(r, Err(ProviderError::Aborted)), "{r:?}");
+            assert_eq!(billed, [1200]);
             let _ = std::fs::remove_dir_all(d);
         });
     }

@@ -120,8 +120,23 @@ fn off_params(m: &ModelSpec) -> ThinkingParams {
 
 /// Marks the last block of the last message a breakpoint; never a thinking block.
 fn mark_last_message(messages: &mut [Value]) {
-    let Some(last) = messages.last_mut() else { return };
-    let Some(blocks) = last["content"].as_array_mut() else { return };
+    if let Some(last) = messages.last_mut() {
+        mark_last_block(last);
+    }
+}
+
+/// Marks the end of the previous request: the user message just before the last assistant turn.
+/// The prompt cache then holds the conversation as it was sent before that turn.
+fn mark_previous_request_end(messages: &mut [Value]) {
+    let Some(assistant) = messages.iter().rposition(|m| m["role"] == "assistant") else { return };
+    if assistant > 0 && messages[assistant - 1]["role"] == "user" {
+        mark_last_block(&mut messages[assistant - 1]);
+    }
+}
+
+/// Puts the breakpoint on the message's last cacheable block, if it has one.
+fn mark_last_block(message: &mut Value) {
+    let Some(blocks) = message["content"].as_array_mut() else { return };
     for b in blocks.iter_mut().rev() {
         if matches!(b["type"].as_str(), Some("text" | "image" | "tool_use" | "tool_result")) {
             b["cache_control"] = json!({"type":"ephemeral"});
@@ -153,7 +168,8 @@ fn betas_for(req: &Request, tp: &ThinkingParams) -> Vec<&'static str> {
 }
 
 /// The JSON body and the `anthropic-beta` values it needs. Prompt-cache breakpoints (5-minute
-/// ephemeral) sit on the last tool, the last system block and the last message: three of the four allowed.
+/// ephemeral) sit on the last tool, the last system block, the last message and the end of the
+/// previous request: four of the four allowed.
 pub fn body(req: &Request) -> (Value, Vec<&'static str>) {
     let m = req.model;
     let max_tokens = output_cap(req);
@@ -161,6 +177,7 @@ pub fn body(req: &Request) -> (Value, Vec<&'static str>) {
     let betas = betas_for(req, &tp);
     let mut messages = to_wire(req.messages, m);
     mark_last_message(&mut messages);
+    mark_previous_request_end(&mut messages);
     let mut body = base_body(&m.wire_id, max_tokens, messages);
     if !req.system.is_empty() {
         body["system"] = json!([{"type":"text","text":req.system,"cache_control":{"type":"ephemeral"}}]);
@@ -318,8 +335,8 @@ mod tests {
             },
         ];
         let (b, betas) = build(&m, Thinking::High, &msgs, &[tool()]);
-        // Three breakpoints: the last tool, the system block and the last message. The replayed
-        // thinking block carries none.
+        // Four breakpoints: the last tool, the system block, the last message and the end of the
+        // previous request (the user turn before the assistant's). The replayed thinking block carries none.
         assert_eq!(
             b,
             json!({
@@ -329,7 +346,7 @@ mod tests {
                 "system": [{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}],
                 "tools": [{"name":"t","description":"d","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],
                 "messages": [
-                    {"role":"user","content":[{"type":"text","text":"hi"}]},
+                    {"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]},
                     {"role":"assistant","content":[
                         {"type":"thinking","thinking":"hm","signature":"sig"},
                         {"type":"text","text":"answer"},
@@ -451,6 +468,47 @@ mod tests {
         assert!(msgs[0]["content"][1].get("cache_control").is_none());
         let mut none: Vec<Value> = vec![];
         mark_last_message(&mut none);
+    }
+
+    #[test]
+    fn the_previous_request_end_gets_the_fourth_breakpoint() {
+        let m = spec("claude-sonnet-5-5");
+        let asst = |ids: &[&str]| Message::Assistant {
+            content: ids
+                .iter()
+                .map(|id| Block::ToolCall { id: (*id).into(), name: "t".into(), arguments: json!({}) })
+                .collect(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            model: "anthropic/claude-sonnet-5-5".into(),
+            usage: Default::default(),
+            stop_reason: mu_base::message::StopReason::ToolUse,
+            timestamp: 0,
+            response_id: None,
+            error_message: None,
+        };
+        let results = |ids: &[&str]| -> Vec<Message> {
+            ids.iter()
+                .map(|id| Message::ToolResult {
+                    tool_call_id: (*id).into(),
+                    tool_name: "t".into(),
+                    content: vec![Block::text("ok")],
+                    is_error: false,
+                    timestamp: 0,
+                    details: None,
+                })
+                .collect()
+        };
+        let many: Vec<String> = (0..12).map(|i| format!("c{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let mut msgs = vec![Message::user("hi"), asst(&["a"])];
+        msgs.extend(results(&["a"]));
+        msgs.push(asst(&many));
+        msgs.extend(results(&many));
+        let (b, _) = build(&m, Thinking::Off, &msgs, &[]);
+        let wire = b["messages"].as_array().unwrap();
+        let marked: Vec<bool> = wire.iter().map(|m| m.to_string().contains("cache_control")).collect();
+        assert_eq!(marked, [false, false, true, false, true], "{b}");
     }
 
     #[test]

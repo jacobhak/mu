@@ -220,15 +220,19 @@ pub struct MuEdit {
 /// retried: `Retry-After` up to this is waited for, anything longer fails at once.
 pub const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Attempts per request, retries included, when `[retry] max_attempts` is not set.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+
 /// `[retry]`: when to wait out a provider's `Retry-After` (a 429, mostly). A request is retried when
 /// the wait is at most `max_wait` (`"90s"`, `"30m"`, `"2h"`, `"1d"`; default `"2m"`) or when its
 /// context is less than `context_below` percent full (default: never). `[retry.providers.<id>]`
-/// overrides both for one provider.
+/// overrides both for one provider. `max_attempts` (1 to 20, default 5) bounds the attempts per request.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct MuRetry {
     pub max_wait: Option<String>,
     pub context_below: Option<f64>,
+    pub max_attempts: Option<u32>,
     pub providers: BTreeMap<String, RetryRule>,
 }
 
@@ -264,6 +268,11 @@ impl RetryPolicy {
 }
 
 impl MuRetry {
+    /// Attempts per request: `max_attempts` when it is 1 to 20, else the default (as `check_retry` warns).
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts.filter(|n| (1..=20).contains(n)).unwrap_or(DEFAULT_MAX_ATTEMPTS)
+    }
+
     pub fn policy(&self, provider: &str) -> RetryPolicy {
         let own = self.providers.get(provider);
         let max_wait = own
@@ -293,6 +302,9 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
 }
 
 fn check_retry(r: &MuRetry, warn: &mut Vec<String>) {
+    if let Some(n) = r.max_attempts.filter(|n| !(1..=20).contains(n)) {
+        warn.push(format!("config.toml: [retry] max_attempts {n} is not between 1 and 20; using the default"));
+    }
     let rules = std::iter::once(("[retry]".to_string(), r.max_wait.as_deref(), r.context_below)).chain(
         r.providers.iter().map(|(p, v)| (format!("[retry.providers.{p}]"), v.max_wait.as_deref(), v.context_below)),
     );
@@ -791,6 +803,27 @@ mod tests {
         check_retry(&r, &mut w);
         assert_eq!(w.len(), 2, "{w:?}");
         assert_eq!(r.policy("y").max_wait, DEFAULT_MAX_WAIT);
+    }
+
+    #[test]
+    fn max_attempts_is_kept_between_1_and_20() {
+        let kept = toml::from_str::<MuRetry>("max_attempts = 7").unwrap();
+        let mut w = Vec::new();
+        check_retry(&kept, &mut w);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(kept.max_attempts(), 7);
+        assert_eq!(MuRetry::default().max_attempts(), DEFAULT_MAX_ATTEMPTS);
+
+        for bad in [0, 21] {
+            let r = toml::from_str::<MuRetry>(&format!("max_attempts = {bad}")).unwrap();
+            let mut w = Vec::new();
+            check_retry(&r, &mut w);
+            assert_eq!(
+                w,
+                [format!("config.toml: [retry] max_attempts {bad} is not between 1 and 20; using the default")]
+            );
+            assert_eq!(r.max_attempts(), DEFAULT_MAX_ATTEMPTS);
+        }
     }
 
     #[test]

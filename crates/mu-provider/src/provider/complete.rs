@@ -10,8 +10,11 @@ use std::rc::Rc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Ceiling for one-shot completions (titles, summaries use their own cancel token as well).
-const COMPLETE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Time allowed for a one-shot completion: 60 s, or 20 tokens/s of the requested output when that is
+/// longer (titles and summaries also take their own cancel token).
+fn ceiling(max_tokens: u32) -> Duration {
+    Duration::from_secs(60u64.max(u64::from(max_tokens) / 20))
+}
 
 impl Providers {
     /// One-shot completion without tools or thinking. `role_or_model` is a model id, or a role
@@ -36,6 +39,7 @@ impl Providers {
         if sels.is_empty() {
             return Err(anyhow!("no model configured for role {role_or_model}"));
         }
+        let limit = ceiling(max_tokens);
         let mut last = anyhow!("no model");
         for sel in sels {
             let (spec, _) = match self.resolve(&sel) {
@@ -56,10 +60,10 @@ impl Providers {
                 session_id: None,
             };
             let mut sink = |_: StreamEvent| {};
-            let attempt = tokio::time::timeout(COMPLETE_TIMEOUT, self.stream(&req, cancel, &mut sink));
+            let attempt = tokio::time::timeout(limit, self.stream(&req, cancel, &mut sink));
             let attempt = attempt.await.unwrap_or_else(|_| {
                 Err(ProviderError::Retryable {
-                    msg: format!("timed out after {}s", COMPLETE_TIMEOUT.as_secs()),
+                    msg: format!("timed out after {}s", limit.as_secs()),
                     retry_after: None,
                 })
             });
@@ -79,5 +83,16 @@ impl Providers {
             }
         }
         Err(last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_scales_with_the_requested_output() {
+        assert_eq!(ceiling(64), Duration::from_secs(60));
+        assert_eq!(ceiling(13_107), Duration::from_secs(655));
     }
 }

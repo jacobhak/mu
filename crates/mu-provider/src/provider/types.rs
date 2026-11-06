@@ -2,7 +2,7 @@
 //! the decoder a wire hands its response bytes to.
 
 use super::providers::{AuthStyle, ProviderDef};
-use mu_base::message::Message;
+use mu_base::message::{Message, Usage};
 use mu_base::models::{ModelSpec, Thinking};
 use mu_base::tool::ToolDef;
 use std::cell::Cell;
@@ -67,6 +67,10 @@ pub enum StreamEvent<'a> {
         delay: Duration,
         reason: String,
     },
+    /// A note for the user about the reply (e.g. the model declined to continue).
+    Notice(String),
+    /// Tokens a failed attempt was billed for before it failed; the retry is billed separately.
+    FailedAttemptUsage(Usage),
 }
 
 #[derive(Debug, Clone)]
@@ -94,5 +98,9 @@ pub(crate) trait Decoder {
     /// The message when the stream ended without its own end marker, if the content is complete enough.
     fn finish(&mut self) -> Option<Message> {
         None
+    }
+    /// Usage seen so far, for billing an attempt that fails before its message completes.
+    fn usage(&self) -> Usage {
+        Usage::default()
     }
 }

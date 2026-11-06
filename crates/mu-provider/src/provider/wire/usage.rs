@@ -8,7 +8,7 @@ use serde_json::Value;
 pub fn anthropic_stop(reason: &str) -> StopReason {
     match reason {
         "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::Length,
+        "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
         _ => StopReason::Stop,
     }
 }
@@ -62,5 +62,18 @@ pub fn chat_stop(reason: Option<&str>, has_calls: bool) -> (StopReason, Option<S
         Some("length" | "max_tokens") => (StopReason::Length, None),
         Some("tool_calls" | "function_call") => (if has_calls { StopReason::ToolUse } else { StopReason::Stop }, None),
         Some(other) => (StopReason::Error, Some(format!("Provider finish_reason: {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_stop_reasons() {
+        assert_eq!(anthropic_stop("model_context_window_exceeded"), StopReason::Length);
+        assert_eq!(anthropic_stop("max_tokens"), StopReason::Length);
+        assert_eq!(anthropic_stop("tool_use"), StopReason::ToolUse);
+        assert_eq!(anthropic_stop("end_turn"), StopReason::Stop);
     }
 }
