@@ -660,6 +660,7 @@ mod tests {
 
     #[test]
     fn golden_body_images_in_user_and_tool_output() {
+        mu_testutil::home();
         let img = mu_base::message::Image { data: "iVBORw0KGgo=".into(), mime_type: "image/png".into() };
         let msgs = [
             Message::user_input(&mu_base::message::UserInput { text: "look".into(), images: vec![img.clone()] }),

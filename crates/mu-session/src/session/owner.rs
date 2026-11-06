@@ -1,5 +1,5 @@
 //! Who has a session open: what this process announces about itself, and the owner record
-//! (`$MU_HOME/run/<id>.json`) it holds under `flock` while it has a session open.
+//! (`<profile home>/run/<id>.json`) it holds under `flock` while it has a session open.
 use super::list::{id_of, valid_id};
 use mu_base::process::try_flock;
 use mu_common::paths;
@@ -106,7 +106,7 @@ pub(super) struct LiveRecord {
 
 fn record_path(session: &Path) -> Option<PathBuf> {
     let id = id_of(session);
-    valid_id(&id).then(|| paths::mu_home().join("run").join(format!("{id}.json")))
+    valid_id(&id).then(|| paths::profile_home().join("run").join(format!("{id}.json")))
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -165,10 +165,15 @@ pub struct LiveSession {
     pub abort: bool,
 }
 
-/// Every live owner record in `$MU_HOME/run`. A record whose writer is gone (its lock is free) or
-/// whose session file is missing is left out.
+/// Every live owner record of this profile (`<profile home>/run`). A record whose writer is gone (its
+/// lock is free) or whose session file is missing is left out.
 pub fn live_sessions() -> Vec<LiveSession> {
-    let Ok(rd) = std::fs::read_dir(paths::mu_home().join("run")) else { return Vec::new() };
+    live_sessions_in(&paths::profile_home().join("run"))
+}
+
+/// `live_sessions` for the owner records in `run_dir`.
+pub fn live_sessions_in(run_dir: &Path) -> Vec<LiveSession> {
+    let Ok(rd) = std::fs::read_dir(run_dir) else { return Vec::new() };
     rd.flatten()
         .filter(|e| {
             let n = e.file_name();
@@ -265,7 +270,7 @@ fn sweep_stale(dir: &Path) {
     }
 }
 
-/// `$MU_HOME/run/<id>.json`, held under `flock` by the process that has the session open.
+/// `<profile home>/run/<id>.json`, held under `flock` by the process that has the session open.
 /// Best effort: any failure just means no record.
 pub(super) struct OwnerRecord {
     path: PathBuf,

@@ -34,9 +34,10 @@ fn initialize(agent_dir: &Path, mu_home: &Path) -> Result<(), String> {
     if MAILBOX.get().is_some() {
         return Ok(());
     }
-    let state_dir = mu_home.join("predict");
+    let profile_home = mu_common::paths::profile_home();
+    let state_dir = profile_home.join("predict");
     let mut st = State::open(&state_dir)?;
-    let rows = corpus::load_corpus(agent_dir, mu_home, &mu_common::paths::home());
+    let rows = corpus::load_corpus(agent_dir, &profile_home, &mu_common::paths::home());
     for r in &rows {
         st.observe_n(&r.text, &r.cwd, r.count);
     }

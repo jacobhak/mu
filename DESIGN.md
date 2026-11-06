@@ -51,11 +51,11 @@ flowchart LR
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
 | Provider client | Streaming requests, retries, thinking mapping and usage, over three wire formats (Anthropic Messages, OpenAI Responses, Chat Completions) to a provider's own API with the user's key or ChatGPT sign-in, or Anthropic Messages to the omp gateway | — |
-| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `$MU_HOME/run/` (pid, kind, agent, cwd, parent; the jobs panel's Sessions tab lists the live ones); a per-session inbox in `$MU_HOME/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
+| Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `<profile home>/run/` (pid, kind, agent, cwd, parent; the jobs panel's Sessions tab lists the live ones); a per-session inbox in `<profile home>/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
 | Built-in tools | read, write, edit (hash-anchored), bash, grep, glob, find, todo, ask | `pi-edit`, `pi-shell`, `pi-walker`, `pi-diff`, `pi-vcs` |
-| Output spill | Tool output above a threshold goes to `artifact://` files, not the heap. Images are stored once as content-addressed blob files (`$MU_HOME/blobs/<sha256>`) and messages keep only omp's `blob:sha256:<hash>` reference; the bytes are read back when a request is built. mu also reads blobs from omp's own store, so omp sessions with images load; omp does not read mu's store | — |
+| Output spill | Tool output above a threshold goes to `artifact://` files, not the heap. Images are stored once as content-addressed blob files (`<profile home>/blobs/<sha256>`) and messages keep only omp's `blob:sha256:<hash>` reference; the bytes are read back when a request is built. mu also reads blobs from omp's own store, so omp sessions with images load; omp does not read mu's store | — |
 | Subagents | Spawn `mu --headless` with a task; receive a schema-validated result. A `task` item may carry `outputSchema` (omp's name); the child then gets omp's `yield` tool (`{data}` or `{error}`; `data` is checked against the schema and a mismatch comes back as a tool error to retry). The `result` NDJSON line gains `data` and `schemaOk`; `text` and `isError` stay. A schema task with no valid `yield` fails (one nudge turn first). Validation is a small in-tree validator (no `$ref`), not a crate. | — |
 | Plugin host | Manifests, lazy start, lifetimes, hooks, MCP client | — |
 | Terminal UI | Inline rendering into the terminal's scrollback; streaming markdown, diffs, status line | — |
@@ -107,7 +107,7 @@ The tools-to-provider edge exists because the plugin host serves `core/complete`
   stdio server's process is the server itself; an http server's process is the `mcp-http` bridge. The core speaks
   MCP (`initialize`, `tools/list`, `tools/call`, `notifications/cancelled`; answers `ping` and `roots/list`)
   instead of the plugin protocol, and everything else — spawn, lifetimes, `/plugins` — is the plugin host's.
-  The tool list is cached on disk (`$MU_HOME/mcp/tools/<hash>.json`), keyed by a hash of the server's config,
+  The tool list is cached on disk (`<profile home>/mcp/tools/<hash>.json`), keyed by a hash of the server's config,
   and checked again whenever the server actually starts. Nothing starts at launch; the first session after a
   config change starts the server once, when the first turn builds its tool list, and a server started only to
   list tools exits after 60 s unless it is used. A server that fails to list is left out of that session. Esc and

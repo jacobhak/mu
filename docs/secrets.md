@@ -20,7 +20,7 @@ Prevention comes first: the `bash` tool description tells the model never to pri
 Every replacement is recorded in the session as a `secrets_redacted` entry with where it happened (`tool:bash`, `message`, `plugin:memory`, `resume`, `user-bash`) and the placeholder names, never the values. Counting them shows how often the filter has to step in:
 
 ```sh
-jq -c 'select(.customType == "secrets_redacted") | .data' ~/.mu/sessions/*/*.jsonl
+jq -c 'select(.customType == "secrets_redacted") | .data' ~/.mu/profiles/<name>/sessions/*/*.jsonl  # ~/.mu/sessions without a profile
 ```
 
 This guards against a careless model printing a key (`env`, `cat .env`, a token in a git remote). It is not a boundary: anything with bash can encode or move a value without mu seeing it. Keep credentials the agent should not have out of the account it runs as.

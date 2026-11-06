@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// A private `MU_HOME` for this test process, created once. Tests that touch mu's state
-/// (sessions, blobs) call it first so they never write to the real `~/.mu`.
+/// A private `MU_HOME` for this test process, created once, with no omp profile, so per-profile state
+/// is `MU_HOME` itself whatever the developer's shell sets. Tests that touch mu's state (sessions,
+/// blobs) call it first so they never write to the real `~/.mu`.
 pub fn home() -> &'static Path {
     static H: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     H.get_or_init(|| {
@@ -17,7 +18,11 @@ pub fn home() -> &'static Path {
         };
         std::fs::create_dir_all(&d).unwrap();
         // SAFETY: set once, before any test in this process reads it through `home()`.
-        unsafe { std::env::set_var("MU_HOME", &d) };
+        unsafe {
+            std::env::set_var("MU_HOME", &d);
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+        }
         d
     })
 }

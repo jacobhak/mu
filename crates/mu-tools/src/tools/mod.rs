@@ -64,6 +64,7 @@ pub struct Tools {
 impl Tools {
     #[cfg(test)]
     pub fn for_test() -> Self {
+        mu_testutil::home(); // spilled output and image blobs go to a private MU_HOME
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         Self::new(PathBuf::from("/tmp"), PluginHost::new(vec![], vec![], tx, Default::default()))
     }

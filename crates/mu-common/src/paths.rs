@@ -60,11 +60,28 @@ pub fn mu_home() -> PathBuf {
     }
 }
 
-/// Per-profile cache dir: `$MU_HOME`, or `$MU_HOME/profiles/<name>` under an omp profile. Data that depends
-/// on a profile's credentials (model catalogue, prices) lives here so profiles never overwrite each other's.
-pub fn profile_cache_dir() -> PathBuf {
+/// Per-profile state: `$MU_HOME`, or `$MU_HOME/profiles/<name>` under an omp profile. Everything that belongs
+/// to one profile's work lives here (sessions and their run records, inbox, artifacts, plans, prompt history,
+/// credentials, model and price caches), so profiles never see or overwrite each other's. Install-wide files
+/// (bin, plugins, logs, config.toml, themes, model weights) stay in `mu_home()`.
+pub fn profile_home() -> PathBuf {
     profile_subdir(mu_home(), profile().as_deref())
 }
+
+/// The dirs and files `profile_home()` holds that existed in `$MU_HOME` itself before state was per profile.
+pub const PROFILE_STATE: &[&str] = &[
+    "sessions",
+    "run",
+    "inbox",
+    "artifacts",
+    "local",
+    "blobs",
+    "plans",
+    "deliveries",
+    "mcp",
+    "predict",
+    "history.jsonl",
+];
 
 /// The running executable, for re-spawning ourselves (subagents, daemons). After the binary is replaced on
 /// disk (`cargo install` under a running session) `current_exe()` names a path that no longer exists
@@ -79,7 +96,7 @@ pub fn self_exe() -> std::io::Result<PathBuf> {
 }
 
 pub fn session_dir(cwd: &Path) -> PathBuf {
-    mu_home().join("sessions").join(encode_cwd(cwd))
+    profile_home().join("sessions").join(encode_cwd(cwd))
 }
 
 fn dashed(rel: &Path) -> String {

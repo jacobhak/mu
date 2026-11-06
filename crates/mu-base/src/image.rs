@@ -28,7 +28,7 @@ pub fn sniff(b: &[u8]) -> Option<&'static str> {
 const BLOB_PREFIX: &str = "blob:sha256:";
 
 fn blob_dir() -> PathBuf {
-    mu_common::paths::mu_home().join("blobs")
+    mu_common::paths::profile_home().join("blobs")
 }
 
 /// Whether `data` is a blob reference rather than inline base64.

@@ -47,11 +47,11 @@ fn dir_id(session_id: &str) -> &str {
 }
 
 pub fn local_root(session_id: &str) -> PathBuf {
-    paths::mu_home().join("local").join(dir_id(session_id))
+    paths::profile_home().join("local").join(dir_id(session_id))
 }
 
 pub fn artifact_dir(session_id: &str) -> PathBuf {
-    paths::mu_home().join("artifacts").join(dir_id(session_id))
+    paths::profile_home().join("artifacts").join(dir_id(session_id))
 }
 
 impl Tools {

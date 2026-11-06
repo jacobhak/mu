@@ -1,4 +1,4 @@
-//! The queue behind `mu notify`: the messages sent to a session, in `$MU_HOME/inbox/<id>/<ts>-<pid>-<n>.json`.
+//! The queue behind `mu notify`: the messages sent to a session, in `<profile home>/inbox/<id>/<ts>-<pid>-<n>.json`.
 //! `send` (called by the `mu notify` CLI) queues them; the owner of the session lists, announces and
 //! drains them. An interactive owner announces SIGUSR2 support in its owner record
 //! (`inbox: true`) and drains the directory itself.
@@ -31,7 +31,7 @@ pub struct Note {
 }
 
 pub(crate) fn root() -> PathBuf {
-    paths::mu_home().join("inbox")
+    paths::profile_home().join("inbox")
 }
 
 pub(crate) fn dir(id: &str) -> Option<PathBuf> {

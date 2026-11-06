@@ -5,7 +5,7 @@ use mu_agent::plans;
 use mu_agent::review::facts::repo_root;
 use mu_agent::review::report::{Finding, fix_message, loc, raw_message};
 use mu_base::git::{git, short_sha};
-use mu_common::paths::{encode_cwd, mu_home, self_exe};
+use mu_common::paths::{encode_cwd, profile_home, self_exe};
 use mu_session::session::{inbox, list};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
@@ -100,7 +100,7 @@ pub struct Record {
 }
 
 async fn deliveries_dir(cwd: &Path) -> PathBuf {
-    mu_home().join("deliveries").join(encode_cwd(&plans::main_checkout(cwd).await))
+    profile_home().join("deliveries").join(encode_cwd(&plans::main_checkout(cwd).await))
 }
 
 fn save(dir: &Path, r: &Record) {

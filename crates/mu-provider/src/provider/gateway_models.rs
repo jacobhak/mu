@@ -53,7 +53,7 @@ fn model_row(m: &Value) -> Option<GatewayModel> {
 
 /// Per profile: each profile's gateway serves its own models.
 fn cache() -> mu_base::jsoncache::JsonCache {
-    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("gateway-models.json"))
+    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_home().join("gateway-models.json"))
 }
 
 pub(super) fn load_cache() -> Option<Vec<GatewayModel>> {

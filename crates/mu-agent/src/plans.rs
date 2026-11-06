@@ -1,12 +1,12 @@
 //! Durable plans: a plan written in plan mode can be parked and approved later, in another session.
 //! Each plan is `<id>.md` (the text as written) plus `<id>.json` (metadata) under
-//! `$MU_HOME/plans/<repo-key>/`. All worktrees of one clone share a store.
+//! `<profile home>/plans/<repo-key>/` (`paths::profile_home`). All worktrees of one clone share a store.
 use crate::review::facts::{numstat, repo_root, snapshot_tree};
 use mu_base::events::{Approval, Base, PlanMeta, Status};
 use mu_base::git::{git, short_sha};
 use mu_base::message::{Message, tool_calls};
 use mu_common::fs::write_atomic;
-use mu_common::paths::{encode_cwd, mu_home};
+use mu_common::paths::{encode_cwd, profile_home};
 use std::path::{Path, PathBuf};
 
 pub struct Store {
@@ -62,7 +62,10 @@ pub async fn main_checkout(cwd: &Path) -> PathBuf {
 }
 
 pub async fn store_for(cwd: &Path) -> Store {
-    Store { dir: mu_home().join("plans").join(encode_cwd(&main_checkout(cwd).await)), root: repo_root(cwd).await.ok() }
+    Store {
+        dir: profile_home().join("plans").join(encode_cwd(&main_checkout(cwd).await)),
+        root: repo_root(cwd).await.ok(),
+    }
 }
 
 pub(crate) async fn base_now(root: &Path) -> Option<Base> {

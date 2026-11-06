@@ -325,7 +325,8 @@ mod tests {
     #[ignore = "reads ~/.mu and ~/.omp transcripts; run by hand"]
     fn transcripts() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        let roots = [home.join(".omp/profiles/private/agent/sessions"), home.join(".mu/sessions")];
+        let roots =
+            [home.join(".omp/profiles/private/agent/sessions"), mu_common::paths::profile_home().join("sessions")];
         let mut finals: Vec<String> = Vec::new();
         for root in roots {
             for dir in entries(&root) {

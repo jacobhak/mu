@@ -36,7 +36,7 @@ struct File {
 }
 
 fn cache() -> mu_base::jsoncache::JsonCache {
-    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("chatgpt-models.json"))
+    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_home().join("chatgpt-models.json"))
 }
 
 fn load() -> File {
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(cached(a).len(), 2);
         assert!(cached(b).is_empty(), "another account sees nothing");
         assert!(!stale(a) && stale(b));
-        let text = std::fs::read_to_string(mu_common::paths::profile_cache_dir().join("chatgpt-models.json")).unwrap();
+        let text = std::fs::read_to_string(mu_common::paths::profile_home().join("chatgpt-models.json")).unwrap();
         assert!(!text.contains(a), "the file names no account");
     }
 }

@@ -171,7 +171,7 @@ static CMD_CACHE: Mutex<Option<HashMap<String, (String, String)>>> = Mutex::new(
 impl Store {
     /// The active profile's store.
     pub fn new() -> Self {
-        Self { path: mu_common::paths::profile_cache_dir().join("auth.json") }
+        Self { path: mu_common::paths::profile_home().join("auth.json") }
     }
 
     #[cfg(any(test, feature = "test-support"))]

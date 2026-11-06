@@ -86,8 +86,8 @@ pub fn mu_row(line: &str) -> Option<Row> {
     }
 }
 
-fn mu_rows(mu_home: &Path, out: &mut Recent) {
-    let Ok(f) = std::fs::File::open(mu_home.join("history.jsonl")) else { return };
+fn mu_rows(profile_home: &Path, out: &mut Recent) {
+    let Ok(f) = std::fs::File::open(profile_home.join("history.jsonl")) else { return };
     for l in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         if let Some(r) = mu_row(&l) {
             out.push(r);
@@ -96,11 +96,11 @@ fn mu_rows(mu_home: &Path, out: &mut Recent) {
 }
 
 /// All rows from every readable source, oldest first. Missing sources are skipped.
-pub fn load_corpus(agent_dir: &Path, mu_home: &Path, home: &Path) -> Vec<Row> {
+pub fn load_corpus(agent_dir: &Path, profile_home: &Path, home: &Path) -> Vec<Row> {
     let mut recent = Recent::default();
     omp_rows(agent_dir, &mut recent);
     claude_rows(home, &mut recent);
-    mu_rows(mu_home, &mut recent);
+    mu_rows(profile_home, &mut recent);
     let mut rows = recent.into_rows();
     rows.retain(|r| !r.text.trim().is_empty());
     rows.sort_by_key(|r| r.ts);

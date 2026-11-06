@@ -58,7 +58,8 @@ live)
   tmux -L $sock send-keys -t live Enter
   settle live
   capture live
-  s=$(ls -t "$HOME"/.mu/sessions/*themeshot-fixture*/*.jsonl | head -1)
+  profile="${OMP_PROFILE:-${PI_PROFILE:-}}"
+  s=$(ls -t "${MU_HOME:-$HOME/.mu}${profile:+/profiles/$profile}"/sessions/*themeshot-fixture*/*.jsonl | head -1)
   cp "$s" "$out/session.jsonl"
   echo "session: $out/session.jsonl (from $s)"
   ;;

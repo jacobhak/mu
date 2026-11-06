@@ -7,9 +7,16 @@ mu --acp
 mu take <session|id>
 mu review [--base REF] [--plan FILE] [--focus TEXT] [--out FILE] [--markdown]
 mu update [--check] [--tag TAG] [--force]
+mu migrate-profile NAME [--dry-run]
 ```
 
-`SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory; `--resume` takes a session id or path, or opens a picker. `--profile` picks an omp profile (sets `OMP_PROFILE`); `--theme` overrides `[theme] source` for one run. Sessions are omp v3 JSONL under `~/.mu/sessions/` and open in omp.
+`SEL` is `provider/model[:level]` or `@role`. `-c` resumes the latest session for the directory; `--resume` takes a session id or path, or opens a picker. `--profile` picks an omp profile (sets `OMP_PROFILE`); `--theme` overrides `[theme] source` for one run. Sessions are omp v3 JSONL under `<profile home>/sessions/` and open in omp.
+
+## Profile home
+
+Everything one omp profile's work produces lives in its profile home: `~/.mu` (`$MU_HOME`) without a profile, `~/.mu/profiles/<name>` under one. That covers sessions, their owner records and inbox, artifacts and `local://` files, image blobs, durable plans and deliveries, prompt history, the ghost-text corpus, cached MCP tool lists, API keys and model caches. Profiles never see each other's: `-c`, `--resume`, `/plans` and the jobs panel show only the active profile's. Install-wide files stay in `~/.mu`: `bin/`, `plugins/`, `logs/`, `themes/`, `models/` and `config.toml`.
+
+Before this split, mu kept that state in `~/.mu` for every profile. `mu migrate-profile NAME` moves it into `NAME`'s profile home once: close every mu first (it refuses while a session in `~/.mu` is open), and `--dry-run` lists what would move. Where the profile already has a file of the same name, the profile's copy wins: identical files are dropped, prompt history is joined (older lines first) and any other clash stays in place and is reported (exit 1). Session headers, plans and deliveries name sessions by absolute path; those paths are rewritten to the new location so subagent and fork links survive.
 
 Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal` reads as `low`). Through the gateway, `xhigh` and `max` send the matching `output_config.effort`. An effort the model does not serve goes to the tier the model maps it to, if any (a route serving only low/high/max takes `medium` as `high`), otherwise to the nearest lower tier it serves. On a native provider (a key added with `/login` or `mu auth`, or a ChatGPT sign-in; see [Providers](providers.md)) each level maps to the nearest effort in the model's own ladder instead, and what is sent differs per provider and model kind (adaptive, budget, effort).
 

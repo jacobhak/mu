@@ -120,4 +120,13 @@ pub enum Sub {
     },
     /// Deliver a parked plan: approve and implement it, review it against the plan, send blocking findings back to the implementer (at most --max-fix rounds), then have it commit. Exit codes: 0 pass, 1 fixes still needed, 2 error or failed.
     Deliver(deliver::DeliverArgs),
+    /// Move sessions, plans, prompt history and other state that older mu kept in $MU_HOME for every
+    /// profile into $MU_HOME/profiles/<NAME>, where that omp profile now finds it. Run it once, with
+    /// no mu open, for the profile you used. Exit codes: 0 done, 1 something was left in place, 2 bad name.
+    MigrateProfile {
+        name: String,
+        /// Print what would move without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }

@@ -12,7 +12,7 @@ A plan does not have to be approved in the session that wrote it. It can be park
 
 ## Store
 
-Per machine, under `$MU_HOME/plans/<repo-key>/`. The key is the main checkout's path, so all worktrees of one clone share a store. Outside git the key is the current directory.
+Per machine and profile, under `<profile home>/plans/<repo-key>/` (see [Profile home](usage.md#profile-home)). The key is the main checkout's path, so all worktrees of one clone share a store. Outside git the key is the current directory.
 
 - `<id>.md`: the plan text as written. No front matter; edit it with any tool. The review dialog re-reads it, so Ctrl-G edits count.
 - `<id>.json`: metadata.

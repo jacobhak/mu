@@ -1,5 +1,5 @@
 //! The jobs panel's Sessions tab: every live mu process with a session open, from the owner records in
-//! `$MU_HOME/run`, as a tree (a subagent under the session that spawned it). See `design/jobs-panel.md`.
+//! `<profile home>/run`, as a tree (a subagent under the session that spawned it). See `design/jobs-panel.md`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

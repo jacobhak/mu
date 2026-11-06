@@ -4,7 +4,7 @@ use crate::corpus::{Row, load_corpus};
 use crate::engine::{State, split_word};
 use crate::settings::DEFAULT_THREADS;
 use crate::smollm;
-use mu_common::paths::{mu_home, omp_agent_dir};
+use mu_common::paths::{omp_agent_dir, profile_home};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -107,7 +107,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             _ => return Err(format!("unknown option {a}")),
         }
     }
-    let rows = load_corpus(&omp_agent_dir(), &mu_home(), &mu_common::paths::home());
+    let rows = load_corpus(&omp_agent_dir(), &profile_home(), &mu_common::paths::home());
     let dir = std::env::temp_dir().join(format!("mu-predict-bench-{}", std::process::id()));
     if let Some(n) = latency {
         let model = model.ok_or("--latency needs --smollm DIR")?;

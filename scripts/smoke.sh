@@ -5,6 +5,8 @@ set -uo pipefail
 mu="$(readlink -f "${1:-target/release/mu}")"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 export MU_HOME="$(mktemp -d)"
+profile="${OMP_PROFILE:-${PI_PROFILE:-}}"
+state="$MU_HOME${profile:+/profiles/$profile}" # mu's per-profile state (paths::profile_home)
 mkdir -p "$MU_HOME/plugins" && ln -s "$root/plugins/gateway" "$MU_HOME/plugins/gateway"
 work="$(mktemp -d)"
 tm="mu-smoke-$$"
@@ -27,7 +29,7 @@ wait_for() { # pattern timeout_s
   while ((SECONDS < end)); do screen | grep -qF -- "$1" && return 0; sleep 0.5; done
   return 1
 }
-session_file() { ls -t "$MU_HOME"/sessions/*/*.jsonl | head -1; }
+session_file() { ls -t "$state"/sessions/*/*.jsonl | head -1; }
 check() { # name command...
   local name="$1"; shift
   if "$@"; then pass "$name"; else bad "$name"; fi
@@ -50,7 +52,7 @@ rm -f "$MU_HOME/config.toml"
 
 # subagents: two scouts, child sessions linked to the parent
 "$mu" -p 'Use the task tool with two scout tasks: (1) say the word ALPHA, (2) say the word BETA. Then reply with both words.' --model @smol 2>/dev/null | grep -q ALPHA
-check "task: two scouts" test "$(grep -l parentSession "$MU_HOME"/sessions/*/*.jsonl | wc -l)" -ge 2
+check "task: two scouts" test "$(grep -l parentSession "$state"/sessions/*/*.jsonl | wc -l)" -ge 2
 
 # TUI
 tmux new -d -s "$tm" -x 150 -y 40 "cd $work && MU_HOME=$MU_HOME OMP_PROFILE=${OMP_PROFILE:-} $mu --model @smol; echo EXIT=\$?; sleep 120"
@@ -89,7 +91,7 @@ check "notify delivered" test "${out#delivered (pid }" != "$out"
 check "notify wakes the TUI" wait_for "mu notify from smoke" 10
 check "notify answered" wait_for "GNOP" 60
 wait_for "ctx" 60; sleep 3
-check "inbox drained" test -z "$(ls "$MU_HOME/inbox/$sid" 2>/dev/null)"
+check "inbox drained" test -z "$(ls "$state/inbox/$sid" 2>/dev/null)"
 
 tmux send-keys -t "$tm" C-c
 tmux send-keys -t "$tm" C-c

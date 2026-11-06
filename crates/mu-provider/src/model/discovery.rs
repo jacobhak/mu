@@ -44,7 +44,7 @@ pub fn discovers(def: &ProviderDef) -> bool {
 }
 
 fn cache() -> mu_base::jsoncache::JsonCache {
-    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_cache_dir().join("native-models.json"))
+    mu_base::jsoncache::JsonCache::new(mu_common::paths::profile_home().join("native-models.json"))
 }
 
 fn num(v: &serde_json::Value) -> f64 {
@@ -95,7 +95,7 @@ type Loaded = (Option<(SystemTime, u64)>, Arc<File>);
 static LOADED: Mutex<Option<(std::path::PathBuf, Loaded)>> = Mutex::new(None);
 
 fn load() -> Arc<File> {
-    let path = mu_common::paths::profile_cache_dir().join("native-models.json");
+    let path = mu_common::paths::profile_home().join("native-models.json");
     let stamp = std::fs::metadata(&path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
     let mut g = LOADED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((p, (s, f))) = g.as_ref()
@@ -352,7 +352,7 @@ mod refresh_tests {
                 f.failed_at.clear();
             });
             assert!(stale("baseten"));
-            let path = mu_common::paths::profile_cache_dir().join("native-models.json");
+            let path = mu_common::paths::profile_home().join("native-models.json");
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         });
     }

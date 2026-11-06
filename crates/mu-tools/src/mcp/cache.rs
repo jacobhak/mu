@@ -55,7 +55,7 @@ pub fn config_hash(s: &McpServer, project: &str) -> String {
 }
 
 pub fn dir() -> PathBuf {
-    mu_common::paths::mu_home().join("mcp").join("tools")
+    mu_common::paths::profile_home().join("mcp").join("tools")
 }
 
 fn file(dir: &Path, hash: &str) -> JsonCache {

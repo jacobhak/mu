@@ -2,12 +2,17 @@ use super::host::{InitParams, McpSync, PluginHost};
 use super::manifest::{self, Manifest};
 use super::process::sibling_of;
 use crate::mcp;
-use mu_testutil::block_on_local as run;
 use serde_json::json;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// `block_on_local` with a private MU_HOME, so plugin logs and MCP image blobs stay out of the real `~/.mu`.
+fn run<F: std::future::Future>(f: F) -> F::Output {
+    mu_testutil::home();
+    mu_testutil::block_on_local(f)
+}
 
 /// A plugin script: answers `initialize`, then hangs on `tool/call` or exits, per `on_call`.
 fn host(on_call: &str, lifetime: &str) -> (Rc<PluginHost>, std::path::PathBuf) {

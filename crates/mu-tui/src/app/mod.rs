@@ -172,7 +172,7 @@ pub async fn run(init: AppInit) -> i32 {
             notify,
         },
         prompt: Prompt {
-            composer: Composer::new(Some(paths::mu_home().join("history.jsonl"))).with_cwd(&cwd),
+            composer: Composer::new(Some(paths::profile_home().join("history.jsonl"))).with_cwd(&cwd),
             commands,
             ghost_seq: 0,
             ghost_asked: String::new(),

@@ -1,7 +1,7 @@
 //! Per-model token prices, from omp's catalogue.
 //!
 //! Source: `omp models ls --json` (per-million rates, `pricingStatus`). It lists only models the active
-//! profile can use, so its output is cached per profile (`paths::profile_cache_dir()/pricing.json`) and
+//! profile can use, so its output is cached per profile (`paths::profile_home()/pricing.json`) and
 //! refreshed at most once a day, off the draw path. A model missing from the cache forces one refresh.
 use mu_base::message::{Cost, Usage};
 use mu_common::paths;
@@ -145,7 +145,7 @@ static TABLE: RwLock<Option<Arc<Table>>> = RwLock::new(None);
 static FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn cache() -> mu_base::jsoncache::JsonCache {
-    mu_base::jsoncache::JsonCache::new(paths::profile_cache_dir().join("pricing.json"))
+    mu_base::jsoncache::JsonCache::new(paths::profile_home().join("pricing.json"))
 }
 
 fn table() -> Arc<Table> {
@@ -288,7 +288,7 @@ fn cache_fresh(path: &std::path::Path) -> bool {
 /// Refreshes the cached catalogue when it is missing or older than a day. Failures keep the old cache.
 /// Runs `omp models ls --json` at most once per day; never called from the draw path.
 pub async fn refresh() {
-    if !cache_fresh(&paths::profile_cache_dir().join("pricing.json")) {
+    if !cache_fresh(&paths::profile_home().join("pricing.json")) {
         fetch().await;
     }
 }
