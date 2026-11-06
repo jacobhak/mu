@@ -44,6 +44,38 @@ fn steer_and_follow_up_sent_mid_turn_are_reported_when_it_ends() {
 }
 
 #[test]
+fn cancel_closes_an_open_plan_dialog_without_a_decision() {
+    run(async {
+        let (mut a, mut rx) = crate::testing::agent(vec![]);
+        a.cwd = crate::testing::git_repo();
+        let store = crate::testing::save_plan_in(&a.cwd, &["a.txt"]).await;
+        let (tx, crx) = unbounded_channel();
+        let inbox = a.ports.inbox.clone();
+        let mut q = queue(crx, &inbox, a.ports.events.clone());
+        // The reply stays alive while the dialog is open, so only Cancel can end it.
+        let feeder = async {
+            let mut reply = None;
+            while let Some(e) = rx.recv().await {
+                if let AgentEvent::PlanReview { reply: r, .. } = e {
+                    reply = Some(r);
+                    tx.send(Command::Cancel).unwrap();
+                    break;
+                }
+            }
+            reply
+        };
+        let (ran, _reply) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), a.command(Command::OpenPlan("t".into()), &mut q)),
+            feeder
+        );
+        assert!(ran.expect("the dialog closes on cancel"), "the run loop goes on");
+        assert!(a.plan.plan.is_none());
+        let (meta, _) = store.load("t").unwrap();
+        assert_eq!(meta.status, mu_base::events::Status::Pending);
+    });
+}
+
+#[test]
 fn cancel_aborts_the_turn_in_flight() {
     run(async {
         let (tx, rx) = unbounded_channel();

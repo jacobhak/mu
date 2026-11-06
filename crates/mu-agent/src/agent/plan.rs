@@ -161,6 +161,9 @@ impl Agent {
     pub(super) async fn open_plan(&mut self, id: &str) -> Option<Start> {
         let (store, meta, shown, drift) = self.pending_plan(id).await?;
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // A cancel (Esc, Ctrl-C) closes the dialog without a decision, as it ends a turn.
+        let cancel = CancellationToken::new();
+        self.ports.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::PlanReview {
             title: meta.title.clone(),
             uri: format!("local://{id}-plan.md"),
@@ -174,7 +177,10 @@ impl Agent {
             )),
             reply: tx,
         });
-        let decision = rx.await.ok()?;
+        let decision = tokio::select! {
+            r = rx => r.ok()?,
+            _ = cancel.cancelled() => return None,
+        };
         // The user may have edited the file with Ctrl-G while the dialog was up.
         let content = std::fs::read_to_string(store.md_path(id)).unwrap_or(shown);
         self.apply_stored(&store, &meta, content, drift.describe(), decision).await

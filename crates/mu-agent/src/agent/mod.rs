@@ -466,7 +466,16 @@ impl Agent {
             Command::RefreshTools => self.refresh_tool_defs(),
             Command::ListPlans => self.list_plans().await,
             Command::OpenPlan(id) => {
-                if let Some(s) = self.open_plan(&id).await {
+                // The dialog runs under `drive`, so Esc and cancel reach it.
+                let mut start = None;
+                drive(
+                    async {
+                        start = self.open_plan(&id).await;
+                    },
+                    q,
+                )
+                .await;
+                if let Some(s) = start {
                     drive(self.turn_from(s), q).await;
                 }
             }

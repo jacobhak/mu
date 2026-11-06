@@ -26,13 +26,14 @@ pub fn id_of(path: &Path) -> String {
     name.rsplit_once('_').map_or(name.clone(), |(_, id)| id.to_string())
 }
 
+/// The newest session of `cwd` that has content and a readable header: a crash can leave a newer,
+/// empty or torn file behind, and that one is not what `--continue` means.
 pub fn latest_for(cwd: &Path) -> Option<PathBuf> {
-    let dir = paths::session_dir(cwd);
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .max_by(|a, b| a.file_name().cmp(&b.file_name()))
+    let mut files = jsonl_files(&paths::session_dir(cwd));
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    files.into_iter().find(|p| {
+        std::fs::metadata(p).is_ok_and(|m| m.len() > 0) && read_info(p.clone()).is_some_and(|s| s.cwd.is_some())
+    })
 }
 
 /// A session id is `[A-Za-z0-9-]+`: nothing that could name a path.
@@ -191,6 +192,18 @@ mod tests {
             let e = find_id(cwd, &ia[..common]).unwrap_err();
             assert!(e.contains("ambiguous"), "{e}");
         }
+    }
+
+    #[test]
+    fn latest_skips_newer_files_that_are_empty_or_headerless() {
+        home();
+        let cwd = Path::new("/opt/latest-empty");
+        let mut s = SessionFile::create(cwd, None).unwrap();
+        s.message(&Message::user("hello"));
+        let dir = s.path.parent().unwrap().to_path_buf();
+        std::fs::write(dir.join("9999_empty.jsonl"), "").unwrap();
+        std::fs::write(dir.join("9998_torn.jsonl"), "{\"type\":\"sess").unwrap();
+        assert_eq!(latest_for(cwd), Some(s.path.clone()));
     }
 
     #[test]

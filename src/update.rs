@@ -66,6 +66,15 @@ fn tag_sha(tag: &str) -> Option<&str> {
     (s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit())).then_some(s)
 }
 
+/// Whether `t` is a release tag as the bot names them: `mu-YYYYMMDD-` and 7 to 40 lowercase hex digits.
+fn is_release_tag(t: &str) -> bool {
+    let Some((date, sha)) = t.strip_prefix("mu-").and_then(|r| r.split_once('-')) else { return false };
+    date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && (7..=40).contains(&sha.len())
+        && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Maps the compare API's `status` and `ahead_by` (installed...release) to a result.
 fn classify(tag: &str, status: &str, ahead: u64, sha: &str) -> Status {
     match status {
@@ -220,6 +229,9 @@ pub fn startup_notice() -> Option<String> {
 
 /// `mu update [--check] [--force] [--tag T]`.
 pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
+    if let Some(t) = tag.as_deref().filter(|t| !is_release_tag(t)) {
+        bail!("not a mu release tag: {t}");
+    }
     let st = check();
     println!("{}", st.describe());
     if check_only {
@@ -277,6 +289,27 @@ mod tests {
         assert_eq!(tag_sha("mu-20261026-799ca34"), Some("799ca34"));
         assert_eq!(tag_sha("mu-20261026"), None);
         assert_eq!(tag_sha("v1"), None);
+    }
+
+    #[test]
+    fn release_tags_are_checked_by_shape() {
+        assert!(is_release_tag("mu-20261026-799ca34"));
+        assert!(is_release_tag(&format!("mu-20261026-{}", "a".repeat(40))));
+        for bad in [
+            "mu-20261026-799ca3",
+            "mu-20261026-799ca34x",
+            "mu-20261026-799CA34",
+            "mu-2026102-799ca34",
+            "mu-2026102a-799ca34",
+            "mu-20261026-799ca34-1",
+            "mu-20261026-",
+            "mu-20261026",
+            "v1",
+            "../mu-20261026-799ca34",
+            "",
+        ] {
+            assert!(!is_release_tag(bad), "{bad:?}");
+        }
     }
 
     #[test]

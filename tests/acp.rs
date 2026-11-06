@@ -495,3 +495,79 @@ fn a_deleted_session_leaves_the_list() {
     let r = acp.call("session/delete", json!({"sessionId": sid}));
     assert_eq!(r["result"], json!({}), "a session that is gone is deleted already: {r}");
 }
+
+#[test]
+fn a_session_in_use_is_not_deleted() {
+    let (base, _) = serve(vec![text("unused")]);
+    let home = home_with_key(&base);
+    let cwd = mu_testutil::tmp();
+    let mut acp = Acp::start(&home, &cwd);
+    acp.init(json!({}));
+    let (sid, _) = acp.new_session(&cwd);
+    let r = acp.call("session/close", json!({"sessionId": sid}));
+    assert_eq!(r["result"], json!({}), "{r}");
+    let path = session_file(&home, &sid).expect("the session file");
+    // Wait for the closed agent to let go, then hold the lock as another process would.
+    let held = std::fs::File::open(&path).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while held.try_lock().is_err() {
+        assert!(Instant::now() < end, "the closed session never let go of its lock");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let r = acp.call("session/delete", json!({"sessionId": sid}));
+    assert_eq!(
+        (r["error"]["code"].as_i64(), r["error"]["message"].as_str()),
+        (Some(-32600), Some("session is in use")),
+        "{r}"
+    );
+    assert!(path.exists(), "the session file is kept");
+}
+
+/// The session file of `sid` under `dir`, found by its id.
+fn session_file(dir: &Path, sid: &str) -> Option<PathBuf> {
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(f) = session_file(&p, sid) {
+                return Some(f);
+            }
+        } else if p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&format!("_{sid}.jsonl"))) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[test]
+fn initialize_negotiates_the_protocol_version() {
+    let (mut acp, _, _) = setup(vec![]);
+    let r = acp.call("initialize", json!({"clientCapabilities": {}}));
+    assert_eq!(r["error"]["code"], -32602, "a version is required: {r}");
+    let r = acp.call("initialize", json!({"protocolVersion": "1"}));
+    assert_eq!(r["error"]["code"], -32602, "a version must be a number: {r}");
+    let r = acp.call("initialize", json!({"protocolVersion": 0}));
+    assert_eq!(r["error"]["code"], -32022, "{r}");
+    assert_eq!(r["error"]["message"], "Unsupported protocol version");
+    assert_eq!(r["error"]["data"], json!({"requested": 0, "supported": [1]}));
+    // Version 2 is not spoken yet: a v1 answer, as the spec asks of agents without v2.
+    let r = acp.call("initialize", json!({"protocolVersion": 2}));
+    assert_eq!(r["result"]["protocolVersion"], 1, "{r}");
+}
+
+#[test]
+fn session_list_rejects_a_relative_cwd_and_a_bad_cursor() {
+    let (mut acp, _, _) = setup(vec![]);
+    acp.init(json!({}));
+    let r = acp.call("session/list", json!({"cwd": "relative/dir"}));
+    assert_eq!(
+        (r["error"]["code"].as_i64(), r["error"]["message"].as_str()),
+        (Some(-32602), Some("cwd must be an absolute path")),
+        "{r}"
+    );
+    let r = acp.call("session/list", json!({"cursor": "soon"}));
+    assert_eq!(
+        (r["error"]["code"].as_i64(), r["error"]["message"].as_str()),
+        (Some(-32602), Some("invalid cursor")),
+        "{r}"
+    );
+}

@@ -18,6 +18,7 @@ use mu_base::models::Thinking;
 use mu_base::roles;
 use mu_provider::model::pricing;
 use mu_session::session::list;
+use mu_session::session::owner::{self, Owner};
 use mu_tools::context::Context;
 use mu_tools::plugin::host::PluginHost;
 use serde_json::{Value, json};
@@ -34,6 +35,10 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL: i64 = -32603;
+/// The protocol version asked for is not one this server speaks.
+const UNSUPPORTED_VERSION: i64 = -32022;
+/// Sessions per `session/list` page.
+const PAGE: usize = 100;
 
 pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
     mu_session::session::owner::set_run_info(mu_session::session::owner::RunKind::Acp, None);
@@ -137,6 +142,8 @@ struct Session {
     /// The turn ended on a fatal error, and the message of the last error.
     failed: bool,
     last_error: Option<String>,
+    /// Reply text has streamed since the last block or turn ended: a retry then starts a visibly new reply.
+    streamed: bool,
     pending_cfg: Option<Pending>,
     models: Vec<String>,
     advertised: Advertised,
@@ -220,6 +227,7 @@ enum Done {
     Listed {
         id: Value,
         sessions: Vec<Value>,
+        next: Option<String>,
     },
 }
 
@@ -306,6 +314,17 @@ impl Server {
         let sid = p["sessionId"].as_str().unwrap_or("");
         match (method, id) {
             ("initialize", Some(id)) => {
+                let Some(requested) = p["protocolVersion"].as_u64() else {
+                    return fail(&id, INVALID_PARAMS, "protocolVersion must be a non-negative integer");
+                };
+                // Only v1 is spoken. A client asking for something older than 1 gets the supported versions.
+                if requested == 0 {
+                    return send(&json!({"jsonrpc": "2.0", "id": id, "error": {
+                        "code": UNSUPPORTED_VERSION,
+                        "message": "Unsupported protocol version",
+                        "data": {"requested": 0, "supported": [1]},
+                    }}));
+                }
                 self.notices = p["clientCapabilities"]["session"]["notices"].is_object();
                 self.elicit = p["clientCapabilities"]["elicitation"]["form"].is_object();
                 respond(
@@ -327,12 +346,25 @@ impl Server {
                 self.spawn_open(id, cwd, None, false, true);
             }
             ("session/list", Some(id)) => {
+                let want = match p.get("cwd").filter(|c| !c.is_null()) {
+                    None => None,
+                    Some(c) => match c.as_str().map(PathBuf::from).filter(|c| c.is_absolute()) {
+                        Some(c) => Some(c),
+                        None => return fail(&id, INVALID_PARAMS, "cwd must be an absolute path"),
+                    },
+                };
+                let offset = match p.get("cursor").filter(|c| !c.is_null()) {
+                    None => 0,
+                    Some(c) => match c.as_str().and_then(|s| s.parse::<usize>().ok()) {
+                        Some(o) => o,
+                        None => return fail(&id, INVALID_PARAMS, "invalid cursor"),
+                    },
+                };
                 let home = std::env::current_dir().unwrap_or_default();
-                let want = p["cwd"].as_str().map(PathBuf::from);
                 let done = self.done_tx.clone();
-                // Sorted by file name and capped before any file is read; off the request loop.
+                // Newest first by file name; only as many files as the page needs are read. Off the request loop.
                 let work = tokio::task::spawn_blocking(move || {
-                    let sessions: Vec<Value> = list::list_recent(&home, want.as_deref(), 500)
+                    let total: Vec<Value> = list::list_recent(&home, want.as_deref(), offset.saturating_add(PAGE + 1))
                         .into_iter()
                         .filter_map(|s| {
                             let cwd = s.cwd.clone().filter(|c| c.is_absolute())?;
@@ -342,12 +374,12 @@ impl Server {
                             Some(json!({"sessionId": list::id_of(&s.path), "cwd": cwd, "title": title, "updatedAt": updated}))
                         })
                         .collect();
-                    sessions
+                    page(total, offset)
                 });
                 tokio::task::spawn_local(async move {
                     match work.await {
-                        Ok(sessions) => {
-                            let _ = done.send(Done::Listed { id, sessions });
+                        Ok((sessions, next)) => {
+                            let _ = done.send(Done::Listed { id, sessions, next });
                         }
                         Err(e) => fail(&id, INTERNAL, format!("listing failed: {e}")),
                     }
@@ -395,10 +427,21 @@ impl Server {
                 self.close(sid);
                 let cwd = std::env::current_dir().unwrap_or_default();
                 match list::find_id(&cwd, sid) {
-                    Ok(path) => match std::fs::remove_file(&path) {
-                        Ok(()) => respond(&id, json!({})),
-                        Err(e) => fail(&id, INTERNAL, format!("cannot delete the session: {e}")),
-                    },
+                    Ok(path) => {
+                        // This server's own session is closed above; anything else open is someone else's.
+                        match owner::owner(&path) {
+                            Owner::Free => {}
+                            Owner::Live { pid, .. } if pid == std::process::id() => {}
+                            Owner::Live { pid, .. } => {
+                                return fail(&id, INVALID_REQUEST, format!("session is open in process {pid}"));
+                            }
+                            Owner::Unknown => return fail(&id, INVALID_REQUEST, "session is in use"),
+                        }
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => respond(&id, json!({})),
+                            Err(e) => fail(&id, INTERNAL, format!("cannot delete the session: {e}")),
+                        }
+                    }
                     Err(_) => respond(&id, json!({})),
                 }
             }
@@ -538,7 +581,10 @@ impl Server {
 
     fn on_done(&mut self, d: Done) {
         match d {
-            Done::Listed { id, sessions } => respond(&id, json!({"sessions": sessions})),
+            Done::Listed { id, sessions, next } => match next {
+                Some(c) => respond(&id, json!({"sessions": sessions, "nextCursor": c})),
+                None => respond(&id, json!({"sessions": sessions})),
+            },
             Done::Models { sid, epoch, models } => {
                 let Some(s) = self.sessions.get_mut(&sid).filter(|s| s.epoch == epoch) else { return };
                 let before = s.models.len();
@@ -619,6 +665,11 @@ impl Server {
         }
         let (notices, rpc, elicit) = (self.notices, self.rpc.clone(), self.elicit);
         let Some(s) = self.sessions.get_mut(sid) else { return };
+        match &e {
+            AgentEvent::Text(_) => s.streamed = true,
+            AgentEvent::BlockEnd | AgentEvent::TurnEnd { .. } => s.streamed = false,
+            _ => {}
+        }
         match e {
             AgentEvent::Status(st) => {
                 if !s.models.contains(&st.model_id) {
@@ -690,13 +741,21 @@ impl Server {
                 }
             }
             AgentEvent::Notice(m) => notice(notices, s.prompt.is_some(), sid, "info", m),
-            AgentEvent::Retry { attempt, delay, reason } => notice(
-                notices,
-                s.prompt.is_some(),
-                sid,
-                "warning",
-                mu_base::events::retry_notice(attempt, delay, &reason),
-            ),
+            AgentEvent::Retry { attempt, delay, reason } => {
+                if std::mem::take(&mut s.streamed) {
+                    update(
+                        sid,
+                        json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "\n\n— retrying; the reply starts over below —\n\n"}}),
+                    );
+                }
+                notice(
+                    notices,
+                    s.prompt.is_some(),
+                    sid,
+                    "warning",
+                    mu_base::events::retry_notice(attempt, delay, &reason),
+                )
+            }
             AgentEvent::Compacted { before, after } => {
                 notice(notices, s.prompt.is_some(), sid, "info", format!("compacted {before}→{after} tokens"))
             }
@@ -854,6 +913,7 @@ async fn open_session(
         prompt: None,
         failed: false,
         last_error: None,
+        streamed: false,
         pending_cfg: None,
         models,
         advertised: Advertised { model: st.model_id, thinking: st.thinking, plan: st.plan },
@@ -880,6 +940,14 @@ async fn forward<T: 'static>(
             break;
         }
     }
+}
+
+/// One `session/list` page out of `total` (already newest first and cut at `offset + PAGE + 1`), and the
+/// cursor of the next page when more remain.
+fn page(total: Vec<Value>, offset: usize) -> (Vec<Value>, Option<String>) {
+    let more = total.len() > offset.saturating_add(PAGE);
+    let items = total.into_iter().skip(offset).take(PAGE).collect();
+    (items, more.then(|| offset.saturating_add(PAGE).to_string()))
 }
 
 fn user_input(blocks: &Value) -> UserInput {
@@ -945,6 +1013,18 @@ mod tests {
         assert_eq!(model_target("@slow:high", &models, resolve), Ok("b/n".into()));
         assert!(model_target("@nope", &models, resolve).unwrap_err().contains("not configured"));
         assert_eq!(model_target("x/y", &models, resolve), Err("unknown model x/y".into()));
+    }
+
+    #[test]
+    fn a_listing_pages_by_offset_and_names_the_next_page() {
+        let all = |n: usize| (0..n).map(|i| json!({"sessionId": i})).collect::<Vec<_>>();
+        assert_eq!(page(all(3), 0), (all(3), None));
+        assert_eq!(page(all(100), 0), (all(100), None));
+        let (items, next) = page(all(101), 0);
+        assert_eq!((items.len(), next.as_deref()), (100, Some("100")));
+        assert_eq!(page(all(101), 100), (vec![json!({"sessionId": 100})], None));
+        assert_eq!(page(all(201), 100).1.as_deref(), Some("200"));
+        assert!(page(all(3), 10).0.is_empty());
     }
 
     #[test]

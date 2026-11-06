@@ -71,6 +71,11 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         return acp::run(cli.model.clone(), cli_thinking);
     }
     let mode = Mode::of(cli, plan.is_some());
+    if matches!(cli.resume, Some(None)) && mode != Mode::Tui {
+        bail!(
+            "--resume without a session opens the session picker, which needs the interactive mode; pass a session id or path"
+        );
+    }
     let cwd = std::env::current_dir()?;
     let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
     if mode == Mode::Tui && cfgs.mu.update.check {

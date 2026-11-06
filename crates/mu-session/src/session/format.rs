@@ -225,6 +225,11 @@ fn scan(path: &Path) -> Result<Scan> {
                 title = v.as_ref().and_then(slot_title);
                 continue;
             }
+            // A title slot torn by a crash: full size, not JSON. The file goes on without a title.
+            if !first_seen && v.is_none() && n == TITLE_SLOT_BYTES {
+                first_seen = true;
+                continue;
+            }
             if !v.is_some_and(|h| h["type"] == "session" && h["version"] == 3) {
                 bail!("not a v3 session file: {}", path.display());
             }
@@ -346,6 +351,19 @@ mod tests {
         let d = std::env::temp_dir().join(format!("mu-test-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_torn_title_slot_is_skipped() {
+        let d = tmp("torn");
+        let p = d.join("s.jsonl");
+        let header = json!({"type":"session","version":3,"id":"a","timestamp":"t","cwd":"/"});
+        let msg = json!({"type":"message","id":"1","parentId":null,"message":json!({"role":"user","content":"hi","timestamp":1})});
+        let garbage = format!("{}\n", "#".repeat(TITLE_SLOT_BYTES - 1));
+        assert_eq!(garbage.len(), TITLE_SLOT_BYTES);
+        std::fs::write(&p, format!("{garbage}{header}\n{msg}\n")).unwrap();
+        let l = load(&p).unwrap();
+        assert_eq!((l.title, l.messages.len()), (None, 1));
     }
 
     #[test]

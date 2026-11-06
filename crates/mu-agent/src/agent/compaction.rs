@@ -107,22 +107,26 @@ fn serialize_one(m: &Message) -> Vec<String> {
     out
 }
 
-/// Serializes `messages` into at most about `max_chars` characters, dropping the oldest first.
-pub(crate) fn serialize_within(messages: &[Message], max_chars: usize) -> String {
-    let parts: Vec<Vec<String>> = messages.iter().map(serialize_one).collect();
-    let size = |p: &Vec<String>| p.iter().map(|s| s.len() + 2).sum::<usize>();
-    let mut total: usize = parts.iter().map(size).sum();
-    let mut skip = 0;
-    while total > max_chars && skip + 1 < parts.len() {
-        total -= size(&parts[skip]);
-        skip += 1;
+/// Serializes `messages` in order into chunks of at most `max_chars` characters, so every message
+/// reaches the summarizer. A part longer than `max_chars` is cut with `cap_chars`.
+pub(crate) fn chunks_within(messages: &[Message], max_chars: usize) -> Vec<String> {
+    let len = |s: &str| s.chars().count();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for part in messages.iter().flat_map(serialize_one) {
+        let part = cap_chars(&part, max_chars);
+        if !cur.is_empty() && len(&cur) + 2 + len(&part) > max_chars {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push_str("\n\n");
+        }
+        cur.push_str(&part);
     }
-    let mut out: Vec<String> = Vec::new();
-    if skip > 0 {
-        out.push(format!("[{skip} older messages omitted to fit the summarizer's context window]"));
+    if !cur.is_empty() {
+        chunks.push(cur);
     }
-    out.extend(parts.into_iter().skip(skip).flatten());
-    out.join("\n\n")
+    chunks
 }
 
 pub(crate) fn summary_prompt(serialized: &str, prev: Option<&str>, focus: Option<&str>, extra: &[String]) -> String {
@@ -215,22 +219,27 @@ impl Agent {
             .into_iter()
             .filter_map(|(_, v)| v["context"].as_str().filter(|c| !c.is_empty()).map(String::from))
             .collect();
-        let prompt = summary_prompt(
-            &serialize_within(&self.messages[..cut], summary_input_chars(self.model.model.context_window)),
-            self.compaction.state.as_ref().map(|c| c.summary.as_str()),
-            focus,
-            &extra,
-        );
-        let summary = match self
-            .ports
-            .providers
-            .complete(&self.model.model.id, SYSTEM_PROMPT, &prompt, SUMMARY_MAX_TOKENS, cancel)
-            .await
-        {
-            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
-            Ok(_) => return Outcome::Failed("empty summary".into()),
-            Err(e) => return Outcome::Failed(e.to_string()),
+        // Each chunk is folded into the summary so far, so the last call has seen everything.
+        let chunks = match chunks_within(&self.messages[..cut], summary_input_chars(self.model.model.context_window)) {
+            c if c.is_empty() => vec![String::new()],
+            c => c,
         };
+        let mut prev = self.compaction.state.as_ref().map(|c| c.summary.clone());
+        let mut summary = String::new();
+        for chunk in &chunks {
+            let prompt = summary_prompt(chunk, prev.as_deref(), focus, &extra);
+            summary = match self
+                .ports
+                .providers
+                .complete(&self.model.model.id, SYSTEM_PROMPT, &prompt, SUMMARY_MAX_TOKENS, cancel)
+                .await
+            {
+                Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+                Ok(_) => return Outcome::Failed("empty summary".into()),
+                Err(e) => return Outcome::Failed(e.to_string()),
+            };
+            prev = Some(summary.clone());
+        }
         let first_kept = self.entry_ids.get(cut).cloned().unwrap_or_default();
         if self.session.is_some() && first_kept.is_empty() {
             // The entry the summary would point at was never written; cutting there would corrupt the chain.
@@ -292,15 +301,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caps_keep_head_and_tail_and_oldest_messages_go_first() {
+    fn caps_keep_head_and_tail() {
         let c = cap_chars(&"a".repeat(3000), 2000);
         assert!(c.starts_with("aaa") && c.contains("1000 chars elided") && c.chars().count() < 2100);
         assert_eq!(cap_chars("short", 2000), "short");
-        let msgs: Vec<Message> = (0..10).map(|i| Message::user(&format!("{i}{}", "x".repeat(900)))).collect();
-        let s = serialize_within(&msgs, 3000);
-        assert!(s.contains("older messages omitted") && s.contains("[User]: 9") && !s.contains("[User]: 0"));
-        assert!(s.len() < 4000);
         assert_eq!(summary_input_chars(200_000), 480_000);
+    }
+
+    #[test]
+    fn chunks_keep_every_message_in_order() {
+        let msgs: Vec<Message> = (0..10).map(|i| Message::user(&format!("{i}{}", "x".repeat(900)))).collect();
+        let chunks = chunks_within(&msgs, 3000);
+        assert!(chunks.len() > 1 && chunks.iter().all(|c| c.chars().count() <= 3000), "{}", chunks.len());
+        let all = chunks.join("\n\n");
+        let at: Vec<usize> = (0..10).map(|i| all.find(&format!("[User]: {i}x")).expect("kept")).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]));
+        assert!(!all.contains("omitted"));
+    }
+
+    #[test]
+    fn three_chunks_from_a_small_budget() {
+        let msgs: Vec<Message> = (0..3).map(|i| Message::user(&format!("{i}{}", "x".repeat(900)))).collect();
+        let chunks = chunks_within(&msgs, 1000);
+        assert_eq!(chunks.len(), 3);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.contains(&format!("[User]: {i}{}", "x".repeat(900))), "message {i} is whole");
+        }
+    }
+
+    #[test]
+    fn an_oversized_part_is_cut_not_dropped() {
+        let chunks = chunks_within(&[Message::user(&"a".repeat(1900))], 1000);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].starts_with("[User]: aaa") && chunks[0].contains("chars elided"));
+        assert!(chunks_within(&[], 1000).is_empty());
     }
 
     #[test]

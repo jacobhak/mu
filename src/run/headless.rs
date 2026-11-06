@@ -18,6 +18,8 @@ impl Accum {
     fn fold(&mut self, e: &AgentEvent) {
         match e {
             AgentEvent::Text(t) => self.buf.push_str(t),
+            // The provider starts the reply over, so the partial text is not part of the answer.
+            AgentEvent::Retry { .. } => self.buf.clear(),
             AgentEvent::BlockEnd => {
                 if !self.buf.is_empty() {
                     self.last = std::mem::take(&mut self.buf);
@@ -402,6 +404,16 @@ mod tests {
         let parked = AgentEvent::PlanParked { id: "t".into(), path: "/p/t.md".into() };
         assert_eq!(run(vec![parked, AgentEvent::Exit], true), 0);
         assert_eq!(run(vec![AgentEvent::Exit], false), 0);
+    }
+
+    #[test]
+    fn a_retry_discards_the_partial_reply() {
+        let mut acc = Accum::default();
+        acc.fold(&AgentEvent::Text("partial".into()));
+        acc.fold(&AgentEvent::Retry { attempt: 1, delay: std::time::Duration::ZERO, reason: "slow down".into() });
+        acc.fold(&AgentEvent::Text("full".into()));
+        acc.fold(&AgentEvent::BlockEnd);
+        assert_eq!(acc.text(), "full");
     }
 
     #[test]

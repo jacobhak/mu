@@ -52,7 +52,7 @@ pub struct Cli {
     #[arg(long, requires = "print")]
     pub max_cost: Option<f64>,
     /// Serve the Agent Client Protocol over stdio.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["resume", "continue_latest", "print", "headless"])]
     pub acp: bool,
     #[command(subcommand)]
     pub command: Option<Sub>,
@@ -60,7 +60,7 @@ pub struct Cli {
 
 #[derive(clap::Subcommand)]
 pub enum Sub {
-    /// Check for a newer release and install it (needs an authenticated `gh`).
+    /// Check for a newer release and install it (uses the public GitHub API; falls back to an authenticated gh for a private repo).
     Update {
         /// Only report whether a newer release exists.
         #[arg(long)]
@@ -144,4 +144,17 @@ pub enum Sub {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_takes_no_session_or_print_flags() {
+        assert!(Cli::try_parse_from(["mu", "--acp", "-c"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "--acp", "--resume", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "--acp", "-p", "x"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "--acp", "--model", "a/b"]).is_ok());
+    }
 }
