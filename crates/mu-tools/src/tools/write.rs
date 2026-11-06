@@ -10,6 +10,12 @@ pub struct Args {
     content: String,
 }
 
+impl Args {
+    pub(super) fn paths(&self) -> Vec<String> {
+        vec![self.path.clone()]
+    }
+}
+
 impl Tools {
     pub async fn write(&self, a: Args, plan: bool) -> ToolOutput {
         let res = match self.resolve(&a.path) {

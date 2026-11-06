@@ -14,6 +14,49 @@ pub struct Args {
     input: String,
 }
 
+impl Args {
+    pub(super) fn paths(&self) -> Vec<String> {
+        super::pathnote::edit_paths(&self.input)
+    }
+}
+
+/// The first line that looks like a sloppy-format header but is not one. The parser reads such a line as
+/// body text, so `*** Find all` would be written into the file. Only unindented lines count: an indented
+/// one is how a literal `*** …` line is written.
+fn near_miss_header(input: &str) -> Option<(usize, &str)> {
+    input.lines().enumerate().find_map(|(i, line)| {
+        let rest = line.strip_prefix("***")?;
+        let spaced = rest.starts_with([' ', '\t']);
+        let body = rest.trim();
+        let lower = body.to_ascii_lowercase();
+        let word = |w: &str| lower.strip_prefix(w).filter(|t| t.is_empty() || t.starts_with(char::is_whitespace));
+        let op = ["find", "replace", "insert before", "insert after"].iter().find_map(|w| word(w));
+        let bad = match op {
+            // An operator header takes no argument.
+            Some(tail) => !spaced || !tail.trim().is_empty(),
+            None => {
+                !spaced && ["edit file", "find", "replace", "insert"].iter().any(|w| lower.starts_with(w))
+                    || spaced && word("all").is_some()
+                    || spaced && word("insert").is_some()
+            }
+        };
+        bad.then_some((i + 1, line.trim_end()))
+    })
+}
+
+fn refuse_near_miss(mode: EditMode, input: &str) -> Option<ToolOutput> {
+    if mode != EditMode::Sloppy {
+        return None;
+    }
+    let (n, line) = near_miss_header(input)?;
+    Some(ToolOutput::err(format!(
+        "Line {n}, `{line}`, looks like an edit header but is not one, so it would be written into the file as \
+         text. Headers are `*** Edit File: <path>` (with ` all` after the path to change every match), \
+         `*** Find`, `*** Replace`, `*** Insert Before` and `*** Insert After`, each alone on its line. If the \
+         line is meant as text, indent it. Nothing was changed."
+    )))
+}
+
 #[cfg(test)]
 impl Args {
     pub fn for_test(input: String) -> Self {
@@ -109,6 +152,9 @@ impl EditWriter for FsWriter {
 
 impl Tools {
     pub async fn edit(&self, a: Args, plan: bool) -> ToolOutput {
+        if let Some(refusal) = refuse_near_miss(mode(), &a.input) {
+            return refusal;
+        }
         let policy = PathPolicy {
             cwd: self.cwd.clone(),
             home_dir: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
@@ -162,5 +208,36 @@ impl Tools {
             }
             Err(e) => ToolOutput::err(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn near_miss_headers_are_found_and_real_ones_are_not() {
+        let ok = "*** Edit File: a.rs\n*** Find\nx\n*** Replace\ny\n*** Edit File: b.rs all\n*** Insert Before\nz\n\
+                  *** Insert After\n***bold*** text\n*** Finding things\n*** End Patch\n    *** Find all\n";
+        assert_eq!(near_miss_header(ok), None);
+        for (bad, line) in [
+            ("*** Find\nx\n*** Find all\n", 3),
+            ("*** all\n", 1),
+            ("***Find\n", 1),
+            ("*** Replace now\n", 1),
+            ("*** Insert\n", 1),
+            ("***Edit File: a.rs\n", 1),
+            ("*** Insert After here\n", 1),
+        ] {
+            assert_eq!(near_miss_header(bad).map(|(n, _)| n), Some(line), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_near_miss_is_refused_in_sloppy_mode_only() {
+        let input = "*** Edit File: x.txt\n*** Find\na\n*** Replace\nb\n*** Find all\n";
+        let r = refuse_near_miss(EditMode::Sloppy, input).unwrap();
+        assert!(r.is_error && r.text.contains("Line 6") && r.text.contains("indent it"), "{}", r.text);
+        assert!(refuse_near_miss(EditMode::Hashline, input).is_none());
     }
 }

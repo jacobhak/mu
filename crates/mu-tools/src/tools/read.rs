@@ -9,6 +9,12 @@ pub struct Args {
     path: String,
 }
 
+impl Args {
+    pub(super) fn paths(&self) -> Vec<String> {
+        vec![self.path.clone()]
+    }
+}
+
 const DEFAULT_LINES: usize = 300;
 const MAX_LINES: usize = 3000;
 const MAX_BYTES: usize = 50 * 1024;

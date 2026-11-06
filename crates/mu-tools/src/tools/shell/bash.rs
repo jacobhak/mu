@@ -206,6 +206,7 @@ impl Tools {
             return out;
         }
         let mut out = self.bash_plain(a, ctx).await;
+        self.refresh_shell_cwd().await;
         if fallback {
             out.text.push_str("\n\n[pty unavailable without the terminal UI; ran without a terminal]");
         }
@@ -701,6 +702,24 @@ mod tests {
         tools.set_session("abc", Some(std::path::PathBuf::from("/tmp/x_abc.jsonl")));
         let out = tools.call("bash", &cmd, &ctx).await;
         assert!(out.text.contains("[abc|/tmp/x_abc.jsonl]"), "{}", out.text);
+    }
+
+    /// After a `cd`, a file tool given a relative path says where it resolved it; an absolute path does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_tool_notes_a_relative_path_after_the_shell_moved() {
+        let tools = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let glob = json!({"pattern": "*.mu-no-such-ext", "path": "."});
+        let out = tools.call("glob", &glob, &ctx).await;
+        assert!(!out.text.contains("[mu:"), "no shell call yet: {}", out.text);
+        tools.call("bash", &json!({"command": "cd /usr"}), &ctx).await;
+        let out = tools.call("glob", &glob, &ctx).await;
+        assert!(out.text.contains("[mu: the relative path `.`") && out.text.contains("/usr"), "{}", out.text);
+        let abs = json!({"pattern": "*.mu-no-such-ext", "path": "/usr"});
+        assert!(!tools.call("glob", &abs, &ctx).await.text.contains("[mu:"));
+        tools.call("bash", &json!({"command": "cd /tmp"}), &ctx).await;
+        assert!(!tools.call("glob", &glob, &ctx).await.text.contains("[mu:"));
     }
 
     /// True if a live process has exactly `sleep {arg}` as its command line. `$` anchors the

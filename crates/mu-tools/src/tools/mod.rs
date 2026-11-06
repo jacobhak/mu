@@ -3,6 +3,7 @@ mod diff;
 pub mod edit;
 mod glob;
 pub(crate) mod grep;
+mod pathnote;
 mod plan;
 mod read;
 pub(crate) mod shell;
@@ -56,6 +57,8 @@ pub struct Tools {
     pub output_schema: std::cell::RefCell<Option<Value>>,
     pub edit_store: pi_edit::EditStore,
     shell: OnceCell<pi_shell::shell::Shell>,
+    /// Where the persistent shell was after the last foreground bash call; see `pathnote`.
+    shell_cwd: std::cell::RefCell<Option<PathBuf>>,
     /// Test seam: the `__panic` tool panics. Only test builders turn it on.
     #[cfg(any(test, feature = "test-support"))]
     pub panic_tool: std::cell::Cell<bool>,
@@ -78,6 +81,7 @@ impl Tools {
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
             shell: OnceCell::new(),
+            shell_cwd: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             panic_tool: Default::default(),
         }
@@ -218,7 +222,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "path":{"type":"string","description":"File or directory path, optionally with a selector suffix"}},"required":["path"]}),
             )
         }),
-        call: dispatch!("read", async |t, a: read::Args, _c| t.read(a)),
+        call: dispatch!("read", async |t, a: read::Args, _c| t.noted(a.paths(), t.read(a))),
     },
     Builtin {
         name: "write",
@@ -233,7 +237,7 @@ pub static BUILTINS: &[Builtin] = &[
                 json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
             )
         }),
-        call: dispatch!("write", async |t, a: write::Args, c| t.write(a, c.plan)),
+        call: dispatch!("write", async |t, a: write::Args, c| t.noted(a.paths(), t.write(a, c.plan))),
     },
     Builtin {
         name: "edit",
@@ -245,7 +249,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "input":{"type":"string","description":"The edit payload, in the format described above"}},"required":["input"]}),
             )
         }),
-        call: dispatch!("edit", async |t, a: edit::Args, c| t.edit(a, c.plan)),
+        call: dispatch!("edit", async |t, a: edit::Args, c| t.noted(a.paths(), t.edit(a, c.plan))),
     },
     Builtin {
         name: "bash",
@@ -274,7 +278,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "case":{"type":"boolean","description":"Case-sensitive; default true"}},"required":["pattern"]}),
             )
         }),
-        call: dispatch!("grep", async |t, a: grep::Args, _c| t.grep(a)),
+        call: dispatch!("grep", async |t, a: grep::Args, _c| t.noted(a.paths(), t.grep(a))),
     },
     Builtin {
         name: "glob",
@@ -286,7 +290,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "pattern":{"type":"string"},"path":{"type":"string","description":"Directory; default ."}},"required":["pattern"]}),
             )
         }),
-        call: dispatch!("glob", async |t, a: glob::Args, _c| t.glob(a)),
+        call: dispatch!("glob", async |t, a: glob::Args, _c| t.noted(a.paths(), t.glob(a))),
     },
     Builtin {
         name: "todo",

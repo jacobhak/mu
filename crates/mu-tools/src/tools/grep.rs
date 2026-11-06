@@ -14,6 +14,12 @@ pub struct Args {
     case: Option<bool>,
 }
 
+impl Args {
+    pub(super) fn paths(&self) -> Vec<String> {
+        vec![self.path.clone().unwrap_or_else(|| ".".into())]
+    }
+}
+
 const PER_FILE: usize = 20;
 const TOTAL: usize = 200;
 const MAX_COL: usize = 512;

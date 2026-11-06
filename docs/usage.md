@@ -24,6 +24,8 @@ Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal`
 
 While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
 
+File tools (`read`, `write`, `edit`, `grep`, `glob`) resolve relative paths against the session's directory, not against wherever a `cd` in `bash` has moved the shell. When the shell is elsewhere and a call used a relative path, the result ends with a note naming both directories, so a mistaken edit shows on the first call. In `edit`'s `sloppy` mode, an unindented line such as `*** Find all` that looks like a header but is not one is refused instead of being written into the file; indent a line that is meant as text.
+
 Besides the built-in slash commands, prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands` and `.omp/prompts` run as slash commands, and skills as `/skill:<name>`.
 
 `/copy` opens a picker of recent replies, code blocks and bash commands; `/copy code`, `/copy cmd` and `/copy link` copy the latest one directly. Under tmux the text goes through `tmux load-buffer -w`; otherwise via OSC 52, plus `wl-copy`/`xclip` when a local display exists.

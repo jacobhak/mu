@@ -11,6 +11,12 @@ pub struct Args {
     path: Option<String>,
 }
 
+impl Args {
+    pub(super) fn paths(&self) -> Vec<String> {
+        vec![self.path.clone().unwrap_or_else(|| ".".into())]
+    }
+}
+
 const MAX: usize = 200;
 
 impl Tools {
