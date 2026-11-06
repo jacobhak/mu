@@ -23,6 +23,7 @@ use self::chatgpt::ChatgptFlow;
 use self::keys::KeyFlow;
 use self::services::Services;
 use self::slash::command_entries;
+pub use self::slash::interactive_reference;
 use self::ui_msgs::UiMsg;
 use crate::chat::composer::Composer;
 use crate::mcp::mcp_wizard::Wizard;

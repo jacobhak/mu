@@ -65,6 +65,25 @@ Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand outpu
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
 
+/// `mu://reference/interactive.md`: the built-in slash commands and the key bindings.
+pub fn interactive_reference() -> String {
+    let mut s = String::from(
+        "# Interactive use\n\n## Slash commands\n\nBuilt in; commands, skills (`/skill:<name>`) and agents you add are listed in `mu://state/context.md`.\n\n",
+    );
+    for (name, desc, needs_arg) in BUILTIN_DESC {
+        let arg = if needs_arg { " <arg>" } else { "" };
+        s.push_str(&format!("- `/{name}{arg}`: {desc}\n"));
+    }
+    s.push_str("\n### `/mcp` subcommands\n\n");
+    for (name, desc) in MCP_SUBCOMMANDS {
+        s.push_str(&format!("- `/mcp {name}`: {desc}\n"));
+    }
+    s.push_str("\n## Key bindings\n\n```\n");
+    s.push_str(HOTKEYS);
+    s.push_str("\n```\n");
+    s
+}
+
 /// The completion list of the composer: the built-in commands, `/mcp` subcommands, the login and
 /// logout targets, then the commands and skills that come from the context.
 pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs) -> Vec<Entry> {

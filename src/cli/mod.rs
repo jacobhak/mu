@@ -1,6 +1,7 @@
 //! The `mu` command line: the flags and subcommands. Model selection lives in `select`.
 
 pub mod auth;
+pub mod docs;
 pub mod models;
 pub mod predict;
 pub mod select;

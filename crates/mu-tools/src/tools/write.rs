@@ -22,7 +22,7 @@ impl Tools {
             Ok(r) => r,
             Err(e) => return ToolOutput::err(e),
         };
-        if let Some(s @ (Scheme::Artifact | Scheme::Skill)) = res.scheme {
+        if let Some(s @ (Scheme::Artifact | Scheme::Skill | Scheme::Mu)) = res.scheme {
             return ToolOutput::err(format!("{}:// is read-only", s.name()));
         }
         if plan && res.scheme != Some(Scheme::Local) {

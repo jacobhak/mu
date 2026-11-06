@@ -116,3 +116,41 @@ fn plan_mode_without_a_parked_plan_exits_nonzero() {
     assert!(!o.status.success());
     assert!(stderr(&o).contains("no plan was parked"), "stderr: {}", stderr(&o));
 }
+
+fn tool_use(id: &str, name: &str, input: serde_json::Value) -> Reply {
+    let sse_body = format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m1\"}}}}\n\n\
+         event: content_block_start\ndata: {}\n\n\
+         event: content_block_delta\ndata: {}\n\n\
+         event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}\n\n\
+         event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}),
+    );
+    sse(&sse_body)
+}
+
+#[test]
+fn the_model_can_search_mu_docs_with_grep() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        block_on(async move {
+            let replies = vec![
+                tool_use("t1", "grep", json!({"pattern": "migrate-profile", "path": "mu://reference"})),
+                sse(ANSWER),
+            ];
+            tx.send(fake_server(replies).await).unwrap();
+            std::future::pending::<()>().await;
+        })
+    });
+    let (base, seen) = rx.recv().unwrap();
+    let home = home_with_key(&base);
+    let cwd = mu_testutil::tmp();
+    let o = mu(&home, &cwd).args(["-p", "how do I move a profile?", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let requests = seen.lock().unwrap();
+    let second = requests.get(1).expect("a second request carries the tool result");
+    assert!(second.contains("mu://reference/cli.md:"), "{second}");
+    assert!(home.join("docs").is_dir(), "the docs were written under MU_HOME");
+}

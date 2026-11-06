@@ -27,16 +27,19 @@ const MAX_COL: usize = 512;
 impl Tools {
     /// The filesystem walk and search run on a blocking thread so the event loop keeps turning.
     pub async fn grep(&self, a: Args) -> ToolOutput {
-        let root = self.abs(a.path.as_deref().unwrap_or("."));
+        let (root, prefix) = match self.search_root(a.path.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::err(e),
+        };
         let cwd = self.cwd.clone();
-        tokio::task::spawn_blocking(move || grep_blocking(&cwd, root, a))
+        tokio::task::spawn_blocking(move || grep_blocking(&cwd, root, prefix, a))
             .await
             .unwrap_or_else(|e| ToolOutput::err(format!("grep failed: {e}")))
     }
 }
 
-fn grep_blocking(cwd: &std::path::Path, root: PathBuf, a: Args) -> ToolOutput {
-    let display = |abs: &std::path::Path| super::display_in(cwd, abs);
+fn grep_blocking(cwd: &std::path::Path, root: PathBuf, prefix: Option<String>, a: Args) -> ToolOutput {
+    let display = |abs: &std::path::Path| super::uri::shown(cwd, &root, prefix.as_deref(), abs);
     let matcher = match RegexMatcherBuilder::new().case_insensitive(!a.case.unwrap_or(true)).build(&a.pattern) {
         Ok(m) => m,
         Err(e) => return ToolOutput::err(format!("Invalid pattern: {e}")),
@@ -142,5 +145,15 @@ pub(super) mod tests {
         assert_eq!(o.text, "a.rs:1:fn needle() {}\nsub/b.rs:1:fn needle() {}");
         let o = t.grep(Args { pattern: "needle".into(), path: Some("big.rs".into()), case: None }).await;
         assert_eq!(o.text, "big.rs:1:fn needle() {}", "an explicit file is searched regardless of size");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_root_inside_a_hidden_directory_is_still_searched() {
+        let d = std::env::temp_dir().join(format!("mu-walk-{}", uuid::Uuid::new_v4())).join(".hid/docs");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.md"), "needle\n").unwrap();
+        let t = Tools::for_test();
+        let o = t.grep(Args { pattern: "needle".into(), path: Some(d.display().to_string()), case: None }).await;
+        assert!(o.text.contains("a.md:1:needle"), "{}", o.text);
     }
 }

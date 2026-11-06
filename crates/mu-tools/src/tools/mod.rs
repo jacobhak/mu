@@ -1,5 +1,6 @@
 mod ask;
 mod diff;
+pub mod docs;
 pub mod edit;
 mod glob;
 pub(crate) mod grep;
@@ -45,6 +46,8 @@ pub(crate) struct ToolSession {
     /// `PI_SESSION_FILE`, and the parent of a subagent's session.
     path: std::cell::RefCell<Option<PathBuf>>,
     skills: std::cell::RefCell<Vec<(String, PathBuf)>>,
+    /// `mu://state/context.md`, built by the agent from what context discovery loaded.
+    context_page: std::cell::RefCell<String>,
 }
 
 pub struct Tools {

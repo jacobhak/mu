@@ -218,6 +218,7 @@ impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let tools = Tools::new(i.cwd.clone(), i.plugins.clone());
         tools.set_skills(i.ctx.skills.iter().map(|s| (s.name.clone(), s.dir.clone())).collect());
+        tools.set_context_page(prompt::context_page(&i.ctx));
         let (title_tx, title_rx) = unbounded_channel();
         Self {
             tools,

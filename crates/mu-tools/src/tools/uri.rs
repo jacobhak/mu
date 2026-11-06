@@ -7,6 +7,8 @@ pub enum Scheme {
     Local,
     Artifact,
     Skill,
+    /// mu's own documentation; see `docs`.
+    Mu,
 }
 
 impl Scheme {
@@ -15,6 +17,7 @@ impl Scheme {
             Scheme::Local => "local",
             Scheme::Artifact => "artifact",
             Scheme::Skill => "skill",
+            Scheme::Mu => "mu",
         }
     }
 }
@@ -25,7 +28,7 @@ pub struct Resolved {
 }
 
 fn split_scheme(p: &str) -> Option<(Scheme, &str)> {
-    for s in [Scheme::Local, Scheme::Artifact, Scheme::Skill] {
+    for s in [Scheme::Local, Scheme::Artifact, Scheme::Skill, Scheme::Mu] {
         if let Some(rest) = p.strip_prefix(s.name()).and_then(|r| r.strip_prefix("://")) {
             return Some((s, rest));
         }
@@ -33,7 +36,7 @@ fn split_scheme(p: &str) -> Option<(Scheme, &str)> {
     None
 }
 
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(super) fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel = Path::new(rel.trim_start_matches('/'));
     if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         return Err(format!("path escapes its root: {}", rel.display()));
@@ -52,6 +55,11 @@ pub fn local_root(session_id: &str) -> PathBuf {
 
 pub fn artifact_dir(session_id: &str) -> PathBuf {
     paths::profile_home().join("artifacts").join(dir_id(session_id))
+}
+
+/// Where `mu://state/` is written for this session.
+pub(super) fn state_dir(session_id: &str) -> PathBuf {
+    paths::profile_home().join("mu-state").join(dir_id(session_id))
 }
 
 impl Tools {
@@ -88,6 +96,14 @@ impl Tools {
         (max + 1, dir.join(format!("{}.log", max + 1)))
     }
 
+    /// The directory or file `grep` and `glob` search: `path` (default `.`) resolved, plus the URL to
+    /// show results under when it was an internal URL.
+    pub(super) fn search_root(&self, path: Option<&str>) -> Result<(PathBuf, Option<String>), String> {
+        let p = path.unwrap_or(".");
+        let r = self.resolve(p)?;
+        Ok((r.path, r.scheme.map(|_| p.to_string())))
+    }
+
     /// Maps a user-supplied path or internal URL to a filesystem path.
     pub fn resolve(&self, p: &str) -> Result<Resolved, String> {
         let Some((scheme, rest)) = split_scheme(p) else {
@@ -102,6 +118,7 @@ impl Tools {
                 }
                 self.artifact_dir().join(format!("{n}.log"))
             }
+            Scheme::Mu => self.mu_path(rest)?,
             Scheme::Skill => {
                 let (name, rel) = rest.split_once('/').unwrap_or((rest, ""));
                 let dir = self
@@ -116,6 +133,19 @@ impl Tools {
             }
         };
         Ok(Resolved { path, scheme: Some(scheme) })
+    }
+}
+
+/// `abs`, found under a search `root`, as shown to the model: under the URL `prefix` the search
+/// started from when it was an internal URL, else relative to `cwd`.
+pub(super) fn shown(cwd: &Path, root: &Path, prefix: Option<&str>, abs: &Path) -> String {
+    let Some(p) = prefix else { return super::display_in(cwd, abs) };
+    match abs.strip_prefix(root) {
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            let sep = if p.ends_with('/') { "" } else { "/" };
+            format!("{p}{sep}{}", rel.display())
+        }
+        _ => p.to_string(),
     }
 }
 

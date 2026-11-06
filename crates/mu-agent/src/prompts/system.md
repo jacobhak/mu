@@ -9,6 +9,7 @@ MUST use the specialized tool over its shell equivalent:
 - Content search: `grep`, NEVER shell `grep`/`rg`/`awk`. File names and structure: `glob`, NEVER `find`/`fd`/`ls **/*.ext`.
 - `bash`: real binaries (builds, tests, git, package managers) and short fact pipelines such as counts or checksums. NEVER specialized-tool work, and NEVER paging, moving or trimming bytes you could `read`.
 {redact_rule}
+- Questions about mu itself (commands, config, tools, how it behaves): `read mu://` for the docs shipped with this mu; `grep` and `glob` search `mu://` too. Read it before guessing or searching the web or the source.
 <critical>
 NEVER use `sed`, `perl`, `awk`, `python`, `node`, heredocs or `echo >` through `bash` to change files, singly or in bulk; MUST use `edit` or `write`. If `edit` fails, read its error, fix the payload and retry with `edit`. A failed edit is NEVER a reason to switch to the shell.
 </critical>

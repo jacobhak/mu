@@ -21,15 +21,18 @@ const MAX: usize = 200;
 
 impl Tools {
     pub async fn glob(&self, a: Args) -> ToolOutput {
-        let root = self.abs(a.path.as_deref().unwrap_or("."));
+        let (root, prefix) = match self.search_root(a.path.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::err(e),
+        };
         let cwd = self.cwd.clone();
-        tokio::task::spawn_blocking(move || glob_blocking(&cwd, root, a))
+        tokio::task::spawn_blocking(move || glob_blocking(&cwd, root, prefix, a))
             .await
             .unwrap_or_else(|e| ToolOutput::err(format!("glob failed: {e}")))
     }
 }
 
-fn glob_blocking(cwd: &std::path::Path, root: std::path::PathBuf, a: Args) -> ToolOutput {
+fn glob_blocking(cwd: &std::path::Path, root: std::path::PathBuf, prefix: Option<String>, a: Args) -> ToolOutput {
     // Non-recursive: the pattern applies to the root-relative path as written (`*.rs` is top level only).
     let opts = GlobOptions {
         pattern: a.pattern,
@@ -48,7 +51,8 @@ fn glob_blocking(cwd: &std::path::Path, root: std::path::PathBuf, a: Args) -> To
         return ToolOutput::ok("No files found matching pattern");
     }
     let extra = v.len().saturating_sub(MAX);
-    let mut lines: Vec<String> = v.into_iter().take(MAX).map(|e| super::display_in(cwd, &root.join(e.path))).collect();
+    let mut lines: Vec<String> =
+        v.into_iter().take(MAX).map(|e| super::uri::shown(cwd, &root, prefix.as_deref(), &root.join(e.path))).collect();
     if extra > 0 {
         lines.push(format!("… {extra} more"));
     }
@@ -58,6 +62,16 @@ fn glob_blocking(cwd: &std::path::Path, root: std::path::PathBuf, a: Args) -> To
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_root_inside_a_hidden_directory_is_still_globbed() {
+        let d = std::env::temp_dir().join(format!("mu-walk-{}", uuid::Uuid::new_v4())).join(".hid/docs");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.md"), "x\n").unwrap();
+        let t = Tools::for_test();
+        let o = t.glob(Args { pattern: "*.md".into(), path: Some(d.display().to_string()) }).await;
+        assert!(o.text.ends_with("a.md"), "{}", o.text);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn pattern_is_root_relative_and_newest_first() {

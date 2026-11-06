@@ -25,6 +25,40 @@ pub struct PromptInput<'a> {
 
 const SYSTEM: &str = include_str!("prompts/system.md");
 
+/// `mu://state/context.md`: what context discovery loaded for this session.
+pub(crate) fn context_page(ctx: &Context) -> String {
+    let mut s = String::from("# Context loaded\n\n## Context files\n\n");
+    if ctx.files.is_empty() {
+        s.push_str("None.\n");
+    }
+    for f in &ctx.files {
+        s.push_str(&format!("- {}\n", f.path.display()));
+    }
+    s.push_str(&format!("\nRules blocks: {}. Nested AGENTS.md: {}.\n\n## Skills\n\nRead one with `read skill://<name>`; `/skill:<name>` runs it.\n\n", ctx.rules.len(), ctx.nested.len()));
+    if ctx.skills.is_empty() {
+        s.push_str("None.\n");
+    }
+    for k in &ctx.skills {
+        let hidden = if k.hidden { " (hidden from the model)" } else { "" };
+        s.push_str(&format!("- {}{hidden}: {} ({})\n", k.name, k.description, k.dir.display()));
+    }
+    s.push_str("\n## Prompt commands\n\n");
+    if ctx.commands.is_empty() {
+        s.push_str("None.\n");
+    }
+    for c in &ctx.commands {
+        s.push_str(&format!("- /{}: {}\n", c.name, c.description));
+    }
+    s.push_str("\n## Custom agents\n\n");
+    if ctx.agents.is_empty() {
+        s.push_str("None.\n");
+    }
+    for a in &ctx.agents {
+        s.push_str(&format!("- {}: {}\n", a.name, a.description));
+    }
+    s
+}
+
 pub(crate) fn system_prompt(i: &PromptInput) -> String {
     // The kernel release does not change under a running process: read it once.
     static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
