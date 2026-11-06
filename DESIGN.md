@@ -17,14 +17,14 @@ Status: early and experimental, changing quickly; no stable version (see README,
 
 ## Why
 
-Measured 2026-10-23 on this machine (method in the appendix), except the mu row (2026-10-31). [`BENCHMARKS.md`](BENCHMARKS.md) has the current comparison on a scripted task.
+Measured 2026-10-23 on this machine (method in the appendix), except the mu row (2026-11-06). [`BENCHMARKS.md`](BENCHMARKS.md) has the current comparison on a scripted task.
 
 | Agent | Private RAM per idle session | Notes |
 |---|---|---|
 | omp 18.12.6 | 165 MB (133 MB with extensions, LSP, skills, rules off) | Disabled features stay resident; plus machine-wide helpers of 97 + 23 + 23 MB |
 | pi 1.4.0 | 72 MB | Node runtime floor |
 | Codex CLI (Rust) | 27 MB | 308 MB binary; everything bundled |
-| mu | 3.5 MB (19 MB total with the binary's shared pages) | Without its gateway pair, which is shared by all sessions and only needed for providers without an API key in mu: 210 MB private, 251 MB total idle |
+| mu | 3.6 MB (20 MB total with the binary's shared pages) | Without its gateway pair, which is shared by all sessions and only needed for providers without an API key in mu: 155 MB private, 239 MB total idle |
 | Rust floor (HTTPS + TLS + async runtime) | 0.6 MB | 6.2 MB binary |
 
 ## Architecture
@@ -186,8 +186,8 @@ All omp features outside the core become first-party plugins that load on use.
 - **Lifecycle:** the plugin starts both processes when a model is first used, on loopback
   ports, passing `OMP_AUTH_BROKER_URL` only to the gateway process it spawns — the user's omp config is not
   changed. It authenticates with the bearer tokens omp keeps in its config dir. Lifetime `idle:<duration>`
-  stops both. One pair serves all mu sessions of the same omp profile (state in `$MU_HOME/gateway/`, or `gateway/profiles/<name>/` under a profile): the pair holds that profile's credentials and `models.yml`, so profiles never share one. Idle, the pair measured 251 MB total and 210 MB private (gateway 179 / 154 MB, broker 72 / 56 MB), and about 305 / 275 MB with a request in flight (`BENCHMARKS.md`).
-- **JIT off:** the daemon starts both omp processes with `BUN_JSC_useJIT=0` (`MU_GATEWAY_JIT=1` leaves it on). A/B on the real daemon with this profile, one request served: pair 119 MB private / 153 MB total off, against 156 / 194 MB on (broker 37 vs 43, gateway 81 vs 112). Request time was the same (0.58 s, upstream-bound), and with it off the gateway's private memory stayed flat across 36 concurrent requests instead of growing. The cost is about 0.6 s more CPU at startup and about 7 ms more per request. Not tested: very large contexts, tool-call and thinking streams, macOS. Absolute figures differ from the `BENCHMARKS.md` ones (different profile and omp version), so compare only the off/on pair.
+  stops both. One pair serves all mu sessions of the same omp profile (state in `$MU_HOME/gateway/`, or `gateway/profiles/<name>/` under a profile): the pair holds that profile's credentials and `models.yml`, so profiles never share one. Idle, the pair measured 239 MB total and 155 MB private with the JIT off as below (gateway 158 / 108 MB, broker 81 / 48 MB; `BENCHMARKS.md`).
+- **JIT off:** the daemon starts both omp processes with `BUN_JSC_useJIT=0` (`MU_GATEWAY_JIT=1` leaves it on). A/B on the real daemon with this profile, one request served: pair 119 MB private / 153 MB total off, against 156 / 194 MB on (broker 37 vs 43, gateway 81 vs 112). Request time was the same (0.58 s, upstream-bound), and with it off the gateway's private memory stayed flat across 36 concurrent requests instead of growing. The cost is about 0.6 s more CPU at startup and about 7 ms more per request. Not tested: very large contexts, tool-call and thinking streams, macOS. Absolute figures differ from the `BENCHMARKS.md` ones (a different profile and omp version; there a rejected request adds nothing measurable to the JIT-off pair, 239 / 155 MB idle), so compare only the off/on pair.
 - **What `serve` does not do** (unlike `stdio`): role selectors such as `@smol` and omp's fallback chains.
   The core resolves roles itself from omp's config and sends provider-qualified ids.
 - **Open risk:** the broker refreshes OAuth tokens in the same credential store that running omp

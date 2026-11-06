@@ -86,6 +86,26 @@ pub fn sample_tree(root: i32) -> Vec<Proc> {
         .collect()
 }
 
+/// Memory of every process under any of `roots`, counted once, from a single scan of `/proc`. This is what several
+/// sessions hold together at one instant.
+pub fn sample_roots(roots: &[i32]) -> Mem {
+    let edges = all_edges();
+    let mut seen: Vec<i32> = Vec::new();
+    let mut t = Mem::default();
+    for &root in roots {
+        for pid in descendants(root, &edges) {
+            if seen.contains(&pid) {
+                continue;
+            }
+            seen.push(pid);
+            if let Ok(text) = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
+                t += parse_rollup(&text);
+            }
+        }
+    }
+    t
+}
+
 pub fn total(procs: &[Proc]) -> Mem {
     let mut t = Mem::default();
     for p in procs {
@@ -260,5 +280,9 @@ mod tests {
         let procs = sample_tree(me);
         assert_eq!(procs[0].pid, me);
         assert!(procs[0].mem.pss_anon_kb > 0 && procs[0].mem.pss_kb >= procs[0].mem.pss_anon_kb);
+        let one = sample_roots(&[me]);
+        let twice = sample_roots(&[me, me]);
+        assert!(one.pss_kb > 0 && twice.pss_kb < one.pss_kb * 3 / 2, "a repeated root is counted once");
+        assert_eq!(sample_roots(&[]), Mem::default());
     }
 }

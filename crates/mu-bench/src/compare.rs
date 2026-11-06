@@ -10,7 +10,8 @@ use serde::Serialize;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const ALL: [&str; 5] = ["mu", "claude", "opencode", "omp", "pi"];
@@ -67,6 +68,44 @@ fn which(name: &str) -> Result<PathBuf> {
 
 fn s(v: impl Into<String>) -> String {
     v.into()
+}
+
+fn is_node_script(head: &str) -> bool {
+    head.lines().next().is_some_and(|l| l.starts_with("#!") && l.contains("node"))
+}
+
+/// `src` copied to `dir/name`, unless a copy of the same size is already there.
+fn copy_into(src: &Path, dir: &Path, name: &std::ffi::OsStr) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let dst = dir.join(name);
+    let len = std::fs::metadata(src)?.len();
+    if std::fs::metadata(&dst).is_ok_and(|m| m.len() == len) {
+        return Ok(dst);
+    }
+    let part = dir.join(format!(".{}.{}", name.to_string_lossy(), std::process::id()));
+    std::fs::copy(src, &part).with_context(|| format!("copying {}", src.display()))?;
+    std::fs::rename(&part, &dst)?;
+    Ok(dst)
+}
+
+/// Runs the launch from private copies of its executable files (for a node script, of `node`). Every process that
+/// maps a file shares its pages and `Pss` divides them among those processes, so another instance of the same
+/// harness running on the machine (a real session, a daemon, the interpreter of some other tool) would lower the
+/// numbers. A copy is a different file, so only the benchmark's own sessions share it.
+fn privatize(l: &mut Launch, bins: &Path) -> Result<()> {
+    use std::io::Read;
+    let name = l.program.file_name().context("program has no file name")?.to_owned();
+    let src = std::fs::canonicalize(&l.program)?;
+    let mut head = Vec::new();
+    std::fs::File::open(&src)?.take(256).read_to_end(&mut head)?;
+    if is_node_script(&String::from_utf8_lossy(&head)) {
+        let node = std::fs::canonicalize(which("node")?)?;
+        l.args.insert(0, src.display().to_string());
+        l.program = copy_into(&node, bins, "node".as_ref())?;
+    } else {
+        l.program = copy_into(&src, bins, &name)?;
+    }
+    Ok(())
 }
 
 pub fn omp_models_yml(url: &str) -> String {
@@ -192,6 +231,10 @@ pub struct RunOut {
     pub final_pss_kb: u64,
     pub final_private_kb: u64,
     pub peak_procs: usize,
+    /// The most that all the sessions started together held at one instant, summed over every process of every
+    /// session. For a single session it is that session's own peak.
+    pub group_peak_pss_kb: u64,
+    pub group_peak_private_kb: u64,
     pub model_requests: usize,
     pub tool_errors: usize,
     pub overruns: usize,
@@ -204,25 +247,71 @@ pub struct RunOut {
     pub log_tail: String,
 }
 
+/// Root pids of the sessions of one group that are running now.
+type Live = Arc<Mutex<Vec<i32>>>;
+
 pub async fn run_once(name: &str, sc: &Arc<Scenario>, mu: &Path, home_base: &Path, sessions: usize) -> Result<RunOut> {
+    once(name, sc, mu, home_base, sessions, &Live::default()).await
+}
+
+async fn once(
+    name: &str,
+    sc: &Arc<Scenario>,
+    mu: &Path,
+    home_base: &Path,
+    sessions: usize,
+    live: &Live,
+) -> Result<RunOut> {
     let tmp = scratch()?;
     let home = home_base.join(name);
-    let r = run_in(name, sc, mu, &tmp, &home, sessions).await;
+    let r = run_in(name, sc, mu, &tmp, &home, sessions, live).await;
     let _ = std::fs::remove_dir_all(&tmp);
     r
 }
 
+/// Peak of the memory of all live sessions together, sampled until `stop`.
+async fn group_sampler(live: Live, stop: Arc<AtomicBool>) -> smaps::Mem {
+    let mut peak = smaps::Mem::default();
+    while !stop.load(Ordering::Relaxed) {
+        let roots = live.lock().unwrap().clone();
+        if !roots.is_empty() {
+            let m = smaps::sample_roots(&roots);
+            peak.pss_kb = peak.pss_kb.max(m.pss_kb);
+            peak.pss_anon_kb = peak.pss_anon_kb.max(m.pss_anon_kb);
+        }
+        tokio::time::sleep(SAMPLE_EVERY).await;
+    }
+    peak
+}
+
 /// `k` sessions of one harness started together and sharing its `HOME`, as several terminals of one user do.
 pub async fn run_group(name: &str, k: usize, sc: &Arc<Scenario>, mu: &Path, home_base: &Path) -> Result<Vec<RunOut>> {
+    let live = Live::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = tokio::spawn(group_sampler(live.clone(), stop.clone()));
     let tasks: Vec<_> = (0..k)
         .map(|_| {
-            let (n, sc, mu, hb) = (name.to_string(), sc.clone(), mu.to_path_buf(), home_base.to_path_buf());
-            tokio::spawn(async move { run_once(&n, &sc, &mu, &hb, k).await })
+            let (n, sc, mu, hb, live) =
+                (name.to_string(), sc.clone(), mu.to_path_buf(), home_base.to_path_buf(), live.clone());
+            tokio::spawn(async move { once(&n, &sc, &mu, &hb, k, &live).await })
         })
         .collect();
-    let mut out = Vec::new();
+    let (mut out, mut failure) = (Vec::new(), None);
     for t in tasks {
-        out.push(t.await??);
+        match t.await {
+            Ok(Ok(r)) => out.push(r),
+            Ok(Err(e)) => failure = Some(e),
+            Err(e) => failure = Some(e.into()),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let peak = sampler.await?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    for r in &mut out {
+        r.group_peak_pss_kb = peak.pss_kb;
+        r.group_peak_private_kb = peak.pss_anon_kb;
     }
     Ok(out)
 }
@@ -232,7 +321,15 @@ fn cpu_ms(ru: &libc::rusage) -> f64 {
     tv(ru.ru_utime) + tv(ru.ru_stime)
 }
 
-async fn run_in(name: &str, sc: &Arc<Scenario>, mu: &Path, tmp: &Path, home: &Path, sessions: usize) -> Result<RunOut> {
+async fn run_in(
+    name: &str,
+    sc: &Arc<Scenario>,
+    mu: &Path,
+    tmp: &Path,
+    home: &Path,
+    sessions: usize,
+    live: &Live,
+) -> Result<RunOut> {
     let work = tmp.join("work");
     std::fs::create_dir_all(&work)?;
     std::fs::create_dir_all(home)?;
@@ -240,7 +337,8 @@ async fn run_in(name: &str, sc: &Arc<Scenario>, mu: &Path, tmp: &Path, home: &Pa
     seed_caches(&tmp.join("mu"))?;
     let srv = Server::start_in(sc.clone(), Some(work.clone())).await?;
     let url = srv.url();
-    let l = launch(name, &Ctx { mu, url: &url, prompt: &sc.turns[0].prompt, tmp, home })?;
+    let mut l = launch(name, &Ctx { mu, url: &url, prompt: &sc.turns[0].prompt, tmp, home })?;
+    privatize(&mut l, &home.parent().unwrap_or(home).join("bin"))?;
     let log_path = tmp.join("out.log");
     let log = std::fs::File::create(&log_path)?;
     let mut cmd = Command::new(&l.program);
@@ -252,6 +350,7 @@ async fn run_in(name: &str, sc: &Arc<Scenario>, mu: &Path, tmp: &Path, home: &Pa
     let start = Instant::now();
     let mut child = cmd.spawn().with_context(|| format!("starting {}", l.program.display()))?;
     let pid = child.id() as i32;
+    live.lock().unwrap().push(pid);
     let (mut peak_pss, mut peak_priv, mut peak_procs) = (0, 0, 0);
     let mut last = smaps::Mem::default();
     let (status, max_rss_kb, cpu) = loop {
@@ -278,6 +377,7 @@ async fn run_in(name: &str, sc: &Arc<Scenario>, mu: &Path, tmp: &Path, home: &Pa
         tokio::time::sleep(SAMPLE_EVERY).await;
     };
     let wall = start.elapsed();
+    live.lock().unwrap().retain(|p| *p != pid);
     // SAFETY: plain kill(2) on the process group this function created; stragglers must not outlive the run.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
     if status.is_none() {
@@ -314,6 +414,8 @@ async fn run_in(name: &str, sc: &Arc<Scenario>, mu: &Path, tmp: &Path, home: &Pa
         final_pss_kb: last.pss_kb,
         final_private_kb: last.pss_anon_kb,
         peak_procs,
+        group_peak_pss_kb: peak_pss,
+        group_peak_private_kb: peak_priv,
         model_requests,
         tool_errors,
         overruns,
@@ -337,6 +439,9 @@ pub struct Row {
     pub final_pss_mb: f64,
     pub peak_pss_mb: f64,
     pub peak_private_mb: f64,
+    /// Peak of all the sessions together (see `RunOut::group_peak_pss_kb`).
+    pub group_peak_pss_mb: f64,
+    pub group_peak_private_mb: f64,
     pub max_rss_mb: f64,
     pub peak_procs: usize,
     pub model_requests: f64,
@@ -371,6 +476,8 @@ pub fn summarize(runs: &[RunOut]) -> Vec<Row> {
                 final_pss_mb: median(&col(&|r| r.final_pss_kb as f64)) / 1024.0,
                 peak_pss_mb: median(&col(&|r| r.peak_pss_kb as f64)) / 1024.0,
                 peak_private_mb: median(&col(&|r| r.peak_private_kb as f64)) / 1024.0,
+                group_peak_pss_mb: median(&col(&|r| r.group_peak_pss_kb as f64)) / 1024.0,
+                group_peak_private_mb: median(&col(&|r| r.group_peak_private_kb as f64)) / 1024.0,
                 max_rss_mb: median(&col(&|r| r.max_rss_kb as f64)) / 1024.0,
                 peak_procs: rs.iter().map(|r| r.peak_procs).max().unwrap_or(0),
                 model_requests: median(&col(&|r| r.model_requests as f64)),
@@ -421,13 +528,16 @@ pub fn print(rows: &[Row]) {
             );
         }
     }
-    if let Some(k) = multi.first().map(|r| r.sessions) {
+    let mut counts: Vec<usize> = multi.iter().map(|r| r.sessions).collect();
+    counts.sort_unstable();
+    counts.dedup();
+    for k in &counts {
         println!("\n{k} sessions at once, per session");
         println!(
             "{:<9} {:>8} {:>21} {:>12} {:>12} {:>9}",
             "harness", "finished", "wall s, median", "private MB", "total MB", "peak MB"
         );
-        for r in multi {
+        for r in multi.iter().filter(|r| r.sessions == *k) {
             println!(
                 "{:<9} {:>8} {:>21.2} {:>12.0} {:>12.0} {:>9.0}",
                 r.harness,
@@ -439,20 +549,27 @@ pub fn print(rows: &[Row]) {
             );
         }
     }
+    if !counts.is_empty() {
+        print_scaling(rows, &counts, "total", |r| r.group_peak_pss_mb);
+        print_scaling(rows, &counts, "private", |r| r.group_peak_private_mb);
+    }
     println!(
         "\nprivate and total are what the process tree still held in its last sample before exit; total counts shared"
     );
     println!("pages divided among the processes sharing them, so with several sessions it is each one's real share.");
     println!("peak is the same total at its highest.");
     println!(
+        "all sessions together is the peak of the memory summed over every process of every live session at one instant."
+    );
+    println!(
         "\nCAVEAT: mu is measured WITHOUT its gateway. mu normally reaches models through a shared `omp auth-broker` +"
     );
     println!(
-        "`omp auth-gateway` pair: 251 MB total and 210 MB private idle, about 305 MB and 275 MB while serving a request,"
+        "`omp auth-gateway` pair: 239 MB total and 155 MB private idle (JIT off, as the daemon runs it; 306 / 216 MB with it on),"
     );
     println!("shared by every mu session, measured separately");
     println!(
-        "and NOT in the mu rows above. With it, a single mu session costs about what claude or omp do; the saving"
+        "and NOT in the mu rows above. With it, a single mu session costs a little less than claude or omp; the saving"
     );
     println!(
         "appears only with several sessions. The other harnesses call their providers directly. No model, and no other"
@@ -460,10 +577,47 @@ pub fn print(rows: &[Row]) {
     println!("shared daemon, is included for any harness.");
 }
 
+/// All sessions together: the peak of the memory summed over every process of every session at one instant, for each
+/// session count, and what each further session costs, `(sum at the most sessions - sum of one) / (sessions - 1)`.
+fn print_scaling(rows: &[Row], counts: &[usize], what: &str, value: impl Fn(&Row) -> f64) {
+    let mut harnesses: Vec<&str> = Vec::new();
+    for r in rows {
+        if !harnesses.contains(&r.harness.as_str()) {
+            harnesses.push(&r.harness);
+        }
+    }
+    let last = *counts.last().unwrap();
+    println!("\nall sessions together, peak {what} MB over every process of every session");
+    print!("{:<9} {:>9}", "harness", "1 session");
+    for k in counts {
+        print!(" {:>10}", format!("{k} at once"));
+    }
+    println!(" {:>13} {:>10}", "per further", "share of 1");
+    for h in harnesses {
+        let at = |k: usize| rows.iter().find(|r| r.harness == h && r.sessions == k).map(&value);
+        let Some(one) = at(1) else { continue };
+        print!("{h:<9} {one:>9.0}");
+        for &k in counts {
+            match at(k) {
+                Some(v) => print!(" {v:>10.0}"),
+                None => print!(" {:>10}", "-"),
+            }
+        }
+        match at(last) {
+            Some(v) if one > 0.0 => {
+                let each = (v - one) / (last - 1) as f64;
+                println!(" {each:>13.1} {:>9.0}%", 100.0 * each / one);
+            }
+            _ => println!(),
+        }
+    }
+}
+
 pub struct Args {
     pub mu: PathBuf,
     pub runs: usize,
-    pub sessions: usize,
+    /// Session counts above 1 to run at once, besides the single session every round starts with.
+    pub sessions: Vec<usize>,
     pub harnesses: Vec<String>,
     pub out: Option<PathBuf>,
     pub scenario: PathBuf,
@@ -473,7 +627,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut a = Args {
         mu: "target/release/mu".into(),
         runs: 5,
-        sessions: 3,
+        sessions: vec![3],
         harnesses: ALL.iter().map(|h| (*h).to_string()).collect(),
         out: None,
         scenario: PathBuf::new(),
@@ -485,7 +639,11 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
         match arg.as_str() {
             "--mu" => a.mu = value("--mu")?.into(),
             "--runs" => a.runs = value("--runs")?.parse()?,
-            "--sessions" => a.sessions = value("--sessions")?.parse()?,
+            "--sessions" => {
+                a.sessions = value("--sessions")?.split(',').map(str::parse).collect::<Result<_, _>>()?;
+                a.sessions.sort_unstable();
+                a.sessions.dedup();
+            }
             "--harness" => a.harnesses = value("--harness")?.split(',').map(str::to_string).collect(),
             "--out" => a.out = Some(value("--out")?.into()),
             x if x.starts_with("--") => bail!("unknown option {x}"),
@@ -496,7 +654,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
         bail!("compare takes exactly one scenario file");
     }
     a.scenario = scenarios.remove(0).into();
-    if a.runs == 0 || a.sessions == 0 {
+    if a.runs == 0 || a.sessions.contains(&0) {
         bail!("--runs and --sessions must be at least 1");
     }
     if let Some(h) = a.harnesses.iter().find(|h| !ALL.contains(&h.as_str())) {
@@ -535,8 +693,8 @@ pub async fn main(args: impl IntoIterator<Item = String>) -> Result<()> {
             let r = run_once(h, &sc, &mu, &home_base, 1).await?;
             note_failure(&r);
             runs.push(r);
-            if a.sessions > 1 {
-                for r in run_group(h, a.sessions, &sc, &mu, &home_base).await? {
+            for &k in a.sessions.iter().filter(|&&k| k > 1) {
+                for r in run_group(h, k, &sc, &mu, &home_base).await? {
                     note_failure(&r);
                     runs.push(r);
                 }
@@ -575,6 +733,28 @@ mod tests {
         assert!(p(&["a.toml", "b.toml"]).is_err());
         assert!(p(&["--harness", "nope", "s.toml"]).is_err());
         assert!(p(&["--runs", "0", "s.toml"]).is_err());
+    }
+
+    #[test]
+    fn executables_are_copied_so_their_pages_are_not_shared() {
+        use std::os::unix::fs::MetadataExt;
+        assert!(is_node_script("#!/usr/bin/env node\nconsole.log(1)"));
+        assert!(!is_node_script("#!/bin/sh\necho node"));
+        assert!(!is_node_script("\x7fELF"));
+        let dir = scratch().unwrap();
+        let src = dir.join("tool");
+        std::fs::write(&src, b"\x7fELF binary").unwrap();
+        let mut l = Launch { program: src.clone(), args: vec![s("-p")], env: vec![] };
+        privatize(&mut l, &dir.join("bin")).unwrap();
+        assert_ne!(l.program, src);
+        assert_eq!(std::fs::read(&l.program).unwrap(), b"\x7fELF binary");
+        assert_ne!(std::fs::metadata(&l.program).unwrap().ino(), std::fs::metadata(&src).unwrap().ino());
+        assert_eq!(l.args, ["-p"]);
+        let first = l.program.clone();
+        let mut again = Launch { program: src, args: vec![], env: vec![] };
+        privatize(&mut again, &dir.join("bin")).unwrap();
+        assert_eq!(again.program, first, "an existing copy is reused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -618,6 +798,8 @@ mod tests {
             final_pss_kb: pss / 2,
             final_private_kb: pss / 4,
             peak_procs: 2,
+            group_peak_pss_kb: pss * u64::try_from(sessions).unwrap(),
+            group_peak_private_kb: pss / 2,
             model_requests: 10,
             tool_errors: 0,
             overruns: 0,
@@ -642,12 +824,16 @@ mod tests {
         assert_eq!(rows[0].final_pss_mb, 1.0);
         assert_eq!((rows[2].harness.as_str(), rows[2].sessions), ("a", 3));
         assert_eq!(rows[2].final_private_mb, 2.0);
+        assert_eq!(rows[2].group_peak_pss_mb, 24.0);
     }
 
     #[test]
     fn session_count_argument() {
-        assert_eq!(p(&["s.toml"]).unwrap().sessions, 3);
-        assert_eq!(p(&["--sessions", "1", "s.toml"]).unwrap().sessions, 1);
+        assert_eq!(p(&["s.toml"]).unwrap().sessions, vec![3]);
+        assert_eq!(p(&["--sessions", "1", "s.toml"]).unwrap().sessions, vec![1]);
+        assert_eq!(p(&["--sessions", "8,2,4,2", "s.toml"]).unwrap().sessions, vec![2, 4, 8]);
         assert!(p(&["--sessions", "0", "s.toml"]).is_err());
+        assert!(p(&["--sessions", "2,0", "s.toml"]).is_err());
+        assert!(p(&["--sessions", "x", "s.toml"]).is_err());
     }
 }

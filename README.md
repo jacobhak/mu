@@ -8,9 +8,9 @@ mu is a terminal coding agent with a Rust core (agent loop, TUI, sessions) built
 
 mu keeps most of what omp does and changes where the memory goes. A session holds your conversation, and anything else runs only while it's being used.
 
-- **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3.5 MB of private memory (about 19 MB counting the binary's shared pages).
+- **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3.6 MB of private memory (about 20 MB counting the binary's shared pages).
 - **Features start on use.** Web, memory and prediction are separate processes, and so is the model gateway, which only providers without an API key or ChatGPT sign-in in mu need. Each starts on first use and exits after a few idle minutes. A session that talks only to Anthropic, OpenAI or Baseten with your own key, or to OpenAI on your ChatGPT plan, starts no omp process at all. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
-- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 250 MB while they run, idle). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
+- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 240 MB while they run, idle). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
 - **Works with your omp setup.** mu uses omp's config, models, MCP setup, context files and skills, and its login for OAuth providers. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup: the installer bundles omp for the providers that need it, and Anthropic, OpenAI and Baseten work with just an API key (OpenAI models also run on a ChatGPT plan).
 
