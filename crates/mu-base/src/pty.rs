@@ -152,8 +152,7 @@ impl PtyIo {
     /// Signals the whole process group; only call before the child has been reaped.
     pub fn signal(&self, sig: c_int) {
         if self.pid > 0 {
-            // SAFETY: plain kill(2).
-            unsafe { libc::kill(-self.pid, sig) };
+            crate::process::kill_group(self.pid, sig);
         }
     }
 

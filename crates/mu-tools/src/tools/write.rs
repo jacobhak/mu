@@ -42,7 +42,11 @@ impl Tools {
                 std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
             }
             // A symlink is written through, so the link survives the rename that ends the write.
-            let target = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            // A dangling link is written through to where it points.
+            let target = std::fs::canonicalize(&path).unwrap_or_else(|_| match std::fs::read_link(&path) {
+                Ok(l) => path.parent().map_or(l.clone(), |p| p.join(&l)),
+                Err(_) => path.clone(),
+            });
             let (old, too_big, crlf) = match std::fs::metadata(&target) {
                 Ok(m) if m.len() <= CHANGE_TEXT_MAX as u64 => {
                     let bytes = std::fs::read(&target).ok();

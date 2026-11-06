@@ -146,10 +146,17 @@ pub fn remove(cwd: &Path, agent: &Path, name: &str) -> Result<Vec<PathBuf>, Stri
     }
     for f in &files {
         let mut root = read_root(f)?;
+        let was_trusted = root.get("mcpServers").is_some_and(|s| trust::is_trusted(f, &trust::digest(s)));
         if let Some(Value::Object(m)) = root.get_mut("mcpServers") {
             m.shift_remove(name);
         }
         write_root(f, &root)?;
+        if was_trusted
+            && trust::is_project_file(cwd, f)
+            && let Some(s) = root.get("mcpServers")
+        {
+            trust::trust(f, &trust::digest(s)).map_err(|e| format!("{}: {e}", f.display()))?;
+        }
     }
     clear_switches(agent, name)?;
     Ok(files)

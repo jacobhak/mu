@@ -46,7 +46,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 30] = [
 
 /// `/mcp` subcommands for the completion menu, with what each does. The names that need a server
 /// open the server picker when typed bare.
-const MCP_SUBCOMMANDS: [(&str, &str); 10] = [
+const MCP_SUBCOMMANDS: [(&str, &str); 12] = [
     ("add", "Add a server: discovered, popular or custom"),
     ("import", "Copy servers other tools have configured"),
     ("list", "Show servers and their state"),
@@ -56,6 +56,8 @@ const MCP_SUBCOMMANDS: [(&str, &str); 10] = [
     ("test", "Reconnect a server and list its tools"),
     ("reconnect", "Restart a server and refresh its tools"),
     ("reload", "Re-read the config files"),
+    ("trust", "Start this project's MCP servers"),
+    ("untrust", "Stop trusting this project's MCP servers"),
     ("help", "Show the syntax"),
 ];
 
