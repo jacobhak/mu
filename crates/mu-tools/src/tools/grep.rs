@@ -1,7 +1,7 @@
 use super::Tools;
 use crate::walk::{block_on_walk, walk_options};
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::UTF8};
+use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
 use mu_base::tool::ToolOutput;
 use pi_walker::{Detail, FileType, Fs, walk};
 use serde::Deserialize;
@@ -81,7 +81,7 @@ fn grep_blocking(cwd: &std::path::Path, root: PathBuf, prefix: Option<String>, a
         let _ = searcher.search_path(
             &matcher,
             &abs,
-            UTF8(|ln, line| {
+            Lossy(|ln, line| {
                 if n >= PER_FILE {
                     capped = true;
                     return Ok(false);
@@ -145,6 +145,22 @@ pub(super) mod tests {
         assert_eq!(o.text, "a.rs:1:fn needle() {}\nsub/b.rs:1:fn needle() {}");
         let o = t.grep(Args { pattern: "needle".into(), path: Some("big.rs".into()), case: None }).await;
         assert_eq!(o.text, "big.rs:1:fn needle() {}", "an explicit file is searched regardless of size");
+    }
+
+    /// Invalid UTF-8 on one matching line does not stop the search: that line and the next are both reported.
+    #[tokio::test(flavor = "current_thread")]
+    async fn matches_past_invalid_utf8_are_reported() {
+        let d = std::env::temp_dir().join(format!("mu-walk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), b"needle \xFF here\nneedle ok\n").unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.grep(Args { pattern: "needle".into(), path: Some("f.txt".into()), case: None }).await;
+        assert!(!o.is_error, "{}", o.text);
+        let lines: Vec<&str> = o.text.lines().collect();
+        assert_eq!(lines.len(), 2, "{}", o.text);
+        assert!(lines[0].starts_with("f.txt:1:needle ") && lines[0].ends_with(" here"), "{}", o.text);
+        assert_eq!(lines[1], "f.txt:2:needle ok", "{}", o.text);
     }
 
     #[tokio::test(flavor = "current_thread")]

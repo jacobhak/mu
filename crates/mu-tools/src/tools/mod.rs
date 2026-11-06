@@ -104,7 +104,16 @@ impl Tools {
         vec![("PI_SESSION_FILE", file), ("PI_SESSION_ID", id)]
     }
 
+    /// `~` and `~/…` are `$HOME`; other paths are absolute or relative to `cwd`.
     pub fn abs(&self, p: &str) -> PathBuf {
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) {
+            if p == "~" {
+                return home;
+            }
+            if let Some(rest) = p.strip_prefix("~/") {
+                return home.join(rest);
+            }
+        }
         let p = Path::new(p);
         if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) }
     }
@@ -360,6 +369,67 @@ pub fn summary(name: &str, args: &Value) -> String {
         _ => "",
     };
     trunc(s, 120)
+}
+
+/// Tests that read or set `HOME` run one at a time.
+#[cfg(test)]
+pub(crate) mod home_guard {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    /// Points `HOME` at `home` until dropped (`""` unsets it for `abs`).
+    pub(crate) struct HomeGuard {
+        old: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        pub(crate) fn set(home: &Path) -> Self {
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let old = std::env::var_os("HOME");
+            // SAFETY: HOME is only changed while LOCK is held.
+            unsafe { std::env::set_var("HOME", home) };
+            Self { old, _lock: lock }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe {
+                match self.old.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use home_guard::HomeGuard;
+
+    #[test]
+    fn tilde_paths_are_home_relative() {
+        let home = std::env::temp_dir().join(format!("mu-home-{}", uuid::Uuid::new_v4()));
+        let mut t = Tools::for_test();
+        t.cwd = PathBuf::from("/work");
+        {
+            let _h = HomeGuard::set(&home);
+            assert_eq!(t.abs("~/x"), home.join("x"));
+            assert_eq!(t.abs("~"), home);
+            assert_eq!(t.abs("~user/x"), PathBuf::from("/work/~user/x"));
+            assert_eq!(t.abs("a/b"), PathBuf::from("/work/a/b"));
+            assert_eq!(t.abs("/etc/x"), PathBuf::from("/etc/x"));
+        }
+        let _h = HomeGuard::set(Path::new(""));
+        assert_eq!(t.abs("~/x"), PathBuf::from("/work/~/x"), "an empty HOME leaves the path alone");
+    }
 }
 
 #[cfg(test)]

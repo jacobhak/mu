@@ -14,6 +14,10 @@ const TEXT_CAP: usize = 50 * 1024;
 /// Allocates the next artifact: its number and path.
 pub type Alloc<'a> = &'a dyn Fn() -> (u32, PathBuf);
 
+/// Text held back from a spill until a newline (or this much) arrives, so a secret split across
+/// chunks is seen whole by redaction.
+const PENDING_MAX: usize = 64 * 1024;
+
 /// An artifact being written. Text is redacted on the way in, and at most `cap` bytes are kept.
 struct Spill {
     id: u32,
@@ -24,6 +28,8 @@ struct Spill {
     capped: bool,
     /// The first I/O error; nothing is written after it.
     error: Option<String>,
+    /// Text after the last newline seen, not yet redacted or written.
+    pending: String,
 }
 
 impl Spill {
@@ -34,10 +40,35 @@ impl Spill {
             let _ = std::fs::create_dir_all(dir);
         }
         let file = BufWriter::new(File::create(&path)?);
-        Ok(Self { id, file, cwd: cwd.to_path_buf(), cap, written: 0, capped: false, error: None })
+        Ok(Self {
+            id,
+            file,
+            cwd: cwd.to_path_buf(),
+            cap,
+            written: 0,
+            capped: false,
+            error: None,
+            pending: String::new(),
+        })
     }
 
+    /// Holds `text` back up to its last newline (or up to `PENDING_MAX` bytes without one).
     fn write(&mut self, text: &str) {
+        if self.capped || self.error.is_some() {
+            return;
+        }
+        self.pending.push_str(text);
+        let cut = match self.pending.rfind('\n') {
+            Some(i) => i + 1,
+            None if self.pending.len() > PENDING_MAX => self.pending.len(),
+            None => return,
+        };
+        let rest = self.pending.split_off(cut);
+        let chunk = std::mem::replace(&mut self.pending, rest);
+        self.emit(&chunk);
+    }
+
+    fn emit(&mut self, text: &str) {
         if self.capped || self.error.is_some() {
             return;
         }
@@ -62,6 +93,8 @@ impl Spill {
     }
 
     fn flush(&mut self) {
+        let rest = std::mem::take(&mut self.pending);
+        self.emit(&rest);
         if let Err(e) = self.file.flush() {
             self.error.get_or_insert(e.to_string());
         }
@@ -175,4 +208,27 @@ pub fn cap_text(text: String, cwd: &Path, alloc: Alloc) -> String {
         None => format!("[Output truncated at {kb} KB of {total} KB]"),
     };
     format!("{}\n\n{note}", &text[..cut])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_secret_split_across_chunks_never_reaches_the_artifact() {
+        mu_base::secrets::register_stored("SPILL_TEST_KEY", "Zq8-spill-test-value");
+        let d = std::env::temp_dir().join(format!("mu-spill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("out.log");
+        let artifact = path.clone();
+        let alloc = move || (7, artifact.clone());
+        let mut sp = Spill::open(&alloc, &d, u64::MAX).unwrap();
+        sp.write("before Zq8-spill-");
+        sp.write("test-value after\nnext line\ntrailing");
+        sp.flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("Zq8-spill"), "{text}");
+        assert!(text.contains("[REDACTED:SPILL_TEST_KEY] after\nnext line\n"), "{text}");
+        assert!(text.ends_with("trailing"), "the held-back tail is written at flush: {text}");
+    }
 }

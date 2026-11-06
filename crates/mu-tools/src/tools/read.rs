@@ -1,8 +1,13 @@
 use super::Tools;
+use encoding_rs::{CoderResult, Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252};
 use mu_base::tool::{FileMeta, ToolMeta, ToolOutput};
-use pi_edit::{path_policy::canonical_key, text};
+use pi_edit::{path_policy::canonical_key, store::MAX_SNAPSHOT_FILE_BYTES, text};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::fmt::Write;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -89,6 +94,187 @@ fn runs(lines: &[usize]) -> String {
     s
 }
 
+/// The ranges a selector names in a file of `total` lines (`usize::MAX` while that is unknown).
+fn selection(sel: Option<&str>, total: usize) -> Option<Vec<(usize, usize)>> {
+    match sel {
+        Some(l) if l.contains(',') => parse_list(l, total),
+        s => select(s, total).map(|r| vec![r]),
+    }
+}
+
+/// Each range cut to the most lines one read shows: MAX_LINES from its first line.
+fn window_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    ranges.iter().map(|&(s, e)| (s, e.min(s.saturating_add(MAX_LINES - 1)))).collect()
+}
+
+/// The part of a line a read can look at. Enough bytes that the row decisions (cut or not, and
+/// where) are the same as for the whole line: a raw row is cut at MAX_BYTES after its number, and
+/// a plain row at MAX_COL chars, where each char is at most 4 bytes.
+fn kept(line: &str, raw_mode: bool) -> &str {
+    let limit = if raw_mode { MAX_BYTES + 32 } else { MAX_COL * 4 + 4 };
+    if line.len() <= limit {
+        return line;
+    }
+    let mut cut = limit;
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &line[..cut]
+}
+
+/// Collects the lines a read shows as they stream past, in order. It keeps at most MAX_LINES + 1
+/// (a list shows at most MAX_LINES rows, and the extra line says where the rest starts) and, in
+/// raw mode, stops once the kept text is over the byte budget.
+struct Picker<'a> {
+    windows: &'a [(usize, usize)],
+    last: usize,
+    raw_mode: bool,
+    picks: Vec<(usize, String)>,
+    kept_bytes: usize,
+    full: bool,
+    next: Option<usize>,
+}
+
+impl<'a> Picker<'a> {
+    fn new(windows: &'a [(usize, usize)], raw_mode: bool) -> Self {
+        let last = windows.iter().map(|w| w.1).max().unwrap_or(0);
+        Self { windows, last, raw_mode, picks: Vec::new(), kept_bytes: 0, full: false, next: None }
+    }
+
+    /// Feeds line `n` (1-based). Returns false once no further line is wanted.
+    fn feed(&mut self, n: usize, line: &str) -> bool {
+        if n > self.last {
+            return false;
+        }
+        if !self.windows.iter().any(|&(s, e)| (s..=e).contains(&n)) {
+            return true;
+        }
+        if self.full {
+            self.next = Some(n);
+            return false;
+        }
+        let text = kept(line, self.raw_mode);
+        self.kept_bytes += text.len();
+        self.picks.push((n, text.to_string()));
+        self.full = self.picks.len() > MAX_LINES || (self.raw_mode && self.kept_bytes > MAX_BYTES);
+        true
+    }
+
+    /// The kept lines, and the first wanted line that was not kept (if any).
+    fn finish(self) -> (Vec<(usize, String)>, Option<usize>) {
+        (self.picks, self.next)
+    }
+}
+
+/// One row, `N:text`, and whether its text was cut to fit.
+fn row(n: usize, line: &str, raw_mode: bool) -> (String, bool) {
+    if raw_mode {
+        let mut row = format!("{n}:{line}");
+        if row.len() > MAX_BYTES {
+            let mut cut = MAX_BYTES - '…'.len_utf8();
+            while !row.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            row.truncate(cut);
+            row.push('…');
+            return (row, true);
+        }
+        (row, false)
+    } else if line.chars().count() > MAX_COL {
+        (format!("{n}:{}…", line.chars().take(MAX_COL).collect::<String>()), true)
+    } else {
+        (format!("{n}:{line}"), false)
+    }
+}
+
+/// The read's text: `head` (the header line), the rows of the picked lines within the byte budget,
+/// and the notes that say what was left out. `total` is `None` when the file's length is unknown.
+/// Returns the text and the line numbers shown in full (what the edit store may record).
+fn render(
+    head: &str,
+    disp: &str,
+    sel: Option<&str>,
+    raw_mode: bool,
+    ranges: &[(usize, usize)],
+    picked: (Vec<(usize, String)>, Option<usize>),
+    total: Option<usize>,
+) -> (String, Vec<u32>) {
+    let (lines, next) = picked;
+    let multi = sel.is_some_and(|s| s.contains(','));
+    let mut out = format!("{head}\n");
+    let mut seen = Vec::new();
+    let mut cut_lines: Vec<usize> = Vec::new();
+    let mut bytes = 0;
+    let mut last = ranges.first().map_or(0, |r| r.0.saturating_sub(1));
+    let mut capped_any = false;
+    // First unshown line when the output limit ends a read early.
+    let mut stopped: Option<usize> = None;
+    let mut range = 0;
+    let mut prev_range = None;
+    // Every earlier line was shown, so the index is the number of rows shown so far.
+    for (rows, (n, line)) in lines.iter().enumerate() {
+        let n = *n;
+        while range + 1 < ranges.len() && ranges[range].1 < n {
+            range += 1;
+        }
+        let (row, capped) = row(n, line, raw_mode);
+        // At least one row is always shown; after that the budget covers the whole read.
+        if bytes > 0 && (bytes + row.len() > MAX_BYTES || (multi && rows >= MAX_LINES)) {
+            stopped = Some(n);
+            break;
+        }
+        if capped {
+            if raw_mode {
+                capped_any = true;
+            } else {
+                cut_lines.push(n);
+            }
+        } else {
+            seen.push(n as u32);
+        }
+        if multi && bytes > 0 && prev_range != Some(range) {
+            out.push_str("...\n");
+            bytes += 4;
+        }
+        prev_range = Some(range);
+        bytes += row.len() + 1;
+        out.push_str(&row);
+        out.push('\n');
+        last = n;
+    }
+    out.pop();
+    let stopped = stopped.or(next);
+    let sfx = if raw_mode { ":raw" } else { "" };
+    if let (true, Some(n)) = (multi, stopped) {
+        let rest: Vec<String> = ranges
+            .iter()
+            .filter(|r| r.1 >= n)
+            .map(|&(s, e)| {
+                let s = s.max(n);
+                if s == e { s.to_string() } else { format!("{s}-{e}") }
+            })
+            .collect();
+        let _ = write!(out, "\n\n[Output limit reached. Use {disp}:{}{sfx} for the rest]", rest.join(","));
+    } else if !multi && total.is_none_or(|t| last < t) {
+        match total {
+            Some(t) => {
+                let _ = write!(out, "\n\n[{} more lines in file. Use {disp}:{}{sfx} to continue]", t - last, last + 1);
+            }
+            None => {
+                let _ = write!(out, "\n\n[more lines in file. Use {disp}:{}{sfx} to continue]", last + 1);
+            }
+        }
+    }
+    if raw_mode && capped_any {
+        let _ = write!(out, "\n[A line exceeded {MAX_BYTES} bytes and was cut]");
+    }
+    if !cut_lines.is_empty() {
+        let _ =
+            write!(out, "\n[Lines cut at {MAX_COL} chars; use {disp}:{}:raw for their full content]", runs(&cut_lines));
+    }
+    (out, seen)
+}
+
 impl Tools {
     pub async fn read(&self, a: Args) -> ToolOutput {
         let super::uri::ReadTarget { path: authored, sel, raw: raw_mode } =
@@ -107,149 +293,243 @@ impl Tools {
         }
         // Directory listing and file reading run on a blocking thread.
         let path = abs.clone();
+        let (sel_big, disp_big) = (sel.clone(), disp.clone());
         let source = tokio::task::spawn_blocking(move || {
-            if path.is_dir() { Source::Dir(Box::new(list_dir(&path))) } else { Source::File(std::fs::read(&path)) }
+            if path.is_dir() {
+                return Source::Dir(Box::new(list_dir(&path)));
+            }
+            match std::fs::metadata(&path) {
+                Ok(m) if !m.is_file() => Source::Special,
+                Ok(m) if m.len() > MAX_SNAPSHOT_FILE_BYTES => {
+                    Source::Large(Box::new(read_large(&path, sel_big.as_deref(), raw_mode, &disp_big, m.len())))
+                }
+                _ => Source::File(std::fs::read(&path)),
+            }
         })
         .await;
         let raw = match source {
-            Ok(Source::Dir(out)) => return *out,
+            Ok(Source::Dir(out) | Source::Large(out)) => return *out,
+            Ok(Source::Special) => {
+                return ToolOutput::err(format!("Not a regular file: {disp} (a FIFO, socket or device)"));
+            }
             Ok(Source::File(Ok(raw))) => raw,
             Ok(Source::File(Err(e))) => return ToolOutput::err(format!("Cannot read {disp}: {e}")),
             Err(e) => return ToolOutput::err(format!("read failed: {e}")),
         };
         // Images go to the model as image blocks; the text names what it is looking at.
         if let Some(mime) = mu_base::image::sniff(&raw) {
-            let n = raw.len();
-            return match mu_base::image::from_bytes(raw) {
-                Ok(img) => {
-                    ToolOutput { images: vec![img], ..ToolOutput::ok(format!("Image: {disp} ({mime}, {n} bytes)")) }
-                }
-                Err(e) => ToolOutput::err(format!("{disp}: {e}")),
-            };
+            return image_output(raw, &disp, mime);
         }
         let head = &raw[..raw.len().min(8192)];
-        let s = match std::str::from_utf8(&raw) {
-            Ok(s) if !head.contains(&0) => s,
-            _ => return ToolOutput::ok(format!("Binary file ({} bytes); not displayed", raw.len())),
+        let (decoded_src, decoded) = match std::str::from_utf8(&raw) {
+            Ok(s) if !head.contains(&0) => (Cow::Borrowed(s), None),
+            _ => match decode_fallback(&raw, head) {
+                Some((s, name)) => (s, Some(name)),
+                None => return ToolOutput::ok(format!("Binary file ({} bytes); not displayed", raw.len())),
+            },
         };
         // Borrowed all the way unless the file has CRLFs: no copy of a large file just to read it.
-        let norm = text::normalize_to_lf(text::strip_bom(s).1);
-        let key = canonical_key(&abs);
-        let tag = self.edit_store.record(&key, &norm, None);
+        let norm = text::normalize_to_lf(text::strip_bom(&decoded_src).1);
         let total = line_count(&norm);
-        let ranges = match sel.as_deref() {
-            Some(l) if l.contains(',') => parse_list(l, total),
-            s => select(s, total).map(|r| vec![r]),
+        let key = canonical_key(&abs);
+        let (head_line, tag) = match decoded {
+            Some(name) => (format!("[{disp}] (decoded from {name}; read-only view, edit anchors not available)"), None),
+            None => {
+                let tag = self.edit_store.record(&key, &norm, None);
+                (format!("[{disp}#{tag}]"), Some(tag))
+            }
         };
-        let Some(ranges) = ranges else {
+        let Some(ranges) = selection(sel.as_deref(), total) else {
             return ToolOutput::err(format!("Invalid selector in {}", a.path));
         };
         if total == 0 {
-            return ToolOutput::ok(format!("[{disp}#{tag}]\n(empty file)"));
+            return ToolOutput::ok(format!("{head_line}\n(empty file)"));
         }
         if ranges.iter().all(|r| r.0 > total) {
             return ToolOutput::err(format!("{disp} has only {total} lines"));
         }
-        let mut out = format!("[{disp}#{tag}]\n");
-        let mut seen = Vec::new();
-        let mut cut_lines: Vec<usize> = Vec::new();
-        let mut bytes = 0;
-        let mut rows = 0;
-        let mut last = 0;
-        let mut capped_any = false;
-        // First unshown line (and its range) when the output limit ends a list early.
-        let mut stopped: Option<(usize, usize)> = None;
-        let multi = sel.as_deref().is_some_and(|s| s.contains(','));
-        'ranges: for (ri, &(start, end)) in ranges.iter().enumerate() {
-            if start > total {
-                continue;
-            }
-            let mut separator = multi && bytes > 0;
-            last = start - 1;
-            // Only the window is walked; lines before it are skipped and lines after it never visited.
-            let window = end.min(start + MAX_LINES - 1) + 1 - start;
-            for (k, line) in norm.lines().skip(start - 1).take(window).enumerate() {
-                let n = start + k;
-                let mut capped = false;
-                let row = if raw_mode {
-                    let mut row = format!("{n}:{line}");
-                    if row.len() > MAX_BYTES {
-                        let mut cut = MAX_BYTES - '…'.len_utf8();
-                        while !row.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        row.truncate(cut);
-                        row.push('…');
-                        capped = true;
-                    }
-                    row
-                } else if line.chars().count() > MAX_COL {
-                    capped = true;
-                    format!("{n}:{}…", line.chars().take(MAX_COL).collect::<String>())
-                } else {
-                    format!("{n}:{line}")
-                };
-                // At least one row is always shown; after that the budget covers the whole read.
-                if bytes > 0 && (bytes + row.len() > MAX_BYTES || (multi && rows >= MAX_LINES)) {
-                    stopped = Some((ri, n));
-                    break 'ranges;
-                }
-                if capped {
-                    if raw_mode {
-                        capped_any = true;
-                    } else {
-                        cut_lines.push(n);
-                    }
-                } else {
-                    seen.push(n as u32);
-                }
-                if separator {
-                    out.push_str("...\n");
-                    bytes += 4;
-                    separator = false;
-                }
-                bytes += row.len() + 1;
-                rows += 1;
-                out.push_str(&row);
-                out.push('\n');
-                last = n;
+        let windows = window_ranges(&ranges);
+        let mut picker = Picker::new(&windows, raw_mode);
+        for (i, line) in norm.lines().enumerate() {
+            if !picker.feed(i + 1, line) {
+                break;
             }
         }
-        out.pop();
-        self.edit_store.record_seen_lines(&key, &tag, &seen);
-        let sfx = if raw_mode { ":raw" } else { "" };
-        if let (true, Some((ri, n))) = (multi, stopped) {
-            let rest: Vec<String> = ranges[ri..]
-                .iter()
-                .enumerate()
-                .map(|(i, &(s, e))| {
-                    let s = if i == 0 { n } else { s };
-                    if s == e { s.to_string() } else { format!("{s}-{e}") }
-                })
-                .collect();
-            let _ = write!(out, "\n\n[Output limit reached. Use {disp}:{}{sfx} for the rest]", rest.join(","));
-        } else if !multi && last < total {
-            let _ = write!(out, "\n\n[{} more lines in file. Use {disp}:{}{sfx} to continue]", total - last, last + 1);
-        }
-        if raw_mode && capped_any {
-            let _ = write!(out, "\n[A line exceeded {MAX_BYTES} bytes and was cut]");
-        }
-        if !cut_lines.is_empty() {
-            let _ = write!(
-                out,
-                "\n[Lines cut at {MAX_COL} chars; use {disp}:{}:raw for their full content]",
-                runs(&cut_lines)
-            );
+        let (out, seen) = render(&head_line, &disp, sel.as_deref(), raw_mode, &ranges, picker.finish(), Some(total));
+        if let Some(tag) = &tag {
+            self.edit_store.record_seen_lines(&key, tag, &seen);
         }
         let mut result = ToolOutput::ok(out);
-        result.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag: Some(tag), plan: false }));
+        result.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag, plan: false }));
         result
     }
 }
 
 enum Source {
     Dir(Box<ToolOutput>),
+    /// Neither a directory nor a regular file: a FIFO, socket or device. Never opened.
+    Special,
+    /// Over `MAX_SNAPSHOT_FILE_BYTES`; read by streaming.
+    Large(Box<ToolOutput>),
     File(std::io::Result<Vec<u8>>),
+}
+
+/// An image goes to the model as an image block.
+fn image_output(raw: Vec<u8>, disp: &str, mime: &str) -> ToolOutput {
+    let n = raw.len();
+    match mu_base::image::from_bytes(raw) {
+        Ok(img) => ToolOutput { images: vec![img], ..ToolOutput::ok(format!("Image: {disp} ({mime}, {n} bytes)")) },
+        Err(e) => ToolOutput::err(format!("{disp}: {e}")),
+    }
+}
+
+/// Text that is not UTF-8 and has no NUL in its first 8 KiB: UTF-16 with a byte order mark, else
+/// Windows-1252. `None` for binary.
+fn decode_fallback<'a>(raw: &'a [u8], head: &[u8]) -> Option<(Cow<'a, str>, &'static str)> {
+    if let Some((enc, _)) = Encoding::for_bom(head).filter(|(e, _)| *e == UTF_16LE || *e == UTF_16BE) {
+        let (s, _, _) = enc.decode(raw);
+        return Some((s, enc.name()));
+    }
+    if head.contains(&0) {
+        return None;
+    }
+    let (s, _, _) = WINDOWS_1252.decode(raw);
+    Some((s, WINDOWS_1252.name()))
+}
+
+/// The encoding a large file is streamed as, judged from its first 8 KiB. `None` for binary.
+fn large_encoding(head: &[u8]) -> Option<&'static Encoding> {
+    if let Some((enc, _)) = Encoding::for_bom(head).filter(|(e, _)| *e == UTF_16LE || *e == UTF_16BE) {
+        return Some(enc);
+    }
+    if head.contains(&0) {
+        return None;
+    }
+    let utf8 = match std::str::from_utf8(head) {
+        Ok(_) => true,
+        // A character cut by the 8 KiB sample is still UTF-8.
+        Err(e) => e.error_len().is_none(),
+    };
+    Some(if utf8 { UTF_8 } else { WINDOWS_1252 })
+}
+
+/// Calls `f` with each line of `file` (1-based number, decoded as `enc`, without its line ending)
+/// until `f` returns false. Returns whether the end of the file was reached.
+fn each_line(file: &mut File, enc: &'static Encoding, mut f: impl FnMut(usize, &str) -> bool) -> std::io::Result<bool> {
+    let mut dec = enc.new_decoder_with_bom_removal();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut partial = String::new();
+    let mut out = String::new();
+    let mut n = 0;
+    loop {
+        let read = file.read(&mut buf)?;
+        let at_end = read == 0;
+        let mut src = &buf[..read];
+        out.clear();
+        loop {
+            // `decode_to_string` never grows the String: reserve room for this input first.
+            out.reserve(src.len() * 3 + 16);
+            let (res, used, _) = dec.decode_to_string(src, &mut out, at_end);
+            src = &src[used..];
+            if res == CoderResult::InputEmpty {
+                break;
+            }
+        }
+        let text = std::mem::take(&mut partial) + &out;
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find('\n') {
+            n += 1;
+            if !f(n, trim_cr(&rest[..i])) {
+                return Ok(false);
+            }
+            rest = &rest[i + 1..];
+        }
+        if at_end {
+            if !rest.is_empty() {
+                n += 1;
+                if !f(n, trim_cr(rest)) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        partial = rest.to_string();
+    }
+}
+
+fn trim_cr(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// A file over `MAX_SNAPSHOT_FILE_BYTES`, read by streaming: only the selected lines are kept, and
+/// nothing is recorded for edits.
+fn read_large(path: &Path, sel: Option<&str>, raw_mode: bool, disp: &str, size: u64) -> ToolOutput {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => return ToolOutput::err(format!("Cannot read {disp}: {e}")),
+    };
+    let mut head = Vec::new();
+    if let Err(e) = (&mut file).take(8192).read_to_end(&mut head) {
+        return ToolOutput::err(format!("Cannot read {disp}: {e}"));
+    }
+    if let Some(mime) = mu_base::image::sniff(&head) {
+        return match std::fs::read(path) {
+            Ok(raw) => image_output(raw, disp, mime),
+            Err(e) => ToolOutput::err(format!("Cannot read {disp}: {e}")),
+        };
+    }
+    let Some(enc) = large_encoding(&head) else {
+        return ToolOutput::ok(format!("Binary file ({size} bytes); not displayed"));
+    };
+    let decoded = (enc != UTF_8).then(|| enc.name());
+    let note = decoded.map(|name| format!("decoded from {name}; ")).unwrap_or_default();
+    let head_line = format!(
+        "[{disp}]\n(large file: {size} bytes; {note}only the selected lines were read; edit anchors are not available)"
+    );
+    let io_err = |e: std::io::Error| ToolOutput::err(format!("Cannot read {disp}: {e}"));
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        return io_err(e);
+    }
+
+    // A tail selector needs the length first; a pass over the file is the only way to get it.
+    let mut total = None;
+    if sel.is_some_and(|s| s.starts_with('-')) {
+        let mut count = 0;
+        if let Err(e) = each_line(&mut file, enc, |n, _| {
+            count = n;
+            true
+        }) {
+            return io_err(e);
+        }
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            return io_err(e);
+        }
+        total = Some(count);
+    }
+    let Some(ranges) = selection(sel, total.unwrap_or(usize::MAX)) else {
+        return ToolOutput::err(format!("Invalid selector in {disp}"));
+    };
+    let windows = window_ranges(&ranges);
+    let mut picker = Picker::new(&windows, raw_mode);
+    let mut seen_lines = 0;
+    let reached_end = match each_line(&mut file, enc, |n, line| {
+        seen_lines = n;
+        picker.feed(n, line)
+    }) {
+        Ok(reached) => reached,
+        Err(e) => return io_err(e),
+    };
+    let total = total.or(reached_end.then_some(seen_lines));
+    if let Some(t) = total
+        && ranges.iter().all(|r| r.0 > t)
+    {
+        return ToolOutput::err(format!("{disp} has only {t} lines"));
+    }
+    let (out, _) = render(&head_line, disp, sel, raw_mode, &ranges, picker.finish(), total);
+    ToolOutput {
+        meta: Some(ToolMeta::File(FileMeta { path: disp.to_string(), tag: None, plan: false })),
+        ..ToolOutput::ok(out)
+    }
 }
 
 /// Number of lines `str::lines` would yield, without building them.
@@ -488,5 +768,93 @@ mod tests {
         std::fs::write(d.join("b.bin"), b"\0\x01\x02").unwrap();
         let o = t.read(Args { path: "b.bin".into() }).await;
         assert!(o.images.is_empty() && o.text.starts_with("Binary file"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fifo_is_refused_without_being_opened() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let fifo = d.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that lives across the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = tokio::time::timeout(std::time::Duration::from_secs(5), t.read(Args { path: "pipe".into() }))
+            .await
+            .expect("read blocked on the FIFO");
+        assert!(o.is_error, "{}", o.text);
+        assert_eq!(o.text, "Not a regular file: pipe (a FIFO, socket or device)");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_large_file_shows_only_the_selected_lines() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let body: String = (1..=120_000).map(|i| format!("row {i:08} {}\n", "y".repeat(40))).collect();
+        assert!(body.len() > MAX_SNAPSHOT_FILE_BYTES as usize);
+        let header = format!(
+            "[big.txt]\n(large file: {} bytes; only the selected lines were read; edit anchors are not available)\n",
+            body.len()
+        );
+        std::fs::write(d.join("big.txt"), body).unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+
+        let o = t.read(Args { path: "big.txt:100-102".into() }).await;
+        assert!(!o.is_error, "{}", o.text);
+        // `N-M` keeps its context lines, as it does for a small file: 99 to 105.
+        assert!(o.text.starts_with(&format!("{header}99:row 00000099 ")), "{}", o.text);
+        assert!(o.text.contains("\n105:row 00000105 ") && !o.text.contains("106:row"), "{}", o.text);
+        assert!(o.text.contains("[more lines in file. Use big.txt:106 to continue]"), "{}", o.text);
+        assert!(!o.text.contains("#"), "no edit tag for a large file");
+        assert!(matches!(&o.meta, Some(ToolMeta::File(f)) if f.tag.is_none()));
+
+        let o = t.read(Args { path: "big.txt:100,101,102".into() }).await;
+        assert!(o.text.starts_with(&format!("{header}100:row 00000100 ")), "{}", o.text);
+        assert!(o.text.contains("\n102:row 00000102 "), "{}", o.text.len());
+        assert!(!o.text.contains("99:row") && !o.text.contains("103:row"), "{}", o.text);
+
+        let o = t.read(Args { path: "big.txt:-2".into() }).await;
+        assert!(o.text.starts_with(&format!("{header}119999:row 00119999 ")), "{}", o.text);
+        assert!(o.text.contains("\n120000:row 00120000 "), "{}", o.text);
+        assert!(!o.text.contains("more lines"), "{}", o.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn utf16_with_a_bom_reads_as_text() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "héllo\nworld\n".encode_utf16() {
+            bytes.extend(u.to_le_bytes());
+        }
+        std::fs::write(d.join("u16.txt"), bytes).unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "u16.txt".into() }).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert_eq!(
+            o.text,
+            "[u16.txt] (decoded from UTF-16LE; read-only view, edit anchors not available)\n1:héllo\n2:world"
+        );
+        assert!(matches!(&o.meta, Some(ToolMeta::File(f)) if f.tag.is_none()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_utf8_text_reads_as_windows_1252() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("latin.txt"), b"caf\xE9\n").unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "latin.txt".into() }).await;
+        assert!(!o.is_error, "{}", o.text);
+        assert_eq!(
+            o.text,
+            "[latin.txt] (decoded from windows-1252; read-only view, edit anchors not available)\n1:café"
+        );
     }
 }
