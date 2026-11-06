@@ -761,7 +761,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "lang-rust")]
     fn fence_body_uses_syntax_colours() {
         let ls = render("```rust\nfn f() {}\n```", 40);
         assert_eq!(line_text(&ls[1]), "  fn f() {}");

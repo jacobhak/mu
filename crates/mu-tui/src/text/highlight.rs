@@ -1,6 +1,6 @@
-//! Syntax highlighting for fenced code via tree-sitter. Each language is a Cargo feature
-//! (`lang-*`); without any, `highlight` returns `None`. Captures map to 17 categories (omp's syntax
-//! set plus diff, heading, code, link and emphasis kinds), coloured with the active theme. Configs are built on first use per language.
+//! Syntax highlighting for fenced code via tree-sitter, for the grammars omp's `pi-ast` links in
+//! anyway. Captures map to 17 categories (omp's syntax set plus diff, heading, code, link and
+//! emphasis kinds), coloured with the active theme. Configs are built on first use per language.
 
 use crate::text::line::Line;
 
@@ -10,29 +10,20 @@ const MAX_LINES: usize = 2000;
 const MAX_LINE_BYTES: usize = 2000;
 
 /// Highlights `code` as `lang` (name, alias or extension). One `Line` per source line.
-/// `None` when the language isn't compiled in, the input is over the caps, or highlighting fails.
+/// `None` when the language is unknown, the input is over the caps, or highlighting fails.
 pub fn highlight(code: &str, lang: &str) -> Option<Vec<Line>> {
     if lang.is_empty() || code.lines().count() > MAX_LINES || code.lines().any(|l| l.len() > MAX_LINE_BYTES) {
         return None;
     }
-    #[cfg(feature = "highlight")]
-    {
-        let canon = canonical(&lang.to_ascii_lowercase())?;
-        std::panic::catch_unwind(|| ts::run(code, canon)).ok().flatten()
-    }
-    #[cfg(not(feature = "highlight"))]
-    {
-        None
-    }
+    let canon = canonical(&lang.to_ascii_lowercase())?;
+    std::panic::catch_unwind(|| ts::run(code, canon)).ok().flatten()
 }
 
-/// Canonical language for an info-string token, only for languages compiled in.
-#[cfg(feature = "highlight")]
+/// Canonical language for an info-string token.
 fn canonical(l: &str) -> Option<&'static str> {
     ts::LANGS.iter().find(|g| g.name == l || g.aliases.contains(&l)).map(|g| g.name).filter(|n| *n != "markdown_inline")
 }
 
-#[cfg(feature = "highlight")]
 mod ts {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -134,7 +125,7 @@ mod ts {
         ("text.strong", Cat::Strong),
     ];
 
-    /// One compiled-in language: its canonical name, the info-string aliases that select it, and how
+    /// One language: its canonical name, the info-string aliases that select it, and how
     /// to load its grammar, highlight query and injection query. The only list of languages.
     pub struct Lang {
         pub name: &'static str,
@@ -143,7 +134,6 @@ mod ts {
     }
 
     pub static LANGS: &[Lang] = &[
-        #[cfg(feature = "lang-diff")]
         Lang {
             name: "diff",
             aliases: &["patch"],
@@ -155,7 +145,6 @@ mod ts {
                 )
             },
         },
-        #[cfg(feature = "lang-markdown")]
         Lang {
             name: "markdown",
             aliases: &["md"],
@@ -168,7 +157,6 @@ mod ts {
             },
         },
         // Reached only through markdown's injections, never from an info string.
-        #[cfg(feature = "lang-markdown")]
         Lang {
             name: "markdown_inline",
             aliases: &[],
@@ -180,7 +168,6 @@ mod ts {
                 )
             },
         },
-        #[cfg(feature = "lang-rust")]
         Lang {
             name: "rust",
             aliases: &["rs"],
@@ -192,37 +179,31 @@ mod ts {
                 )
             },
         },
-        #[cfg(feature = "lang-json")]
         Lang {
             name: "json",
             aliases: &["jsonc", "json5"],
             load: || (tree_sitter_json::LANGUAGE.into(), tree_sitter_json::HIGHLIGHTS_QUERY.into(), ""),
         },
-        #[cfg(feature = "lang-bash")]
         Lang {
             name: "bash",
             aliases: &["sh", "shell", "zsh", "shellscript"],
             load: || (tree_sitter_bash::LANGUAGE.into(), tree_sitter_bash::HIGHLIGHT_QUERY.into(), ""),
         },
-        #[cfg(feature = "lang-toml")]
         Lang {
             name: "toml",
             aliases: &[],
             load: || (tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY.into(), ""),
         },
-        #[cfg(feature = "lang-yaml")]
         Lang {
             name: "yaml",
             aliases: &["yml"],
             load: || (tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY.into(), ""),
         },
-        #[cfg(feature = "lang-python")]
         Lang {
             name: "python",
             aliases: &["py", "python3"],
             load: || (tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY.into(), ""),
         },
-        #[cfg(feature = "lang-javascript")]
         Lang {
             name: "javascript",
             aliases: &["js", "jsx", "mjs", "cjs"],
@@ -239,7 +220,6 @@ mod ts {
             },
         },
         // The TypeScript query only adds to the JavaScript one.
-        #[cfg(feature = "lang-typescript")]
         Lang {
             name: "typescript",
             aliases: &["ts", "mts", "cts"],
@@ -255,7 +235,6 @@ mod ts {
                 )
             },
         },
-        #[cfg(feature = "lang-typescript")]
         Lang {
             name: "tsx",
             aliases: &[],
@@ -271,13 +250,61 @@ mod ts {
                 )
             },
         },
+        Lang {
+            name: "c",
+            aliases: &["h"],
+            load: || (tree_sitter_c::LANGUAGE.into(), tree_sitter_c::HIGHLIGHT_QUERY.into(), ""),
+        },
+        // The C++ query only adds to the C one.
+        Lang {
+            name: "cpp",
+            aliases: &["c++", "cc", "cxx", "hpp", "hh", "hxx"],
+            load: || {
+                (
+                    tree_sitter_cpp::LANGUAGE.into(),
+                    format!("{}\n{}", tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY),
+                    "",
+                )
+            },
+        },
+        Lang {
+            name: "css",
+            aliases: &[],
+            load: || (tree_sitter_css::LANGUAGE.into(), tree_sitter_css::HIGHLIGHTS_QUERY.into(), ""),
+        },
+        Lang {
+            name: "go",
+            aliases: &["golang"],
+            load: || (tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY.into(), ""),
+        },
+        Lang {
+            name: "html",
+            aliases: &["htm", "xhtml"],
+            load: || {
+                (
+                    tree_sitter_html::LANGUAGE.into(),
+                    tree_sitter_html::HIGHLIGHTS_QUERY.into(),
+                    tree_sitter_html::INJECTIONS_QUERY,
+                )
+            },
+        },
+        Lang {
+            name: "java",
+            aliases: &[],
+            load: || (tree_sitter_java::LANGUAGE.into(), tree_sitter_java::HIGHLIGHTS_QUERY.into(), ""),
+        },
+        Lang {
+            name: "regex",
+            aliases: &["regexp"],
+            load: || (tree_sitter_regex::LANGUAGE.into(), tree_sitter_regex::HIGHLIGHTS_QUERY.into(), ""),
+        },
     ];
 
     thread_local! {
         static CONFIGS: RefCell<HashMap<&'static str, Option<&'static HighlightConfiguration>>> = RefCell::default();
     }
 
-    fn config(lang: &'static str) -> Option<&'static HighlightConfiguration> {
+    pub(super) fn config(lang: &'static str) -> Option<&'static HighlightConfiguration> {
         CONFIGS.with(|c| {
             *c.borrow_mut().entry(lang).or_insert_with(|| {
                 // Leaked: one config per language for the process lifetime, so injection callbacks can return `'static` refs.
@@ -346,7 +373,7 @@ mod ts {
     }
 }
 
-#[cfg(all(test, feature = "highlight"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::text::line::line_text;
@@ -375,12 +402,40 @@ mod tests {
 
     #[test]
     fn aliases_resolve() {
-        for lang in ["rs", "py", "sh", "json", "yaml", "ts", "toml", "js", "diff", "md"] {
+        for lang in [
+            "rs", "py", "sh", "json", "yaml", "ts", "toml", "js", "diff", "md", "c", "h", "cpp", "c++", "css", "go",
+            "html", "java", "regex",
+        ] {
             assert!(highlight("x\n", lang).is_some(), "{lang}");
         }
     }
 
-    #[cfg(feature = "lang-diff")]
+    #[test]
+    fn every_language_builds_its_highlight_config() {
+        for g in ts::LANGS {
+            assert!(ts::config(g.name).is_some(), "the {} query does not compile", g.name);
+        }
+    }
+
+    #[test]
+    fn the_languages_beyond_the_first_ten_colour_their_keywords_and_strings() {
+        let t = theme::get();
+        let samples = [
+            ("c", "int main(void) { return 0; } // x\n", "return"),
+            ("cpp", "class A { public: int f() const; };\n", "class"),
+            ("go", "package main\nfunc main() {}\n", "func"),
+            ("java", "public class A { private int x; }\n", "class"),
+        ];
+        for (lang, src, kw) in samples {
+            let ls = highlight(src, lang).unwrap_or_else(|| panic!("{lang} is known"));
+            assert_eq!(fg_of(&ls, kw), t.color(Role::SynKeyword), "{lang}: {kw}");
+        }
+        let css = highlight("a { color: red; } /* c */\n", "css").unwrap();
+        assert_eq!(fg_of(&css, "c */"), t.color(Role::SynComment));
+        let html = highlight("<p class=\"x\">hi</p>\n", "html").unwrap();
+        assert!(html.iter().flatten().any(|s| s.style.foreground_color.is_some()), "html has coloured spans");
+    }
+
     #[test]
     fn diff_lines_use_diff_colours() {
         let t = theme::get();
@@ -390,7 +445,6 @@ mod tests {
         assert!(t.color(Role::Ok).is_some());
     }
 
-    #[cfg(all(feature = "lang-markdown", feature = "lang-rust"))]
     #[test]
     fn markdown_heading_and_injected_rust() {
         let t = theme::get();

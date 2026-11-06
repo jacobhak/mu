@@ -870,7 +870,6 @@ mod tests {
     use mu_testutil::key;
 
     #[test]
-    #[cfg(feature = "lang-rust")]
     fn code_previews_are_syntax_highlighted() {
         let s = described(&[("a", "")]).previews(vec![Some("fn main() {\n    run();\n}".into())]);
         let (lines, _) = s.render(40, 30);

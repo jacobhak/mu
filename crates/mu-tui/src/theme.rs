@@ -51,15 +51,11 @@ pub enum Role {
     ErrSoft,
     Literal,
     Tool,
-    #[cfg_attr(not(feature = "highlight"), allow(dead_code))]
     SynKeyword,
     SynFunction,
-    #[cfg_attr(not(feature = "highlight"), allow(dead_code))]
     SynString,
-    #[cfg_attr(not(feature = "highlight"), allow(dead_code))]
     SynNumber,
     SynType,
-    #[cfg_attr(not(feature = "highlight"), allow(dead_code))]
     SynComment,
     SynPunct,
 }

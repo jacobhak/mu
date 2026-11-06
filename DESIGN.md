@@ -74,7 +74,7 @@ The core is a workspace of crates. Each depends only on the ones above it in thi
 | `mu-session` | session files, tail reader, the notify inbox and sender, run control (stop, terminate, live-run check) | mu-base |
 | `mu-tools` | built-in tools (`tools/`, with the shell), background jobs, the plugin host, the MCP data layer, context discovery | mu-base, mu-provider, mu-session |
 | `mu-agent` | the agent loop, compaction, the system prompt, plans, review core, `AgentHandle` and `build_agent` | mu-base, mu-provider, mu-session, mu-tools |
-| `mu-tui` | the terminal UI, themes, the tree-sitter `lang-*` features | mu-base, mu-provider, mu-session, mu-tools |
+| `mu-tui` | the terminal UI, themes, tree-sitter syntax highlighting | mu-base, mu-provider, mu-session, mu-tools |
 | `mu` (root) | `main.rs`, `cli/`, `run/` (modes, setup, signals, headless, ACP), `workflow/` (deliver, plan and review commands, notify, take), `update.rs` | everything |
 
 The tools-to-provider edge exists because the plugin host serves `core/complete` through the provider client. Nothing depends on `mu-tui` or `mu`. Test-only hooks sit behind a `test-support` feature of the crate that owns them, enabled from `[dev-dependencies]` so release builds never contain them.

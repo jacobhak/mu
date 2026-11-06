@@ -336,7 +336,6 @@ mod tests {
         assert_eq!(line_text(ls.last().unwrap()), "… 11 more lines");
     }
 
-    #[cfg(feature = "lang-python")]
     #[test]
     fn code_is_highlighted_by_extension() {
         let t = theme::get();

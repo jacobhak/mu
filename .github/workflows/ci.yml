@@ -24,9 +24,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      # Default features hide code that only builds or tests with a feature on (e.g. syntax highlighting).
-      - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-      - run: cargo test --workspace --no-default-features --locked
       - run: df -h / && du -sh target
         if: always()
       - run: scripts/build-mcp-http.sh test

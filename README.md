@@ -70,12 +70,7 @@ Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web`, `mu-
 
 ### Syntax highlighting
 
-Fenced code is highlighted with tree-sitter, one Cargo feature per language: `lang-rust`, `lang-json`, `lang-bash`, `lang-toml`, `lang-yaml`, `lang-python`, `lang-javascript`, `lang-typescript`, `lang-diff`, `lang-markdown` (all on by default; `all-langs` is the same set). Markdown fences inject the other grammars. Pick a subset:
-
-```sh
-cargo build --release --no-default-features --features lang-rust,lang-bash   # only these
-cargo build --release --no-default-features                                   # no highlighting
-```
+Fenced code is highlighted with tree-sitter for Rust, JSON, Bash, TOML, YAML, Python, JavaScript, TypeScript (and TSX), C, C++, CSS, Go, HTML, Java, regex, diff and Markdown, the grammars omp's `pi-ast` links into the binary anyway. Markdown fences inject the other grammars.
 
 Grammars load on first use of that language (about 1-2 MB resident each); idle memory is unaffected.
 

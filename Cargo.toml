@@ -46,6 +46,13 @@ tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-diff = "0.1"
 tree-sitter-md = "0.5"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-css = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-html = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-regex = "0.25"
 base64 = "0.22"
 terminput = "0.5"
 terminput-crossterm = { version = "0.4", default-features = false, features = ["crossterm_0_28"] }
@@ -69,21 +76,6 @@ sha2 = "0.11.1"
 ring = "0.17"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary", "NSString"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSBitmapImageRep", "NSImageRep"] }
-
-[features]
-default = ["lang-rust", "lang-json", "lang-bash", "lang-toml", "lang-yaml", "lang-python", "lang-javascript", "lang-typescript", "lang-diff", "lang-markdown"]
-all-langs = ["mu-tui/all-langs"]
-highlight = ["mu-tui/highlight"]
-lang-rust = ["mu-tui/lang-rust"]
-lang-json = ["mu-tui/lang-json"]
-lang-bash = ["mu-tui/lang-bash"]
-lang-toml = ["mu-tui/lang-toml"]
-lang-yaml = ["mu-tui/lang-yaml"]
-lang-python = ["mu-tui/lang-python"]
-lang-javascript = ["mu-tui/lang-javascript"]
-lang-typescript = ["mu-tui/lang-typescript"]
-lang-diff = ["mu-tui/lang-diff"]
-lang-markdown = ["mu-tui/lang-markdown"]
 
 [dependencies]
 mu-common.workspace = true
@@ -115,6 +107,9 @@ brush-core   = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 brush-parser = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 grep-searcher = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
+
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 strip = true
