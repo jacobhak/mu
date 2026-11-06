@@ -145,6 +145,48 @@ pub struct MuConfig {
     pub retry: MuRetry,
     pub mcp: MuMcp,
     pub secrets: MuSecrets,
+    pub status: MuStatus,
+}
+
+/// `[status]`: when the footer's context share turns warning or error colour. A level is reached at
+/// its percent of the window or its token count, whichever is lower.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MuStatus {
+    pub warn_percent: f64,
+    pub warn_tokens: u64,
+    pub err_percent: f64,
+    pub err_tokens: u64,
+}
+
+impl Default for MuStatus {
+    fn default() -> Self {
+        Self { warn_percent: 50.0, warn_tokens: 270_000, err_percent: 70.0, err_tokens: 500_000 }
+    }
+}
+
+/// Puts back the default for a `[status]` value that is not a percentage above 0 and up to 100, or
+/// a token count of at least 1.
+fn check_status(s: &mut MuStatus, warn: &mut Vec<String>) {
+    let d = MuStatus::default();
+    for (key, v, default) in
+        [("warn_percent", &mut s.warn_percent, d.warn_percent), ("err_percent", &mut s.err_percent, d.err_percent)]
+    {
+        if !(v.is_finite() && *v > 0.0 && *v <= 100.0) {
+            warn.push(format!(
+                "config.toml: [status] {key} {v} is not a percentage above 0 and up to 100; using {default}"
+            ));
+            *v = default;
+        }
+    }
+    for (key, v, default) in
+        [("warn_tokens", &mut s.warn_tokens, d.warn_tokens), ("err_tokens", &mut s.err_tokens, d.err_tokens)]
+    {
+        if *v == 0 {
+            warn.push(format!("config.toml: [status] {key} must be at least 1; using {default}"));
+            *v = default;
+        }
+    }
 }
 
 /// `[ask]`: `nudge = false` turns off the reminder to use `ask` when a turn ends with a decision question in prose.
@@ -450,6 +492,8 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
     check_predict(&predict, warn);
     let retry: MuRetry = parse(section("retry"), "retry", warn);
     check_retry(&retry, warn);
+    let mut status: MuStatus = parse(section("status"), "status", warn);
+    check_status(&mut status, warn);
     MuConfig {
         predict,
         ask: parse(section("ask"), "ask", warn),
@@ -459,6 +503,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         retry,
         mcp: parse(section("mcp"), "mcp", warn),
         secrets: parse(section("secrets"), "secrets", warn),
+        status,
     }
 }
 
@@ -717,6 +762,17 @@ mod tests {
         assert_eq!(a.limit(10.0), Duration::MAX);
         assert_eq!(a.limit(60.0), Duration::from_secs(3 * 3600));
         assert_eq!(RetryPolicy::default().limit(0.0), DEFAULT_MAX_WAIT);
+    }
+
+    #[test]
+    fn status_thresholds_default_and_reject_bad_values() {
+        let d = toml::from_str::<MuConfig>("").unwrap().status;
+        assert_eq!((d.warn_tokens, d.err_tokens, d.warn_percent, d.err_percent), (270_000, 500_000, 50.0, 70.0));
+        let mut s = toml::from_str::<MuStatus>("warn_tokens = 100000\nerr_percent = 150\nerr_tokens = 0").unwrap();
+        let mut w = Vec::new();
+        check_status(&mut s, &mut w);
+        assert_eq!(s, MuStatus { warn_tokens: 100_000, ..MuStatus::default() });
+        assert_eq!(w.len(), 2, "{w:?}");
     }
 
     #[test]

@@ -27,6 +27,12 @@ max_wait = "2m"       # Retry-After up to this: "90s", "30m", "2h", "1d". Longer
 # max_wait = "3h"
 # context_below = 60
 
+[status]              # when the footer's context share turns yellow (warn) or red (err); a level is reached at its percent of the window or its token count, whichever is lower
+warn_percent = 50
+warn_tokens = 270000
+err_percent = 70
+err_tokens = 500000
+
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 

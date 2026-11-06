@@ -3,7 +3,7 @@
 use crate::text::line::{Line, line_width, span, truncate};
 use crate::theme::{self, Role};
 use crossterm::style::ContentStyle;
-use mu_base::config::OmpStatusLine;
+use mu_base::config::{MuStatus, OmpStatusLine};
 use mu_base::events::{GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,6 +34,8 @@ pub struct StatusEnv<'a> {
     pub jobs: JobCounts,
     /// What this session's subagents (descendants included) have spent, for the `cost` segment.
     pub subagent_cost: f64,
+    /// When the context share turns warning and error colour.
+    pub levels: MuStatus,
 }
 
 /// How many background jobs are running, done and failed.
@@ -69,6 +71,7 @@ impl<'a> StatusEnv<'a> {
             turn_elapsed: None,
             jobs: JobCounts::default(),
             subagent_cost: 0.0,
+            levels: MuStatus::default(),
         }
     }
 }
@@ -296,8 +299,8 @@ fn seg_git(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
     git_line(s.git.as_ref()?, env)
 }
 
-fn seg_context_pct(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
-    Some(context_line(s))
+fn seg_context_pct(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+    Some(context_line(s, &env.levels))
 }
 
 fn seg_context_total(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
@@ -372,12 +375,12 @@ fn timer(d: Duration) -> String {
     }
 }
 
-/// `1.5% of 1M`: context share over the window, coloured by omp's thresholds.
-fn context_line(s: &StatusSnapshot) -> Line {
+/// `1.5% of 1M`: context share over the window, coloured by the `[status]` thresholds.
+fn context_line(s: &StatusSnapshot, levels: &MuStatus) -> Line {
     let window = s.context_window as u64;
     let pct = s.context_tokens.filter(|_| window > 0).map(|t| t as f64 / window as f64 * 100.0);
     let t = theme::get();
-    let level = context_color(pct, window);
+    let level = context_color(pct, window, levels);
     match pct {
         Some(p) => vec![
             span(format!("{p:.1}%"), t.fg(if level == Role::Muted { Role::Accent } else { level })),
@@ -387,16 +390,17 @@ fn context_line(s: &StatusSnapshot) -> Line {
     }
 }
 
-/// omp's `getContextUsageLevel`: a level is reached at its percent or its token count, whichever is lower.
-fn context_color(pct: Option<f64>, window: u64) -> Role {
+/// Modelled on omp's `getContextUsageLevel`: a level is reached at its percent or its token count,
+/// whichever is lower.
+fn context_color(pct: Option<f64>, window: u64, levels: &MuStatus) -> Role {
     let Some(p) = pct.filter(|p| *p > 0.0) else { return Role::Muted };
-    let reaches = |percent: f64, tokens: f64| {
-        let token_pct = if window > 0 { tokens / window as f64 * 100.0 } else { f64::INFINITY };
+    let reaches = |percent: f64, tokens: u64| {
+        let token_pct = if window > 0 { tokens as f64 / window as f64 * 100.0 } else { f64::INFINITY };
         p >= percent.min(token_pct)
     };
-    if reaches(70.0, 270_000.0) {
+    if reaches(levels.err_percent, levels.err_tokens) {
         Role::Err
-    } else if reaches(50.0, 150_000.0) {
+    } else if reaches(levels.warn_percent, levels.warn_tokens) {
         Role::Warn
     } else {
         Role::Muted
@@ -594,6 +598,7 @@ mod tests {
             turn_elapsed: None,
             jobs: JobCounts::default(),
             subagent_cost: 0.0,
+            levels: MuStatus::default(),
         }
     }
 
@@ -747,10 +752,18 @@ mod tests {
         assert_eq!(format_number(200_000), "200K");
         assert_eq!(format_number(1_500), "1.5K");
         assert_eq!(format_number(1_500_000_000), "1.5B");
-        assert_eq!(context_color(Some(1.5), 1_000_000), Role::Muted);
-        assert_eq!(context_color(Some(20.0), 1_000_000), Role::Warn);
-        assert_eq!(context_color(None, 1_000_000), Role::Muted);
-        assert_eq!(context_color(Some(30.0), 1_000_000), Role::Err);
+        let d = MuStatus::default();
+        assert_eq!(context_color(Some(1.5), 1_000_000, &d), Role::Muted);
+        assert_eq!(context_color(Some(20.0), 1_000_000, &d), Role::Muted);
+        assert_eq!(context_color(Some(30.0), 1_000_000, &d), Role::Warn);
+        assert_eq!(context_color(Some(55.0), 1_000_000, &d), Role::Err);
+        assert_eq!(context_color(None, 1_000_000, &d), Role::Muted);
+        // On a small window the percent is reached before the token count.
+        assert_eq!(context_color(Some(55.0), 200_000, &d), Role::Warn);
+        assert_eq!(context_color(Some(75.0), 200_000, &d), Role::Err);
+        let custom = MuStatus { warn_tokens: 100_000, err_tokens: 200_000, ..d };
+        assert_eq!(context_color(Some(12.0), 1_000_000, &custom), Role::Warn);
+        assert_eq!(context_color(Some(25.0), 1_000_000, &custom), Role::Err);
         assert_eq!(reset_text("5h", Duration::from_secs(90 * 60)), "1h 30m");
         assert_eq!(reset_text("7d", Duration::from_secs(30 * 3600)), "1d 6h");
         assert_eq!(reset_text("7d", Duration::from_secs(4 * 86400)), "4d");
