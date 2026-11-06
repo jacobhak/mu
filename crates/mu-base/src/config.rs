@@ -146,6 +146,32 @@ pub struct MuConfig {
     pub mcp: MuMcp,
     pub secrets: MuSecrets,
     pub status: MuStatus,
+    pub bash: MuBash,
+}
+
+/// `[bash]`: while a background job runs, a model's command that starts with a sleep of at least
+/// `wait_sleep_secs` is not run and the turn ends (0 = only commands that do nothing but wait).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MuBash {
+    pub wait_sleep_secs: f64,
+}
+
+impl Default for MuBash {
+    fn default() -> Self {
+        Self { wait_sleep_secs: 10.0 }
+    }
+}
+
+fn check_bash(b: &mut MuBash, warn: &mut Vec<String>) {
+    let default = MuBash::default().wait_sleep_secs;
+    if !(b.wait_sleep_secs.is_finite() && b.wait_sleep_secs >= 0.0) {
+        warn.push(format!(
+            "config.toml: [bash] wait_sleep_secs {} is not 0 or more; using {default}",
+            b.wait_sleep_secs
+        ));
+        b.wait_sleep_secs = default;
+    }
 }
 
 /// `[status]`: when the footer's context share turns warning or error colour. A level is reached at
@@ -506,6 +532,8 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
     check_retry(&retry, warn);
     let mut status: MuStatus = parse(section("status"), "status", warn);
     check_status(&mut status, warn);
+    let mut bash: MuBash = parse(section("bash"), "bash", warn);
+    check_bash(&mut bash, warn);
     MuConfig {
         predict,
         ask: parse(section("ask"), "ask", warn),
@@ -516,6 +544,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         mcp: parse(section("mcp"), "mcp", warn),
         secrets: parse(section("secrets"), "secrets", warn),
         status,
+        bash,
     }
 }
 
@@ -817,6 +846,18 @@ mod tests {
         check_status(&mut s, &mut w);
         assert_eq!(s, MuStatus { warn_tokens: 100_000, ..MuStatus::default() });
         assert_eq!(w.len(), 2, "{w:?}");
+    }
+
+    #[test]
+    fn bash_wait_sleep_defaults_and_rejects_negatives() {
+        assert_eq!(toml::from_str::<MuConfig>("").unwrap().bash, MuBash::default());
+        let mut b = toml::from_str::<MuBash>("wait_sleep_secs = 0").unwrap();
+        let mut w = Vec::new();
+        check_bash(&mut b, &mut w);
+        assert_eq!((b.wait_sleep_secs, w.len()), (0.0, 0));
+        let mut b = toml::from_str::<MuBash>("wait_sleep_secs = -3").unwrap();
+        check_bash(&mut b, &mut w);
+        assert_eq!((b, w.len()), (MuBash::default(), 1));
     }
 
     #[test]

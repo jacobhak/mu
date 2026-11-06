@@ -268,7 +268,7 @@ impl Agent {
                     None => continue,
                 }
             }
-            let yielded = self.run_calls(calls, cancel).await;
+            let ran = self.run_calls(calls, cancel).await;
             if cancel.is_cancelled() {
                 return Flow::Aborted;
             }
@@ -276,12 +276,15 @@ impl Agent {
                 return Flow::Stopped;
             }
             // A successful yield is the subagent's result; another request would only produce an unused reply.
-            if yielded || self.plan.exec_plan.is_some() {
+            if ran.yielded || self.plan.exec_plan.is_some() {
                 return Flow::Done;
             }
-            self.take_steer();
-            self.take_jobs();
-            self.take_notify();
+            let steered = self.take_steer();
+            let delivered = self.take_jobs() | self.take_notify();
+            // A refused wait ends the turn: the job's result starts the next one.
+            if ran.waited && !steered && !delivered {
+                return Flow::Done;
+            }
         }
     }
 
@@ -401,10 +404,10 @@ impl Agent {
     }
 
     /// Runs a reply's tool calls in order. Once the run is cancelled, stopped, steered or a `yield`
-    /// succeeded, the rest are skipped with a result. Returns whether a `yield` succeeded.
-    async fn run_calls(&mut self, calls: Vec<(String, String, Value)>, cancel: &CancellationToken) -> bool {
+    /// succeeded, the rest are skipped with a result. A call that waits for a background job is not run.
+    async fn run_calls(&mut self, calls: Vec<(String, String, Value)>, cancel: &CancellationToken) -> Ran {
         let mut skip: Option<&str> = None;
-        let mut yielded = false;
+        let (mut yielded, mut waited) = (false, false);
         for (id, name, args) in calls {
             if skip.is_none() {
                 if cancel.is_cancelled() {
@@ -417,9 +420,14 @@ impl Agent {
                 self.emit_skipped(&id, &name, &args, reason);
                 continue;
             }
-            let out = self.run_tool(&id, &name, args, cancel).await;
-            self.push_result(&id, &name, &out);
-            yielded |= name == "yield" && !out.is_error;
+            if let Some(reason) = self.wait_refusal(&name, &args) {
+                waited = true;
+                self.emit_skipped(&id, &name, &args, &reason);
+            } else {
+                let out = self.run_tool(&id, &name, args, cancel).await;
+                self.push_result(&id, &name, &out);
+                yielded |= name == "yield" && !out.is_error;
+            }
             if cancel.is_cancelled() {
                 skip = Some(SKIP_ABORTED);
             } else if self.ports.inbox.borrow().stop {
@@ -430,6 +438,13 @@ impl Agent {
                 skip = Some(SKIP_STEER);
             }
         }
-        yielded
+        Ran { yielded, waited }
     }
+}
+
+struct Ran {
+    /// A `yield` succeeded.
+    yielded: bool,
+    /// A call was refused for waiting on a background job.
+    waited: bool,
 }

@@ -439,6 +439,57 @@ fn the_todo_reminder_waits_for_a_running_background_job() {
     });
 }
 
+#[test]
+fn a_wait_while_a_job_runs_is_refused_and_ends_the_turn() {
+    use mu_tools::tools::subagent::BackgroundResult;
+    run(async {
+        let bash = |id: &str, cmd: &str| Block::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: json!({"command": cmd}),
+        };
+        let script = vec![
+            Ok(assistant(vec![bash("w1", "sleep 60; echo"), bash("t2", "basename /x/ran")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = notify_agent(script);
+        let jobs = a.tools.jobs.clone().unwrap();
+        jobs.spawn_bash("cargo build".into(), std::env::temp_dir(), |cancel, _| async move {
+            cancel.cancelled().await;
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into() }
+        });
+        a.turn(Some("go".to_string().into())).await;
+        jobs.kill(None);
+        let r = results(&a);
+        assert!(r[0].0 && r[0].1.contains("Not run: this command waits, and background job bg_"), "{:?}", r[0]);
+        assert!(!r[1].0 && r[1].1.contains("text: \"ran"), "the rest of the batch still runs: {:?}", r[1]);
+        assert_eq!(a.ports.providers.scripted.borrow().len(), 1, "no request after the refusal");
+        assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::ToolSkipped { id } if id == "w1")));
+    });
+}
+
+#[test]
+fn a_wait_with_no_job_running_runs() {
+    run(async {
+        let script = vec![
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: "w1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "echo waiting"}),
+                }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, _rx) = notify_agent(script);
+        a.turn(Some("go".to_string().into())).await;
+        let r = results(&a);
+        assert!(!r[0].0 && r[0].1.contains("text: \"waiting"), "{:?}", r[0]);
+        assert!(a.ports.providers.scripted.borrow().is_empty());
+    });
+}
+
 /// A turn that ends with a prose question, with `tweak` applied first. Returns the message count
 /// and how many scripted replies were left unused.
 async fn question_turn(run: RunConfig) -> (usize, usize) {

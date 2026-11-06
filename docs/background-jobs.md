@@ -6,6 +6,16 @@
 
 A turn that began this way rings the terminal; see [Detached runs](detached-runs.md#terminal-bell).
 
+## Waiting for a job
+
+The model waits for a job by ending its turn. While a job runs, mu does not run a model's `bash` command (foreground or `async`) that only waits; it marks the call as not run and ends the turn, and the job's result starts the next one. These commands count as waits:
+
+- one made only of `sleep`, `echo` or `printf` with fixed text, `true`, `:`, `wait` and `cd`, such as `sleep 60; echo` or `echo waiting`;
+- one that starts, after any `cd`, with a `sleep` of at least `[bash] wait_sleep_secs` seconds (default 10; see [Config](config.md)), such as `sleep 120; ls out/`;
+- a `while`, `until` or `for` loop that sleeps.
+
+Commands you run yourself with `!` are never refused, and with no job running every command runs.
+
 ## Cancelling a job
 
 You do not need the jobs panel to stop a job. While jobs run, their rows sit above the prompt:

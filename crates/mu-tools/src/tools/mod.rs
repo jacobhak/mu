@@ -18,6 +18,8 @@ pub mod web_gate;
 mod write;
 mod yield_;
 
+pub use shell::wait;
+
 use crate::jobs::JobsHandle;
 use crate::plugin::host::PluginHost;
 use mu_base::events::EventTx;
@@ -276,7 +278,7 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| {
             tool_def(
                 "bash",
-                "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits). The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. Any command that may take longer than ~5 seconds (builds, tests, installs, servers, watches, downloads) MUST use `async: true`, not the foreground: it runs as a tracked background job and its result arrives automatically as a system notice. Keep working or end your turn; never poll, sleep or loop for it. Without `async`, `cmd &` keeps running after the call and shows in `jobs` (stop with `kill %N`); nothing reports its exit, so prefer `async`. `(cmd &)` ends with the command. An async job starts from the shell's cwd and exported environment as of launch; its own changes do not flow back, and functions and aliases are not carried over. In pty mode, anything left running ends with the command. Stays available in plan mode (as in omp), where you must not change anything with it. NEVER print secret values: check that a variable is set with `[ -n \"$NAME\" ] && echo set` (or `${#NAME}` for its length), and keep tokens out of verbose output (`curl -v`, `set -x`, `git remote -v`). Pass secrets by variable name (`\"$NAME\"`), never by value, and never write them into files, commits or messages.",
+                "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits). The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. Any command that may take longer than ~5 seconds (builds, tests, installs, servers, watches, downloads) MUST use `async: true`, not the foreground: it runs as a tracked background job and its result arrives as a system notice that starts your next turn. Do other work meanwhile, or end your turn: that is how you wait. While a job runs, a command that sleeps or polls is not run and ends your turn. Without `async`, `cmd &` keeps running after the call and shows in `jobs` (stop with `kill %N`); nothing reports its exit, so prefer `async`. `(cmd &)` ends with the command. An async job starts from the shell's cwd and exported environment as of launch; its own changes do not flow back, and functions and aliases are not carried over. In pty mode, anything left running ends with the command. Stays available in plan mode (as in omp), where you must not change anything with it. NEVER print secret values: check that a variable is set with `[ -n \"$NAME\" ] && echo set` (or `${#NAME}` for its length), and keep tokens out of verbose output (`curl -v`, `set -x`, `git remote -v`). Pass secrets by variable name (`\"$NAME\"`), never by value, and never write them into files, commits or messages.",
                 json!({"type":"object","properties":{
                     "command":{"type":"string"},
                     "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},

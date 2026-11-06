@@ -34,6 +34,9 @@ warn_tokens = 270000
 err_percent = 70
 err_tokens = 500000
 
+[bash]
+wait_sleep_secs = 10  # while a background job runs, a model command that starts with a sleep this long or longer is not run and the turn ends (see background-jobs.md); 0 = only commands that do nothing but wait
+
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 

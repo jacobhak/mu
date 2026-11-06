@@ -59,6 +59,29 @@ impl Agent {
         self.push_result(id, name, &ToolOutput::err(reason));
     }
 
+    /// Why a `bash` call is not run: it waits (see `wait::waits`) while a background job runs. The
+    /// model waits for a job by ending its turn; the job's result starts the next one.
+    pub(super) fn wait_refusal(&self, name: &str, args: &Value) -> Option<String> {
+        if name != "bash" {
+            return None;
+        }
+        let running = self.tools.jobs.as_ref()?.running_ids();
+        let command = args["command"].as_str()?;
+        if running.is_empty()
+            || !mu_tools::tools::wait::waits(command, self.ports.providers.cfg.mu.bash.wait_sleep_secs)
+        {
+            return None;
+        }
+        let jobs = match running.as_slice() {
+            [one] => format!("background job {one} is"),
+            many => format!("background jobs {} are", many.join(", ")),
+        };
+        Some(format!(
+            "Not run: this command waits, and {jobs} still running. Your turn has ended; a job's result arrives as a \
+             system notice and starts your next turn. To wait for a job, end your turn with a short status and no tool call."
+        ))
+    }
+
     /// Replaces secrets in the text of a user message or tool result.
     pub(super) fn redact_message(&self, m: &mut Message) -> Vec<secrets::Hit> {
         let (Message::User { content, .. } | Message::ToolResult { content, .. }) = m else { return Vec::new() };

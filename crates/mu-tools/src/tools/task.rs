@@ -40,7 +40,7 @@ pub const DESCRIPTION: &str = concat!(
 );
 
 pub const ASYNC_DESCRIPTION: &str = concat!(
-    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message and wake an idle session: keep working or end your turn. Never poll, sleep or loop for them; stop one with `job_cancel`. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
+    "Spawn subagents in the background; job ids return immediately. Results arrive as a <system-notice> message that starts your next turn: do other work meanwhile, or end your turn, which is how you wait. Stop one with `job_cancel`. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
     guidance!()
 );
 
@@ -125,7 +125,7 @@ impl Tools {
                 started.push(format!("{id} ({agent})"));
             }
             return ToolOutput::ok(format!(
-                "Started {} background job(s): {}\nResults arrive automatically as a system notice. Keep working or end your turn; never poll, sleep or loop for them.",
+                "Started {} background job(s): {}\nTheir results arrive as a system notice that starts your next turn. Do other work that does not depend on them; if there is none, end your turn now with a short status and no tool call.",
                 started.len(),
                 started.join(", ")
             ));
