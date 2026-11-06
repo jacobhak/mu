@@ -108,6 +108,13 @@ impl Providers {
         Self::with_store(cfg, gateway, crate::auth::store::Store::at(mu_testutil::home().join("auth.json")))
     }
 
+    /// `for_tests` with a key store at `auth`, so a test that saves or removes keys cannot
+    /// disturb another's.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests_with_auth(cfg: Rc<Configs>, gateway: endpoint::GatewaySource, auth: std::path::PathBuf) -> Self {
+        Self::with_store(cfg, gateway, crate::auth::store::Store::at(auth))
+    }
+
     pub(super) fn with_store(
         cfg: Rc<Configs>,
         gateway: endpoint::GatewaySource,
@@ -198,7 +205,7 @@ impl Providers {
             return r;
         }
         if req.model.is_unselected() {
-            return Err(ProviderError::Fatal("no model chosen: pick one with /model".into()));
+            return Err(ProviderError::Fatal("no model chosen: pick one with /switch".into()));
         }
         if !req.model.native && !self.gw_fresh.get() {
             tokio::select! {
@@ -247,7 +254,7 @@ impl Providers {
         } else {
             self.cfg.mu.retry.policy(&req.model.provider).limit(retry::context_fill(req))
         };
-        let resp = check_status(resp, &route, rekeyed, limit, cancel).await?;
+        let resp = check_status(resp, &route, self.store.path(), rekeyed, limit, cancel).await?;
         pump_sse(resp, format.decoder(req), &route, cancel, ev).await
     }
 
@@ -299,6 +306,7 @@ async fn send(
 async fn check_status(
     resp: reqwest::Response,
     route: &Route,
+    store: &std::path::Path,
     rekeyed: &mut bool,
     wait_limit: Duration,
     cancel: &CancellationToken,
@@ -334,7 +342,7 @@ async fn check_status(
     if let Some(def) = route.def
         && status.as_u16() == 401
         && !*rekeyed
-        && crate::auth::store::forget_cached(def.id)
+        && crate::auth::store::forget_cached(store, def.id)
     {
         *rekeyed = true;
         return Err(ProviderError::Retryable {
@@ -594,6 +602,7 @@ mod native_route_tests {
     use crate::auth::store::{Entry, Store};
     use mu_base::config::{MuConfig, MuRetry, RetryRule};
     use mu_base::tool::ToolDef;
+    use mu_testutil::block_on as rt;
     use mu_testutil::{Reply, fake_server};
     use std::path::PathBuf;
 
@@ -606,13 +615,6 @@ mod native_route_tests {
 
     fn ok() -> Reply {
         Reply::new(200, SSE).header("content-type", "text/event-stream")
-    }
-
-    /// The `!command` key cache is per process and keyed by provider, so these tests take turns.
-    fn rt<F: std::future::Future>(f: F) -> F::Output {
-        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-        mu_testutil::block_on(f)
     }
 
     /// Providers over a private store whose `anthropic` entry points at `base`, with no gateway.

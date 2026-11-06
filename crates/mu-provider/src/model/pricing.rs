@@ -228,7 +228,17 @@ fn cost_in(t: &Table, model_id: &str, usage: &Usage) -> Option<Cost> {
     if let Some(c) = t.cost_with(model_id, usage) {
         return Some(c);
     }
+    if let Some(id) = openai_plan_model(model_id)
+        && let Some(c) = t.cost_with(&id, usage)
+    {
+        return Some(c);
+    }
     price(&snapshot_entry(model_id)?, usage)
+}
+
+fn openai_plan_model(model_id: &str) -> Option<String> {
+    let (provider, model) = model_id.split_once('/')?;
+    (provider == crate::auth::chatgpt::PROVIDER_ID).then(|| format!("openai/{model}"))
 }
 
 /// Whether the model is reasoning-capable; `None` when unknown.
@@ -238,7 +248,9 @@ pub fn reasoning(model_id: &str) -> Option<bool> {
 
 /// Whether a catalogue has an entry for the model, priced or not.
 pub fn known(model_id: &str) -> bool {
-    table().entries.contains_key(model_id) || snapshot_entry(model_id).is_some()
+    table().entries.contains_key(model_id)
+        || openai_plan_model(model_id).is_some_and(|id| table().entries.contains_key(&id))
+        || snapshot_entry(model_id).is_some()
 }
 
 /// Catalogue name without the `Claude ` prefix, else a name derived from the model id.
@@ -371,6 +383,16 @@ mod tests {
         .unwrap();
         let priced = |c: Option<Cost>| c.map(|c| c.total);
         assert_eq!(priced(cost_in(&t, "anthropic/claude-sonnet-5-5", &usage(1000, 1000, 0, 0))), priced(snap));
+    }
+
+    #[test]
+    fn chatgpt_plan_uses_openai_catalogue_prices() {
+        let t = Table::from_json(
+            r#"{"models":[{"provider":"openai","id":"new-model","pricingStatus":"fixed","cost":{"input":2,"output":4}}]}"#,
+        )
+        .unwrap();
+        let u = usage(1_000_000, 1_000_000, 0, 0);
+        assert_eq!(cost_in(&t, "openai-chatgpt/new-model", &u).unwrap().total, 6.0);
     }
 
     #[test]

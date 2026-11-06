@@ -143,6 +143,43 @@ pub fn write_role(text: &str, set: &str, role: &str, v: &str) -> Result<String, 
     Ok(doc.to_string())
 }
 
+/// Removes a role without creating a missing set or removing its table.
+pub fn remove_role(text: &str, set: &str, role: &str) -> Result<String, String> {
+    let mut doc = parse_doc(text)?;
+    let Some(sets) = doc.get_mut("sets") else { return Ok(text.to_string()) };
+    let sets = sets.as_table_like_mut().ok_or_else(|| not_a_table("sets"))?;
+    for (name, item) in sets.iter() {
+        if !item.is_table_like() {
+            return Err(not_a_table(&format!("sets.{name}")));
+        }
+    }
+    let Some(roles) = sets.get_mut(set) else { return Ok(text.to_string()) };
+    let roles = roles.as_table_like_mut().ok_or_else(|| not_a_table(&format!("sets.{set}")))?;
+    if roles.remove(role).is_none() {
+        return Ok(text.to_string());
+    }
+    Ok(doc.to_string())
+}
+
+/// Checks the on-disk sets before editing a specific target.
+pub fn validate_role_target(text: &str, set: &str) -> Result<(), String> {
+    let doc = parse_doc(text)?;
+    let Some(item) = doc.get("sets") else {
+        return if set == MAIN_SET { Ok(()) } else { Err(format!("no model set `{set}`")) };
+    };
+    let sets = item.as_table_like().ok_or_else(|| not_a_table("sets"))?;
+    for (name, item) in sets.iter() {
+        if !item.is_table_like() {
+            return Err(not_a_table(&format!("sets.{name}")));
+        }
+    }
+    if sets.contains_key(set) || (set == MAIN_SET && sets.is_empty()) {
+        Ok(())
+    } else {
+        Err(format!("no model set `{set}`"))
+    }
+}
+
 /// Sets the top-level `set = "<name>"`.
 pub fn write_active(text: &str, name: &str) -> Result<String, String> {
     let mut doc = parse_doc(text)?;
@@ -446,6 +483,36 @@ max_tokens = 65536
         let out = write_role(&out, "main", "smol", "e/f").unwrap();
         assert_eq!(parse(&out).0.role("smol").map(String::as_str), Some("e/f"));
         assert_eq!(out.matches("smol").count(), 1);
+    }
+
+    #[test]
+    fn remove_role_preserves_other_text_and_empty_sets() {
+        let text = "# top\n[sets.main]\nsmol = \"a/b\"\n# keep\ndefault = \"c/d\"\n\n[sets.other]\nx = \"e/f\"\n";
+        let out = remove_role(text, "main", "smol").unwrap();
+        assert_eq!(out, text.replace("smol = \"a/b\"\n", ""));
+        assert_eq!(remove_role(text, "main", "missing").unwrap(), text);
+        assert_eq!(remove_role(text, "missing", "smol").unwrap(), text);
+        assert_eq!(remove_role("# only\n", "main", "smol").unwrap(), "# only\n");
+        assert_eq!(remove_role("[sets.main]\nsmol = \"a/b\"\n", "main", "smol").unwrap(), "[sets.main]\n");
+        assert_eq!(
+            remove_role("sets = { main = { smol = \"a/b\", default = \"c/d\" } }\n", "main", "smol").unwrap(),
+            "sets = { main = { default = \"c/d\" } }\n"
+        );
+        assert!(remove_role("x = [", "main", "smol").is_err());
+        assert!(remove_role("sets = 3\n", "main", "smol").is_err());
+        assert!(remove_role("[sets]\nmain = 3\n", "main", "smol").is_err());
+    }
+
+    #[test]
+    fn role_targets_are_checked_against_valid_disk_structure() {
+        assert!(validate_role_target("", "main").is_ok());
+        assert!(validate_role_target("[sets]\n", "main").is_ok());
+        assert!(validate_role_target("", "other").is_err());
+        assert!(validate_role_target("[sets.other]\n", "main").is_err());
+        assert!(validate_role_target("[sets.other]\n", "other").is_ok());
+        assert!(validate_role_target("sets = 3\n", "main").unwrap_err().contains("not a table"));
+        assert!(validate_role_target("[sets]\nother = 3\n", "main").unwrap_err().contains("not a table"));
+        assert!(validate_role_target("not valid [", "other").unwrap_err().contains("fix it by hand"));
     }
 
     #[test]

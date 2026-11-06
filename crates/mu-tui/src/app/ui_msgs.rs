@@ -22,7 +22,10 @@ pub(super) enum UiMsg {
     Sessions(Vec<mu_session::session::list::SessionInfo>),
     /// The result of a clipboard copy: the notice to show, or the error.
     Copied(Result<String, String>),
-    Models(Result<Vec<GatewayModel>, String>),
+    Models {
+        request: u64,
+        result: Result<Vec<GatewayModel>, String>,
+    },
     LoginProviders(Result<Vec<(usize, String)>, String>),
     /// An MCP login finished: tool count and whether the tool set changed.
     McpLoggedIn(String, Result<(usize, bool), String>),
@@ -99,21 +102,31 @@ impl App {
                 Ok(n) => self.notice(&n),
                 Err(e) => self.error(&format!("copy failed: {e}")),
             },
-            UiMsg::Models(r) => {
-                let target = self.flows.assign_role.take();
-                let gw = match r {
-                    Ok(g) => g,
-                    Err(e) => {
-                        // Native models are listed either way; only a session without any says why.
-                        if self.services.providers.direct_models().is_empty() {
-                            self.error(&format!("could not fetch gateway models: {e}"));
-                        } else {
-                            self.notice(&format!("gateway models unavailable: {e}"));
-                        }
-                        vec![]
-                    }
+            UiMsg::Models { request, result } => {
+                let session =
+                    matches!(&self.overlay, Some(Overlay::Model { request: active, .. }) if *active == request);
+                let role_editor = matches!(&self.overlay, Some(Overlay::ModelRoles { .. }));
+                if !session && !role_editor {
+                    return;
+                }
+                let failed = result.as_ref().err().cloned();
+                let gateway = result.unwrap_or_default();
+                let (items, ids) = self.concrete_model_rows(&gateway);
+                let accepted = if session {
+                    self.open_session_model_picker(request, &gateway);
+                    true
+                } else if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
+                    st.models_loaded(request, items, ids)
+                } else {
+                    false
                 };
-                self.open_model_picker(gw, target);
+                if accepted && let Some(e) = failed {
+                    if self.services.providers.direct_models().is_empty() {
+                        self.error(&format!("could not fetch gateway models: {e}"));
+                    } else {
+                        self.notice(&format!("gateway models unavailable: {e}"));
+                    }
+                }
             }
             UiMsg::McpLoggedIn(name, r) => match r {
                 Ok((n, changed)) => {

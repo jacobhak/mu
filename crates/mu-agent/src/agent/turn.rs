@@ -29,7 +29,7 @@ impl Agent {
 
     pub(super) async fn turn_from(&mut self, start: Start) {
         if self.model.model.is_unselected() {
-            self.error("no model chosen: sign in with /login if you have not, then pick one with /model");
+            self.error("no model chosen: sign in with /login if you have not, then pick one with /switch");
             self.emit(AgentEvent::TurnEnd { aborted: true });
             return;
         }

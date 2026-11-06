@@ -3,6 +3,7 @@
 use super::child::ChildThen;
 use super::*;
 use crate::panels::jobs_panel::JobsPanel;
+use crate::panels::model_roles::RoleEditor;
 use crate::panels::plan_review::Tier;
 use crate::panels::reply::ReplyPicker;
 use crate::text::markdown;
@@ -10,8 +11,8 @@ use crate::widgets::overlay::{LoginTarget, OverlayEvent};
 use crate::widgets::select::{Item, Select};
 use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
-use mu_base::models::{GatewayModel, split_level};
-use mu_base::roles::{self, RoleView};
+use mu_base::model_config::MAIN_SET;
+use mu_base::models::GatewayModel;
 use mu_provider::provider::providers::KeyTarget;
 use tokio::sync::oneshot;
 
@@ -36,47 +37,52 @@ impl App {
     }
 
     pub(super) fn request_models(&mut self) {
+        self.flows.model_request_seq += 1;
+        let request = self.flows.model_request_seq;
         self.notice("fetching models…");
+        self.overlay = Some(Overlay::Model {
+            sel: Select::new("Switch model (this session)", vec![]).context("Loading models…").back_keys(true),
+            ids: Vec::new(),
+            request,
+        });
+        self.fetch_models(request);
+    }
+
+    fn request_role_models(&mut self) {
+        self.flows.model_request_seq += 1;
+        let request = self.flows.model_request_seq;
+        if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
+            st.begin_models(request);
+        } else {
+            return;
+        }
+        self.notice("fetching models…");
+        self.fetch_models(request);
+    }
+
+    fn fetch_models(&self, request: u64) {
         let providers = self.services.providers.clone();
         let tx = self.ui_tx.clone();
         tokio::task::spawn_local(async move {
-            let r = providers.gateway_models().await.map_err(|e| e.to_string());
-            let _ = tx.send(UiMsg::Models(r));
+            let result = providers.gateway_models().await.map_err(|e| e.to_string());
+            let _ = tx.send(UiMsg::Models { request, result });
         });
     }
 
-    /// The model roles as they are shown: what each is for, and what it is set to.
-    fn role_views(&self) -> Vec<RoleView> {
-        let agents: Vec<(&str, &[String])> =
-            self.ctx.agents.iter().map(|a| (a.name.as_str(), a.model.as_slice())).collect();
-        roles::views(&self.services.providers.cfg, &agents)
-    }
-
-    /// `target` is a role without a model that the picked model is for.
-    pub(super) fn open_model_picker(&mut self, gateway: Vec<GatewayModel>, target: Option<String>) {
-        let providers = self.services.providers.clone();
+    pub(super) fn concrete_model_rows(&self, gateway: &[GatewayModel]) -> (Vec<Item>, Vec<String>) {
+        let providers = &self.services.providers;
         let mut items = Vec::new();
         let mut ids = Vec::new();
-        let mut details = Vec::new();
-        if target.is_none() {
-            for r in self.role_views() {
-                // `/switch` only changes this session, so it lists the roles that have a model.
-                if r.value.is_none() && !self.flows.pick_assign {
-                    continue;
-                }
-                items.push(Item { label: format!("@{}", r.name), detail: r.row() });
-                ids.push(format!("@{}", r.name));
-                let enter = if r.value.is_some() { "\nEnter switches this session to it." } else { "" };
-                details.push(Some(format!("{}{enter}", r.detail())));
+        for m in providers.direct_models() {
+            if !ids.contains(&m.id) {
+                items.push(Item { label: m.id.clone(), detail: chatgpt::native_label(&m.provider).into() });
+                ids.push(m.id);
             }
         }
-        for m in providers.direct_models() {
-            items.push(Item { label: m.id.clone(), detail: chatgpt::native_label(&m.provider).into() });
-            ids.push(m.id);
-        }
-        let known = ids.clone();
-        for g in gateway.iter().filter(|g| !known.contains(&g.id)) {
-            // A gateway id of a native provider with a key is routed natively: it shows the key marker.
+        for g in gateway {
+            if ids.contains(&g.id) {
+                continue;
+            }
             let native = g.id.split_once('/').filter(|(p, _)| providers.is_direct(p));
             let detail = match native {
                 Some((p, _)) => chatgpt::native_label(p).into(),
@@ -91,30 +97,45 @@ impl App {
                 ids.push(id);
             }
         }
-        details.resize(items.len(), None);
-        let title = match (&target, self.flows.pick_assign) {
-            (Some(role), _) => format!("Choose a model for @{role}"),
-            (None, true) => "Select model (then choose where it applies)".to_string(),
-            (None, false) => "Switch model (this session)".to_string(),
-        };
-        let assign = self.flows.pick_assign || target.is_some();
-        self.overlay = Some(Overlay::Model { sel: Select::new(&title, items).details(details), ids, assign, target });
+        (items, ids)
     }
 
-    pub(super) fn open_role_picker(&mut self, model: String) {
-        let mut items = vec![Item { label: "This session only".into(), detail: model.clone() }];
-        let mut roles = vec![None];
-        for r in self.role_views() {
-            let now = r.value.as_ref().map_or("unset".to_string(), |v| format!("now {v}"));
-            let label = if r.name == "default" {
-                "Set as @default (and switch now)".into()
-            } else {
-                format!("Set as @{}", r.name)
-            };
-            items.push(Item { label, detail: format!("{} · {now}", r.purpose) });
-            roles.push(Some(r.name));
+    pub(super) fn open_session_model_picker(&mut self, request: u64, gateway: &[GatewayModel]) {
+        let mut items = Vec::new();
+        let mut ids = Vec::new();
+        let mut details = Vec::new();
+        for role in super::slash::role_views(&self.services.providers.cfg, &self.ctx) {
+            if role.value.is_none() {
+                continue;
+            }
+            items.push(Item { label: format!("@{}", role.name), detail: role.row() });
+            ids.push(format!("@{}", role.name));
+            details.push(Some(format!("{}\nEnter switches this session to it.", role.detail())));
         }
-        self.overlay = Some(Overlay::Role { sel: Select::new(&format!("Use {model}"), items), model, roles });
+        let (concrete, concrete_ids) = self.concrete_model_rows(gateway);
+        items.extend(concrete);
+        ids.extend(concrete_ids);
+        details.resize(items.len(), None);
+        let context = if items.is_empty() {
+            "No models available; use /login to configure a provider"
+        } else {
+            "Session-only model switch"
+        };
+        self.overlay = Some(Overlay::Model {
+            sel: Select::new("Switch model (this session)", items).context(context).details(details).back_keys(true),
+            ids,
+            request,
+        });
+    }
+
+    pub(super) fn open_model_roles(&mut self, role: Option<String>) {
+        let cfg = &self.services.providers.cfg;
+        let set = cfg.active_set().unwrap_or_else(|| MAIN_SET.into());
+        let path = mu_base::config::models_path();
+        match RoleEditor::new(set, path, super::slash::role_views(cfg, &self.ctx), role.as_deref()) {
+            Ok(st) => self.overlay = Some(Overlay::ModelRoles { st: Box::new(st) }),
+            Err(e) => self.error(&e),
+        }
     }
 
     /// Opens the picker at once with a loading row; the (capped, sorted) listing is read on a
@@ -283,6 +304,25 @@ impl App {
         }
     }
 
+    fn save_role(&mut self, set: &str, role: &str, value: Option<&str>) {
+        match self.services.edit_role(set, role, value) {
+            Ok(()) => {
+                let cfg = &self.services.providers.cfg;
+                let active = cfg.active_set().unwrap_or_else(|| MAIN_SET.into());
+                let roles = super::slash::role_views(cfg, &self.ctx);
+                if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
+                    st.saved(active, roles);
+                }
+                self.prompt.commands = super::slash::command_entries(&self.plugins, &self.ctx, cfg);
+                if value.is_some() {
+                    self.notice(&format!("saved @{role} in set {set}"));
+                } else {
+                    self.notice(&format!("cleared @{role} in set {set}"));
+                }
+            }
+            Err(e) => self.error(&format!("could not save @{role}: {e}")),
+        }
+    }
     /// Carries out what the user chose in an overlay.
     pub(super) fn on_overlay_event(&mut self, e: OverlayEvent) {
         match e {
@@ -291,26 +331,9 @@ impl App {
             OverlayEvent::ModelImport(false) => {}
             OverlayEvent::McpTrust(true, files) => self.trust_mcp_files(files),
             OverlayEvent::McpTrust(false, _) => {}
-            OverlayEvent::SetModel(id) => match id.strip_prefix('@') {
-                // A role with no model has nothing to switch to: pick one for it instead.
-                Some(role) if self.services.providers.cfg.role(&split_level(role).0).is_none() => {
-                    self.flows.pick_assign = true;
-                    self.flows.assign_role = Some(role.to_string());
-                    self.request_models();
-                }
-                _ => self.send(Command::SetModel(id)),
-            },
-            OverlayEvent::PickRole(model) => self.open_role_picker(model),
-            OverlayEvent::AssignRole { role: Some(role), model } => match self.services.set_role(&role, &model) {
-                Ok(v) => {
-                    self.notice(&format!("@{role} = {v}"));
-                    if role == "default" {
-                        self.send(Command::SetModel(model));
-                    }
-                }
-                Err(e) => self.error(&format!("could not set @{role}: {e}")),
-            },
-            OverlayEvent::AssignRole { role: None, model } => self.send(Command::SetModel(model)),
+            OverlayEvent::SetModel(id) => self.send(Command::SetModel(id)),
+            OverlayEvent::LoadRoleModels => self.request_role_models(),
+            OverlayEvent::SaveRole { set, role, value } => self.save_role(&set, &role, value.as_deref()),
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ChatGpt) => self.chatgpt_row(),

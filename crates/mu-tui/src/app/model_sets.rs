@@ -18,7 +18,7 @@ impl App {
             [word] if !matches!(*word, "new" | "delete" | "rename") => return self.switch_to(word),
             ["new", name] => self.services.new_set(name).map(|from| {
                 format!(
-                    "model set {name} created from {} and active; /model assigns its roles",
+                    "model set {name} created from {} and active; /model edits its roles",
                     from.as_deref().unwrap_or("nothing")
                 )
             }),
@@ -47,7 +47,7 @@ impl App {
         let names = cfg.set_names();
         if names.is_empty() {
             let mut msg =
-                "no model sets yet: roles you assign with /model go into set main; /modelset new <name> adds another"
+                "no model sets yet: roles you save with /model go into set main; /modelset new <name> adds another"
                     .to_string();
             if cfg.import_offer.borrow().is_some() {
                 msg.push_str("\n/modelset import copies omp's model config");

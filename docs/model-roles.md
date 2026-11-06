@@ -2,7 +2,7 @@
 
 A role is a name for a model, set in mu's own `models.toml` (see [below](#models-toml)). Select one with `--model @role`, `/switch @role`, or in the `model:` list of a [custom agent](custom-agents.md).
 
-`/model` is where roles are seen and set: the role rows come first, each with the model it points at and what it is for. Highlighting one shows what uses it, which of your agents list it, and what it is now: its model, or (when unset) the role mu uses instead. The same descriptions appear in the "Set as @role" step, and in the `model` option of an [ACP](acp.md) client.
+`/model` (Alt+M) edits the saved roles: every role is listed, set or not, with the model it points at and what it is for, and the screen names the active set and the `models.toml` it writes to. Highlighting one shows what uses it, which of your agents list it, and what it is now: its model, or (when unset) the role mu uses instead. `/model @role` opens that role's editor directly. The same descriptions appear in the `model` option of an [ACP](acp.md) client. `/model` never changes the current session: `/switch` does that.
 
 | Role | Used for | When unset |
 |---|---|---|
@@ -17,7 +17,7 @@ A role is a name for a model, set in mu's own `models.toml` (see [below](#models
 
 Roles in `cycle_order` are the ones offered when you approve a plan. Roles that only appear in `models.toml` and that nothing in mu or your agents refers to (omp's `commit`, say) are not listed.
 
-Pressing Enter on a role with no model in `/model` opens the model list for it: the model you pick is assigned to that role in the active set. On a role that has a model, Enter switches this session to it. Roles your agents or `cycle_order` name but mu has no use for are listed as `custom role`; an agent whose role is unset takes the `task` model.
+Enter on a role in `/model` opens its editor: **Model** (a concrete model; the list is fetched only then), **Thinking** (`No override`, or `off` to `max`), **Clear assignment** (Save then removes the key, so the fallback chain above applies again), **Save** and **Cancel**. Nothing is written until Save, and Esc or Cancel discards the draft. Changing only the model keeps the role's existing thinking suffix. Saving writes to the set that was shown when the editor opened, and never switches the current session; running sessions keep their model, and later reads of the role see the new value. Roles your agents or `cycle_order` name but mu has no use for are listed as `custom role`; an agent whose role is unset takes the `task` model.
 
 `@role` that is not configured fails with a message that names what the role is for and its fallback chain.
 
@@ -46,7 +46,7 @@ max_tokens = 65536
 
 Every role lives in a **set**: a complete role list, usually one per provider. With one set (`main` by default) you never see sets. A role a set leaves out falls back along the chain in the table above, within that set. The active set is `set` if it names one; otherwise the only set, else `main`, else the first by name (and the file warns at startup when `set` is missing or wrong with several sets).
 
-`/modelset` switches sets: bare it lists them, `/modelset <name>` makes one active for this profile (new sessions and subagents follow, and the current session moves to the set's `@default`, or `@plan` in plan mode). `/modelset new <name>` copies the active set and switches to it, `delete`, `rename`, and `import` complete it. `/model` assigns roles in the active set.
+`/modelset` switches sets: bare it lists them, `/modelset <name>` makes one active for this profile (new sessions and subagents follow, and the current session moves to the set's `@default`, or `@plan` in plan mode). `/modelset new <name>` copies the active set and switches to it, `delete`, `rename`, and `import` complete it. `/model` edits roles in the active set.
 
 ### Importing omp's config
 

@@ -1,4 +1,4 @@
-use crate::model_config::{self, Import, MAIN_SET, ModelConfig, ModelLimits};
+use crate::model_config::{self, Import, ModelConfig, ModelLimits};
 use mu_common::paths;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -578,27 +578,26 @@ impl Configs {
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
         let out = f(&text)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if out != text {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            mu_common::fs::write_atomic(&path, out.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
         }
-        mu_common::fs::write_atomic(&path, out.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
         *self.models.borrow_mut() = model_config::parse(&out).0;
         *self.import_offer.borrow_mut() = None;
         Ok(())
     }
 
-    /// Points `name` at `model` in the active set (`main` when there are no sets), keeping the role's
-    /// existing `:level`. Returns the stored value.
-    pub fn set_role(&self, name: &str, model: &str) -> Result<String, String> {
-        let level =
-            self.role(name).and_then(|v| v.rsplit_once(':').map(|(_, l)| l.to_string()).filter(|l| !l.contains('/')));
-        let value = match level {
-            Some(l) => format!("{model}:{l}"),
-            None => model.to_string(),
-        };
-        let set = self.active_set().unwrap_or_else(|| MAIN_SET.to_string());
-        self.edit_models(|t| model_config::write_role(t, &set, name, &value))?;
-        Ok(value)
+    /// Assigns or removes a role in a specific set, using the current on-disk configuration.
+    pub fn edit_role(&self, set: &str, name: &str, model: Option<&str>) -> Result<(), String> {
+        self.edit_models(|text| {
+            model_config::validate_role_target(text, set)?;
+            match model {
+                Some(model) => model_config::write_role(text, set, name, model),
+                None => model_config::remove_role(text, set, name),
+            }
+        })
     }
 
     fn no_such_set(&self, name: &str) -> String {
@@ -724,6 +723,39 @@ impl Configs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_role_reads_disk_and_skips_unchanged_writes() {
+        use std::os::unix::fs::MetadataExt;
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        let home = mu_testutil::home();
+        let path = home.join("models.toml");
+        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"stale/model:high\"\n");
+        let disk = "# disk\n[sets.main]\ndefault = \"disk/model:high\"\nsmol = \"disk/small\"\n";
+        std::fs::write(&path, disk).unwrap();
+        cfg.edit_role("main", "default", Some("new/model")).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# disk") && out.contains("smol = \"disk/small\""));
+        assert_eq!(cfg.role("default").as_deref(), Some("new/model"));
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        *cfg.models.borrow_mut() = ModelConfig::default();
+        cfg.edit_role("main", "absent", None).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(cfg.role("default").as_deref(), Some("new/model"));
+        cfg.edit_role("main", "default", None).unwrap();
+        assert_eq!(cfg.role("default"), None);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[sets.main]"));
+        let before = cfg.models.borrow().clone();
+        std::fs::write(&path, "sets = 3\n").unwrap();
+        assert!(cfg.edit_role("main", "default", Some("x/y")).is_err());
+        assert_eq!(*cfg.models.borrow(), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sets = 3\n");
+        std::fs::write(&path, "[sets.other]\nx = \"x/y\"\n").unwrap();
+        assert!(cfg.edit_role("main", "default", Some("x/y")).is_err());
+        assert_eq!(*cfg.models.borrow(), before);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn predict_engine_and_threads_parse_and_unknown_engine_warns() {

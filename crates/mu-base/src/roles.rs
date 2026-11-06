@@ -104,8 +104,8 @@ impl RoleView {
         }
         out.push_str(&match (&self.value, &self.fallback) {
             (Some(v), _) => format!("\nSet to {v}"),
-            (None, Some((f, v))) => format!("\nNot set: uses @{f} ({v}). Enter assigns a model."),
-            (None, None) => format!("\nNot set: {}. Enter assigns a model.", self.unset),
+            (None, Some((f, v))) => format!("\nNot set: uses @{f} ({v})."),
+            (None, None) => format!("\nNot set: {}.", self.unset),
         });
         out
     }
@@ -201,7 +201,8 @@ mod tests {
         assert_eq!(find(&v, "review").row(), "(unset → @default) · /review lead");
         assert_eq!(find(&v, "slow").row(), "(unset) · plan execution");
         let d = find(&v, "review").detail();
-        assert!(d.contains("Not set: uses @default (a/b)") && d.contains("Enter assigns"), "{d}");
+        assert!(d.contains("Not set: uses @default (a/b)"), "{d}");
+        assert!(!d.contains("Enter"), "{d}");
         assert!(find(&v, "slow").detail().contains("not offered when you approve a plan"));
         let v = views(&cfg("[sets.main]\ndefault = \"a/b\"\nsmol = \"s/m\"\n"), &[]);
         assert_eq!(find(&v, "scout").row(), "(unset → @smol) · read-only scouts");

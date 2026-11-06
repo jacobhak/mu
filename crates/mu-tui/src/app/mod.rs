@@ -114,10 +114,7 @@ struct Prompt {
 
 /// Multi-step interactions that take over input.
 struct Flows {
-    /// `/model` assigns roles; `/switch` only changes this session.
-    pick_assign: bool,
-    /// A role without a model that the model being picked is for.
-    assign_role: Option<String>,
+    model_request_seq: u64,
     pick_deliver: bool,
     /// An `/mcp add` wizard is collecting answers; the composer's lines go to it.
     mcp_wizard: Option<Wizard>,
@@ -184,8 +181,7 @@ pub async fn run(init: AppInit) -> i32 {
         },
         overlay: None,
         flows: Flows {
-            pick_assign: false,
-            assign_role: None,
+            model_request_seq: 0,
             pick_deliver: false,
             mcp_wizard: None,
             web_wizard: None,

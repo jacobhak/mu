@@ -165,8 +165,10 @@ pub struct Store {
 /// Parsed files by path, with the stamp they were read at.
 type Cached = HashMap<PathBuf, (Stamp, Arc<FileData>)>;
 static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
-/// `!command` results by provider, with the command that produced them.
-static CMD_CACHE: Mutex<Option<HashMap<String, (String, String)>>> = Mutex::new(None);
+/// `!command` results by store file and provider, with the command that produced them. A store
+/// only sees its own results; every real run has the one profile store.
+type CmdKey = (PathBuf, String);
+static CMD_CACHE: Mutex<Option<HashMap<CmdKey, (String, String)>>> = Mutex::new(None);
 
 impl Store {
     /// The active profile's store.
@@ -333,7 +335,7 @@ impl Store {
         if let Some(k) = &entry.key {
             mu_base::secrets::register_stored(&label(provider), k);
         }
-        forget_cached(provider);
+        forget_cached(&self.path, provider);
         self.modify(|d| {
             d.providers.insert(provider.to_string(), entry);
             true
@@ -367,7 +369,7 @@ impl Store {
 
     /// Removes a provider's entry; `false` when there was none.
     pub fn remove(&self, provider: &str) -> Result<bool> {
-        forget_cached(provider);
+        forget_cached(&self.path, provider);
         self.modify(|d| d.providers.remove(provider).is_some())
     }
 
@@ -375,7 +377,7 @@ impl Store {
     /// A reference that cannot be resolved is an error: it never falls back to the reference text.
     pub async fn resolve(&self, provider: &str) -> Result<Resolved> {
         let entry = self.get(provider).ok_or_else(|| anyhow!("no API key stored for {provider}"))?;
-        resolve_entry(provider, &entry).await
+        resolve_entry_in(&self.path, provider, &entry).await
     }
 }
 
@@ -401,8 +403,13 @@ impl Store {
     }
 }
 
-/// `Store::resolve` for an entry that need not be saved yet.
+/// `Store::resolve` for an entry that need not be saved yet, on the profile's store.
 pub async fn resolve_entry(provider: &str, entry: &Entry) -> Result<Resolved> {
+    resolve_entry_in(Store::new().path(), provider, entry).await
+}
+
+/// `resolve_entry` with its command result cached for the store file `scope`.
+async fn resolve_entry_in(scope: &Path, provider: &str, entry: &Entry) -> Result<Resolved> {
     let base_url = entry
         .base_url
         .as_deref()
@@ -415,7 +422,7 @@ pub async fn resolve_entry(provider: &str, entry: &Entry) -> Result<Resolved> {
             Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => bail!("${n} (the key for {provider}) is not set"),
         },
-        Some(Origin::Cmd(c)) => run_cmd(provider, &c, CMD_TIMEOUT).await?,
+        Some(Origin::Cmd(c)) => run_cmd(scope, provider, &c, CMD_TIMEOUT).await?,
         None => bail!("no API key stored for {provider}"),
     };
     mu_base::secrets::register_stored(&label(provider), &key);
@@ -436,8 +443,9 @@ fn label(provider: &str) -> String {
     )
 }
 
-async fn run_cmd(provider: &str, cmd: &str, limit: Duration) -> Result<String> {
-    let cached = CMD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(provider).cloned());
+async fn run_cmd(scope: &Path, provider: &str, cmd: &str, limit: Duration) -> Result<String> {
+    let key = (scope.to_path_buf(), provider.to_string());
+    let cached = CMD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned());
     if let Some((c, v)) = cached
         && c == cmd
     {
@@ -457,14 +465,15 @@ async fn run_cmd(provider: &str, cmd: &str, limit: Duration) -> Result<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
-        .insert(provider.to_string(), (cmd.to_string(), out.clone()));
+        .insert(key, (cmd.to_string(), out.clone()));
     Ok(out)
 }
 
-/// Drops the cached `!command` result for `provider`. `true` when there was one, so the caller
-/// knows a second try (after a 401) can produce a different key.
-pub fn forget_cached(provider: &str) -> bool {
-    CMD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|m| m.remove(provider).is_some())
+/// Drops the cached `!command` result for `provider` in the store file `scope`. `true` when there
+/// was one, so the caller knows a second try (after a 401) can produce a different key.
+pub fn forget_cached(scope: &Path, provider: &str) -> bool {
+    let key = (scope.to_path_buf(), provider.to_string());
+    CMD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|m| m.remove(&key).is_some())
 }
 
 /// Registers every stored key for redaction; re-reads the file at most once a second.
@@ -628,7 +637,7 @@ mod tests {
         assert_eq!(rt(s.resolve("p-cmd")).unwrap().key, "key-from-cmd-0123456");
         assert_eq!(rt(s.resolve("p-cmd")).unwrap().key, "key-from-cmd-0123456");
         assert_eq!(runs(), 1, "second resolve is cached");
-        assert!(forget_cached("p-cmd"));
+        assert!(forget_cached(s.path(), "p-cmd"));
         rt(s.resolve("p-cmd")).unwrap();
         assert_eq!(runs(), 2, "runs again after a rejection");
         // failing and silent commands are errors
@@ -641,7 +650,8 @@ mod tests {
 
     #[test]
     fn a_hanging_command_times_out() {
-        let e = rt(run_cmd("p-hang", "sleep 5", Duration::from_millis(200))).err().unwrap().to_string();
+        let e =
+            rt(run_cmd(Path::new("hang"), "p-hang", "sleep 5", Duration::from_millis(200))).err().unwrap().to_string();
         assert!(e.contains("failed or took longer than"), "{e}");
     }
 
@@ -714,10 +724,10 @@ mod tests {
     fn forgetting_a_command_result_reports_whether_there_was_one() {
         let (s, d) = store("forget");
         s.set("p-forget", Entry::reference("!echo key-forget-0123456").unwrap()).unwrap();
-        assert!(!forget_cached("p-forget"));
+        assert!(!forget_cached(s.path(), "p-forget"));
         assert_eq!(rt(s.resolve("p-forget")).unwrap().key, "key-forget-0123456");
-        assert!(forget_cached("p-forget"));
-        assert!(!forget_cached("p-forget"));
+        assert!(forget_cached(s.path(), "p-forget"));
+        assert!(!forget_cached(s.path(), "p-forget"));
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -731,10 +741,15 @@ mod tests {
         let c = Entry::reference("!op read --token sk-abc-0123456789").unwrap();
         let dbg = format!("{c:?}");
         assert!(dbg.contains("!op …") && !dbg.contains("sk-abc"), "{dbg}");
-        let err = rt(run_cmd("p-quiet", "sh -c 'echo sk-leak-0123456789; exit 3'", Duration::from_secs(5)))
-            .err()
-            .unwrap()
-            .to_string();
+        let err = rt(run_cmd(
+            Path::new("quiet"),
+            "p-quiet",
+            "sh -c 'echo sk-leak-0123456789; exit 3'",
+            Duration::from_secs(5),
+        ))
+        .err()
+        .unwrap()
+        .to_string();
         assert!(err.contains("!sh …") && !err.contains("sk-leak"), "{err}");
     }
 

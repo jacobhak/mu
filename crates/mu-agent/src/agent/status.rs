@@ -83,7 +83,7 @@ impl Agent {
         self.settle_prices();
     }
 
-    /// Native models are metered by API key: there is no subscription quota to poll.
+    /// Native models have no gateway quota to poll.
     pub(super) fn tick_quota(&mut self) {
         if self.gateway_idle() {
             return;

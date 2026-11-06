@@ -16,9 +16,8 @@ pub(super) struct Services {
 }
 
 impl Services {
-    /// Points `role` at `model` in the active model set; returns the value the role now has.
-    pub(super) fn set_role(&self, role: &str, model: &str) -> Result<String, String> {
-        self.providers.cfg.set_role(role, model)
+    pub(super) fn edit_role(&self, set: &str, role: &str, model: Option<&str>) -> Result<(), String> {
+        self.providers.cfg.edit_role(set, role, model)
     }
 
     pub(super) fn switch_set(&self, name: &str) -> Result<(), String> {

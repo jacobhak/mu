@@ -217,7 +217,7 @@ impl App {
                 self.agent.tr.toggle_thinking(w);
             }
             Action::ToggleExpanded => self.agent.expanded = !self.agent.expanded,
-            Action::ModelPicker => self.request_models(),
+            Action::ModelPicker => self.model_cmd(""),
             Action::EditExternal => self.edit_external(),
             Action::PasteImage => {
                 let tx = self.ui_tx.clone();
@@ -715,6 +715,17 @@ mod tests {
     use mu_provider::provider::client::Providers;
     use mu_tools::context::Context;
 
+    static MODEL_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Providers over a key store of their own: tests that save or remove keys must not see each other's.
+    fn test_providers(
+        cfg: Rc<mu_base::config::Configs>,
+        gateway: mu_provider::provider::endpoint::GatewaySource,
+    ) -> Providers {
+        let auth = std::env::temp_dir().join(format!("mu-tui-auth-{}", uuid::Uuid::new_v4())).join("auth.json");
+        Providers::for_tests_with_auth(cfg, gateway, auth)
+    }
+
     fn transcript_text(app: &App) -> String {
         app.agent.tr.pending.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
@@ -762,15 +773,19 @@ mod tests {
     }
 
     fn test_app(history: std::path::PathBuf) -> App {
+        test_app_with_commands(history).0
+    }
+
+    fn test_app_with_commands(history: std::path::PathBuf) -> (App, UnboundedReceiver<Command>) {
         use mu_base::config::Configs;
-        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ui_tx, _ui_rx) = unbounded_channel();
         let (ntx, _nrx) = unbounded_channel();
         let plugins = mu_tools::plugin::host::PluginHost::new(vec![], vec![], ntx, Default::default());
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
-        App {
+        let app = App {
             agent: AgentView::new(true, false),
-            services: Services { providers: Rc::new(Providers::for_tests(Rc::new(Configs::default()), gateway)) },
+            services: Services { providers: Rc::new(test_providers(Rc::new(Configs::default()), gateway)) },
             link: Link { cmd_tx },
             ctx: Rc::new(Context::default()),
             plugins,
@@ -794,8 +809,7 @@ mod tests {
             },
             overlay: None,
             flows: Flows {
-                pick_assign: false,
-                assign_role: None,
+                model_request_seq: 0,
                 pick_deliver: false,
                 mcp_wizard: None,
                 web_wizard: None,
@@ -805,7 +819,8 @@ mod tests {
                 chatgpt_seq: 0,
             },
             quitting: false,
-        }
+        };
+        (app, cmd_rx)
     }
 
     fn press(code: KeyCode, mods: KeyModifiers) -> Event {
@@ -1038,42 +1053,87 @@ mod tests {
     }
 
     #[test]
-    fn model_lists_every_role_and_a_role_without_a_model_gets_one_picked() {
+    fn model_editor_is_independent_of_session_switching_and_discovery() {
         use mu_base::config::Configs;
-        let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\ncommit = \"c/d\"\n");
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Rc::new(Configs::from_models_toml("[sets.main]\ndefault = \"a/old:high\"\n"));
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
-        app.services = Services { providers: Rc::new(Providers::for_tests(Rc::new(cfg), gateway)) };
+        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
 
-        app.flows.pick_assign = true;
-        app.open_model_picker(vec![], None);
-        let Some(Overlay::Model { ids, target: None, .. }) = &app.overlay else { panic!("no model picker") };
-        let roles: Vec<&str> = ids.iter().map(String::as_str).take_while(|i| i.starts_with('@')).collect();
-        assert_eq!(roles, ["@default", "@plan", "@task", "@scout", "@review", "@smol", "@memory", "@slow"]);
+        app.model_cmd("");
+        assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
+        assert_eq!(app.flows.model_request_seq, 0, "listing roles does not discover models");
+        app.model_cmd("@task");
+        assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
+        app.model_cmd("provider/model");
+        app.model_cmd("@missing");
+        app.model_cmd("@task:high");
+        assert!(transcript_text(&app).contains("usage: /model [@role]"));
+        assert_eq!(cfg.role("default").as_deref(), Some("a/old:high"));
+        assert!(commands.try_recv().is_err());
 
-        // /switch lists only the roles that have a model.
-        app.flows.pick_assign = false;
-        app.open_model_picker(vec![], None);
-        let Some(Overlay::Model { ids, .. }) = &app.overlay else { panic!("no model picker") };
-        assert_eq!(ids, &["@default"]);
+        app.overlay = None;
+        app.on_terminal(press(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })), "Alt+M opens saved roles");
+        app.submit(UserInput::from("/switch @default"), false);
+        assert!(matches!(commands.try_recv(), Ok(Command::SetModel(id)) if id == "@default"));
+        assert_eq!(cfg.role("default").as_deref(), Some("a/old:high"));
+    }
 
-        // Enter on an unset role asks for a model for it, and the picked model goes to that role.
-        app.flows.pick_assign = true;
-        mu_testutil::block_on_local(async { app.on_overlay_event(OverlayEvent::SetModel("@review".into())) });
-        assert_eq!(app.flows.assign_role.as_deref(), Some("review"));
-        let target = app.flows.assign_role.take();
-        app.open_model_picker(vec![], target);
-        let Some(Overlay::Model { ids, assign: true, target: Some(role), .. }) = &app.overlay else {
-            panic!("no picker for the role")
-        };
-        assert_eq!(role, "review");
-        assert!(ids.iter().all(|i| !i.starts_with('@')), "no roles to pick from: {ids:?}");
+    #[test]
+    fn late_model_lists_only_fill_their_own_picker() {
+        use mu_base::models::GatewayModel;
+        let (mut app, _commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let gw = |id: &str| vec![GatewayModel { id: id.into(), context_length: None, max_output_tokens: None }];
+        in_local(async {
+            app.request_models();
+            let a = app.flows.model_request_seq;
+            app.overlay = None;
+            app.on_ui(UiMsg::Models { request: a, result: Ok(gw("x/a")) });
+            assert!(app.overlay.is_none(), "a cancelled picker is not reopened");
+
+            app.open_model_roles(Some("default".into()));
+            app.overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let b = app.flows.model_request_seq;
+            assert_eq!(b, a + 1);
+            app.on_ui(UiMsg::Models { request: a, result: Err("late".into()) });
+            assert!(!transcript_text(&app).contains("late"), "a stale error is not shown");
+            app.on_ui(UiMsg::Models { request: b, result: Ok(gw("x/b")) });
+            let Some(Overlay::ModelRoles { st }) = &app.overlay else { panic!("editor gone") };
+            assert!(st.select().highlighted().is_some(), "the matching list filled the sub-picker");
+        });
+    }
+
+    #[test]
+    fn saving_a_role_edits_config_without_sending_session_commands() {
+        use mu_base::config::{Configs, models_path};
+        let _guard = MODEL_CONFIG_TEST_LOCK.lock().unwrap();
+        mu_testutil::home();
+        let path = models_path();
+        let text = "[sets.main]\ndefault = \"a/old:high\"\n";
+        std::fs::write(&path, text).unwrap();
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Rc::new(Configs::from_models_toml(text));
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
+        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
+        app.open_model_roles(Some("default".into()));
+        app.on_overlay_event(OverlayEvent::SaveRole {
+            set: "main".into(),
+            role: "default".into(),
+            value: Some("a/new:low".into()),
+        });
+        assert_eq!(cfg.role("default").as_deref(), Some("a/new:low"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("default = \"a/new:low\""));
+        assert_eq!(app.agent.status.model_id, "");
+        assert!(commands.try_recv().is_err(), "role saves do not send commands to the session");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn modelset_switches_creates_renames_and_deletes() {
         use mu_base::config::{Configs, models_path};
         use mu_base::model_config;
+        let _guard = MODEL_CONFIG_TEST_LOCK.lock().unwrap();
         mu_testutil::home();
         let path = models_path();
         let text = "[sets.main]\ndefault = \"a/b\"\n";
@@ -1081,14 +1141,14 @@ mod tests {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let cfg = Rc::new(Configs::from_models_toml(text));
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
-        app.services = Services { providers: Rc::new(Providers::for_tests(cfg.clone(), gateway)) };
+        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
         let on_disk = || model_config::parse(&std::fs::read_to_string(&path).unwrap()).0;
 
         app.modelset_cmd("new openai");
         assert_eq!(cfg.active_set().as_deref(), Some("openai"));
         assert_eq!(cfg.role("default").as_deref(), Some("a/b"));
 
-        app.services.set_role("smol", "c/d").unwrap();
+        app.services.edit_role("openai", "smol", Some("c/d")).unwrap();
         let disk = on_disk();
         assert_eq!(disk.sets["openai"]["smol"], "c/d");
         assert!(!disk.sets["main"].contains_key("smol"));

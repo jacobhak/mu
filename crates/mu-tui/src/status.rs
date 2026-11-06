@@ -273,7 +273,7 @@ fn seg_pi(_: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
 
 fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
     if s.model_id.is_empty() {
-        return Some(vec![span("no model", st(Role::Faint)), span(" · /model", st(Role::Muted))]);
+        return Some(vec![span("no model", st(Role::Faint)), span(" · /switch", st(Role::Muted))]);
     }
     let mut line = vec![span(s.model_name.clone(), st(Role::Tool))];
     if let Some(l) = thinking_label(s, env) {
@@ -562,7 +562,7 @@ mod tests {
     fn no_model_chosen_is_shown_as_such() {
         let c = cfg(&["model"], &[]);
         let t = line_text(&seg_model(&StatusSnapshot::default(), &env(&c, Path::new("/")), 0).unwrap());
-        assert_eq!(t, "no model · /model");
+        assert_eq!(t, "no model · /switch");
     }
 
     fn snap() -> StatusSnapshot {

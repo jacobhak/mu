@@ -7,6 +7,7 @@ use crate::text::markdown;
 use mu_base::config::Configs;
 use mu_base::image;
 use mu_base::models::Thinking;
+use mu_base::roles::{self, RoleView};
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
@@ -18,7 +19,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 30] = [
     ("resume", "Resume a session from this directory", false),
     ("fork", "Continue in a copy of this session; the original stays as it is", false),
     ("rewind", "Go back to an earlier prompt and take it from there", false),
-    ("model", "Pick a model and assign a role", false),
+    ("model", "Edit saved model roles [@role]", false),
     ("switch", "Switch this session's model", false),
     ("modelset", "Switch model sets [name | new | delete | rename | import]", false),
     ("login", "Sign in with ChatGPT, add an API key, or log in to a provider or MCP server", false),
@@ -63,7 +64,7 @@ const MCP_SUBCOMMANDS: [(&str, &str); 12] = [
 
 pub(super) const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Alt+↑  edit last queued
 Shift+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn (in a pty command: sent to it)      Ctrl+C  clear · abort · exit (twice)
-Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model picker      Alt+J  background jobs      Ctrl+R  quote parts of a reply
+Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand output      Alt+M  model roles      Alt+J  background jobs      Ctrl+R  quote parts of a reply
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
 
@@ -86,6 +87,11 @@ pub fn interactive_reference() -> String {
     s
 }
 
+pub(super) fn role_views(cfg: &Configs, ctx: &Context) -> Vec<RoleView> {
+    let agents: Vec<(&str, &[String])> = ctx.agents.iter().map(|a| (a.name.as_str(), a.model.as_slice())).collect();
+    roles::views(cfg, &agents)
+}
+
 /// The completion list of the composer: the built-in commands, `/mcp` subcommands, the login and
 /// logout targets, then the commands and skills that come from the context.
 pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs) -> Vec<Entry> {
@@ -96,6 +102,7 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs
                 "thinking" => (Thinking::NAMES.iter().map(|s| s.to_string()).collect(), vec![]),
                 "copy" => (["code", "cmd", "link"].map(String::from).to_vec(), vec![]),
                 "jobs" => (vec!["kill".to_string()], vec![]),
+                "model" => role_views(cfg, ctx).into_iter().map(|r| (format!("@{}", r.name), r.row())).unzip(),
                 "modelset" => {
                     let subs = [
                         ("new", "Copy the active set into a new one and switch to it"),
@@ -161,7 +168,7 @@ impl App {
         if input.images.is_empty() {
             let t = input.text.as_str();
             if !t.starts_with(['/', '!']) && self.agent.status.model_id.is_empty() {
-                self.notice("no model chosen: sign in with /login if you have not, then pick one with /model");
+                self.notice("no model chosen: sign in with /login if you have not, then pick one with /switch");
                 return self.restore_queued(vec![input]);
             }
             if let Some(cmd) = t.strip_prefix("!!") {
@@ -177,6 +184,25 @@ impl App {
             self.observe_prompt(&t);
         }
         self.send_prompt(input, follow_up);
+    }
+
+    pub(super) fn model_cmd(&mut self, arg: &str) {
+        if self.agent.running {
+            return self.notice("busy — Esc to abort first");
+        }
+        if arg.is_empty() {
+            self.open_model_roles(None);
+        } else if let Some(role) = arg
+            .strip_prefix('@')
+            .filter(|r| !r.is_empty() && !r.contains(char::is_whitespace) && !r.contains(':') && !r.starts_with('@'))
+            .filter(|role| {
+                super::slash::role_views(&self.services.providers.cfg, &self.ctx).iter().any(|r| r.name == *role)
+            })
+        {
+            self.open_model_roles(Some(role.to_string()));
+        } else {
+            self.error("usage: /model [@role]; use /switch <provider/model or @role> to change this session");
+        }
     }
 
     fn user_bash(&mut self, cmd: &str, include: bool) {
@@ -215,8 +241,8 @@ impl App {
         let (name, arg) = cmd.split_once(char::is_whitespace).map_or((cmd, ""), |(n, a)| (n, a.trim()));
         let allowed_busy = matches!(
             name,
-            "thinking" | "model" | "todo" | "skills" | "plugins" | "session" | "copy" | "reply" | "image" | "jobs"
-        ) && !(name == "model" && arg.is_empty());
+            "thinking" | "todo" | "skills" | "plugins" | "session" | "copy" | "reply" | "image" | "jobs"
+        );
         if self.agent.running && !allowed_busy {
             return self.notice("busy — Esc to abort first");
         }
@@ -230,11 +256,9 @@ impl App {
             "resume" => self.open_session_picker(),
             "fork" => self.send(Command::Fork),
             "rewind" => self.send(Command::ListRewind),
-            "model" | "switch" if arg.is_empty() => {
-                self.flows.pick_assign = name == "model";
-                self.request_models();
-            }
-            "model" | "switch" => self.send(Command::SetModel(arg.into())),
+            "model" => self.model_cmd(arg),
+            "switch" if arg.is_empty() => self.request_models(),
+            "switch" => self.send(Command::SetModel(arg.into())),
             "login" => self.login(arg),
             "logout" => self.logout_cmd(arg),
             "web" => self.start_web_wizard(None),

@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::oneshot;
 
 use crate::panels::jobs_panel::{JobsPanel, JobsResult};
+use crate::panels::model_roles::{RoleEditor, RoleEditorAction};
 use crate::panels::plan_review::{PlanReview, ReviewResult};
 use crate::panels::reply::{ReplyPicker, ReplyResult};
 use crate::widgets::select::{Item, Select, SelectResult};
@@ -91,15 +92,10 @@ pub enum Overlay {
     Model {
         sel: Select,
         ids: Vec<String>,
-        assign: bool,
-        /// The role the model is for, when the picker was opened from a role that has none.
-        target: Option<String>,
+        request: u64,
     },
-    /// Where a picked model goes: this session, or a role in omp's config.
-    Role {
-        sel: Select,
-        model: String,
-        roles: Vec<Option<String>>,
+    ModelRoles {
+        st: Box<RoleEditor>,
     },
     /// What can be logged into: `omp login` providers, then MCP servers that need auth.
     Login {
@@ -192,12 +188,11 @@ pub enum Overlay {
 pub enum OverlayEvent {
     /// Switch this session to the model.
     SetModel(String),
-    /// A model was picked for assignment: ask which role gets it.
-    PickRole(String),
-    /// Assign `model` to a role (`None`: only use it for this session).
-    AssignRole {
-        role: Option<String>,
-        model: String,
+    LoadRoleModels,
+    SaveRole {
+        set: String,
+        role: String,
+        value: Option<String>,
     },
     Login(LoginTarget),
     /// The API-key picker chose this for `provider` (`Cancel` when it was dismissed).
@@ -529,7 +524,6 @@ impl Overlay {
     pub fn select(&self) -> Option<&Select> {
         match self {
             Overlay::Model { sel, .. }
-            | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
             | Overlay::KeyChoice { sel, .. }
             | Overlay::Logout { sel, .. }
@@ -544,6 +538,7 @@ impl Overlay {
             | Overlay::Copy { sel, .. }
             | Overlay::Memory { sel, .. }
             | Overlay::MemoryLog { sel, .. } => Some(sel),
+            Overlay::ModelRoles { st } => Some(st.select()),
             Overlay::Ask(a) => Some(&a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
@@ -552,7 +547,6 @@ impl Overlay {
     pub fn select_mut(&mut self) -> Option<&mut Select> {
         match self {
             Overlay::Model { sel, .. }
-            | Overlay::Role { sel, .. }
             | Overlay::Login { sel, .. }
             | Overlay::KeyChoice { sel, .. }
             | Overlay::Logout { sel, .. }
@@ -567,6 +561,7 @@ impl Overlay {
             | Overlay::Copy { sel, .. }
             | Overlay::Memory { sel, .. }
             | Overlay::MemoryLog { sel, .. } => Some(sel),
+            Overlay::ModelRoles { st } => Some(st.select_mut()),
             Overlay::Ask(a) => Some(&mut a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
@@ -617,33 +612,23 @@ impl Overlay {
     /// Handles one key. Returns the overlay if it stays open, and what the user chose, if anything.
     pub fn on_key(self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
         match self {
-            Overlay::Model { mut sel, ids, assign, target } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Model { sel, ids, assign, target }), None),
+            Overlay::Model { mut sel, ids, request } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Model { sel, ids, request }), None),
                 SelectResult::Chosen(i) => {
-                    let ev = i.first().and_then(|i| ids.get(*i)).map(|id| {
-                        if assign && !id.starts_with('@') {
-                            match target {
-                                Some(role) => OverlayEvent::AssignRole { role: Some(role), model: id.clone() },
-                                None => OverlayEvent::PickRole(id.clone()),
-                            }
-                        } else {
-                            OverlayEvent::SetModel(id.clone())
-                        }
-                    });
-                    (None, ev)
+                    let event = i.first().and_then(|i| ids.get(*i)).cloned().map(OverlayEvent::SetModel);
+                    (None, event)
                 }
                 _ => (None, None),
             },
-            Overlay::Role { mut sel, model, roles } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Role { sel, model, roles }), None),
-                SelectResult::Chosen(i) => {
-                    let ev = i
-                        .first()
-                        .and_then(|i| roles.get(*i))
-                        .map(|role| OverlayEvent::AssignRole { role: role.clone(), model: model.clone() });
-                    (None, ev)
+            Overlay::ModelRoles { mut st } => match st.on_key(k) {
+                RoleEditorAction::Pending => (Some(Overlay::ModelRoles { st }), None),
+                RoleEditorAction::Close => (None, None),
+                RoleEditorAction::RequestModels => {
+                    (Some(Overlay::ModelRoles { st }), Some(OverlayEvent::LoadRoleModels))
                 }
-                _ => (None, None),
+                RoleEditorAction::Save { set, role, value } => {
+                    (Some(Overlay::ModelRoles { st }), Some(OverlayEvent::SaveRole { set, role, value }))
+                }
             },
             Overlay::Login { mut sel, targets } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Login { sel, targets }), None),
@@ -807,33 +792,31 @@ mod tests {
     }
 
     #[test]
-    fn choosing_a_model_yields_an_event_and_closes() {
+    fn model_picker_switches_only_and_model_roles_expose_the_editor_select() {
         let ov = Overlay::Model {
             sel: Select::new("m", items(&["a/x", "@smol"])),
             ids: vec!["a/x".into(), "@smol".into()],
-            assign: true,
-            target: None,
+            request: 9,
         };
-        let (rest, ev) = ov.on_key(key(KeyCode::Enter));
+        let (rest, event) = ov.on_key(key(KeyCode::Enter));
         assert!(rest.is_none());
-        assert!(matches!(ev, Some(OverlayEvent::PickRole(m)) if m == "a/x"), "a concrete model asks for a role");
-        let ov = Overlay::Model {
-            sel: Select::new("m", items(&["@smol"])),
-            ids: vec!["@smol".into()],
-            assign: true,
-            target: None,
+        assert!(matches!(event, Some(OverlayEvent::SetModel(id)) if id == "a/x"));
+
+        let role = mu_base::roles::RoleView {
+            name: "task".into(),
+            purpose: "subagents".into(),
+            used_by: "Agents".into(),
+            value: None,
+            fallback: None,
+            unset: "uses session".into(),
+            agents: vec![],
         };
-        assert!(matches!(ov.on_key(key(KeyCode::Enter)).1, Some(OverlayEvent::SetModel(m)) if m == "@smol"));
-        let ov = Overlay::Model {
-            sel: Select::new("m", items(&["a/x"])),
-            ids: vec!["a/x".into()],
-            assign: true,
-            target: Some("review".into()),
-        };
-        assert!(
-            matches!(ov.on_key(key(KeyCode::Enter)).1, Some(OverlayEvent::AssignRole { role: Some(r), model }) if r == "review" && model == "a/x"),
-            "a picker opened for a role assigns it without asking again"
-        );
+        let st =
+            crate::panels::model_roles::RoleEditor::new("main".into(), "models.toml".into(), vec![role], None).unwrap();
+        let mut ov = Overlay::ModelRoles { st: Box::new(st) };
+        assert!(ov.select().is_some());
+        assert!(ov.select_mut().is_some());
+        assert!(ov.on_key(key(KeyCode::Enter)).1.is_none(), "enter opens edit, not assignment");
     }
 
     #[test]

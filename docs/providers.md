@@ -16,7 +16,7 @@ For Anthropic and OpenAI the key can serve chat models, or only web search ([web
 
 Add a key for chat and the provider's models go native at once, in running sessions too; remove it (`/logout`, `mu auth rm`) and they go back through omp. The status line shows `· key` after a natively routed model, and cost is shown instead of subscription usage, since a key is metered.
 
-A ChatGPT sign-in routes `openai-chatgpt/*` natively on the same terms, once the account's grant includes plan usage. Nothing picks between `openai/*` and `openai-chatgpt/*` for you: the model you choose decides the credential, and a plan model never falls back to your key or the reverse. The status line shows `· ChatGPT plan` for a plan model.
+A ChatGPT sign-in routes `openai-chatgpt/*` natively on the same terms, once the account's grant includes plan usage. Nothing picks between `openai/*` and `openai-chatgpt/*` for you: the model you choose decides the credential, and a plan model never falls back to your key or the reverse. The status line shows `· ChatGPT plan` for a plan model and tracks session cost at model token rates, as for gateway subscriptions.
 
 ## Sign in with ChatGPT
 
@@ -24,7 +24,7 @@ OpenAI lets open-source tools run requests on a ChatGPT Plus or Pro plan. mu sig
 
 Sign in from `/login` (the first row, "Continue with ChatGPT") or with `mu auth login openai-chatgpt`. mu opens the sign-in page in your browser; the browser returns to `127.0.0.1:1455`. Over SSH, or wherever the browser cannot reach that address, the browser ends on a page that does not load. Copy its address and paste it into mu (or the terminal running `mu auth login`), then press Enter. Esc or Ctrl-C cancels, and nothing is saved.
 
-Plan models come from your account's own list and appear in `/model` marked `ChatGPT plan`. `openai/<model>` (your API key) and `openai-chatgpt/<model>` (your plan) are separate choices; mu has no preference between them.
+Plan models come from your account's own list and appear in `/switch` and `/model` marked `ChatGPT plan`. `openai/<model>` (your API key) and `openai-chatgpt/<model>` (your plan) are separate choices; mu has no preference between them.
 
 Plan usage counts against your plan's limits. At a limit, mu stops with OpenAI's message: open https://chatgpt.com/settings/usage (Manage usage) to see or change usage, or ask your workspace admin for a workspace plan. The first time you sign in, mu says "You're using your ChatGPT plan" once.
 
@@ -108,9 +108,9 @@ Anthropic requests also carry 5-minute prompt-cache breakpoints on the last tool
 
 ## Models and prices
 
-Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`crates/mu-provider/src/model/catalog.json`), regenerated on every omp bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.toml` limits win over both.
+Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`crates/mu-provider/src/model/catalog.json`), regenerated on every omp bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/switch` and `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.toml` limits win over both.
 
-`/model` marks native models `key` and plan models `ChatGPT plan`. mu never picks a model for you: with no `--model` and no `default` role (set with `/model` or in `models.toml`; `mu models import` copies omp's), `-p`, `--headless` and ACP runs stop with an error that says so, and the TUI starts with no model (the status line shows `no model · /model`), refuses prompts, and waits for you to `/login` and choose one with `/model`. A chosen model stays on its credential until you pick another; nothing falls back from one to another. A gateway model whose provider is native is routed natively and is marked `key` too.
+`/switch` and the model list of the `/model` editor mark native models `key` and plan models `ChatGPT plan`. mu never picks a model for you: with no `--model` and no `default` role (set with `/model`, or in `models.toml`; `mu models import` copies omp's), `-p`, `--headless` and ACP runs stop with an error that says so, and the TUI starts with no model (the status line shows `no model · /switch`), refuses prompts, and waits for you to `/login` and choose one with `/switch` (`/model` only edits the saved roles, so saving `@default` does not choose a model for the running session). A chosen model stays on its credential until you pick another; nothing falls back from one to another. A gateway model whose provider is native is routed natively and is marked `key` too.
 
 ## Sessions
 
