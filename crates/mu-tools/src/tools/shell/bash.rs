@@ -259,8 +259,8 @@ impl Tools {
         let ms = SNAPSHOT_TIMEOUT.as_millis() as u32;
         let (tx, rx) = flume::unbounded::<String>();
         let opts = ShellRunOptions { command: SNAPSHOT_COMMAND.into(), timeout_ms: Some(ms), ..Default::default() };
-        let run = self.shell().run(opts, Some(tx), CancelToken::new(Some(ms)));
-        let res = tokio::time::timeout(SNAPSHOT_TIMEOUT, run).await.ok()?.ok()?;
+        let mut run = self.shell().spawn(opts, Some(tx), CancelToken::new(Some(ms)));
+        let res = tokio::time::timeout(SNAPSHOT_TIMEOUT, run.join()).await.ok()?.ok()?;
         if res.cancelled || res.timed_out || res.exit_code != Some(0) {
             return None;
         }
@@ -370,36 +370,39 @@ impl Tools {
             ..Default::default()
         };
         let start = Instant::now();
-        let run = async {
-            let fut = self.shell().run(opts, Some(tx), cancel);
-            tokio::pin!(fut);
+        let mut shell_run = self.shell().spawn(opts, Some(tx), cancel);
+        let run = shell_run.finish(
+            ctx.cancel.cancelled(),
+            || {
+                aborted.set(true);
+                abort.abort(AbortReason::Signal);
+            },
+            limits.timeout,
+        );
+        tokio::pin!(run);
+        let mut c = Collector::new(run_cwd.clone());
+        // The live tail shows cleaned text; only the pty view gets raw bytes.
+        let mut cleaner = mu_base::pty::Cleaner::default();
+        let mut feed = |s: String| {
+            let clean = cleaner.push(&s);
+            if !clean.is_empty() {
+                let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: clean });
+            }
+            c.push(&s, &|| self.next_artifact());
+        };
+        // Not "until the channel closes": a hung shell keeps its end open for good.
+        let res = loop {
             tokio::select! {
-                r = &mut fut => r,
-                _ = ctx.cancel.cancelled() => {
-                    aborted.set(true);
-                    abort.abort(AbortReason::Signal);
-                    fut.await
-                }
+                r = &mut run => break r,
+                Ok(s) = rx.recv_async() => feed(s),
             }
         };
-        let drain = async {
-            let mut c = Collector::new(run_cwd.clone());
-            // The live tail shows cleaned text; only the pty view gets raw bytes.
-            let mut cleaner = mu_base::pty::Cleaner::default();
-            while let Ok(s) = rx.recv_async().await {
-                let clean = cleaner.push(&s);
-                if !clean.is_empty() {
-                    let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: clean });
-                }
-                c.push(&s, &|| self.next_artifact());
-            }
-            let rest = cleaner.finish();
-            if !rest.is_empty() {
-                let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: rest });
-            }
-            c.finish()
-        };
-        let (res, output) = tokio::join!(run, drain);
+        rx.drain().for_each(&mut feed);
+        let rest = cleaner.finish();
+        if !rest.is_empty() {
+            let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: rest });
+        }
+        let output = c.finish();
         let res = match res {
             Ok(r) => r,
             Err(_) if aborted.get() => {
@@ -931,6 +934,33 @@ mod tests {
         assert!(!alive(&arg).await);
         let next = tools.call("bash", &json!({"command": "echo after"}), &ctx()).await;
         assert_eq!(next.text.trim(), "after");
+    }
+
+    /// A shell whose threads are all stuck (a builtin blocked in a syscall) does not freeze the caller:
+    /// the call ends once its timeout and the grace pass, or at once on abort, and the next call gets a
+    /// working shell.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hung_shell_does_not_freeze_the_caller() {
+        let tools = Tools::for_test();
+        tools.shell().jam(30);
+        let t = std::time::Instant::now();
+        let out = tools.call("bash", &json!({"command": "true", "timeout": 1}), &ctx()).await;
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
+        assert!(out.is_error && out.text.contains("stopped responding"), "{}", out.text);
+        assert_eq!(tools.call("bash", &json!({"command": "echo back"}), &ctx()).await.text.trim(), "back");
+
+        tools.shell().jam(30);
+        let c = ctx();
+        let cancel = c.cancel.clone();
+        let abort = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel.cancel();
+        };
+        let cmd = json!({"command": "true"});
+        let (out, ()) = tokio::join!(tools.call("bash", &cmd, &c), abort);
+        let Some(ToolMeta::Bash(m)) = &out.meta else { panic!("no meta: {:?}", out.text) };
+        assert!(m.cancelled, "{}", out.text);
+        assert_eq!(tools.call("bash", &json!({"command": "echo again"}), &ctx()).await.text.trim(), "again");
     }
 
     /// Tools with a jobs handle attached; background jobs are spawned on the current LocalSet.

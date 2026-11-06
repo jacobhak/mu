@@ -217,7 +217,7 @@ Non-goal: running pi or omp TypeScript extensions.
 | Eager initialization | Data built into the binary or loaded on first use; nothing parsed at startup |
 | Allocator retention | Stream request bodies to the socket; release memory after each turn (allocator choice measured) |
 | Background processes | None in the core; plugins start on use and follow their lifetime |
-| Threads | Single-threaded runtime; worker threads only for the duration of parallel work |
+| Threads | Single-threaded runtime; worker threads only for the duration of parallel work. The in-process shell is the exception: its builtins do blocking I/O, so it runs on a two-thread runtime of its own, started by the first `bash` call, and a stuck shell is abandoned instead of freezing the UI |
 | Terminal UI copies | Finished output lives in the terminal's scrollback; resize redraws from the session file |
 | Inactive session parts | Old branches and compacted history stay on disk |
 | Large tool output, images | Spilled to files; read on expand |

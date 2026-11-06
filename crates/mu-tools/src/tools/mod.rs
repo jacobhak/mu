@@ -24,7 +24,6 @@ use mu_base::text::truncate_text as trunc;
 use mu_base::tool::{ToolDef, ToolOutput};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tokio_util::sync::CancellationToken;
@@ -59,7 +58,7 @@ pub struct Tools {
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
     pub edit_store: pi_edit::EditStore,
-    shell: OnceCell<pi_shell::shell::Shell>,
+    shell: shell::worker::ShellWorker,
     /// Where the persistent shell was after the last foreground bash call; see `pathnote`.
     shell_cwd: std::cell::RefCell<Option<PathBuf>>,
     /// The persistent shell's exported variables as of the last bash call; `None` before the first.
@@ -85,7 +84,7 @@ impl Tools {
             session: Default::default(),
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
-            shell: OnceCell::new(),
+            shell: Default::default(),
             shell_cwd: Default::default(),
             shell_env: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -93,8 +92,8 @@ impl Tools {
         }
     }
 
-    pub fn shell(&self) -> &pi_shell::shell::Shell {
-        self.shell.get_or_init(|| pi_shell::shell::Shell::new(None))
+    pub(crate) fn shell(&self) -> &shell::worker::ShellWorker {
+        &self.shell
     }
 
     /// `PI_SESSION_FILE` / `PI_SESSION_ID` for bash commands (omp's names). Always both, empty
