@@ -377,13 +377,17 @@ impl Agent {
             return Some(Flow::Stopped);
         }
         // Stop reminder: the model is about to finish with open todo items. Nudge it to
-        // update the list or finish the work, at most twice per run so it cannot loop.
-        let open = if stop == StopReason::Stop && *todo_nags < 2 { self.tools.todo_open() } else { Vec::new() };
+        // update the list or finish the work, at most twice per run so it cannot loop. Not while a
+        // background job runs: ending the turn is how the model waits for it, and its result wakes
+        // the next turn.
+        let waiting = self.tools.jobs.as_ref().is_some_and(|j| j.running() > 0);
+        let open =
+            if stop == StopReason::Stop && *todo_nags < 2 && !waiting { self.tools.todo_open() } else { Vec::new() };
         if !open.is_empty() {
             *todo_nags += 1;
             let list = open.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
             self.push(Message::user(&format!(
-                "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work on them, marking each `done` only when you have actually finished it. Do not tick items off that you did not do. `drop` an item that is no longer needed; `block` it if you are waiting on the user. Do not reply to this reminder.\n</system-reminder>",
+                "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work on them, marking each `done` only when you have actually finished it. Do not tick items off that you did not do. `drop` an item that is no longer needed; `block` it (with a reason) if you are waiting on the user or something external. Never run a command in the foreground to wait it out. Do not reply to this reminder.\n</system-reminder>",
                 open.len()
             )));
             return None;

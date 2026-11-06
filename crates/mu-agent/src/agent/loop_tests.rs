@@ -387,6 +387,31 @@ fn a_stop_with_no_calls_skips_the_todo_reminder() {
     });
 }
 
+#[test]
+fn the_todo_reminder_waits_for_a_running_background_job() {
+    use mu_tools::tools::subagent::BackgroundResult;
+    use mu_tools::tools::todo::{Phase, Status, Task};
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![Block::text("waiting on bg")], StopReason::Stop)),
+            Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+        ];
+        let (mut a, _rx) = notify_agent(script);
+        let task = Task { content: "open item".into(), status: Status::Pending, blocker: None };
+        a.tools.set_todo(vec![Phase { name: "p".into(), tasks: vec![task] }]);
+        let jobs = a.tools.jobs.clone().unwrap();
+        jobs.spawn_bash("sleep 99".into(), std::env::temp_dir(), |cancel, _| async move {
+            cancel.cancelled().await;
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into() }
+        });
+        assert_eq!(jobs.running(), 1);
+        a.turn(Some("go".to_string().into())).await;
+        assert_eq!(a.messages.len(), 2, "no reminder while the job runs");
+        assert_eq!(a.ports.providers.scripted.borrow().len(), 1, "no second request");
+        jobs.kill(None);
+    });
+}
+
 /// A turn that ends with a prose question, with `tweak` applied first. Returns the message count
 /// and how many scripted replies were left unused.
 async fn question_turn(run: RunConfig) -> (usize, usize) {
