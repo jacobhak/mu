@@ -135,6 +135,11 @@ pub enum Overlay {
     ModelImport {
         sel: Select,
     },
+    /// The startup offer to trust a project's MCP servers: each file, its digest and its server names.
+    McpTrust {
+        sel: Select,
+        files: Vec<(PathBuf, String, Vec<String>)>,
+    },
     Session {
         sel: Select,
         paths: Vec<PathBuf>,
@@ -210,6 +215,8 @@ pub enum OverlayEvent {
     ModelSet(String),
     /// The import offer: `true` to copy omp's model config.
     ModelImport(bool),
+    /// The MCP trust offer: `true` to trust these files as they were shown.
+    McpTrust(bool, Vec<(PathBuf, String, Vec<String>)>),
     Copy(Option<String>),
     /// Insert these blockquotes at the end of the composer.
     Quote(Vec<String>),
@@ -530,6 +537,7 @@ impl Overlay {
             | Overlay::Web { sel }
             | Overlay::ModelSet { sel, .. }
             | Overlay::ModelImport { sel }
+            | Overlay::McpTrust { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
@@ -552,6 +560,7 @@ impl Overlay {
             | Overlay::Web { sel }
             | Overlay::ModelSet { sel, .. }
             | Overlay::ModelImport { sel }
+            | Overlay::McpTrust { sel, .. }
             | Overlay::Session { sel, .. }
             | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
@@ -679,6 +688,11 @@ impl Overlay {
                 SelectResult::Pending => (Some(Overlay::ModelImport { sel }), None),
                 SelectResult::Chosen(i) => (None, Some(OverlayEvent::ModelImport(i.first() == Some(&0)))),
                 _ => (None, Some(OverlayEvent::ModelImport(false))),
+            },
+            Overlay::McpTrust { mut sel, files } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::McpTrust { sel, files }), None),
+                SelectResult::Chosen(i) => (None, Some(OverlayEvent::McpTrust(i.first() == Some(&0), files))),
+                _ => (None, Some(OverlayEvent::McpTrust(false, files))),
             },
             Overlay::Copy { mut sel, texts } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Copy { sel, texts }), None),

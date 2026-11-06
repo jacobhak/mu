@@ -12,6 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mu_base::events::Command;
 use mu_tools::mcp::config::{self, Entry, Kind};
 use mu_tools::mcp::discover::{self, Found, Roots};
+use mu_tools::mcp::trust;
 use mu_tools::plugin::host::McpInfo;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +51,14 @@ fn tool_names(info: &McpInfo) -> String {
     s
 }
 
+/// A server as its file writes it (an untrusted entry is shown unexpanded): a command with its arguments, or a url.
+fn as_written(s: &config::McpServer) -> String {
+    match &s.kind {
+        Kind::Stdio { command, args, .. } => format!("{command} {}", args.join(" ")).trim_end().to_string(),
+        Kind::Http { url, .. } => url.clone(),
+    }
+}
+
 impl App {
     pub(super) fn mcp_cmd(&mut self, arg: &str) {
         if arg.trim().is_empty() {
@@ -72,6 +81,8 @@ impl App {
             Ok(McpCmd::Reload) => self.mcp_apply("re-reading the MCP config".into(), true),
             Ok(McpCmd::Reconnect(name)) => self.mcp_reconnect(name, false),
             Ok(McpCmd::Test(name)) => self.mcp_reconnect(name, true),
+            Ok(McpCmd::Trust) => self.mcp_trust(),
+            Ok(McpCmd::Untrust) => self.mcp_untrust(),
         }
     }
 
@@ -86,6 +97,9 @@ impl App {
     }
 
     fn state_of(&self, e: &Entry) -> String {
+        if !e.trusted {
+            return "(untrusted)".into();
+        }
         if !e.enabled {
             return "disabled".into();
         }
@@ -180,6 +194,25 @@ impl App {
         add("Remove…", "delete it from the config", McpAction::Remove);
         let title = format!("mcp:{name} · {}", self.state_of(entry));
         self.overlay = Some(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::Actions(name, acts) });
+    }
+
+    /// The startup offer to trust a project's MCP servers before they start. `files` are what
+    /// `config::untrusted_files` found; the context shows each file's servers as written.
+    pub(super) fn open_mcp_trust(&mut self, files: Vec<(PathBuf, String, Vec<String>)>) {
+        let (all, _) = config::load_all_with(&self.cwd, &paths::omp_agent_dir(), &|_| None);
+        let mut context = String::new();
+        for (file, _, _) in &files {
+            context.push_str(&format!("{}\n", file.display()));
+            for e in all.iter().filter(|e| !e.trusted && e.file == *file) {
+                context.push_str(&format!("  {}: {}\n", e.server.name, as_written(&e.server)));
+            }
+        }
+        let items = vec![
+            Item { label: "Trust".into(), detail: "start them; asked again if the file's servers change".into() },
+            Item { label: "Not now".into(), detail: "they stay off; /mcp trust starts them later".into() },
+        ];
+        let sel = Select::new("Trust this project's MCP servers?", items).context(context.trim_end());
+        self.overlay = Some(Overlay::McpTrust { sel, files });
     }
 
     fn open_mcp_confirm_remove(&mut self, name: String) {
@@ -277,6 +310,35 @@ impl App {
             }
             let _ = tx.send(UiMsg::McpApplied { lines, refresh: !sync.is_empty() });
         });
+    }
+
+    /// Trusts each file's server set as the offer showed it, then starts the servers.
+    pub(super) fn trust_mcp_files(&mut self, files: Vec<(PathBuf, String, Vec<String>)>) {
+        for (file, digest, _) in &files {
+            if let Err(e) = trust::trust(file, digest) {
+                return self.error(&format!("{}: {e}", file.display()));
+            }
+        }
+        self.mcp_apply("trusted the project's MCP servers".into(), true);
+    }
+
+    /// `/mcp trust`: trusts the project's current servers without a dialog.
+    fn mcp_trust(&mut self) {
+        let files = config::untrusted_files(&self.cwd, &paths::omp_agent_dir());
+        if files.is_empty() {
+            return self.notice("no project MCP servers are waiting for trust");
+        }
+        self.trust_mcp_files(files);
+    }
+
+    /// `/mcp untrust`: the project's servers stay off until they are trusted again.
+    fn mcp_untrust(&mut self) {
+        for file in config::candidate_files(&self.cwd, &paths::omp_agent_dir()) {
+            if trust::is_project_file(&self.cwd, &file) {
+                trust::untrust(&file);
+            }
+        }
+        self.mcp_apply("untrusted the project's MCP servers".into(), true);
     }
 
     fn mcp_reconnect(&mut self, name: String, verbose: bool) {

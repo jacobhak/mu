@@ -210,6 +210,14 @@ pub async fn run(init: AppInit) -> i32 {
             app.open_import_offer();
         }
     }
+    let untrusted = mu_tools::mcp::config::untrusted_files(&cwd, &paths::omp_agent_dir());
+    if !untrusted.is_empty() {
+        if app.overlay.is_none() && !pick_session {
+            app.open_mcp_trust(untrusted);
+        } else {
+            app.notice("this project's MCP servers are off until you trust them: /mcp trust");
+        }
+    }
     if pick_session {
         app.open_session_picker();
     }

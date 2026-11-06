@@ -289,6 +289,8 @@ impl App {
             OverlayEvent::ModelSet(name) => self.switch_to(&name),
             OverlayEvent::ModelImport(true) => self.import_now(),
             OverlayEvent::ModelImport(false) => {}
+            OverlayEvent::McpTrust(true, files) => self.trust_mcp_files(files),
+            OverlayEvent::McpTrust(false, _) => {}
             OverlayEvent::SetModel(id) => match id.strip_prefix('@') {
                 // A role with no model has nothing to switch to: pick one for it instead.
                 Some(role) if self.services.providers.cfg.role(&split_level(role).0).is_none() => {

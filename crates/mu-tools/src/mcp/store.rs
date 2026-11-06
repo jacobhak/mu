@@ -3,6 +3,7 @@
 //! overwritten.
 
 use super::config::{as_bool, candidate_files};
+use super::trust;
 use super::{JsonError, read_json};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -105,12 +106,23 @@ pub fn add(level: Level, cwd: &Path, agent: &Path, name: &str, entry: Value) -> 
     }
     let path = file_for(level, cwd, agent);
     let mut root = read_root(&path)?;
+    // A project file the user trusted, or a new one, stays trusted with the new server in it.
+    let was_trusted = match root.get("mcpServers") {
+        Some(old) => trust::is_trusted(&path, &trust::digest(old)),
+        None => true,
+    };
     let servers = root.entry("mcpServers").or_insert_with(|| Value::Object(Map::new()));
     let Value::Object(servers) = servers else {
         return Err(format!("{}: `mcpServers` is not an object; left unchanged", path.display()));
     };
     servers.insert(name.into(), entry);
     write_root(&path, &root)?;
+    if level == Level::Project
+        && was_trusted
+        && let Some(servers) = root.get("mcpServers")
+    {
+        trust::trust(&path, &trust::digest(servers)).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
     // A stale switch from an earlier server of the same name would silence this one.
     clear_switches(agent, name)?;
     Ok(path)
@@ -185,8 +197,31 @@ mod tests {
     }
 
     fn state(cwd: &Path, agent: &Path) -> Vec<(String, bool)> {
+        mu_testutil::home();
         let (all, _) = load_all_with(cwd, agent, &|_| None);
         all.into_iter().map(|e| (e.server.name, e.enabled)).collect()
+    }
+
+    fn trusted_state(cwd: &Path, agent: &Path) -> Vec<(String, bool)> {
+        mu_testutil::home();
+        let (all, _) = load_all_with(cwd, agent, &|_| None);
+        all.into_iter().map(|e| (e.server.name, e.trusted)).collect()
+    }
+
+    #[test]
+    fn adding_a_project_server_keeps_the_file_trusted_only_if_it_was() {
+        mu_testutil::home();
+        let d = tmp();
+        let (cwd, agent) = (d.join("p"), d.join("a"));
+        add(Level::Project, &cwd, &agent, "one", json!({"command": "x"})).unwrap();
+        assert_eq!(trusted_state(&cwd, &agent), vec![("one".into(), true)], "a new file is trusted");
+        add(Level::Project, &cwd, &agent, "two", json!({"url": "http://t"})).unwrap();
+        assert_eq!(trusted_state(&cwd, &agent), vec![("one".into(), true), ("two".into(), true)]);
+        // A file changed by hand is not trusted, so adding to it does not trust it either.
+        put(&cwd.join(".omp/mcp.json"), r#"{"mcpServers":{"evil":{"command":"rm"}}}"#);
+        add(Level::Project, &cwd, &agent, "three", json!({"command": "y"})).unwrap();
+        assert_eq!(trusted_state(&cwd, &agent), vec![("evil".into(), false), ("three".into(), false)]);
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
@@ -199,6 +234,7 @@ mod tests {
 
     #[test]
     fn add_keeps_everything_else_and_refuses_duplicates() {
+        mu_testutil::home();
         let d = tmp();
         let (cwd, agent) = (d.join("p"), d.join("a"));
         put(&agent.join("mcp.json"), r#"{"zeta":1,"mcpServers":{"old":{"command":"o"}},"disabledServers":["new"]}"#);

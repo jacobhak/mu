@@ -25,6 +25,10 @@ pub enum McpCmd {
     Reload,
     Reconnect(String),
     Test(String),
+    /// Trust this project's MCP servers as they are now, so they start.
+    Trust,
+    /// Stop this project's MCP servers until they are trusted again.
+    Untrust,
     Help,
 }
 
@@ -46,6 +50,8 @@ pub const USAGE: &str = "\
 /mcp reload                   re-read the config files and reconnect
 /mcp reconnect <name>         reconnect one server
 /mcp test <name>              connect and list the server's tools
+/mcp trust                    trust this project's MCP servers so they start
+/mcp untrust                  stop this project's MCP servers until trusted again
 /mcp help                     show this help
 Example: /mcp add fs --project -e DEBUG=1 -- npx -y @modelcontextprotocol/server-filesystem .";
 
@@ -74,6 +80,8 @@ pub fn parse(arg: &str) -> Result<McpCmd, String> {
         "disable" => one_name(rest, "disable <name>").map(McpCmd::Disable),
         "reconnect" => one_name(rest, "reconnect <name>").map(McpCmd::Reconnect),
         "test" => one_name(rest, "test <name>").map(McpCmd::Test),
+        "trust" => no_args(rest, "trust", McpCmd::Trust),
+        "untrust" => no_args(rest, "untrust", McpCmd::Untrust),
         other => Err(format!("unknown /mcp subcommand `{other}` (try /mcp help)")),
     }
 }
@@ -331,6 +339,9 @@ mod tests {
         assert_eq!(parse("list"), Ok(McpCmd::List));
         assert_eq!(parse("ls"), Ok(McpCmd::List));
         assert_eq!(parse("reload"), Ok(McpCmd::Reload));
+        assert_eq!(parse("trust"), Ok(McpCmd::Trust));
+        assert_eq!(parse("untrust"), Ok(McpCmd::Untrust));
+        assert!(parse("trust now").is_err());
         for h in ["help", "-h", "--help", "?"] {
             assert_eq!(parse(h), Ok(McpCmd::Help), "{h}");
         }

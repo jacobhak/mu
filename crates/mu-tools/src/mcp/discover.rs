@@ -310,7 +310,12 @@ mod tests {
     }
 
     fn configured(name: &str, entry: Value) -> Entry {
-        Entry { server: parse_entry(name, &entry).unwrap().unwrap(), enabled: true, file: PathBuf::new() }
+        Entry {
+            server: parse_entry(name, &entry).unwrap().unwrap(),
+            enabled: true,
+            file: PathBuf::new(),
+            trusted: true,
+        }
     }
 
     fn fixtures(base: &Path, r: &Roots) {

@@ -8,6 +8,7 @@ pub mod config;
 pub(crate) mod convert;
 pub mod discover;
 pub mod store;
+pub mod trust;
 
 use crate::plugin::manifest::ToolSpec;
 use cache::RemoteTool;

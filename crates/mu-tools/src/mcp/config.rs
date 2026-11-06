@@ -1,6 +1,7 @@
 //! omp's `mcp.json` files: where they are, how entries merge, and what one entry means.
 //! Pure: reads files and the environment, starts nothing.
 
+use super::trust;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -213,6 +214,8 @@ pub struct Entry {
     pub server: McpServer,
     pub enabled: bool,
     pub file: PathBuf,
+    /// False for a project file's servers the user has not trusted yet: nothing of them was expanded.
+    pub trusted: bool,
 }
 
 /// Every server for a project, in file order, including the ones switched off, plus warnings.
@@ -228,15 +231,19 @@ pub fn load_all_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<
     let mut claimed: Vec<String> = Vec::new();
     let mut out: Vec<Entry> = Vec::new();
     let mut keys: Vec<Value> = Vec::new();
+    let agent_files = [agent.join("mcp.json"), agent.join(".mcp.json")];
     for file in candidate_files(cwd, agent) {
         let Some(Value::Object(root)) = read_json(&file, &mut warnings) else { continue };
-        let Some(Value::Object(servers)) = root.get("mcpServers") else { continue };
+        let Some(mcp) = root.get("mcpServers") else { continue };
+        let Value::Object(servers) = mcp else { continue };
+        let project = trust::is_project_file(cwd, &file) && !agent_files.contains(&file);
+        let trusted = !project || trust::is_trusted(&file, &trust::digest(mcp));
         for (name, raw) in servers {
             if claimed.contains(name) {
                 continue;
             }
             claimed.push(name.clone());
-            let entry = expand_value(raw, get_env);
+            let entry = if trusted { expand_value(raw, get_env) } else { raw.clone() };
             let on = entry.get("enabled").and_then(as_bool).unwrap_or(true);
             let on = if disabled.contains(name) { false } else { on || enabled.contains(name) };
             match parse_entry(name, &entry) {
@@ -251,7 +258,7 @@ pub fn load_all_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<
                         continue;
                     }
                     keys.push(key);
-                    out.push(Entry { server: s, enabled: on, file: file.clone() });
+                    out.push(Entry { server: s, enabled: on, file: file.clone(), trusted });
                 }
             }
         }
@@ -259,10 +266,39 @@ pub fn load_all_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<
     (out, warnings)
 }
 
-/// The servers that are switched on for a project, in file order, plus warnings.
+/// The trusted servers that are switched on for a project, in file order, plus warnings.
 pub fn load_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<String>) -> (Vec<McpServer>, Vec<String>) {
-    let (all, warnings) = load_all_with(cwd, agent, get_env);
-    (all.into_iter().filter(|e| e.enabled).map(|e| e.server).collect(), warnings)
+    let (all, mut warnings) = load_all_with(cwd, agent, get_env);
+    let mut held: Vec<(PathBuf, usize)> = Vec::new();
+    for e in all.iter().filter(|e| !e.trusted) {
+        match held.iter_mut().find(|(f, _)| *f == e.file) {
+            Some((_, n)) => *n += 1,
+            None => held.push((e.file.clone(), 1)),
+        }
+    }
+    for (file, n) in held {
+        warnings.push(format!(
+            "mcp: {n} server(s) in {} not started: this project's MCP config is not trusted yet (in mu: /mcp trust)",
+            file.display()
+        ));
+    }
+    (all.into_iter().filter(|e| e.enabled && e.trusted).map(|e| e.server).collect(), warnings)
+}
+
+/// The project files that define servers not yet trusted: each file, its digest and its server names.
+pub fn untrusted_files(cwd: &Path, agent: &Path) -> Vec<(PathBuf, String, Vec<String>)> {
+    let (all, _) = load_all_with(cwd, agent, &|_| None);
+    let mut out: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+    for e in all.iter().filter(|e| !e.trusted) {
+        if let Some((_, _, names)) = out.iter_mut().find(|(f, _, _)| *f == e.file) {
+            names.push(e.server.name.clone());
+            continue;
+        }
+        let Some(Value::Object(root)) = read_json(&e.file, &mut Vec::new()) else { continue };
+        let digest = trust::digest(root.get("mcpServers").unwrap_or(&Value::Null));
+        out.push((e.file.clone(), digest, vec![e.server.name.clone()]));
+    }
+    out
 }
 
 pub fn load_all(cwd: &Path, agent: &Path) -> (Vec<Entry>, Vec<String>) {
@@ -297,8 +333,72 @@ mod tests {
     fn env(k: &str) -> Option<String> {
         match k {
             "HOME_X" => Some("/h".into()),
+            "SECRET" => Some("s3cr3t".into()),
             _ => None,
         }
+    }
+
+    /// Trusts every untrusted project file as it stands, the way the user's `/mcp trust` does.
+    fn trust_all(cwd: &Path, agent: &Path) {
+        mu_testutil::home();
+        for (file, digest, _) in untrusted_files(cwd, agent) {
+            trust::trust(&file, &digest).unwrap();
+        }
+    }
+
+    #[test]
+    fn project_servers_wait_for_trust() {
+        mu_testutil::home();
+        let d = tmp();
+        let (cwd, agent) = (d.join("proj"), d.join("agent"));
+        let file = cwd.join(".omp/mcp.json");
+        write(&file, r#"{"mcpServers":{"p":{"command":"x","args":["${SECRET}"]}}}"#);
+        // Untrusted: nothing is read from the environment, so this stub must not be called.
+        let never = |k: &str| -> Option<String> { panic!("${k} expanded for an untrusted file") };
+        let (all, _) = load_all_with(&cwd, &agent, &never);
+        assert_eq!(all.len(), 1);
+        assert!(!all[0].trusted);
+        assert_eq!(
+            all[0].server.kind,
+            Kind::Stdio { command: "x".into(), args: vec!["${SECRET}".into()], env: vec![], cwd: None }
+        );
+        let (s, w) = load_with(&cwd, &agent, &never);
+        assert!(s.is_empty());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("1 server(s)") && w[0].contains("not trusted") && w[0].contains("/mcp trust"), "{w:?}");
+
+        let (files, digest, names) = untrusted_files(&cwd, &agent).remove(0);
+        assert_eq!((files.as_path(), names.as_slice()), (file.as_path(), ["p".to_string()].as_slice()));
+        trust::trust(&file, &digest).unwrap();
+        let (s, w) = load_with(&cwd, &agent, &env);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].kind, Kind::Stdio { command: "x".into(), args: vec!["s3cr3t".into()], env: vec![], cwd: None });
+        assert!(untrusted_files(&cwd, &agent).is_empty());
+
+        // A changed server set is untrusted again, until it is trusted again.
+        write(&file, r#"{"mcpServers":{"p":{"command":"x","args":["${SECRET}"]},"q":{"url":"http://q"}}}"#);
+        let (all, _) = load_all_with(&cwd, &agent, &env);
+        assert!(all.iter().all(|e| !e.trusted), "{all:?}");
+        assert_eq!(untrusted_files(&cwd, &agent)[0].2, vec!["p".to_string(), "q".to_string()]);
+        let (s, _) = load_with(&cwd, &agent, &env);
+        assert!(s.is_empty());
+        trust_all(&cwd, &agent);
+        assert_eq!(load_with(&cwd, &agent, &env).0.len(), 2);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn agent_files_are_always_trusted() {
+        mu_testutil::home();
+        let d = tmp();
+        let (cwd, agent) = (d.join("p"), d.join("a"));
+        write(&agent.join("mcp.json"), r#"{"mcpServers":{"u":{"command":"x","args":["${SECRET}"]}}}"#);
+        let (all, _) = load_all_with(&cwd, &agent, &env);
+        assert!(all[0].trusted);
+        assert_eq!(load_with(&cwd, &agent, &env).0.len(), 1);
+        assert!(untrusted_files(&cwd, &agent).is_empty());
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
@@ -325,6 +425,7 @@ mod tests {
             &cwd.join(".mcp.json"),
             r#"{"mcpServers":{"c":{"command":"c","enabled":0},"d":{"type":"sse","url":"u"}}}"#,
         );
+        trust_all(&cwd, &agent);
         let (s, w) = load_with(&cwd, &agent, &env);
         let names: Vec<_> = s.iter().map(|s| s.name.as_str()).collect();
         // `a` from the project wins; `b` duplicates `a`'s connection; `gone` is disabled and keeps its name;
