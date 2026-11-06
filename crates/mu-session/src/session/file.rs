@@ -202,6 +202,21 @@ impl SessionFile {
         Ok(())
     }
 
+    /// Rewinds to just after the entry `id`, which stays: the next entry, and a reload, continue
+    /// from it. What came after stays in the file as an abandoned branch.
+    pub fn rewind_after(&mut self, id: &str) -> Result<()> {
+        if !self.ids.contains_key(id) {
+            bail!("no entry {id} in this session");
+        }
+        let old = self.leaf.replace(id.to_string());
+        if self.append(EntryKind::Custom, json!({"customType":"rewind","data":{"after":id}})).is_none() {
+            self.leaf = old;
+            bail!("could not record the rewind in the session file");
+        }
+        self.sync();
+        Ok(())
+    }
+
     /// Flushes the file to disk. Called after entries that must survive a crash, and at turn end.
     /// Unit tests skip it: `fdatasync` waits for the disk's journal and stalled a test for up to
     /// two minutes on a busy disk, and nothing in-process can observe the difference.
@@ -390,6 +405,20 @@ mod tests {
         assert_eq!(l.model.as_deref(), Some("a/x"));
         r.message(&Message::user("fresh"));
         assert_eq!(texts(&path), ["fresh"]);
+    }
+
+    #[test]
+    fn a_rewind_after_keeps_the_entry_and_drops_what_followed() {
+        home();
+        let mut s = SessionFile::create(Path::new("/opt/rewind-after"), None).unwrap();
+        s.message(&Message::user("one"));
+        let two = s.message(&Message::user("two")).unwrap();
+        s.message(&Message::user("three"));
+        assert!(s.rewind_after("nope").is_err());
+        s.rewind_after(&two).unwrap();
+        assert_eq!(load(&s.path).unwrap().messages.len(), 2);
+        s.message(&Message::user("four"));
+        assert_eq!(load(&s.path).unwrap().messages.len(), 3);
     }
 
     #[test]

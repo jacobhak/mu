@@ -174,10 +174,11 @@ impl App {
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths });
     }
 
-    /// The prompts that can be taken back, the newest first and selected.
+    /// The prompts that can be taken back and the replies that can be returned to, the newest
+    /// first and selected.
     pub(super) fn show_rewind(&mut self, points: Vec<mu_base::events::RewindPoint>) {
         if points.is_empty() {
-            return self.notice("no prompt to go back to");
+            return self.notice("no prompt or reply to go back to");
         }
         let total = points.len();
         let (items, ids): (Vec<_>, Vec<_>) = points
@@ -187,10 +188,12 @@ impl App {
             .map(|(n, p)| {
                 let first = p.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
                 let detail = if n == 0 { "last".to_string() } else { format!("{n} back") };
-                (Item { label: trunc(first, 80), detail }, p.id)
+                let who = if p.reply { "agent" } else { "you" };
+                (Item { label: format!("{who}: {}", trunc(first, 74)), detail }, p.id)
             })
             .unzip();
-        let title = format!("Rewind to before a prompt ({total}); files stay as they are");
+        let title =
+            format!("Rewind to before a prompt (you) or after a reply (agent) ({total}); files stay as they are");
         self.overlay = Some(Overlay::Rewind { sel: Select::new(&title, items), ids });
     }
 

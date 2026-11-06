@@ -18,7 +18,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 30] = [
     ("new", "Start a new session", false),
     ("resume", "Resume a session from this directory", false),
     ("fork", "Continue in a copy of this session; the original stays as it is", false),
-    ("rewind", "Go back to an earlier prompt and take it from there", false),
+    ("rewind", "Go back to before an earlier prompt, or to after an earlier reply", false),
     ("model", "Edit saved model roles [@role]", false),
     ("switch", "Switch this session's model", false),
     ("modelset", "Switch model sets [name | new | delete | rename | import]", false),

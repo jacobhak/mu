@@ -787,10 +787,15 @@ fn rewind_takes_a_prompt_back_and_the_session_continues_from_before_it() {
             .into_iter()
             .find_map(|e| if let AgentEvent::RewindPoints(p) = e { Some(p) } else { None })
             .expect("the points are listed");
-        assert_eq!(points.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        assert_eq!(points.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["first", "r1", "second"]);
+        assert_eq!(
+            points.iter().map(|p| p.reply).collect::<Vec<_>>(),
+            [false, true, false],
+            "the last reply is not offered"
+        );
 
         let path = a.session.as_ref().unwrap().path.clone();
-        a.rewind(&points[1].id).await;
+        a.rewind(&points[2].id).await;
         let evs = drain(&mut rx);
         assert!(evs.iter().any(|e| matches!(e, AgentEvent::QueuePopped(p) if p.text == "second")));
         assert!(!evs.iter().any(|e| matches!(e, AgentEvent::UserPrompt(_))), "the screen is not replayed");
@@ -807,7 +812,36 @@ fn rewind_takes_a_prompt_back_and_the_session_continues_from_before_it() {
 }
 
 #[test]
-fn rewind_offers_only_what_the_user_typed() {
+fn rewind_to_a_reply_keeps_it_and_drops_what_came_after() {
+    run(async {
+        let reply = |t: &str| Ok(assistant(vec![Block::text(t)], StopReason::Stop));
+        let (mut a, mut rx) = agent(vec![reply("r1"), reply("r2"), reply("r3")]);
+        a.ensure_session().await;
+        a.turn(Some("first".to_string().into())).await;
+        a.turn(Some("second".to_string().into())).await;
+        drain(&mut rx);
+
+        a.list_rewind();
+        let points = drain(&mut rx)
+            .into_iter()
+            .find_map(|e| if let AgentEvent::RewindPoints(p) = e { Some(p) } else { None })
+            .expect("the points are listed");
+        let path = a.session.as_ref().unwrap().path.clone();
+        a.rewind(&points[1].id).await;
+        let evs = drain(&mut rx);
+        assert!(!evs.iter().any(|e| matches!(e, AgentEvent::QueuePopped(_))), "nothing goes back to the composer");
+        assert_eq!(user_texts(&a), ["first"]);
+        assert_eq!(a.messages.len(), 2, "the reply stays");
+
+        a.turn(Some("third".to_string().into())).await;
+        assert_eq!(user_texts(&a), ["first", "third"]);
+        let loaded = mu_session::session::format::load(&path).unwrap();
+        assert_eq!(loaded.messages.len(), 4, "the abandoned branch is not loaded");
+    });
+}
+
+#[test]
+fn rewind_offers_only_what_the_user_typed_and_the_agent_replied() {
     run(async {
         let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
         a.ensure_session().await;
@@ -822,8 +856,11 @@ fn rewind_offers_only_what_the_user_typed() {
             .into_iter()
             .find_map(|e| if let AgentEvent::RewindPoints(p) = e { Some(p) } else { None })
             .unwrap();
-        assert_eq!(points.len(), 1);
-        assert_eq!(points[0].text, "typed");
+        assert_eq!(
+            points.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            ["typed", "ok"],
+            "not mu's own messages"
+        );
         a.rewind("nope").await;
         assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::Error(_))));
     });

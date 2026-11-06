@@ -147,7 +147,7 @@ pub enum Overlay {
         /// Chosen plans are delivered, not opened.
         deliver: bool,
     },
-    /// `/rewind`: the prompts to go back to; `ids` are their session entries.
+    /// `/rewind`: the prompts and replies to go back to; `ids` are their session entries.
     Rewind {
         sel: Select,
         ids: Vec<String>,

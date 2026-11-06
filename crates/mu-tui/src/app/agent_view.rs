@@ -801,7 +801,7 @@ mod tests {
     #[test]
     fn rewind_points_are_handed_over_and_a_taken_back_prompt_goes_to_the_composer() {
         let mut v = view();
-        let points = vec![RewindPoint { id: "a".into(), text: "first".into() }];
+        let points = vec![RewindPoint { id: "a".into(), text: "first".into(), reply: false }];
         let fx = v.on_event(AgentEvent::RewindPoints(points.clone()), SIZE);
         assert!(matches!(fx.as_slice(), [Effect::RewindPoints(p)] if *p == points));
         let fx = v.on_event(AgentEvent::QueuePopped("first".into()), SIZE);

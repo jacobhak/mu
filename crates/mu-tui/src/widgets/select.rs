@@ -336,7 +336,13 @@ impl Select {
                 SelectResult::Pending
             }
             KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
-                if self.text.is_blank() { SelectResult::Pending } else { SelectResult::Text(self.text.text()) }
+                if self.text.is_blank() {
+                    SelectResult::Pending
+                } else if self.multi && !self.checked.is_empty() {
+                    SelectResult::Noted(self.checked.iter().copied().collect(), self.text.text())
+                } else {
+                    SelectResult::Text(self.text.text())
+                }
             }
             _ => {
                 self.text.key(key, true);
@@ -651,12 +657,12 @@ impl Select {
     }
 
     /// Picks the highlighted row, or the checked rows in multi mode. The free-text row opens its
-    /// editor.
+    /// editor, even with rows checked: they are then submitted with the typed text as its note.
     fn choose(&mut self, rows: &[Row]) -> SelectResult {
         if rows.get(self.sel) == Some(&Row::Skip) {
             return SelectResult::Skipped;
         }
-        if self.multi && !self.checked.is_empty() {
+        if self.multi && !self.checked.is_empty() && rows.get(self.sel) != Some(&Row::Free) {
             return self.finish(self.checked.iter().copied().collect());
         }
         match rows.get(self.sel) {
@@ -1013,6 +1019,20 @@ mod tests {
         assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![1]));
         let mut s = Select::new("t", items(&["a", "b", "c"])).multi().preselect_all(&[0, 2]);
         assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn multi_other_with_rows_checked_opens_the_editor_and_keeps_the_picks() {
+        let mut s = Select::new("t", items(&["a", "b"])).multi().free_text("Other");
+        s.on_key(key(KeyCode::Char(' ')));
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Down));
+        assert!(matches!(s.on_key(key(KeyCode::Enter)), SelectResult::Pending));
+        type_str(&mut s, "hi");
+        match s.on_key(key(KeyCode::Enter)) {
+            SelectResult::Noted(picks, t) => assert_eq!((picks, t.as_str()), (vec![0], "hi")),
+            _ => panic!("expected the picks with the text"),
+        }
     }
 
     #[test]
