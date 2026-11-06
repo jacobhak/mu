@@ -44,16 +44,107 @@ fn near_miss_header(input: &str) -> Option<(usize, &str)> {
     })
 }
 
-fn refuse_near_miss(mode: EditMode, input: &str) -> Option<ToolOutput> {
+#[derive(Clone, Copy, PartialEq)]
+enum Header {
+    Edit,
+    Find,
+    Replace,
+    Insert { before: bool },
+}
+
+fn header_of(line: &str) -> Option<Header> {
+    let rest = line.trim().strip_prefix("***")?;
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let words: Vec<String> = rest.split_whitespace().map(str::to_ascii_lowercase).collect();
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["find"] => Some(Header::Find),
+        ["replace"] => Some(Header::Replace),
+        ["insert", "before"] => Some(Header::Insert { before: true }),
+        ["insert", "after"] => Some(Header::Insert { before: false }),
+        ["edit", "file", ..] | ["edit", "file:", ..] => Some(Header::Edit),
+        _ => None,
+    }
+}
+
+fn trim_blank<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let start = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(lines.len());
+    let end = lines.iter().rposition(|l| !l.trim().is_empty()).map_or(start, |i| i + 1);
+    &lines[start..end]
+}
+
+/// The first `Insert Before/After` whose body repeats the `Find` lines it is anchored on (the anchor goes in
+/// `Find` only; the insert body holds just the new text). Returns the `*** Find` line number and the header.
+/// Anchors under 8 non-blank characters (`}`, `end`) are skipped: new code legitimately repeats those.
+fn repeated_anchor(input: &str) -> Option<(usize, &'static str)> {
+    fn check(find: &[&str], body: &[&str], before: bool, at: usize) -> Option<(usize, &'static str)> {
+        let (anchor, body) = (trim_blank(find), trim_blank(body));
+        let chars: usize = anchor.iter().map(|l| l.trim().chars().count()).sum();
+        let same =
+            |a: &[&str], b: &[&str]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.trim_end() == y.trim_end());
+        let hit = chars >= 8
+            && body.len() >= anchor.len()
+            && if before {
+                same(&body[body.len() - anchor.len()..], anchor)
+            } else {
+                same(&body[..anchor.len()], anchor)
+            };
+        hit.then_some((at, if before { "*** Insert Before" } else { "*** Insert After" }))
+    }
+    let (mut find, mut body): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    let (mut find_at, mut part) = (0, None::<Header>);
+    for (i, line) in input.lines().enumerate() {
+        let Some(h) = header_of(line) else {
+            match part {
+                Some(Header::Find) => find.push(line),
+                Some(Header::Insert { .. }) => body.push(line),
+                _ => {}
+            }
+            continue;
+        };
+        if let Some(Header::Insert { before }) = part
+            && let Some(hit) = check(&find, &body, before, find_at)
+        {
+            return Some(hit);
+        }
+        match h {
+            Header::Edit => find.clear(),
+            Header::Find => {
+                find.clear();
+                find_at = i + 1;
+            }
+            Header::Insert { .. } => body.clear(),
+            Header::Replace => {}
+        }
+        part = Some(h);
+    }
+    match part {
+        Some(Header::Insert { before }) => check(&find, &body, before, find_at),
+        _ => None,
+    }
+}
+
+/// Sloppy payload mistakes the parser would accept silently: a header-looking line it reads as text, and an
+/// insert body that repeats its anchor. Refused before anything is written.
+fn refuse_malformed(mode: EditMode, input: &str) -> Option<ToolOutput> {
     if mode != EditMode::Sloppy {
         return None;
     }
-    let (n, line) = near_miss_header(input)?;
+    if let Some((n, line)) = near_miss_header(input) {
+        return Some(ToolOutput::err(format!(
+            "Line {n}, `{line}`, looks like an edit header but is not one, so it would be written into the file as \
+             text. Headers are `*** Edit File: <path>` (with ` all` after the path to change every match), \
+             `*** Find`, `*** Replace`, `*** Insert Before` and `*** Insert After`, each alone on its line. If the \
+             line is meant as text, indent it. Nothing was changed."
+        )));
+    }
+    let (n, header) = repeated_anchor(input)?;
     Some(ToolOutput::err(format!(
-        "Line {n}, `{line}`, looks like an edit header but is not one, so it would be written into the file as \
-         text. Headers are `*** Edit File: <path>` (with ` all` after the path to change every match), \
-         `*** Find`, `*** Replace`, `*** Insert Before` and `*** Insert After`, each alone on its line. If the \
-         line is meant as text, indent it. Nothing was changed."
+        "The `{header}` body for the `*** Find` at line {n} repeats the Find lines, so they would appear twice. \
+         The Find lines are only the anchor; put just the new text in the insert body. If the repeat is \
+         intended, make the Find differ (add a neighbouring line to it). Nothing was changed."
     )))
 }
 
@@ -152,7 +243,7 @@ impl EditWriter for FsWriter {
 
 impl Tools {
     pub async fn edit(&self, a: Args, plan: bool) -> ToolOutput {
-        if let Some(refusal) = refuse_near_miss(mode(), &a.input) {
+        if let Some(refusal) = refuse_malformed(mode(), &a.input) {
             return refusal;
         }
         let policy = PathPolicy {
@@ -236,8 +327,28 @@ mod tests {
     #[test]
     fn a_near_miss_is_refused_in_sloppy_mode_only() {
         let input = "*** Edit File: x.txt\n*** Find\na\n*** Replace\nb\n*** Find all\n";
-        let r = refuse_near_miss(EditMode::Sloppy, input).unwrap();
+        let r = refuse_malformed(EditMode::Sloppy, input).unwrap();
         assert!(r.is_error && r.text.contains("Line 6") && r.text.contains("indent it"), "{}", r.text);
-        assert!(refuse_near_miss(EditMode::Hashline, input).is_none());
+        assert!(refuse_malformed(EditMode::Hashline, input).is_none());
+    }
+
+    #[test]
+    fn an_insert_body_that_repeats_its_anchor_is_found() {
+        let before = "*** Edit File: a.rs\n*** Find\n#[cfg(test)]\nimpl Args {\n*** Insert Before\nfn new() {}\n\n#[cfg(test)]\nimpl Args {\n";
+        assert_eq!(repeated_anchor(before), Some((2, "*** Insert Before")));
+        let after = "*** Edit File: a.rs\n*** Find\nlet total = compute();\n*** Insert After\nlet total = compute();\nuse(total);\n";
+        assert_eq!(repeated_anchor(after), Some((2, "*** Insert After")));
+        let r = refuse_malformed(EditMode::Sloppy, after).unwrap();
+        assert!(r.is_error && r.text.contains("line 2") && r.text.contains("only the anchor"), "{}", r.text);
+    }
+
+    #[test]
+    fn correct_inserts_and_short_anchors_pass() {
+        let ok = "*** Edit File: a.rs\n*** Find\nlet total = compute();\n*** Insert After\nuse(total);\n\
+                  *** Find\nimpl Args {\n*** Insert Before\n#[cfg(test)]\n\
+                  *** Find\n}\n*** Insert Before\nfn f() {\n}\n\
+                  *** Find\nlet x = 1;\n*** Replace\nlet x = 1;\nlet y = 2;\n";
+        assert_eq!(repeated_anchor(ok), None);
+        assert!(refuse_malformed(EditMode::Sloppy, ok).is_none());
     }
 }

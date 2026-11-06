@@ -205,8 +205,12 @@ impl Tools {
         {
             return out;
         }
+        self.baseline_shell_env().await;
         let mut out = self.bash_plain(a, ctx).await;
-        self.refresh_shell_cwd().await;
+        if let Some(note) = self.after_foreground().await {
+            out.text.push_str("\n\n");
+            out.text.push_str(&note);
+        }
         if fallback {
             out.text.push_str("\n\n[pty unavailable without the terminal UI; ran without a terminal]");
         }
@@ -261,6 +265,39 @@ impl Tools {
             return None;
         }
         parse_snapshot(&rx.drain().collect::<String>())
+    }
+
+    /// Before the first foreground command: what the shell starts with, so later changes are the command's.
+    async fn baseline_shell_env(&self) {
+        if self.shell_env.borrow().is_some() {
+            return;
+        }
+        if let Some((cwd, vars)) = self.shell_snapshot().await {
+            *self.shell_cwd.borrow_mut() = Some(cwd);
+            *self.shell_env.borrow_mut() = Some(vars.into_iter().collect());
+        }
+    }
+
+    /// After a foreground command: records the shell's directory (for the file tools' relative-path note) and
+    /// returns a reminder when the command set or changed an exported variable, which then stays set for every
+    /// later call and for anything those start. Names only, never values.
+    async fn after_foreground(&self) -> Option<String> {
+        let (cwd, vars) = self.shell_snapshot().await?;
+        *self.shell_cwd.borrow_mut() = Some(cwd);
+        let session: Vec<&str> = self.session_env().iter().map(|(k, _)| *k).collect();
+        let now: std::collections::BTreeMap<String, String> = vars.into_iter().collect();
+        let before = self.shell_env.borrow_mut().replace(now.clone())?;
+        let changed = env_changes(&before, &now, &session);
+        if changed.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "[mu: this command set or changed {} in the persistent shell. Exports outlive the call: every later bash \
+             command, and anything it starts (install scripts, builds), sees them. Unset {} when done, or pass values \
+             for one command with `env NAME=value cmd`.]",
+            changed.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "),
+            if changed.len() == 1 { "it" } else { "them" }
+        ))
     }
 
     async fn bash_pty(&self, a: &Args, ctx: &ToolCtx) -> Option<ToolOutput> {
@@ -429,6 +466,21 @@ fn parse_snapshot(out: &str) -> Option<(PathBuf, Vec<(String, String)>)> {
         env.push((kv[0].to_string(), kv[1].to_string()));
     }
     Some((PathBuf::from(cwd), env))
+}
+
+/// Names of variables added or changed from `before` to `after`, without shell bookkeeping and mu's session variables.
+fn env_changes(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+    session: &[&str],
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(k, v)| {
+            !NOT_INHERITED.contains(&k.as_str()) && !session.contains(&k.as_str()) && before.get(*k) != Some(*v)
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
 }
 
 /// mu's own environment, for a job whose shell state could not be read.
@@ -702,6 +754,39 @@ mod tests {
         tools.set_session("abc", Some(std::path::PathBuf::from("/tmp/x_abc.jsonl")));
         let out = tools.call("bash", &cmd, &ctx).await;
         assert!(out.text.contains("[abc|/tmp/x_abc.jsonl]"), "{}", out.text);
+    }
+
+    /// An export outlives its call, so the call that makes it says so: names only, once, and not for
+    /// variables the command merely read or for ones that were already set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_command_that_exports_a_variable_is_told_it_persists() {
+        let tools = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let run = |c: &str| {
+            let tools = &tools;
+            let ctx = &ctx;
+            let cmd = json!({"command": c});
+            async move { tools.call("bash", &cmd, ctx).await.text }
+        };
+        let quiet = run("echo $HOME > /dev/null; FOO_LOCAL=1 true").await;
+        assert!(!quiet.contains("[mu: this command set"), "{quiet}");
+        let out = run("export MU_TEST_LEAK=topsecretvalue; export MU_TEST_LEAK2=1").await;
+        assert!(out.contains("`MU_TEST_LEAK`, `MU_TEST_LEAK2`") && out.contains("Unset them"), "{out}");
+        assert!(!out.contains("topsecretvalue"), "values are never echoed: {out}");
+        let next = run("echo $MU_TEST_LEAK").await;
+        assert!(!next.contains("[mu: this command set"), "only the call that changed it: {next}");
+        let changed = run("export MU_TEST_LEAK=other").await;
+        assert!(changed.contains("`MU_TEST_LEAK`") && changed.contains("Unset it"), "{changed}");
+    }
+
+    #[test]
+    fn env_changes_ignore_bookkeeping_and_session_variables() {
+        let m = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let before = m(&[("A", "1"), ("PWD", "/a")]);
+        let after = m(&[("A", "1"), ("B", "2"), ("PWD", "/b"), ("SHLVL", "3"), ("PI_SESSION_ID", "x")]);
+        assert_eq!(env_changes(&before, &after, &["PI_SESSION_ID"]), ["B"]);
+        assert!(env_changes(&after, &before, &[]).is_empty(), "an unset variable is not reported");
     }
 
     /// After a `cd`, a file tool given a relative path says where it resolved it; an absolute path does not.

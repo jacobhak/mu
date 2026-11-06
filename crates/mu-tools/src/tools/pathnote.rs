@@ -4,10 +4,7 @@
 use super::Tools;
 use mu_base::tool::ToolOutput;
 use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-const PWD_TIMEOUT: Duration = Duration::from_millis(500);
+use std::path::Path;
 
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
@@ -43,25 +40,6 @@ pub(super) fn edit_paths(input: &str) -> Vec<String> {
 }
 
 impl Tools {
-    /// Records where the persistent shell is after a foreground command, for `cwd_note`.
-    pub(super) async fn refresh_shell_cwd(&self) {
-        use pi_shell::{cancel::CancelToken, shell::ShellRunOptions};
-        let ms = PWD_TIMEOUT.as_millis() as u32;
-        let (tx, rx) = flume::unbounded::<String>();
-        let opts = ShellRunOptions { command: "pwd -P".into(), timeout_ms: Some(ms), ..Default::default() };
-        let run = self.shell().run(opts, Some(tx), CancelToken::new(Some(ms)));
-        let ok =
-            matches!(tokio::time::timeout(PWD_TIMEOUT, run).await, Ok(Ok(r)) if r.exit_code == Some(0) && !r.timed_out);
-        if !ok {
-            return;
-        }
-        let out: String = rx.drain().collect();
-        let p = PathBuf::from(out.trim());
-        if p.is_absolute() {
-            *self.shell_cwd.borrow_mut() = Some(p);
-        }
-    }
-
     /// Warns about relative `paths` when the bash shell's directory differs from the session's.
     pub(super) fn cwd_note(&self, paths: &[String]) -> Option<String> {
         let shell = self.shell_cwd.borrow().clone()?;
@@ -92,6 +70,7 @@ impl Tools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn finds_paths_in_both_edit_formats() {

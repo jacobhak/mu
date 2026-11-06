@@ -59,6 +59,8 @@ pub struct Tools {
     shell: OnceCell<pi_shell::shell::Shell>,
     /// Where the persistent shell was after the last foreground bash call; see `pathnote`.
     shell_cwd: std::cell::RefCell<Option<PathBuf>>,
+    /// The persistent shell's exported variables as of the last bash call; `None` before the first.
+    shell_env: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>>,
     /// Test seam: the `__panic` tool panics. Only test builders turn it on.
     #[cfg(any(test, feature = "test-support"))]
     pub panic_tool: std::cell::Cell<bool>,
@@ -82,6 +84,7 @@ impl Tools {
             edit_store: pi_edit::EditStore::new(),
             shell: OnceCell::new(),
             shell_cwd: Default::default(),
+            shell_env: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             panic_tool: Default::default(),
         }
