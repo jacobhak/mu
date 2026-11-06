@@ -495,6 +495,7 @@ mod tests {
         let input = UserInput {
             text: "look".into(),
             images: vec![mu_base::message::Image { data: "QUJD".into(), mime_type: "image/png".into() }],
+            command: None,
         };
         let w = to_wire(&[Message::user_input(&input)], &gw());
         let c = w[0]["content"].as_array().unwrap();
@@ -638,6 +639,7 @@ mod redacted_tests {
         let img = mu_base::message::UserInput {
             text: String::new(),
             images: vec![mu_base::message::Image { data: "x".into(), mime_type: "image/png".into() }],
+            command: None,
         };
         let w = to_wire(&[Message::user_input(&img)], &model);
         assert_eq!(w[0]["content"].as_array().unwrap().len(), 1);

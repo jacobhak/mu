@@ -44,9 +44,9 @@ Memory is not only written when the model decides to. A review reads a session a
 - before each compaction, in the background while the session goes on;
 - at session end, queued in `.state/queue.jsonl` and run when a later session starts (at most 3 per start, oldest first; a failed one stays queued).
 
-The review runs on the `memory` [role](model-roles.md) (`@smol`, then `@default`). It sees your messages, the assistant's text and tool call names with short argument summaries, never tool results, so file and web content cannot reach memory. It is told that most sessions deserve no change, to record only what you said or confirmed, to prefer replacing stale entries over adding, and to stay within the caps. A parse or cap error is retried once; if it fails again you get a warning and the session is tried again later.
+The review runs on the `memory` [role](model-roles.md) (`@smol`, then `@default`). It sees what you typed, the assistant's text and tool call names with short argument summaries. A slash command or skill shows as the command you typed (`user ran: /ship`), not the text it expands to, so a command file's instructions are not taken for your preferences. Tool results, job notices, reminders and `!` command output are left out, so file, web and command output cannot reach memory. The session's own `memory` edits are shown in full, marked applied or rejected, so the review does not repeat or undo them. It is told that most sessions deserve no change, to record only what you said or confirmed, not to record how something the session built works, to prefer replacing stale entries over adding, and to stay within the caps. A parse or cap error is retried once; if it fails again you get a warning and the session is tried again later.
 
-Not reviewed: subagent sessions, sessions with fewer than two user turns since the last review, and everything when `[memory] review = false`. Each session has a cursor in `.state/cursors/`, so a review never repeats earlier turns.
+Not reviewed: subagent sessions, sessions with fewer than two user turns since the last review (job notices and reminders are not turns), and everything when `[memory] review = false`. Each session has a cursor in `.state/cursors/`, so a review never repeats earlier turns.
 
 ## History and `/memory`
 
@@ -64,4 +64,4 @@ Each result is a session (title, date, path) with up to 3 hits and the message b
 
 ## What is never stored
 
-Secrets the filter recognises; tool results and file or web content (the review does not read them); thinking; and anything over the caps. The memory directory is plain text you can read, edit or delete: removing it resets memory, and `git log` shows what was saved and when.
+Secrets the filter recognises; tool results, job and `!` command output, and file or web content (the review does not read them); thinking; and anything over the caps. The memory directory is plain text you can read, edit or delete: removing it resets memory, and `git log` shows what was saved and when.

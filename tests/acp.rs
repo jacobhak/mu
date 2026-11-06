@@ -359,6 +359,35 @@ fn slash_commands_run_without_the_model_and_modes_switch() {
 }
 
 #[test]
+fn a_prompt_template_reaches_the_model_expanded_and_the_session_records_the_command() {
+    let (base, seen) = serve(vec![text("hi Bob")]);
+    let home = home_with_key(&base);
+    let cwd = mu_testutil::tmp();
+    std::fs::create_dir_all(cwd.join(".agents/commands")).unwrap();
+    std::fs::write(cwd.join(".agents/commands/greet.md"), "Say hi to $1 politely").unwrap();
+    let mut acp = Acp::start(&home, &cwd);
+    acp.init(json!({}));
+    let (sid, _) = acp.new_session(&cwd);
+    let r = acp.prompt(&sid, "/greet Bob");
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    let sent = seen.lock().unwrap()[0].clone();
+    assert!(sent.contains("Say hi to Bob politely") && !sent.contains("/greet"), "{sent}");
+    let path = session_file(&home, &sid).expect("the session file");
+    let end = Instant::now() + Duration::from_secs(10);
+    let user = loop {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let found =
+            text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["message"]["role"] == "user");
+        if let Some(u) = found {
+            break u;
+        }
+        assert!(Instant::now() < end, "no user message in {}", path.display());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(user["message"]["command"], "/greet Bob", "{user}");
+}
+
+#[test]
 fn a_plan_is_approved_through_a_permission_request() {
     let (mut acp, cwd, _) = setup(vec![
         tool_use("w1", "write", json!({"path": "local://demo-plan.md", "content": "# Demo plan\n"})),

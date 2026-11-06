@@ -1,7 +1,7 @@
 //! Review facts: the git snapshots and diff of base..worktree, the changed files, the plan and
 //! the request the lead reviewer is given. Shared by `/review` and `mu review`.
 use mu_base::git::git;
-use mu_base::message::{Message, text_of};
+use mu_base::message::{Message, is_injected, text_of};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -112,14 +112,10 @@ pub(crate) fn user_notes(messages: &[Message], since: i64) -> Vec<String> {
     let mut out: Vec<String> = messages
         .iter()
         .filter_map(|m| match m {
-            Message::User { content, timestamp, synthetic: false } if *timestamp >= since => {
+            Message::User { content, timestamp, synthetic: false, .. } if *timestamp >= since => {
                 let t = text_of(content);
                 let t = t.trim();
-                let skip = t.is_empty()
-                    || ["<system-notice>", "<system-reminder>", "I ran `", "Prior model work/tool state available."]
-                        .iter()
-                        .any(|p| t.starts_with(p));
-                (!skip).then(|| truncate(t, 1500))
+                (!t.is_empty() && !is_injected(t)).then(|| truncate(t, 1500))
             }
             _ => None,
         })

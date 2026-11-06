@@ -741,7 +741,7 @@ impl Composer {
         found.sort_by_key(|(at, _)| *at);
         self.push_history(&text);
         self.clear();
-        UserInput { text, images: found.into_iter().map(|(_, img)| img).collect() }
+        UserInput { text, images: found.into_iter().map(|(_, img)| img).collect(), command: None }
     }
 
     /// Inserts an `[Image #n]` marker at the cursor and keeps the image for submission.
@@ -1438,8 +1438,11 @@ mod tests {
         c.attach_image(png());
         let mut other = png();
         other.data = "REVG".into();
-        let queued =
-            UserInput { text: "see [Image #1] and [Image #2]".into(), images: vec![other.clone(), other.clone()] };
+        let queued = UserInput {
+            text: "see [Image #1] and [Image #2]".into(),
+            images: vec![other.clone(), other.clone()],
+            command: None,
+        };
         c.restore(vec![queued]).unwrap();
         assert_eq!(c.text(), "[Image #1]\n\nsee [Image #2] and [Image #3]");
         let input = c.take_for_submit();

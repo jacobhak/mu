@@ -689,6 +689,7 @@ mod tests {
             ],
             timestamp: 0,
             synthetic: false,
+            command: None,
         }];
         let m = kimi();
         let b = body(&request(&m, Thinking::Off, &[], &msgs));

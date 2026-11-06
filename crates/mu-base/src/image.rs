@@ -200,6 +200,7 @@ mod tests {
             content: vec![crate::message::Block::Image(img.clone())],
             timestamp: 0,
             synthetic: false,
+            command: None,
         };
         let line = serde_json::to_string(&msg).unwrap();
         assert!(line.len() < 300, "{}", line.len());

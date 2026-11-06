@@ -116,7 +116,8 @@ mod tests {
             Message::synthetic_user("plan"),
             Message::user("<system-notice>x"),
             Message::user("<system-reminder>x"),
-            Message::user("I ran `ls`:"),
+            Message::user("I ran `ls`:\n```\na.txt\n```"),
+            Message::user("I ran `cargo test` and it failed"),
             Message::user("Prior model work/tool state available. x"),
             Message::user("  "),
             Message::user("skip the test"),
@@ -125,7 +126,7 @@ mod tests {
             *timestamp = 1;
         }
         let n = user_notes(&msgs, 100);
-        assert_eq!(n, ["skip the test"]);
+        assert_eq!(n, ["I ran `cargo test` and it failed", "skip the test"]);
     }
 
     fn meta() -> Meta {

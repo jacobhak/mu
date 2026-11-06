@@ -319,14 +319,15 @@ impl App {
             "jobs" => self.jobs_cmd(arg),
             "memory" => self.open_memory(),
             _ => {
+                let typed = |text: String| UserInput { text, images: Vec::new(), command: Some(format!("/{cmd}")) };
                 if let Some(sk) = name.strip_prefix("skill:") {
                     match self.ctx.skill_prompt(sk, arg) {
-                        Some(p) => self.send_prompt(p, false),
+                        Some(p) => self.send_prompt(typed(p), false),
                         None => self.error(&format!("unknown skill {sk}")),
                     }
                 } else if let Some(c) = self.ctx.commands.iter().find(|c| c.name == name) {
                     let p = c.expand(arg);
-                    self.send_prompt(p, false);
+                    self.send_prompt(typed(p), false);
                 } else {
                     self.error(&format!("unknown command /{name}"));
                 }

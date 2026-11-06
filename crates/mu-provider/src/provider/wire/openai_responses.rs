@@ -667,7 +667,11 @@ mod tests {
         mu_testutil::home();
         let img = mu_base::message::Image { data: "iVBORw0KGgo=".into(), mime_type: "image/png".into() };
         let msgs = [
-            Message::user_input(&mu_base::message::UserInput { text: "look".into(), images: vec![img.clone()] }),
+            Message::user_input(&mu_base::message::UserInput {
+                text: "look".into(),
+                images: vec![img.clone()],
+                command: None,
+            }),
             assistant(
                 vec![Block::ToolCall { id: "call_1|fc_1".into(), name: "read".into(), arguments: json!({"path":"a"}) }],
                 "openai-responses",

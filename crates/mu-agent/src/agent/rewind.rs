@@ -7,13 +7,13 @@ use mu_session::session::fork;
 
 /// What the user typed in `m`, or `None` for a message mu sent itself (a plan, a reminder).
 fn prompt_of(m: &Message) -> Option<UserInput> {
-    let Message::User { content, synthetic: false, .. } = m else { return None };
+    let Message::User { content, synthetic: false, command, .. } = m else { return None };
     let text = text_of(content);
     if text.starts_with("<system-reminder>") {
         return None;
     }
     let images = content.iter().filter_map(|b| if let Block::Image(i) = b { Some(i.clone()) } else { None }).collect();
-    Some(UserInput { text, images })
+    Some(UserInput { text, images, command: command.clone() })
 }
 
 /// The text of an assistant message that ends a turn (no tool calls, no error), or `None`.

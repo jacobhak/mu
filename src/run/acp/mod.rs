@@ -475,7 +475,8 @@ impl Server {
             }
             Parsed::Prompt(text) => {
                 s.prompt = Some(id);
-                let _ = s.cmd.send(Command::Prompt(UserInput { text, images: input.images }));
+                let command = Some(input.text.trim().to_string());
+                let _ = s.cmd.send(Command::Prompt(UserInput { text, images: input.images, command }));
             }
             Parsed::Compact(focus) => {
                 s.prompt = Some(id);
@@ -975,7 +976,7 @@ fn user_input(blocks: &Value) -> UserInput {
             _ => {}
         }
     }
-    UserInput { text: parts.join("\n\n"), images }
+    UserInput { text: parts.join("\n\n"), images, command: None }
 }
 
 #[cfg(test)]

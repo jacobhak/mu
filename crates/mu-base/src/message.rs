@@ -91,6 +91,10 @@ pub enum Message {
         /// Sent by mu itself (an approved plan), not typed by the user; the UI does not echo it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         synthetic: bool,
+        /// What the user typed (`/ship --keep`) when `content` is a slash command's or skill's expansion,
+        /// so readers of the session can tell the template's words from the user's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
     },
     #[serde(rename = "assistant", rename_all = "camelCase")]
     Assistant {
@@ -135,18 +139,28 @@ pub struct Image {
 pub struct UserInput {
     pub text: String,
     pub images: Vec<Image>,
+    /// The slash command `text` was expanded from, as typed; see `Message::User::command`.
+    pub command: Option<String>,
 }
 
 impl From<String> for UserInput {
     fn from(text: String) -> Self {
-        Self { text, images: Vec::new() }
+        Self { text, ..Default::default() }
     }
 }
 
 impl From<&str> for UserInput {
     fn from(text: &str) -> Self {
-        Self { text: text.into(), images: Vec::new() }
+        Self { text: text.into(), ..Default::default() }
     }
+}
+
+/// User-role text that mu injected rather than the user typed: job and inbox notices, reminders,
+/// `!cmd` output and the compaction summary.
+pub fn is_injected(text: &str) -> bool {
+    const PREFIXES: [&str; 3] = ["<system-notice>", "<system-reminder>", "Prior model work/tool state available."];
+    let t = text.trim_start();
+    PREFIXES.iter().any(|p| t.starts_with(p)) || (t.starts_with("I ran `") && t.contains("`:\n```"))
 }
 
 /// The text blocks of `blocks`, one per line.
@@ -202,12 +216,12 @@ impl Block {
 
 impl Message {
     pub fn user(text: &str) -> Self {
-        Message::User { content: vec![Block::text(text)], timestamp: now_ms(), synthetic: false }
+        Message::User { content: vec![Block::text(text)], timestamp: now_ms(), synthetic: false, command: None }
     }
 
     /// A user-role message the user did not type and the transcript does not echo.
     pub fn synthetic_user(text: &str) -> Self {
-        Message::User { content: vec![Block::text(text)], timestamp: now_ms(), synthetic: true }
+        Message::User { content: vec![Block::text(text)], timestamp: now_ms(), synthetic: true, command: None }
     }
 
     /// A user message: the text, then one image block per attachment.
@@ -215,7 +229,7 @@ impl Message {
         // An image-only prompt has no text block: the API rejects empty ones.
         let text = (!i.text.is_empty() || i.images.is_empty()).then(|| Block::text(i.text.as_str()));
         let content = text.into_iter().chain(i.images.iter().cloned().map(Block::Image)).collect();
-        Message::User { content, timestamp: now_ms(), synthetic: false }
+        Message::User { content, timestamp: now_ms(), synthetic: false, command: i.command.clone() }
     }
 
     /// Token estimate of what this message adds to a request: about 4 bytes per token over its
@@ -475,6 +489,7 @@ mod estimate_tests {
             ],
             timestamp: 0,
             synthetic: false,
+            command: None,
         };
         let est = with_image.estimate_tokens();
         assert!((1600..1700).contains(&est), "a flat 1600 for the image, its bytes not counted: {est}");
@@ -495,5 +510,33 @@ mod estimate_tests {
         };
         assert!(call.estimate_tokens() >= 100, "tool arguments count");
         assert_eq!(text_of(&[Block::text("a"), Block::Unknown, Block::text("b")]), "a\nb");
+    }
+
+    #[test]
+    fn a_command_prompt_keeps_what_was_typed_and_plain_ones_store_nothing_extra() {
+        let input = UserInput { text: "Ship it".into(), command: Some("/ship --keep".into()), ..Default::default() };
+        let v = serde_json::to_value(Message::user_input(&input)).unwrap();
+        assert_eq!(v["command"], "/ship --keep");
+        let back: Message = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, Message::User { command: Some(c), .. } if c == "/ship --keep"));
+        let plain = serde_json::to_value(Message::user("hi")).unwrap();
+        assert!(plain.get("command").is_none(), "{plain}");
+        let old: Message = serde_json::from_str(r#"{"role":"user","content":"hi","timestamp":1}"#).unwrap();
+        assert!(matches!(old, Message::User { command: None, .. }));
+    }
+
+    #[test]
+    fn injected_user_text_is_told_apart_from_typed_text() {
+        for t in [
+            "<system-notice>\njob done",
+            "<system-reminder>\nx",
+            "I ran `ls`:\n```\n```",
+            "Prior model work/tool state available.\n",
+        ] {
+            assert!(is_injected(t), "{t}");
+        }
+        for t in ["please fix the bug", "what is <system-notice>?", "I ran `cargo test` and it failed"] {
+            assert!(!is_injected(t), "{t}");
+        }
     }
 }

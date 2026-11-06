@@ -1,14 +1,18 @@
-//! What the review reads of a session: user and assistant text, and tool calls by name with a short argument
-//! summary. Tool results, thinking and anything the system or a plugin injected stay out, so file and web
-//! content never reaches the memory model.
+//! What the review reads of a session: what the user typed, the assistant's text, and tool calls by name with a
+//! short argument summary. Tool results, thinking and anything mu or a plugin injected (job notices,
+//! reminders, `!cmd` output) stay out, so file, web and command output never reaches the memory model. A
+//! slash command or skill shows as the command the user typed, not its expansion: the template's
+//! instructions are not the user's words. The session's own memory edits show in full with whether they
+//! were applied, so the review does not redo or undo them.
 
-use mu_base::message::{Message, is_dismissal, text_of, tool_calls};
+use mu_base::message::{Message, is_dismissal, is_injected, text_of, tool_calls};
 use mu_session::session::format::Loaded;
+use serde_json::Value;
+use std::collections::HashMap;
 
 /// Characters of transcript the review sends. The newest turns are kept.
 pub const CAP: usize = 60_000;
 const ARG_CHARS: usize = 120;
-const SYSTEM_REMINDER: &str = "<system-reminder>";
 const OMITTED: &str = "[earlier turns omitted]\n\n";
 
 #[derive(Debug, PartialEq)]
@@ -32,6 +36,7 @@ struct Group {
 pub fn extract(loaded: &Loaded, cursor: Option<&str>, cap: usize) -> Option<Transcript> {
     let start = cursor.and_then(|c| loaded.entry_ids.iter().position(|id| id == c)).map_or(0, |i| i + 1);
     let mut turn = loaded.messages[..start].iter().filter(|m| is_user_turn(m)).count();
+    let failed = memory_results(&loaded.messages);
     let mut user_turns = 0;
     let mut groups: Vec<Group> = Vec::new();
     for m in &loaded.messages[start..] {
@@ -40,7 +45,7 @@ pub fn extract(loaded: &Loaded, cursor: Option<&str>, cap: usize) -> Option<Tran
             turn += 1;
             user_turns += 1;
         }
-        let lines = render(m);
+        let lines = render(m, &failed);
         if lines.is_empty() {
             continue;
         }
@@ -88,33 +93,65 @@ pub fn extract(loaded: &Loaded, cursor: Option<&str>, cap: usize) -> Option<Tran
     Some(Transcript { text, first_turn, last_turn: turn, last_entry: loaded.entry_ids.last()?.clone() })
 }
 
-fn user_text(m: &Message) -> Option<String> {
-    let Message::User { content, synthetic: false, .. } = m else { return None };
+/// The line for what the user did in `m`, or `None` for a message mu or a plugin sent.
+fn user_line(m: &Message) -> Option<String> {
+    let Message::User { content, synthetic: false, command, .. } = m else { return None };
+    if let Some(c) = command.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        return Some(format!("user ran: {c}"));
+    }
     let t = text_of(content);
     let t = t.trim();
-    (!t.is_empty() && !t.starts_with(SYSTEM_REMINDER)).then(|| t.to_string())
+    (!t.is_empty() && !is_injected(t)).then(|| format!("user: {t}"))
 }
 
 fn is_user_turn(m: &Message) -> bool {
-    user_text(m).is_some()
+    user_line(m).is_some()
 }
 
-fn render(m: &Message) -> Vec<String> {
+/// Whether each `memory` tool call failed, by call id.
+fn memory_results(messages: &[Message]) -> HashMap<String, bool> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult { tool_call_id, tool_name, is_error, .. } if tool_name == "memory" => {
+                Some((tool_call_id.clone(), *is_error))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn render(m: &Message, failed: &HashMap<String, bool>) -> Vec<String> {
     match m {
-        Message::User { .. } => user_text(m).map(|t| vec![format!("user: {t}")]).unwrap_or_default(),
+        Message::User { .. } => user_line(m).into_iter().collect(),
         Message::Assistant { content, .. } if !is_dismissal(m) => {
             let mut out = Vec::new();
             let t = text_of(content);
             if !t.trim().is_empty() {
                 out.push(format!("assistant: {}", t.trim()));
             }
-            for (_, name, args) in tool_calls(m) {
-                out.push(format!("tool call: {name} {}", summary(&args.to_string())));
+            for (id, name, args) in tool_calls(m) {
+                out.push(match memory_edit(&name, &args) {
+                    Some(ops) => {
+                        let status = match failed.get(&id) {
+                            Some(false) => "applied: already in the files above",
+                            Some(true) => "rejected: not applied",
+                            None => "no result",
+                        };
+                        format!("memory edit by the session ({status}): {ops}")
+                    }
+                    None => format!("tool call: {name} {}", summary(&args.to_string())),
+                });
             }
             out
         }
         _ => Vec::new(),
     }
+}
+
+/// The ops of a `memory` edit call, in full.
+fn memory_edit(name: &str, args: &Value) -> Option<String> {
+    (name == "memory" && args["action"] == "edit").then(|| args["ops"].to_string())
 }
 
 fn summary(args: &str) -> String {
@@ -169,6 +206,18 @@ pub(crate) mod fixture {
 
     pub fn custom_message(text: &str) -> Value {
         json!({"type": "custom_message", "content": text})
+    }
+
+    /// A prompt the TUI expanded from the slash command `command`.
+    pub fn user_command(text: &str, command: &str) -> Value {
+        json!({"type": "message", "message": {"role": "user", "content": text, "timestamp": 1, "command": command}})
+    }
+
+    pub fn memory_result(call: &str, is_error: bool) -> Value {
+        json!({"type": "message", "message": {
+            "role": "toolResult", "toolCallId": call, "toolName": "memory",
+            "content": [{"type": "text", "text": "result"}], "isError": is_error, "timestamp": 1
+        }})
     }
 }
 
@@ -295,5 +344,68 @@ mod tests {
         let t = extract(&l, None, CAP).unwrap();
         let line = t.text.lines().find(|l| l.starts_with("tool call: write")).unwrap();
         assert!(line.ends_with('…') && line.chars().count() < 160, "{line}");
+    }
+
+    #[test]
+    fn notices_and_command_output_are_not_user_turns() {
+        let notice = "<system-notice>\nBackground job A has completed.\n## A (task) — ok\nJOB_REPORT\n</system-notice>";
+        let entries = [
+            user(notice),
+            user("I ran `ls`:\n```\nCMD_OUTPUT\n```"),
+            user("<system-reminder>\nYou stopped with 1 open todo item(s)\n</system-reminder>"),
+            assistant(json!([{"type": "text", "text": "a"}])),
+            user("only one"),
+        ];
+        assert!(extract(&session("notices", &entries), None, CAP).is_none());
+        let mut entries = entries.to_vec();
+        entries.push(user("second"));
+        let t = extract(&session("notices2", &entries), None, CAP).unwrap();
+        for hidden in ["JOB_REPORT", "CMD_OUTPUT", "open todo"] {
+            assert!(!t.text.contains(hidden), "{hidden} leaked: {}", t.text);
+        }
+        assert_eq!((t.first_turn, t.last_turn), (1, 2));
+    }
+
+    #[test]
+    fn a_slash_command_shows_as_typed_not_expanded() {
+        let l = session(
+            "command",
+            &[
+                user_command("Ship the current work to main. Never stop to confirm.", "/ship --keep"),
+                assistant(json!([{"type": "text", "text": "Shipped."}])),
+                user("thanks"),
+            ],
+        );
+        let t = extract(&l, None, CAP).unwrap();
+        assert!(t.text.contains("user ran: /ship --keep\n"), "{}", t.text);
+        assert!(!t.text.contains("Never stop to confirm"), "{}", t.text);
+        assert_eq!(t.last_turn, 2);
+    }
+
+    #[test]
+    fn the_sessions_memory_edits_show_in_full_with_their_outcome() {
+        let long = format!("Release flow: {}", "step ".repeat(60));
+        let edit = |id: &str, text: &str| {
+            json!({"type": "toolCall", "id": id, "name": "memory",
+                "arguments": {"action": "edit", "ops": [{"op": "add", "file": "project", "text": text}]}})
+        };
+        let l = session(
+            "memory-edits",
+            &[
+                user("remember the release flow"),
+                assistant(json!([edit("m1", &long), edit("m2", "too big")])),
+                memory_result("m1", false),
+                memory_result("m2", true),
+                assistant(json!([{"type": "toolCall", "id": "m3", "name": "memory", "arguments": {"action": "read"}}])),
+                user("ok"),
+            ],
+        );
+        let t = extract(&l, None, CAP).unwrap();
+        let applied = t.text.lines().find(|l| l.contains("applied: already in the files above")).unwrap();
+        assert!(applied.starts_with("memory edit by the session") && applied.contains(long.trim_end()), "{applied}");
+        assert!(t.text.contains(
+            r#"memory edit by the session (rejected: not applied): [{"op":"add","file":"project","text":"too big"}]"#
+        ));
+        assert!(t.text.contains(r#"tool call: memory {"action":"read"}"#), "{}", t.text);
     }
 }
