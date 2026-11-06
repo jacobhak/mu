@@ -44,6 +44,105 @@ fn steer_and_follow_up_sent_mid_turn_are_reported_when_it_ends() {
 }
 
 #[test]
+fn thinking_changes_are_published_during_a_turn_and_applied_afterwards() {
+    run(async {
+        let (mut a, mut events) = crate::testing::agent(vec![]);
+        let (tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        q.live = a.model.live_thinking.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let observer = async {
+            for level in [Thinking::High, Thinking::Low] {
+                tx.send(Command::SetThinking(level)).unwrap();
+                assert!(matches!(events.recv().await, Some(AgentEvent::ThinkingLevel(t)) if t == level));
+                assert_eq!(a.snapshot().thinking, level.as_str());
+            }
+            done_tx.send(()).unwrap();
+        };
+        tokio::join!(
+            drive(
+                async {
+                    let _ = done_rx.await;
+                },
+                &mut q
+            ),
+            observer
+        );
+        assert_eq!(q.live.get(), Thinking::Low);
+        for level in [Thinking::High, Thinking::Low] {
+            let cmd = q.backlog.pop_front().unwrap();
+            assert!(matches!(cmd, Command::SetThinking(t) if t == level));
+            assert!(a.command(cmd, &mut q).await);
+        }
+        assert_eq!(a.snapshot().thinking, "low");
+    });
+}
+
+#[test]
+fn rapid_thinking_cycles_follow_command_order_during_a_turn() {
+    run(async {
+        let (mut a, mut events) = crate::testing::agent(vec![]);
+        let (tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        q.live = a.model.live_thinking.clone();
+        q.live.set(Thinking::Off);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let observer = async {
+            tx.send(Command::CycleThinking).unwrap();
+            tx.send(Command::CycleThinking).unwrap();
+            tx.send(Command::SetThinking(Thinking::High)).unwrap();
+            tx.send(Command::CycleThinking).unwrap();
+            let expected =
+                [Thinking::Off.cycle(), Thinking::Off.cycle().cycle(), Thinking::High, Thinking::High.cycle()];
+            for level in expected {
+                assert!(matches!(events.recv().await, Some(AgentEvent::ThinkingLevel(t)) if t == level));
+            }
+            done_tx.send(()).unwrap();
+        };
+        tokio::join!(
+            drive(
+                async {
+                    let _ = done_rx.await;
+                },
+                &mut q
+            ),
+            observer
+        );
+        for level in [Thinking::Off.cycle(), Thinking::Off.cycle().cycle(), Thinking::High, Thinking::High.cycle()] {
+            let cmd = q.backlog.pop_front().unwrap();
+            assert!(matches!(cmd, Command::SetThinking(t) if t == level));
+            assert!(a.command(cmd, &mut q).await);
+        }
+        assert_eq!(a.snapshot().thinking, Thinking::High.cycle().as_str());
+    });
+}
+
+#[test]
+fn idle_thinking_cycles_ignore_intervening_status_events() {
+    run(async {
+        let (mut a, mut events) = crate::testing::agent(vec![]);
+        let (_tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        a.set_thinking(Thinking::Off);
+        assert!(a.command(Command::CycleThinking, &mut q).await);
+        assert!(a.command(Command::SetThinking(Thinking::High), &mut q).await);
+        assert!(a.command(Command::CycleThinking, &mut q).await);
+        let snapshots: Vec<_> = drain(&mut events)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Status(s) => Some(s.thinking),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            snapshots,
+            [Thinking::Off, Thinking::Off.cycle(), Thinking::High, Thinking::High.cycle()]
+                .map(|t| t.as_str().to_string())
+        );
+    });
+}
+
+#[test]
 fn cancel_closes_an_open_plan_dialog_without_a_decision() {
     run(async {
         let (mut a, mut rx) = crate::testing::agent(vec![]);

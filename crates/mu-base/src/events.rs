@@ -33,6 +33,7 @@ pub enum Command {
     /// Re-resolve the current model: a key was added or removed, so its route may have changed.
     RefreshModel,
     SetThinking(Thinking),
+    CycleThinking,
     NewSession,
     Compact(Option<String>),
     /// `/review [focus]`.
@@ -368,6 +369,8 @@ pub enum AgentEvent {
     UserPrompt(String),
     Text(String),
     Thinking(String),
+    /// Desired thinking level changed while a turn is running.
+    ThinkingLevel(Thinking),
     BlockEnd,
     /// The model began a tool call; its arguments follow as `ToolCallDelta`s.
     ToolCallStart {

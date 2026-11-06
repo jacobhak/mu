@@ -59,7 +59,7 @@ impl Agent {
             model_id: self.model.model.id.clone(),
             model_name: if none { "no model".into() } else { pricing::display_name(&self.model.model.id) },
             reasoning: !none && pricing::reasoning(&self.model.model.id).unwrap_or(true),
-            thinking: self.model.thinking.as_str().into(),
+            thinking: self.model.live_thinking.get().as_str().into(),
             subscription: self.on_chatgpt_plan()
                 || (!self.gateway_idle() && self.costs.quota.is_subscription(&self.model.model.provider)),
             native: self.model.model.native,

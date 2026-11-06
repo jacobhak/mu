@@ -9,7 +9,6 @@ use crate::term::clipboard;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::select::{Item, Select};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use mu_base::models::Thinking;
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::Entry;
@@ -211,10 +210,7 @@ impl App {
             Action::QueueFollowUp(t) => self.submit(t, true),
             Action::Abort => self.send(Command::Cancel),
             Action::Exit => self.quit(),
-            Action::CycleThinking => {
-                let cur = Thinking::parse(&self.agent.status.thinking).unwrap_or(Thinking::Medium);
-                self.send(Command::SetThinking(cur.cycle()));
-            }
+            Action::CycleThinking => self.send(Command::CycleThinking),
             Action::ToggleThinking => {
                 let w = self.width();
                 self.agent.tr.toggle_thinking(w);

@@ -196,10 +196,16 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
                     let n = q.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
                     let _ = q.events.send(AgentEvent::Notice(format!("killed {n} job(s)")));
                 }
-                Some(Command::SetThinking(t)) => {
+                Some(c @ (Command::SetThinking(_) | Command::CycleThinking)) => {
+                    let t = match c {
+                        Command::SetThinking(t) => t,
+                        Command::CycleThinking => q.live.get().cycle(),
+                        _ => unreachable!(),
+                    };
                     // Takes effect on the next request (including retries); also queued so the
                     // session records it once the turn ends.
                     q.live.set(t);
+                    let _ = q.events.send(AgentEvent::ThinkingLevel(t));
                     q.backlog.push_back(Command::SetThinking(t));
                 }
                 Some(other) => {
@@ -424,6 +430,7 @@ impl Agent {
                 self.emit_status();
             }
             Command::SetThinking(t) => self.set_thinking(t),
+            Command::CycleThinking => self.set_thinking(self.model.live_thinking.get().cycle()),
             Command::NewSession => {
                 self.end_session().await;
                 self.reset_conversation();

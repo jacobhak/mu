@@ -195,6 +195,7 @@ impl AgentView {
                 | AgentEvent::ToolCallDelta { .. }
                 | AgentEvent::ToolOutput { .. }
                 | AgentEvent::Status(_)
+                | AgentEvent::ThinkingLevel(_)
                 | AgentEvent::Jobs(_)
                 | AgentEvent::Todo(_)
                 | AgentEvent::TurnStart
@@ -336,6 +337,7 @@ impl AgentView {
             AgentEvent::PlanList(list) => fx.push(Effect::PlanList(list)),
             AgentEvent::RewindPoints(list) => fx.push(Effect::RewindPoints(list)),
             AgentEvent::Status(s) => self.status = s,
+            AgentEvent::ThinkingLevel(t) => self.status.thinking = t.as_str().into(),
             AgentEvent::Todo(v) => self.todo = serde_json::from_value(v).unwrap_or_default(),
             AgentEvent::TurnEnd { aborted } => {
                 self.pty = None;
@@ -867,6 +869,21 @@ mod tests {
         assert!(matches!(fx.as_slice(), [Effect::PlanList(l)] if l.is_empty()));
         let fx = v.on_event(AgentEvent::Status(StatusSnapshot { context_window: 9, ..Default::default() }), SIZE);
         assert!(fx.is_empty());
+        assert_eq!(v.status.context_window, 9);
+    }
+
+    #[test]
+    fn live_thinking_level_updates_status_without_resetting_other_fields() {
+        let mut v = view();
+        v.on_event(
+            AgentEvent::Status(StatusSnapshot { thinking: "medium".into(), context_window: 9, ..Default::default() }),
+            SIZE,
+        );
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        let fx = v.on_event(AgentEvent::ThinkingLevel(mu_base::models::Thinking::High), SIZE);
+        assert!(fx.is_empty());
+        assert!(v.running);
+        assert_eq!(v.status.thinking, "high");
         assert_eq!(v.status.context_window, 9);
     }
 
