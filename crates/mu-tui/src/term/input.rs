@@ -18,7 +18,7 @@ use mu_base::message::Image;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 /// An unterminated escape sequence or paste this large is garbage; drop it.
-const MAX_PENDING: usize = 64 * 1024 * 1024;
+const MAX_PENDING: usize = 16 * 1024 * 1024;
 
 pub enum Input {
     /// A terminal control sequence the parser wants sent back (e.g. a clipboard request); the
@@ -37,6 +37,8 @@ pub struct Reader {
     queue: VecDeque<Input>,
     /// Read buffer, kept across reads instead of allocating 64 KB per call.
     buf: Vec<u8>,
+    /// The terminal ended; `next` returns `None` once the queued inputs are drained.
+    closed: bool,
 }
 
 /// How readiness of the tty is learned. epoll (Linux) lets tokio watch the fd; kqueue (macOS) cannot register
@@ -87,9 +89,14 @@ impl Reader {
     }
 
     fn from_fd(owned: OwnedFd) -> io::Result<Self> {
-        let raw = owned.as_raw_fd();
         // MU_INPUT_SELECT forces the select backend, so it can be tested on Linux.
-        let src = if cfg!(target_os = "macos") || std::env::var_os("MU_INPUT_SELECT").is_some() {
+        let select = cfg!(target_os = "macos") || std::env::var_os("MU_INPUT_SELECT").is_some();
+        Self::with_backend(owned, select)
+    }
+
+    fn with_backend(owned: OwnedFd, select: bool) -> io::Result<Self> {
+        let raw = owned.as_raw_fd();
+        let src = if select {
             let (rtx, ready) = tokio::sync::mpsc::unbounded_channel();
             let (ack, arx) = std::sync::mpsc::channel();
             std::thread::Builder::new().name("tty-select".into()).spawn(move || select_thread(raw, rtx, arx))?;
@@ -104,6 +111,7 @@ impl Reader {
             winch: signal(SignalKind::window_change())?,
             queue: VecDeque::new(),
             buf: vec![0u8; 64 * 1024],
+            closed: false,
         })
     }
 
@@ -120,7 +128,10 @@ impl Reader {
             if let Some(i) = self.queue.pop_front() {
                 return Some(i);
             }
-            let Self { src, parser, winch, queue, buf } = self;
+            if self.closed {
+                return None;
+            }
+            let Self { src, parser, winch, queue, buf, closed } = self;
             match src {
                 Source::Async(fd) => {
                     tokio::select! {
@@ -145,19 +156,28 @@ impl Reader {
                             got?;
                             let raw = fd.as_raw_fd();
                             let mut chunks: Vec<Vec<u8>> = Vec::new();
+                            let mut ended = false;
                             loop {
                                 match read_fd(raw, buf) {
-                                    Ok(0) => return None,
+                                    Ok(0) => {
+                                        ended = true;
+                                        break;
+                                    }
                                     Ok(n) => chunks.push(buf[..n].to_vec()),
                                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => return None,
+                                    Err(_) => {
+                                        ended = true;
+                                        break;
+                                    }
                                 }
                             }
                             let _ = ack.send(());
                             for c in chunks {
                                 Self::consume(parser, queue, &c);
                             }
+                            // `next` returns None only after these queued inputs are drained.
+                            *closed = ended;
                         }
                     }
                 }
@@ -292,8 +312,18 @@ impl Parser {
                     }
                     break;
                 };
-                let text = String::from_utf8_lossy(&self.buf[PASTE_START.len()..end]).into_owned();
-                self.buf.drain(..end + PASTE_END.len());
+                if end + PASTE_END.len() > MAX_PENDING {
+                    self.buf.drain(..end + PASTE_END.len());
+                    self.scan_from = 0;
+                    out.push(Input::Status("paste truncated: too large".into()));
+                    continue;
+                }
+                let mut bytes = std::mem::take(&mut self.buf);
+                self.buf = bytes.split_off(end + PASTE_END.len());
+                bytes.truncate(end);
+                bytes.drain(..PASTE_START.len());
+                let text =
+                    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 self.scan_from = 0;
                 out.push(Input::Term(Event::Paste(text)));
                 continue;
@@ -465,9 +495,8 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    /// The app's `select!` drops `next()` whenever another branch wins; input must survive that.
-    #[tokio::test]
-    async fn next_survives_cancellation() {
+    /// A non-blocking pipe: (read end, write end).
+    fn pipe_pair() -> (OwnedFd, OwnedFd) {
         let mut fds = [0 as RawFd; 2];
         // SAFETY: `fds` has room for the two descriptors pipe writes; fcntl acts on those fresh fds.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -479,7 +508,13 @@ mod tests {
             }
         }
         // SAFETY: both descriptors are fresh and owned here.
-        let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    /// The app's `select!` drops `next()` whenever another branch wins; input must survive that.
+    #[tokio::test]
+    async fn next_survives_cancellation() {
+        let (rd, wr) = pipe_pair();
         let mut reader = Reader::from_fd(rd).unwrap();
         for _ in 0..3 {
             let idle = tokio::time::timeout(std::time::Duration::from_millis(20), reader.next()).await;
@@ -492,6 +527,23 @@ mod tests {
             matches!(got, Some(Input::Term(Event::Key(k))) if k.code == KeyCode::Char('a')),
             "keypress after cancelled polls"
         );
+    }
+
+    /// The select backend reads until EOF before it notices the end, so bytes sent just before a close
+    /// are delivered, not lost.
+    #[tokio::test]
+    async fn select_backend_delivers_bytes_read_before_eof() {
+        let (rd, wr) = pipe_pair();
+        // SAFETY: `wr` is a valid pipe write end; two bytes fit in an empty pipe.
+        assert_eq!(unsafe { libc::write(wr.as_raw_fd(), b"ab".as_ptr().cast(), 2) }, 2);
+        drop(wr);
+        let mut reader = Reader::with_backend(rd, true).unwrap();
+        let timeout = std::time::Duration::from_secs(2);
+        for want in ['a', 'b'] {
+            let got = tokio::time::timeout(timeout, reader.next()).await.unwrap();
+            assert!(matches!(got, Some(Input::Term(Event::Key(k))) if k.code == KeyCode::Char(want)), "key {want}");
+        }
+        assert!(tokio::time::timeout(timeout, reader.next()).await.unwrap().is_none());
     }
 
     fn key(c: KeyCode) -> Input {
@@ -605,6 +657,38 @@ mod tests {
         let jpeg = STANDARD.encode("image/jpeg");
         let name = STANDARD.encode("Paste event");
         assert_eq!(p.take_writes(), [format!("\x1b]5522;type=read:pw=abc:name={name};{jpeg}\x07")]);
+    }
+
+    #[test]
+    fn paste_above_the_cap_is_truncated_even_when_its_end_arrives_in_one_read() {
+        let mut p = Parser::default();
+        let mut big = PASTE_START.to_vec();
+        big.extend(vec![b'x'; MAX_PENDING]);
+        big.extend_from_slice(PASTE_END);
+        big.push(b'z');
+        let out = p.feed(&big);
+        assert!(
+            matches!(&out[..], [Input::Status(s), Input::Term(Event::Key(k))]
+                if s == "paste truncated: too large" && k.code == KeyCode::Char('z')),
+            "got {} inputs",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn normal_paste_round_trips_and_keeps_the_bytes_after_it() {
+        let mut p = Parser::default();
+        let got = p.feed("\x1b[200~héllo\nwörld\x1b[201~tail".as_bytes());
+        assert!(same(
+            &got,
+            &[
+                Input::Term(Event::Paste("héllo\nwörld".into())),
+                key(KeyCode::Char('t')),
+                key(KeyCode::Char('a')),
+                key(KeyCode::Char('i')),
+                key(KeyCode::Char('l')),
+            ]
+        ));
     }
 
     #[test]

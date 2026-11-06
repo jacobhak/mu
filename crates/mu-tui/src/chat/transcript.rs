@@ -145,7 +145,8 @@ impl Transcript {
             Some((_, t)) => t.push_str(s),
             None => self.thinking = Some((Instant::now(), s.to_string())),
         }
-        if self.show_thinking {
+        // Like `ingest_text`, parse only at line ends; `finish_thinking` commits the rest.
+        if self.show_thinking && s.contains('\n') {
             self.commit_stable_thinking(w);
         }
     }
@@ -316,5 +317,18 @@ mod tests {
         assert!(t.revealing(), "a step shows only part of the backlog");
         t.flush_reveal(40);
         assert!(!t.revealing());
+    }
+
+    #[test]
+    fn thinking_commits_only_at_line_ends() {
+        let mut t = Transcript::new(true, false);
+        t.queue_reveal(Stream::Thinking, "first\n\n".into(), 40);
+        assert!(t.pending.is_empty(), "one paragraph is not yet stable");
+        t.queue_reveal(Stream::Thinking, "second".into(), 40);
+        assert!(t.pending.is_empty(), "a delta without a line end is not parsed");
+        t.queue_reveal(Stream::Thinking, "\n".into(), 40);
+        assert!(!t.pending.is_empty(), "the line end makes the first paragraph stable");
+        t.finish_thinking(40);
+        assert!(!t.thinking_active());
     }
 }
