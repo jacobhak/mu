@@ -6,6 +6,8 @@
 //! Reads are cached per file stamp (inode, ctime, mtime and size), so a key added by one session reaches the
 //! others without a restart. Writes hold a lock file, re-read, and replace the file atomically.
 
+use super::chatgpt::ChatgptData;
+use super::chatgpt::store::register_tokens;
 use super::web::WebSearch;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -15,8 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 2 added `Entry::chat` and `web`; an older mu refuses the file rather than rewriting it without them.
-const VERSION: u32 = 2;
+/// 2 added `Entry::chat` and `web`; 3 added the `chatgpt` section. An older mu refuses a newer file
+/// rather than rewriting it without them. A file with no sign-in is still written as 2.
+const VERSION: u32 = 3;
+const VERSION_WITHOUT_CHATGPT: u32 = 2;
 /// A `!command` reference gets this long to print the key.
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -137,6 +141,12 @@ struct FileData {
     providers: BTreeMap<String, Entry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web: Option<WebSearch>,
+    #[serde(default, skip_serializing_if = "chatgpt_unset")]
+    chatgpt: ChatgptData,
+}
+
+fn chatgpt_unset(c: &ChatgptData) -> bool {
+    *c == ChatgptData::default()
 }
 
 /// What `resolve` hands to a request.
@@ -180,7 +190,7 @@ impl Store {
         Some([m.dev() as i64, m.ino() as i64, m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec(), m.len() as i64])
     }
 
-    fn lock_path(&self) -> PathBuf {
+    pub(crate) fn lock_path(&self) -> PathBuf {
         let mut n = self.path.file_name().unwrap_or_default().to_os_string();
         n.push(".lock");
         self.path.with_file_name(n)
@@ -221,6 +231,7 @@ impl Store {
                 mu_base::secrets::register_stored(&label(provider), k);
             }
         }
+        register_tokens(&data.chatgpt);
         cache.insert(self.path.clone(), (stamp, data.clone()));
         data
     }
@@ -229,6 +240,16 @@ impl Store {
     /// mu ignores (no usable key or reference, or a base URL it refuses), named by provider.
     pub fn check(&self) -> Result<()> {
         let data = self.read_fresh()?;
+        if [data.chatgpt.auth_base.as_deref(), data.chatgpt.api_base.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|u| check_base_url(u).is_err())
+        {
+            bail!(
+                "{} has a ChatGPT base URL override mu refuses (https, or http to loopback; no user name or password)",
+                self.path.display()
+            );
+        }
         let ignored: Vec<&str> = data
             .providers
             .iter()
@@ -280,10 +301,15 @@ impl Store {
     fn modify(&self, f: impl FnOnce(&mut FileData) -> bool) -> Result<bool> {
         let _lock = mu_common::fs::FileLock::exclusive(&self.lock_path())
             .with_context(|| format!("locking {}", self.lock_path().display()))?;
+        self.modify_locked(f)
+    }
+
+    /// `modify` for a caller that already holds the lock file.
+    fn modify_locked(&self, f: impl FnOnce(&mut FileData) -> bool) -> Result<bool> {
         let mut data = self.read_fresh()?;
         let changed = f(&mut data);
         if changed {
-            data.version = VERSION;
+            data.version = if data.chatgpt == ChatgptData::default() { VERSION_WITHOUT_CHATGPT } else { VERSION };
             for (p, e) in data.providers.iter_mut() {
                 if e.chat.is_none() && crate::provider::providers::native_def(p).is_some() {
                     e.chat = Some(true);
@@ -350,6 +376,28 @@ impl Store {
     pub async fn resolve(&self, provider: &str) -> Result<Resolved> {
         let entry = self.get(provider).ok_or_else(|| anyhow!("no API key stored for {provider}"))?;
         resolve_entry(provider, &entry).await
+    }
+}
+
+impl Store {
+    /// The cached `chatgpt` section (see `read_fresh` for a re-read under the lock).
+    pub(crate) fn chatgpt_cached(&self) -> ChatgptData {
+        self.snapshot().chatgpt.clone()
+    }
+
+    /// The `chatgpt` section as the file holds it now. Callers that write must hold `lock_path`.
+    pub(crate) fn chatgpt_fresh(&self) -> Result<ChatgptData> {
+        Ok(self.read_fresh()?.chatgpt)
+    }
+
+    /// Applies `f` to the `chatgpt` section under the lock file; writes only when `f` reports a change.
+    pub(crate) fn update_chatgpt(&self, f: impl FnOnce(&mut ChatgptData) -> bool) -> Result<bool> {
+        self.modify(|d| f(&mut d.chatgpt))
+    }
+
+    /// `update_chatgpt` for a caller that holds the lock file (`lock_path`) already.
+    pub(crate) fn update_chatgpt_locked(&self, f: impl FnOnce(&mut ChatgptData) -> bool) -> Result<bool> {
+        self.modify_locked(|d| f(&mut d.chatgpt))
     }
 }
 
@@ -508,7 +556,7 @@ mod tests {
     #[test]
     fn a_newer_file_is_refused() {
         let (s, d) = store("v3");
-        replace_file(s.path(), r#"{"version":3,"providers":{}}"#);
+        replace_file(s.path(), r#"{"version":4,"providers":{}}"#);
         assert!(s.check().is_err());
         assert!(s.set("openai", Entry::literal("sk-test-0123456789")).is_err());
         let _ = std::fs::remove_dir_all(d);

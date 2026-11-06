@@ -1,51 +1,56 @@
 //! Which model and thinking level a new agent gets.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use mu_base::{config, models};
-use mu_common::paths;
 use mu_provider::provider::client::Providers;
-use mu_provider::provider::providers::PROVIDERS;
 use mu_tools::context;
 
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5-5";
+const NO_MODEL: &str =
+    "no model chosen: pass --model provider/model, or set the `default` role (modelRoles.default in omp's config.yml)";
 
-/// Model and thinking level for a new agent: `sel` (command line or headless role) beats the `default` role.
+/// The model and level a new agent asked for: `sel` (command line or headless role) beats the
+/// `default` role. `None` when neither names one: mu never picks a model itself.
+fn chosen(cfgs: &config::Configs, sel: Option<String>) -> (Option<String>, Option<models::Thinking>) {
+    let (cfg_model, cfg_level) = cfgs.role("default").map(|v| models::split_level(&v)).unzip();
+    (sel.or(cfg_model), cfg_level.flatten())
+}
+
+fn resolve_chosen(
+    providers: &Providers,
+    sel: &str,
+    level: Option<models::Thinking>,
+    cli_thinking: Option<models::Thinking>,
+) -> Result<(models::ModelSpec, models::Thinking)> {
+    let (spec, role_level) = providers.resolve(sel)?;
+    Ok((spec, cli_thinking.or(role_level).or(level).unwrap_or(models::Thinking::Medium)))
+}
+
+/// Model and thinking level for a run that cannot ask: an error when none is named.
 pub(crate) fn pick_model(
     cfgs: &config::Configs,
     providers: &Providers,
     sel: Option<String>,
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
-    let (cfg_model, cfg_level) = cfgs.role("default").map(|v| models::split_level(&v)).unzip();
-    let sel = sel.or(cfg_model).unwrap_or_else(|| default_model(providers));
-    let (spec, role_level) = providers.resolve(&sel)?;
-    Ok((spec, cli_thinking.or(role_level).or(cfg_level.flatten()).unwrap_or(models::Thinking::Medium)))
+    let (sel, level) = chosen(cfgs, sel);
+    let sel = sel.ok_or_else(|| anyhow!(NO_MODEL))?;
+    resolve_chosen(providers, &sel, level, cli_thinking)
 }
 
-/// The model used when nothing names one: omp's default while omp can run, else the first native
-/// provider with a key, else omp's default (which then says what is missing).
-fn default_model(providers: &Providers) -> String {
-    default_model_for(omp_installed(), |p| providers.is_direct(p))
-}
-
-/// `default_model` with the two facts it depends on passed in.
-fn default_model_for(omp: bool, native: impl Fn(&str) -> bool) -> String {
-    if omp {
-        return DEFAULT_MODEL.into();
+/// `pick_model` for the TUI: with no model named it starts unselected, so the user can `/login`
+/// and `/model` first.
+pub(crate) fn pick_model_or_none(
+    cfgs: &config::Configs,
+    providers: &Providers,
+    sel: Option<String>,
+    cli_thinking: Option<models::Thinking>,
+) -> Result<(models::ModelSpec, models::Thinking)> {
+    match chosen(cfgs, sel) {
+        (Some(sel), level) => resolve_chosen(providers, &sel, level, cli_thinking),
+        (None, level) => {
+            Ok((models::ModelSpec::unselected(), cli_thinking.or(level).unwrap_or(models::Thinking::Medium)))
+        }
     }
-    PROVIDERS
-        .iter()
-        .find(|d| native(d.id))
-        .map_or_else(|| DEFAULT_MODEL.into(), |d| format!("{}/{}", d.id, d.default_model))
-}
-
-/// Whether omp can run: `$MU_OMP`, else mu's own copy, else `omp` on `$PATH`.
-fn omp_installed() -> bool {
-    let bin = paths::omp_bin();
-    if bin.components().count() > 1 {
-        return bin.is_file();
-    }
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&bin).is_file()))
 }
 
 /// First `provider/model[:level]` or configured `@role` in the agent's model list, else the role chain of
@@ -74,16 +79,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_model_is_omps_while_omp_can_run() {
-        assert_eq!(default_model_for(true, |_| false), DEFAULT_MODEL);
-        assert_eq!(default_model_for(true, |_| true), DEFAULT_MODEL);
+    fn a_model_comes_from_the_selector_or_the_default_role_and_never_from_credentials() {
+        let mut cfgs = config::Configs::default();
+        assert_eq!(chosen(&cfgs, None), (None, None));
+        assert_eq!(chosen(&cfgs, Some("a/b".into())), (Some("a/b".into()), None));
+        cfgs.omp.model_roles.insert("default".into(), "a/d:high".into());
+        assert_eq!(chosen(&cfgs, None), (Some("a/d".into()), Some(models::Thinking::High)));
+        assert_eq!(chosen(&cfgs, Some("a/b".into())).0.as_deref(), Some("a/b"));
     }
 
     #[test]
-    fn without_omp_the_first_native_key_provides_the_default() {
-        let first = &PROVIDERS[0];
-        assert_eq!(default_model_for(false, |p| p == first.id), format!("{}/{}", first.id, first.default_model));
-        assert_eq!(default_model_for(false, |_| false), DEFAULT_MODEL, "no key: omp's default says what is missing");
+    fn no_model_is_an_error_for_a_run_that_cannot_ask_and_unselected_in_the_tui() {
+        let cfgs = config::Configs::default();
+        let providers = Providers::for_tests(
+            std::rc::Rc::new(config::Configs::default()),
+            mu_provider::provider::endpoint::GatewaySource::new(mu_provider::provider::endpoint::start_fn(|| async {
+                Err::<(String, String), String>("none".into())
+            })),
+        );
+        let e = pick_model(&cfgs, &providers, None, None).unwrap_err().to_string();
+        assert!(e.contains("--model") && e.contains("default"), "{e}");
+        let (spec, level) = pick_model_or_none(&cfgs, &providers, None, None).unwrap();
+        assert!(spec.is_unselected());
+        assert_eq!(level, models::Thinking::Medium);
     }
 
     #[test]

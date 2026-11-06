@@ -1,9 +1,10 @@
 use super::endpoint;
 use super::gateway_models::load_cache;
-use super::providers::{ProviderDef, direct_spec, native_def};
+use super::providers::{Credential, ProviderDef, direct_spec, native_def};
 use super::retry;
 use super::types::{Auth, Decoder, ProviderError, Request, StreamEvent};
 use super::wire::{self, WireFormat};
+use crate::auth::chatgpt::{self, oauth::RefreshError};
 use crate::net::{self, host_of};
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -136,7 +137,23 @@ impl Providers {
 
     pub fn resolve(&self, sel: &str) -> Result<(ModelSpec, Option<Thinking>)> {
         let direct = |p: &str, m: &str| self.is_direct(p).then(|| direct_spec(p, m)).flatten();
-        models::resolve(sel, &self.cfg, self.gw_models.borrow().as_deref(), &direct)
+        let (spec, level) = models::resolve(sel, &self.cfg, self.gw_models.borrow().as_deref(), &direct)?;
+        // The ChatGPT plan is never sent through the gateway; without a usable sign-in it has no spec.
+        if spec.provider == chatgpt::PROVIDER_ID && !spec.native {
+            return Err(anyhow::anyhow!(self.chatgpt_sign_in_needed()));
+        }
+        Ok((spec, level))
+    }
+
+    fn chatgpt_sign_in_needed(&self) -> String {
+        let id = chatgpt::PROVIDER_ID;
+        if self.store.chatgpt_account().is_some_and(|a| a.signed_in()) {
+            format!(
+                "the ChatGPT sign-in does not include plan usage; sign in again with /login (or `mu auth login {id}`)"
+            )
+        } else {
+            format!("{id} models need a ChatGPT sign-in: sign in with /login or `mu auth login {id}`")
+        }
     }
 
     pub(super) async fn endpoint(&self) -> Result<Endpoint, ProviderError> {
@@ -144,11 +161,16 @@ impl Providers {
         Ok(Endpoint { base, token })
     }
 
-    /// Where a request for `m` goes.
-    async fn route(&self, m: &ModelSpec) -> Result<Route, ProviderError> {
+    /// Where a request for `m` goes. `refresh` forces a new ChatGPT access token (after a 401).
+    async fn route(&self, m: &ModelSpec, refresh: bool) -> Result<Route, ProviderError> {
         if m.native {
             let def = native_def(&m.provider)
                 .ok_or_else(|| ProviderError::Fatal(format!("{} is not a native provider", m.provider)))?;
+            if def.kind == Credential::ChatgptPlan {
+                let access = self.store.chatgpt_access(refresh).await.map_err(route_error)?;
+                let base = self.store.chatgpt_api_base();
+                return Ok(Route { base, auth: Auth::Bearer(access.token), def: Some(def) });
+            }
             let r = self.store.resolve(&m.provider).await.map_err(|e| ProviderError::Fatal(e.to_string()))?;
             let base = r.base_url.unwrap_or_else(|| def.base_url.to_string());
             return Ok(Route { base, auth: Auth::for_def(def, &r.key), def: Some(def) });
@@ -174,6 +196,9 @@ impl Providers {
                 }
             }
             return r;
+        }
+        if req.model.is_unselected() {
+            return Err(ProviderError::Fatal("no model chosen: pick one with /model".into()));
         }
         if !req.model.native && !self.gw_fresh.get() {
             tokio::select! {
@@ -206,7 +231,7 @@ impl Providers {
         ev: &mut dyn FnMut(StreamEvent),
         rekeyed: &mut bool,
     ) -> Result<Message, ProviderError> {
-        let route = self.route(req.model).await?;
+        let route = self.route(req.model, *rekeyed).await?;
         let format = wire::select(req.model, &route);
         let body = format.body(req);
         dump_request(req, &body);
@@ -235,6 +260,14 @@ impl Providers {
             rb = rb.header(k, v);
         }
         route.auth.apply(rb.body(body.to_string()))
+    }
+}
+
+/// A ChatGPT sign-in that could not be refreshed: a transient failure is retried, anything else is shown.
+fn route_error(e: anyhow::Error) -> ProviderError {
+    match e.downcast_ref::<RefreshError>() {
+        Some(RefreshError::Transient(_)) => ProviderError::Retryable { msg: e.to_string(), retry_after: None },
+        _ => ProviderError::Fatal(e.to_string()),
     }
 }
 
@@ -269,7 +302,22 @@ async fn check_status(
     if let Some(e) = retry::too_long(retry_after, wait_limit) {
         return Err(e);
     }
+    let request_id = resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let text = mu_base::secrets::redact_keys(&resp.text().await.unwrap_or_default());
+    if let Some(def) = route.def
+        && def.kind == Credential::ChatgptPlan
+    {
+        // One forced refresh per stream: a second rejection of a fresh token means the sign-in is no good.
+        if status.as_u16() == 401 && !*rekeyed {
+            *rekeyed = true;
+            return Err(ProviderError::Retryable {
+                msg: format!("{} rejected the sign-in; refreshing it", def.label),
+                retry_after: Some(Duration::ZERO),
+            });
+        }
+        let e = retry::chatgpt_error(status.as_u16(), retry_after, &text, request_id.as_deref());
+        return Err(retry::honour_should_retry(e, should_retry));
+    }
     if let Some(def) = route.def
         && status.as_u16() == 401
         && !*rekeyed
@@ -357,6 +405,156 @@ mod route_tests {
             def: native_def("anthropic"),
         };
         assert_eq!((n.peer().as_str(), n.idle_peer().as_str()), ("api.anthropic.com", "api.anthropic.com"));
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_route_tests {
+    use super::*;
+    use crate::auth::chatgpt::{Account, DIRECT_SCOPE, Tokens};
+    use crate::auth::store::Store;
+    use mu_testutil::{Reply, block_on, fake_server};
+    use std::path::PathBuf;
+
+    const SSE: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"pong\"}\n\n\
+        event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n";
+    const ACCESS: &str = "acc-route-0123456789";
+    const FRESH: &str = "acc-fresh-0123456789";
+
+    fn ok() -> Reply {
+        Reply::new(200, SSE).header("content-type", "text/event-stream")
+    }
+
+    fn refresh_reply() -> Reply {
+        let body = format!(
+            r#"{{"access_token":"{FRESH}","refresh_token":"ref-fresh-0123456789","token_type":"Bearer","expires_in":3600}}"#
+        );
+        Reply::new(200, &body).header("content-type", "application/json")
+    }
+
+    /// Providers over a private store signed in to the plan, with the issuer and the API at the fake servers.
+    /// The token is not due, so only a forced refresh reaches the issuer.
+    fn plan(auth: &str, api: &str) -> (Providers, PathBuf) {
+        let d = std::env::temp_dir().join(format!("mu-chatgpt-route-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(d.join("auth.json"));
+        store
+            .update_chatgpt(|c| {
+                c.auth_base = Some(auth.into());
+                c.api_base = Some(api.into());
+                true
+            })
+            .unwrap();
+        let account = Account {
+            client_id: "oaiapp_route".into(),
+            subject: "route-subject".into(),
+            email: None,
+            tokens: Some(Tokens {
+                id_token: "id-route-0123456789".into(),
+                access_token: ACCESS.into(),
+                refresh_token: "ref-route-0123456789".into(),
+                refresh_at: i64::MAX / 2,
+                scopes: vec![DIRECT_SCOPE.into()],
+            }),
+            added: "2026-11-06T00:00:00Z".into(),
+        };
+        store.chatgpt_save(account).unwrap();
+        (Providers::with_store(Rc::new(Configs::default()), no_gateway(), store), d)
+    }
+
+    async fn turn(p: &Providers, events: &mut Vec<String>) -> Result<Message, ProviderError> {
+        let (spec, _) = p.resolve("openai-chatgpt/gpt-5.5").unwrap();
+        let msgs = [Message::user("ping")];
+        let req = Request {
+            model: &spec,
+            thinking: Rc::new(Cell::new(Thinking::Off)),
+            system: "be brief",
+            tools: &[],
+            messages: &msgs,
+            max_tokens: Some(4096),
+            session_id: Some("s1"),
+        };
+        let mut ev = |e: StreamEvent| {
+            events.push(match e {
+                StreamEvent::Text(t) => format!("text:{t}"),
+                StreamEvent::Retry { reason, .. } => format!("retry:{reason}"),
+                _ => "other".into(),
+            })
+        };
+        p.stream(&req, &CancellationToken::new(), &mut ev).await
+    }
+
+    #[test]
+    fn a_plan_request_is_bearer_and_omits_the_fields_the_plan_refuses() {
+        block_on(async {
+            let (api, seen) = fake_server(vec![ok()]).await;
+            let (auth, hits) = fake_server(vec![refresh_reply()]).await;
+            let (p, d) = plan(&auth, &api);
+            let mut events = Vec::new();
+            let m = turn(&p, &mut events).await.unwrap();
+            let Message::Assistant { provider, api: wire, .. } = &m else { panic!() };
+            assert_eq!((provider.as_str(), wire.as_str()), ("openai-chatgpt", "openai-responses"));
+            assert_eq!(events, ["text:pong"]);
+            let raw = seen.lock().unwrap()[0].clone();
+            let head = raw.split("\r\n\r\n").next().unwrap().to_lowercase();
+            assert!(head.starts_with("post /responses "), "{head}");
+            assert!(head.contains(&format!("authorization: bearer {ACCESS}")), "{head}");
+            let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!((&body["store"], &body["stream"]), (&json!(false), &json!(true)));
+            assert_eq!(body["instructions"], "be brief");
+            for field in ["max_output_tokens", "temperature", "top_p", "truncation", "user", "metadata"] {
+                assert!(body.get(field).is_none(), "{field}");
+            }
+            assert!(hits.lock().unwrap().is_empty(), "a token that is not due is not refreshed");
+            let _ = std::fs::remove_dir_all(d);
+        });
+    }
+
+    #[test]
+    fn a_401_refreshes_the_token_once_and_retries() {
+        block_on(async {
+            let (api, seen) = fake_server(vec![Reply::new(401, r#"{"detail":"no"}"#), ok()]).await;
+            let (auth, hits) = fake_server(vec![refresh_reply()]).await;
+            let (p, d) = plan(&auth, &api);
+            let mut events = Vec::new();
+            turn(&p, &mut events).await.unwrap();
+            let reqs = seen.lock().unwrap().clone();
+            assert_eq!(reqs.len(), 2);
+            assert!(reqs[0].to_lowercase().contains(&format!("authorization: bearer {ACCESS}")), "{}", reqs[0]);
+            assert!(reqs[1].to_lowercase().contains(&format!("authorization: bearer {FRESH}")), "{}", reqs[1]);
+            assert_eq!(hits.lock().unwrap().len(), 1, "one refresh");
+            assert!(events.iter().any(|e| e.starts_with("retry:")), "{events:?}");
+            let _ = std::fs::remove_dir_all(d);
+        });
+    }
+
+    #[test]
+    fn a_second_401_says_to_sign_in_again() {
+        block_on(async {
+            let (api, seen) = fake_server(vec![Reply::new(401, r#"{"detail":"no"}"#)]).await;
+            let (auth, hits) = fake_server(vec![refresh_reply()]).await;
+            let (p, d) = plan(&auth, &api);
+            let e = turn(&p, &mut Vec::new()).await.unwrap_err();
+            let msg = e.to_string();
+            assert!(matches!(e, ProviderError::Fatal(_)) && msg.contains("run /login"), "{msg}");
+            assert!(!msg.contains("API key"), "{msg}");
+            assert_eq!(seen.lock().unwrap().len(), 2, "one retry, then the error");
+            assert_eq!(hits.lock().unwrap().len(), 1);
+            let _ = std::fs::remove_dir_all(d);
+        });
+    }
+
+    #[test]
+    fn a_usage_limit_is_fatal_and_names_the_usage_page() {
+        block_on(async {
+            let body = r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit reached"}}"#;
+            let (api, seen) = fake_server(vec![Reply::new(429, body)]).await;
+            let (auth, _) = fake_server(vec![refresh_reply()]).await;
+            let (p, d) = plan(&auth, &api);
+            let e = turn(&p, &mut Vec::new()).await.unwrap_err();
+            assert!(matches!(e, ProviderError::Fatal(_)) && e.to_string().contains(chatgpt::USAGE_URL), "{e}");
+            assert_eq!(seen.lock().unwrap().len(), 1, "never retried");
+            let _ = std::fs::remove_dir_all(d);
+        });
     }
 }
 

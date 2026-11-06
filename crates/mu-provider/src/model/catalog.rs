@@ -114,6 +114,8 @@ fn all() -> &'static HashMap<String, Vec<Row>> {
 
 /// The provider's rows, sorted by id; empty for a provider the snapshot does not cover.
 pub fn rows(provider: &str) -> &'static [Row] {
+    // The ChatGPT plan serves the API's models, so it reads their rows.
+    let provider = if provider == crate::auth::chatgpt::PROVIDER_ID { "openai" } else { provider };
     all().get(provider).map_or(&[], Vec::as_slice)
 }
 

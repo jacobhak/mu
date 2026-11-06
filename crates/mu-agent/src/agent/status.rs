@@ -1,4 +1,5 @@
 use super::*;
+use mu_provider::auth::chatgpt;
 
 impl Agent {
     /// Tokens of the system prompt, measured again only when what it is built from changes.
@@ -41,14 +42,27 @@ impl Agent {
         }
     }
 
+    /// The current model runs on the ChatGPT plan: reported like a subscription, never billed per token.
+    fn on_chatgpt_plan(&self) -> bool {
+        self.model.model.provider == chatgpt::PROVIDER_ID
+    }
+
+    /// Nothing is asked of the gateway: the model is native or none is chosen yet.
+    fn gateway_idle(&self) -> bool {
+        self.model.model.native || self.model.model.is_unselected()
+    }
+
     pub fn snapshot(&self) -> StatusSnapshot {
+        let none = self.model.model.is_unselected();
         StatusSnapshot {
             model_id: self.model.model.id.clone(),
-            model_name: pricing::display_name(&self.model.model.id),
-            reasoning: pricing::reasoning(&self.model.model.id).unwrap_or(true),
+            model_name: if none { "no model".into() } else { pricing::display_name(&self.model.model.id) },
+            reasoning: !none && pricing::reasoning(&self.model.model.id).unwrap_or(true),
             thinking: self.model.thinking.as_str().into(),
-            subscription: !self.model.model.native && self.costs.quota.is_subscription(&self.model.model.provider),
+            subscription: self.on_chatgpt_plan()
+                || (!self.gateway_idle() && self.costs.quota.is_subscription(&self.model.model.provider)),
             native: self.model.model.native,
+            chatgpt_plan: self.on_chatgpt_plan(),
             plan: self.plan.plan.is_some(),
             context_tokens: Some(self.context_tokens()),
             context_window: self.model.model.context_window,
@@ -58,7 +72,7 @@ impl Agent {
             title: self.title.text.clone(),
             session_path: self.session.as_ref().map(|s| s.path.to_string_lossy().into_owned()),
             git: self.costs.git.clone(),
-            usage: if self.model.model.native { None } else { self.costs.quota.usage_for(&self.model.model.provider) },
+            usage: if self.gateway_idle() { None } else { self.costs.quota.usage_for(&self.model.model.provider) },
         }
     }
 
@@ -71,7 +85,7 @@ impl Agent {
 
     /// Native models are metered by API key: there is no subscription quota to poll.
     pub(super) fn tick_quota(&mut self) {
-        if self.model.model.native {
+        if self.gateway_idle() {
             return;
         }
         let provider = self.model.model.provider.clone();
@@ -81,7 +95,7 @@ impl Agent {
     /// Prices usage recorded before the table knew its model. A model the table does not list forces
     /// one catalogue refresh per process.
     pub(super) fn settle_prices(&mut self) {
-        if self.costs.cost.settle() && self.costs.quota.enabled && !self.model.model.native {
+        if self.costs.cost.settle() && self.costs.quota.enabled && !self.gateway_idle() {
             tokio::task::spawn_local(pricing::refresh_missing());
         }
     }
@@ -97,8 +111,8 @@ impl Agent {
     /// Native models pause quota polling. omp's catalogue is read only once a gateway model is in use,
     /// so a native-only session never starts omp.
     pub(super) fn sync_model_state(&mut self) {
-        self.costs.quota.set_paused(self.model.model.native);
-        if !self.model.model.native && !self.model.pricing_checked {
+        self.costs.quota.set_paused(self.gateway_idle());
+        if !self.gateway_idle() && !self.model.pricing_checked {
             self.model.pricing_checked = true;
             tokio::task::spawn_local(pricing::refresh());
         }

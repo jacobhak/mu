@@ -5,6 +5,7 @@
 //! leave the screen: config, stored keys, MCP definitions, session control).
 
 mod agent_view;
+mod chatgpt;
 mod child;
 mod keys;
 mod mcp;
@@ -15,6 +16,7 @@ mod ui_msgs;
 mod web;
 
 use self::agent_view::{AgentView, error_lines, notice_lines};
+use self::chatgpt::ChatgptFlow;
 use self::keys::KeyFlow;
 use self::services::Services;
 use self::slash::command_entries;
@@ -118,6 +120,9 @@ struct Flows {
     /// An API-key flow in progress; while it types, the composer takes its text.
     key_flow: Option<KeyFlow>,
     key_flow_seq: u64,
+    /// A ChatGPT sign-in in progress; while it waits the composer takes the redirect URL.
+    chatgpt: Option<ChatgptFlow>,
+    chatgpt_seq: u64,
     /// The `/web` wizard, and who is waiting for it: a `web_search` call that found no backend.
     web_wizard: Option<(crate::web::wizard::Wizard, Option<tokio::sync::oneshot::Sender<bool>>)>,
 }
@@ -182,6 +187,8 @@ pub async fn run(init: AppInit) -> i32 {
             web_wizard: None,
             key_flow: None,
             key_flow_seq: 0,
+            chatgpt: None,
+            chatgpt_seq: 0,
         },
         quitting: false,
     };

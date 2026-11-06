@@ -13,7 +13,7 @@ Status: early and experimental, changing quickly; no stable version (see README,
    reads, allocator retention — must go to zero.
 2. **Load on use.** Nothing starts, parses or allocates until the user or the model needs it.
 3. **omp-compatible files.** Context files, skills, rules, MCP config and sessions work unchanged.
-4. **Reuse before rewrite.** omp's MIT-licensed Rust crates for tools; omp's own gateway for OAuth and other providers; native clients only for API keys.
+4. **Reuse before rewrite.** omp's MIT-licensed Rust crates for tools; omp's own gateway for OAuth and other providers; native clients only for API keys and the ChatGPT sign-in.
 
 ## Why
 
@@ -50,7 +50,7 @@ flowchart LR
 | Component | Responsibility | Reuse |
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode | — |
-| Provider client | Streaming requests, retries, thinking mapping and usage, over three wire formats (Anthropic Messages, OpenAI Responses, Chat Completions) to a provider's own API with the user's key, or Anthropic Messages to the omp gateway | — |
+| Provider client | Streaming requests, retries, thinking mapping and usage, over three wire formats (Anthropic Messages, OpenAI Responses, Chat Completions) to a provider's own API with the user's key or ChatGPT sign-in, or Anthropic Messages to the omp gateway | — |
 | Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `$MU_HOME/run/` (pid, kind, agent, cwd, parent; the jobs panel's Sessions tab lists the live ones); a per-session inbox in `$MU_HOME/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching and checkpoint/rewind: *not implemented — out of scope for now* | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
@@ -70,7 +70,7 @@ The core is a workspace of crates. Each depends only on the ones above it in thi
 |---|---|---|
 | `mu-common` | paths, fs, rpc, time | — |
 | `mu-base` | protocol and foundation: messages, the agent event protocol, the tool contract (`tool`), text helpers, process and pty handling, `jsoncache`, schema validation, secrets redaction, config, model types and roles, git, `mem` | mu-common |
-| `mu-provider` | provider client and wire formats, model catalog, discovery and pricing, the API-key store, the gateway source and quota | mu-base |
+| `mu-provider` | provider client and wire formats, model catalog, discovery and pricing, the API-key store, the ChatGPT sign-in (`auth/chatgpt`), the gateway source and quota | mu-base |
 | `mu-session` | session files, tail reader, the notify inbox and sender, run control (stop, terminate, live-run check) | mu-base |
 | `mu-tools` | built-in tools (`tools/`, with the shell), background jobs, the plugin host, the MCP data layer, context discovery | mu-base, mu-provider, mu-session |
 | `mu-agent` | the agent loop, compaction, the system prompt, plans, review core, `AgentHandle` and `build_agent` | mu-base, mu-provider, mu-session, mu-tools |
@@ -176,7 +176,8 @@ All omp features outside the core become first-party plugins that load on use.
   generic client). Model limits, prices, reasoning ladders and Chat Completions quirks come from a snapshot of
   omp's catalog regenerated on every bump (`crates/mu-provider/src/model/catalog.json`), plus live discovery for Baseten. A
   session that uses only native providers starts no omp process.
-- **Gateway:** every other model, and every provider without a key in mu, is served through `omp auth-gateway
+- **ChatGPT plan:** `openai-chatgpt/*` models are called directly with the user's ChatGPT sign-in: OAuth against `auth.openai.com` with a dynamically registered client, then the Responses API with a Bearer access token. The sign-in never goes through the gateway. Its state is the `chatgpt` section of `auth.json` (store version 3). Plan models have the same ids as `openai/*`; the model picker chooses between key and plan, with no precedence rule.
+- **Gateway:** every other model, and every provider without a key or sign-in in mu, is served through `omp auth-gateway
   serve`, backed by `omp auth-broker serve`. The
   core speaks one wire protocol, Anthropic Messages, to it and holds no credentials for those providers.
   (`auth-gateway stdio` was rejected: it returns a streamed reply as one string after the stream ends.) The

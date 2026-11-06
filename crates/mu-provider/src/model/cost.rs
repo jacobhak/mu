@@ -1,5 +1,6 @@
 //! What a session has spent: dollars, tokens, and usage the price table could not price yet.
 
+use crate::auth::chatgpt;
 use crate::model::pricing;
 use mu_base::message::Usage;
 
@@ -28,13 +29,16 @@ impl CostLedger {
     /// Records one assistant response, pricing it now if the table knows the model. `usage.cost`
     /// is filled in when priced.
     pub fn record(&mut self, provider: &str, model: &str, usage: &mut Usage) {
-        let id = priced_id(provider, model);
-        match pricing::cost(&id, usage) {
-            Some(c) => usage.cost = c,
-            None if has_tokens(usage) => self.unpriced.push((id, usage.clone())),
-            None => {}
+        // The ChatGPT plan is not billed per token: its tokens count, its dollars never do.
+        if provider != chatgpt::PROVIDER_ID {
+            let id = priced_id(provider, model);
+            match pricing::cost(&id, usage) {
+                Some(c) => usage.cost = c,
+                None if has_tokens(usage) => self.unpriced.push((id, usage.clone())),
+                None => {}
+            }
+            self.total += usage.cost.total;
         }
-        self.total += usage.cost.total;
         self.tokens_in += usage.input + usage.cache_read + usage.cache_write;
         self.tokens_out += usage.output;
     }
@@ -42,6 +46,9 @@ impl CostLedger {
     /// Takes in a stored response when a session is resumed: its recorded cost, except turns that
     /// were saved unpriced (the price table was missing the model at the time).
     pub fn add_stored(&mut self, provider: &str, model: &str, usage: &Usage) {
+        if provider == chatgpt::PROVIDER_ID {
+            return;
+        }
         if usage.cost.total == 0.0 && has_tokens(usage) {
             self.unpriced.push((priced_id(provider, model), usage.clone()));
         } else {
@@ -99,6 +106,15 @@ mod tests {
         assert_eq!(l.pending(), 1, "an unknown model waits for a price");
         l.reset();
         assert_eq!((l.tokens_in, l.pending()), (0, 0));
+    }
+
+    #[test]
+    fn the_chatgpt_plan_counts_tokens_and_never_dollars() {
+        let mut l = CostLedger::default();
+        let mut u = Usage { input: 10, output: 5, ..Default::default() };
+        l.record(chatgpt::PROVIDER_ID, "gpt-6.1-sol", &mut u);
+        l.add_stored(chatgpt::PROVIDER_ID, "gpt-6.1-sol", &u);
+        assert_eq!((l.tokens_in, l.tokens_out, l.total, l.pending()), (10, 5, 0.0, 0));
     }
 
     #[test]

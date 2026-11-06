@@ -269,11 +269,16 @@ fn seg_pi(_: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
 }
 
 fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+    if s.model_id.is_empty() {
+        return Some(vec![span("no model", st(Role::Faint)), span(" · /model", st(Role::Muted))]);
+    }
     let mut line = vec![span(s.model_name.clone(), st(Role::Tool))];
     if let Some(l) = thinking_label(s, env) {
         line.push(span(format!(" ({l})"), st(Role::Muted)));
     }
-    if s.native {
+    if s.chatgpt_plan {
+        line.push(span(" · ChatGPT plan", st(Role::Muted)));
+    } else if s.native {
         line.push(span(" · key", st(Role::Muted)));
     }
     Some(line)
@@ -533,8 +538,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_model_segment_marks_the_plan_apart_from_a_key() {
+        let c = cfg(&["model"], &[]);
+        let mut s = StatusSnapshot {
+            model_id: "openai-chatgpt/gpt-6.1-sol".into(),
+            model_name: "openai-chatgpt/gpt-6.1-sol".into(),
+            native: true,
+            chatgpt_plan: true,
+            ..Default::default()
+        };
+        let text = |s: &StatusSnapshot| line_text(&seg_model(s, &env(&c, Path::new("/")), 0).unwrap());
+        assert!(text(&s).ends_with(" · ChatGPT plan"), "{}", text(&s));
+        s.chatgpt_plan = false;
+        assert!(text(&s).ends_with(" · key"), "{}", text(&s));
+    }
+
+    #[test]
+    fn no_model_chosen_is_shown_as_such() {
+        let c = cfg(&["model"], &[]);
+        let t = line_text(&seg_model(&StatusSnapshot::default(), &env(&c, Path::new("/")), 0).unwrap());
+        assert_eq!(t, "no model · /model");
+    }
+
     fn snap() -> StatusSnapshot {
         StatusSnapshot {
+            model_id: "anthropic/claude-haiku-5-5".into(),
             model_name: "Haiku 5.5".into(),
             reasoning: true,
             thinking: "high".into(),

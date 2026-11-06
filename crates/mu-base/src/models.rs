@@ -225,6 +225,15 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
+    /// Stands in while no model is chosen (the TUI before `/model`). No request goes out with it.
+    pub fn unselected() -> Self {
+        Self::gateway("", DEFAULT_WINDOW, DEFAULT_MAX_OUT)
+    }
+
+    pub fn is_unselected(&self) -> bool {
+        self.id.is_empty()
+    }
+
     /// A gateway-routed Anthropic Messages model.
     pub fn gateway(id: &str, context_window: u32, max_output: u32) -> Self {
         let (provider, wire_id) = id.split_once('/').unwrap_or(("", id));

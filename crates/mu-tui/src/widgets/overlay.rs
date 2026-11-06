@@ -22,6 +22,8 @@ pub enum LoginTarget {
     Mcp(String),
     /// A key target (a chat provider or a search service), by id (`KeyTarget::find`).
     ApiKey(String),
+    /// Sign in with ChatGPT (or the sign-in menu when already signed in).
+    ChatGpt,
 }
 
 /// What the user does next in the API-key picker.
@@ -39,6 +41,12 @@ pub enum KeyOption {
     Chat(bool),
     /// Start the key flow over for a provider that already has a key.
     Replace,
+    /// Sign in with ChatGPT again (the ChatGPT menu).
+    SignIn,
+    /// Sign out of ChatGPT and revoke the sign-in (the ChatGPT menu).
+    SignOut,
+    /// Forget the ChatGPT registration and sign in again, possibly as another account (the ChatGPT menu).
+    Forget,
     Cancel,
 }
 

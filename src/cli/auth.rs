@@ -1,15 +1,18 @@
-//! `mu auth`: manage provider API keys without the TUI (see `mu_provider::auth::store`).
+//! `mu auth`: manage provider API keys and the ChatGPT sign-in without the TUI (see
+//! `mu_provider::auth::store` and `mu_provider::auth::chatgpt`).
 
 use anyhow::{Result, anyhow, bail};
+use mu_provider::auth::chatgpt::{self, Account, PROVIDER_ID, USAGE_URL, oauth, signin};
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::{Entry, Origin, Store};
 use mu_provider::provider::providers;
-use mu_provider::provider::providers::{KeyTarget, PROVIDERS, SEARCH_KEYS};
+use mu_provider::provider::providers::{KeyTarget, SEARCH_KEYS};
 use std::io::{IsTerminal, Read, Write};
+use tokio_util::sync::CancellationToken;
 
 #[derive(clap::Subcommand)]
 pub enum Cmd {
-    /// Show the providers that have a key, where it comes from and its last four characters.
+    /// Show the keys and the ChatGPT sign-in: where each comes from and what it is used for.
     List,
     /// Add or replace an API key. The key is read from stdin (a no-echo prompt on a
     /// terminal), or referenced with --env / --cmd so it is never stored in the file.
@@ -35,9 +38,24 @@ pub enum Cmd {
         #[arg(long)]
         no_chat: bool,
     },
-    /// Remove a key; a provider's chat models go back through omp.
+    /// Remove a key; a provider's chat models go back through omp. `openai-chatgpt` signs out instead.
     Rm { provider: String },
-    /// Ask the provider whether the stored key works.
+    /// Sign in with ChatGPT: `openai-chatgpt/*` models then run on your ChatGPT plan. Opens a browser;
+    /// over SSH, paste the final redirect URL back into the terminal.
+    Login {
+        /// `openai-chatgpt` (the default; `chatgpt` also works).
+        provider: Option<String>,
+    },
+    /// Sign out of ChatGPT and revoke the sign-in. The registration is kept, so the next sign-in reuses it.
+    Logout {
+        /// `openai-chatgpt` (the default; `chatgpt` also works).
+        provider: Option<String>,
+        /// Also forget the registration, so the next sign-in may be another ChatGPT account. The old app
+        /// stays listed in your ChatGPT settings until you disconnect it there.
+        #[arg(long)]
+        forget: bool,
+    },
+    /// Ask the provider whether the stored key works; for `openai-chatgpt`, whether the plan answers.
     Test { provider: String },
     /// Choose whether an anthropic or openai key serves chat models.
     Use {
@@ -54,6 +72,17 @@ pub fn run(cmd: Cmd) -> Result<i32> {
     let mut out = std::io::stdout();
     match cmd {
         Cmd::List => list(&store, &mut out),
+        Cmd::Login { provider } => {
+            chatgpt_only("login", provider.as_deref())?;
+            login(&store, &mut out)
+        }
+        Cmd::Logout { provider, forget } => {
+            chatgpt_only("logout", provider.as_deref())?;
+            logout(&store, &mut out, forget)
+        }
+        Cmd::Add { provider, env, cmd, base_url, chat, no_chat, .. } if is_chatgpt(&provider) => {
+            Err(chatgpt_key_refusal(env.is_some() || cmd.is_some() || base_url.is_some(), chat || no_chat))
+        }
         Cmd::Add { provider, env, cmd, base_url, no_validate, chat, no_chat } => {
             let target = target(&provider)?;
             let chat = chat_flag(target, chat, no_chat)?;
@@ -86,6 +115,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Rm { provider } if is_chatgpt(&provider) => logout(&store, &mut out, false),
         Cmd::Rm { provider } => {
             let target = target(&provider)?;
             let was_chat =
@@ -102,6 +132,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
                 Ok(1)
             }
         }
+        Cmd::Test { provider } if is_chatgpt(&provider) => chatgpt_test(&store, &mut out),
         Cmd::Test { provider } => {
             let target = target(&provider)?;
             let entry = store
@@ -121,6 +152,9 @@ pub fn run(cmd: Cmd) -> Result<i32> {
                     Ok(1)
                 }
             }
+        }
+        Cmd::Use { provider, .. } if is_chatgpt(&provider) => {
+            bail!("`mu auth use` does not apply to {PROVIDER_ID}: its models run on your ChatGPT plan once signed in")
         }
         Cmd::Use { provider, chat, no_chat } => {
             let target = target(&provider)?;
@@ -170,7 +204,9 @@ fn parse_base_url(raw: Option<String>) -> Result<Option<String>> {
 }
 
 fn target(id: &str) -> Result<KeyTarget> {
-    KeyTarget::find(id).ok_or_else(|| anyhow!("unknown provider `{id}`; mu can use keys for: {}", names()))
+    KeyTarget::find(id).ok_or_else(|| {
+        anyhow!("unknown provider `{id}`; mu can use keys for: {}, or sign in with ChatGPT as {PROVIDER_ID}", names())
+    })
 }
 
 async fn check_entry(t: KeyTarget, entry: &Entry) -> Check {
@@ -185,23 +221,185 @@ fn list(store: &Store, out: &mut impl Write) -> Result<i32> {
         eprintln!("warning: {w}");
     }
     let rows = store.list();
-    if rows.is_empty() {
-        writeln!(out, "no API keys stored; add one with `mu auth add <provider>` ({})", names())?;
+    let chatgpt = store.chatgpt_account();
+    if rows.is_empty() && chatgpt.is_none() {
+        writeln!(
+            out,
+            "no API keys stored; add one with `mu auth add <provider>` ({}), or sign in with `mu auth login {PROVIDER_ID}`",
+            names()
+        )?;
         return Ok(0);
     }
-    writeln!(out, "{}", render(&rows))?;
+    writeln!(out, "{}", render(&rows, chatgpt.as_ref()))?;
     Ok(0)
 }
 
 fn names() -> String {
-    PROVIDERS.iter().map(|d| d.id).chain(SEARCH_KEYS.iter().map(|d| d.id)).collect::<Vec<_>>().join(", ")
+    providers::api_key_defs().map(|d| d.id).chain(SEARCH_KEYS.iter().map(|d| d.id)).collect::<Vec<_>>().join(", ")
+}
+
+/// `openai-chatgpt`, or its `chatgpt` alias.
+fn is_chatgpt(id: &str) -> bool {
+    matches!(id, PROVIDER_ID | "chatgpt")
+}
+
+/// Why `mu auth add openai-chatgpt` is refused: the sign-in takes no key, and none of the flags that
+/// shape a key.
+fn chatgpt_key_refusal(key_flags: bool, chat_flags: bool) -> anyhow::Error {
+    if key_flags || chat_flags {
+        anyhow!(
+            "--env, --cmd, --base-url and --chat/--no-chat do not apply to {PROVIDER_ID}, which signs in with ChatGPT"
+        )
+    } else {
+        anyhow!("{PROVIDER_ID} takes no API key; sign in with `mu auth login {PROVIDER_ID}`")
+    }
+}
+
+/// `mu auth login` and `mu auth logout` act on the ChatGPT sign-in only; its id is optional.
+fn chatgpt_only(cmd: &str, provider: Option<&str>) -> Result<()> {
+    match provider {
+        Some(p) if !is_chatgpt(p) => bail!("`mu auth {cmd}` applies to {PROVIDER_ID} (ChatGPT sign-in), not `{p}`"),
+        _ => Ok(()),
+    }
+}
+
+/// Signs in through the browser. On a terminal the pasted redirect URL is accepted too, for machines
+/// the browser's callback cannot reach. The sign-in is saved only when it is the registered account.
+fn login(store: &Store, out: &mut impl Write) -> Result<i32> {
+    let host = store.chatgpt_host_id()?;
+    let endpoints = store.chatgpt_endpoints();
+    let req = oauth::LoginRequest {
+        endpoints: &endpoints,
+        host_id: &host,
+        known: store.chatgpt_known(),
+        cancel: CancellationToken::new(),
+    };
+    let tty = std::io::stdin().is_terminal();
+    // The sender lives until the sign-in ends: a closed channel would fail the wait for the browser.
+    let (paste_tx, mut paste_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    if tty {
+        let tx = paste_tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines().map_while(std::result::Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let mut on_url = |url: &str| {
+        eprintln!("Sign in with ChatGPT. A browser should open; if it does not, open this link:\n\n{url}\n");
+        if tty {
+            eprintln!("If the browser cannot reach this machine, paste the final redirect URL here and press Enter.");
+        }
+        let _ = chatgpt::browser::open_browser(url);
+    };
+    let mut notice = |text: &str| eprintln!("{text}");
+    let rt = mu_base::runtime::current_thread_runtime()?;
+    let account = match rt.block_on(oauth::login(req, &mut on_url, &mut notice, &mut paste_rx)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sign-in did not finish: {e}; nothing saved");
+            return Ok(1);
+        }
+    };
+    let saved = match signin::save(store, account) {
+        Ok(s) => s,
+        Err(m) => {
+            eprintln!("{m}");
+            return Ok(1);
+        }
+    };
+    writeln!(out, "signed in as {}", saved.label)?;
+    if !saved.plan_usage {
+        eprintln!(
+            "plan usage is not enabled for this sign-in, so {PROVIDER_ID}/* models cannot run yet. Run `mu auth login {PROVIDER_ID}` again and approve the plan permission."
+        );
+        return Ok(1);
+    }
+    writeln!(out, "{PROVIDER_ID}/* models now run on your ChatGPT plan.")?;
+    if saved.welcome {
+        writeln!(out, "You're using your ChatGPT plan. Manage usage: {USAGE_URL}")?;
+    }
+    Ok(0)
+}
+
+/// Drops the tokens, then revokes the refresh token at the issuer. `forget` drops the registration too.
+fn logout(store: &Store, out: &mut impl Write, forget: bool) -> Result<i32> {
+    if forget {
+        return forget_registration(store, out);
+    }
+    let Some(account) = signin::sign_out(store).map_err(|e| anyhow!("{e}"))? else {
+        eprintln!("not signed in with ChatGPT");
+        return Ok(1);
+    };
+    writeln!(
+        out,
+        "signed out of ChatGPT ({}); {PROVIDER_ID}/* models stop running until you sign in again",
+        account.label()
+    )?;
+    if let Err(m) = mu_base::runtime::current_thread_runtime()?.block_on(signin::revoke(store, &account)) {
+        eprintln!(
+            "could not confirm that the sign-in was revoked ({m}). Disconnect mu under your ChatGPT settings, apps."
+        );
+    }
+    Ok(0)
+}
+
+/// Drops the registration and its tokens, then revokes the refresh token at the issuer. The app stays
+/// listed in ChatGPT settings, so that is said too.
+fn forget_registration(store: &Store, out: &mut impl Write) -> Result<i32> {
+    let Some(account) = signin::forget(store).map_err(|e| anyhow!("{e}"))? else {
+        eprintln!("no ChatGPT sign-in is saved");
+        return Ok(1);
+    };
+    writeln!(
+        out,
+        "forgot the ChatGPT registration ({}); {PROVIDER_ID}/* models stop running until you sign in again",
+        account.label()
+    )?;
+    writeln!(
+        out,
+        "The next `mu auth login {PROVIDER_ID}` registers a new client and may sign in as a different ChatGPT account."
+    )?;
+    writeln!(out, "The old app stays listed under your ChatGPT settings, apps, until you disconnect it there.")?;
+    let revoked = if account.signed_in() {
+        mu_base::runtime::current_thread_runtime()?.block_on(signin::revoke(store, &account))
+    } else {
+        Ok(())
+    };
+    if let Err(m) = revoked {
+        eprintln!(
+            "could not confirm that the sign-in was revoked ({m}). Disconnect mu under your ChatGPT settings, apps."
+        );
+    }
+    Ok(0)
+}
+
+/// Asks the ChatGPT plan whether the sign-in works: the model list is fetched with it.
+fn chatgpt_test(store: &Store, out: &mut impl Write) -> Result<i32> {
+    if !store.chatgpt_account().is_some_and(|a| a.signed_in()) {
+        eprintln!("not signed in with ChatGPT; run `mu auth login {PROVIDER_ID}`");
+        return Ok(1);
+    }
+    match mu_base::runtime::current_thread_runtime()?.block_on(chatgpt::store::check(store)) {
+        Ok(models) => {
+            writeln!(out, "{PROVIDER_ID}: the plan answers; {} models", models.len())?;
+            Ok(0)
+        }
+        Err(m) => {
+            eprintln!("{PROVIDER_ID}: {m}");
+            Ok(1)
+        }
+    }
 }
 
 /// One line per provider: its source, for a stored key the last four characters, and what the key
-/// is used for. A `!command` is not run to show anything.
-pub fn render(rows: &[(String, Entry)]) -> String {
-    let w = rows.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
-    rows.iter()
+/// is used for. A `!command` is not run to show anything. The ChatGPT sign-in, when there is one, is last.
+pub fn render(rows: &[(String, Entry)], chatgpt: Option<&Account>) -> String {
+    let w = rows.iter().map(|(p, _)| p.len()).chain(chatgpt.map(|_| PROVIDER_ID.len())).max().unwrap_or(0);
+    let mut lines: Vec<String> = rows
+        .iter()
         .filter_map(|(p, e)| {
             let (src, detail) = match e.origin()? {
                 Origin::Stored => {
@@ -220,18 +418,33 @@ pub fn render(rows: &[(String, Entry)]) -> String {
                 None => "",
             };
             let url = e.base_url.as_deref().map(|u| format!("  {u}")).unwrap_or_default();
-            let line = [src.as_str(), detail.as_str(), used].iter().filter(|s| !s.is_empty()).fold(
-                format!("{p:<w$}"),
-                |mut l, s| {
-                    l.push_str("  ");
-                    l.push_str(s);
-                    l
-                },
-            );
-            Some(format!("{line}{url}"))
+            Some(format!("{}{url}", columns(w, p, &[src.as_str(), detail.as_str(), used])))
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    lines.extend(chatgpt.map(|a| chatgpt_line(w, a)));
+    lines.join("\n")
+}
+
+/// `id` padded to `w`, then each non-empty cell two spaces after the last.
+fn columns(w: usize, id: &str, cells: &[&str]) -> String {
+    cells.iter().filter(|s| !s.is_empty()).fold(format!("{id:<w$}"), |mut l, s| {
+        l.push_str("  ");
+        l.push_str(s);
+        l
+    })
+}
+
+/// The ChatGPT sign-in's row: where it comes from, the account, and what it is used for.
+fn chatgpt_line(w: usize, a: &Account) -> String {
+    let used = if !a.signed_in() {
+        "signed out"
+    } else if a.plan_usage() {
+        "chat · plan"
+    } else {
+        "plan usage not enabled"
+    };
+    let label = a.label();
+    columns(w, PROVIDER_ID, &["ChatGPT sign-in", label.as_str(), used])
 }
 
 /// The key from stdin: a no-echo prompt on a terminal, else the piped text.
@@ -370,7 +583,7 @@ mod tests {
             ("baseten".to_string(), Entry::reference("$MU_TEST_SURELY_UNSET_VAR").unwrap()),
             ("openai".to_string(), Entry::reference("!op read op://dev/openai/key").unwrap()),
         ];
-        let text = render(&rows);
+        let text = render(&rows, None);
         assert!(text.contains("…WXYZ"), "{text}");
         assert!(!text.contains("SECRETPART") && !text.contains("sk-ant"), "{text}");
         assert!(text.contains("$MU_TEST_SURELY_UNSET_VAR  not set"), "{text}");
@@ -382,7 +595,7 @@ mod tests {
 
     #[test]
     fn short_keys_show_nothing() {
-        let text = render(&[("anthropic".to_string(), Entry::literal("tiny-key"))]);
+        let text = render(&[("anthropic".to_string(), Entry::literal("tiny-key"))], None);
         assert!(!text.contains("tiny"), "{text}");
         assert!(!text.contains("-key"), "{text}");
     }
@@ -429,7 +642,7 @@ mod tests {
             ("baseten".to_string(), Entry { chat: Some(true), ..Entry::literal("bt-test-0123456789") }),
             ("exa".to_string(), Entry::literal("exa-test-0123456789")),
         ];
-        let lines: Vec<String> = render(&rows).lines().map(String::from).collect();
+        let lines: Vec<String> = render(&rows, None).lines().map(String::from).collect();
         assert!(lines[0].ends_with("not set  not for chat"), "{lines:?}");
         assert!(lines[1].ends_with("chat") && !lines[1].contains("not for"), "{lines:?}");
         assert!(lines[2].ends_with("web search"), "{lines:?}");
@@ -459,6 +672,100 @@ mod tests {
             parse_base_url(Some("https://p.example/v1/".into())).unwrap().as_deref(),
             Some("https://p.example/v1")
         );
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_tests {
+    use super::*;
+    use clap::Parser;
+    use mu_provider::auth::chatgpt::{DIRECT_SCOPE, Tokens};
+
+    fn account(signed_in: bool, plan: bool) -> Account {
+        let tokens = signed_in.then(|| Tokens {
+            id_token: String::new(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            refresh_at: 0,
+            scopes: if plan { vec![DIRECT_SCOPE.into()] } else { vec![] },
+        });
+        Account {
+            client_id: "oaiapp_test".into(),
+            subject: "user-test".into(),
+            email: Some("me@example.com".into()),
+            tokens,
+            added: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn the_sign_in_refuses_key_flags_with_a_clear_error() {
+        let key = chatgpt_key_refusal(true, false).to_string();
+        assert!(key.contains("--env, --cmd, --base-url") && key.contains("openai-chatgpt"), "{key}");
+        let chat = chatgpt_key_refusal(false, true).to_string();
+        assert!(chat.contains("--chat/--no-chat"), "{chat}");
+        let bare = chatgpt_key_refusal(false, false).to_string();
+        assert!(bare.contains("takes no API key") && bare.contains("mu auth login openai-chatgpt"), "{bare}");
+    }
+
+    #[test]
+    fn the_sign_in_takes_its_provider_id_and_alias_only() {
+        assert!(chatgpt_only("login", None).is_ok());
+        assert!(chatgpt_only("login", Some("openai-chatgpt")).is_ok());
+        assert!(chatgpt_only("logout", Some("chatgpt")).is_ok());
+        let e = chatgpt_only("login", Some("openai")).unwrap_err().to_string();
+        assert!(e.contains("`mu auth login`") && e.contains("openai-chatgpt"), "{e}");
+    }
+
+    #[derive(clap::Parser)]
+    struct Wrap {
+        #[command(subcommand)]
+        cmd: Cmd,
+    }
+
+    #[test]
+    fn login_and_logout_parse_with_an_optional_provider() {
+        let parse =
+            |args: &[&str]| Wrap::try_parse_from(std::iter::once("mu").chain(args.iter().copied())).map(|w| w.cmd);
+        assert!(matches!(parse(&["login"]), Ok(Cmd::Login { provider: None })));
+        assert!(matches!(parse(&["login", "chatgpt"]), Ok(Cmd::Login { provider: Some(p) }) if p == "chatgpt"));
+        assert!(matches!(parse(&["logout", "openai-chatgpt"]), Ok(Cmd::Logout { provider: Some(_), forget: false })));
+        assert!(matches!(parse(&["logout", "--forget"]), Ok(Cmd::Logout { provider: None, forget: true })));
+        assert!(matches!(
+            parse(&["logout", "chatgpt", "--forget"]),
+            Ok(Cmd::Logout { provider: Some(_), forget: true })
+        ));
+        assert!(parse(&["rm", "openai-chatgpt", "--forget"]).is_err(), "rm stays a plain sign-out");
+        assert!(matches!(parse(&["rm", "openai-chatgpt"]), Ok(Cmd::Rm { .. })));
+        assert!(parse(&["login", "--chat"]).is_err(), "the sign-in takes no chat flag");
+        assert!(parse(&["logout", "--no-chat"]).is_err(), "the sign-in takes no chat flag");
+    }
+
+    #[test]
+    fn forget_says_what_is_left_and_what_comes_next() {
+        let d = std::env::temp_dir().join(format!("mu-cli-forget-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(d.join("auth.json"));
+        store.chatgpt_save(account(false, false)).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(forget_registration(&store, &mut out).unwrap(), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("forgot the ChatGPT registration (me@example.com)"), "{text}");
+        assert!(text.contains("registers a new client") && text.contains("apps, until"), "{text}");
+        assert!(store.chatgpt_account().is_none());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn list_adds_the_sign_in_row_with_its_state() {
+        let rows = vec![("anthropic".to_string(), Entry::literal("ant-test-0123456789"))];
+        let text = render(&rows, Some(&account(true, true)));
+        let last = text.lines().last().unwrap();
+        assert!(last.starts_with("openai-chatgpt") && last.contains("ChatGPT sign-in"), "{text}");
+        assert!(last.contains("me@example.com") && last.ends_with("chat · plan"), "{text}");
+        assert!(text.lines().next().unwrap().starts_with(&format!("{:<14}", "anthropic")), "{text}");
+        assert!(render(&rows, Some(&account(true, false))).ends_with("plan usage not enabled"));
+        assert!(render(&[], Some(&account(false, false))).ends_with("signed out"));
+        assert!(!render(&rows, None).contains("ChatGPT"));
     }
 }
 

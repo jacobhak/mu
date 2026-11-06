@@ -2,7 +2,7 @@
 
 use super::store::{Entry, check_base_url, resolve_entry};
 use crate::net;
-use crate::provider::providers::{KeyTarget, ProviderDef};
+use crate::provider::providers::{Credential, KeyTarget, ProviderDef};
 use crate::provider::types::Auth;
 use std::time::Duration;
 
@@ -53,6 +53,9 @@ pub async fn validate(def: &ProviderDef, key: &str, base_url: Option<&str>) -> C
 /// Resolves `entry` (running its `!command` if it has one), then validates the key it yields.
 /// `Err` when the entry cannot be resolved; nothing was sent.
 pub async fn check_entry(def: &ProviderDef, entry: &Entry) -> Result<Check, String> {
+    if def.kind != Credential::ApiKey {
+        return Err(format!("{} takes no key; sign in with /login instead", def.label));
+    }
     let resolved = resolve_entry(def.id, entry).await.map_err(|e| e.to_string())?;
     Ok(validate(def, &resolved.key, entry.base_url.as_deref()).await)
 }

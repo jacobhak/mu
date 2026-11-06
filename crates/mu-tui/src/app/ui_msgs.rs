@@ -7,6 +7,7 @@ use crate::widgets::overlay::LoginTarget;
 use crate::widgets::select::{Item, Select};
 use mu_base::message::Image;
 use mu_base::models::GatewayModel;
+use mu_provider::auth::chatgpt::Account;
 use mu_provider::auth::check::Check;
 use mu_provider::auth::store::Entry;
 use mu_provider::provider::providers::KeyTarget;
@@ -51,6 +52,23 @@ pub(super) enum UiMsg {
         entry: Entry,
         r: Result<Check, String>,
     },
+    /// A ChatGPT sign-in is waiting: the authorization URL to show.
+    ChatgptUrl {
+        flow: u64,
+        url: String,
+    },
+    /// A ChatGPT sign-in finished: the account, or why it did not.
+    ChatgptDone {
+        flow: u64,
+        r: Result<Account, String>,
+    },
+    /// A ChatGPT sign-in reports a line while it waits.
+    ChatgptNotice {
+        flow: u64,
+        text: String,
+    },
+    /// Revoking a signed-out ChatGPT sign-in finished.
+    ChatgptRevoked(Result<(), String>),
 }
 
 impl App {
@@ -103,6 +121,10 @@ impl App {
             }
             UiMsg::McpReconnected { name, verbose, ms, result } => self.on_mcp_reconnected(&name, verbose, ms, result),
             UiMsg::KeyChecked { flow, target, entry, r } => self.on_key_checked(flow, target, entry, r),
+            UiMsg::ChatgptUrl { flow, url } => self.on_chatgpt_url(flow, &url),
+            UiMsg::ChatgptDone { flow, r } => self.on_chatgpt_done(flow, r),
+            UiMsg::ChatgptNotice { flow, text } => self.on_chatgpt_notice(flow, &text),
+            UiMsg::ChatgptRevoked(r) => self.on_chatgpt_revoked(r),
             UiMsg::LoginProviders(r) => {
                 let (mut items, mut targets) = self.api_key_rows();
                 match r {

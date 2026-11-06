@@ -314,6 +314,26 @@ fn a_fatal_error_emits_turn_failed_before_turn_end() {
     });
 }
 
+#[test]
+fn a_turn_with_no_model_chosen_sends_nothing_and_keeps_no_message() {
+    run(async {
+        let (mut a, mut rx) = agent(vec![]);
+        a.model.model = mu_base::models::ModelSpec::unselected();
+        a.turn(Some("go".to_string().into())).await;
+        let mut seen = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                AgentEvent::Error(m) => seen.push(m),
+                AgentEvent::TurnEnd { aborted } => seen.push(format!("end {aborted}")),
+                _ => {}
+            }
+        }
+        assert!(seen[0].contains("no model chosen") && seen[1] == "end true", "{seen:?}");
+        assert!(a.messages.is_empty());
+        assert_eq!(a.snapshot().model_name, "no model");
+    });
+}
+
 // ---- `mu notify` delivery ----
 
 fn notify_agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, UnboundedReceiver<AgentEvent>) {

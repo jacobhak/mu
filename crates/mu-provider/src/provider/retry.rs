@@ -1,4 +1,5 @@
 use super::types::ProviderError;
+use crate::auth::chatgpt;
 use mu_base::events::wait_text;
 use std::time::Duration;
 
@@ -54,6 +55,83 @@ pub fn context_fill(req: &super::types::Request<'_>) -> f64 {
 
 const LOGIN_HINT: &str = "\nIf you haven't logged in yet, run /login (or `omp login`) first.";
 
+/// What a ChatGPT plan error code tells the user, as `(retryable, text)`; `None` for codes the plan
+/// does not use. `param` is the field the API refused (`error.param`).
+pub(crate) fn chatgpt_text(code: &str, msg: &str, param: &str) -> Option<(bool, String)> {
+    let usage = chatgpt::USAGE_URL;
+    Some(match code {
+        "subscription_sharing_user_not_eligible" => {
+            (false, format!("this ChatGPT account is not eligible to use its plan here: {msg}"))
+        }
+        "subscription_sharing_usage_limit_exceeded" => {
+            (false, format!("your ChatGPT plan usage limit is reached; open Manage usage at {usage}"))
+        }
+        "subscription_sharing_workplace_individual_usage_limit_exceeded" => (
+            false,
+            "your individual ChatGPT usage limit in this workspace is reached; ask the workspace admin to raise it"
+                .into(),
+        ),
+        "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable" => {
+            (true, format!("ChatGPT plan usage is temporarily unavailable: {msg}"))
+        }
+        "subscription_sharing_unsupported_capability" => {
+            let what = if param.is_empty() { "this request" } else { param };
+            (false, format!("the ChatGPT plan does not support {what}: {msg}"))
+        }
+        "subscription_sharing_route_not_supported" => {
+            (false, format!("the ChatGPT plan does not accept this request: {msg}"))
+        }
+        "subscription_sharing_invalid_user"
+        | "chatpass_v2_scope_not_authorized"
+        | "chatpass_v2_invalid_authorization_context" => {
+            (false, "the ChatGPT sign-in is not accepted for this request; run /login to sign in again".into())
+        }
+        _ => return None,
+    })
+}
+
+/// The error for a non-2xx answer over the ChatGPT plan. The plan's `error.code` (or a bare `detail`)
+/// decides the class, else the status. The HTTP status, body and request id stay in the text.
+pub fn chatgpt_error(
+    status: u16,
+    retry_after: Option<Duration>,
+    body: &str,
+    request_id: Option<&str>,
+) -> ProviderError {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let code = v["error"]["code"].as_str().unwrap_or("");
+    let msg = v["error"]["message"].as_str().or(v["detail"].as_str()).unwrap_or("");
+    let param = v["error"]["param"].as_str().unwrap_or("");
+    let id = request_id.map(|id| format!("\nrequest id: {id}")).unwrap_or_default();
+    let shown: String = body.chars().take(2000).collect();
+    let named = if code.is_empty() { String::new() } else { format!(" ({code})") };
+    let detail = format!("\nHTTP {status}{named}: {shown}{id}");
+    match chatgpt_text(code, msg, param) {
+        Some((true, t)) => ProviderError::Retryable { msg: t + &detail, retry_after },
+        Some((false, t)) => ProviderError::Fatal(t + &detail),
+        None => match status {
+            503 => {
+                ProviderError::Retryable { msg: format!("ChatGPT plan routing is unavailable{detail}"), retry_after }
+            }
+            401 => ProviderError::Fatal(format!(
+                "the ChatGPT sign-in was not accepted; run /login to sign in again{detail}"
+            )),
+            403 => ProviderError::Fatal(format!("ChatGPT plan usage is not allowed here (policy or region){detail}")),
+            _ => append(classify_http(status, retry_after, body, Some(chatgpt::LABEL)), &id),
+        },
+    }
+}
+
+/// `tail` after an error's text.
+pub(crate) fn append(e: ProviderError, tail: &str) -> ProviderError {
+    match e {
+        ProviderError::Retryable { msg, retry_after } => ProviderError::Retryable { msg: msg + tail, retry_after },
+        ProviderError::Overflow(m) => ProviderError::Overflow(m + tail),
+        ProviderError::Fatal(m) => ProviderError::Fatal(m + tail),
+        ProviderError::Aborted => ProviderError::Aborted,
+    }
+}
+
 /// `retry-after-ms` (else `retry-after` in seconds) and `x-should-retry`.
 pub fn headers(h: &reqwest::header::HeaderMap) -> (Option<Duration>, Option<bool>) {
     let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
@@ -100,6 +178,9 @@ pub fn classify_http(status: u16, retry_after: Option<Duration>, body: &str, nat
             if matches!(status, 401 | 403) || (status == 404 && body.to_lowercase().contains("unknown model")) {
                 msg.push_str(LOGIN_HINT);
             }
+        }
+        Some(label) if matches!(status, 401 | 403) && label == chatgpt::LABEL => {
+            msg.push_str("\nThe ChatGPT sign-in was not accepted; run /login to sign in again");
         }
         Some(label) if matches!(status, 401 | 403) => {
             msg.push_str(&format!("\n{label} rejected the API key; run /login to replace it"));
@@ -153,6 +234,37 @@ mod tests {
         let e = gw(404, r#"{"message":"Unknown model: x/y"}"#).to_string();
         assert!(e.contains("/login"), "{e}");
         assert!(!gw(400, "bad field").to_string().contains("/login"));
+    }
+
+    #[test]
+    fn chatgpt_codes_map_to_the_documented_classes() {
+        let usage = chatgpt_error(
+            429,
+            None,
+            r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit"}}"#,
+            Some("req_1"),
+        );
+        let s = usage.to_string();
+        assert!(matches!(usage, ProviderError::Fatal(_)), "{s}");
+        assert!(s.contains("https://chatgpt.com/settings/usage") && s.contains("req_1"), "{s}");
+        let busy = chatgpt_error(503, None, r#"{"error":{"code":"subscription_sharing_usage_unavailable"}}"#, None);
+        assert!(matches!(busy, ProviderError::Retryable { .. }));
+        let routing = chatgpt_error(503, None, r#"{"detail":"Direct routing unavailable"}"#, None);
+        assert!(matches!(routing, ProviderError::Retryable { .. }));
+        let cap = chatgpt_error(
+            400,
+            None,
+            r#"{"error":{"code":"subscription_sharing_unsupported_capability","param":"tools[0].type"}}"#,
+            None,
+        )
+        .to_string();
+        assert!(cap.contains("tools[0].type"), "{cap}");
+        assert!(matches!(chatgpt_error(403, None, r#"{"detail":"region"}"#, None), ProviderError::Fatal(_)));
+        let e = chatgpt_error(401, None, r#"{"detail":"no"}"#, None).to_string();
+        assert!(e.contains("/login") && !e.contains("API key"), "{e}");
+        assert!(matches!(chatgpt_error(400, None, r#"{"error":{"message":"bad"}}"#, None), ProviderError::Fatal(_)));
+        let v = classify_http(401, None, "x", Some(chatgpt::LABEL)).to_string();
+        assert!(v.contains("sign-in was not accepted") && !v.contains("omp login"), "{v}");
     }
 
     #[test]

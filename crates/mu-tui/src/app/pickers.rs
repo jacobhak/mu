@@ -71,17 +71,16 @@ impl App {
             }
         }
         for m in providers.direct_models() {
-            items.push(Item { label: m.id.clone(), detail: "key".into() });
+            items.push(Item { label: m.id.clone(), detail: chatgpt::native_label(&m.provider).into() });
             ids.push(m.id);
         }
         let known = ids.clone();
         for g in gateway.iter().filter(|g| !known.contains(&g.id)) {
             // A gateway id of a native provider with a key is routed natively: it shows the key marker.
-            let native = g.id.split_once('/').is_some_and(|(p, _)| providers.is_direct(p));
-            let detail = if native {
-                "key".into()
-            } else {
-                g.context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000))
+            let native = g.id.split_once('/').filter(|(p, _)| providers.is_direct(p));
+            let detail = match native {
+                Some((p, _)) => chatgpt::native_label(p).into(),
+                None => g.context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000)),
             };
             items.push(Item { label: g.id.clone(), detail });
             ids.push(g.id.clone());
@@ -292,6 +291,7 @@ impl App {
             OverlayEvent::AssignRole { role: None, model } => self.send(Command::SetModel(model)),
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
+            OverlayEvent::Login(LoginTarget::ChatGpt) => self.chatgpt_row(),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
                 if let Some(target) = KeyTarget::find(&id) {
                     self.begin_key(target);

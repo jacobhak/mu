@@ -62,8 +62,8 @@ pub enum Sub {
         #[arg(long)]
         tag: Option<String>,
     },
-    /// Provider API keys: `mu auth add|list|rm|test`. A provider with a key is used directly,
-    /// without omp.
+    /// Provider API keys and the ChatGPT sign-in: `mu auth add|login|logout|list|rm|test`. A provider
+    /// with a key or a sign-in is used directly, without omp.
     Auth {
         #[command(subcommand)]
         cmd: auth::Cmd,

@@ -6,7 +6,8 @@ use crate::term::clipboard;
 use crate::text::markdown;
 use mu_base::image;
 use mu_base::models::Thinking;
-use mu_provider::provider::providers::PROVIDERS;
+use mu_provider::auth::chatgpt::PROVIDER_ID;
+use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
 
 const BUILTIN_DESC: [(&str, &str, bool); 26] = [
@@ -16,8 +17,8 @@ const BUILTIN_DESC: [(&str, &str, bool); 26] = [
     ("resume", "Resume a session from this directory", false),
     ("model", "Pick a model and assign a role", false),
     ("switch", "Switch this session's model", false),
-    ("login", "Add an API key, or log in to a provider or MCP server", false),
-    ("logout", "Remove a stored API key", false),
+    ("login", "Sign in with ChatGPT, add an API key, or log in to a provider or MCP server", false),
+    ("logout", "Remove a stored API key, or sign out of ChatGPT", false),
     ("web", "Choose the web search backend", false),
     ("thinking", "Set the thinking level", false),
     ("compact", "Compact the context [focus]", false),
@@ -71,14 +72,18 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context) -> Vec<Entry>
                 "jobs" => (vec!["kill".to_string()], vec![]),
                 "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
                 "login" => (
-                    PROVIDERS
-                        .iter()
-                        .map(|d| d.id.to_string())
+                    std::iter::once(PROVIDER_ID.to_string())
+                        .chain(providers::api_key_defs().map(|d| d.id.to_string()))
                         .chain(plugins.mcp_names().iter().map(|n| format!("mcp:{n}")))
                         .collect(),
                     vec![],
                 ),
-                "logout" => (PROVIDERS.iter().map(|d| d.id.to_string()).collect(), vec![]),
+                "logout" => (
+                    std::iter::once(PROVIDER_ID.to_string())
+                        .chain(providers::api_key_defs().map(|d| d.id.to_string()))
+                        .collect(),
+                    vec![],
+                ),
                 _ => (vec![], vec![]),
             };
             Entry { name: name.into(), desc: desc.into(), needs_arg, args, arg_descs }
@@ -113,6 +118,10 @@ impl App {
         }
         if input.images.is_empty() {
             let t = input.text.as_str();
+            if !t.starts_with(['/', '!']) && self.agent.status.model_id.is_empty() {
+                self.notice("no model chosen: sign in with /login if you have not, then pick one with /model");
+                return self.restore_queued(vec![input]);
+            }
             if let Some(cmd) = t.strip_prefix("!!") {
                 return self.user_bash(cmd.trim(), false);
             }

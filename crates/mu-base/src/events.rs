@@ -99,6 +99,9 @@ pub struct StatusSnapshot {
     pub subscription: bool,
     /// Routed to the provider's own API with a key mu holds (shown as `· key`).
     pub native: bool,
+    /// Runs on the user's ChatGPT plan (Sign in with ChatGPT): shown as `· ChatGPT plan` instead of
+    /// `· key`, and not metered per token. Implies `native`.
+    pub chatgpt_plan: bool,
     pub plan: bool,
     /// Estimated context tokens of the next request: the last response's usage plus an estimate for
     /// what was added since. `None` only when a producer cannot estimate.

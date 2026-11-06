@@ -6,6 +6,8 @@
 use super::convert::{normalize_id, paired, same_origin, tool_list, unavailable};
 use super::usage;
 use super::{SseFrames, WireFormat};
+use crate::auth::chatgpt;
+use crate::provider::retry;
 use crate::provider::sse::SseDecoder;
 use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
 use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
@@ -47,8 +49,11 @@ pub fn body(req: &Request) -> Value {
         "input": to_wire(req.messages, req.model),
         "stream": true,
         "store": false,
-        "max_output_tokens": req.max_tokens.unwrap_or(req.model.max_output),
     });
+    // The ChatGPT plan refuses `max_output_tokens`, as it refuses the other limit and sampling fields.
+    if req.model.provider != chatgpt::PROVIDER_ID {
+        body["max_output_tokens"] = json!(req.max_tokens.unwrap_or(req.model.max_output));
+    }
     if !req.system.is_empty() {
         body["instructions"] = json!(req.system);
     }
@@ -312,6 +317,7 @@ impl Assembler {
                 return Err(stream_failure(
                     e["code"].as_str().unwrap_or(""),
                     e["message"].as_str().unwrap_or("unknown stream error"),
+                    e["param"].as_str().unwrap_or(""),
                 ));
             }
             _ => {}
@@ -448,7 +454,14 @@ fn texts_of(parts: &Value, sep: &str) -> String {
 }
 
 /// Maps an in-stream error by OpenAI's error code.
-fn stream_failure(code: &str, msg: &str) -> ProviderError {
+fn stream_failure(code: &str, msg: &str, param: &str) -> ProviderError {
+    if let Some((retryable, text)) = retry::chatgpt_text(code, msg, param) {
+        return if retryable {
+            ProviderError::Retryable { msg: text, retry_after: None }
+        } else {
+            ProviderError::Fatal(text)
+        };
+    }
     match code {
         "rate_limit_exceeded" | "server_error" => ProviderError::Retryable { msg: msg.into(), retry_after: None },
         "context_length_exceeded" => ProviderError::Overflow(msg.into()),
@@ -459,7 +472,11 @@ fn stream_failure(code: &str, msg: &str) -> ProviderError {
 fn failed_response(r: &Value) -> ProviderError {
     let e = &r["error"];
     if e.is_object() {
-        return stream_failure(e["code"].as_str().unwrap_or(""), e["message"].as_str().unwrap_or("no message"));
+        return stream_failure(
+            e["code"].as_str().unwrap_or(""),
+            e["message"].as_str().unwrap_or("no message"),
+            e["param"].as_str().unwrap_or(""),
+        );
     }
     match r["incomplete_details"]["reason"].as_str() {
         Some(reason) => ProviderError::Fatal(format!("incomplete: {reason}")),
@@ -603,6 +620,32 @@ mod tests {
         assert!(out.get("prompt_cache_key").is_none());
         let plain = model(false);
         assert!(body(&request(&plain, Thinking::High, &msgs, &[])).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn the_plan_body_drops_what_it_refuses_and_its_errors_are_named() {
+        let mut m = model(true);
+        m.id = "openai-chatgpt/gpt-5.5".into();
+        m.provider = "openai-chatgpt".into();
+        let msgs = [Message::user("hi")];
+        let tools = [read_tool()];
+        let b = body(&request(&m, Thinking::High, &msgs, &tools));
+        assert!(b.get("max_output_tokens").is_none(), "{b}");
+        assert_eq!((&b["store"], &b["stream"]), (&json!(false), &json!(true)));
+        assert_eq!(
+            (&b["tools"][0]["strict"], &b["include"][0]),
+            (&json!(false), &json!("reasoning.encrypted_content"))
+        );
+        assert!(!b.to_string().contains("\"role\":\"system\""), "{b}");
+        // The usage limit arrives as a failed response mid-stream.
+        let failed = "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\",\"message\":\"limit\"}}}\n\n";
+        let err = Assembler::new(&m).feed(failed.as_bytes(), &mut |_: StreamEvent| {}).unwrap_err().to_string();
+        assert!(err.contains("https://chatgpt.com/settings/usage"), "{err}");
+        let unsupported = "data: {\"type\":\"error\",\"error\":{\"code\":\"subscription_sharing_unsupported_capability\",\"param\":\"tools[0].type\",\"message\":\"no\"}}\n\n";
+        let err = Assembler::new(&m).feed(unsupported.as_bytes(), &mut |_: StreamEvent| {}).unwrap_err().to_string();
+        assert!(err.contains("tools[0].type"), "{err}");
+        // An API-key route keeps its limit field.
+        assert!(body(&request(&model(true), Thinking::High, &msgs, &[])).get("max_output_tokens").is_some());
     }
 
     #[test]

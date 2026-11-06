@@ -7,7 +7,7 @@ pub mod setup;
 mod signals;
 
 use crate::cli::Cli;
-use crate::cli::select::{agent_selector, model_label, pick_model};
+use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none};
 use crate::workflow::{deliver, plans_cli::PlanRun};
 use anyhow::{Result, bail};
 use mu_agent::agent;
@@ -113,7 +113,11 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     }
     let def_thinking = agent_def.as_ref().and_then(|d| d.thinking.as_deref()).and_then(models::Thinking::parse);
     let role_sel = sel.clone();
-    let (spec, thinking) = pick_model(&cfgs, &providers, sel, cli_thinking.or(def_thinking))?;
+    let level = cli_thinking.or(def_thinking);
+    let (spec, thinking) = match mode {
+        Mode::Tui => pick_model_or_none(&cfgs, &providers, sel, level)?,
+        _ => pick_model(&cfgs, &providers, sel, level)?,
+    };
     let model_label = model_label(role_sel.as_deref(), &spec.id);
 
     let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;

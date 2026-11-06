@@ -10,9 +10,10 @@ use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::select::{Item, Select};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mu_base::models::Thinking;
+use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::Entry;
-use mu_provider::provider::providers::{self, KeyTarget, PROVIDERS, SEARCH_KEYS};
+use mu_provider::provider::providers::{self, KeyTarget, SEARCH_KEYS};
 
 /// What the composer holds while a key flow waits for text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +67,7 @@ fn api_key_items(
     env_set: impl Fn(&str) -> bool,
     routes_chat: impl Fn(&str) -> bool,
 ) -> (Vec<Item>, Vec<LoginTarget>) {
-    let providers = PROVIDERS.iter().map(|d| {
+    let providers = providers::api_key_defs().map(|d| {
         let mut detail = key_status(stored(d.id), env_set(d.env_hint), d.env_hint);
         if stored(d.id) {
             detail.push_str(if routes_chat(d.id) { " · chat" } else { " · not for chat" });
@@ -176,7 +177,11 @@ impl App {
     fn on_key_inner(&mut self, k: KeyEvent) {
         // While a key is typed, every key goes to the masked composer, even past an open overlay.
         let typing = self.typing();
-        if typing {
+        if self.chatgpt_typing() {
+            if self.chatgpt_key(k) {
+                return;
+            }
+        } else if typing {
             if self.key_flow_key(k) {
                 return;
             }
@@ -227,6 +232,9 @@ impl App {
     /// `/login`: with a provider id run `omp login <id>`, with `mcp:<name>` log in to that MCP
     /// server; otherwise list omp's providers and the MCP servers that need auth in a picker.
     pub(super) fn login(&mut self, provider: &str) {
+        if chatgpt::is_chatgpt(provider) {
+            return self.start_chatgpt();
+        }
         if let Some(target) = KeyTarget::find(provider) {
             return self.begin_key(target);
         }
@@ -281,11 +289,17 @@ impl App {
     /// Clears the typed text, gives the composer its normal behaviour back, and restores what was
     /// held back while the text was typed.
     fn end_typing(&mut self) {
+        self.set_typing(None);
+        self.unlock_composer();
+    }
+
+    /// Clears the typed text, gives the composer its normal behaviour back, and restores what was
+    /// held back while the text was typed.
+    pub(super) fn unlock_composer(&mut self) {
         self.prompt.composer.take_secret();
         self.prompt.composer.set_masked(false);
         self.prompt.composer.set_private(false);
         self.prompt.composer.set_closed(false);
-        self.set_typing(None);
         let held = std::mem::take(&mut self.prompt.held_back);
         self.restore_queued(held);
     }
@@ -308,12 +322,12 @@ impl App {
 
     /// Whether a key or command is being typed: the composer is locked to it.
     pub(super) fn typing(&self) -> bool {
-        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some())
+        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some()) || self.chatgpt_typing()
     }
 
     /// A key is being typed or a choice waits for the user: no prediction is asked for.
     fn key_flow_pending(&self) -> bool {
-        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some() || f.pending.is_some())
+        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some() || f.pending.is_some()) || self.chatgpt_typing()
     }
 
     /// Ends the flow without saving. A flow that began elsewhere (the wizard) resumes there.
@@ -346,7 +360,12 @@ impl App {
     /// The API-key rows that open `/login`.
     pub(super) fn api_key_rows(&self) -> (Vec<Item>, Vec<LoginTarget>) {
         let store = self.services.providers.store();
-        api_key_items(|p| store.has(p), env_is_set, |p| store.get(p).is_some_and(|e| e.routes_chat()))
+        let (mut items, mut targets) =
+            api_key_items(|p| store.has(p), env_is_set, |p| store.get(p).is_some_and(|e| e.routes_chat()));
+        let (item, target) = chatgpt::login_item(store.chatgpt_account().as_ref());
+        items.insert(0, item);
+        targets.insert(0, target);
+        (items, targets)
     }
 
     /// `/login <id>` or a `/login` row: a key already stored for anthropic or openai opens a menu
@@ -397,6 +416,9 @@ impl App {
 
     /// What the picker chose for `provider`, or `Cancel` when it was dismissed.
     pub(super) fn on_key_choice(&mut self, provider: &str, choice: KeyOption) {
+        if provider == PROVIDER_ID {
+            return self.on_chatgpt_choice(choice);
+        }
         let Some(target) = KeyTarget::find(provider) else { return };
         match choice {
             KeyOption::Paste => {
@@ -441,6 +463,9 @@ impl App {
                 },
             },
             KeyOption::Replace => self.start_key_flow(target, None, None),
+            KeyOption::SignIn => self.start_chatgpt(),
+            KeyOption::SignOut => self.chatgpt_sign_out(),
+            KeyOption::Forget => self.chatgpt_forget(),
             KeyOption::Cancel => self.cancel_key_flow(),
         }
     }
@@ -554,7 +579,7 @@ impl App {
         if !arg.is_empty() {
             return self.logout(arg);
         }
-        let providers: Vec<String> = self
+        let mut providers: Vec<String> = self
             .services
             .providers
             .store()
@@ -563,20 +588,31 @@ impl App {
             .map(|(p, _)| p)
             .filter(|p| KeyTarget::find(p).is_some())
             .collect();
+        if self.services.providers.store().chatgpt_account().is_some_and(|a| a.signed_in()) {
+            providers.push(PROVIDER_ID.into());
+        }
         if providers.is_empty() {
             return self.notice("no API keys are stored; /login adds one");
         }
         let items = providers
             .iter()
-            .map(|p| Item {
-                label: KeyTarget::find(p).map_or_else(|| p.clone(), |t| t.label().to_string()),
-                detail: "remove this key".into(),
+            .map(|p| {
+                if chatgpt::is_chatgpt(p) {
+                    return Item { label: "ChatGPT sign-in".into(), detail: "sign out and revoke".into() };
+                }
+                Item {
+                    label: KeyTarget::find(p).map_or_else(|| p.clone(), |t| t.label().to_string()),
+                    detail: "remove this key".into(),
+                }
             })
             .collect();
-        self.overlay = Some(Overlay::Logout { sel: Select::new("Remove an API key", items), providers });
+        self.overlay = Some(Overlay::Logout { sel: Select::new("Remove a key or sign out", items), providers });
     }
 
     pub(super) fn logout(&mut self, provider: &str) {
+        if chatgpt::is_chatgpt(provider) {
+            return self.chatgpt_sign_out();
+        }
         let Some(target) = KeyTarget::find(provider) else {
             return self.error(&format!("no API key support for `{provider}`"));
         };
@@ -708,6 +744,23 @@ mod tests {
         assert!(matches!(ev, Some(OverlayEvent::Key { choice: KeyOption::Cancel, .. })));
     }
 
+    #[test]
+    fn a_late_chatgpt_result_is_ignored_and_escape_ends_the_sign_in() {
+        use tokio_util::sync::CancellationToken;
+        let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let (paste, _paste_rx) = unbounded_channel();
+        app.flows.chatgpt = Some(chatgpt::ChatgptFlow { id: 2, cancel: CancellationToken::new(), paste });
+        app.on_chatgpt_done(1, Err("late".into()));
+        assert_eq!(app.flows.chatgpt.as_ref().map(|f| f.id), Some(2), "the current sign-in survives");
+        assert!(app.typing(), "the composer is locked to the redirect URL");
+        app.on_terminal(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.prompt.composer.text(), "x");
+        app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.flows.chatgpt.is_none() && !app.typing());
+        assert_eq!(app.prompt.composer.text(), "", "the typed text is cleared");
+        assert!(transcript_text(&app).contains("sign-in cancelled"));
+    }
+
     fn test_app(history: std::path::PathBuf) -> App {
         use mu_base::config::Configs;
         let (cmd_tx, _cmd_rx) = unbounded_channel();
@@ -748,6 +801,8 @@ mod tests {
                 web_wizard: None,
                 key_flow: None,
                 key_flow_seq: 0,
+                chatgpt: None,
+                chatgpt_seq: 0,
             },
             quitting: false,
         }

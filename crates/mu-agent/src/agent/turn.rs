@@ -28,6 +28,11 @@ impl Agent {
     }
 
     pub(super) async fn turn_from(&mut self, start: Start) {
+        if self.model.model.is_unselected() {
+            self.error("no model chosen: sign in with /login if you have not, then pick one with /model");
+            self.emit(AgentEvent::TurnEnd { aborted: true });
+            return;
+        }
         if matches!(start, Start::Wake)
             && !self.tools.jobs.as_ref().is_some_and(|j| j.has_undelivered())
             && !self.notify_pending(true)

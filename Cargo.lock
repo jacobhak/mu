@@ -4410,6 +4410,7 @@ name = "mu-provider"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "futures-util",
  "jiff",
  "libc",
@@ -4418,10 +4419,12 @@ dependencies = [
  "mu-session",
  "mu-testutil",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.11.1",
  "tokio",
  "tokio-util",
  "uuid",
