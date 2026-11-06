@@ -4420,6 +4420,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "futures-util",
+ "httpdate",
  "jiff",
  "libc",
  "mu-base",
@@ -4468,6 +4469,7 @@ name = "mu-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "encoding_rs",
  "flume",
  "futures-util",
  "grep-regex",

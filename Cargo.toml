@@ -27,6 +27,8 @@ pi-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-diff = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
 pi-walker = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.16.0" }
+encoding_rs = "0.8"
+httpdate = "1"
 tokio = "1"
 tokio-util = "0.7"
 serde_yaml_ng = "0.10"
