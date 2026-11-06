@@ -6,6 +6,17 @@
 
 A turn that began this way rings the terminal; see [Detached runs](detached-runs.md#terminal-bell).
 
+## Cancelling a job
+
+You do not need the jobs panel to stop a job. While jobs run, their rows sit above the prompt:
+
+- `Alt+↓` marks the first running job (`▸`, highlighted, with the keys listed under it) and moves down the list; past the last job the mark is off. `Alt+↑` moves up. (`Shift+↑` edits the last queued message.)
+- While a job is marked, a bare `k` or `x` cancels it and Esc takes the mark off; any other key takes the mark off and then does what it normally does, so typing is never swallowed. (Ctrl and Alt chords such as `Ctrl+O` leave the mark alone.)
+- `Alt+K` cancels the marked job, or the only running job when none is marked. With several running and none marked it says so instead of guessing. No key cancels everything at once; use the jobs panel (`X`) or `/jobs kill all` for that.
+- `Ctrl+O` expands the rows with each job's task, run time and output tail.
+
+The model has the same power through the `job_cancel` tool, offered in interactive sessions: `id` cancels one job, `all` every running job. The job's result reaches the model as the usual notice, so the model never needs `kill` to stop something it started with `bash` `async` or `task`.
+
 ## Jobs panel
 
 `Alt+J` or `/jobs` opens the jobs panel: this session's subagents and `bash` jobs run with `async`, one row each (state, name, agent, tool count, elapsed time, what a subagent has cost, last activity), with the selected job's details below: state and whether its result has been delivered to the model, working directory, the task prompt or command, and how a command ended. It follows the jobs live. `j`/`k` or the arrow keys move, `g`/`G` jump to the first and last job, `x` cancels the selected job, `X` cancels every running job, `q` or Esc closes. `/jobs kill <id|all>` cancels from the prompt.

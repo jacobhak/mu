@@ -114,6 +114,8 @@ pub(super) struct AgentView {
     jobs_committed: HashSet<String>,
     /// Newest output of each background bash job, for the jobs panel.
     pub(super) job_out: HashMap<String, String>,
+    /// The running job the inline marker is on, by name: `Alt+K` cancels it.
+    pub(super) job_focus: Option<String>,
     pub(super) todo: Vec<Phase>,
     pub(super) status: StatusSnapshot,
     /// Bash commands run, for `/copy`.
@@ -144,6 +146,7 @@ impl AgentView {
             child_costs: HashMap::new(),
             jobs_committed: HashSet::new(),
             job_out: HashMap::new(),
+            job_focus: None,
             todo: Vec::new(),
             status: StatusSnapshot::default(),
             bash_cmds: Vec::new(),
@@ -303,6 +306,9 @@ impl AgentView {
                 }
                 self.job_out.retain(|id, _| v.iter().any(|j| &j.name == id));
                 self.jobs = v;
+                if !self.job_focus.as_ref().is_some_and(|f| self.running_names().contains(f)) {
+                    self.job_focus = None;
+                }
                 fx.push(Effect::JobsChanged);
             }
             AgentEvent::JobOutput { id, tail } => {
@@ -356,6 +362,29 @@ impl AgentView {
         fx
     }
 
+    pub(super) fn running_names(&self) -> Vec<String> {
+        self.jobs.iter().filter(|j| j.state == SubagentState::Running).map(|j| j.name.clone()).collect()
+    }
+
+    /// Moves the inline marker over the running jobs by `by` places; past either end it is off.
+    pub(super) fn focus_job(&mut self, by: i8) {
+        let names = self.running_names();
+        let slot = self.job_focus.as_ref().and_then(|f| names.iter().position(|n| n == f)).map_or(0, |i| i + 1);
+        let next = (slot as isize + by as isize).rem_euclid(names.len() as isize + 1) as usize;
+        self.job_focus = next.checked_sub(1).map(|i| names[i].clone());
+    }
+
+    /// What `Alt+K` cancels: the marked job, or the only running job. Otherwise the reason there is none.
+    pub(super) fn cancel_target(&self) -> Result<String, &'static str> {
+        let names = self.running_names();
+        match (&self.job_focus, names.as_slice()) {
+            (_, []) => Err("no jobs are running"),
+            (Some(f), _) => Ok(f.clone()),
+            (None, [only]) => Ok(only.clone()),
+            (None, _) => Err("several jobs are running: Alt+↓ marks one, then Alt+K cancels it"),
+        }
+    }
+
     fn ring_if_attention(&mut self, fx: &mut Vec<Effect>) {
         if self.bell.on_attention() {
             fx.push(Effect::Ring);
@@ -394,9 +423,13 @@ impl AgentView {
             out.extend(blocks::tool_streaming(&c.name, &c.args, spin, w));
         }
         for j in self.jobs.iter().filter(|j| j.state == SubagentState::Running) {
-            out.extend(blocks::subagent_rows(std::slice::from_ref(j), spin, |j| {
+            let mut rows = blocks::subagent_rows(std::slice::from_ref(j), spin, |j| {
                 j.session.as_ref().and_then(|p| self.child_costs.get(p)).copied()
-            }));
+            });
+            if self.job_focus.as_deref() == Some(j.name.as_str()) {
+                rows = rows.into_iter().flat_map(|r| blocks::focused_job(r, w)).collect();
+            }
+            out.extend(rows);
             if self.expanded {
                 out.extend(blocks::job_details(j, self.job_out.get(&j.name).map(String::as_str), w));
             }
@@ -742,6 +775,45 @@ mod tests {
         assert!(matches!(fx.as_slice(), [Effect::JobOutput(id)] if id == "b1"));
         v.on_event(AgentEvent::Jobs(vec![]), SIZE);
         assert!(v.job_out.is_empty());
+    }
+
+    fn running_jobs(v: &mut AgentView, names: &[&str]) {
+        let jobs = names.iter().map(|n| job(n, SubagentState::Running, JobKind::Bash)).collect();
+        v.on_event(AgentEvent::Jobs(jobs), SIZE);
+    }
+
+    #[test]
+    fn the_marker_steps_over_running_jobs_and_wraps_through_off() {
+        let mut v = view();
+        running_jobs(&mut v, &["a", "b"]);
+        v.focus_job(1);
+        assert_eq!(v.job_focus.as_deref(), Some("a"));
+        v.focus_job(1);
+        assert_eq!(v.job_focus.as_deref(), Some("b"));
+        v.focus_job(1);
+        assert_eq!(v.job_focus, None, "past the last job it is off");
+        v.focus_job(-1);
+        assert_eq!(v.job_focus.as_deref(), Some("b"), "up from off lands on the last job");
+        let rows = v.live_lines(80, ' ').0.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rows.contains("▸") && rows.contains("k cancel"), "{rows}");
+        v.on_event(AgentEvent::Jobs(vec![job("a", SubagentState::Running, JobKind::Bash)]), SIZE);
+        assert_eq!(v.job_focus, None, "a job that ended loses the marker");
+        v.focus_job(1);
+        v.focus_job(1);
+        assert_eq!(v.job_focus, None, "one job: on, then off");
+    }
+
+    #[test]
+    fn alt_k_targets_the_marked_job_else_the_only_one() {
+        let mut v = view();
+        assert!(v.cancel_target().is_err(), "nothing runs");
+        running_jobs(&mut v, &["a"]);
+        assert_eq!(v.cancel_target(), Ok("a".into()));
+        running_jobs(&mut v, &["a", "b"]);
+        assert!(v.cancel_target().is_err(), "two jobs and no marker: say how to choose");
+        v.focus_job(1);
+        v.focus_job(1);
+        assert_eq!(v.cancel_target(), Ok("b".into()));
     }
 
     #[test]

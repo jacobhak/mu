@@ -348,8 +348,8 @@ impl App {
             .collect();
         if let Some(last) = out.last_mut() {
             let used: usize = line_text(last).chars().count();
-            if used + 12 <= w {
-                last.push(span("  alt+↑ edit", dim()));
+            if used + 15 <= w {
+                last.push(span("  shift+↑ edit", dim()));
             }
         }
         out

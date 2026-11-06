@@ -4,6 +4,7 @@ pub mod docs;
 pub mod edit;
 mod glob;
 pub(crate) mod grep;
+mod job_cancel;
 mod pathnote;
 mod plan;
 mod read;
@@ -144,6 +145,11 @@ impl Tools {
         ToolDef { name: "yield".into(), description: yield_::DESCRIPTION.into(), schema: yield_::schema(output) }
     }
 
+    /// Offered only where background jobs exist (interactive sessions).
+    pub fn job_cancel_def() -> ToolDef {
+        ToolDef { name: "job_cancel".into(), description: job_cancel::DESCRIPTION.into(), schema: job_cancel::schema() }
+    }
+
     pub fn plan_def() -> ToolDef {
         ToolDef { name: "propose_plan".into(), description: plan::DESCRIPTION.into(), schema: plan::schema() }
     }
@@ -275,7 +281,7 @@ pub static BUILTINS: &[Builtin] = &[
                     "command":{"type":"string"},
                     "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
                     "cwd":{"type":"string","description":"Working directory for this command"},
-                    "async":{"type":"boolean","description":"Set for any command that may take more than ~5 seconds: runs as a background job, returns at once, and the result arrives automatically. Interactive sessions only (elsewhere it runs in the foreground); not with pty."},
+                    "async":{"type":"boolean","description":"Set for any command that may take more than ~5 seconds: runs as a background job, returns at once, and the result arrives automatically; stop it with `job_cancel`. Interactive sessions only (elsewhere it runs in the foreground); not with pty."},
                     "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
             )
         }),
@@ -323,6 +329,7 @@ pub static BUILTINS: &[Builtin] = &[
         call: dispatch!("propose_plan", async |t, a: plan::Args, c| t.propose_plan(a, c)),
     },
     Builtin { name: "task", def: None, call: dispatch!("task", async |t, a: task::Args, c| t.task(a, c)) },
+    Builtin { name: "job_cancel", def: None, call: dispatch!("job_cancel", |t, a: job_cancel::Args| t.job_cancel(a)) },
     Builtin { name: "yield", def: None, call: dispatch!("yield", |t, a: yield_::Args| t.yield_result(a)) },
 ];
 
@@ -359,6 +366,8 @@ pub fn summary(name: &str, args: &Value) -> String {
         "glob" | "grep" => first("pattern"),
         "edit" => first("input"),
         "bash" => first("command"),
+        "job_cancel" if args["all"].as_bool() == Some(true) => "all",
+        "job_cancel" => first("id"),
         "web_search" => first("query"),
         "fetch" => first("url"),
         "review" => first("scope"),

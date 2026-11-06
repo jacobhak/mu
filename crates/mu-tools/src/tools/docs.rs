@@ -100,6 +100,7 @@ fn pages() -> Vec<(String, String)> {
 fn tools_reference() -> String {
     let mut defs = Tools::definitions();
     defs.push(Tools::task_def(true, &[]));
+    defs.push(Tools::job_cancel_def());
     defs.push(Tools::plan_def());
     let mut s = String::from(
         "# Tools\n\nThe built-in tools the model is offered. Plugin and MCP tools are listed in `mu://state/plugins.md`.\n",

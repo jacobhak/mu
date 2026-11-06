@@ -8,7 +8,7 @@ use crate::chat::composer::Action;
 use crate::term::clipboard;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::select::{Item, Select};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mu_base::models::Thinking;
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::auth::check::{self, Check};
@@ -193,6 +193,9 @@ impl App {
                 return;
             }
         }
+        if !typing && self.marked_job_key(&k) {
+            return;
+        }
         let action = self.prompt.composer.on_key(k, self.agent.running, &self.prompt.commands);
         // Only actions that stay in the composer may run while a key or command is typed.
         if typing
@@ -225,7 +228,43 @@ impl App {
                     let _ = tx.send(UiMsg::ClipboardImage(clipboard::read_image().await));
                 });
             }
+            Action::JobFocus(by) => self.agent.focus_job(by),
+            Action::JobCancel => self.cancel_job(),
             Action::PopQueue => self.send(Command::PopQueue),
+        }
+    }
+
+    fn cancel_job(&mut self) {
+        match self.agent.cancel_target() {
+            Ok(id) => self.send(Command::KillJobs(Some(id))),
+            Err(why) => self.notice(why),
+        }
+    }
+
+    /// Keys while a job is marked: `k` or `x` cancels it, Esc takes the mark off, and any other
+    /// key takes it off and then does what it normally does. Ctrl/Alt chords (and a bare modifier)
+    /// leave the mark alone. True when the key was used up here.
+    fn marked_job_key(&mut self, k: &KeyEvent) -> bool {
+        if self.agent.job_focus.is_none()
+            || !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            || k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            || matches!(k.code, KeyCode::Modifier(_))
+        {
+            return false;
+        }
+        match k.code {
+            KeyCode::Char('k' | 'x') if k.modifiers.is_empty() => {
+                self.cancel_job();
+                true
+            }
+            KeyCode::Esc => {
+                self.agent.job_focus = None;
+                true
+            }
+            _ => {
+                self.agent.job_focus = None;
+                false
+            }
         }
     }
 
@@ -919,6 +958,65 @@ mod tests {
         });
         assert!((app.agent.subagent_cost - 0.25).abs() < 1e-9, "{}", app.agent.subagent_cost);
         assert!(app.agent.spend.is_some(), "the reader is back for the next read");
+    }
+
+    #[test]
+    fn alt_keys_mark_and_cancel_running_jobs_without_the_panel() {
+        use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+        let job = |name: &str| SubagentStatus {
+            name: name.into(),
+            agent: "bash".into(),
+            tools: 0,
+            last: String::new(),
+            state: SubagentState::Running,
+            kind: JobKind::Bash,
+            cwd: std::path::PathBuf::from("/"),
+            task: "sleep".into(),
+            started: std::time::SystemTime::now(),
+            ended: None,
+            delivered: false,
+            note: None,
+            session: None,
+            model: None,
+        };
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        in_local(async {
+            app.on_agent(AgentEvent::Jobs(vec![job("a"), job("b")]));
+            app.on_terminal(press(KeyCode::Char('k'), KeyModifiers::ALT));
+            assert!(commands.try_recv().is_err(), "two jobs and none marked: nothing is guessed");
+            assert!(transcript_text(&app).contains("Alt+↓ marks one"));
+            app.on_terminal(press(KeyCode::Down, KeyModifiers::ALT));
+            app.on_terminal(press(KeyCode::Down, KeyModifiers::ALT));
+            app.on_terminal(press(KeyCode::Char('k'), KeyModifiers::ALT));
+            assert!(matches!(commands.try_recv(), Ok(Command::KillJobs(Some(id))) if id == "b"));
+            app.on_terminal(press(KeyCode::Char('K'), KeyModifiers::ALT | KeyModifiers::SHIFT));
+            assert!(commands.try_recv().is_err(), "no key cancels every job");
+            // Alt+↑ marks upward; Shift+↑ is the queued-message key.
+            app.agent.job_focus = None;
+            app.on_terminal(press(KeyCode::Up, KeyModifiers::ALT));
+            assert_eq!(app.agent.job_focus.as_deref(), Some("b"));
+            assert!(commands.try_recv().is_err());
+            app.on_terminal(press(KeyCode::Up, KeyModifiers::SHIFT));
+            assert!(matches!(commands.try_recv(), Ok(Command::PopQueue)));
+            assert_eq!(app.agent.job_focus, None, "a key that is not a job key takes the mark off");
+
+            // While a job is marked a bare `k` or `x` cancels it, and Esc only unmarks.
+            app.on_terminal(press(KeyCode::Up, KeyModifiers::ALT));
+            app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.agent.job_focus, None);
+            assert!(commands.try_recv().is_err(), "Esc is not an abort while a job is marked");
+            app.on_terminal(press(KeyCode::Char('k'), KeyModifiers::NONE));
+            assert_eq!(app.prompt.composer.text(), "k", "unmarked, `k` is a letter");
+            app.prompt.composer.take_for_submit();
+            app.on_terminal(press(KeyCode::Up, KeyModifiers::ALT));
+            app.on_terminal(press(KeyCode::Char('o'), KeyModifiers::CONTROL));
+            assert_eq!(app.agent.job_focus.as_deref(), Some("b"), "a chord leaves the mark");
+            app.on_terminal(press(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert!(matches!(commands.try_recv(), Ok(Command::KillJobs(Some(id))) if id == "b"));
+            assert_eq!(app.prompt.composer.text(), "", "the key was used up");
+            app.on_terminal(press(KeyCode::Char('h'), KeyModifiers::NONE));
+            assert_eq!(app.prompt.composer.text(), "h");
+        });
     }
 
     #[test]

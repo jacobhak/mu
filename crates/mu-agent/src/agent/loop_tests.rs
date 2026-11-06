@@ -154,6 +154,33 @@ fn policy_is_enforced_at_dispatch_and_in_defs() {
 }
 
 #[test]
+fn job_cancel_is_offered_where_jobs_exist_and_stops_a_background_bash_job() {
+    run(async {
+        let (base, _rx) = agent(vec![]);
+        assert!(base.tool_defs().iter().all(|d| d.name != "job_cancel"), "no jobs, no tool");
+        let (mut a, _rx) = notify_agent(vec![]);
+        assert!(a.tool_defs().iter().any(|d| d.name == "job_cancel"));
+
+        let cancel = CancellationToken::new();
+        let started = a.run_tool("b1", "bash", json!({"command": "sleep 30", "async": true}), &cancel).await;
+        assert!(!started.is_error, "{}", started.text);
+        let jobs = a.tools.jobs.clone().unwrap();
+        let id = jobs.running_ids().remove(0);
+        let out = a.run_tool("c1", "job_cancel", json!({"id": id}), &cancel).await;
+        assert!(!out.is_error && out.text.contains("Cancelled"), "{}", out.text);
+        for _ in 0..100 {
+            if jobs.has_undelivered() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let done = jobs.take_undelivered();
+        assert!(done.len() == 1 && !done[0].ok, "the job ended, cancelled, long before 30 s");
+        assert!(jobs.running_ids().is_empty());
+    });
+}
+
+#[test]
 fn calls_after_a_successful_yield_are_skipped() {
     run(async {
         let script = vec![

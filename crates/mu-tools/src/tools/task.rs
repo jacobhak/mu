@@ -40,7 +40,7 @@ pub const DESCRIPTION: &str = concat!(
 );
 
 pub const ASYNC_DESCRIPTION: &str = concat!(
-    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message and wake an idle session: keep working or end your turn. Never poll, sleep or loop for them. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
+    "Spawn subagents in the background; job ids return immediately. Results arrive automatically as a <system-notice> message and wake an idle session: keep working or end your turn. Never poll, sleep or loop for them; stop one with `job_cancel`. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
     guidance!()
 );
 

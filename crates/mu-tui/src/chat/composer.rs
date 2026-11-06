@@ -124,6 +124,10 @@ pub enum Action {
     EditExternal,
     Reply,
     Jobs,
+    /// Move the marker over the running jobs: `1` is down, `-1` up.
+    JobFocus(i8),
+    /// Cancel the marked job, or the only running one.
+    JobCancel,
     PopQueue,
     Redraw,
 }
@@ -518,7 +522,7 @@ impl Composer {
             }
             KeyCode::Enter => self.submit(false),
             KeyCode::Char('q') if ctrl => self.submit(running),
-            KeyCode::Up if alt => Action::PopQueue,
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && !alt && !ctrl => Action::PopQueue,
             KeyCode::Esc if self.buf.masked => {
                 self.clear();
                 Action::Redraw
@@ -537,6 +541,9 @@ impl Composer {
             KeyCode::Char('g') if ctrl && !self.locked() => Action::EditExternal,
             KeyCode::Char('r') if ctrl && self.menu.is_none() && !self.locked() => Action::Reply,
             KeyCode::Char('j') if alt && !ctrl => Action::Jobs,
+            KeyCode::Char('k') if alt && !ctrl && !key.modifiers.contains(KeyModifiers::SHIFT) => Action::JobCancel,
+            KeyCode::Down if alt && !ctrl => Action::JobFocus(1),
+            KeyCode::Up if alt && !ctrl => Action::JobFocus(-1),
             KeyCode::Up | KeyCode::Char('p') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
                 if self.buf.row == 0 {
                     self.history_prev();
@@ -913,6 +920,18 @@ mod tests {
         assert_ne!(press(&mut c, KeyCode::Char('j'), KeyModifiers::CONTROL), Action::Jobs);
         assert_ne!(press(&mut c, KeyCode::Char('j'), KeyModifiers::NONE), Action::Jobs);
         assert_eq!(c.text(), "\nj", "Ctrl+J is still a newline");
+    }
+
+    #[test]
+    fn alt_k_cancels_a_job_and_alt_down_moves_the_marker() {
+        let mut c = Composer::new(None);
+        assert_eq!(press(&mut c, KeyCode::Char('k'), KeyModifiers::ALT), Action::JobCancel);
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_ne!(press(&mut c, KeyCode::Char('K'), alt_shift), Action::JobCancel, "no key cancels every job");
+        assert_ne!(press(&mut c, KeyCode::Char('k'), alt_shift), Action::JobCancel);
+        assert_eq!(press(&mut c, KeyCode::Down, KeyModifiers::ALT), Action::JobFocus(1));
+        assert_eq!(press(&mut c, KeyCode::Up, KeyModifiers::ALT), Action::JobFocus(-1));
+        assert_eq!(c.text(), "", "none of them type or move in the buffer");
     }
 
     #[test]
@@ -1386,7 +1405,7 @@ mod tests {
         );
         type_str(&mut c, "b");
         assert_eq!(c.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), false, &[]), Action::Submit("b".into()));
-        assert_eq!(c.on_key(key(KeyCode::Up, KeyModifiers::ALT), true, &[]), Action::PopQueue);
+        assert_eq!(c.on_key(key(KeyCode::Up, KeyModifiers::SHIFT), true, &[]), Action::PopQueue);
         assert_eq!(c.on_key(key(KeyCode::Esc, KeyModifiers::NONE), true, &[]), Action::Abort);
         assert_eq!(c.on_key(key(KeyCode::Esc, KeyModifiers::NONE), false, &[]), Action::None);
         assert_eq!(c.on_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), false, &[]), Action::CycleThinking);

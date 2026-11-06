@@ -435,6 +435,22 @@ impl JobsHandle {
         self.inner.borrow().iter().any(|j| j.state != SubagentState::Running && !j.delivered)
     }
 
+    /// Ids of the running jobs, oldest first.
+    pub fn running_ids(&self) -> Vec<String> {
+        let jobs = self.inner.borrow();
+        jobs.iter().filter(|j| j.state == SubagentState::Running).map(|j| j.spec.id.clone()).collect()
+    }
+
+    /// The state of job `id`, `None` when this session has no such job.
+    pub fn state_of(&self, id: &str) -> Option<SubagentState> {
+        self.inner.borrow().iter().find(|j| j.spec.id == id).map(|j| j.state.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self, id: &str) -> bool {
+        self.inner.borrow().iter().any(|j| j.spec.id == id && j.cancel.is_cancelled())
+    }
+
     /// Cancels running jobs (all when `id` is `None`); returns how many.
     pub fn kill(&self, id: Option<&str>) -> usize {
         let jobs = self.inner.borrow();
@@ -469,7 +485,7 @@ impl JobsHandle {
     }
 
     #[cfg(test)]
-    fn finish(&self, id: &str, ok: bool, text: &str) {
+    pub(crate) fn finish(&self, id: &str, ok: bool, text: &str) {
         if let Some(j) = self.inner.borrow_mut().iter_mut().find(|j| j.spec.id == id) {
             j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
             j.text = text.into();

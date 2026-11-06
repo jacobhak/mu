@@ -686,6 +686,17 @@ pub fn subagent_rows(rows: &[SubagentStatus], spin: char, cost: impl Fn(&Subagen
         .collect()
 }
 
+/// A running job's row with the inline marker (`▸`, row highlighted), and the keys that act on it
+/// in a row of its own.
+pub fn focused_job(mut row: Line, width: usize) -> Vec<Line> {
+    if let Some(first) = row.first_mut() {
+        first.text = first.text.replacen("  ", "▸ ", 1);
+    }
+    let row = fill(&truncate(&row, width), width, theme::get().color(Role::Selected));
+    let hint = "    k cancel · Esc unmark · Alt+↓ next · Alt+↑ previous";
+    vec![row, vec![span(trunc(hint, width), tfg(Role::Faint))]]
+}
+
 /// Most lines of a bash job's newest output shown under its row when expanded.
 const JOB_TAIL: usize = 8;
 
@@ -818,6 +829,15 @@ mod tests {
         assert_eq!(text.len(), 2 + JOB_TAIL);
         assert!(text.last().unwrap().contains("l19"));
         assert!(!text.iter().any(|l| l.contains("l11")));
+    }
+
+    #[test]
+    fn a_focused_job_row_is_marked_and_followed_by_the_keys() {
+        let row = vec![span("  ⠋ ", tfg(Role::Accent)), span("b1", ContentStyle::default())];
+        let t = texts(&focused_job(row, 80));
+        assert_eq!(t[0].trim_end(), "▸ ⠋ b1");
+        assert!(t[1].contains("k cancel") && t[1].contains("Esc unmark"), "{t:?}");
+        assert!(t.iter().all(|l| l.chars().count() <= 80));
     }
 
     #[test]
