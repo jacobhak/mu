@@ -156,6 +156,26 @@ impl App {
         self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths });
     }
 
+    /// The prompts that can be taken back, the newest first and selected.
+    pub(super) fn show_rewind(&mut self, points: Vec<mu_base::events::RewindPoint>) {
+        if points.is_empty() {
+            return self.notice("no prompt to go back to");
+        }
+        let total = points.len();
+        let (items, ids): (Vec<_>, Vec<_>) = points
+            .into_iter()
+            .rev()
+            .enumerate()
+            .map(|(n, p)| {
+                let first = p.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                let detail = if n == 0 { "last".to_string() } else { format!("{n} back") };
+                (Item { label: trunc(first, 80), detail }, p.id)
+            })
+            .unzip();
+        let title = format!("Rewind to before a prompt ({total}); files stay as they are");
+        self.overlay = Some(Overlay::Rewind { sel: Select::new(&title, items), ids });
+    }
+
     pub(super) fn show_plans(&mut self, list: Vec<mu_base::events::PlanMeta>) {
         let deliver = std::mem::take(&mut self.flows.pick_deliver);
         if list.is_empty() {
@@ -312,6 +332,7 @@ impl App {
                     self.send(Command::Resume(p));
                 }
             }
+            OverlayEvent::Rewind(id) => self.send(Command::Rewind(id)),
             OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
             OverlayEvent::EditPlan(file) => self.run_editor(&file.clone(), ChildThen::PlanEdit(file)),
             OverlayEvent::PlanCancelled { stored: true } => self.notice("plan left parked"),

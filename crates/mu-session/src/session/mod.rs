@@ -3,6 +3,7 @@
 //! (`mu notify`) and `control`.
 pub mod control;
 pub mod file;
+pub mod fork;
 pub mod format;
 pub mod inbox;
 pub mod list;

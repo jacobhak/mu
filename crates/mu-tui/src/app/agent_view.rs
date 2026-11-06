@@ -12,7 +12,9 @@ use crate::term::bell::WokenBell;
 use crate::text::line::{Line, dim, styled};
 use crate::theme::{self, Role};
 use crate::widgets::overlay::Overlay;
-use mu_base::events::{AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, QueueState, StatusSnapshot};
+use mu_base::events::{
+    AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, QueueState, RewindPoint, StatusSnapshot,
+};
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_base::message::UserInput;
 use mu_base::text::truncate_text as trunc;
@@ -76,6 +78,8 @@ pub(super) enum Effect {
         reply: oneshot::Sender<bool>,
     },
     PlanList(Vec<PlanMeta>),
+    /// The prompts `/rewind` can go back to.
+    RewindPoints(Vec<RewindPoint>),
     /// The job snapshot changed: an open jobs panel takes it.
     JobsChanged,
     /// A bash job's output changed: an open jobs panel takes it from `AgentView::job_out`.
@@ -324,6 +328,7 @@ impl AgentView {
                 self.tr.commit(notice_lines(&format!("plan parked: {id} · {}", path.display())));
             }
             AgentEvent::PlanList(list) => fx.push(Effect::PlanList(list)),
+            AgentEvent::RewindPoints(list) => fx.push(Effect::RewindPoints(list)),
             AgentEvent::Status(s) => self.status = s,
             AgentEvent::Todo(v) => self.todo = serde_json::from_value(v).unwrap_or_default(),
             AgentEvent::TurnEnd { aborted } => {
@@ -484,6 +489,7 @@ impl App {
                 self.overlay = Some(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
             }
             Effect::PlanList(list) => self.show_plans(list),
+            Effect::RewindPoints(list) => self.show_rewind(list),
             Effect::JobsChanged => {
                 if let Some(Overlay::Jobs { st }) = &mut self.overlay {
                     st.set_jobs(self.agent.jobs.clone());
@@ -775,5 +781,15 @@ mod tests {
         let fx = v.on_event(AgentEvent::Status(StatusSnapshot { context_window: 9, ..Default::default() }), SIZE);
         assert!(fx.is_empty());
         assert_eq!(v.status.context_window, 9);
+    }
+
+    #[test]
+    fn rewind_points_are_handed_over_and_a_taken_back_prompt_goes_to_the_composer() {
+        let mut v = view();
+        let points = vec![RewindPoint { id: "a".into(), text: "first".into() }];
+        let fx = v.on_event(AgentEvent::RewindPoints(points.clone()), SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::RewindPoints(p)] if *p == points));
+        let fx = v.on_event(AgentEvent::QueuePopped("first".into()), SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Popped(p)] if p.text == "first"));
     }
 }

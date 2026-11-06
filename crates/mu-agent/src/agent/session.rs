@@ -2,6 +2,17 @@ use super::*;
 use mu_session::session::format::{self, Loaded};
 use mu_session::session::inbox;
 
+/// Why a session file is being opened.
+#[derive(Clone, Copy)]
+pub(super) enum Reopen {
+    /// Another session, or this one again, that the screen does not show.
+    Resume,
+    /// A copy of the conversation on screen.
+    Fork,
+    /// The conversation on screen, cut back.
+    Rewind,
+}
+
 impl Agent {
     pub fn session_id(&self) -> String {
         self.session.as_ref().map(|s| s.id()).unwrap_or_default()
@@ -127,6 +138,12 @@ impl Agent {
 
     /// `false` (with an error shown) when the session could not be loaded or opened.
     pub(crate) async fn load_session(&mut self, path: &Path) -> bool {
+        self.reopen(path, Reopen::Resume).await
+    }
+
+    /// Switches to the session file at `path`, whatever brought it about. The conversation is
+    /// replayed to the front end only when it is not already on screen.
+    pub(super) async fn reopen(&mut self, path: &Path, how: Reopen) -> bool {
         let loaded = match format::load(path) {
             Ok(l) => l,
             Err(e) => {
@@ -174,8 +191,14 @@ impl Agent {
         self.sync_plugin_session();
         let res = self.ports.plugins.hook("session_start", json!({"resumed": true})).await;
         self.apply_plugin_context(res);
-        self.replay_history();
-        self.notice(format!("resumed {}", path.display()));
+        match how {
+            Reopen::Resume => {
+                self.replay_history();
+                self.notice(format!("resumed {}", path.display()));
+            }
+            Reopen::Fork => self.notice(format!("── forked: continuing in {}", path.display())),
+            Reopen::Rewind => {}
+        }
         self.announce_waiting_notify();
         self.emit_status();
         true

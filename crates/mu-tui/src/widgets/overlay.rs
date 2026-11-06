@@ -129,6 +129,11 @@ pub enum Overlay {
         /// Chosen plans are delivered, not opened.
         deliver: bool,
     },
+    /// `/rewind`: the prompts to go back to; `ids` are their session entries.
+    Rewind {
+        sel: Select,
+        ids: Vec<String>,
+    },
     /// A question, or the review after the last one. Boxed: the largest variant.
     Ask(Box<AskState>),
     Review {
@@ -178,6 +183,8 @@ pub enum OverlayEvent {
     /// Insert these blockquotes at the end of the composer.
     Quote(Vec<String>),
     Resume(PathBuf),
+    /// Go back to before the prompt in this session entry.
+    Rewind(String),
     /// Copy the plan text.
     CopyPlan(String),
     /// Edit the plan file; the overlay stays up and reloads it afterwards.
@@ -477,6 +484,7 @@ impl Overlay {
             | Overlay::Mcp { sel, .. }
             | Overlay::Web { sel }
             | Overlay::Session { sel, .. }
+            | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
             Overlay::Ask(a) => Some(&a.sel),
@@ -494,6 +502,7 @@ impl Overlay {
             | Overlay::Mcp { sel, .. }
             | Overlay::Web { sel }
             | Overlay::Session { sel, .. }
+            | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
             Overlay::Ask(a) => Some(&mut a.sel),
@@ -637,6 +646,13 @@ impl Overlay {
                 SelectResult::Pending => (Some(Overlay::Session { sel, paths }), None),
                 SelectResult::Chosen(i) => {
                     (None, i.first().and_then(|i| paths.get(*i)).map(|p| OverlayEvent::Resume(p.clone())))
+                }
+                _ => (None, None),
+            },
+            Overlay::Rewind { mut sel, ids } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Rewind { sel, ids }), None),
+                SelectResult::Chosen(i) => {
+                    (None, i.first().and_then(|i| ids.get(*i)).map(|id| OverlayEvent::Rewind(id.clone())))
                 }
                 _ => (None, None),
             },

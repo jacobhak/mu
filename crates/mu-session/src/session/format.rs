@@ -107,7 +107,8 @@ pub(super) fn title_slot(title: &str, source: Option<&str>) -> String {
     slot_line(&best, source, &updated_at, &" ".repeat(pad))
 }
 
-pub(super) type Parsed = (Loaded, Option<String>, std::collections::HashSet<String>);
+/// What `parse` returns: the loaded session, its last entry's id, and every entry id with its parent.
+pub(super) type Parsed = (Loaded, Option<String>, HashMap<String, Option<String>>);
 
 pub(super) fn slot_title(first: &Value) -> Option<String> {
     first["title"].as_str().filter(|t| !t.is_empty()).map(String::from)
@@ -155,11 +156,46 @@ fn read_at(r: &mut std::io::BufReader<File>, offset: u64) -> Option<Value> {
     serde_json::from_slice(&buf).ok()
 }
 
-/// Two passes over the file. The first reads line by line and keeps only an index; the second
-/// deserializes just the entries that matter: everything from the latest compaction's first kept
-/// entry onwards, plus the small state entries (model, title, mode, plugin context, latest todo).
-/// Peak memory follows the active chain, not the file.
-pub(super) fn parse(path: &Path) -> Result<Parsed> {
+/// The first pass over a file: an index of its entries, and the active chain's end.
+struct Scan {
+    title: Option<String>,
+    index: Vec<Index>,
+    by_id: HashMap<String, usize>,
+    /// The last entry written: the leaf of the active chain.
+    last: Option<usize>,
+}
+
+impl Scan {
+    /// Positions in `index` of the active chain, root first.
+    fn chain(&self) -> Vec<usize> {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut cur = self.last;
+        while let Some(i) = cur {
+            chain.push(i);
+            cur = self.index[i].parent.as_deref().and_then(|p| self.by_id.get(p).copied());
+            if chain.len() > self.index.len() {
+                break;
+            }
+        }
+        chain.reverse();
+        chain
+    }
+}
+
+/// The active chain as `(id, parent id, line offset)`, root first: what a fork copies.
+pub(super) fn chain_lines(path: &Path) -> Result<Vec<(String, Option<String>, u64)>> {
+    let s = scan(path)?;
+    Ok(s.chain()
+        .into_iter()
+        .map(|i| {
+            let e = &s.index[i];
+            (e.id.clone(), e.parent.clone(), e.offset)
+        })
+        .collect())
+}
+
+/// Reads line by line and keeps only an index.
+fn scan(path: &Path) -> Result<Scan> {
     use std::io::{BufRead, BufReader};
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -209,18 +245,18 @@ pub(super) fn parse(path: &Path) -> Result<Parsed> {
     if !header_seen {
         bail!("not a v3 session file: {}", path.display());
     }
-    // Walk from the leaf to the root.
-    let mut chain: Vec<usize> = Vec::new();
-    let mut cur = last;
-    while let Some(i) = cur {
-        chain.push(i);
-        cur = index[i].parent.as_deref().and_then(|p| by_id.get(p).copied());
-        if chain.len() > index.len() {
-            break;
-        }
-    }
-    chain.reverse();
+    Ok(Scan { title, index, by_id, last })
+}
 
+/// Two passes over the file. The first (`scan`) keeps only an index; the second deserializes just
+/// the entries that matter: everything from the latest compaction's first kept entry onwards,
+/// plus the small state entries (model, title, mode, plugin context, latest todo). Peak memory
+/// follows the active chain, not the file.
+pub(super) fn parse(path: &Path) -> Result<Parsed> {
+    use std::io::BufReader;
+    let scan = scan(path)?;
+    let chain = scan.chain();
+    let Scan { title, index, .. } = scan;
     let mut rd = BufReader::new(File::open(path)?);
     let mut loaded = Loaded { title, ..Default::default() };
     // Entries before the latest compaction's first kept entry are summarized away.
@@ -293,7 +329,8 @@ pub(super) fn parse(path: &Path) -> Result<Parsed> {
     loaded.plugin_context.retain(|_, c| !c.is_empty());
     let notes = mu_base::message::repair_tool_pairs_with_ids(&mut loaded.messages, Some(&mut loaded.entry_ids));
     loaded.warnings.extend(notes);
-    Ok((loaded, index.last().map(|e| e.id.clone()), by_id.into_keys().collect()))
+    let parents = index.iter().map(|e| (e.id.clone(), e.parent.clone())).collect();
+    Ok((loaded, index.last().map(|e| e.id.clone()), parents))
 }
 
 pub fn load(path: &Path) -> Result<Loaded> {

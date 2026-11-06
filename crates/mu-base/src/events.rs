@@ -39,6 +39,13 @@ pub enum Command {
     Review(Option<String>),
     TogglePlan(Option<String>),
     Resume(PathBuf),
+    /// `/fork`: continue in a new session file holding a copy of this conversation.
+    Fork,
+    /// `/rewind`: list the prompts that can be taken back, as `RewindPoints`.
+    ListRewind,
+    /// Take back the prompt in this session entry: the conversation returns to just before it and
+    /// the prompt goes back to the composer as `QueuePopped`.
+    Rewind(String),
     Bash {
         cmd: String,
         include: bool,
@@ -76,6 +83,14 @@ pub enum Command {
     Cancel,
     /// Finish at the next tool/turn boundary, leaving the session resumable (headless first Ctrl-C).
     Stop,
+}
+
+/// A user prompt `Command::Rewind` can go back to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RewindPoint {
+    /// The session entry holding the prompt.
+    pub id: String,
+    pub text: String,
 }
 
 /// Messages queued for the agent: steered into the running turn, or held until it ends.
@@ -443,8 +458,10 @@ pub enum AgentEvent {
     TurnFailed,
     /// What is queued for the agent; sent whenever it changes.
     Queue(QueueState),
-    /// A queued message taken back by `Command::PopQueue`.
+    /// A queued message taken back by `Command::PopQueue`, or the prompt `Command::Rewind` took back.
     QueuePopped(UserInput),
+    /// The prompts of the conversation that `Command::Rewind` can take back, oldest first.
+    RewindPoints(Vec<RewindPoint>),
     /// Queued input a finished turn did not take. Sent after its `TurnEnd`; the front end restores it.
     QueuedDropped(Vec<UserInput>),
     Exit,

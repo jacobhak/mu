@@ -10,11 +10,13 @@ use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
 
-const BUILTIN_DESC: [(&str, &str, bool); 26] = [
+const BUILTIN_DESC: [(&str, &str, bool); 28] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
     ("resume", "Resume a session from this directory", false),
+    ("fork", "Continue in a copy of this session; the original stays as it is", false),
+    ("rewind", "Go back to an earlier prompt and take it from there", false),
     ("model", "Pick a model and assign a role", false),
     ("switch", "Switch this session's model", false),
     ("login", "Sign in with ChatGPT, add an API key, or log in to a provider or MCP server", false),
@@ -186,6 +188,8 @@ impl App {
                 self.commit(vec![styled("── new session".to_string(), |_| dim())]);
             }
             "resume" => self.open_session_picker(),
+            "fork" => self.send(Command::Fork),
+            "rewind" => self.send(Command::ListRewind),
             "model" | "switch" if arg.is_empty() => {
                 self.flows.pick_assign = name == "model";
                 self.request_models();

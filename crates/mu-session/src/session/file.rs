@@ -17,7 +17,8 @@ pub struct SessionFile {
     file: Option<File>,
     owner: Option<OwnerRecord>,
     leaf: Option<String>,
-    ids: std::collections::HashSet<String>,
+    /// Every entry id with its parent's.
+    ids: std::collections::HashMap<String, Option<String>>,
     /// Consecutive failed writes; persistence is given up at `MAX_WRITE_FAILURES`.
     failures: u32,
     /// The last write may have left a partial line, so the next one starts on a fresh line.
@@ -66,6 +67,16 @@ impl Drop for SessionFile {
 impl SessionFile {
     /// Creates the file with its title slot and header.
     pub fn create(cwd: &Path, parent_session: Option<&Path>) -> Result<Self> {
+        Self::create_with(cwd, parent_session, None)
+    }
+
+    /// Creates the file for a fork of `from`. The header records it as `forkedFrom`, not as
+    /// `parentSession`: that one marks a subagent, whose cost its parent's status line adds up.
+    pub fn create_fork(cwd: &Path, from: &Path) -> Result<Self> {
+        Self::create_with(cwd, None, Some(from))
+    }
+
+    fn create_with(cwd: &Path, parent_session: Option<&Path>, forked_from: Option<&Path>) -> Result<Self> {
         let dir = paths::session_dir(cwd);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let id = uuid::Uuid::now_v7();
@@ -77,6 +88,9 @@ impl SessionFile {
             json!({"type":"session","version":3,"id":id.to_string(),"timestamp":iso_ms(),"cwd":cwd.to_string_lossy()});
         if let Some(p) = parent_session {
             header["parentSession"] = json!(p.to_string_lossy());
+        }
+        if let Some(p) = forked_from {
+            header["forkedFrom"] = json!(p.to_string_lossy());
         }
         let owner = OwnerRecord::claim(&path, Some(cwd), parent_session);
         file.write_all(format!("{}{header}\n", title_slot("", None)).as_bytes())?;
@@ -129,7 +143,7 @@ impl SessionFile {
         let id = loop {
             let u = uuid::Uuid::new_v4().simple().to_string();
             let id = u[u.len() - 8..].to_string();
-            if !self.ids.contains(&id) {
+            if !self.ids.contains_key(&id) {
                 break id;
             }
         };
@@ -156,9 +170,36 @@ impl SessionFile {
         }
         self.torn = false;
         self.failures = 0;
-        self.ids.insert(id.clone());
+        self.ids.insert(id.clone(), self.leaf.clone());
         self.leaf = Some(id.clone());
         Some(id)
+    }
+
+    /// Appends an existing entry's line unchanged (a fork copies the active chain), so its id and
+    /// parent keep their meaning.
+    pub(crate) fn copy_entry(&mut self, line: &[u8], id: &str, parent: Option<&str>) -> std::io::Result<()> {
+        let file = self.file.as_mut().ok_or_else(|| std::io::Error::other("session file is closed"))?;
+        file.write_all(line)?;
+        if !line.ends_with(b"\n") {
+            file.write_all(b"\n")?;
+        }
+        self.ids.insert(id.into(), parent.map(String::from));
+        self.leaf = Some(id.into());
+        Ok(())
+    }
+
+    /// Rewinds to just before the entry `id`: the next entry continues from its parent, and so
+    /// does a reload, because a `rewind` marker is written there. What came after stays in the
+    /// file as an abandoned branch.
+    pub fn rewind_before(&mut self, id: &str) -> Result<()> {
+        let Some(parent) = self.ids.get(id).cloned() else { bail!("no entry {id} in this session") };
+        let old = std::mem::replace(&mut self.leaf, parent);
+        if self.append(EntryKind::Custom, json!({"customType":"rewind","data":{"before":id}})).is_none() {
+            self.leaf = old;
+            bail!("could not record the rewind in the session file");
+        }
+        self.sync();
+        Ok(())
     }
 
     /// Flushes the file to disk. Called after entries that must survive a crash, and at turn end.
@@ -309,6 +350,46 @@ mod tests {
         assert_eq!(l.mode.unwrap().0, "plan");
         assert_eq!(l.plugin_context.len(), 1);
         assert_eq!(l.plugin_context["memory"], "ctx");
+    }
+
+    #[test]
+    fn a_rewind_survives_a_reload_and_keeps_the_old_branch_in_the_file() {
+        home();
+        let mut s = SessionFile::create(Path::new("/opt/rewind"), None).unwrap();
+        s.model_change("a/x");
+        let one = s.message(&Message::user("one")).unwrap();
+        let two = s.message(&Message::user("two")).unwrap();
+        s.message(&Message::user("three"));
+        let path = s.path.clone();
+        let texts = |p: &Path| -> Vec<String> {
+            load(p)
+                .unwrap()
+                .messages
+                .iter()
+                .map(|m| match m {
+                    Message::User { content, .. } => mu_base::message::text_of(content),
+                    _ => String::new(),
+                })
+                .collect()
+        };
+
+        assert!(s.rewind_before("nope").is_err());
+        s.rewind_before(&two).unwrap();
+        assert_eq!(texts(&path), ["one"], "the rewind alone changes what loads");
+        drop(s);
+        let mut r = SessionFile::open_append(&path).unwrap();
+        r.message(&Message::user("two again"));
+        assert_eq!(texts(&path), ["one", "two again"]);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"three\""), "the abandoned branch is still in the file");
+
+        // Before the first prompt: no messages are left, but the settings written before it are.
+        r.rewind_before(&one).unwrap();
+        let l = load(&path).unwrap();
+        assert!(l.messages.is_empty());
+        assert_eq!(l.model.as_deref(), Some("a/x"));
+        r.message(&Message::user("fresh"));
+        assert_eq!(texts(&path), ["fresh"]);
     }
 
     #[test]

@@ -773,6 +773,89 @@ fn the_waiting_notice_follows_the_replayed_history() {
 }
 
 #[test]
+fn rewind_takes_a_prompt_back_and_the_session_continues_from_before_it() {
+    run(async {
+        let reply = |t: &str| Ok(assistant(vec![Block::text(t)], StopReason::Stop));
+        let (mut a, mut rx) = agent(vec![reply("r1"), reply("r2"), reply("r3")]);
+        a.ensure_session().await;
+        a.turn(Some("first".to_string().into())).await;
+        a.turn(Some("second".to_string().into())).await;
+        drain(&mut rx);
+
+        a.list_rewind();
+        let points = drain(&mut rx)
+            .into_iter()
+            .find_map(|e| if let AgentEvent::RewindPoints(p) = e { Some(p) } else { None })
+            .expect("the points are listed");
+        assert_eq!(points.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+
+        let path = a.session.as_ref().unwrap().path.clone();
+        a.rewind(&points[1].id).await;
+        let evs = drain(&mut rx);
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::QueuePopped(p) if p.text == "second")));
+        assert!(!evs.iter().any(|e| matches!(e, AgentEvent::UserPrompt(_))), "the screen is not replayed");
+        assert_eq!(user_texts(&a), ["first"]);
+        assert_eq!(a.messages.len(), 2);
+        assert_eq!(a.session.as_ref().unwrap().path, path, "same file");
+
+        a.turn(Some("second, reworded".to_string().into())).await;
+        assert_eq!(user_texts(&a), ["first", "second, reworded"]);
+        let loaded = mu_session::session::format::load(&path).unwrap();
+        assert_eq!(loaded.messages.len(), 4, "the abandoned branch is not loaded");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"second\""), "but it is kept in the file");
+    });
+}
+
+#[test]
+fn rewind_offers_only_what_the_user_typed() {
+    run(async {
+        let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
+        a.ensure_session().await;
+        a.turn(Some("typed".to_string().into())).await;
+        a.messages.push(Message::synthetic_user("plan"));
+        a.entry_ids.push("p".into());
+        a.messages.push(Message::user("<system-reminder>\nnote\n</system-reminder>"));
+        a.entry_ids.push("r".into());
+        drain(&mut rx);
+        a.list_rewind();
+        let points = drain(&mut rx)
+            .into_iter()
+            .find_map(|e| if let AgentEvent::RewindPoints(p) = e { Some(p) } else { None })
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].text, "typed");
+        a.rewind("nope").await;
+        assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::Error(_))));
+    });
+}
+
+#[test]
+fn fork_continues_in_a_copy_and_leaves_the_original_alone() {
+    run(async {
+        let reply = |t: &str| Ok(assistant(vec![Block::text(t)], StopReason::Stop));
+        let (mut a, mut rx) = agent(vec![reply("r1"), reply("r2")]);
+        a.fork().await;
+        assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::Error(m) if m.contains("nothing to fork"))));
+
+        a.ensure_session().await;
+        a.turn(Some("first".to_string().into())).await;
+        let original = a.session.as_ref().unwrap().path.clone();
+        drain(&mut rx);
+        a.fork().await;
+        let forked = a.session.as_ref().unwrap().path.clone();
+        assert_ne!(forked, original);
+        let evs = drain(&mut rx);
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("forked"))));
+        assert!(!evs.iter().any(|e| matches!(e, AgentEvent::UserPrompt(_))), "the screen is not replayed");
+        assert_eq!(user_texts(&a), ["first"]);
+
+        a.turn(Some("only in the fork".to_string().into())).await;
+        assert_eq!(mu_session::session::format::load(&forked).unwrap().messages.len(), 4);
+        assert_eq!(mu_session::session::format::load(&original).unwrap().messages.len(), 2);
+    });
+}
+
+#[test]
 fn the_real_loop_wakes_on_the_channel() {
     run(async {
         let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("PONG")], StopReason::Stop))]);

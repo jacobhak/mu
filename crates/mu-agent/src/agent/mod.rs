@@ -11,6 +11,7 @@ mod plan;
 #[cfg(test)]
 mod queue_tests;
 mod review;
+mod rewind;
 mod session;
 mod status;
 mod title;
@@ -433,6 +434,9 @@ impl Agent {
                     return false;
                 }
             }
+            Command::Fork => self.fork().await,
+            Command::ListRewind => self.list_rewind(),
+            Command::Rewind(id) => self.rewind(&id).await,
             Command::TogglePlan(prompt) => match (self.plan.plan.is_some(), prompt) {
                 (false, p) => {
                     self.enter_plan().await;
