@@ -146,7 +146,8 @@ pub(super) fn elicitation_params(sid: &str, questions: &[AskQuestion]) -> Value 
     })
 }
 
-/// The answers in an accepted form, one per question; a question left empty is `Cancelled`.
+/// The answers in an accepted form, one per question; a question left empty is `Skipped` when it
+/// can be, else `Cancelled`.
 pub(super) fn answers_from(content: &Value, questions: &[AskQuestion]) -> Vec<Answer> {
     (0..questions.len())
         .map(|i| {
@@ -158,6 +159,7 @@ pub(super) fn answers_from(content: &Value, questions: &[AskQuestion]) -> Vec<An
                 Value::Array(a) if !a.is_empty() => {
                     Answer::Options(a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 }
+                _ if questions[i].skippable => Answer::Skipped,
                 _ => Answer::Cancelled,
             }
         })
@@ -195,6 +197,7 @@ mod tests {
             multi,
             recommended: Some(1),
             confirm: false,
+            skippable: false,
         }
     }
 
@@ -256,6 +259,9 @@ mod tests {
         let got = answers_from(&json!({"q0": "A", "q0_other": " mine ", "q1": []}), &qs);
         assert!(matches!(&got[0], Answer::Custom(t) if t == "mine"), "a typed answer wins");
         assert!(matches!(got[1], Answer::Cancelled), "nothing chosen is no answer");
+        let skippable: Vec<AskQuestion> = qs.iter().cloned().map(|q| AskQuestion { skippable: true, ..q }).collect();
+        let got = answers_from(&json!({"q0": "A"}), &skippable);
+        assert!(matches!(got[1], Answer::Skipped), "a skippable question left empty is skipped");
     }
 
     #[test]

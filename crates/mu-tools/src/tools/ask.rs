@@ -88,6 +88,7 @@ fn question(q: &Q) -> AskQuestion {
         multi: q.multi,
         recommended: q.recommended,
         confirm: q.confirm,
+        skippable: true,
     }
 }
 
@@ -105,6 +106,7 @@ fn format_answer(q: &Q, a: &Answer) -> String {
     let id = &q.id;
     match a {
         Answer::Cancelled => format!("{id}: (cancelled)"),
+        Answer::Skipped => format!("{id}: (skipped)"),
         Answer::Custom(t) => format!("{id}: \"{t}\""),
         Answer::Options(o) => format!("{id}: {}", pick_text(q, o)),
         Answer::Noted { picks, note } => format!("{id}: {} — note: \"{note}\"", pick_text(q, picks)),
@@ -158,6 +160,8 @@ mod tests {
         assert_eq!(format_answer(&a.questions[1], &Answer::Options(vec!["X".into(), "Y".into()])), "many: [X, Y]");
         assert_eq!(format_answer(&a.questions[0], &Answer::Custom("mine".into())), "pick: \"mine\"");
         assert_eq!(format_answer(&a.questions[0], &Answer::Cancelled), "pick: (cancelled)");
+        assert_eq!(format_answer(&a.questions[0], &Answer::Skipped), "pick: (skipped)");
+        assert!(qs.iter().all(|q| q.skippable));
     }
 
     #[test]

@@ -298,6 +298,9 @@ fn ask_at(q: &AskQuestion, pos: Option<(usize, usize)>, prior: Option<&Answer>) 
         .described()
         .back_keys(back)
         .hint(&ask_hint(q, pos));
+    if q.skippable {
+        s = s.skip_row("Skip");
+    }
     if q.multi {
         s = s.multi();
     } else if q.confirm {
@@ -324,6 +327,7 @@ fn prefill(s: Select, q: &AskQuestion, prior: &Answer) -> Select {
         Answer::Options(labels) => s.preselect_all(&indices(labels)),
         Answer::Noted { picks, note } => s.preselect_all(&indices(picks)).note_text(note),
         Answer::Custom(text) => s.prefill_text(text),
+        Answer::Skipped => s.prefill_skip(),
         Answer::Cancelled => s,
     }
 }
@@ -372,6 +376,7 @@ fn answer_text(a: &Answer) -> String {
         Answer::Options(picks) => picks.join(", "),
         Answer::Noted { picks, note } => format!("{} — note: {note}", picks.join(", ")),
         Answer::Custom(t) => format!("\"{t}\""),
+        Answer::Skipped => "(skipped)".to_string(),
         Answer::Cancelled => "(cancelled)".to_string(),
     };
     text.replace('\n', " ")
@@ -474,6 +479,7 @@ impl AskState {
             SelectResult::Chosen(i) => Answer::Options(picked_labels(&self.qs[self.idx], &i)),
             SelectResult::Noted(i, note) => Answer::Noted { picks: picked_labels(&self.qs[self.idx], &i), note },
             SelectResult::Text(t) => Answer::Custom(t),
+            SelectResult::Skipped => Answer::Skipped,
             SelectResult::Back => {
                 if self.idx > 0 {
                     self.goto(self.idx - 1);
@@ -874,6 +880,7 @@ mod tests {
             multi: false,
             recommended: None,
             confirm: false,
+            skippable: false,
         };
         let (tx, mut rx) = oneshot::channel();
         let qs = vec![q("one"), q("two")];
@@ -900,6 +907,7 @@ mod tests {
             multi: false,
             recommended: None,
             confirm: false,
+            skippable: false,
         };
         let (lines, _) = ask_select(&q).render(40, 20);
         let t: Vec<String> = lines.iter().map(crate::text::line::line_text).collect();
@@ -922,6 +930,7 @@ mod tests {
             multi: false,
             recommended: None,
             confirm: false,
+            skippable: false,
         };
         let (lines, cur) = ask_select(&q).render(30, 20);
         let t: Vec<String> = lines.iter().map(crate::text::line::line_text).collect();
@@ -949,6 +958,7 @@ mod tests {
             multi: false,
             recommended: None,
             confirm: false,
+            skippable: false,
         };
         let (lines, cur) = ask_select(&q).render(30, 20);
         let t: Vec<String> = lines.iter().map(crate::text::line::line_text).collect();
@@ -978,7 +988,30 @@ mod tests {
             multi,
             recommended,
             confirm,
+            skippable: false,
         }
+    }
+
+    #[test]
+    fn the_skip_row_answers_skipped_and_the_turn_goes_on() {
+        let q = AskQuestion { skippable: true, ..ask_q(&["A", "B"], false, false, None) };
+        let (ov, mut rx) = ask_ov(q.clone());
+        let ov = press(ov, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        let (rest, _) = ov.on_key(key(KeyCode::Enter));
+        assert!(rest.is_none());
+        assert_eq!(answer(&mut rx), "[Skipped]");
+
+        let (ov, mut rx) = ask_ov(AskQuestion { multi: true, ..q.clone() });
+        let ov = press(ov, &[KeyCode::Tab, KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        let (rest, _) = ov.on_key(key(KeyCode::Enter));
+        assert!(rest.is_none());
+        assert_eq!(answer(&mut rx), "[Skipped]", "Enter on the skip row wins over checked options");
+
+        let (ov, mut rx) = ask_ov(ask_q(&["A", "B"], false, false, None));
+        let ov = press(ov, &[KeyCode::Down, KeyCode::Down]);
+        let (rest, _) = ov.on_key(key(KeyCode::Enter));
+        assert!(rest.is_some(), "the last row is the free-text one unless the question is skippable");
+        assert!(rx.try_recv().is_err());
     }
 
     /// Feeds keys to an open ask, which must stay open.

@@ -47,12 +47,15 @@ pub enum SelectResult {
     /// Like `Chosen`, with the note (only when the note is non-empty).
     Noted(Vec<usize>, String),
     Text(String),
+    /// The skip row was chosen (see `skip_row`).
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Row {
     Item(usize),
     Free,
+    Skip,
 }
 
 pub struct Select {
@@ -62,6 +65,8 @@ pub struct Select {
     items: Vec<Item>,
     multi: bool,
     free: Option<String>,
+    /// Label of the last row, which declines the question: Enter on it returns `SelectResult::Skipped`.
+    skip: Option<String>,
     /// The filter line. Single line: Enter and newlines are the caller's.
     filter: Editor,
     /// Highlighted row position in the filtered row list.
@@ -110,6 +115,7 @@ impl Select {
             items,
             multi: false,
             free: None,
+            skip: None,
             filter: Editor::default(),
             sel: 0,
             checked: BTreeSet::new(),
@@ -158,6 +164,13 @@ impl Select {
         self
     }
 
+    /// Adds a last row that declines the question.
+    pub fn skip_row(mut self, label: &str) -> Self {
+        self.skip = Some(label.to_string());
+        *self.rows_cache.borrow_mut() = None;
+        self
+    }
+
     /// Highlights `idx`. In multi mode it is also checked.
     pub fn preselect(mut self, idx: usize) -> Self {
         if idx < self.items.len() {
@@ -181,6 +194,14 @@ impl Select {
         if self.free.is_some() {
             self.text = Editor::from_text(s);
             self.sel = self.items.len();
+        }
+        self
+    }
+
+    /// Highlights the skip row.
+    pub fn prefill_skip(mut self) -> Self {
+        if self.skip.is_some() {
+            self.sel = self.items.len() + usize::from(self.free.is_some());
         }
         self
     }
@@ -524,6 +545,9 @@ impl Select {
         if self.free.is_some() {
             rows.push(Row::Free);
         }
+        if self.skip.is_some() {
+            rows.push(Row::Skip);
+        }
         let rows = Rc::new(rows);
         *cache = Some((filter, rows.clone()));
         rows
@@ -537,7 +561,7 @@ impl Select {
         let n = rows.len();
         let detail = |pos: usize| match rows[pos] {
             Row::Item(i) => self.items[i].detail.as_str(),
-            Row::Free => "",
+            Row::Free | Row::Skip => "",
         };
         let note = (!self.note.is_blank()).then(|| self.note.text().replace('\n', " "));
         let note_h = usize::from(note.is_some() && avail >= 2);
@@ -561,7 +585,7 @@ impl Select {
                         ),
                         _ => Vec::new(),
                     },
-                    Row::Free => Vec::new(),
+                    Row::Free | Row::Skip => Vec::new(),
                 })
                 .collect()
         };
@@ -629,6 +653,9 @@ impl Select {
     /// Picks the highlighted row, or the checked rows in multi mode. The free-text row opens its
     /// editor.
     fn choose(&mut self, rows: &[Row]) -> SelectResult {
+        if rows.get(self.sel) == Some(&Row::Skip) {
+            return SelectResult::Skipped;
+        }
         if self.multi && !self.checked.is_empty() {
             return self.finish(self.checked.iter().copied().collect());
         }
@@ -638,7 +665,7 @@ impl Select {
                 self.editing = true;
                 SelectResult::Pending
             }
-            None => SelectResult::Pending,
+            Some(Row::Skip) | None => SelectResult::Pending,
         }
     }
 
@@ -675,6 +702,12 @@ impl Select {
                     l.push(span("    ", ContentStyle::default()));
                 }
                 l.push(span(self.free_label(), emphasis));
+            }
+            Row::Skip => {
+                if self.multi {
+                    l.push(span("    ", ContentStyle::default()));
+                }
+                l.push(span(self.skip.clone().unwrap_or_default(), if selected { emphasis } else { dim() }));
             }
         }
         if selected {

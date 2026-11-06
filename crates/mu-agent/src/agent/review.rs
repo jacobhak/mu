@@ -246,6 +246,7 @@ impl Agent {
             multi: false,
             recommended: Some(1),
             confirm: false,
+            skippable: false,
         };
         match self.review_ask(q, cancel).await {
             Answer::Options(o) | Answer::Noted { picks: o, .. } if o.first().is_some_and(|l| l.starts_with("Send")) => {
@@ -285,6 +286,7 @@ impl Agent {
             multi: false,
             recommended: Some(recommended),
             confirm: false,
+            skippable: false,
         };
         let default_set = if n > 0 { blocking.clone() } else { (0..m).collect() };
         let (answer, typed) = match self.review_ask(q, cancel).await {
@@ -319,6 +321,7 @@ impl Agent {
                         multi: true,
                         recommended: None,
                         confirm: false,
+                        skippable: false,
                     };
                     let (sel, typed) = match self.review_ask(q, cancel).await {
                         Answer::Options(sel) => (sel, None),
@@ -336,7 +339,7 @@ impl Agent {
                 _ => (Vec::new(), None),
             },
             Answer::Custom(t) => (default_set, Some(t)),
-            Answer::Cancelled | Answer::Noted { .. } => (Vec::new(), None),
+            Answer::Cancelled | Answer::Skipped | Answer::Noted { .. } => (Vec::new(), None),
         };
         let note = note.or(typed);
         if chosen.is_empty() {

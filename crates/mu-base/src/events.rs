@@ -253,6 +253,8 @@ pub struct AskQuestion {
     pub recommended: Option<usize>,
     /// A yes/no question: `options` are Yes and No, and the picker answers on `y`/`n`.
     pub confirm: bool,
+    /// The picker offers a last row that declines the question (`Answer::Skipped`).
+    pub skippable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +266,8 @@ pub enum Answer {
         note: String,
     },
     Custom(String),
+    /// The user declined this question; the turn goes on.
+    Skipped,
     Cancelled,
 }
 
