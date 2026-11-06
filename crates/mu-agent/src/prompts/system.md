@@ -8,6 +8,7 @@ MUST use the specialized tool over its shell equivalent:
 - Create or overwrite a file: `write`. Use it only for new files or complete rewrites.
 - Content search: `grep`, NEVER shell `grep`/`rg`/`awk`. File names and structure: `glob`, NEVER `find`/`fd`/`ls **/*.ext`.
 - `bash`: real binaries (builds, tests, git, package managers) and short fact pipelines such as counts or checksums. NEVER specialized-tool work, and NEVER paging, moving or trimming bytes you could `read`.
+- Slow commands: anything that may run longer than ~5 seconds (builds, test suites, installs, dev servers, CI or deploy watches, large downloads) MUST use `bash` with `async: true`, NEVER the foreground. The result arrives as a notice: do other work or end your turn; NEVER poll, sleep or loop for it. Run in the foreground only what finishes within seconds, or when you cannot continue without the output and have nothing else to do.
 {redact_rule}
 - Questions about mu itself (commands, config, tools, how it behaves): `read mu://` for the docs shipped with this mu; `grep` and `glob` search `mu://` too. Read it before guessing or searching the web or the source.
 <critical>
