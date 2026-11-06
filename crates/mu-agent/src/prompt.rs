@@ -135,6 +135,9 @@ mod tests {
         w(agent.join("skills/off/SKILL.md"), "---\ndescription: d\nenabled: false\n---\nx");
         w(proj.join(".omp/commands/greet.md"), "---\nargument-hint: <who>\n---\nSay hi to $1 ($@)");
         w(proj.join(".omp/commands/plain.md"), "Do the thing");
+        w(proj.join(".agents/commands/plain.md"), "shadowed by .omp/commands");
+        w(proj.join(".agents/commands/shared.md"), "From .agents");
+        w(home.join(".agent/commands/mine.md"), "From ~/.agent");
         w(agent.join("RULES.md"), "user rule");
         let ctx = Context::load_all(&proj, &home, &agent, false);
         let names: Vec<_> = ctx.skills.iter().map(|s| (s.name.as_str(), s.description.as_str(), s.hidden)).collect();
@@ -143,6 +146,8 @@ mod tests {
         assert_eq!(greet.expand("Bob \"a b\""), "Say hi to Bob (Bob a b)");
         let plain = ctx.commands.iter().find(|c| c.name == "plain").unwrap();
         assert_eq!(plain.expand("extra"), "Do the thing\n\nextra");
+        let body = |n: &str| ctx.commands.iter().find(|c| c.name == n).map(|c| c.body.as_str());
+        assert_eq!((body("shared"), body("mine")), (Some("From .agents"), Some("From ~/.agent")));
         let sp = system_prompt(&PromptInput {
             model: "m",
             hashline: true,

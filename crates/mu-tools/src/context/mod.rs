@@ -314,6 +314,10 @@ pub fn discover_commands(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<Slash
     roots.extend(dirs.iter().map(|d| d.join(".claude/commands")));
     roots.extend(dirs.iter().map(|d| d.join(".omp/prompts")));
     roots.push(agent_dir.join("prompts"));
+    for d in dirs.iter().map(PathBuf::as_path).chain([home]) {
+        roots.push(d.join(".agent/commands"));
+        roots.push(d.join(".agents/commands"));
+    }
     let mut out: Vec<SlashCommand> = Vec::new();
     for root in roots {
         let Ok(rd) = std::fs::read_dir(&root) else { continue };

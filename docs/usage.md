@@ -26,7 +26,7 @@ While a turn runs, Enter steers (the message is delivered after the current tool
 
 File tools (`read`, `write`, `edit`, `grep`, `glob`) resolve relative paths against the session's directory, not against wherever a `cd` in `bash` has moved the shell. When the shell is elsewhere and a call used a relative path, the result ends with a note naming both directories, so a mistaken edit shows on the first call. In `edit`'s `sloppy` mode, an unindented line such as `*** Find all` that looks like a header but is not one is refused instead of being written into the file; indent a line that is meant as text. An `Insert Before` or `Insert After` whose body repeats its `*** Find` lines (the Find is only the anchor) is refused too, unless the anchor is under 8 characters. The persistent shell keeps `export`s between `bash` calls, so a call that sets or changes an exported variable ends with a reminder naming it (never its value).
 
-Besides the built-in slash commands, prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands` and `.omp/prompts` run as slash commands, and skills as `/skill:<name>`.
+Besides the built-in slash commands, prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands`, `.omp/prompts`, and the harness-neutral `.agent/commands` and `.agents/commands` (in the project and in `~`) run as slash commands, and skills as `/skill:<name>`. On a name clash the earlier directory in that list wins.
 
 `/copy` opens a picker of recent replies, code blocks and bash commands; `/copy code`, `/copy cmd` and `/copy link` copy the latest one directly. Under tmux the text goes through `tmux load-buffer -w`; otherwise via OSC 52, plus `wl-copy`/`xclip` when a local display exists.
 
