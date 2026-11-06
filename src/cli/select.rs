@@ -6,7 +6,7 @@ use mu_provider::provider::client::Providers;
 use mu_tools::context;
 
 const NO_MODEL: &str =
-    "no model chosen: pass --model provider/model, or set the `default` role (modelRoles.default in omp's config.yml)";
+    "no model chosen: pass --model provider/model, or set the `default` role (with /model, or in models.toml)";
 
 /// The model and level a new agent asked for: `sel` (command line or headless role) beats the
 /// `default` role. `None` when neither names one: mu never picks a model itself.
@@ -33,7 +33,11 @@ pub(crate) fn pick_model(
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
     let (sel, level) = chosen(cfgs, sel);
-    let sel = sel.ok_or_else(|| anyhow!(NO_MODEL))?;
+    let sel = sel.ok_or_else(|| {
+        let hint =
+            if cfgs.import_offer.borrow().is_some() { "; copy omp's model config with `mu models import`" } else { "" };
+        anyhow!("{NO_MODEL}{hint}")
+    })?;
     resolve_chosen(providers, &sel, level, cli_thinking)
 }
 
@@ -80,10 +84,10 @@ mod tests {
 
     #[test]
     fn a_model_comes_from_the_selector_or_the_default_role_and_never_from_credentials() {
-        let mut cfgs = config::Configs::default();
+        let cfgs = config::Configs::default();
         assert_eq!(chosen(&cfgs, None), (None, None));
         assert_eq!(chosen(&cfgs, Some("a/b".into())), (Some("a/b".into()), None));
-        cfgs.omp.model_roles.insert("default".into(), "a/d:high".into());
+        let cfgs = config::Configs::from_models_toml("[sets.main]\ndefault = \"a/d:high\"\n");
         assert_eq!(chosen(&cfgs, None), (Some("a/d".into()), Some(models::Thinking::High)));
         assert_eq!(chosen(&cfgs, Some("a/b".into())).0.as_deref(), Some("a/b"));
     }
@@ -113,10 +117,8 @@ mod tests {
 
     #[test]
     fn an_agent_with_no_usable_model_takes_the_role_of_its_kind() {
-        let mut cfgs = config::Configs::default();
-        for (role, model) in [("default", "a/d"), ("task", "a/t"), ("scout", "a/s")] {
-            cfgs.omp.model_roles.insert(role.into(), model.into());
-        }
+        let cfgs =
+            config::Configs::from_models_toml("[sets.main]\ndefault = \"a/d\"\ntask = \"a/t\"\nscout = \"a/s\"\n");
         let def = |name: &str, model: &[&str]| context::AgentDef {
             name: name.into(),
             description: String::new(),

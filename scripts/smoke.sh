@@ -37,18 +37,21 @@ check() { # name command...
 
 cd "$work" || exit 1
 
+"$mu" models import --yes >/dev/null || bad "models import"
+
 # headless: bash output over the cap spills to an artifact that `read` can slice
 out="$("$mu" -p 'Run bash: seq 1 40000. Then read artifact://1:-3 and reply with only the numbers, comma separated.' --model @smol 2>/dev/null)"
 check "artifact spill + read selector" test "$(echo "$out" | tr -d ' \n')" = "39998,39999,40000"
 
 # headless: auto-compaction fires mid-turn under a low fixed threshold
-printf '[compaction.model_thresholds]\n"anthropic/claude-haiku-5-5" = "f24000"\n' > "$MU_HOME/config.toml"
+mv "$state/models.toml" "$work/models.toml.bak"
+printf '[sets.main]\nsmol = "anthropic/claude-haiku-5-5"\n[compaction.thresholds]\n"anthropic/claude-haiku-5-5" = "f24000"\n' > "$state/models.toml"
 files=$(ls -S "$root"/src/*.rs "$root"/crates/*/src/*.rs "$root"/crates/*/src/*/*.rs | head -8 | tr '\n' ' ')
 "$mu" -p "Read each of these files in separate read calls, then say DONE: $files" --model @smol >/dev/null 2>"$work/err"
 check "auto-compaction" grep -q "compacted" "$work/err"
 has_compaction() { jq -e -s 'any(.[]; .type == "compaction")' "$(session_file)" >/dev/null; }
 check "compaction entry persisted" has_compaction
-rm -f "$MU_HOME/config.toml"
+mv "$work/models.toml.bak" "$state/models.toml"
 
 # subagents: two scouts, child sessions linked to the parent
 "$mu" -p 'Use the task tool with two scout tasks: (1) say the word ALPHA, (2) say the word BETA. Then reply with both words.' --model @smol 2>/dev/null | grep -q ALPHA

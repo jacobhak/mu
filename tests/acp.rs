@@ -250,11 +250,9 @@ fn a_session_offers_modes_and_commands_and_a_prompt_streams_its_reply() {
 fn model_roles_are_offered_with_what_they_are_for() {
     let (base, _) = serve(vec![]);
     let home = home_with_key(&base);
-    let agent_dir = home.join(".omp/agent");
-    std::fs::create_dir_all(&agent_dir).unwrap();
     std::fs::write(
-        agent_dir.join("config.yml"),
-        "modelRoles:\n  default: anthropic/claude-sonnet-5-5\n  plan: anthropic/claude-sonnet-5-5:high\n  commit: anthropic/claude-haiku-5-5\n",
+        home.join("models.toml"),
+        "[sets.main]\ndefault = \"anthropic/claude-sonnet-5-5\"\nplan = \"anthropic/claude-sonnet-5-5:high\"\ncommit = \"anthropic/claude-haiku-5-5\"\n",
     )
     .unwrap();
     let cwd = mu_testutil::tmp();

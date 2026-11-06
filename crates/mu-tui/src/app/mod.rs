@@ -2,7 +2,7 @@
 //! `agent_view` (the agent-event reducer), `ui_msgs` (results of background work and the tick),
 //! `slash` (what the composer submits), `pickers` (overlays), `child` (programs that take the
 //! terminal), `keys` (input routing and API keys), `mcp` (`/mcp`),
-//! `memory` (`/memory`), and `services` (the writes that leave the screen: config, stored keys, MCP
+//! `memory` (`/memory`), `model_sets` (`/modelset`), and `services` (the writes that leave the screen: config, stored keys, MCP
 //! definitions, session control).
 
 mod agent_view;
@@ -11,6 +11,7 @@ mod child;
 mod keys;
 mod mcp;
 mod memory;
+mod model_sets;
 mod pickers;
 mod services;
 mod slash;
@@ -153,7 +154,7 @@ pub async fn run(init: AppInit) -> i32 {
     } = init;
     let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
-    let commands = command_entries(&plugins, &ctx);
+    let commands = command_entries(&plugins, &ctx, &providers.cfg);
     let show_thinking = !providers.cfg.omp.hide_thinking_block;
     let smooth = providers.cfg.omp.display.smooth_streaming;
     let mut app = App {
@@ -200,6 +201,13 @@ pub async fn run(init: AppInit) -> i32 {
         theme_warnings.iter().chain(app.plugins.warnings.iter()).chain(store_warning.iter()).chain(store_check.iter())
     {
         app.agent.tr.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
+    }
+    if app.services.providers.cfg.import_offer.borrow().is_some() {
+        if pick_session {
+            app.notice("omp's model config was not copied: /modelset import");
+        } else {
+            app.open_import_offer();
+        }
     }
     if pick_session {
         app.open_session_picker();

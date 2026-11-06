@@ -6,7 +6,7 @@ mu reaches a model one of three ways:
 - **Natively, on your ChatGPT plan**, for `openai-chatgpt/*` models after [Sign in with ChatGPT](#sign-in-with-chatgpt). Requests go straight to `api.openai.com`. No omp process runs.
 - **Through the omp gateway** for everything else: subscription logins (Claude Pro/Max, Codex), every other omp provider, and any of the three providers you have not given a key to. The gateway holds those credentials; log in with omp (`/login` lists omp's providers too).
 
-Model ids are omp's (`anthropic/claude-sonnet-5-5`, `openai/gpt-5.5`, `baseten/moonshotai/Kimi-K3`), so model roles in omp's `config.yml` work in both tools. Plan models are `openai-chatgpt/<model>` (`openai-chatgpt/gpt-6.1-sol`): the same models as `openai/<model>`, billed to your ChatGPT plan instead of a key.
+Model ids are omp's (`anthropic/claude-sonnet-5-5`, `openai/gpt-5.5`, `baseten/moonshotai/Kimi-K3`), so the roles you copy from omp (`mu models import`) work in both tools. Plan models are `openai-chatgpt/<model>` (`openai-chatgpt/gpt-6.1-sol`): the same models as `openai/<model>`, billed to your ChatGPT plan instead of a key.
 
 ## How routing is decided
 
@@ -108,9 +108,9 @@ Anthropic requests also carry 5-minute prompt-cache breakpoints on the last tool
 
 ## Models and prices
 
-Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`crates/mu-provider/src/model/catalog.json`), regenerated on every omp bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.yml` entries and overrides still win over both.
+Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`crates/mu-provider/src/model/catalog.json`), regenerated on every omp bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.toml` limits win over both.
 
-`/model` marks native models `key` and plan models `ChatGPT plan`. mu never picks a model for you: with no `--model` and no `default` role (`modelRoles.default` in omp's `config.yml`), `-p`, `--headless` and ACP runs stop with an error that says so, and the TUI starts with no model (the status line shows `no model · /model`), refuses prompts, and waits for you to `/login` and choose one with `/model`. A chosen model stays on its credential until you pick another; nothing falls back from one to another. A gateway model whose provider is native is routed natively and is marked `key` too.
+`/model` marks native models `key` and plan models `ChatGPT plan`. mu never picks a model for you: with no `--model` and no `default` role (set with `/model` or in `models.toml`; `mu models import` copies omp's), `-p`, `--headless` and ACP runs stop with an error that says so, and the TUI starts with no model (the status line shows `no model · /model`), refuses prompts, and waits for you to `/login` and choose one with `/model`. A chosen model stays on its credential until you pick another; nothing falls back from one to another. A gateway model whose provider is native is routed natively and is marked `key` too.
 
 ## Sessions
 
@@ -120,7 +120,7 @@ Messages store the same `api` strings as omp (`anthropic-messages`, `openai-resp
 
 - Subscription logins through omp (Claude Pro/Max, Codex) and every provider other than Anthropic, OpenAI, Baseten and ChatGPT (the gateway). Sign in with ChatGPT itself needs no omp.
 - OAuth for MCP servers. Web search and fetch no longer use omp ([web.md](web.md)).
-- Model roles and `models.yml` are omp's files.
+- Model roles and limits are mu's own `models.toml`; omp's `models.yml` only matters to the gateway.
 
 ## Not in v1
 

@@ -1,6 +1,9 @@
+use crate::model_config::{self, Import, MAIN_SET, ModelConfig, ModelLimits};
 use mu_common::paths;
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// How a threshold value bounds the context window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,20 +31,6 @@ fn clamp_tokens(n: u64, key: &str, warn: &mut Vec<String>) -> u32 {
 }
 
 impl Threshold {
-    fn from_yaml(v: &serde_yaml_ng::Value, key: &str, warn: &mut Vec<String>) -> Option<Self> {
-        match v {
-            serde_yaml_ng::Value::Number(n) => match n.as_u64() {
-                Some(n) => Some(Self::Window(clamp_tokens(n, key, warn))),
-                None => {
-                    warn.push(format!("ignoring negative or fractional threshold for {key}"));
-                    None
-                }
-            },
-            serde_yaml_ng::Value::String(s) => Self::from_str(s, key, warn),
-            _ => None,
-        }
-    }
-
     fn from_toml(v: &toml::Value, key: &str, warn: &mut Vec<String>) -> Option<Self> {
         match v {
             toml::Value::Integer(n) => match u64::try_from(*n) {
@@ -71,9 +60,6 @@ impl Threshold {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct OmpConfig {
-    pub model_roles: BTreeMap<String, String>,
-    pub cycle_order: Vec<String>,
-    pub compaction: OmpCompaction,
     pub skills: OmpSkills,
     pub status_line: OmpStatusLine,
     pub composer: OmpComposer,
@@ -127,16 +113,6 @@ impl<'de> Deserialize<'de> for OmpCompletion {
     }
 }
 
-impl OmpConfig {
-    pub fn role_cycle(&self) -> Vec<String> {
-        if self.cycle_order.is_empty() {
-            ["smol", "default", "slow"].map(String::from).to_vec()
-        } else {
-            self.cycle_order.clone()
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct OmpStatusLine {
@@ -154,48 +130,13 @@ pub struct OmpComposer {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub struct OmpCompaction {
-    pub model_thresholds: BTreeMap<String, serde_yaml_ng::Value>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
 pub struct OmpSkills {
     pub enable_claude_user: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ModelsYml {
-    pub providers: BTreeMap<String, ProviderCfg>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ProviderCfg {
-    pub models: Vec<ModelCfg>,
-    pub model_overrides: BTreeMap<String, ModelOverride>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ModelCfg {
-    pub id: String,
-    pub context_window: Option<u32>,
-    pub max_tokens: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ModelOverride {
-    pub context_window: Option<u32>,
-    pub max_tokens: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct MuConfig {
-    pub compaction: MuCompaction,
     pub predict: MuPredict,
     pub ask: MuAsk,
     pub theme: MuTheme,
@@ -398,82 +339,40 @@ fn check_predict(p: &MuPredict, warn: &mut Vec<String>) {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct MuCompaction {
-    pub model_thresholds: BTreeMap<String, toml::Value>,
-}
-
 #[derive(Debug, Default)]
 pub struct Configs {
     pub omp: OmpConfig,
-    pub models: ModelsYml,
     pub mu: MuConfig,
-    /// Role assignments made this session; shadow `omp.model_roles`.
-    pub role_edits: std::cell::RefCell<BTreeMap<String, String>>,
+    pub models: RefCell<ModelConfig>,
+    /// What `mu models import` would copy; set at load when models.toml is missing and omp has model config.
+    pub import_offer: RefCell<Option<Import>>,
     /// Problems found while loading; shown as notices at startup.
     pub warnings: Vec<String>,
 }
 
-/// Sets `role: value` under the top-level `modelRoles:` block, leaving the rest of the file untouched.
-/// Refuses anything but a single-line plain value, and keeps the file's line endings.
-fn rewrite_role(text: &str, role: &str, value: &str) -> Result<String, String> {
-    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut lines: Vec<String> = text.lines().map(String::from).collect();
-    let hand = format!("edit config.yml by hand: role {role} is not a single-line value");
-    // The role's current value must be a plain scalar if it exists at all.
-    if let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text)
-        && let Some(cur) = doc.get("modelRoles").and_then(|m| m.get(role))
-        && !matches!(cur, serde_yaml_ng::Value::String(_) | serde_yaml_ng::Value::Null)
-    {
-        return Err(hand);
-    }
-    let Some(head) = lines.iter().position(|l| l.starts_with("modelRoles:")) else {
-        let mut out = text.to_string();
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push_str(eol);
-        }
-        out.push_str(&format!("modelRoles:{eol}  {role}: {value}{eol}"));
-        return Ok(out);
-    };
-    if !lines[head]["modelRoles:".len()..].trim().is_empty() {
-        return Err("modelRoles is written inline in config.yml; edit it by hand".into());
-    }
-    let end = lines[head + 1..]
-        .iter()
-        .position(|l| !l.is_empty() && !l.starts_with(' '))
-        .map_or(lines.len(), |i| head + 1 + i);
-    let indent = lines[head + 1..end]
-        .iter()
-        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-        .map_or("  ".to_string(), |l| l[..l.len() - l.trim_start().len()].to_string());
-    let key = format!("{indent}{role}:");
-    match lines[head + 1..end].iter().position(|l| l.starts_with(&key)) {
-        Some(i) => {
-            let at = head + 1 + i;
-            let rest = lines[at][key.len()..].trim();
-            let block = rest.is_empty()
-                || rest.starts_with(['|', '>', '[', '{', '&', '*', '!'])
-                || lines[at + 1..end].first().is_some_and(|n| {
-                    !n.trim().is_empty()
-                        && n.len() - n.trim_start().len() > indent.len()
-                        && !n.trim_start().starts_with('#')
-                });
-            if block {
-                return Err(hand);
-            }
-            lines[at] = format!("{key} {value}");
-        }
-        None => {
-            let last = lines[..end].iter().rposition(|l| !l.trim().is_empty()).unwrap_or(head);
-            lines.insert(last + 1, format!("{key} {value}"));
-        }
-    }
-    let mut out = lines.join(eol);
-    if text.ends_with('\n') {
-        out.push_str(eol);
-    }
-    Ok(out)
+/// This profile's `models.toml`.
+pub fn models_path() -> PathBuf {
+    paths::profile_home().join("models.toml")
+}
+
+/// mu's old `[compaction.model_thresholds]` in `config.toml`, which an import carries over.
+fn old_mu_thresholds() -> BTreeMap<String, toml::Value> {
+    let Ok(text) = std::fs::read_to_string(paths::mu_home().join("config.toml")) else { return Default::default() };
+    let Ok(table) = text.parse::<toml::Table>() else { return Default::default() };
+    table
+        .get("compaction")
+        .and_then(|c| c.get("model_thresholds"))
+        .and_then(toml::Value::as_table)
+        .map(|t| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
+/// What copying omp's model config (and mu's old thresholds) into `models.toml` would write.
+pub fn omp_import() -> Option<Import> {
+    let mut ignored = Vec::new();
+    let config = yaml_doc("config.yml", &mut ignored);
+    let models = yaml_doc("models.yml", &mut ignored);
+    model_config::build_import(&config, &models, &old_mu_thresholds())
 }
 
 /// One top-level YAML section; a bad one falls back to its default and warns, naming the section only.
@@ -513,9 +412,6 @@ fn load_omp(warn: &mut Vec<String>) -> OmpConfig {
     let d = yaml_doc("config.yml", warn);
     let f = "config.yml";
     OmpConfig {
-        model_roles: yaml_section(&d, "modelRoles", f, warn),
-        cycle_order: yaml_section(&d, "cycleOrder", f, warn),
-        compaction: yaml_section(&d, "compaction", f, warn),
         skills: yaml_section(&d, "skills", f, warn),
         status_line: yaml_section(&d, "statusLine", f, warn),
         composer: yaml_section(&d, "composer", f, warn),
@@ -544,12 +440,17 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
             T::default()
         })
     }
+    if table.contains_key("compaction") {
+        warn.push(format!(
+            "config.toml: [compaction] is no longer read; thresholds now live in [compaction.thresholds] of {}",
+            models_path().display()
+        ));
+    }
     let predict: MuPredict = parse(section("predict"), "predict", warn);
     check_predict(&predict, warn);
     let retry: MuRetry = parse(section("retry"), "retry", warn);
     check_retry(&retry, warn);
     MuConfig {
-        compaction: parse(section("compaction"), "compaction", warn),
         predict,
         ask: parse(section("ask"), "ask", warn),
         theme: parse(section("theme"), "theme", warn),
@@ -561,13 +462,76 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
     }
 }
 
+pub fn nothing_to_import() -> String {
+    format!("nothing to import: omp has no model config in {}", paths::omp_agent_dir().display())
+}
+
+/// An import must not silently replace an existing `models.toml`.
+pub fn check_import_target(force: bool) -> Result<(), String> {
+    let path = models_path();
+    if path.exists() && !force {
+        return Err(format!("{} already exists; `mu models import --force` replaces it", path.display()));
+    }
+    Ok(())
+}
+
+fn invalid_set_name(name: &str) -> String {
+    format!("invalid set name `{name}`: use a letter, then letters, digits, - or _")
+}
+
 impl Configs {
-    /// Configured `provider/model[:level]` for a role.
-    pub fn role(&self, name: &str) -> Option<String> {
-        self.role_edits.borrow().get(name).or_else(|| self.omp.model_roles.get(name)).cloned()
+    /// Test and tool helper: a `Configs` holding just this `models.toml` text.
+    pub fn from_models_toml(text: &str) -> Self {
+        Self { models: RefCell::new(model_config::parse(text).0), ..Default::default() }
     }
 
-    /// Points `name` at `model` in omp's `config.yml`, keeping the role's existing `:level`.
+    /// Configured `provider/model[:level]` for a role in the active set.
+    pub fn role(&self, name: &str) -> Option<String> {
+        self.models.borrow().role(name).cloned()
+    }
+
+    pub fn role_cycle(&self) -> Vec<String> {
+        self.models.borrow().role_cycle()
+    }
+
+    pub fn model_limits(&self, id: &str) -> Option<ModelLimits> {
+        self.models.borrow().models.get(id).copied()
+    }
+
+    /// Ids with limits in models.toml.
+    pub fn listed_models(&self) -> Vec<String> {
+        self.models.borrow().models.keys().cloned().collect()
+    }
+
+    pub fn set_names(&self) -> Vec<String> {
+        self.models.borrow().sets.keys().cloned().collect()
+    }
+
+    pub fn active_set(&self) -> Option<String> {
+        self.models.borrow().active().map(String::from)
+    }
+
+    /// Applies `f` to the current text of `models.toml` (read fresh, so another session's changes are
+    /// kept), writes the result and reloads from it.
+    fn edit_models(&self, f: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
+        let path = models_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let out = f(&text)?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        mu_common::fs::write_atomic(&path, out.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+        *self.models.borrow_mut() = model_config::parse(&out).0;
+        *self.import_offer.borrow_mut() = None;
+        Ok(())
+    }
+
+    /// Points `name` at `model` in the active set (`main` when there are no sets), keeping the role's
+    /// existing `:level`. Returns the stored value.
     pub fn set_role(&self, name: &str, model: &str) -> Result<String, String> {
         let level =
             self.role(name).and_then(|v| v.rsplit_once(':').map(|(_, l)| l.to_string()).filter(|l| !l.contains('/')));
@@ -575,16 +539,86 @@ impl Configs {
             Some(l) => format!("{model}:{l}"),
             None => model.to_string(),
         };
-        let path = paths::omp_agent_dir().join("config.yml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
-        };
-        let out = rewrite_role(&text, name, &value)?;
-        mu_common::fs::write_atomic(&path, out.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
-        self.role_edits.borrow_mut().insert(name.to_string(), value.clone());
+        let set = self.active_set().unwrap_or_else(|| MAIN_SET.to_string());
+        self.edit_models(|t| model_config::write_role(t, &set, name, &value))?;
         Ok(value)
+    }
+
+    fn no_such_set(&self, name: &str) -> String {
+        let names = self.set_names();
+        if names.is_empty() {
+            format!("no model set `{name}`: there are no model sets yet")
+        } else {
+            format!("no model set `{name}` (sets: {})", names.join(", "))
+        }
+    }
+
+    /// Makes `name` the active set, for this profile.
+    pub fn switch_set(&self, name: &str) -> Result<(), String> {
+        if !self.set_names().iter().any(|n| n == name) {
+            return Err(self.no_such_set(name));
+        }
+        self.edit_models(|t| model_config::write_active(t, name))
+    }
+
+    /// Adds set `name` holding a copy of the active set's roles and makes it active. Returns the set
+    /// it was copied from.
+    pub fn new_set(&self, name: &str) -> Result<Option<String>, String> {
+        if !model_config::valid_set_name(name) {
+            return Err(invalid_set_name(name));
+        }
+        if self.set_names().iter().any(|n| n == name) {
+            return Err(format!("model set `{name}` already exists"));
+        }
+        let from = self.active_set();
+        let roles = from.as_ref().and_then(|f| self.models.borrow().sets.get(f).cloned()).unwrap_or_default();
+        self.edit_models(|t| {
+            let t = model_config::write_set(t, name, &roles)?;
+            model_config::write_active(&t, name)
+        })?;
+        Ok(from)
+    }
+
+    pub fn delete_set(&self, name: &str) -> Result<(), String> {
+        if !self.set_names().iter().any(|n| n == name) {
+            return Err(self.no_such_set(name));
+        }
+        if self.active_set().as_deref() == Some(name) {
+            return Err(format!("`{name}` is the active model set; switch to another first"));
+        }
+        self.edit_models(|t| model_config::remove_set(t, name))
+    }
+
+    pub fn rename_set(&self, old: &str, new: &str) -> Result<(), String> {
+        if !self.set_names().iter().any(|n| n == old) {
+            return Err(self.no_such_set(old));
+        }
+        if old == new {
+            return Err(format!("model set `{old}` already has that name"));
+        }
+        if !model_config::valid_set_name(new) {
+            return Err(invalid_set_name(new));
+        }
+        if self.set_names().iter().any(|n| n == new) {
+            return Err(format!("model set `{new}` already exists"));
+        }
+        let active = self.active_set().as_deref() == Some(old);
+        self.edit_models(|t| model_config::rename_set(t, old, new, active))
+    }
+
+    /// Copies omp's model config into `models.toml`; returns what was copied, one line per item.
+    pub fn import_models(&self, force: bool) -> Result<Vec<String>, String> {
+        check_import_target(force)?;
+        let import = omp_import().ok_or_else(nothing_to_import)?;
+        self.write_import(&import, force)?;
+        Ok(import.lines)
+    }
+
+    /// Writes `import` as `models.toml`; refuses to replace an existing file unless `force`.
+    pub fn write_import(&self, import: &Import, force: bool) -> Result<(), String> {
+        check_import_target(force)?;
+        let text = model_config::render(&import.config);
+        self.edit_models(|_| Ok(text))
     }
 
     pub fn load() -> Self {
@@ -595,36 +629,38 @@ impl Configs {
             mu.theme.source = t;
         }
         let omp = load_omp(&mut warnings);
-        let models: ModelsYml = {
-            let d = yaml_doc("models.yml", &mut warnings);
-            ModelsYml { providers: yaml_section(&d, "providers", "models.yml", &mut warnings) }
-        };
-        let mut cfg = Self { omp, models, mu, role_edits: Default::default(), warnings };
+        let path = models_path();
+        let mut models = ModelConfig::default();
+        let mut import_offer = None;
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let (cfg, w) = model_config::parse(&text);
+                models = cfg;
+                warnings.extend(w);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => import_offer = omp_import(),
+            Err(e) => warnings.push(format!("{}: {e}", path.display())),
+        }
+        let mut cfg =
+            Self { omp, mu, models: RefCell::new(models), import_offer: RefCell::new(import_offer), warnings };
         let mut w = Vec::new();
         cfg.thresholds_with(&mut w);
         cfg.warnings.extend(w);
         cfg
     }
 
-    /// omp's thresholds overlaid per key by mu's.
     pub fn thresholds(&self) -> BTreeMap<String, Threshold> {
         self.thresholds_with(&mut Vec::new())
     }
 
     fn thresholds_with(&self, warn: &mut Vec<String>) -> BTreeMap<String, Threshold> {
-        let mut out: BTreeMap<String, Threshold> = self
-            .omp
+        self.models
+            .borrow()
             .compaction
-            .model_thresholds
+            .thresholds
             .iter()
-            .filter_map(|(k, v)| Some((k.clone(), Threshold::from_yaml(v, k, warn)?)))
-            .collect();
-        for (k, v) in &self.mu.compaction.model_thresholds {
-            if let Some(t) = Threshold::from_toml(v, k, warn) {
-                out.insert(k.clone(), t);
-            }
-        }
-        out
+            .filter_map(|(k, v)| Some((k.clone(), Threshold::from_toml(v, k, warn)?)))
+            .collect()
     }
 }
 
@@ -702,49 +738,16 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_role_edits_in_place_or_appends() {
-        let t = "a: 1\nmodelRoles:\n  default: x/y:high\n  smol: s\n\ntheme:\n  dark: d\n";
-        assert_eq!(
-            rewrite_role(t, "smol", "n/m").unwrap(),
-            "a: 1\nmodelRoles:\n  default: x/y:high\n  smol: n/m\n\ntheme:\n  dark: d\n"
-        );
-        assert_eq!(
-            rewrite_role(t, "plan", "p/q").unwrap(),
-            "a: 1\nmodelRoles:\n  default: x/y:high\n  smol: s\n  plan: p/q\n\ntheme:\n  dark: d\n"
-        );
-        assert_eq!(rewrite_role("a: 1\n", "plan", "p/q").unwrap(), "a: 1\nmodelRoles:\n  plan: p/q\n");
-        assert!(rewrite_role("modelRoles: {}\n", "plan", "p").is_err());
-    }
-
-    #[test]
-    fn role_cycle_default_and_configured() {
-        let omp: OmpConfig = serde_yaml_ng::from_str("modelRoles: {}\n").unwrap();
-        assert_eq!(omp.role_cycle(), ["smol", "default", "slow"]);
-        let omp: OmpConfig = serde_yaml_ng::from_str("cycleOrder: [slow, default]\n").unwrap();
-        assert_eq!(omp.role_cycle(), ["slow", "default"]);
-    }
-
-    #[test]
     fn realistic_configs() {
-        let omp: OmpConfig = serde_yaml_ng::from_str(
-            "modelRoles:\n  default: anthropic/claude-sonnet-5-5:medium\n  smol: anthropic/claude-haiku-5-5\nunknown: {a: 1}\n\
-             skills:\n  enableClaudeUser: true\ncompaction:\n  modelThresholds:\n    anthropic/claude-haiku-5-5: 800000\n    \"openai/*\": 50%\n",
-        )
-        .unwrap();
-        assert_eq!(omp.model_roles["smol"], "anthropic/claude-haiku-5-5");
+        let omp: OmpConfig = serde_yaml_ng::from_str("unknown: {a: 1}\nskills:\n  enableClaudeUser: true\n").unwrap();
         assert!(omp.skills.enable_claude_user);
-        let models: ModelsYml = serde_yaml_ng::from_str(
-            "providers:\n  modal:\n    models:\n      - id: a/b\n        contextWindow: 1048576\n        maxTokens: 65536\n  openai-codex:\n    modelOverrides:\n      gpt-5.6-terra:\n        contextWindow: 272000\n",
-        )
-        .unwrap();
-        assert_eq!(models.providers["modal"].models[0].context_window, Some(1048576));
-        assert_eq!(models.providers["openai-codex"].model_overrides["gpt-5.6-terra"].context_window, Some(272000));
-        let mu: MuConfig =
-            toml::from_str("[compaction.model_thresholds]\n\"anthropic/claude-haiku-5-5\" = \"f20000\"\n").unwrap();
-        let cfg = Configs { omp, models, mu, ..Default::default() };
+        let cfg = Configs::from_models_toml(
+            "[compaction.thresholds]\n\"anthropic/claude-haiku-5-5\" = \"f20000\"\n\"openai/*\" = \"50%\"\nbig = 800000\n",
+        );
         let t = cfg.thresholds();
         assert_eq!(t["anthropic/claude-haiku-5-5"], Threshold::Fixed(20000));
         assert_eq!(t["openai/*"], Threshold::Percent(50));
+        assert_eq!(t["big"], Threshold::Window(800000));
     }
 
     #[test]
@@ -759,20 +762,10 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_role_refuses_multiline_values_and_keeps_crlf() {
-        let block = "modelRoles:\n  smol: |\n    x\n";
-        assert!(rewrite_role(block, "smol", "n/m").unwrap_err().contains("by hand"));
-        let cont = "modelRoles:\n  smol: a\n    b\n";
-        assert!(rewrite_role(cont, "smol", "n/m").is_err());
-        let crlf = "a: 1\r\nmodelRoles:\r\n  smol: s\r\n";
-        assert_eq!(rewrite_role(crlf, "smol", "n/m").unwrap(), "a: 1\r\nmodelRoles:\r\n  smol: n/m\r\n");
-    }
-
-    #[test]
     fn thresholds_are_clamped_not_truncated() {
         let mut w = Vec::new();
-        let big = serde_yaml_ng::Value::Number(5_000_000_000u64.into());
-        assert_eq!(Threshold::from_yaml(&big, "m", &mut w), Some(Threshold::Window(MAX_THRESHOLD)));
+        let big = toml::Value::Integer(5_000_000_000);
+        assert_eq!(Threshold::from_toml(&big, "m", &mut w), Some(Threshold::Window(MAX_THRESHOLD)));
         assert_eq!(w.len(), 1);
         assert_eq!(Threshold::from_toml(&toml::Value::Integer(-5), "m", &mut w), None);
         assert_eq!(Threshold::from_str("f999999999999", "m", &mut w), Some(Threshold::Fixed(MAX_THRESHOLD)));
@@ -780,13 +773,13 @@ mod tests {
 
     #[test]
     fn one_bad_section_does_not_drop_the_rest() {
-        let doc: serde_yaml_ng::Mapping = serde_yaml_ng::from_str("modelRoles: {smol: a/b}\ncycleOrder: 7\n").unwrap();
+        let doc: serde_yaml_ng::Mapping = serde_yaml_ng::from_str("composer: {shape: box}\nskills: 7\n").unwrap();
         let mut w = Vec::new();
-        let roles: BTreeMap<String, String> = yaml_section(&doc, "modelRoles", "config.yml", &mut w);
-        let cycle: Vec<String> = yaml_section(&doc, "cycleOrder", "config.yml", &mut w);
-        assert_eq!(roles["smol"], "a/b");
-        assert!(cycle.is_empty());
+        let composer: OmpComposer = yaml_section(&doc, "composer", "config.yml", &mut w);
+        let skills: OmpSkills = yaml_section(&doc, "skills", "config.yml", &mut w);
+        assert_eq!(composer.shape.as_deref(), Some("box"));
+        assert!(!skills.enable_claude_user);
         assert_eq!(w.len(), 1);
-        assert!(w[0].contains("cycleOrder"));
+        assert!(w[0].contains("skills"));
     }
 }

@@ -29,5 +29,5 @@ cat > "$out/touchpoints.md" <<'TP'
 - Rust crates pinned in Cargo.toml by tag: `pi-edit`, `pi-shell`, `pi-diff`, `pi-walker`, plus patched `brush-core`, `brush-parser`, `tree-sitter-go`.
 - The `omp` CLI, run as a subprocess (the pinned copy at ~/.mu/bin/omp): `auth-broker`, `auth-gateway`, `models ls --json`, `login`, `search`, `read`, `--version`.
 - Provider APIs reached through the omp gateway.
-- omp config read by mu: `config.yml` model roles, status line, theme, skills; `.omp/agents`, `.omp/commands`, `AGENTS.md`.
+- omp config read by mu: `config.yml` status line, theme, skills; `.omp/agents`, `.omp/commands`, `AGENTS.md`.
 TP

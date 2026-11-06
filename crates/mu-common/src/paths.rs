@@ -81,6 +81,7 @@ pub const PROFILE_STATE: &[&str] = &[
     "mcp",
     "predict",
     "history.jsonl",
+    "models.toml",
 ];
 
 /// The running executable, for re-spawning ourselves (subagents, daemons). After the binary is replaced on

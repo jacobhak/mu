@@ -4341,6 +4341,7 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "toml",
+ "toml_edit",
  "unicode-segmentation",
  "unicode-width",
  "uuid",

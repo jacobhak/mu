@@ -1,4 +1,4 @@
-//! The writes `App` makes outside the screen: omp's config roles, stored API keys, MCP server
+//! The writes `App` makes outside the screen: model roles and sets, stored API keys, MCP server
 //! definitions and session control. Reads stay with their callers.
 
 use mu_common::paths;
@@ -16,9 +16,31 @@ pub(super) struct Services {
 }
 
 impl Services {
-    /// Points `role` at `model` in omp's config; returns the value the role now has.
+    /// Points `role` at `model` in the active model set; returns the value the role now has.
     pub(super) fn set_role(&self, role: &str, model: &str) -> Result<String, String> {
         self.providers.cfg.set_role(role, model)
+    }
+
+    pub(super) fn switch_set(&self, name: &str) -> Result<(), String> {
+        self.providers.cfg.switch_set(name)
+    }
+
+    /// Returns the set the new one was copied from.
+    pub(super) fn new_set(&self, name: &str) -> Result<Option<String>, String> {
+        self.providers.cfg.new_set(name)
+    }
+
+    pub(super) fn delete_set(&self, name: &str) -> Result<(), String> {
+        self.providers.cfg.delete_set(name)
+    }
+
+    pub(super) fn rename_set(&self, old: &str, new: &str) -> Result<(), String> {
+        self.providers.cfg.rename_set(old, new)
+    }
+
+    /// Copies omp's model config into models.toml, never over an existing file.
+    pub(super) fn import_models(&self) -> Result<Vec<String>, String> {
+        self.providers.cfg.import_models(false)
     }
 
     pub(super) fn save_key(&self, id: &str, entry: Entry) -> Result<(), String> {

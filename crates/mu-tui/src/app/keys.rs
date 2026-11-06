@@ -1041,10 +1041,7 @@ mod tests {
     fn model_lists_every_role_and_a_role_without_a_model_gets_one_picked() {
         use mu_base::config::Configs;
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let cfg = Configs {
-            omp: serde_yaml_ng::from_str("modelRoles:\n  default: a/b\n  commit: c/d\n").unwrap(),
-            ..Default::default()
-        };
+        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\ncommit = \"c/d\"\n");
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
         app.services = Services { providers: Rc::new(Providers::for_tests(Rc::new(cfg), gateway)) };
 
@@ -1071,5 +1068,49 @@ mod tests {
         };
         assert_eq!(role, "review");
         assert!(ids.iter().all(|i| !i.starts_with('@')), "no roles to pick from: {ids:?}");
+    }
+
+    #[test]
+    fn modelset_switches_creates_renames_and_deletes() {
+        use mu_base::config::{Configs, models_path};
+        use mu_base::model_config;
+        mu_testutil::home();
+        let path = models_path();
+        let text = "[sets.main]\ndefault = \"a/b\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Rc::new(Configs::from_models_toml(text));
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
+        app.services = Services { providers: Rc::new(Providers::for_tests(cfg.clone(), gateway)) };
+        let on_disk = || model_config::parse(&std::fs::read_to_string(&path).unwrap()).0;
+
+        app.modelset_cmd("new openai");
+        assert_eq!(cfg.active_set().as_deref(), Some("openai"));
+        assert_eq!(cfg.role("default").as_deref(), Some("a/b"));
+
+        app.services.set_role("smol", "c/d").unwrap();
+        let disk = on_disk();
+        assert_eq!(disk.sets["openai"]["smol"], "c/d");
+        assert!(!disk.sets["main"].contains_key("smol"));
+
+        app.modelset_cmd("main");
+        assert_eq!(cfg.active_set().as_deref(), Some("main"));
+        assert_eq!(cfg.role("smol"), None);
+
+        app.modelset_cmd("");
+        let Some(Overlay::ModelSet { names, .. }) = &app.overlay else { panic!("no set picker") };
+        assert_eq!(names, &["main", "openai"]);
+        app.overlay = None;
+
+        app.modelset_cmd("delete main");
+        assert!(transcript_text(&app).contains("`main` is the active model set"), "{}", transcript_text(&app));
+        assert_eq!(cfg.set_names(), ["main", "openai"]);
+
+        app.modelset_cmd("rename openai oa");
+        assert_eq!(cfg.set_names(), ["main", "oa"]);
+        assert_eq!(cfg.active_set().as_deref(), Some("main"));
+        app.modelset_cmd("delete oa");
+        assert_eq!(on_disk().sets.keys().collect::<Vec<_>>(), ["main"]);
+        let _ = std::fs::remove_file(&path);
     }
 }

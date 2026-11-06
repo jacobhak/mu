@@ -1,11 +1,8 @@
 # Config
 
-`~/.mu/config.toml` is optional, and so is every key in it. Apart from the compaction example, the values below are the defaults.
+`~/.mu/config.toml` is optional, and so is every key in it. The values below are the defaults. Model roles, per-model limits and compaction thresholds live in [`models.toml`](model-roles.md#models-toml), not here; a `[compaction]` table left in `config.toml` is no longer read and warns at startup.
 
 ```toml
-[compaction.model_thresholds]   # same keys/values as omp's compaction.modelThresholds; overrides per key
-"anthropic/claude-haiku-5-5" = "f200000"
-
 [theme]
 source = "tokyo-night"  # default; or "terminal" (follow your terminal's palette), "omarchy", a bundled or ~/.mu/themes name, or a colors.toml path
 # accent = "blue"     # palette key or "#rrggbb"

@@ -51,6 +51,7 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Update { check, force, tag } => update::run(check, force, tag),
         Sub::Auth { cmd } => cli::auth::run(cmd),
         Sub::Web { cmd } => cli::web::run(cmd),
+        Sub::Models { cmd } => cli::models::run(cmd),
         Sub::Predict { cmd } => cli::predict::run(cmd),
         Sub::MigrateProfile { name, dry_run } => workflow::migrate::run(&name, dry_run),
         Sub::Plan { .. } => unreachable!("`mu plan` is routed in dispatch"),

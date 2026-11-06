@@ -85,13 +85,10 @@ impl App {
             items.push(Item { label: g.id.clone(), detail });
             ids.push(g.id.clone());
         }
-        for (p, pc) in &providers.cfg.models.providers {
-            for m in &pc.models {
-                let id = format!("{p}/{}", m.id);
-                if !ids.contains(&id) {
-                    items.push(Item { label: id.clone(), detail: "models.yml".into() });
-                    ids.push(id);
-                }
+        for id in providers.cfg.listed_models() {
+            if !ids.contains(&id) {
+                items.push(Item { label: id.clone(), detail: "models.toml".into() });
+                ids.push(id);
             }
         }
         details.resize(items.len(), None);
@@ -260,12 +257,12 @@ impl App {
         }
     }
 
-    /// Roles from omp's `cycleOrder` that can be switched to when implementing an approved plan.
+    /// Roles from `cycle_order` that can be switched to when implementing an approved plan.
     pub(super) fn plan_tiers(&self) -> Vec<Tier> {
         let providers = &self.services.providers;
         let cfg = &providers.cfg;
         let mut out = Vec::new();
-        for r in cfg.omp.role_cycle() {
+        for r in cfg.role_cycle() {
             match cfg.role(&r) {
                 Some(v) if providers.resolve(&format!("@{r}")).is_ok() => {
                     out.push(Tier { model: Some(format!("@{r}")), detail: v, role: r });
@@ -289,6 +286,9 @@ impl App {
     /// Carries out what the user chose in an overlay.
     pub(super) fn on_overlay_event(&mut self, e: OverlayEvent) {
         match e {
+            OverlayEvent::ModelSet(name) => self.switch_to(&name),
+            OverlayEvent::ModelImport(true) => self.import_now(),
+            OverlayEvent::ModelImport(false) => {}
             OverlayEvent::SetModel(id) => match id.strip_prefix('@') {
                 // A role with no model has nothing to switch to: pick one for it instead.
                 Some(role) if self.services.providers.cfg.role(&split_level(role).0).is_none() => {

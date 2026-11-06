@@ -303,7 +303,7 @@ impl Providers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mu_base::config::{Configs, ModelsYml, MuConfig, OmpConfig};
+    use mu_base::config::Configs;
     use mu_base::models::{GatewayModel, resolve};
 
     #[test]
@@ -392,19 +392,14 @@ mod tests {
     }
 
     fn cfg() -> Configs {
-        let omp: OmpConfig = serde_yaml_ng::from_str(
-            "modelRoles:\n  default: anthropic/claude-sonnet-5-5:medium\n  smol: modal/a/b:high\n",
+        Configs::from_models_toml(
+            "[sets.main]\ndefault = \"anthropic/claude-sonnet-5-5:medium\"\nsmol = \"modal/a/b:high\"\n\
+             [models.\"modal/a/b\"]\ncontext_window = 1000\n[models.\"openai-codex/g\"]\ncontext_window = 272000\n",
         )
-        .unwrap();
-        let models: ModelsYml = serde_yaml_ng::from_str(
-            "providers:\n  modal:\n    models:\n      - id: a/b\n        contextWindow: 1000\n  openai-codex:\n    modelOverrides:\n      g:\n        contextWindow: 272000\n",
-        )
-        .unwrap();
-        Configs { omp, models, mu: MuConfig::default(), ..Default::default() }
     }
 
     #[test]
-    fn native_models_use_the_catalog_below_models_yml() {
+    fn native_models_use_the_catalog_below_models_toml() {
         let native = |p: &str, m: &str| (p == "anthropic" || p == "baseten").then(|| direct_spec(p, m)).flatten();
         let c = cfg();
         // The catalog row beats the gateway's figures.
@@ -416,12 +411,8 @@ mod tests {
         let (m, _) = resolve("anthropic/claude-sonnet-5-5", &c, Some(&gw), &native).unwrap();
         assert!(m.native && m.context_window > 500 && m.max_output > 9, "{m:?}");
         assert_eq!((m.wire_id.as_str(), m.thinking.mode), ("claude-sonnet-5-5", ThinkingMode::AnthropicAdaptive));
-        // An explicit models.yml entry beats the catalog.
-        let models: ModelsYml = serde_yaml_ng::from_str(
-            "providers:\n  anthropic:\n    modelOverrides:\n      claude-sonnet-5-5:\n        contextWindow: 123\n",
-        )
-        .unwrap();
-        let c2 = Configs { models, ..Default::default() };
+        // An explicit models.toml entry beats the catalog.
+        let c2 = Configs::from_models_toml("[models.\"anthropic/claude-sonnet-5-5\"]\ncontext_window = 123\n");
         let (m, _) = resolve("anthropic/claude-sonnet-5-5", &c2, None, &native).unwrap();
         assert_eq!(m.context_window, 123);
         // A provider without a key stays on the gateway; an unknown native id gets a safe spec.

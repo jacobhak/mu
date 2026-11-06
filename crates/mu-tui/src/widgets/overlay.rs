@@ -126,6 +126,15 @@ pub enum Overlay {
     Web {
         sel: Select,
     },
+    /// `/modelset`: the model sets, to switch to one.
+    ModelSet {
+        sel: Select,
+        names: Vec<String>,
+    },
+    /// The startup offer to copy omp's model config into models.toml.
+    ModelImport {
+        sel: Select,
+    },
     Session {
         sel: Select,
         paths: Vec<PathBuf>,
@@ -197,6 +206,10 @@ pub enum OverlayEvent {
     Mcp(McpPick, Option<usize>),
     /// A `/web` wizard picker closed: the row chosen, or `None` when dismissed.
     Web(Option<usize>),
+    /// Switch to this model set.
+    ModelSet(String),
+    /// The import offer: `true` to copy omp's model config.
+    ModelImport(bool),
     Copy(Option<String>),
     /// Insert these blockquotes at the end of the composer.
     Quote(Vec<String>),
@@ -509,6 +522,8 @@ impl Overlay {
             | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
             | Overlay::Web { sel }
+            | Overlay::ModelSet { sel, .. }
+            | Overlay::ModelImport { sel }
             | Overlay::Session { sel, .. }
             | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
@@ -529,6 +544,8 @@ impl Overlay {
             | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
             | Overlay::Web { sel }
+            | Overlay::ModelSet { sel, .. }
+            | Overlay::ModelImport { sel }
             | Overlay::Session { sel, .. }
             | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
@@ -644,6 +661,18 @@ impl Overlay {
                 SelectResult::Pending => (Some(Overlay::Web { sel }), None),
                 SelectResult::Chosen(i) => (None, Some(OverlayEvent::Web(i.first().copied()))),
                 _ => (None, Some(OverlayEvent::Web(None))),
+            },
+            Overlay::ModelSet { mut sel, names } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::ModelSet { sel, names }), None),
+                SelectResult::Chosen(i) => {
+                    (None, i.first().and_then(|i| names.get(*i)).cloned().map(OverlayEvent::ModelSet))
+                }
+                _ => (None, None),
+            },
+            Overlay::ModelImport { mut sel } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::ModelImport { sel }), None),
+                SelectResult::Chosen(i) => (None, Some(OverlayEvent::ModelImport(i.first() == Some(&0)))),
+                _ => (None, Some(OverlayEvent::ModelImport(false))),
             },
             Overlay::Copy { mut sel, texts } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Copy { sel, texts }), None),

@@ -1,21 +1,30 @@
 //! The `mu` command line: the flags and subcommands. Model selection lives in `select`.
 
 pub mod auth;
+pub mod models;
 pub mod predict;
 pub mod select;
 pub mod web;
 
 use crate::workflow::{deliver, plans_cli};
+use anyhow::{Result, bail};
 use clap::Parser;
-use mu_base::models;
 use std::path::PathBuf;
+
+/// Passes when `--yes` was given or the user answered `y`/`yes` to the prompt.
+pub(crate) fn approved(yes: bool, answer: Option<String>) -> Result<()> {
+    if yes || answer.is_some_and(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes")) {
+        return Ok(());
+    }
+    bail!("approval needed: rerun with --yes after reading the text above")
+}
 
 #[derive(Parser)]
 #[command(name = "mu", version = env!("MU_VERSION"))]
 pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(models::Thinking::NAMES))]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(mu_base::models::Thinking::NAMES))]
     pub thinking: Option<String>,
     /// Resume the latest session for this directory.
     #[arg(short = 'c', long = "continue")]
@@ -72,6 +81,11 @@ pub enum Sub {
     Web {
         #[command(subcommand)]
         cmd: web::Cmd,
+    },
+    /// Model config: `mu models import` copies omp's model roles, presets and limits into models.toml.
+    Models {
+        #[command(subcommand)]
+        cmd: models::Cmd,
     },
     /// Ghost-text prediction. `mu predict setup smollm` downloads the opt-in SmolLM weights.
     Predict {

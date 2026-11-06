@@ -28,7 +28,7 @@ mu also adds a few things omp doesn't have:
 Early and experimental: started in October 2026 and changing quickly.
 
 - No stable version. Releases are nightly builds of `main` (`mu-YYYYMMDD-<sha7>`); config, flags and plugin interfaces can change without notice.
-- Model roles and `models.yml` are omp's. Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth`), with no omp involved; OpenAI models also run on your ChatGPT plan through Sign in with ChatGPT (`/login`). Every other provider, and subscription logins, go through omp (see [Providers](docs/providers.md)).
+- Model roles, per-model limits and compaction thresholds live in mu's own `models.toml` (copy omp's with `mu models import`). Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth`), with no omp involved; OpenAI models also run on your ChatGPT plan through Sign in with ChatGPT (`/login`). Every other provider, and subscription logins, go through omp (see [Providers](docs/providers.md)).
 - Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
 - No support promised. Issues and PRs are welcome but may go unanswered.
 

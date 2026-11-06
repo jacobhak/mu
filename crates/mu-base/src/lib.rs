@@ -10,6 +10,7 @@ pub mod jsoncache;
 pub mod jtd;
 pub mod mem;
 pub mod message;
+pub mod model_config;
 pub mod models;
 pub mod process;
 pub mod pty;

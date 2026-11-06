@@ -1,5 +1,6 @@
 //! `mu web`: choose where `web_search` sends queries (see `mu_provider::auth::web`).
 
+use super::approved;
 use anyhow::{Result, bail};
 use mu_provider::auth::store::{Store, now};
 use mu_provider::auth::web::{self, SearchBackend, WebSearch, WebStatus, parse_backend};
@@ -55,13 +56,6 @@ fn plan_use(backend: SearchBackend, keyless: bool, has_key: bool) -> Result<Plan
         bail!("no {label} key is stored; add one with `mu auth add {id}{chat}`");
     }
     Ok(Plan::Keyed(backend))
-}
-
-fn approved(yes: bool, answer: Option<String>) -> Result<()> {
-    if yes || answer.is_some_and(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes")) {
-        return Ok(());
-    }
-    bail!("approval needed: rerun with --yes after reading the text above")
 }
 
 pub fn run(cmd: Cmd) -> Result<i32> {

@@ -59,7 +59,7 @@ const DOCS: [Doc; 8] = [
     Doc {
         name: "slow",
         purpose: "plan execution",
-        used_by: "A stronger model offered when you approve a plan (omp's `cycleOrder` lists the offered roles).",
+        used_by: "A stronger model offered when you approve a plan (`cycle_order` in models.toml lists the offered roles).",
         unset: "not offered when you approve a plan",
     },
 ];
@@ -111,10 +111,10 @@ impl RoleView {
     }
 }
 
-/// The roles mu uses, then the others your agents or `cycleOrder` name. Roles that only exist in
-/// `config.yml` and that nothing refers to are left out.
+/// The roles mu uses, then the others your agents or `cycle_order` name. Roles that only exist in
+/// `models.toml` and that nothing refers to are left out.
 pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
-    let cycle = cfg.omp.role_cycle();
+    let cycle = cfg.role_cycle();
     let using = |role: &str| -> Vec<String> {
         agents
             .iter()
@@ -148,7 +148,7 @@ pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
     for name in custom {
         let mut parts = Vec::new();
         if cycle.contains(&name) {
-            parts.push("offered when you approve a plan (`cycleOrder`)");
+            parts.push("offered when you approve a plan (`cycle_order`)");
         }
         if !using(&name).is_empty() {
             parts.push("agents that list it in `model:`");
@@ -180,8 +180,8 @@ pub fn not_configured(role: &str) -> String {
 mod tests {
     use super::*;
 
-    fn cfg(roles: &str) -> Configs {
-        Configs { omp: serde_yaml_ng::from_str(roles).unwrap(), ..Default::default() }
+    fn cfg(toml: &str) -> Configs {
+        Configs::from_models_toml(toml)
     }
 
     fn find<'a>(v: &'a [RoleView], name: &str) -> &'a RoleView {
@@ -190,16 +190,20 @@ mod tests {
 
     #[test]
     fn every_role_mu_uses_is_listed_set_or_not_with_its_fallback() {
-        let v = views(&cfg("modelRoles:\n  default: a/b\n  commit: c/d\n"), &[]);
+        let v = views(&cfg("[sets.main]\ndefault = \"a/b\"\ncommit = \"c/d\"\n"), &[]);
         let names: Vec<&str> = v.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["default", "plan", "task", "scout", "review", "smol", "memory", "slow"], "commit is omp's");
+        assert_eq!(
+            names,
+            ["default", "plan", "task", "scout", "review", "smol", "memory", "slow"],
+            "commit is not one mu uses"
+        );
         assert_eq!(find(&v, "default").row(), "a/b · main session");
         assert_eq!(find(&v, "review").row(), "(unset → @default) · /review lead");
         assert_eq!(find(&v, "slow").row(), "(unset) · plan execution");
         let d = find(&v, "review").detail();
         assert!(d.contains("Not set: uses @default (a/b)") && d.contains("Enter assigns"), "{d}");
         assert!(find(&v, "slow").detail().contains("not offered when you approve a plan"));
-        let v = views(&cfg("modelRoles:\n  default: a/b\n  smol: s/m\n"), &[]);
+        let v = views(&cfg("[sets.main]\ndefault = \"a/b\"\nsmol = \"s/m\"\n"), &[]);
         assert_eq!(find(&v, "scout").row(), "(unset → @smol) · read-only scouts");
         assert_eq!(find(&v, "task").row(), "(unset → @default) · subagents");
     }
@@ -210,13 +214,14 @@ mod tests {
             ("docs", &["@writer:high".to_string(), "a/b".to_string()][..]),
             ("lint", &["@writer".to_string(), "@smol".to_string()][..]),
         ];
-        let v = views(&cfg("modelRoles:\n  smol: a/b\n  writer: c/d\ncycleOrder: [smol, fast]\n"), &agents);
+        let v =
+            views(&cfg("cycle_order = [\"smol\", \"fast\"]\n[sets.main]\nsmol = \"a/b\"\nwriter = \"c/d\"\n"), &agents);
         assert_eq!(find(&v, "smol").agents, ["lint"]);
         let w = find(&v, "writer");
         assert_eq!((w.agents.clone(), w.value.as_deref()), (vec!["docs".into(), "lint".into()], Some("c/d")));
         assert_eq!(w.purpose, "custom role");
         let f = find(&v, "fast");
-        assert!(f.used_by.contains("cycleOrder") && f.agents.is_empty(), "{f:?}");
+        assert!(f.used_by.contains("cycle_order") && f.agents.is_empty(), "{f:?}");
         assert_eq!(f.row(), "(unset) · custom role");
         assert!(f.detail().contains("agents use @task"));
     }

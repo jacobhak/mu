@@ -4,13 +4,14 @@
 use super::*;
 use crate::term::clipboard;
 use crate::text::markdown;
+use mu_base::config::Configs;
 use mu_base::image;
 use mu_base::models::Thinking;
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
 
-const BUILTIN_DESC: [(&str, &str, bool); 29] = [
+const BUILTIN_DESC: [(&str, &str, bool); 30] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -19,6 +20,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 29] = [
     ("rewind", "Go back to an earlier prompt and take it from there", false),
     ("model", "Pick a model and assign a role", false),
     ("switch", "Switch this session's model", false),
+    ("modelset", "Switch model sets [name | new | delete | rename | import]", false),
     ("login", "Sign in with ChatGPT, add an API key, or log in to a provider or MCP server", false),
     ("logout", "Remove a stored API key, or sign out of ChatGPT", false),
     ("web", "Choose the web search backend", false),
@@ -65,7 +67,7 @@ Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept sugg
 
 /// The completion list of the composer: the built-in commands, `/mcp` subcommands, the login and
 /// logout targets, then the commands and skills that come from the context.
-pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context) -> Vec<Entry> {
+pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs) -> Vec<Entry> {
     let mut commands: Vec<Entry> = BUILTIN_DESC
         .iter()
         .map(|&(name, desc, needs_arg)| {
@@ -73,6 +75,22 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context) -> Vec<Entry>
                 "thinking" => (Thinking::NAMES.iter().map(|s| s.to_string()).collect(), vec![]),
                 "copy" => (["code", "cmd", "link"].map(String::from).to_vec(), vec![]),
                 "jobs" => (vec!["kill".to_string()], vec![]),
+                "modelset" => {
+                    let subs = [
+                        ("new", "Copy the active set into a new one and switch to it"),
+                        ("delete", "Remove a set"),
+                        ("rename", "Rename a set"),
+                        ("import", "Copy omp's model config"),
+                    ];
+                    let sets = cfg.set_names();
+                    let args = subs.iter().map(|s| s.0.to_string()).chain(sets.iter().cloned()).collect();
+                    let descs = subs
+                        .iter()
+                        .map(|s| s.1.to_string())
+                        .chain(sets.iter().map(|_| "Switch to this set".to_string()))
+                        .collect();
+                    (args, descs)
+                }
                 "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
                 "login" => (
                     std::iter::once(PROVIDER_ID.to_string())
@@ -199,6 +217,7 @@ impl App {
             "login" => self.login(arg),
             "logout" => self.logout_cmd(arg),
             "web" => self.start_web_wizard(None),
+            "modelset" => self.modelset_cmd(arg),
             "mcp" => self.mcp_cmd(arg),
             "thinking" => match Thinking::parse(arg) {
                 Some(t) => self.send(Command::SetThinking(t)),

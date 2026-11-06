@@ -314,25 +314,21 @@ pub fn resolve(
     let Some((provider, model)) = base.split_once('/') else {
         bail!("model must be provider/model or @role, got `{base}`");
     };
-    let pc = cfg.models.providers.get(provider);
-    let entry = pc.and_then(|p| p.models.iter().find(|m| m.id == model));
-    let ov = pc.and_then(|p| p.model_overrides.get(model));
+    let lim = cfg.model_limits(&base);
     let gw = gateway_models.and_then(|g| g.iter().find(|m| m.id == base));
     let mut spec = match native_spec(provider, model) {
         Some(s) => s,
         None => ModelSpec::gateway(&base, DEFAULT_WINDOW, DEFAULT_MAX_OUT),
     };
-    // Explicit models.yml entries win, then overrides, then what the catalog or gateway reports.
+    // Explicit models.toml limits win, then what the catalog or gateway reports.
     let known = spec.native.then_some((spec.context_window, spec.max_output));
-    spec.context_window = entry
-        .and_then(|m| m.context_window)
-        .or(ov.and_then(|o| o.context_window))
+    spec.context_window = lim
+        .and_then(|l| l.context_window)
         .or(known.map(|k| k.0))
         .or(gw.and_then(|g| g.context_length))
         .unwrap_or(DEFAULT_WINDOW);
-    spec.max_output = entry
-        .and_then(|m| m.max_tokens)
-        .or(ov.and_then(|o| o.max_tokens))
+    spec.max_output = lim
+        .and_then(|l| l.max_tokens)
         .or(known.map(|k| k.1))
         .or(gw.and_then(|g| g.max_output_tokens))
         .unwrap_or(DEFAULT_MAX_OUT);
@@ -345,15 +341,10 @@ mod tests {
     use crate::config::*;
 
     fn cfg() -> Configs {
-        let omp: OmpConfig = serde_yaml_ng::from_str(
-            "modelRoles:\n  default: anthropic/claude-sonnet-5-5:medium\n  smol: modal/a/b:high\n",
+        Configs::from_models_toml(
+            "[sets.main]\ndefault = \"anthropic/claude-sonnet-5-5:medium\"\nsmol = \"modal/a/b:high\"\n\
+             [models.\"modal/a/b\"]\ncontext_window = 1000\n[models.\"openai-codex/g\"]\ncontext_window = 272000\n",
         )
-        .unwrap();
-        let models: ModelsYml = serde_yaml_ng::from_str(
-            "providers:\n  modal:\n    models:\n      - id: a/b\n        contextWindow: 1000\n  openai-codex:\n    modelOverrides:\n      g:\n        contextWindow: 272000\n",
-        )
-        .unwrap();
-        Configs { omp, models, mu: MuConfig::default(), ..Default::default() }
     }
 
     #[test]
