@@ -9,22 +9,26 @@ Model ids are omp's (`anthropic/claude-sonnet-5-5`, `openai/gpt-5.5`, `baseten/m
 
 ## How routing is decided
 
-A provider is native **only when mu's key store has an entry for it**. A `ANTHROPIC_API_KEY` in your environment does not switch anything: that would silently move `anthropic/*` from a Claude subscription to per-token billing. To use the variable, add it explicitly (`mu auth add anthropic --env ANTHROPIC_API_KEY`, or pick it in `/login`).
+A provider is native **only when mu's key store has an entry for it and the entry says its chat models use the key**. A `ANTHROPIC_API_KEY` in your environment does not switch anything: that would silently move `anthropic/*` from a Claude subscription to per-token billing. To use the variable, add it explicitly (`mu auth add anthropic --chat --env ANTHROPIC_API_KEY`, or pick it in `/login`).
 
-Add a key and the provider's models go native at once, in running sessions too; remove it (`/logout`, `mu auth rm`) and they go back through omp. The status line shows `· key` after a natively routed model, and cost is shown instead of subscription usage, since a key is metered.
+For Anthropic and OpenAI the key can serve chat models, or only web search ([web.md](web.md)), and you say which: `/login` asks "Use this key for chat models?", `mu auth add` needs `--chat` or `--no-chat`, and `mu auth use <provider> --chat|--no-chat` changes it later. A key saved with `--no-chat` leaves `anthropic/*` on omp (your subscription). Baseten's key is only for chat. Keys for Parallel and Exa are only for web search.
+
+Add a key for chat and the provider's models go native at once, in running sessions too; remove it (`/logout`, `mu auth rm`) and they go back through omp. The status line shows `· key` after a natively routed model, and cost is shown instead of subscription usage, since a key is metered.
 
 ## Adding a key
 
-In the TUI, `/login` lists the three providers under "API keys" (`key saved`, `$ANTHROPIC_API_KEY is set`, `not set`), then omp's OAuth providers. `/login anthropic` goes straight to the key flow: paste a key (masked, nothing is echoed), use the environment variable, or give a command. mu asks the provider whether the key works before saving (`401`/`403` rejects it; if the provider cannot be reached you can save anyway). `/logout` removes a stored key.
+In the TUI, `/login` lists the providers and the search services under "API keys" (`key saved · chat`, `key saved · not for chat`, `$ANTHROPIC_API_KEY is set`, `not set`), then omp's OAuth providers. `/login anthropic` goes straight to the key flow: paste a key (masked, nothing is echoed), use the environment variable, or give a command. mu asks the provider whether the key works before saving (`401`/`403` rejects it; if the provider cannot be reached you can save anyway; Parallel and Exa have no free way to test a key, so theirs are saved unchecked). With a key already stored for Anthropic or OpenAI, `/login anthropic` offers to change its chat use or replace it. `/logout` removes a stored key.
 
 From a shell, for scripts and headless setups:
 
 ```sh
-mu auth add anthropic < key.txt                 # or a no-echo prompt on a terminal
-mu auth add openai --env OPENAI_API_KEY         # read at request time, never stored in the file
+mu auth add anthropic --chat < key.txt          # or a no-echo prompt on a terminal
+mu auth add openai --no-chat --env OPENAI_API_KEY   # read at request time, never stored; web search only
 mu auth add baseten --cmd 'op read op://dev/baseten/key'
-mu auth add anthropic --base-url https://proxy.example/anthropic   # a proxy; https, or http to loopback, no user:password
-mu auth list                                    # provider, source, last four characters (a command shows only its program)
+mu auth add exa --env EXA_API_KEY               # web search only
+mu auth add anthropic --chat --base-url https://proxy.example/anthropic   # a proxy; https, or http to loopback, no user:password
+mu auth use openai --chat                       # let openai/* chat models use the stored key
+mu auth list                                    # provider, source, last four characters, what the key is for
 mu auth test anthropic
 mu auth rm anthropic
 ```
@@ -36,13 +40,15 @@ mu auth rm anthropic
 `auth.json` lives in the profile's cache directory (`~/.mu/auth.json`, or `~/.mu/profiles/<name>/auth.json` under an omp profile), mode 0600, in a 0700 directory. mu warns when it is readable by others, and at startup when it cannot be read or parsed.
 
 ```json
-{"version":1,"providers":{
-  "anthropic":{"key":"sk-ant-…","added":"2026-11-04T10:00:00Z"},
-  "openai":{"ref":"!op read op://dev/openai/key"},
-  "baseten":{"ref":"$BASETEN_API_KEY","baseUrl":"https://…"}}}
+{"version":2,"providers":{
+  "anthropic":{"key":"sk-ant-…","chat":true,"added":"2026-11-04T10:00:00Z"},
+  "openai":{"ref":"!op read op://dev/openai/key","chat":false},
+  "baseten":{"ref":"$BASETEN_API_KEY","chat":true,"baseUrl":"https://…"},
+  "exa":{"ref":"$EXA_API_KEY"}},
+ "web":{"backend":"exa","keyless":false}}
 ```
 
-One entry per provider. An entry has a literal `key` or a `ref`:
+Version 2 added `chat` and `web`. A version-1 entry has no `chat` and routed chat models; mu writes `chat: true` for such entries on the next change, and an older mu refuses a version-2 file rather than rewriting it without them. One entry per provider or search service. An entry has a literal `key` or a `ref`:
 
 - `$NAME` reads the environment variable. If it is unset, the request fails with that message; mu never falls back to sending the text `$NAME`.
 - `!command` runs through `sh -c` in its own process group (10 s limit; on timeout the whole group is killed) and uses its output. The result is cached in the process; after a `401` mu runs the command once more, in case the key rotated.
@@ -77,7 +83,7 @@ Messages store the same `api` strings as omp (`anthropic-messages`, `openai-resp
 ## What still needs omp
 
 - Subscription logins and every provider other than the three above (the gateway).
-- Web search and fetch (`omp search`, `omp read` through the web plugin), and OAuth for MCP servers.
+- OAuth for MCP servers. Web search and fetch no longer use omp ([web.md](web.md)).
 - Model roles and `models.yml` are omp's files.
 
 ## Not in v1

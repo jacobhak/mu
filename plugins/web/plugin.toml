@@ -5,7 +5,7 @@ hooks = []
 
 [[tools]]
 name = "web_search"
-description = "Search the web. Returns ranked sources with URLs and excerpts."
+description = "Search the web with the backend the user chose in /web. Returns sources (and an answer for Anthropic/OpenAI backends)."
 schema = "schemas/web_search.json"
 
 [[tools]]

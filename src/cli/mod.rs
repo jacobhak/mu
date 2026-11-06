@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod predict;
 pub mod select;
+pub mod web;
 
 use crate::workflow::{deliver, plans_cli};
 use clap::Parser;
@@ -66,6 +67,11 @@ pub enum Sub {
     Auth {
         #[command(subcommand)]
         cmd: auth::Cmd,
+    },
+    /// Where `web_search` sends queries: `mu web status|use|reset`. Nothing is contacted until you choose.
+    Web {
+        #[command(subcommand)]
+        cmd: web::Cmd,
     },
     /// Ghost-text prediction. `mu predict setup smollm` downloads the opt-in SmolLM weights.
     Predict {

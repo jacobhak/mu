@@ -11,6 +11,7 @@ pub mod subagent;
 pub mod task;
 pub mod todo;
 pub mod uri;
+pub mod web_gate;
 mod write;
 mod yield_;
 
@@ -140,6 +141,12 @@ impl Tools {
             return (b.call)(self, args, ctx).await;
         }
         if self.plugins.has_tool(name) {
+            if name == "web_search" {
+                let store = mu_provider::auth::store::Store::new();
+                if let Err(e) = web_gate::gate(&store, self.plugins.is_interactive(), ctx).await {
+                    return *e;
+                }
+            }
             let mut out = self.plugins.call_tool(name, args, &ctx.cancel).await;
             // Only MCP results are capped here: native plugins size their own output (web caps fetches itself).
             if self.plugins.is_mcp_tool(name) {

@@ -77,7 +77,7 @@ pub(super) struct Endpoint {
 const STREAM_IDLE: Duration = Duration::from_secs(90);
 
 #[cfg(test)]
-fn no_gateway() -> endpoint::GatewaySource {
+pub(super) fn no_gateway() -> endpoint::GatewaySource {
     endpoint::GatewaySource::new(endpoint::start_fn(|| async {
         Err::<(String, String), String>("no gateway in tests".into())
     }))
@@ -107,7 +107,11 @@ impl Providers {
         Self::with_store(cfg, gateway, crate::auth::store::Store::at(mu_testutil::home().join("auth.json")))
     }
 
-    fn with_store(cfg: Rc<Configs>, gateway: endpoint::GatewaySource, store: crate::auth::store::Store) -> Self {
+    pub(super) fn with_store(
+        cfg: Rc<Configs>,
+        gateway: endpoint::GatewaySource,
+        store: crate::auth::store::Store,
+    ) -> Self {
         Self {
             cfg,
             client: OnceCell::new(),

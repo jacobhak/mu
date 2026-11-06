@@ -20,7 +20,7 @@ pub enum LoginTarget {
     Provider(usize),
     /// An MCP server, by its name in `mcp.json`.
     Mcp(String),
-    /// A native API-key provider, by id (`models::PROVIDERS`).
+    /// A key target (a chat provider or a search service), by id (`KeyTarget::find`).
     ApiKey(String),
 }
 
@@ -35,6 +35,10 @@ pub enum KeyOption {
     Command,
     /// Validation could not reach the provider: keep the key anyway.
     SaveAnyway,
+    /// Whether the provider's chat models use this key.
+    Chat(bool),
+    /// Start the key flow over for a provider that already has a key.
+    Replace,
     Cancel,
 }
 
@@ -102,6 +106,10 @@ pub enum Overlay {
         sel: Select,
         pick: McpPick,
     },
+    /// A step of the `/web` setup wizard.
+    Web {
+        sel: Select,
+    },
     Session {
         sel: Select,
         paths: Vec<PathBuf>,
@@ -156,6 +164,8 @@ pub enum OverlayEvent {
     Logout(String),
     /// A `/mcp` picker closed: the row chosen, or `None` when dismissed.
     Mcp(McpPick, Option<usize>),
+    /// A `/web` wizard picker closed: the row chosen, or `None` when dismissed.
+    Web(Option<usize>),
     Copy(Option<String>),
     /// Insert these blockquotes at the end of the composer.
     Quote(Vec<String>),
@@ -457,6 +467,7 @@ impl Overlay {
             | Overlay::KeyChoice { sel, .. }
             | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
+            | Overlay::Web { sel }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
@@ -473,6 +484,7 @@ impl Overlay {
             | Overlay::KeyChoice { sel, .. }
             | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
+            | Overlay::Web { sel }
             | Overlay::Session { sel, .. }
             | Overlay::Plans { sel, .. }
             | Overlay::Copy { sel, .. } => Some(sel),
@@ -580,6 +592,11 @@ impl Overlay {
                 SelectResult::Pending => (Some(Overlay::Mcp { sel, pick }), None),
                 SelectResult::Chosen(i) => (None, Some(OverlayEvent::Mcp(pick, i.first().copied()))),
                 _ => (None, Some(OverlayEvent::Mcp(pick, None))),
+            },
+            Overlay::Web { mut sel } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Web { sel }), None),
+                SelectResult::Chosen(i) => (None, Some(OverlayEvent::Web(i.first().copied()))),
+                _ => (None, Some(OverlayEvent::Web(None))),
             },
             Overlay::Copy { mut sel, texts } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Copy { sel, texts }), None),

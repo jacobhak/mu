@@ -71,9 +71,81 @@ pub fn native_def(provider: &str) -> Option<&'static ProviderDef> {
     PROVIDERS.iter().find(|d| d.id == provider)
 }
 
-/// What the user is told after saving a key: the routing and billing change.
-pub fn saved_notice(def: &ProviderDef) -> String {
-    format!("{}/* models now use your API key (billed per token) instead of omp.", def.id)
+/// A key that only serves web search.
+#[derive(Debug)]
+pub struct SearchKeyDef {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub key_url: &'static str,
+    pub env_hint: &'static str,
+}
+
+pub const SEARCH_KEYS: [SearchKeyDef; 2] = [
+    SearchKeyDef {
+        id: "parallel",
+        label: "Parallel",
+        key_url: "https://platform.parallel.ai",
+        env_hint: "PARALLEL_API_KEY",
+    },
+    SearchKeyDef { id: "exa", label: "Exa", key_url: "https://dashboard.exa.ai/api-keys", env_hint: "EXA_API_KEY" },
+];
+
+/// Something a key can be stored for: a chat provider or a search service.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyTarget {
+    Provider(&'static ProviderDef),
+    Search(&'static SearchKeyDef),
+}
+
+impl KeyTarget {
+    pub fn find(id: &str) -> Option<Self> {
+        native_def(id).map(Self::Provider).or_else(|| SEARCH_KEYS.iter().find(|d| d.id == id).map(Self::Search))
+    }
+
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::Provider(d) => d.id,
+            Self::Search(d) => d.id,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Provider(d) => d.label,
+            Self::Search(d) => d.label,
+        }
+    }
+
+    pub fn key_url(&self) -> &'static str {
+        match self {
+            Self::Provider(d) => d.key_url,
+            Self::Search(d) => d.key_url,
+        }
+    }
+
+    pub fn env_hint(&self) -> &'static str {
+        match self {
+            Self::Provider(d) => d.env_hint,
+            Self::Search(d) => d.env_hint,
+        }
+    }
+
+    /// anthropic and openai: the key can serve chat models or only web search, so the user must say which.
+    pub fn asks_chat(&self) -> bool {
+        matches!(self, Self::Provider(d) if d.id == "anthropic" || d.id == "openai")
+    }
+}
+
+/// What the user is told after saving a provider's key: the routing and billing consequence.
+pub fn saved_notice(def: &ProviderDef, chat: bool) -> String {
+    if chat {
+        format!("{}/* models now use your API key (billed per token) instead of omp.", def.id)
+    } else {
+        format!(
+            "saved the {} key; {}/* chat models still go through omp (your subscription). The key is used only where you choose it, such as /web.",
+            def.label, def.id
+        )
+    }
 }
 
 /// A natively routed model: its catalog row, else a conservative spec for the provider's wire
@@ -119,7 +191,7 @@ impl Providers {
     /// Whether `provider`'s models go to its own API with the user's key: the provider is one
     /// mu speaks natively and the key store has an entry for it.
     pub fn is_direct(&self, provider: &str) -> bool {
-        native_def(provider).is_some() && self.store.has(provider)
+        native_def(provider).is_some() && self.store.get(provider).is_some_and(|e| e.routes_chat())
     }
 
     /// Models of the direct providers that have a key: the snapshot's rows (and, for Baseten,
@@ -181,6 +253,36 @@ mod tests {
             assert_eq!(native_def(d.id).map(|x| x.id), Some(d.id));
         }
         assert!(native_def("nope").is_none());
+    }
+
+    #[test]
+    fn a_search_only_key_does_not_route_chat() {
+        use crate::auth::store::{Entry, Store};
+        use std::rc::Rc;
+        let d = std::env::temp_dir().join(format!("mu-direct-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(d.join("auth.json"));
+        let p =
+            Providers::with_store(Rc::new(Configs::default()), crate::provider::client::no_gateway(), store.clone());
+        assert!(!p.is_direct("openai"));
+        store.set("openai", Entry::literal("sk-test-0123456789")).unwrap();
+        assert!(p.is_direct("openai"), "a stored key routes chat unless told otherwise");
+        assert!(store.set_chat("openai", false).unwrap());
+        assert!(!p.is_direct("openai") && p.direct_models().is_empty());
+        assert!(!store.set_chat("baseten", true).unwrap());
+        // Parallel and Exa keys never route anything.
+        store.set("parallel", Entry::literal("par-test-0123456789")).unwrap();
+        assert!(!p.is_direct("parallel"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn key_targets_cover_providers_and_search() {
+        let ids: Vec<_> =
+            ["anthropic", "openai", "baseten", "parallel", "exa"].iter().map(|i| KeyTarget::find(i).unwrap()).collect();
+        assert_eq!(ids.iter().filter(|t| t.asks_chat()).count(), 2);
+        assert!(KeyTarget::find("nope").is_none());
+        assert_eq!(KeyTarget::find("exa").unwrap().env_hint(), "EXA_API_KEY");
+        assert!(saved_notice(native_def("openai").unwrap(), false).contains("still go through omp"));
     }
 
     fn cfg() -> Configs {

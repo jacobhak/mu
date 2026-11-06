@@ -406,6 +406,11 @@ pub enum AgentEvent {
         questions: Vec<AskQuestion>,
         reply: oneshot::Sender<Option<Vec<Answer>>>,
     },
+    /// `web_search` was called and no backend is set up: the front end runs the setup wizard and
+    /// replies whether web search is now ready. A dropped `reply` means no.
+    WebSetup {
+        reply: oneshot::Sender<bool>,
+    },
     PlanReview {
         title: String,
         uri: String,

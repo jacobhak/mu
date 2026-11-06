@@ -19,6 +19,36 @@ pub fn notify(method: &str, params: Value) {
     }
 }
 
+/// Requests this plugin sent to the host (`request`), awaiting replies.
+static PENDING: std::sync::OnceLock<Pending> = std::sync::OnceLock::new();
+
+fn pending() -> &'static Pending {
+    PENDING.get_or_init(Pending::default)
+}
+
+/// Calls a host method (such as `core/webSearch`) and waits for the reply. `Err` carries the
+/// host's error message, `"not serving"` outside `serve_stdio`, or `"host closed"`.
+pub async fn request(method: &str, params: Value) -> Result<Value, String> {
+    let tx = OUTBOX.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("not serving")?;
+    let (id, rx) = pending().register();
+    let line = serde_json::to_string(&Request::new(Some(Value::from(id)), method, params)).unwrap();
+    if tx.send(line).is_err() {
+        pending().cancel(id);
+        return Err("host closed".into());
+    }
+    rx.await.unwrap_or_else(|_| Err("host closed".into()))
+}
+
+/// Hands a host reply to the `request` waiting for it.
+fn route_response(p: &Pending, r: Response) {
+    let Some(id) = r.id.as_u64() else { return };
+    let result = match r.error {
+        Some(e) => Err(e.message),
+        None => Ok(r.result.unwrap_or(Value::Null)),
+    };
+    p.resolve(id, result);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub jsonrpc: String,
@@ -193,8 +223,13 @@ where
     let handler = Arc::new(handler);
     let mut input = Framed::new(BufReader::new(tokio::io::stdin()));
     while let Some(frame) = input.next_frame().await {
-        // Plugins served here only answer requests; replies to calls they never make are ignored.
-        let Frame::Request(req) = frame else { continue };
+        let req = match frame {
+            Frame::Request(req) => req,
+            Frame::Response(r) => {
+                route_response(pending(), r);
+                continue;
+            }
+        };
         let stop = req.method == "shutdown";
         let (h, tx) = (handler.clone(), tx.clone());
         let task = tokio::spawn(async move {
@@ -214,6 +249,7 @@ where
         }
     }
     OUTBOX.lock().unwrap_or_else(|e| e.into_inner()).take();
+    pending().fail_all("host closed");
     // dropping every sender lets the writer drain and finish
     drop(tx);
     let _ = writer.await;
@@ -223,6 +259,39 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_request_to_the_host_gets_its_reply_or_its_error() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            assert_eq!(request("core/x", json!({})).await.unwrap_err(), "not serving");
+            let (tx, mut out) = mpsc::unbounded_channel::<String>();
+            OUTBOX.lock().unwrap().replace(tx);
+            let host = async {
+                for reply in [
+                    |id: Value| Response::ok(id, json!({"backend": "exa"})),
+                    |id: Value| Response::err(id, -32603, "no key"),
+                ] {
+                    let line = out.recv().await.unwrap();
+                    let sent: Request = serde_json::from_str(&line).unwrap();
+                    assert_eq!(sent.method, "core/webSearch");
+                    route_response(pending(), reply(sent.id.unwrap()));
+                }
+            };
+            let calls = async {
+                let a = request("core/webSearch", json!({})).await;
+                let b = request("core/webSearch", json!({})).await;
+                (a, b)
+            };
+            let ((a, b), ()) = tokio::join!(calls, host);
+            assert_eq!(a.unwrap(), json!({"backend": "exa"}));
+            assert_eq!(b.unwrap_err(), "no key");
+            // A reply nobody waits for is dropped; closing the host fails the waiters.
+            route_response(pending(), Response::ok(json!(999), Value::Null));
+            OUTBOX.lock().unwrap().take();
+            assert!(pending().is_empty());
+        });
+    }
 
     #[test]
     fn framed_skips_bad_lines_and_pending_routes_replies() {

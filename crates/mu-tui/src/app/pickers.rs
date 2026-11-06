@@ -12,7 +12,7 @@ use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
 use mu_base::models::{GatewayModel, split_level};
 use mu_base::roles::{self, RoleView};
-use mu_provider::provider::providers::native_def;
+use mu_provider::provider::providers::KeyTarget;
 use tokio::sync::oneshot;
 
 /// How long ago `t` was, in words for the session picker.
@@ -293,13 +293,14 @@ impl App {
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
-                if let Some(def) = native_def(&id) {
-                    self.start_key_flow(def);
+                if let Some(target) = KeyTarget::find(&id) {
+                    self.begin_key(target);
                 }
             }
             OverlayEvent::Key { provider, choice } => self.on_key_choice(&provider, choice),
             OverlayEvent::Logout(provider) => self.logout(&provider),
             OverlayEvent::Mcp(pick, row) => self.on_mcp_pick(pick, row),
+            OverlayEvent::Web(row) => self.on_web_pick(row),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
             OverlayEvent::Quote(q) => self.prompt.composer.append_quotes(&q),
             OverlayEvent::Resume(p) => {

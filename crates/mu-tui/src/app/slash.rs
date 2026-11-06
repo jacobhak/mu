@@ -9,7 +9,7 @@ use mu_base::models::Thinking;
 use mu_provider::provider::providers::PROVIDERS;
 use mu_tools::tools::todo::Status;
 
-const BUILTIN_DESC: [(&str, &str, bool); 25] = [
+const BUILTIN_DESC: [(&str, &str, bool); 26] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -18,6 +18,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 25] = [
     ("switch", "Switch this session's model", false),
     ("login", "Add an API key, or log in to a provider or MCP server", false),
     ("logout", "Remove a stored API key", false),
+    ("web", "Choose the web search backend", false),
     ("thinking", "Set the thinking level", false),
     ("compact", "Compact the context [focus]", false),
     ("plan", "Toggle plan mode", false),
@@ -183,6 +184,7 @@ impl App {
             "model" | "switch" => self.send(Command::SetModel(arg.into())),
             "login" => self.login(arg),
             "logout" => self.logout_cmd(arg),
+            "web" => self.start_web_wizard(None),
             "mcp" => self.mcp_cmd(arg),
             "thinking" => match Thinking::parse(arg) {
                 Some(t) => self.send(Command::SetThinking(t)),

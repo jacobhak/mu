@@ -308,6 +308,10 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
                 };
                 Ok(json!({"text": text}))
             }
+            "core/webSearch" if proc.name == "web" => {
+                mu_provider::auth::web::plugin_config(&mu_provider::auth::store::Store::new()).await
+            }
+            "core/webSearch" => Err("core/webSearch is only for the web plugin".into()),
             "ui/notify" => {
                 let level = p["level"].as_str().unwrap_or("info");
                 let _ =
@@ -321,7 +325,10 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
         let resp = match result {
             Ok(v) => Response::ok(id, v),
             // A token that could not be fetched is a failed request, not a missing method.
-            Err(e) if req.method == "core/mcpToken" && !e.starts_with("method not found") => {
+            Err(e)
+                if matches!(req.method.as_str(), "core/mcpToken" | "core/webSearch")
+                    && !e.starts_with("method not found") =>
+            {
                 Response::err(id, -32603, e)
             }
             Err(e) => Response::err(id, -32601, e),

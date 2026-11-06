@@ -6,6 +6,7 @@
 //! Reads are cached per file stamp (inode, ctime, mtime and size), so a key added by one session reaches the
 //! others without a restart. Writes hold a lock file, re-read, and replace the file atomically.
 
+use super::web::WebSearch;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -14,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const VERSION: u32 = 1;
+/// 2 added `Entry::chat` and `web`; an older mu refuses the file rather than rewriting it without them.
+const VERSION: u32 = 2;
 /// A `!command` reference gets this long to print the key.
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -31,6 +33,10 @@ pub struct Entry {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added: Option<String>,
+    /// Whether the provider's chat models use this key. `None` is a version-1 entry, which did.
+    /// Meaningless for search-only targets such as Parallel and Exa.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<bool>,
 }
 
 /// Where an entry's key comes from.
@@ -55,6 +61,10 @@ impl Entry {
             _ => bail!("a reference is `$ENV_NAME` or `!command`"),
         }
         Ok(Self { reference: Some(r.to_string()), added: Some(now()), ..Self::default() })
+    }
+
+    pub fn routes_chat(&self) -> bool {
+        self.chat.unwrap_or(true)
     }
 
     pub fn origin(&self) -> Option<Origin> {
@@ -87,6 +97,7 @@ impl fmt::Debug for Entry {
             .field("origin", &self.origin())
             .field("base_url", &self.base_url)
             .field("added", &self.added)
+            .field("chat", &self.chat)
             .finish()
     }
 }
@@ -114,7 +125,7 @@ fn valid_env_name(n: &str) -> bool {
         && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn now() -> String {
+pub fn now() -> String {
     jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
@@ -124,6 +135,8 @@ struct FileData {
     version: u32,
     #[serde(default)]
     providers: BTreeMap<String, Entry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web: Option<WebSearch>,
 }
 
 /// What `resolve` hands to a request.
@@ -271,6 +284,11 @@ impl Store {
         let changed = f(&mut data);
         if changed {
             data.version = VERSION;
+            for (p, e) in data.providers.iter_mut() {
+                if e.chat.is_none() && crate::provider::providers::native_def(p).is_some() {
+                    e.chat = Some(true);
+                }
+            }
             let json = serde_json::to_string_pretty(&data)? + "\n";
             mu_common::fs::write_private(&self.path, json.as_bytes())
                 .with_context(|| format!("writing {}", self.path.display()))?;
@@ -292,6 +310,30 @@ impl Store {
         forget_cached(provider);
         self.modify(|d| {
             d.providers.insert(provider.to_string(), entry);
+            true
+        })?;
+        Ok(())
+    }
+
+    /// Decides whether `provider`'s chat models use its key. `false` when there is no entry.
+    pub fn set_chat(&self, provider: &str, chat: bool) -> Result<bool> {
+        self.modify(|d| match d.providers.get_mut(provider) {
+            Some(e) => {
+                e.chat = Some(chat);
+                true
+            }
+            None => false,
+        })
+    }
+
+    pub fn web(&self) -> Option<WebSearch> {
+        self.snapshot().web.clone()
+    }
+
+    /// `None` forgets the choice, so the setup wizard runs again.
+    pub fn set_web(&self, w: Option<WebSearch>) -> Result<()> {
+        self.modify(|d| {
+            d.web = w;
             true
         })?;
         Ok(())
@@ -437,12 +479,38 @@ mod tests {
         e.base_url = Some("http://127.0.0.1:9".into());
         s.set("openai", e).unwrap();
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(s.path()).unwrap()).unwrap();
-        assert_eq!(v["version"], 1);
+        assert_eq!(v["version"], 2);
         assert_eq!(v["providers"]["anthropic"]["key"], "sk-ant-test-0123456789");
+        assert_eq!(v["providers"]["anthropic"]["chat"], true);
         assert!(v["providers"]["anthropic"]["added"].as_str().unwrap().ends_with('Z'));
         assert_eq!(v["providers"]["openai"]["ref"], "!op read op://dev/openai/key");
         assert_eq!(v["providers"]["openai"]["baseUrl"], "http://127.0.0.1:9");
         assert!(v["providers"]["openai"].get("key").is_none());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_version_1_entry_routes_chat_and_is_made_explicit_on_rewrite() {
+        let (s, d) = store("v1");
+        replace_file(s.path(), r#"{"version":1,"providers":{"openai":{"key":"sk-test-0123456789"}}}"#);
+        let e = s.get("openai").unwrap();
+        assert!(e.chat.is_none() && e.routes_chat());
+        s.set("parallel", Entry::literal("par-test-0123456789")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(s.path()).unwrap()).unwrap();
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["providers"]["openai"]["chat"], true);
+        assert!(v["providers"]["parallel"].get("chat").is_none(), "search keys have no chat flag");
+        assert!(s.set_chat("openai", false).unwrap());
+        assert!(!s.get("openai").unwrap().routes_chat());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_newer_file_is_refused() {
+        let (s, d) = store("v3");
+        replace_file(s.path(), r#"{"version":3,"providers":{}}"#);
+        assert!(s.check().is_err());
+        assert!(s.set("openai", Entry::literal("sk-test-0123456789")).is_err());
         let _ = std::fs::remove_dir_all(d);
     }
 

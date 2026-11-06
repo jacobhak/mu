@@ -69,6 +69,10 @@ pub(super) enum Effect {
         note: Option<String>,
         reply: oneshot::Sender<PlanDecision>,
     },
+    /// `web_search` needs a backend: run the setup wizard and reply whether web search is ready.
+    WebSetup {
+        reply: oneshot::Sender<bool>,
+    },
     PlanList(Vec<PlanMeta>),
     /// The job snapshot changed: an open jobs panel takes it.
     JobsChanged,
@@ -294,6 +298,10 @@ impl AgentView {
                 self.ring_if_attention(&mut fx);
                 fx.push(Effect::Ask { questions, reply });
             }
+            AgentEvent::WebSetup { reply } => {
+                self.ring_if_attention(&mut fx);
+                fx.push(Effect::WebSetup { reply });
+            }
             AgentEvent::PlanReview { title, uri, file, content, stored, note, reply } => {
                 self.ring_if_attention(&mut fx);
                 fx.push(Effect::PlanReview { title, uri, file, content, stored, note, reply });
@@ -416,6 +424,7 @@ impl App {
         match effect {
             Effect::Ring => self.ring(),
             Effect::Ask { questions, reply } => self.start_ask(questions, reply),
+            Effect::WebSetup { reply } => self.start_web_wizard(Some(reply)),
             Effect::PlanReview { title, uri, file, content, stored, note, reply } => {
                 let context = self
                     .agent
@@ -688,6 +697,14 @@ mod tests {
         v.on_event(AgentEvent::Woken, SIZE);
         let fx = v.on_event(AgentEvent::Ask { questions: vec![], reply: tx }, SIZE);
         assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::Ask { .. }]));
+    }
+
+    #[test]
+    fn a_web_setup_request_becomes_an_effect() {
+        let (tx, _rx) = oneshot::channel::<bool>();
+        let mut v = view();
+        let fx = v.on_event(AgentEvent::WebSetup { reply: tx }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::WebSetup { .. }]));
     }
 
     #[test]

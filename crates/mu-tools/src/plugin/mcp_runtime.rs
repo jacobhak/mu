@@ -326,6 +326,10 @@ impl PluginHost {
         self.shared.interactive.set(true);
     }
 
+    pub fn is_interactive(&self) -> bool {
+        self.shared.interactive.get()
+    }
+
     /// Starts the server, lists its tools and makes them this slot's tools (and the cache's).
     async fn list_slot(&self, slot: &Rc<Slot>) -> Result<usize, String> {
         let m = slot.as_mcp().expect("an mcp slot");

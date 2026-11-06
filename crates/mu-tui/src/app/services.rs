@@ -3,8 +3,8 @@
 
 use mu_common::paths;
 use mu_provider::auth::store::Entry;
+use mu_provider::auth::web::WebSearch;
 use mu_provider::provider::client::Providers;
-use mu_provider::provider::providers::ProviderDef;
 use mu_session::session::{control, inbox};
 use mu_tools::mcp::store::{self, Level};
 use serde_json::Value;
@@ -21,8 +21,16 @@ impl Services {
         self.providers.cfg.set_role(role, model)
     }
 
-    pub(super) fn save_key(&self, def: &ProviderDef, entry: Entry) -> Result<(), String> {
-        self.providers.store().set(def.id, entry).map_err(|e| e.to_string())
+    pub(super) fn save_key(&self, id: &str, entry: Entry) -> Result<(), String> {
+        self.providers.store().set(id, entry).map_err(|e| e.to_string())
+    }
+
+    pub(super) fn set_chat(&self, id: &str, chat: bool) -> Result<bool, String> {
+        self.providers.store().set_chat(id, chat).map_err(|e| e.to_string())
+    }
+
+    pub(super) fn set_web(&self, w: WebSearch) -> Result<(), String> {
+        self.providers.store().set_web(Some(w)).map_err(|e| e.to_string())
     }
 
     pub(super) fn remove_key(&self, provider: &str) -> Result<bool, String> {

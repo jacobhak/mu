@@ -12,6 +12,7 @@ mod pickers;
 mod services;
 mod slash;
 mod ui_msgs;
+mod web;
 
 use self::agent_view::{AgentView, error_lines, notice_lines};
 use self::keys::KeyFlow;
@@ -117,6 +118,8 @@ struct Flows {
     /// An API-key flow in progress; while it types, the composer takes its text.
     key_flow: Option<KeyFlow>,
     key_flow_seq: u64,
+    /// The `/web` wizard, and who is waiting for it: a `web_search` call that found no backend.
+    web_wizard: Option<(crate::web::wizard::Wizard, Option<tokio::sync::oneshot::Sender<bool>>)>,
 }
 
 pub async fn run(init: AppInit) -> i32 {
@@ -176,6 +179,7 @@ pub async fn run(init: AppInit) -> i32 {
             assign_role: None,
             pick_deliver: false,
             mcp_wizard: None,
+            web_wizard: None,
             key_flow: None,
             key_flow_seq: 0,
         },

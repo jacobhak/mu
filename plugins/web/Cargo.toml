@@ -5,5 +5,14 @@ edition = "2024"
 
 [dependencies]
 mu-common = { path = "../../crates/mu-common" }
+base64.workspace = true
+encoding_rs = "0.8"
+html-to-markdown-rs = { version = "=3.18.3", default-features = false }
+httpdate = "1"
+pdf-inspector = "1"
+reqwest.workspace = true
+rustls.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util", "net"] }
+url = "2"

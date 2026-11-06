@@ -9,7 +9,7 @@ use mu_base::message::Image;
 use mu_base::models::GatewayModel;
 use mu_provider::auth::check::Check;
 use mu_provider::auth::store::Entry;
-use mu_provider::provider::providers::ProviderDef;
+use mu_provider::provider::providers::KeyTarget;
 
 pub(super) enum UiMsg {
     ChildDone {
@@ -44,7 +44,7 @@ pub(super) enum UiMsg {
     /// An API key was checked: the outcome, and the entry to save when it holds.
     KeyChecked {
         flow: u64,
-        def: &'static ProviderDef,
+        target: KeyTarget,
         entry: Entry,
         r: Result<Check, String>,
     },
@@ -92,7 +92,7 @@ impl App {
                 }
             }
             UiMsg::McpReconnected { name, verbose, ms, result } => self.on_mcp_reconnected(&name, verbose, ms, result),
-            UiMsg::KeyChecked { flow, def, entry, r } => self.on_key_checked(flow, def, entry, r),
+            UiMsg::KeyChecked { flow, target, entry, r } => self.on_key_checked(flow, target, entry, r),
             UiMsg::LoginProviders(r) => {
                 let (mut items, mut targets) = self.api_key_rows();
                 match r {

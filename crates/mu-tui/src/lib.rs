@@ -9,4 +9,5 @@ pub(crate) mod status;
 pub(crate) mod term;
 pub(crate) mod text;
 pub(crate) mod theme;
+pub(crate) mod web;
 pub(crate) mod widgets;

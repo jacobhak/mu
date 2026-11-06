@@ -2,7 +2,7 @@
 
 use super::store::{Entry, check_base_url, resolve_entry};
 use crate::net;
-use crate::provider::providers::ProviderDef;
+use crate::provider::providers::{KeyTarget, ProviderDef};
 use crate::provider::types::Auth;
 use std::time::Duration;
 
@@ -14,6 +14,8 @@ pub enum Check {
     Rejected(String),
     /// Anything else (no network, a 5xx): the key is neither confirmed nor refuted.
     Unreachable(String),
+    /// The service has no free way to validate a key; the entry resolved and nothing was sent.
+    Unchecked,
 }
 
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -53,6 +55,18 @@ pub async fn validate(def: &ProviderDef, key: &str, base_url: Option<&str>) -> C
 pub async fn check_entry(def: &ProviderDef, entry: &Entry) -> Result<Check, String> {
     let resolved = resolve_entry(def.id, entry).await.map_err(|e| e.to_string())?;
     Ok(validate(def, &resolved.key, entry.base_url.as_deref()).await)
+}
+
+/// `check_entry` for a provider; for a search service the entry is only resolved, since a test
+/// search would cost money.
+pub async fn check_target(t: KeyTarget, entry: &Entry) -> Result<Check, String> {
+    match t {
+        KeyTarget::Provider(def) => check_entry(def, entry).await,
+        KeyTarget::Search(_) => {
+            resolve_entry(t.id(), entry).await.map_err(|e| e.to_string())?;
+            Ok(Check::Unchecked)
+        }
+    }
 }
 
 #[cfg(test)]
