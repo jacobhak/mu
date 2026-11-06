@@ -347,6 +347,7 @@ impl App {
         env.expanded = self.agent.expanded;
         env.turn_elapsed = self.agent.turn_started.map(|t| t.elapsed());
         env.jobs = status::JobCounts::of(&self.agent.jobs);
+        env.subagent_cost = self.agent.subagent_cost;
         let status_lines = status::render(&self.agent.status, &env, w);
         let pty_open = self.agent.pty.is_some();
         let (lines, cur) = match &mut self.overlay {

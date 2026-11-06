@@ -63,6 +63,11 @@ impl Tail {
         self.tokens
     }
 
+    /// Bytes consumed so far: whole lines read, or skipped for being longer than one read.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
     /// False until the first poll has read to the end of the file: the totals are partial before.
     pub fn caught_up(&self) -> bool {
         self.caught_up

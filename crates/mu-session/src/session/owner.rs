@@ -200,7 +200,7 @@ pub fn live_sessions() -> Vec<LiveSession> {
 }
 
 /// `parentSession` from a session file's header, which sits in its first few lines.
-fn header_parent(session: &Path) -> Option<PathBuf> {
+pub(super) fn header_parent(session: &Path) -> Option<PathBuf> {
     use std::io::BufRead;
     let f = File::open(session).ok()?;
     std::io::BufReader::new(f).lines().take(3).map_while(Result::ok).find_map(|l| {

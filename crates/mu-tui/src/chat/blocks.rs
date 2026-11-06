@@ -660,8 +660,9 @@ pub fn pty_live(
     (lines, cur)
 }
 
-/// Subagent rows: state mark, name, tool count, and the last activity.
-pub fn subagent_rows(rows: &[SubagentStatus], spin: char) -> Vec<Line> {
+/// Subagent rows: state mark, name, tool count, cost and the last activity. `cost` says what a row's
+/// session has spent; none, or nothing yet, leaves the figure out (omp does the same).
+pub fn subagent_rows(rows: &[SubagentStatus], spin: char, cost: impl Fn(&SubagentStatus) -> Option<f64>) -> Vec<Line> {
     rows.iter()
         .map(|r| {
             let (mark, style) = match r.state {
@@ -670,11 +671,17 @@ pub fn subagent_rows(rows: &[SubagentStatus], spin: char) -> Vec<Line> {
                 SubagentState::Failed => ('✗', tfg(Role::Err)),
             };
             let model = r.model.as_deref().map(|m| format!(" · {m}")).unwrap_or_default();
-            vec![
+            let mut row = vec![
                 span(format!("  {mark} "), style),
                 span(r.name.clone(), ContentStyle::default()),
-                span(format!("{model} · {} tools · {}", r.tools, trunc(&r.last, 80)), tfg(Role::Muted)),
-            ]
+                span(format!("{model} · {} tools", r.tools), tfg(Role::Muted)),
+            ];
+            if let Some(c) = cost(r).filter(|c| *c > 0.0) {
+                row.push(span(" · ", tfg(Role::Muted)));
+                row.push(span(format!("${c:.2}"), tfg(Role::SynType)));
+            }
+            row.push(span(format!(" · {}", trunc(&r.last, 80)), tfg(Role::Muted)));
+            row
         })
         .collect()
 }
@@ -760,6 +767,38 @@ mod tests {
     use super::*;
     use crate::text::line::line_text as text_of;
     use serde_json::json;
+
+    #[test]
+    fn subagent_rows_show_their_cost_only_when_there_is_some() {
+        let row = |state| SubagentStatus {
+            name: "scout-1".into(),
+            agent: "scout".into(),
+            tools: 4,
+            last: "read a.rs".into(),
+            state,
+            kind: mu_base::events::JobKind::Subagent,
+            cwd: std::path::PathBuf::new(),
+            task: String::new(),
+            started: std::time::SystemTime::UNIX_EPOCH,
+            ended: None,
+            delivered: false,
+            note: None,
+            session: None,
+            model: Some("scout · anthropic/haiku".into()),
+        };
+        let text = |cost: Option<f64>, state| text_of(&subagent_rows(&[row(state)], '⠋', |_| cost)[0]);
+        assert_eq!(
+            text(Some(0.123), SubagentState::Running),
+            "  ⠋ scout-1 · scout · anthropic/haiku · 4 tools · $0.12 · read a.rs"
+        );
+        assert_eq!(
+            text(Some(0.5), SubagentState::Done),
+            "  ✓ scout-1 · scout · anthropic/haiku · 4 tools · $0.50 · read a.rs"
+        );
+        let plain = "  ⠋ scout-1 · scout · anthropic/haiku · 4 tools · read a.rs";
+        assert_eq!(text(None, SubagentState::Running), plain, "no session, no figure");
+        assert_eq!(text(Some(0.0), SubagentState::Running), plain, "unpriced is not free: no `$0.00`");
+    }
 
     #[test]
     fn pty_live_cursor() {

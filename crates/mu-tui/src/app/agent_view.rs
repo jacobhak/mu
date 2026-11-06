@@ -3,6 +3,7 @@
 //! what it cannot do alone (overlays, the inbox, the bell) comes back as an `Effect` for `App`.
 
 use super::App;
+use super::ui_msgs::UiMsg;
 use crate::chat::blocks;
 use crate::chat::partial_json::Partial;
 use crate::chat::transcript::{Stream, Transcript};
@@ -12,10 +13,11 @@ use crate::text::line::{Line, dim, styled};
 use crate::theme::{self, Role};
 use crate::widgets::overlay::Overlay;
 use mu_base::events::{AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, QueueState, StatusSnapshot};
-use mu_base::events::{SubagentState, SubagentStatus};
+use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_base::message::UserInput;
 use mu_base::text::truncate_text as trunc;
 use mu_base::tool::ToolOutput;
+use mu_session::session::tree_cost::{Child, TreeCost, session_cost};
 use mu_tools::tools::todo::{Phase, Status};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -98,6 +100,13 @@ pub(super) struct AgentView {
     pub(super) calls: Vec<StreamingCall>,
     /// Latest background-job snapshot, and finished jobs already printed to the transcript.
     pub(super) jobs: Vec<SubagentStatus>,
+    /// Reads the subagents' session files for the status line's cost. `None` while that read runs on
+    /// a blocking thread, which hands it back in `UiMsg::Spend`.
+    pub(super) spend: Option<TreeCost>,
+    /// What the subagents have spent, as the last read found it.
+    pub(super) subagent_cost: f64,
+    /// What each subagent session has cost by itself, as the last read found it, for the running rows.
+    pub(super) child_costs: HashMap<PathBuf, f64>,
     jobs_committed: HashSet<String>,
     /// Newest output of each background bash job, for the jobs panel.
     pub(super) job_out: HashMap<String, String>,
@@ -126,6 +135,9 @@ impl AgentView {
             tools: Vec::new(),
             calls: Vec::new(),
             jobs: Vec::new(),
+            spend: Some(TreeCost::default()),
+            subagent_cost: 0.0,
+            child_costs: HashMap::new(),
             jobs_committed: HashSet::new(),
             job_out: HashMap::new(),
             todo: Vec::new(),
@@ -280,7 +292,9 @@ impl AgentView {
                 }
                 for r in v.iter().filter(|r| r.state != SubagentState::Running) {
                     if self.jobs_committed.insert(r.name.clone()) {
-                        self.tr.commit(blocks::subagent_rows(std::slice::from_ref(r), ' '));
+                        // Its file is final now, and the periodic read may not have seen the end of it.
+                        let cost = r.session.as_deref().map(session_cost);
+                        self.tr.commit(blocks::subagent_rows(std::slice::from_ref(r), ' ', |_| cost));
                     }
                 }
                 self.job_out.retain(|id, _| v.iter().any(|j| &j.name == id));
@@ -376,7 +390,9 @@ impl AgentView {
         }
         let running: Vec<SubagentStatus> =
             self.jobs.iter().filter(|j| j.state == SubagentState::Running).cloned().collect();
-        out.extend(blocks::subagent_rows(&running, spin));
+        out.extend(blocks::subagent_rows(&running, spin, |j| {
+            j.session.as_ref().and_then(|p| self.child_costs.get(p)).copied()
+        }));
         if self.compacting {
             out.push(styled(format!("{spin} Compacting context…"), |_| theme::get().fg(Role::Warn)));
         }
@@ -414,10 +430,39 @@ impl App {
     /// view and carries out the effects it leaves.
     pub(super) fn on_agent(&mut self, e: AgentEvent) {
         self.screen.dirty = true;
+        // A new session path or a job's progress can change what the subagents have spent.
+        let spend = matches!(e, AgentEvent::Status(_) | AgentEvent::Jobs(_));
         let fx = self.agent.on_event(e, self.screen.renderer.size());
         for effect in fx {
             self.apply(effect);
         }
+        if spend {
+            self.poll_spend();
+        }
+    }
+
+    /// Starts reading the subagents' session files on a blocking thread when that is due; the total
+    /// comes back in `UiMsg::Spend`, so no file I/O runs on the draw path.
+    pub(super) fn poll_spend(&mut self) {
+        let root = self.agent.status.session_path.as_deref().map(PathBuf::from);
+        let children: Vec<Child> = self
+            .agent
+            .jobs
+            .iter()
+            .filter(|j| j.kind == JobKind::Subagent)
+            .filter_map(|j| Some(Child { path: j.session.clone()?, running: j.state == SubagentState::Running }))
+            .collect();
+        let Some(mut tracker) = self.agent.spend.take_if(|t| t.due(root.as_deref(), &children)) else { return };
+        let tx = self.ui_tx.clone();
+        tokio::task::spawn_local(async move {
+            let tracker = tokio::task::spawn_blocking(move || {
+                tracker.poll(root.as_deref(), &children);
+                tracker
+            })
+            .await
+            .unwrap_or_default();
+            let _ = tx.send(UiMsg::Spend(Box::new(tracker)));
+        });
     }
 
     fn apply(&mut self, effect: Effect) {

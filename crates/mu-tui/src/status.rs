@@ -32,6 +32,8 @@ pub struct StatusEnv<'a> {
     pub turn_elapsed: Option<Duration>,
     /// Background jobs by state, for the `subagents` segment.
     pub jobs: JobCounts,
+    /// What this session's subagents (descendants included) have spent, for the `cost` segment.
+    pub subagent_cost: f64,
 }
 
 /// How many background jobs are running, done and failed.
@@ -66,6 +68,7 @@ impl<'a> StatusEnv<'a> {
             expanded: false,
             turn_elapsed: None,
             jobs: JobCounts::default(),
+            subagent_cost: 0.0,
         }
     }
 }
@@ -297,16 +300,21 @@ fn seg_context_total(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line
         .then(|| vec![span(format!("{} ctx", format_number(s.context_window as u64)), st(Role::Muted))])
 }
 
-fn seg_cost(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
-    if !s.subscription && s.cost <= 0.0 {
+fn seg_cost(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+    let sub = env.subagent_cost;
+    if !s.subscription && s.cost <= 0.0 && sub <= 0.0 {
         return None;
     }
-    // omp: a zero subscription spend reads `(sub)`; otherwise the unit (`S` subscription, `$` metered) and amount.
-    let text = match (s.cost > 0.0, s.subscription) {
+    // omp: a zero subscription spend reads `(sub)`; otherwise the unit (`S` subscription, `$` metered)
+    // and amount, then the subagent tree's spend as `(+0.12)`; the unit is the session's own.
+    let mut text = match (s.cost > 0.0 || sub > 0.0, s.subscription) {
         (false, _) => "(sub)".to_string(),
         (true, true) => format!("S{:.2}", s.cost),
         (true, false) => format!("${:.2}", s.cost),
     };
+    if sub > 0.0 {
+        text.push_str(&format!(" (+{sub:.2})"));
+    }
     Some(vec![span(text, st(Role::SynType))])
 }
 
@@ -556,6 +564,7 @@ mod tests {
             expanded: false,
             turn_elapsed: None,
             jobs: JobCounts::default(),
+            subagent_cost: 0.0,
         }
     }
 
@@ -603,6 +612,31 @@ mod tests {
         s.cost = 0.25;
         let c = cfg(&["mode", "cost"], &[]);
         assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " plan · $0.25 ");
+    }
+
+    #[test]
+    fn cost_shows_the_subagent_tree_after_the_sessions_own_spend() {
+        let c = cfg(&["cost"], &[]);
+        let cwd = Path::new("/home/u/x");
+        let text = |s: &StatusSnapshot, sub: f64| {
+            let mut e = env(&c, cwd);
+            e.subagent_cost = sub;
+            line_text(&render(s, &e, 80)[0]).trim().to_string()
+        };
+        let mut s = StatusSnapshot { subscription: false, cost: 0.38, ..snap() };
+        s.usage = None;
+        s.title = None;
+        assert_eq!(text(&s, 0.12), "$0.38 (+0.12)");
+        assert_eq!(text(&s, 0.0), "$0.38");
+        s.cost = 0.0;
+        assert_eq!(text(&s, 0.0), "", "nothing spent, nothing shown");
+        assert_eq!(text(&s, 0.2), "$0.00 (+0.20)", "subagents alone still show");
+        // Subscription spend keeps its mark on the session's own amount only.
+        s.subscription = true;
+        assert_eq!(text(&s, 0.0), "(sub)");
+        assert_eq!(text(&s, 0.2), "S0.00 (+0.20)");
+        s.cost = 0.38;
+        assert_eq!(text(&s, 0.2), "S0.38 (+0.20)");
     }
 
     #[test]

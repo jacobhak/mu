@@ -806,6 +806,52 @@ mod tests {
     }
 
     #[test]
+    fn the_status_line_adds_what_the_subagents_spent() {
+        use mu_base::events::{AgentEvent, JobKind, StatusSnapshot, SubagentState, SubagentStatus};
+        let d = std::env::temp_dir().join(format!("mu-spend-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let root = d.join("2026-01-01T00-00-00-000Z_root.jsonl");
+        let kid = d.join("2026-01-01T00-00-01-000Z_kid.jsonl");
+        std::fs::write(&root, "{\"type\":\"session\",\"id\":\"root\"}\n").unwrap();
+        let reply = serde_json::json!({"role":"assistant","content":[],"usage":{"input":1,"output":1,"cacheRead":0,
+            "cacheWrite":0,"totalTokens":2,"cost":{"total":0.25}},"stopReason":"stop","timestamp":1});
+        let entry = serde_json::json!({"type":"message","id":"a","parentId":null,"message":reply});
+        std::fs::write(&kid, format!("{{\"type\":\"session\",\"id\":\"kid\"}}\n{entry}\n")).unwrap();
+        let job = SubagentStatus {
+            name: "scout".into(),
+            agent: "scout".into(),
+            tools: 1,
+            last: String::new(),
+            state: SubagentState::Done,
+            kind: JobKind::Subagent,
+            cwd: d.clone(),
+            task: String::new(),
+            started: std::time::SystemTime::now(),
+            ended: None,
+            delivered: true,
+            note: None,
+            session: Some(kid),
+            model: None,
+        };
+        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        app.ui_tx = ui_tx;
+        in_local(async {
+            let status =
+                StatusSnapshot { session_path: Some(root.to_string_lossy().into_owned()), ..Default::default() };
+            app.on_agent(AgentEvent::Status(status));
+            app.on_agent(AgentEvent::Jobs(vec![job]));
+            // Each event started a read; the first one's reader came back before the second began.
+            while app.agent.subagent_cost == 0.0 {
+                let Some(msg) = ui_rx.recv().await else { panic!("the read never reported") };
+                app.on_ui(msg);
+            }
+        });
+        assert!((app.agent.subagent_cost - 0.25).abs() < 1e-9, "{}", app.agent.subagent_cost);
+        assert!(app.agent.spend.is_some(), "the reader is back for the next read");
+    }
+
+    #[test]
     fn a_late_check_result_of_an_old_flow_is_ignored() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let t = KeyTarget::find("anthropic").unwrap();

@@ -20,3 +20,5 @@ A turn that began this way rings the terminal; see [Detached runs](detached-runs
 
 The `subagents` status-line segment (add it to omp's `statusLine` in `config.yml`) shows the job counts as `◌2 ✓1 ✗1` (running, done, failed); zero counts are left out, and with no jobs there is no segment.
 
+The `cost` segment shows the session's own spend, then its subagents' as `$0.38 (+0.12)`, as omp does. The subagent figure sums the assistant replies in the session files of every subagent the session has started, grandchildren included, and updates while they run. A resumed session finds its earlier subagents by the `parentSession` in their headers, so the figure survives a restart. The unit (`$`, or `S` for subscription spend) belongs to the session's own amount; subagents on a different billing are not told apart. Replies the price table could not price are stored as zero, so the figure can undercount for a model it does not know.
+
