@@ -5,7 +5,7 @@ use crate::text::markdown;
 use crate::theme::{self, Role};
 use crossterm::style::{Attribute, Color, ContentStyle};
 use mu_base::config::Cards;
-use mu_base::events::{SubagentState, SubagentStatus};
+use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text as trunc;
 use mu_base::tool::{BashMeta, FileMeta, ToolMeta, ToolOutput};
 use serde_json::Value;
@@ -686,6 +686,31 @@ pub fn subagent_rows(rows: &[SubagentStatus], spin: char, cost: impl Fn(&Subagen
         .collect()
 }
 
+/// Most lines of a bash job's newest output shown under its row when expanded.
+const JOB_TAIL: usize = 8;
+
+/// Rows under a job's row when expanded: its task, agent, run time and directory, the full last
+/// activity and, for a bash job, the tail of its output.
+pub fn job_details(r: &SubagentStatus, out: Option<&str>, width: usize) -> Vec<Line> {
+    let inner = width.saturating_sub(6);
+    let row =
+        |text: String| vec![span("    │ ".to_string(), tfg(Role::Faint)), span(trunc(&text, inner), tfg(Role::Muted))];
+    let secs = std::time::SystemTime::now().duration_since(r.started).map(|d| d.as_secs()).unwrap_or(0);
+    let mut rows = Vec::new();
+    if let Some(first) = r.task.lines().next().filter(|t| !t.is_empty()) {
+        rows.push(row(first.to_string()));
+    }
+    rows.push(row(format!("{} · {}m{:02}s · {}", r.agent, secs / 60, secs % 60, r.cwd.display())));
+    if r.kind == JobKind::Subagent && !r.last.is_empty() {
+        rows.push(row(format!("last: {}", r.last)));
+    }
+    if let Some(out) = out {
+        let lines: Vec<&str> = out.lines().collect();
+        rows.extend(lines[lines.len().saturating_sub(JOB_TAIL)..].iter().map(|l| row(l.to_string())));
+    }
+    rows
+}
+
 fn italic(mut s: ContentStyle) -> ContentStyle {
     s.attributes.set(Attribute::Italic);
     s
@@ -767,6 +792,33 @@ mod tests {
     use super::*;
     use crate::text::line::line_text as text_of;
     use serde_json::json;
+
+    #[test]
+    fn job_details_show_task_and_the_output_tail() {
+        let r = SubagentStatus {
+            name: "b1".into(),
+            agent: "bash".into(),
+            tools: 0,
+            last: String::new(),
+            state: SubagentState::Running,
+            kind: JobKind::Bash,
+            cwd: "/w".into(),
+            task: "build it".into(),
+            started: std::time::SystemTime::now(),
+            ended: None,
+            delivered: false,
+            note: None,
+            session: None,
+            model: None,
+        };
+        let out: String = (0..20).map(|i| format!("l{i}\n")).collect();
+        let text: Vec<String> = job_details(&r, Some(&out), 80).iter().map(text_of).collect();
+        assert!(text[0].contains("build it"));
+        assert!(text[1].contains("/w"));
+        assert_eq!(text.len(), 2 + JOB_TAIL);
+        assert!(text.last().unwrap().contains("l19"));
+        assert!(!text.iter().any(|l| l.contains("l11")));
+    }
 
     #[test]
     fn subagent_rows_show_their_cost_only_when_there_is_some() {

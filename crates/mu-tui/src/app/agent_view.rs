@@ -393,11 +393,14 @@ impl AgentView {
         for c in &self.calls {
             out.extend(blocks::tool_streaming(&c.name, &c.args, spin, w));
         }
-        let running: Vec<SubagentStatus> =
-            self.jobs.iter().filter(|j| j.state == SubagentState::Running).cloned().collect();
-        out.extend(blocks::subagent_rows(&running, spin, |j| {
-            j.session.as_ref().and_then(|p| self.child_costs.get(p)).copied()
-        }));
+        for j in self.jobs.iter().filter(|j| j.state == SubagentState::Running) {
+            out.extend(blocks::subagent_rows(std::slice::from_ref(j), spin, |j| {
+                j.session.as_ref().and_then(|p| self.child_costs.get(p)).copied()
+            }));
+            if self.expanded {
+                out.extend(blocks::job_details(j, self.job_out.get(&j.name).map(String::as_str), w));
+            }
+        }
         if self.compacting {
             out.push(styled(format!("{spin} Compacting context…"), |_| theme::get().fg(Role::Warn)));
         }
@@ -716,6 +719,18 @@ mod tests {
         assert!(v.tr.pending.is_empty());
         assert!(v.busy(), "a running job keeps the screen busy");
         assert!(v.live_lines(80, ' ').0.iter().any(|l| line_text(l).contains("j2")));
+    }
+
+    #[test]
+    fn expanding_adds_detail_rows_under_a_running_job() {
+        let mut v = view();
+        v.on_event(AgentEvent::Jobs(vec![job("b1", SubagentState::Running, JobKind::Bash)]), SIZE);
+        v.on_event(AgentEvent::JobOutput { id: "b1".into(), tail: "compiling\n".into() }, SIZE);
+        let rows = |v: &AgentView| v.live_lines(80, ' ').0.len();
+        let collapsed = rows(&v);
+        v.expanded = true;
+        assert!(rows(&v) > collapsed);
+        assert!(v.live_lines(80, ' ').0.iter().any(|l| line_text(l).contains("compiling")));
     }
 
     #[test]
