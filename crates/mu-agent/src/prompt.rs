@@ -15,6 +15,8 @@ pub struct PromptInput<'a> {
     pub subagent: bool,
     /// The `ask` tool is offered to this run; the decision rule is only stated then.
     pub ask: bool,
+    /// The `task` tool is offered to this run; the delegation rules are only stated then.
+    pub task: bool,
     pub agent_prompt: Option<&'a str>,
     pub plugin_ctx: &'a std::collections::BTreeMap<String, String>,
     /// The MCP servers' instructions block (`PluginHost::mcp_instructions`).
@@ -64,15 +66,14 @@ pub(crate) fn system_prompt(i: &PromptInput) -> String {
     static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let os = OS.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
     let date = jiff::Zoned::now().strftime("%Y-%m-%d");
+    // The edit tool's own description covers its format; this adds only the cross-call rule.
     let edit_rule = if i.hashline {
-        "- Surgical edits: `edit`, with the `[path#TAG]` header from your latest `read`, `write` or `edit` of that file. Every edit changes the tag and shifts line numbers: put all changes to one file in a single call, or re-read the affected window before editing it again."
+        " Every edit changes a file's `[path#TAG]`: put all changes to one file in a single `edit` call."
     } else {
-        "- Surgical edits: `edit`. Copy `*** Find` text verbatim from a recent `read`, and give each `*** Find` exactly one of `*** Replace`, `*** Insert Before` or `*** Insert After`."
+        ""
     };
-    let redact_rule = "- `[REDACTED:NAME]` in output is a secret mu hid from you, not an error: use `\"$NAME\"` when NAME is an environment variable, and NEVER write a placeholder into a file or command.";
     let mut s = SYSTEM
         .replace("{edit_rule}", edit_rule)
-        .replace("{redact_rule}", redact_rule)
         .replace("{os}", format!("{} {}", std::env::consts::OS, os.trim()).trim_end())
         .replace("{arch}", std::env::consts::ARCH)
         .replace("{date}", &date.to_string())
@@ -81,12 +82,10 @@ pub(crate) fn system_prompt(i: &PromptInput) -> String {
     if i.ask {
         s.push_str(
             "\n# Decisions\n\
-- A decision that belongs to the user (scope, design, trade-offs, anything ambiguous, risky or hard to undo) MUST be asked with `ask`: 2-5 options, one recommended, each with its trade-off. NEVER end a turn with a decision question or an option list in prose.\n\
-- The user sees only the dialog, not your reasoning or earlier tool calls: put the background in `context` (what you found, why it needs their decision, what depends on it, with concrete names) and keep `question` to the decision itself.\n\
-- Informational and rhetorical questions are fine in prose. Do not ask what code, config or docs answer.\n",
+A decision that belongs to the user (scope, design, trade-offs, anything ambiguous, risky or hard to undo) MUST be asked with `ask`; NEVER end a turn with a decision question or an option list in prose. Informational and rhetorical questions are fine in prose.\n",
         );
     }
-    if !i.subagent {
+    if i.task && !i.subagent {
         s.push_str(
             "\n# Delegation\n\
 When the `task` tool is available, SHOULD use it instead of doing everything inline:\n\
@@ -104,11 +103,11 @@ When the `task` tool is available, SHOULD use it instead of doing everything inl
         s.push_str(p);
     }
     if !i.ctx.files.is_empty() {
-        s.push_str("\n<repo-rules>\nMUST follow these context files for all tasks:\n");
+        s.push_str("\n<context-files>\nMUST follow these context files for all tasks:\n");
         for f in &i.ctx.files {
             s.push_str(&format!("<file path=\"{}\">\n{}\n</file>\n", f.path.display(), f.content.trim_end()));
         }
-        s.push_str("</repo-rules>\n");
+        s.push_str("</context-files>\n");
     }
     if !i.ctx.nested.is_empty() {
         s.push_str("\n<dir-context>\nSome directories may have rules; deeper rules override higher ones.\nBefore changes in these directories, MUST read:\n");
@@ -190,6 +189,7 @@ mod tests {
             plan: None,
             subagent: false,
             ask: false,
+            task: false,
             agent_prompt: None,
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
@@ -219,6 +219,7 @@ mod tests {
             plan: None,
             subagent: false,
             ask: false,
+            task: false,
             agent_prompt: None,
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
@@ -228,20 +229,48 @@ mod tests {
 
     #[test]
     fn system_prompt_forbids_shell_file_edits_and_tracks_edit_mode() {
-        let sp = system_prompt(&PromptInput {
+        let ctx = Context::default();
+        let plugins = std::collections::BTreeMap::new();
+        let input = |hashline| PromptInput {
             model: "m",
-            hashline: true,
+            hashline,
             cwd: Path::new("/tmp"),
-            ctx: &Context::default(),
+            ctx: &ctx,
             plan: None,
             subagent: false,
             ask: false,
+            task: false,
             agent_prompt: None,
-            plugin_ctx: &Default::default(),
+            plugin_ctx: &plugins,
             mcp_instructions: None,
-        });
+        };
+        let sp = system_prompt(&input(true));
         assert!(sp.contains("NEVER use `sed`, `perl`") && sp.contains("NEVER `cat`"));
-        assert!(sp.contains("[path#TAG]") && !sp.contains("*** Find"));
+        assert!(sp.contains("[path#TAG]`: put all changes") && !sp.contains("{edit_rule}"));
+        let find = system_prompt(&input(false));
+        assert!(!find.contains("[path#TAG]") && !find.contains("{edit_rule}"));
+    }
+
+    #[test]
+    fn delegation_only_when_task_is_offered_to_a_parent() {
+        let ctx = Context::default();
+        let plugins = std::collections::BTreeMap::new();
+        let input = |task, subagent| PromptInput {
+            model: "m",
+            hashline: true,
+            cwd: Path::new("/tmp"),
+            ctx: &ctx,
+            plan: None,
+            subagent,
+            ask: false,
+            task,
+            agent_prompt: None,
+            plugin_ctx: &plugins,
+            mcp_instructions: None,
+        };
+        assert!(system_prompt(&input(true, false)).contains("# Delegation"));
+        assert!(!system_prompt(&input(false, false)).contains("# Delegation"));
+        assert!(!system_prompt(&input(true, true)).contains("# Delegation"));
     }
 
     #[test]
@@ -256,6 +285,7 @@ mod tests {
             plan: None,
             subagent: false,
             ask,
+            task: false,
             agent_prompt: None,
             plugin_ctx: &plugins,
             mcp_instructions: None,
@@ -287,6 +317,7 @@ mod tests {
             plan: None,
             subagent: true,
             ask: false,
+            task: false,
             agent_prompt: Some(block),
             plugin_ctx: &Default::default(),
             mcp_instructions: None,

@@ -13,6 +13,7 @@ impl Agent {
             &self.run.agent_prompt,
             self.run.subagent,
             self.policy().permits("ask"),
+            self.policy().permits("task"),
         )
             .hash(&mut h);
         self.ports.plugins.mcp_instructions().hash(&mut h);

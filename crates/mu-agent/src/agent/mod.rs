@@ -336,6 +336,7 @@ impl Agent {
             plan: self.plan.plan.as_ref().map(|_| PLAN_PROMPT),
             subagent: self.run.subagent,
             ask: self.policy().permits("ask"),
+            task: self.policy().permits("task"),
             agent_prompt: self.run.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),
