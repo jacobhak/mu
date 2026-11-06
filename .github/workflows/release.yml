@@ -11,7 +11,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-22.04, plat: linux-x64 }
-          - { os: macos-14, plat: darwin-arm64 }
+          - { os: macos-15, plat: darwin-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
