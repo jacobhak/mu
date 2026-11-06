@@ -33,22 +33,28 @@ pub fn try_flock(file: &std::fs::File, op: libc::c_int) -> std::io::Result<()> {
     }
 }
 
+/// Sends `sig` to every process in group `pgid`. Never signals pid 0, 1 or a negative group: the
+/// caller must have created the group (a child spawned with `process_group(0)` or `setsid`).
+/// Returns whether the signal was delivered to at least one process.
+pub fn kill_group(pgid: i32, sig: libc::c_int) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: plain kill(2) with a negative pid addresses a process group.
+    unsafe { libc::kill(-pgid, sig) == 0 }
+}
+
 /// Terminates a whole process group: SIGTERM, then SIGKILL after `TERM_GRACE`.
 /// `pgid` must be a group the caller created (a child spawned with `process_group(0)` or `setsid`).
 pub async fn terminate_group(pgid: i32) {
-    if pgid <= 1 {
-        return;
-    }
     // Signal 0 only asks whether any process is left in the group; usually none, and no delay.
-    // SAFETY: plain kill(2).
-    if unsafe { libc::kill(-pgid, 0) } != 0 {
+    if !kill_group(pgid, 0) {
         return;
     }
-    // SAFETY: plain kill(2) on a group we own.
-    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    kill_group(pgid, libc::SIGTERM);
     tokio::time::sleep(TERM_GRACE).await;
-    // SAFETY: as above; ESRCH if the group is already gone is fine.
-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    // ESRCH if the group is already gone is fine.
+    kill_group(pgid, libc::SIGKILL);
 }
 
 /// Spawns `cmd` as the leader of a new process group, so `terminate_group` reaches everything it
@@ -131,6 +137,13 @@ mod tests {
         assert_eq!(unsafe { libc::getpgid(pid) }, pid);
         rt.block_on(terminate_group(pid));
         assert!(!rt.block_on(child.wait()).unwrap().success());
+    }
+
+    #[test]
+    fn kill_group_refuses_pid_zero_one_and_negatives() {
+        assert!(!kill_group(0, 0));
+        assert!(!kill_group(1, 0));
+        assert!(!kill_group(-5, libc::SIGKILL));
     }
 
     #[test]

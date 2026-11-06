@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,10 +16,19 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(200);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_GRACE: Duration = Duration::from_secs(2);
+const STOP_POLL: Duration = Duration::from_millis(200);
+
+/// Set by SIGTERM, SIGHUP or SIGINT: `serve` stops and its children go with it.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_stop(_sig: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
 
 /// Spawns (detached, setsid) `mu-gateway daemon` unless one is already healthy, and returns its URL.
 /// Called with the `gateway/lock` held.
 pub fn start(dir: &Path) -> Result<String, String> {
+    stop_orphaned_pair(dir);
     fs::create_dir_all(shared::logs_dir()).map_err(|e| e.to_string())?;
     let log_path = shared::daemon_log();
     let log = OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| e.to_string())?;
@@ -62,6 +72,60 @@ pub fn start(dir: &Path) -> Result<String, String> {
     }
 }
 
+/// A daemon that died without stopping its omp pair (a crash, or SIGKILL) leaves the pair running,
+/// and the next start would stack a second one. Stops the pair the dead daemon recorded.
+fn stop_orphaned_pair(dir: &Path) {
+    let Some(st) = shared::read_state(dir) else { return };
+    if shared::alive(st.pid) {
+        return;
+    }
+    for pid in st.kids {
+        let Ok(out) = Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output() else {
+            continue;
+        };
+        if is_omp_pair(&String::from_utf8_lossy(&out.stdout)) {
+            signal_group(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// Whether a `ps -o command=` line is one of the omp pair's processes.
+fn is_omp_pair(cmdline: &str) -> bool {
+    cmdline.contains("auth-broker") || cmdline.contains("auth-gateway")
+}
+
+/// Sends `sig` to the process group `pgid`. The omp children are spawned with `process_group(0)`, so
+/// their pid is their group id.
+fn signal_group(pgid: i32, sig: libc::c_int) {
+    if pgid > 1 {
+        // SAFETY: plain kill(2) on a group this daemon (or an earlier one) created.
+        unsafe { libc::kill(-pgid, sig) };
+    }
+}
+
+fn group_alive(pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only asks whether the group has members.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Sleeps for `tick` in `STOP_POLL` steps; true as soon as a stop signal has arrived.
+fn sleep_unless_stopped(tick: Duration) -> bool {
+    let deadline = Instant::now() + tick;
+    loop {
+        if STOP.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(STOP_POLL.min(deadline - now));
+    }
+}
+
 /// Daemon entry point (`mu-gateway daemon`). Returns the process exit code.
 pub fn run() -> i32 {
     match serve() {
@@ -101,6 +165,11 @@ fn serve() -> Result<i32, String> {
     let idle = env_secs("MU_GATEWAY_IDLE_SECS", 1800.0);
     let tick = env_secs("MU_GATEWAY_TICK_SECS", 30.0);
     let me = std::process::id();
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+        let handler = request_stop as extern "C" fn(libc::c_int);
+        unsafe { libc::signal(sig, handler as libc::sighandler_t) };
+    }
 
     // Dropping `kids` (on any early return) terminates the children.
     let mut kids = Kids(Vec::new());
@@ -124,11 +193,16 @@ fn serve() -> Result<i32, String> {
         &[("OMP_AUTH_BROKER_URL", &broker_url), ("OMP_AUTH_BROKER_TOKEN", &token)],
     )?;
     kids.0.push(gw);
-    shared::write_state(&dir, me, &gw_url, &broker_url).map_err(|e| e.to_string())?;
+    let kid_pids: Vec<i32> = kids.0.iter().map(|c| c.id() as i32).collect();
+    shared::write_state_with_kids(&dir, me, &gw_url, &broker_url, &kid_pids).map_err(|e| e.to_string())?;
     eprintln!("mu-gateway daemon {me}: gateway at {gw_url}");
 
     loop {
-        thread::sleep(tick);
+        if sleep_unless_stopped(tick) {
+            shared::remove_state_if_owned(&dir, me);
+            eprintln!("mu-gateway daemon {me}: stopping on a signal");
+            return Ok(0);
+        }
         if kids.exited() {
             let lock = shared::lock(&dir).map_err(|e| e.to_string())?;
             shared::remove_state_if_owned(&dir, me);
@@ -161,19 +235,26 @@ impl Kids {
         self.0.iter_mut().any(|c| matches!(c.try_wait(), Ok(Some(_))))
     }
 
-    /// SIGTERM, wait up to `STOP_GRACE`, then SIGKILL.
+    /// SIGTERM to each child's group, wait up to `STOP_GRACE` for the groups to empty, then SIGKILL.
     fn terminate(&mut self) {
         let mut kids = std::mem::take(&mut self.0);
-        for c in &kids {
-            unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
+        let pids: Vec<i32> = kids.iter().map(|c| c.id() as i32).collect();
+        for &pid in &pids {
+            signal_group(pid, libc::SIGTERM);
         }
         let deadline = Instant::now() + STOP_GRACE;
         loop {
-            kids.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-            if kids.is_empty() || Instant::now() >= deadline {
+            // Reap leaders first: a zombie leader keeps its group visible to `group_alive`.
+            for c in &mut kids {
+                let _ = c.try_wait();
+            }
+            if pids.iter().all(|&p| !group_alive(p)) || Instant::now() >= deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
+        }
+        for &pid in &pids {
+            signal_group(pid, libc::SIGKILL);
         }
         for c in &mut kids {
             let _ = c.kill();
@@ -247,6 +328,14 @@ fn listen_url(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_omp_pair_commands_match() {
+        assert!(is_omp_pair("/usr/local/bin/omp auth-broker serve --bind=127.0.0.1:0\n"));
+        assert!(is_omp_pair("omp auth-gateway serve --bind=127.0.0.1:0"));
+        assert!(!is_omp_pair("sleep 30"));
+        assert!(!is_omp_pair(""));
+    }
 
     #[test]
     fn url_from_listening_line() {

@@ -142,9 +142,7 @@ pub async fn run_child_observed(
     }
     // A child that ignores everything must not hang the parent: bound the wait, then kill.
     if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await.is_err() {
-        if pid > 0 {
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-        }
+        mu_base::process::kill_group(pid, libc::SIGKILL);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
     }
     let stderr_tail = err_task.await.unwrap_or_default();

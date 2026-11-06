@@ -23,23 +23,55 @@ fn live_groups() -> &'static Mutex<Vec<i32>> {
     G.get_or_init(Default::default)
 }
 
-/// SIGKILLs every running plugin's process group.
+/// SIGKILLs every running plugin's process group, and every process group mu started itself (background
+/// jobs, subagents, foreground commands).
 pub(crate) fn kill_all_groups() {
-    for g in live_groups().lock().unwrap().iter().filter(|g| **g > 1) {
-        // SAFETY: each plugin runs in its own process group (`process_group(0)`).
-        unsafe { libc::kill(-*g, libc::SIGKILL) };
+    for g in live_groups().lock().unwrap().iter() {
+        mu_base::process::kill_group(*g, libc::SIGKILL);
+    }
+    let me = std::process::id() as i32;
+    for g in child_groups(me) {
+        mu_base::process::kill_group(g, libc::SIGKILL);
+    }
+    // A direct child in mu's own group cannot be reached by group; kill its tree.
+    // SAFETY: plain getpgid(2) on an integer pid.
+    let own = unsafe { libc::getpgid(me) };
+    for child in direct_children(me) {
+        if child.group_id() == Some(own) {
+            let _ = child.kill_tree(Some(libc::SIGKILL));
+        }
     }
 }
 
-/// For modes without a terminal UI (`-p`, subagents, ACP): on SIGTERM or SIGHUP kill every plugin's
-/// process group and exit. Needs a running `LocalSet`.
+fn direct_children(parent: i32) -> Vec<pi_shell::process::Process> {
+    pi_shell::process::Process::from_pid(parent).map(|p| p.children()).unwrap_or_default()
+}
+
+/// Process groups of `parent`'s direct children, except `parent`'s own group.
+fn child_groups(parent: i32) -> Vec<i32> {
+    // SAFETY: plain getpgid(2) on an integer pid.
+    let own = unsafe { libc::getpgid(parent) };
+    let mut groups: Vec<i32> =
+        direct_children(parent).iter().filter_map(|c| c.group_id()).filter(|g| *g > 1 && *g != own).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
+/// For modes without a terminal UI (`-p`, subagents, ACP): on SIGTERM, SIGHUP or SIGINT kill every
+/// plugin's and every child's process group, then exit with the signal's shell status. Needs a running
+/// `LocalSet`.
 pub fn exit_on_signals() {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut t), Ok(mut h)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup())) else { return };
+    let (Ok(mut t), Ok(mut h), Ok(mut i)) =
+        (signal(SignalKind::terminate()), signal(SignalKind::hangup()), signal(SignalKind::interrupt()))
+    else {
+        return;
+    };
     tokio::task::spawn_local(async move {
-        let n = tokio::select! { _ = t.recv() => 15, _ = h.recv() => 1 };
+        let code = tokio::select! { _ = t.recv() => 143, _ = h.recv() => 129, _ = i.recv() => 130 };
         kill_all_groups();
-        std::process::exit(128 + n);
+        std::process::exit(code);
     });
 }
 
@@ -167,16 +199,23 @@ impl Proc {
         // Runs on every exit, including this future being dropped (a cancelled call).
         let _guard = InflightGuard { proc: self, id };
         let line = serde_json::to_string(&Request::new(Some(self.wire_id(id)), method, params)).unwrap();
-        self.write_line(&line).await?;
         let gone =
             |r: Result<Result<Value, String>, _>| r.unwrap_or_else(|_| Err(format!("plugin {} exited", self.name)));
+        // The write sits inside the timeout and the cancel race: a plugin that stops reading stdin
+        // must not hold the call.
+        let exchange = async {
+            match self.write_line(&line).await {
+                Ok(()) => gone(rx.await),
+                Err(e) => Err(e),
+            }
+        };
         let reply = async {
             match timeout {
-                Some(t) => match tokio::time::timeout(t, rx).await {
-                    Ok(r) => End::Done(gone(r)),
+                Some(t) => match tokio::time::timeout(t, exchange).await {
+                    Ok(r) => End::Done(r),
                     Err(_) => End::Timeout,
                 },
-                None => End::Done(gone(rx.await)),
+                None => End::Done(exchange.await),
             }
         };
         let aborted = async {
@@ -194,7 +233,8 @@ impl Proc {
         if self.mcp().is_some() {
             let n =
                 Request::new(None, "notifications/cancelled", json!({"requestId": self.wire_id(id), "reason": why}));
-            let _ = self.write_line(&serde_json::to_string(&n).unwrap()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.write_line(&serde_json::to_string(&n).unwrap()))
+                .await;
         }
         Err(match why {
             "cancelled" => "Tool call aborted by user".to_string(),
@@ -204,9 +244,16 @@ impl Proc {
 
     pub(super) async fn shutdown(&self) {
         if self.mcp().is_none() {
-            let _ = self.write_line(&serde_json::to_string(&Request::new(None, "shutdown", json!({}))).unwrap()).await;
+            let line = serde_json::to_string(&Request::new(None, "shutdown", json!({}))).unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.write_line(&line)).await;
         }
-        self.stdin.lock().await.take();
+        let Ok(mut stdin) = tokio::time::timeout(Duration::from_secs(2), self.stdin.lock()).await else {
+            // A writer is stuck on a full pipe: the plugin is not reading, so stop its group.
+            mu_base::process::terminate_group(self.pid as i32).await;
+            return;
+        };
+        stdin.take();
+        drop(stdin);
         let mut rx = self.dead.subscribe();
         let exited = tokio::time::timeout(Duration::from_secs(2), async {
             while !*rx.borrow_and_update() {
@@ -261,14 +308,10 @@ async fn read_loop(
     proc.pending.fail_all(&format!("plugin {} exited", proc.name));
     slot.detach(&proc);
     proc.stdin.lock().await.take();
-    if proc.pid > 1 {
-        // SAFETY: the plugin runs in its own process group (`process_group(0)`).
-        unsafe { libc::kill(-(proc.pid as i32), libc::SIGTERM) };
-    }
+    // The plugin runs in its own process group (`process_group(0)`).
+    mu_base::process::kill_group(proc.pid as i32, libc::SIGTERM);
     if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
-        if proc.pid > 1 {
-            unsafe { libc::kill(-(proc.pid as i32), libc::SIGKILL) };
-        }
+        mu_base::process::kill_group(proc.pid as i32, libc::SIGKILL);
         let _ = child.wait().await;
     }
     live_groups().lock().unwrap().retain(|g| *g != proc.pid as i32);
@@ -290,23 +333,20 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
             "core/complete" => {
                 let target = p["model"].as_str().or(p["role"].as_str()).unwrap_or("smol").to_string();
                 let providers = shared.providers.borrow().upgrade();
-                let text = match providers {
-                    Some(pr) => tokio::time::timeout(
-                        Duration::from_secs(180),
-                        pr.complete(
+                match providers {
+                    Some(pr) => pr
+                        .complete(
                             &target,
                             p["system"].as_str().unwrap_or(""),
                             p["prompt"].as_str().unwrap_or(""),
                             p["maxTokens"].as_u64().unwrap_or(2048) as u32,
                             &CancellationToken::new(),
-                        ),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok()),
-                    None => None,
-                };
-                Ok(json!({"text": text}))
+                        )
+                        .await
+                        .map(|text| json!({"text": text}))
+                        .map_err(|e| e.to_string()),
+                    None => Err(format!("no model configured for role {target}")),
+                }
             }
             "core/webSearch" if proc.name == "web" => {
                 mu_provider::auth::web::plugin_config(&mu_provider::auth::store::Store::new()).await
@@ -326,7 +366,7 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
             Ok(v) => Response::ok(id, v),
             // A token that could not be fetched is a failed request, not a missing method.
             Err(e)
-                if matches!(req.method.as_str(), "core/mcpToken" | "core/webSearch")
+                if matches!(req.method.as_str(), "core/mcpToken" | "core/webSearch" | "core/complete")
                     && !e.starts_with("method not found") =>
             {
                 Response::err(id, -32603, e)
@@ -456,5 +496,22 @@ impl PluginHost {
             });
         }
         Ok(proc)
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn child_groups_lists_a_child_in_its_own_group() {
+        let mut child = std::process::Command::new("sh").args(["-c", "sleep 30"]).process_group(0).spawn().unwrap();
+        let pid = child.id() as i32;
+        let groups = child_groups(std::process::id() as i32);
+        // SAFETY: plain kill(2) on the test's own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait();
+        assert!(groups.contains(&pid), "{pid} not in {groups:?}");
     }
 }

@@ -313,7 +313,13 @@ impl PluginHost {
         });
         let res = match &mcp_call {
             Some((_, _, params, timeout)) => proc.request_c("tools/call", params.clone(), *timeout, Some(cancel)).await,
-            None => proc.request_c("tool/call", json!({"name": name, "arguments": args}), None, Some(cancel)).await,
+            None => {
+                let timeout = match &slot.kind {
+                    Kind::Native { manifest } => Some(manifest.timeout),
+                    Kind::Mcp(_) => None,
+                };
+                proc.request_c("tool/call", json!({"name": name, "arguments": args}), timeout, Some(cancel)).await
+            }
         };
         if self.lifetime_of(&slot) == Lifetime::Call {
             stop_slot(&slot, &proc).await;

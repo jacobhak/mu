@@ -86,6 +86,8 @@ pub struct Manifest {
     pub hooks: Vec<String>,
     pub provider: Option<String>,
     pub tools: Vec<ToolSpec>,
+    /// Limit on one native `tool/call`.
+    pub timeout: Duration,
     pub dir: PathBuf,
 }
 
@@ -101,6 +103,8 @@ struct Raw {
     provider: Option<String>,
     #[serde(default)]
     tools: Vec<RawTool>,
+    #[serde(default)]
+    timeout: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +124,10 @@ fn load_one(dir: &Path) -> Result<Manifest, String> {
         None => Lifetime::Session,
         Some(l) => Lifetime::parse(l).ok_or_else(|| format!("bad lifetime `{l}`"))?,
     };
+    let timeout = match raw.timeout.as_deref() {
+        None => Duration::from_secs(300),
+        Some(t) => mu_base::config::parse_duration(t).ok_or_else(|| format!("bad timeout `{t}`"))?,
+    };
     let mut tools = Vec::new();
     for t in raw.tools {
         let p = dir.join(&t.schema);
@@ -136,6 +144,7 @@ fn load_one(dir: &Path) -> Result<Manifest, String> {
         hooks: raw.hooks,
         provider: raw.provider,
         tools,
+        timeout,
         dir: dir.into(),
     })
 }
@@ -172,6 +181,23 @@ mod tests {
         assert_eq!(Lifetime::parse("idle:5x"), None);
         assert_eq!(Lifetime::parse("idle:"), None);
         assert_eq!(Lifetime::parse("idle:5é"), None);
+    }
+
+    fn load_with(extra: &str) -> Result<Manifest, String> {
+        let d = std::env::temp_dir().join(format!("mu-man-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("plugin.toml"), format!("name = \"x\"\ncommand = [\"x\"]\n{extra}")).unwrap();
+        let m = load_one(&d);
+        let _ = std::fs::remove_dir_all(d);
+        m
+    }
+
+    #[test]
+    fn native_tool_timeout_defaults_and_parses() {
+        assert_eq!(load_with("").unwrap().timeout, Duration::from_secs(300));
+        assert_eq!(load_with("timeout = \"90s\"\n").unwrap().timeout, Duration::from_secs(90));
+        let err = load_with("timeout = \"soon\"\n").unwrap_err();
+        assert_eq!(err, "bad timeout `soon`");
     }
 
     #[test]

@@ -128,6 +128,7 @@ mod tests {
             hooks: vec![],
             provider: None,
             tools: vec![manifest::ToolSpec::with_schema("web_search", serde_json::json!({}))],
+            timeout: std::time::Duration::from_secs(300),
             dir: dir.clone(),
         };
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();

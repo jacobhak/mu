@@ -166,7 +166,7 @@ impl Bridge {
 
     /// Hands `r` to the transport. Send futures are pushed and polled in order, so rmcp's ordering
     /// barrier for initialize and initialized keeps the handshake in order.
-    fn dispatch(&mut self, r: Retry) -> Result<(), String> {
+    async fn dispatch(&mut self, r: Retry) -> Result<(), String> {
         if r.replay
             && let Some(id) = r.msg.get("id")
             && !self.swallow.contains(id)
@@ -176,7 +176,15 @@ impl Bridge {
         let typed: ClientJsonRpcMessage = match serde_json::from_value(r.msg.clone()) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("mu-mcp-http: dropped a message the MCP schema rejects: {e}");
+                let reason = format!("dropped a message the MCP schema rejects: {e}");
+                eprintln!("mu-mcp-http: {reason}");
+                // A rejected core request must still get its answer, or the core waits for it.
+                if let Some(id) = r.msg.get("id")
+                    && method_of(&r.msg).is_some()
+                {
+                    let reply = json!({"jsonrpc":"2.0","id":id,"error":{"code":-32600,"message":reason}});
+                    self.emit(&reply).await?;
+                }
                 return Ok(());
             }
         };
@@ -198,7 +206,7 @@ impl Bridge {
             }
             self.connect();
         }
-        self.dispatch(r)
+        self.dispatch(r).await
     }
 
     /// Asks the core for a token, unless a request is already outstanding.
@@ -240,7 +248,7 @@ impl Bridge {
         }
         if generation < self.generation {
             // Sent on a transport that was replaced since; the current one carries the latest token.
-            return self.dispatch(r);
+            return self.dispatch(r).await;
         }
         self.episode_401s += 1;
         if self.episode_401s > 2 {
@@ -266,7 +274,7 @@ impl Bridge {
         }
         queue.extend(msgs);
         for r in queue {
-            self.dispatch(r)?;
+            self.dispatch(r).await?;
         }
         Ok(())
     }
@@ -287,7 +295,11 @@ impl Bridge {
                 return Err("the server dropped the session again right after re-initializing".into());
             }
             let retry = Retry { attempt: r.attempt + 1, ..r };
-            return if generation < self.generation { self.dispatch(retry) } else { self.rebuild(vec![retry]).await };
+            return if generation < self.generation {
+                self.dispatch(retry).await
+            } else {
+                self.rebuild(vec![retry]).await
+            };
         }
         Err(format!("transport error: {err}"))
     }

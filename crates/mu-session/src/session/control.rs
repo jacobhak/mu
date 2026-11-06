@@ -114,8 +114,7 @@ fn terminate_leader(pid: u32) -> Result<String, String> {
     if unsafe { libc::getpgid(p) } != p {
         return Err(format!("pid {pid} does not lead its own process group; nothing was signalled"));
     }
-    // SAFETY: as above.
-    if unsafe { libc::kill(-p, libc::SIGTERM) } == 0 {
+    if mu_base::process::kill_group(p, libc::SIGTERM) {
         Ok(format!("asked pid {pid} to terminate"))
     } else {
         Err(format!("cannot signal pid {pid}: {}", std::io::Error::last_os_error()))

@@ -96,6 +96,9 @@ pub enum Frame {
     Response(Response),
 }
 
+/// Longest line kept in memory. A longer one is dropped and reported as `Line::Bad`.
+pub const MAX_LINE: usize = 64 * 1024 * 1024;
+
 /// Reads newline-delimited JSON-RPC from any async reader. Lines are read as bytes, so one invalid
 /// UTF-8 line is reported and skipped instead of ending the stream.
 pub struct Framed<R> {
@@ -115,13 +118,41 @@ impl<R: tokio::io::AsyncBufRead + Unpin> Framed<R> {
         Self { reader, buf: Vec::new() }
     }
 
-    /// The next non-blank line, or `None` at end of input or on a read error.
+    /// The next non-blank line, or `None` at end of input or on a read error. A line over `MAX_LINE`
+    /// is consumed to its end and reported as `Line::Bad`, so the stream goes on.
     pub async fn next_line(&mut self) -> Option<Line> {
         loop {
             self.buf.clear();
-            match self.reader.read_until(b'\n', &mut self.buf).await {
-                Ok(0) | Err(_) => return None,
-                Ok(_) => {}
+            let mut dropped = false;
+            let mut saw_bytes = false;
+            loop {
+                let chunk = self.reader.fill_buf().await.ok()?;
+                if chunk.is_empty() {
+                    break;
+                }
+                saw_bytes = true;
+                let (end, used) = match chunk.iter().position(|b| *b == b'\n') {
+                    Some(i) => (true, i + 1),
+                    None => (false, chunk.len()),
+                };
+                if !dropped {
+                    if self.buf.len() + used > MAX_LINE {
+                        dropped = true;
+                        self.buf = Vec::new();
+                    } else {
+                        self.buf.extend_from_slice(&chunk[..used]);
+                    }
+                }
+                self.reader.consume(used);
+                if end {
+                    break;
+                }
+            }
+            if !saw_bytes {
+                return None;
+            }
+            if dropped {
+                return Some(Line::Bad(format!("line longer than {} MiB dropped", MAX_LINE >> 20)));
             }
             if self.buf.iter().all(u8::is_ascii_whitespace) {
                 continue;
@@ -303,6 +334,26 @@ mod tests {
             assert!(matches!(f.next_frame().await, Some(Frame::Response(r)) if r.id == 2));
             assert!(f.next_frame().await.is_none());
         });
+    }
+
+    #[test]
+    fn an_overlong_line_is_dropped_and_the_stream_goes_on() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut data = vec![b'a'; MAX_LINE + 1024 * 1024];
+            data.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":1}\n");
+            let mut f = Framed::new(BufReader::new(&data[..]));
+            match f.next_line().await {
+                Some(Line::Bad(why)) => assert_eq!(why, "line longer than 64 MiB dropped"),
+                _ => panic!("expected the overlong line to be reported as bad"),
+            }
+            assert!(matches!(f.next_line().await, Some(Line::Value(_))));
+            assert!(f.next_line().await.is_none());
+        });
+    }
+
+    #[test]
+    fn pending_routes_replies() {
         let p = Pending::default();
         let (id, rx) = p.register();
         let (id2, rx2) = p.register();

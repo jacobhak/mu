@@ -78,14 +78,18 @@ fn queue_len_in(root: &Path) -> usize {
     std::fs::read_to_string(queue_path(root)).map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
-/// The model call. `Ok(None)` when no model serves the role.
+/// The model call. `Ok(None)` only when no model serves the role; any other failure is an error.
 async fn complete_rpc(system: String, prompt: String) -> Result<Option<String>, String> {
     let r = mu_common::rpc::request(
         "core/complete",
         json!({"role": "memory", "system": system, "prompt": prompt, "maxTokens": MAX_TOKENS}),
     )
-    .await?;
-    Ok(r["text"].as_str().map(str::to_string))
+    .await;
+    match r {
+        Ok(r) => Ok(r["text"].as_str().map(str::to_string)),
+        Err(e) if e.starts_with("no model configured") => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn notify_ui(msg: &str) {
@@ -488,6 +492,18 @@ mod tests {
             assert!(run_job(&env.root, &job, &cfg(), &model).await.is_err());
             assert_eq!(fake.calls(), 2);
             assert!(read_cursor(&env.root, "s6").is_none());
+        });
+    }
+
+    #[test]
+    fn a_model_error_other_than_no_model_reaches_the_job_error() {
+        let env = env("rate");
+        let job = session(&env, "s8", 2);
+        let model =
+            |_: String, _: String| std::future::ready(Err::<Option<String>, String>("HTTP 429: rate limited".into()));
+        rt().block_on(async {
+            let e = run_job(&env.root, &job, &cfg(), &model).await.unwrap_err();
+            assert!(e.contains("HTTP 429: rate limited"), "{e}");
         });
     }
 

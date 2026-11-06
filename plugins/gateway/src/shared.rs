@@ -55,6 +55,9 @@ pub struct State {
     pub url: String,
     /// The `omp auth-broker` URL. Absent in state.json files written before `broker/endpoint` existed.
     pub broker_url: Option<String>,
+    /// The daemon's omp children (broker, gateway), each the leader of its own process group. Absent
+    /// in state.json files written before this field existed.
+    pub kids: Vec<i32>,
 }
 
 pub fn read_state(dir: &Path) -> Option<State> {
@@ -63,14 +66,25 @@ pub fn read_state(dir: &Path) -> Option<State> {
         pid: v["pid"].as_i64()? as i32,
         url: v["url"].as_str()?.to_string(),
         broker_url: v["brokerUrl"].as_str().filter(|u| !u.is_empty()).map(str::to_string),
+        kids: v["kids"]
+            .as_array()
+            .map_or_else(Vec::new, |a| a.iter().filter_map(|k| k.as_i64()).map(|k| k as i32).collect()),
     })
 }
 
-/// Writes `state.json` atomically (tmp + rename).
+/// Writes a state with no children recorded (the tests in `main.rs` set up states this way).
+#[cfg(test)]
 pub fn write_state(dir: &Path, pid: u32, url: &str, broker_url: &str) -> io::Result<()> {
+    write_state_with_kids(dir, pid, url, broker_url, &[])
+}
+
+/// As `write_state`, also recording the daemon's child pids, so a later start can clean them up
+/// after a crash.
+pub fn write_state_with_kids(dir: &Path, pid: u32, url: &str, broker_url: &str, kids: &[i32]) -> io::Result<()> {
     let started = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let tmp = dir.join("state.json.tmp");
-    fs::write(&tmp, json!({"pid": pid, "url": url, "brokerUrl": broker_url, "startedAt": started}).to_string())?;
+    let body = json!({"pid": pid, "url": url, "brokerUrl": broker_url, "kids": kids, "startedAt": started});
+    fs::write(&tmp, body.to_string())?;
     fs::rename(tmp, dir.join("state.json"))
 }
 
@@ -171,6 +185,15 @@ mod tests {
         let st = read_state(&dir).expect("state");
         assert_eq!((st.pid, st.url.as_str()), (42, "http://127.0.0.1:1"));
         assert_eq!(st.broker_url.as_deref(), Some("http://127.0.0.1:2"));
+    }
+
+    #[test]
+    fn state_records_the_daemon_children() {
+        let dir = scratch("state-kids");
+        write_state_with_kids(&dir, 42, "http://127.0.0.1:1", "http://127.0.0.1:2", &[7, 8]).unwrap();
+        assert_eq!(read_state(&dir).expect("state").kids, [7, 8]);
+        write_state(&dir, 42, "http://127.0.0.1:1", "http://127.0.0.1:2").unwrap();
+        assert!(read_state(&dir).expect("state").kids.is_empty());
     }
 
     #[test]

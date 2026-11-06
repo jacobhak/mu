@@ -37,6 +37,7 @@ done
         hooks: vec![],
         provider: None,
         tools: vec![manifest::ToolSpec::with_schema("slow", json!({}))],
+        timeout: std::time::Duration::from_secs(300),
         dir: dir.clone(),
     };
     let (ntx, _nrx) = mpsc::unbounded_channel();
@@ -466,6 +467,7 @@ while :; do sleep 100 & wait; done
             hooks: vec![],
             provider: None,
             tools: vec![manifest::ToolSpec::with_schema("slow", json!({}))],
+            timeout: std::time::Duration::from_secs(300),
             dir: dir.clone(),
         };
         let (ntx, _nrx) = mpsc::unbounded_channel();
