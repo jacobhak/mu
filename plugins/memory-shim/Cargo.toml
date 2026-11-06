@@ -1,9 +1,0 @@
-[package]
-name = "mu-memory"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-mu-common = { path = "../../crates/mu-common" }
-fs4 = { version = "1", features = ["sync"] }
-libc = "0.2"

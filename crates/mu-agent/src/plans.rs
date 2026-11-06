@@ -40,26 +40,7 @@ pub async fn base_label(meta: &PlanMeta, cwd: &Path) -> String {
     s
 }
 
-/// The main checkout of the clone `cwd` is in, or `cwd` outside git.
-pub async fn main_checkout(cwd: &Path) -> PathBuf {
-    let root = repo_root(cwd).await.ok();
-    let common = git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None).await;
-    let common = match common {
-        Ok(s) => Some(PathBuf::from(s.trim())),
-        // Git older than 2.31: the common dir may come back relative.
-        Err(_) => git(cwd, &["rev-parse", "--git-common-dir"], None).await.ok().map(|s| cwd.join(s.trim())),
-    };
-    match common {
-        Some(c) if root.is_some() => {
-            if c.file_name().is_some_and(|n| n == ".git") {
-                c.parent().map(Path::to_path_buf).unwrap_or(c)
-            } else {
-                c
-            }
-        }
-        _ => cwd.to_path_buf(),
-    }
-}
+pub use mu_base::git::main_checkout;
 
 pub async fn store_for(cwd: &Path) -> Store {
     Store {

@@ -1,14 +1,16 @@
 //! The TUI's event loop and the state it runs on. The method groups live in the sibling files:
 //! `agent_view` (the agent-event reducer), `ui_msgs` (results of background work and the tick),
 //! `slash` (what the composer submits), `pickers` (overlays), `child` (programs that take the
-//! terminal), `keys` (input routing and API keys), `mcp` (`/mcp`), and `services` (the writes that
-//! leave the screen: config, stored keys, MCP definitions, session control).
+//! terminal), `keys` (input routing and API keys), `mcp` (`/mcp`),
+//! `memory` (`/memory`), and `services` (the writes that leave the screen: config, stored keys, MCP
+//! definitions, session control).
 
 mod agent_view;
 mod chatgpt;
 mod child;
 mod keys;
 mod mcp;
+mod memory;
 mod pickers;
 mod services;
 mod slash;

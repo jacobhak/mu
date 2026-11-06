@@ -79,6 +79,14 @@ pub enum McpPick {
     Wizard,
 }
 
+/// A row of the `/memory` picker.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MemoryPick {
+    /// A memory file (the user's, this repository's, or a note), opened in `$EDITOR`.
+    File(PathBuf),
+    History,
+}
+
 pub enum Overlay {
     Model {
         sel: Select,
@@ -154,6 +162,16 @@ pub enum Overlay {
     Jobs {
         st: Box<JobsPanel>,
     },
+    /// `/memory`: the memory files and notes, then the history. Empty while the list loads.
+    Memory {
+        sel: Select,
+        picks: Vec<MemoryPick>,
+    },
+    /// `/memory` history: the commits, newest first; `shas` are their ids.
+    MemoryLog {
+        sel: Select,
+        shas: Vec<String>,
+    },
 }
 
 /// What the user chose; the app carries it out.
@@ -219,6 +237,14 @@ pub enum OverlayEvent {
     },
     /// Take over a `-p` run: the panel closes and `mu take` runs on the terminal.
     TakeSession(PathBuf),
+    /// Open a memory file in `$EDITOR`.
+    MemoryOpen(PathBuf),
+    /// Load the memory history.
+    MemoryHistory,
+    /// Show a commit's message and diff.
+    MemoryShow(String),
+    /// Revert a commit.
+    MemoryRevert(String),
 }
 
 /// The question as a picker: its options, a free-text row, multi-select, the recommended choice
@@ -486,7 +512,9 @@ impl Overlay {
             | Overlay::Session { sel, .. }
             | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
-            | Overlay::Copy { sel, .. } => Some(sel),
+            | Overlay::Copy { sel, .. }
+            | Overlay::Memory { sel, .. }
+            | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::Ask(a) => Some(&a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
@@ -504,7 +532,9 @@ impl Overlay {
             | Overlay::Session { sel, .. }
             | Overlay::Rewind { sel, .. }
             | Overlay::Plans { sel, .. }
-            | Overlay::Copy { sel, .. } => Some(sel),
+            | Overlay::Copy { sel, .. }
+            | Overlay::Memory { sel, .. }
+            | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::Ask(a) => Some(&mut a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
@@ -667,6 +697,32 @@ impl Overlay {
                 }
                 _ => (None, None),
             },
+            Overlay::Memory { mut sel, picks } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Memory { sel, picks }), None),
+                SelectResult::Chosen(i) => {
+                    let ev = i.first().and_then(|i| picks.get(*i)).map(|p| match p {
+                        MemoryPick::File(path) => OverlayEvent::MemoryOpen(path.clone()),
+                        MemoryPick::History => OverlayEvent::MemoryHistory,
+                    });
+                    (None, ev)
+                }
+                _ => (None, None),
+            },
+            Overlay::MemoryLog { mut sel, shas } => {
+                // `r` is the revert key unless the filter holds text, which then takes it.
+                if k.code == KeyCode::Char('r') && k.modifiers.is_empty() && !sel.is_filtering() {
+                    let ev = sel.highlighted().and_then(|i| shas.get(i)).cloned().map(OverlayEvent::MemoryRevert);
+                    return (Some(Overlay::MemoryLog { sel, shas }), ev);
+                }
+                match sel.on_key(k) {
+                    SelectResult::Pending => (Some(Overlay::MemoryLog { sel, shas }), None),
+                    SelectResult::Chosen(i) => {
+                        let ev = i.first().and_then(|i| shas.get(*i)).cloned().map(OverlayEvent::MemoryShow);
+                        (Some(Overlay::MemoryLog { sel, shas }), ev)
+                    }
+                    _ => (None, None),
+                }
+            }
             Overlay::Review { mut review, mut reply, stored } => match review.on_key(k) {
                 ReviewResult::Pending => (Some(Overlay::Review { review, reply, stored }), None),
                 ReviewResult::Copy => {
@@ -740,6 +796,43 @@ mod tests {
         assert!(rest.select().is_some() && rest.select_mut().is_some());
         rest.on_paste("ne");
         assert!(matches!(rest.on_key(key(KeyCode::Esc)), (None, None)));
+    }
+
+    #[test]
+    fn memory_picker_opens_a_file_or_loads_the_history() {
+        let picks = vec![MemoryPick::File("/m/user.md".into()), MemoryPick::History];
+        let ov = Overlay::Memory { sel: Select::new("m", items(&["User", "History"])), picks: picks.clone() };
+        let (rest, ev) = ov.on_key(key(KeyCode::Enter));
+        assert!(rest.is_none());
+        assert!(matches!(ev, Some(OverlayEvent::MemoryOpen(p)) if p.to_str() == Some("/m/user.md")));
+        let ov = Overlay::Memory { sel: Select::new("m", items(&["User", "History"])), picks };
+        let (rest, ev) = ov.on_key(key(KeyCode::Down));
+        assert!(ev.is_none());
+        let (rest, ev) = rest.expect("still open").on_key(key(KeyCode::Enter));
+        assert!(rest.is_none() && matches!(ev, Some(OverlayEvent::MemoryHistory)));
+    }
+
+    #[test]
+    fn memory_picker_closes_while_it_loads_on_enter() {
+        let ov = Overlay::Memory { sel: Select::new("m", items(&["Loading…"])), picks: vec![] };
+        assert!(matches!(ov.on_key(key(KeyCode::Enter)), (None, None)));
+    }
+
+    #[test]
+    fn memory_history_shows_a_commit_and_reverts_the_highlighted_one_on_r() {
+        let shas: Vec<String> = vec!["aaa".into(), "bbb".into()];
+        let ov = Overlay::MemoryLog { sel: Select::new("h", items(&["one", "two"])), shas };
+        let (rest, ev) = ov.on_key(key(KeyCode::Enter));
+        assert!(matches!(ev, Some(OverlayEvent::MemoryShow(s)) if s == "aaa"));
+        let (rest, ev) = rest.expect("the history stays open after a diff").on_key(key(KeyCode::Down));
+        assert!(ev.is_none());
+        let (rest, ev) = rest.expect("still open").on_key(key(KeyCode::Char('r')));
+        assert!(matches!(ev, Some(OverlayEvent::MemoryRevert(s)) if s == "bbb"));
+        let (rest, ev) = rest.expect("the history stays open after a revert").on_key(key(KeyCode::Char('o')));
+        assert!(ev.is_none(), "typing filters the list");
+        let (rest, ev) = rest.expect("still open").on_key(key(KeyCode::Char('r')));
+        assert!(ev.is_none(), "with the filter holding text, r is typed into it");
+        assert!(matches!(rest.expect("still open").on_key(key(KeyCode::Esc)), (None, None)));
     }
 
     #[test]

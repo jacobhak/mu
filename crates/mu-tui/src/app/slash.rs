@@ -10,7 +10,7 @@ use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
 
-const BUILTIN_DESC: [(&str, &str, bool); 28] = [
+const BUILTIN_DESC: [(&str, &str, bool); 29] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -38,6 +38,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 28] = [
     ("image", "Attach an image file", true),
     ("jobs", "Show background jobs and other mu sessions", false),
     ("plans", "Approve, refine or drop a parked plan", false),
+    ("memory", "Show and edit memory: files, notes and history; revert a commit", false),
     ("deliver", "Implement, review and commit a parked plan in a worktree [id]", false),
 ];
 
@@ -252,6 +253,7 @@ impl App {
             "reply" => self.open_reply(),
             "image" => self.image_cmd(arg),
             "jobs" => self.jobs_cmd(arg),
+            "memory" => self.open_memory(),
             _ => {
                 if let Some(sk) = name.strip_prefix("skill:") {
                     match self.ctx.skill_prompt(sk, arg) {

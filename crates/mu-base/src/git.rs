@@ -1,7 +1,7 @@
 //! Git runner, and branch and working-tree counts from one `git status --porcelain=v2 --branch`.
 //! Runs off the draw path (the agent calls it after each turn).
 use crate::events::GitInfo;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -41,6 +41,38 @@ pub(crate) async fn git_for(
         let err = String::from_utf8_lossy(&out.stderr);
         Err(err.lines().next().unwrap_or("git failed").trim().to_string())
     }
+}
+
+/// The top level of the working tree `cwd` is in.
+pub async fn repo_root(cwd: &Path) -> Result<PathBuf, String> {
+    git(cwd, &["rev-parse", "--show-toplevel"], None).await.map(|s| PathBuf::from(s.trim()))
+}
+
+/// The main checkout of the clone `cwd` is in, or `cwd` outside git.
+pub async fn main_checkout(cwd: &Path) -> PathBuf {
+    let root = repo_root(cwd).await.ok();
+    let common = git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None).await;
+    let common = match common {
+        Ok(s) => Some(PathBuf::from(s.trim())),
+        // Git older than 2.31: the common dir may come back relative.
+        Err(_) => git(cwd, &["rev-parse", "--git-common-dir"], None).await.ok().map(|s| cwd.join(s.trim())),
+    };
+    match common {
+        Some(c) if root.is_some() => {
+            if c.file_name().is_some_and(|n| n == ".git") {
+                c.parent().map(Path::to_path_buf).unwrap_or(c)
+            } else {
+                c
+            }
+        }
+        _ => cwd.to_path_buf(),
+    }
+}
+
+/// The directory name per-repository state is kept under: `encode_cwd` of the main checkout, so every
+/// worktree of one clone shares it.
+pub async fn repo_key(cwd: &Path) -> String {
+    mu_common::paths::encode_cwd(&main_checkout(cwd).await)
 }
 
 /// The first 7 characters of a sha.
@@ -92,6 +124,22 @@ pub(crate) fn parse_porcelain_v2(out: &str) -> GitInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worktrees_of_one_clone_share_the_main_checkout_and_key() {
+        use mu_testutil::{block_on, repo, sh, tmp};
+        let main = repo();
+        let wt = tmp().join("wt");
+        sh(&main, &["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()]);
+        let outside = tmp();
+        block_on(async {
+            assert_eq!(main_checkout(&main).await, main);
+            assert_eq!(main_checkout(&wt).await, main);
+            assert_eq!(repo_root(&wt).await.unwrap(), wt.canonicalize().unwrap());
+            assert_eq!(repo_key(&wt).await, repo_key(&main).await);
+            assert_eq!(main_checkout(&outside).await, outside);
+            assert!(repo_root(&outside).await.is_err());
+        });
+    }
 
     #[test]
     fn parses_branch_and_counts() {

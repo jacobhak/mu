@@ -14,7 +14,7 @@ mu migrate-profile NAME [--dry-run]
 
 ## Profile home
 
-Everything one omp profile's work produces lives in its profile home: `~/.mu` (`$MU_HOME`) without a profile, `~/.mu/profiles/<name>` under one. That covers sessions, their owner records and inbox, artifacts and `local://` files, image blobs, durable plans and deliveries, prompt history, the ghost-text corpus, cached MCP tool lists, API keys and model caches. Profiles never see each other's: `-c`, `--resume`, `/plans` and the jobs panel show only the active profile's. Install-wide files stay in `~/.mu`: `bin/`, `plugins/`, `logs/`, `themes/`, `models/` and `config.toml`.
+Everything one omp profile's work produces lives in its profile home: `~/.mu` (`$MU_HOME`) without a profile, `~/.mu/profiles/<name>` under one. That covers sessions, their owner records and inbox, artifacts and `local://` files, image blobs, durable plans and deliveries, memory and the session search index, prompt history, the ghost-text corpus, cached MCP tool lists, API keys and model caches. Profiles never see each other's: `-c`, `--resume`, `/plans` and the jobs panel show only the active profile's. Install-wide files stay in `~/.mu`: `bin/`, `plugins/`, `logs/`, `themes/`, `models/` and `config.toml`.
 
 Before this split, mu kept that state in `~/.mu` for every profile. `mu migrate-profile NAME` moves it into `NAME`'s profile home once: close every mu first (it refuses while a session in `~/.mu` is open), and `--dry-run` lists what would move. Where the profile already has a file of the same name, the profile's copy wins: identical files are dropped, prompt history is joined (older lines first) and any other clash stays in place and is reported (exit 1). Session headers, plans and deliveries name sessions by absolute path; those paths are rewritten to the new location so subagent and fork links survive.
 
@@ -27,5 +27,7 @@ While a turn runs, Enter steers (the message is delivered after the current tool
 Besides the built-in slash commands, prompt templates from `.omp/commands`, `<agentDir>/commands`, `.claude/commands` and `.omp/prompts` run as slash commands, and skills as `/skill:<name>`.
 
 `/copy` opens a picker of recent replies, code blocks and bash commands; `/copy code`, `/copy cmd` and `/copy link` copy the latest one directly. Under tmux the text goes through `tmux load-buffer -w`; otherwise via OSC 52, plus `wl-copy`/`xclip` when a local display exists.
+
+`/memory` opens the memory picker: the user's memory file, this repository's, each note, and the history. Enter on a file opens it in `$VISUAL` or `$EDITOR`. Enter on the history lists the last 50 commits; Enter on one shows its message and diff in the transcript, and `r` reverts it. The history is only there when git is installed and memory has been written. `/memory` waits for a running turn to finish.
 
 Images: paste an image file path, run `/image <path>`, press Ctrl+V (reads `wl-paste`/`xclip`), or paste an image from the terminal clipboard when it supports kitty's OSC 5522 (tmux needs `allow-passthrough on`). PNG, JPEG, GIF and WebP up to 5 MB; no resizing.

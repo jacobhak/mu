@@ -364,6 +364,10 @@ impl App {
                 };
                 self.panel_status(msg);
             }
+            OverlayEvent::MemoryOpen(path) => self.open_memory_file(path),
+            OverlayEvent::MemoryHistory => self.open_memory_history(),
+            OverlayEvent::MemoryShow(sha) => self.show_memory_commit(sha),
+            OverlayEvent::MemoryRevert(sha) => self.revert_memory_commit(sha),
             OverlayEvent::TakeSession(path) => self.take_session(path),
         }
     }

@@ -130,8 +130,8 @@ bump_flow() {
   worktree bump origin/main "$branch"
   rc=0; "$here/bump.sh" "$bwt" "$latest" > "$RUN/bump.log" 2>&1 || rc=$?
   if [ "$rc" = 75 ]; then
-    log "npm package not published yet; retry next run"
-    result=waiting-npm; echo "$result" > "$RUN/result"
+    log "omp release not published yet; retry next run"
+    result=waiting-release; echo "$result" > "$RUN/result"
     return 0
   elif [ "$rc" != 0 ]; then
     tail -n 50 "$RUN/bump.log" >&2

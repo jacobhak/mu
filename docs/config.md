@@ -38,4 +38,9 @@ check = true          # daily release check at startup
 
 [secrets]
 env = []              # extra environment variables whose values count as secrets (redaction is always on; see secrets.md)
+
+[memory]
+review = true         # review sessions in the background and save what is worth keeping (see memory.md)
+user_cap = 1500       # characters in user.md
+project_cap = 4000    # characters in a repository's memory.md
 ```

@@ -84,7 +84,7 @@ fi
 
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
-for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory mu-memory-daemon; do
+for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do
   [ -e "$stage/bin/$b" ] || continue
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"
@@ -101,7 +101,9 @@ for p in gateway web predict memory; do
   mv "$dest.new" "$dest"
   rm -rf "$dest.old"
 done
-[ -d "$stage/plugins/memory" ] || echo "this release has no memory plugin; any installed one is left as is" >&2
+# The memory plugin used to be a Bun daemon; its socket and lock are all it left in $MU_HOME/memory.
+rm -f "$home/bin/mu-memory-daemon" "$home/memory/sock" "$home/memory/lock"
+rmdir "$home/memory" 2>/dev/null || true
 
 # 4. Link
 if [ "$link" = 1 ]; then

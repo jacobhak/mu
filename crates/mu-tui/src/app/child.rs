@@ -15,6 +15,8 @@ pub(super) enum ChildThen {
     ComposerEdit(PathBuf),
     /// The editor was run on the plan file shown in the review overlay.
     PlanEdit(PathBuf),
+    /// The editor was run on a memory file from `/memory`; the file is read on the next use.
+    MemoryEdit,
     /// `mu take` ran on the terminal for a session picked in the jobs panel.
     Take,
 }
@@ -87,6 +89,11 @@ impl App {
                     Err(e) => self.error(&format!("cannot run mu take: {e}")),
                 }
                 self.open_sessions();
+            }
+            ChildThen::MemoryEdit => {
+                if let Err(e) = status {
+                    self.error(&format!("editor failed: {e}"));
+                }
             }
             ChildThen::PlanEdit(path) => {
                 if let Err(e) = status {

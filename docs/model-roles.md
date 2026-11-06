@@ -12,7 +12,7 @@ A role is a name for a model, set in omp's `config.yml` (`modelRoles:`) and shar
 | `scout` | `scout` subagents: read-only research, plan-mode research, the `/review` scouts | `@smol`, then `@default` |
 | `review` | The `/review` lead (its scouts run on `@scout`) | `@plan`, then `@default` |
 | `smol` | Session titles, plugins that ask for a model, a cheap choice when you approve a plan | `@default` |
-| `memory` | The memory plugin | `@smol`, then `@default` |
+| `memory` | The memory plugin's background review of sessions | `@smol`, then `@default` |
 | `slow` | A stronger model offered when you approve a plan | not offered |
 
 Roles in `cycleOrder` are the ones offered when you approve a plan. Roles that only appear in `config.yml` and that nothing in mu or your agents refers to (omp's `commit`, say) are not listed.

@@ -1,6 +1,6 @@
 # Secrets
 
-mu replaces recognisable secrets with placeholders such as `[REDACTED:GEMINI_API_KEY]` before it stores or sends text. This covers tool results, your messages, plugin context such as recalled memories, full output saved to `artifact://` files, and sessions opened with `--resume` (old sessions may hold raw values). Nothing with a secret it recognises reaches the provider, the session file, memory or a subagent's result.
+mu replaces recognisable secrets with placeholders such as `[REDACTED:GEMINI_API_KEY]` before it stores or sends text. This covers tool results, your messages, plugin context such as the memory snapshot, full output saved to `artifact://` files, and sessions opened with `--resume` (old sessions may hold raw values). Nothing with a secret it recognises reaches the provider, the session file, memory or a subagent's result.
 
 What counts as a secret:
 
@@ -22,6 +22,8 @@ Every replacement is recorded in the session as a `secrets_redacted` entry with 
 ```sh
 jq -c 'select(.customType == "secrets_redacted") | .data' ~/.mu/profiles/<name>/sessions/*/*.jsonl  # ~/.mu/sessions without a profile
 ```
+
+Memory has its own pass: every text the `memory` tool or the background review writes goes through the same filter before it is saved, and the tool's reply names any placeholder that replaced a value (`plugin:memory` in the list above is the snapshot). The review reads no tool results, so file and web content never reaches it.
 
 This guards against a careless model printing a key (`env`, `cat .env`, a token in a git remote). It is not a boundary: anything with bash can encode or move a value without mu seeing it. Keep credentials the agent should not have out of the account it runs as.
 

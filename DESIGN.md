@@ -121,13 +121,13 @@ The tools-to-provider edge exists because the plugin host serves `core/complete`
 
 | Hook | Fires | Plugin may | Used by |
 |---|---|---|---|
-| `session_start` | Session opens or resumes | Return context to inject | memory (recall) |
-| `prompt_submit` | User sends a prompt | Return context to inject | memory |
+| `session_start` | Session opens or resumes | Return context to inject | — |
+| `prompt_submit` | User sends a prompt | Return context to inject | memory (snapshot on the first prompt; starts queued reviews) |
 | `tool_call` | Before a tool runs | Block, rewrite arguments | approval-style plugins |
 | `tool_result:<tool>` | After a tool runs | Append context to the result | result-annotating plugins |
-| `turn_end` | Assistant turn completes | Observe the turn | memory (retain), advisor |
-| `pre_compaction` | Before compaction | Return context to preserve | memory |
-| `session_end` | Session closes | Flush state | memory |
+| `turn_end` | Assistant turn completes | Observe the turn | advisor |
+| `pre_compaction` | Before compaction | Return context to preserve | memory (starts a background review) |
+| `session_end` | Session closes | Flush state | memory (queues a review) |
 
 ### Plugin ↔ core calls
 
@@ -150,7 +150,7 @@ All omp features outside the core become first-party plugins that load on use.
 | gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider without a native API key in mu, OAuth logins, account pools, quota. See Providers. |
 | mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It is a separate Cargo project outside the workspace so that the core does not build `rmcp`; it installs its own rustls crypto provider. It answers any `core/*` request a server sends with -32601. |
 | web | yes | Rust; fetch. Search uses the model provider's own search tool (Anthropic/OpenAI), so no extra key; models without one get no search. Passing server tools through the gateway still needs verifying. |
-| memory | yes | Day one: wraps the `mnemopi` CLI against the user's existing store (a Bun process only during recall/retain). Later: Rust port on the same SQLite schema with `fastembed-rs`. |
+| memory | yes | Rust; curated markdown memory per repository plus a user file, versioned in git, reviewed in the background by the `memory` role, with FTS5 search over past sessions. See docs/memory.md. |
 | prediction | yes | Rust; word n-gram by default, optional SmolLM2-135M. See Prediction below. |
 | debugger, eval, github, browser, ssh | later | — |
 | advisor, commit messages, export/share, usage display | later | Need `core/complete` / `turn_end` |

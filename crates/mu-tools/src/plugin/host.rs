@@ -17,6 +17,8 @@ pub struct InitParams {
     pub cwd: String,
     pub session_id: String,
     pub session_file: Option<String>,
+    /// A subagent's session: plugins that learn from conversations skip it.
+    pub subagent: bool,
 }
 
 /// State shared with every plugin process's reader task.

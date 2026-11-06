@@ -12,6 +12,7 @@ use mu_provider::auth::check::Check;
 use mu_provider::auth::store::Entry;
 use mu_provider::provider::providers::KeyTarget;
 use mu_session::session::tree_cost::TreeCost;
+use serde_json::Value;
 
 pub(super) enum UiMsg {
     ChildDone {
@@ -69,6 +70,16 @@ pub(super) enum UiMsg {
     },
     /// Revoking a signed-out ChatGPT sign-in finished.
     ChatgptRevoked(Result<(), String>),
+    /// The `/memory` picker's files and notes, or why they could not be read.
+    MemoryFiles(Result<Value, String>),
+    MemoryLog(Result<Value, String>),
+    /// A commit's message and diff.
+    MemoryShown(Result<Value, String>),
+    /// A revert finished; `short` names the commit.
+    MemoryReverted {
+        short: String,
+        r: Result<Value, String>,
+    },
 }
 
 impl App {
@@ -125,6 +136,10 @@ impl App {
             UiMsg::ChatgptDone { flow, r } => self.on_chatgpt_done(flow, r),
             UiMsg::ChatgptNotice { flow, text } => self.on_chatgpt_notice(flow, &text),
             UiMsg::ChatgptRevoked(r) => self.on_chatgpt_revoked(r),
+            UiMsg::MemoryFiles(r) => self.show_memory(r),
+            UiMsg::MemoryLog(r) => self.show_memory_log(r),
+            UiMsg::MemoryShown(r) => self.on_memory_shown(r),
+            UiMsg::MemoryReverted { short, r } => self.on_memory_reverted(&short, r),
             UiMsg::LoginProviders(r) => {
                 let (mut items, mut targets) = self.api_key_rows();
                 match r {

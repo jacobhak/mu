@@ -10,7 +10,7 @@ mu keeps most of what omp does and changes where the memory goes. A session hold
 
 - **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3.5 MB of private memory (about 19 MB counting the binary's shared pages).
 - **Features start on use.** Web, memory and prediction are separate processes, and so is the model gateway, which only providers without an API key or ChatGPT sign-in in mu need. Each starts on first use and exits after a few idle minutes. A session that talks only to Anthropic, OpenAI or Baseten with your own key, or to OpenAI on your ChatGPT plan, starts no omp process at all. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
-- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 250 MB while they run, idle), and all sessions share one memory daemon. [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
+- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 250 MB while they run, idle). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
 - **Works with your omp setup.** mu uses omp's config, models, MCP setup, context files and skills, and its login for OAuth providers. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup: the installer bundles omp for the providers that need it, and Anthropic, OpenAI and Baseten work with just an API key (OpenAI models also run on a ChatGPT plan).
 
@@ -44,7 +44,7 @@ scripts/install.sh --from-source .            # build and install a checkout
 
 If the repo is private (or you install from a private fork), the public URLs return 404. `install.sh` and `mu update` then fall back to an authenticated `gh`; fetch the script itself with `gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash`.
 
-This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Releases include the memory daemon as a compiled binary, so they need no Bun; installing `--from-source` needs Bun to build it and otherwise leaves the memory plugin out (keeping any installed one). `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
+This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Installing `--from-source` needs only a Rust toolchain; no Bun. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
 
 Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu auth add <provider>`; those models then run without omp. Or sign in with ChatGPT (`/login`, or `mu auth login openai-chatgpt` from a shell) to run OpenAI models on your plan. omp is only needed for subscription (OAuth) logins, the other providers, web search and fetch, and MCP OAuth: log in with `/login` for those, or `~/.mu/bin/omp login` for `mu -p`.
 
@@ -54,7 +54,7 @@ Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu
 
 ### Pinned omp
 
-`upstream.toml` pins one oh-my-pi release for everything mu uses: the Rust crates (`tag = "v<ver>"` in `Cargo.toml`), `@oh-my-pi/pi-mnemopi` in `plugins/memory`, and the `omp` CLI mu runs as a subprocess. mu runs `$MU_OMP`, else `~/.mu/bin/omp`, else `omp` on PATH, so the `omp` you use interactively can update itself without affecting mu. `scripts/fetch-omp.sh <ver> <dest>` installs a checksummed omp binary.
+`upstream.toml` pins one oh-my-pi release for everything mu uses: the Rust crates (`tag = "v<ver>"` in `Cargo.toml`) and the `omp` CLI mu runs as a subprocess. mu runs `$MU_OMP`, else `~/.mu/bin/omp`, else `omp` on PATH, so the `omp` you use interactively can update itself without affecting mu. `scripts/fetch-omp.sh <ver> <dest>` installs a checksummed omp binary.
 
 ### Manual build
 
@@ -63,7 +63,6 @@ cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web,
 scripts/build-mcp-http.sh                # target/release/mu-mcp-http (see docs/mcp.md)
 mkdir -p ~/.mu/plugins
 for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
-(cd plugins/memory && bun install)       # dev checkout: the memory plugin runs under Bun
 ```
 
 Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web`, `mu-predict` and `mu-mcp-http` are resolved next to the `mu` binary. `MU_GATEWAY_URL` / `MU_GATEWAY_TOKEN` bypass the gateway plugin.

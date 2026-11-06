@@ -223,6 +223,19 @@ impl Select {
         self
     }
 
+    /// The original index of the highlighted item, or `None` when the highlight is on the free-text row.
+    pub fn highlighted(&self) -> Option<usize> {
+        match self.rows().get(self.sel) {
+            Some(Row::Item(i)) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Whether the filter holds text, so that typed keys are the filter's rather than the caller's.
+    pub fn is_filtering(&self) -> bool {
+        !self.filter.is_empty()
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> SelectResult {
         if key.kind == KeyEventKind::Release {
             return SelectResult::Pending;

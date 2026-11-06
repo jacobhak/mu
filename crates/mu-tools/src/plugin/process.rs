@@ -414,6 +414,7 @@ impl PluginHost {
                     "cwd": init.cwd,
                     "sessionId": init.session_id,
                     "sessionFile": init.session_file,
+                    "subagent": init.subagent,
                     "muHome": mu_common::paths::mu_home(),
                     "agentDir": mu_common::paths::omp_agent_dir(),
                 });

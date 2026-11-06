@@ -10,10 +10,7 @@ const MAX_FILES_LISTED: usize = 400;
 const REQUEST: &str = include_str!("../prompts/review-request.md");
 
 pub async fn repo_root(cwd: &Path) -> Result<PathBuf, String> {
-    match git(cwd, &["rev-parse", "--show-toplevel"], None).await {
-        Ok(s) => Ok(PathBuf::from(s.trim())),
-        Err(e) => Err(format!("review needs a git repository: {e}")),
-    }
+    mu_base::git::repo_root(cwd).await.map_err(|e| format!("review needs a git repository: {e}"))
 }
 
 /// A tree sha of the whole working tree, untracked non-ignored files included. Uses a copy of the

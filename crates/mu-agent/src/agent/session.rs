@@ -55,6 +55,7 @@ impl Agent {
             cwd: self.cwd.to_string_lossy().into(),
             session_id: self.session_id(),
             session_file: self.session.as_ref().map(|s| s.path.to_string_lossy().into()),
+            subagent: self.run.subagent,
         });
     }
 

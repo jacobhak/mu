@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "action": { "type": "string", "enum": ["read", "edit"], "description": "`read` returns the current memory (or one note); `edit` applies `ops`" },
+    "note": { "type": "string", "description": "For `read`: the note slug to show instead of the entry files" },
+    "ops": {
+      "type": "array",
+      "description": "For `edit`: applied in order, all or nothing",
+      "items": {
+        "type": "object",
+        "properties": {
+          "op": { "type": "string", "enum": ["add", "replace", "remove", "write_note", "delete_note"] },
+          "file": { "type": "string", "enum": ["user", "project"], "description": "add/replace/remove: `user` (holds everywhere) or `project` (this repository)" },
+          "match": { "type": "string", "description": "replace/remove: a substring that identifies exactly one entry" },
+          "text": { "type": "string", "description": "add/replace: the entry; write_note: the note body" },
+          "note": { "type": "string", "description": "write_note/delete_note: slug, lowercase letters, digits and dashes" },
+          "description": { "type": "string", "description": "write_note: one line shown in the index" },
+          "type": { "type": "string", "enum": ["project", "reference", "feedback"], "description": "write_note: kind of note" }
+        },
+        "required": ["op"]
+      }
+    }
+  },
+  "required": ["action"]
+}

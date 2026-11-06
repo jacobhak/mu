@@ -20,7 +20,6 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -28,5 +27,3 @@ jobs:
         if: always()
       - run: scripts/build-mcp-http.sh test
       - run: node --test scripts/maint/gen-catalog.test.mjs
-      - run: bun test content.test.ts
-        working-directory: plugins/memory

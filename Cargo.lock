@@ -4385,8 +4385,15 @@ name = "mu-memory"
 version = "0.1.0"
 dependencies = [
  "fs4",
- "libc",
+ "mu-base",
  "mu-common",
+ "mu-session",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "uuid",
 ]
 
 [[package]]

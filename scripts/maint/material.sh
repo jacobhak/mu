@@ -16,11 +16,11 @@ fi
 
 d() { git -C "$OMPSRC" diff "v$old" "v$new" -- "${@}" > "$out/$DEST" || true; }
 DEST=changelog.diff; d 'packages/*/CHANGELOG.md'
-DEST=cli.diff; d packages/coding-agent/src/cli packages/mnemopi/src
+DEST=cli.diff; d packages/coding-agent/src/cli
 DEST=crates.diff; d crates/pi-edit crates/pi-shell crates/pi-diff crates/pi-walker crates/vendor
 # stat files: a short index of every changed file
 stat() { git -C "$OMPSRC" diff --stat=200 "v$old" "v$new" -- "${@:2}" > "$out/$1" || true; }
-stat cli.stat packages/coding-agent/src/cli packages/mnemopi/src
+stat cli.stat packages/coding-agent/src/cli
 stat crates.stat crates/pi-edit crates/pi-shell crates/pi-diff crates/pi-walker crates/vendor
 
 cat > "$out/touchpoints.md" <<'TP'
@@ -28,7 +28,6 @@ cat > "$out/touchpoints.md" <<'TP'
 
 - Rust crates pinned in Cargo.toml by tag: `pi-edit`, `pi-shell`, `pi-diff`, `pi-walker`, plus patched `brush-core`, `brush-parser`, `tree-sitter-go`.
 - The `omp` CLI, run as a subprocess (the pinned copy at ~/.mu/bin/omp): `auth-broker`, `auth-gateway`, `models ls --json`, `login`, `search`, `read`, `--version`.
-- `@oh-my-pi/pi-mnemopi` in `plugins/memory` (mnemopi storage format).
 - Provider APIs reached through the omp gateway.
 - omp config read by mu: `config.yml` model roles, status line, theme, skills; `.omp/agents`, `.omp/commands`, `AGENTS.md`.
 TP
