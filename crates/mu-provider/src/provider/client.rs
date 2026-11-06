@@ -219,6 +219,14 @@ impl Providers {
         loop {
             match self.attempt(req, cancel, ev, &mut rekeyed).await {
                 Err(ProviderError::Retryable { msg, retry_after }) if attempt < max_attempts => {
+                    // A relayed error carries its wait in the text; it is held to the same limit as a header.
+                    let retry_after = retry_after.or_else(|| retry::hint(&msg));
+                    if retry_after.is_some() {
+                        let limit = self.cfg.mu.retry.policy(&req.model.provider).limit(retry::context_fill(req));
+                        if let Some(e) = retry::too_long(retry_after, limit) {
+                            return Err(e);
+                        }
+                    }
                     let delay = retry::backoff(attempt, retry_after);
                     ev(StreamEvent::Retry { attempt, delay, reason: msg });
                     tokio::select! {
@@ -757,6 +765,32 @@ mod native_route_tests {
             let (p, d2) = providers(entry("sk-ant-api03-NATIVE0123456789", &base));
             let e = turn(&p, Thinking::Off, &mut Vec::new()).await.unwrap_err();
             assert!(matches!(e, ProviderError::Fatal(_)), "{e:?}");
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            for x in [d, d2] {
+                let _ = std::fs::remove_dir_all(x);
+            }
+        });
+    }
+
+    /// The gateway relays a provider's 429 as an in-stream error whose text ends in `retry-after-ms=N`.
+    #[test]
+    fn a_wait_in_an_error_event_is_honoured() {
+        rt(async {
+            let event = |ms: u32| {
+                let data = json!({"type":"error","error":{"type":"rate_limit_error","message":format!("429 slow down retry-after-ms={ms}")}});
+                Reply::new(200, &format!("event: error\ndata: {data}\n\n")).header("content-type", "text/event-stream")
+            };
+            let (base, seen) = fake_server(vec![event(7), ok()]).await;
+            let (p, d) = providers(entry("test-key", &base));
+            let mut events = Vec::new();
+            turn(&p, Thinking::Off, &mut events).await.unwrap();
+            assert_eq!(seen.lock().unwrap().len(), 2);
+            assert!(events[0].starts_with("retry:7ms:"), "{events:?}");
+
+            let (base, seen) = fake_server(vec![event(301_000)]).await;
+            let (p, d2) = providers(entry("test-key", &base));
+            let e = turn(&p, Thinking::Off, &mut Vec::new()).await.unwrap_err();
+            assert!(matches!(&e, ProviderError::Fatal(m) if m.contains("retry after 5m 1s")), "{e:?}");
             assert_eq!(seen.lock().unwrap().len(), 1);
             for x in [d, d2] {
                 let _ = std::fs::remove_dir_all(x);

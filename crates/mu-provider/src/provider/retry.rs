@@ -21,6 +21,28 @@ pub fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
     }
 }
 
+/// The wait the omp gateway appends to an error's text as `retry-after-ms=N` when it relays a
+/// provider error (an in-stream error event has no headers to carry it).
+pub fn hint(msg: &str) -> Option<Duration> {
+    const KEY: &str = "retry-after-ms=";
+    let mut from = 0;
+    while let Some(i) = msg[from..].find(KEY) {
+        let start = from + i;
+        from = start + KEY.len();
+        if start > 0 && !msg[..start].ends_with(char::is_whitespace) {
+            continue;
+        }
+        let num: String = msg[from..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        if let Ok(ms) = num.parse::<f64>()
+            && ms.is_finite()
+            && ms >= 0.0
+        {
+            return Some(Duration::from_secs_f64(ms / 1000.0));
+        }
+    }
+    None
+}
+
 /// `d` scaled by a factor in 0.8..=1.2; `r` is in 0.0..1.0.
 pub fn jitter(d: Duration, r: f64) -> Duration {
     d.mul_f64(0.8 + 0.4 * r.clamp(0.0, 1.0))
@@ -221,6 +243,10 @@ mod tests {
         assert_eq!(jitter(Duration::from_secs(10), 0.0), Duration::from_secs(8));
         assert_eq!(jitter(Duration::from_secs(10), 1.0), Duration::from_secs(12));
         assert_eq!(backoff(1, Some(Duration::from_secs(7))).as_secs(), 7);
+        assert_eq!(hint(r#"429 {"type":"error"} retry-after-ms=301000"#), Some(Duration::from_secs(301)));
+        assert_eq!(hint("retry-after-ms=1500.5 x"), Some(Duration::from_micros(1_500_500)));
+        assert_eq!(hint("x-retry-after-ms=5"), None);
+        assert_eq!(hint("HTTP 429: slow down"), None);
         let limit = Duration::from_secs(120);
         let e = too_long(Some(Duration::from_secs(900)), limit).unwrap().to_string();
         assert!(e.contains("retry after 15m") && e.contains("up to 2m"), "{e}");
