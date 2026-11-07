@@ -33,6 +33,9 @@ pub struct BashMeta {
     pub artifact: Option<u32>,
     /// The full-output spill was cut short or could not be written.
     pub spill_note: Option<String>,
+    /// Set when the call only started a background job of that id. The command runs on, so the
+    /// result carries no output of its own; the job's is shown when it finishes.
+    pub background: Option<String>,
 }
 
 impl BashMeta {

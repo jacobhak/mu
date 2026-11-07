@@ -413,6 +413,46 @@ fn bash_box_at(
     frame_at(&Card { tone, title: None, sections, footer }, width)
 }
 
+/// How long a job has run, or ran, in seconds.
+fn job_secs(r: &SubagentStatus) -> f64 {
+    let end = r.ended.unwrap_or_else(std::time::SystemTime::now);
+    end.duration_since(r.started).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// `3.4s`, or `3m04s` past a minute.
+fn run_time(secs: f64) -> String {
+    if secs >= 60.0 { format!("{}m{:02}s", secs as u64 / 60, secs as u64 % 60) } else { format!("{secs:.1}s") }
+}
+
+/// How a `bash` job ended, as a footer fact. A clean `exit 0` says nothing, as a foreground run's
+/// footer does.
+fn exit_fact(note: Option<&str>) -> Option<Fact> {
+    let note = note?;
+    if let Some(code) = note.strip_prefix("exit ") {
+        return match code.trim().parse::<i32>() {
+            Ok(0) => None,
+            Ok(c) => Some(Fact::Exit(c)),
+            Err(_) => Some(Fact::Note(note.to_string())),
+        };
+    }
+    Some(match note {
+        "timed out" => Fact::TimedOut,
+        "cancelled" => Fact::Cancelled,
+        other => Fact::Note(other.to_string()),
+    })
+}
+
+/// The result of a finished `bash` job: its command, the newest of its output and a footer with
+/// its run time and how it ended.
+pub fn bash_job_result(r: &SubagentStatus, out: Option<&str>, expanded: bool, width: usize) -> Vec<Line> {
+    let args = serde_json::json!({ "command": r.task });
+    let output: Vec<&str> = out.unwrap_or("").lines().collect();
+    let tone = if r.state == SubagentState::Failed { Tone::Error } else { Tone::Success };
+    let mut footer = vec![Fact::Wall(job_secs(r))];
+    footer.extend(exit_fact(r.note.as_deref()));
+    bash_box(&args, &output, expanded, tone, footer, width)
+}
+
 /// Plain indented result rows, cut at `TEXT_CUT` unless expanded.
 fn text_rows(text: &str, expanded: bool, style: impl Fn(&str) -> ContentStyle) -> Vec<Line> {
     let lines: Vec<&str> = text.lines().collect();
@@ -442,6 +482,11 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
     if name == "bash"
         && let Some(ToolMeta::Bash(m)) = &out.meta
     {
+        if m.background.is_some() {
+            // The call only started a job: it has no output of its own, and its result comes as a
+            // card of its own when the job finishes. One line marks the call.
+            return vec![header_line("●", tfg(Role::Faint), name, args, out.meta.as_ref(), width)];
+        }
         // The command's own output ends where the tool said; nothing after it is parsed.
         let end = m.output_end.min(out.text.len());
         let mut body: Vec<&str> = out.text.get(..end).unwrap_or_default().lines().collect();
@@ -670,12 +715,17 @@ pub fn subagent_rows(rows: &[SubagentStatus], spin: char, cost: impl Fn(&Subagen
                 SubagentState::Done => ('✓', tfg(Role::Ok)),
                 SubagentState::Failed => ('✗', tfg(Role::Err)),
             };
-            let model = r.model.as_deref().map(|m| format!(" · {m}")).unwrap_or_default();
-            let mut row = vec![
-                span(format!("  {mark} "), style),
-                span(r.name.clone(), ContentStyle::default()),
-                span(format!("{model} · {} tools", r.tools), tfg(Role::Muted)),
-            ];
+            let mut row = vec![span(format!("  {mark} "), style), span(r.name.clone(), ContentStyle::default())];
+            match r.kind {
+                // A bash job runs one command: its row says how long it has run, not what it called.
+                JobKind::Bash => row.push(span(format!(" · {}", run_time(job_secs(r))), tfg(Role::Muted))),
+                JobKind::Subagent => {
+                    if let Some(m) = r.model.as_deref() {
+                        row.push(span(format!(" · {m}"), tfg(Role::Muted)));
+                    }
+                    row.push(span(format!(" · {} tools", r.tools), tfg(Role::Muted)));
+                }
+            }
             if let Some(c) = cost(r).filter(|c| *c > 0.0) {
                 row.push(span(" · ", tfg(Role::Muted)));
                 row.push(span(format!("${c:.2}"), tfg(Role::SynType)));
@@ -706,12 +756,11 @@ pub fn job_details(r: &SubagentStatus, out: Option<&str>, width: usize) -> Vec<L
     let inner = width.saturating_sub(6);
     let row =
         |text: String| vec![span("    │ ".to_string(), tfg(Role::Faint)), span(trunc(&text, inner), tfg(Role::Muted))];
-    let secs = std::time::SystemTime::now().duration_since(r.started).map(|d| d.as_secs()).unwrap_or(0);
     let mut rows = Vec::new();
     if let Some(first) = r.task.lines().next().filter(|t| !t.is_empty()) {
         rows.push(row(first.to_string()));
     }
-    rows.push(row(format!("{} · {}m{:02}s · {}", r.agent, secs / 60, secs % 60, r.cwd.display())));
+    rows.push(row(format!("{} · {} · {}", r.agent, run_time(job_secs(r)), r.cwd.display())));
     if r.kind == JobKind::Subagent && !r.last.is_empty() {
         rows.push(row(format!("last: {}", r.last)));
     }
@@ -870,6 +919,79 @@ mod tests {
         let plain = "  ⠋ scout-1 · scout · anthropic/haiku · 4 tools · read a.rs";
         assert_eq!(text(None, SubagentState::Running), plain, "no session, no figure");
         assert_eq!(text(Some(0.0), SubagentState::Running), plain, "unpriced is not free: no `$0.00`");
+    }
+
+    /// A `bash` job that has been running, or ran, for `secs` seconds.
+    fn bash_job(state: SubagentState, secs: f64) -> SubagentStatus {
+        let elapsed = std::time::Duration::from_secs_f64(secs);
+        let running = state == SubagentState::Running;
+        let now = std::time::SystemTime::now();
+        let started = if running { now - elapsed } else { std::time::SystemTime::UNIX_EPOCH };
+        let ended = (!running).then(|| started + elapsed);
+        SubagentStatus {
+            name: "bg_1".into(),
+            agent: "bash".into(),
+            tools: 0,
+            last: "cargo build".into(),
+            state,
+            kind: JobKind::Bash,
+            cwd: "/w".into(),
+            task: "cargo build".into(),
+            started,
+            ended,
+            delivered: true,
+            note: Some("exit 0".into()),
+            session: None,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn an_async_bash_call_is_one_line() {
+        // The result text is for the model; the transcript marks the call and shows the job.
+        let text = "Started background job bg_1.\nWhen it finishes, mu automatically starts your next turn…";
+        let mut out = ToolOutput::ok(text);
+        out.meta =
+            Some(ToolMeta::Bash(BashMeta { output_end: 0, background: Some("bg_1".into()), ..Default::default() }));
+        let t = texts(&tool_result("bash", &json!({"command": "cargo build"}), &out, false, 40));
+        assert_eq!(t, ["● Bash cargo build"]);
+    }
+
+    #[test]
+    fn a_bash_job_row_says_how_long_it_has_run() {
+        let row = |state, secs| text_of(&subagent_rows(&[bash_job(state, secs)], '⠋', |_| None)[0]);
+        assert_eq!(row(SubagentState::Running, 0.0), "  ⠋ bg_1 · 0.0s · cargo build", "no tool count");
+        assert_eq!(row(SubagentState::Running, 12.5), "  ⠋ bg_1 · 12.5s · cargo build");
+        assert_eq!(row(SubagentState::Done, 3.4), "  ✓ bg_1 · 3.4s · cargo build");
+        let long = bash_job(SubagentState::Done, 184.0);
+        assert_eq!(text_of(&subagent_rows(&[long], '⠋', |_| None)[0]), "  ✓ bg_1 · 3m04s · cargo build");
+    }
+
+    #[test]
+    fn a_finished_bash_job_is_a_bash_card_with_its_run_time() {
+        let out = "Compiling mu\nFinished dev profile";
+        let t = texts(&bash_job_result(&bash_job(SubagentState::Done, 3.4), Some(out), false, 40));
+        assert!(t[0].starts_with('╭') && t[0].ends_with('╮'), "{t:?}");
+        assert!(t[1].starts_with("│ $ cargo build") && t[1].ends_with(" │"), "{t:?}");
+        assert!(t[2].starts_with("├─ Output ") && t[2].ends_with('┤'), "{t:?}");
+        assert!(t[3].starts_with("│ Compiling mu") && t[4].starts_with("│ Finished dev"), "{t:?}");
+        assert!(t[5].starts_with("╰─ Wall: 3.4s ") && t[5].ends_with('╯'), "{}", t[5]);
+        assert!(!t[5].contains("Exit"), "a clean exit says nothing: {}", t[5]);
+        assert!(t.iter().all(|l| unicode_width_of(l) == 40), "every row is full width: {t:?}");
+    }
+
+    #[test]
+    fn a_failed_bash_job_keeps_its_exit_and_its_output() {
+        let mut r = bash_job(SubagentState::Failed, 1.5);
+        r.note = Some("exit 2".into());
+        let t = texts(&bash_job_result(&r, Some("boom"), false, 30));
+        let last = t.last().unwrap();
+        assert!(last.contains("Wall: 1.5s") && last.contains("Exit: 2"), "{last}");
+        assert!(t.iter().any(|l| l.contains("boom")), "{t:?}");
+        let top = &bash_job_result(&r, None, false, 30)[0];
+        assert_eq!(top[0].style.foreground_color, theme::get().color(Role::ErrSoft), "the card takes the error tone");
+        r.note = Some("timed out".into());
+        assert!(texts(&bash_job_result(&r, None, false, 30)).last().unwrap().contains("timed out"));
     }
 
     #[test]

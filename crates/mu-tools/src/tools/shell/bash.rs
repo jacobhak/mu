@@ -247,9 +247,11 @@ impl Tools {
         } else {
             "\nShell state from earlier calls was not inherited (the shell was busy or did not answer in time): the job uses mu's own environment.".to_string()
         };
-        ToolOutput::ok(format!(
+        let mut out = ToolOutput::ok(format!(
             "Started background job {id}.{note}\nWhen it finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on it. When your next step needs its result, end your turn now with a short status and no tool call."
-        ))
+        ));
+        out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
+        out
     }
 
     /// The persistent shell's cwd and exported variables, from one state-neutral command. `None`
@@ -558,6 +560,7 @@ fn finish(c: Collected, end: RunEnd) -> ToolOutput {
         cancelled,
         artifact: c.artifact,
         spill_note: c.spill_note,
+        background: None,
     }));
     out
 }
@@ -987,6 +990,11 @@ mod tests {
                 let (tools, jobs) = tools_with_jobs();
                 let out = tools.call("bash", &json!({"command": "echo hi; exit 3", "async": true}), &ctx()).await;
                 assert!(!out.is_error && out.text.contains("bg_1"), "{}", out.text);
+                assert!(
+                    matches!(&out.meta, Some(ToolMeta::Bash(BashMeta { background: Some(id), .. })) if id == "bg_1"),
+                    "{:?}",
+                    out.meta
+                );
                 let done = finished(&jobs).await;
                 assert_eq!(done.len(), 1);
                 assert!(!done[0].ok && done[0].note.as_deref() == Some("exit 3"), "{:?}", done[0].note);
@@ -1045,6 +1053,7 @@ mod tests {
         let tools = Tools::for_test();
         let out = tools.call("bash", &json!({"command": "echo fg", "async": true}), &ctx()).await;
         assert_eq!(out.text.trim(), "fg");
+        assert!(matches!(&out.meta, Some(ToolMeta::Bash(BashMeta { background: None, .. }))), "{:?}", out.meta);
     }
 
     /// A job starts from the cwd and exported variables the persistent shell has at launch, and

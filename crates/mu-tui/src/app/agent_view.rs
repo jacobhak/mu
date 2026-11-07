@@ -302,7 +302,15 @@ impl AgentView {
                     if self.jobs_committed.insert(r.name.clone()) {
                         // Its file is final now, and the periodic read may not have seen the end of it.
                         let cost = r.session.as_deref().map(session_cost);
-                        self.tr.commit(blocks::subagent_rows(std::slice::from_ref(r), ' ', |_| cost));
+                        let lines = match r.kind {
+                            // A bash job's result is its output, run time and end, like a foreground run's.
+                            JobKind::Bash => {
+                                let out = self.job_out.get(&r.name).map(String::as_str);
+                                blocks::bash_job_result(r, out, self.expanded, w)
+                            }
+                            JobKind::Subagent => blocks::subagent_rows(std::slice::from_ref(r), ' ', |_| cost),
+                        };
+                        self.tr.commit(lines);
                     }
                 }
                 self.job_out.retain(|id, _| v.iter().any(|j| &j.name == id));
@@ -745,6 +753,23 @@ mod tests {
         v.on_event(AgentEvent::Jobs(vec![]), SIZE);
         v.on_event(AgentEvent::Jobs(done), SIZE);
         assert_eq!(v.tr.pending.len(), 2 * once, "after an empty snapshot it is printed again");
+    }
+
+    #[test]
+    fn a_finished_bash_job_is_printed_as_its_output_and_run_time() {
+        let mut v = view();
+        let mut done = job("bg_1", SubagentState::Done, JobKind::Bash);
+        done.task = "cargo build".into();
+        done.ended = Some(done.started);
+        done.note = Some("exit 0".into());
+        v.on_event(AgentEvent::Jobs(vec![job("bg_1", SubagentState::Running, JobKind::Bash)]), SIZE);
+        v.on_event(AgentEvent::JobOutput { id: "bg_1".into(), tail: "Compiling mu\n".into() }, SIZE);
+        assert!(v.tr.pending.is_empty(), "a running job only gets a live row");
+        v.on_event(AgentEvent::Jobs(vec![done]), SIZE);
+        let printed: String = v.tr.pending.iter().flat_map(|l| l.iter()).map(|s| s.text.clone()).collect();
+        assert!(printed.contains("$ cargo build"), "{printed}");
+        assert!(printed.contains("Compiling mu"), "the job's output is shown: {printed}");
+        assert!(printed.contains("Wall: 0.0s"), "{printed}");
     }
 
     #[test]
