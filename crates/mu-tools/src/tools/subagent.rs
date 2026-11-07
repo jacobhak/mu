@@ -220,4 +220,5 @@ pub struct BackgroundResult {
     pub text: String,
     /// "exit 3", "timed out", "cancelled", …
     pub note: String,
+    pub meta: Option<mu_base::tool::BashMeta>,
 }

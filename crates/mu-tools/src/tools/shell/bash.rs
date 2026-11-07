@@ -1,4 +1,4 @@
-use crate::jobs::JobsHandle;
+use crate::jobs::{JobsHandle, WaitReady};
 use crate::tools::spill::{Collected, Collector};
 use crate::tools::subagent::BackgroundResult;
 use crate::tools::{ToolCtx, Tools};
@@ -191,6 +191,21 @@ impl PtyRun {
     }
 }
 
+struct ForegroundJobGuard {
+    jobs: Rc<JobsHandle>,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for ForegroundJobGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.jobs.kill(Some(&self.id));
+            self.jobs.discard_result(&self.id);
+        }
+    }
+}
+
 impl Tools {
     pub async fn bash(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
         if let Some(jobs) = &self.jobs
@@ -198,6 +213,14 @@ impl Tools {
             && !a.pty
         {
             return self.bash_background(a, jobs).await;
+        }
+        if self.interruptible_wait_enabled()
+            && !a.pty
+            && !a.r#async
+            && let Some(interrupt) = &ctx.wait_interrupt
+            && let Some(jobs) = &self.jobs
+        {
+            return self.bash_interruptible(a, jobs, ctx, interrupt).await;
         }
         let fallback = a.pty;
         if a.pty
@@ -220,17 +243,92 @@ impl Tools {
     /// `async`: the command runs as a tracked job; its result arrives as a system notice. The job
     /// starts from the persistent shell's cwd and exported environment as of launch.
     async fn bash_background(&self, a: Args, jobs: &Rc<JobsHandle>) -> ToolOutput {
-        if let Err(e) = jobs.check_capacity(1) {
-            return ToolOutput::err(e);
+        let (id, note) = match self.start_bash_job(a, jobs, None, None).await {
+            Ok(started) => started,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let next = if self.interruptible_wait_enabled() {
+            "When it finishes, mu automatically starts your next turn with its result; use `wait` when you need it now. Until then, do other work that does not depend on it."
+        } else {
+            "When it finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on it. When your next step needs its result, end your turn now with a short status and no tool call."
+        };
+        let mut out = ToolOutput::ok(format!("Started background job {id}.{note}\n{next}"));
+        out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
+        out
+    }
+
+    async fn bash_interruptible(
+        &self,
+        a: Args,
+        jobs: &Rc<JobsHandle>,
+        ctx: &ToolCtx,
+        interrupt: &CancellationToken,
+    ) -> ToolOutput {
+        let (id, note) = match self.start_bash_job(a, jobs, Some(&ctx.cancel), Some(self.cwd.clone())).await {
+            Ok(started) => started,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let mut guard = ForegroundJobGuard { jobs: jobs.clone(), id: id.clone(), armed: true };
+        let ids = [id.clone()];
+        let mut ready = jobs.wait_ready(&ids, &ctx.cancel, interrupt).await;
+        if ready == WaitReady::Cancelled {
+            jobs.kill(Some(&id));
+            ready = jobs.wait_ready(&ids, &CancellationToken::new(), &CancellationToken::new()).await;
         }
+        match ready {
+            WaitReady::Ready(_) => {
+                if let Some(done) = jobs.take_undelivered_for(&ids).into_iter().next() {
+                    guard.armed = false;
+                    let mut out = if done.ok { ToolOutput::ok(done.text) } else { ToolOutput::err(done.text) };
+                    out.text.push_str(&note);
+                    let mut meta = done.meta.unwrap_or_default();
+                    meta.job = Some(id);
+                    meta.background = None;
+                    out.meta = Some(ToolMeta::Bash(meta));
+                    out
+                } else {
+                    ToolOutput::err("Command job is no longer available.")
+                }
+            }
+            WaitReady::Interrupted => {
+                guard.armed = false;
+                let mut out = ToolOutput::ok(format!(
+                    "Command continues as background job {id}. Your new prompt will be handled now; its result will arrive automatically.{note}"
+                ));
+                out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
+                out
+            }
+            WaitReady::Nothing | WaitReady::Unknown(_) | WaitReady::Cancelled => {
+                ToolOutput::err("Command job is no longer available.")
+            }
+        }
+    }
+
+    /// Starts one command as a job. `base`: the directory the command starts in, when the caller has
+    /// its own shell instead of inheriting the persistent one's; `cancel` is checked again just
+    /// before the spawn, so a cancelled call never launches.
+    async fn start_bash_job(
+        &self,
+        a: Args,
+        jobs: &Rc<JobsHandle>,
+        cancel: Option<&CancellationToken>,
+        base: Option<PathBuf>,
+    ) -> Result<(String, String), String> {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err("Command cancelled before launch.".into());
+        }
+        jobs.check_capacity(1)?;
         let snapshot = self.shell_snapshot().await;
         let inherited = snapshot.is_some();
-        let (base_cwd, vars) = snapshot.unwrap_or_else(|| (self.cwd.clone(), process_env()));
-        let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or(base_cwd);
+        let (snap_cwd, vars) = snapshot.unwrap_or_else(|| (self.cwd.clone(), process_env()));
+        let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or(base.unwrap_or(snap_cwd));
         let env = job_env(vars, &cwd, self.session_env());
         let artifact_dir = self.artifact_dir();
         let (command, timeout) = (a.command.clone(), a.timeout);
         let job_cwd = cwd.clone();
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err("Command cancelled before launch.".into());
+        }
         let id = jobs.spawn_bash(a.command, job_cwd, move |cancel, sink| {
             run_background(
                 command,
@@ -247,11 +345,7 @@ impl Tools {
         } else {
             "\nShell state from earlier calls was not inherited (the shell was busy or did not answer in time): the job uses mu's own environment.".to_string()
         };
-        let mut out = ToolOutput::ok(format!(
-            "Started background job {id}.{note}\nWhen it finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on it. When your next step needs its result, end your turn now with a short status and no tool call."
-        ));
-        out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
-        out
+        Ok((id, note))
     }
 
     /// The persistent shell's cwd and exported variables, from one state-neutral command. `None`
@@ -562,6 +656,7 @@ fn finish(c: Collected, end: RunEnd) -> ToolOutput {
         artifact: c.artifact,
         spill_note: c.spill_note,
         background: None,
+        job: None,
     }));
     out
 }
@@ -609,6 +704,7 @@ pub async fn run_background(
                 ok: false,
                 text: format!("cannot start command: {e}"),
                 note: "did not start".into(),
+                meta: None,
             };
         }
     };
@@ -685,13 +781,19 @@ pub async fn run_background(
     } else {
         code.map_or("no exit status".to_string(), |c| format!("exit {c}"))
     };
-    BackgroundResult { ok: !failed, text: out.text, note }
+    let meta = match out.meta {
+        Some(ToolMeta::Bash(meta)) => Some(meta),
+        _ => None,
+    };
+    BackgroundResult { ok: !failed, text: out.text, note, meta }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_base::events::EventTx;
     use serde_json::json;
+    use std::future::Future;
     use std::time::Duration;
 
     #[tokio::test(flavor = "current_thread")]
@@ -699,7 +801,8 @@ mod tests {
         let tools = Tools::for_test();
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let out = tools.call("bash", &json!({"command":"echo hi","pty":true}), &ctx).await;
         assert!(out.text.contains("hi"), "{}", out.text);
         assert!(out.text.contains("[pty unavailable without the terminal UI; ran without a terminal]"));
@@ -754,7 +857,8 @@ mod tests {
     async fn session_env_reaches_commands() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let cmd = json!({"command": "echo \"[$PI_SESSION_ID|$PI_SESSION_FILE]\""});
         let out = tools.call("bash", &cmd, &ctx).await;
         assert!(out.text.contains("[|]"), "{}", out.text);
@@ -769,7 +873,8 @@ mod tests {
     async fn a_command_that_exports_a_variable_is_told_it_persists() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let run = |c: &str| {
             let tools = &tools;
             let ctx = &ctx;
@@ -801,7 +906,8 @@ mod tests {
     async fn a_file_tool_notes_a_relative_path_after_the_shell_moved() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let glob = json!({"pattern": "*.mu-no-such-ext", "path": "."});
         let out = tools.call("glob", &glob, &ctx).await;
         assert!(!out.text.contains("[mu:"), "no shell call yet: {}", out.text);
@@ -840,7 +946,8 @@ mod tests {
         let (quiet, kept) = (format!("2{pid:07}"), format!("3{pid:07}"));
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let cmd = format!("(/bin/sleep {quiet} &); nohup /bin/sleep {kept} >/dev/null 2>&1 & echo started");
         let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
         assert!(out.text.contains("started"), "{}", out.text);
@@ -862,7 +969,8 @@ mod tests {
     async fn finished_background_job_is_reaped_and_keeps_its_status() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let out = tools.call("bash", &json!({"command": "/bin/sh -c 'sleep 0.3; exit 7' & echo $!"}), &ctx).await;
         let pid: i32 = out.text.trim().parse().unwrap_or_else(|_| panic!("no pid: {}", out.text));
         let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -894,7 +1002,8 @@ mod tests {
                     }
                 }
             });
-            let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+            let ctx =
+                ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
             let t = std::time::Instant::now();
             let out =
                 tools.call("bash", &json!({"command":"sleep 0.3; echo done","pty":true,"timeout":20}), &ctx).await;
@@ -909,7 +1018,8 @@ mod tests {
     async fn result_carries_structured_facts_and_the_same_text() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let out = tools.call("bash", &json!({"command": "echo hi; exit 3"}), &ctx).await;
         let Some(ToolMeta::Bash(m)) = &out.meta else { panic!("no meta: {:?}", out.text) };
         assert_eq!(m.exit_code, Some(3));
@@ -985,7 +1095,7 @@ mod tests {
 
     fn ctx() -> ToolCtx {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false }
+        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None }
     }
 
     async fn finished(jobs: &crate::jobs::JobsHandle) -> Vec<crate::jobs::Done> {
@@ -1172,6 +1282,207 @@ mod tests {
         assert!(parse_snapshot("/a\0A\0").is_none());
         assert!(parse_snapshot("/a\0=x\0v\0").is_none());
         assert!(parse_snapshot("").is_none());
+    }
+
+    type Events = (EventTx, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>);
+
+    fn experimental() -> (Tools, Rc<crate::jobs::JobsHandle>, Events) {
+        let mut tools = Tools::for_test();
+        let (wake, _wake_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        let jobs = crate::jobs::JobsHandle::new(wake, events.clone());
+        tools.jobs = Some(jobs.clone());
+        tools.interruptible_wait = true;
+        (tools, jobs, (events, rx))
+    }
+
+    fn wait_ctx(
+        jobs: &Rc<crate::jobs::JobsHandle>,
+        events: EventTx,
+        cancel: CancellationToken,
+    ) -> (ToolCtx, crate::jobs::ActiveWait) {
+        let wait = jobs.begin_wait();
+        (ToolCtx { events, cancel, call_id: "c".into(), plan: false, wait_interrupt: Some(wait.token()) }, wait)
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-fg-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    /// Polls `events` until a job output contains `needle`, or panics once `call` finishes first.
+    async fn until_output<F: Future<Output = ToolOutput>>(
+        mut call: std::pin::Pin<&mut F>,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+        needle: &str,
+    ) {
+        loop {
+            tokio::select! {
+                out = call.as_mut() => panic!("the call finished before `{needle}`: {}", out.text),
+                ev = rx.recv() => {
+                    if let Some(AgentEvent::JobOutput { tail, .. }) = ev
+                        && tail.contains(needle)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_experimental_foreground_call_returns_its_output_and_claims_its_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs, (events, _rx)) = experimental();
+                let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
+                let out = tools.call("bash", &json!({"command": "printf 'finished\\n'"}), &ctx).await;
+                assert!(!out.is_error && out.text.contains("finished"), "{}", out.text);
+                let id = jobs.snapshot()[0].name.clone();
+                assert!(
+                    matches!(&out.meta, Some(ToolMeta::Bash(m)) if m.job.as_deref() == Some(id.as_str()) && m.background.is_none()),
+                    "{:?}",
+                    out.meta
+                );
+                assert!(!jobs.has_undelivered(), "the call claimed the job's result");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_experimental_call_does_not_inherit_shell_state() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tmp("isolated");
+                std::fs::create_dir_all(dir.join("sub")).unwrap();
+                let (mut tools, jobs, (events, _rx)) = experimental();
+                tools.cwd = dir.clone();
+                let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
+                let a = json!({"command": "export MU_WAIT_TEST_VALUE=set; cd sub"});
+                assert!(!tools.call("bash", &a, &ctx).await.is_error);
+                let b = json!({"command": "printf '%s\\n' \"${MU_WAIT_TEST_VALUE-unset}\"; pwd"});
+                let out = tools.call("bash", &b, &ctx).await;
+                assert!(out.text.starts_with("unset\n"), "{}", out.text);
+                assert!(out.text.contains(&dir.display().to_string()), "{}", out.text);
+                let c = json!({"command": "printf '%s\\n' \"$PWD\"", "cwd": "sub"});
+                let out = tools.call("bash", &c, &ctx).await;
+                assert!(out.text.contains(&dir.join("sub").display().to_string()), "{}", out.text);
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_prompt_interrupt_backgrounds_the_command_and_its_result_arrives_once() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tmp("interrupt");
+                let (mut tools, jobs, (events, mut rx)) = experimental();
+                tools.cwd = dir.clone();
+                let (ctx, wait) = wait_ctx(&jobs, events, CancellationToken::new());
+                let args = json!({"command": "printf 'started\\n'; while [ ! -f release ]; do sleep 0.02; done; printf 'finished\\n'"});
+                let call = tools.call("bash", &args, &ctx);
+                tokio::pin!(call);
+                until_output(call.as_mut(), &mut rx, "started").await;
+                wait.token().cancel();
+                let out = call.await;
+                assert!(!out.is_error, "{}", out.text);
+                assert!(out.text.starts_with("Command continues as background job "), "{}", out.text);
+                assert!(
+                    matches!(&out.meta, Some(ToolMeta::Bash(m)) if m.background.is_some() && m.job.is_none()),
+                    "{:?}",
+                    out.meta
+                );
+                assert_eq!(jobs.running(), 1, "the work keeps running");
+                assert!(!jobs.has_undelivered(), "no result before it finishes");
+                std::fs::write(dir.join("release"), "go").unwrap();
+                let done = jobs.finished().await;
+                assert_eq!(done.len(), 1);
+                assert!(done[0].text.contains("finished"), "{}", done[0].text);
+                assert!(!jobs.has_undelivered(), "exactly one result");
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_an_experimental_call_terminates_and_claims_its_command() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs, (events, mut rx)) = experimental();
+                let cancel = CancellationToken::new();
+                let (ctx, _wait) = wait_ctx(&jobs, events, cancel.clone());
+                let args = json!({"command": "printf 'started\\n'; sleep 30; printf 'done\\n'"});
+                let call = tools.call("bash", &args, &ctx);
+                tokio::pin!(call);
+                until_output(call.as_mut(), &mut rx, "started").await;
+                cancel.cancel();
+                let out = call.await;
+                assert!(out.is_error && out.text.contains("[Command cancelled]"), "{}", out.text);
+                assert!(!jobs.has_undelivered(), "the cancelled result was claimed, not announced");
+                assert_eq!(jobs.running(), 0);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_call_never_launches_and_a_dropped_call_kills_its_job() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs, (events, mut rx)) = experimental();
+                let cancelling = CancellationToken::new();
+                cancelling.cancel();
+                let (ctx, _wait) = wait_ctx(&jobs, events.clone(), cancelling);
+                let out = tools.call("bash", &json!({"command": "printf 'ran\\n'"}), &ctx).await;
+                assert!(out.is_error && out.text == "Command cancelled before launch.", "{}", out.text);
+                assert_eq!(jobs.snapshot().len(), 0, "no job was created");
+
+                let dir = tmp("dropped");
+                let mut tools = tools;
+                tools.cwd = dir.clone();
+                let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
+                let args = json!({"command": "printf 'started\\n'; while [ ! -f release ]; do sleep 0.02; done"});
+                let mut call = Box::pin(tools.call("bash", &args, &ctx));
+                until_output(call.as_mut(), &mut rx, "started").await;
+                drop(call);
+                let killed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while jobs.running() > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+                assert!(killed.is_ok(), "the dropped call's job is cancelled");
+                assert!(!jobs.has_undelivered(), "no surprise notice for a dropped call");
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_accounts_for_the_foreground_job_and_job_cancel_releases_it() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs, (events, mut rx)) = experimental();
+                let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
+                for i in 0..crate::tools::task::MAX_TASKS {
+                    jobs.push_running(&format!("full{i}"));
+                }
+                let out = tools.call("bash", &json!({"command": "printf 'no\\n'"}), &ctx).await;
+                assert!(out.is_error && out.text.contains("too many background jobs running"), "{}", out.text);
+                assert_eq!(jobs.snapshot().len(), crate::tools::task::MAX_TASKS, "nothing was launched");
+                jobs.clear();
+
+                let args = json!({"command": "printf 'started\\n'; sleep 30; printf 'done\\n'"});
+                let mut call = Box::pin(tools.call("bash", &args, &ctx));
+                until_output(call.as_mut(), &mut rx, "started").await;
+                let id = jobs.snapshot()[0].name.clone();
+                assert_eq!(jobs.kill(Some(&id)), 1, "the foreground job is an ordinary job");
+                let out = call.await;
+                assert!(out.is_error && out.text.contains("[Command cancelled]"), "{}", out.text);
+                assert!(!jobs.has_undelivered(), "the cancelled result stays with the call");
+            })
+            .await;
     }
 
     #[test]

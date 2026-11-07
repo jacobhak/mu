@@ -437,7 +437,7 @@ fn the_todo_reminder_waits_for_a_running_background_job() {
         let jobs = a.tools.jobs.clone().unwrap();
         jobs.spawn_bash("sleep 99".into(), std::env::temp_dir(), |cancel, _| async move {
             cancel.cancelled().await;
-            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into() }
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into(), meta: None }
         });
         assert_eq!(jobs.running(), 1);
         a.turn(Some("go".to_string().into())).await;
@@ -464,7 +464,7 @@ fn a_wait_while_a_job_runs_is_refused_and_ends_the_turn() {
         let jobs = a.tools.jobs.clone().unwrap();
         jobs.spawn_bash("cargo build".into(), std::env::temp_dir(), |cancel, _| async move {
             cancel.cancelled().await;
-            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into() }
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into(), meta: None }
         });
         a.turn(Some("go".to_string().into())).await;
         jobs.kill(None);
@@ -499,6 +499,60 @@ fn a_wait_with_no_job_running_runs() {
     });
 }
 
+fn experimental_agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    let mut cfg = Configs::default();
+    cfg.mu.experimental.interruptible_wait = true;
+    agent_with(script, cfg)
+}
+
+fn bash_call(id: &str, args: serde_json::Value) -> Block {
+    Block::ToolCall { id: id.into(), name: "bash".into(), arguments: args }
+}
+
+#[test]
+fn wait_is_offered_only_with_the_experiment_and_jobs() {
+    run(async {
+        let names = |a: &Agent| a.tool_defs().into_iter().map(|d| d.name).collect::<Vec<_>>();
+        let (mut off, _rx) = agent(vec![]);
+        off.enable_jobs();
+        assert!(!names(&off).contains(&"wait".to_string()), "the experiment is off");
+
+        let (mut on, _rx) = experimental_agent(vec![]);
+        assert!(!names(&on).contains(&"wait".to_string()), "no jobs, no wait");
+        on.enable_jobs();
+        assert!(names(&on).contains(&"wait".to_string()));
+
+        let bash = |a: &Agent| a.tool_defs().into_iter().find(|d| d.name == "bash").unwrap().description;
+        assert!(bash(&off).contains("The shell persists across calls"), "flag off keeps the persistent shell");
+        assert!(bash(&on).contains("Each call runs in its own shell"), "flag on describes isolated calls");
+        assert!(!bash(&on).contains("Never wait for a job in the foreground"));
+    });
+}
+
+#[test]
+fn with_the_experiment_a_waiting_command_runs_and_no_end_of_turn_is_prescribed() {
+    use mu_tools::tools::subagent::BackgroundResult;
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![bash_call("w1", json!({"command": "printf 'waited\\n'"}))], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, _rx) = experimental_agent(script);
+        a.enable_jobs();
+        let jobs = a.tools.jobs.clone().unwrap();
+        jobs.spawn_bash("cargo build".into(), std::env::temp_dir(), |cancel, _| async move {
+            cancel.cancelled().await;
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into(), meta: None }
+        });
+        a.turn(Some("go".to_string().into())).await;
+        jobs.kill(None);
+        let r = results(&a);
+        assert!(!r[0].0 && r[0].1.contains("waited"), "the command ran instead of being refused: {:?}", r[0]);
+        assert!(r[0].1.contains("use `wait` when you need it now"), "{:?}", r[0]);
+        assert!(!r[0].1.contains("end your turn now"), "{:?}", r[0]);
+    });
+}
+
 #[test]
 fn a_running_job_is_reported_on_the_last_result_of_a_later_batch() {
     use mu_tools::tools::subagent::BackgroundResult;
@@ -516,7 +570,7 @@ fn a_running_job_is_reported_on_the_last_result_of_a_later_batch() {
         let jobs = a.tools.jobs.clone().unwrap();
         jobs.spawn_bash("cargo build".into(), std::env::temp_dir(), |cancel, _| async move {
             cancel.cancelled().await;
-            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into() }
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into(), meta: None }
         });
         a.turn(Some("go".to_string().into())).await;
         jobs.kill(None);

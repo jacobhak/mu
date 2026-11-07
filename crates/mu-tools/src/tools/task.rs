@@ -46,6 +46,11 @@ pub const ASYNC_DESCRIPTION: &str = concat!(
     guidance!()
 );
 
+pub const ASYNC_WAIT_DESCRIPTION: &str = concat!(
+    "Spawn subagents in the background; job ids return immediately. Their results arrive as <system-notice> messages when they finish. Use `wait` when a job's result is needed now: it returns when one of the jobs finishes, and a new prompt from the user stops the wait without stopping the work. Stop a job with `job_cancel`. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
+    guidance!()
+);
+
 pub fn schema(names: &[&str]) -> Value {
     let mut agents = vec!["task", "scout"];
     agents.extend_from_slice(names);
@@ -134,8 +139,13 @@ impl Tools {
                 );
                 started.push(format!("{id} ({agent})"));
             }
+            let next = if self.interruptible_wait_enabled() {
+                "When each finishes, mu automatically starts your next turn with its result; use `wait` when you need a result now. Until then, do other work that does not depend on them."
+            } else {
+                "When each finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on them. When your next step needs a result, end your turn now with a short status and no tool call."
+            };
             return ToolOutput::ok(format!(
-                "Started {} background job(s): {}\nWhen each finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on them. When your next step needs a result, end your turn now with a short status and no tool call.",
+                "Started {} background job(s): {}\n{next}",
                 started.len(),
                 started.join(", ")
             ));
@@ -362,7 +372,8 @@ mod typed_tests {
     async fn bad_output_schema_is_rejected_before_spawning() {
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
         let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","outputSchema":{"type":"bogus"}}]})).unwrap();
         let out = t.task(a, &ctx).await;
         assert!(out.is_error && out.text.contains("outputSchema"), "{}", out.text);

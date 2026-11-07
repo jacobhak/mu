@@ -300,6 +300,241 @@ fn a_follow_up_that_starts_running_leaves_the_published_queue() {
     });
 }
 
+/// One end-to-end case: a foreground command waits for its result, the user submits `mk()`, and the
+/// command keeps running as a job while the new message is answered first.
+fn interruptible_wait_case(cmd: fn() -> Command) {
+    use crate::testing::assistant;
+    use mu_base::config::Configs;
+    use mu_base::message::{Block, StopReason};
+    use serde_json::json;
+    run(async {
+        let dir = std::env::temp_dir().join(format!("mu-iw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let release = dir.join("release");
+        let unwanted = dir.join("unwanted");
+        let wait = format!(
+            "printf 'started\\n'; while [ ! -f '{}' ]; do sleep 0.02; done; printf 'finished\\n'",
+            release.display()
+        );
+        let touch = format!("touch '{}'", unwanted.display());
+        let bash = |id: &str, command: String| Block::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: json!({"command": command, "cwd": dir.clone()}),
+        };
+        let script = vec![
+            Ok(assistant(vec![bash("b1", wait), bash("b2", touch)], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("handled next")], StopReason::Stop)),
+            Ok(assistant(vec![Block::text("job finished")], StopReason::Stop)),
+        ];
+        let mut cfg = Configs::default();
+        cfg.mu.experimental.interruptible_wait = true;
+        let (mut a, mut ev) = crate::testing::agent_with(script, cfg);
+        a.enable_jobs();
+        let (tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        q.jobs = a.tools.jobs.clone();
+        let observer = async {
+            while let Some(e) = ev.recv().await {
+                if let AgentEvent::JobOutput { tail, .. } = &e
+                    && tail.contains("started")
+                {
+                    tx.send(cmd()).unwrap();
+                    break;
+                }
+            }
+        };
+        let ((), ()) = tokio::join!(drive(a.turn(Some("go".to_string().into())), &mut q), observer);
+        let r = crate::testing::results(&a);
+        assert!(!r[0].0 && r[0].1.contains("Command continues as background job bg_"), "{:?}", r[0]);
+        assert!(r[1].0 && r[1].1.contains("the user sent a new message"), "{:?}", r[1]);
+        assert!(!unwanted.exists(), "the second call of the batch did not run");
+        assert_eq!(
+            a.messages
+                .iter()
+                .filter(|m| matches!(m, Message::User { content, .. } if mu_base::message::text_of(content) == "next"))
+                .count(),
+            1,
+            "the new message is delivered once"
+        );
+        assert!(a.ports.providers.scripted.borrow().len() == 1, "the job had not finished yet");
+        assert!(!a.messages.iter().any(
+            |m| matches!(m, Message::User { content, .. } if mu_base::message::text_of(content).contains("finished"))
+        ));
+
+        std::fs::write(&release, "go").unwrap();
+        let jobs = a.tools.jobs.clone().unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !jobs.has_undelivered() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the backgrounded command finished");
+        a.turn(None).await;
+        let notices: Vec<String> = a
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content, .. } => Some(mu_base::message::text_of(content)),
+                _ => None,
+            })
+            .filter(|t| t.contains("finished"))
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("<system-notice>"));
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn interruptible_wait_prompt_backgrounds_foreground_command() {
+    for cmd in [
+        (|| Command::Steer("next".to_string().into())) as fn() -> Command,
+        || Command::FollowUp("next".to_string().into()),
+        || Command::Prompt("next".to_string().into()),
+    ] {
+        interruptible_wait_case(cmd);
+    }
+}
+
+/// The model waits on a running job; a prompt releases the wait, the job keeps running, and the
+/// wait tool itself reports only its summary.
+#[test]
+fn interruptible_wait_on_a_job_is_released_by_input_and_ends_cleanly() {
+    use crate::testing::assistant;
+    use mu_base::config::Configs;
+    use mu_base::message::{Block, StopReason};
+    use mu_tools::tools::subagent::BackgroundResult;
+    use serde_json::json;
+    run(async {
+        let dir = std::env::temp_dir().join(format!("mu-iw-wait-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let release = dir.join("release");
+        let script = vec![
+            Ok(assistant(
+                vec![Block::ToolCall { id: "w".into(), name: "wait".into(), arguments: json!({}) }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("handled next")], StopReason::Stop)),
+            Ok(assistant(vec![Block::text("job done")], StopReason::Stop)),
+        ];
+        let mut cfg = Configs::default();
+        cfg.mu.experimental.interruptible_wait = true;
+        let (mut a, mut ev) = crate::testing::agent_with(script, cfg);
+        a.enable_jobs();
+        let jobs = a.tools.jobs.clone().unwrap();
+        let gate = release.clone();
+        jobs.spawn_bash("marker-gated".into(), dir.clone(), move |_cancel, _sink| async move {
+            while !gate.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            BackgroundResult { ok: true, text: "finished".into(), note: "exit 0".into(), meta: None }
+        });
+        let (tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        q.jobs = a.tools.jobs.clone();
+        // Queued as steering right away: the guard is registered just before the call, so this
+        // reaches it even if `wait` starts a moment later.
+        let observer = async {
+            while let Some(e) = ev.recv().await {
+                if matches!(&e, AgentEvent::ToolStart { name, .. } if name == "wait") {
+                    tx.send(Command::Steer("next".to_string().into())).unwrap();
+                    break;
+                }
+            }
+        };
+        let joined = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(drive(a.turn(Some("go".to_string().into())), &mut q), observer)
+        });
+        joined.await.expect("the queued steering released the wait");
+        let r = crate::testing::results(&a);
+        assert!(!r[0].0 && r[0].1.contains("Waiting stopped for your new prompt"), "{:?}", r[0]);
+        assert!(!r[0].1.contains("finished"), "the wait does not carry the job's result: {:?}", r[0]);
+        assert_eq!(
+            a.messages
+                .iter()
+                .filter(|m| matches!(m, Message::User { content, .. } if mu_base::message::text_of(content) == "next"))
+                .count(),
+            1,
+            "the message is delivered once"
+        );
+        assert!(!jobs.interrupt_wait(), "the guard is dropped after the call");
+
+        std::fs::write(&release, "go").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !jobs.has_undelivered() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the job finished");
+        a.turn(None).await;
+        let notices: Vec<String> = a
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content, .. } => Some(mu_base::message::text_of(content)),
+                _ => None,
+            })
+            .filter(|t| t.contains("finished"))
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("<system-notice>"));
+        assert!(a.ports.providers.scripted.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// Input already queued when the wait is registered steers at once instead of waiting for the job.
+#[test]
+fn input_queued_before_a_wait_is_registered_relaunches_nothing_and_steers() {
+    use crate::testing::assistant;
+    use mu_base::config::Configs;
+    use mu_base::message::{Block, StopReason};
+    use mu_tools::tools::subagent::BackgroundResult;
+    use serde_json::json;
+    run(async {
+        let script = vec![
+            Ok(assistant(
+                vec![Block::ToolCall { id: "w".into(), name: "wait".into(), arguments: json!({}) }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("handled early")], StopReason::Stop)),
+        ];
+        let mut cfg = Configs::default();
+        cfg.mu.experimental.interruptible_wait = true;
+        let (mut a, _ev) = crate::testing::agent_with(script, cfg);
+        a.enable_jobs();
+        let jobs = a.tools.jobs.clone().unwrap();
+        jobs.spawn_bash("never ends".into(), std::env::temp_dir(), |cancel, _| async move {
+            cancel.cancelled().await;
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into(), meta: None }
+        });
+        a.ports.inbox.borrow_mut().steer.push_back("early".into());
+        a.ports.inbox.borrow_mut().follow_up.push_back("later".into());
+        let (_tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        q.jobs = a.tools.jobs.clone();
+        let turn = tokio::time::timeout(Duration::from_secs(20), drive(a.turn(Some("go".to_string().into())), &mut q));
+        turn.await.expect("the queued steering released the wait");
+        let r = crate::testing::results(&a);
+        assert!(!r[0].0 && r[0].1.contains("Waiting stopped for your new prompt"), "{:?}", r[0]);
+        let delivered: Vec<String> = a
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content, .. } => Some(mu_base::message::text_of(content)),
+                _ => None,
+            })
+            .filter(|t| t == "early" || t == "later")
+            .collect();
+        assert_eq!(delivered, ["early", "later"], "queued input is steered, steering first");
+        assert_eq!(jobs.running(), 1, "the job was never restarted or killed");
+        jobs.kill(None);
+    });
+}
+
 #[test]
 fn handle_methods_send_the_matching_commands() {
     run(async {

@@ -23,7 +23,15 @@ pub struct PromptInput<'a> {
     pub mcp_instructions: Option<&'a str>,
     /// The edit tool takes `[path#TAG]` hashline edits (`edit` in hashline mode) rather than `*** Find` blocks.
     pub hashline: bool,
+    /// Ordinary `bash` commands may wait for their result instead of ending the turn (`wait` exists).
+    pub interruptible_wait: bool,
 }
+
+/// How a command that takes a while is run. The default is to end the turn and let its result start
+/// the next one; the experiment lets an ordinary call wait, with a new prompt releasing the wait.
+const BASH_ASYNC_RULE: &str = "- Commands that may run longer than ~5 seconds MUST use `bash` with `async: true`. It returns a job id at once; when the job finishes, mu automatically starts your next turn with its result, with no user input needed. Meanwhile do other work that does not depend on it; when your next step needs the result, end your turn with a short status and no tool call. Never wait for a job in the foreground.";
+
+const BASH_WAIT_RULE: &str = "- `bash` runs every command in its own shell: pass `cwd` and the environment a command needs, and put setup that must carry over into the same command. Nothing persists between calls, and background descendants end with the call.\n- A command may run in the foreground until it finishes. When a result is needed now, use `wait` on a background job; it returns as soon as one of the jobs finishes, and a new prompt from the user releases the wait without stopping the work. Use `async: true` for independent concurrent work or a long-lived service: it returns a job id at once and its result arrives as a system notice, with no user input needed.";
 
 const SYSTEM: &str = include_str!("prompts/system.md");
 
@@ -72,8 +80,10 @@ pub(crate) fn system_prompt(i: &PromptInput) -> String {
     } else {
         ""
     };
+    let bash_wait_rule = if i.interruptible_wait { BASH_WAIT_RULE } else { BASH_ASYNC_RULE };
     let mut s = SYSTEM
         .replace("{edit_rule}", edit_rule)
+        .replace("{bash_wait_rule}", bash_wait_rule)
         .replace("{os}", format!("{} {}", std::env::consts::OS, os.trim()).trim_end())
         .replace("{arch}", std::env::consts::ARCH)
         .replace("{date}", &date.to_string())
@@ -184,6 +194,7 @@ mod tests {
         let sp = system_prompt(&PromptInput {
             model: "m",
             hashline: true,
+            interruptible_wait: false,
             cwd: &proj,
             ctx: &ctx,
             plan: None,
@@ -214,6 +225,7 @@ mod tests {
         let sp = system_prompt(&PromptInput {
             model: "m",
             hashline: true,
+            interruptible_wait: false,
             cwd: &proj,
             ctx: &ctx,
             plan: None,
@@ -234,6 +246,7 @@ mod tests {
         let input = |hashline| PromptInput {
             model: "m",
             hashline,
+            interruptible_wait: false,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -252,12 +265,41 @@ mod tests {
     }
 
     #[test]
+    fn the_command_rule_follows_the_interruptible_wait_experiment() {
+        let ctx = Context::default();
+        let plugins = std::collections::BTreeMap::new();
+        let input = |interruptible_wait| PromptInput {
+            model: "m",
+            hashline: true,
+            interruptible_wait,
+            cwd: Path::new("/tmp"),
+            ctx: &ctx,
+            plan: None,
+            subagent: false,
+            ask: false,
+            task: false,
+            agent_prompt: None,
+            plugin_ctx: &plugins,
+            mcp_instructions: None,
+        };
+        let on = system_prompt(&input(true));
+        assert!(on.contains("every command in its own shell") && on.contains("use `wait`"));
+        assert!(!on.contains("Never wait for a job in the foreground"));
+        assert!(!on.contains("MUST use `bash` with `async: true`"));
+        assert!(!on.contains("{bash_wait_rule}"));
+        let off = system_prompt(&input(false));
+        assert!(off.contains("Never wait for a job in the foreground"));
+        assert!(!off.contains("use `wait`"));
+    }
+
+    #[test]
     fn delegation_only_when_task_is_offered_to_a_parent() {
         let ctx = Context::default();
         let plugins = std::collections::BTreeMap::new();
         let input = |task, subagent| PromptInput {
             model: "m",
             hashline: true,
+            interruptible_wait: false,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -280,6 +322,7 @@ mod tests {
         let input = |ask| PromptInput {
             model: "m",
             hashline: true,
+            interruptible_wait: false,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -312,6 +355,7 @@ mod tests {
         let sp = system_prompt(&PromptInput {
             model: "m",
             hashline: true,
+            interruptible_wait: false,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,

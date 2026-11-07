@@ -36,6 +36,9 @@ pub struct BashMeta {
     /// Set when the call only started a background job of that id. The command runs on, so the
     /// result carries no output of its own; the job's is shown when it finishes.
     pub background: Option<String>,
+    /// The job that completed during an interruptible foreground call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
 }
 
 impl BashMeta {

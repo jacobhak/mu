@@ -62,4 +62,9 @@ env = []              # extra environment variables whose values count as secret
 review = true         # review sessions in the background and save what is worth keeping (see memory.md)
 user_cap = 1500       # characters in user.md
 project_cap = 4000    # characters in a repository's memory.md
+
+[experimental]
+interruptible_wait = false  # let a model command wait for its result and a new prompt release the wait instead of ending the turn (see background-jobs.md); interactive sessions only
 ```
+
+`[experimental]` holds behaviour that may change or be removed. `interruptible_wait` is read when a session starts; a bad value warns and means `false`.

@@ -47,6 +47,7 @@ const READ_TOOLS: &[&str] = &[
     "propose_plan",
     "yield",
     "job_cancel",
+    "wait",
     "task",
     "web_search",
     "fetch",
@@ -546,6 +547,13 @@ mod tests {
         assert!(matches!(v, Verdict::Ask(_)), ".git is protected");
         let v = p.check(&t, "write", &json!({"path": "local://p.md", "content": "x"}));
         assert!(matches!(v, Verdict::Allow), "local:// is read tier");
+    }
+
+    #[test]
+    fn merely_waiting_needs_no_execution_approval() {
+        let (p, t) = setup(PermissionMode::Ask);
+        assert!(matches!(p.check(&t, "wait", &json!({})), Verdict::Allow), "wait is read tier");
+        assert!(matches!(p.check(&t, "bash", &json!({"command": "cargo build"})), Verdict::Ask(_)));
     }
 
     #[test]

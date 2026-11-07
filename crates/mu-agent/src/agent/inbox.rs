@@ -78,6 +78,44 @@ fn take_queue(inbox: &SharedInbox) -> Vec<UserInput> {
     q
 }
 
+/// Appends `input` to the steer queue: after earlier steering, and after queued follow-ups, which
+/// become steering too.
+pub(super) fn steer_input(input: UserInput, inbox: &SharedInbox, events: &EventTx) {
+    {
+        let mut ib = inbox.borrow_mut();
+        let follow: Vec<UserInput> = ib.follow_up.drain(..).collect();
+        ib.steer.extend(follow);
+        ib.steer.push_back(input);
+    }
+    publish(inbox, events);
+}
+
+/// Consumes a submitted prompt as steering while an interruptible wait is active. `false` for any
+/// other command, which keeps its usual handling.
+pub(super) fn steer_now(c: Command, inbox: &SharedInbox, events: &EventTx) -> bool {
+    let input = match c {
+        Command::Prompt(i) | Command::Steer(i) | Command::FollowUp(i) => i,
+        _ => return false,
+    };
+    steer_input(input, inbox, events);
+    true
+}
+
+/// Moves already-queued steering and follow-ups into steering, so a newly registered wait is
+/// released by input that arrived before it. Returns whether there was any.
+pub(super) fn promote_queued(inbox: &SharedInbox, events: &EventTx) -> bool {
+    {
+        let mut ib = inbox.borrow_mut();
+        if ib.steer.is_empty() && ib.follow_up.is_empty() {
+            return false;
+        }
+        let follow: Vec<UserInput> = ib.follow_up.drain(..).collect();
+        ib.steer.extend(follow);
+    }
+    publish(inbox, events);
+    true
+}
+
 /// Sends the queue's current contents to the front end.
 pub(super) fn publish(inbox: &SharedInbox, events: &EventTx) {
     let ib = inbox.borrow();

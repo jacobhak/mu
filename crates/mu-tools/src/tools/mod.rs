@@ -5,6 +5,7 @@ pub mod edit;
 mod glob;
 pub(crate) mod grep;
 mod job_cancel;
+mod job_wait;
 mod pathnote;
 mod plan;
 mod read;
@@ -34,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 pub struct ToolCtx {
     pub events: EventTx,
     pub cancel: CancellationToken,
+    pub wait_interrupt: Option<CancellationToken>,
     pub call_id: String,
     /// Plan mode is on for this call. The agent owns the plan state and hands it in per call.
     pub plan: bool,
@@ -57,6 +59,7 @@ pub struct Tools {
     pub plugins: Rc<PluginHost>,
     /// Set in interactive sessions: `task` then runs in the background.
     pub jobs: Option<Rc<JobsHandle>>,
+    pub interruptible_wait: bool,
     session: ToolSession,
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
@@ -86,6 +89,7 @@ impl Tools {
             cwd,
             plugins,
             jobs: None,
+            interruptible_wait: false,
             session: Default::default(),
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
@@ -96,6 +100,10 @@ impl Tools {
             #[cfg(any(test, feature = "test-support"))]
             panic_tool: Default::default(),
         }
+    }
+
+    pub fn interruptible_wait_enabled(&self) -> bool {
+        self.interruptible_wait && self.jobs.is_some()
     }
 
     pub(crate) fn shell(&self) -> &shell::worker::ShellWorker {
@@ -134,9 +142,42 @@ impl Tools {
         BUILTINS.iter().filter_map(|b| b.def.map(|d| d())).collect()
     }
 
+    /// The `bash` tool. `interruptible_wait`: every ordinary command runs in its own shell as a
+    /// tracked job the model may wait on, so nothing carries over between calls.
+    pub fn bash_def(interruptible_wait: bool) -> ToolDef {
+        let shell = if interruptible_wait {
+            " Each call runs in its own shell: pass `cwd` and any variables the command needs, and put setup that must carry over into the same command. `cmd &` and background descendants do not outlive the call. Ordinary commands may wait for their result; use `wait` when a running job's result is needed, and `async: true` for independent concurrent work or long-lived services. A new prompt from the user releases a wait without killing the work."
+        } else {
+            " The shell persists across calls (cwd and exported variables carry over). Any command that may take longer than ~5 seconds (builds, tests, installs, servers, watches, downloads) MUST use `async: true`, not the foreground: it runs as a tracked background job, and when it finishes mu automatically starts your next turn with its result (no user input needed). Do other work meanwhile; to wait for it, end your turn. Without `async`, `cmd &` keeps running after the call and shows in `jobs` (stop with `kill %N`); nothing reports its exit, so prefer `async`. `(cmd &)` outlives the call too but is not in `jobs`, so nothing can stop it; use `async: true` for anything long-running. An async job starts from the shell's cwd and exported environment as of launch; its own changes do not flow back, and functions and aliases are not carried over."
+        };
+        let description = format!(
+            "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits).{shell} Output is truncated in the middle when large. In pty mode, anything left running ends with the command. Stays available in plan mode (as in omp), where you must not change anything with it. NEVER print secret values: check that a variable is set with `[ -n \"$NAME\" ] && echo set` (or `${{#NAME}}` for its length), and keep tokens out of verbose output (`curl -v`, `set -x`, `git remote -v`). Pass secrets by variable name (`\"$NAME\"`), never by value, and never write them into files, commits or messages."
+        );
+        let async_desc = if interruptible_wait {
+            "Set for independent concurrent work or a long-lived service: runs as a background job, returns a job id at once, and when it finishes mu starts your next turn with its result; stop it with `job_cancel`. Interactive sessions only (elsewhere it runs in the foreground); not with pty."
+        } else {
+            "Set for any command that may take more than ~5 seconds: runs as a background job, returns a job id at once, and when it finishes mu starts your next turn with its result; stop it with `job_cancel`. Interactive sessions only (elsewhere it runs in the foreground); not with pty."
+        };
+        tool_def(
+            "bash",
+            description,
+            json!({"type":"object","properties":{
+                "command":{"type":"string"},
+                "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
+                "cwd":{"type":"string","description":"Working directory for this command"},
+                "async":{"type":"boolean","description":async_desc},
+                "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
+        )
+    }
+
     /// `async_jobs`: `task` returns job ids immediately instead of blocking.
-    pub fn task_def(async_jobs: bool, agents: &[crate::context::AgentDef]) -> ToolDef {
-        let mut description = String::from(if async_jobs { task::ASYNC_DESCRIPTION } else { task::DESCRIPTION });
+    /// `interruptible_wait`: a job's result may be awaited with `wait` instead of ending the turn.
+    pub fn task_def(async_jobs: bool, interruptible_wait: bool, agents: &[crate::context::AgentDef]) -> ToolDef {
+        let mut description = String::from(match (async_jobs, interruptible_wait) {
+            (true, true) => task::ASYNC_WAIT_DESCRIPTION,
+            (true, false) => task::ASYNC_DESCRIPTION,
+            (false, _) => task::DESCRIPTION,
+        });
         if !agents.is_empty() {
             let list: Vec<String> = agents.iter().map(|a| format!("`{}`: {}", a.name, a.description)).collect();
             description.push_str("\nCustom agents: ");
@@ -278,18 +319,7 @@ pub static BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "bash",
-        def: Some(|| {
-            tool_def(
-                "bash",
-                "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits). The shell persists across calls (cwd and exported variables carry over). Output is truncated in the middle when large. Any command that may take longer than ~5 seconds (builds, tests, installs, servers, watches, downloads) MUST use `async: true`, not the foreground: it runs as a tracked background job, and when it finishes mu automatically starts your next turn with its result (no user input needed). Do other work meanwhile; to wait for it, end your turn. Without `async`, `cmd &` keeps running after the call and shows in `jobs` (stop with `kill %N`); nothing reports its exit, so prefer `async`. `(cmd &)` outlives the call too but is not in `jobs`, so nothing can stop it; use `async: true` for anything long-running. An async job starts from the shell's cwd and exported environment as of launch; its own changes do not flow back, and functions and aliases are not carried over. In pty mode, anything left running ends with the command. Stays available in plan mode (as in omp), where you must not change anything with it. NEVER print secret values: check that a variable is set with `[ -n \"$NAME\" ] && echo set` (or `${#NAME}` for its length), and keep tokens out of verbose output (`curl -v`, `set -x`, `git remote -v`). Pass secrets by variable name (`\"$NAME\"`), never by value, and never write them into files, commits or messages.",
-                json!({"type":"object","properties":{
-                    "command":{"type":"string"},
-                    "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
-                    "cwd":{"type":"string","description":"Working directory for this command"},
-                    "async":{"type":"boolean","description":"Set for any command that may take more than ~5 seconds: runs as a background job, returns a job id at once, and when it finishes mu starts your next turn with its result; stop it with `job_cancel`. Interactive sessions only (elsewhere it runs in the foreground); not with pty."},
-                    "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
-            )
-        }),
+        def: Some(|| Tools::bash_def(false)),
         call: dispatch!("bash", async |t, a: shell::bash::Args, c| t.bash(a, c)),
     },
     Builtin {
@@ -335,6 +365,7 @@ pub static BUILTINS: &[Builtin] = &[
     },
     Builtin { name: "task", def: None, call: dispatch!("task", async |t, a: task::Args, c| t.task(a, c)) },
     Builtin { name: "job_cancel", def: None, call: dispatch!("job_cancel", |t, a: job_cancel::Args| t.job_cancel(a)) },
+    Builtin { name: "wait", def: None, call: dispatch!("wait", async |t, a: job_wait::Args, c| t.job_wait(a, c)) },
     Builtin { name: "yield", def: None, call: dispatch!("yield", |t, a: yield_::Args| t.yield_result(a)) },
 ];
 
@@ -373,6 +404,10 @@ pub fn summary(name: &str, args: &Value) -> String {
         "bash" => first("command"),
         "job_cancel" if args["all"].as_bool() == Some(true) => "all",
         "job_cancel" => first("id"),
+        "wait" => {
+            let ids: Vec<&str> = args["ids"].as_array().into_iter().flatten().filter_map(|i| i.as_str()).collect();
+            return if ids.is_empty() { "any".into() } else { trunc(&ids.join(", "), 120) };
+        }
         "web_search" => first("query"),
         "fetch" => first("url"),
         "review" => first("scope"),
@@ -451,15 +486,31 @@ mod table_tests {
     use super::*;
 
     #[test]
+    fn interruptible_wait_requires_flag_and_jobs() {
+        let mut tools = Tools::for_test();
+        assert!(!tools.interruptible_wait_enabled());
+        tools.interruptible_wait = true;
+        assert!(!tools.interruptible_wait_enabled());
+        let (wake, _wake_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        tools.jobs = Some(JobsHandle::new(wake, events));
+        assert!(tools.interruptible_wait_enabled());
+        tools.interruptible_wait = false;
+        assert!(!tools.interruptible_wait_enabled());
+    }
+
+    #[test]
     fn one_table_drives_names_definitions_and_dispatch() {
         let names: Vec<String> = Tools::definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "todo", "ask"]);
-        assert!(is_builtin("task") && is_builtin("propose_plan") && !is_builtin("wait"));
+        assert!(is_builtin("task") && is_builtin("propose_plan") && is_builtin("wait"));
+        assert!(!names.contains(&"wait".to_string()), "wait is session-only");
         assert!(!is_builtin("web_search"));
         // Every built-in dispatches (bad arguments are an argument error, never "Unknown tool").
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false };
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), wait_interrupt: None, call_id: "c".into(), plan: false };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         for b in BUILTINS {
             let out = rt.block_on(t.call(b.name, &json!({"__nonsense": true}), &ctx));

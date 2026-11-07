@@ -100,6 +100,32 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_completed_foreground_bash_result_keeps_its_output_and_footer() {
+        let mut out = mu_base::tool::ToolOutput::ok("the output\nexit 3");
+        out.meta = Some(mu_base::tool::ToolMeta::Bash(mu_base::tool::BashMeta {
+            job: Some("bg_1".into()),
+            output_end: "the output\n".len(),
+            exit_code: Some(3),
+            artifact: Some(2),
+            ..Default::default()
+        }));
+        let stored = out.stored_details();
+        let ms = vec![
+            user("make it"),
+            msg(json!({"role":"assistant","content":[{"type":"toolCall","id":"b1","name":"bash",
+                "arguments":{"command":"make"}}],"api":"a","provider":"p","model":"m",
+                "usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"total":0.0}},
+                "stopReason":"toolUse","timestamp":2})),
+            msg(json!({"role":"toolResult","toolCallId":"b1","toolName":"bash",
+                "content":[{"type":"text","text":"the output\nexit 3"}],"isError":false,"timestamp":3,
+                "details":stored})),
+        ];
+        let t = text(&lines(&ms, 80));
+        assert!(t.contains("the output"), "no historical job snapshot is needed: {t}");
+        assert!(t.contains("artifact://2") && t.contains("Exit: 3"), "{t}");
+    }
+
+    #[test]
     fn thinking_is_a_marker_not_the_text() {
         let ms = vec![assistant(json!([{"type":"thinking","thinking":"secret plans"},{"type":"text","text":"ok"}]))];
         let t = text(&lines(&ms, 80));

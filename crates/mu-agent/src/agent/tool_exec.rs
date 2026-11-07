@@ -32,12 +32,20 @@ impl Agent {
             .base_defs
             .get_or_init(|| Tools::definitions().into_iter().chain(self.ports.plugins.tool_defs()).collect())
             .clone();
+        if self.tools.interruptible_wait_enabled()
+            && let Some(d) = v.iter_mut().find(|d| d.name == "bash")
+        {
+            *d = Tools::bash_def(true);
+        }
         if self.plan.plan.is_some() {
             v.push(Tools::plan_def());
         }
-        v.push(Tools::task_def(self.tools.jobs.is_some(), &self.ctx.agents));
+        v.push(Tools::task_def(self.tools.jobs.is_some(), self.tools.interruptible_wait_enabled(), &self.ctx.agents));
         if self.tools.jobs.is_some() {
             v.push(Tools::job_cancel_def());
+        }
+        if self.tools.interruptible_wait_enabled() {
+            v.push(Tools::wait_def());
         }
         if let Some(o) = self.tools.output_schema.borrow().as_ref() {
             v.push(Tools::yield_def(o));
@@ -86,7 +94,8 @@ impl Agent {
     /// Why a `bash` call is not run: it waits (see `wait::waits`) while a background job runs. The
     /// model waits for a job by ending its turn; the job's result starts the next one.
     pub(super) fn wait_refusal(&self, name: &str, args: &Value) -> Option<String> {
-        if name != "bash" {
+        // With the experiment on, an ordinary command may wait: `wait` is the way to do it.
+        if name != "bash" || self.tools.interruptible_wait_enabled() {
             return None;
         }
         let running = self.tools.jobs.as_ref()?.running_ids();
@@ -105,6 +114,26 @@ impl Agent {
              automatically starts your next turn with its result. To wait for a job, end your turn with a short \
              status and no tool call."
         ))
+    }
+
+    /// Registers an interruptible wait for this call, when the experiment is on and the call can
+    /// wait: `wait`, or `bash` that is neither `pty` nor `async`. User input releases the wait
+    /// without cancelling the work; input queued before this call steers at once instead.
+    fn wait_guard(&self, name: &str, args: &Value) -> Option<mu_tools::jobs::ActiveWait> {
+        if !self.tools.interruptible_wait_enabled() {
+            return None;
+        }
+        let eligible = match name {
+            "wait" => true,
+            "bash" => args["pty"].as_bool() != Some(true) && args["async"].as_bool() != Some(true),
+            _ => false,
+        };
+        let jobs = self.tools.jobs.clone().filter(|_| eligible)?;
+        let guard = jobs.begin_wait();
+        if promote_queued(&self.ports.inbox, &self.ports.events) {
+            guard.token().cancel();
+        }
+        Some(guard)
     }
 
     /// A status block for the model: jobs started before `since` that still run. `None` when there are none.
@@ -129,10 +158,15 @@ impl Agent {
             [] => return None,
             [one] => {
                 let (label, elapsed) = line(one);
+                let next = if self.tools.interruptible_wait_enabled() {
+                    "When it finishes, mu automatically starts your next turn with its result; use `wait` when you \
+                     need it now."
+                } else {
+                    "When it finishes, mu automatically starts your next turn with its result; no user input is \
+                     needed. If your next step needs it, end your turn now with a short status."
+                };
                 format!(
-                    "\n\n<background-jobs>\n{} ({label}) has been running for {elapsed}.\nWhen it finishes, mu \
-                     automatically starts your next turn with its result; no user input is needed. If your next step \
-                     needs it, end your turn now with a short status.\n</background-jobs>",
+                    "\n\n<background-jobs>\n{} ({label}) has been running for {elapsed}.\n{next}\n</background-jobs>",
                     one.name
                 )
             }
@@ -144,11 +178,14 @@ impl Agent {
                         format!("- {} ({label}), {elapsed}\n", j.name)
                     })
                     .collect();
-                format!(
-                    "\n\n<background-jobs>\nStill running:\n{items}When each finishes, mu automatically starts your \
-                     next turn with its result; no user input is needed. If your next step needs one of them, end \
-                     your turn now with a short status.\n</background-jobs>"
-                )
+                let next = if self.tools.interruptible_wait_enabled() {
+                    "When each finishes, mu automatically starts your next turn with its result; use `wait` when you \
+                     need one now."
+                } else {
+                    "When each finishes, mu automatically starts your next turn with its result; no user input is \
+                     needed. If your next step needs one of them, end your turn now with a short status."
+                };
+                format!("\n\n<background-jobs>\nStill running:\n{items}{next}\n</background-jobs>")
             }
         })
     }
@@ -231,6 +268,7 @@ impl Agent {
             cancel: cancel.clone(),
             call_id: id.clone(),
             plan: self.plan.plan.is_some(),
+            wait_interrupt: None,
         };
         let mut out = self.tools.call("bash", &args, &ctx).await;
         let hits = self.redact_output(&mut out, false);
@@ -321,24 +359,31 @@ impl Agent {
                 match stop {
                     Some(o) => o,
                     None => {
+                        // Only the call itself is interruptible: the approval above is not.
+                        let guard = self.wait_guard(name, &args);
                         let ctx = ToolCtx {
                             events: self.ports.events.clone(),
                             cancel: cancel.clone(),
                             call_id: id.into(),
                             plan: self.plan.plan.is_some(),
+                            wait_interrupt: guard.as_ref().map(|g| g.token()),
                         };
                         use futures_util::FutureExt;
-                        match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await {
-                            Ok(o) => o,
-                            Err(p) => {
-                                let msg = p
-                                    .downcast_ref::<&str>()
-                                    .map(|s| s.to_string())
-                                    .or_else(|| p.downcast_ref::<String>().cloned())
-                                    .unwrap_or_else(|| "unknown panic".into());
-                                ToolOutput::err(format!("tool panicked: {msg}"))
-                            }
-                        }
+                        let out =
+                            match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await
+                            {
+                                Ok(o) => o,
+                                Err(p) => {
+                                    let msg = p
+                                        .downcast_ref::<&str>()
+                                        .map(|s| s.to_string())
+                                        .or_else(|| p.downcast_ref::<String>().cloned())
+                                        .unwrap_or_else(|| "unknown panic".into());
+                                    ToolOutput::err(format!("tool panicked: {msg}"))
+                                }
+                            };
+                        drop(guard);
+                        out
                     }
                 }
             }

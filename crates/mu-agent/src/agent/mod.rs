@@ -4,7 +4,7 @@ pub use state::RunConfig;
 use state::{CompactionFlow, Costs, Mailbox, Memo, ModelState, PlanFlow, Ports, SharedInbox, TitleState, new_inbox};
 use std::cell::Cell;
 mod inbox;
-use inbox::{inbox_cmd, report_dropped};
+use inbox::{inbox_cmd, promote_queued, report_dropped, steer_now};
 #[cfg(test)]
 mod loop_tests;
 #[cfg(test)]
@@ -224,6 +224,13 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
                     let _ = q.events.send(AgentEvent::ThinkingLevel(t));
                     q.backlog.push_back(Command::SetThinking(t));
                 }
+                Some(c @ (Command::Prompt(_) | Command::Steer(_) | Command::FollowUp(_)))
+                    if q.jobs.as_ref().is_some_and(|j| j.interrupt_wait()) =>
+                {
+                    // An active interruptible wait is released by the new message, which steers the
+                    // turn; the work behind the wait keeps running.
+                    steer_now(c, &q.inbox, &q.events);
+                }
                 Some(other) => {
                     if let Err(c) = inbox_cmd(other, &q.inbox, &q.events) {
                         q.backlog.push_back(c);
@@ -239,6 +246,7 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
 impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let mut tools = Tools::new(i.cwd.clone(), i.plugins.clone());
+        tools.interruptible_wait = i.providers.cfg.mu.experimental.interruptible_wait;
         tools.set_skills(i.ctx.skills.iter().map(|s| (s.name.clone(), s.dir.clone())).collect());
         tools.set_context_page(prompt::context_page(&i.ctx));
         // The flag wins over inheritance, which wins over the config.
@@ -372,6 +380,7 @@ impl Agent {
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),
             hashline: mu_tools::tools::edit::is_hashline(),
+            interruptible_wait: self.tools.interruptible_wait_enabled(),
         })
     }
 

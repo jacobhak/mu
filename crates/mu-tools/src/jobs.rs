@@ -2,13 +2,13 @@
 //! are delivered to the model as a `<system-notice>` message.
 
 use std::cell::{Cell, RefCell, RefMut};
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
-#[cfg(test)]
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +18,7 @@ use crate::tools::subagent::{BackgroundResult, Outcome, run_child_observed};
 use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
+use mu_base::tool::BashMeta;
 
 /// Newest bytes of a running bash job's output kept for the jobs panel.
 const OUTPUT_KEEP: usize = 64 * 1024;
@@ -122,6 +123,7 @@ struct Job {
     last: String,
     state: SubagentState,
     text: String,
+    meta: Option<BashMeta>,
     started: SystemTime,
     ended: Option<SystemTime>,
     /// How a bash job ended ("exit 3", "timed out", …).
@@ -130,6 +132,7 @@ struct Job {
     session: Option<PathBuf>,
     model: Option<String>,
     delivered: bool,
+    notice_owned: bool,
     cancel: CancellationToken,
 }
 
@@ -138,6 +141,7 @@ struct Finished {
     ok: bool,
     text: String,
     note: Option<String>,
+    meta: Option<BashMeta>,
 }
 
 pub struct Done {
@@ -147,13 +151,47 @@ pub struct Done {
     pub text: String,
     pub command: Option<String>,
     pub note: Option<String>,
+    pub meta: Option<BashMeta>,
+}
+
+/// A scoped registration for an interruptible wait.
+pub struct ActiveWait {
+    jobs: Rc<JobsHandle>,
+    generation: u64,
+    interrupt: CancellationToken,
+}
+
+impl ActiveWait {
+    pub fn token(&self) -> CancellationToken {
+        self.interrupt.clone()
+    }
+}
+
+impl Drop for ActiveWait {
+    fn drop(&mut self) {
+        let mut active = self.jobs.active_wait.borrow_mut();
+        if active.as_ref().is_some_and(|(generation, _)| *generation == self.generation) {
+            *active = None;
+        }
+    }
+}
+
+/// Readiness does not consume results; callers choose when to deliver them.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitReady {
+    Ready(Vec<String>),
+    Nothing,
+    Interrupted,
+    Cancelled,
+    Unknown(Vec<String>),
 }
 
 pub struct JobsHandle {
     inner: RefCell<Vec<Job>>,
     next_seq: Cell<u64>,
-    #[cfg(test)]
     notify: Notify,
+    wait_generation: Cell<u64>,
+    active_wait: RefCell<Option<(u64, CancellationToken)>>,
     wake: UnboundedSender<()>,
     events: EventTx,
 }
@@ -163,11 +201,90 @@ impl JobsHandle {
         Rc::new(Self {
             inner: RefCell::default(),
             next_seq: Cell::new(0),
-            #[cfg(test)]
             notify: Notify::new(),
+            wait_generation: Cell::new(0),
+            active_wait: RefCell::new(None),
             wake,
             events,
         })
+    }
+
+    /// Registers the current wait. Dropping an older guard cannot unregister a newer wait.
+    pub fn begin_wait(self: &Rc<Self>) -> ActiveWait {
+        let generation = self.wait_generation.get().wrapping_add(1);
+        self.wait_generation.set(generation);
+        let interrupt = CancellationToken::new();
+        *self.active_wait.borrow_mut() = Some((generation, interrupt.clone()));
+        ActiveWait { jobs: Rc::clone(self), generation, interrupt }
+    }
+
+    /// Interrupts only the currently registered wait, not its jobs.
+    pub fn interrupt_wait(&self) -> bool {
+        if let Some((_, token)) = self.active_wait.borrow().as_ref() {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Waits for selected jobs, or any notice-owned job when `ids` is empty.
+    /// Unknown ids and an exhausted selection return immediately.
+    pub async fn wait_ready(
+        &self,
+        ids: &[String],
+        cancel: &CancellationToken,
+        interrupt: &CancellationToken,
+    ) -> WaitReady {
+        let mut seen = HashSet::new();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect();
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cancel.is_cancelled() {
+                return WaitReady::Cancelled;
+            }
+            if interrupt.is_cancelled() {
+                return WaitReady::Interrupted;
+            }
+            let (ready, unknown, running) = {
+                let jobs = self.inner.borrow();
+                let unknown = ids
+                    .iter()
+                    .filter(|id| !jobs.iter().any(|j| j.spec.id == **id))
+                    .map(|id| (*id).to_string())
+                    .collect::<Vec<_>>();
+                let eligible = |j: &&Job| j.notice_owned && !j.delivered;
+                let selected: Vec<&Job> = if ids.is_empty() {
+                    jobs.iter().filter(eligible).collect()
+                } else {
+                    ids.iter().filter_map(|id| jobs.iter().find(|j| j.spec.id == *id)).filter(eligible).collect()
+                };
+                let ready = selected
+                    .iter()
+                    .filter(|j| j.state != SubagentState::Running)
+                    .map(|j| j.spec.id.clone())
+                    .collect::<Vec<_>>();
+                let running = selected.iter().any(|j| j.state == SubagentState::Running);
+                (ready, unknown, running)
+            };
+            if !unknown.is_empty() {
+                return WaitReady::Unknown(unknown);
+            }
+            if !ready.is_empty() {
+                return WaitReady::Ready(ready);
+            }
+            if !running {
+                return WaitReady::Nothing;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return WaitReady::Cancelled,
+                _ = interrupt.cancelled() => return WaitReady::Interrupted,
+                _ = &mut notified => {}
+            }
+        }
     }
 
     /// `base`, or `base-2`, `base-3`, … when taken this session.
@@ -225,7 +342,7 @@ impl JobsHandle {
         RefMut::filter_map(self.inner.borrow_mut(), |jobs| jobs.iter_mut().find(|j| j.seq == seq)).ok()
     }
 
-    fn start(&self, spec: Spec, last: String, cancel: CancellationToken) -> u64 {
+    fn start(&self, spec: Spec, last: String, cancel: CancellationToken, notice_owned: bool) -> u64 {
         let seq = self.next_seq.get();
         self.next_seq.set(seq + 1);
         self.inner.borrow_mut().push(Job {
@@ -235,12 +352,14 @@ impl JobsHandle {
             last,
             state: SubagentState::Running,
             text: String::new(),
+            meta: None,
             started: SystemTime::now(),
             ended: None,
             note: None,
             session: None,
             model: None,
             delivered: false,
+            notice_owned,
             cancel,
         });
         self.emit();
@@ -248,14 +367,16 @@ impl JobsHandle {
     }
 
     /// Records a finished job and wakes an idle agent.
-    fn complete(&self, seq: u64, ok: bool, text: String, note: Option<String>) {
+    fn complete(&self, seq: u64, ok: bool, text: String, note: Option<String>, meta: Option<BashMeta>) {
         if let Some(mut j) = self.job_mut(seq) {
             j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
             j.ended = Some(SystemTime::now());
-            j.text = text;
+            if !j.delivered {
+                j.text = text;
+                j.meta = meta;
+            }
             j.note = note;
         }
-        #[cfg(test)]
         self.notify.notify_waiters();
         let _ = self.wake.send(());
         self.emit();
@@ -267,12 +388,12 @@ impl JobsHandle {
     where
         F: Future<Output = Finished> + 'static,
     {
-        let seq = self.start(spec, last, cancel);
+        let seq = self.start(spec, last, cancel, true);
         let fut = work(seq);
         let me = self.clone();
         tokio::task::spawn_local(async move {
             let done = fut.await;
-            me.complete(seq, done.ok, done.text, done.note);
+            me.complete(seq, done.ok, done.text, done.note, done.meta);
         });
     }
 
@@ -301,7 +422,7 @@ impl JobsHandle {
             let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
-            Finished { ok: out.ok, text: out.text, note: None }
+            Finished { ok: out.ok, text: out.text, note: None, meta: None }
         });
     }
 
@@ -331,7 +452,7 @@ impl JobsHandle {
             task: command_line(payload["task"].as_str().unwrap_or("")),
             command: None,
         };
-        let seq = self.start(spec, String::new(), own.clone());
+        let seq = self.start(spec, String::new(), own.clone(), false);
         let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool, &perms, "review").await;
         if let Some(mut j) = self.job_mut(seq) {
             j.state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
@@ -415,7 +536,7 @@ impl JobsHandle {
             async move {
                 let r = fut.await;
                 sink.flush();
-                Finished { ok: r.ok, text: r.text, note: Some(r.note) }
+                Finished { ok: r.ok, text: r.text, note: Some(r.note), meta: r.meta }
             }
         });
         id
@@ -423,11 +544,21 @@ impl JobsHandle {
 
     /// Finished, undelivered jobs; marks them delivered.
     pub fn take_undelivered(&self) -> Vec<Done> {
+        self.take_undelivered_for(&[])
+    }
+
+    /// Takes completed notice-owned results for the selected ids, or all when empty.
+    pub fn take_undelivered_for(&self, ids: &[String]) -> Vec<Done> {
         let done: Vec<Done> = self
             .inner
             .borrow_mut()
             .iter_mut()
-            .filter(|j| j.state != SubagentState::Running && !j.delivered)
+            .filter(|j| {
+                j.notice_owned
+                    && j.state != SubagentState::Running
+                    && !j.delivered
+                    && (ids.is_empty() || ids.contains(&j.spec.id))
+            })
             .map(|j| {
                 j.delivered = true;
                 Done {
@@ -438,6 +569,7 @@ impl JobsHandle {
                     text: std::mem::take(&mut j.text),
                     command: j.spec.command.take(),
                     note: j.note.clone(),
+                    meta: j.meta.take(),
                 }
             })
             .collect();
@@ -448,7 +580,28 @@ impl JobsHandle {
     }
 
     pub fn has_undelivered(&self) -> bool {
-        self.inner.borrow().iter().any(|j| j.state != SubagentState::Running && !j.delivered)
+        self.inner.borrow().iter().any(|j| j.notice_owned && j.state != SubagentState::Running && !j.delivered)
+    }
+
+    /// Discards a notice-owned result, including one that has yet to finish.
+    pub fn discard_result(&self, id: &str) -> bool {
+        let found = {
+            let mut jobs = self.inner.borrow_mut();
+            if let Some(j) = jobs.iter_mut().find(|j| j.notice_owned && j.spec.id == id && !j.delivered) {
+                j.delivered = true;
+                j.text.clear();
+                j.meta = None;
+                j.spec.command = None;
+                true
+            } else {
+                false
+            }
+        };
+        if found {
+            self.notify.notify_waiters();
+            self.emit();
+        }
+        found
     }
 
     /// Ids of the running jobs, oldest first.
@@ -482,6 +635,7 @@ impl JobsHandle {
     pub fn clear(&self) {
         self.kill(None);
         self.inner.borrow_mut().clear();
+        self.notify.notify_waiters();
         self.emit();
     }
 
@@ -525,12 +679,14 @@ impl JobsHandle {
             last: String::new(),
             state: SubagentState::Running,
             text: String::new(),
+            meta: None,
             started: SystemTime::now(),
             ended: None,
             note: None,
             session: None,
             model: None,
             delivered: false,
+            notice_owned: true,
             cancel: CancellationToken::new(),
         });
     }
@@ -584,8 +740,96 @@ pub(crate) mod tests {
         JobsHandle::new(wake, events)
     }
 
+    #[tokio::test]
+    async fn wait_priority_and_guard_generation() {
+        let h = handle();
+        h.push_running("A");
+        let old = h.begin_wait();
+        let current = h.begin_wait();
+        drop(old);
+        h.finish("A", true, "result");
+        assert!(h.interrupt_wait());
+        assert!(h.interrupt_wait());
+        let cancel = CancellationToken::new();
+        assert_eq!(h.wait_ready(&[], &cancel, &current.token()).await, WaitReady::Interrupted);
+        cancel.cancel();
+        assert_eq!(h.wait_ready(&[], &cancel, &current.token()).await, WaitReady::Cancelled);
+        drop(current);
+        assert!(!h.interrupt_wait());
+        let next = h.begin_wait();
+        assert_eq!(
+            h.wait_ready(&[], &CancellationToken::new(), &next.token()).await,
+            WaitReady::Ready(vec!["A".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_selects_deduplicates_and_excludes_owned_jobs() {
+        let h = handle();
+        h.push_running("A");
+        h.push_running("B");
+        h.push_running("review");
+        h.inner.borrow_mut().iter_mut().find(|j| j.spec.id == "review").unwrap().notice_owned = false;
+        h.finish("A", true, "a");
+        h.finish("B", true, "b");
+        h.finish("review", true, "private");
+        let guard = h.begin_wait();
+        let ids = vec!["A".into(), "missing".into(), "A".into(), "other".into(), "missing".into(), "review".into()];
+        let cancel = CancellationToken::new();
+        let interrupt = guard.token();
+        assert_eq!(
+            h.wait_ready(&ids, &cancel, &interrupt).await,
+            WaitReady::Unknown(vec!["missing".into(), "other".into()])
+        );
+        assert_eq!(h.wait_ready(&["review".into()], &cancel, &interrupt).await, WaitReady::Nothing);
+        assert_eq!(
+            h.wait_ready(&["B".into(), "A".into(), "B".into()], &cancel, &interrupt).await,
+            WaitReady::Ready(vec!["B".into(), "A".into()])
+        );
+        assert_eq!(h.take_undelivered_for(&ids).len(), 1);
+        assert_eq!(h.wait_ready(&["A".into()], &cancel, &interrupt).await, WaitReady::Nothing);
+        assert_eq!(h.take_undelivered()[0].id, "B");
+        assert!(!h.has_undelivered());
+    }
+
+    #[tokio::test]
+    async fn wait_wakes_on_completion_clear_and_discard() {
+        let h = handle();
+        h.push_running("A");
+        let guard = h.begin_wait();
+        let cancel = CancellationToken::new();
+        let interrupt = guard.token();
+        let wait = h.wait_ready(&[], &cancel, &interrupt);
+        let finish = async {
+            tokio::task::yield_now().await;
+            h.finish("A", true, "a");
+        };
+        let (result, ()) = tokio::join!(wait, finish);
+        assert_eq!(result, WaitReady::Ready(vec!["A".into()]));
+        h.take_undelivered();
+        h.push_running("B");
+        let wait = h.wait_ready(&[], &cancel, &interrupt);
+        let clear = async {
+            tokio::task::yield_now().await;
+            h.clear();
+        };
+        let (result, ()) = tokio::join!(wait, clear);
+        assert_eq!(result, WaitReady::Nothing);
+        h.push_running("C");
+        let wait = h.wait_ready(&[], &cancel, &interrupt);
+        let discard = async {
+            tokio::task::yield_now().await;
+            assert!(h.discard_result("C"));
+        };
+        let (result, ()) = tokio::join!(wait, discard);
+        assert_eq!(result, WaitReady::Nothing);
+        h.complete(0, true, "discarded".into(), None, None);
+        assert!(h.take_undelivered().is_empty());
+        assert!(h.inner.borrow()[0].text.is_empty());
+    }
+
     fn done(id: &str, ok: bool, text: &str) -> Done {
-        Done { id: id.into(), agent: "scout".into(), ok, text: text.into(), command: None, note: None }
+        Done { id: id.into(), agent: "scout".into(), ok, text: text.into(), command: None, note: None, meta: None }
     }
 
     #[test]
@@ -605,12 +849,14 @@ pub(crate) mod tests {
             last: String::new(),
             state: SubagentState::Done,
             text: "big output".into(),
+            meta: None,
             started: SystemTime::now(),
             ended: Some(SystemTime::now()),
             note: Some("exit 0".into()),
             session: None,
             model: None,
             delivered: false,
+            notice_owned: true,
             cancel: CancellationToken::new(),
         });
         let snap = h.snapshot();
@@ -832,6 +1078,7 @@ pub(crate) mod tests {
             text: "out".into(),
             command: Some("make\n  test".into()),
             note: Some("exit 2".into()),
+            meta: None,
         };
         assert_eq!(result_text(&d), "## bg_1 (bash: make test) — failed, exit 2\nout");
     }

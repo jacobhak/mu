@@ -389,8 +389,13 @@ impl Agent {
         if !open.is_empty() {
             *todo_nags += 1;
             let list = open.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
+            let wait = if self.tools.interruptible_wait_enabled() {
+                ""
+            } else {
+                " Never run a command in the foreground to wait it out."
+            };
             self.push(Message::user(&format!(
-                "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work on them, marking each `done` only when you have actually finished it. Do not tick items off that you did not do. `drop` an item that is no longer needed; `block` it (with a reason) if you are waiting on the user or something external. Never run a command in the foreground to wait it out. Do not reply to this reminder.\n</system-reminder>",
+                "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work on them, marking each `done` only when you have actually finished it. Do not tick items off that you did not do. `drop` an item that is no longer needed; `block` it (with a reason) if you are waiting on the user or something external.{wait} Do not reply to this reminder.\n</system-reminder>",
                 open.len()
             )));
             return None;
