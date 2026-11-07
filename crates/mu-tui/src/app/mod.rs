@@ -137,7 +137,7 @@ pub async fn run(init: AppInit) -> i32 {
     let _term = match Term::enter() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("mu: cannot initialise terminal: {e}");
+            term::say_err(format_args!("mu: cannot initialise terminal: {e}\n"));
             return 1;
         }
     };
@@ -234,7 +234,7 @@ pub async fn run(init: AppInit) -> i32 {
     let mut reader = match input::Reader::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("mu: cannot read the terminal: {e}");
+            term::say_err(format_args!("mu: cannot read the terminal: {e}\n"));
             return 1;
         }
     };
@@ -245,15 +245,23 @@ pub async fn run(init: AppInit) -> i32 {
         if let Some(p) = term::take_panic() {
             app.error(&p);
         }
-        if app.screen.dirty
-            && !app.screen.child_busy
-            && Instant::now() >= app.screen.last_draw + FRAME
-            && let Err(e) = app.draw()
-            && !draw_failed
-        {
-            // Said once: stderr is the terminal, and repeating it would flood the screen.
-            draw_failed = true;
-            eprintln!("mu: draw failed: {e}");
+        if app.screen.dirty && !app.screen.child_busy && Instant::now() >= app.screen.last_draw + FRAME {
+            match app.draw() {
+                Ok(()) => {}
+                // The terminal hung up: nothing can be drawn on it again. Ask the agent to stop and
+                // leave without a word.
+                Err(e) if term::hangup(&e) => {
+                    term::mark_lost();
+                    app.quit();
+                    break;
+                }
+                Err(e) if !draw_failed => {
+                    // Said once: stderr is the terminal, and repeating it would flood the screen.
+                    draw_failed = true;
+                    term::say_err(format_args!("mu: draw failed: {e}\n"));
+                }
+                Err(_) => {}
+            }
         }
         let due = app.screen.last_draw + FRAME;
         tokio::select! {
@@ -282,17 +290,27 @@ pub async fn run(init: AppInit) -> i32 {
         app.sync_key_flow();
     }
     // Lines committed in the last moments (a final reply, the exit notice) are drawn before the
-    // terminal is handed back.
-    let _ = app.draw();
-    let _ = app.screen.renderer.finish();
-    if let Some(path) = app.agent.status.session_path.as_deref().filter(|p| std::path::Path::new(p).exists()) {
-        let id = std::path::Path::new(path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.rsplit_once('_'))
-            .map_or(path, |(_, id)| id);
-        let profile = mu_session::session::list::profile_flag();
-        eprint!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n");
+    // terminal is handed back. A terminal that hung up takes neither the last frame nor the
+    // farewell: writes to it fail, and this is exactly the path that used to abort on the panic
+    // from a failed `eprint!`.
+    if !term::is_lost() {
+        if let Err(e) = app.draw()
+            && term::hangup(&e)
+        {
+            term::mark_lost();
+        }
+        let _ = app.screen.renderer.finish();
+        if !term::is_lost()
+            && let Some(path) = app.agent.status.session_path.as_deref().filter(|p| std::path::Path::new(p).exists())
+        {
+            let id = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit_once('_'))
+                .map_or(path, |(_, id)| id);
+            let profile = mu_session::session::list::profile_flag();
+            term::say_err(format_args!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n"));
+        }
     }
     0
 }

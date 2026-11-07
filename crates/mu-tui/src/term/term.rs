@@ -46,9 +46,11 @@ impl Drop for Term {
             }
         }
         off();
-        if fatal {
+        // Not `eprint!`: a second panic here aborts the process, and this runs exactly when the
+        // terminal may have hung up.
+        if fatal && !is_lost() {
             let msg = PANIC.lock().ok().and_then(|mut g| g.take());
-            eprint!("\r\n{}\r\n", msg.unwrap_or_else(|| "mu: internal error".into()));
+            say_err(format_args!("\r\n{}\r\n", msg.unwrap_or_else(|| "mu: internal error".into())));
         }
     }
 }
@@ -81,6 +83,32 @@ pub fn set_rows_below(n: usize) {
 /// background task) land here; a fatal one is printed by `Term::drop` instead.
 pub fn take_panic() -> Option<String> {
     PANIC.lock().ok().and_then(|mut g| g.take())
+}
+
+/// True once the terminal hung up.
+static LOST: AtomicBool = AtomicBool::new(false);
+
+/// Writes a farewell to stderr without ever panicking. `eprint!` panics when the write fails, and
+/// a write to a terminal that hung up fails with `EIO`; on the way out that panic is the crash.
+pub fn say_err(args: std::fmt::Arguments<'_>) {
+    let mut err = io::stderr().lock();
+    let _ = err.write_fmt(args);
+    let _ = err.flush();
+}
+
+/// Whether an output error means the terminal is gone: a pty whose master closed answers `EIO`.
+pub fn hangup(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EIO) | Some(libc::EPIPE) | Some(libc::ENXIO))
+}
+
+/// Remembers the hangup, so the screen is not drawn to a terminal that cannot show it.
+pub fn mark_lost() {
+    LOST.store(true, SeqCst);
+}
+
+/// Whether the terminal hung up: nothing can be drawn or said to it any more.
+pub fn is_lost() -> bool {
+    LOST.load(SeqCst)
 }
 
 /// Waits for SIGTERM, SIGHUP or SIGQUIT, so the terminal can be restored on the way out.
@@ -236,6 +264,39 @@ mod tests {
             unsafe { libc::raise(libc::SIGHUP) };
             tokio::time::timeout(std::time::Duration::from_secs(2), s.next()).await.expect("signal delivered");
         });
+    }
+
+    #[test]
+    fn a_hung_up_terminal_is_recognised() {
+        for code in [libc::EIO, libc::EPIPE, libc::ENXIO] {
+            assert!(hangup(&io::Error::from_raw_os_error(code)), "os error {code} is a hangup");
+        }
+        assert!(!hangup(&io::Error::from_raw_os_error(libc::EAGAIN)));
+        assert!(!hangup(&io::Error::from(io::ErrorKind::Other)));
+    }
+
+    #[test]
+    fn a_write_after_the_master_closed_is_a_hangup() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (-1 as libc::c_int, -1 as libc::c_int);
+        let ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: valid out-pointers; name and termios are null. macOS declares the winsize pointer
+        // `*mut`, Linux `*const`; the cast is only read through.
+        let r = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of!(ws).cast_mut().cast(),
+            )
+        };
+        assert_eq!(r, 0, "openpty: {}", io::Error::last_os_error());
+        // SAFETY: openpty returned two fresh descriptors that nothing else owns.
+        let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        drop(master);
+        let e = std::fs::File::from(slave).write_all(b"x").expect_err("a hung-up pty takes no writes");
+        assert!(hangup(&e), "the write reported {e:?}");
     }
 
     #[test]
