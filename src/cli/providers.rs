@@ -7,16 +7,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::{Entry, Store, resolve_entry};
 use mu_provider::model::discovery::{self, CustomRow};
-use mu_provider::provider::custom::{self, AuthMode, CustomModel, CustomProvider, Registry, SaveError};
+use mu_provider::provider::custom::{self, AuthMode, CustomModel, CustomProvider, Reasoning, Registry, SaveError};
+use serde_json::Map;
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
 
+/// `Add` carries every `--model` setting and is parsed once per run, so it is not worth boxing.
+#[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 pub enum Cmd {
     /// List the custom endpoints: base URL, credential state, discovery and manual models. Never shows a key.
     List,
     /// Add a custom OpenAI-compatible endpoint. Its key is read from stdin (a no-echo prompt on a
     /// terminal), or referenced with --env or --cmd; --no-auth for an endpoint that takes none.
+    /// Each --model reasons with an effort ladder (low, medium, high) unless --reasoning or
+    /// --effort say otherwise.
     Add {
         /// The provider id: models are then selected as `<id>/<model id>`.
         id: String,
@@ -35,6 +40,22 @@ pub enum Cmd {
         /// Output limit of the --model ids.
         #[arg(long)]
         max_tokens: Option<u32>,
+        /// How the --model ids reason: none, effort (sends reasoning_effort) or template (request
+        /// switches). Default effort, with low, medium and high.
+        #[arg(long, value_name = "MODE")]
+        reasoning: Option<String>,
+        /// An effort level the --model ids take: minimal, low, medium, high, xhigh or max. Repeat,
+        /// lowest first. Default low, medium and high; effort only.
+        #[arg(long = "effort", value_name = "LEVEL")]
+        efforts: Vec<String>,
+        /// A request switch while thinking is on, as `path = value` (with reasoning = template).
+        /// Repeat for each one.
+        #[arg(long = "thinking-on", value_name = "PATH=VALUE")]
+        thinking_on: Vec<String>,
+        /// A request switch while thinking is off, as `path = value` (with reasoning = template).
+        /// Repeat for each one.
+        #[arg(long = "thinking-off", value_name = "PATH=VALUE")]
+        thinking_off: Vec<String>,
         /// Read the key from this environment variable at request time.
         #[arg(long, conflicts_with_all = ["cmd", "no_auth"])]
         env: Option<String>,
@@ -86,6 +107,10 @@ pub struct AddArgs {
     pub models: Vec<String>,
     pub context_window: Option<u32>,
     pub max_tokens: Option<u32>,
+    pub reasoning: Option<String>,
+    pub efforts: Vec<String>,
+    pub thinking_on: Vec<String>,
+    pub thinking_off: Vec<String>,
     pub source: Source,
     pub no_discover: bool,
     pub no_validate: bool,
@@ -122,6 +147,10 @@ fn exec(
             models,
             context_window,
             max_tokens,
+            reasoning,
+            efforts,
+            thinking_on,
+            thinking_off,
             env,
             cmd,
             no_auth,
@@ -134,8 +163,21 @@ fn exec(
                 (_, _, true) => Source::Keyless,
                 _ => Source::Prompt,
             };
-            let args =
-                AddArgs { id, base_url, label, models, context_window, max_tokens, source, no_discover, no_validate };
+            let args = AddArgs {
+                id,
+                base_url,
+                label,
+                models,
+                context_window,
+                max_tokens,
+                reasoning,
+                efforts,
+                thinking_on,
+                thinking_off,
+                source,
+                no_discover,
+                no_validate,
+            };
             let prompt = format!("API key for {}", args.id);
             add(registry, store, &args, &|| read_secret("", &prompt), out)?
         }
@@ -152,8 +194,17 @@ fn draft(args: &AddArgs) -> Result<CustomProvider> {
     p.auth = if args.source == Source::Keyless { AuthMode::None } else { AuthMode::Bearer };
     p.discover = !args.no_discover;
     if args.models.is_empty() {
-        if args.context_window.is_some() || args.max_tokens.is_some() {
-            bail!("--context-window and --max-tokens apply to the --model ids; give at least one --model");
+        if args.context_window.is_some()
+            || args.max_tokens.is_some()
+            || args.reasoning.is_some()
+            || !args.efforts.is_empty()
+            || !args.thinking_on.is_empty()
+            || !args.thinking_off.is_empty()
+        {
+            bail!(
+                "--context-window, --max-tokens, --reasoning, --effort and --thinking-on/--thinking-off \
+                 apply to the --model ids; give at least one --model"
+            );
         }
         if args.no_discover {
             bail!("--no-discover needs at least one --model: without discovery, the models are the ones you list");
@@ -163,13 +214,55 @@ fn draft(args: &AddArgs) -> Result<CustomProvider> {
         if m.trim().is_empty() {
             bail!("--model needs a model id");
         }
-        let model =
-            CustomModel { context_window: args.context_window, max_tokens: args.max_tokens, ..Default::default() };
+        let model = model_settings(args)?;
         if p.models.insert(m.clone(), model).is_some() {
             bail!("--model {m} is given more than once");
         }
     }
     Ok(p)
+}
+
+/// The limits and reasoning `--model` ids get. A model nobody says otherwise about reasons with an
+/// effort ladder, since a level only reaches the server while thinking is on.
+fn model_settings(args: &AddArgs) -> Result<CustomModel> {
+    let reasoning = match args.reasoning.as_deref() {
+        None => Reasoning::Effort,
+        Some(mode) => Reasoning::parse(mode)
+            .ok_or_else(|| anyhow!("--reasoning must be one of {}", Reasoning::NAMES.join(", ")))?,
+    };
+    let mut on = Map::new();
+    for entry in &args.thinking_on {
+        custom::set_switch(&mut on, entry).map_err(|e| anyhow!("--thinking-on: {e}"))?;
+    }
+    let mut off = Map::new();
+    for entry in &args.thinking_off {
+        custom::set_switch(&mut off, entry).map_err(|e| anyhow!("--thinking-off: {e}"))?;
+    }
+    let efforts = match (reasoning, args.efforts.len()) {
+        (Reasoning::Effort, 0) => custom::default_efforts(),
+        (Reasoning::Effort, _) => args.efforts.clone(),
+        (_, 0) => Vec::new(),
+        (mode, _) => bail!("--effort only applies to --reasoning effort, not {}", mode.as_str()),
+    };
+    if reasoning == Reasoning::Template && (on.is_empty() || off.is_empty()) {
+        bail!(
+            "--reasoning template needs --thinking-on and --thinking-off, e.g. \
+             --thinking-on 'chat_template_kwargs.enable_thinking = true' \
+             --thinking-off 'chat_template_kwargs.enable_thinking = false'"
+        );
+    }
+    if reasoning == Reasoning::None && (!on.is_empty() || !off.is_empty()) {
+        bail!("--thinking-on and --thinking-off need --reasoning effort or template, not none");
+    }
+    Ok(CustomModel {
+        context_window: args.context_window,
+        max_tokens: args.max_tokens,
+        reasoning,
+        efforts,
+        extra_body_on: on,
+        extra_body_off: off,
+        ..Default::default()
+    })
 }
 
 /// `mu providers add`: checks the endpoint and the key, then saves the definition and the key. A
@@ -349,7 +442,12 @@ fn model_rows(c: &CustomProvider, listed: &[CustomRow]) -> Vec<String> {
                 .and_then(|x| x.context_window)
                 .or_else(|| listed.iter().find(|r| r.id == *m).and_then(|r| r.context_length));
             let context = context.map_or(String::new(), |n| format!("  context {n}"));
-            format!("{}/{m}  {source}{context}", c.id)
+            let reasoning = c.models.get(*m).map_or(String::new(), |x| match x.reasoning {
+                Reasoning::None => String::new(),
+                Reasoning::Effort => format!("  reasoning effort {}", x.efforts.join("/")),
+                Reasoning::Template => "  reasoning by request switches".to_string(),
+            });
+            format!("{}/{m}  {source}{context}{reasoning}", c.id)
         })
         .collect()
 }
@@ -430,6 +528,10 @@ mod tests {
             models: Vec::new(),
             context_window: None,
             max_tokens: None,
+            reasoning: None,
+            efforts: Vec::new(),
+            thinking_on: Vec::new(),
+            thinking_off: Vec::new(),
             source,
             no_discover: false,
             no_validate: false,
@@ -493,6 +595,57 @@ mod tests {
         a.max_tokens = Some(200);
         let e = draft(&a).unwrap().validated("modal").unwrap_err();
         assert!(format!("{e:#}").contains("exceeds"), "{e:#}");
+    }
+
+    #[test]
+    fn models_get_an_effort_ladder_by_default_and_the_flags_can_change_it() {
+        let mut a = args("modal", "https://x.test/v1", Source::Keyless);
+        a.models = vec!["org/m".into()];
+        let saved = |a: &AddArgs| draft(a).unwrap().validated("modal");
+        let p = saved(&a).unwrap();
+        assert_eq!(p.models["org/m"].reasoning, Reasoning::Effort);
+        assert_eq!(p.models["org/m"].efforts, ["low", "medium", "high"], "a new model reasons by default");
+
+        // A chosen ladder; the whole definition still refuses one out of order or unknown.
+        a.efforts = vec!["minimal".into(), "high".into()];
+        assert_eq!(saved(&a).unwrap().models["org/m"].efforts, ["minimal", "high"]);
+        a.efforts = vec!["high".into(), "low".into()];
+        assert!(format!("{:#}", saved(&a).unwrap_err()).contains("ascending"));
+        a.efforts = vec!["huge".into()];
+        assert!(format!("{:#}", saved(&a).unwrap_err()).contains("unknown effort"));
+
+        // None sends nothing at all.
+        a.reasoning = Some("none".into());
+        a.efforts.clear();
+        let p = saved(&a).unwrap();
+        assert_eq!(p.models["org/m"].reasoning, Reasoning::None);
+        assert!(p.models["org/m"].efforts.is_empty());
+
+        // Template takes its switches as `path = value`, one flag each, and needs both sides.
+        a.reasoning = Some("template".into());
+        a.thinking_on = vec!["chat_template_kwargs.enable_thinking = true".into()];
+        let e = draft(&a).unwrap_err().to_string();
+        assert!(e.contains("--thinking-off"), "{e}");
+        a.thinking_off = vec!["chat_template_kwargs.enable_thinking = false".into()];
+        let p = saved(&a).unwrap();
+        let m = &p.models["org/m"];
+        assert_eq!(m.reasoning, Reasoning::Template);
+        assert_eq!(m.extra_body_on["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(custom::switches_text(&m.extra_body_off), "chat_template_kwargs.enable_thinking = false");
+
+        // Effort keeps a switch too, and the flags that need a model without one say so.
+        a.reasoning = Some("effort".into());
+        assert!(saved(&a).is_ok(), "effort with request switches is valid");
+        a.reasoning = Some("none".into());
+        a.efforts = vec!["low".into()];
+        assert!(draft(&a).unwrap_err().to_string().contains("--effort only applies"));
+        a.reasoning = Some("maybe".into());
+        assert!(draft(&a).unwrap_err().to_string().contains("none, effort, template"));
+        a.reasoning = None;
+        a.thinking_on.clear();
+        a.thinking_off.clear();
+        a.models.clear();
+        assert!(draft(&a).unwrap_err().to_string().contains("apply to the --model ids"));
     }
 
     #[test]

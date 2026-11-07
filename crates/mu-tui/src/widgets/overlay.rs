@@ -25,8 +25,8 @@ pub enum LoginTarget {
     ApiKey(String),
     /// Sign in with ChatGPT (or the sign-in menu when already signed in).
     ChatGpt,
-    /// Add a custom OpenAI-compatible endpoint (the panel).
-    CustomProvider,
+    /// The custom-endpoint panel: a new endpoint, or the existing one with this id to edit.
+    CustomProvider(Option<String>),
 }
 
 /// What the user does next in the API-key picker.

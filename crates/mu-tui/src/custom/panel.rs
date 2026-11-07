@@ -9,7 +9,9 @@
 use crate::widgets::select::{Item, Select};
 use mu_provider::auth::store::{Entry, cmd_label};
 use mu_provider::model::discovery::CustomRow;
-use mu_provider::provider::custom::{self, AuthMode, CustomModel, CustomProvider, DEFAULT_CONTEXT, DEFAULT_OUTPUT};
+use mu_provider::provider::custom::{
+    self, AuthMode, CustomModel, CustomProvider, DEFAULT_CONTEXT, DEFAULT_OUTPUT, EFFORT_LADDER, Reasoning,
+};
 use std::collections::BTreeMap;
 
 /// The files a save writes, named on the first screen.
@@ -34,6 +36,10 @@ pub struct Saved {
     pub id: String,
     pub provider: CustomProvider,
     pub entry: Option<Entry>,
+    /// An existing definition is replaced rather than added.
+    pub editing: bool,
+    /// Whether the user chose how the key is taken; false leaves a stored key as it is.
+    pub key_changed: bool,
     pub listed: Option<Vec<CustomRow>>,
 }
 
@@ -91,6 +97,9 @@ enum Field {
     ModelId,
     Context,
     Output,
+    /// The request switches merged while thinking is on / off.
+    SwitchesOn,
+    SwitchesOff,
 }
 
 /// What the row at an index of the current screen stands for.
@@ -116,8 +125,17 @@ enum Row {
     // One model's limits.
     Context,
     Output,
+    Reasoning,
     Add,
     Remove,
+    // How a model reasons.
+    ModeNone,
+    ModeEffort,
+    ModeTemplate,
+    /// A level of the effort ladder, by its place in `EFFORT_LADDER`.
+    Level(usize),
+    SwitchesOn,
+    SwitchesOff,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +144,7 @@ enum Screen {
     Auth,
     Models,
     Limits,
+    Reasoning,
     /// A field open for typing; the screen behind it is the one it belongs to.
     Field(Field),
 }
@@ -140,12 +159,21 @@ enum Listing {
     Failed(String),
 }
 
-/// The limits being set for one model.
+/// The model being set: its limits and how it reasons, as Add writes it.
 #[derive(Clone, Debug, PartialEq)]
 struct Limits {
     id: String,
-    ctx: u32,
-    out: u32,
+    model: CustomModel,
+}
+
+impl Limits {
+    fn ctx(&self) -> u32 {
+        self.model.context_window.unwrap_or(DEFAULT_CONTEXT)
+    }
+
+    fn out(&self) -> u32 {
+        self.model.max_tokens.unwrap_or(DEFAULT_OUTPUT)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,8 +194,13 @@ pub struct Panel {
     label: String,
     base_url: String,
     auth: Option<Auth>,
+    /// Whether the auth row was chosen here, so an edit only writes a key it was given.
+    auth_changed: bool,
     /// Why the key was refused, shown on the auth screen.
     problem: String,
+    discover: bool,
+    /// An existing definition is edited: its id is fixed and its key stays unless replaced.
+    editing: bool,
     listing: Listing,
     models: BTreeMap<String, CustomModel>,
     limits: Option<Limits>,
@@ -191,7 +224,10 @@ impl Panel {
             label: String::new(),
             base_url: String::new(),
             auth: None,
+            auth_changed: false,
             problem: String::new(),
+            discover: true,
+            editing: false,
             listing: Listing::Unread,
             models: BTreeMap::new(),
             limits: None,
@@ -199,6 +235,24 @@ impl Panel {
             pending: false,
             notes: Vec::new(),
         }
+    }
+
+    /// Starts on an existing definition: the same fields, with the id fixed, the models loaded and
+    /// the key the store holds (`entry`) shown as it is taken. Save replaces the definition there.
+    pub fn edited(dests: Destinations, def: &CustomProvider, entry: Option<Entry>) -> Self {
+        let mut p = Self::new(dests, |_| false);
+        p.editing = true;
+        p.id = def.id.clone();
+        p.label = def.label.clone().unwrap_or_default();
+        p.base_url = def.base_url.clone();
+        p.discover = def.discover;
+        p.models = def.models.clone();
+        p.auth = match (def.auth, entry) {
+            (AuthMode::None, _) => Some(Auth::Keyless),
+            (AuthMode::Bearer, Some(entry)) => Some(Auth::Bearer { source: entry_source(&entry), entry }),
+            (AuthMode::Bearer, None) => None,
+        };
+        p
     }
 
     pub fn take_notes(&mut self) -> Vec<String> {
@@ -213,6 +267,7 @@ impl Panel {
             Screen::Auth => Step::Pick(Box::new(self.auth_screen())),
             Screen::Models => Step::Pick(Box::new(self.models_screen())),
             Screen::Limits => Step::Pick(Box::new(self.limits_screen())),
+            Screen::Reasoning => Step::Pick(Box::new(self.reasoning_screen())),
             Screen::Field(f) => Step::Pick(Box::new(self.field_screen(f))),
         }
     }
@@ -287,8 +342,10 @@ impl Panel {
             Screen::Field(Field::EnvName | Field::Command) => Screen::Auth,
             Screen::Field(Field::ModelId) => Screen::Models,
             Screen::Field(Field::Context | Field::Output) => Screen::Limits,
+            Screen::Field(Field::SwitchesOn | Field::SwitchesOff) => Screen::Reasoning,
             Screen::Auth | Screen::Models => Screen::Form,
             Screen::Limits => Screen::Models,
+            Screen::Reasoning => Screen::Limits,
         };
         Action::Pending
     }
@@ -332,23 +389,65 @@ impl Panel {
             Row::Manual => return self.edit(Field::ModelId, ""),
             Row::Check => self.listing = Listing::Unread,
             Row::Context => {
-                let ctx = self.limits.as_ref().map(|l| l.ctx.to_string()).unwrap_or_default();
+                let ctx = self.limits.as_ref().map(|l| l.ctx().to_string()).unwrap_or_default();
                 return self.edit(Field::Context, &ctx);
             }
             Row::Output => {
-                let out = self.limits.as_ref().map(|l| l.out.to_string()).unwrap_or_default();
+                let out = self.limits.as_ref().map(|l| l.out().to_string()).unwrap_or_default();
                 return self.edit(Field::Output, &out);
             }
-            Row::Add => {
-                self.add_limits();
-                self.screen = Screen::Models;
-            }
+            Row::Reasoning => self.screen = Screen::Reasoning,
+            Row::Add => return self.add_limits(),
             Row::Remove => {
                 self.remove_limits();
                 self.screen = Screen::Models;
             }
+            Row::ModeNone => self.set_reasoning(Reasoning::None),
+            Row::ModeEffort => self.set_reasoning(Reasoning::Effort),
+            Row::ModeTemplate => self.set_reasoning(Reasoning::Template),
+            Row::Level(i) => self.toggle_level(i),
+            Row::SwitchesOn => {
+                let text = self.limits.as_ref().map(|l| custom::switches_text(&l.model.extra_body_on));
+                return self.edit(Field::SwitchesOn, &text.unwrap_or_default());
+            }
+            Row::SwitchesOff => {
+                let text = self.limits.as_ref().map(|l| custom::switches_text(&l.model.extra_body_off));
+                return self.edit(Field::SwitchesOff, &text.unwrap_or_default());
+            }
         }
         Action::Pending
+    }
+
+    /// Switches the model's reasoning mode, dropping what the new mode cannot hold.
+    fn set_reasoning(&mut self, mode: Reasoning) {
+        let Some(l) = self.limits.as_mut() else { return };
+        let m = &mut l.model;
+        m.reasoning = mode;
+        match mode {
+            Reasoning::None => {
+                m.efforts.clear();
+                m.extra_body_on.clear();
+                m.extra_body_off.clear();
+            }
+            // `efforts` only applies to effort, and a level list is never left empty.
+            Reasoning::Effort if m.efforts.is_empty() => m.efforts = custom::default_efforts(),
+            Reasoning::Effort => m.efforts = ordered_efforts(&m.efforts),
+            Reasoning::Template => m.efforts.clear(),
+        }
+    }
+
+    /// Adds or drops a level of the model's effort ladder.
+    fn toggle_level(&mut self, idx: usize) {
+        let Some(name) = EFFORT_LADDER.get(idx) else { return };
+        let Some(l) = self.limits.as_mut() else { return };
+        let m = &mut l.model;
+        match m.efforts.iter().position(|e| e == name) {
+            Some(at) => {
+                m.efforts.remove(at);
+            }
+            None => m.efforts.push((*name).to_string()),
+        }
+        m.efforts = ordered_efforts(&m.efforts);
     }
 
     /// Opens a field for typing, starting from `text`.
@@ -420,20 +519,38 @@ impl Panel {
                 return Ok(Some(self.open_limits(v)));
             }
             Field::Context => {
-                let Some(l) = self.limits.clone() else { return Ok(None) };
-                let ctx = tokens(v, l.ctx, "the context window")?;
+                let Some(mut l) = self.limits.clone() else { return Ok(None) };
+                let ctx = tokens(v, l.ctx(), "the context window")?;
                 // The output limit never exceeds the window.
-                self.limits = Some(Limits { ctx, out: l.out.min(ctx), ..l });
+                l.model.context_window = Some(ctx);
+                l.model.max_tokens = Some(l.out().min(ctx));
+                self.limits = Some(l);
                 self.screen = Screen::Limits;
             }
             Field::Output => {
-                let Some(l) = self.limits.clone() else { return Ok(None) };
-                let out = tokens(v, l.out, "the output limit")?;
-                if out > l.ctx {
-                    return Err(format!("the output limit ({out}) must not exceed the context window ({})", l.ctx));
+                let Some(mut l) = self.limits.clone() else { return Ok(None) };
+                let out = tokens(v, l.out(), "the output limit")?;
+                if out > l.ctx() {
+                    return Err(format!("the output limit ({out}) must not exceed the context window ({})", l.ctx()));
                 }
-                self.limits = Some(Limits { out, ..l });
+                l.model.max_tokens = Some(out);
+                self.limits = Some(l);
                 self.screen = Screen::Limits;
+            }
+            Field::SwitchesOn | Field::SwitchesOff => {
+                let (name, on) = match field {
+                    Field::SwitchesOn => ("extra_body_on", true),
+                    _ => ("extra_body_off", false),
+                };
+                let map = custom::parse_switches(v)?;
+                custom::check_extra(name, &map).map_err(|e| format!("{e:#}"))?;
+                let Some(l) = self.limits.as_mut() else { return Ok(None) };
+                if on {
+                    l.model.extra_body_on = map;
+                } else {
+                    l.model.extra_body_off = map;
+                }
+                self.screen = Screen::Reasoning;
             }
         }
         Ok(None)
@@ -454,31 +571,56 @@ impl Panel {
         Action::Fetch(Probe { id: self.id.clone(), base_url, credential })
     }
 
-    /// Takes the limits of `id` from the listing, or from what is configured, or the defaults.
+    /// Takes the limits and reasoning of `id` from what is configured, or the listing, or the
+    /// defaults. A model nobody configured starts with the effort ladder.
     fn open_limits(&mut self, id: &str) -> Action {
         let listed = match &self.listing {
             Listing::Read(rows) => rows.iter().find(|r| r.id == id),
             _ => None,
         };
-        let configured = self.models.get(id);
+        let configured = self.models.get(id).cloned();
         let ctx = configured
+            .as_ref()
             .and_then(|m| m.context_window)
             .or(listed.and_then(|r| r.context_length))
             .unwrap_or(DEFAULT_CONTEXT);
         let out = configured
+            .as_ref()
             .and_then(|m| m.max_tokens)
             .or(listed.and_then(|r| r.max_completion_tokens))
             .unwrap_or(DEFAULT_OUTPUT.min(ctx))
             .min(ctx);
-        self.limits = Some(Limits { id: id.to_string(), ctx, out });
+        let mut model = configured.unwrap_or_else(CustomModel::with_effort_defaults);
+        model.context_window = Some(ctx);
+        model.max_tokens = Some(out);
+        self.limits = Some(Limits { id: id.to_string(), model });
         self.screen = Screen::Limits;
         Action::Pending
     }
 
-    fn add_limits(&mut self) {
-        let Some(l) = self.limits.clone() else { return };
-        let model = CustomModel { context_window: Some(l.ctx), max_tokens: Some(l.out), ..Default::default() };
-        self.models.insert(l.id, model);
+    /// Adds the model as the screen sets it, or says why it cannot be added yet.
+    fn add_limits(&mut self) -> Action {
+        let Some(l) = self.limits.clone() else { return Action::Pending };
+        let m = &l.model;
+        match m.reasoning {
+            Reasoning::Effort if m.efforts.is_empty() => {
+                return Action::Refused("pick at least one effort level: Enter toggles one".into());
+            }
+            Reasoning::Template if m.extra_body_on.is_empty() || m.extra_body_off.is_empty() => {
+                return Action::Refused(
+                    "template reasoning needs a switch while thinking is on and one while it is off, \
+                     e.g. `chat_template_kwargs.enable_thinking = true`"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        if let Err(e) = m.validate() {
+            return Action::Refused(format!("{e:#}"));
+        }
+        self.models.insert(l.id, l.model);
+        self.screen = Screen::Models;
+        Action::Pending
     }
 
     fn remove_limits(&mut self) {
@@ -488,6 +630,7 @@ impl Panel {
 
     fn set_auth(&mut self, auth: Auth) {
         self.auth = Some(auth);
+        self.auth_changed = true;
         // Another key means the listing is not known to be this endpoint's any more.
         self.listing = Listing::Unread;
         self.problem.clear();
@@ -511,6 +654,7 @@ impl Panel {
         let mut provider = CustomProvider::new(&self.base_url);
         provider.label = Some(self.label.trim().to_string()).filter(|l| !l.is_empty());
         provider.auth = if matches!(self.auth, Some(Auth::Keyless)) { AuthMode::None } else { AuthMode::Bearer };
+        provider.discover = self.discover;
         provider.models = self.models.clone();
         let entry = match &self.auth {
             Some(Auth::Bearer { entry, .. }) => Some(entry.clone()),
@@ -520,7 +664,15 @@ impl Panel {
             Listing::Read(rows) => Some(rows.clone()),
             _ => None,
         };
-        Saved { id: self.id.clone(), provider, entry, listed }
+        Saved {
+            id: self.id.clone(),
+            provider,
+            entry,
+            editing: self.editing,
+            // A keyless endpoint has no credential to write, whatever was chosen before it.
+            key_changed: self.auth_changed && !matches!(self.auth, Some(Auth::Keyless)),
+            listed,
+        }
     }
 
     fn env_default(&self) -> String {
@@ -532,6 +684,10 @@ impl Panel {
     /// The rows of the screen on show, in the order `step()` lists them.
     fn rows(&self) -> Vec<Row> {
         match self.screen {
+            // An edit keeps the id: the definition it replaces is the one named in the title.
+            Screen::Form if self.editing => {
+                vec![Row::Label, Row::Base, Row::Key, Row::Models, Row::Save, Row::Cancel]
+            }
             Screen::Form => vec![Row::Id, Row::Label, Row::Base, Row::Key, Row::Models, Row::Save, Row::Cancel],
             Screen::Auth => vec![Row::Paste, Row::Env, Row::Command, Row::NoKey],
             Screen::Models => {
@@ -546,9 +702,18 @@ impl Panel {
                 rows
             }
             Screen::Limits => {
-                let mut rows = vec![Row::Context, Row::Output, Row::Add];
+                let mut rows = vec![Row::Context, Row::Output, Row::Reasoning, Row::Add];
                 if self.limits.as_ref().is_some_and(|l| self.models.contains_key(&l.id)) {
                     rows.push(Row::Remove);
+                }
+                rows
+            }
+            Screen::Reasoning => {
+                let mut rows = vec![Row::ModeNone, Row::ModeEffort, Row::ModeTemplate];
+                match self.limits.as_ref().map(|l| l.model.reasoning) {
+                    Some(Reasoning::Effort) => rows.extend((0..EFFORT_LADDER.len()).map(Row::Level)),
+                    Some(Reasoning::Template) => rows.extend([Row::SwitchesOn, Row::SwitchesOff]),
+                    _ => {}
                 }
                 rows
             }
@@ -587,17 +752,29 @@ impl Panel {
             Row::Context => (
                 "Context window".to_string(),
                 match &self.limits {
-                    Some(l) => format!("{} tokens", l.ctx),
+                    Some(l) => format!("{} tokens", l.ctx()),
                     None => format!("{DEFAULT_CONTEXT} tokens"),
                 },
             ),
             Row::Output => (
                 "Output limit".to_string(),
                 match &self.limits {
-                    Some(l) => format!("{} tokens, at most the context window", l.out),
+                    Some(l) => format!("{} tokens, at most the context window", l.out()),
                     None => format!("{DEFAULT_OUTPUT} tokens, at most the context window"),
                 },
             ),
+            Row::Reasoning => ("Reasoning".to_string(), self.reasoning_text()),
+            Row::ModeNone => ("No reasoning".to_string(), self.mode_detail(Reasoning::None)),
+            Row::ModeEffort => ("Effort levels".to_string(), self.mode_detail(Reasoning::Effort)),
+            Row::ModeTemplate => ("Request switches".to_string(), self.mode_detail(Reasoning::Template)),
+            Row::Level(i) => {
+                let name = EFFORT_LADDER[i];
+                let on = self.limits.as_ref().is_some_and(|l| l.model.efforts.iter().any(|e| e == name));
+                let detail = if on { "on; /thinking uses it" } else { "off; Enter adds it" };
+                (name.to_string(), detail.to_string())
+            }
+            Row::SwitchesOn => ("While thinking".to_string(), self.switches_detail(true)),
+            Row::SwitchesOff => ("While not thinking".to_string(), self.switches_detail(false)),
             Row::Add => {
                 let id = self.limits.as_ref().map(|l| l.id.as_str()).unwrap_or_default();
                 let label = if self.models.contains_key(id) { format!("Save {id}") } else { format!("Add {id}") };
@@ -612,11 +789,20 @@ impl Panel {
     }
 
     fn form(&self) -> Select {
-        let context = format!(
-            "Chat Completions, at <base URL>/chat/completions; never through omp.\nWrites {}, and {}.",
-            self.dests.providers, self.dests.auth
-        );
-        Select::new("Add a custom endpoint", self.items())
+        let context = if self.editing {
+            format!(
+                "Editing `{}` in {}; its id stays and its entry is replaced. {} is written only for a key chosen here.",
+                self.id, self.dests.providers, self.dests.auth
+            )
+        } else {
+            format!(
+                "Chat Completions, at <base URL>/chat/completions; never through omp.\nWrites {}, and {}.",
+                self.dests.providers, self.dests.auth
+            )
+        };
+        let title =
+            if self.editing { format!("Edit custom endpoint {}", self.name()) } else { "Add a custom endpoint".into() };
+        Select::new(&title, self.items())
             .context(&context)
             .hint("↑↓ move · Enter edit · Esc cancel; nothing is written")
     }
@@ -656,9 +842,30 @@ impl Panel {
         };
         Select::new(&format!("Limits of {id}"), self.items())
             .context(&context)
-            .preselect(2)
+            .preselect(3)
             .back_keys(true)
-            .hint("↑↓ move · Enter edit or add · ← / ⇧Tab / Esc back")
+            .hint("↑↓ move · Enter edit, reason or add · ← / ⇧Tab / Esc back")
+    }
+
+    fn reasoning_screen(&self) -> Select {
+        let id = self.limits.as_ref().map(|l| l.id.clone()).unwrap_or_default();
+        let context = match self.limits.as_ref().map(|l| l.model.reasoning) {
+            Some(Reasoning::Effort) => {
+                "Sends `reasoning_effort` with one of the levels below; `/thinking off` sends none.".to_string()
+            }
+            Some(Reasoning::Template) => {
+                "No effort: the switches below are merged into the request while thinking is on, and the \
+                 others while it is off."
+                    .to_string()
+            }
+            _ => "No thinking parameters at all: `/thinking` will have nothing to send.".to_string(),
+        };
+        Select::new(&format!("How does {id} reason?"), self.items())
+            .context(&context)
+            // The first level or switch, once a mode above it adds rows there.
+            .preselect(3)
+            .back_keys(true)
+            .hint("↑↓ move · Enter choose or toggle · ← / ⇧Tab / Esc back")
     }
 
     fn field_screen(&self, f: Field) -> Select {
@@ -712,11 +919,54 @@ impl Panel {
         format!("{}: {}", names.len(), names.join(", "))
     }
 
-    fn save_text(&self) -> String {
-        if matches!(self.auth, Some(Auth::Keyless)) {
-            "the definition".into()
+    /// What the Limits screen says about the model's reasoning: its mode and the levels or switches.
+    fn reasoning_text(&self) -> String {
+        let Some(l) = self.limits.as_ref() else { return "not set".into() };
+        let m = &l.model;
+        match m.reasoning {
+            Reasoning::None => "none; /thinking has nothing to set".into(),
+            Reasoning::Effort if m.efforts.is_empty() => "effort; no level picked yet".into(),
+            Reasoning::Effort => format!("effort: {}", m.efforts.join(", ")),
+            Reasoning::Template => {
+                let part = |label: &str, map: &serde_json::Map<String, serde_json::Value>| {
+                    let text = custom::switches_text(map);
+                    if text.is_empty() { format!("{label}: not set") } else { format!("{label}: {text}") }
+                };
+                format!("switches; {} · {}", part("on", &m.extra_body_on), part("off", &m.extra_body_off))
+            }
+        }
+    }
+
+    /// One reasoning mode's row: what it does, and whether it is the one the model has.
+    fn mode_detail(&self, mode: Reasoning) -> String {
+        let what = match mode {
+            Reasoning::None => "no effort and no request switches",
+            Reasoning::Effort => "sends reasoning_effort from the levels below",
+            Reasoning::Template => "merges request switches while thinking is on or off",
+        };
+        let current = self.limits.as_ref().is_some_and(|l| l.model.reasoning == mode);
+        if current { format!("{what}; current") } else { what.to_string() }
+    }
+
+    /// The switches merged while thinking is on (`on`) or off, as the reasoning screen shows them.
+    fn switches_detail(&self, on: bool) -> String {
+        let text = self
+            .limits
+            .as_ref()
+            .map(|l| custom::switches_text(if on { &l.model.extra_body_on } else { &l.model.extra_body_off }))
+            .unwrap_or_default();
+        if text.is_empty() {
+            "not set; Enter for `path = value`, e.g. chat_template_kwargs.enable_thinking = true".into()
         } else {
-            "the definition and the key".into()
+            text
+        }
+    }
+
+    fn save_text(&self) -> String {
+        match &self.auth {
+            _ if self.editing && !self.auth_changed => "the definition; its stored key stays".into(),
+            Some(Auth::Keyless) => "the definition".into(),
+            _ => "the definition and the key".into(),
         }
     }
 
@@ -731,9 +981,13 @@ impl Panel {
         let limits = limits_of(row);
         let Some(m) = self.models.get(&row.id) else { return limits };
         let added = format!(
-            "added: {} ctx · {} out",
+            "added: {} ctx · {} out · {}",
             m.context_window.unwrap_or(DEFAULT_CONTEXT),
-            m.max_tokens.unwrap_or(DEFAULT_OUTPUT)
+            m.max_tokens.unwrap_or(DEFAULT_OUTPUT),
+            match m.reasoning {
+                Reasoning::Effort => format!("effort {}", m.efforts.join("/")),
+                other => other.as_str().to_string(),
+            }
         );
         if limits.is_empty() { added } else { format!("{limits} · {added}") }
     }
@@ -774,13 +1028,15 @@ impl Field {
             Self::Command => "Command".into(),
             Self::ModelId => "Model id".into(),
             Self::Context => match p.limits.as_ref() {
-                Some(l) => format!("Context window [{}]", l.ctx),
+                Some(l) => format!("Context window [{}]", l.ctx()),
                 None => "Context window".into(),
             },
             Self::Output => match p.limits.as_ref() {
-                Some(l) => format!("Output limit [{}, at most {}]", l.out, l.ctx),
+                Some(l) => format!("Output limit [{}, at most {}]", l.out(), l.ctx()),
                 None => "Output limit".into(),
             },
+            Self::SwitchesOn => "Switches while thinking".into(),
+            Self::SwitchesOff => "Switches while not thinking".into(),
         }
     }
 
@@ -802,7 +1058,26 @@ impl Field {
             Self::ModelId => "Exactly as the endpoint names it, e.g. org/model.".into(),
             Self::Context => "In tokens; Enter keeps the value shown.".into(),
             Self::Output => "In tokens, at most the context window; Enter keeps the value shown.".into(),
+            Self::SwitchesOn | Self::SwitchesOff => {
+                "One or more `path = value` switches, comma-separated; values are JSON (`true`, `0.6`, \
+                 `\"text\"`). Enter keeps the value shown; an empty answer clears them."
+                    .into()
+            }
         }
+    }
+}
+
+/// The ladder in `efforts`, in ascending order and without names the ladder does not have.
+fn ordered_efforts(efforts: &[String]) -> Vec<String> {
+    EFFORT_LADDER.iter().filter(|name| efforts.iter().any(|e| e == *name)).map(|n| (*n).to_string()).collect()
+}
+
+/// How the auth screen names a stored credential, never showing a literal key.
+fn entry_source(entry: &Entry) -> String {
+    match entry.reference.as_deref() {
+        Some(r) if r.starts_with('!') => cmd_label(r.trim_start_matches('!')),
+        Some(r) => r.to_string(),
+        None => "the stored key (not shown)".into(),
     }
 }
 
@@ -1085,6 +1360,180 @@ mod tests {
         assert_eq!(saved.provider.auth, AuthMode::None);
         assert!(saved.entry.is_none(), "a keyless endpoint stores no credential");
         assert!(saved.listed.is_none(), "nothing was read, so nothing is cached");
+    }
+
+    #[test]
+    fn a_new_model_starts_with_the_effort_ladder_and_its_levels_toggle() {
+        let mut p = ready();
+        pick(&mut p, "Models");
+        p.fetched(Fetch::Failed("unreachable".into()));
+        type_into(&mut p, "Type a model id", "org/typed");
+        assert!(screen(&p).contains("effort: low, medium, high"), "{}", screen(&p));
+
+        let i = row(&p, "Add org/typed");
+        assert_eq!(p.answer(Answer::Pick(i)), Action::Pending);
+        let m = p.saved().provider.models["org/typed"].clone();
+        assert_eq!((m.reasoning, m.efforts), (Reasoning::Effort, custom::default_efforts()));
+
+        // The whole ladder is offered; picking a level adds it, picking it again removes it.
+        type_into(&mut p, "Type a model id", "org/typed");
+        pick(&mut p, "Reasoning");
+        let text = screen(&p);
+        assert!(text.contains("How does org/typed reason?"), "{text}");
+        assert!(text.contains("minimal") && text.contains(EFFORT_LADDER[5]), "the whole ladder:\n{text}");
+        assert!(text.contains("off; Enter adds it"), "{text}");
+        pick(&mut p, "high");
+        pick(&mut p, "xhigh");
+        assert_eq!(p.limits.as_ref().unwrap().model.efforts, ["low", "medium", "xhigh"], "kept ascending");
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(screen(&p).contains("effort: low, medium, xhigh"), "{}", screen(&p));
+
+        // A model with no level at all cannot be saved, and the panel says why.
+        pick(&mut p, "Reasoning");
+        for level in ["low", "medium", "xhigh"] {
+            pick(&mut p, level);
+        }
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(
+            matches!(pick(&mut p, "Save org/typed"), Action::Refused(m) if m.contains("at least one effort level")),
+            "{}",
+            screen(&p)
+        );
+
+        // No reasoning drops the ladder.
+        pick(&mut p, "Reasoning");
+        pick(&mut p, "No reasoning");
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(screen(&p).contains("none; /thinking has nothing to set"), "{}", screen(&p));
+        let i = row(&p, "Save org/typed");
+        assert_eq!(p.answer(Answer::Pick(i)), Action::Pending);
+        let m = p.saved().provider.models["org/typed"].clone();
+        assert_eq!((m.reasoning, m.efforts), (Reasoning::None, Vec::new()));
+    }
+
+    #[test]
+    fn template_reasoning_takes_its_switches_as_path_value_text() {
+        let mut p = ready();
+        pick(&mut p, "Models");
+        p.fetched(Fetch::Failed("unreachable".into()));
+        type_into(&mut p, "Type a model id", "org/typed");
+        pick(&mut p, "Reasoning");
+        pick(&mut p, "Request switches");
+        let text = screen(&p);
+        assert!(text.contains("While thinking") && text.contains("While not thinking"), "{text}");
+        type_into(&mut p, "While thinking", "chat_template_kwargs.enable_thinking = true");
+        assert!(screen(&p).contains("chat_template_kwargs.enable_thinking = true"), "{}", screen(&p));
+
+        // A switch that would replace a field mu owns, missing `=` and a table clash are refused.
+        assert!(matches!(type_into(&mut p, "While not thinking", "reasoning_effort = \"high\""), Action::Refused(m)
+                if m.contains("reasoning_effort")));
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(matches!(type_into(&mut p, "While not thinking", "chat_template_kwargs"), Action::Refused(m)
+                if m.contains("path = value")));
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(matches!(type_into(&mut p, "While not thinking", "a.b = 1, a = 2"), Action::Refused(m)
+                if m.contains("table")));
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+
+        // Only one side set is not template reasoning yet, and Add says so.
+        type_into(&mut p, "While thinking", "chat_template_kwargs.enable_thinking = true");
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(
+            matches!(pick(&mut p, "Add org/typed"), Action::Refused(m) if m.contains("while it is off")),
+            "{}",
+            screen(&p)
+        );
+        pick(&mut p, "Reasoning");
+        type_into(&mut p, "While not thinking", "chat_template_kwargs.enable_thinking = false");
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        let m = p.limits.as_ref().unwrap().model.clone();
+        assert_eq!(m.reasoning, Reasoning::Template);
+        assert!(m.efforts.is_empty(), "template sends no effort");
+        assert_eq!(m.extra_body_on["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(m.extra_body_off["chat_template_kwargs"]["enable_thinking"], false);
+        let i = row(&p, "Add org/typed");
+        assert_eq!(p.answer(Answer::Pick(i)), Action::Pending);
+        let saved = p.saved().provider.models["org/typed"].clone();
+        assert_eq!(custom::switches_text(&saved.extra_body_off), "chat_template_kwargs.enable_thinking = false");
+    }
+
+    /// An endpoint that is already in the profile, with one model and no discovery.
+    fn existing() -> CustomProvider {
+        CustomProvider {
+            id: "modal".into(),
+            env_hint: custom::env_hint("modal"),
+            label: Some("Modal".into()),
+            base_url: "https://modal.example/v1".into(),
+            auth: AuthMode::Bearer,
+            discover: false,
+            models: BTreeMap::from([(
+                "org/quiet".to_string(),
+                CustomModel { context_window: Some(8192), max_tokens: Some(1024), ..Default::default() },
+            )]),
+        }
+    }
+
+    fn edited(entry: Option<Entry>) -> Panel {
+        let dests = Destinations { providers: "/p/providers.toml".into(), auth: "/p/auth.json".into() };
+        Panel::edited(dests, &existing(), entry)
+    }
+
+    #[test]
+    fn an_edit_opens_on_the_definition_with_its_key_and_keeps_what_it_is_not_shown_here() {
+        let mut p = edited(Some(Entry::literal("stored-key-0123456789")));
+        let text = screen(&p);
+        assert!(text.contains("Edit custom endpoint Modal"), "{text}");
+        assert!(text.contains("/p/providers.toml"), "{text}");
+        assert!(!text.contains("stored-key-0123456789"), "{text}");
+        assert!(!text.contains("Provider id"), "the id is fixed:\n{text}");
+        assert!(text.contains("the stored key (not shown)"), "{text}");
+        assert!(text.contains("the definition; its stored key stays"), "{text}");
+
+        // Its model keeps the settings the file has; only its reasoning changes.
+        assert!(matches!(pick(&mut p, "Models"), Action::Fetch(_)));
+        p.fetched(Fetch::Failed("unreachable".into()));
+        type_into(&mut p, "Type a model id", "org/quiet");
+        assert!(screen(&p).contains("8192 tokens"), "the configured limits:\n{}", screen(&p));
+        assert!(screen(&p).contains("none; /thinking has nothing to set"), "{}", screen(&p));
+        pick(&mut p, "Reasoning");
+        pick(&mut p, "Effort levels");
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        let i = row(&p, "Save org/quiet");
+        assert_eq!(p.answer(Answer::Pick(i)), Action::Pending);
+        assert_eq!(p.answer(Answer::Back), Action::Pending, "the models screen goes back to the fields");
+
+        let Action::Save(saved) = pick(&mut p, "Save") else { panic!("not saved:\n{}", screen(&p)) };
+        assert!(saved.editing && !saved.key_changed, "an untouched key is not written again");
+        assert_eq!((saved.id.as_str(), saved.provider.label()), ("modal", "Modal"));
+        assert!(!saved.provider.discover, "the definition keeps its own discovery setting");
+        assert_eq!(saved.provider.models["org/quiet"].efforts, ["low", "medium", "high"]);
+        assert_eq!(saved.entry.and_then(|e| e.key).as_deref(), Some("stored-key-0123456789"));
+    }
+
+    #[test]
+    fn an_edited_endpoint_names_its_reference_and_writes_the_key_only_when_it_is_chosen_again() {
+        let entry = Entry::reference("$MODAL_API_KEY").unwrap();
+        let mut p = edited(Some(entry));
+        assert!(screen(&p).contains("$MODAL_API_KEY"), "{}", screen(&p));
+        pick(&mut p, "Key");
+        assert!(screen(&p).contains("(current)"), "{}", screen(&p));
+        pick(&mut p, "Use a command");
+        p.answer(Answer::Text("pass show modal/token".into()));
+        assert!(screen(&p).contains("!pass …"), "{}", screen(&p));
+        assert!(screen(&p).contains("the definition and the key"), "{}", screen(&p));
+        let Action::Save(saved) = pick(&mut p, "Save") else { panic!("not saved") };
+        assert!(saved.editing && saved.key_changed);
+        assert_eq!(saved.entry.and_then(|e| e.reference).as_deref(), Some("!pass show modal/token"));
+
+        // A bearer endpoint with no stored key has to be given one before it can be saved.
+        let mut p = edited(None);
+        assert!(screen(&p).contains("not chosen"), "{}", screen(&p));
+        assert!(matches!(pick(&mut p, "Save"), Action::Refused(m) if m.contains("key")));
+        pick(&mut p, "Key");
+        pick(&mut p, "No authentication");
+        assert!(screen(&p).contains("Save  the definition"), "{}", screen(&p));
+        let Action::Save(saved) = pick(&mut p, "Save") else { panic!("not saved") };
+        assert!(!saved.key_changed && saved.provider.auth == AuthMode::None);
     }
 
     #[test]

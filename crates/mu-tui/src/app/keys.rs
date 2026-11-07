@@ -281,6 +281,12 @@ impl App {
         if provider == "custom" {
             return self.start_custom_wizard();
         }
+        // `/login custom <id>` edits an endpoint that is already defined.
+        if let Some(id) = provider.strip_prefix("custom ").map(str::trim)
+            && !id.is_empty()
+        {
+            return self.start_custom_edit(id);
+        }
         if let Some(name) = provider.strip_prefix("mcp:") {
             return self.run_mcp_login(name);
         }
@@ -435,9 +441,14 @@ impl App {
             };
             items.push(Item { label, detail: c.key_state(store).word().into() });
             targets.push(LoginTarget::ApiKey(c.id.clone()));
+            items.push(Item {
+                label: format!("Edit custom endpoint: {}", c.label()),
+                detail: "address, key, models, reasoning".into(),
+            });
+            targets.push(LoginTarget::CustomProvider(Some(c.id.clone())));
         }
         items.push(Item { label: "+ Add a custom endpoint…".into(), detail: "guided: address, key, models".into() });
-        targets.push(LoginTarget::CustomProvider);
+        targets.push(LoginTarget::CustomProvider(None));
         (items, targets)
     }
 
@@ -446,9 +457,10 @@ impl App {
     pub(super) fn begin_key(&mut self, target: KeyTarget) {
         if target.is_keyless() {
             return self.notice(&format!(
-                "{} takes no key (auth = \"none\" in {}); edit or remove its definition to change that",
+                "{} takes no key (auth = \"none\" in {}); `Edit custom endpoint: {}` changes that",
                 target.label(),
-                self.services.providers.custom_registry().path().display()
+                self.services.providers.custom_registry().path().display(),
+                target.label()
             ));
         }
         let stored = self.services.providers.store().get(target.id());

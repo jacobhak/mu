@@ -6,7 +6,7 @@ use mu_provider::auth::store::Entry;
 use mu_provider::auth::web::WebSearch;
 use mu_provider::model::discovery::{self, CustomRow};
 use mu_provider::provider::client::Providers;
-use mu_provider::provider::custom::{self, CustomProvider, SaveError};
+use mu_provider::provider::custom::{self, CustomProvider, KeyEdit, SaveError};
 use mu_session::session::{control, inbox};
 use mu_tools::mcp::store::{self, Level};
 use serde_json::Value;
@@ -56,6 +56,15 @@ impl Services {
         entry: Option<Entry>,
     ) -> Result<CustomProvider, SaveError> {
         custom::save(self.providers.custom_registry(), self.providers.store(), id, provider, entry)
+    }
+
+    pub(super) fn update_custom(
+        &self,
+        id: &str,
+        provider: CustomProvider,
+        key: KeyEdit,
+    ) -> Result<CustomProvider, SaveError> {
+        custom::update(self.providers.custom_registry(), self.providers.store(), id, provider, key)
     }
 
     /// Caches the listing read for a saved endpoint.

@@ -381,7 +381,8 @@ impl App {
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ChatGpt) => self.chatgpt_row(),
-            OverlayEvent::Login(LoginTarget::CustomProvider) => self.start_custom_wizard(),
+            OverlayEvent::Login(LoginTarget::CustomProvider(None)) => self.start_custom_wizard(),
+            OverlayEvent::Login(LoginTarget::CustomProvider(Some(id))) => self.start_custom_edit(&id),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
                 match KeyTarget::find(&id, self.services.providers.custom_registry()) {
                     Ok(Some(target)) => self.begin_key(target),

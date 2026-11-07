@@ -47,7 +47,14 @@ pub const RESERVED_BODY_KEYS: [&str; 11] = [
     "reasoning_effort",
 ];
 
-const EFFORT_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+/// The effort names a model's ladder may use, lowest first.
+pub const EFFORT_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The ladder a model gets when nobody chose one: the levels an effort-capable server is
+/// expected to take.
+pub fn default_efforts() -> Vec<String> {
+    ["low", "medium", "high"].map(String::from).to_vec()
+}
 
 /// The `compat` keys a definition may set (`CompletionsCompat`'s camelCase names, less the
 /// request-extra maps, which are the model's own `extra_body*` tables).
@@ -84,6 +91,27 @@ pub enum Reasoning {
     Effort,
     /// Request-parameter switches (`extra_body_on` / `extra_body_off`).
     Template,
+}
+
+impl Reasoning {
+    pub const NAMES: [&'static str; 3] = ["none", "effort", "template"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Effort => "effort",
+            Self::Template => "template",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "none" => Self::None,
+            "effort" => Self::Effort,
+            "template" => Self::Template,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -267,7 +295,111 @@ pub fn check_extra(name: &str, map: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+/// One request switch (`extra_body_on` / `extra_body_off`) as text: a dotted path and a JSON
+/// value, e.g. `chat_template_kwargs.enable_thinking = true`. A value that is not JSON is a string.
+pub fn set_switch(map: &mut Map<String, Value>, entry: &str) -> Result<(), String> {
+    let (path, raw) = entry.split_once('=').ok_or_else(|| {
+        format!(
+            "`{}` is not a switch; write `path = value`, e.g. chat_template_kwargs.enable_thinking = true",
+            entry.trim()
+        )
+    })?;
+    let (path, raw) = (path.trim(), raw.trim());
+    if path.is_empty() || raw.is_empty() {
+        return Err("a switch is `path = value`, with both sides filled in".into());
+    }
+    let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+    let segs: Vec<&str> = path.split('.').map(str::trim).collect();
+    if segs.iter().any(|s| s.is_empty()) {
+        return Err(format!("`{path}` has an empty key"));
+    }
+    insert_switch(map, &segs, path, value)
+}
+
+fn insert_switch(map: &mut Map<String, Value>, segs: &[&str], path: &str, value: Value) -> Result<(), String> {
+    let Some((head, rest)) = segs.split_first() else { return Ok(()) };
+    if rest.is_empty() {
+        if map.get(*head).is_some_and(Value::is_object) {
+            return Err(format!("`{path}` collides with another switch that is a table"));
+        }
+        map.insert((*head).to_string(), value);
+        return Ok(());
+    }
+    let slot = map.entry((*head).to_string()).or_insert_with(|| Value::Object(Map::new()));
+    match slot.as_object_mut() {
+        Some(t) => insert_switch(t, rest, path, value),
+        None => Err(format!("`{path}` needs `{head}` to be a table")),
+    }
+}
+
+/// The switches in `text` (comma- or newline-separated), as the nested maps a request takes.
+pub fn parse_switches(text: &str) -> Result<Map<String, Value>, String> {
+    let mut map = Map::new();
+    for entry in split_switches(text) {
+        set_switch(&mut map, &entry)?;
+    }
+    Ok(map)
+}
+
+/// The nested maps back as `path = value` switches, one line for a whole map.
+pub fn switches_text(map: &Map<String, Value>) -> String {
+    fn flatten(map: &Map<String, Value>, prefix: &str, out: &mut Vec<String>) {
+        for (k, v) in map {
+            let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            match v {
+                Value::Object(m) if !m.is_empty() => flatten(m, &path, out),
+                other => out.push(format!("{path} = {other}")),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    flatten(map, "", &mut out);
+    out.join(", ")
+}
+
+/// Splits at commas and newlines that are outside a JSON string or bracket.
+fn split_switches(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quote, mut depth, mut escaped) = (false, 0i32, false);
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+            cur.push(c);
+            continue;
+        }
+        match c {
+            '\\' if quote => {
+                escaped = true;
+                cur.push(c);
+            }
+            '"' => {
+                quote = !quote;
+                cur.push(c);
+            }
+            '[' | '{' if !quote => {
+                depth += 1;
+                cur.push(c);
+            }
+            ']' | '}' if !quote => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' | '\n' if !quote && depth <= 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
 impl CustomModel {
+    /// A model nobody has configured yet: an effort ladder the panel and `mu providers add` start
+    /// from, so `/thinking` has levels to choose. Only a thinking level above `off` sends anything.
+    pub fn with_effort_defaults() -> Self {
+        Self { reasoning: Reasoning::Effort, efforts: default_efforts(), ..Self::default() }
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (label, v) in [("context_window", self.context_window), ("max_tokens", self.max_tokens)] {
             if v == Some(0) {
@@ -552,12 +684,25 @@ impl Registry {
     /// Adds a definition, keeping the file's comments and other entries. Refuses an existing id
     /// and a file that does not parse.
     pub fn add(&self, id: &str, provider: CustomProvider) -> Result<()> {
+        self.write_entry(id, provider, false)
+    }
+
+    /// Replaces a definition's entry as an edit, keeping the file's comments, the other entries and
+    /// the position of this one. Refuses an id that is not there and a file that does not parse.
+    pub fn set(&self, id: &str, provider: CustomProvider) -> Result<()> {
+        self.write_entry(id, provider, true)
+    }
+
+    fn write_entry(&self, id: &str, provider: CustomProvider, replace: bool) -> Result<()> {
         let provider = provider.validated(id)?;
         let _lock = mu_common::fs::FileLock::exclusive(&self.lock_path())
             .with_context(|| format!("locking {}", self.lock_path().display()))?;
         let text = self.read_text()?;
-        if self.parse(&text)?.contains_key(id) {
-            bail!("custom provider `{id}` already exists in {}", self.path.display());
+        let exists = self.parse(&text)?.contains_key(id);
+        match (replace, exists) {
+            (false, true) => bail!("custom provider `{id}` already exists in {}", self.path.display()),
+            (true, false) => bail!("custom provider `{id}` is not in {}", self.path.display()),
+            _ => {}
         }
         let mut doc: toml_edit::DocumentMut =
             text.parse().with_context(|| format!("{} is not valid TOML", self.path.display()))?;
@@ -578,7 +723,16 @@ impl Registry {
             })
             .as_table_mut()
             .ok_or_else(|| anyhow!("`providers` in {} is not a table", self.path.display()))?;
-        providers.insert(id, toml_edit::Item::Table(table));
+        // An entry being replaced keeps its place in the file and the comment above it.
+        let old = providers.remove(id);
+        let mut item = toml_edit::Item::Table(table);
+        if let Some(toml_edit::Item::Table(old)) = old
+            && let Some(new) = item.as_table_mut()
+        {
+            new.set_position(old.position());
+            *new.decor_mut() = old.decor().clone();
+        }
+        providers.insert(id, item);
         self.write(&doc.to_string())
     }
 
@@ -692,6 +846,59 @@ pub fn save(
     {
         let raced = error.downcast_ref::<EntryExists>().is_some();
         return Err(SaveError::KeyNotSaved { id: id.to_string(), raced, error });
+    }
+    Ok(provider)
+}
+
+/// What an edit does with the endpoint's credential.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyEdit {
+    /// The endpoint keeps the credential the store holds (or none, for a keyless endpoint).
+    Keep,
+    /// The endpoint takes this newly chosen credential instead.
+    Set(Entry),
+}
+
+/// Saves an edit of an existing definition: the same checks as [`save`], but the id must already be
+/// there, the entry is replaced rather than added, and a stored credential is only written by
+/// [`KeyEdit::Set`], so editing a model's reasoning never touches the key. A definition saved as
+/// keyless leaves any stored credential in place; removing it stays `mu auth rm`.
+pub fn update(
+    registry: &Registry,
+    store: &Store,
+    id: &str,
+    provider: CustomProvider,
+    key: KeyEdit,
+) -> Result<CustomProvider, SaveError> {
+    let reject = |e: anyhow::Error| SaveError::Rejected(e);
+    let provider = provider.validated(id).map_err(reject)?;
+    let entry = match (provider.auth, key) {
+        (AuthMode::None, KeyEdit::Set(_)) => {
+            return Err(reject(anyhow!("a keyless provider takes no credential")));
+        }
+        (AuthMode::Bearer, KeyEdit::Set(mut e)) => {
+            if e.origin().is_none() {
+                return Err(reject(anyhow!("the credential needs a key or a reference")));
+            }
+            if e.base_url.is_some() {
+                return Err(reject(anyhow!("a custom provider's base URL comes from its definition")));
+            }
+            e.chat = Some(true);
+            Some(e)
+        }
+        _ => None,
+    };
+    if registry.get(id).map_err(reject)?.is_none() {
+        return Err(reject(anyhow!(
+            "custom provider `{id}` does not exist in {}; add it with /login custom or `mu providers add`",
+            registry.path().display()
+        )));
+    }
+    registry.set(id, provider.clone()).map_err(reject)?;
+    if let Some(entry) = entry
+        && let Err(error) = store.set(id, entry)
+    {
+        return Err(SaveError::KeyNotSaved { id: id.to_string(), raced: false, error });
     }
     Ok(provider)
 }
@@ -942,6 +1149,106 @@ enable_thinking = false
                 && e.to_string().contains("mu auth add z")
         );
         assert!(r.snapshot().unwrap().contains_key("z"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn request_switches_round_trip_as_text() {
+        let text = "chat_template_kwargs.enable_thinking = true, \
+                    chat_template_kwargs.thinking_budget = 512, note = \"a, b = c\"";
+        let m = parse_switches(text).unwrap();
+        assert_eq!(m["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(m["chat_template_kwargs"]["thinking_budget"], 512);
+        assert_eq!(m["note"], "a, b = c", "quoted text is one value, commas and all");
+        assert_eq!(
+            switches_text(&m),
+            "chat_template_kwargs.enable_thinking = true, \
+             chat_template_kwargs.thinking_budget = 512, note = \"a, b = c\""
+        );
+        // A bare word is a string; JSON values keep their type.
+        assert_eq!(parse_switches("a = on").unwrap()["a"], "on");
+        assert!(parse_switches("a = {b: 1}").unwrap()["a"].is_string(), "not JSON, so a string");
+        assert!(parse_switches("").unwrap().is_empty());
+        // Entries say what they should look like.
+        assert!(parse_switches("a").unwrap_err().contains("path = value"));
+        assert!(parse_switches("a = ").unwrap_err().contains("both sides"));
+        assert!(parse_switches("a..b = 1").unwrap_err().contains("empty key"));
+        assert!(parse_switches("a.b = 1, a = 2").unwrap_err().contains("table"));
+        assert!(parse_switches("a = 2, a.b = 1").unwrap_err().contains("table"));
+        let mut m = Map::new();
+        set_switch(&mut m, "nested.on = false").unwrap();
+        assert_eq!(switches_text(&m), "nested.on = false");
+    }
+
+    #[test]
+    fn a_new_model_starts_with_the_effort_ladder() {
+        let m = CustomModel::with_effort_defaults();
+        assert_eq!(m.reasoning, Reasoning::Effort);
+        assert_eq!(m.efforts, ["low", "medium", "high"]);
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn set_replaces_one_entry_and_keeps_the_others() {
+        let (r, d) = reg("set");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            r.path(),
+            "# keep me\n[providers.a]\nbase_url = \"https://a.test/v1\"\n\n[providers.b]\nbase_url = \"https://b.test/v1\"\n",
+        )
+        .unwrap();
+        let mut p = CustomProvider::new("https://a2.test/v1");
+        p.models.insert("org/m".into(), CustomModel::with_effort_defaults());
+        r.set("a", p).unwrap();
+        let all = r.snapshot().unwrap();
+        assert_eq!(all["a"].base_url, "https://a2.test/v1");
+        assert_eq!(all["a"].models["org/m"].efforts, ["low", "medium", "high"]);
+        assert_eq!(all["b"].base_url, "https://b.test/v1");
+        let text = std::fs::read_to_string(r.path()).unwrap();
+        assert!(text.starts_with("# keep me\n"), "{text}");
+        let missing = r.set("nope", CustomProvider::new("https://x.test/v1")).unwrap_err().to_string();
+        assert!(missing.contains("is not in"), "{missing}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn update_keeps_the_stored_key_unless_a_new_one_is_given() {
+        let (r, d) = reg("update");
+        let s = Store::at(d.join("auth.json"));
+        let def = || CustomProvider::new("https://x.test/v1");
+        let key = |k: &str| Entry::literal(k);
+        save(&r, &s, "x", def(), Some(key("first-key-0123456789"))).unwrap();
+        let shown = s.get("x").unwrap();
+
+        // An edit of a model keeps the credential exactly as it was.
+        let mut p = def();
+        p.models.insert("org/m".into(), CustomModel::with_effort_defaults());
+        update(&r, &s, "x", p, KeyEdit::Keep).unwrap();
+        assert_eq!(s.get("x").unwrap().key, shown.key);
+        assert_eq!(r.get("x").unwrap().unwrap().models["org/m"].efforts, ["low", "medium", "high"]);
+
+        // A newly chosen credential replaces it and is used for chat.
+        update(&r, &s, "x", def(), KeyEdit::Set(key("second-key-0123456789"))).unwrap();
+        let e = s.get("x").unwrap();
+        assert_eq!(e.key.as_deref(), Some("second-key-0123456789"));
+        assert!(e.routes_chat() && e.base_url.is_none());
+
+        // Keyless: an entry edits it without touching the key, and a key is refused.
+        let mut k = def();
+        k.auth = AuthMode::None;
+        update(&r, &s, "x", k.clone(), KeyEdit::Keep).unwrap();
+        assert_eq!(s.get("x").unwrap().key.as_deref(), Some("second-key-0123456789"), "keys are not deleted here");
+        let refused = update(&r, &s, "x", k, KeyEdit::Set(key("third-key-0123456789"))).unwrap_err();
+        assert!(refused.to_string().contains("keyless"), "{refused}");
+
+        // An id that is not there, and a credential write that fails, both say so.
+        let missing = update(&r, &s, "nope", def(), KeyEdit::Keep).unwrap_err();
+        assert!(missing.to_string().contains("does not exist"), "{missing}");
+        std::fs::create_dir_all(d.join("blocked").join("auth.json")).unwrap();
+        let bad = Store::at(d.join("blocked").join("auth.json"));
+        let e = update(&r, &bad, "x", def(), KeyEdit::Set(key("fourth-key-0123456789"))).unwrap_err();
+        assert!(matches!(e, SaveError::KeyNotSaved { raced: false, .. }), "{e}");
+        assert!(r.get("x").unwrap().is_some(), "the definition was written");
         let _ = std::fs::remove_dir_all(d);
     }
 }

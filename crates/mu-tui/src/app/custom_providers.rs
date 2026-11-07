@@ -12,7 +12,7 @@ use crate::widgets::overlay::PanelPick;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mu_provider::auth::store::resolve_entry;
 use mu_provider::model::discovery::{DiscoverError, custom_fetch};
-use mu_provider::provider::custom::{self, CustomProvider, SaveError};
+use mu_provider::provider::custom::{self, CustomProvider, KeyEdit, SaveError};
 
 /// The panel in progress, and the composer text it displaced (put back when it ends).
 pub(super) struct CustomFlow {
@@ -53,13 +53,39 @@ impl App {
         let dests =
             Destinations { providers: registry.path().display().to_string(), auth: store.path().display().to_string() };
         let taken = move |id: &str| names.iter().any(|n| n == id) || store.has(id);
+        self.open_custom_panel(panel::Panel::new(dests, taken));
+    }
+
+    /// Opens the panel on an existing endpoint: its definition, models and reasoning as saved, and
+    /// the key it takes now. Save replaces the definition; the key is written only when it is chosen.
+    pub(super) fn start_custom_edit(&mut self, id: &str) {
+        let registry = self.services.providers.custom_registry();
+        let def = match registry.get(id) {
+            Ok(Some(def)) => def,
+            Ok(None) => {
+                return self.error(&format!(
+                    "no custom endpoint `{id}` in {}; `+ Add a custom endpoint…` starts a new one",
+                    registry.path().display()
+                ));
+            }
+            Err(e) => return self.error(&format!("{e:#}")),
+        };
+        let store = self.services.providers.store().clone();
+        let dests =
+            Destinations { providers: registry.path().display().to_string(), auth: store.path().display().to_string() };
+        let panel = panel::Panel::edited(dests, &def, store.get(id));
+        self.open_custom_panel(panel);
+    }
+
+    /// Shows `panel` as the flow on screen, taking the composer's draft aside until it ends.
+    fn open_custom_panel(&mut self, panel: panel::Panel) {
+        self.leave_custom_wizard();
         self.flows.custom_wizard_seq += 1;
         let id = self.flows.custom_wizard_seq;
         let draft = self.prompt.composer.take_secret();
         self.prompt.composer.set_private(true);
         self.prompt.composer.set_closed(true);
-        self.flows.custom_wizard =
-            Some(CustomFlow { id, panel: panel::Panel::new(dests, taken), draft, checking: false });
+        self.flows.custom_wizard = Some(CustomFlow { id, panel, draft, checking: false });
         self.custom_show();
     }
 
@@ -253,13 +279,27 @@ impl App {
     /// Only Save reaches here. The definition and key are written, then the listing is cached.
     fn custom_save(&mut self, saved: Saved) {
         self.end_custom_wizard();
-        let Saved { id, provider, entry, listed } = saved;
-        match self.services.save_custom(&id, provider, entry) {
+        let Saved { id, provider, entry, editing, key_changed, listed } = saved;
+        let written = if editing {
+            // An edit only writes the key it was given; otherwise the stored one stays.
+            let key = match (key_changed, entry) {
+                (true, Some(entry)) => KeyEdit::Set(entry),
+                _ => KeyEdit::Keep,
+            };
+            self.services.update_custom(&id, provider, key)
+        } else {
+            self.services.save_custom(&id, provider, entry)
+        };
+        match written {
             Ok(p) => {
                 if let Some(rows) = listed {
                     self.services.commit_custom(&p, rows);
                 }
-                self.notice("Provider configured; use /switch to try it or /model to save a role.");
+                self.notice(if editing {
+                    "Endpoint updated; use /switch to try it or /model to save a role."
+                } else {
+                    "Provider configured; use /switch to try it or /model to save a role."
+                });
                 self.custom_written();
             }
             Err(e) => {
@@ -409,7 +449,7 @@ mod tests {
             choose(&mut app, 4); // Models: reads the endpoint
             settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
             choose(&mut app, 0); // the model, with the limits the listing reported
-            choose(&mut app, 2); // Add it (preselected on the limits screen)
+            choose(&mut app, 3); // Add it (preselected on the limits screen)
             esc(&mut app); // back to the fields
             choose(&mut app, 5); // Save
             assert!(
@@ -422,6 +462,11 @@ mod tests {
             let saved = app.services.providers.custom_registry().get("modal").unwrap().expect("saved");
             assert_eq!(saved.auth, AuthMode::None);
             assert_eq!(saved.models["org/model"].context_window, Some(65536), "the listed limits");
+            assert_eq!(
+                saved.models["org/model"].efforts,
+                ["low", "medium", "high"],
+                "an added model gets the effort ladder"
+            );
             assert!(
                 transcript_text(&app).contains("Provider configured; use /switch to try it or /model to save a role.")
             );
@@ -621,7 +666,7 @@ mod tests {
             assert!(screen(&app).contains("Type a model id"), "{}", screen(&app));
             choose(&mut app, 0); // Type a model id…
             line(&mut app, "org/typed");
-            choose(&mut app, 2); // Add it with the defaults
+            choose(&mut app, 3); // Add it with the defaults
             esc(&mut app);
             choose(&mut app, 5); // Save
             let saved = app.services.providers.custom_registry().get("modal").unwrap().expect("saved");
@@ -706,7 +751,7 @@ mod tests {
         assert!(shown.contains("fix"), "{shown}");
         assert!(matches!(&app.overlay, Some(Overlay::Model { .. })), "the picker still opens");
         let (items, targets) = app.api_key_rows();
-        assert!(targets.contains(&LoginTarget::CustomProvider), "the add row needs no valid file");
+        assert!(targets.contains(&LoginTarget::CustomProvider(None)), "the add row needs no valid file");
         assert!(items.len() >= 2);
         assert!(transcript_text(&app).contains("providers.toml"));
     }
@@ -722,7 +767,7 @@ mod tests {
         let row = |t: &LoginTarget| items.iter().zip(&targets).find(|(_, x)| *x == t).map(|(i, _)| i.detail.clone());
         assert_eq!(row(&LoginTarget::ApiKey("modal".into())).as_deref(), Some("key missing"));
         assert_eq!(row(&LoginTarget::ApiKey("lab".into())).as_deref(), Some("no auth"));
-        assert!(targets.last() == Some(&LoginTarget::CustomProvider), "the add row comes last");
+        assert!(targets.last() == Some(&LoginTarget::CustomProvider(None)), "the add row comes last");
         assert_eq!(items.last().map(|i| i.label.as_str()), Some("+ Add a custom endpoint…"));
 
         // A keyless endpoint takes no key: its row says so instead of opening a key flow.
@@ -731,6 +776,83 @@ mod tests {
         assert!(app.overlay.is_none());
         app.login("modal");
         assert!(matches!(&app.overlay, Some(Overlay::KeyChoice { provider, .. }) if provider == "modal"));
+    }
+
+    #[test]
+    fn editing_an_endpoint_from_login_replaces_it_and_keeps_its_stored_key() {
+        let (mut app, mut cmds, mut ui) = app_with("");
+        in_local(async {
+            let (base, _seen) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
+            let def = CustomProvider {
+                models: BTreeMap::from([(
+                    "org/model".to_string(),
+                    CustomModel { context_window: Some(65_536), max_tokens: Some(8_192), ..Default::default() },
+                )]),
+                ..CustomProvider::new(&base)
+            };
+            let registry = app.services.providers.custom_registry().clone();
+            registry.add("modal", def.validated("modal").unwrap()).unwrap();
+            let store = app.services.providers.store().clone();
+            store.set("modal", mu_provider::auth::store::Entry::literal("stored-key-0123456789")).unwrap();
+
+            app.login("custom modal");
+            let text = screen(&app);
+            assert!(text.contains("Edit custom endpoint modal"), "{text}");
+            assert!(text.contains("the stored key (not shown)"), "{text}");
+            assert!(!text.contains("Provider id"), "the id is fixed:\n{text}");
+
+            // Its model gains the effort ladder, keeping the limits the file set.
+            choose(&mut app, 3); // Models
+            settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
+            choose(&mut app, 0); // the model
+            assert!(screen(&app).contains("none; /thinking has nothing to set"), "{}", screen(&app));
+            choose(&mut app, 2); // Reasoning
+            choose(&mut app, 1); // Effort levels
+            esc(&mut app); // back to the limits
+            assert!(screen(&app).contains("effort: low, medium, high"), "{}", screen(&app));
+            choose(&mut app, 3); // Save org/model
+            esc(&mut app); // models → fields
+            choose(&mut app, 4); // Save
+
+            assert!(!app.custom_wizard_active() && app.overlay.is_none(), "{}", transcript_text(&app));
+            assert!(transcript_text(&app).contains("Endpoint updated"), "{}", transcript_text(&app));
+            let def = registry.get("modal").unwrap().expect("still there");
+            assert_eq!(def.base_url, base, "the address is kept");
+            assert_eq!(def.models["org/model"].context_window, Some(65_536));
+            assert_eq!(def.models["org/model"].efforts, ["low", "medium", "high"]);
+            assert_eq!(
+                store.get("modal").and_then(|e| e.key).as_deref(),
+                Some("stored-key-0123456789"),
+                "an edit that chooses no key leaves the stored one alone"
+            );
+            assert!(matches!(cmds.try_recv(), Ok(Command::RefreshModel)));
+        });
+    }
+
+    #[test]
+    fn the_login_list_offers_an_edit_row_and_an_unknown_id_is_an_error() {
+        let (mut app, _cmds, _ui) = app_with("");
+        let registry = app.services.providers.custom_registry().clone();
+        registry.add("modal", CustomProvider::new("http://127.0.0.1:9").validated("modal").unwrap()).unwrap();
+        let (items, targets) = app.api_key_rows();
+        assert!(
+            targets.contains(&LoginTarget::CustomProvider(Some("modal".into()))),
+            "each endpoint has a row that edits it"
+        );
+        let label = items
+            .iter()
+            .zip(&targets)
+            .find(|(_, t)| **t == LoginTarget::CustomProvider(Some("modal".into())))
+            .map(|(i, _)| i.label.clone());
+        assert_eq!(label.as_deref(), Some("Edit custom endpoint: modal"));
+
+        app.login("custom modal");
+        assert!(app.custom_wizard_active());
+        assert!(screen(&app).contains("Edit custom endpoint modal"), "{}", screen(&app));
+        app.custom_cancel();
+        app.login("custom nope");
+        assert!(!app.custom_wizard_active());
+        assert!(transcript_text(&app).contains("no custom endpoint `nope`"), "{}", transcript_text(&app));
     }
 
     #[test]
