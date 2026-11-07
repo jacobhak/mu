@@ -1,1 +1,1 @@
-pub mod wizard;
+pub mod panel;

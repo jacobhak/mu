@@ -25,7 +25,7 @@ pub enum LoginTarget {
     ApiKey(String),
     /// Sign in with ChatGPT (or the sign-in menu when already signed in).
     ChatGpt,
-    /// Add a custom OpenAI-compatible endpoint (the guided wizard).
+    /// Add a custom OpenAI-compatible endpoint (the panel).
     CustomProvider,
 }
 
@@ -59,6 +59,15 @@ pub enum McpRow {
     Server(String),
     Add,
     Import,
+}
+
+/// What a custom-endpoint panel picker answered.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PanelPick {
+    /// The row chosen, or `None` when the picker was dismissed.
+    Row(Option<usize>),
+    /// The text typed into the panel's free-text field.
+    Text(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,8 +133,8 @@ pub enum Overlay {
     Web {
         sel: Select,
     },
-    /// A choice step of the custom-endpoint wizard.
-    CustomWizard {
+    /// A screen of the custom-endpoint panel.
+    Custom {
         sel: Select,
     },
     /// `/modelset`: the model sets, to switch to one.
@@ -212,8 +221,9 @@ pub enum OverlayEvent {
     Mcp(McpPick, Option<usize>),
     /// A `/web` wizard picker closed: the row chosen, or `None` when dismissed.
     Web(Option<usize>),
-    /// A choice of the custom-endpoint wizard: the row chosen, or `None` when dismissed.
-    CustomWizard(Option<usize>),
+    /// A step of the custom-endpoint panel: the row chosen, the text typed into a field, or
+    /// `None` when it was dismissed.
+    Custom(PanelPick),
     /// Switch to this model set.
     ModelSet(String),
     /// The import offer: `true` to copy omp's model config.
@@ -536,7 +546,7 @@ impl Overlay {
             | Overlay::KeyChoice { sel, .. }
             | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
-            | Overlay::CustomWizard { sel }
+            | Overlay::Custom { sel }
             | Overlay::Web { sel }
             | Overlay::ModelSet { sel, .. }
             | Overlay::ModelImport { sel }
@@ -560,7 +570,7 @@ impl Overlay {
             | Overlay::KeyChoice { sel, .. }
             | Overlay::Logout { sel, .. }
             | Overlay::Mcp { sel, .. }
-            | Overlay::CustomWizard { sel }
+            | Overlay::Custom { sel }
             | Overlay::Web { sel }
             | Overlay::ModelSet { sel, .. }
             | Overlay::ModelImport { sel }
@@ -672,10 +682,11 @@ impl Overlay {
                 SelectResult::Chosen(i) => (None, Some(OverlayEvent::Web(i.first().copied()))),
                 _ => (None, Some(OverlayEvent::Web(None))),
             },
-            Overlay::CustomWizard { mut sel } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::CustomWizard { sel }), None),
-                SelectResult::Chosen(i) => (None, Some(OverlayEvent::CustomWizard(i.first().copied()))),
-                _ => (None, Some(OverlayEvent::CustomWizard(None))),
+            Overlay::Custom { mut sel } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::Custom { sel }), None),
+                SelectResult::Chosen(i) => (None, Some(OverlayEvent::Custom(PanelPick::Row(i.first().copied())))),
+                SelectResult::Text(t) => (None, Some(OverlayEvent::Custom(PanelPick::Text(t)))),
+                _ => (None, Some(OverlayEvent::Custom(PanelPick::Row(None)))),
             },
             Overlay::ModelSet { mut sel, names } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::ModelSet { sel, names }), None),

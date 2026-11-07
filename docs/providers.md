@@ -62,7 +62,7 @@ mu auth test openai-chatgpt                  # does the plan answer?
 
 ## Custom endpoints (vLLM, Modal, any OpenAI-compatible server)
 
-Any server that speaks Chat Completions (`POST <base>/chat/completions`, `GET <base>/models`) can be a named provider, with no omp involved. Set one up from `/login` ("Add custom OpenAI-compatible endpoint", or `/login custom`), or from a shell:
+Any server that speaks Chat Completions (`POST <base>/chat/completions`, `GET <base>/models`) can be a named provider, with no omp involved. Set one up from `/login` ("+ Add a custom endpoint…", or `/login custom`), or from a shell:
 
 ```sh
 mu providers add modal --base-url https://example--serve.modal.run/v1 --label Modal --env MODAL_API_KEY
@@ -72,7 +72,7 @@ mu providers models modal --refresh   # GET /models now, with the real error if 
 mu providers rm modal                 # removes the definition and its stored key; roles are never touched
 ```
 
-The base URL is used exactly as given (include `/v1` when the server's API lives there); `/models` and `/chat/completions` are appended. It must be `https`, or `http` to a loopback address, and carry no user name, password, query or fragment; redirects are never followed, so a key only reaches the host you named. Keys are never accepted as arguments: `mu providers add` reads one from stdin or a no-echo prompt, or takes `--env NAME` / `--cmd 'command'` (read at request time, as for `mu auth add`). `--no-auth` is for servers that need none. mu checks `GET /models` with the key before saving (`401`/`403` saves nothing; other failures need `--no-validate`). The guided `/login` flow does the same, reviews what it will write, and writes only on Save; Esc at any step writes nothing. Neither flow picks a model or edits a role: use `/switch <id>/<model>` to try it and `/model` to save a role.
+The base URL is used exactly as given (include `/v1` when the server's API lives there); `/models` and `/chat/completions` are appended. It must be `https`, or `http` to a loopback address, and carry no user name, password, query or fragment; redirects are never followed, so a key only reaches the host you named. Keys are never accepted as arguments: `mu providers add` reads one from stdin or a no-echo prompt, or takes `--env NAME` / `--cmd 'command'` (read at request time, as for `mu auth add`). `--no-auth` is for servers that need none. mu checks `GET /models` with the key before saving (`401`/`403` saves nothing; other failures need `--no-validate`). The `/login` flow is a panel of the same fields: Enter edits the one highlighted, its Models screen reads `GET /models` once (and says why when it cannot), and Save writes the definition and the key together. `←` / `⇧Tab` / Esc go back a screen, and Esc on the first writes nothing; a key that is refused is asked for again rather than saved. Neither flow picks a model or edits a role: use `/switch <id>/<model>` to try it and `/model` to save a role.
 
 Definitions live in `providers.toml` in the [profile home](usage.md#profile-home), never keys. The file is read afresh on every use, so a change made by `mu providers`, another session or your editor applies without a restart. A file that does not parse or validate blocks model resolution (and `/switch`, `/model`) with the path and the key at fault, until it is fixed. Unknown keys are errors. The key itself is stored under the provider id in `auth.json` like any other (`mu auth add|test|rm <id>`, `/login <id>`, `/logout`), always for chat, and never with its own `baseUrl`.
 

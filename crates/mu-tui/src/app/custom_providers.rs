@@ -1,23 +1,27 @@
-//! The custom-endpoint wizard: `/login custom`, or the "Add custom OpenAI-compatible endpoint" row.
-//! The app shows each step of `custom::wizard` and runs the one model check it asks for. Only Save
-//! writes (the definition, the key, then the listing); every other way out writes nothing and gives
-//! the composer back its text. Typed keys stay in the composer's masked input and in the wizard's
-//! draft, and are registered for redaction as soon as they are checked.
+//! The custom-endpoint panel: `/login custom`, or the `/login` row that adds one.
+//! One screen of fields reads like the `providers.toml` table it writes; the app shows each step of
+//! `custom::panel`, takes the key in the masked composer, runs the one `/models` check it asks for
+//! and carries out its Save. Only Save writes (the definition, the key, then the listing); every
+//! other way out writes nothing and gives the composer back its text. A typed key stays in the
+//! composer's masked input and in the panel's draft, and is registered for redaction as soon as
+//! it is checked.
 
 use super::*;
-use crate::custom::wizard::{Answer, Destinations, Fetch, Probe, Saved, Step, Wizard};
-use crate::widgets::select::{Item, Select};
+use crate::custom::panel::{self, Action, Answer, Destinations, Fetch, Probe, Saved, Step};
+use crate::widgets::overlay::PanelPick;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mu_provider::auth::store::resolve_entry;
 use mu_provider::model::discovery::{DiscoverError, custom_fetch};
 use mu_provider::provider::custom::{self, CustomProvider, SaveError};
 
-/// The wizard in progress, and the composer text it displaced (put back when it ends).
+/// The panel in progress, and the composer text it displaced (put back when it ends).
 pub(super) struct CustomFlow {
-    /// Tells a late check result from this wizard's.
+    /// Tells a late check result from this panel's.
     id: u64,
-    wizard: Wizard,
+    panel: panel::Panel,
     draft: String,
+    /// A `/models` read is running; keys wait for its answer.
+    checking: bool,
 }
 
 impl App {
@@ -25,17 +29,17 @@ impl App {
         self.flows.custom_wizard.is_some()
     }
 
-    /// Whether the composer is locked to the wizard: it waits for a line of text, or a check runs.
+    /// Whether the composer is locked to the panel: it takes the key, or a check runs.
     pub(super) fn custom_typing(&self) -> bool {
-        self.flows.custom_wizard.as_ref().is_some_and(|f| f.wizard.awaits_text() || f.wizard.busy())
+        self.flows.custom_wizard.as_ref().is_some_and(|f| f.panel.awaits_key() || f.checking)
     }
 
     /// Whether a check is running; nothing typed or pasted goes anywhere until it answers.
     pub(super) fn custom_busy(&self) -> bool {
-        self.flows.custom_wizard.as_ref().is_some_and(|f| f.wizard.busy())
+        self.flows.custom_wizard.as_ref().is_some_and(|f| f.checking)
     }
 
-    /// Opens the wizard at its first step. One that is already open is left alone.
+    /// Opens the panel at its fields. One that is already open is left alone.
     pub(super) fn start_custom_wizard(&mut self) {
         if self.custom_wizard_active() {
             return;
@@ -54,104 +58,145 @@ impl App {
         let draft = self.prompt.composer.take_secret();
         self.prompt.composer.set_private(true);
         self.prompt.composer.set_closed(true);
-        self.flows.custom_wizard = Some(CustomFlow { id, wizard: Wizard::new(dests, taken), draft });
+        self.flows.custom_wizard =
+            Some(CustomFlow { id, panel: panel::Panel::new(dests, taken), draft, checking: false });
         self.custom_show();
     }
 
-    /// Shows the wizard's current step: a line of text, a picker, or the check it asks for.
+    /// Shows the panel's current step.
     fn custom_show(&mut self) {
-        let Some(f) = self.flows.custom_wizard.as_mut() else { return };
-        let (flow, notes, step) = (f.id, f.wizard.take_notes(), f.wizard.step());
-        if !notes.is_empty() {
-            self.notice(&notes.join("\n"));
-        }
-        // The previous step's picker is replaced or dropped, never left on screen.
-        if matches!(self.overlay, Some(Overlay::CustomWizard { .. })) {
+        self.custom_notes();
+        // The previous step's screen is replaced or dropped, never left on display.
+        if matches!(self.overlay, Some(Overlay::Custom { .. })) {
             self.overlay = None;
         }
+        let Some(f) = self.flows.custom_wizard.as_ref() else { return };
+        let step = f.panel.step();
         match step {
-            Step::Text { prompt, secret, .. } => {
-                // Clears the composer: each line starts empty, masked when it is a key.
-                self.prompt.composer.set_masked(secret);
-                self.notice(&format!("{prompt}   (Esc cancels)"));
-            }
-            Step::Pick { title, context, items } => {
+            Step::Pick(sel) => {
                 self.prompt.composer.set_masked(false);
-                let items: Vec<Item> = items.into_iter().map(|i| Item { label: i.label, detail: i.detail }).collect();
-                self.overlay = Some(Overlay::CustomWizard { sel: Select::new(&title, items).context(&context) });
+                self.overlay = Some(Overlay::Custom { sel: *sel });
             }
-            Step::Fetch(probe) => self.custom_check(flow, probe),
-            Step::Save(saved) => self.custom_save(*saved),
-            Step::Cancelled => {
-                self.end_custom_wizard();
+            Step::Key => {
+                self.prompt.composer.set_masked(true);
+                self.notice("paste the key and press Enter (shown as bullets; Esc goes back)");
             }
         }
     }
 
-    /// Keys the wizard takes before the composer and the overlay. True when the key was used up here.
+    /// Prints what the panel has to say; it is drained whenever the panel moves on.
+    fn custom_notes(&mut self) {
+        let Some(f) = self.flows.custom_wizard.as_mut() else { return };
+        let notes = f.panel.take_notes();
+        if !notes.is_empty() {
+            self.notice(&notes.join("\n"));
+        }
+    }
+
+    /// Keys the panel takes before the composer and the overlay. True when the key was used up here.
     pub(super) fn custom_key(&mut self, k: KeyEvent) -> bool {
-        let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-        if k.code == KeyCode::Esc || ctrl_c {
+        // Ctrl-C leaves the panel from any screen, as it leaves any other picker.
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             self.custom_cancel();
             return true;
         }
         let Some(f) = self.flows.custom_wizard.as_ref() else { return false };
-        if f.wizard.busy() {
+        // A check is running: Esc gives up on it, and its late answer is ignored.
+        if f.checking {
+            if k.code == KeyCode::Esc {
+                self.custom_cancel();
+            }
             return true;
         }
-        if f.wizard.awaits_text() {
+        if f.panel.awaits_key() {
+            if k.code == KeyCode::Esc {
+                self.custom_key_cancelled();
+                return true;
+            }
             let enter = k.code == KeyCode::Enter && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
             if enter {
                 let text = self.prompt.composer.secret_text();
-                self.custom_answer(Answer::Text(text), true);
+                self.custom_key_typed(&text);
                 return true;
             }
             return false;
         }
+        // Esc in a field's editor leaves the field, rather than a list of one empty row.
+        if k.code == KeyCode::Esc
+            && let Some(Overlay::Custom { sel }) = &self.overlay
+            && sel.is_editing()
+        {
+            self.overlay = None;
+            self.custom_answer(Answer::Back);
+            return true;
+        }
         // A picker step: its overlay takes the keys. Another flow that replaced it ends this one,
         // so the keys reach that flow and never the composer.
-        if !matches!(self.overlay, Some(Overlay::CustomWizard { .. })) {
+        if !matches!(self.overlay, Some(Overlay::Custom { .. })) {
             self.custom_cancel();
         }
         false
     }
 
-    /// Answers the current step. `from_text`: the answer came from the composer, which is cleared
-    /// once accepted. A refused answer keeps what was typed, so it can be corrected.
-    fn custom_answer(&mut self, a: Answer, from_text: bool) {
+    /// The key or command the panel asked for: Enter in the masked composer.
+    fn custom_key_typed(&mut self, text: &str) {
         let Some(f) = self.flows.custom_wizard.as_mut() else { return };
-        match f.wizard.answer(a) {
+        match f.panel.key_typed(text) {
             Ok(()) => {
-                if from_text {
-                    self.prompt.composer.take_secret();
-                }
+                self.prompt.composer.take_secret();
+                self.prompt.composer.set_masked(false);
                 self.custom_show();
             }
+            // The key stays in the composer, so it can be corrected.
             Err(e) => self.error(&e),
         }
     }
 
-    /// The overlay's choice: the row chosen, or `None` when it was dismissed.
-    pub(super) fn on_custom_pick(&mut self, row: Option<usize>) {
-        match row {
-            Some(i) => self.custom_answer(Answer::Pick(i), false),
-            None => self.custom_cancel(),
-        }
+    /// Esc while the key is typed: back to the choice of how the endpoint takes one.
+    fn custom_key_cancelled(&mut self) {
+        self.prompt.composer.take_secret();
+        self.prompt.composer.set_masked(false);
+        self.custom_answer(Answer::Back);
     }
 
-    /// A model check answered. Only the wizard that started it hears the answer.
-    pub(super) fn on_custom_fetched(&mut self, flow: u64, r: Fetch) {
-        if !self.flows.custom_wizard.as_ref().is_some_and(|f| f.id == flow) {
-            return;
-        }
-        // Another flow has the screen now: this wizard yields to it rather than replace its picker.
-        if self.overlay.is_some() {
-            return self.custom_cancel();
-        }
+    /// The overlay's answer: the row chosen, the text typed in a field, or neither when dismissed.
+    pub(super) fn on_custom_pick(&mut self, pick: PanelPick) {
+        let event = match pick {
+            PanelPick::Row(Some(i)) => Answer::Pick(i),
+            PanelPick::Text(text) => Answer::Text(text),
+            PanelPick::Row(None) => Answer::Back,
+        };
+        self.custom_answer(event);
+    }
+
+    /// Feeds one answer to the panel and carries out what it asks for.
+    fn custom_answer(&mut self, a: Answer) {
         let Some(f) = self.flows.custom_wizard.as_mut() else { return };
-        match f.wizard.answer(Answer::Fetched(r)) {
-            Ok(()) => self.custom_show(),
-            Err(e) => self.error(&e),
+        let action = f.panel.answer(a);
+        match action {
+            Action::Pending => self.custom_show(),
+            Action::Close => self.custom_cancel(),
+            Action::Refused(m) => {
+                // The panel keeps the field open on what was typed.
+                self.custom_show();
+                self.error(&m);
+            }
+            Action::Fetch(probe) => {
+                self.custom_show();
+                self.custom_check(probe);
+            }
+            Action::Save(saved) => self.custom_save(*saved),
+        }
+    }
+
+    /// A `/models` check answered. Only the panel that started it hears the answer.
+    pub(super) fn on_custom_fetched(&mut self, flow: u64, r: Fetch) {
+        let Some(f) = self.flows.custom_wizard.as_mut().filter(|f| f.id == flow) else { return };
+        f.checking = false;
+        let action = f.panel.fetched(r);
+        match action {
+            Action::Fetch(probe) => self.custom_check(probe),
+            _ => self.custom_show(),
         }
     }
 
@@ -162,16 +207,16 @@ impl App {
         }
     }
 
-    /// Ends the wizard without a notice, for a flow that opens over it.
+    /// Ends the panel without a notice, for a flow that opens over it.
     pub(super) fn leave_custom_wizard(&mut self) {
         self.end_custom_wizard();
     }
 
-    /// Ends the wizard: its picker goes, and the composer gets its modes and its text back. Writes
-    /// nothing. False when no wizard was open.
+    /// Ends the panel: its screen goes, and the composer gets its modes and its text back. Writes
+    /// nothing. False when no panel was open.
     fn end_custom_wizard(&mut self) -> bool {
         let Some(flow) = self.flows.custom_wizard.take() else { return false };
-        if matches!(self.overlay, Some(Overlay::CustomWizard { .. })) {
+        if matches!(self.overlay, Some(Overlay::Custom { .. })) {
             self.overlay = None;
         }
         self.unlock_composer();
@@ -185,9 +230,15 @@ impl App {
         true
     }
 
-    /// Starts the check: the draft key is registered for redaction, then the endpoint's `/models` is
-    /// read in the background. The answer comes back as `UiMsg::CustomFetched`.
-    fn custom_check(&mut self, flow: u64, probe: Probe) {
+    /// Starts the check: the draft key is registered for redaction, then the endpoint's `/models`
+    /// is read in the background. The answer comes back as `UiMsg::CustomFetched`.
+    fn custom_check(&mut self, probe: Probe) {
+        let Some(flow) = self.flows.custom_wizard.as_mut().map(|f| {
+            f.checking = true;
+            f.id
+        }) else {
+            return;
+        };
         if let Some(key) = probe.credential.as_ref().and_then(|e| e.key.as_deref()) {
             mu_base::secrets::register_stored(&custom::env_hint(&probe.id), key);
         }
@@ -260,13 +311,12 @@ mod tests {
     use mu_base::events::Command;
     use mu_provider::provider::custom::{AuthMode, CustomModel, CustomProvider};
     use mu_provider::provider::endpoint::{GatewaySource, start_fn};
-    use mu_provider::provider::providers::KeyTarget;
     use mu_testutil::Reply;
     use std::collections::BTreeMap;
     use std::rc::Rc;
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    /// A gateway that never starts: the picker must work without one.
+    /// A gateway that never starts: the panel must work without one.
     fn no_gateway() -> GatewaySource {
         GatewaySource::new(start_fn(|| async { Err::<(String, String), String>("no gateway in tests".into()) }))
     }
@@ -277,16 +327,12 @@ mod tests {
 
     /// An app with its own providers (and no gateway), a command receiver and a UI channel it reads.
     fn app_with(cfg: &str) -> (App, UnboundedReceiver<Command>, UnboundedReceiver<UiMsg>) {
-        let (mut app, cmds) = test_app_with_commands(history());
+        let (mut app, cmds) = super::super::keys::tests::test_app_with_commands(history());
         let cfg = Rc::new(Configs::from_models_toml(cfg));
         app.services = Services { providers: Rc::new(test_providers(cfg, no_gateway())) };
         let (ui_tx, ui_rx) = unbounded_channel();
         app.ui_tx = ui_tx;
         (app, cmds, ui_rx)
-    }
-
-    fn test_app_with_commands(h: PathBuf) -> (App, UnboundedReceiver<Command>) {
-        super::super::keys::tests::test_app_with_commands(h)
     }
 
     /// The picker's text as drawn.
@@ -295,24 +341,44 @@ mod tests {
         sel.render(120, 60).0.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
 
+    /// The row at `index` of the screen on show, chosen with the arrow keys. A screen may open with
+    /// another row highlighted, so the arrows move until this one is.
+    fn choose(app: &mut App, index: usize) {
+        for _ in 0..40 {
+            let at = app.overlay.as_ref().and_then(|o| o.select()).and_then(|s| s.highlighted());
+            if at == Some(index) {
+                break;
+            }
+            app.on_terminal(press(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.on_terminal(press(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
     fn type_text(app: &mut App, s: &str) {
         for c in s.chars() {
             app.on_terminal(press(KeyCode::Char(c), KeyModifiers::NONE));
         }
     }
 
-    /// Types `s` and presses Enter.
+    /// Types `s` into the open field and presses Enter.
     fn line(app: &mut App, s: &str) {
         type_text(app, s);
         app.on_terminal(press(KeyCode::Enter, KeyModifiers::NONE));
     }
 
-    /// Id, label and base URL, to the credential picker.
-    fn to_credentials(app: &mut App, base: &str) {
+    fn esc(app: &mut App) {
+        app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    /// An endpoint with an id, a base URL and no key, at the panel's first screen.
+    fn filled(app: &mut App, base: &str) {
         app.login("custom");
+        choose(app, 0);
         line(app, "modal");
-        line(app, "");
+        choose(app, 2);
         line(app, base);
+        choose(app, 3);
+        choose(app, 3); // No authentication
     }
 
     /// Carries the background answers to the app until `done` holds on the screen.
@@ -325,39 +391,37 @@ mod tests {
                 app.on_ui(m);
             }
         }
-        panic!("the wizard did not reach its step; screen:\n{}", screen(app));
-    }
-
-    /// A listing that says `/models` is up; the wizard's check is answered by the fake server.
-    fn listing(body: &str) -> Reply {
-        Reply::new(200, body)
+        panic!("the panel did not reach its screen; screen:\n{}", screen(app));
     }
 
     const ONE_MODEL: &str = r#"{"data":[{"id":"org/model","max_model_len":65536,"max_completion_tokens":8192}]}"#;
 
-    fn env_free_name() -> String {
-        format!("MU_TEST_UNSET_{}", uuid::Uuid::new_v4().simple())
+    fn listing(body: &str) -> Reply {
+        Reply::new(200, body)
     }
 
     #[test]
-    fn a_wizard_add_through_save_lists_its_models_and_changes_no_assignment() {
+    fn a_panel_add_through_save_lists_its_models_and_changes_no_assignment() {
         let (mut app, mut cmds, mut ui) = app_with("[sets.main]\ndefault = \"a/old\"\n");
         in_local(async {
             let (base, _seen) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
-            to_credentials(&mut app, &base);
-            assert!(app.custom_wizard_active());
-            app.on_custom_pick(Some(3));
-            settle(&mut app, &mut ui, |a| screen(a).contains("Choose a model")).await;
-            app.on_custom_pick(Some(0));
-            line(&mut app, "");
-            line(&mut app, "");
-            app.on_custom_pick(Some(0));
-            app.on_custom_pick(Some(0));
-            assert!(!app.custom_wizard_active() && app.overlay.is_none(), "saved, and the wizard is done");
+            filled(&mut app, &base);
+            choose(&mut app, 4); // Models: reads the endpoint
+            settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
+            choose(&mut app, 0); // the model, with the limits the listing reported
+            choose(&mut app, 2); // Add it (preselected on the limits screen)
+            esc(&mut app); // back to the fields
+            choose(&mut app, 5); // Save
+            assert!(
+                !app.custom_wizard_active() && app.overlay.is_none(),
+                "saved, and the panel is done; screen:\n{}\n{}",
+                screen(&app),
+                transcript_text(&app)
+            );
 
             let saved = app.services.providers.custom_registry().get("modal").unwrap().expect("saved");
             assert_eq!(saved.auth, AuthMode::None);
-            assert_eq!(saved.models["org/model"].context_window, Some(65536), "the listed limits are the default");
+            assert_eq!(saved.models["org/model"].context_window, Some(65536), "the listed limits");
             assert!(
                 transcript_text(&app).contains("Provider configured; use /switch to try it or /model to save a role.")
             );
@@ -376,57 +440,95 @@ mod tests {
         });
     }
 
+    /// Esc `exits` times: each goes back a screen, and the last one closes the panel.
+    fn escape_from(app: &mut App, exits: usize) {
+        for _ in 0..exits {
+            esc(app);
+        }
+    }
+
+    /// Nothing was written, and the composer is as it was.
+    fn assert_nothing_written(app: &App, draft: &str, name: &str) {
+        assert!(!app.custom_wizard_active() && app.overlay.is_none(), "{name}");
+        assert!(!app.typing(), "{name}: the composer is unlocked");
+        assert_eq!(app.prompt.composer.text(), draft, "{name}: the draft is back");
+        assert!(!app.services.providers.custom_registry().path().exists(), "{name}: no definition");
+        assert!(app.services.providers.store().get("modal").is_none(), "{name}: no key");
+        assert!(!transcript_text(app).contains("SECRET"), "{name}");
+    }
+
     #[test]
-    fn escape_at_every_step_writes_nothing_and_gives_the_composer_back() {
-        // Each stage is reached from a fresh `/login custom`, then escape is pressed.
-        type Stage = (&'static str, fn(&mut App));
-        let stages: [Stage; 7] = [
-            ("id", |_| {}),
-            ("label", |a| line(a, "modal")),
-            ("base", |a| {
-                line(a, "modal");
-                line(a, "")
-            }),
-            ("credential picker", |a| {
-                line(a, "modal");
-                line(a, "");
-                line(a, "http://127.0.0.1:9")
-            }),
-            ("key", |a| {
-                line(a, "modal");
-                line(a, "");
-                line(a, "http://127.0.0.1:9");
-                a.on_custom_pick(Some(0));
-                type_text(a, "typed-SECRET-01")
-            }),
-            ("command", |a| {
-                line(a, "modal");
-                line(a, "");
-                line(a, "http://127.0.0.1:9");
-                a.on_custom_pick(Some(2));
-                type_text(a, "pass show modal")
-            }),
-            ("checking", |a| {
-                line(a, "modal");
-                line(a, "");
-                line(a, "http://127.0.0.1:9");
-                a.on_custom_pick(Some(3))
-            }),
+    fn escape_at_every_screen_writes_nothing_and_gives_the_composer_back() {
+        // Each stage is reached from a fresh `/login custom`, and leaves it with Esc.
+        type Stage = (&'static str, fn(&mut App), usize);
+        let stages: [Stage; 4] = [
+            ("fields", |_| {}, 1),
+            ("a field", |a| choose(a, 0), 2),
+            ("the auth screen", |a| choose(a, 3), 2),
+            (
+                "the key",
+                |a| {
+                    choose(a, 3);
+                    choose(a, 0);
+                    type_text(a, "typed-SECRET-01")
+                },
+                2,
+            ),
         ];
+        in_local(async {
+            for (name, reach, exits) in stages {
+                let (mut app, _cmds, _ui) = app_with("");
+                app.prompt.composer.set_text("my draft");
+                app.login("custom");
+                assert_eq!(app.prompt.composer.text(), "", "{name}: the draft is taken aside");
+                reach(&mut app);
+                escape_from(&mut app, exits);
+                assert_nothing_written(&app, "my draft", name);
+            }
+        });
+    }
+
+    #[test]
+    fn escape_after_the_listing_leaves_the_models_and_limits_screens_without_writing() {
+        in_local(async {
+            // The models screen, once the endpoint's listing is on it.
+            let (mut app, _cmds, mut ui) = app_with("");
+            let (base, _) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
+            app.prompt.composer.set_text("my draft");
+            filled(&mut app, &base);
+            choose(&mut app, 4); // Models reads the endpoint
+            settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
+            escape_from(&mut app, 2); // models → fields → out
+            assert_nothing_written(&app, "my draft", "the models");
+
+            // A model's limits, one screen further in.
+            let (mut app, _cmds, mut ui) = app_with("");
+            let (base, _) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
+            app.prompt.composer.set_text("my draft");
+            filled(&mut app, &base);
+            choose(&mut app, 4);
+            settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
+            choose(&mut app, 0); // the model, with its limits
+            assert!(screen(&app).contains("Limits of org/model"), "{}", screen(&app));
+            escape_from(&mut app, 3); // limits → models → fields → out
+            assert_nothing_written(&app, "my draft", "a model's limits");
+        });
+    }
+
+    #[test]
+    fn ctrl_c_leaves_the_panel_from_any_screen() {
+        // Esc goes back a screen; Ctrl-C leaves, as it leaves any other picker.
+        type Stage = (&'static str, fn(&mut App));
+        let stages: [Stage; 3] =
+            [("the fields", |_| {}), ("a field", |a| choose(a, 0)), ("the auth screen", |a| choose(a, 3))];
         in_local(async {
             for (name, reach) in stages {
                 let (mut app, _cmds, _ui) = app_with("");
                 app.prompt.composer.set_text("my draft");
                 app.login("custom");
-                assert_eq!(app.prompt.composer.text(), "", "{name}: the draft is taken aside while the wizard runs");
                 reach(&mut app);
-                app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
-                assert!(!app.custom_wizard_active() && app.overlay.is_none(), "{name}");
-                assert!(!app.typing(), "{name}: the composer is unlocked");
-                assert_eq!(app.prompt.composer.text(), "my draft", "{name}: the draft is back");
-                assert!(!app.services.providers.custom_registry().path().exists(), "{name}: no definition");
-                assert!(app.services.providers.store().get("modal").is_none(), "{name}: no key");
-                assert!(!app.prompt.composer.is_empty() && !transcript_text(&app).contains("SECRET"), "{name}");
+                app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+                assert_nothing_written(&app, "my draft", name);
             }
         });
     }
@@ -436,10 +538,10 @@ mod tests {
         let (mut app, _cmds, mut ui) = app_with("");
         in_local(async {
             app.prompt.composer.set_text("my draft");
-            to_credentials(&mut app, "http://127.0.0.1:9");
-            app.on_custom_pick(Some(3));
+            filled(&mut app, "http://127.0.0.1:9");
+            choose(&mut app, 4);
             assert!(app.custom_busy(), "the check is running");
-            app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
+            esc(&mut app);
             assert!(!app.custom_wizard_active());
             assert_eq!(app.prompt.composer.text(), "my draft");
 
@@ -453,46 +555,55 @@ mod tests {
     }
 
     #[test]
-    fn stale_answers_cannot_save_or_reopen_a_wizard() {
+    fn stale_answers_cannot_save_or_reopen_a_panel() {
         let (mut app, _cmds, _ui) = app_with("");
         in_local(async {
-            to_credentials(&mut app, "http://127.0.0.1:9");
-            app.on_custom_pick(Some(3));
+            filled(&mut app, "http://127.0.0.1:9");
+            choose(&mut app, 4);
             let old = app.flows.custom_wizard_seq;
-            app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
+            esc(&mut app);
 
-            // A new wizard is at its first step when the old check's answer arrives.
+            // A new panel is at its first screen when the old check's answer arrives.
             app.login("custom");
             let new = app.flows.custom_wizard_seq;
             assert_ne!(old, new);
             app.on_ui(UiMsg::CustomFetched { flow: old, r: Fetch::Listed(vec![]) });
             app.on_ui(UiMsg::CustomFetched { flow: old, r: Fetch::Rejected("late".into()) });
-            assert_eq!(app.flows.custom_wizard.as_ref().map(|f| f.id), Some(new), "the new wizard survives");
-            assert!(app.custom_typing() && !app.custom_busy(), "still at its id line");
+            assert_eq!(app.flows.custom_wizard.as_ref().map(|f| f.id), Some(new), "the new panel survives");
+            assert!(app.overlay.is_some() && !app.custom_typing(), "still at its fields");
             assert!(!app.services.providers.custom_registry().path().exists());
             assert!(!transcript_text(&app).contains("late"));
         });
     }
 
     #[test]
-    fn a_refused_key_or_a_missing_variable_returns_to_the_credential_choice_and_saves_nothing() {
+    fn a_refused_key_or_a_missing_variable_returns_to_the_choice_and_saves_nothing() {
         let (mut app, _cmds, mut ui) = app_with("");
         in_local(async {
             let (base, _) = mu_testutil::fake_server(vec![Reply::new(401, "{}")]).await;
-            to_credentials(&mut app, &base);
-            app.on_custom_pick(Some(0));
-            type_text(&mut app, "refused-0123456789");
-            app.on_terminal(press(KeyCode::Enter, KeyModifiers::NONE));
+            app.login("custom");
+            choose(&mut app, 0);
+            line(&mut app, "modal");
+            choose(&mut app, 2);
+            line(&mut app, &base);
+            choose(&mut app, 3);
+            choose(&mut app, 0); // Paste a key
+            line(&mut app, "refused-0123456789");
+            choose(&mut app, 4); // Models: the check is refused
             settle(&mut app, &mut ui, |a| screen(a).contains("How does the endpoint take its key?")).await;
             assert!(transcript_text(&app).contains("Nothing was saved"));
+            assert!(screen(&app).contains("HTTP 401"), "{}", screen(&app));
             assert!(!app.services.providers.custom_registry().path().exists());
-            app.on_custom_pick(None);
+            esc(&mut app);
+            esc(&mut app);
 
             let (mut app, _cmds, mut ui) = app_with("");
-            let unset = env_free_name();
-            to_credentials(&mut app, "http://127.0.0.1:9");
-            app.on_custom_pick(Some(1));
+            let unset = format!("MU_TEST_UNSET_{}", uuid::Uuid::new_v4().simple());
+            filled(&mut app, "http://127.0.0.1:9");
+            choose(&mut app, 3); // Key: another way to give one
+            choose(&mut app, 1); // an environment variable
             line(&mut app, &unset);
+            choose(&mut app, 4);
             settle(&mut app, &mut ui, |a| screen(a).contains("How does the endpoint take its key?")).await;
             assert!(transcript_text(&app).contains(&unset), "the variable is named");
             assert!(app.services.providers.store().get("modal").is_none());
@@ -500,19 +611,19 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_that_does_not_read_is_a_discovery_failure_with_a_manual_model() {
+    fn a_listing_that_does_not_read_is_shown_and_a_typed_model_still_saves() {
         let (mut app, _cmds, mut ui) = app_with("");
         in_local(async {
             let (base, _) = mu_testutil::fake_server(vec![listing(r#"{"data":[]}"#)]).await;
-            to_credentials(&mut app, &base);
-            app.on_custom_pick(Some(3));
-            settle(&mut app, &mut ui, |a| screen(a).contains("did not list its models")).await;
-            app.on_custom_pick(Some(2));
+            filled(&mut app, &base);
+            choose(&mut app, 4);
+            settle(&mut app, &mut ui, |a| screen(a).contains("listed no usable models")).await;
+            assert!(screen(&app).contains("Type a model id"), "{}", screen(&app));
+            choose(&mut app, 0); // Type a model id…
             line(&mut app, "org/typed");
-            line(&mut app, "");
-            line(&mut app, "");
-            app.on_custom_pick(Some(0));
-            app.on_custom_pick(Some(0));
+            choose(&mut app, 2); // Add it with the defaults
+            esc(&mut app);
+            choose(&mut app, 5); // Save
             let saved = app.services.providers.custom_registry().get("modal").unwrap().expect("saved");
             assert!(saved.models.contains_key("org/typed"));
             assert!(app.services.providers.direct_models().unwrap().iter().any(|m| m.id == "modal/org/typed"));
@@ -525,39 +636,42 @@ mod tests {
         let key = "modalkey-SECRET-0123456789";
         in_local(async {
             let (base, _) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
-            to_credentials(&mut app, &base);
-            app.on_custom_pick(Some(0));
+            app.login("custom");
+            choose(&mut app, 0);
+            line(&mut app, "modal");
+            choose(&mut app, 2);
+            line(&mut app, &base);
+            choose(&mut app, 3);
+            choose(&mut app, 0); // Paste a key
             type_text(&mut app, key);
-            app.on_terminal(Event::Paste("-PASTED-SECRET-99".into()));
+            app.on_terminal(crossterm::event::Event::Paste("-PASTED-SECRET-99".into()));
             assert_eq!(app.prompt.composer.text(), format!("{key}-PASTED-SECRET-99"), "the masked input holds it");
             assert_eq!(app.prompt.ghost_seq, 0, "no prediction is asked for while a key is typed");
             app.on_terminal(press(KeyCode::Enter, KeyModifiers::NONE));
             assert!(app.prompt.composer.is_empty(), "the typed key leaves the composer");
+            choose(&mut app, 4);
+            settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
             let full = format!("{key}-PASTED-SECRET-99");
             assert!(!mu_base::secrets::redact_keys(&full).contains(&full), "the key is registered for redaction");
-            settle(&mut app, &mut ui, |a| screen(a).contains("Choose a model")).await;
             let shown = transcript_text(&app);
             assert!(!shown.contains("SECRET"), "{shown}");
+            assert!(!screen(&app).contains("SECRET"), "{}", screen(&app));
         });
     }
 
     #[test]
     fn a_command_is_previewed_by_its_program_only() {
-        let (mut app, _cmds, mut ui) = app_with("");
+        let (mut app, _cmds, _ui) = app_with("");
         in_local(async {
-            let (base, _) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
-            to_credentials(&mut app, &base);
-            app.on_custom_pick(Some(2));
+            filled(&mut app, "https://modal.example/v1");
+            choose(&mut app, 3);
+            choose(&mut app, 2); // Use a command
             line(&mut app, "echo modalkey-ARG-0123456789");
-            settle(&mut app, &mut ui, |a| screen(a).contains("Choose a model")).await;
-            app.on_custom_pick(Some(0));
-            line(&mut app, "");
-            line(&mut app, "");
-            app.on_custom_pick(Some(0));
-            let review = screen(&app);
-            assert!(review.contains("Auth: !echo …"), "{review}");
-            assert!(!review.contains("modalkey-ARG") && !review.contains("0123456789"), "{review}");
+            assert!(screen(&app).contains("!echo …"), "{}", screen(&app));
             assert!(!transcript_text(&app).contains("modalkey-ARG"));
+            choose(&mut app, 5); // Save
+            let entry = app.services.providers.store().get("modal").expect("a stored command");
+            assert_eq!(entry.reference.as_deref(), Some("!echo modalkey-ARG-0123456789"));
         });
     }
 
@@ -609,7 +723,7 @@ mod tests {
         assert_eq!(row(&LoginTarget::ApiKey("modal".into())).as_deref(), Some("key missing"));
         assert_eq!(row(&LoginTarget::ApiKey("lab".into())).as_deref(), Some("no auth"));
         assert!(targets.last() == Some(&LoginTarget::CustomProvider), "the add row comes last");
-        assert_eq!(items.last().map(|i| i.label.as_str()), Some("Add custom OpenAI-compatible endpoint"));
+        assert_eq!(items.last().map(|i| i.label.as_str()), Some("+ Add a custom endpoint…"));
 
         // A keyless endpoint takes no key: its row says so instead of opening a key flow.
         app.login("lab");
@@ -638,38 +752,12 @@ mod tests {
     }
 
     #[test]
-    fn a_picker_replaced_by_another_flow_ends_the_wizard_and_keeps_its_keys() {
-        let (mut app, mut cmds, _ui) = app_with("");
-        to_credentials(&mut app, "http://127.0.0.1:9");
-        assert!(matches!(app.overlay, Some(Overlay::CustomWizard { .. })));
-        app.overlay = Some(Overlay::Logout { sel: Select::new("t", vec![]), providers: vec![] });
-        app.on_terminal(press(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(!app.custom_wizard_active(), "the wizard ends");
-        assert!(transcript_text(&app).contains("cancelled; nothing was saved"));
-        assert!(cmds.try_recv().is_err(), "Enter never submits the composer's text");
-    }
-
-    #[test]
-    fn a_check_answering_under_another_picker_ends_the_wizard_without_replacing_it() {
-        let (mut app, _cmds, _ui) = app_with("");
-        in_local(async {
-            to_credentials(&mut app, "http://127.0.0.1:9");
-            app.on_custom_pick(Some(3));
-            app.overlay = Some(Overlay::Logout { sel: Select::new("t", vec![]), providers: vec![] });
-            let flow = app.flows.custom_wizard_seq;
-            app.on_ui(UiMsg::CustomFetched { flow, r: Fetch::Listed(vec![]) });
-            assert!(!app.custom_wizard_active());
-            assert!(matches!(app.overlay, Some(Overlay::Logout { .. })), "the other picker stays");
-        });
-    }
-
-    #[test]
-    fn another_flow_takes_the_wizards_place() {
+    fn another_flow_takes_the_panels_place() {
         let (mut app, _cmds, _ui) = app_with("");
         app.prompt.composer.set_text("kept");
         app.login("custom");
         assert!(app.custom_wizard_active());
-        app.start_key_flow(KeyTarget::builtin("anthropic").unwrap(), None, None);
+        app.start_key_flow(mu_provider::provider::providers::KeyTarget::builtin("anthropic").unwrap(), None, None);
         assert!(!app.custom_wizard_active(), "the key flow replaces it");
         assert_eq!(app.prompt.composer.text(), "kept", "the draft comes back");
     }

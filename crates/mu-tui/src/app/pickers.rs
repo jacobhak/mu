@@ -393,7 +393,7 @@ impl App {
             OverlayEvent::Logout(provider) => self.logout(&provider),
             OverlayEvent::Mcp(pick, row) => self.on_mcp_pick(pick, row),
             OverlayEvent::Web(row) => self.on_web_pick(row),
-            OverlayEvent::CustomWizard(row) => self.on_custom_pick(row),
+            OverlayEvent::Custom(pick) => self.on_custom_pick(pick),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
             OverlayEvent::Quote(q) => self.prompt.composer.append_quotes(&q),
             OverlayEvent::Resume(p) => {

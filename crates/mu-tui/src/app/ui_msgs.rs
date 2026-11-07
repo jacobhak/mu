@@ -3,7 +3,7 @@
 use super::child::ChildThen;
 use super::keys::is_baseten;
 use super::*;
-use crate::custom::wizard::Fetch;
+use crate::custom::panel::Fetch;
 use crate::widgets::overlay::LoginTarget;
 use crate::widgets::select::{Item, Select};
 use mu_base::message::Image;

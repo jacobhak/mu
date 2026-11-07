@@ -198,6 +198,17 @@ impl Select {
         self
     }
 
+    /// Opens the free-text row for editing with `s` already typed, and its cursor at the end. Unlike
+    /// `prefill_text` the row is live, so Enter submits and Esc returns to the list.
+    pub fn edit_text(mut self, s: &str) -> Self {
+        if self.free.is_some() {
+            self.text = Editor::from_text(s);
+            self.sel = self.items.len();
+            self.editing = true;
+        }
+        self
+    }
+
     /// Highlights the skip row.
     pub fn prefill_skip(mut self) -> Self {
         if self.skip.is_some() {
@@ -255,6 +266,11 @@ impl Select {
     /// Whether the filter holds text, so that typed keys are the filter's rather than the caller's.
     pub fn is_filtering(&self) -> bool {
         !self.filter.is_empty()
+    }
+
+    /// Whether the free-text row is open for typing.
+    pub fn is_editing(&self) -> bool {
+        self.editing
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> SelectResult {
@@ -1046,6 +1062,23 @@ mod tests {
             SelectResult::Text(t) => assert_eq!(t, "hi"),
             _ => panic!("expected text"),
         }
+    }
+
+    #[test]
+    fn edit_text_opens_the_free_row_on_its_value() {
+        // A field: no rows of its own, its value typed in place, Enter submits it.
+        let mut s = Select::new("Provider id", Vec::new()).free_text("Provider id").edit_text("modal");
+        assert!(s.is_editing(), "the row is live from the start");
+        let (rows, _) = s.render(20, 6);
+        let drawn: Vec<String> = rows.iter().map(line::line_text).collect();
+        assert!(drawn.iter().any(|l| l.contains("› modal")), "{drawn:?}");
+        s.on_key(key(KeyCode::Char('!')));
+        match s.on_key(key(KeyCode::Enter)) {
+            SelectResult::Text(t) => assert_eq!(t, "modal!"),
+            _ => panic!("expected the typed value"),
+        }
+        // A list with no free row has nothing to open.
+        assert!(!Select::new("t", items(&["a"])).edit_text("x").is_editing());
     }
 
     #[test]

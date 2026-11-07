@@ -393,14 +393,27 @@ mod tests {
         lock(&held);
         std::fs::create_dir_all(h.join("run")).unwrap();
         let rec = h.join("run").join(format!("{id}.json"));
-        let write = |inbox: Option<bool>| {
+        let mut created = false;
+        let mut write = |inbox: Option<bool>| {
             let mut v = json!({"pid": cpid, "print_run": false, "started": "t", "session": path});
             if let Some(b) = inbox {
                 v["inbox"] = json!(b);
             }
-            // Rewrite in place so the record's lock inode stays the same.
-            let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&rec).unwrap();
-            std::io::Write::write_all(&mut &f, v.to_string().as_bytes()).unwrap();
+            let text = v.to_string();
+            if created {
+                // Rewrite in place so the record's lock inode stays the same.
+                let f = std::fs::OpenOptions::new().write(true).truncate(true).open(&rec).unwrap();
+                std::io::Write::write_all(&mut &f, text.as_bytes()).unwrap();
+                return f;
+            }
+            // The record appears under its lock: another test's sweep of the shared run directory
+            // would otherwise remove it in the moment between its creation and this lock.
+            let tmp = h.join("run").join(format!("{id}.new"));
+            let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp).unwrap();
+            lock(&f);
+            std::io::Write::write_all(&mut &f, text.as_bytes()).unwrap();
+            std::fs::rename(&tmp, &rec).unwrap();
+            created = true;
             f
         };
         let f = write(Some(false));

@@ -436,10 +436,7 @@ impl App {
             items.push(Item { label, detail: c.key_state(store).word().into() });
             targets.push(LoginTarget::ApiKey(c.id.clone()));
         }
-        items.push(Item {
-            label: "Add custom OpenAI-compatible endpoint".into(),
-            detail: "guided: address, key, models".into(),
-        });
+        items.push(Item { label: "+ Add a custom endpoint…".into(), detail: "guided: address, key, models".into() });
         targets.push(LoginTarget::CustomProvider);
         (items, targets)
     }
