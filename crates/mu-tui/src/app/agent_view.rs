@@ -1049,7 +1049,17 @@ mod tests {
             reason: "ask mode: bash needs approval".into(),
             body: body.into(),
             from: None,
-            grant: Some(mu_base::permissions::Grant { tool: tool.into(), patterns: vec!["touch *".into()] }),
+            grant: Some(mu_base::permissions::Grant {
+                tool: tool.into(),
+                patterns: vec!["touch *".into()],
+                wider: vec![
+                    mu_base::permissions::GrantWidth {
+                        label: "its directory".into(),
+                        patterns: vec!["touch dir/*".into()],
+                    },
+                    mu_base::permissions::GrantWidth { label: "everything".into(), patterns: vec!["touch /*".into()] },
+                ],
+            }),
         }
     }
 
@@ -1071,7 +1081,54 @@ mod tests {
         press(&mut app, crossterm::event::KeyCode::Char('y'));
         press(&mut app, crossterm::event::KeyCode::Enter);
         assert!(app.overlay.is_none());
-        assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None })));
+        assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, .. })));
+    }
+
+    #[test]
+    fn a_width_then_a_scope_grants_the_directory() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        // Widths: once, the exact call, its directory, everything, then No.
+        let mut rx = open_approval(&mut app, approval("bash", "touch a.txt"));
+        press(&mut app, crossterm::event::KeyCode::Char('3'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(matches!(app.overlay, Some(Overlay::Approve(_))), "the scope step comes next");
+        press(&mut app, crossterm::event::KeyCode::Char('1'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        match rx.try_recv() {
+            Ok(ApprovalDecision::Allow { scope: ApprovalScope::Session, patterns: Some(p), .. }) => {
+                assert_eq!(p, ["touch dir/*"])
+            }
+            other => panic!("expected the session's directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_typed_pattern_is_asked_for_and_grants_what_it_names() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut rx = open_approval(&mut app, approval("bash", "touch a.txt"));
+        press(&mut app, crossterm::event::KeyCode::Char('e'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        press(&mut app, crossterm::event::KeyCode::Char('2'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        match rx.try_recv() {
+            Ok(ApprovalDecision::Allow { scope: ApprovalScope::Project, patterns: Some(p), .. }) => {
+                assert_eq!(p, ["touch dir/*"], "the prefill is kept when it is submitted untouched")
+            }
+            other => panic!("expected the project scope for the typed pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_at_the_scope_step_goes_back_to_the_widths() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut rx = open_approval(&mut app, approval("bash", "touch a.txt"));
+        press(&mut app, crossterm::event::KeyCode::Char('3'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(matches!(app.overlay, Some(Overlay::Approve(_))), "back on the widths, nothing answered");
+        assert!(rx.try_recv().is_err());
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Deny { note: None })), "Esc on the widths denies");
     }
 
     #[test]

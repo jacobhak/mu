@@ -124,7 +124,7 @@ pub(super) fn approval_decision(result: &Value) -> ApprovalDecision {
         Some("global") => ApprovalScope::Global,
         _ => return ApprovalDecision::Deny { note: None },
     };
-    ApprovalDecision::Allow { scope, note: None }
+    ApprovalDecision::Allow { scope, note: None, patterns: None }
 }
 
 pub(super) async fn approve_tool(
@@ -310,7 +310,11 @@ mod tests {
             reason: "ask mode: bash needs approval".into(),
             body: "touch x".into(),
             from: None,
-            grant: grant.then(|| mu_base::permissions::Grant { tool: "bash".into(), patterns: vec!["touch *".into()] }),
+            grant: grant.then(|| mu_base::permissions::Grant {
+                tool: "bash".into(),
+                patterns: vec!["touch *".into()],
+                wider: Vec::new(),
+            }),
         };
         let ids = |v: &Value| -> Vec<String> {
             v["options"].as_array().unwrap().iter().map(|o| o["optionId"].as_str().unwrap().to_string()).collect()

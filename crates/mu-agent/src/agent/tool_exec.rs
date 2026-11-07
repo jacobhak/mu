@@ -330,10 +330,10 @@ impl Agent {
                         let grant = req.grant.clone();
                         let reason = req.reason.clone();
                         match self.approve(req, cancel).await {
-                            ApprovalDecision::Allow { scope, note } => {
+                            ApprovalDecision::Allow { scope, note, patterns } => {
                                 if scope != ApprovalScope::Once
-                                    && let Some(g) = &grant
-                                    && let Err(e) = self.tools.permissions.remember(g, scope, true)
+                                    && let Some(g) = grant
+                                    && let Err(e) = self.tools.permissions.remember(&g.picked(patterns), scope, true)
                                 {
                                     self.notice(format!("could not save the approval: {e}"));
                                 }

@@ -19,20 +19,22 @@ edit = { "*.lock" = "ask" }
 
 | Mode | Runs without asking | Asks |
 |---|---|---|
-| `ask` | reads: `read`, `grep`, `glob`, `todo`, `ask`, `web_search`, `fetch`, `memory`, … and read-only `bash` | everything that writes or runs |
-| `edits` | the same, plus file edits inside the project | commands, and writes outside the project or into `.git` |
+| `ask` | reads inside the project: `read`, `grep`, `glob`, read-only `bash`; and `todo`, `ask`, `web_search`, `fetch`, … | everything that writes or runs, and reads outside the project |
+| `edits` | the same, plus file edits inside the project | commands, writes outside the project or into `.git`, and reads outside the project |
 | `yolo` | everything | only what a rule says to ask |
 
-`local://` files (plans, notes) count as reading, as do the `artifact://`, `skill://` and `mu://` pages the tools refuse to write. Anything under the project's `.git` or under `~/.mu` is never covered by `edits`. Subagents run with the same mode and the same session grants.
+"Inside the project" means under its root, with symlinks resolved. `local://` files (plans, notes) count as reading, as do the `artifact://`, `skill://` and `mu://` pages the tools refuse to write, so those always stay quiet; `fetch` and `web_search` read the network, not the machine, and are not gated by their reach. Reading outside the project asks in both `ask` and `edits`, so neither mode can walk `~/.ssh` or another checkout without permission; only `yolo` reads anywhere. Anything under the project's `.git` or under `~/.mu` is never covered by `edits`. Subagents run with the same mode and the same session grants.
 
 `readonly_bash = false` makes every `bash` call ask unless a rule allows it. The read-only set covers programs such as `ls`, `cat`, `grep`, `git status`, `git log`, `git diff`, `find` without `-delete`/`-exec`, and pipelines and loops made only of those; anything the classifier is not sure about is not read-only.
+
+A read-only command is judged by the files it may open — its path words and its input redirections — so `cat README.md` and `grep -r TODO src/` stay quiet while `cat /etc/passwd`, `cat < /etc/passwd` and `grep -r x /etc` ask. A glob is judged by its prefix (`src/*.rs` cannot leave `src/`), but a `$VAR`, a leading `~` or an absolute path that leaves the root counts as outside, because mu cannot know where it points. Relative paths are resolved against the session's directory: mu does not track the shell's own `cd`, so a relative read after `cd /etc` is not caught.
 
 ## Rules
 
 Keys are tool-name globs, values are `allow`, `ask` or `deny`, either for every call of the tool (`"mcp__github_*" = "allow"`) or for commands and paths that match a pattern:
 
 - `bash`: every simple command of the line, as written (`cargo test --release`), including those inside `$(…)`, loops and subshells.
-- `write`, `edit`, `read`, `grep`, `glob`: each target path, relative to the project when inside it.
+- `write`, `edit`, `read`, `grep`, `glob`: each target path, matched either as it is shown (relative to the project when inside it) or by its absolute path, so `src/*` and `/home/jacob/code/private/mu/src/*` both cover `src/a.rs`.
 - `fetch`: the URL.
 - Other tools: only `"*"` and whole-tool string values match.
 
@@ -42,15 +44,31 @@ A `deny` always wins, then an `ask`, and only then does a covering `allow` (or t
 
 ## The prompt
 
-When a call needs approval, mu shows what it would do and why, with these answers:
+When a call needs approval, mu first asks how much to allow. The widths are landmarks, not every ancestor, so the list stays short however deep the path is:
 
-1. **Yes** — run it this once.
-2. **Yes, don't ask again this session for …** — remember the grant until mu exits.
-3. **Yes, always in this project for …** — save it under `~/.mu/permissions/`, per checkout (worktrees share it). Never in the repository.
-4. **Yes, always everywhere for …** — add the rule to `~/.mu/config.toml`.
-5. **No** — do not run it. Esc is No. Tab (or Right) attaches a note for the model first.
+- **Yes, just this once** — run it now and remember nothing.
+- **For what it asked for** — the exact paths or command line the call touched.
+- **For its directory** — `/etc/*` for a read of `/etc/passwd`.
+- **For this checkout** — the git root the path lives in, `/home/jacob/code/private/mu/*`.
+- **For the checkouts beside it** — that root's parent, `/home/jacob/code/private/*`.
+- **For all of ~** and **For everything** — `~/*` and `/*`.
+- **e** — type a pattern of your own, prefilled with the directory, so anything else is one keystroke away.
+- **No** — do not run it. Esc on this step denies.
 
-The grant offered is the program plus its subcommand (`cargo test *`), the file paths a write or edit touches, or the site of a `fetch`. Options 2–4 appear only when a grant can be expressed.
+Then, for any width, where to remember it:
+
+1. **This session** — until mu exits.
+2. **In this project** — saved under `~/.mu/permissions/`, per checkout (worktrees share it). Never in the repository.
+3. **Everywhere** — added to `~/.mu/config.toml`.
+4. **No** — do not run it.
+
+Esc on the second step goes back to the widths without answering. Tab (or Right) attaches a note for the model at either step, and a note on **No** lets the turn continue instead of ending it.
+
+The grant offered is the program plus its subcommand (`cargo test *`) for a command that runs, the paths a write, edit or read touches, or the site of a `fetch`. A read-only command that leaves the project is granted as the line it ran, with its outside path in place (`cat /etc/passwd`), and widens by that path (`cat /etc/*`, then `cat /home/*`).
+
+A file tool widens the same way wherever the path is: `ask` mode prompts for a write inside the project too, and `src/parser/a.rs` offers `…/mu/src/parser/*`, then `…/mu/*`, the checkouts beside it, `~` and `/`. Those widths are absolute, which is also how a rule matches an inside path, so saving one holds for the files it names. Since a grant is an explicit approval, it can cover what the mode alone would not: `ask` mode plus `…/mu/*` grants writes anywhere in the checkout, `.git` included, just as `cargo test *` silences a command that `edits` would otherwise ask about.
+
+A grant made through `read`, `grep` or `glob` is saved for all three, since they reach the same files, and so is one made through `write` or `edit`, since they change the same paths: approving the write of a file also covers editing it. The two families never cross, so a read approval does not allow writing and a write approval does not open reads. A directory grant also includes the directory itself (`/etc` as well as `/etc/*`), so searching the granted directory is covered. Commands keep their own grant: `cat /etc/hosts` is still its own decision. A rule stored for a directory is a glob, so it covers everything below it.
 
 A denial with a note lets the turn continue: the model sees `Not run: the user denied this bash call: <note>` and can try something else. A denial without a note ends the turn, as Esc does.
 
@@ -60,4 +78,4 @@ Rules that deny show up in the tool result: `Not run: permission rule "git push 
 
 A `task` subagent inherits the mode and the session grants, and its prompts are forwarded to your UI labelled with the subagent that asked (`from Task1 (task)`).
 
-A `-p` run has nobody to ask, so a call that needs approval does not run: stderr says `approval needed: bash: touch x` and the model is told nobody can approve it in this run. Use `--permissions yolo` or a rule when a scripted run must be allowed to act. `mu deliver` runs its subprocesses with `--permissions yolo`: approving the plan is the authorization, and deny rules still apply.
+A `-p` run has nobody to ask, so a call that needs approval does not run: stderr says `approval needed: bash: touch x` and the model is told nobody can approve it in this run. A read outside the project is refused the same way, so a scripted run that reads elsewhere needs `--permissions yolo` or a rule. `mu deliver` runs its subprocesses with `--permissions yolo`: approving the plan is the authorization, and deny rules still apply.

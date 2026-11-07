@@ -430,7 +430,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         let answer = |r: ApprovalRequest| {
             seen.borrow_mut().push(r.title.clone());
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None });
+            let _ = tx.send(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None });
             rx
         };
         let out = tokio::task::LocalSet::new().run_until(run(&base, Some(&answer))).await;

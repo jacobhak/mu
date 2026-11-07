@@ -521,28 +521,42 @@ impl AskState {
     }
 }
 
-/// A tool call waiting for approval: what it is, why it asks, and the ways to answer it.
+/// A tool call waiting for approval: first how much to allow, then where to remember it.
 pub struct ApproveState {
     req: ApprovalRequest,
-    sel: Select,
+    /// The question on screen; `None` only while it is being answered.
+    step: Option<Step>,
+    /// A note typed at the width step, carried into the scope step.
+    note: Option<String>,
     reply: Option<oneshot::Sender<ApprovalDecision>>,
+}
+
+/// Which question the dialog is on.
+enum Step {
+    /// How much: this once, one of the grant's widths, or a pattern typed by hand.
+    Width(Select),
+    /// The pattern being typed.
+    Pattern(Select),
+    /// Where to remember the patterns picked above.
+    Scope { patterns: Vec<String>, sel: Select },
 }
 
 impl ApproveState {
     pub fn new(req: ApprovalRequest, reply: oneshot::Sender<ApprovalDecision>) -> Self {
-        let mut items = vec![Item { label: "Yes".into(), detail: String::new() }];
-        if let Some(g) = &req.grant {
-            let what = if g.patterns.is_empty() { g.tool.clone() } else { g.patterns.join(", ") };
-            for label in [
-                format!("Yes, don't ask again this session for {what}"),
-                format!("Yes, always in this project for {what}"),
-                format!("Yes, always everywhere for {what}"),
-            ] {
-                items.push(Item { label, detail: String::new() });
-            }
-        }
-        items.push(Item { label: "No".into(), detail: String::new() });
-        let last = items.len() - 1;
+        let sel = Self::width_picker(&req);
+        Self { req, step: Some(Step::Width(sel)), note: None, reply: Some(reply) }
+    }
+
+    /// The widths on offer: the exact grant, then each named one above it.
+    fn widths(req: &ApprovalRequest) -> Vec<(String, Vec<String>)> {
+        let Some(g) = &req.grant else { return Vec::new() };
+        let mut out = vec![("what it asked for".to_string(), g.patterns.clone())];
+        out.extend(g.wider.iter().map(|w| (w.label.clone(), w.patterns.clone())));
+        out
+    }
+
+    /// What the request is about: where it came from, why it asks, and what it would do.
+    fn context(req: &ApprovalRequest) -> String {
         let mut context = String::new();
         if let Some(from) = &req.from {
             context.push_str(&format!("from {from}\n"));
@@ -550,71 +564,225 @@ impl ApproveState {
         context.push_str(&req.reason);
         context.push_str("\n\n");
         context.push_str(&truncated(&req.body));
-        let hint = if last > 1 {
-            format!("y yes · n no · 1–{} pick · Enter choose · Tab/→ note · Esc cancel", last + 1)
-        } else {
+        context
+    }
+
+    /// First step: how much to allow. The widths are landmarks, not every directory, so the list
+    /// stays short however deep the path is.
+    fn width_picker(req: &ApprovalRequest) -> Select {
+        let widths = Self::widths(req);
+        let mut items = vec![Item { label: "Yes, just this once".into(), detail: String::new() }];
+        for (label, patterns) in &widths {
+            items.push(Item { label: format!("For {label}"), detail: patterns.join(", ") });
+        }
+        items.push(Item { label: "No".into(), detail: String::new() });
+        let hint = if widths.is_empty() {
             "y yes · n no · Enter choose · Tab/→ note · Esc cancel".to_string()
+        } else {
+            format!("y yes · n no · 1–{} pick · e type a pattern · Enter choose · Tab/→ note · Esc cancel", items.len())
         };
-        let sel = Select::new(&req.title, items).context(&context).notes().described().hint(&hint);
-        Self { req, sel, reply: Some(reply) }
+        Select::new(&req.title, items).context(&Self::context(req)).notes().described().hint(&hint)
     }
 
-    /// The row `c` points at: `y` and `n` the first and last, digits 1–5 the rest.
-    fn row_for(&self, c: char) -> Option<usize> {
-        let last = if self.req.grant.is_some() { 4 } else { 1 };
-        match c {
-            'y' => Some(0),
-            'n' => Some(last),
-            '1'..='5' => {
-                let i = c.to_digit(10)? as usize - 1;
-                (i <= last).then_some(i)
-            }
-            _ => None,
-        }
+    /// The typed pattern, prefilled with the directory width so it only has to be trimmed.
+    fn pattern_picker(&self) -> Select {
+        let widths = Self::widths(&self.req);
+        let prefill = widths.get(1).or_else(|| widths.first()).map(|(_, p)| p.join(", ")).unwrap_or_default();
+        Select::new("Pattern to remember", Vec::new())
+            .free_text("pattern")
+            .edit_text(&prefill)
+            .hint("Enter saves what you type · Esc goes back")
     }
 
-    /// What row `i` answers.
-    fn decide(&self, i: usize, note: Option<String>) -> ApprovalDecision {
-        let scope = match (self.req.grant.is_some(), i) {
-            (true, 0) | (false, 0) => Some(ApprovalScope::Once),
-            (true, 1) => Some(ApprovalScope::Session),
-            (true, 2) => Some(ApprovalScope::Project),
-            (true, 3) => Some(ApprovalScope::Global),
-            _ => None,
-        };
-        match scope {
-            Some(scope) => ApprovalDecision::Allow { scope, note },
-            None => ApprovalDecision::Deny { note },
-        }
+    /// Second step: where to remember the patterns.
+    fn scope_picker(&self, patterns: &[String]) -> Select {
+        let items = ["This session", "In this project", "Everywhere", "No"]
+            .into_iter()
+            .map(|label| Item { label: label.into(), detail: String::new() })
+            .collect();
+        Select::new(&format!("Remember {} for", patterns.join(", ")), items)
+            .context("Esc goes back to the widths.")
+            .notes()
+            .note_text(self.note.as_deref().unwrap_or(""))
+            .hint("1–3 pick · Enter choose · Tab/→ note · Esc back")
     }
 
     fn keep(self) -> (Option<Overlay>, Option<OverlayEvent>) {
         (Some(Overlay::Approve(Box::new(self))), None)
     }
 
-    fn key(mut self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
-        // The shortcuts move the highlight rather than answer, so a note can still be typed
-        // (n, Tab, the reason, Enter).
-        if k.modifiers.is_empty()
-            && let KeyCode::Char(c) = k.code
-            && !self.sel.is_typing()
-            && let Some(i) = self.row_for(c)
-        {
-            self.sel.select_row(i);
-            return self.keep();
+    /// The picker on screen, whichever step it is.
+    fn select(&self) -> &Select {
+        match self.step.as_ref().expect("an approval dialog always has a step") {
+            Step::Width(sel) | Step::Pattern(sel) => sel,
+            Step::Scope { sel, .. } => sel,
         }
-        let decision = match self.sel.on_key(k) {
-            SelectResult::Pending => return self.keep(),
-            SelectResult::Chosen(i) => i.first().map(|i| self.decide(*i, None)),
-            SelectResult::Noted(i, note) => i.first().map(|i| self.decide(*i, Some(note))),
-            SelectResult::Cancelled => Some(ApprovalDecision::Deny { note: None }),
-            _ => None,
-        };
-        let Some(d) = decision else { return self.keep() };
+    }
+
+    fn select_mut(&mut self) -> &mut Select {
+        match self.step.as_mut().expect("an approval dialog always has a step") {
+            Step::Width(sel) | Step::Pattern(sel) => sel,
+            Step::Scope { sel, .. } => sel,
+        }
+    }
+
+    fn answer(mut self, decision: ApprovalDecision) -> (Option<Overlay>, Option<OverlayEvent>) {
         if let Some(r) = self.reply.take() {
-            let _ = r.send(d);
+            let _ = r.send(decision);
         }
         (None, None)
+    }
+
+    fn key(mut self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let step = self.step.take().expect("an approval dialog always has a step");
+        match step {
+            Step::Width(sel) => self.width_key(k, sel),
+            Step::Pattern(sel) => self.pattern_key(k, sel),
+            Step::Scope { patterns, sel } => self.scope_key(k, patterns, sel),
+        }
+    }
+
+    fn width_key(mut self, k: KeyEvent, mut sel: Select) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let widths = Self::widths(&self.req);
+        // Shortcuts move the highlight rather than answer, so a note can still be typed.
+        if k.modifiers.is_empty()
+            && let KeyCode::Char(c) = k.code
+            && !sel.is_typing()
+        {
+            if c == 'e' && !widths.is_empty() {
+                let sel = self.pattern_picker();
+                self.step = Some(Step::Pattern(sel));
+                return self.keep();
+            }
+            let rows = widths.len() + 2;
+            let row = match c {
+                'y' => Some(0),
+                'n' => Some(rows - 1),
+                '1'..='9' => c.to_digit(10).map(|d| d as usize - 1).filter(|i| *i < rows),
+                _ => None,
+            };
+            if let Some(i) = row {
+                sel.select_row(i);
+                self.step = Some(Step::Width(sel));
+                return self.keep();
+            }
+        }
+        match sel.on_key(k) {
+            SelectResult::Pending => {
+                self.step = Some(Step::Width(sel));
+                self.keep()
+            }
+            SelectResult::Chosen(i) => self.width_chosen(widths, i.first().copied(), None),
+            SelectResult::Noted(i, note) => self.width_chosen(widths, i.first().copied(), Some(note)),
+            SelectResult::Cancelled => self.answer(ApprovalDecision::Deny { note: None }),
+            _ => {
+                self.step = Some(Step::Width(sel));
+                self.keep()
+            }
+        }
+    }
+
+    /// What the width step answered: once, a width (then ask where), or no.
+    fn width_chosen(
+        mut self,
+        widths: Vec<(String, Vec<String>)>,
+        row: Option<usize>,
+        note: Option<String>,
+    ) -> (Option<Overlay>, Option<OverlayEvent>) {
+        match row {
+            Some(0) => self.answer(ApprovalDecision::Allow { scope: ApprovalScope::Once, note, patterns: None }),
+            Some(i) if i == widths.len() + 1 => self.answer(ApprovalDecision::Deny { note }),
+            Some(i) => {
+                let patterns = widths[i - 1].1.clone();
+                self.note = note;
+                let sel = self.scope_picker(&patterns);
+                self.step = Some(Step::Scope { patterns, sel });
+                self.keep()
+            }
+            None => self.keep(),
+        }
+    }
+
+    fn pattern_key(mut self, k: KeyEvent, sel: Select) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let mut sel = sel;
+        match sel.on_key(k) {
+            SelectResult::Text(text) => {
+                let patterns: Vec<String> =
+                    text.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
+                if patterns.is_empty() {
+                    self.step = Some(Step::Pattern(sel));
+                    return self.keep();
+                }
+                let picker = self.scope_picker(&patterns);
+                self.step = Some(Step::Scope { patterns, sel: picker });
+                self.keep()
+            }
+            SelectResult::Cancelled => {
+                let sel = Self::width_picker(&self.req);
+                self.step = Some(Step::Width(sel));
+                self.keep()
+            }
+            _ => {
+                self.step = Some(Step::Pattern(sel));
+                self.keep()
+            }
+        }
+    }
+
+    fn scope_key(
+        mut self,
+        k: KeyEvent,
+        patterns: Vec<String>,
+        mut sel: Select,
+    ) -> (Option<Overlay>, Option<OverlayEvent>) {
+        if k.modifiers.is_empty()
+            && let KeyCode::Char(c) = k.code
+            && !sel.is_typing()
+        {
+            let row = match c {
+                'y' => Some(0),
+                'n' => Some(3),
+                '1'..='3' => c.to_digit(10).map(|d| d as usize - 1),
+                _ => None,
+            };
+            if let Some(i) = row {
+                sel.select_row(i);
+                self.step = Some(Step::Scope { patterns, sel });
+                return self.keep();
+            }
+        }
+        match sel.on_key(k) {
+            SelectResult::Pending => {
+                self.step = Some(Step::Scope { patterns, sel });
+                self.keep()
+            }
+            SelectResult::Chosen(i) => self.scope_chosen(patterns, i.first().copied(), None),
+            SelectResult::Noted(i, note) => self.scope_chosen(patterns, i.first().copied(), Some(note)),
+            SelectResult::Cancelled => {
+                let sel = Self::width_picker(&self.req);
+                self.step = Some(Step::Width(sel));
+                self.keep()
+            }
+            _ => {
+                self.step = Some(Step::Scope { patterns, sel });
+                self.keep()
+            }
+        }
+    }
+
+    fn scope_chosen(
+        self,
+        patterns: Vec<String>,
+        row: Option<usize>,
+        note: Option<String>,
+    ) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let scope = match row {
+            Some(0) => ApprovalScope::Session,
+            Some(1) => ApprovalScope::Project,
+            Some(2) => ApprovalScope::Global,
+            _ => return self.answer(ApprovalDecision::Deny { note }),
+        };
+        self.answer(ApprovalDecision::Allow { scope, note, patterns: Some(patterns) })
     }
 
     /// The turn it belonged to ended before it was answered.
@@ -676,7 +844,7 @@ impl Overlay {
             | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::ModelRoles { st } => Some(st.select()),
             Overlay::Ask(a) => Some(&a.sel),
-            Overlay::Approve(a) => Some(&a.sel),
+            Overlay::Approve(a) => Some(a.select()),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
     }
@@ -701,7 +869,7 @@ impl Overlay {
             | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::ModelRoles { st } => Some(st.select_mut()),
             Overlay::Ask(a) => Some(&mut a.sel),
-            Overlay::Approve(a) => Some(&mut a.sel),
+            Overlay::Approve(a) => Some(a.select_mut()),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
     }

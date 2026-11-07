@@ -16,8 +16,39 @@ pub enum PermissionMode {
     Yolo,
 }
 
+/// What one classified call may do: the unit a mode runs without asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capability {
+    /// Read files inside the project.
+    ReadProject,
+    /// Change files inside the project.
+    WriteProject,
+    /// Read anything outside the project.
+    ReadOutside,
+    /// Run commands, and write outside the project.
+    Exec,
+}
+
 impl PermissionMode {
     pub const NAMES: [&str; 3] = ["ask", "edits", "yolo"];
+
+    /// What this mode runs without asking; every call outside the set prompts, unless a rule
+    /// decided it first.
+    pub fn capabilities(self) -> &'static [Capability] {
+        const ASK: &[Capability] = &[Capability::ReadProject];
+        const EDITS: &[Capability] = &[Capability::ReadProject, Capability::WriteProject];
+        const YOLO: &[Capability] =
+            &[Capability::ReadProject, Capability::WriteProject, Capability::ReadOutside, Capability::Exec];
+        match self {
+            Self::Ask => ASK,
+            Self::Edits => EDITS,
+            Self::Yolo => YOLO,
+        }
+    }
+
+    pub fn allows(self, c: Capability) -> bool {
+        self.capabilities().contains(&c)
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -132,6 +163,30 @@ pub struct Grant {
     pub tool: String,
     /// Subjects matched as-is; empty grants the whole tool.
     pub patterns: Vec<String>,
+    /// The widths above the exact one, narrowest first: the directory, the checkout it sits in,
+    /// the checkouts beside it, `~`, and `/`. Empty when the grant cannot widen.
+    #[serde(default)]
+    pub wider: Vec<GrantWidth>,
+}
+
+/// One width a grant can widen to, named so the prompt reads as a choice of scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantWidth {
+    /// How the prompt names it: "its directory", "this checkout", "all of ~".
+    pub label: String,
+    /// What it would remember: `<dir>/*` for each path, or the rebuilt command line.
+    pub patterns: Vec<String>,
+}
+
+impl Grant {
+    /// This grant with the patterns an answer picked, or with its own when it named none.
+    pub fn picked(&self, patterns: Option<Vec<String>>) -> Grant {
+        Grant {
+            tool: self.tool.clone(),
+            wider: self.wider.clone(),
+            patterns: patterns.unwrap_or_else(|| self.patterns.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,6 +231,9 @@ pub enum ApprovalDecision {
     Allow {
         scope: ApprovalScope,
         note: Option<String>,
+        /// The patterns the answer picked from the wider levels; `None` for the request's own.
+        #[serde(default)]
+        patterns: Option<Vec<String>>,
     },
     Deny {
         note: Option<String>,
@@ -195,6 +253,23 @@ mod tests {
         }
         assert_eq!(PermissionMode::parse("nope"), None);
         assert_eq!(PermissionMode::default(), PermissionMode::Yolo);
+    }
+
+    #[test]
+    fn each_mode_grants_a_superset_of_the_one_below() {
+        use Capability::*;
+        let ask = PermissionMode::Ask.capabilities();
+        let edits = PermissionMode::Edits.capabilities();
+        let yolo = PermissionMode::Yolo.capabilities();
+        assert_eq!(ask, [ReadProject]);
+        assert_eq!(edits, [ReadProject, WriteProject]);
+        assert_eq!(yolo, [ReadProject, WriteProject, ReadOutside, Exec]);
+        assert!(ask.iter().all(|c| edits.contains(c)), "edits adds to ask");
+        assert!(edits.iter().all(|c| yolo.contains(c)), "yolo adds to edits");
+        assert!(!PermissionMode::Ask.allows(ReadOutside));
+        assert!(!PermissionMode::Edits.allows(ReadOutside), "edits reads outside the project only when asked");
+        assert!(!PermissionMode::Edits.allows(Exec));
+        assert!(PermissionMode::Yolo.allows(ReadOutside) && PermissionMode::Yolo.allows(Exec));
     }
 
     #[test]

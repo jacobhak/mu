@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::agent::RunConfig;
-use crate::testing::{agent_run, assistant};
+use crate::testing::{agent_in, agent_run, assistant};
 use mu_base::config::Configs;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 use mu_testutil::block_on_local as run;
@@ -77,9 +77,12 @@ fn a_session_grant_covers_later_calls() {
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
         let (mut a, rx) = agent_run(script, Configs::default(), ask());
-        let reqs =
-            turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow { scope: ApprovalScope::Session, note: None })
-                .await;
+        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow {
+            scope: ApprovalScope::Session,
+            note: None,
+            patterns: None,
+        })
+        .await;
         assert_eq!(reqs.len(), 1, "the second call is covered by the session grant");
         assert_eq!(reqs[0].grant.as_ref().unwrap().patterns, ["cargo test *"]);
         assert_eq!(tool_texts(&a).len(), 2);
@@ -97,6 +100,121 @@ fn read_only_commands_do_not_prompt() {
         let reqs = turn_answered(&mut a, rx, "go", |_| panic!("no prompt expected")).await;
         assert!(reqs.is_empty());
         assert_eq!(tool_texts(&a).len(), 1);
+    });
+}
+
+#[test]
+fn a_read_outside_the_project_prompts_and_is_granted_by_its_path() {
+    run(async {
+        let call = Block::ToolCall { id: "t1".into(), name: "read".into(), arguments: json!({"path": "/etc/passwd"}) };
+        let script = vec![
+            Ok(assistant(vec![call], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_run(script, Configs::default(), ask());
+        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Deny { note: Some("not that".into()) }).await;
+        assert_eq!(reqs.len(), 1, "reading outside the project prompts");
+        assert_eq!(reqs[0].title, "read: /etc/passwd");
+        assert_eq!(reqs[0].reason, "ask mode: reading outside the project needs approval");
+        assert_eq!(reqs[0].grant.as_ref().unwrap().patterns, ["/etc/passwd"]);
+        assert_eq!(tool_texts(&a), ["Not run: the user denied this read call: not that"]);
+    });
+}
+
+#[test]
+fn a_wider_answer_covers_a_neighbouring_file() {
+    run(async {
+        let call = |path: &str, id: &str| Block::ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: json!({"path": path}),
+        };
+        let script = vec![
+            Ok(assistant(vec![call("/etc/passwd", "t1")], StopReason::ToolUse)),
+            Ok(assistant(vec![call("/etc/hosts", "t2")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_run(script, Configs::default(), ask());
+        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow {
+            scope: ApprovalScope::Session,
+            note: None,
+            patterns: Some(vec!["/etc/*".into()]),
+        })
+        .await;
+        assert_eq!(reqs.len(), 1, "the second file is covered by the directory grant");
+        assert_eq!(reqs[0].grant.as_ref().unwrap().wider[0].patterns, ["/etc/*"]);
+        assert_eq!(tool_texts(&a).len(), 2, "both reads ran");
+    });
+}
+
+#[test]
+fn a_granted_directory_covers_grep_too() {
+    run(async {
+        let script = vec![
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "/etc/passwd"}),
+                }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: "t2".into(),
+                    name: "grep".into(),
+                    arguments: json!({"pattern": "x", "path": "/etc/hosts"}),
+                }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_run(script, Configs::default(), ask());
+        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow {
+            scope: ApprovalScope::Session,
+            note: None,
+            patterns: Some(vec!["/etc/*".into()]),
+        })
+        .await;
+        assert_eq!(reqs.len(), 1, "the grant covers grep of the same directory");
+        assert_eq!(tool_texts(&a).len(), 2, "both calls ran");
+    });
+}
+
+#[test]
+fn a_write_grant_covers_editing_the_same_file() {
+    run(async {
+        let root = mu_testutil::repo();
+        let script = vec![
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: "t1".into(),
+                    name: "write".into(),
+                    arguments: json!({"path": "c.txt", "content": "x\n"}),
+                }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: "t2".into(),
+                    name: "edit".into(),
+                    // The write's result names the file as `[c.txt#9396]`, a hash of the content it wrote.
+                    arguments: json!({"input": "[c.txt#9396]\nPUT 1.=1:\n+y\n"}),
+                }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), root.clone());
+        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow {
+            scope: ApprovalScope::Session,
+            note: None,
+            patterns: None,
+        })
+        .await;
+        assert_eq!(reqs.len(), 1, "the write's grant covers editing that file");
+        assert_eq!(tool_texts(&a).len(), 2, "both calls ran");
+        assert_eq!(std::fs::read_to_string(root.join("c.txt")).unwrap(), "y\n");
     });
 }
 

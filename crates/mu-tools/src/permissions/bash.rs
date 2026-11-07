@@ -87,6 +87,33 @@ pub struct SimpleCmd {
     pub second: Option<String>,
     pub assigns: bool,
     pub readonly: bool,
+    /// Its words as written, one per entry of `text`; a grant can replace one to widen itself.
+    pub words: Vec<String>,
+    /// The files a read-only command may open: its path words and input redirections.
+    pub paths: Vec<PathWord>,
+}
+
+/// A word that may name a file a read-only command opens. Only its text up to the first glob is
+/// known, and nothing at all when an expansion could point it anywhere.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PathWord {
+    /// `None` for `$DIR/x` and `~/x`; otherwise the literal prefix, so `src/*.rs` is `src/`.
+    pub prefix: Option<String>,
+    /// Its index in `SimpleCmd.words`; `None` for an input redirection's target.
+    pub word: Option<usize>,
+}
+
+/// Which arguments of a read-only program can name a file it opens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opens {
+    /// No argument names a file: `echo`, `pwd`, `ps`.
+    Nothing,
+    /// Every positional argument does: `cat`, `ls`, `find`.
+    All,
+    /// All but the first positional, which is a pattern or filter: `grep`, `rg`, `jq`.
+    AfterFirst,
+    /// `git`: the first positional is the subcommand.
+    Git,
 }
 
 pub struct BashAnalysis {
@@ -101,7 +128,15 @@ pub fn analyze(cmd: &str) -> BashAnalysis {
     let Ok(Program { commands }) = parse_all(src, Features::NONE) else {
         return BashAnalysis {
             parsed: false,
-            cmds: vec![SimpleCmd { text: cmd.to_string(), argv0: None, second: None, assigns: false, readonly: false }],
+            cmds: vec![SimpleCmd {
+                text: cmd.to_string(),
+                argv0: None,
+                second: None,
+                assigns: false,
+                readonly: false,
+                words: Vec::new(),
+                paths: Vec::new(),
+            }],
         };
     };
     let mut w = Walker { src, cmds: Vec::new(), bad: false };
@@ -164,6 +199,17 @@ impl Walker<'_> {
                         .map(|w| String::from_utf8_lossy(w.span.slice(self.src)).into_owned())
                         .collect::<Vec<_>>()
                         .join(" "),
+                    words: s
+                        .words
+                        .iter()
+                        .map(|w| String::from_utf8_lossy(w.span.slice(self.src)).into_owned())
+                        .collect(),
+                    paths: s
+                        .words
+                        .first()
+                        .and_then(literal)
+                        .map(|argv0| read_words(&argv0, &s.words[1..], &c.redirs))
+                        .unwrap_or_default(),
                     argv0: s.words.first().and_then(literal),
                     second: s.words.get(1).map(|w| String::from_utf8_lossy(w.span.slice(self.src)).into_owned()),
                     assigns: !s.assigns.is_empty(),
@@ -553,6 +599,93 @@ fn literal_part(p: &WordPart, out: &mut String, at_start: bool) -> bool {
     }
 }
 
+/// The files one simple command may open: the path words its program reads, plus the targets of
+/// its input redirections.
+fn read_words(argv0: &str, args: &[Word], redirs: &[Redir]) -> Vec<PathWord> {
+    let mut words: Vec<PathWord> = redirs
+        .iter()
+        .filter(|r| matches!(r.op, RedirOp::In))
+        .filter_map(|r| match &r.target {
+            RedirTarget::Word(w) => Some(PathWord { prefix: path_prefix(w), word: None }),
+            RedirTarget::HereDoc(_) => None,
+        })
+        .collect();
+    let opens = opens_of(argv0);
+    if opens == Opens::Nothing {
+        return words;
+    }
+    let mut positional = 0;
+    for (i, a) in args.iter().enumerate() {
+        let text = literal(a);
+        if text.as_deref().is_some_and(|t| t.starts_with('-')) {
+            continue;
+        }
+        positional += 1;
+        match opens {
+            // The first positional is a pattern or a subcommand, unless it is a path itself.
+            Opens::AfterFirst | Opens::Git if positional == 1 && !looks_like_path(a) => continue,
+            _ => words.push(PathWord { prefix: path_prefix(a), word: Some(i + 1) }),
+        }
+    }
+    words
+}
+
+/// Whether a word could name a place: it has a separator, is `.`/`..`, or starts with a tilde or
+/// an expansion that might be one.
+fn looks_like_path(word: &Word) -> bool {
+    match path_prefix(word) {
+        Some(p) => p.contains('/') || p == "." || p == "..",
+        None => true,
+    }
+}
+
+fn opens_of(argv0: &str) -> Opens {
+    match argv0 {
+        "echo" | "printf" | "pwd" | "true" | "false" | "which" | "type" | "printenv" | "id" | "whoami" | "uname"
+        | "ps" | "tr" | "date" | "env" | "hostname" | "command" | "basename" | "dirname" => Opens::Nothing,
+        "grep" | "egrep" | "fgrep" | "rg" | "jq" | "yq" | "fd" => Opens::AfterFirst,
+        "git" => Opens::Git,
+        _ => Opens::All,
+    }
+}
+
+/// The word's text up to its first glob, or nothing when a substitution or a leading `~` decides
+/// where it points. A glob cannot leave the directory its prefix names.
+fn path_prefix(word: &Word) -> Option<String> {
+    let mut out = String::new();
+    prefix_parts(&word.parts, &mut out, true).then_some(out)
+}
+
+fn prefix_parts(parts: &[WordPart], out: &mut String, at_start: bool) -> bool {
+    let mut first = at_start;
+    for p in parts {
+        match p {
+            WordPart::Lit(b) => {
+                if first && b.first() == Some(&b'~') {
+                    return false;
+                }
+                match b.iter().position(|c| matches!(c, b'*' | b'?' | b'[' | b'{')) {
+                    Some(i) => {
+                        out.push_str(&String::from_utf8_lossy(&b[..i]));
+                        return true;
+                    }
+                    None => out.push_str(&String::from_utf8_lossy(b)),
+                }
+            }
+            WordPart::Escaped(b) | WordPart::SQuote(b) => out.push_str(&String::from_utf8_lossy(b)),
+            WordPart::DQuote(ps) | WordPart::Locale(ps) => {
+                if !prefix_parts(ps, out, false) {
+                    return false;
+                }
+            }
+            WordPart::DroppedQuote => {}
+            _ => return false,
+        }
+        first = false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +768,54 @@ mod tests {
         assert_eq!(a.cmds[0].text, "ls \"unterminated");
         assert!(!a.cmds[0].readonly);
         assert_eq!(a.cmds[0].argv0, None);
+    }
+
+    /// The path words of every simple command, flattened.
+    fn paths(cmd: &str) -> Vec<Option<String>> {
+        let a = analyze(cmd);
+        assert!(a.parsed, "{cmd}");
+        a.cmds.iter().flat_map(|c| c.paths.iter().map(|w| w.prefix.clone())).collect()
+    }
+
+    fn some(p: &str) -> Option<String> {
+        Some(p.to_string())
+    }
+
+    #[test]
+    fn path_words_name_the_files_a_read_only_command_opens() {
+        assert_eq!(paths("cat /etc/passwd"), [some("/etc/passwd")]);
+        assert_eq!(paths("ls -la"), [], "no argument, so the shell's directory");
+        assert_eq!(paths("ls .. && cat notes.txt"), [some(".."), some("notes.txt")]);
+        assert_eq!(paths("find . -name '*.rs'"), [some("."), some("*.rs")]);
+    }
+
+    #[test]
+    fn a_glob_is_judged_from_its_prefix_and_an_expansion_from_nothing() {
+        assert_eq!(paths("cat src/*.rs"), [some("src/")], "a glob cannot leave its prefix");
+        assert_eq!(paths("cat \"src/*.rs\""), [some("src/")]);
+        assert_eq!(paths("cat $DIR/x"), [None], "a variable can point anywhere");
+        assert_eq!(paths("cat $(pwd)/x"), [None], "the substitution is its own command");
+        assert_eq!(paths("cat ~/.ssh/id_rsa"), [None], "so can a tilde");
+        assert_eq!(paths("cat ~jacob/x"), [None]);
+    }
+
+    #[test]
+    fn only_the_arguments_a_program_reads_are_path_words() {
+        assert_eq!(paths("echo /etc/passwd"), [], "echo prints its arguments");
+        assert_eq!(paths("pwd"), []);
+        assert_eq!(paths("ps aux"), [], "ps reads /proc, whatever it is given");
+        assert_eq!(paths("grep -r foo src"), [some("src")], "the first positional is the pattern");
+        assert_eq!(paths("grep -f /etc/patterns src"), [some("/etc/patterns"), some("src")]);
+        assert_eq!(paths("git status"), [], "the subcommand is not a path");
+        assert_eq!(paths("git diff -- /etc"), [some("/etc")]);
+        assert_eq!(paths("cd /etc"), [some("/etc")]);
+    }
+
+    #[test]
+    fn input_redirections_are_path_words_too() {
+        assert_eq!(paths("cat < /etc/passwd"), [some("/etc/passwd")]);
+        assert_eq!(paths("grep x < /etc/passwd"), [some("/etc/passwd")]);
+        assert_eq!(paths("cat <<'EOF'\n/etc\ny\nEOF"), [], "a heredoc is data, not a file");
+        assert_eq!(paths("cat <<< /etc"), [], "so is a here string");
     }
 }

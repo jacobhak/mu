@@ -70,41 +70,49 @@ fn write_grant(path: &Path, section: &[&str], root: Option<&Path>, g: &Grant) ->
             format!("{}: [{}] is not a table; add the rule by hand", path.display(), section[..=i].join("."))
         })?;
     }
-    match table.get_mut(&g.tool) {
+    let patterns = super::grant_patterns(&g.patterns);
+    for tool in super::grant_tools(&g.tool) {
+        add_rule(table, section, tool, &patterns, path)?;
+    }
+    fs::write_atomic(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Adds `allow` for every pattern under `tool`, keeping what the file already says there.
+fn add_rule(table: &mut Table, section: &[&str], tool: &str, patterns: &[String], path: &Path) -> Result<(), String> {
+    match table.get_mut(tool) {
         // An action already decides every call of this tool.
         Some(Item::Value(Value::String(_))) => {}
         Some(Item::Value(Value::InlineTable(t))) => {
-            for p in &g.patterns {
+            for p in patterns {
                 t.entry(p).or_insert(Value::from("allow"));
             }
         }
         Some(Item::Table(t)) => {
-            for p in &g.patterns {
+            for p in patterns {
                 t.entry(p).or_insert(Item::Value(Value::from("allow")));
             }
         }
         Some(_) => {
             return Err(format!(
-                "{}: [{}] {} is not an action or a table; add the rule by hand",
+                "{}: [{}] {tool} is not an action or a table; add the rule by hand",
                 path.display(),
-                section.join("."),
-                g.tool
+                section.join(".")
             ));
         }
         None => {
-            let item = if g.patterns.is_empty() {
+            let item = if patterns.is_empty() {
                 Item::Value(Value::from("allow"))
             } else {
                 let mut t = toml_edit::InlineTable::new();
-                for p in &g.patterns {
+                for p in patterns {
                     t.insert(p, Value::from("allow"));
                 }
                 Item::Value(Value::InlineTable(t))
             };
-            table.insert(&g.tool, item);
+            table.insert(tool, item);
         }
     }
-    fs::write_atomic(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    Ok(())
 }
 
 fn implicit() -> Table {
@@ -117,6 +125,10 @@ fn implicit() -> Table {
 mod tests {
     use super::*;
 
+    fn grant(tool: &str, patterns: &[&str]) -> Grant {
+        Grant { tool: tool.into(), patterns: patterns.iter().map(|p| p.to_string()).collect(), wider: Vec::new() }
+    }
+
     #[test]
     fn grants_round_trip_and_keep_what_is_there() {
         mu_testutil::home();
@@ -124,7 +136,7 @@ mod tests {
         std::fs::create_dir_all(paths::mu_home()).unwrap();
         std::fs::write(&config, "# keep me\n[theme]\nname = \"x\"\n").unwrap();
 
-        let g = Grant { tool: "probebash".into(), patterns: vec!["git push *".into()] };
+        let g = grant("probebash", &["git push *"]);
         add_global(&g).unwrap();
         add_global(&g).unwrap();
         let text = std::fs::read_to_string(&config).unwrap();
@@ -135,27 +147,59 @@ mod tests {
         assert_eq!(rules["git push *"].as_str(), Some("allow"));
 
         // A tool-wide grant is the string form.
-        add_global(&Grant { tool: "probefetch".into(), patterns: vec![] }).unwrap();
+        add_global(&grant("probefetch", &[])).unwrap();
         let text = std::fs::read_to_string(&config).unwrap();
         let table: toml::Table = text.parse().unwrap();
         assert_eq!(table["permissions"]["rules"]["probefetch"].as_str(), Some("allow"));
 
         // A hand-written rule is left alone.
-        add_global(&Grant { tool: "probebash".into(), patterns: vec!["git push *".into()] }).unwrap();
+        add_global(&grant("probebash", &["git push *"])).unwrap();
         let text = std::fs::read_to_string(&config).unwrap();
         assert_eq!(text.matches("git push *").count(), 1);
 
         let key = std::path::Path::new("/tmp/project-grants-test");
-        add_project(key, &Grant { tool: "write".into(), patterns: vec!["a/*.txt".into()] }).unwrap();
-        add_project(key, &Grant { tool: "write".into(), patterns: vec!["a/*.txt".into()] }).unwrap();
+        add_project(key, &grant("write", &["a/*.txt"])).unwrap();
+        add_project(key, &grant("write", &["a/*.txt"])).unwrap();
         let mut warn = Vec::new();
         let rules = load_project(key, &mut warn);
         assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!(rules.0.len(), 1);
-        assert_eq!(rules.0[0].0, "write");
+        assert_eq!(rules.0.len(), 2, "the change family, and no directory to add: {rules:?}");
+        assert_eq!(rules.0[0].0, "edit");
         assert_eq!(rules.0[0].1.pattern, "a/*.txt");
+        assert_eq!(rules.0[1].0, "write");
         let text = std::fs::read_to_string(project_file(key)).unwrap();
         assert!(text.contains("root = "), "{text}");
-        assert_eq!(text.matches("a/*.txt").count(), 1);
+        assert_eq!(text.matches("a/*.txt").count(), 2, "once per tool, not once per add: {text}");
+    }
+
+    #[test]
+    fn a_grant_is_saved_for_every_tool_of_its_family() {
+        mu_testutil::home();
+        let key = std::path::Path::new("/tmp/project-grants-family-test");
+        add_project(key, &grant("read", &["/etc/*"])).unwrap();
+        let mut warn = Vec::new();
+        let rules = load_project(key, &mut warn);
+        assert!(warn.is_empty(), "{warn:?}");
+        // A parsed table stores its tools alphabetically.
+        let saved: Vec<(&str, &str)> = rules.0.iter().map(|(t, r)| (t.as_str(), r.pattern.as_str())).collect();
+        assert_eq!(
+            saved,
+            [
+                ("glob", "/etc"),
+                ("glob", "/etc/*"),
+                ("grep", "/etc"),
+                ("grep", "/etc/*"),
+                ("read", "/etc"),
+                ("read", "/etc/*"),
+            ]
+        );
+
+        // Changes are their own family, kept apart from reads.
+        let key = std::path::Path::new("/tmp/project-grants-change-test");
+        add_project(key, &grant("write", &["src/*"])).unwrap();
+        let rules = load_project(key, &mut warn);
+        assert!(warn.is_empty(), "{warn:?}");
+        let saved: Vec<(&str, &str)> = rules.0.iter().map(|(t, r)| (t.as_str(), r.pattern.as_str())).collect();
+        assert_eq!(saved, [("edit", "src"), ("edit", "src/*"), ("write", "src"), ("write", "src/*")]);
     }
 }
