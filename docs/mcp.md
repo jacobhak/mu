@@ -14,7 +14,7 @@ mu reads omp's MCP config unchanged: `<cwd>/.omp/mcp.json`, `<agentDir>/mcp.json
   - `reload` re-reads the files and applies the difference by server name: removed servers stop, servers whose config changed restart and are listed again, new ones are added. Use it after editing a file by hand. `reconnect` restarts one server and lists its tools again; `test` does the same and prints the tools and the time taken.
   - `/mcp list` shows each server's level, kind, host (or command) and state; it never prints env, headers, paths inside urls or query strings.
 - Not supported: MCP resources and prompts (and so `/mcp resources|prompts|notifications`), `/mcp reauth` and `unauth` (use `/login mcp:<name>`), Smithery, and importing Cursor, Windsurf or VS Code configs.
-- Notes: with a cold cache the first turn waits (up to 30 s per server, 60 s when `timeout` is 0) for servers to list their tools; Esc or Ctrl-C leaves it. The broker is used for token refresh only once the gateway plugin is already running, so the first listing of a session may fetch the token without it. Config warnings (a skipped SSE server, a bad entry) show in the TUI and on stderr for `-p`; ACP and subagents do not show them.
+- Notes: with a cold cache the first turn waits (up to 30 s per server, 60 s when `timeout` is 0) for servers to list their tools; Esc leaves it. The broker is used for token refresh only once the gateway plugin is already running, so the first listing of a session may fetch the token without it. Config warnings (a skipped SSE server, a bad entry) show in the TUI and on stderr for `-p`; ACP and subagents do not show them.
 
 ## Project servers need trust
 

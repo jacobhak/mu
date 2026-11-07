@@ -121,11 +121,6 @@ impl App {
 
     /// Keys the panel takes before the composer and the overlay. True when the key was used up here.
     pub(super) fn custom_key(&mut self, k: KeyEvent) -> bool {
-        // Ctrl-C leaves the panel from any screen, as it leaves any other picker.
-        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-            self.custom_cancel();
-            return true;
-        }
         let Some(f) = self.flows.custom_wizard.as_ref() else { return false };
         // A check is running: Esc gives up on it, and its late answer is ignored.
         if f.checking {
@@ -226,7 +221,7 @@ impl App {
         }
     }
 
-    /// Esc or Ctrl-C: nothing is written.
+    /// Esc: nothing is written.
     pub(super) fn custom_cancel(&mut self) {
         if self.end_custom_wizard() {
             self.notice("cancelled; nothing was saved");
@@ -561,20 +556,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_leaves_the_panel_from_any_screen() {
-        // Esc goes back a screen; Ctrl-C leaves, as it leaves any other picker.
-        type Stage = (&'static str, fn(&mut App));
-        let stages: [Stage; 3] =
-            [("the fields", |_| {}), ("a field", |a| choose(a, 0)), ("the auth screen", |a| choose(a, 3))];
+    fn ctrl_c_no_longer_leaves_the_panel_but_arms_the_exit() {
+        // Esc is what leaves the panel; Ctrl-C belongs to the session's exit.
         in_local(async {
-            for (name, reach) in stages {
-                let (mut app, _cmds, _ui) = app_with("");
-                app.prompt.composer.set_text("my draft");
-                app.login("custom");
-                reach(&mut app);
-                app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
-                assert_nothing_written(&app, "my draft", name);
-            }
+            let (mut app, _cmds, _ui) = app_with("");
+            app.prompt.composer.set_text("my draft");
+            app.login("custom");
+            choose(&mut app, 0);
+            app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(app.custom_wizard_active(), "the panel stays open");
+            assert!(app.ctrl_c_armed, "the exit gesture is armed");
+            assert!(!app.services.providers.custom_registry().path().exists(), "no definition is written");
+            assert!(app.services.providers.store().get("modal").is_none(), "no key is stored");
         });
     }
 

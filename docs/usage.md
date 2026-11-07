@@ -24,6 +24,8 @@ Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal`
 
 While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
 
+Ctrl+C only exits: the first press says so and changes nothing else, and the second exits mu whatever is on screen (a running turn, a panel, a wizard, an embedded terminal). Esc is what backs out of those, one screen at a time, and in an embedded terminal it kills the command instead of being typed into it.
+
 Shift+Enter inserts a newline only in terminals with the kitty keyboard protocol. In tmux and other terminals, use Ctrl+J or Alt+Enter.
 
 File tools (`read`, `write`, `edit`, `grep`, `glob`) resolve relative paths against the session's directory, not against wherever a `cd` in `bash` has moved the shell. When the shell is elsewhere and a call used a relative path, the result ends with a note naming both directories, so a mistaken edit shows on the first call. In `edit`'s `sloppy` mode, an unindented line such as `*** Find all` that looks like a header but is not one is refused instead of being written into the file; indent a line that is meant as text. An `Insert Before` or `Insert After` whose body repeats its `*** Find` lines (the Find is only the anchor) is refused too, unless the anchor is under 8 characters. The persistent shell keeps `export`s between `bash` calls, so a call that sets or changes an exported variable ends with a reminder naming it (never its value).

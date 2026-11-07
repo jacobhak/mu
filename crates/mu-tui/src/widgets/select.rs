@@ -289,9 +289,6 @@ impl Select {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        if ctrl && key.code == KeyCode::Char('c') {
-            return SelectResult::Cancelled;
-        }
         if self.editing {
             return self.text_key(key);
         }

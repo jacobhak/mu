@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::oneshot;
 
 use crate::panels::jobs_panel::{JobsPanel, JobsResult};
@@ -474,14 +474,10 @@ impl AskState {
     }
 
     fn key(mut self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
-        let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
         let n = self.qs.len();
         let res = self.sel.on_key(k);
         if matches!(res, SelectResult::Pending) {
             return self.keep();
-        }
-        if ctrl_c {
-            return self.cancel();
         }
         if self.review {
             match res {
@@ -933,7 +929,7 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::KeyCode;
     use mu_base::events::AskOption;
     use mu_testutil::key;
 
@@ -1360,7 +1356,7 @@ mod tests {
         let (ov, mut rx) = open(two_q());
         let ov = press(ov, &[KeyCode::Enter]);
         assert!(ov.on_key(key(KeyCode::Esc)).0.is_none());
-        assert_eq!(answer(&mut rx), "[Options([\"A\"]), Cancelled]", "Esc on question 2 cancels like Ctrl-C");
+        assert_eq!(answer(&mut rx), "[Options([\"A\"]), Cancelled]", "Esc on question 2 cancels from there");
     }
 
     #[test]
@@ -1373,15 +1369,6 @@ mod tests {
         let mut ov = press(ov, &[KeyCode::Left]);
         let t = screen(&mut ov);
         assert!(t.iter().any(|l| l.contains("1/2")) && t.iter().any(|l| l == "❯ A"), "{t:?}");
-    }
-
-    #[test]
-    fn ctrl_c_cancels_from_the_current_question_and_keeps_earlier_answers() {
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let (ov, mut rx) = open(two_q());
-        let ov = press(ov, &[KeyCode::Enter]);
-        assert!(ov.on_key(ctrl_c).0.is_none());
-        assert_eq!(answer(&mut rx), "[Options([\"A\"]), Cancelled]");
     }
 
     #[test]

@@ -100,6 +100,7 @@ impl App {
         self.screen.dirty = true;
         match e {
             Event::Paste(s) if self.agent.pty.is_some() => {
+                self.ctrl_c_armed = false;
                 if let Some(p) = &self.agent.pty {
                     p.paste(&s);
                 }
@@ -112,6 +113,7 @@ impl App {
             }
             Event::Key(k) => self.on_key(k),
             Event::Paste(s) => {
+                self.ctrl_c_armed = false;
                 // A check is running: nothing typed or pasted goes anywhere until it answers.
                 if self.custom_busy() {
                     return;
@@ -168,6 +170,9 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        if self.ctrl_c(&k) {
+            return;
+        }
         if let Some(p) = &self.agent.pty {
             p.key(k);
             return;
@@ -176,6 +181,26 @@ impl App {
         if self.overlay.is_none() {
             self.request_ghost();
         }
+    }
+
+    /// Ctrl-C before anything else sees the key: the first press arms the exit and does nothing
+    /// else, any other key disarms it, and the next press exits from whatever state the app is in
+    /// (a turn, a pty tool, an overlay, a wizard). True when the key was used up here.
+    fn ctrl_c(&mut self, k: &KeyEvent) -> bool {
+        if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+        if !(k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL)) {
+            self.ctrl_c_armed = false;
+            return false;
+        }
+        if std::mem::take(&mut self.ctrl_c_armed) {
+            self.quit();
+        } else {
+            self.ctrl_c_armed = true;
+            self.screen.dirty = true;
+        }
+        true
     }
 
     fn on_key_inner(&mut self, k: KeyEvent) {
@@ -205,9 +230,7 @@ impl App {
         }
         let action = self.prompt.composer.on_key(k, self.agent.running, &self.prompt.commands);
         // Only actions that stay in the composer may run while a key or command is typed.
-        if typing
-            && !matches!(action, Action::None | Action::Redraw | Action::Abort | Action::Exit | Action::ToggleExpanded)
-        {
+        if typing && !matches!(action, Action::None | Action::Redraw | Action::Abort | Action::ToggleExpanded) {
             return;
         }
         match action {
@@ -217,7 +240,6 @@ impl App {
             Action::Submit(t) => self.submit(t, false),
             Action::QueueFollowUp(t) => self.submit(t, true),
             Action::Abort => self.send(Command::Cancel),
-            Action::Exit => self.quit(),
             Action::CycleThinking => self.send(Command::CycleThinking),
             Action::ToggleThinking => {
                 let w = self.width();
@@ -307,8 +329,7 @@ impl App {
 
     /// Keys the masked or command input takes before the composer. True when the key was handled.
     fn key_flow_key(&mut self, k: KeyEvent) -> bool {
-        let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-        if k.code == KeyCode::Esc || ctrl_c {
+        if k.code == KeyCode::Esc {
             self.cancel_key_flow();
             return true;
         }
@@ -967,6 +988,7 @@ pub(super) mod tests {
                 custom_wizard_seq: 0,
             },
             quitting: false,
+            ctrl_c_armed: false,
         };
         (app, cmd_rx)
     }
@@ -1067,6 +1089,44 @@ pub(super) mod tests {
         });
         assert!((app.agent.subagent_cost - 0.25).abs() < 1e-9, "{}", app.agent.subagent_cost);
         assert!(app.agent.spend.is_some(), "the reader is back for the next read");
+    }
+
+    #[test]
+    fn ctrl_c_twice_exits_from_any_state_and_the_first_press_only_arms() {
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        in_local(async {
+            app.agent.running = true;
+            app.prompt.composer.set_text("half a question");
+            app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(app.ctrl_c_armed && !app.quitting);
+            assert_eq!(app.prompt.composer.text(), "half a question", "Ctrl-C clears nothing");
+            assert!(commands.try_recv().is_err(), "Ctrl-C aborts nothing");
+
+            app.on_terminal(press(KeyCode::Left, KeyModifiers::NONE));
+            assert!(!app.ctrl_c_armed, "any other key disarms");
+            app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(!app.quitting, "the first press only arms");
+
+            // A pty tool takes the keys, but not this one: neither press reaches the command.
+            let (tx, mut pty_in) = unbounded_channel();
+            app.agent.pty = Some(crate::panels::ptyview::PtyView::new("t".into(), tx, (80, 24)));
+            app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(pty_in.try_recv().is_err(), "Ctrl-C is not a keystroke for the command");
+            app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(app.quitting, "the second press exits with a pty open");
+            app.agent.pty = None;
+
+            // Nor does an open panel swallow it.
+            let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+            app.on_terminal(press(KeyCode::Char('j'), KeyModifiers::ALT));
+            assert!(matches!(app.overlay, Some(Overlay::Jobs { .. })));
+            app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(matches!(app.overlay, Some(Overlay::Jobs { .. })) && !app.quitting, "the panel stays");
+            app.on_terminal(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(app.quitting, "the second press exits from inside the panel");
+            let exited = std::iter::from_fn(|| commands.try_recv().ok()).any(|c| matches!(c, Command::Exit));
+            assert!(exited, "the app asked the agent to exit");
+        });
     }
 
     #[test]

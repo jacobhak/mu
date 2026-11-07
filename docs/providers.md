@@ -22,7 +22,7 @@ A ChatGPT sign-in routes `openai-chatgpt/*` natively on the same terms, once the
 
 OpenAI lets open-source tools run requests on a ChatGPT Plus or Pro plan. mu signs you in through the browser and sends requests to `api.openai.com` with the resulting access token. This is not the Codex CLI's login, and omp is not involved. OpenAI offers plan usage to open-source and local personal tools such as mu; a sign-in whose grant lacks plan usage (`chatgpt.tokens.use.direct`) is kept, but cannot run models until you approve that permission by signing in again.
 
-Sign in from `/login` (the first row, "Continue with ChatGPT") or with `mu auth login openai-chatgpt`. mu opens the sign-in page in your browser; the browser returns to `127.0.0.1:1455`. Over SSH, or wherever the browser cannot reach that address, the browser ends on a page that does not load. Copy its address and paste it into mu (or the terminal running `mu auth login`), then press Enter. Esc or Ctrl-C cancels, and nothing is saved.
+Sign in from `/login` (the first row, "Continue with ChatGPT") or with `mu auth login openai-chatgpt`. mu opens the sign-in page in your browser; the browser returns to `127.0.0.1:1455`. Over SSH, or wherever the browser cannot reach that address, the browser ends on a page that does not load. Copy its address and paste it into mu (or the terminal running `mu auth login`), then press Enter. Esc cancels, and nothing is saved.
 
 Plan models come from your account's own list and appear in `/switch` and `/model` marked `ChatGPT plan`. `openai/<model>` (your API key) and `openai-chatgpt/<model>` (your plan) are separate choices; mu has no preference between them.
 

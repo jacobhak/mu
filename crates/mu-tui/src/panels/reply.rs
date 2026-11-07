@@ -1022,7 +1022,7 @@ impl View {
         }
         if footer == 2 {
             let (a, b) = if self.anchor.is_some() {
-                ("Shift+←→ word · Shift+↑↓ unit · Space mark", "Enter quote · Esc drop selection · Ctrl+C close")
+                ("Shift+←→ word · Shift+↑↓ unit · Space mark", "Enter quote · Esc drop selection · Ctrl+G close")
             } else {
                 (
                     "↑↓ jk unit · ←→ hl word · Shift+move select · gg G { } ^D ^U ^N ^P ^F ^B",
@@ -1102,9 +1102,6 @@ impl ReplyPicker {
             return ReplyResult::Pending;
         }
         let (ctrl, alt) = (k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT));
-        if ctrl && k.code == KeyCode::Char('c') {
-            return ReplyResult::Close;
-        }
         // Ctrl+Alt is how some terminals report AltGr, which is how `[` and `]` are typed on many layouts.
         let bracket = (!ctrl && !alt) || (ctrl && alt);
         let dir: isize = match k.code {
@@ -1355,14 +1352,6 @@ mod tests {
         assert_eq!(press(&mut p, KeyCode::Esc), ReplyResult::Pending);
         assert!(view(&p).sel().is_none() && view(&p).marks.is_empty());
         assert_eq!(press(&mut p, KeyCode::Esc), ReplyResult::Close);
-    }
-
-    #[test]
-    fn ctrl_c_closes_from_anywhere() {
-        let mut p = picker(ALPHA);
-        shift(&mut p, KeyCode::Right);
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(p.on_key(ctrl_c), ReplyResult::Close);
     }
 
     #[test]

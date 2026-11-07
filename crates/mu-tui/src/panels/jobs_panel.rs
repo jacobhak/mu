@@ -414,7 +414,6 @@ impl JobsPanel {
         let page = v.body_h.max(1) as isize;
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = None,
-            KeyCode::Char('c') if ctrl => return JobsResult::Close,
             KeyCode::Down | KeyCode::Char('j') => v.scroll(1),
             KeyCode::Char('n') if ctrl => v.scroll(1),
             KeyCode::Up | KeyCode::Char('k') => v.scroll(-1),
@@ -453,7 +452,6 @@ impl JobsPanel {
         let Some(c) = self.input.as_mut() else { return JobsResult::Pending };
         match k.code {
             KeyCode::Esc => self.input = None,
-            KeyCode::Char('c') if ctrl => self.input = None,
             KeyCode::Enter => {
                 if let Some(c) = self.input.take() {
                     let text = c.text.trim().to_string();
@@ -517,7 +515,6 @@ impl JobsPanel {
         let last = self.jobs.len().saturating_sub(1);
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => return JobsResult::Close,
-            KeyCode::Char('c') if ctrl => return JobsResult::Close,
             KeyCode::Down | KeyCode::Char('j') => self.at = (self.at + 1).min(last),
             KeyCode::Char('n') if ctrl => self.at = (self.at + 1).min(last),
             KeyCode::Up | KeyCode::Char('k') => self.at = self.at.saturating_sub(1),
@@ -543,7 +540,6 @@ impl JobsPanel {
         let last = self.rows.len().saturating_sub(1);
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => return JobsResult::Close,
-            KeyCode::Char('c') if ctrl => return JobsResult::Close,
             KeyCode::Down | KeyCode::Char('j') => self.s_at = (self.s_at + 1).min(last),
             KeyCode::Char('n') if ctrl => self.s_at = (self.s_at + 1).min(last),
             KeyCode::Up | KeyCode::Char('k') => self.s_at = self.s_at.saturating_sub(1),
@@ -1110,8 +1106,6 @@ mod tests {
         assert_eq!(p.at, 0);
         assert!(matches!(p.on_key(key(KeyCode::Char('q'))), JobsResult::Close));
         assert!(matches!(p.on_key(key(KeyCode::Esc)), JobsResult::Close));
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(p.on_key(ctrl_c), JobsResult::Close));
     }
 
     #[test]

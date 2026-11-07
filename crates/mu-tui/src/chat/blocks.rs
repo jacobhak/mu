@@ -308,7 +308,7 @@ impl Fact {
             Fact::Timeout(t) => t.clone(),
             Fact::Artifact(n) => format!("artifact://{n}"),
             Fact::Running(s) => format!("running {s}s"),
-            Fact::KillHint => "ctrl+c twice kills".into(),
+            Fact::KillHint => "Esc kills".into(),
             Fact::Lines(n) => format!("{n} lines"),
             Fact::Note(n) => n.clone(),
         }

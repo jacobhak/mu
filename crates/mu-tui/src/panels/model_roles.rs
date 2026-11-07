@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyEventKind};
 use mu_base::models::{Thinking, split_level};
 use mu_base::roles::RoleView;
 
@@ -212,9 +212,6 @@ impl RoleEditor {
         if key.kind == KeyEventKind::Release {
             return RoleEditorAction::Pending;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return RoleEditorAction::Close;
-        }
         match self.select.on_key(key) {
             SelectResult::Cancelled | SelectResult::Back => match self.screen {
                 Screen::Roles => return RoleEditorAction::Close,
@@ -292,7 +289,7 @@ impl RoleEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn role(value: Option<&str>) -> RoleView {
         RoleView {
@@ -390,8 +387,9 @@ mod tests {
         assert_eq!(e.screen, Screen::Models);
         press(&mut e, KeyCode::Esc);
         assert_eq!(e.screen, Screen::Edit);
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(e.on_key(ctrl_c), RoleEditorAction::Close);
+        press(&mut e, KeyCode::Esc);
+        assert_eq!(e.screen, Screen::Roles, "Esc steps back a screen");
+        assert_eq!(press(&mut e, KeyCode::Esc), RoleEditorAction::Close);
     }
 
     #[test]

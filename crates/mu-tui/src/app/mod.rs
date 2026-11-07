@@ -55,6 +55,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME: Duration = Duration::from_millis(33);
+/// Shown under whatever the screen holds while the first Ctrl-C waits for the second.
+const CTRL_C_HINT: &str = "  (press Ctrl-C again to exit)";
 
 pub struct AppInit {
     pub cmd_tx: UnboundedSender<Command>,
@@ -89,6 +91,8 @@ struct App {
     approvals: VecDeque<(ApprovalRequest, tokio::sync::oneshot::Sender<ApprovalDecision>)>,
     flows: Flows,
     quitting: bool,
+    /// The first Ctrl-C was pressed: the next one exits, whatever the screen holds.
+    ctrl_c_armed: bool,
 }
 
 /// The channels to the agent.
@@ -211,6 +215,7 @@ pub async fn run(init: AppInit) -> i32 {
             custom_wizard_seq: 0,
         },
         quitting: false,
+        ctrl_c_armed: false,
     };
     let store_warning = app.services.providers.store().permission_warning();
     let store_check = app.services.providers.store().check().err().map(|e| e.to_string());
@@ -415,14 +420,15 @@ impl App {
         let status_lines = status::render(&self.agent.status, &env, w);
         let pty_open = self.agent.pty.is_some();
         let (lines, cur) = match &mut self.overlay {
-            _ if pty_open => {
-                (vec![styled("  keys go to the command · ctrl+c twice force-kills".to_string(), |_| dim())], (0, 0))
-            }
+            _ if pty_open => (vec![styled("  keys go to the command · Esc kills it".to_string(), |_| dim())], (0, 0)),
             Some(ov) => ov.render(w, rows, vp.len() + status_lines.len()),
             None => self.prompt.composer.render(w),
         };
         let cursor = pty_cursor.filter(|_| pty_open).unwrap_or((vp.len() + cur.0, cur.1));
         vp.extend(lines);
+        if self.ctrl_c_armed {
+            vp.push(vec![span(CTRL_C_HINT.to_string(), theme::get().fg(Role::Faint))]);
+        }
         vp.extend(status_lines);
         let committed = std::mem::take(&mut self.agent.tr.pending);
         if let Err(e) = self.screen.renderer.draw(&committed, &vp, cursor) {

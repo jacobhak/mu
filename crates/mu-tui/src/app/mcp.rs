@@ -432,8 +432,7 @@ impl App {
 
     /// Keys the wizard takes before the composer sees them. True when the key was handled.
     pub(super) fn mcp_wizard_key(&mut self, k: KeyEvent) -> bool {
-        let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-        if k.code == KeyCode::Esc || (ctrl_c && self.prompt.composer.is_empty()) {
+        if k.code == KeyCode::Esc {
             self.mcp_wizard_cancel();
             return true;
         }

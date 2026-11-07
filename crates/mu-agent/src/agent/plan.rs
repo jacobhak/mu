@@ -161,7 +161,7 @@ impl Agent {
     pub(super) async fn open_plan(&mut self, id: &str) -> Option<Start> {
         let (store, meta, shown, drift) = self.pending_plan(id).await?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // A cancel (Esc, Ctrl-C) closes the dialog without a decision, as it ends a turn.
+        // Esc closes the dialog without a decision, as it ends a turn.
         let cancel = CancellationToken::new();
         self.ports.inbox.borrow_mut().cancel = cancel.clone();
         self.emit(AgentEvent::PlanReview {

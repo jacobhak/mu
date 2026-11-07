@@ -1,4 +1,4 @@
-//! Multi-line prompt buffer: editing keys, input history, paste markers, Ctrl-C state.
+//! Multi-line prompt buffer: editing keys, input history, paste markers.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -105,7 +105,6 @@ const INDENT: &str = "    ";
 /// Display width of `PROMPT` and `INDENT`.
 const PREFIX_W: usize = 4;
 const MENU_ROWS: usize = 8;
-const CTRL_C_HINT: &str = "(press Ctrl-C again to exit)";
 /// Blank cells left of the prompt.
 const PAD: usize = 1;
 
@@ -116,7 +115,6 @@ pub enum Action {
     QueueFollowUp(UserInput),
     PasteImage,
     Abort,
-    Exit,
     CycleThinking,
     ToggleThinking,
     ToggleExpanded,
@@ -176,7 +174,6 @@ pub struct Composer {
     browse: Option<(usize, Buf)>,
     paste_count: usize,
     image_count: usize,
-    ctrl_c_armed: bool,
     cwd: String,
     ghost: Option<String>,
     /// Tab completion just appended a space after the cursor; punctuation or Enter typed next removes it.
@@ -225,7 +222,6 @@ impl Composer {
             browse: None,
             paste_count: 0,
             image_count: 0,
-            ctrl_c_armed: false,
             cwd: String::new(),
             ghost: None,
             magic_space: false,
@@ -303,7 +299,6 @@ impl Composer {
                     break 'act a;
                 }
             } else if key.code == KeyCode::Tab {
-                self.ctrl_c_armed = false;
                 break 'act match ghost {
                     Some(g) => {
                         let a = self.accept_ghost(&g);
@@ -319,7 +314,6 @@ impl Composer {
                 && plain_mods
                 && self.at_end()
             {
-                self.ctrl_c_armed = false;
                 break 'act self.accept_ghost(g);
             }
             let a = self.on_key_inner(key, running);
@@ -420,7 +414,6 @@ impl Composer {
             }
             _ => return None,
         }
-        self.ctrl_c_armed = false;
         Some(Action::Redraw)
     }
 
@@ -498,24 +491,9 @@ impl Composer {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
-        // Any key other than Ctrl-C disarms the exit hint.
-        let armed = std::mem::take(&mut self.ctrl_c_armed);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('c') if ctrl => {
-                if !self.is_empty() {
-                    self.clear();
-                    Action::Redraw
-                } else if running {
-                    Action::Abort
-                } else if armed {
-                    Action::Exit
-                } else {
-                    self.ctrl_c_armed = true;
-                    Action::Redraw
-                }
-            }
             KeyCode::Char('d') if ctrl && self.is_empty() => Action::None,
             KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !self.buf.masked => {
                 self.edit(|b| b.newline())
@@ -579,7 +557,6 @@ impl Composer {
     fn paste_inner(&mut self, s: &str) -> Result<(), String> {
         self.ghost = None;
         self.magic_space = false;
-        self.ctrl_c_armed = false;
         self.browse = None;
         if self.locked() {
             self.buf.insert_str(&normalize_paste(s));
@@ -656,9 +633,6 @@ impl Composer {
                 span(" ", ContentStyle::default()),
                 span("type here…", theme::get().fg(Role::Faint)),
             ];
-        }
-        if self.ctrl_c_armed {
-            body.push(vec![span(format!("{pad}{CTRL_C_HINT}"), theme::get().fg(Role::Faint))]);
         }
         if let Some(m) = &self.menu {
             let n = m.items.len();
@@ -746,7 +720,6 @@ impl Composer {
 
     /// Inserts an `[Image #n]` marker at the cursor and keeps the image for submission.
     pub fn attach_image(&mut self, img: Image) {
-        self.ctrl_c_armed = false;
         self.browse = None;
         self.image_count += 1;
         let marker = format!("[Image #{}]", self.image_count);
@@ -1301,36 +1274,16 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_exit_state_machine() {
+    fn ctrl_c_is_left_to_the_app_that_exits() {
+        // Exiting is the app's alone: in the composer Ctrl-C neither clears, aborts nor submits.
         let mut c = Composer::new(None);
-        assert_eq!(ctrl(&mut c, 'c'), Action::Redraw);
+        type_str(&mut c, "x");
+        assert_eq!(ctrl(&mut c, 'c'), Action::None);
+        assert_eq!(c.text(), "x");
+        assert_eq!(c.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), true, &[]), Action::None);
+        assert_eq!(c.text(), "x");
         let (lines, _) = c.render(40);
-        assert!(crate::text::line::line_text(&lines[lines.len() - 1]).contains("press Ctrl-C again"));
-        assert_eq!(ctrl(&mut c, 'c'), Action::Exit);
-
-        let mut c = Composer::new(None);
-        ctrl(&mut c, 'c');
-        press(&mut c, KeyCode::Left, KeyModifiers::NONE);
-        assert_eq!(ctrl(&mut c, 'c'), Action::Redraw, "other key resets the armed state");
-        assert_eq!(ctrl(&mut c, 'c'), Action::Exit);
-
-        let mut c = Composer::new(None);
-        ctrl(&mut c, 'c');
-        c.on_paste("y", &[]).unwrap();
-        assert_eq!(ctrl(&mut c, 'c'), Action::Redraw, "paste resets the armed state");
-        assert!(c.is_empty());
-
-        let mut c = Composer::new(None);
-        type_str(&mut c, "x");
-        assert_eq!(ctrl(&mut c, 'c'), Action::Redraw);
-        assert!(c.is_empty());
-        assert_eq!(ctrl(&mut c, 'c'), Action::Redraw, "first press on empty only arms");
-
-        let mut c = Composer::new(None);
-        assert_eq!(c.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), true, &[]), Action::Abort);
-        type_str(&mut c, "x");
-        assert_eq!(c.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), true, &[]), Action::Redraw);
-        assert!(c.is_empty());
+        assert!(!lines.iter().any(|l| crate::text::line::line_text(l).contains("Ctrl-C")), "no exit hint here");
     }
 
     #[test]

@@ -125,8 +125,7 @@ impl App {
 
     /// Keys the redirect-URL input takes before the composer. True when handled.
     pub(super) fn chatgpt_key(&mut self, k: KeyEvent) -> bool {
-        let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-        if k.code == KeyCode::Esc || ctrl_c {
+        if k.code == KeyCode::Esc {
             self.cancel_chatgpt();
             return true;
         }
@@ -151,7 +150,7 @@ impl App {
         self.notice("checking the redirect URL…");
     }
 
-    /// Esc or Ctrl-C while a sign-in waits: the flow ends, and its late result is ignored.
+    /// Esc while a sign-in waits: the flow ends, and its late result is ignored.
     fn cancel_chatgpt(&mut self) {
         let Some(f) = self.flows.chatgpt.take() else { return };
         f.cancel.cancel();
