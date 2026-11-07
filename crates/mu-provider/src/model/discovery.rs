@@ -4,7 +4,9 @@
 //! snapshot row gets reasoning off (an unknown family's reasoning shape is never guessed).
 //! Cached per profile in `native-models.json`, refreshed at most daily.
 
+use crate::provider::custom::CustomProvider;
 use crate::provider::providers::{ProviderDef, native_def};
+use crate::provider::types::Auth;
 use mu_base::models::{Api, CompletionsCompat, ModelSpec, ThinkingMode, ThinkingSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -36,7 +38,45 @@ struct File {
     #[serde(default)]
     failed_at: std::collections::BTreeMap<String, i64>,
     models: std::collections::BTreeMap<String, Vec<Discovered>>,
+    /// Custom endpoints' listings, by provider id and a hash of the base URL they came from.
+    #[serde(default)]
+    custom: std::collections::BTreeMap<String, CustomEntry>,
 }
+
+/// One custom endpoint's last listing.
+#[derive(Default, Serialize, Deserialize)]
+struct CustomEntry {
+    fetched_at: Option<i64>,
+    failed_at: Option<i64>,
+    models: Vec<CustomRow>,
+}
+
+/// A model a custom endpoint lists. Missing metadata is unknown, never a limit or a price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomRow {
+    pub id: String,
+    pub context_length: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
+}
+
+/// Why a custom endpoint's listing could not be fetched.
+#[derive(Debug)]
+pub enum DiscoverError {
+    /// 401/403: the endpoint refuses the credential.
+    Rejected(String),
+    /// Anything else: unreachable, another status, or an unusable body.
+    Failed(String),
+}
+
+impl std::fmt::Display for DiscoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(m) | Self::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for DiscoverError {}
 
 /// Providers that list their models over the API.
 pub fn discovers(def: &ProviderDef) -> bool {
@@ -121,20 +161,133 @@ pub fn find(provider: &str, id: &str) -> Option<Discovered> {
 /// No fetch yet, or the last one is over a day old. A failed fetch is due again after an hour.
 pub fn stale(provider: &str) -> bool {
     let f = load();
+    due(f.failed_at.get(provider).copied(), f.fetched_at.get(provider).copied())
+}
+
+fn due(failed_at: Option<i64>, last_ok: Option<i64>) -> bool {
     let old = |at: i64, max: Duration| {
         let age = mu_base::message::now_ms().saturating_sub(at);
         age < 0 || age as u128 > max.as_millis()
     };
-    let last_ok = f.fetched_at.get(provider).copied();
-    match (f.failed_at.get(provider).copied(), last_ok) {
+    match (failed_at, last_ok) {
         (Some(failed), ok) if ok.is_none_or(|t| failed > t) => old(failed, RETRY_AFTER_FAILURE),
         (_, Some(t)) => old(t, MAX_AGE),
         (_, None) => true,
     }
 }
 
+/// The cache key of a custom endpoint: its id and a hash of its base URL, so a changed endpoint
+/// never inherits the old server's models and limits.
+fn custom_key(c: &CustomProvider) -> String {
+    use sha2::{Digest, Sha256};
+    let hash: String = Sha256::digest(c.base_url.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{}@{hash}", c.id)
+}
+
+/// Maps a generic OpenAI `/models` body: nonblank ids, deduplicated and sorted, with positive
+/// context and output limits when the server gives them (`max_model_len` is vLLM's context length).
+pub fn parse_generic(body: &str) -> Vec<CustomRow> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return Vec::new() };
+    let mut rows: Vec<CustomRow> = v["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    let id = m["id"].as_str().filter(|s| !s.trim().is_empty())?;
+                    Some(CustomRow {
+                        id: id.to_string(),
+                        context_length: positive(&m["context_length"]).or_else(|| positive(&m["max_model_len"])),
+                        max_completion_tokens: positive(&m["max_completion_tokens"]),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows.dedup_by(|a, b| a.id == b.id);
+    rows
+}
+
+/// The last listing of this endpoint (same id and base URL); empty when never fetched.
+pub fn custom_cached(c: &CustomProvider) -> Vec<CustomRow> {
+    load().custom.get(&custom_key(c)).map(|e| e.models.clone()).unwrap_or_default()
+}
+
+pub fn custom_find(c: &CustomProvider, model: &str) -> Option<CustomRow> {
+    load().custom.get(&custom_key(c))?.models.iter().find(|r| r.id == model).cloned()
+}
+
+pub fn custom_stale(c: &CustomProvider) -> bool {
+    let f = load();
+    match f.custom.get(&custom_key(c)) {
+        Some(e) => due(e.failed_at, e.fetched_at),
+        None => true,
+    }
+}
+
+/// `GET {base}/models` with `key` as the bearer (none for a keyless endpoint). Writes nothing;
+/// the base URL is checked again first and redirects are never followed.
+pub async fn custom_fetch(c: &CustomProvider, key: Option<&str>) -> Result<Vec<CustomRow>, DiscoverError> {
+    let failed = |m: String| DiscoverError::Failed(mu_base::secrets::redact_keys(&m));
+    let base = crate::provider::custom::check_base_url(&c.base_url).map_err(|e| failed(e.to_string()))?;
+    let client = crate::net::http_client().map_err(|e| failed(e.to_string()))?;
+    let auth = key.map_or(Auth::None, |k| Auth::Bearer(k.to_string()));
+    let rb = auth
+        .apply(client.get(format!("{base}/models")).timeout(Duration::from_secs(20)))
+        .map_err(|e| DiscoverError::Rejected(e.to_string()))?;
+    let resp = rb.send().await.map_err(|e| failed(format!("cannot reach {}: {e}", crate::net::host_of(&base))))?;
+    let status = resp.status().as_u16();
+    if matches!(status, 401 | 403) {
+        return Err(DiscoverError::Rejected(format!("{} rejected the credential (HTTP {status})", c.label())));
+    }
+    if !resp.status().is_success() {
+        return Err(failed(format!("{} answered HTTP {status} to GET /models", c.label())));
+    }
+    let body = resp.text().await.map_err(|e| failed(e.to_string()))?;
+    let rows = parse_generic(&body);
+    if rows.is_empty() {
+        return Err(failed(format!("{} listed no usable models at /models", c.label())));
+    }
+    Ok(rows)
+}
+
+/// Stores `rows` as this endpoint's listing, as of now.
+pub fn custom_commit(c: &CustomProvider, rows: Vec<CustomRow>) -> bool {
+    update(|f| {
+        let e = f.custom.entry(custom_key(c)).or_default();
+        e.fetched_at = Some(mu_base::message::now_ms());
+        e.failed_at = None;
+        e.models = rows;
+    })
+}
+
+fn custom_record_failure(c: &CustomProvider) {
+    update(|f| {
+        f.custom.entry(custom_key(c)).or_default().failed_at = Some(mu_base::message::now_ms());
+    });
+}
+
+/// Fetches and caches this endpoint's listing. A failure keeps the old same-endpoint cache and
+/// delays the next automatic try by an hour.
+pub async fn custom_refresh(c: &CustomProvider, key: Option<&str>) -> Result<usize, DiscoverError> {
+    match custom_fetch(c, key).await {
+        Ok(rows) => {
+            let n = rows.len();
+            custom_commit(c, rows);
+            Ok(n)
+        }
+        Err(e) => {
+            custom_record_failure(c);
+            Err(e)
+        }
+    }
+}
+
 /// Read-modify-writes the cache file privately, then drops the in-memory copy.
 fn update(change: impl FnOnce(&mut File)) -> bool {
+    // Concurrent refreshes in one process must not lose each other's rows.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = cache().load(|t| serde_json::from_str::<File>(t).ok()).unwrap_or_default();
     change(&mut file);
     let saved = serde_json::to_string(&file).map(|t| cache().save_private(&t)).unwrap_or(false);
@@ -355,5 +508,85 @@ mod refresh_tests {
             let path = mu_common::paths::profile_home().join("native-models.json");
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         });
+    }
+}
+
+#[cfg(test)]
+mod custom_tests {
+    use super::*;
+    use mu_testutil::{Reply, block_on, fake_server};
+
+    fn provider(id: &str, base: &str) -> CustomProvider {
+        CustomProvider::new(base).validated(id).unwrap()
+    }
+
+    #[test]
+    fn a_bare_openai_listing_parses_without_baseten_features() {
+        let rows = parse_generic(
+            r#"{"data":[{"id":"org/b"},{"id":"org/a","context_length":32768,"max_completion_tokens":4096},
+               {"id":"org/a"},{"id":"  "},{"id":"org/vllm","max_model_len":131072},{"id":"org/zero","context_length":0},{"object":"model"}]}"#,
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["org/a", "org/b", "org/vllm", "org/zero"], "sorted, deduplicated, blank ids dropped");
+        assert_eq!((rows[0].context_length, rows[0].max_completion_tokens), (Some(32768), Some(4096)));
+        assert_eq!((rows[1].context_length, rows[1].max_completion_tokens), (None, None));
+        assert_eq!(rows[2].context_length, Some(131_072));
+        assert_eq!(rows[3].context_length, None, "a zero window is unknown");
+        assert!(parse_generic("nope").is_empty() && parse_generic("{}").is_empty());
+    }
+
+    #[test]
+    fn a_fetch_is_draft_only_and_a_refresh_keeps_the_same_endpoints_cache_on_failure() {
+        mu_testutil::home();
+        block_on(async {
+            let body = r#"{"data":[{"id":"org/m","context_length":4096},{"id":"org/n"}]}"#;
+            let (base, seen) = fake_server(vec![
+                Reply::new(200, body),
+                Reply::new(200, body),
+                Reply::new(200, r#"{"data":[]}"#),
+                Reply::new(200, "<html>"),
+                Reply::new(404, "x"),
+                Reply::new(401, "x"),
+                Reply::new(503, "x"),
+            ])
+            .await;
+            let c = provider("disc-a", &base);
+            let rows = custom_fetch(&c, Some("tok-0123456789")).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            let req = seen.lock().unwrap()[0].to_lowercase();
+            assert!(req.starts_with("get /models ") && req.contains("authorization: bearer tok-0123456789"), "{req}");
+            assert!(custom_cached(&c).is_empty(), "a draft fetch writes nothing");
+
+            assert_eq!(custom_refresh(&c, None).await.unwrap(), 2);
+            assert!(!seen.lock().unwrap()[1].to_lowercase().contains("authorization"));
+            assert_eq!(custom_cached(&c).len(), 2);
+            assert_eq!(custom_find(&c, "org/m").unwrap().context_length, Some(4096));
+            assert!(!custom_stale(&c));
+
+            // Empty, malformed, 404, 401 and 5xx answers all keep the cache and say why.
+            for want_rejected in [false, false, false, true, false] {
+                let e = custom_refresh(&c, None).await.unwrap_err();
+                assert_eq!(matches!(e, DiscoverError::Rejected(_)), want_rejected, "{e}");
+                assert_eq!(custom_cached(&c).len(), 2);
+            }
+            assert!(!custom_stale(&c), "a failure just now is retried only after an hour");
+
+            // The same id at another base URL inherits nothing.
+            let moved = provider("disc-a", "https://moved.example/v1");
+            assert!(custom_cached(&moved).is_empty() && custom_find(&moved, "org/m").is_none());
+            assert!(custom_stale(&moved));
+            // Returning to the first base finds its cache again.
+            assert_eq!(custom_cached(&provider("disc-a", &base)).len(), 2);
+        });
+    }
+
+    #[test]
+    fn a_stale_check_follows_the_daily_and_hourly_rules() {
+        assert!(due(None, None));
+        let now = mu_base::message::now_ms();
+        assert!(!due(None, Some(now)));
+        assert!(due(None, Some(now - 25 * 3_600_000)));
+        assert!(!due(Some(now), Some(now - 3_600_000)), "a fresh failure waits an hour");
+        assert!(due(Some(now - 2 * 3_600_000), Some(now - 3 * 3_600_000)));
     }
 }

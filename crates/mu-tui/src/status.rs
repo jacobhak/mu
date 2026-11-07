@@ -281,6 +281,8 @@ fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
     }
     if s.chatgpt_plan {
         line.push(span(" · ChatGPT plan", st(Role::Muted)));
+    } else if s.native_keyless {
+        line.push(span(" · no auth", st(Role::Muted)));
     } else if s.native {
         line.push(span(" · key", st(Role::Muted)));
     }
@@ -556,6 +558,8 @@ mod tests {
         assert!(text(&s).ends_with(" · ChatGPT plan"), "{}", text(&s));
         s.chatgpt_plan = false;
         assert!(text(&s).ends_with(" · key"), "{}", text(&s));
+        s.native_keyless = true;
+        assert!(text(&s).ends_with(" · no auth"), "{}", text(&s));
     }
 
     #[test]

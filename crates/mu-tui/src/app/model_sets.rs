@@ -1,7 +1,6 @@
 //! `/modelset`: switch, create, delete and rename model sets, and copy omp's model config into
 //! `models.toml` (also offered once at startup).
 
-use super::slash::command_entries;
 use super::*;
 use crate::widgets::overlay::Overlay;
 use crate::widgets::select::{Item, Select};
@@ -35,11 +34,6 @@ impl App {
             }
             Err(e) => self.error(&e),
         }
-    }
-
-    /// The completion list names the sets, so it is rebuilt when they change.
-    fn refresh_commands(&mut self) {
-        self.prompt.commands = command_entries(&self.plugins, &self.ctx, &self.services.providers.cfg);
     }
 
     pub(super) fn open_set_picker(&mut self) {

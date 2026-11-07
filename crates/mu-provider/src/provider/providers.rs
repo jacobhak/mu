@@ -1,6 +1,7 @@
 //! Providers mu talks to directly with an API key, and their table. Everything else goes through the gateway.
 
 use super::client::Providers;
+use super::custom::{AuthMode, CustomProvider, KeyState, Registry};
 use crate::auth::chatgpt;
 use crate::model::{catalog, chatgpt_models, discovery};
 use mu_base::models::{self, Api, CompletionsCompat, ModelSpec, ThinkingMode};
@@ -114,47 +115,91 @@ pub const SEARCH_KEYS: [SearchKeyDef; 2] = [
     SearchKeyDef { id: "exa", label: "Exa", key_url: "https://dashboard.exa.ai/api-keys", env_hint: "EXA_API_KEY" },
 ];
 
-/// Something a key can be stored for: a chat provider or a search service.
-#[derive(Debug, Clone, Copy)]
+/// Where a direct request goes: a provider mu knows, or a custom endpoint from `providers.toml`.
+#[derive(Debug, Clone)]
+pub enum DirectProvider {
+    Builtin(&'static ProviderDef),
+    Custom(CustomProvider),
+}
+
+impl DirectProvider {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Builtin(d) => d.id,
+            Self::Custom(c) => &c.id,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Builtin(d) => d.label,
+            Self::Custom(c) => c.label(),
+        }
+    }
+}
+
+/// Something a key can be stored for: a chat provider, a search service or a custom endpoint.
+#[derive(Debug, Clone)]
 pub enum KeyTarget {
     Provider(&'static ProviderDef),
     Search(&'static SearchKeyDef),
+    Custom(CustomProvider),
 }
 
 impl KeyTarget {
-    pub fn find(id: &str) -> Option<Self> {
+    /// Built-in and search targets resolve at once; any other id is looked up in `registry`,
+    /// whose errors (an unreadable or invalid `providers.toml`) are passed on.
+    pub fn find(id: &str, registry: &Registry) -> anyhow::Result<Option<Self>> {
+        if native_def(id).is_some() || SEARCH_KEYS.iter().any(|d| d.id == id) {
+            return Ok(Self::builtin(id));
+        }
+        Ok(registry.snapshot()?.remove(id).map(Self::Custom))
+    }
+
+    /// A built-in chat provider or search service by id; never consults any configuration.
+    pub fn builtin(id: &str) -> Option<Self> {
         native_def(id)
             .filter(|d| d.kind == Credential::ApiKey)
             .map(Self::Provider)
             .or_else(|| SEARCH_KEYS.iter().find(|d| d.id == id).map(Self::Search))
     }
 
-    pub fn id(&self) -> &'static str {
+    pub fn id(&self) -> &str {
         match self {
             Self::Provider(d) => d.id,
             Self::Search(d) => d.id,
+            Self::Custom(c) => &c.id,
         }
     }
 
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
             Self::Provider(d) => d.label,
             Self::Search(d) => d.label,
+            Self::Custom(c) => c.label(),
         }
     }
 
-    pub fn key_url(&self) -> &'static str {
+    /// Where the user creates a key; empty for a custom endpoint, which has no such page.
+    pub fn key_url(&self) -> &str {
         match self {
             Self::Provider(d) => d.key_url,
             Self::Search(d) => d.key_url,
+            Self::Custom(_) => "",
         }
     }
 
-    pub fn env_hint(&self) -> &'static str {
+    pub fn env_hint(&self) -> &str {
         match self {
             Self::Provider(d) => d.env_hint,
             Self::Search(d) => d.env_hint,
+            Self::Custom(c) => &c.env_hint,
         }
+    }
+
+    /// A custom endpoint that takes no key at all.
+    pub fn is_keyless(&self) -> bool {
+        matches!(self, Self::Custom(c) if c.auth == AuthMode::None)
     }
 
     /// anthropic and openai: the key can serve chat models or only web search, so the user must say which.
@@ -214,6 +259,8 @@ pub struct DirectModel {
     pub id: String,
     pub provider: String,
     pub name: String,
+    /// A custom endpoint's credential state, for its rows; `None` for the built-in providers.
+    pub key: Option<KeyState>,
 }
 
 impl Providers {
@@ -223,18 +270,44 @@ impl Providers {
         if provider == chatgpt::PROVIDER_ID {
             return self.store.chatgpt_account().is_some_and(|a| a.plan_usage());
         }
-        native_def(provider).is_some_and(|d| d.kind == Credential::ApiKey)
-            && self.store.get(provider).is_some_and(|e| e.routes_chat())
+        if let Some(d) = native_def(provider) {
+            return d.kind == Credential::ApiKey && self.store.get(provider).is_some_and(|e| e.routes_chat());
+        }
+        // A configured custom namespace is native whatever its key state: a request without a
+        // usable key fails, it never falls through to the gateway.
+        self.registry.get(provider).is_ok_and(|c| c.is_some())
     }
 
     /// Models of the direct providers that have a key: the snapshot's rows (and, for Baseten,
-    /// the last discovered ones). Never touches the network. Sorted by provider, then id.
-    pub fn direct_models(&self) -> Vec<DirectModel> {
+    /// the last discovered ones), then every configured custom endpoint's manual and cached rows,
+    /// whatever its key state. Never touches the network. Built-ins sort by provider, then id.
+    /// An invalid `providers.toml` is an error.
+    pub fn direct_models(&self) -> anyhow::Result<Vec<DirectModel>> {
+        let custom = self.registry.snapshot()?;
         let mut out = Vec::new();
         for def in PROVIDERS.iter().filter(|d| self.is_direct(d.id)) {
             out.extend(self.provider_models(def));
         }
-        out
+        for c in custom.values() {
+            out.extend(self.custom_models(c));
+        }
+        Ok(out)
+    }
+
+    /// A custom endpoint's picker models: the configured ones and, when it discovers, its own
+    /// cached listing, sorted by id.
+    fn custom_models(&self, c: &CustomProvider) -> Vec<DirectModel> {
+        let key = Some(c.key_state(&self.store));
+        let mut rows: std::collections::BTreeMap<String, String> =
+            c.models.iter().map(|(id, m)| (id.clone(), m.name.clone().unwrap_or_else(|| id.clone()))).collect();
+        if c.discover {
+            for r in discovery::custom_cached(c) {
+                rows.entry(r.id.clone()).or_insert(r.id);
+            }
+        }
+        rows.into_iter()
+            .map(|(id, name)| DirectModel { id: format!("{}/{id}", c.id), provider: c.id.clone(), name, key })
+            .collect()
     }
 
     /// One direct provider's picker models: the ChatGPT account's own list once cached, else the catalogue.
@@ -248,6 +321,7 @@ impl Providers {
                         id: format!("{}/{}", def.id, m.slug),
                         provider: def.id.to_string(),
                         name: m.name,
+                        key: None,
                     })
                     .collect();
             }
@@ -259,6 +333,7 @@ impl Providers {
                 id: format!("{}/{}", def.id, r.id),
                 provider: def.id.to_string(),
                 name: r.name.clone().unwrap_or_else(|| r.id.clone()),
+                key: None,
             })
             .collect();
         if discovery::discovers(def) {
@@ -268,6 +343,7 @@ impl Providers {
                         id: format!("{}/{}", def.id, d.id),
                         provider: def.id.to_string(),
                         name: d.name.clone().unwrap_or_else(|| d.id.clone()),
+                        key: None,
                     },
                 ),
             );
@@ -287,6 +363,13 @@ impl Providers {
             let Ok(r) = self.store.resolve(def.id).await else { continue };
             if let Ok(c) = discovery::refresh(def, &r.key, r.base_url.as_deref()).await {
                 n += c;
+            }
+        }
+        if let Ok(custom) = self.registry.snapshot() {
+            for c in custom.values().filter(|c| c.discover && (force || discovery::custom_stale(c))) {
+                if let Ok(k) = c.refresh_models(&self.store).await {
+                    n += k;
+                }
             }
         }
         let due = self
@@ -328,7 +411,7 @@ mod tests {
         store.set("openai", Entry::literal("sk-test-0123456789")).unwrap();
         assert!(p.is_direct("openai"), "a stored key routes chat unless told otherwise");
         assert!(store.set_chat("openai", false).unwrap());
-        assert!(!p.is_direct("openai") && p.direct_models().is_empty());
+        assert!(!p.is_direct("openai") && p.direct_models().unwrap().is_empty());
         assert!(!store.set_chat("baseten", true).unwrap());
         // Parallel and Exa keys never route anything.
         store.set("parallel", Entry::literal("par-test-0123456789")).unwrap();
@@ -342,12 +425,14 @@ mod tests {
         use crate::auth::store::Store;
         use std::rc::Rc;
         assert!(api_key_defs().all(|d| d.id != "openai-chatgpt"));
-        assert!(KeyTarget::find("openai-chatgpt").is_none());
         let d = std::env::temp_dir().join(format!("mu-chatgpt-route-{}", uuid::Uuid::new_v4()));
         let store = Store::at(d.join("auth.json"));
         let p =
             Providers::with_store(Rc::new(Configs::default()), crate::provider::client::no_gateway(), store.clone());
-        assert!(!p.is_direct("openai-chatgpt") && p.direct_models().iter().all(|m| m.provider != "openai-chatgpt"));
+        assert!(KeyTarget::find("openai-chatgpt", p.custom_registry()).unwrap().is_none());
+        assert!(
+            !p.is_direct("openai-chatgpt") && p.direct_models().unwrap().iter().all(|m| m.provider != "openai-chatgpt")
+        );
         let tokens = |scopes: Vec<String>| Tokens {
             id_token: "id-0123456789".into(),
             access_token: "acc-0123456789".into(),
@@ -372,7 +457,7 @@ mod tests {
             (m.native, m.provider.as_str(), m.wire_id.as_str(), m.api),
             (true, "openai-chatgpt", "gpt-5.5", Api::OpenAiResponses)
         );
-        assert!(p.direct_models().iter().any(|m| m.id == "openai-chatgpt/gpt-5.5"));
+        assert!(p.direct_models().unwrap().iter().any(|m| m.id == "openai-chatgpt/gpt-5.5"));
         let (u, _) = p.resolve("openai-chatgpt/gpt-future-9").unwrap();
         assert_eq!((u.native, u.thinking.mode), (true, ThinkingMode::None));
         store.chatgpt_sign_out().unwrap();
@@ -383,11 +468,14 @@ mod tests {
 
     #[test]
     fn key_targets_cover_providers_and_search() {
+        let reg =
+            Registry::at(std::env::temp_dir().join(format!("mu-kt-{}", uuid::Uuid::new_v4())).join("providers.toml"));
+        let find = |i: &str| KeyTarget::find(i, &reg).unwrap();
         let ids: Vec<_> =
-            ["anthropic", "openai", "baseten", "parallel", "exa"].iter().map(|i| KeyTarget::find(i).unwrap()).collect();
+            ["anthropic", "openai", "baseten", "parallel", "exa"].iter().map(|i| find(i).unwrap()).collect();
         assert_eq!(ids.iter().filter(|t| t.asks_chat()).count(), 2);
-        assert!(KeyTarget::find("nope").is_none());
-        assert_eq!(KeyTarget::find("exa").unwrap().env_hint(), "EXA_API_KEY");
+        assert!(find("nope").is_none());
+        assert_eq!(find("exa").unwrap().env_hint(), "EXA_API_KEY");
         assert!(saved_notice(native_def("openai").unwrap(), false).contains("still go through omp"));
     }
 

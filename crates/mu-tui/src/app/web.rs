@@ -12,6 +12,7 @@ use mu_provider::provider::providers::KeyTarget;
 impl App {
     /// `reply` is the waiting `web_search` call, told whether web search is now ready.
     pub(super) fn start_web_wizard(&mut self, reply: Option<tokio::sync::oneshot::Sender<bool>>) {
+        self.leave_custom_wizard();
         if let Some((_, Some(old))) = self.flows.web_wizard.take() {
             let _ = old.send(false);
         }
@@ -29,7 +30,7 @@ impl App {
                 let rows = items.into_iter().map(|i| Item { label: i.label, detail: i.detail }).collect();
                 self.overlay = Some(Overlay::Web { sel: Select::new(&title, rows).context(&context).details(about) });
             }
-            Step::NeedKey(id) => match KeyTarget::find(id) {
+            Step::NeedKey(id) => match KeyTarget::builtin(id) {
                 // A key added here serves web search only; chat use is a separate, explicit choice.
                 Some(t) => self.start_key_flow(t, Some(false), Some(KeyThen::WebWizard)),
                 None => self.web_wizard_answer(Answer::KeyCancelled),

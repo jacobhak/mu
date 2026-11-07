@@ -119,6 +119,8 @@ pub struct StatusSnapshot {
     pub subscription: bool,
     /// Routed to the provider's own API with a key mu holds (shown as `· key`).
     pub native: bool,
+    /// A native custom endpoint that takes no key: shown as `· no auth` instead of `· key`.
+    pub native_keyless: bool,
     /// Runs on the user's ChatGPT plan (Sign in with ChatGPT): shown as `· ChatGPT plan` instead of
     /// `· key`, and not metered per token. Implies `native`.
     pub chatgpt_plan: bool,

@@ -3,10 +3,10 @@
 use super::child::ChildThen;
 use super::keys::is_baseten;
 use super::*;
+use crate::custom::wizard::Fetch;
 use crate::widgets::overlay::LoginTarget;
 use crate::widgets::select::{Item, Select};
 use mu_base::message::Image;
-use mu_base::models::GatewayModel;
 use mu_provider::auth::chatgpt::Account;
 use mu_provider::auth::check::Check;
 use mu_provider::auth::store::Entry;
@@ -22,9 +22,16 @@ pub(super) enum UiMsg {
     Sessions(Vec<mu_session::session::list::SessionInfo>),
     /// The result of a clipboard copy: the notice to show, or the error.
     Copied(Result<String, String>),
-    Models {
+    /// One source of the model pickers answered (the gateway, or one custom endpoint). The picker
+    /// for `request` rebuilds its rows from what is cached now; `diag` says what failed.
+    ModelsRefreshed {
         request: u64,
-        result: Result<Vec<GatewayModel>, String>,
+        diag: Option<String>,
+    },
+    /// The custom-endpoint wizard's model check answered, for the wizard `flow`.
+    CustomFetched {
+        flow: u64,
+        r: Fetch,
     },
     LoginProviders(Result<Vec<(usize, String)>, String>),
     /// An MCP login finished: tool count and whether the tool set changed.
@@ -102,32 +109,20 @@ impl App {
                 Ok(n) => self.notice(&n),
                 Err(e) => self.error(&format!("copy failed: {e}")),
             },
-            UiMsg::Models { request, result } => {
+            UiMsg::ModelsRefreshed { request, diag } => {
+                let gateway = self.services.providers.cached_models();
                 let session =
                     matches!(&self.overlay, Some(Overlay::Model { request: active, .. }) if *active == request);
-                let role_editor = matches!(&self.overlay, Some(Overlay::ModelRoles { .. }));
-                if !session && !role_editor {
+                if session {
+                    self.open_session_model_picker(request, &gateway);
+                } else if !self.show_role_models(request, &gateway) {
                     return;
                 }
-                let failed = result.as_ref().err().cloned();
-                let gateway = result.unwrap_or_default();
-                let (items, ids) = self.concrete_model_rows(&gateway);
-                let accepted = if session {
-                    self.open_session_model_picker(request, &gateway);
-                    true
-                } else if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
-                    st.models_loaded(request, items, ids)
-                } else {
-                    false
-                };
-                if accepted && let Some(e) = failed {
-                    if self.services.providers.direct_models().is_empty() {
-                        self.error(&format!("could not fetch gateway models: {e}"));
-                    } else {
-                        self.notice(&format!("gateway models unavailable: {e}"));
-                    }
+                if let Some(d) = diag {
+                    self.notice(&d);
                 }
             }
+            UiMsg::CustomFetched { flow, r } => self.on_custom_fetched(flow, r),
             UiMsg::McpLoggedIn(name, r) => match r {
                 Ok((n, changed)) => {
                     self.notice(&format!("mcp:{name}: logged in, {n} tools"));
@@ -154,6 +149,7 @@ impl App {
             UiMsg::MemoryShown(r) => self.on_memory_shown(r),
             UiMsg::MemoryReverted { short, r } => self.on_memory_reverted(&short, r),
             UiMsg::LoginProviders(r) => {
+                self.leave_custom_wizard();
                 let (mut items, mut targets) = self.api_key_rows();
                 match r {
                     Ok(list) => {
@@ -179,7 +175,7 @@ impl App {
                 Err(e) => self.notice(&e),
             },
             UiMsg::Ghost { seq, text, ghost } => {
-                if seq == self.prompt.ghost_seq && self.overlay.is_none() {
+                if seq == self.prompt.ghost_seq && self.overlay.is_none() && !self.key_flow_pending() {
                     self.prompt.composer.set_ghost(&text, ghost);
                 }
             }

@@ -2,12 +2,14 @@
 //! `agent_view` (the agent-event reducer), `ui_msgs` (results of background work and the tick),
 //! `slash` (what the composer submits), `pickers` (overlays), `child` (programs that take the
 //! terminal), `keys` (input routing and API keys), `mcp` (`/mcp`),
-//! `memory` (`/memory`), `model_sets` (`/modelset`), and `services` (the writes that leave the screen: config, stored keys, MCP
+//! `memory` (`/memory`), `model_sets` (`/modelset`), `custom_providers` (the custom-endpoint wizard),
+//! and `services` (the writes that leave the screen: config, stored keys, MCP
 //! definitions, session control).
 
 mod agent_view;
 mod chatgpt;
 mod child;
+mod custom_providers;
 mod keys;
 mod mcp;
 mod memory;
@@ -22,8 +24,8 @@ use self::agent_view::{AgentView, error_lines, notice_lines};
 use self::chatgpt::ChatgptFlow;
 use self::keys::KeyFlow;
 use self::services::Services;
-use self::slash::command_entries;
 pub use self::slash::interactive_reference;
+use self::slash::{command_entries, custom_completion_ids};
 use self::ui_msgs::UiMsg;
 use crate::chat::composer::Composer;
 use crate::mcp::mcp_wizard::Wizard;
@@ -126,6 +128,9 @@ struct Flows {
     chatgpt_seq: u64,
     /// The `/web` wizard, and who is waiting for it: a `web_search` call that found no backend.
     web_wizard: Option<(crate::web::wizard::Wizard, Option<tokio::sync::oneshot::Sender<bool>>)>,
+    /// The custom-endpoint wizard in progress, and the id that tells its late answers from another's.
+    custom_wizard: Option<custom_providers::CustomFlow>,
+    custom_wizard_seq: u64,
 }
 
 pub async fn run(init: AppInit) -> i32 {
@@ -152,7 +157,11 @@ pub async fn run(init: AppInit) -> i32 {
     } = init;
     let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
-    let commands = command_entries(&plugins, &ctx, &providers.cfg);
+    let (custom_ids, custom_err) = match custom_completion_ids(&providers) {
+        Ok(ids) => (ids, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let commands = command_entries(&plugins, &ctx, &providers.cfg, &custom_ids);
     let show_thinking = !providers.cfg.omp.hide_thinking_block;
     let smooth = providers.cfg.omp.display.smooth_streaming;
     let mut app = App {
@@ -189,6 +198,8 @@ pub async fn run(init: AppInit) -> i32 {
             key_flow_seq: 0,
             chatgpt: None,
             chatgpt_seq: 0,
+            custom_wizard: None,
+            custom_wizard_seq: 0,
         },
         quitting: false,
     };
@@ -198,6 +209,9 @@ pub async fn run(init: AppInit) -> i32 {
         theme_warnings.iter().chain(app.plugins.warnings.iter()).chain(store_warning.iter()).chain(store_check.iter())
     {
         app.agent.tr.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
+    }
+    if let Some(e) = custom_err {
+        app.error(&e);
     }
     if app.services.providers.cfg.import_offer.borrow().is_some() {
         if pick_session {

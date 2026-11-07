@@ -5,6 +5,9 @@
 
 pub mod client;
 pub(crate) mod complete;
+pub mod custom;
+#[cfg(test)]
+mod custom_tests;
 pub mod endpoint;
 pub(crate) mod gateway_models;
 pub mod providers;

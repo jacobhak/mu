@@ -1077,6 +1077,28 @@ fn a_native_model_pauses_the_quota_and_shows_no_windows() {
 }
 
 #[test]
+fn a_keyless_custom_model_is_reported_and_stays_native_when_its_definition_vanishes() {
+    use mu_provider::provider::custom::{AuthMode, CustomProvider};
+    run(async {
+        let (mut a, mut rx) = agent(vec![]);
+        let reg = a.ports.providers.custom_registry().clone();
+        let mut c = CustomProvider::new("http://127.0.0.1:9/v1");
+        c.auth = AuthMode::None;
+        reg.add("agent-cust", c).unwrap();
+        a.set_model("agent-cust/org/m");
+        let s = a.snapshot();
+        assert!(s.native && s.native_keyless && !s.reasoning, "{s:?}");
+        assert!(a.model.model.native && a.model.model.provider == "agent-cust");
+        assert!(!a.model.pricing_checked, "a custom endpoint never starts omp");
+        assert!(reg.remove("agent-cust").unwrap());
+        a.refresh_model_meta();
+        assert!(a.model.model.native, "the next request fails locally instead of reaching the gateway");
+        assert!(!a.snapshot().native_keyless);
+        drain(&mut rx);
+    });
+}
+
+#[test]
 fn without_notify_pending_files_are_ignored() {
     run(async {
         let (mut a, mut rx) = agent(vec![]);

@@ -380,6 +380,7 @@ impl App {
 
     /// `import` starts at the servers other tools have configured.
     fn start_mcp_wizard(&mut self, import: bool) {
+        self.leave_custom_wizard();
         let (all, _) = config::load_all(&self.cwd, &paths::omp_agent_dir());
         let found = self.found_servers(&all);
         if import && found.is_empty() {

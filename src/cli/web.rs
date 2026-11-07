@@ -51,7 +51,7 @@ fn plan_use(backend: SearchBackend, keyless: bool, has_key: bool) -> Result<Plan
     }
     if !has_key {
         let id = web::key_id(backend).unwrap_or_default();
-        let label = KeyTarget::find(id).map_or(id, |t| t.label());
+        let label = KeyTarget::builtin(id).map_or_else(|| id.to_string(), |t| t.label().to_string());
         let chat = if matches!(backend, SearchBackend::Anthropic | SearchBackend::Openai) { " --no-chat" } else { "" };
         bail!("no {label} key is stored; add one with `mu auth add {id}{chat}`");
     }

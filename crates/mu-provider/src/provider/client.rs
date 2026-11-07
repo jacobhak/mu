@@ -1,6 +1,7 @@
+use super::custom::{self, Registry};
 use super::endpoint;
 use super::gateway_models::load_cache;
-use super::providers::{Credential, ProviderDef, direct_spec, native_def};
+use super::providers::{Credential, DirectProvider, direct_spec, native_def};
 use super::retry;
 use super::types::{Auth, Decoder, ProviderError, Request, StreamEvent};
 use super::wire::{self, WireFormat};
@@ -27,7 +28,7 @@ pub(crate) struct Route {
     pub base: String,
     pub auth: Auth,
     /// The provider whose own API this is; `None` for the gateway.
-    pub def: Option<&'static ProviderDef>,
+    pub def: Option<DirectProvider>,
 }
 
 impl Route {
@@ -92,6 +93,8 @@ pub struct Providers {
     pub(super) gw_fresh: std::cell::Cell<bool>,
     pub(super) gateway: endpoint::GatewaySource,
     pub(super) store: crate::auth::store::Store,
+    /// The profile's custom endpoints, beside the key store.
+    pub(super) registry: Registry,
     /// Test seam: scripted replies, popped in order by `stream`.
     #[cfg(any(test, feature = "test-support"))]
     pub scripted: RefCell<std::collections::VecDeque<Result<Message, ProviderError>>>,
@@ -120,6 +123,7 @@ impl Providers {
         gateway: endpoint::GatewaySource,
         store: crate::auth::store::Store,
     ) -> Self {
+        let registry = Registry::at(store.path().with_file_name("providers.toml"));
         Self {
             cfg,
             client: OnceCell::new(),
@@ -127,6 +131,7 @@ impl Providers {
             gw_fresh: std::cell::Cell::new(false),
             gateway,
             store,
+            registry,
             #[cfg(any(test, feature = "test-support"))]
             scripted: Default::default(),
         }
@@ -142,9 +147,44 @@ impl Providers {
         &self.store
     }
 
+    /// The custom endpoints this profile defines; read fresh on each use.
+    pub fn custom_registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// Resolves a selector. A malformed `providers.toml` fails every resolution until it is
+    /// fixed: it never reads as "no custom endpoints", nor routes a custom id to the gateway.
     pub fn resolve(&self, sel: &str) -> Result<(ModelSpec, Option<Thinking>)> {
-        let direct = |p: &str, m: &str| self.is_direct(p).then(|| direct_spec(p, m)).flatten();
+        let custom = self.registry.snapshot()?;
+        let failure = RefCell::new(None);
+        let direct = |p: &str, m: &str| {
+            if let Some(c) = custom.get(p) {
+                let listed = crate::model::discovery::custom_find(c, m)
+                    .map_or((None, None), |r| (r.context_length, r.max_completion_tokens));
+                return match c.spec(m, listed) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        failure.borrow_mut().get_or_insert(e);
+                        None
+                    }
+                };
+            }
+            self.is_direct(p).then(|| direct_spec(p, m)).flatten()
+        };
         let (spec, level) = models::resolve(sel, &self.cfg, self.gw_models.borrow().as_deref(), &direct)?;
+        if let Some(e) = failure.into_inner() {
+            return Err(e);
+        }
+        if custom.contains_key(&spec.provider)
+            && (spec.context_window == 0 || spec.max_output == 0 || spec.max_output > spec.context_window)
+        {
+            return Err(anyhow::anyhow!(
+                "{}: output limit {} must be positive and at most the context window {} (check models.toml)",
+                spec.id,
+                spec.max_output,
+                spec.context_window
+            ));
+        }
         // The ChatGPT plan is never sent through the gateway; without a usable sign-in it has no spec.
         if spec.provider == chatgpt::PROVIDER_ID && !spec.native {
             return Err(anyhow::anyhow!(self.chatgpt_sign_in_needed()));
@@ -171,19 +211,34 @@ impl Providers {
     /// Where a request for `m` goes. `refresh` forces a new ChatGPT access token (after a 401).
     async fn route(&self, m: &ModelSpec, refresh: bool) -> Result<Route, ProviderError> {
         if m.native {
-            let def = native_def(&m.provider)
-                .ok_or_else(|| ProviderError::Fatal(format!("{} is not a native provider", m.provider)))?;
+            let Some(def) = native_def(&m.provider) else { return self.custom_route(m).await };
             if def.kind == Credential::ChatgptPlan {
                 let access = self.store.chatgpt_access(refresh).await.map_err(route_error)?;
                 let base = self.store.chatgpt_api_base();
-                return Ok(Route { base, auth: Auth::Bearer(access.token), def: Some(def) });
+                return Ok(Route { base, auth: Auth::Bearer(access.token), def: Some(DirectProvider::Builtin(def)) });
             }
             let r = self.store.resolve(&m.provider).await.map_err(|e| ProviderError::Fatal(e.to_string()))?;
             let base = r.base_url.unwrap_or_else(|| def.base_url.to_string());
-            return Ok(Route { base, auth: Auth::for_def(def, &r.key), def: Some(def) });
+            return Ok(Route { base, auth: Auth::for_def(def, &r.key), def: Some(DirectProvider::Builtin(def)) });
         }
         let ep = self.endpoint().await?;
         Ok(Route { base: ep.base, auth: Auth::Bearer(ep.token), def: None })
+    }
+
+    /// A custom endpoint's route, from its definition as the file holds it now. Never the gateway:
+    /// a removed definition, an unreadable file or a missing key fails the request here.
+    async fn custom_route(&self, m: &ModelSpec) -> Result<Route, ProviderError> {
+        let fatal = |e: anyhow::Error| ProviderError::Fatal(format!("{e:#}"));
+        let c =
+            self.registry.get(&m.provider).map_err(fatal)?.ok_or_else(|| {
+                ProviderError::Fatal(format!("custom provider `{}` is no longer configured", m.provider))
+            })?;
+        let base = custom::check_base_url(&c.base_url).map_err(fatal)?;
+        let auth = match c.credential(&self.store).await.map_err(fatal)? {
+            Some(key) => Auth::Bearer(key),
+            None => Auth::None,
+        };
+        Ok(Route { base, auth, def: Some(DirectProvider::Custom(c)) })
     }
 
     pub async fn stream(
@@ -333,7 +388,7 @@ async fn check_status(
         _ = cancel.cancelled() => return Err(ProviderError::Aborted),
     };
     let text = mu_base::secrets::redact_keys(&body);
-    if let Some(def) = route.def
+    if let Some(DirectProvider::Builtin(def)) = &route.def
         && def.kind == Credential::ChatgptPlan
     {
         // One forced refresh per stream: a second rejection of a fresh token means the sign-in is no good.
@@ -347,18 +402,18 @@ async fn check_status(
         let e = retry::chatgpt_error(status.as_u16(), retry_after, &text, request_id.as_deref());
         return Err(retry::honour_should_retry(e, should_retry));
     }
-    if let Some(def) = route.def
+    if let Some(def) = &route.def
         && status.as_u16() == 401
         && !*rekeyed
-        && crate::auth::store::forget_cached(store, def.id)
+        && crate::auth::store::forget_cached(store, def.id())
     {
         *rekeyed = true;
         return Err(ProviderError::Retryable {
-            msg: format!("{} rejected the API key; running its command again", def.label),
+            msg: format!("{} rejected the API key; running its command again", def.label()),
             retry_after: Some(Duration::ZERO),
         });
     }
-    Err(retry::http_error(status.as_u16(), retry_after, should_retry, &text, route.def.map(|d| d.label)))
+    Err(retry::http_error(status.as_u16(), retry_after, should_retry, &text, route.def.as_ref().map(|d| d.label())))
 }
 
 /// Feeds the response's bytes to `dec` until it completes the message. Silence for `STREAM_IDLE`
@@ -448,7 +503,7 @@ mod route_tests {
         let n = Route {
             base: "https://api.anthropic.com/v1".into(),
             auth: Auth::XApiKey("k".into()),
-            def: native_def("anthropic"),
+            def: native_def("anthropic").map(DirectProvider::Builtin),
         };
         assert_eq!((n.peer().as_str(), n.idle_peer().as_str()), ("api.anthropic.com", "api.anthropic.com"));
     }

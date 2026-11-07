@@ -133,6 +133,18 @@ pub fn now() -> String {
     jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// `Store::set_if_absent` found a credential already stored for the provider and left it alone.
+#[derive(Debug)]
+pub struct EntryExists(pub String);
+
+impl fmt::Display for EntryExists {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "a credential for {} already exists", self.0)
+    }
+}
+
+impl std::error::Error for EntryExists {}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FileData {
     #[serde(default)]
@@ -324,8 +336,8 @@ impl Store {
         Ok(changed)
     }
 
-    /// Adds or replaces a provider's entry.
-    pub fn set(&self, provider: &str, entry: Entry) -> Result<()> {
+    /// Validates `entry` and registers its key for redaction, before it is written.
+    fn prepare(&self, provider: &str, entry: &Entry) -> Result<()> {
         if entry.origin().is_none() {
             bail!("an entry needs a key or a reference");
         }
@@ -336,11 +348,31 @@ impl Store {
             mu_base::secrets::register_stored(&label(provider), k);
         }
         forget_cached(&self.path, provider);
+        Ok(())
+    }
+
+    /// Adds or replaces a provider's entry.
+    pub fn set(&self, provider: &str, entry: Entry) -> Result<()> {
+        self.prepare(provider, &entry)?;
         self.modify(|d| {
             d.providers.insert(provider.to_string(), entry);
             true
         })?;
         Ok(())
+    }
+
+    /// Adds `provider`'s entry unless one exists, checked under the lock so a concurrent writer's
+    /// key is never replaced. [`EntryExists`] when there is one.
+    pub fn set_if_absent(&self, provider: &str, entry: Entry) -> Result<()> {
+        self.prepare(provider, &entry)?;
+        let inserted = self.modify(|d| {
+            if d.providers.get(provider).is_some_and(|e| e.origin().is_some()) {
+                return false;
+            }
+            d.providers.insert(provider.to_string(), entry);
+            true
+        })?;
+        if inserted { Ok(()) } else { Err(EntryExists(provider.to_string()).into()) }
     }
 
     /// Decides whether `provider`'s chat models use its key. `false` when there is no entry.
@@ -511,6 +543,24 @@ mod tests {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text).unwrap();
         std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[test]
+    fn set_if_absent_never_replaces_a_stored_credential() {
+        let (s, d) = store("absent");
+        s.set_if_absent("modal", Entry::literal("first-key-0123456789")).unwrap();
+        let e = s.set_if_absent("modal", Entry::literal("second-key-0123456789")).unwrap_err();
+        assert!(e.downcast_ref::<EntryExists>().is_some(), "{e}");
+        assert_eq!(rt(s.resolve("modal")).unwrap().key, "first-key-0123456789");
+        // An entry mu ignores (no key or reference) does not count as stored.
+        s.modify(|d| {
+            d.providers.insert("blank".into(), Entry::default());
+            true
+        })
+        .unwrap();
+        s.set_if_absent("blank", Entry::literal("real-key-0123456789")).unwrap();
+        assert!(s.has("blank"));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

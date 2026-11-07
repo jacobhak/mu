@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// Field names a reasoning delta may arrive under, in the order they are tried.
-const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
+pub(crate) const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
 pub struct Completions;
 
@@ -68,7 +68,31 @@ pub fn body(req: &Request) -> Value {
     {
         body["reasoning_effort"] = e.into();
     }
+    // Custom endpoints' extra fields, last: the base map, then the one for the thinking state, so an
+    // explicit off setting is never overwritten by the base. Empty for every built-in model.
+    let conditional = if req.thinking.get() == Thinking::Off { &compat.extra_body_off } else { &compat.extra_body_on };
+    if let Some(obj) = body.as_object_mut() {
+        for extra in [&compat.extra_body, conditional] {
+            merge_into(obj, extra, true);
+        }
+    }
     body
+}
+
+/// Merges `src` into `dst`: objects merge child by child, scalars and arrays replace. At the root,
+/// the fields mu owns are never replaced.
+fn merge_into(dst: &mut serde_json::Map<String, Value>, src: &serde_json::Map<String, Value>, root: bool) {
+    for (k, v) in src {
+        if root && crate::provider::custom::RESERVED_BODY_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        match (dst.get_mut(k), v) {
+            (Some(Value::Object(d)), Value::Object(s)) => merge_into(d, s, false),
+            _ => {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+    }
 }
 
 /// The `reasoning_effort` to send. Off is disabled per the model's disable mode: `none-effort`
@@ -603,6 +627,63 @@ mod tests {
             timestamp: 0,
             details: None,
         }
+    }
+
+    fn custom(toml: &str, id: &str) -> ModelSpec {
+        let c: crate::provider::custom::CustomProvider = toml::from_str(toml).unwrap();
+        c.validated("vl").unwrap().spec(id, (None, None)).unwrap()
+    }
+
+    #[test]
+    fn a_template_model_toggles_nested_options_and_never_sends_an_effort() {
+        let m = custom(
+            r#"base_url = "https://x.test/v1"
+            [models."org/m"]
+            reasoning = "template"
+            [models."org/m".extra_body]
+            temperature = 0.6
+            [models."org/m".extra_body.chat_template_kwargs]
+            preserve = "me"
+            [models."org/m".extra_body_on.chat_template_kwargs]
+            enable_thinking = true
+            [models."org/m".extra_body_off.chat_template_kwargs]
+            enable_thinking = false"#,
+            "org/m",
+        );
+        let msgs = [Message::user("hi")];
+        for (level, on) in [(Thinking::Off, false), (Thinking::Low, true), (Thinking::Max, true)] {
+            let b = body(&request(&m, level, &[], &msgs));
+            assert_eq!(b["chat_template_kwargs"], json!({"preserve": "me", "enable_thinking": on}), "{level:?}");
+            assert_eq!(b["temperature"], 0.6);
+            assert!(b.get("reasoning_effort").is_none());
+            assert_eq!(b["model"], "org/m");
+        }
+        // A model with no extras gets exactly the plain request.
+        let plain = custom("base_url = \"https://x.test/v1\"", "org/plain");
+        let b = body(&request(&plain, Thinking::High, &[], &msgs));
+        let keys: Vec<&str> = b.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["model", "messages", "stream", "max_tokens", "stream_options"]);
+    }
+
+    #[test]
+    fn an_effort_model_sends_its_ladder_and_extras_cannot_replace_the_envelope() {
+        let m = custom(
+            r#"base_url = "https://x.test/v1"
+            [models."org/e"]
+            reasoning = "effort"
+            efforts = ["low", "high"]"#,
+            "org/e",
+        );
+        assert_eq!(effort(&m, Thinking::Max).as_deref(), Some("high"));
+        assert_eq!(effort(&m, Thinking::Low).as_deref(), Some("low"));
+        assert_eq!(effort(&m, Thinking::Off), None);
+        // Defence in depth: even a spec built by hand cannot replace mu's own fields.
+        let mut hacked = m.clone();
+        hacked.compat.as_mut().unwrap().extra_body.insert("stream".into(), json!(false));
+        hacked.compat.as_mut().unwrap().extra_body.insert("opts".into(), json!({"model": "inner"}));
+        let b = body(&request(&hacked, Thinking::High, &[], &[]));
+        assert_eq!(b["stream"], true);
+        assert_eq!(b["opts"]["model"], "inner");
     }
 
     #[test]
@@ -1170,7 +1251,8 @@ data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}
         let route = Route {
             base: "https://inference.baseten.co/v1".into(),
             auth: Auth::Bearer(key.clone()),
-            def: crate::provider::providers::native_def("baseten"),
+            def: crate::provider::providers::native_def("baseten")
+                .map(crate::provider::providers::DirectProvider::Builtin),
         };
         let mut w = wire(&req, &route).unwrap();
         let resp = reqwest::Client::new()

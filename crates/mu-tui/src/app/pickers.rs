@@ -36,15 +36,14 @@ impl App {
         self.overlay = Some(Overlay::new_ask(qs, reply));
     }
 
+    /// Opens the session picker at once with the rows already known (cached gateway models,
+    /// direct and custom ones, `models.toml`), then refreshes each source; see `fetch_models`.
     pub(super) fn request_models(&mut self) {
         self.flows.model_request_seq += 1;
         let request = self.flows.model_request_seq;
-        self.notice("fetching models…");
-        self.overlay = Some(Overlay::Model {
-            sel: Select::new("Switch model (this session)", vec![]).context("Loading models…").back_keys(true),
-            ids: Vec::new(),
-            request,
-        });
+        self.leave_custom_wizard();
+        let gateway = self.services.providers.cached_models();
+        self.open_session_model_picker(request, &gateway);
         self.fetch_models(request);
     }
 
@@ -56,26 +55,61 @@ impl App {
         } else {
             return;
         }
-        self.notice("fetching models…");
+        let gateway = self.services.providers.cached_models();
+        self.show_role_models(request, &gateway);
         self.fetch_models(request);
     }
 
+    /// Fills the role editor's list for `request`; false when it is no longer waiting for it.
+    pub(super) fn show_role_models(&mut self, request: u64, gateway: &[GatewayModel]) -> bool {
+        let (items, ids, error) = self.concrete_model_rows(gateway);
+        match &mut self.overlay {
+            Some(Overlay::ModelRoles { st }) => st.models_loaded(request, items, ids, error.as_deref()),
+            _ => false,
+        }
+    }
+
+    /// Refreshes what the pickers list, each source in its own task: the gateway, then every custom
+    /// endpoint that discovers. Each answer is a `ModelsRefreshed` for `request`, and a failure
+    /// keeps the rows already listed.
     fn fetch_models(&self, request: u64) {
         let providers = self.services.providers.clone();
         let tx = self.ui_tx.clone();
+        let (p, t) = (providers.clone(), tx.clone());
         tokio::task::spawn_local(async move {
-            let result = providers.gateway_models().await.map_err(|e| e.to_string());
-            let _ = tx.send(UiMsg::Models { request, result });
+            let diag = p.gateway_models().await.err().map(|e| format!("gateway models unavailable: {e:#}"));
+            let _ = t.send(UiMsg::ModelsRefreshed { request, diag });
         });
+        // A providers.toml that does not read is shown by the picker; there is nothing to fetch.
+        let Ok(custom) = providers.custom_registry().snapshot() else { return };
+        for c in custom.into_values().filter(|c| c.discover) {
+            let (p, t) = (providers.clone(), tx.clone());
+            tokio::task::spawn_local(async move {
+                let diag = c
+                    .refresh_models(p.store())
+                    .await
+                    .err()
+                    .map(|e| format!("{}: its models were not refreshed: {e:#}", c.label()));
+                let _ = t.send(UiMsg::ModelsRefreshed { request, diag });
+            });
+        }
     }
 
-    pub(super) fn concrete_model_rows(&self, gateway: &[GatewayModel]) -> (Vec<Item>, Vec<String>) {
+    /// The rows of the concrete models: direct and custom ones, then the gateway's, then
+    /// `models.toml`'s. A `providers.toml` that does not read is returned as the error, with the rows
+    /// that do not depend on it.
+    pub(super) fn concrete_model_rows(&self, gateway: &[GatewayModel]) -> (Vec<Item>, Vec<String>, Option<String>) {
         let providers = &self.services.providers;
+        let (direct, error) = match providers.direct_models() {
+            Ok(d) => (d, None),
+            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+        };
         let mut items = Vec::new();
         let mut ids = Vec::new();
-        for m in providers.direct_models() {
+        for m in direct {
             if !ids.contains(&m.id) {
-                items.push(Item { label: m.id.clone(), detail: chatgpt::native_label(&m.provider).into() });
+                let detail = m.key.map_or_else(|| chatgpt::native_label(&m.provider).into(), |k| k.word().to_string());
+                items.push(Item { label: m.id.clone(), detail });
                 ids.push(m.id);
             }
         }
@@ -97,10 +131,16 @@ impl App {
                 ids.push(id);
             }
         }
-        (items, ids)
+        (items, ids, error)
     }
 
+    /// Lists the session's models for `request`, keeping the highlighted one when the list is
+    /// rebuilt by a refresh.
     pub(super) fn open_session_model_picker(&mut self, request: u64, gateway: &[GatewayModel]) {
+        let kept = match &self.overlay {
+            Some(Overlay::Model { sel, ids, .. }) => sel.highlighted().and_then(|i| ids.get(i)).cloned(),
+            _ => None,
+        };
         let mut items = Vec::new();
         let mut ids = Vec::new();
         let mut details = Vec::new();
@@ -112,20 +152,21 @@ impl App {
             ids.push(format!("@{}", role.name));
             details.push(Some(format!("{}\nEnter switches this session to it.", role.detail())));
         }
-        let (concrete, concrete_ids) = self.concrete_model_rows(gateway);
+        let (concrete, concrete_ids, error) = self.concrete_model_rows(gateway);
         items.extend(concrete);
         ids.extend(concrete_ids);
         details.resize(items.len(), None);
-        let context = if items.is_empty() {
-            "No models available; use /login to configure a provider"
-        } else {
-            "Session-only model switch"
+        let context = match error {
+            Some(e) => e,
+            None if items.is_empty() => "No models available; use /login to configure a provider".into(),
+            None => "Session-only model switch".into(),
         };
-        self.overlay = Some(Overlay::Model {
-            sel: Select::new("Switch model (this session)", items).context(context).details(details).back_keys(true),
-            ids,
-            request,
-        });
+        let mut sel =
+            Select::new("Switch model (this session)", items).context(&context).details(details).back_keys(true);
+        if let Some(i) = kept.and_then(|id| ids.iter().position(|m| *m == id)) {
+            sel = sel.preselect(i);
+        }
+        self.overlay = Some(Overlay::Model { sel, ids, request });
     }
 
     pub(super) fn open_model_roles(&mut self, role: Option<String>) {
@@ -316,7 +357,7 @@ impl App {
                 if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
                     st.saved(active, roles);
                 }
-                self.prompt.commands = super::slash::command_entries(&self.plugins, &self.ctx, cfg);
+                self.refresh_commands();
                 if value.is_some() {
                     self.notice(&format!("saved @{role} in set {set}"));
                 } else {
@@ -340,15 +381,19 @@ impl App {
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ChatGpt) => self.chatgpt_row(),
+            OverlayEvent::Login(LoginTarget::CustomProvider) => self.start_custom_wizard(),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
-                if let Some(target) = KeyTarget::find(&id) {
-                    self.begin_key(target);
+                match KeyTarget::find(&id, self.services.providers.custom_registry()) {
+                    Ok(Some(target)) => self.begin_key(target),
+                    Ok(None) => {}
+                    Err(e) => self.error(&format!("{e:#}")),
                 }
             }
             OverlayEvent::Key { provider, choice } => self.on_key_choice(&provider, choice),
             OverlayEvent::Logout(provider) => self.logout(&provider),
             OverlayEvent::Mcp(pick, row) => self.on_mcp_pick(pick, row),
             OverlayEvent::Web(row) => self.on_web_pick(row),
+            OverlayEvent::CustomWizard(row) => self.on_custom_pick(row),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
             OverlayEvent::Quote(q) => self.prompt.composer.append_quotes(&q),
             OverlayEvent::Resume(p) => {

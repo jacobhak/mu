@@ -97,6 +97,9 @@ pub enum ThinkingMode {
     AnthropicAdaptive,
     /// OpenAI-style `reasoning.effort` / `reasoning_effort`.
     Effort,
+    /// A server toggled by request parameters (vLLM chat-template switches): the model's
+    /// `extra_body_on`/`extra_body_off` maps, with no effort value.
+    Template,
 }
 
 impl ThinkingMode {
@@ -107,6 +110,7 @@ impl ThinkingMode {
             "anthropic-budget-effort" => Self::BudgetEffort,
             "anthropic-adaptive" => Self::AnthropicAdaptive,
             "effort" => Self::Effort,
+            "template" => Self::Template,
             _ => Self::None,
         }
     }
@@ -146,7 +150,7 @@ pub fn clamp_effort(level: Thinking, efforts: &[String]) -> Option<&str> {
 }
 
 /// Per-model flags for Chat Completions servers, as omp resolves them in its catalog.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompletionsCompat {
     pub max_tokens_field: String,
@@ -165,6 +169,11 @@ pub struct CompletionsCompat {
     pub reasoning_disable_mode: Option<String>,
     pub thinking_format: Option<String>,
     pub strip_image_input: bool,
+    /// Extra request fields merged into every request (custom endpoints only).
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+    /// Merged after `extra_body` while thinking is on / off.
+    pub extra_body_on: serde_json::Map<String, serde_json::Value>,
+    pub extra_body_off: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for CompletionsCompat {
@@ -183,6 +192,9 @@ impl Default for CompletionsCompat {
             reasoning_disable_mode: None,
             thinking_format: None,
             strip_image_input: false,
+            extra_body: Default::default(),
+            extra_body_on: Default::default(),
+            extra_body_off: Default::default(),
         }
     }
 }

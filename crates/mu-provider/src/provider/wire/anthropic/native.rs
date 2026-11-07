@@ -34,7 +34,7 @@ pub fn thinking_params(m: &ModelSpec, level: Thinking, max_tokens: u32) -> Think
     let q = &m.anthropic;
     match m.thinking.mode {
         ThinkingMode::None => return ThinkingParams::default(),
-        ThinkingMode::Gateway | ThinkingMode::Effort => return ThinkingParams::default(),
+        ThinkingMode::Gateway | ThinkingMode::Effort | ThinkingMode::Template => return ThinkingParams::default(),
         _ => {}
     }
     let forced = level == Thinking::Off && q.requires_thinking_enabled && q.disabled_thinking.is_none();

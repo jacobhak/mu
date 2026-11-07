@@ -4436,6 +4436,8 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "tokio-util",
+ "toml",
+ "toml_edit",
  "uuid",
 ]
 

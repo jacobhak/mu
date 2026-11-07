@@ -92,9 +92,14 @@ pub(super) fn role_views(cfg: &Configs, ctx: &Context) -> Vec<RoleView> {
     roles::views(cfg, &agents)
 }
 
+/// The custom endpoint ids in `providers.toml`, for completion. A file that does not read is its error.
+pub(super) fn custom_completion_ids(providers: &Providers) -> Result<Vec<String>, String> {
+    providers.custom_registry().snapshot().map(|c| c.into_keys().collect()).map_err(|e| format!("{e:#}"))
+}
+
 /// The completion list of the composer: the built-in commands, `/mcp` subcommands, the login and
-/// logout targets, then the commands and skills that come from the context.
-pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs) -> Vec<Entry> {
+/// logout targets (with the custom endpoint ids), then the commands and skills that come from the context.
+pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs, custom_ids: &[String]) -> Vec<Entry> {
     let mut commands: Vec<Entry> = BUILTIN_DESC
         .iter()
         .map(|&(name, desc, needs_arg)| {
@@ -122,7 +127,9 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs
                 "mcp" => MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip(),
                 "login" => (
                     std::iter::once(PROVIDER_ID.to_string())
+                        .chain(std::iter::once("custom".to_string()))
                         .chain(providers::api_key_defs().map(|d| d.id.to_string()))
+                        .chain(custom_ids.iter().cloned())
                         .chain(plugins.mcp_names().iter().map(|n| format!("mcp:{n}")))
                         .collect(),
                     vec![],
@@ -130,6 +137,7 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs
                 "logout" => (
                     std::iter::once(PROVIDER_ID.to_string())
                         .chain(providers::api_key_defs().map(|d| d.id.to_string()))
+                        .chain(custom_ids.iter().cloned())
                         .collect(),
                     vec![],
                 ),
@@ -156,6 +164,18 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs
 }
 
 impl App {
+    /// Rebuilds the completion list, which names the model sets and the custom endpoints.
+    pub(super) fn refresh_commands(&mut self) {
+        let ids = match custom_completion_ids(&self.services.providers) {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.error(&e);
+                Vec::new()
+            }
+        };
+        self.prompt.commands = command_entries(&self.plugins, &self.ctx, &self.services.providers.cfg, &ids);
+    }
+
     pub(super) fn submit(&mut self, mut input: UserInput, follow_up: bool) {
         if self.flows.mcp_wizard.is_some() && input.images.is_empty() {
             let line = input.text.trim().to_string();

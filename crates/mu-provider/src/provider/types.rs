@@ -13,6 +13,8 @@ use std::time::Duration;
 pub(crate) enum Auth {
     Bearer(String),
     XApiKey(String),
+    /// A keyless custom endpoint: no auth header at all.
+    None,
 }
 
 impl Auth {
@@ -26,6 +28,7 @@ impl Auth {
     /// The key goes in a header marked sensitive, so it never shows in debug output.
     pub fn apply(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, ProviderError> {
         Ok(match self {
+            Self::None => rb,
             Self::Bearer(t) => rb.bearer_auth(t),
             Self::XApiKey(k) => {
                 let mut v = reqwest::header::HeaderValue::from_str(k).map_err(|_| {

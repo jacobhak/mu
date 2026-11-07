@@ -51,6 +51,7 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Deliver(a) => Ok(deliver::run_cli(a, &std::env::current_dir()?)),
         Sub::Update { check, force, tag } => update::run(check, force, tag),
         Sub::Auth { cmd } => cli::auth::run(cmd),
+        Sub::Providers { cmd } => cli::providers::run(cmd),
         Sub::Web { cmd } => cli::web::run(cmd),
         Sub::Models { cmd } => cli::models::run(cmd),
         Sub::Predict { cmd } => cli::predict::run(cmd),

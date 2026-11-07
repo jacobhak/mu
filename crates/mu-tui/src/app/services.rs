@@ -4,7 +4,9 @@
 use mu_common::paths;
 use mu_provider::auth::store::Entry;
 use mu_provider::auth::web::WebSearch;
+use mu_provider::model::discovery::{self, CustomRow};
 use mu_provider::provider::client::Providers;
+use mu_provider::provider::custom::{self, CustomProvider, SaveError};
 use mu_session::session::{control, inbox};
 use mu_tools::mcp::store::{self, Level};
 use serde_json::Value;
@@ -44,6 +46,21 @@ impl Services {
 
     pub(super) fn save_key(&self, id: &str, entry: Entry) -> Result<(), String> {
         self.providers.store().set(id, entry).map_err(|e| e.to_string())
+    }
+
+    /// Writes a new custom endpoint: its definition, then its key (see `custom::save`).
+    pub(super) fn save_custom(
+        &self,
+        id: &str,
+        provider: CustomProvider,
+        entry: Option<Entry>,
+    ) -> Result<CustomProvider, SaveError> {
+        custom::save(self.providers.custom_registry(), self.providers.store(), id, provider, entry)
+    }
+
+    /// Caches the listing read for a saved endpoint.
+    pub(super) fn commit_custom(&self, provider: &CustomProvider, rows: Vec<CustomRow>) {
+        discovery::custom_commit(provider, rows);
     }
 
     pub(super) fn set_chat(&self, id: &str, chat: bool) -> Result<bool, String> {

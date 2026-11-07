@@ -80,6 +80,10 @@ pub fn setup(cwd: &std::path::Path) -> Setup {
         cfgs.clone(),
         mu_provider::provider::endpoint::GatewaySource::new(host.gateway_start()),
     ));
+    // A malformed providers.toml is reported here; model resolution fails on it until it is fixed.
+    if let Err(e) = providers.custom_registry().snapshot() {
+        let _ = notice_tx.send(format!("warning: {e:#}"));
+    }
     host.set_providers(&providers);
     Setup { cfgs, ctx, host, providers, notice_tx, notice_rx }
 }

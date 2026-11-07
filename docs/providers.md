@@ -60,6 +60,52 @@ mu auth test openai-chatgpt                  # does the plan answer?
 
 `--no-validate` saves without asking the provider. `--env` and `--cmd` are exclusive.
 
+## Custom endpoints (vLLM, Modal, any OpenAI-compatible server)
+
+Any server that speaks Chat Completions (`POST <base>/chat/completions`, `GET <base>/models`) can be a named provider, with no omp involved. Set one up from `/login` ("Add custom OpenAI-compatible endpoint", or `/login custom`), or from a shell:
+
+```sh
+mu providers add modal --base-url https://example--serve.modal.run/v1 --label Modal --env MODAL_API_KEY
+mu providers add local --base-url http://127.0.0.1:8000/v1 --no-auth --model Qwen/Qwen3-32B --context-window 32768 --max-tokens 4096
+mu providers list
+mu providers models modal --refresh   # GET /models now, with the real error if it fails
+mu providers rm modal                 # removes the definition and its stored key; roles are never touched
+```
+
+The base URL is used exactly as given (include `/v1` when the server's API lives there); `/models` and `/chat/completions` are appended. It must be `https`, or `http` to a loopback address, and carry no user name, password, query or fragment; redirects are never followed, so a key only reaches the host you named. Keys are never accepted as arguments: `mu providers add` reads one from stdin or a no-echo prompt, or takes `--env NAME` / `--cmd 'command'` (read at request time, as for `mu auth add`). `--no-auth` is for servers that need none. mu checks `GET /models` with the key before saving (`401`/`403` saves nothing; other failures need `--no-validate`). The guided `/login` flow does the same, reviews what it will write, and writes only on Save; Esc at any step writes nothing. Neither flow picks a model or edits a role: use `/switch <id>/<model>` to try it and `/model` to save a role.
+
+Definitions live in `providers.toml` in the [profile home](usage.md#profile-home), never keys. The file is read afresh on every use, so a change made by `mu providers`, another session or your editor applies without a restart. A file that does not parse or validate blocks model resolution (and `/switch`, `/model`) with the path and the key at fault, until it is fixed. Unknown keys are errors. The key itself is stored under the provider id in `auth.json` like any other (`mu auth add|test|rm <id>`, `/login <id>`, `/logout`), always for chat, and never with its own `baseUrl`.
+
+```toml
+[providers.modal]
+label = "Modal"                     # optional; defaults to the id
+base_url = "https://endpoint.example/v1"
+auth = "bearer"                     # default; or "none"
+discover = true                     # default: GET <base_url>/models fills the model lists
+
+[providers.modal.models."Qwen/example"]   # optional: a manual row, limits and request settings
+name = "Example"
+context_window = 32768              # defaults: 32768 (or what /models reports)
+max_tokens = 4096                   # default 4096, at most the context window
+images = false
+reasoning = "template"              # "none" (default), "effort" (needs efforts = ["low", ...]) or "template"
+
+[providers.modal.models."Qwen/example".compat]        # the same flags as the catalog's compat, camelCase
+reasoningContentField = "reasoning_content"
+requiresReasoningContentForToolCalls = true
+
+[providers.modal.models."Qwen/example".extra_body]    # non-secret request fields, merged into every request
+temperature = 0.6
+[providers.modal.models."Qwen/example".extra_body_on.chat_template_kwargs]    # merged while thinking is on
+enable_thinking = true
+[providers.modal.models."Qwen/example".extra_body_off.chat_template_kwargs]   # and while it is off
+enable_thinking = false
+```
+
+A selector is `<id>/<exact server model id>` (`modal/Qwen/example`); it works whether or not the model is listed or configured, with text and tools, no images and no reasoning unless you say so. `effort` sends `reasoning_effort` from the ladder like Baseten; `template` sends no effort and toggles the `extra_body_on`/`extra_body_off` maps (every level but `off` means on). Extra maps merge objects key by key and replace anything else; their top level may not hold `model`, `messages`, `tools`, `tool_choice`, `functions`, `function_call`, `stream`, `stream_options`, `max_tokens`, `max_completion_tokens` or `reasoning_effort`, and they are for non-secret values only. Limits: `models.toml` over your entry over what `/models` reported over the defaults. Prices are unknown, so spend shows as unpriced. A custom model never falls through to the gateway: a missing key, an unresolvable `$NAME` or `!command`, a key not enabled for chat, or a removed definition is an error naming the provider. The status line shows `· key`, or `· no auth` for a keyless endpoint.
+
+Discovery (`GET /models`, at most daily, an hour after a failure) is cached per provider id and base URL in `native-models.json`, so changing the URL never shows the old server's models. Session files record the provider and model ids but no URL or key: resuming one in another profile needs a definition with the same id there.
+
 ## The store
 
 `auth.json` lives in the [profile home](usage.md#profile-home) (`~/.mu/auth.json`, or `~/.mu/profiles/<name>/auth.json` under an omp profile), mode 0600, in a 0700 directory. mu warns when it is readable by others, and at startup when it cannot be read or parsed.
@@ -124,7 +170,7 @@ Messages store the same `api` strings as omp (`anthropic-messages`, `openai-resp
 
 ## Not in v1
 
-- Custom OpenAI- or Anthropic-compatible providers (a table row plus config later), key pools and rotation, an OS keychain.
+- Custom Responses or Anthropic-compatible providers (custom endpoints speak Chat Completions only), key pools and rotation, an OS keychain.
 - Anthropic 1-hour cache, thinking prefix binding, server compaction.
 - OpenAI stateful chaining (`previous_response_id`), freeform tools, `text.verbosity`.
 - Baseten model-family quirks omp handles: DeepSeek tool-markup healing and thinking-loop guards. Only snapshot rows have reasoning on.

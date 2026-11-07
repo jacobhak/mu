@@ -5,8 +5,10 @@ use anyhow::{Result, anyhow, bail};
 use mu_provider::auth::chatgpt::{self, Account, PROVIDER_ID, USAGE_URL, oauth, signin};
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::{Entry, Origin, Store};
+use mu_provider::provider::custom::{AuthMode, CustomProvider, KeyState, Registry};
 use mu_provider::provider::providers;
 use mu_provider::provider::providers::{KeyTarget, SEARCH_KEYS};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 use tokio_util::sync::CancellationToken;
 
@@ -68,30 +70,47 @@ pub enum Cmd {
 }
 
 pub fn run(cmd: Cmd) -> Result<i32> {
-    let store = Store::new();
-    let mut out = std::io::stdout();
+    exec(&Store::new(), &Registry::new(), cmd, &mut std::io::stdout())
+}
+
+/// `run` on the given key store and custom-provider registry.
+fn exec(store: &Store, registry: &Registry, cmd: Cmd, out: &mut impl Write) -> Result<i32> {
     match cmd {
-        Cmd::List => list(&store, &mut out),
+        Cmd::List => list(store, registry, out),
         Cmd::Login { provider } => {
             chatgpt_only("login", provider.as_deref())?;
-            login(&store, &mut out)
+            login(store, out)
         }
         Cmd::Logout { provider, forget } => {
             chatgpt_only("logout", provider.as_deref())?;
-            logout(&store, &mut out, forget)
+            logout(store, out, forget)
         }
         Cmd::Add { provider, env, cmd, base_url, chat, no_chat, .. } if is_chatgpt(&provider) => {
             Err(chatgpt_key_refusal(env.is_some() || cmd.is_some() || base_url.is_some(), chat || no_chat))
         }
         Cmd::Add { provider, env, cmd, base_url, no_validate, chat, no_chat } => {
-            let target = target(&provider)?;
-            let chat = chat_flag(target, chat, no_chat)?;
+            let target = target(&provider, registry)?;
+            if let KeyTarget::Custom(c) = &target {
+                if base_url.is_some() {
+                    bail!(
+                        "--base-url does not apply to custom provider `{}`: its base URL is set in providers.toml",
+                        c.id
+                    );
+                }
+                if c.auth == AuthMode::None {
+                    bail!(
+                        "custom provider `{}` takes no key (auth = \"none\"); set auth = \"bearer\" in providers.toml before attaching a key",
+                        c.id
+                    );
+                }
+            }
+            let chat = chat_flag(&target, chat, no_chat)?;
             let base_url = parse_base_url(base_url)?;
             let entry = match (env, cmd) {
                 (Some(n), _) => Entry::reference(&format!("${n}"))?,
                 (_, Some(c)) => Entry::reference(&format!("!{c}"))?,
                 _ => {
-                    let key = read_key(target)?;
+                    let key = read_key(&target)?;
                     if key.is_empty() {
                         bail!("no key given");
                     }
@@ -100,7 +119,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             };
             let entry = Entry { base_url, chat, ..entry };
             if !no_validate {
-                match mu_base::runtime::current_thread_runtime()?.block_on(check_entry(target, &entry)) {
+                match mu_base::runtime::current_thread_runtime()?.block_on(check_entry(&target, &entry)) {
                     Check::Valid | Check::Unchecked => {}
                     Check::Rejected(m) => bail!("{m}; nothing saved"),
                     Check::Unreachable(m) => {
@@ -110,21 +129,53 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             }
             store.set(target.id(), entry)?;
             writeln!(out, "saved the {} key to {}", target.label(), store.path().display())?;
-            if let KeyTarget::Provider(def) = target {
-                writeln!(out, "{}", providers::saved_notice(def, chat == Some(true)))?;
+            match &target {
+                KeyTarget::Provider(def) => writeln!(out, "{}", providers::saved_notice(def, chat == Some(true)))?,
+                KeyTarget::Custom(c) => writeln!(out, "{}/* models use this key, sent to {}", c.id, c.base_url)?,
+                KeyTarget::Search(_) => {}
             }
             Ok(0)
         }
-        Cmd::Rm { provider } if is_chatgpt(&provider) => logout(&store, &mut out, false),
+        Cmd::Rm { provider } if is_chatgpt(&provider) => logout(store, out, false),
         Cmd::Rm { provider } => {
-            let target = target(&provider)?;
+            let Some(target) = KeyTarget::find(&provider, registry)? else {
+                // An orphan: a stored key whose custom definition is gone.
+                if store.remove(&provider)? {
+                    writeln!(
+                        out,
+                        "removed the stored key for `{provider}`; no custom provider `{provider}` is configured"
+                    )?;
+                    return Ok(0);
+                }
+                return Err(unknown(&provider));
+            };
+            if let KeyTarget::Custom(c) = &target
+                && c.auth == AuthMode::None
+            {
+                eprintln!(
+                    "{} takes no key (auth = \"none\"), so there is no key to remove; to remove the endpoint, run `mu providers rm {}`",
+                    c.label(),
+                    c.id
+                );
+                return Ok(1);
+            }
             let was_chat =
                 matches!(target, KeyTarget::Provider(_)) && store.get(target.id()).is_some_and(|e| e.routes_chat());
             if store.remove(target.id())? {
-                if was_chat {
-                    writeln!(out, "removed the {} key; {}/* models go through omp again", target.label(), target.id())?;
-                } else {
-                    writeln!(out, "removed the {} key", target.label())?;
+                match &target {
+                    KeyTarget::Custom(c) => writeln!(
+                        out,
+                        "removed the {} key; {id}/* models now need a key: add one with `mu auth add {id}`, or remove the endpoint with `mu providers rm {id}`",
+                        c.label(),
+                        id = c.id
+                    )?,
+                    _ if was_chat => writeln!(
+                        out,
+                        "removed the {} key; {}/* models go through omp again",
+                        target.label(),
+                        target.id()
+                    )?,
+                    _ => writeln!(out, "removed the {} key", target.label())?,
                 }
                 Ok(0)
             } else {
@@ -132,15 +183,26 @@ pub fn run(cmd: Cmd) -> Result<i32> {
                 Ok(1)
             }
         }
-        Cmd::Test { provider } if is_chatgpt(&provider) => chatgpt_test(&store, &mut out),
+        Cmd::Test { provider } if is_chatgpt(&provider) => chatgpt_test(store, out),
         Cmd::Test { provider } => {
-            let target = target(&provider)?;
-            let entry = store
-                .get(target.id())
-                .ok_or_else(|| anyhow!("no {} key is stored; run `mu auth add {}`", target.label(), target.id()))?;
-            match mu_base::runtime::current_thread_runtime()?.block_on(check_entry(target, &entry)) {
+            let target = target(&provider, registry)?;
+            let keyless = matches!(&target, KeyTarget::Custom(c) if c.auth == AuthMode::None);
+            let check = match &target {
+                // A keyless endpoint has no stored entry to check: its `/models` is asked without a key.
+                KeyTarget::Custom(c) if keyless => {
+                    mu_base::runtime::current_thread_runtime()?.block_on(check::validate_custom(c, None))
+                }
+                _ => {
+                    let entry = store.get(target.id()).ok_or_else(|| {
+                        anyhow!("no {} key is stored; run `mu auth add {}`", target.label(), target.id())
+                    })?;
+                    mu_base::runtime::current_thread_runtime()?.block_on(check_entry(&target, &entry))
+                }
+            };
+            match check {
                 Check::Valid => {
-                    writeln!(out, "{}: the key works", target.label())?;
+                    let what = if keyless { "the endpoint answers without a key" } else { "the key works" };
+                    writeln!(out, "{}: {what}", target.label())?;
                     Ok(0)
                 }
                 Check::Unchecked => {
@@ -157,11 +219,11 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             bail!("`mu auth use` does not apply to {PROVIDER_ID}: its models run on your ChatGPT plan once signed in")
         }
         Cmd::Use { provider, chat, no_chat } => {
-            let target = target(&provider)?;
+            let target = target(&provider, registry)?;
             if !target.asks_chat() {
                 bail!("`mu auth use` only applies to anthropic and openai");
             }
-            let Some(chat) = chat_flag(target, chat, no_chat)? else { unreachable!("asks_chat requires a flag") };
+            let Some(chat) = chat_flag(&target, chat, no_chat)? else { unreachable!("asks_chat requires a flag") };
             if store.set_chat(target.id(), chat)? {
                 if chat {
                     writeln!(out, "{}/* models now use your API key (billed per token) instead of omp.", target.id())?;
@@ -179,7 +241,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
 
 /// What `--chat` / `--no-chat` mean for a target: anthropic and openai need one of them,
 /// Baseten's key is only for chat, and search keys have no chat use.
-fn chat_flag(t: KeyTarget, chat: bool, no_chat: bool) -> Result<Option<bool>> {
+fn chat_flag(t: &KeyTarget, chat: bool, no_chat: bool) -> Result<Option<bool>> {
     match t {
         KeyTarget::Search(_) if chat || no_chat => bail!("--chat/--no-chat only apply to anthropic and openai"),
         KeyTarget::Search(_) => Ok(None),
@@ -203,17 +265,23 @@ fn parse_base_url(raw: Option<String>) -> Result<Option<String>> {
     raw.filter(|u| !u.trim().is_empty()).map(|u| mu_provider::auth::store::check_base_url(&u)).transpose()
 }
 
-fn target(id: &str) -> Result<KeyTarget> {
-    KeyTarget::find(id).ok_or_else(|| {
-        anyhow!("unknown provider `{id}`; mu can use keys for: {}, or sign in with ChatGPT as {PROVIDER_ID}", names())
-    })
+/// The key target `id` names: a built-in or search service, or a custom endpoint in `registry`.
+fn target(id: &str, registry: &Registry) -> Result<KeyTarget> {
+    KeyTarget::find(id, registry)?.ok_or_else(|| unknown(id))
 }
 
-async fn check_entry(t: KeyTarget, entry: &Entry) -> Check {
+fn unknown(id: &str) -> anyhow::Error {
+    anyhow!(
+        "unknown provider `{id}`; mu can use keys for: {}, a custom provider from `mu providers add`, or sign in with ChatGPT as {PROVIDER_ID}",
+        names()
+    )
+}
+
+async fn check_entry(t: &KeyTarget, entry: &Entry) -> Check {
     check::check_target(t, entry).await.unwrap_or_else(Check::Rejected)
 }
 
-fn list(store: &Store, out: &mut impl Write) -> Result<i32> {
+fn list(store: &Store, registry: &Registry, out: &mut impl Write) -> Result<i32> {
     if let Err(e) = store.check() {
         bail!("{e}");
     }
@@ -230,7 +298,12 @@ fn list(store: &Store, out: &mut impl Write) -> Result<i32> {
         )?;
         return Ok(0);
     }
-    writeln!(out, "{}", render(&rows, chatgpt.as_ref()))?;
+    let custom = registry.snapshot();
+    if let Err(e) = &custom {
+        eprintln!("warning: {e:#}");
+    }
+    let usage = uses(&rows, store, &custom);
+    writeln!(out, "{}", render(&rows, &usage, chatgpt.as_ref()))?;
     Ok(0)
 }
 
@@ -394,9 +467,64 @@ fn chatgpt_test(store: &Store, out: &mut impl Write) -> Result<i32> {
     }
 }
 
+/// What each stored key is used for, from the store and the registry; `render` only formats it. A
+/// custom id with no definition is an orphan, and an unreadable registry leaves custom rows unknown.
+fn uses(
+    rows: &[(String, Entry)],
+    store: &Store,
+    custom: &Result<BTreeMap<String, CustomProvider>>,
+) -> BTreeMap<String, Usage> {
+    rows.iter()
+        .map(|(p, e)| {
+            let usage = match (KeyTarget::builtin(p), custom) {
+                (Some(KeyTarget::Search(_)), _) => Usage::Search,
+                (Some(_), _) if e.routes_chat() => Usage::Chat,
+                (Some(_), _) => Usage::NotChat,
+                (None, Err(_)) => Usage::Unknown,
+                (None, Ok(defs)) => match defs.get(p) {
+                    None => Usage::Orphan,
+                    Some(def) => match def.key_state(store) {
+                        KeyState::NotNeeded => Usage::Keyless,
+                        KeyState::Saved => Usage::Chat,
+                        KeyState::Disabled => Usage::NotChat,
+                        KeyState::Missing => Usage::Missing,
+                    },
+                },
+            };
+            (p.clone(), usage)
+        })
+        .collect()
+}
+
+/// What a stored key is used for; its row's last column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usage {
+    Search,
+    Chat,
+    NotChat,
+    Keyless,
+    Missing,
+    Orphan,
+    Unknown,
+}
+
+impl Usage {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Search => "web search",
+            Self::Chat => "chat",
+            Self::NotChat => "not for chat",
+            Self::Keyless => "not used: the endpoint takes no key",
+            Self::Missing => "key missing",
+            Self::Orphan => "no provider definition",
+            Self::Unknown => "",
+        }
+    }
+}
+
 /// One line per provider: its source, for a stored key the last four characters, and what the key
 /// is used for. A `!command` is not run to show anything. The ChatGPT sign-in, when there is one, is last.
-pub fn render(rows: &[(String, Entry)], chatgpt: Option<&Account>) -> String {
+pub fn render(rows: &[(String, Entry)], uses: &BTreeMap<String, Usage>, chatgpt: Option<&Account>) -> String {
     let w = rows.iter().map(|(p, _)| p.len()).chain(chatgpt.map(|_| PROVIDER_ID.len())).max().unwrap_or(0);
     let mut lines: Vec<String> = rows
         .iter()
@@ -411,12 +539,7 @@ pub fn render(rows: &[(String, Entry)], chatgpt: Option<&Account>) -> String {
                 }
                 Origin::Cmd(c) => (mu_provider::auth::store::cmd_label(&c), String::new()),
             };
-            let used = match KeyTarget::find(p) {
-                Some(KeyTarget::Search(_)) => "web search",
-                Some(KeyTarget::Provider(_)) if e.routes_chat() => "chat",
-                Some(KeyTarget::Provider(_)) => "not for chat",
-                None => "",
-            };
+            let used = uses.get(p).copied().unwrap_or(Usage::Unknown).text();
             let url = e.base_url.as_deref().map(|u| format!("  {u}")).unwrap_or_default();
             Some(format!("{}{url}", columns(w, p, &[src.as_str(), detail.as_str(), used])))
         })
@@ -447,16 +570,32 @@ fn chatgpt_line(w: usize, a: &Account) -> String {
     columns(w, PROVIDER_ID, &["ChatGPT sign-in", label.as_str(), used])
 }
 
-/// The key from stdin: a no-echo prompt on a terminal, else the piped text.
-fn read_key(def: KeyTarget) -> Result<String> {
+/// The key `mu auth add` reads from stdin (see `read_secret`).
+fn read_key(t: &KeyTarget) -> Result<String> {
+    read_secret(&key_hint(t), &format!("{} API key", t.label()))
+}
+
+/// Where a provider's key is made; a custom endpoint has no such page, so no hint.
+fn key_hint(t: &KeyTarget) -> String {
+    match t.key_url() {
+        "" => String::new(),
+        url => format!("Create a key at {url}"),
+    }
+}
+
+/// A secret from stdin: a no-echo prompt on a terminal (after `hint`, when given), else the piped
+/// text. Shared by `mu auth add` and `mu providers add`; a key is never a command argument.
+pub(crate) fn read_secret(hint: &str, prompt: &str) -> Result<String> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
         let mut s = String::new();
         stdin.lock().read_to_string(&mut s)?;
         return Ok(s.trim().to_string());
     }
-    eprintln!("Create a key at {}", def.key_url());
-    eprint!("{} API key (input is hidden): ", def.label());
+    if !hint.is_empty() {
+        eprintln!("{hint}");
+    }
+    eprint!("{prompt} (input is hidden): ");
     std::io::stderr().flush()?;
     let key = with_echo_off(|| {
         let mut lock = stdin.lock();
@@ -575,6 +714,10 @@ fn with_echo_off<T>(f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T
 mod tests {
     use super::*;
 
+    fn nowhere() -> Registry {
+        Registry::at(std::env::temp_dir().join(format!("mu-cli-none-{}", uuid::Uuid::new_v4())).join("providers.toml"))
+    }
+
     #[test]
     fn list_shows_at_most_the_last_four_characters() {
         let key = "sk-ant-api03-SECRETPARTabcdefWXYZ";
@@ -583,7 +726,7 @@ mod tests {
             ("baseten".to_string(), Entry::reference("$MU_TEST_SURELY_UNSET_VAR").unwrap()),
             ("openai".to_string(), Entry::reference("!op read op://dev/openai/key").unwrap()),
         ];
-        let text = render(&rows, None);
+        let text = render(&rows, &BTreeMap::new(), None);
         assert!(text.contains("…WXYZ"), "{text}");
         assert!(!text.contains("SECRETPART") && !text.contains("sk-ant"), "{text}");
         assert!(text.contains("$MU_TEST_SURELY_UNSET_VAR  not set"), "{text}");
@@ -595,40 +738,40 @@ mod tests {
 
     #[test]
     fn short_keys_show_nothing() {
-        let text = render(&[("anthropic".to_string(), Entry::literal("tiny-key"))], None);
+        let text = render(&[("anthropic".to_string(), Entry::literal("tiny-key"))], &BTreeMap::new(), None);
         assert!(!text.contains("tiny"), "{text}");
         assert!(!text.contains("-key"), "{text}");
     }
 
     #[test]
     fn unknown_providers_are_refused_with_the_known_ones() {
-        let e = target("gemini").unwrap_err().to_string();
+        let e = target("gemini", &nowhere()).unwrap_err().to_string();
         for id in ["anthropic", "openai", "baseten", "parallel", "exa"] {
             assert!(e.contains(id), "{e}");
         }
-        assert_eq!(target("baseten").unwrap().env_hint(), "BASETEN_API_KEY");
-        assert_eq!(target("exa").unwrap().env_hint(), "EXA_API_KEY");
+        assert_eq!(target("baseten", &nowhere()).unwrap().env_hint(), "BASETEN_API_KEY");
+        assert_eq!(target("exa", &nowhere()).unwrap().env_hint(), "EXA_API_KEY");
     }
 
     #[test]
     fn chat_flags_follow_the_target() {
-        let t = |id| target(id).unwrap();
+        let t = |id| target(id, &nowhere()).unwrap();
         for id in ["anthropic", "openai"] {
-            assert_eq!(chat_flag(t(id), true, false).unwrap(), Some(true));
-            assert_eq!(chat_flag(t(id), false, true).unwrap(), Some(false));
-            let e = chat_flag(t(id), false, false).unwrap_err().to_string();
+            assert_eq!(chat_flag(&t(id), true, false).unwrap(), Some(true));
+            assert_eq!(chat_flag(&t(id), false, true).unwrap(), Some(false));
+            let e = chat_flag(&t(id), false, false).unwrap_err().to_string();
             assert!(e.contains("add --chat or --no-chat") && e.contains(&format!("{id}/*")), "{e}");
         }
-        assert_eq!(chat_flag(t("baseten"), false, false).unwrap(), Some(true));
-        assert_eq!(chat_flag(t("baseten"), true, false).unwrap(), Some(true));
+        assert_eq!(chat_flag(&t("baseten"), false, false).unwrap(), Some(true));
+        assert_eq!(chat_flag(&t("baseten"), true, false).unwrap(), Some(true));
         assert_eq!(
-            chat_flag(t("baseten"), false, true).unwrap_err().to_string(),
+            chat_flag(&t("baseten"), false, true).unwrap_err().to_string(),
             "a Baseten key is only used for chat models"
         );
         for id in ["parallel", "exa"] {
-            assert_eq!(chat_flag(t(id), false, false).unwrap(), None);
+            assert_eq!(chat_flag(&t(id), false, false).unwrap(), None);
             for (c, n) in [(true, false), (false, true)] {
-                let e = chat_flag(t(id), c, n).unwrap_err().to_string();
+                let e = chat_flag(&t(id), c, n).unwrap_err().to_string();
                 assert!(e.contains("only apply to anthropic and openai"), "{e}");
             }
         }
@@ -642,7 +785,12 @@ mod tests {
             ("baseten".to_string(), Entry { chat: Some(true), ..Entry::literal("bt-test-0123456789") }),
             ("exa".to_string(), Entry::literal("exa-test-0123456789")),
         ];
-        let lines: Vec<String> = render(&rows, None).lines().map(String::from).collect();
+        let usage = BTreeMap::from([
+            ("anthropic".to_string(), Usage::NotChat),
+            ("baseten".to_string(), Usage::Chat),
+            ("exa".to_string(), Usage::Search),
+        ]);
+        let lines: Vec<String> = render(&rows, &usage, None).lines().map(String::from).collect();
         assert!(lines[0].ends_with("not set  not for chat"), "{lines:?}");
         assert!(lines[1].ends_with("chat") && !lines[1].contains("not for"), "{lines:?}");
         assert!(lines[2].ends_with("web search"), "{lines:?}");
@@ -758,14 +906,14 @@ mod chatgpt_tests {
     #[test]
     fn list_adds_the_sign_in_row_with_its_state() {
         let rows = vec![("anthropic".to_string(), Entry::literal("ant-test-0123456789"))];
-        let text = render(&rows, Some(&account(true, true)));
+        let text = render(&rows, &BTreeMap::new(), Some(&account(true, true)));
         let last = text.lines().last().unwrap();
         assert!(last.starts_with("openai-chatgpt") && last.contains("ChatGPT sign-in"), "{text}");
         assert!(last.contains("me@example.com") && last.ends_with("chat · plan"), "{text}");
         assert!(text.lines().next().unwrap().starts_with(&format!("{:<14}", "anthropic")), "{text}");
-        assert!(render(&rows, Some(&account(true, false))).ends_with("plan usage not enabled"));
-        assert!(render(&[], Some(&account(false, false))).ends_with("signed out"));
-        assert!(!render(&rows, None).contains("ChatGPT"));
+        assert!(render(&rows, &BTreeMap::new(), Some(&account(true, false))).ends_with("plan usage not enabled"));
+        assert!(render(&[], &BTreeMap::new(), Some(&account(false, false))).ends_with("signed out"));
+        assert!(!render(&rows, &BTreeMap::new(), None).contains("ChatGPT"));
     }
 }
 
@@ -785,7 +933,7 @@ mod validate_tests {
         rt(async {
             let (base, seen) = fake_server(vec![Reply::new(200, r#"{"data":[]}"#)]).await;
             let anthropic = KeyTarget::Provider(native_def("anthropic").unwrap());
-            let r = check_entry(anthropic, &entry("ant-key-0123456789", &base)).await;
+            let r = check_entry(&anthropic, &entry("ant-key-0123456789", &base)).await;
             assert_eq!(r, Check::Valid);
             let req = seen.lock().unwrap()[0].to_lowercase();
             assert!(req.starts_with("get /v1/models?limit=1 "), "{req}");
@@ -794,7 +942,7 @@ mod validate_tests {
 
             let (base, seen) = fake_server(vec![Reply::new(200, "{}")]).await;
             let baseten = KeyTarget::Provider(native_def("baseten").unwrap());
-            assert_eq!(check_entry(baseten, &entry("bt-key-0123456789", &base)).await, Check::Valid);
+            assert_eq!(check_entry(&baseten, &entry("bt-key-0123456789", &base)).await, Check::Valid);
             let req = seen.lock().unwrap()[0].to_lowercase();
             assert!(req.starts_with("get /models "), "{req}");
             assert!(req.contains("authorization: bearer bt-key-0123456789"), "{req}");
@@ -808,13 +956,13 @@ mod validate_tests {
             let (base, _) = fake_server(vec![Reply::new(401, "nope")]).await;
             let openai = KeyTarget::Provider(native_def("openai").unwrap());
             assert!(
-                matches!(check_entry(openai, &entry("k-0123456789", &base)).await, Check::Rejected(m) if m.contains("rejected"))
+                matches!(check_entry(&openai, &entry("k-0123456789", &base)).await, Check::Rejected(m) if m.contains("rejected"))
             );
             let (base, _) = fake_server(vec![Reply::new(503, "down")]).await;
-            assert!(matches!(check_entry(openai, &entry("k-0123456789", &base)).await, Check::Unreachable(_)));
+            assert!(matches!(check_entry(&openai, &entry("k-0123456789", &base)).await, Check::Unreachable(_)));
             // nothing listening
             let dead = "http://127.0.0.1:1";
-            assert!(matches!(check_entry(openai, &entry("k-0123456789", dead)).await, Check::Unreachable(_)));
+            assert!(matches!(check_entry(&openai, &entry("k-0123456789", dead)).await, Check::Unreachable(_)));
         });
     }
 
@@ -823,11 +971,182 @@ mod validate_tests {
         rt(async {
             let openai = KeyTarget::Provider(native_def("openai").unwrap());
             let e = Entry::reference("$MU_TEST_SURELY_UNSET_VAR").unwrap();
-            assert!(matches!(check_entry(openai, &e).await, Check::Rejected(m) if m.contains("not set")));
+            assert!(matches!(check_entry(&openai, &e).await, Check::Rejected(m) if m.contains("not set")));
             // A search key is only resolved, never sent anywhere.
-            let exa = KeyTarget::find("exa").unwrap();
-            assert!(matches!(check_entry(exa, &e).await, Check::Rejected(m) if m.contains("not set")));
-            assert_eq!(check_entry(exa, &Entry::literal("exa-test-0123456789")).await, Check::Unchecked);
+            let exa = KeyTarget::builtin("exa").unwrap();
+            assert!(matches!(check_entry(&exa, &e).await, Check::Rejected(m) if m.contains("not set")));
+            assert_eq!(check_entry(&exa, &Entry::literal("exa-test-0123456789")).await, Check::Unchecked);
         });
+    }
+}
+
+#[cfg(test)]
+mod custom_tests {
+    use super::*;
+    use clap::Parser as _;
+    use mu_provider::provider::custom::CustomProvider;
+    use mu_testutil::{Reply, fake_server};
+
+    /// A registry and store in a fresh temp dir, so no test reads or writes the profile.
+    fn files(tag: &str) -> (Registry, Store, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("mu-cli-auth-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        (Registry::at(d.join("providers.toml")), Store::at(d.join("auth.json")), d)
+    }
+
+    /// A fake endpoint that answers from a runtime of its own, so a blocking command can call it.
+    fn server(replies: Vec<Reply>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (base, seen) = rt.block_on(fake_server(replies));
+        (base, seen, rt)
+    }
+
+    fn add_def(reg: &Registry, id: &str, base: &str, auth: AuthMode) {
+        let mut c = CustomProvider::new(base);
+        c.auth = auth;
+        reg.add(id, c).unwrap();
+    }
+
+    fn add_cmd(provider: &str, env: Option<&str>, base_url: Option<&str>, no_chat: bool) -> Cmd {
+        Cmd::Add {
+            provider: provider.into(),
+            env: env.map(Into::into),
+            cmd: None,
+            base_url: base_url.map(Into::into),
+            no_validate: true,
+            chat: false,
+            no_chat,
+        }
+    }
+
+    fn rm_cmd(provider: &str) -> Cmd {
+        Cmd::Rm { provider: provider.into() }
+    }
+
+    fn text(out: Vec<u8>) -> String {
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn custom_targets_refuse_flags_that_do_not_apply() {
+        let (reg, store, d) = files("flags");
+        add_def(&reg, "bearer", "https://x.test/v1", AuthMode::Bearer);
+        add_def(&reg, "open", "https://x.test/v1", AuthMode::None);
+        let e = exec(&store, &reg, add_cmd("bearer", Some("MU_UNSET"), Some("https://y.test"), false), &mut Vec::new());
+        assert!(e.unwrap_err().to_string().contains("--base-url does not apply"));
+        let e = exec(&store, &reg, add_cmd("open", Some("MU_UNSET"), None, false), &mut Vec::new());
+        assert!(e.unwrap_err().to_string().contains("auth = \"bearer\""));
+        // `--no-chat` is for Anthropic and OpenAI: a custom key only ever serves chat.
+        let e = exec(&store, &reg, add_cmd("bearer", Some("MU_UNSET"), None, true), &mut Vec::new());
+        assert!(e.unwrap_err().to_string().contains("only used for chat"));
+        assert!(store.get("bearer").is_none(), "refusals save nothing");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_custom_key_is_stored_for_chat_under_its_definition() {
+        let (reg, store, d) = files("add");
+        add_def(&reg, "bearer", "https://x.test/v1", AuthMode::Bearer);
+        let mut out = Vec::new();
+        assert_eq!(exec(&store, &reg, add_cmd("bearer", Some("MU_UNSET"), None, false), &mut out).unwrap(), 0);
+        let e = store.get("bearer").unwrap();
+        assert!(e.routes_chat() && e.base_url.is_none());
+        assert_eq!(e.reference.as_deref(), Some("$MU_UNSET"));
+        assert!(text(out).contains("sent to https://x.test/v1"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_keyless_endpoint_is_tested_without_a_stored_entry() {
+        let (reg, store, d) = files("keyless-test");
+        let (base, seen, _rt) = server(vec![Reply::new(200, r#"{"data":[]}"#)]);
+        add_def(&reg, "open", &base, AuthMode::None);
+        let mut out = Vec::new();
+        let test = Cmd::Test { provider: "open".into() };
+        assert_eq!(exec(&store, &reg, test, &mut out).unwrap(), 0);
+        assert!(text(out).contains("the endpoint answers without a key"));
+        let req = seen.lock().unwrap()[0].to_lowercase();
+        assert!(req.starts_with("get /models ") && !req.contains("authorization"), "{req}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_bearer_endpoint_is_tested_with_its_stored_key() {
+        let (reg, store, d) = files("bearer-test");
+        let (base, seen, _rt) = server(vec![Reply::new(401, "no")]);
+        add_def(&reg, "bearer", &base, AuthMode::Bearer);
+        store.set("bearer", Entry::literal("bt-test-0123456789")).unwrap();
+        let test = Cmd::Test { provider: "bearer".into() };
+        assert_eq!(exec(&store, &reg, test, &mut Vec::new()).unwrap(), 1, "a 401 is a failed test");
+        let req = seen.lock().unwrap()[0].to_lowercase();
+        assert!(req.contains("authorization: bearer bt-test-0123456789"), "{req}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn rm_says_a_custom_provider_needs_its_key_and_never_falls_back() {
+        let (reg, store, d) = files("rm");
+        add_def(&reg, "bearer", "https://x.test/v1", AuthMode::Bearer);
+        add_def(&reg, "open", "https://x.test/v1", AuthMode::None);
+        store.set("bearer", Entry::literal("bt-test-0123456789")).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(exec(&store, &reg, rm_cmd("bearer"), &mut out).unwrap(), 0);
+        let t = text(out);
+        assert!(t.contains("now need a key") && t.contains("mu auth add bearer"), "{t}");
+        assert!(!t.contains("omp"), "{t}");
+        assert!(store.get("bearer").is_none());
+        assert!(reg.get("bearer").unwrap().is_some(), "`mu auth rm` keeps the definition");
+        // A keyless endpoint has no key to remove: nothing is changed and the exit is 1.
+        assert_eq!(exec(&store, &reg, rm_cmd("open"), &mut Vec::new()).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn rm_removes_an_orphan_key_without_a_definition() {
+        let (reg, store, d) = files("orphan");
+        store.set("ghost", Entry::literal("gh-test-0123456789")).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(exec(&store, &reg, rm_cmd("ghost"), &mut out).unwrap(), 0);
+        assert!(text(out).contains("no custom provider `ghost` is configured"));
+        assert!(!store.has("ghost"));
+        let e = exec(&store, &reg, rm_cmd("ghost"), &mut Vec::new()).unwrap_err();
+        assert!(e.to_string().contains("unknown provider `ghost`"), "{e}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_disabled_key_is_told_apart_from_a_missing_one() {
+        let (reg, store, d) = files("uses");
+        add_def(&reg, "bearer", "https://x.test/v1", AuthMode::Bearer);
+        store.set("bearer", Entry { chat: Some(false), ..Entry::literal("bt-test-0123456789") }).unwrap();
+        store.set("ghost", Entry::literal("gh-test-0123456789")).unwrap();
+        let rows = store.list();
+        let usage = uses(&rows, &store, &reg.snapshot());
+        assert_eq!(usage["bearer"], Usage::NotChat);
+        assert_eq!(usage["ghost"], Usage::Orphan);
+        let t = render(&rows, &usage, None);
+        assert!(t.contains("not for chat") && t.contains("no provider definition"), "{t}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_custom_target_has_no_key_page_to_point_at() {
+        let custom = KeyTarget::Custom(CustomProvider::new("https://x.test/v1"));
+        assert_eq!(key_hint(&custom), "");
+        assert!(key_hint(&KeyTarget::builtin("anthropic").unwrap()).starts_with("Create a key at https://"));
+    }
+
+    #[derive(clap::Parser)]
+    struct Wrap {
+        #[command(subcommand)]
+        cmd: Cmd,
+    }
+
+    #[test]
+    fn custom_add_flags_parse_with_the_others() {
+        let parse =
+            |args: &[&str]| Wrap::try_parse_from(std::iter::once("mu").chain(args.iter().copied())).map(|w| w.cmd);
+        assert!(parse(&["add", "bearer", "--env", "X", "--base-url", "https://x.test/v1"]).is_ok());
+        assert!(parse(&["add", "bearer", "--env", "X", "--chat"]).is_ok());
     }
 }

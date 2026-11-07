@@ -2,6 +2,7 @@
 
 use super::store::{Entry, check_base_url, resolve_entry};
 use crate::net;
+use crate::provider::custom::{self, AuthMode, CustomProvider};
 use crate::provider::providers::{Credential, KeyTarget, ProviderDef};
 use crate::provider::types::Auth;
 use std::time::Duration;
@@ -50,6 +51,37 @@ pub async fn validate(def: &ProviderDef, key: &str, base_url: Option<&str>) -> C
     }
 }
 
+/// One cheap GET of a custom endpoint's `/models` (the definition's URL, rechecked), with `key`
+/// as the bearer or none for a keyless endpoint. 401/403 reject the credential; anything else
+/// that fails says nothing about it.
+pub async fn validate_custom(c: &CustomProvider, key: Option<&str>) -> Check {
+    let base = match custom::check_base_url(&c.base_url) {
+        Ok(b) => b,
+        Err(e) => return Check::Rejected(e.to_string()),
+    };
+    net::install_crypto();
+    let Ok(client) =
+        reqwest::Client::builder().timeout(VALIDATE_TIMEOUT).redirect(reqwest::redirect::Policy::none()).build()
+    else {
+        return Check::Unreachable("cannot build an HTTP client".into());
+    };
+    let auth = key.map_or(Auth::None, |k| Auth::Bearer(k.to_string()));
+    let rb = match auth.apply(client.get(format!("{base}/models"))) {
+        Ok(rb) => rb,
+        Err(e) => return Check::Rejected(e.to_string()),
+    };
+    match rb.send().await {
+        Ok(r) if r.status().is_success() => Check::Valid,
+        Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
+            Check::Rejected(format!("{} rejected the key (HTTP {})", c.label(), r.status().as_u16()))
+        }
+        Ok(r) => Check::Unreachable(format!("{} answered HTTP {}", c.label(), r.status().as_u16())),
+        Err(e) => {
+            Check::Unreachable(mu_base::secrets::redact_keys(&format!("cannot reach {}: {e}", net::host_of(&base))))
+        }
+    }
+}
+
 /// Resolves `entry` (running its `!command` if it has one), then validates the key it yields.
 /// `Err` when the entry cannot be resolved; nothing was sent.
 pub async fn check_entry(def: &ProviderDef, entry: &Entry) -> Result<Check, String> {
@@ -62,12 +94,19 @@ pub async fn check_entry(def: &ProviderDef, entry: &Entry) -> Result<Check, Stri
 
 /// `check_entry` for a provider; for a search service the entry is only resolved, since a test
 /// search would cost money.
-pub async fn check_target(t: KeyTarget, entry: &Entry) -> Result<Check, String> {
+pub async fn check_target(t: &KeyTarget, entry: &Entry) -> Result<Check, String> {
     match t {
         KeyTarget::Provider(def) => check_entry(def, entry).await,
         KeyTarget::Search(_) => {
             resolve_entry(t.id(), entry).await.map_err(|e| e.to_string())?;
             Ok(Check::Unchecked)
+        }
+        KeyTarget::Custom(c) if c.auth == AuthMode::None => {
+            Err(format!("{} takes no key (auth = \"none\")", c.label()))
+        }
+        KeyTarget::Custom(c) => {
+            let resolved = resolve_entry(&c.id, entry).await.map_err(|e| e.to_string())?;
+            Ok(validate_custom(c, Some(&resolved.key)).await)
         }
     }
 }

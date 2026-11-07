@@ -12,6 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::Entry;
+use mu_provider::provider::custom::AuthMode;
 use mu_provider::provider::providers::{self, KeyTarget, SEARCH_KEYS};
 
 /// What the composer holds while a key flow waits for text.
@@ -81,7 +82,7 @@ fn api_key_items(
 }
 
 /// The two answers to "does chat use this key?"; `current` marks the stored choice.
-fn chat_items(target: KeyTarget, current: Option<bool>) -> Vec<Item> {
+fn chat_items(target: &KeyTarget, current: Option<bool>) -> Vec<Item> {
     let id = target.id();
     let row = |label: String, detail: &str, on: bool| Item {
         label,
@@ -111,6 +112,10 @@ impl App {
             }
             Event::Key(k) => self.on_key(k),
             Event::Paste(s) => {
+                // A check is running: nothing typed or pasted goes anywhere until it answers.
+                if self.custom_busy() {
+                    return;
+                }
                 // A key being typed takes the paste even when an overlay is open.
                 let typing = self.typing();
                 match self.overlay.as_mut() {
@@ -176,6 +181,9 @@ impl App {
     fn on_key_inner(&mut self, k: KeyEvent) {
         // While a key is typed, every key goes to the masked composer, even past an open overlay.
         let typing = self.typing();
+        if self.custom_wizard_active() && self.custom_key(k) {
+            return;
+        }
         if self.chatgpt_typing() {
             if self.chatgpt_key(k) {
                 return;
@@ -270,11 +278,16 @@ impl App {
         if chatgpt::is_chatgpt(provider) {
             return self.start_chatgpt();
         }
-        if let Some(target) = KeyTarget::find(provider) {
-            return self.begin_key(target);
+        if provider == "custom" {
+            return self.start_custom_wizard();
         }
         if let Some(name) = provider.strip_prefix("mcp:") {
             return self.run_mcp_login(name);
+        }
+        match KeyTarget::find(provider, self.services.providers.custom_registry()) {
+            Ok(Some(target)) => return self.begin_key(target),
+            Ok(None) => {}
+            Err(e) => return self.error(&format!("{e:#}")),
         }
         if !provider.is_empty() {
             return self.run_login(&[provider], None);
@@ -303,7 +316,7 @@ impl App {
     /// Enter in the masked or command input: the text becomes an entry and is checked.
     fn finish_typing(&mut self) {
         let Some(f) = self.flows.key_flow.as_ref() else { return };
-        let (target, typing) = (f.target, f.typing);
+        let (target, typing) = (f.target.clone(), f.typing);
         let text = self.prompt.composer.secret_text().trim().to_string();
         if text.is_empty() {
             return;
@@ -355,17 +368,22 @@ impl App {
         }
     }
 
-    /// Whether a key or command is being typed: the composer is locked to it.
+    /// Whether a key or command is being typed (or a custom endpoint's text or check is waiting):
+    /// the composer is locked to it.
     pub(super) fn typing(&self) -> bool {
-        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some()) || self.chatgpt_typing()
+        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some())
+            || self.chatgpt_typing()
+            || self.custom_typing()
     }
 
     /// A key is being typed or a choice waits for the user: no prediction is asked for.
-    fn key_flow_pending(&self) -> bool {
-        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some() || f.pending.is_some()) || self.chatgpt_typing()
+    pub(super) fn key_flow_pending(&self) -> bool {
+        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some() || f.pending.is_some())
+            || self.chatgpt_typing()
+            || self.custom_typing()
     }
 
-    /// Ends the flow without saving. A flow that began elsewhere (the wizard) resumes there.
+    /// Ends the key flow without saving. A flow that began elsewhere (the wizard) resumes there.
     fn cancel_key_flow(&mut self) {
         let flow = self.flows.key_flow.take();
         if flow.as_ref().is_some_and(|f| f.typing.is_some()) {
@@ -392,25 +410,55 @@ impl App {
         }
     }
 
-    /// The API-key rows that open `/login`.
-    pub(super) fn api_key_rows(&self) -> (Vec<Item>, Vec<LoginTarget>) {
+    /// The API-key rows that open `/login`: the chat providers, ChatGPT and the search services, then
+    /// each custom endpoint (its key state, or that it takes none), then the row that adds one. A
+    /// `providers.toml` that does not read is reported, and its endpoints are left out.
+    pub(super) fn api_key_rows(&mut self) -> (Vec<Item>, Vec<LoginTarget>) {
+        let customs = match self.services.providers.custom_registry().snapshot() {
+            Ok(c) => c,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                Default::default()
+            }
+        };
         let store = self.services.providers.store();
         let (mut items, mut targets) =
             api_key_items(|p| store.has(p), env_is_set, |p| store.get(p).is_some_and(|e| e.routes_chat()));
         let (item, target) = chatgpt::login_item(store.chatgpt_account().as_ref());
         items.insert(0, item);
         targets.insert(0, target);
+        for c in customs.values() {
+            let label = if c.auth == AuthMode::None {
+                format!("Custom endpoint: {}", c.label())
+            } else {
+                format!("API key: {} (custom)", c.label())
+            };
+            items.push(Item { label, detail: c.key_state(store).word().into() });
+            targets.push(LoginTarget::ApiKey(c.id.clone()));
+        }
+        items.push(Item {
+            label: "Add custom OpenAI-compatible endpoint".into(),
+            detail: "guided: address, key, models".into(),
+        });
+        targets.push(LoginTarget::CustomProvider);
         (items, targets)
     }
 
     /// `/login <id>` or a `/login` row: a key already stored for anthropic or openai opens a menu
     /// (chat use, replace); anything else starts the key flow.
     pub(super) fn begin_key(&mut self, target: KeyTarget) {
+        if target.is_keyless() {
+            return self.notice(&format!(
+                "{} takes no key (auth = \"none\" in {}); edit or remove its definition to change that",
+                target.label(),
+                self.services.providers.custom_registry().path().display()
+            ));
+        }
         let stored = self.services.providers.store().get(target.id());
         let Some(entry) = stored.filter(|_| target.asks_chat()) else {
             return self.start_key_flow(target, None, None);
         };
-        let mut items = chat_items(target, Some(entry.routes_chat()));
+        let mut items = chat_items(&target, Some(entry.routes_chat()));
         items.push(Item { label: "Replace the key".into(), detail: "paste, use a variable or a command".into() });
         items.push(Item { label: "Cancel".into(), detail: "nothing changes".into() });
         self.overlay = Some(Overlay::KeyChoice {
@@ -423,7 +471,14 @@ impl App {
     /// Says where to get a key, then offers the ways to give one.
     /// `chat` presets the answer to "does chat use this key?", `then` resumes another flow at the end.
     pub(super) fn start_key_flow(&mut self, target: KeyTarget, chat: Option<bool>, then: Option<KeyThen>) {
+        self.leave_custom_wizard();
         self.flows.key_flow_seq += 1;
+        let (label, id, hint, url) = (
+            target.label().to_string(),
+            target.id().to_string(),
+            target.env_hint().to_string(),
+            target.key_url().to_string(),
+        );
         self.flows.key_flow = Some(KeyFlow {
             id: self.flows.key_flow_seq,
             target,
@@ -433,20 +488,19 @@ impl App {
             pending: None,
             checking: false,
         });
-        self.notice(&format!("{} API keys: create one at {}", target.label(), target.key_url()));
+        if !url.is_empty() {
+            self.notice(&format!("{label} API keys: create one at {url}"));
+        }
         let mut items = vec![Item { label: "Paste a key".into(), detail: "shown as bullets".into() }];
         let mut options = vec![KeyOption::Paste];
-        if env_is_set(target.env_hint()) {
-            items.push(Item { label: format!("Use ${}", target.env_hint()), detail: "already set".into() });
-            options.push(KeyOption::Env(target.env_hint().into()));
+        if env_is_set(&hint) {
+            items.push(Item { label: format!("Use ${hint}"), detail: "already set".into() });
+            options.push(KeyOption::Env(hint));
         }
         items.push(Item { label: "Use a command".into(), detail: "a command that prints the key".into() });
         options.push(KeyOption::Command);
-        self.overlay = Some(Overlay::KeyChoice {
-            sel: Select::new(&format!("{} API key", target.label()), items),
-            provider: target.id().into(),
-            options,
-        });
+        self.overlay =
+            Some(Overlay::KeyChoice { sel: Select::new(&format!("{label} API key"), items), provider: id, options });
     }
 
     /// What the picker chose for `provider`, or `Cancel` when it was dismissed.
@@ -454,7 +508,11 @@ impl App {
         if provider == PROVIDER_ID {
             return self.on_chatgpt_choice(choice);
         }
-        let Some(target) = KeyTarget::find(provider) else { return };
+        let target = match KeyTarget::find(provider, self.services.providers.custom_registry()) {
+            Ok(Some(t)) => t,
+            Ok(None) => return,
+            Err(e) => return self.error(&format!("{e:#}")),
+        };
         match choice {
             KeyOption::Paste => {
                 self.set_typing(Some(Typing::Key));
@@ -513,7 +571,7 @@ impl App {
         self.notice(&format!("checking the key with {}…", target.label()));
         let tx = self.ui_tx.clone();
         tokio::task::spawn_local(async move {
-            let r = check::check_target(target, &entry).await;
+            let r = check::check_target(&target, &entry).await;
             let _ = tx.send(UiMsg::KeyChecked { flow, target, entry, r });
         });
     }
@@ -574,7 +632,7 @@ impl App {
             f.pending = Some(entry);
         }
         self.overlay = Some(Overlay::KeyChoice {
-            sel: Select::new(&format!("Use this {} key for chat models?", target.label()), chat_items(target, None)),
+            sel: Select::new(&format!("Use this {} key for chat models?", target.label()), chat_items(&target, None)),
             provider: target.id().into(),
             options: vec![KeyOption::Chat(true), KeyOption::Chat(false)],
         });
@@ -583,22 +641,31 @@ impl App {
     fn save_key(&mut self, target: KeyTarget, mut entry: Entry) {
         let flow = self.flows.key_flow.take();
         let then = flow.as_ref().and_then(|f| f.then);
-        entry.chat = match target {
+        entry.chat = match &target {
             // A search-only key has no chat flag; Baseten's only use is chat.
             KeyTarget::Search(_) => None,
+            // A custom endpoint's key is for chat and nothing else; it never carries a base URL.
+            KeyTarget::Custom(_) => Some(true),
             KeyTarget::Provider(_) if !target.asks_chat() => Some(true),
             // Never left unset: an unset flag would route chat.
             KeyTarget::Provider(_) => Some(entry.chat.or(flow.and_then(|f| f.chat)).unwrap_or(false)),
         };
+        if matches!(target, KeyTarget::Custom(_)) {
+            entry.base_url = None;
+        }
         let chat = entry.chat.unwrap_or(false);
         match self.services.save_key(target.id(), entry) {
             Ok(()) => {
-                match target {
+                match &target {
                     KeyTarget::Provider(def) => {
                         self.notice(&providers::saved_notice(def, chat));
                         self.send(Command::RefreshModel);
                     }
                     KeyTarget::Search(d) => self.notice(&format!("saved the {} key", d.label)),
+                    KeyTarget::Custom(c) => {
+                        self.notice(&format!("saved the {} key; {}/* models use it.", c.label(), c.id));
+                        self.send(Command::RefreshModel);
+                    }
                 }
                 self.key_flow_ended(then, true);
             }
@@ -614,6 +681,13 @@ impl App {
         if !arg.is_empty() {
             return self.logout(arg);
         }
+        let custom = match self.services.providers.custom_registry().snapshot() {
+            Ok(c) => c,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                Default::default()
+            }
+        };
         let mut providers: Vec<String> = self
             .services
             .providers
@@ -621,7 +695,7 @@ impl App {
             .list()
             .into_iter()
             .map(|(p, _)| p)
-            .filter(|p| KeyTarget::find(p).is_some())
+            .filter(|p| KeyTarget::builtin(p).is_some() || custom.contains_key(p))
             .collect();
         if self.services.providers.store().chatgpt_account().is_some_and(|a| a.signed_in()) {
             providers.push(PROVIDER_ID.into());
@@ -636,7 +710,10 @@ impl App {
                     return Item { label: "ChatGPT sign-in".into(), detail: "sign out and revoke".into() };
                 }
                 Item {
-                    label: KeyTarget::find(p).map_or_else(|| p.clone(), |t| t.label().to_string()),
+                    label: KeyTarget::builtin(p)
+                        .map(|t| t.label().to_string())
+                        .or_else(|| custom.get(p).map(|c| c.label().to_string()))
+                        .unwrap_or_else(|| p.clone()),
                     detail: "remove this key".into(),
                 }
             })
@@ -648,9 +725,33 @@ impl App {
         if chatgpt::is_chatgpt(provider) {
             return self.chatgpt_sign_out();
         }
-        let Some(target) = KeyTarget::find(provider) else {
-            return self.error(&format!("no API key support for `{provider}`"));
+        let target = match KeyTarget::find(provider, self.services.providers.custom_registry()) {
+            Ok(Some(t)) => t,
+            Ok(None) => return self.error(&format!("no API key support for `{provider}`")),
+            Err(e) => return self.error(&format!("{e:#}")),
         };
+        if target.is_keyless() {
+            return self.notice(&format!(
+                "{} takes no key, so there is none to remove; remove its definition with `mu providers rm {}`",
+                target.label(),
+                target.id()
+            ));
+        }
+        if matches!(target, KeyTarget::Custom(_)) {
+            return match self.services.remove_key(target.id()) {
+                Ok(true) => {
+                    self.notice(&format!(
+                        "removed the {} key; {}/* models now need a key (/login {})",
+                        target.label(),
+                        target.id(),
+                        target.id()
+                    ));
+                    self.send(Command::RefreshModel);
+                }
+                Ok(false) => self.notice(&format!("no {} key is stored", target.label())),
+                Err(e) => self.error(&format!("could not remove the {} key: {e}", target.label())),
+            };
+        }
         let was_chat = matches!(target, KeyTarget::Provider(_))
             && self.services.providers.store().get(target.id()).is_some_and(|e| e.routes_chat());
         match self.services.remove_key(target.id()) {
@@ -742,7 +843,7 @@ mod login_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::render::Renderer;
     use crate::text::line::line_text;
@@ -753,7 +854,7 @@ mod tests {
     static MODEL_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Providers over a key store of their own: tests that save or remove keys must not see each other's.
-    fn test_providers(
+    pub(in crate::app) fn test_providers(
         cfg: Rc<mu_base::config::Configs>,
         gateway: mu_provider::provider::endpoint::GatewaySource,
     ) -> Providers {
@@ -761,7 +862,7 @@ mod tests {
         Providers::for_tests_with_auth(cfg, gateway, auth)
     }
 
-    fn transcript_text(app: &App) -> String {
+    pub(in crate::app) fn transcript_text(app: &App) -> String {
         app.agent.tr.pending.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
 
@@ -807,11 +908,11 @@ mod tests {
         assert!(transcript_text(&app).contains("sign-in cancelled"));
     }
 
-    fn test_app(history: std::path::PathBuf) -> App {
+    pub(super) fn test_app(history: std::path::PathBuf) -> App {
         test_app_with_commands(history).0
     }
 
-    fn test_app_with_commands(history: std::path::PathBuf) -> (App, UnboundedReceiver<Command>) {
+    pub(in crate::app) fn test_app_with_commands(history: std::path::PathBuf) -> (App, UnboundedReceiver<Command>) {
         use mu_base::config::Configs;
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ui_tx, _ui_rx) = unbounded_channel();
@@ -852,18 +953,20 @@ mod tests {
                 key_flow_seq: 0,
                 chatgpt: None,
                 chatgpt_seq: 0,
+                custom_wizard: None,
+                custom_wizard_seq: 0,
             },
             quitting: false,
         };
         (app, cmd_rx)
     }
 
-    fn press(code: KeyCode, mods: KeyModifiers) -> Event {
+    pub(in crate::app) fn press(code: KeyCode, mods: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, mods))
     }
 
     /// Runs `f` on a current-thread runtime inside a `LocalSet`, as `spawn_local` needs.
-    fn in_local(f: impl std::future::Future<Output = ()>) {
+    pub(in crate::app) fn in_local(f: impl std::future::Future<Output = ()>) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         tokio::task::LocalSet::new().block_on(&rt, f);
     }
@@ -873,7 +976,7 @@ mod tests {
         let hist = std::env::temp_dir().join(format!("mu-keyflow-{}", uuid::Uuid::new_v4())).join("history.jsonl");
         let mut app = test_app(hist.clone());
         in_local(async {
-            app.start_key_flow(KeyTarget::find("anthropic").unwrap(), None, None);
+            app.start_key_flow(KeyTarget::builtin("anthropic").unwrap(), None, None);
             app.on_key_choice("anthropic", KeyOption::Paste);
             app.overlay = None;
             for c in "sk-ab".chars() {
@@ -1018,10 +1121,10 @@ mod tests {
     #[test]
     fn a_late_check_result_of_an_old_flow_is_ignored() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let t = KeyTarget::find("anthropic").unwrap();
-        app.start_key_flow(t, None, None);
+        let t = KeyTarget::builtin("anthropic").unwrap();
+        app.start_key_flow(t.clone(), None, None);
         app.flows.key_flow = None;
-        app.start_key_flow(t, None, None);
+        app.start_key_flow(t.clone(), None, None);
         app.on_key_checked(1, t, Entry::literal("sk-x"), Ok(Check::Valid));
         assert_eq!(app.flows.key_flow.as_ref().map(|f| f.id), Some(2), "the current flow survives");
     }
@@ -1029,9 +1132,9 @@ mod tests {
     #[test]
     fn a_valid_openai_key_asks_about_chat_and_saves_the_answer() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let t = KeyTarget::find("openai").unwrap();
-        app.start_key_flow(t, None, None);
-        app.on_key_checked(1, t, Entry::literal("sk-test-0123456789"), Ok(Check::Valid));
+        let t = KeyTarget::builtin("openai").unwrap();
+        app.start_key_flow(t.clone(), None, None);
+        app.on_key_checked(1, t.clone(), Entry::literal("sk-test-0123456789"), Ok(Check::Valid));
         let Some(Overlay::KeyChoice { options, .. }) = &app.overlay else { panic!("no chat question") };
         assert_eq!(options, &[KeyOption::Chat(true), KeyOption::Chat(false)]);
         assert!(app.services.providers.store().get("openai").is_none(), "nothing is saved before the answer");
@@ -1052,8 +1155,8 @@ mod tests {
     #[test]
     fn a_search_key_is_saved_without_a_chat_question() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let t = KeyTarget::find("exa").unwrap();
-        app.start_key_flow(t, None, None);
+        let t = KeyTarget::builtin("exa").unwrap();
+        app.start_key_flow(t.clone(), None, None);
         app.overlay = None;
         app.on_key_checked(1, t, Entry::literal("exa-test-0123456789"), Ok(Check::Unchecked));
         assert!(app.overlay.is_none(), "no chat question for a search key");
@@ -1110,7 +1213,7 @@ mod tests {
     #[test]
     fn a_flow_whose_overlay_was_replaced_is_dropped() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        app.start_key_flow(KeyTarget::find("anthropic").unwrap(), None, None);
+        app.start_key_flow(KeyTarget::builtin("anthropic").unwrap(), None, None);
         app.sync_key_flow();
         assert!(app.flows.key_flow.is_some(), "the key choice is still open");
         app.overlay = Some(Overlay::Logout { sel: Select::new("t", vec![]), providers: vec![] });
@@ -1176,23 +1279,30 @@ mod tests {
 
     #[test]
     fn late_model_lists_only_fill_their_own_picker() {
-        use mu_base::models::GatewayModel;
+        use mu_provider::provider::custom::{CustomModel, CustomProvider};
         let (mut app, _commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let gw = |id: &str| vec![GatewayModel { id: id.into(), context_length: None, max_output_tokens: None }];
+        // A configured model is a row the picker has before any refresh answers.
+        let modal = CustomProvider {
+            models: std::collections::BTreeMap::from([("x/b".to_string(), CustomModel::default())]),
+            discover: false,
+            ..CustomProvider::new("http://127.0.0.1:9")
+        };
+        app.services.providers.custom_registry().add("modal", modal.validated("modal").unwrap()).unwrap();
+        let report = |request: u64, diag: &str| UiMsg::ModelsRefreshed { request, diag: Some(diag.into()) };
         in_local(async {
             app.request_models();
             let a = app.flows.model_request_seq;
             app.overlay = None;
-            app.on_ui(UiMsg::Models { request: a, result: Ok(gw("x/a")) });
+            app.on_ui(UiMsg::ModelsRefreshed { request: a, diag: None });
             assert!(app.overlay.is_none(), "a cancelled picker is not reopened");
 
             app.open_model_roles(Some("default".into()));
             app.overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             let b = app.flows.model_request_seq;
             assert_eq!(b, a + 1);
-            app.on_ui(UiMsg::Models { request: a, result: Err("late".into()) });
-            assert!(!transcript_text(&app).contains("late"), "a stale error is not shown");
-            app.on_ui(UiMsg::Models { request: b, result: Ok(gw("x/b")) });
+            app.on_ui(report(a, "late"));
+            assert!(!transcript_text(&app).contains("late"), "a stale report is not shown");
+            app.on_ui(UiMsg::ModelsRefreshed { request: b, diag: None });
             let Some(Overlay::ModelRoles { st }) = &app.overlay else { panic!("editor gone") };
             assert!(st.select().highlighted().is_some(), "the matching list filled the sub-picker");
         });

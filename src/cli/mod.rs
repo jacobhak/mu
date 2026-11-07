@@ -4,6 +4,7 @@ pub mod auth;
 pub mod docs;
 pub mod models;
 pub mod predict;
+pub mod providers;
 pub mod select;
 pub mod web;
 
@@ -77,6 +78,12 @@ pub enum Sub {
     Auth {
         #[command(subcommand)]
         cmd: auth::Cmd,
+    },
+    /// Custom OpenAI-compatible endpoints (vLLM, Modal, ...): `mu providers list|add|models|rm`. Their models
+    /// are selected as `<id>/<model id>`, without omp.
+    Providers {
+        #[command(subcommand)]
+        cmd: providers::Cmd,
     },
     /// Where `web_search` sends queries: `mu web status|use|reset`. Nothing is contacted until you choose.
     Web {

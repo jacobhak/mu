@@ -70,6 +70,7 @@ impl App {
 
     /// Starts the browser sign-in, as `/login chatgpt` and the `/login` row do.
     pub(super) fn start_chatgpt(&mut self) {
+        self.leave_custom_wizard();
         if self.chatgpt_typing() {
             return self.notice("a ChatGPT sign-in is already waiting: paste its redirect URL, or press Esc");
         }

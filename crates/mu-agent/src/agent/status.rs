@@ -1,5 +1,8 @@
 use super::*;
+use mu_base::models::ThinkingMode;
 use mu_provider::auth::chatgpt;
+use mu_provider::provider::custom::AuthMode;
+use mu_provider::provider::providers::native_def;
 
 impl Agent {
     /// Tokens of the system prompt, measured again only when what it is built from changes.
@@ -53,16 +56,42 @@ impl Agent {
         self.model.model.native || self.model.model.is_unselected()
     }
 
+    /// A native model's reasoning support is what its spec says; unknown-price catalogue heuristics
+    /// are for gateway models only.
+    fn reasoning_capable(&self) -> bool {
+        let m = &self.model.model;
+        if m.native {
+            return !matches!(m.thinking.mode, ThinkingMode::None | ThinkingMode::Gateway);
+        }
+        pricing::reasoning(&m.id).unwrap_or(true)
+    }
+
+    /// The model is a custom endpoint configured without authentication.
+    fn native_keyless(&self) -> bool {
+        let m = &self.model.model;
+        m.native
+            && native_def(&m.provider).is_none()
+            && self
+                .ports
+                .providers
+                .custom_registry()
+                .get(&m.provider)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.auth == AuthMode::None)
+    }
+
     pub fn snapshot(&self) -> StatusSnapshot {
         let none = self.model.model.is_unselected();
         StatusSnapshot {
             model_id: self.model.model.id.clone(),
             model_name: if none { "no model".into() } else { pricing::display_name(&self.model.model.id) },
-            reasoning: !none && pricing::reasoning(&self.model.model.id).unwrap_or(true),
+            reasoning: !none && self.reasoning_capable(),
             thinking: self.model.live_thinking.get().as_str().into(),
             subscription: self.on_chatgpt_plan()
                 || (!self.gateway_idle() && self.costs.quota.is_subscription(&self.model.model.provider)),
             native: self.model.model.native,
+            native_keyless: self.native_keyless(),
             chatgpt_plan: self.on_chatgpt_plan(),
             plan: self.plan.plan.is_some(),
             context_tokens: Some(self.context_tokens()),
@@ -104,6 +133,12 @@ impl Agent {
     /// Picks up gateway-reported context windows once they are known.
     pub(super) fn refresh_model_meta(&mut self) {
         if let Ok((spec, _)) = self.ports.providers.resolve(&self.model.model.id) {
+            // A custom endpoint whose definition vanished mid-session stays native, so its next
+            // request fails locally instead of starting the gateway.
+            let m = &self.model.model;
+            if m.native && !spec.native && native_def(&m.provider).is_none() {
+                return;
+            }
             self.model.model = spec;
             self.sync_model_state();
         }

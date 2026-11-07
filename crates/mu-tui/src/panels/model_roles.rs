@@ -149,10 +149,15 @@ impl RoleEditor {
         self.select = Select::new("Choose a model", vec![]).context("Loading models…").back_keys(true);
     }
 
-    pub fn models_loaded(&mut self, request: u64, items: Vec<Item>, ids: Vec<String>) -> bool {
+    /// Fills the list for `request`. Each source's answer may call this again: the list is
+    /// rebuilt and the highlighted model kept. Once the user leaves the list, chooses a model or
+    /// clears the draft, the request no longer matches and nothing changes. `note` replaces the
+    /// context line (a `providers.toml` that does not read).
+    pub fn models_loaded(&mut self, request: u64, items: Vec<Item>, ids: Vec<String>, note: Option<&str>) -> bool {
         if self.screen != Screen::Models || self.request != Some(request) || items.len() != ids.len() {
             return false;
         }
+        let highlighted = self.select.highlighted().and_then(|i| self.models.get(i)).cloned();
         let current = self.draft.as_deref().map(split_level).map(|(m, _)| m).filter(|m| !m.is_empty());
         let mut items = items;
         let mut ids = ids;
@@ -160,19 +165,19 @@ impl RoleEditor {
             items.push(Item { label: id.clone(), detail: "Current configured model".into() });
             ids.push(id.clone());
         }
-        let selected = current.and_then(|id| ids.iter().position(|m| m == &id));
-        let context = if items.is_empty() {
+        let selected =
+            highlighted.filter(|h| ids.contains(h)).or(current).and_then(|id| ids.iter().position(|m| m == &id));
+        let context = note.unwrap_or(if items.is_empty() {
             "No models available; use /login to configure a provider"
         } else {
             "Concrete models only"
-        };
+        });
         self.select = Select::new("Choose a model", items).context(context).back_keys(true);
         if let Some(i) = selected {
             let select = std::mem::replace(&mut self.select, Select::new("", vec![]));
             self.select = select.preselect(i);
         }
         self.models = ids;
-        self.request = None;
         true
     }
 
@@ -340,8 +345,8 @@ mod tests {
             enter(&mut e);
             assert_eq!(enter(&mut e), RoleEditorAction::RequestModels);
             e.begin_models(7);
-            assert!(!e.models_loaded(6, vec![item("a/new")], vec!["a/new".into()]));
-            assert!(e.models_loaded(7, vec![item("a/new")], vec!["a/new".into()]));
+            assert!(!e.models_loaded(6, vec![item("a/new")], vec!["a/new".into()], None));
+            assert!(e.models_loaded(7, vec![item("a/new")], vec!["a/new".into()], None));
             press(&mut e, KeyCode::Down);
             enter(&mut e);
             let expected = if suffix == ":odd" { "a/new".to_string() } else { format!("a/new{suffix}") };
@@ -381,11 +386,40 @@ mod tests {
         assert_eq!(e.screen, Screen::Edit);
         assert_eq!(enter(&mut e), RoleEditorAction::RequestModels);
         e.begin_models(1);
-        assert!(e.models_loaded(1, vec![], vec![]));
+        assert!(e.models_loaded(1, vec![], vec![], None));
         assert_eq!(e.screen, Screen::Models);
         press(&mut e, KeyCode::Esc);
         assert_eq!(e.screen, Screen::Edit);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(e.on_key(ctrl_c), RoleEditorAction::Close);
+    }
+
+    #[test]
+    fn repeated_updates_keep_the_highlight_and_stop_once_the_user_moves_on() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let rows = |v: &[&str]| v.iter().map(|s| item(s)).collect::<Vec<Item>>();
+        let mut e = editor(None);
+        enter(&mut e);
+        assert_eq!(enter(&mut e), RoleEditorAction::RequestModels);
+        e.begin_models(3);
+        assert!(e.models_loaded(3, rows(&["a/a", "a/b"]), ids(&["a/a", "a/b"]), None));
+        down(&mut e, 1);
+        assert!(e.models_loaded(3, rows(&["a/a", "a/b", "a/c"]), ids(&["a/a", "a/b", "a/c"]), None));
+        assert_eq!(e.select().highlighted(), Some(1), "the refresh keeps the highlighted model");
+        assert!(e.models_loaded(3, rows(&["a/a", "a/b"]), ids(&["a/a", "a/b"]), Some("providers.toml is bad")));
+        assert_eq!(e.select().highlighted(), Some(1));
+        assert!(!e.models_loaded(2, rows(&["a/x"]), ids(&["a/x"]), None), "another request is not this list");
+
+        press(&mut e, KeyCode::Esc);
+        assert!(!e.models_loaded(3, rows(&["a/z"]), ids(&["a/z"]), None), "after leaving, the list is not revived");
+
+        let mut e = editor(None);
+        enter(&mut e);
+        enter(&mut e);
+        e.begin_models(4);
+        assert!(e.models_loaded(4, rows(&["a/a"]), ids(&["a/a"]), None));
+        enter(&mut e);
+        assert!(!e.models_loaded(4, rows(&["a/a"]), ids(&["a/a"]), None), "a chosen model ends the list");
+        assert_eq!(e.draft.as_deref(), Some("a/a"));
     }
 }
