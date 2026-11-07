@@ -14,6 +14,18 @@ fn run<F: std::future::Future>(f: F) -> F::Output {
     mu_testutil::block_on_local(f)
 }
 
+/// Whether any process in group `pgid` is still running. A killed process whose parent is gone
+/// stays a zombie until something reaps it — forever in a container whose PID 1 does not reap (the
+/// release build) — and a zombie still answers `kill(-pgid, 0)`, so ask each member's state.
+fn group_running(pgid: i32) -> bool {
+    let group = pgid.to_string();
+    let out = std::process::Command::new("ps").args(["-o", "pgid=,stat=", "-ax"]).output().expect("ps runs");
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        matches!((fields.next(), fields.next()), (Some(g), Some(stat)) if g == group && !stat.starts_with('Z'))
+    })
+}
+
 /// A plugin script: answers `initialize`, then hangs on `tool/call` or exits, per `on_call`.
 fn host(on_call: &str, lifetime: &str) -> (Rc<PluginHost>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("mu-plug-{}", uuid::Uuid::new_v4()));
@@ -379,8 +391,7 @@ fn mcp_cancel_sends_notifications_cancelled_and_shutdown_leaves_no_process_group
         let pid = slot.proc.borrow().clone().unwrap().pid as i32;
         h.shutdown_all().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        // SAFETY: signal 0 only checks that the group exists.
-        assert_eq!(unsafe { libc::kill(-pid, 0) }, -1, "the process group is gone");
+        assert!(!group_running(pid), "the process group is gone");
     });
 }
 
@@ -477,8 +488,7 @@ while :; do sleep 100 & wait; done
         proc.shutdown().await;
         assert!(marker.exists(), "the group got SIGTERM before SIGKILL");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        // SAFETY: signal 0 only checks that the group exists.
-        assert_eq!(unsafe { libc::kill(-pid, 0) }, -1, "the process group is gone");
+        assert!(!group_running(pid), "the process group is gone");
         let _ = std::fs::remove_dir_all(dir);
     });
 }

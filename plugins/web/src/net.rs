@@ -481,7 +481,17 @@ pub(crate) mod test_server {
         serve_at("127.0.0.1", handler).await
     }
 
-    /// `serve` on another loopback address (127.0.0.0/8 all answer on Linux).
+    /// The address that plays a LAN host in tests: `::1`, the only loopback address besides
+    /// `127.0.0.1` that macOS has assigned, so binding it works on both platforms. Any other
+    /// 127/8 address fails with `EADDRNOTAVAIL` on macOS, as a real LAN address would.
+    pub const LAN: &str = "::1";
+
+    /// The origin of a server on `LAN`; IPv6, so the host is bracketed.
+    pub fn lan_origin(port: u16) -> String {
+        format!("http://[{LAN}]:{port}")
+    }
+
+    /// `serve` on another address.
     pub async fn serve_at<F>(ip: &str, handler: F) -> u16
     where
         F: Fn(&Req) -> Resp + Send + Sync + 'static,
@@ -627,30 +637,30 @@ mod tests {
         assert!(err.contains("internal address"), "{err}");
     }
 
-    /// 127.0.0.2 plays the LAN and 127.0.0.1 the public internet.
+    /// `::1` plays the LAN and 127.0.0.1 the public internet.
     fn lan_guard() -> Guard {
-        Guard { blocked: |_| false, lan: |ip| ip == IpAddr::from([127, 0, 0, 2]) }
+        Guard { blocked: |_| false, lan: |ip| ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST) }
     }
 
     #[tokio::test]
     async fn a_lan_url_asked_for_directly_is_fetched() {
-        use super::test_server::serve_at;
-        let port = serve_at("127.0.0.2", |_| Resp::new(200, "text/plain", "router page")).await;
-        let p = load_page(&lan_guard(), &format!("http://127.0.0.2:{port}/"), LoadOpts::default()).await;
+        use super::test_server::{LAN, lan_origin, serve_at};
+        let port = serve_at(LAN, |_| Resp::new(200, "text/plain", "router page")).await;
+        let p = load_page(&lan_guard(), &format!("{}/", lan_origin(port)), LoadOpts::default()).await;
         assert!(p.ok && p.lan, "{:?}", p.error);
     }
 
     #[tokio::test]
     async fn a_public_page_cannot_redirect_into_the_lan() {
-        use super::test_server::serve_at;
+        use super::test_server::{LAN, lan_origin, serve_at};
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        let lan = serve_at("127.0.0.2", move |_| {
+        let lan = serve_at(LAN, move |_| {
             h.fetch_add(1, Ordering::SeqCst);
             Resp::new(200, "text/plain", "admin")
         })
         .await;
-        let loc = format!("http://127.0.0.2:{lan}/");
+        let loc = format!("{}/", lan_origin(lan));
         let public = serve(move |_| Resp::new(302, "text/plain", "").with("Location", &loc)).await;
         let p = load_page(&lan_guard(), &format!("http://127.0.0.1:{public}/"), LoadOpts::default()).await;
         assert!(!p.ok);
@@ -660,27 +670,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_lan_page_may_redirect_within_the_lan_but_not_out_and_back() {
-        use super::test_server::serve_at;
-        let b = serve_at("127.0.0.2", |_| Resp::new(200, "text/plain", "b")).await;
-        let to_b = format!("http://127.0.0.2:{b}/");
-        let a = serve_at("127.0.0.2", move |_| Resp::new(302, "text/plain", "").with("Location", &to_b)).await;
-        let p = load_page(&lan_guard(), &format!("http://127.0.0.2:{a}/"), LoadOpts::default()).await;
+        use super::test_server::{LAN, lan_origin, serve_at};
+        let b = serve_at(LAN, |_| Resp::new(200, "text/plain", "b")).await;
+        let to_b = format!("{}/", lan_origin(b));
+        let a = serve_at(LAN, move |_| Resp::new(302, "text/plain", "").with("Location", &to_b)).await;
+        let p = load_page(&lan_guard(), &format!("{}/", lan_origin(a)), LoadOpts::default()).await;
         assert!(p.ok && p.lan, "{:?}", p.error);
 
         // LAN, then public, then LAN again: once out, the chain cannot return.
-        let back = format!("http://127.0.0.2:{b}/");
+        let back = format!("{}/", lan_origin(b));
         let public = serve(move |_| Resp::new(302, "text/plain", "").with("Location", &back)).await;
         let out = format!("http://127.0.0.1:{public}/");
-        let a2 = serve_at("127.0.0.2", move |_| Resp::new(302, "text/plain", "").with("Location", &out)).await;
-        let p = load_page(&lan_guard(), &format!("http://127.0.0.2:{a2}/"), LoadOpts::default()).await;
+        let a2 = serve_at(LAN, move |_| Resp::new(302, "text/plain", "").with("Location", &out)).await;
+        let p = load_page(&lan_guard(), &format!("{}/", lan_origin(a2)), LoadOpts::default()).await;
         assert!(!p.ok && p.error.unwrap_or_default().contains("LAN address"));
     }
 
     #[tokio::test]
     async fn a_derived_request_reaches_the_lan_only_from_a_lan_page() {
-        use super::test_server::serve_at;
-        let lan = serve_at("127.0.0.2", |_| Resp::new(200, "text/plain", "x")).await;
-        let url = format!("http://127.0.0.2:{lan}/");
+        use super::test_server::{LAN, lan_origin, serve_at};
+        let lan = serve_at(LAN, |_| Resp::new(200, "text/plain", "x")).await;
+        let url = format!("{}/", lan_origin(lan));
         let from_public = LoadOpts { reach: Reach::Derived { lan_ok: false }, ..Default::default() };
         let p = load_page(&lan_guard(), &url, from_public).await;
         assert!(!p.ok && p.error.unwrap_or_default().contains("LAN address"));

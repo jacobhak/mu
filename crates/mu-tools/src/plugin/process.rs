@@ -43,8 +43,8 @@ pub(crate) fn kill_all_groups() {
     }
 }
 
-fn direct_children(parent: i32) -> Vec<pi_shell::process::Process> {
-    pi_shell::process::Process::from_pid(parent).map(|p| p.children()).unwrap_or_default()
+fn direct_children(parent: i32) -> Vec<pi_shell::proctree::Process> {
+    pi_shell::proctree::Process::from_pid(parent).map(|p| p.children()).unwrap_or_default()
 }
 
 /// Process groups of `parent`'s direct children, except `parent`'s own group.

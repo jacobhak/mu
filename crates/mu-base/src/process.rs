@@ -164,9 +164,31 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
     }
 
-    fn alive(pid: i32) -> bool {
+    /// Whether `pid` is still running. A killed process whose parent is gone stays a zombie until
+    /// something reaps it, and `kill(pid, 0)` succeeds on a zombie; in a container with no reaper
+    /// (the release build) that lasts forever, so ask the kernel for its state.
+    fn running(pid: i32) -> bool {
         // SAFETY: signal 0 only asks whether the pid exists.
-        unsafe { libc::kill(pid, 0) == 0 }
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Field 3 of /proc/<pid>/stat; field 2 (the command) may hold spaces and parentheses.
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return true };
+            let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next());
+            !matches!(state, Some("Z" | "X" | "x"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            // SAFETY: `info` is `size` bytes and proc_pidinfo writes at most that many.
+            let n = unsafe {
+                libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut libc::c_void, size)
+            };
+            n != size || info.pbi_status != libc::SZOMB
+        }
     }
 
     #[test]
@@ -179,7 +201,7 @@ mod tests {
         assert!(runtime().block_on(run_capture(c, Duration::from_millis(500))).is_none());
         let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
         let gone = (0..50).any(|_| {
-            let dead = !alive(pid);
+            let dead = !running(pid);
             if !dead {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -207,7 +229,7 @@ mod tests {
         let out = runtime().block_on(run_capture(c, Duration::from_secs(5))).unwrap();
         let pid: i32 = out.trim().parse().unwrap();
         std::thread::sleep(Duration::from_millis(800));
-        let survived = alive(pid);
+        let survived = running(pid);
         // SAFETY: plain kill(2) on the test's own child.
         unsafe { libc::kill(pid, libc::SIGKILL) };
         assert!(survived, "the released child {pid} was killed");

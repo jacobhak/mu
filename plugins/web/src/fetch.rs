@@ -323,16 +323,16 @@ mod tests {
         assert!(out.contains("# Intro"), "{out}");
     }
 
-    /// 127.0.0.2 plays the LAN and 127.0.0.1 the public internet.
+    /// `::1` plays the LAN and 127.0.0.1 the public internet.
     #[tokio::test]
     async fn a_link_on_a_public_page_cannot_pull_in_a_lan_url() {
-        use crate::net::test_server::serve_at;
+        use crate::net::test_server::{LAN, lan_origin, serve_at};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let md = "# Secret\n\nThis markdown lives on the LAN and is long enough to be accepted as an alternate if it were ever fetched by the page's link.";
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        let lan = serve_at("127.0.0.2", move |_| {
+        let lan = serve_at(LAN, move |_| {
             h.fetch_add(1, Ordering::SeqCst);
             Resp::new(200, "text/markdown", md)
         })
@@ -342,19 +342,20 @@ mod tests {
                 200,
                 "text/html",
                 format!(
-                    r#"<html><head><link rel="alternate" type="text/markdown" href="http://127.0.0.2:{lan}/p.md"></head><body><h1>Public</h1></body></html>"#
+                    r#"<html><head><link rel="alternate" type="text/markdown" href="{}/p.md"></head><body><h1>Public</h1></body></html>"#,
+                    lan_origin(lan)
                 ),
             )
         };
-        let g = Guard { blocked: |_| false, lan: |ip| ip == std::net::IpAddr::from([127, 0, 0, 2]) };
+        let g = Guard { blocked: |_| false, lan: |ip| ip == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST) };
         let public = serve(page).await;
         let out = fetch(&g, &format!("{}/p", base(public)), false).await.unwrap_or_else(|e| e);
         assert_ne!(method(&out), "alternate-markdown", "{out}");
         assert_eq!(hits.load(Ordering::SeqCst), 0, "the LAN host was contacted");
 
         // The same page served from the LAN may link to the LAN.
-        let lan_page = serve_at("127.0.0.2", page).await;
-        let out = fetch(&g, &format!("http://127.0.0.2:{lan_page}/p"), false).await.unwrap();
+        let lan_page = serve_at(LAN, page).await;
+        let out = fetch(&g, &format!("{}/p", lan_origin(lan_page)), false).await.unwrap();
         assert_eq!(method(&out), "alternate-markdown", "{out}");
     }
 

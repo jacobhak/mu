@@ -61,9 +61,12 @@ check "task: two scouts" test "$(grep -l parentSession "$state"/sessions/*/*.jso
 tmux new -d -s "$tm" -x 150 -y 40 "cd $work && MU_HOME=$MU_HOME OMP_PROFILE=${OMP_PROFILE:-} $mu --model @smol; echo EXIT=\$?; sleep 120"
 wait_for "μ" 20 || bad "tui starts"
 tmux send-keys -t "$tm" 'run bash: sleep 8; echo done. Then reply FIN.' Enter
-wait_for "\$ sleep 8" 30
+# Steer while that turn is certainly running. Waiting for the bash card first races the model's reply
+# (it may hand `sleep 8` to a background job and answer at once), and the steer would arrive as a
+# fresh prompt instead of a queued one.
 tmux send-keys -t "$tm" 'also run date' Enter
 check "steer shows in queue bar" wait_for "↳ steer: also run date" 5
+wait_for "\$ sleep 8" 30
 check "steer reaches the model" wait_for "\$ date" 60
 wait_for "FIN" 60
 

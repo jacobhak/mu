@@ -449,9 +449,10 @@ impl Tools {
 const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Prints the cwd, then each exported name and value as NUL-terminated fields. Values hold anything
-/// but NUL, so the fields split exactly; `export -p` does not quote values and cannot be split.
-const SNAPSHOT_COMMAND: &str =
-    r#"printf '%s\0' "$(pwd)"; for n in $(compgen -e); do printf '%s\0%s\0' "$n" "${!n}"; done"#;
+/// but NUL, so the fields split exactly. The tool profile has no `compgen -e` (oh-my-pi v18.17
+/// dropped it), so the names come from `declare -px` and each value is re-read with `${!name}`:
+/// that needs no unquoting of `declare`'s own escaping, so a value's bytes survive exactly.
+const SNAPSHOT_COMMAND: &str = r#"printf '%s\0' "$(pwd)"; while IFS= read -r __mu_l; do case $__mu_l in 'declare -'*x*) __mu_n=${__mu_l#declare -}; __mu_n=${__mu_n#* }; __mu_n=${__mu_n%%=*}; printf '%s\0%s\0' "$__mu_n" "${!__mu_n}";; esac; done <<< "$(declare -px)""#;
 
 /// Not inherited by a job: shell bookkeeping, and PWD, which is set from the job's cwd.
 const NOT_INHERITED: [&str; 4] = ["_", "SHLVL", "OLDPWD", "PWD"];
@@ -819,6 +820,17 @@ mod tests {
         std::process::Command::new("pgrep").args(["-f", &format!("sleep {arg}$")]).output().unwrap().status.success()
     }
 
+    /// `alive`, after up to 5 s: a background process may not have exec'd yet when the call returns.
+    async fn alive_soon(arg: &str) -> bool {
+        for _ in 0..50 {
+            if alive(arg).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn background_processes_in_plain_mode() {
         // `pgrep`/`pkill -f` see every process on the machine, so the sleep durations carry this
@@ -832,19 +844,16 @@ mod tests {
         let cmd = format!("(/bin/sleep {quiet} &); nohup /bin/sleep {kept} >/dev/null 2>&1 & echo started");
         let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
         assert!(out.text.contains("started"), "{}", out.text);
-        // A `(… &)` subshell job ends with the command; `nohup … &` (pi-shell's builtin, which detaches) keeps one alive.
-        assert!(!alive(&quiet).await);
-        // The background process may not have exec'd `sleep` yet when the command returns.
-        let mut up = false;
-        for _ in 0..50 {
-            if alive(&kept).await {
-                up = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // A subshell's background external outlives the call, as it does in bash (oh-my-pi v18.18
+        // stopped ending it), and so does a `nohup` job, which pi-shell detaches from the session.
+        assert!(alive_soon(&quiet).await, "the subshell's job did not outlive the call");
+        assert!(alive_soon(&kept).await, "the nohup job did not outlive the call");
+        // The subshell's job is not in the table, so nothing mu exposes can stop it; `nohup … &` is.
+        let jobs = tools.call("bash", &json!({"command": "jobs"}), &ctx).await;
+        assert!(!jobs.text.contains(&quiet) && jobs.text.contains(&kept), "{}", jobs.text);
+        for arg in [&quiet, &kept] {
+            let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {arg}$")]).status();
         }
-        assert!(up);
-        let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {kept}$")]).status();
     }
 
     /// mu's runtime is current-thread: the persistent shell must still reap a finished `&` child
