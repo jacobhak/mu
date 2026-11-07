@@ -1,4 +1,5 @@
 use crate::model_config::{self, Import, ModelConfig, ModelLimits};
+use crate::permissions::{PermissionMode, RuleSet};
 use mu_common::paths;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -147,6 +148,58 @@ pub struct MuConfig {
     pub secrets: MuSecrets,
     pub status: MuStatus,
     pub bash: MuBash,
+    /// `[permissions]`, parsed by `load_permissions` rather than serde.
+    #[serde(skip)]
+    pub permissions: MuPermissions,
+}
+
+/// `[permissions]`: which tool calls may run without asking, and the rules that override it.
+#[derive(Debug, Clone)]
+pub struct MuPermissions {
+    pub mode: PermissionMode,
+    /// The built-in read-only command set counts as tier read.
+    pub readonly_bash: bool,
+    pub rules: RuleSet,
+}
+
+impl Default for MuPermissions {
+    fn default() -> Self {
+        Self { mode: PermissionMode::Yolo, readonly_bash: true, rules: RuleSet::default() }
+    }
+}
+
+fn load_permissions(v: &toml::Value, warn: &mut Vec<String>) -> MuPermissions {
+    let mut p = MuPermissions::default();
+    let Some(t) = v.as_table() else {
+        warn.push("config.toml: [permissions] is not a table; ignored".to_string());
+        return p;
+    };
+    match t.get("mode") {
+        None => {}
+        Some(v) => {
+            let s = v.as_str();
+            match s.and_then(PermissionMode::parse) {
+                Some(m) => p.mode = m,
+                None => warn.push(format!(
+                    "config.toml: [permissions] mode \"{}\" is not ask, edits or yolo; using yolo",
+                    s.map_or_else(|| v.to_string(), str::to_string)
+                )),
+            }
+        }
+    }
+    match t.get("readonly_bash") {
+        None => {}
+        Some(toml::Value::Boolean(b)) => p.readonly_bash = *b,
+        Some(v) => warn.push(format!("config.toml: [permissions] readonly_bash {v} is not true or false; using true")),
+    }
+    match t.get("rules") {
+        None => {}
+        Some(v) => match v.as_table() {
+            Some(table) => p.rules = RuleSet::parse(table, "config.toml", warn),
+            None => warn.push("config.toml: [permissions] rules is not a table; ignored".to_string()),
+        },
+    }
+    p
 }
 
 /// `[bash]`: while a background job runs, a model's command that starts with a sleep of at least
@@ -545,6 +598,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         secrets: parse(section("secrets"), "secrets", warn),
         status,
         bash,
+        permissions: load_permissions(&section("permissions"), warn),
     }
 }
 
@@ -858,6 +912,36 @@ mod tests {
         let mut b = toml::from_str::<MuBash>("wait_sleep_secs = -3").unwrap();
         check_bash(&mut b, &mut w);
         assert_eq!((b, w.len()), (MuBash::default(), 1));
+    }
+
+    #[test]
+    fn permissions_default_to_yolo_and_warn_on_bad_values() {
+        let default = load_permissions(&toml::Value::Table(Default::default()), &mut Vec::new());
+        assert_eq!(default.mode, PermissionMode::Yolo);
+        assert!(default.readonly_bash);
+        assert!(default.rules.is_empty());
+
+        let mut w = Vec::new();
+        let text: toml::Table =
+            "mode = \"nope\"\nreadonly_bash = 3\n[rules]\nbash = { \"git push *\" = \"deny\" }".parse().unwrap();
+        let p = load_permissions(&toml::Value::Table(text), &mut w);
+        assert_eq!(p.mode, PermissionMode::Yolo, "a bad mode falls back to yolo");
+        assert!(p.readonly_bash, "a bad readonly_bash falls back to true");
+        assert_eq!(p.rules.0.len(), 1);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("mode"));
+
+        let mut w = Vec::new();
+        let text: toml::Table = "[rules]\nbash = \"push\"".parse().unwrap();
+        let p = load_permissions(&toml::Value::Table(text), &mut w);
+        assert!(p.rules.is_empty(), "an unknown action never becomes allow");
+        assert_eq!(w.len(), 1);
+
+        let mut w = Vec::new();
+        let text: toml::Table = "[rules]\n\"mcp__github_*\" = \"allow\"".parse().unwrap();
+        let p = load_permissions(&toml::Value::Table(text), &mut w);
+        assert!(w.is_empty());
+        assert_eq!(p.rules.0[0].1.pattern, "*", "a string value means every call of the tool");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::message::UserInput;
 use crate::models::Thinking;
+use crate::permissions::{ApprovalDecision, ApprovalRequest, PermissionMode};
 use crate::tool::ToolOutput;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -34,6 +35,8 @@ pub enum Command {
     RefreshModel,
     SetThinking(Thinking),
     CycleThinking,
+    /// `/permissions` or `--permissions`: the mode applies to the next tool call.
+    SetPermissionMode(PermissionMode),
     NewSession,
     Compact(Option<String>),
     /// `/review [focus]`.
@@ -139,6 +142,8 @@ pub struct StatusSnapshot {
     pub git: Option<GitInfo>,
     /// Quota windows of the current provider, when the gateway reports them.
     pub usage: Option<ProviderUsage>,
+    /// Tool permissions; the status line shows it unless it is `yolo`.
+    pub permissions: PermissionMode,
 }
 
 /// A plan's state in the plan store.
@@ -373,6 +378,8 @@ pub enum AgentEvent {
     Thinking(String),
     /// Desired thinking level changed while a turn is running.
     ThinkingLevel(Thinking),
+    /// Tool permissions changed (`/permissions`).
+    PermissionMode(PermissionMode),
     BlockEnd,
     /// The model began a tool call; its arguments follow as `ToolCallDelta`s.
     ToolCallStart {
@@ -436,6 +443,11 @@ pub enum AgentEvent {
     Ask {
         questions: Vec<AskQuestion>,
         reply: oneshot::Sender<Option<Vec<Answer>>>,
+    },
+    /// A tool call needs the user's approval. Dropping `reply` denies it and ends the turn.
+    Approve {
+        request: ApprovalRequest,
+        reply: oneshot::Sender<ApprovalDecision>,
     },
     /// `web_search` was called and no backend is set up: the front end runs the setup wizard and
     /// replies whether web search is now ready. A dropped `reply` means no.

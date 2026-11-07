@@ -273,6 +273,16 @@ impl Select {
         self.editing
     }
 
+    /// The note or the free-text row takes keystrokes, so they are not shortcuts.
+    pub fn is_typing(&self) -> bool {
+        self.editing || self.noting
+    }
+
+    /// Moves the highlight to item `idx`; dialogs that use it keep the filter empty.
+    pub fn select_row(&mut self, idx: usize) {
+        self.sel = idx.min(self.items.len().saturating_sub(1));
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> SelectResult {
         if key.kind == KeyEventKind::Release {
             return SelectResult::Pending;

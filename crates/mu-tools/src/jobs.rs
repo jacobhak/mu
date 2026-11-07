@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::permissions::Permissions;
 use crate::tools::subagent::{BackgroundResult, Outcome, run_child_observed};
 use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
@@ -275,9 +276,18 @@ impl JobsHandle {
         });
     }
 
-    pub fn spawn(self: &Rc<Self>, id: String, agent: String, exe: PathBuf, cwd: PathBuf, payload: Value) {
+    pub fn spawn(
+        self: &Rc<Self>,
+        id: String,
+        agent: String,
+        exe: PathBuf,
+        cwd: PathBuf,
+        payload: Value,
+        perms: Rc<Permissions>,
+    ) {
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
+        let label = format!("{id} ({agent})");
         let spec = Spec {
             id,
             agent,
@@ -288,7 +298,7 @@ impl JobsHandle {
         };
         let me = self.clone();
         self.spawn_job(spec, String::new(), cancel, move |seq| async move {
-            let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}).await;
+            let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
             Finished { ok: out.ok, text: out.text, note: None }
@@ -309,6 +319,7 @@ impl JobsHandle {
         payload: &Value,
         cancel: &CancellationToken,
         on_tool: impl FnMut(&str, &str),
+        perms: Rc<Permissions>,
     ) -> Outcome {
         let id = self.unique_id(id);
         let own = cancel.child_token();
@@ -321,7 +332,7 @@ impl JobsHandle {
             command: None,
         };
         let seq = self.start(spec, String::new(), own.clone());
-        let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool).await;
+        let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool, &perms, "review").await;
         if let Some(mut j) = self.job_mut(seq) {
             j.state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
             j.ended = Some(SystemTime::now());
@@ -332,6 +343,8 @@ impl JobsHandle {
     }
 
     /// Runs the child of job `seq`, keeping its tool count, last activity, session and model current.
+    /// An approval it needs is asked in the parent's UI, labelled `from` it.
+    #[allow(clippy::too_many_arguments)]
     async fn run_subagent(
         &self,
         seq: u64,
@@ -340,6 +353,8 @@ impl JobsHandle {
         payload: &Value,
         cancel: &CancellationToken,
         mut on_tool: impl FnMut(&str, &str),
+        perms: &Rc<Permissions>,
+        from: &str,
     ) -> Outcome {
         run_child_observed(
             exe,
@@ -366,6 +381,7 @@ impl JobsHandle {
                 }
                 self.emit();
             },
+            Some(&|r| perms.forward(&self.events, from, r)),
         )
         .await
     }
@@ -642,7 +658,14 @@ pub(crate) mod tests {
         let h = handle();
         tokio::task::LocalSet::new()
             .run_until(async {
-                h.spawn("A".into(), "scout".into(), exe, base.clone(), serde_json::json!({"task": "find  x\nnow"}));
+                h.spawn(
+                    "A".into(),
+                    "scout".into(),
+                    exe,
+                    base.clone(),
+                    serde_json::json!({"task": "find  x\nnow"}),
+                    Rc::default(),
+                );
                 assert_eq!(h.finished().await.len(), 1);
             })
             .await;
@@ -681,6 +704,7 @@ pub(crate) mod tests {
                 &serde_json::json!({"task": "review it"}),
                 &CancellationToken::new(),
                 |n, s| seen.push(format!("{n} {s}")),
+                Rc::default(),
             ))
             .await;
         assert_eq!((out.ok, out.text.as_str()), (true, "report"));
@@ -708,7 +732,7 @@ pub(crate) mod tests {
                     assert_eq!(h.kill(Some("review")), 1);
                 };
                 let (out, ()) = tokio::join!(
-                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}),
+                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}, Rc::default()),
                     killer
                 );
                 assert!(!out.ok && out.text == "cancelled", "{}", out.text);
@@ -722,7 +746,7 @@ pub(crate) mod tests {
                     owner.cancel();
                 };
                 let (out, ()) = tokio::join!(
-                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}),
+                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}, Rc::default()),
                     canceller
                 );
                 assert!(!out.ok);

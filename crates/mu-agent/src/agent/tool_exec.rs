@@ -1,7 +1,21 @@
 use super::*;
 use crate::review;
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope, PermissionMode};
+use mu_tools::permissions::Verdict;
 use std::time::SystemTime;
+
+/// The model's reason when nobody can approve a call.
+fn approval_unavailable(name: &str, reason: &str, mode: PermissionMode) -> String {
+    let how = reason
+        .strip_prefix("rule \"")
+        .and_then(|rest| rest.split_once('"'))
+        .map(|(pattern, _)| format!("by rule \"{pattern}\""))
+        .unwrap_or_else(|| format!("in {} mode", mode.as_str()));
+    format!(
+        "Not run: {name} needs approval {how} and nobody can approve it in this run. The user can allow it with a [permissions.rules] entry in ~/.mu/config.toml or run with --permissions yolo."
+    )
+}
 
 fn elapsed_text(secs: u64) -> String {
     match secs {
@@ -229,6 +243,18 @@ impl Agent {
         self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
     }
 
+    /// Puts one tool call to the user. A cancelled turn, or a front end that drops the dialog,
+    /// denies it.
+    async fn approve(&self, req: ApprovalRequest, cancel: &CancellationToken) -> ApprovalDecision {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.emit(AgentEvent::Approve { request: req, reply: tx });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => ApprovalDecision::Deny { note: None },
+            r = rx => r.unwrap_or(ApprovalDecision::Deny { note: None }),
+        }
+    }
+
     pub(super) async fn run_tool(
         &mut self,
         id: &str,
@@ -248,29 +274,78 @@ impl Agent {
         }
         self.emit(AgentEvent::ToolStart { id: id.into(), name: name.into(), args: args.clone() });
         let denied = self.policy().check(name).err().or_else(|| secrets::guard(name, &args).err());
+        let mut user_note = None;
         let mut out = match blocked.or(denied) {
             Some(b) => ToolOutput::err(b),
             None => {
-                let ctx = ToolCtx {
-                    events: self.ports.events.clone(),
-                    cancel: cancel.clone(),
-                    call_id: id.into(),
-                    plan: self.plan.plan.is_some(),
-                };
-                use futures_util::FutureExt;
-                match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await {
-                    Ok(o) => o,
-                    Err(p) => {
-                        let msg = p
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| p.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown panic".into());
-                        ToolOutput::err(format!("tool panicked: {msg}"))
+                let mut warns = Vec::new();
+                self.tools.permissions.ensure_project(&self.cwd, &mut warns).await;
+                for w in warns {
+                    self.notice(w);
+                }
+                let mut stop = None;
+                match self.tools.permissions.check(&self.tools, name, &args) {
+                    Verdict::Allow => {}
+                    Verdict::Deny(msg) => stop = Some(ToolOutput::err(msg)),
+                    Verdict::Ask(mut req) => {
+                        req.call_id = id.into();
+                        let grant = req.grant.clone();
+                        let reason = req.reason.clone();
+                        match self.approve(req, cancel).await {
+                            ApprovalDecision::Allow { scope, note } => {
+                                if scope != ApprovalScope::Once
+                                    && let Some(g) = &grant
+                                    && let Err(e) = self.tools.permissions.remember(g, scope, true)
+                                {
+                                    self.notice(format!("could not save the approval: {e}"));
+                                }
+                                user_note = note;
+                            }
+                            ApprovalDecision::Deny { note: Some(n) } => {
+                                stop = Some(ToolOutput::err(format!("Not run: the user denied this {name} call: {n}")));
+                            }
+                            ApprovalDecision::Deny { note: None } => {
+                                cancel.cancel();
+                                stop = Some(ToolOutput::err("Not run: the user denied this call."));
+                            }
+                            ApprovalDecision::Unavailable => {
+                                stop = Some(ToolOutput::err(approval_unavailable(
+                                    name,
+                                    &reason,
+                                    self.tools.permissions.mode(),
+                                )));
+                            }
+                        }
+                    }
+                }
+                match stop {
+                    Some(o) => o,
+                    None => {
+                        let ctx = ToolCtx {
+                            events: self.ports.events.clone(),
+                            cancel: cancel.clone(),
+                            call_id: id.into(),
+                            plan: self.plan.plan.is_some(),
+                        };
+                        use futures_util::FutureExt;
+                        match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await {
+                            Ok(o) => o,
+                            Err(p) => {
+                                let msg = p
+                                    .downcast_ref::<&str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| p.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "unknown panic".into());
+                                ToolOutput::err(format!("tool panicked: {msg}"))
+                            }
+                        }
                     }
                 }
             }
         };
+        if let Some(n) = user_note {
+            out.text.push_str(&format!("\n\nUser note: {n}"));
+        }
         let hits = self.redact_output(&mut out, true);
         self.log_redaction(&format!("tool:{name}"), &hits);
         let sub = format!("tool_result:{name}");

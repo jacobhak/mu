@@ -103,6 +103,7 @@ impl Agent {
             session_path: self.session.as_ref().map(|s| s.path.to_string_lossy().into_owned()),
             git: self.costs.git.clone(),
             usage: if self.gateway_idle() { None } else { self.costs.quota.usage_for(&self.model.model.provider) },
+            permissions: self.tools.permissions.mode(),
         }
     }
 

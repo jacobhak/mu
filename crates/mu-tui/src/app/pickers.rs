@@ -7,12 +7,13 @@ use crate::panels::model_roles::RoleEditor;
 use crate::panels::plan_review::Tier;
 use crate::panels::reply::ReplyPicker;
 use crate::text::markdown;
-use crate::widgets::overlay::{LoginTarget, OverlayEvent};
+use crate::widgets::overlay::{ApproveState, LoginTarget, OverlayEvent};
 use crate::widgets::select::{Item, Select};
 use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
 use mu_base::model_config::MAIN_SET;
 use mu_base::models::GatewayModel;
+use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_provider::provider::providers::KeyTarget;
 use tokio::sync::oneshot;
 
@@ -33,7 +34,37 @@ impl App {
             let _ = reply.send(Some(vec![]));
             return;
         }
+        self.set_aside_approval();
         self.overlay = Some(Overlay::new_ask(qs, reply));
+    }
+
+    /// Queues an approval and shows it unless another dialog is up.
+    pub(super) fn start_approve(&mut self, request: ApprovalRequest, reply: oneshot::Sender<ApprovalDecision>) {
+        self.approvals.push_back((request, reply));
+        self.open_queued_approval();
+    }
+
+    /// Shows the oldest queued approval once no other dialog is up, dropping the ones whose turn
+    /// is over.
+    pub(super) fn open_queued_approval(&mut self) {
+        self.approvals.retain(|(_, reply)| !reply.is_closed());
+        if self.overlay.is_some() {
+            return;
+        }
+        if let Some((req, reply)) = self.approvals.pop_front() {
+            self.overlay = Some(Overlay::Approve(Box::new(ApproveState::new(req, reply))));
+        }
+    }
+
+    /// An approval on screen gives way to another dialog: it goes back to the front of the queue
+    /// unanswered, so it reopens when that dialog closes.
+    pub(super) fn set_aside_approval(&mut self) {
+        if matches!(self.overlay, Some(Overlay::Approve(_)))
+            && let Some(Overlay::Approve(st)) = self.overlay.take()
+            && let Some(pending) = st.into_pending()
+        {
+            self.approvals.push_front(pending);
+        }
     }
 
     /// Opens the session picker at once with the rows already known (cached gateway models,
@@ -346,6 +377,7 @@ impl App {
         if let Some(e) = event {
             self.on_overlay_event(e);
         }
+        self.open_queued_approval();
     }
 
     fn save_role(&mut self, set: &str, role: &str, value: Option<&str>) {

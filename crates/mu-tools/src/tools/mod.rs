@@ -15,7 +15,7 @@ pub mod task;
 pub mod todo;
 pub mod uri;
 pub mod web_gate;
-mod write;
+pub(crate) mod write;
 mod yield_;
 
 pub use shell::wait;
@@ -61,6 +61,8 @@ pub struct Tools {
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
     pub edit_store: pi_edit::EditStore,
+    /// The session's tool permissions: the gate reads it, `task` hands it to subagents.
+    pub permissions: Rc<crate::permissions::Permissions>,
     shell: shell::worker::ShellWorker,
     /// Where the persistent shell was after the last foreground bash call; see `pathnote`.
     shell_cwd: std::cell::RefCell<Option<PathBuf>>,
@@ -87,6 +89,7 @@ impl Tools {
             session: Default::default(),
             output_schema: Default::default(),
             edit_store: pi_edit::EditStore::new(),
+            permissions: Rc::default(),
             shell: Default::default(),
             shell_cwd: Default::default(),
             shell_env: Default::default(),

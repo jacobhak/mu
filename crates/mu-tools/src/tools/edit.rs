@@ -15,7 +15,7 @@ pub struct Args {
 }
 
 impl Args {
-    pub(super) fn paths(&self) -> Vec<String> {
+    pub(crate) fn paths(&self) -> Vec<String> {
         super::pathnote::edit_paths(&self.input)
     }
 }

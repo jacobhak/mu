@@ -17,6 +17,7 @@ use mu_base::events::{
 };
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_base::message::UserInput;
+use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_base::text::truncate_text as trunc;
 use mu_base::tool::ToolOutput;
 use mu_session::session::tree_cost::{Child, TreeCost, session_cost};
@@ -63,6 +64,11 @@ pub(super) enum Effect {
     Ask {
         questions: Vec<AskQuestion>,
         reply: oneshot::Sender<Option<Vec<Answer>>>,
+    },
+    /// A tool call needs the user's approval.
+    Approve {
+        request: ApprovalRequest,
+        reply: oneshot::Sender<ApprovalDecision>,
     },
     PlanReview {
         title: String,
@@ -196,6 +202,7 @@ impl AgentView {
                 | AgentEvent::ToolOutput { .. }
                 | AgentEvent::Status(_)
                 | AgentEvent::ThinkingLevel(_)
+                | AgentEvent::PermissionMode(_)
                 | AgentEvent::Jobs(_)
                 | AgentEvent::Todo(_)
                 | AgentEvent::TurnStart
@@ -331,6 +338,10 @@ impl AgentView {
                 self.ring_if_attention(&mut fx);
                 fx.push(Effect::Ask { questions, reply });
             }
+            AgentEvent::Approve { request, reply } => {
+                self.ring_if_attention(&mut fx);
+                fx.push(Effect::Approve { request, reply });
+            }
             AgentEvent::WebSetup { reply } => {
                 self.ring_if_attention(&mut fx);
                 fx.push(Effect::WebSetup { reply });
@@ -346,6 +357,7 @@ impl AgentView {
             AgentEvent::RewindPoints(list) => fx.push(Effect::RewindPoints(list)),
             AgentEvent::Status(s) => self.status = s,
             AgentEvent::ThinkingLevel(t) => self.status.thinking = t.as_str().into(),
+            AgentEvent::PermissionMode(m) => self.status.permissions = m,
             AgentEvent::Todo(v) => self.todo = serde_json::from_value(v).unwrap_or_default(),
             AgentEvent::TurnEnd { aborted } => {
                 self.pty = None;
@@ -487,6 +499,7 @@ impl App {
         for effect in fx {
             self.apply(effect);
         }
+        self.open_queued_approval();
         if spend {
             self.poll_spend();
         }
@@ -520,8 +533,10 @@ impl App {
         match effect {
             Effect::Ring => self.ring(),
             Effect::Ask { questions, reply } => self.start_ask(questions, reply),
+            Effect::Approve { request, reply } => self.start_approve(request, reply),
             Effect::WebSetup { reply } => self.start_web_wizard(Some(reply)),
             Effect::PlanReview { title, uri, file, content, stored, note, reply } => {
+                self.set_aside_approval();
                 let context = self
                     .agent
                     .status
@@ -546,7 +561,13 @@ impl App {
                     st.set_output(&id, tail);
                 }
             }
-            Effect::TurnEnded { aborted } => self.agent.turn_aborted = aborted,
+            Effect::TurnEnded { aborted } => {
+                self.agent.turn_aborted = aborted;
+                // A cancelled turn drops its approval: close a dialog nobody will answer.
+                if matches!(&self.overlay, Some(Overlay::Approve(a)) if a.reply_closed()) {
+                    self.overlay = None;
+                }
+            }
             Effect::Restore { queued } => {
                 if !self.agent.turn_aborted {
                     self.notice("queued messages were not sent; they are back in the composer");
@@ -578,9 +599,11 @@ pub(super) fn error_lines(s: &str) -> Vec<Line> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::keys::tests::test_app;
     use super::*;
     use crate::text::line::line_text;
     use mu_base::events::{JobKind, StatusSnapshot};
+    use mu_base::permissions::ApprovalScope;
     use std::time::{Duration, SystemTime};
 
     const SIZE: (usize, usize) = (80, 24);
@@ -920,5 +943,78 @@ mod tests {
         assert!(matches!(fx.as_slice(), [Effect::RewindPoints(p)] if *p == points));
         let fx = v.on_event(AgentEvent::QueuePopped("first".into()), SIZE);
         assert!(matches!(fx.as_slice(), [Effect::Popped(p)] if p.text == "first"));
+    }
+
+    fn approval(tool: &str, body: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            tool: tool.into(),
+            call_id: "c1".into(),
+            title: format!("{tool}: {body}"),
+            reason: "ask mode: bash needs approval".into(),
+            body: body.into(),
+            from: None,
+            grant: Some(mu_base::permissions::Grant { tool: tool.into(), patterns: vec!["touch *".into()] }),
+        }
+    }
+
+    fn open_approval(app: &mut App, req: ApprovalRequest) -> oneshot::Receiver<ApprovalDecision> {
+        let (tx, rx) = oneshot::channel();
+        app.on_agent(AgentEvent::Approve { request: req, reply: tx });
+        rx
+    }
+
+    fn press(app: &mut App, code: crossterm::event::KeyCode) {
+        app.overlay_key(mu_testutil::key(code));
+    }
+
+    #[test]
+    fn an_approval_opens_and_y_enter_allows_once() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut rx = open_approval(&mut app, approval("bash", "touch a.txt"));
+        assert!(matches!(app.overlay, Some(Overlay::Approve(_))));
+        press(&mut app, crossterm::event::KeyCode::Char('y'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.overlay.is_none());
+        assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None })));
+    }
+
+    #[test]
+    fn esc_denies_without_a_note() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut rx = open_approval(&mut app, approval("bash", "touch a.txt"));
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(app.overlay.is_none());
+        assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
+    }
+
+    #[test]
+    fn n_then_a_note_denies_with_the_reason() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut rx = open_approval(&mut app, approval("write", "b.txt"));
+        press(&mut app, crossterm::event::KeyCode::Char('n'));
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        for c in "why".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.overlay.is_none());
+        match rx.try_recv() {
+            Ok(ApprovalDecision::Deny { note: Some(n) }) => assert_eq!(n, "why"),
+            other => panic!("expected a deny with a note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_approval_waits_until_the_first_is_answered() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut first = open_approval(&mut app, approval("bash", "touch a.txt"));
+        let mut second = open_approval(&mut app, approval("bash", "touch b.txt"));
+        assert_eq!(app.approvals.len(), 1);
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(matches!(app.overlay, Some(Overlay::Approve(_))), "the queued one takes over");
+        assert!(matches!(first.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(app.overlay.is_none() && app.approvals.is_empty());
+        assert!(matches!(second.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
     }
 }

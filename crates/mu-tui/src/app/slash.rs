@@ -7,12 +7,13 @@ use crate::text::markdown;
 use mu_base::config::Configs;
 use mu_base::image;
 use mu_base::models::Thinking;
+use mu_base::permissions::PermissionMode;
 use mu_base::roles::{self, RoleView};
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
 
-const BUILTIN_DESC: [(&str, &str, bool); 30] = [
+const BUILTIN_DESC: [(&str, &str, bool); 31] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -26,6 +27,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 30] = [
     ("logout", "Remove a stored API key, or sign out of ChatGPT", false),
     ("web", "Choose the web search backend", false),
     ("thinking", "Set the thinking level", false),
+    ("permissions", "Show or set tool permissions: ask, edits or yolo", true),
     ("compact", "Compact the context [focus]", false),
     ("plan", "Toggle plan mode", false),
     ("review", "Review changes against the approved plan [focus]", false),
@@ -105,6 +107,7 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs
         .map(|&(name, desc, needs_arg)| {
             let (args, arg_descs): (Vec<String>, Vec<String>) = match name {
                 "thinking" => (Thinking::NAMES.iter().map(|s| s.to_string()).collect(), vec![]),
+                "permissions" => (PermissionMode::NAMES.iter().map(|s| s.to_string()).collect(), vec![]),
                 "copy" => (["code", "cmd", "link"].map(String::from).to_vec(), vec![]),
                 "jobs" => (vec!["kill".to_string()], vec![]),
                 "model" => role_views(cfg, ctx).into_iter().map(|r| (format!("@{}", r.name), r.row())).unzip(),
@@ -261,7 +264,16 @@ impl App {
         let (name, arg) = cmd.split_once(char::is_whitespace).map_or((cmd, ""), |(n, a)| (n, a.trim()));
         let allowed_busy = matches!(
             name,
-            "thinking" | "todo" | "skills" | "plugins" | "session" | "copy" | "reply" | "image" | "jobs"
+            "thinking"
+                | "permissions"
+                | "todo"
+                | "skills"
+                | "plugins"
+                | "session"
+                | "copy"
+                | "reply"
+                | "image"
+                | "jobs"
         );
         if self.agent.running && !allowed_busy {
             return self.notice("busy — Esc to abort first");
@@ -287,6 +299,13 @@ impl App {
             "thinking" => match Thinking::parse(arg) {
                 Some(t) => self.send(Command::SetThinking(t)),
                 None => self.error("usage: /thinking off|low|medium|high|xhigh|max"),
+            },
+            "permissions" if arg.is_empty() => {
+                self.notice(&format!("permissions: {} (ask | edits | yolo)", self.agent.status.permissions.as_str()))
+            }
+            "permissions" => match PermissionMode::parse(arg) {
+                Some(m) => self.send(Command::SetPermissionMode(m)),
+                None => self.error("usage: /permissions ask|edits|yolo"),
             },
             "plan" => self.send(Command::TogglePlan((!arg.is_empty()).then(|| arg.to_string()))),
             "plans" => self.send(Command::ListPlans),

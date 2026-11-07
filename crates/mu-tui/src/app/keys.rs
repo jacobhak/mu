@@ -917,7 +917,7 @@ pub(super) mod tests {
         assert!(transcript_text(&app).contains("sign-in cancelled"));
     }
 
-    pub(super) fn test_app(history: std::path::PathBuf) -> App {
+    pub(in crate::app) fn test_app(history: std::path::PathBuf) -> App {
         test_app_with_commands(history).0
     }
 
@@ -953,6 +953,7 @@ pub(super) mod tests {
                 held_back: vec![],
             },
             overlay: None,
+            approvals: VecDeque::new(),
             flows: Flows {
                 model_request_seq: 0,
                 pick_deliver: false,

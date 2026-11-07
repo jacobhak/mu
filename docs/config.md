@@ -37,6 +37,14 @@ err_tokens = 500000
 [bash]
 wait_sleep_secs = 10  # while a background job runs, a model command that starts with a sleep this long or longer is not run and the turn ends (see background-jobs.md); 0 = only commands that do nothing but wait
 
+[permissions]
+mode = "yolo"          # ask | edits | yolo (see permissions.md); --permissions overrides it for one run
+readonly_bash = true   # the built-in read-only command set counts as reading; false makes every bash call ask unless a rule allows it
+
+# [permissions.rules]  # tool-name globs, or pattern tables for bash, write, edit, read, grep, glob and fetch
+# bash = { "cargo test *" = "allow", "git push *" = "deny" }
+# "mcp__github_*" = "allow"
+
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 

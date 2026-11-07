@@ -13,6 +13,7 @@ use crate::panels::plan_review::{PlanReview, ReviewResult};
 use crate::panels::reply::{ReplyPicker, ReplyResult};
 use crate::widgets::select::{Item, Select, SelectResult};
 use mu_base::events::{Answer, AskQuestion, PlanDecision};
+use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 
 /// One entry of the `/login` picker.
 #[derive(Clone, Debug, PartialEq)]
@@ -169,6 +170,8 @@ pub enum Overlay {
     },
     /// A question, or the review after the last one. Boxed: the largest variant.
     Ask(Box<AskState>),
+    /// A tool call waiting for approval.
+    Approve(Box<ApproveState>),
     Review {
         review: Box<PlanReview>,
         reply: Option<oneshot::Sender<PlanDecision>>,
@@ -522,6 +525,124 @@ impl AskState {
     }
 }
 
+/// A tool call waiting for approval: what it is, why it asks, and the ways to answer it.
+pub struct ApproveState {
+    req: ApprovalRequest,
+    sel: Select,
+    reply: Option<oneshot::Sender<ApprovalDecision>>,
+}
+
+impl ApproveState {
+    pub fn new(req: ApprovalRequest, reply: oneshot::Sender<ApprovalDecision>) -> Self {
+        let mut items = vec![Item { label: "Yes".into(), detail: String::new() }];
+        if let Some(g) = &req.grant {
+            let what = if g.patterns.is_empty() { g.tool.clone() } else { g.patterns.join(", ") };
+            for label in [
+                format!("Yes, don't ask again this session for {what}"),
+                format!("Yes, always in this project for {what}"),
+                format!("Yes, always everywhere for {what}"),
+            ] {
+                items.push(Item { label, detail: String::new() });
+            }
+        }
+        items.push(Item { label: "No".into(), detail: String::new() });
+        let last = items.len() - 1;
+        let mut context = String::new();
+        if let Some(from) = &req.from {
+            context.push_str(&format!("from {from}\n"));
+        }
+        context.push_str(&req.reason);
+        context.push_str("\n\n");
+        context.push_str(&truncated(&req.body));
+        let hint = if last > 1 {
+            format!("y yes · n no · 1–{} pick · Enter choose · Tab/→ note · Esc cancel", last + 1)
+        } else {
+            "y yes · n no · Enter choose · Tab/→ note · Esc cancel".to_string()
+        };
+        let sel = Select::new(&req.title, items).context(&context).notes().described().hint(&hint);
+        Self { req, sel, reply: Some(reply) }
+    }
+
+    /// The row `c` points at: `y` and `n` the first and last, digits 1–5 the rest.
+    fn row_for(&self, c: char) -> Option<usize> {
+        let last = if self.req.grant.is_some() { 4 } else { 1 };
+        match c {
+            'y' => Some(0),
+            'n' => Some(last),
+            '1'..='5' => {
+                let i = c.to_digit(10)? as usize - 1;
+                (i <= last).then_some(i)
+            }
+            _ => None,
+        }
+    }
+
+    /// What row `i` answers.
+    fn decide(&self, i: usize, note: Option<String>) -> ApprovalDecision {
+        let scope = match (self.req.grant.is_some(), i) {
+            (true, 0) | (false, 0) => Some(ApprovalScope::Once),
+            (true, 1) => Some(ApprovalScope::Session),
+            (true, 2) => Some(ApprovalScope::Project),
+            (true, 3) => Some(ApprovalScope::Global),
+            _ => None,
+        };
+        match scope {
+            Some(scope) => ApprovalDecision::Allow { scope, note },
+            None => ApprovalDecision::Deny { note },
+        }
+    }
+
+    fn keep(self) -> (Option<Overlay>, Option<OverlayEvent>) {
+        (Some(Overlay::Approve(Box::new(self))), None)
+    }
+
+    fn key(mut self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
+        // The shortcuts move the highlight rather than answer, so a note can still be typed
+        // (n, Tab, the reason, Enter).
+        if k.modifiers.is_empty()
+            && let KeyCode::Char(c) = k.code
+            && !self.sel.is_typing()
+            && let Some(i) = self.row_for(c)
+        {
+            self.sel.select_row(i);
+            return self.keep();
+        }
+        let decision = match self.sel.on_key(k) {
+            SelectResult::Pending => return self.keep(),
+            SelectResult::Chosen(i) => i.first().map(|i| self.decide(*i, None)),
+            SelectResult::Noted(i, note) => i.first().map(|i| self.decide(*i, Some(note))),
+            SelectResult::Cancelled => Some(ApprovalDecision::Deny { note: None }),
+            _ => None,
+        };
+        let Some(d) = decision else { return self.keep() };
+        if let Some(r) = self.reply.take() {
+            let _ = r.send(d);
+        }
+        (None, None)
+    }
+
+    /// The turn it belonged to ended before it was answered.
+    pub fn reply_closed(&self) -> bool {
+        self.reply.as_ref().is_some_and(|r| r.is_closed())
+    }
+
+    /// The request and its unanswered reply, so the dialog can be reopened later.
+    pub fn into_pending(mut self) -> Option<(ApprovalRequest, oneshot::Sender<ApprovalDecision>)> {
+        self.reply.take().map(|r| (self.req, r))
+    }
+}
+
+/// The body as at most 40 lines.
+fn truncated(body: &str) -> String {
+    const MAX: usize = 40;
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= MAX {
+        body.to_string()
+    } else {
+        format!("{}\n… ({} more lines)", lines[..MAX].join("\n"), lines.len() - MAX)
+    }
+}
+
 /// The picker on screen for question `idx`.
 fn picker(qs: &[AskQuestion], idx: usize, answers: &[Option<Answer>]) -> Select {
     let pos = (qs.len() > 1).then_some((idx + 1, qs.len()));
@@ -559,6 +680,7 @@ impl Overlay {
             | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::ModelRoles { st } => Some(st.select()),
             Overlay::Ask(a) => Some(&a.sel),
+            Overlay::Approve(a) => Some(&a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
     }
@@ -583,6 +705,7 @@ impl Overlay {
             | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::ModelRoles { st } => Some(st.select_mut()),
             Overlay::Ask(a) => Some(&mut a.sel),
+            Overlay::Approve(a) => Some(&mut a.sel),
             Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
         }
     }
@@ -802,6 +925,7 @@ impl Overlay {
                 }
             },
             Overlay::Ask(a) => a.key(k),
+            Overlay::Approve(a) => a.key(k),
         }
     }
 }

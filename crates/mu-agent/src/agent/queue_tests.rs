@@ -16,6 +16,7 @@ fn queue(rx: UnboundedReceiver<Command>, inbox: &SharedInbox, events: EventTx) -
         jobs: None,
         events,
         live: Rc::new(Cell::new(Thinking::Off)),
+        perms: Rc::default(),
     }
 }
 

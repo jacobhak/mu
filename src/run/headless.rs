@@ -1,4 +1,5 @@
 use mu_base::events::{AgentEvent, Command, PlanDecision, retry_notice};
+use mu_base::permissions::ApprovalDecision;
 use mu_tools::tools::summary;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -131,6 +132,11 @@ pub async fn print_mode(
             AgentEvent::PlanReview { reply, .. } => {
                 let _ = reply.send(PlanDecision::Park);
             }
+            // A `-p` run has no one to answer a tool approval.
+            AgentEvent::Approve { request, reply } => {
+                eprintln!("approval needed: {}", request.title);
+                let _ = reply.send(ApprovalDecision::Unavailable);
+            }
             AgentEvent::PlanParked { id, path } => {
                 eprintln!("plan: {id} · {}", path.display());
                 parked = true;
@@ -189,7 +195,23 @@ pub async fn subagent_mode(
     cmd: UnboundedSender<Command>,
     ev: UnboundedReceiver<AgentEvent>,
 ) -> i32 {
-    let (result, code) = run_subagent(prompt, output_schema.is_some(), cmd, ev, |l| println!("{l}")).await;
+    // The parent answers this child's approvals on stdin, one JSON line each; a closed stdin means
+    // nobody can. The task payload was the first line, already read.
+    let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            match line {
+                Ok(l) => {
+                    if line_tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let (result, code) = run_subagent(prompt, output_schema.is_some(), cmd, ev, line_rx, |l| println!("{l}")).await;
     println!("{result}");
     code
 }
@@ -199,6 +221,7 @@ pub(crate) async fn run_subagent(
     structured: bool,
     cmd: UnboundedSender<Command>,
     mut ev: UnboundedReceiver<AgentEvent>,
+    mut lines: UnboundedReceiver<String>,
     out: impl Fn(serde_json::Value),
 ) -> (serde_json::Value, i32) {
     use serde_json::json;
@@ -211,11 +234,52 @@ pub(crate) async fn run_subagent(
     let mut acc = Accum::default();
     let (mut is_error, mut session) = (false, None::<String>);
     let (mut data, mut yield_error, mut nudged) = (None::<serde_json::Value>, None::<String>, false);
-    while let Some(e) = ev.recv().await {
+    let mut pending: std::collections::HashMap<u64, tokio::sync::oneshot::Sender<ApprovalDecision>> =
+        Default::default();
+    let mut next_id: u64 = 0;
+    let mut stdin_open = true;
+    loop {
+        let e = tokio::select! {
+            e = ev.recv() => match e {
+                Some(e) => e,
+                None => break,
+            },
+            line = lines.recv(), if stdin_open => match line {
+                Some(l) => {
+                    // `{"type":"approval","id":N,"decision":{…}}`; anything else is ignored.
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l)
+                        && v["type"] == "approval"
+                        && let Some(id) = v["id"].as_u64()
+                        && let Some(tx) = pending.remove(&id)
+                        && let Ok(d) = serde_json::from_value::<ApprovalDecision>(v["decision"].clone())
+                    {
+                        let _ = tx.send(d);
+                    }
+                    continue;
+                }
+                None => {
+                    stdin_open = false;
+                    for (_, tx) in pending.drain() {
+                        let _ = tx.send(ApprovalDecision::Unavailable);
+                    }
+                    continue;
+                }
+            },
+        };
         acc.fold(&e);
         match e {
             AgentEvent::ToolStart { name, args, .. } => {
                 out(json!({"type": "tool", "name": name, "summary": summary(&name, &args)}));
+            }
+            AgentEvent::Approve { request, reply } => {
+                if stdin_open {
+                    let id = next_id;
+                    next_id += 1;
+                    pending.insert(id, reply);
+                    out(json!({"type": "approve", "id": id, "request": request}));
+                } else {
+                    let _ = reply.send(ApprovalDecision::Unavailable);
+                }
             }
             AgentEvent::ToolEnd { name, output, .. } if name == "yield" && !output.is_error => {
                 match output.details.as_ref().map(|d| (d["status"].as_str(), d)) {
@@ -449,7 +513,8 @@ mod tests {
         for e in events {
             etx.send(e).unwrap();
         }
-        let (r, code) = rt.block_on(run_subagent("x".into(), structured, ctx, erx, |_| {}));
+        let (_line_tx, line_rx) = unbounded_channel();
+        let (r, code) = rt.block_on(run_subagent("x".into(), structured, ctx, erx, line_rx, |_| {}));
         let mut cmds = Vec::new();
         while let Ok(c) = crx.try_recv() {
             cmds.push(c);
@@ -472,7 +537,8 @@ mod tests {
             etx.send(e).unwrap();
         }
         let lines = std::cell::RefCell::new(Vec::new());
-        rt.block_on(run_subagent("x".into(), false, ctx, erx, |l| lines.borrow_mut().push(l)));
+        let (_line_tx, line_rx) = unbounded_channel();
+        rt.block_on(run_subagent("x".into(), false, ctx, erx, line_rx, |l| lines.borrow_mut().push(l)));
         let lines = lines.into_inner();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0], serde_json::json!({"type": "session", "path": "/s/a.jsonl"}));
@@ -560,7 +626,8 @@ mod tests {
                 }
             }
         };
-        let (_, r) = tokio::join!(agent_side, run_subagent("go".into(), structured, ctx, rx, |_| {}));
+        let (_line_tx, line_rx) = unbounded_channel();
+        let (_, r) = tokio::join!(agent_side, run_subagent("go".into(), structured, ctx, rx, line_rx, |_| {}));
         r
     }
 

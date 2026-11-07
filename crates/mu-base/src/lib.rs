@@ -12,6 +12,7 @@ pub mod mem;
 pub mod message;
 pub mod model_config;
 pub mod models;
+pub mod permissions;
 pub mod process;
 pub mod pty;
 pub mod roles;

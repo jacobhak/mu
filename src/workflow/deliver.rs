@@ -147,6 +147,8 @@ impl MuSteps {
         let status = tokio::process::Command::new(&self.cmd[0])
             .args(&self.cmd[1..])
             .args(args)
+            // Approving the plan for detached delivery is the authorization; deny rules still apply.
+            .args(["--permissions", "yolo"])
             .current_dir(dir)
             .stdin(Stdio::null())
             .stdout(out)
@@ -923,9 +925,10 @@ mod tests {
         let log = std::fs::read_to_string(repo.join("args.log")).unwrap();
         let o = out.join("r.json");
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines[0], "plan|approve|x|");
-        assert_eq!(lines[1], format!("review|--base|B|--plan|/p.md|--out|{}|", o.display()));
-        assert_eq!(lines[2], "--resume|/s/impl.jsonl|-p|do it|");
+        // Every subprocess runs unprompted: approving the plan for delivery is the authorization.
+        assert_eq!(lines[0], "plan|approve|x|--permissions|yolo|");
+        assert_eq!(lines[1], format!("review|--base|B|--plan|/p.md|--out|{}|--permissions|yolo|", o.display()));
+        assert_eq!(lines[2], "--resume|/s/impl.jsonl|-p|do it|--permissions|yolo|");
         assert_eq!(std::fs::read_to_string(out.join("f.md")).unwrap().trim(), "final answer");
     }
 

@@ -7,6 +7,8 @@ mod inbox;
 use inbox::{inbox_cmd, report_dropped};
 #[cfg(test)]
 mod loop_tests;
+#[cfg(test)]
+mod permissions_tests;
 mod plan;
 #[cfg(test)]
 mod queue_tests;
@@ -28,6 +30,7 @@ use mu_base::mem;
 use mu_base::message::UserInput;
 use mu_base::message::{Block, Message, StopReason, history_events, is_dismissal, now_ms, text_of, tool_calls};
 use mu_base::models::{ModelSpec, Thinking};
+use mu_base::permissions::PermissionMode;
 use mu_base::secrets;
 use mu_base::tool::{ToolDef, ToolMeta, ToolOutput};
 use mu_provider::gateway::quota::QuotaTracker;
@@ -39,6 +42,7 @@ use mu_session::session::file::SessionFile;
 use mu_session::session::format::TitleSource;
 use mu_tools::context::{self, Context};
 use mu_tools::jobs::{self, JobsHandle};
+use mu_tools::permissions::Permissions;
 use mu_tools::plugin::host::{InitParams, PluginHost};
 use mu_tools::tools::{ToolCtx, Tools};
 use serde_json::{Value, json};
@@ -181,6 +185,13 @@ struct Queue {
     jobs: Option<Rc<JobsHandle>>,
     events: EventTx,
     live: Rc<std::cell::Cell<Thinking>>,
+    perms: Rc<Permissions>,
+}
+
+/// Reports a new mode to the front end and the transcript.
+fn announce_mode(events: &EventTx, m: PermissionMode) {
+    let _ = events.send(AgentEvent::PermissionMode(m));
+    let _ = events.send(AgentEvent::Notice(format!("permissions: {}", m.as_str())));
 }
 
 /// Runs `fut` (a turn) while still reading commands. Commands that are safe mid-turn (`KillJobs`)
@@ -195,6 +206,11 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
                 Some(Command::KillJobs(id)) => {
                     let n = q.jobs.as_ref().map_or(0, |j| j.kill(id.as_deref()));
                     let _ = q.events.send(AgentEvent::Notice(format!("killed {n} job(s)")));
+                }
+                Some(Command::SetPermissionMode(m)) => {
+                    // The gate checks per call, so this applies to the next call of this turn.
+                    q.perms.set_mode(m);
+                    announce_mode(&q.events, m);
                 }
                 Some(c @ (Command::SetThinking(_) | Command::CycleThinking)) => {
                     let t = match c {
@@ -222,9 +238,18 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
 
 impl Agent {
     pub fn new(i: AgentInit) -> Self {
-        let tools = Tools::new(i.cwd.clone(), i.plugins.clone());
+        let mut tools = Tools::new(i.cwd.clone(), i.plugins.clone());
         tools.set_skills(i.ctx.skills.iter().map(|s| (s.name.clone(), s.dir.clone())).collect());
         tools.set_context_page(prompt::context_page(&i.ctx));
+        // The flag wins over inheritance, which wins over the config.
+        let permissions = Rc::new(Permissions::new(&i.providers.cfg.mu.permissions));
+        if let Some(v) = &i.run.inherited_permissions {
+            permissions.apply_inherited(v);
+        }
+        if let Some(m) = i.run.permission_mode {
+            permissions.set_mode(m);
+        }
+        tools.permissions = permissions;
         let (title_tx, title_rx) = unbounded_channel();
         Self {
             tools,
@@ -369,6 +394,7 @@ impl Agent {
             events: self.ports.events.clone(),
             live: self.model.live_thinking.clone(),
             inbox: self.ports.inbox.clone(),
+            perms: self.tools.permissions.clone(),
         };
         loop {
             let cmd = if let Some(c) = q.backlog.pop_front() {
@@ -431,6 +457,11 @@ impl Agent {
             }
             Command::SetThinking(t) => self.set_thinking(t),
             Command::CycleThinking => self.set_thinking(self.model.live_thinking.get().cycle()),
+            Command::SetPermissionMode(m) => {
+                self.tools.permissions.set_mode(m);
+                announce_mode(&self.ports.events, m);
+                self.emit_status();
+            }
             Command::NewSession => {
                 self.end_session().await;
                 self.reset_conversation();

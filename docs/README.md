@@ -14,6 +14,7 @@
 - [Custom agents](custom-agents.md)
 - [Memory](memory.md)
 - [Secrets](secrets.md): what mu redacts before storing or sending text, and what it does not protect against
+- [Tool permissions](permissions.md): modes (`ask`, `edits`, `yolo`), rules, and the approval prompt
 - [Config](config.md): `~/.mu/config.toml`
 - [mu documents itself](self-documentation.md): `mu://`, these pages and generated references for the agent to read and search
 

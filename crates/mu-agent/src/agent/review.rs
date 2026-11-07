@@ -178,6 +178,7 @@ impl Agent {
             "agent": context::REVIEW_LEAD,
             "outputSchema": review::report::report_schema(),
             "parentSession": self.session.as_ref().map(|s| s.path.clone()),
+            "permissions": self.tools.permissions.inherit_json(),
         });
         // A job when the UI keeps them: listed in the jobs panel, which opens its transcript and
         // cancels it with `x`.
@@ -203,7 +204,17 @@ impl Agent {
         };
         let out = match (&self.tools.jobs, &job) {
             (Some(jobs), Some(id)) => {
-                jobs.run_owned(id, context::REVIEW_LEAD, &exe, &scope.root, &payload, cancel, progress).await
+                jobs.run_owned(
+                    id,
+                    context::REVIEW_LEAD,
+                    &exe,
+                    &scope.root,
+                    &payload,
+                    cancel,
+                    progress,
+                    self.tools.permissions.clone(),
+                )
+                .await
             }
             _ => mu_tools::tools::subagent::run_child(&exe, &scope.root, &payload, cancel, progress).await,
         };
@@ -372,7 +383,15 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
         let live = Rc::new(std::cell::Cell::new(Thinking::Off));
-        let mut q = Queue { rx, inbox: new_inbox(), backlog: Default::default(), jobs: None, events: etx, live };
+        let mut q = Queue {
+            rx,
+            inbox: new_inbox(),
+            backlog: Default::default(),
+            jobs: None,
+            events: etx,
+            live,
+            perms: Rc::default(),
+        };
         a.command(Command::Review(None), &mut q).await;
     }
 
@@ -443,7 +462,11 @@ mod tests {
             std::fs::write(dir.join("a.txt"), "two\n").unwrap();
             let payload = dir.join("payload.json");
             let child = dir.join("fake-mu");
-            let script = format!("#!/bin/sh\ncat > '{}'\necho '{RESULT}'\n", payload.display());
+            // The child reads its task line and keeps stdin open for approval answers.
+            let script = format!(
+                "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' \"$line\" > '{}'\necho '{RESULT}'\n",
+                payload.display()
+            );
             std::fs::write(&child, script).unwrap();
             std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
             let (mut a, mut rx) = agent_in(vec![], Configs::default(), RunConfig::default(), dir.clone());
@@ -474,7 +497,7 @@ mod tests {
             std::fs::write(dir.join("a.txt"), "two\n").unwrap();
             let child = dir.join("fake-mu");
             let result = r#"{"type":"result","isError":false,"text":"","data":{"verdict":"fail","summary":"s","findings":[{"title":"t","body":"b","file":"a.txt","priority":1,"confidence":1}]}}"#;
-            std::fs::write(&child, format!("#!/bin/sh\ncat > /dev/null\necho '{result}'\n")).unwrap();
+            std::fs::write(&child, format!("#!/bin/sh\nIFS= read -r line\necho '{result}'\n")).unwrap();
             std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
             let fixed = Ok(assistant(vec![Block::text("fixed")], StopReason::Stop));
             let (mut a, mut rx) = agent_in(vec![fixed], Configs::default(), RunConfig::default(), dir.clone());

@@ -26,6 +26,7 @@ const PAGES: &[(&str, &str)] = &[
     ("mcp.md", include_str!("../../../../docs/mcp.md")),
     ("memory.md", include_str!("../../../../docs/memory.md")),
     ("model-roles.md", include_str!("../../../../docs/model-roles.md")),
+    ("permissions.md", include_str!("../../../../docs/permissions.md")),
     ("providers.md", include_str!("../../../../docs/providers.md")),
     ("reply-picker.md", include_str!("../../../../docs/reply-picker.md")),
     ("review.md", include_str!("../../../../docs/review.md")),

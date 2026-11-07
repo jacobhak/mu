@@ -1,11 +1,13 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
 use super::task::depth;
+use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 pub struct Outcome {
@@ -40,6 +42,11 @@ enum ChildEvent {
         #[serde(default)]
         label: String,
     },
+    /// A tool call needs approval; the parent answers with an `approval` line on stdin.
+    Approve {
+        id: u64,
+        request: ApprovalRequest,
+    },
     Result(ChildResult),
 }
 
@@ -63,11 +70,13 @@ pub async fn run_child(
     cancel: &CancellationToken,
     on_tool: impl FnMut(&str, &str),
 ) -> Outcome {
-    run_child_observed(exe, cwd, payload, cancel, on_tool, |_| {}, |_| {}).await
+    run_child_observed(exe, cwd, payload, cancel, on_tool, |_| {}, |_| {}, None).await
 }
 
 /// `run_child` that also reports the child's session file to `on_session(path)` as soon as the child
 /// has opened it, and its model label to `on_model` (older children never say, so either may not run).
+/// `approve` answers the child's approval requests; `None` means nobody can.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_child_observed(
     exe: &Path,
     cwd: &Path,
@@ -76,6 +85,7 @@ pub async fn run_child_observed(
     mut on_tool: impl FnMut(&str, &str),
     mut on_session: impl FnMut(&str),
     mut on_model: impl FnMut(&str),
+    approve: Option<&dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision>>,
 ) -> Outcome {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--headless")
@@ -91,8 +101,19 @@ pub async fn run_child_observed(
     };
     let pid = child.id().unwrap_or(0) as i32;
     let mut stdin = child.stdin.take().unwrap();
-    let _ = stdin.write_all(payload.to_string().as_bytes()).await;
-    drop(stdin);
+    // The task payload, then one line per approval answer, for as long as the child reads them.
+    let (wtx, mut wrx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let task = payload.to_string();
+    tokio::task::spawn_local(async move {
+        let _ = stdin.write_all(task.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        while let Some(line) = wrx.recv().await {
+            if stdin.write_all(line.as_bytes()).await.is_err() || stdin.write_all(b"\n").await.is_err() {
+                break;
+            }
+        }
+        let _ = stdin.shutdown().await;
+    });
     let stderr = child.stderr.take().unwrap();
     let err_task = tokio::task::spawn_local(async move {
         let mut tail: std::collections::VecDeque<String> = Default::default();
@@ -120,6 +141,21 @@ pub async fn run_child_observed(
                         Ok(ChildEvent::Tool { name, summary }) => on_tool(&name, &summary),
                         Ok(ChildEvent::Session { path }) => on_session(&path),
                         Ok(ChildEvent::Model { label }) => on_model(&label),
+                        Ok(ChildEvent::Approve { id, request }) => {
+                            let rx = match approve {
+                                Some(f) => f(request),
+                                None => {
+                                    let (tx, rx) = oneshot::channel();
+                                    let _ = tx.send(ApprovalDecision::Unavailable);
+                                    rx
+                                }
+                            };
+                            let out = wtx.clone();
+                            tokio::task::spawn_local(async move {
+                                let d = rx.await.unwrap_or(ApprovalDecision::Deny { note: None });
+                                let _ = out.send(json!({"type": "approval", "id": id, "decision": d}).to_string());
+                            });
+                        }
                         Ok(ChildEvent::Result(r)) => result = Some(r),
                         Err(_) => {}
                     }
@@ -140,6 +176,7 @@ pub async fn run_child_observed(
             }
         }
     }
+    drop(wtx);
     // A child that ignores everything must not hang the parent: bound the wait, then kill.
     if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await.is_err() {
         mu_base::process::kill_group(pid, libc::SIGKILL);

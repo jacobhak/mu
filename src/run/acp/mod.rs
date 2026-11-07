@@ -15,6 +15,7 @@ use mu_agent::handle::{AgentHandle, AgentSetup, Mode, build_agent};
 use mu_base::events::{AgentEvent, Command};
 use mu_base::message::{Image, UserInput};
 use mu_base::models::Thinking;
+use mu_base::permissions::PermissionMode;
 use mu_base::roles;
 use mu_provider::model::pricing;
 use mu_session::session::list;
@@ -40,13 +41,13 @@ const UNSUPPORTED_VERSION: i64 = -32022;
 /// Sessions per `session/list` page.
 const PAGE: usize = 100;
 
-pub fn run(model: Option<String>, thinking: Option<Thinking>) -> Result<i32> {
+pub fn run(model: Option<String>, thinking: Option<Thinking>, permissions: Option<PermissionMode>) -> Result<i32> {
     mu_session::session::owner::set_run_info(mu_session::session::owner::RunKind::Acp, None);
     let rt = mu_base::runtime::current_thread_runtime()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         mu_tools::plugin::process::exit_on_signals();
-        serve(model, thinking).await
+        serve(model, thinking, permissions).await
     });
     Ok(0)
 }
@@ -198,6 +199,8 @@ impl Session {
 struct Server {
     model: Option<String>,
     thinking: Option<Thinking>,
+    /// `--permissions`, applied to every session this server opens.
+    permissions: Option<PermissionMode>,
     /// The client advertised `session.notices`.
     notices: bool,
     /// The client can show an `elicitation/create` form, so the model may use `ask`.
@@ -239,13 +242,14 @@ struct Opened {
     providers: Rc<mu_provider::provider::client::Providers>,
 }
 
-async fn serve(model: Option<String>, thinking: Option<Thinking>) {
+async fn serve(model: Option<String>, thinking: Option<Thinking>, permissions: Option<PermissionMode>) {
     let mut input = spawn_stdin();
     let (ev_tx, mut ev_rx) = unbounded_channel();
     let (done_tx, mut done_rx) = unbounded_channel();
     let mut srv = Server {
         model,
         thinking,
+        permissions,
         notices: false,
         elicit: false,
         sessions: HashMap::new(),
@@ -574,8 +578,9 @@ impl Server {
         self.next_epoch += 1;
         let epoch = self.next_epoch;
         let (model, thinking, done, elicit) = (self.model.clone(), self.thinking, self.done_tx.clone(), self.elicit);
+        let permissions = self.permissions;
         tokio::task::spawn_local(async move {
-            let result = open_session(model, thinking, epoch, cwd, resume, replay, elicit).await;
+            let result = open_session(model, thinking, permissions, epoch, cwd, resume, replay, elicit).await;
             let _ = done.send(Done::Opened { id, new, result });
         });
     }
@@ -789,6 +794,9 @@ impl Server {
                     update(sid, u);
                 }
             }
+            AgentEvent::Approve { request, reply } => {
+                tokio::task::spawn_local(client::approve_tool(rpc, sid.to_string(), request, reply));
+            }
             AgentEvent::Ask { questions, reply } => {
                 // `ask` is only offered when the client takes forms, so this is the form case; a
                 // dropped reply is a cancelled question.
@@ -838,9 +846,11 @@ impl Server {
 /// Starts an agent for `cwd` and waits until its session file exists. Replayed history, if
 /// requested, is streamed before this returns. Runs off the request loop. `elicit`: the client
 /// can ask the user a form, so the model may use `ask`.
+#[allow(clippy::too_many_arguments)]
 async fn open_session(
     model: Option<String>,
     thinking: Option<Thinking>,
+    permissions: Option<PermissionMode>,
     epoch: u64,
     cwd: PathBuf,
     resume: Option<PathBuf>,
@@ -852,6 +862,7 @@ async fn open_session(
     let run = agent::RunConfig {
         pin_model: model.is_some() && resume.is_some(),
         pin_thinking: thinking.is_some() && resume.is_some(),
+        permission_mode: permissions,
         // Plans are approved through `session/request_permission`, which every client has.
         excluded: if elicit { vec![] } else { vec!["ask"] },
         ..Default::default()

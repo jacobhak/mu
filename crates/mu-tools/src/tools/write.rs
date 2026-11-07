@@ -14,7 +14,7 @@ pub struct Args {
 }
 
 impl Args {
-    pub(super) fn paths(&self) -> Vec<String> {
+    pub(crate) fn paths(&self) -> Vec<String> {
         vec![self.path.clone()]
     }
 }

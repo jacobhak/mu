@@ -28,6 +28,9 @@ pub struct Cli {
     pub model: Option<String>,
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(mu_base::models::Thinking::NAMES))]
     pub thinking: Option<String>,
+    /// Tool permissions: `ask`, `edits` or `yolo` (default: the config's mode).
+    #[arg(long, global = true, value_parser = clap::builder::PossibleValuesParser::new(mu_base::permissions::PermissionMode::NAMES))]
+    pub permissions: Option<String>,
     /// Resume the latest session for this directory.
     #[arg(short = 'c', long = "continue")]
     pub continue_latest: bool,

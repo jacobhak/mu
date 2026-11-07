@@ -2,6 +2,7 @@
 //! model's `ask` questions (`elicitation/create`).
 
 use mu_base::events::{Answer, AskQuestion, PlanDecision};
+use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -80,6 +81,64 @@ pub(super) fn plan_decision(result: &Value) -> PlanDecision {
         Some("park") => PlanDecision::Park,
         _ => PlanDecision::Refine("The plan is not approved yet. Stop and wait for the user's instructions.".into()),
     }
+}
+
+/// A tool call's approval options: answering once, then the scopes the prompt offers a grant for.
+const APPROVAL_OPTIONS: [(&str, &str, &str); 5] = [
+    ("once", "Yes", "allow_once"),
+    ("session", "Yes, this session", "allow_always"),
+    ("project", "Always in this project", "allow_always"),
+    ("global", "Always everywhere", "allow_always"),
+    ("deny", "No", "reject_once"),
+];
+
+pub(super) fn approval_request(sid: &str, req: &ApprovalRequest) -> Value {
+    let options: Vec<Value> = APPROVAL_OPTIONS
+        .iter()
+        .filter(|(id, ..)| req.grant.is_some() || !matches!(*id, "session" | "project" | "global"))
+        .map(|(id, name, kind)| json!({"optionId": id, "name": name, "kind": kind}))
+        .collect();
+    let text = format!("{}\n\n{}", req.reason, req.body);
+    json!({
+        "sessionId": sid,
+        "toolCall": {
+            "toolCallId": req.call_id,
+            "title": req.title,
+            "status": "pending",
+            "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+        },
+        "options": options,
+    })
+}
+
+/// What a tool approval's answer decides. Anything but a known approval is a denial.
+pub(super) fn approval_decision(result: &Value) -> ApprovalDecision {
+    let o = &result["outcome"];
+    if o["outcome"] != "selected" {
+        return ApprovalDecision::Deny { note: None };
+    }
+    let scope = match o["optionId"].as_str() {
+        Some("once") => ApprovalScope::Once,
+        Some("session") => ApprovalScope::Session,
+        Some("project") => ApprovalScope::Project,
+        Some("global") => ApprovalScope::Global,
+        _ => return ApprovalDecision::Deny { note: None },
+    };
+    ApprovalDecision::Allow { scope, note: None }
+}
+
+pub(super) async fn approve_tool(
+    rpc: Rpc,
+    sid: String,
+    req: ApprovalRequest,
+    reply: oneshot::Sender<ApprovalDecision>,
+) {
+    let rx = rpc.request("session/request_permission", approval_request(&sid, &req));
+    let decision = match rx.await {
+        Ok(Ok(v)) => approval_decision(&v),
+        _ => ApprovalDecision::Deny { note: None },
+    };
+    let _ = reply.send(decision);
 }
 
 pub(super) async fn review_plan(
@@ -240,6 +299,35 @@ mod tests {
         assert!(matches!(pick("something else"), PlanDecision::Refine(_)));
         assert!(matches!(plan_decision(&json!({"outcome": {"outcome": "cancelled"}})), PlanDecision::Drop));
         assert!(matches!(plan_decision(&json!({})), PlanDecision::Drop));
+    }
+
+    #[test]
+    fn tool_approvals_offer_the_grant_scopes_and_map_back() {
+        let req = |grant: bool| ApprovalRequest {
+            tool: "bash".into(),
+            call_id: "c".into(),
+            title: "bash: touch x".into(),
+            reason: "ask mode: bash needs approval".into(),
+            body: "touch x".into(),
+            from: None,
+            grant: grant.then(|| mu_base::permissions::Grant { tool: "bash".into(), patterns: vec!["touch *".into()] }),
+        };
+        let ids = |v: &Value| -> Vec<String> {
+            v["options"].as_array().unwrap().iter().map(|o| o["optionId"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(ids(&approval_request("s", &req(false))), ["once", "deny"]);
+        assert_eq!(ids(&approval_request("s", &req(true))), ["once", "session", "project", "global", "deny"]);
+        let pick = |id: &str| approval_decision(&json!({"outcome": {"outcome": "selected", "optionId": id}}));
+        assert!(matches!(pick("once"), ApprovalDecision::Allow { scope: ApprovalScope::Once, .. }));
+        assert!(matches!(pick("session"), ApprovalDecision::Allow { scope: ApprovalScope::Session, .. }));
+        assert!(matches!(pick("project"), ApprovalDecision::Allow { scope: ApprovalScope::Project, .. }));
+        assert!(matches!(pick("global"), ApprovalDecision::Allow { scope: ApprovalScope::Global, .. }));
+        assert!(matches!(pick("deny"), ApprovalDecision::Deny { .. }));
+        assert!(matches!(pick("other"), ApprovalDecision::Deny { .. }));
+        assert!(matches!(
+            approval_decision(&json!({"outcome": {"outcome": "cancelled"}})),
+            ApprovalDecision::Deny { .. }
+        ));
     }
 
     #[test]

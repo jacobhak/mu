@@ -1,12 +1,14 @@
 use super::subagent::run_child_observed;
 use super::{ToolCtx, Tools};
+use crate::permissions::Permissions;
 use futures_util::future::join_all;
-use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+use mu_base::events::{EventTx, JobKind, SubagentState, SubagentStatus};
 use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Hard cap on tasks per call and on running background jobs.
 pub const MAX_TASKS: usize = 8;
@@ -108,6 +110,7 @@ impl Tools {
         };
         let payload = |agent: &str, task: &str, schema: Option<&Value>| {
             let mut p = json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
+            p["permissions"] = self.permissions.inherit_json();
             if let Some(s) = schema {
                 p["outputSchema"] = s.clone();
             }
@@ -121,7 +124,14 @@ impl Tools {
             let mut started = Vec::new();
             for (i, (name, agent, task, cwd)) in specs.iter().enumerate() {
                 let id = jobs.unique_id(name);
-                jobs.spawn(id.clone(), agent.clone(), exe.clone(), cwd.clone(), payload(agent, task, schemas[i]));
+                jobs.spawn(
+                    id.clone(),
+                    agent.clone(),
+                    exe.clone(),
+                    cwd.clone(),
+                    payload(agent, task, schemas[i]),
+                    self.permissions.clone(),
+                );
                 started.push(format!("{id} ({agent})"));
             }
             return ToolOutput::ok(format!(
@@ -130,17 +140,21 @@ impl Tools {
                 started.join(", ")
             ));
         }
-        run_foreground(&specs, &schemas, &exe, &payload, &ctx.cancel).await
+        run_foreground(&specs, &schemas, &exe, &payload, &ctx.cancel, &ctx.events, &self.permissions).await
     }
 }
 
-/// Runs every task to completion in this call; each row's progress is reported in `details`.
+/// Runs every task to completion in this call; each row's progress is reported in `details`, and an
+/// approval a task needs is asked in the parent's UI.
+#[allow(clippy::too_many_arguments)]
 async fn run_foreground(
     specs: &[(String, String, String, PathBuf)],
     schemas: &[Option<&Value>],
     exe: &Path,
     payload: &dyn Fn(&str, &str, Option<&Value>) -> Value,
     cancel: &tokio_util::sync::CancellationToken,
+    events: &EventTx,
+    perms: &Rc<Permissions>,
 ) -> ToolOutput {
     let rows = RefCell::new(
         specs
@@ -163,9 +177,10 @@ async fn run_foreground(
             })
             .collect::<Vec<_>>(),
     );
-    let futs = specs.iter().enumerate().map(|(i, (_, agent, task, cwd))| {
+    let futs = specs.iter().enumerate().map(|(i, (name, agent, task, cwd))| {
         let rows = &rows;
         let payload = payload(agent, task, schemas[i]);
+        let label = format!("{name} ({agent})");
         async move {
             let out = run_child_observed(
                 exe,
@@ -179,6 +194,7 @@ async fn run_foreground(
                 },
                 |_| {},
                 |model| rows.borrow_mut()[i].model = Some(model.to_string()),
+                Some(&|r| perms.forward(events, &label, r)),
             )
             .await;
             rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
@@ -274,6 +290,7 @@ mod cwd_tests {
                 |n, _| seen.borrow_mut().push(format!("tool {n}")),
                 |p| seen.borrow_mut().push(format!("session {p}")),
                 |m| seen.borrow_mut().push(format!("model {m}")),
+                None,
             ))
             .await;
         assert!(out.ok, "{}", out.text);
@@ -349,5 +366,73 @@ mod typed_tests {
         let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","outputSchema":{"type":"bogus"}}]})).unwrap();
         let out = t.task(a, &ctx).await;
         assert!(out.is_error && out.text.contains("outputSchema"), "{}", out.text);
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use crate::tools::subagent::run_child_observed;
+    use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
+
+    /// A child that reads its task line, asks for approval, then echoes the answer it got back.
+    const CHILD: &str = r#"#!/bin/sh
+IFS= read -r task
+printf '%s\n' '{"type":"approve","id":1,"request":{"tool":"bash","call_id":"c","title":"bash: touch x","reason":"ask mode: bash needs approval","body":"touch x","from":null,"grant":null}}'
+IFS= read -r line
+escaped=$(printf '%s' "$line" | sed 's/"/\\"/g')
+printf '{"type":"result","text":"%s"}\n' "$escaped"
+"#;
+
+    fn fake(base: &Path) -> PathBuf {
+        std::fs::create_dir_all(base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    async fn run(
+        base: &Path,
+        answer: Option<&dyn Fn(ApprovalRequest) -> tokio::sync::oneshot::Receiver<ApprovalDecision>>,
+    ) -> String {
+        run_child_observed(
+            &fake(base),
+            base,
+            &json!({"task": "go"}),
+            &CancellationToken::new(),
+            |_, _| {},
+            |_| {},
+            |_| {},
+            answer,
+        )
+        .await
+        .text
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_approval_reaches_the_parent_and_the_answer_reaches_the_child() {
+        let base = std::env::temp_dir().join(format!("mu-task-approve-{}", uuid::Uuid::new_v4()));
+        let seen = std::cell::RefCell::new(Vec::new());
+        let answer = |r: ApprovalRequest| {
+            seen.borrow_mut().push(r.title.clone());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None });
+            rx
+        };
+        let out = tokio::task::LocalSet::new().run_until(run(&base, Some(&answer))).await;
+        assert!(out.contains("\"decision\":\"allow\""), "{out}");
+        assert_eq!(*seen.borrow(), ["bash: touch x"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_a_forwarder_the_child_is_told_nobody_can_approve() {
+        let base = std::env::temp_dir().join(format!("mu-task-approve-{}", uuid::Uuid::new_v4()));
+        let out = tokio::task::LocalSet::new().run_until(run(&base, None)).await;
+        assert!(out.contains("\"decision\":\"unavailable\""), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

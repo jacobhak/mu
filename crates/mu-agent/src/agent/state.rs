@@ -4,12 +4,14 @@ use super::{DeliverFn, ExecPlan, PlanState};
 use mu_base::events::{EventTx, GitInfo};
 use mu_base::message::UserInput;
 use mu_base::models::{ModelSpec, Thinking};
+use mu_base::permissions::PermissionMode;
 use mu_base::tool::ToolDef;
 use mu_provider::gateway::quota::QuotaTracker;
 use mu_provider::model::cost::CostLedger;
 use mu_provider::provider::client::Providers;
 use mu_session::session::format::CompactionState;
 use mu_tools::plugin::host::PluginHost;
+use serde_json::Value;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -37,6 +39,10 @@ pub struct RunConfig {
     pub pin_model: bool,
     /// `--resume` with an explicit `--thinking`: the resumed session keeps the flag's level.
     pub pin_thinking: bool,
+    /// `--permissions`: overrides the config's mode.
+    pub permission_mode: Option<PermissionMode>,
+    /// A subagent's inherited `{"mode", "session"}` payload from its parent.
+    pub inherited_permissions: Option<Value>,
 }
 
 /// Messages queued while a turn runs, plus the turn's cancellation token. Only the agent loop touches it;

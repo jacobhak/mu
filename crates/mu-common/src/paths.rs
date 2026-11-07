@@ -79,6 +79,7 @@ pub const PROFILE_STATE: &[&str] = &[
     "plans",
     "deliveries",
     "mcp",
+    "permissions",
     "predict",
     "history.jsonl",
     "models.toml",

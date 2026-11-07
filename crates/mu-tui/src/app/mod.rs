@@ -40,12 +40,14 @@ use crate::widgets::overlay::Overlay;
 use crossterm::event::Event;
 use mu_base::events::{AgentEvent, Command};
 use mu_base::message::UserInput;
+use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
 use mu_provider::provider::client::Providers;
 use mu_tools::context::Context;
 use mu_tools::plugin::host::PluginHost;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -80,6 +82,8 @@ struct App {
     screen: Screen,
     prompt: Prompt,
     overlay: Option<Overlay>,
+    /// Tool calls waiting for approval, oldest first; one is on screen at a time.
+    approvals: VecDeque<(ApprovalRequest, tokio::sync::oneshot::Sender<ApprovalDecision>)>,
     flows: Flows,
     quitting: bool,
 }
@@ -189,6 +193,7 @@ pub async fn run(init: AppInit) -> i32 {
             held_back: Vec::new(),
         },
         overlay: None,
+        approvals: VecDeque::new(),
         flows: Flows {
             model_request_seq: 0,
             pick_deliver: false,

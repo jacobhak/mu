@@ -12,6 +12,7 @@ use crate::workflow::{deliver, plans_cli::PlanRun};
 use anyhow::{Result, bail};
 use mu_agent::agent;
 use mu_agent::handle::{AgentSetup, build_agent};
+use mu_base::permissions::PermissionMode;
 use mu_base::{events, models, schema};
 use mu_common::paths;
 use mu_session::session::{inbox, list, owner};
@@ -67,8 +68,9 @@ impl Mode {
 /// Runs the front end `cli` asks for. `plan` is the first step of a `mu plan` command, if that is what ran.
 pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
+    let permissions = cli.permissions.as_deref().and_then(PermissionMode::parse);
     if cli.acp {
-        return acp::run(cli.model.clone(), cli_thinking);
+        return acp::run(cli.model.clone(), cli_thinking, permissions);
     }
     let mode = Mode::of(cli, plan.is_some());
     if matches!(cli.resume, Some(None)) && mode != Mode::Tui {
@@ -153,12 +155,14 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         exit_on_resume_failure: cli.print.is_some(),
         pin_model: cli.model.is_some() && resume.is_some(),
         pin_thinking: cli_thinking.is_some() && resume.is_some(),
+        permission_mode: permissions,
         ..Default::default()
     };
     if let Some(p) = &task_payload {
         run.subagent = true;
         run.excluded = agent::HEADLESS_EXCLUDED.to_vec();
         run.parent_session = p["parentSession"].as_str().map(std::path::PathBuf::from);
+        run.inherited_permissions = p.get("permissions").cloned();
         if p["agent"] == "scout" {
             run.allow = Some(["read", "grep", "glob", "web_search", "fetch"].map(String::from).to_vec());
         }
@@ -320,8 +324,9 @@ async fn subagent(
 
 /// The subagent task on stdin, and the agent it names (`task` and `scout` are the built-in roles).
 fn read_task(ctx: &context::Context) -> Result<(Value, Option<context::AgentDef>)> {
+    // Only the first line: later lines are the parent's approval answers, read as they arrive.
     let mut input = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    std::io::stdin().read_line(&mut input)?;
     let p: Value = serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
     let mut def = None;
     if let Some(name) = p["agent"].as_str().filter(|n| !matches!(*n, "task" | "scout")) {

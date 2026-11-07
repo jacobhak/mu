@@ -5,6 +5,7 @@ use crate::theme::{self, Role};
 use crossterm::style::ContentStyle;
 use mu_base::config::{MuStatus, OmpStatusLine};
 use mu_base::events::{GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus};
+use mu_base::permissions::PermissionMode;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -290,7 +291,17 @@ fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
 }
 
 fn seg_mode(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
-    s.plan.then(|| vec![span("plan", st(Role::Accent))])
+    let mut line = Vec::new();
+    if s.plan {
+        line.push(span("plan", st(Role::Accent)));
+    }
+    if s.permissions != PermissionMode::Yolo {
+        if !line.is_empty() {
+            line.push(span(" ", st(Role::Accent)));
+        }
+        line.push(span(s.permissions.as_str(), st(Role::Accent)));
+    }
+    (!line.is_empty()).then_some(line)
 }
 
 fn seg_path(_: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Option<Line> {
@@ -567,6 +578,17 @@ mod tests {
         let c = cfg(&["model"], &[]);
         let t = line_text(&seg_model(&StatusSnapshot::default(), &env(&c, Path::new("/")), 0).unwrap());
         assert_eq!(t, "no model · /switch");
+    }
+
+    #[test]
+    fn the_mode_segment_shows_plan_and_a_non_yolo_mode() {
+        let c = cfg(&["mode"], &[]);
+        let e = env(&c, Path::new("/"));
+        assert!(seg_mode(&StatusSnapshot::default(), &e, 0).is_none(), "yolo and no plan is silent");
+        let s = StatusSnapshot { permissions: PermissionMode::Ask, ..Default::default() };
+        assert_eq!(line_text(&seg_mode(&s, &e, 0).unwrap()), "ask");
+        let s = StatusSnapshot { plan: true, permissions: PermissionMode::Edits, ..Default::default() };
+        assert_eq!(line_text(&seg_mode(&s, &e, 0).unwrap()), "plan edits");
     }
 
     fn snap() -> StatusSnapshot {
