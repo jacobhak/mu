@@ -123,10 +123,6 @@ pub(super) fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
         }
         AgentEvent::ToolEnd { id, output, .. } => {
             let mut u = json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "status": if output.is_error { "failed" } else { "completed" }});
-            let job_notice = match &output.meta {
-                Some(ToolMeta::Bash(m)) if live => m.job.as_ref().map(|id| format!("Result shown in job {id}.")),
-                _ => None,
-            };
             let mut content: Vec<Value> = output
                 .changes
                 .iter()
@@ -134,8 +130,8 @@ pub(super) fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
                     json!({"type": "diff", "path": c.path, "oldText": c.old, "newText": c.new.clone().unwrap_or_default()})
                 })
                 .collect();
-            if let Some(text) = job_notice.as_ref().or((!output.text.is_empty()).then_some(&output.text)) {
-                content.extend(text_block(text.clone()).as_array().cloned().unwrap_or_default());
+            if !output.text.is_empty() {
+                content.extend(text_block(output.text.clone()).as_array().cloned().unwrap_or_default());
             }
             if !content.is_empty() {
                 u["content"] = Value::Array(content);
@@ -146,7 +142,7 @@ pub(super) fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
                     // clean exit records no code.
                     let end = m.output_end.min(output.text.len());
                     let body = if output.text.is_char_boundary(end) { &output.text[..end] } else { &output.text };
-                    json!({"output": job_notice.as_deref().unwrap_or(body), "exitCode": m.exit_code.or((!m.failed()).then_some(0))})
+                    json!({"output": body, "exitCode": m.exit_code.or((!m.failed()).then_some(0))})
                 }
                 _ => json!({"text": output.text}),
             };
@@ -447,13 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn bash_job_result_is_deduplicated_live_but_complete_on_replay() {
+    fn a_foreground_bash_result_shows_its_output_live_and_on_replay() {
         use mu_base::tool::BashMeta;
 
         for live in [true, false] {
             let mut out = ToolOutput::err("command output\nexit 3");
             out.meta = Some(ToolMeta::Bash(BashMeta {
-                job: Some("bg_1".into()),
                 output_end: "command output\n".len(),
                 exit_code: Some(3),
                 ..Default::default()
@@ -465,14 +460,8 @@ mod tests {
             );
             assert_eq!(u[0]["status"], "failed");
             assert_eq!(u[0]["rawOutput"]["exitCode"], 3);
-            assert_eq!(
-                u[0]["content"][0]["content"]["text"],
-                if live { "Result shown in job bg_1." } else { "command output\nexit 3" }
-            );
-            assert_eq!(
-                u[0]["rawOutput"]["output"],
-                if live { "Result shown in job bg_1." } else { "command output\n" }
-            );
+            assert_eq!(u[0]["content"][0]["content"]["text"], "command output\nexit 3");
+            assert_eq!(u[0]["rawOutput"]["output"], "command output\n");
         }
     }
 

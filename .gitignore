@@ -1,4 +1,5 @@
 /target
+/.cargo/config.toml
 /dist
 __pycache__/
 rustc-ice-*.txt

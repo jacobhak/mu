@@ -243,7 +243,7 @@ impl Tools {
     /// `async`: the command runs as a tracked job; its result arrives as a system notice. The job
     /// starts from the persistent shell's cwd and exported environment as of launch.
     async fn bash_background(&self, a: Args, jobs: &Rc<JobsHandle>) -> ToolOutput {
-        let (id, note) = match self.start_bash_job(a, jobs, None, None).await {
+        let (id, note) = match self.start_bash_job(a, jobs, None, None, true).await {
             Ok(started) => started,
             Err(e) => return ToolOutput::err(e),
         };
@@ -264,7 +264,7 @@ impl Tools {
         ctx: &ToolCtx,
         interrupt: &CancellationToken,
     ) -> ToolOutput {
-        let (id, note) = match self.start_bash_job(a, jobs, Some(&ctx.cancel), Some(self.cwd.clone())).await {
+        let (id, note) = match self.start_bash_job(a, jobs, Some(&ctx.cancel), Some(self.cwd.clone()), false).await {
             Ok(started) => started,
             Err(e) => return ToolOutput::err(e),
         };
@@ -282,7 +282,6 @@ impl Tools {
                     let mut out = if done.ok { ToolOutput::ok(done.text) } else { ToolOutput::err(done.text) };
                     out.text.push_str(&note);
                     let mut meta = done.meta.unwrap_or_default();
-                    meta.job = Some(id);
                     meta.background = None;
                     out.meta = Some(ToolMeta::Bash(meta));
                     out
@@ -292,6 +291,8 @@ impl Tools {
             }
             WaitReady::Interrupted => {
                 guard.armed = false;
+                // The command runs on: from now on it is listed as an ordinary background job.
+                jobs.promote(&id);
                 let mut out = ToolOutput::ok(format!(
                     "Command continues as background job {id}. Your new prompt will be handled now; its result will arrive automatically.{note}"
                 ));
@@ -306,13 +307,15 @@ impl Tools {
 
     /// Starts one command as a job. `base`: the directory the command starts in, when the caller has
     /// its own shell instead of inheriting the persistent one's; `cancel` is checked again just
-    /// before the spawn, so a cancelled call never launches.
+    /// before the spawn, so a cancelled call never launches. `listed`: the job shows as a background
+    /// job, which a foreground call's does not while the call waits for it.
     async fn start_bash_job(
         &self,
         a: Args,
         jobs: &Rc<JobsHandle>,
         cancel: Option<&CancellationToken>,
         base: Option<PathBuf>,
+        listed: bool,
     ) -> Result<(String, String), String> {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err("Command cancelled before launch.".into());
@@ -329,7 +332,7 @@ impl Tools {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err("Command cancelled before launch.".into());
         }
-        let id = jobs.spawn_bash(a.command, job_cwd, move |cancel, sink| {
+        let run = move |cancel: CancellationToken, sink: crate::jobs::OutputSink| {
             run_background(
                 command,
                 cwd,
@@ -339,7 +342,12 @@ impl Tools {
                 move || Tools::next_artifact_in(&artifact_dir),
                 move |s| sink.push(s),
             )
-        });
+        };
+        let id = if listed {
+            jobs.spawn_bash(a.command, job_cwd, run)
+        } else {
+            jobs.spawn_bash_waiting(a.command, job_cwd, run)
+        };
         let note = if inherited {
             String::new()
         } else {
@@ -656,7 +664,6 @@ fn finish(c: Collected, end: RunEnd) -> ToolOutput {
         artifact: c.artifact,
         spill_note: c.spill_note,
         background: None,
-        job: None,
     }));
     out
 }
@@ -1339,12 +1346,8 @@ mod tests {
                 let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
                 let out = tools.call("bash", &json!({"command": "printf 'finished\\n'"}), &ctx).await;
                 assert!(!out.is_error && out.text.contains("finished"), "{}", out.text);
-                let id = jobs.snapshot()[0].name.clone();
-                assert!(
-                    matches!(&out.meta, Some(ToolMeta::Bash(m)) if m.job.as_deref() == Some(id.as_str()) && m.background.is_none()),
-                    "{:?}",
-                    out.meta
-                );
+                assert!(matches!(&out.meta, Some(ToolMeta::Bash(m)) if m.background.is_none()), "{:?}", out.meta);
+                assert!(jobs.snapshot().is_empty(), "the call's job is not listed as a background job");
                 assert!(!jobs.has_undelivered(), "the call claimed the job's result");
             })
             .await;
@@ -1385,16 +1388,15 @@ mod tests {
                 let call = tools.call("bash", &args, &ctx);
                 tokio::pin!(call);
                 until_output(call.as_mut(), &mut rx, "started").await;
+                assert!(jobs.snapshot().is_empty(), "a waiting call's command is not listed as a background job");
                 wait.token().cancel();
                 let out = call.await;
                 assert!(!out.is_error, "{}", out.text);
                 assert!(out.text.starts_with("Command continues as background job "), "{}", out.text);
-                assert!(
-                    matches!(&out.meta, Some(ToolMeta::Bash(m)) if m.background.is_some() && m.job.is_none()),
-                    "{:?}",
-                    out.meta
-                );
+                assert!(matches!(&out.meta, Some(ToolMeta::Bash(m)) if m.background.is_some()), "{:?}", out.meta);
                 assert_eq!(jobs.running(), 1, "the work keeps running");
+                assert_eq!(jobs.snapshot().len(), 1, "listed as a background job once the prompt released the wait");
+                assert_eq!(jobs.snapshot()[0].kind, mu_base::events::JobKind::Bash);
                 assert!(!jobs.has_undelivered(), "no result before it finishes");
                 std::fs::write(dir.join("release"), "go").unwrap();
                 let done = jobs.finished().await;
@@ -1476,8 +1478,9 @@ mod tests {
                 let args = json!({"command": "printf 'started\\n'; sleep 30; printf 'done\\n'"});
                 let mut call = Box::pin(tools.call("bash", &args, &ctx));
                 until_output(call.as_mut(), &mut rx, "started").await;
-                let id = jobs.snapshot()[0].name.clone();
-                assert_eq!(jobs.kill(Some(&id)), 1, "the foreground job is an ordinary job");
+                assert_eq!(jobs.running(), 1, "the foreground job is an ordinary job");
+                assert!(jobs.snapshot().is_empty(), "but not listed as a background job");
+                assert_eq!(jobs.kill(None), 1);
                 let out = call.await;
                 assert!(out.is_error && out.text.contains("[Command cancelled]"), "{}", out.text);
                 assert!(!jobs.has_undelivered(), "the cancelled result stays with the call");

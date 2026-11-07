@@ -133,6 +133,9 @@ struct Job {
     model: Option<String>,
     delivered: bool,
     notice_owned: bool,
+    /// Counted and shown as a background job. A foreground call's job is not, so the call keeps its
+    /// usual running card; it is listed once the call is interrupted and the command runs on.
+    listed: bool,
     cancel: CancellationToken,
 }
 
@@ -310,10 +313,13 @@ impl JobsHandle {
         Ok(())
     }
 
+    /// Every listed job: the background jobs this session shows. A foreground call's job is left
+    /// out until the call is interrupted.
     pub fn snapshot(&self) -> Vec<SubagentStatus> {
         self.inner
             .borrow()
             .iter()
+            .filter(|j| j.listed)
             .map(|j| SubagentStatus {
                 name: j.spec.id.clone(),
                 agent: j.spec.agent.clone(),
@@ -342,7 +348,7 @@ impl JobsHandle {
         RefMut::filter_map(self.inner.borrow_mut(), |jobs| jobs.iter_mut().find(|j| j.seq == seq)).ok()
     }
 
-    fn start(&self, spec: Spec, last: String, cancel: CancellationToken, notice_owned: bool) -> u64 {
+    fn start(&self, spec: Spec, last: String, cancel: CancellationToken, notice_owned: bool, listed: bool) -> u64 {
         let seq = self.next_seq.get();
         self.next_seq.set(seq + 1);
         self.inner.borrow_mut().push(Job {
@@ -360,10 +366,30 @@ impl JobsHandle {
             model: None,
             delivered: false,
             notice_owned,
+            listed,
             cancel,
         });
         self.emit();
         seq
+    }
+
+    /// Lists a job started for a foreground call: the call was interrupted, so its command runs on
+    /// as an ordinary background job from now on. `false` when there is no such job.
+    pub fn promote(&self, id: &str) -> bool {
+        let found = {
+            let mut jobs = self.inner.borrow_mut();
+            match jobs.iter_mut().find(|j| j.spec.id == id) {
+                Some(j) if !j.listed => {
+                    j.listed = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if found {
+            self.emit();
+        }
+        found
     }
 
     /// Records a finished job and wakes an idle agent.
@@ -384,11 +410,17 @@ impl JobsHandle {
 
     /// The one path a job starts on: records it, runs `work` on the local set and records what
     /// `work` finishes with.
-    fn spawn_job<F>(self: &Rc<Self>, spec: Spec, last: String, cancel: CancellationToken, work: impl FnOnce(u64) -> F)
-    where
+    fn spawn_job<F>(
+        self: &Rc<Self>,
+        spec: Spec,
+        last: String,
+        cancel: CancellationToken,
+        listed: bool,
+        work: impl FnOnce(u64) -> F,
+    ) where
         F: Future<Output = Finished> + 'static,
     {
-        let seq = self.start(spec, last, cancel, true);
+        let seq = self.start(spec, last, cancel, true, listed);
         let fut = work(seq);
         let me = self.clone();
         tokio::task::spawn_local(async move {
@@ -418,7 +450,7 @@ impl JobsHandle {
             command: None,
         };
         let me = self.clone();
-        self.spawn_job(spec, String::new(), cancel, move |seq| async move {
+        self.spawn_job(spec, String::new(), cancel, true, move |seq| async move {
             let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
@@ -452,7 +484,7 @@ impl JobsHandle {
             task: command_line(payload["task"].as_str().unwrap_or("")),
             command: None,
         };
-        let seq = self.start(spec, String::new(), own.clone(), false);
+        let seq = self.start(spec, String::new(), own.clone(), false, true);
         let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool, &perms, "review").await;
         if let Some(mut j) = self.job_mut(seq) {
             j.state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
@@ -518,6 +550,33 @@ impl JobsHandle {
     where
         F: Future<Output = BackgroundResult> + 'static,
     {
+        self.spawn_bash_job(command, cwd, true, run)
+    }
+
+    /// Starts a foreground call's command: a job so an interrupted call leaves it running, but not
+    /// listed among the background jobs while the call waits for it.
+    pub(crate) fn spawn_bash_waiting<F>(
+        self: &Rc<Self>,
+        command: String,
+        cwd: PathBuf,
+        run: impl FnOnce(CancellationToken, OutputSink) -> F,
+    ) -> String
+    where
+        F: Future<Output = BackgroundResult> + 'static,
+    {
+        self.spawn_bash_job(command, cwd, false, run)
+    }
+
+    fn spawn_bash_job<F>(
+        self: &Rc<Self>,
+        command: String,
+        cwd: PathBuf,
+        listed: bool,
+        run: impl FnOnce(CancellationToken, OutputSink) -> F,
+    ) -> String
+    where
+        F: Future<Output = BackgroundResult> + 'static,
+    {
         let id = self.unique_id(&format!("bg_{}", self.next_seq.get() + 1));
         let cancel = CancellationToken::new();
         let line = command_line(&command);
@@ -531,7 +590,7 @@ impl JobsHandle {
             command: Some(command),
         };
         let run_cancel = cancel.clone();
-        self.spawn_job(spec, line, cancel, move |_| {
+        self.spawn_job(spec, line, cancel, listed, move |_| {
             let fut = run(run_cancel, sink.clone());
             async move {
                 let r = fut.await;
@@ -604,10 +663,10 @@ impl JobsHandle {
         found
     }
 
-    /// Ids of the running jobs, oldest first.
+    /// Ids of the running listed jobs, oldest first.
     pub fn running_ids(&self) -> Vec<String> {
         let jobs = self.inner.borrow();
-        jobs.iter().filter(|j| j.state == SubagentState::Running).map(|j| j.spec.id.clone()).collect()
+        jobs.iter().filter(|j| j.listed && j.state == SubagentState::Running).map(|j| j.spec.id.clone()).collect()
     }
 
     /// The state of job `id`, `None` when this session has no such job.
@@ -687,6 +746,7 @@ impl JobsHandle {
             model: None,
             delivered: false,
             notice_owned: true,
+            listed: true,
             cancel: CancellationToken::new(),
         });
     }
@@ -857,6 +917,7 @@ pub(crate) mod tests {
             model: None,
             delivered: false,
             notice_owned: true,
+            listed: true,
             cancel: CancellationToken::new(),
         });
         let snap = h.snapshot();

@@ -20,7 +20,7 @@ use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_base::message::UserInput;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_base::text::truncate_text as trunc;
-use mu_base::tool::{ToolMeta, ToolOutput};
+use mu_base::tool::ToolOutput;
 use mu_session::session::tree_cost::{Child, TreeCost, session_cost};
 use mu_tools::tools::todo::{Phase, Status};
 use serde_json::{Value, json};
@@ -294,11 +294,7 @@ impl AgentView {
                     .position(|t| t.id == id)
                     .map(|i| self.tools.remove(i).args)
                     .unwrap_or(Value::Null);
-                let shown = name == "bash"
-                    && matches!(&output.meta, Some(ToolMeta::Bash(m)) if m.job.as_ref().is_some_and(|id| self.jobs_committed.contains(id)));
-                if !shown {
-                    self.commit_tool_result(&name, &args, &output, w);
-                }
+                self.commit_tool_result(&name, &args, &output, w);
             }
             AgentEvent::Retry { attempt, delay, reason } => {
                 self.tr.reset_stream();
@@ -618,6 +614,7 @@ mod tests {
     use crate::text::line::line_text;
     use mu_base::events::{JobKind, StatusSnapshot};
     use mu_base::permissions::ApprovalScope;
+    use mu_base::tool::ToolMeta;
     use std::time::{Duration, SystemTime};
 
     const SIZE: (usize, usize) = (80, 24);
@@ -691,29 +688,22 @@ mod tests {
     }
 
     #[test]
-    fn committed_bash_job_suppresses_only_its_duplicate_tool_result() {
+    fn a_foreground_call_prints_its_own_result_even_while_jobs_run() {
         use mu_base::tool::BashMeta;
 
         let mut v = view();
         v.on_event(AgentEvent::JobOutput { id: "bg_1".into(), tail: "job output".into() }, SIZE);
         v.on_event(AgentEvent::Jobs(vec![job("bg_1", SubagentState::Done, JobKind::Bash)]), SIZE);
-        let before = pending(&v);
-        assert!(before.contains("job output"));
-        v.on_event(AgentEvent::ToolStart { id: "t1".into(), name: "bash".into(), args: json!({}) }, SIZE);
-        let mut out = output("job output");
-        out.meta = Some(ToolMeta::Bash(BashMeta { job: Some("bg_1".into()), ..Default::default() }));
+        assert!(pending(&v).contains("job output"));
+        v.on_event(
+            AgentEvent::ToolStart { id: "t1".into(), name: "bash".into(), args: json!({"command": "ls"}) },
+            SIZE,
+        );
+        let mut out = output("own output");
+        out.meta = Some(ToolMeta::Bash(BashMeta { output_end: "own output".len(), ..Default::default() }));
         v.on_event(AgentEvent::ToolEnd { id: "t1".into(), name: "bash".into(), output: out }, SIZE);
         assert!(v.tools.is_empty());
-        assert_eq!(pending(&v), before);
-
-        let mut out = output("other output");
-        out.meta = Some(ToolMeta::Bash(BashMeta {
-            job: Some("bg_2".into()),
-            output_end: "other output".len(),
-            ..Default::default()
-        }));
-        v.on_event(AgentEvent::ToolEnd { id: "t2".into(), name: "bash".into(), output: out }, SIZE);
-        assert!(pending(&v).contains("other output"));
+        assert!(pending(&v).contains("own output"), "a foreground result is never left to a job card");
     }
 
     #[test]
@@ -723,7 +713,6 @@ mod tests {
 
         let mut out = ToolOutput::ok("the output\nexit 3");
         out.meta = Some(ToolMeta::Bash(mu_base::tool::BashMeta {
-            job: Some("bg_1".into()),
             output_end: "the output\n".len(),
             exit_code: Some(3),
             artifact: Some(2),
@@ -731,7 +720,7 @@ mod tests {
         }));
         let stored = out.stored_details();
         let back = ToolOutput::from_stored(out.text.clone(), out.is_error, stored.clone());
-        assert_eq!(back.meta, out.meta, "the job metadata survives storage");
+        assert_eq!(back.meta, out.meta, "the metadata survives storage");
 
         let call = Message::deserialize(json!({"role":"assistant","content":[{"type":"toolCall",
             "id":"t1","name":"bash","arguments":{"command":"make"}}],"api":"a","provider":"p","model":"m",

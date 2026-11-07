@@ -28,7 +28,7 @@ The session advertises its commands with `available_commands_update`, and a prom
 
 While a command runs its newest output (up to 16 KiB, secrets redacted) is sent as `in_progress` updates, at most four a second per call, so a long build shows progress. mu runs commands itself and does not use the client's `terminal/*` methods.
 
-Background jobs (`task`, and `bash` with `async`) show as tool calls of their own, `job:<id>`: `in_progress` with the subagent's tool count and latest activity, or the command's output, then `completed` or `failed`. Their results still reach the model as a notice, as in the TUI.
+Background jobs (`task`, `bash` with `async`, and a command that kept running after a prompt released its call's wait) show as tool calls of their own, `job:<id>`: `in_progress` with the subagent's tool count and latest activity, or the command's output, then `completed` or `failed`. Their results still reach the model as a notice, as in the TUI.
 
 ## Asking the client
 

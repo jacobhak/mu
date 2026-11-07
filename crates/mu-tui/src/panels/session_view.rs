@@ -103,7 +103,6 @@ mod tests {
     fn a_stored_completed_foreground_bash_result_keeps_its_output_and_footer() {
         let mut out = mu_base::tool::ToolOutput::ok("the output\nexit 3");
         out.meta = Some(mu_base::tool::ToolMeta::Bash(mu_base::tool::BashMeta {
-            job: Some("bg_1".into()),
             output_end: "the output\n".len(),
             exit_code: Some(3),
             artifact: Some(2),

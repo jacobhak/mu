@@ -23,6 +23,7 @@ Commands you run yourself with `!` are never refused, and with no job running ev
 With `[experimental] interruptible_wait = true` in `config.toml` (see [Config](config.md)), a turn no longer has to end to wait. In an interactive session:
 
 - An ordinary `bash` call (no `async`, no `pty`) runs as a tracked job and waits for its result itself; the result comes back in that call, not as a separate notice. Each call runs in its own shell: pass `cwd` and the environment the command needs, group setup that must carry over into the same command, and expect `cmd &` and background descendants to end with the call.
+- It stays an ordinary `bash` card while it runs: it is not listed among the background jobs (no row above the prompt, no jobs-panel entry, no count in the status line) until a prompt releases the wait, at which point the command keeps running as a job of its own.
 - The model can also call `wait` with job ids (or none, for any job). It returns when one of those jobs finishes; their results still arrive as a notice, once.
 - A prompt you submit while the model waits releases the wait: the job keeps running and its result arrives later, and your message steers the turn at the next tool boundary. A second tool call in the same reply is skipped so your message is answered first.
 - Esc still cancels the turn, including a waiting command. Nothing else cancels a wait, and releasing a wait never cancels the work.
