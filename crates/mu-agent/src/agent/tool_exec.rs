@@ -1,5 +1,15 @@
 use super::*;
 use crate::review;
+use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+use std::time::SystemTime;
+
+fn elapsed_text(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+    }
+}
 
 impl Agent {
     pub fn tool_defs(&self) -> Vec<ToolDef> {
@@ -77,9 +87,56 @@ impl Agent {
             many => format!("background jobs {} are", many.join(", ")),
         };
         Some(format!(
-            "Not run: this command waits, and {jobs} still running. Your turn has ended; a job's result arrives as a \
-             system notice and starts your next turn. To wait for a job, end your turn with a short status and no tool call."
+            "Not run: this command waits, and {jobs} still running. Your turn has ended; when a job finishes, mu \
+             automatically starts your next turn with its result. To wait for a job, end your turn with a short \
+             status and no tool call."
         ))
+    }
+
+    /// A status block for the model: jobs started before `since` that still run. `None` when there are none.
+    pub(super) fn job_status(&self, since: SystemTime) -> Option<String> {
+        let running: Vec<_> = self
+            .tools
+            .jobs
+            .as_ref()?
+            .snapshot()
+            .into_iter()
+            .filter(|j| j.state == SubagentState::Running && j.started < since)
+            .collect();
+        let line = |j: &SubagentStatus| {
+            let label = match j.kind {
+                JobKind::Bash => format!("bash: {}", j.task),
+                JobKind::Subagent => format!("{}: {}", j.agent, j.task),
+            };
+            let secs = since.duration_since(j.started).map_or(0, |d| d.as_secs());
+            (mu_base::text::truncate_text(&label, 80), elapsed_text(secs))
+        };
+        Some(match running.as_slice() {
+            [] => return None,
+            [one] => {
+                let (label, elapsed) = line(one);
+                format!(
+                    "\n\n<background-jobs>\n{} ({label}) has been running for {elapsed}.\nWhen it finishes, mu \
+                     automatically starts your next turn with its result; no user input is needed. If your next step \
+                     needs it, end your turn now with a short status.\n</background-jobs>",
+                    one.name
+                )
+            }
+            many => {
+                let items: String = many
+                    .iter()
+                    .map(|j| {
+                        let (label, elapsed) = line(j);
+                        format!("- {} ({label}), {elapsed}\n", j.name)
+                    })
+                    .collect();
+                format!(
+                    "\n\n<background-jobs>\nStill running:\n{items}When each finishes, mu automatically starts your \
+                     next turn with its result; no user input is needed. If your next step needs one of them, end \
+                     your turn now with a short status.\n</background-jobs>"
+                )
+            }
+        })
     }
 
     /// Replaces secrets in the text of a user message or tool result.
@@ -331,4 +388,16 @@ fn plan_decision(d: &Value) -> Option<PlanDecision> {
         "park" => PlanDecision::Park,
         _ => return None,
     })
+}
+#[cfg(test)]
+mod elapsed_tests {
+    use super::elapsed_text;
+
+    #[test]
+    fn formats_elapsed_time() {
+        assert_eq!(elapsed_text(0), "0s");
+        assert_eq!(elapsed_text(59), "59s");
+        assert_eq!(elapsed_text(65), "1m 5s");
+        assert_eq!(elapsed_text(3725), "1h 2m");
+    }
 }

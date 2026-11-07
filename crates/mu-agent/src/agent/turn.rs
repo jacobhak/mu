@@ -408,7 +408,9 @@ impl Agent {
     async fn run_calls(&mut self, calls: Vec<(String, String, Value)>, cancel: &CancellationToken) -> Ran {
         let mut skip: Option<&str> = None;
         let (mut yielded, mut waited) = (false, false);
-        for (id, name, args) in calls {
+        let since = std::time::SystemTime::now();
+        let last = calls.len().saturating_sub(1);
+        for (i, (id, name, args)) in calls.into_iter().enumerate() {
             if skip.is_none() {
                 if cancel.is_cancelled() {
                     skip = Some(SKIP_ABORTED);
@@ -424,7 +426,13 @@ impl Agent {
                 waited = true;
                 self.emit_skipped(&id, &name, &args, &reason);
             } else {
-                let out = self.run_tool(&id, &name, args, cancel).await;
+                let mut out = self.run_tool(&id, &name, args, cancel).await;
+                if i == last
+                    && name != "yield"
+                    && let Some(status) = self.job_status(since)
+                {
+                    out.text.push_str(&status);
+                }
                 self.push_result(&id, &name, &out);
                 yielded |= name == "yield" && !out.is_error;
             }

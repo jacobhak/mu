@@ -248,7 +248,7 @@ impl Tools {
             "\nShell state from earlier calls was not inherited (the shell was busy or did not answer in time): the job uses mu's own environment.".to_string()
         };
         ToolOutput::ok(format!(
-            "Started background job {id}.{note}\nIts result arrives as a system notice that starts your next turn. Do other work that does not depend on it; if there is none, end your turn now with a short status and no tool call."
+            "Started background job {id}.{note}\nWhen it finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on it. When your next step needs its result, end your turn now with a short status and no tool call."
         ))
     }
 

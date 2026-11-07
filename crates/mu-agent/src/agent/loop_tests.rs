@@ -486,7 +486,60 @@ fn a_wait_with_no_job_running_runs() {
         a.turn(Some("go".to_string().into())).await;
         let r = results(&a);
         assert!(!r[0].0 && r[0].1.contains("text: \"waiting"), "{:?}", r[0]);
+        assert!(!r[0].1.contains("<background-jobs>"), "{:?}", r[0]);
         assert!(a.ports.providers.scripted.borrow().is_empty());
+    });
+}
+
+#[test]
+fn a_running_job_is_reported_on_the_last_result_of_a_later_batch() {
+    use mu_tools::tools::subagent::BackgroundResult;
+    run(async {
+        let bash = |id: &str, cmd: &str| Block::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: json!({"command": cmd}),
+        };
+        let script = vec![
+            Ok(assistant(vec![bash("a", "basename /x/a"), bash("b", "basename /x/b")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, _rx) = notify_agent(script);
+        let jobs = a.tools.jobs.clone().unwrap();
+        jobs.spawn_bash("cargo build".into(), std::env::temp_dir(), |cancel, _| async move {
+            cancel.cancelled().await;
+            BackgroundResult { ok: false, text: String::new(), note: "cancelled".into() }
+        });
+        a.turn(Some("go".to_string().into())).await;
+        jobs.kill(None);
+        let r = results(&a);
+        assert!(!r[0].1.contains("<background-jobs>"), "{:?}", r[0]);
+        assert!(r[1].1.contains("<background-jobs>\\nbg_1 (bash: cargo build) has been running for"), "{:?}", r[1]);
+        assert!(r[1].1.contains("mu automatically starts your next turn"), "{:?}", r[1]);
+    });
+}
+
+#[test]
+fn a_job_started_in_the_batch_gets_no_status_block() {
+    run(async {
+        let script = vec![
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: "s".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "sleep 30", "async": true}),
+                }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, _rx) = notify_agent(script);
+        let jobs = a.tools.jobs.clone().unwrap();
+        a.turn(Some("go".to_string().into())).await;
+        jobs.kill(None);
+        let r = results(&a);
+        assert!(r[0].1.contains("Started background job"), "{:?}", r[0]);
+        assert!(!r[0].1.contains("<background-jobs>"), "{:?}", r[0]);
     });
 }
 
