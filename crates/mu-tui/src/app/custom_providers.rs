@@ -449,7 +449,7 @@ mod tests {
             choose(&mut app, 4); // Models: reads the endpoint
             settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
             choose(&mut app, 0); // the model, with the limits the listing reported
-            choose(&mut app, 3); // Add it (preselected on the limits screen)
+            choose(&mut app, 4); // Add it (preselected on the limits screen)
             esc(&mut app); // back to the fields
             choose(&mut app, 5); // Save
             assert!(
@@ -666,7 +666,7 @@ mod tests {
             assert!(screen(&app).contains("Type a model id"), "{}", screen(&app));
             choose(&mut app, 0); // Type a model id…
             line(&mut app, "org/typed");
-            choose(&mut app, 3); // Add it with the defaults
+            choose(&mut app, 4); // Add it with the defaults
             esc(&mut app);
             choose(&mut app, 5); // Save
             let saved = app.services.providers.custom_registry().get("modal").unwrap().expect("saved");
@@ -806,11 +806,11 @@ mod tests {
             settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
             choose(&mut app, 0); // the model
             assert!(screen(&app).contains("none; /thinking has nothing to set"), "{}", screen(&app));
-            choose(&mut app, 2); // Reasoning
+            choose(&mut app, 3); // Reasoning
             choose(&mut app, 1); // Effort levels
             esc(&mut app); // back to the limits
             assert!(screen(&app).contains("effort: low, medium, high"), "{}", screen(&app));
-            choose(&mut app, 3); // Save org/model
+            choose(&mut app, 4); // Save org/model
             esc(&mut app); // models → fields
             choose(&mut app, 4); // Save
 

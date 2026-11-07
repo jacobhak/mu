@@ -202,6 +202,22 @@ fn snapshot_entry(model_id: &str) -> Option<Entry> {
     })
 }
 
+/// The rates a custom endpoint's model is configured with (`providers.toml`), which is normally the
+/// only price such a model has: it is in neither catalogue. Asked only when both have no price, so a
+/// custom id that happens to name a provider omp lists takes omp's price for that model. Read
+/// afresh, so a rate added or changed applies without a restart.
+fn custom_entry(model_id: &str) -> Option<Entry> {
+    let (provider, id) = model_id.split_once('/')?;
+    let def = crate::provider::custom::Registry::new().get(provider).ok()??;
+    let c = def.models.get(id)?.cost?;
+    Some(Entry {
+        name: None,
+        reasoning: false,
+        rates: Some(Rates { input: c.input, output: c.output, cache_read: c.cache_read, cache_write: c.cache_write }),
+        long_context: None,
+    })
+}
+
 /// A discovered listing is the provider's current price list: its positive prices replace the
 /// snapshot's field by field. Listings carry no long-context tier, so an override drops the snapshot's.
 fn with_listed_prices(snap: Option<Rates>, d: Option<&crate::model::discovery::Discovered>) -> (Option<Rates>, bool) {
@@ -218,7 +234,8 @@ fn with_listed_prices(snap: Option<Rates>, d: Option<&crate::model::discovery::D
 }
 
 /// Priced usage for `model_id` (`provider/model`), or `None` when there is no fixed price: omp's
-/// catalogue first, else mu's snapshot (the providers it drives natively, which need no omp).
+/// catalogue first, else mu's snapshot (the providers it drives natively, which need no omp), else
+/// the rates a custom endpoint configures for its model.
 pub fn cost(model_id: &str, usage: &Usage) -> Option<Cost> {
     cost_in(&table(), model_id, usage)
 }
@@ -233,7 +250,9 @@ fn cost_in(t: &Table, model_id: &str, usage: &Usage) -> Option<Cost> {
     {
         return Some(c);
     }
-    price(&snapshot_entry(model_id)?, usage)
+    snapshot_entry(model_id)
+        .and_then(|e| price(&e, usage))
+        .or_else(|| custom_entry(model_id).and_then(|e| price(&e, usage)))
 }
 
 fn openai_plan_model(model_id: &str) -> Option<String> {

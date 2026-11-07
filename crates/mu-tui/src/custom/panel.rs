@@ -10,7 +10,7 @@ use crate::widgets::select::{Item, Select};
 use mu_provider::auth::store::{Entry, cmd_label};
 use mu_provider::model::discovery::CustomRow;
 use mu_provider::provider::custom::{
-    self, AuthMode, CustomModel, CustomProvider, DEFAULT_CONTEXT, DEFAULT_OUTPUT, EFFORT_LADDER, Reasoning,
+    self, AuthMode, Cost, CustomModel, CustomProvider, DEFAULT_CONTEXT, DEFAULT_OUTPUT, EFFORT_LADDER, Reasoning,
 };
 use std::collections::BTreeMap;
 
@@ -97,6 +97,10 @@ enum Field {
     ModelId,
     Context,
     Output,
+    CostInput,
+    CostOutput,
+    CostRead,
+    CostWrite,
     /// The request switches merged while thinking is on / off.
     SwitchesOn,
     SwitchesOff,
@@ -125,9 +129,15 @@ enum Row {
     // One model's limits.
     Context,
     Output,
+    Costs,
     Reasoning,
     Add,
     Remove,
+    // One model's token costs, in dollars per million tokens.
+    CostInput,
+    CostOutput,
+    CostRead,
+    CostWrite,
     // How a model reasons.
     ModeNone,
     ModeEffort,
@@ -145,6 +155,7 @@ enum Screen {
     Models,
     Limits,
     Reasoning,
+    Costs,
     /// A field open for typing; the screen behind it is the one it belongs to.
     Field(Field),
 }
@@ -268,6 +279,7 @@ impl Panel {
             Screen::Models => Step::Pick(Box::new(self.models_screen())),
             Screen::Limits => Step::Pick(Box::new(self.limits_screen())),
             Screen::Reasoning => Step::Pick(Box::new(self.reasoning_screen())),
+            Screen::Costs => Step::Pick(Box::new(self.costs_screen())),
             Screen::Field(f) => Step::Pick(Box::new(self.field_screen(f))),
         }
     }
@@ -343,9 +355,10 @@ impl Panel {
             Screen::Field(Field::ModelId) => Screen::Models,
             Screen::Field(Field::Context | Field::Output) => Screen::Limits,
             Screen::Field(Field::SwitchesOn | Field::SwitchesOff) => Screen::Reasoning,
+            Screen::Field(Field::CostInput | Field::CostOutput | Field::CostRead | Field::CostWrite) => Screen::Costs,
             Screen::Auth | Screen::Models => Screen::Form,
             Screen::Limits => Screen::Models,
-            Screen::Reasoning => Screen::Limits,
+            Screen::Reasoning | Screen::Costs => Screen::Limits,
         };
         Action::Pending
     }
@@ -396,6 +409,11 @@ impl Panel {
                 let out = self.limits.as_ref().map(|l| l.out().to_string()).unwrap_or_default();
                 return self.edit(Field::Output, &out);
             }
+            Row::Costs => self.screen = Screen::Costs,
+            Row::CostInput => return self.edit_rate(Field::CostInput),
+            Row::CostOutput => return self.edit_rate(Field::CostOutput),
+            Row::CostRead => return self.edit_rate(Field::CostRead),
+            Row::CostWrite => return self.edit_rate(Field::CostWrite),
             Row::Reasoning => self.screen = Screen::Reasoning,
             Row::Add => return self.add_limits(),
             Row::Remove => {
@@ -455,6 +473,23 @@ impl Panel {
         self.screen = Screen::Field(field);
         self.entry = text.to_string();
         Action::Pending
+    }
+
+    /// The model's configured cost, `None` while it is unpriced.
+    fn cost(&self) -> Option<Cost> {
+        self.limits.as_ref().and_then(|l| l.model.cost)
+    }
+
+    /// A cost field's rate as its row shows it; an unpriced model's rates are 0.
+    fn cost_rate_text(&self, field: Field) -> String {
+        shown_rate(self.cost().map_or(0.0, |c| rate_of(&c, field)))
+    }
+
+    /// Opens a cost field on the rate it holds. An unpriced model's field starts empty, since a 0
+    /// there would price it as free.
+    fn edit_rate(&mut self, field: Field) -> Action {
+        let text = self.cost().map(|c| rate_of(&c, field).to_string()).unwrap_or_default();
+        self.edit(field, &text)
     }
 
     /// The value typed into the field that is open.
@@ -536,6 +571,25 @@ impl Panel {
                 l.model.max_tokens = Some(out);
                 self.limits = Some(l);
                 self.screen = Screen::Limits;
+            }
+            Field::CostInput | Field::CostOutput | Field::CostRead | Field::CostWrite => {
+                let Some(mut l) = self.limits.clone() else { return Ok(None) };
+                l.model.cost = match parse_rate(v)? {
+                    // An empty answer unprices the model, whichever rate it was typed into.
+                    None => None,
+                    Some(r) => {
+                        let mut c = l.model.cost.unwrap_or_default();
+                        match field {
+                            Field::CostInput => c.input = r,
+                            Field::CostOutput => c.output = r,
+                            Field::CostRead => c.cache_read = r,
+                            _ => c.cache_write = r,
+                        }
+                        Some(c)
+                    }
+                };
+                self.limits = Some(l);
+                self.screen = Screen::Costs;
             }
             Field::SwitchesOn | Field::SwitchesOff => {
                 let (name, on) = match field {
@@ -702,7 +756,7 @@ impl Panel {
                 rows
             }
             Screen::Limits => {
-                let mut rows = vec![Row::Context, Row::Output, Row::Reasoning, Row::Add];
+                let mut rows = vec![Row::Context, Row::Output, Row::Costs, Row::Reasoning, Row::Add];
                 if self.limits.as_ref().is_some_and(|l| self.models.contains_key(&l.id)) {
                     rows.push(Row::Remove);
                 }
@@ -717,6 +771,7 @@ impl Panel {
                 }
                 rows
             }
+            Screen::Costs => vec![Row::CostInput, Row::CostOutput, Row::CostRead, Row::CostWrite],
             Screen::Field(_) => Vec::new(),
         }
     }
@@ -763,6 +818,14 @@ impl Panel {
                     None => format!("{DEFAULT_OUTPUT} tokens, at most the context window"),
                 },
             ),
+            Row::Costs => (
+                "Costs".to_string(),
+                self.cost().map_or_else(|| "not set; the model is unpriced".to_string(), |c| c.summary()),
+            ),
+            Row::CostInput => ("Input".to_string(), self.cost_rate_text(Field::CostInput)),
+            Row::CostOutput => ("Output".to_string(), self.cost_rate_text(Field::CostOutput)),
+            Row::CostRead => ("Cache read".to_string(), self.cost_rate_text(Field::CostRead)),
+            Row::CostWrite => ("Cache write".to_string(), self.cost_rate_text(Field::CostWrite)),
             Row::Reasoning => ("Reasoning".to_string(), self.reasoning_text()),
             Row::ModeNone => ("No reasoning".to_string(), self.mode_detail(Reasoning::None)),
             Row::ModeEffort => ("Effort levels".to_string(), self.mode_detail(Reasoning::Effort)),
@@ -842,9 +905,20 @@ impl Panel {
         };
         Select::new(&format!("Limits of {id}"), self.items())
             .context(&context)
-            .preselect(3)
+            .preselect(4)
             .back_keys(true)
             .hint("↑↓ move · Enter edit, reason or add · ← / ⇧Tab / Esc back")
+    }
+
+    fn costs_screen(&self) -> Select {
+        let id = self.limits.as_ref().map(|l| l.id.clone()).unwrap_or_default();
+        Select::new(&format!("Costs of {id}"), self.items())
+            .context(
+                "Dollars per million tokens. A rate typed here prices the model, the others at 0; an empty \
+                 answer unprices it.",
+            )
+            .back_keys(true)
+            .hint("↑↓ move · Enter edit · ← / ⇧Tab / Esc back")
     }
 
     fn reasoning_screen(&self) -> Select {
@@ -980,8 +1054,9 @@ impl Panel {
     fn listed_detail(&self, row: &CustomRow) -> String {
         let limits = limits_of(row);
         let Some(m) = self.models.get(&row.id) else { return limits };
+        let cost = m.cost.map(|c| format!(" · {}", c.summary())).unwrap_or_default();
         let added = format!(
-            "added: {} ctx · {} out · {}",
+            "added: {} ctx · {} out · {}{cost}",
             m.context_window.unwrap_or(DEFAULT_CONTEXT),
             m.max_tokens.unwrap_or(DEFAULT_OUTPUT),
             match m.reasoning {
@@ -1035,6 +1110,10 @@ impl Field {
                 Some(l) => format!("Output limit [{}, at most {}]", l.out(), l.ctx()),
                 None => "Output limit".into(),
             },
+            Self::CostInput => cost_title("Input", p, self),
+            Self::CostOutput => cost_title("Output", p, self),
+            Self::CostRead => cost_title("Cache read", p, self),
+            Self::CostWrite => cost_title("Cache write", p, self),
             Self::SwitchesOn => "Switches while thinking".into(),
             Self::SwitchesOff => "Switches while not thinking".into(),
         }
@@ -1058,6 +1137,9 @@ impl Field {
             Self::ModelId => "Exactly as the endpoint names it, e.g. org/model.".into(),
             Self::Context => "In tokens; Enter keeps the value shown.".into(),
             Self::Output => "In tokens, at most the context window; Enter keeps the value shown.".into(),
+            Self::CostInput | Self::CostOutput | Self::CostRead | Self::CostWrite => {
+                "Dollars per million tokens; an empty answer clears the whole cost table.".into()
+            }
             Self::SwitchesOn | Self::SwitchesOff => {
                 "One or more `path = value` switches, comma-separated; values are JSON (`true`, `0.6`, \
                  `\"text\"`). Enter keeps the value shown; an empty answer clears them."
@@ -1070,6 +1152,46 @@ impl Field {
 /// The ladder in `efforts`, in ascending order and without names the ladder does not have.
 fn ordered_efforts(efforts: &[String]) -> Vec<String> {
     EFFORT_LADDER.iter().filter(|name| efforts.iter().any(|e| e == *name)).map(|n| (*n).to_string()).collect()
+}
+
+/// A rate typed into a cost field: an empty answer clears the whole table, anything else must be a
+/// dollar amount per million tokens.
+fn parse_rate(s: &str) -> Result<Option<f64>, String> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    s.parse::<f64>()
+        .ok()
+        .filter(|r| r.is_finite() && *r >= 0.0)
+        .map(Some)
+        .ok_or_else(|| "a rate is a dollar amount per million tokens, zero or more".to_string())
+}
+
+/// The rate a cost field stands for.
+fn rate_of(c: &Cost, field: Field) -> f64 {
+    match field {
+        Field::CostInput => c.input,
+        Field::CostOutput => c.output,
+        Field::CostRead => c.cache_read,
+        _ => c.cache_write,
+    }
+}
+
+/// A rate as a cost row shows it: `$0.3/M tokens`, or `0`.
+fn shown_rate(v: f64) -> String {
+    if v == 0.0 { "0".into() } else { format!("${v}/M tokens") }
+}
+
+/// A cost field's title, with the rate it holds in brackets once the model has a cost.
+fn cost_title(name: &str, p: &Panel, field: Field) -> String {
+    match p.cost() {
+        Some(c) => {
+            let v = rate_of(&c, field);
+            let shown = if v == 0.0 { "0".to_string() } else { format!("${v}/M") };
+            format!("{name} cost [{shown}]")
+        }
+        None => format!("{name} cost"),
+    }
 }
 
 /// How the auth screen names a stored credential, never showing a literal key.
@@ -1551,5 +1673,100 @@ mod tests {
             saved.entry.and_then(|e| e.reference).as_deref(),
             Some("!pass show modal/token --secret-flag arg-123")
         );
+    }
+
+    /// An endpoint with one typed model, on its limits screen.
+    fn typed_model() -> Panel {
+        let mut p = ready();
+        pick(&mut p, "Models");
+        p.fetched(Fetch::Failed("unreachable".into()));
+        type_into(&mut p, "Type a model id", "org/typed");
+        p
+    }
+
+    #[test]
+    fn a_model_is_priced_on_its_costs_screen_and_the_rates_are_added_with_it() {
+        let mut p = typed_model();
+        assert!(screen(&p).contains("not set; the model is unpriced"), "{}", screen(&p));
+
+        pick(&mut p, "Costs");
+        let text = screen(&p);
+        assert!(text.contains("Costs of org/typed"), "{text}");
+        for label in ["Input", "Output", "Cache read", "Cache write"] {
+            assert!(text.contains(label), "{text}");
+        }
+
+        type_into(&mut p, "Input", "0.3");
+        pick(&mut p, "Input");
+        assert!(screen(&p).contains("Input cost [$0.3/M]"), "{}", screen(&p));
+        assert_eq!(p.answer(Answer::Back), Action::Pending, "back to the costs");
+        type_into(&mut p, "Output", "1.2");
+        assert_eq!(p.answer(Answer::Back), Action::Pending, "back to the limits");
+        assert!(screen(&p).contains("$0.3/M in, $1.2/M out"), "{}", screen(&p));
+
+        let i = row(&p, "Add org/typed");
+        assert_eq!(p.answer(Answer::Pick(i)), Action::Pending);
+        let m = p.saved().provider.models["org/typed"].clone();
+        assert_eq!(m.cost, Some(Cost { input: 0.3, output: 1.2, ..Cost::default() }));
+    }
+
+    #[test]
+    fn a_typed_zero_is_a_real_rate_and_an_empty_answer_unprices_the_model() {
+        let mut p = typed_model();
+        pick(&mut p, "Costs");
+        type_into(&mut p, "Input", "0");
+        assert_eq!(p.limits.as_ref().unwrap().model.cost, Some(Cost::default()), "a typed 0 prices it as free");
+        pick(&mut p, "Input");
+        assert!(screen(&p).contains("Input cost [0]"), "{}", screen(&p));
+        assert_eq!(p.answer(Answer::Text("0.3".into())), Action::Pending);
+        type_into(&mut p, "Output", "1.2");
+
+        // The other rates keep their values while one is set; an empty answer clears all four.
+        assert_eq!(p.limits.as_ref().unwrap().model.cost.unwrap().output, 1.2);
+        type_into(&mut p, "Cache read", "");
+        assert_eq!(p.limits.as_ref().unwrap().model.cost, None);
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(screen(&p).contains("not set; the model is unpriced"), "{}", screen(&p));
+    }
+
+    #[test]
+    fn a_negative_or_unreadable_rate_is_refused_and_the_field_stays_open() {
+        let mut p = typed_model();
+        pick(&mut p, "Costs");
+        pick(&mut p, "Input");
+        for bad in ["-1", "cheap", "inf"] {
+            let action = p.answer(Answer::Text(bad.into()));
+            assert!(matches!(&action, Action::Refused(m) if m.contains("zero or more")), "{bad}: {action:?}");
+            assert!(typing(&p), "the field stays open on {bad}");
+        }
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert_eq!(p.limits.as_ref().unwrap().model.cost, None, "nothing was stored");
+    }
+
+    #[test]
+    fn esc_goes_back_from_a_cost_field_to_the_costs_and_from_the_costs_to_the_limits() {
+        let mut p = typed_model();
+        pick(&mut p, "Costs");
+        pick(&mut p, "Output");
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(screen(&p).contains("Costs of org/typed"), "{}", screen(&p));
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        assert!(screen(&p).contains("Limits of org/typed"), "{}", screen(&p));
+    }
+
+    #[test]
+    fn a_priced_model_says_its_costs_in_the_models_list() {
+        let mut p = ready();
+        pick(&mut p, "Models");
+        p.fetched(Fetch::Listed(vec![listed("org/a", Some(65_536), Some(8_192))]));
+        pick(&mut p, "org/a");
+        pick(&mut p, "Costs");
+        type_into(&mut p, "Input", "0.3");
+        type_into(&mut p, "Output", "1.2");
+        assert_eq!(p.answer(Answer::Back), Action::Pending);
+        let i = row(&p, "Add org/a");
+        assert_eq!(p.answer(Answer::Pick(i)), Action::Pending);
+        // The row is cut at the screen's width, so the detail is checked as the row holds it.
+        assert!(p.item(Row::Listed(0)).detail.ends_with("· $0.3/M in, $1.2/M out"), "{}", screen(&p));
     }
 }

@@ -13,6 +13,9 @@
 //! [providers.modal.models."org/model"]
 //! context_window = 32768
 //! reasoning = "template"     # "none" | "effort" | "template"
+//! [providers.modal.models."org/model".cost]    # dollars per million tokens
+//! input = 0.30
+//! output = 1.20
 //! [providers.modal.models."org/model".extra_body_on.chat_template_kwargs]
 //! enable_thinking = true
 //! ```
@@ -139,6 +142,46 @@ fn yes() -> bool {
     true
 }
 
+/// What a model's tokens cost: dollars per million tokens, as the catalog and the providers' own
+/// listings give them. Every field is 0 unless configured.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cost {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub input: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub output: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write: f64,
+}
+
+fn is_zero(n: &f64) -> bool {
+    *n == 0.0
+}
+
+impl Cost {
+    /// The input and output rates as the model lists show them: `$0.3/M in, $1.2/M out`.
+    pub fn summary(&self) -> String {
+        format!("${}/M in, ${}/M out", self.input, self.output)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, rate) in [
+            ("input", self.input),
+            ("output", self.output),
+            ("cache_read", self.cache_read),
+            ("cache_write", self.cache_write),
+        ] {
+            if !rate.is_finite() || rate < 0.0 {
+                bail!("cost.{name} must be a dollar rate per million tokens, zero or more");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomModel {
@@ -154,6 +197,9 @@ pub struct CustomModel {
     pub reasoning: Reasoning,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub efforts: Vec<String>,
+    /// What a turn costs, per million tokens; `None` leaves the model unpriced, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
     #[serde(
         default,
         deserialize_with = "de_compat",
@@ -410,6 +456,9 @@ impl CustomModel {
             && m > w
         {
             bail!("max_tokens ({m}) exceeds context_window ({w})");
+        }
+        if let Some(c) = &self.cost {
+            c.validate()?;
         }
         match self.reasoning {
             Reasoning::Effort if self.efforts.is_empty() => {
@@ -929,6 +978,11 @@ context_window = 32768
 max_tokens = 4096
 reasoning = "template"
 
+[providers.modal.models."Qwen/example".cost]
+input = 0.3
+output = 1.2
+cache_read = 0.05
+
 [providers.modal.models."Qwen/example".compat]
 reasoningContentField = "reasoning_content"
 requiresReasoningContentForToolCalls = true
@@ -968,6 +1022,8 @@ enable_thinking = false
             ("Qwen/example", "modal/Qwen/example", ThinkingMode::Template)
         );
         assert!(s.native && !s.images && s.compat.as_ref().unwrap().requires_reasoning_content_for_tool_calls);
+        let cost = p.models["Qwen/example"].cost.unwrap();
+        assert_eq!((cost.input, cost.output, cost.cache_read, cost.cache_write), (0.3, 1.2, 0.05, 0.0));
         let c = s.compat.unwrap();
         assert_eq!(c.extra_body_on["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(c.extra_body["temperature"], 0.6);
@@ -1010,6 +1066,9 @@ enable_thinking = false
         );
         assert!(err(&format!("{m}[providers.a.models.m.extra_body]\nwhen = 2026-01-01T00:00:00Z\n")).contains("date"));
         assert!(err(&format!("{m}[providers.a.models.m.extra_body]\nx = nan\n")).contains("non-finite"));
+        assert!(err(&format!("{m}cost = {{ input = -1.0 }}\n")).contains("cost.input"));
+        assert!(err(&format!("{m}cost = {{ output = inf }}\n")).contains("cost.output"));
+        assert!(err(&format!("{m}cost = {{ tokens = 1.0 }}\n")).contains("tokens"));
         assert!(err(&format!("{m}[providers.a.models.m.compat]\nextraBody = {{}}\n")).contains("extra_body"));
         assert!(err(&format!("{m}[providers.a.models.m.compat]\nbogus = 1\n")).contains("bogus"));
         assert!(
@@ -1045,6 +1104,7 @@ enable_thinking = false
                 context_window: Some(8192),
                 max_tokens: Some(1024),
                 reasoning: Reasoning::Template,
+                cost: Some(Cost { input: 0.3, output: 1.2, ..Default::default() }),
                 compat: CompletionsCompat {
                     reasoning_content_field: Some("reasoning".into()),
                     requires_reasoning_content_for_tool_calls: true,

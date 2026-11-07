@@ -7,7 +7,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::{Entry, Store, resolve_entry};
 use mu_provider::model::discovery::{self, CustomRow};
-use mu_provider::provider::custom::{self, AuthMode, CustomModel, CustomProvider, Reasoning, Registry, SaveError};
+use mu_provider::provider::custom::{
+    self, AuthMode, Cost, CustomModel, CustomProvider, Reasoning, Registry, SaveError,
+};
 use serde_json::Map;
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
@@ -56,6 +58,19 @@ pub enum Cmd {
         /// Repeat for each one.
         #[arg(long = "thinking-off", value_name = "PATH=VALUE")]
         thinking_off: Vec<String>,
+        /// Input price of the --model ids, in dollars per million tokens. Once any cost flag is given,
+        /// the unset rates are 0.
+        #[arg(long, allow_negative_numbers = true)]
+        input_cost: Option<f64>,
+        /// Output price of the --model ids, in dollars per million tokens.
+        #[arg(long, allow_negative_numbers = true)]
+        output_cost: Option<f64>,
+        /// Cache-read price of the --model ids, in dollars per million tokens.
+        #[arg(long, allow_negative_numbers = true)]
+        cache_read_cost: Option<f64>,
+        /// Cache-write price of the --model ids, in dollars per million tokens.
+        #[arg(long, allow_negative_numbers = true)]
+        cache_write_cost: Option<f64>,
         /// Read the key from this environment variable at request time.
         #[arg(long, conflicts_with_all = ["cmd", "no_auth"])]
         env: Option<String>,
@@ -111,6 +126,10 @@ pub struct AddArgs {
     pub efforts: Vec<String>,
     pub thinking_on: Vec<String>,
     pub thinking_off: Vec<String>,
+    pub input_cost: Option<f64>,
+    pub output_cost: Option<f64>,
+    pub cache_read_cost: Option<f64>,
+    pub cache_write_cost: Option<f64>,
     pub source: Source,
     pub no_discover: bool,
     pub no_validate: bool,
@@ -151,6 +170,10 @@ fn exec(
             efforts,
             thinking_on,
             thinking_off,
+            input_cost,
+            output_cost,
+            cache_read_cost,
+            cache_write_cost,
             env,
             cmd,
             no_auth,
@@ -174,6 +197,10 @@ fn exec(
                 efforts,
                 thinking_on,
                 thinking_off,
+                input_cost,
+                output_cost,
+                cache_read_cost,
+                cache_write_cost,
                 source,
                 no_discover,
                 no_validate,
@@ -200,10 +227,12 @@ fn draft(args: &AddArgs) -> Result<CustomProvider> {
             || !args.efforts.is_empty()
             || !args.thinking_on.is_empty()
             || !args.thinking_off.is_empty()
+            || cost_flags(args).is_some()
         {
             bail!(
-                "--context-window, --max-tokens, --reasoning, --effort and --thinking-on/--thinking-off \
-                 apply to the --model ids; give at least one --model"
+                "--context-window, --max-tokens, --reasoning, --effort, --thinking-on/--thinking-off and \
+                 --input-cost/--output-cost/--cache-read-cost/--cache-write-cost apply to the --model ids; \
+                 give at least one --model"
             );
         }
         if args.no_discover {
@@ -220,6 +249,17 @@ fn draft(args: &AddArgs) -> Result<CustomProvider> {
         }
     }
     Ok(p)
+}
+
+/// The rates the `--*-cost` flags give, or None when none is given, so the model stays unpriced.
+fn cost_flags(args: &AddArgs) -> Option<Cost> {
+    let rates = [args.input_cost, args.output_cost, args.cache_read_cost, args.cache_write_cost];
+    rates.iter().any(Option::is_some).then(|| Cost {
+        input: args.input_cost.unwrap_or(0.0),
+        output: args.output_cost.unwrap_or(0.0),
+        cache_read: args.cache_read_cost.unwrap_or(0.0),
+        cache_write: args.cache_write_cost.unwrap_or(0.0),
+    })
 }
 
 /// The limits and reasoning `--model` ids get. A model nobody says otherwise about reasons with an
@@ -254,6 +294,7 @@ fn model_settings(args: &AddArgs) -> Result<CustomModel> {
     if reasoning == Reasoning::None && (!on.is_empty() || !off.is_empty()) {
         bail!("--thinking-on and --thinking-off need --reasoning effort or template, not none");
     }
+    let cost = cost_flags(args);
     Ok(CustomModel {
         context_window: args.context_window,
         max_tokens: args.max_tokens,
@@ -261,6 +302,7 @@ fn model_settings(args: &AddArgs) -> Result<CustomModel> {
         efforts,
         extra_body_on: on,
         extra_body_off: off,
+        cost,
         ..Default::default()
     })
 }
@@ -447,7 +489,9 @@ fn model_rows(c: &CustomProvider, listed: &[CustomRow]) -> Vec<String> {
                 Reasoning::Effort => format!("  reasoning effort {}", x.efforts.join("/")),
                 Reasoning::Template => "  reasoning by request switches".to_string(),
             });
-            format!("{}/{m}  {source}{context}{reasoning}", c.id)
+            let cost = c.models.get(*m).and_then(|x| x.cost);
+            let cost = cost.map_or(String::new(), |k| format!("  cost {}", k.summary()));
+            format!("{}/{m}  {source}{context}{reasoning}{cost}", c.id)
         })
         .collect()
 }
@@ -532,6 +576,10 @@ mod tests {
             efforts: Vec::new(),
             thinking_on: Vec::new(),
             thinking_off: Vec::new(),
+            input_cost: None,
+            output_cost: None,
+            cache_read_cost: None,
+            cache_write_cost: None,
             source,
             no_discover: false,
             no_validate: false,
@@ -816,6 +864,75 @@ mod tests {
         assert!(t.contains("1 manual models") && t.contains("discovery on"), "{t}");
         assert!(!t.contains("secret") && !t.contains("md-"), "{t}");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn cost_flags_parse_and_refuse_without_a_model() {
+        let cmd = parse(&[
+            "add",
+            "modal",
+            "--base-url",
+            "https://x.test/v1",
+            "--model",
+            "m",
+            "--input-cost",
+            "0.3",
+            "--output-cost",
+            "-1",
+            "--cache-read-cost",
+            "0.03",
+            "--cache-write-cost",
+            "0.375",
+        ])
+        .unwrap();
+        let Cmd::Add { input_cost, output_cost, cache_read_cost, cache_write_cost, .. } = cmd else {
+            panic!("not add");
+        };
+        assert_eq!(
+            [input_cost, output_cost, cache_read_cost, cache_write_cost],
+            [Some(0.3), Some(-1.0), Some(0.03), Some(0.375)]
+        );
+
+        let mut a = args("modal", "https://x.test/v1", Source::Keyless);
+        a.cache_write_cost = Some(0.0);
+        let e = draft(&a).unwrap_err().to_string();
+        assert!(e.contains("--cache-write-cost") && e.contains("--model"), "{e}");
+    }
+
+    #[test]
+    fn cost_rates_reach_each_model_and_a_negative_one_is_refused() {
+        let mut a = args("modal", "https://x.test/v1", Source::Keyless);
+        a.models = vec!["org/m".into()];
+        let p = draft(&a).unwrap().validated("modal").unwrap();
+        assert!(p.models["org/m"].cost.is_none(), "no cost flag leaves the model unpriced");
+
+        a.input_cost = Some(0.3);
+        a.output_cost = Some(1.2);
+        a.cache_read_cost = Some(0.03);
+        let p = draft(&a).unwrap().validated("modal").unwrap();
+        let cost = p.models["org/m"].cost.unwrap();
+        assert_eq!(cost, Cost { input: 0.3, output: 1.2, cache_read: 0.03, cache_write: 0.0 });
+
+        a.input_cost = Some(-1.0);
+        let e = format!("{:#}", draft(&a).unwrap().validated("modal").unwrap_err());
+        assert!(e.contains("models.\"org/m\"") && e.contains("cost.input"), "{e}");
+    }
+
+    #[test]
+    fn model_rows_show_the_configured_rates_and_none_for_an_unpriced_model() {
+        let mut a = args("modal", "https://x.test/v1", Source::Keyless);
+        a.models = vec!["org/priced".into()];
+        a.input_cost = Some(0.3);
+        a.output_cost = Some(1.2);
+        let mut p = draft(&a).unwrap().validated("modal").unwrap();
+        p.models.insert("org/bare".into(), CustomModel::default());
+        assert_eq!(
+            model_rows(&p, &[]),
+            [
+                "modal/org/bare  manual",
+                "modal/org/priced  manual  reasoning effort low/medium/high  cost $0.3/M in, $1.2/M out",
+            ]
+        );
     }
 
     #[test]
