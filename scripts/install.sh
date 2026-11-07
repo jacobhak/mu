@@ -29,6 +29,21 @@ trap 'rm -rf "$tmp"' EXIT
 # Public URLs first; a private repo (or fork) falls back to an authenticated gh.
 has_gh() { command -v gh >/dev/null && gh auth status >/dev/null 2>&1; }
 
+# A file's physical path, following symlinks (macOS has no `readlink -f`) and any `..` or symlinked
+# directory in the way (`pwd -P`), so two spellings of the same binary compare equal.
+resolved_path() {
+  local p="$1" t hops=0
+  while [ -L "$p" ] && [ "$hops" -lt 40 ]; do
+    t="$(readlink "$p")"
+    case "$t" in
+      /*) p="$t" ;;
+      *) p="$(dirname "$p")/$t" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  (cd "$(dirname "$p")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$p")")
+}
+
 # 1. Source
 if [ -n "$src" ]; then
   (cd "$src" && cargo build --release --workspace --locked && scripts/build-mcp-http.sh build)
@@ -110,7 +125,7 @@ if [ "$link" = 1 ]; then
   mkdir -p "$HOME/.local/bin"
   ln -sfn "$home/bin/mu" "$HOME/.local/bin/mu"
   other="$(command -v mu || true)"
-  if [ -n "$other" ] && [ "$other" != "$HOME/.local/bin/mu" ]; then
+  if [ -n "$other" ] && [ "$(resolved_path "$other")" != "$(resolved_path "$HOME/.local/bin/mu")" ]; then
     echo "another mu shadows ~/.local/bin/mu: $other" >&2
   fi
 fi
