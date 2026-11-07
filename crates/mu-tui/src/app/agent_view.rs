@@ -223,6 +223,7 @@ impl AgentView {
             AgentEvent::TurnStart => {
                 self.running = true;
                 self.turn_started = Some(Instant::now());
+                self.bell.on_turn_start();
             }
             AgentEvent::Woken => self.bell.on_woken(),
             AgentEvent::UserPrompt(t) => {
@@ -948,17 +949,42 @@ mod tests {
     }
 
     #[test]
-    fn a_question_rings_only_in_a_turn_the_user_did_not_start() {
-        let (tx, _rx) = oneshot::channel::<Option<Vec<Answer>>>();
+    fn a_question_rings_once_whoever_started_the_turn() {
+        let ask = || {
+            let (tx, _rx) = oneshot::channel::<Option<Vec<Answer>>>();
+            AgentEvent::Ask { questions: vec![], reply: tx }
+        };
         let mut v = view();
-        let fx = v.on_event(AgentEvent::Ask { questions: vec![], reply: tx }, SIZE);
-        assert!(matches!(fx.as_slice(), [Effect::Ask { .. }]));
+        let fx = v.on_event(ask(), SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::Ask { .. }]));
+        let fx = v.on_event(ask(), SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Ask { .. }]), "one ring per turn");
 
-        let (tx, _rx) = oneshot::channel::<Option<Vec<Answer>>>();
         let mut v = view();
         v.on_event(AgentEvent::Woken, SIZE);
-        let fx = v.on_event(AgentEvent::Ask { questions: vec![], reply: tx }, SIZE);
+        let fx = v.on_event(ask(), SIZE);
         assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::Ask { .. }]));
+    }
+
+    #[test]
+    fn a_prompt_between_turns_does_not_silence_the_next_turn() {
+        let (tx, _rx) = oneshot::channel::<Option<Vec<Answer>>>();
+        let mut v = view();
+        let fx = v.on_event(AgentEvent::Ask { questions: vec![], reply: tx }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::Ask { .. }]), "a job's question still rings");
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::TurnEnded { aborted: false }]));
+    }
+
+    #[test]
+    fn a_turn_that_asked_does_not_ring_again_at_the_end() {
+        let (tx, _rx) = oneshot::channel::<Option<Vec<Answer>>>();
+        let mut v = view();
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        v.on_event(AgentEvent::Ask { questions: vec![], reply: tx }, SIZE);
+        let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::TurnEnded { aborted: false }]));
     }
 
     #[test]
@@ -966,7 +992,7 @@ mod tests {
         let (tx, _rx) = oneshot::channel::<bool>();
         let mut v = view();
         let fx = v.on_event(AgentEvent::WebSetup { reply: tx }, SIZE);
-        assert!(matches!(fx.as_slice(), [Effect::WebSetup { .. }]));
+        assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::WebSetup { .. }]));
     }
 
     #[test]

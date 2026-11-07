@@ -83,8 +83,8 @@ impl Default for OmpDisplay {
 }
 
 /// omp's `completion.notify` (`on`/`off`, default on): ring the terminal when a turn you typed ends
-/// with nothing running in the background, or when a turn mu started itself needs you (`ask`, plan
-/// review).
+/// with nothing running in the background, or when a running turn needs you (`ask`, an approval,
+/// plan review), whoever started it.
 #[derive(Debug, Clone, Copy)]
 pub struct OmpCompletion {
     pub notify: bool,
@@ -212,7 +212,7 @@ fn load_permissions(v: &toml::Value, warn: &mut Vec<String>) -> MuPermissions {
 }
 
 /// `[bell]`: which events ring the terminal. `turn_end`: a turn you typed ends with no background
-/// command or subagent running. `attention`: a turn mu started itself needs you (`ask`, plan
+/// command or subagent running. `attention`: a running turn needs you (`ask`, an approval, plan
 /// review). omp's `completion.notify = off` silences both.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default)]

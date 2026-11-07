@@ -70,7 +70,8 @@ pub struct AppInit {
     pub status_cfg: mu_base::config::OmpStatusLine,
     pub theme: mu_base::config::MuTheme,
     /// Ring the terminal when your turn ends with nothing running in the background, or when a
-    /// turn mu started itself needs you (omp's `completion.notify`).
+    /// running turn needs you: a question, an approval or a plan review, whoever started it (omp's
+    /// `completion.notify`).
     pub notify: bool,
     /// Which events ring (`[bell]` in config.toml); `notify` off silences all of them.
     pub bell: mu_base::config::MuBell,

@@ -6,7 +6,7 @@
 
 A `bash` call with `async` shows in the transcript as one line, `● Bash <command>`, since all it does is start the job. Its row above the prompt carries the run time while it runs, and when the job finishes its output is printed as the usual `bash` card: the command, the tail of its output and a footer with `Wall:` and, unless it ended at exit 0, how it ended.
 
-A turn that began this way rings the terminal; see [Detached runs](detached-runs.md#terminal-bell).
+A turn that began this way rings the terminal only when it needs you (a question, an approval, plan review), not when it finishes; see [Detached runs](detached-runs.md#terminal-bell).
 
 ## Waiting for a job
 
