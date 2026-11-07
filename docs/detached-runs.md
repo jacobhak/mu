@@ -24,7 +24,7 @@ Messages are files in `<profile home>/inbox/<id>/` (directory mode 0700), writte
 
 ## Terminal bell
 
-A turn that began without user input (a `mu notify` message or a finished [background job](background-jobs.md)) rings the terminal when it ends or when it asks you something (`ask`, plan review): BEL, plus an OSC 9 notification under tmux (needs `allow-passthrough`) and in Ghostty, WezTerm, iTerm2 and Warp; omp's `completion: {notify: off}` in `config.yml` turns it off.
+A turn you started rings the terminal when it ends, unless a [background job](background-jobs.md) or subagent is still running (aborting does not ring). A turn that began without user input (a `mu notify` message or a finished job or subagent) rings only when it needs you (`ask`, plan review), not when it finishes: BEL, plus an OSC 9 notification under tmux (needs `allow-passthrough`) and in Ghostty, WezTerm, iTerm2 and Warp; omp's `completion: {notify: off}` in `config.yml` turns it off, and `[bell] turn_end` / `attention` in `config.toml` turn off each kind (see [Config](config.md)).
 
 ## Session environment
 

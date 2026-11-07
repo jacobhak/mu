@@ -1,5 +1,7 @@
-//! When to ring the terminal for a turn nobody typed (a `mu notify` message or a finished
-//! background job woke the agent). Pure state, so it is testable without a terminal.
+//! When to ring the terminal. A turn the user typed rings when it ends, unless a background
+//! command or subagent is still running. A turn mu started itself (a `mu notify` message, a
+//! finished background job or subagent) rings only when it needs the user (`ask`, plan review),
+//! never because it finished. Pure state, so it is testable without a terminal.
 
 #[derive(Default)]
 pub struct WokenBell {
@@ -23,10 +25,10 @@ impl WokenBell {
         ring
     }
 
-    /// The turn ended. True when it should ring: a woken turn that did not already ring and was
-    /// not aborted by the user.
-    pub fn on_turn_end(&mut self, aborted: bool) -> bool {
-        let ring = self.woken && !self.rang && !aborted;
+    /// The turn ended. True when it should ring: the user started it, did not abort it and
+    /// nothing runs in the background.
+    pub fn on_turn_end(&mut self, aborted: bool, jobs_running: bool) -> bool {
+        let ring = !self.woken && !aborted && !jobs_running;
         *self = Self::default();
         ring
     }
@@ -37,33 +39,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_woken_turn_rings_once_at_the_end() {
-        let mut b = WokenBell::default();
-        b.on_woken();
-        assert!(b.on_turn_end(false));
-        assert!(!b.on_turn_end(false));
-    }
-
-    #[test]
     fn a_user_turn_never_rings() {
         let mut b = WokenBell::default();
         assert!(!b.on_attention());
-        assert!(!b.on_turn_end(false));
     }
 
     #[test]
-    fn an_aborted_woken_turn_does_not_ring() {
-        let mut b = WokenBell::default();
-        b.on_woken();
-        assert!(!b.on_turn_end(true));
-    }
-
-    #[test]
-    fn attention_then_end_rings_once() {
+    fn a_woken_turn_rings_once_when_it_needs_the_user() {
         let mut b = WokenBell::default();
         b.on_woken();
         assert!(b.on_attention());
         assert!(!b.on_attention());
-        assert!(!b.on_turn_end(false));
+    }
+
+    #[test]
+    fn a_user_turn_rings_at_the_end_when_nothing_runs() {
+        let mut b = WokenBell::default();
+        assert!(b.on_turn_end(false, false));
+    }
+
+    #[test]
+    fn a_user_turn_stays_quiet_while_jobs_run_or_when_aborted() {
+        let mut b = WokenBell::default();
+        assert!(!b.on_turn_end(false, true));
+        assert!(!b.on_turn_end(true, false));
+    }
+
+    #[test]
+    fn a_woken_turn_does_not_ring_at_the_end() {
+        let mut b = WokenBell::default();
+        b.on_woken();
+        assert!(!b.on_turn_end(false, false));
+        assert!(b.on_turn_end(false, false), "the next turn is a user turn again");
     }
 }

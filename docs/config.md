@@ -45,6 +45,10 @@ readonly_bash = true   # the built-in read-only command set counts as reading; f
 # bash = { "cargo test *" = "allow", "git push *" = "deny" }
 # "mcp__github_*" = "allow"
 
+[bell]                # what rings the terminal (BEL, plus a toast in some terminals; see detached-runs.md); omp's `completion: {notify: off}` silences both
+turn_end = true       # a turn you typed ends with no background command or subagent running
+attention = true      # a turn mu started itself (a finished job, a `mu notify` message) asks you something or needs a plan review
+
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 

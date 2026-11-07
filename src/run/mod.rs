@@ -303,6 +303,7 @@ async fn tui(
         status_cfg: cfgs.omp.status_line.clone(),
         theme: cfgs.mu.theme.clone(),
         notify: cfgs.omp.completion.notify,
+        bell: cfgs.mu.bell,
     })
     .await
 }

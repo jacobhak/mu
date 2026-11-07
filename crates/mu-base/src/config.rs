@@ -82,8 +82,9 @@ impl Default for OmpDisplay {
     }
 }
 
-/// omp's `completion.notify` (`on`/`off`, default on): ring the terminal when a turn nobody typed
-/// finishes. mu applies it only to those woken turns.
+/// omp's `completion.notify` (`on`/`off`, default on): ring the terminal when a turn you typed ends
+/// with nothing running in the background, or when a turn mu started itself needs you (`ask`, plan
+/// review).
 #[derive(Debug, Clone, Copy)]
 pub struct OmpCompletion {
     pub notify: bool,
@@ -151,6 +152,7 @@ pub struct MuConfig {
     /// `[permissions]`, parsed by `load_permissions` rather than serde.
     #[serde(skip)]
     pub permissions: MuPermissions,
+    pub bell: MuBell,
 }
 
 /// `[permissions]`: which tool calls may run without asking, and the rules that override it.
@@ -200,6 +202,22 @@ fn load_permissions(v: &toml::Value, warn: &mut Vec<String>) -> MuPermissions {
         },
     }
     p
+}
+
+/// `[bell]`: which events ring the terminal. `turn_end`: a turn you typed ends with no background
+/// command or subagent running. `attention`: a turn mu started itself needs you (`ask`, plan
+/// review). omp's `completion.notify = off` silences both.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MuBell {
+    pub turn_end: bool,
+    pub attention: bool,
+}
+
+impl Default for MuBell {
+    fn default() -> Self {
+        Self { turn_end: true, attention: true }
+    }
 }
 
 /// `[bash]`: while a background job runs, a model's command that starts with a sleep of at least
@@ -599,6 +617,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         status,
         bash,
         permissions: load_permissions(&section("permissions"), warn),
+        bell: parse(section("bell"), "bell", warn),
     }
 }
 
@@ -900,6 +919,13 @@ mod tests {
         check_status(&mut s, &mut w);
         assert_eq!(s, MuStatus { warn_tokens: 100_000, ..MuStatus::default() });
         assert_eq!(w.len(), 2, "{w:?}");
+    }
+
+    #[test]
+    fn bell_defaults_on_and_switches_off_per_trigger() {
+        assert_eq!(toml::from_str::<MuConfig>("").unwrap().bell, MuBell::default());
+        let b = toml::from_str::<MuConfig>("[bell]\nturn_end = false").unwrap().bell;
+        assert_eq!(b, MuBell { turn_end: false, attention: true });
     }
 
     #[test]

@@ -67,8 +67,11 @@ pub struct AppInit {
     pub pick_session: bool,
     pub status_cfg: mu_base::config::OmpStatusLine,
     pub theme: mu_base::config::MuTheme,
-    /// Ring the terminal at the end of a turn nobody typed (omp's `completion.notify`).
+    /// Ring the terminal when your turn ends with nothing running in the background, or when a
+    /// turn mu started itself needs you (omp's `completion.notify`).
     pub notify: bool,
+    /// Which events ring (`[bell]` in config.toml); `notify` off silences all of them.
+    pub bell: mu_base::config::MuBell,
 }
 
 struct App {
@@ -158,6 +161,7 @@ pub async fn run(init: AppInit) -> i32 {
         status_cfg,
         theme,
         notify,
+        bell,
     } = init;
     let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
@@ -169,7 +173,7 @@ pub async fn run(init: AppInit) -> i32 {
     let show_thinking = !providers.cfg.omp.hide_thinking_block;
     let smooth = providers.cfg.omp.display.smooth_streaming;
     let mut app = App {
-        agent: AgentView::new(show_thinking, smooth),
+        agent: AgentView::new(show_thinking, smooth).with_bell(bell),
         services: Services { providers },
         link: Link { cmd_tx },
         ctx,

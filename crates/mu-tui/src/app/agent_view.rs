@@ -12,6 +12,7 @@ use crate::term::bell::WokenBell;
 use crate::text::line::{Line, dim, styled};
 use crate::theme::{self, Role};
 use crate::widgets::overlay::Overlay;
+use mu_base::config::MuBell;
 use mu_base::events::{
     AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, QueueState, RewindPoint, StatusSnapshot,
 };
@@ -138,9 +139,15 @@ pub(super) struct AgentView {
     /// The last turn was aborted: input it leaves queued goes back to the composer without a notice.
     pub(super) turn_aborted: bool,
     bell: WokenBell,
+    bell_cfg: MuBell,
 }
 
 impl AgentView {
+    pub(super) fn with_bell(mut self, cfg: MuBell) -> Self {
+        self.bell_cfg = cfg;
+        self
+    }
+
     pub(super) fn new(show_thinking: bool, smooth: bool) -> Self {
         Self {
             tr: Transcript::new(show_thinking, smooth),
@@ -165,6 +172,7 @@ impl AgentView {
             queued: QueueState::default(),
             turn_aborted: false,
             bell: WokenBell::default(),
+            bell_cfg: MuBell::default(),
         }
     }
 
@@ -368,7 +376,8 @@ impl AgentView {
                 self.retry_wait = None;
                 self.running = false;
                 self.turn_started = None;
-                if self.bell.on_turn_end(aborted) {
+                let jobs_running = self.jobs.iter().any(|j| j.state == SubagentState::Running);
+                if self.bell.on_turn_end(aborted, jobs_running) && self.bell_cfg.turn_end {
                     fx.push(Effect::Ring);
                 }
                 if aborted {
@@ -408,7 +417,7 @@ impl AgentView {
     }
 
     fn ring_if_attention(&mut self, fx: &mut Vec<Effect>) {
-        if self.bell.on_attention() {
+        if self.bell.on_attention() && self.bell_cfg.attention {
             fx.push(Effect::Ring);
         }
     }
@@ -709,7 +718,7 @@ mod tests {
         assert!(v.running && v.turn_started.is_some());
         let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
         assert!(!v.running && v.turn_started.is_none());
-        assert!(matches!(fx.as_slice(), [Effect::TurnEnded { aborted: false }]));
+        assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::TurnEnded { aborted: false }]));
         assert!(!pending(&v).contains("[aborted]"));
     }
 
@@ -896,18 +905,25 @@ mod tests {
     }
 
     #[test]
-    fn a_woken_turn_rings_once_when_it_ends() {
+    fn a_woken_turn_does_not_ring_when_it_ends() {
         let mut v = view();
         v.on_event(AgentEvent::Woken, SIZE);
         v.on_event(AgentEvent::TurnStart, SIZE);
         let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::TurnEnded { aborted: false }]));
+    }
+
+    #[test]
+    fn a_user_turn_rings_at_the_end_only_when_no_job_runs() {
+        let mut v = view();
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
         assert!(matches!(fx.as_slice(), [Effect::Ring, Effect::TurnEnded { aborted: false }]));
-        let aborted = {
-            v.on_event(AgentEvent::Woken, SIZE);
-            v.on_event(AgentEvent::TurnStart, SIZE);
-            v.on_event(AgentEvent::TurnEnd { aborted: true }, SIZE)
-        };
-        assert!(matches!(aborted.as_slice(), [Effect::TurnEnded { aborted: true }]), "an aborted turn does not ring");
+
+        v.on_event(AgentEvent::Jobs(vec![job("b1", SubagentState::Running, JobKind::Bash)]), SIZE);
+        v.on_event(AgentEvent::TurnStart, SIZE);
+        let fx = v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::TurnEnded { aborted: false }]));
     }
 
     #[test]
