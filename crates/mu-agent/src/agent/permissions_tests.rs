@@ -25,6 +25,15 @@ fn tool_texts(a: &Agent) -> Vec<String> {
         .collect()
 }
 
+/// A directory outside the checkout, held at its resolved path. macOS resolves `/etc` and `/tmp`
+/// through symlinks and the gate matches subjects as resolved, so the platform's own directories
+/// cannot serve as fixtures.
+fn outside(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mu-perm-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.canonicalize().unwrap()
+}
+
 /// Runs one turn while a task answers every approval with `answer`.
 async fn turn_answered(
     a: &mut Agent,
@@ -106,56 +115,68 @@ fn read_only_commands_do_not_prompt() {
 #[test]
 fn a_read_outside_the_project_prompts_and_is_granted_by_its_path() {
     run(async {
-        let call = Block::ToolCall { id: "t1".into(), name: "read".into(), arguments: json!({"path": "/etc/passwd"}) };
+        let outside = outside("read-outside");
+        let path = outside.join("passwd").to_string_lossy().into_owned();
+        let call = Block::ToolCall { id: "t1".into(), name: "read".into(), arguments: json!({"path": &path}) };
         let script = vec![
             Ok(assistant(vec![call], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
-        let (mut a, rx) = agent_run(script, Configs::default(), ask());
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), mu_testutil::repo());
         let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Deny { note: Some("not that".into()) }).await;
         assert_eq!(reqs.len(), 1, "reading outside the project prompts");
-        assert_eq!(reqs[0].title, "read: /etc/passwd");
+        assert_eq!(reqs[0].title, format!("read: {path}"));
         assert_eq!(reqs[0].reason, "ask mode: reading outside the project needs approval");
-        assert_eq!(reqs[0].grant.as_ref().unwrap().patterns, ["/etc/passwd"]);
+        assert_eq!(reqs[0].grant.as_ref().unwrap().patterns, [path]);
         assert_eq!(tool_texts(&a), ["Not run: the user denied this read call: not that"]);
+        std::fs::remove_dir_all(&outside).ok();
     });
 }
 
 #[test]
 fn a_wider_answer_covers_a_neighbouring_file() {
     run(async {
-        let call = |path: &str, id: &str| Block::ToolCall {
+        let outside = outside("wider");
+        let dir = outside.to_string_lossy().into_owned();
+        let (first, second) = (outside.join("passwd"), outside.join("hosts"));
+        let call = |path: String, id: &str| Block::ToolCall {
             id: id.into(),
             name: "read".into(),
             arguments: json!({"path": path}),
         };
         let script = vec![
-            Ok(assistant(vec![call("/etc/passwd", "t1")], StopReason::ToolUse)),
-            Ok(assistant(vec![call("/etc/hosts", "t2")], StopReason::ToolUse)),
+            Ok(assistant(vec![call(first.to_string_lossy().into_owned(), "t1")], StopReason::ToolUse)),
+            Ok(assistant(vec![call(second.to_string_lossy().into_owned(), "t2")], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
-        let (mut a, rx) = agent_run(script, Configs::default(), ask());
-        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow {
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), mu_testutil::repo());
+        let width = format!("{dir}/*");
+        let answer = width.clone();
+        let reqs = turn_answered(&mut a, rx, "go", move |_| ApprovalDecision::Allow {
             scope: ApprovalScope::Session,
             note: None,
-            patterns: Some(vec!["/etc/*".into()]),
+            patterns: Some(vec![answer.clone()]),
         })
         .await;
         assert_eq!(reqs.len(), 1, "the second file is covered by the directory grant");
-        assert_eq!(reqs[0].grant.as_ref().unwrap().wider[0].patterns, ["/etc/*"]);
+        assert_eq!(reqs[0].grant.as_ref().unwrap().wider[0].patterns, [width]);
         assert_eq!(tool_texts(&a).len(), 2, "both reads ran");
+        std::fs::remove_dir_all(&outside).ok();
     });
 }
 
 #[test]
 fn a_granted_directory_covers_grep_too() {
     run(async {
+        let outside = outside("granted-dir");
+        let dir = outside.to_string_lossy().into_owned();
+        let (passwd, hosts) = (outside.join("passwd"), outside.join("hosts"));
         let script = vec![
             Ok(assistant(
                 vec![Block::ToolCall {
                     id: "t1".into(),
                     name: "read".into(),
-                    arguments: json!({"path": "/etc/passwd"}),
+                    arguments: json!({"path": passwd.to_string_lossy()}),
                 }],
                 StopReason::ToolUse,
             )),
@@ -163,21 +184,22 @@ fn a_granted_directory_covers_grep_too() {
                 vec![Block::ToolCall {
                     id: "t2".into(),
                     name: "grep".into(),
-                    arguments: json!({"pattern": "x", "path": "/etc/hosts"}),
+                    arguments: json!({"pattern": "x", "path": hosts.to_string_lossy()}),
                 }],
                 StopReason::ToolUse,
             )),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
-        let (mut a, rx) = agent_run(script, Configs::default(), ask());
-        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow {
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), mu_testutil::repo());
+        let reqs = turn_answered(&mut a, rx, "go", move |_| ApprovalDecision::Allow {
             scope: ApprovalScope::Session,
             note: None,
-            patterns: Some(vec!["/etc/*".into()]),
+            patterns: Some(vec![format!("{dir}/*")]),
         })
         .await;
         assert_eq!(reqs.len(), 1, "the grant covers grep of the same directory");
         assert_eq!(tool_texts(&a).len(), 2, "both calls ran");
+        std::fs::remove_dir_all(&outside).ok();
     });
 }
 

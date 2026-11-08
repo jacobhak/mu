@@ -794,6 +794,15 @@ mod tests {
         (perms, t)
     }
 
+    /// A directory outside the checkout, held at its resolved path. macOS resolves `/etc` and
+    /// `/tmp` through symlinks and subjects are matched as resolved, so the platform's own
+    /// directories cannot serve as fixtures.
+    fn outside(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mu-outside-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
     fn verdict(p: &Permissions, t: &Tools, cmd: &str) -> Verdict {
         p.check(t, "bash", &json!({"command": cmd}))
     }
@@ -815,31 +824,63 @@ mod tests {
 
     #[test]
     fn reads_outside_the_project_ask_while_inside_ones_run() {
+        let outside = outside("reads-outside");
+        let file = outside.join("passwd").to_string_lossy().into_owned();
+        let dir = outside.to_string_lossy().into_owned();
         for mode in [PermissionMode::Ask, PermissionMode::Edits] {
             let (p, t) = setup(mode);
-            assert!(matches!(p.check(&t, "read", &json!({"path": "/etc/passwd"})), Verdict::Ask(_)), "{mode:?}");
-            assert!(matches!(p.check(&t, "grep", &json!({"pattern": "x", "path": "/etc"})), Verdict::Ask(_)));
+            assert!(matches!(p.check(&t, "read", &json!({"path": &file})), Verdict::Ask(_)), "{mode:?}");
+            assert!(matches!(p.check(&t, "grep", &json!({"pattern": "x", "path": &dir})), Verdict::Ask(_)));
             assert!(matches!(p.check(&t, "read", &json!({"path": "src/lib.rs"})), Verdict::Allow));
             assert!(matches!(p.check(&t, "glob", &json!({"pattern": "*"})), Verdict::Allow));
             assert!(
                 matches!(p.check(&t, "read", &json!({"path": "local://p.md"})), Verdict::Allow),
                 "mu's own pages stay in"
             );
-            let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": "/etc/passwd"})) else { panic!() };
+            let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": &file})) else { panic!() };
             assert_eq!(req.reason, format!("{} mode: reading outside the project needs approval", mode.as_str()));
         }
         let (p, t) = setup(PermissionMode::Yolo);
-        assert!(matches!(p.check(&t, "read", &json!({"path": "/etc/passwd"})), Verdict::Allow));
+        assert!(matches!(p.check(&t, "read", &json!({"path": &file})), Verdict::Allow));
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
     fn an_outside_read_is_granted_by_its_path() {
+        let outside = outside("grant-by-path");
+        let (passwd, hosts) = (outside.join("passwd"), outside.join("hosts"));
         let (p, t) = setup(PermissionMode::Ask);
-        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": "/etc/passwd"})) else { panic!() };
-        assert_eq!(req.grant.as_ref().unwrap().patterns, ["/etc/passwd"]);
+        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": passwd.to_string_lossy()})) else { panic!() };
+        assert_eq!(req.grant.as_ref().unwrap().patterns, [passwd.to_string_lossy().into_owned()]);
         p.remember(&req.grant.unwrap(), ApprovalScope::Session, false).unwrap();
-        assert!(matches!(p.check(&t, "read", &json!({"path": "/etc/passwd"})), Verdict::Allow));
-        assert!(matches!(p.check(&t, "read", &json!({"path": "/etc/hosts"})), Verdict::Ask(_)));
+        assert!(matches!(p.check(&t, "read", &json!({"path": passwd.to_string_lossy()})), Verdict::Allow));
+        assert!(matches!(p.check(&t, "read", &json!({"path": hosts.to_string_lossy()})), Verdict::Ask(_)));
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn an_outside_read_through_a_symlink_is_granted_as_its_target() {
+        let outside = outside("symlink");
+        let (real, link) = (outside.join("real"), outside.join("link"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (p, t) = setup(PermissionMode::Ask);
+        let through = link.join("a.txt");
+        let target = real.join("a.txt");
+        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": through.to_string_lossy()})) else { panic!() };
+        let g = req.grant.unwrap();
+        assert_eq!(g.patterns, [target.to_string_lossy().into_owned()], "the link resolves to its target");
+        p.remember(&g, ApprovalScope::Session, false).unwrap();
+        assert!(
+            matches!(p.check(&t, "read", &json!({"path": through.to_string_lossy()})), Verdict::Allow),
+            "the same file through the link"
+        );
+        assert!(
+            matches!(p.check(&t, "read", &json!({"path": real.join("b.txt").to_string_lossy()})), Verdict::Ask(_)),
+            "another file in the target directory"
+        );
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
@@ -856,23 +897,27 @@ mod tests {
 
     #[test]
     fn a_grant_offers_landmarks_rather_than_every_ancestor() {
+        let outside = outside("landmarks");
+        let dir = outside.to_string_lossy().into_owned();
+        let passwd = outside.join("passwd");
         let (p, t) = setup(PermissionMode::Ask);
-        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": "/etc/passwd"})) else { panic!() };
+        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": passwd.to_string_lossy()})) else { panic!() };
         let g = req.grant.unwrap();
-        assert_eq!(g.patterns, ["/etc/passwd"]);
+        assert_eq!(g.patterns, [passwd.to_string_lossy().into_owned()]);
         let labels: Vec<&str> = g.wider.iter().map(|w| w.label.as_str()).collect();
         assert_eq!(labels, ["its directory", "everything"], "no checkout and no home above this path");
-        assert_eq!(g.wider[0].patterns, ["/etc/*"]);
+        assert_eq!(g.wider[0].patterns, [format!("{dir}/*")]);
         assert_eq!(g.wider[1].patterns, ["/*"]);
 
-        let Verdict::Ask(req) = p.check(&t, "grep", &json!({"pattern": "x", "path": "/etc"})) else { panic!() };
-        assert_eq!(req.grant.unwrap().wider[0].patterns, ["/etc/*"], "a directory is its own container");
+        let Verdict::Ask(req) = p.check(&t, "grep", &json!({"pattern": "x", "path": &dir})) else { panic!() };
+        assert_eq!(req.grant.unwrap().wider[0].patterns, [format!("{dir}/*")], "a directory is its own container");
 
-        let Verdict::Ask(req) = verdict(&p, &t, "cat /etc/passwd") else { panic!() };
+        let Verdict::Ask(req) = verdict(&p, &t, &format!("cat {dir}/passwd")) else { panic!() };
         let g = req.grant.unwrap();
-        assert_eq!(g.patterns, ["cat /etc/passwd"]);
-        assert_eq!(g.wider[0].patterns, ["cat /etc/*"]);
+        assert_eq!(g.patterns, [format!("cat {dir}/passwd")]);
+        assert_eq!(g.wider[0].patterns, [format!("cat {dir}/*")]);
         assert_eq!(g.wider[1].patterns, ["cat /*"]);
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
@@ -930,19 +975,26 @@ mod tests {
 
     #[test]
     fn a_read_grant_covers_grep_and_glob_of_the_same_directory() {
+        let outside = outside("read-grant");
+        let dir = outside.to_string_lossy().into_owned();
+        let (passwd, hosts) = (outside.join("passwd"), outside.join("hosts"));
         let (p, t) = setup(PermissionMode::Ask);
-        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": "/etc/passwd"})) else { panic!() };
-        let g = req.grant.unwrap().picked(Some(vec!["/etc/*".into()]));
+        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": passwd.to_string_lossy()})) else { panic!() };
+        let g = req.grant.unwrap().picked(Some(vec![format!("{dir}/*")]));
         p.remember(&g, ApprovalScope::Session, false).unwrap();
-        assert!(matches!(p.check(&t, "read", &json!({"path": "/etc/hosts"})), Verdict::Allow));
-        assert!(matches!(p.check(&t, "grep", &json!({"pattern": "x", "path": "/etc/hosts"})), Verdict::Allow));
+        assert!(matches!(p.check(&t, "read", &json!({"path": hosts.to_string_lossy()})), Verdict::Allow));
+        assert!(matches!(
+            p.check(&t, "grep", &json!({"pattern": "x", "path": hosts.to_string_lossy()})),
+            Verdict::Allow
+        ));
         assert!(
-            matches!(p.check(&t, "grep", &json!({"pattern": "x", "path": "/etc"})), Verdict::Allow),
+            matches!(p.check(&t, "grep", &json!({"pattern": "x", "path": &dir})), Verdict::Allow),
             "the directory itself"
         );
-        assert!(matches!(p.check(&t, "glob", &json!({"pattern": "*", "path": "/etc"})), Verdict::Allow));
+        assert!(matches!(p.check(&t, "glob", &json!({"pattern": "*", "path": &dir})), Verdict::Allow));
         assert!(matches!(p.check(&t, "read", &json!({"path": "/root/x"})), Verdict::Ask(_)));
-        assert!(matches!(verdict(&p, &t, "cat /etc/hosts"), Verdict::Ask(_)), "a command is its own grant");
+        assert!(matches!(verdict(&p, &t, &format!("cat {dir}/hosts")), Verdict::Ask(_)), "a command is its own grant");
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
