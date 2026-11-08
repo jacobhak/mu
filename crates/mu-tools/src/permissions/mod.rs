@@ -1034,28 +1034,39 @@ mod tests {
 
     #[test]
     fn a_wider_answer_covers_neighbouring_files() {
+        let outside = outside("wider-answer");
+        let dir = outside.to_string_lossy().into_owned();
+        let (passwd, hosts) = (outside.join("passwd"), outside.join("hosts"));
         let (p, t) = setup(PermissionMode::Ask);
-        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": "/etc/passwd"})) else { panic!() };
-        let g = req.grant.unwrap().picked(Some(vec!["/etc/*".into()]));
+        let Verdict::Ask(req) = p.check(&t, "read", &json!({"path": passwd.to_string_lossy()})) else { panic!() };
+        let g = req.grant.unwrap().picked(Some(vec![format!("{dir}/*")]));
         p.remember(&g, ApprovalScope::Session, false).unwrap();
-        assert!(matches!(p.check(&t, "read", &json!({"path": "/etc/hosts"})), Verdict::Allow));
+        assert!(matches!(p.check(&t, "read", &json!({"path": hosts.to_string_lossy()})), Verdict::Allow));
         assert!(matches!(p.check(&t, "read", &json!({"path": "/root/x"})), Verdict::Ask(_)));
 
-        let Verdict::Ask(req) = verdict(&p, &t, "cat /etc/passwd") else { panic!() };
-        let g = req.grant.unwrap().picked(Some(vec!["cat /etc/*".into()]));
+        let Verdict::Ask(req) = verdict(&p, &t, &format!("cat {dir}/passwd")) else { panic!() };
+        let g = req.grant.unwrap().picked(Some(vec![format!("cat {dir}/*")]));
         p.remember(&g, ApprovalScope::Session, false).unwrap();
-        assert!(matches!(verdict(&p, &t, "cat /etc/hosts"), Verdict::Allow));
+        assert!(matches!(verdict(&p, &t, &format!("cat {dir}/hosts")), Verdict::Allow));
         assert!(matches!(verdict(&p, &t, "cat /root/x"), Verdict::Ask(_)));
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
     fn an_outside_bash_read_is_granted_as_the_line_it_is() {
+        let outside = outside("bash-line");
+        let dir = outside.to_string_lossy().into_owned();
         let (p, t) = setup(PermissionMode::Ask);
-        let Verdict::Ask(req) = verdict(&p, &t, "cat /etc/passwd") else { panic!() };
-        assert_eq!(req.grant.as_ref().unwrap().patterns, ["cat /etc/passwd"], "not `cat *`, which would read anywhere");
+        let Verdict::Ask(req) = verdict(&p, &t, &format!("cat {dir}/passwd")) else { panic!() };
+        assert_eq!(
+            req.grant.as_ref().unwrap().patterns,
+            [format!("cat {dir}/passwd")],
+            "not `cat *`, which would read anywhere"
+        );
         p.remember(&req.grant.unwrap(), ApprovalScope::Session, false).unwrap();
-        assert!(matches!(verdict(&p, &t, "cat /etc/passwd"), Verdict::Allow));
-        assert!(matches!(verdict(&p, &t, "cat /etc/hosts"), Verdict::Ask(_)));
+        assert!(matches!(verdict(&p, &t, &format!("cat {dir}/passwd")), Verdict::Allow));
+        assert!(matches!(verdict(&p, &t, &format!("cat {dir}/hosts")), Verdict::Ask(_)));
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
