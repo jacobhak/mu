@@ -185,15 +185,15 @@ impl RoleEditor {
                 }
             },
         );
-        let model_detail = if model.is_empty() {
-            role.fallback.as_ref().map_or_else(
-                || format!("Not assigned · {}", role.unset),
-                |(r, v)| format!("Not assigned · fallback @{r} ({v})"),
-            )
-        } else {
+        let effective = self.effective_fallback(role);
+        let fallback = effective.as_ref().map_or_else(|| role.unset.clone(), |(r, v)| format!("@{r} ({v})"));
+        let model_detail = if !model.is_empty() {
             model
+        } else if effective.is_some() {
+            format!("Not assigned · fallback {fallback}")
+        } else {
+            format!("Not assigned · {}", role.unset)
         };
-        let fallback = role.fallback.as_ref().map_or_else(|| role.unset.clone(), |(r, v)| format!("@{r} ({v})"));
         let mut rows: Vec<(EditRow, Item)> = vec![
             (EditRow::Model, Item { label: "Model".into(), detail: model_detail }),
             (EditRow::Thinking, Item { label: "Thinking".into(), detail: thinking }),
@@ -227,13 +227,16 @@ impl RoleEditor {
             };
             rows.push((EditRow::Delegate, Item { label: "Delegate".into(), detail: delegate }));
         }
-        rows.push((
-            EditRow::Clear,
-            Item {
-                label: "Clear assignment".into(),
-                detail: format!("Save restores the existing fallback chain: {fallback}"),
-            },
-        ));
+        let assigned = self.draft.is_some() || self.original.is_some();
+        if assigned {
+            rows.push((
+                EditRow::Clear,
+                Item {
+                    label: "Clear assignment".into(),
+                    detail: format!("Save restores the existing fallback chain: {fallback}"),
+                },
+            ));
+        }
         if role.custom {
             rows.push((
                 EditRow::Delete,
@@ -247,7 +250,11 @@ impl RoleEditor {
             EditRow::Save,
             Item {
                 label: "Save".into(),
-                detail: self.draft.clone().unwrap_or_else(|| format!("Clear; restore {fallback}")),
+                detail: match (&self.draft, assigned) {
+                    (Some(v), _) => v.clone(),
+                    (None, true) => format!("Clear; restore {fallback}"),
+                    (None, false) => "Write the role's settings".into(),
+                },
             },
         ));
         rows.push((
@@ -255,19 +262,50 @@ impl RoleEditor {
             Item { label: "Cancel".into(), detail: "Discard changes and return to roles".into() },
         ));
         let mut context = format!("Saved configuration · set {}\n{}\n", self.set, self.path.display());
-        context.push_str(&role.detail());
+        context.push_str(&format!("Used by: {}", role.used_by));
+        if !role.agents.is_empty() {
+            context.push_str(&format!("\nAgents: {}", role.agents.join(", ")));
+        }
+        // A custom role's chain can be changed here, so its state comes from the draft, not the view.
+        context.push_str(&if self.meta.is_some() {
+            match (&self.draft, effective.is_some()) {
+                (Some(v), _) => format!("\nSet to {v}"),
+                (None, true) => format!("\nNot set: uses {fallback}."),
+                (None, false) => format!("\nNot set: {}.", role.unset),
+            }
+        } else {
+            role.state()
+        });
         if let Some(original) = &self.original {
             context.push_str(&format!("\nOriginal explicit value: {original}"));
         } else {
             context.push_str("\nOriginal explicit value: not assigned");
         }
-        context.push_str(&format!("\nClearing restores the existing fallback chain: {fallback}"));
+        if assigned {
+            context.push_str(&format!("\nClearing restores the existing fallback chain: {fallback}"));
+        }
         if !self.message.is_empty() {
             context.push_str(&format!("\n{}", self.message));
         }
         self.rows = rows.iter().map(|(row, _)| *row).collect();
         let items = rows.into_iter().map(|(_, item)| item).collect();
         self.select = Select::new(&format!("Edit @{}", role.name), items).context(&context).back_keys(true);
+    }
+
+    /// The role this one runs on when it has no model of its own: the first set role in its chain.
+    /// A custom role's `fallback` list is read from the draft, so a fallback added here counts
+    /// before it is saved; `@task`'s own chain follows it, as `roles::views` orders it. A built-in
+    /// role keeps the chain it was listed with.
+    fn effective_fallback(&self, role: &RoleView) -> Option<(String, String)> {
+        let Some(meta) = &self.meta else { return role.fallback.clone() };
+        let set = |name: &str| self.roles.iter().find(|r| r.name == name).and_then(|r| r.value.clone());
+        for r in meta.fallback.iter().filter(|r| **r != role.name) {
+            if let Some(v) = set(r) {
+                return Some((r.clone(), v));
+            }
+        }
+        let task = self.roles.iter().find(|r| r.name == "task")?;
+        task.value.clone().map(|v| ("task".to_string(), v)).or_else(|| task.fallback.clone())
     }
 
     /// Every role the edited one may fall back to, with its place in the chain.
@@ -769,7 +807,7 @@ mod tests {
         enter(&mut e);
         assert_eq!(e.screen, Screen::Edit, "Done goes back to the role");
         assert_eq!(meta(&e).fallback, ["reviewer"]);
-        down(&mut e, 7);
+        down(&mut e, 6);
         assert_eq!(
             enter(&mut e),
             RoleEditorAction::Save {
@@ -779,6 +817,38 @@ mod tests {
                 meta: Some(RoleMeta { fallback: vec!["reviewer".into()], ..RoleMeta::default() }),
             }
         );
+    }
+
+    #[test]
+    fn a_role_without_a_model_shows_the_chain_it_drafts() {
+        // @writer as a role started in this session reads: no model, and nothing resolved yet.
+        let mut writer = custom("writer", None);
+        writer.fallback = None;
+        let mut smol = custom("smol", Some("s/m"));
+        smol.custom = false;
+        smol.fallback = None;
+        let roles = vec![role(Some("t/m")), writer, smol];
+        let mut e = RoleEditor::new("main".into(), "models.toml".into(), roles, Some("writer")).unwrap();
+        let shown = |e: &RoleEditor| texts(e).join("\n");
+        assert!(shown(&e).contains("Not assigned · fallback @task (t/m)"), "{}", shown(&e));
+        assert!(shown(&e).contains("Save  Write the role's settings"), "{}", shown(&e));
+        assert!(
+            !shown(&e).contains("Clear assignment"),
+            "nothing is assigned, so nothing can be cleared: {}",
+            shown(&e)
+        );
+
+        down(&mut e, 2);
+        enter(&mut e);
+        down(&mut e, 1);
+        enter(&mut e);
+        assert_eq!(meta(&e).fallback, ["smol"]);
+        press(&mut e, KeyCode::Esc);
+        assert_eq!(e.screen, Screen::Edit);
+        let after = shown(&e);
+        assert!(after.contains("Not assigned · fallback @smol (s/m)"), "a fallback set here counts at once: {after}");
+        assert!(!after.contains("agents use @task"), "{after}");
+        assert!(!after.contains("Clear"), "neither the clear row nor a clear on save: {after}");
     }
 
     #[test]
@@ -814,7 +884,7 @@ mod tests {
         e.roles[1].other_sets = vec!["work".into()];
         e.roles[1].agents = vec!["docs".into()];
         e.open_edit();
-        down(&mut e, 6);
+        down(&mut e, 5);
         enter(&mut e);
         assert_eq!(e.screen, Screen::Confirm);
         let shown = texts(&e).join("\n");
@@ -823,7 +893,7 @@ mod tests {
         down(&mut e, 1);
         enter(&mut e);
         assert_eq!(e.screen, Screen::Edit, "Cancel keeps the role");
-        down(&mut e, 6);
+        down(&mut e, 5);
         enter(&mut e);
         assert_eq!(enter(&mut e), RoleEditorAction::Delete { set: "main".into(), role: "writer".into() });
 

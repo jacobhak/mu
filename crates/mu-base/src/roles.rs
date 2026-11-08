@@ -118,12 +118,17 @@ impl RoleView {
         if !self.agents.is_empty() {
             out.push_str(&format!("\nAgents: {}", self.agents.join(", ")));
         }
-        out.push_str(&match (&self.value, &self.fallback) {
+        out.push_str(&self.state());
+        out
+    }
+
+    /// The role's model: what is assigned, else what the chain reaches.
+    pub fn state(&self) -> String {
+        match (&self.value, &self.fallback) {
             (Some(v), _) => format!("\nSet to {v}"),
             (None, Some((f, v))) => format!("\nNot set: uses @{f} ({v})."),
             (None, None) => format!("\nNot set: {}.", self.unset),
-        });
-        out
+        }
     }
 
     /// The `[roles.<name>]` settings this view shows.
