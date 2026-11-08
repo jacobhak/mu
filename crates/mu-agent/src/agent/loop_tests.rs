@@ -499,6 +499,37 @@ fn a_wait_with_no_job_running_runs() {
     });
 }
 
+#[test]
+fn delegated_roles_reach_the_top_level_prompt_and_task_schema_only() {
+    run(async {
+        let cfg = || {
+            Configs::from_models_toml(
+                "[sets.main]\ndefault = \"a/b\"\nw = \"a/c\"\n[roles.w]\ndescription = \"Docs\"\ndelegate = true\n",
+            )
+        };
+        let task_model = |a: &Agent| {
+            a.tool_defs().into_iter().find(|d| d.name == "task").and_then(|d| {
+                d.schema["properties"]["tasks"]["items"]["properties"]["model"]["enum"].as_array().cloned()
+            })
+        };
+        let (parent, _rx) = agent_with(vec![], cfg());
+        assert!(parent.system().contains("  - `@w`: Docs\n"), "{}", parent.system());
+        assert_eq!(task_model(&parent), Some(vec![json!("@w")]));
+        assert_eq!(*parent.tools.delegated.borrow(), ["@w"]);
+
+        let (sub, _rx) = agent_run(vec![], cfg(), RunConfig { subagent: true, ..Default::default() });
+        assert!(!sub.system().contains("- `@w`:"));
+        assert_eq!(task_model(&sub), None);
+
+        let no_delegate = Configs::from_models_toml(
+            "[sets.main]\ndefault = \"a/b\"\nw = \"a/c\"\n[roles.w]\ndescription = \"Docs\"\n",
+        );
+        let (plain, _rx) = agent_with(vec![], no_delegate);
+        assert!(!plain.system().contains("- `@w`:"));
+        assert_eq!(task_model(&plain), None);
+    });
+}
+
 fn experimental_agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, UnboundedReceiver<AgentEvent>) {
     let mut cfg = Configs::default();
     cfg.mu.experimental.interruptible_wait = true;

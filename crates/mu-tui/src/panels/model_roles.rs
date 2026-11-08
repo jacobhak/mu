@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyEvent, KeyEventKind};
+use mu_base::model_config::valid_set_name;
 use mu_base::models::{Thinking, split_level};
-use mu_base::roles::RoleView;
+use mu_base::roles::{self, RoleView};
 
 use crate::widgets::select::{Item, Select, SelectResult};
 
@@ -27,6 +28,8 @@ pub struct RoleEditor {
     path: PathBuf,
     roles: Vec<RoleView>,
     role: Option<usize>,
+    /// The role at `role` is a new, unsaved view.
+    added: bool,
     original: Option<String>,
     draft: Option<String>,
     screen: Screen,
@@ -38,14 +41,13 @@ pub struct RoleEditor {
 
 impl RoleEditor {
     pub fn new(set: String, path: PathBuf, roles: Vec<RoleView>, role: Option<&str>) -> Result<Self, String> {
-        let selected = role
-            .map(|name| roles.iter().position(|r| r.name == name).ok_or_else(|| format!("unknown model role @{name}")))
-            .transpose()?;
+        let selected = role.and_then(|name| roles.iter().position(|r| r.name == name));
         let mut editor = Self {
             set,
             path,
             roles,
             role: selected,
+            added: false,
             original: None,
             draft: None,
             screen: Screen::Roles,
@@ -54,12 +56,41 @@ impl RoleEditor {
             request: None,
             message: String::new(),
         };
-        if selected.is_some() {
-            editor.open_edit();
-        } else {
-            editor.open_roles();
+        match role {
+            Some(name) if selected.is_none() => editor.start_role(name)?,
+            _ if selected.is_some() => editor.open_edit(),
+            _ => editor.open_roles(),
         }
         Ok(editor)
+    }
+
+    /// Selects `name`, or starts an unsaved role of that name when nothing has it.
+    fn start_role(&mut self, name: &str) -> Result<(), String> {
+        let name = name.trim().trim_start_matches('@');
+        if !valid_set_name(name) {
+            return Err("role names are a letter, then letters, digits, - or _".into());
+        }
+        match self.roles.iter().position(|r| r.name == name) {
+            Some(i) => self.role = Some(i),
+            None => {
+                self.roles.push(roles::unsaved(name));
+                self.role = Some(self.roles.len() - 1);
+                self.added = true;
+            }
+        }
+        self.open_edit();
+        Ok(())
+    }
+
+    /// Leaves Edit without saving; a role started in this session and never saved disappears.
+    fn cancel_edit(&mut self) {
+        self.draft = None;
+        if self.added {
+            self.roles.pop();
+            self.role = None;
+            self.added = false;
+        }
+        self.open_roles();
     }
 
     pub fn select(&self) -> &Select {
@@ -74,9 +105,12 @@ impl RoleEditor {
         self.screen = Screen::Roles;
         let items = self.roles.iter().map(|r| Item { label: format!("@{}", r.name), detail: r.row() }).collect();
         let details = self.roles.iter().map(|r| Some(format!("{}\nEnter edits this role.", r.detail()))).collect();
-        self.select = Select::new("Model roles", items)
-            .context(&format!("Saved configuration · set {}\n{}", self.set, self.path.display()))
-            .details(details);
+        let mut context = format!("Saved configuration · set {}\n{}", self.set, self.path.display());
+        if !self.message.is_empty() {
+            context.push_str(&format!("\n{}", self.message));
+        }
+        self.select = Select::new("Model roles", items).context(&context).details(details).free_text("New role…");
+        self.message.clear();
         if let Some(i) = self.role {
             let select = std::mem::replace(&mut self.select, Select::new("", vec![]));
             self.select = select.preselect(i);
@@ -202,6 +236,7 @@ impl RoleEditor {
         let name = self.role.map(|i| self.roles[i].name.clone());
         self.set = set;
         self.roles = roles;
+        self.added = false;
         self.role = name.and_then(|name| self.roles.iter().position(|r| r.name == name));
         self.original = None;
         self.draft = None;
@@ -215,10 +250,7 @@ impl RoleEditor {
         match self.select.on_key(key) {
             SelectResult::Cancelled | SelectResult::Back => match self.screen {
                 Screen::Roles => return RoleEditorAction::Close,
-                Screen::Edit => {
-                    self.draft = None;
-                    self.open_roles();
-                }
+                Screen::Edit => self.cancel_edit(),
                 Screen::Models | Screen::Thinking => self.show_edit(),
             },
             SelectResult::Chosen(indices) => {
@@ -241,7 +273,7 @@ impl RoleEditor {
                         }
                         3 => {
                             if self.draft == self.original {
-                                self.open_roles();
+                                self.cancel_edit();
                             } else {
                                 return RoleEditorAction::Save {
                                     set: self.set.clone(),
@@ -250,10 +282,7 @@ impl RoleEditor {
                                 };
                             }
                         }
-                        4 => {
-                            self.draft = None;
-                            self.open_roles();
-                        }
+                        4 => self.cancel_edit(),
                         _ => {}
                     },
                     Screen::Models if i < self.models.len() => {
@@ -278,6 +307,12 @@ impl RoleEditor {
                         self.show_edit();
                     }
                     _ => {}
+                }
+            }
+            SelectResult::Text(name) if self.screen == Screen::Roles => {
+                if let Err(e) = self.start_role(&name) {
+                    self.message = e;
+                    self.open_roles();
                 }
             }
             _ => {}
@@ -323,6 +358,22 @@ mod tests {
 
     fn item(id: &str) -> Item {
         Item { label: id.into(), detail: String::new() }
+    }
+
+    fn texts(e: &RoleEditor) -> Vec<String> {
+        let (lines, _) = e.select().render(80, 40);
+        lines.iter().map(|l| crate::text::line::line_text(l).trim_end().to_string()).collect()
+    }
+
+    /// Types `name` into the "New role…" row and submits it.
+    fn new_role(e: &mut RoleEditor, name: &str) {
+        down(e, 1);
+        enter(e);
+        assert!(e.select().is_editing(), "the free-text row is live");
+        for c in name.chars() {
+            press(e, KeyCode::Char(c));
+        }
+        enter(e);
     }
 
     #[test]
@@ -390,6 +441,47 @@ mod tests {
         press(&mut e, KeyCode::Esc);
         assert_eq!(e.screen, Screen::Roles, "Esc steps back a screen");
         assert_eq!(press(&mut e, KeyCode::Esc), RoleEditorAction::Close);
+    }
+
+    #[test]
+    fn a_new_role_is_typed_into_the_free_text_row_and_escaped_away() {
+        let mut e = editor(None);
+        new_role(&mut e, "writer");
+        assert_eq!(e.screen, Screen::Edit);
+        assert_eq!(e.roles[e.role.unwrap()].name, "writer");
+        press(&mut e, KeyCode::Esc);
+        assert_eq!(e.screen, Screen::Roles);
+        assert_eq!(e.roles.len(), 1, "@writer was never saved");
+        assert_eq!(e.select().highlighted(), Some(0));
+    }
+
+    #[test]
+    fn an_invalid_new_role_name_is_refused_on_the_roles_screen() {
+        let mut e = editor(None);
+        new_role(&mut e, "1x");
+        assert_eq!(e.screen, Screen::Roles);
+        assert_eq!(e.roles.len(), 1);
+        assert!(texts(&e).iter().any(|l| l.contains("role names are a letter")), "{:?}", texts(&e));
+        match RoleEditor::new("main".into(), "models.toml".into(), vec![role(None)], Some("1x")) {
+            Err(e) => assert!(e.contains("role names are a letter"), "{e}"),
+            Ok(_) => panic!("an invalid name must be refused"),
+        }
+    }
+
+    #[test]
+    fn a_new_role_saves_its_chosen_model() {
+        let mut e = editor(None);
+        new_role(&mut e, "writer");
+        assert_eq!(enter(&mut e), RoleEditorAction::RequestModels);
+        e.begin_models(9);
+        assert!(e.models_loaded(9, vec![item("a/b")], vec!["a/b".into()], None));
+        enter(&mut e);
+        assert_eq!(e.draft.as_deref(), Some("a/b"));
+        down(&mut e, 3);
+        assert_eq!(
+            enter(&mut e),
+            RoleEditorAction::Save { set: "main".into(), role: "writer".into(), value: Some("a/b".into()) }
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ impl Providers {
         let sels: Vec<String> = if role_or_model.contains('/') {
             vec![role_or_model.to_string()]
         } else {
-            models::role_chain(role_or_model.trim_start_matches('@'))
+            models::role_chain_for(role_or_model.trim_start_matches('@'), &self.cfg)
                 .into_iter()
                 .filter(|r| self.cfg.role(r).is_some())
                 .map(|r| format!("@{r}"))

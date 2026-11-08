@@ -368,6 +368,7 @@ impl Agent {
 
     pub fn system(&self) -> String {
         let mcp = self.ports.plugins.mcp_instructions();
+        let roles = self.delegated_roles();
         prompt::system_prompt(&PromptInput {
             model: &self.model.model.id,
             cwd: &self.cwd,
@@ -376,6 +377,7 @@ impl Agent {
             subagent: self.run.subagent,
             ask: self.policy().permits("ask"),
             task: self.policy().permits("task"),
+            roles: &roles,
             agent_prompt: self.run.agent_prompt.as_deref(),
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),

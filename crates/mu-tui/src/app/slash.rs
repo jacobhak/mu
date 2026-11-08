@@ -218,9 +218,6 @@ impl App {
         } else if let Some(role) = arg
             .strip_prefix('@')
             .filter(|r| !r.is_empty() && !r.contains(char::is_whitespace) && !r.contains(':') && !r.starts_with('@'))
-            .filter(|role| {
-                super::slash::role_views(&self.services.providers.cfg, &self.ctx).iter().any(|r| r.name == *role)
-            })
         {
             self.open_model_roles(Some(role.to_string()));
         } else {

@@ -15,9 +15,22 @@ pub struct ModelConfig {
     pub set: Option<String>,
     pub cycle_order: Vec<String>,
     pub sets: BTreeMap<String, BTreeMap<String, String>>,
+    /// What a custom role is for; `[roles.<name>]`.
+    pub roles: BTreeMap<String, RoleMeta>,
     /// Keyed by the full `provider/model` id.
     pub models: BTreeMap<String, ModelLimits>,
     pub compaction: ModelCompaction,
+}
+
+/// What `[roles.<name>]` says about a custom role beyond its models.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoleMeta {
+    pub description: Option<String>,
+    /// Roles tried in order when this one is unset; flat, not followed transitively.
+    pub fallback: Vec<String>,
+    /// The model may pick this role for a `task` subagent.
+    pub delegate: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
@@ -89,13 +102,28 @@ pub fn parse(text: &str) -> (ModelConfig, Vec<String>) {
             T::default()
         })
     }
-    let cfg = ModelConfig {
+    let mut cfg = ModelConfig {
         set: section(&table, "set", &mut warn),
         cycle_order: section(&table, "cycle_order", &mut warn),
         sets: section(&table, "sets", &mut warn),
+        roles: section(&table, "roles", &mut warn),
         models: section(&table, "models", &mut warn),
         compaction: section(&table, "compaction", &mut warn),
     };
+    let builtins: Vec<String> = cfg.roles.keys().filter(|n| crate::roles::is_builtin(n)).cloned().collect();
+    for name in builtins {
+        cfg.roles.remove(&name);
+        warn.push(format!("models.toml: [roles.{name}] is ignored: @{name} is built in"));
+    }
+    for (name, meta) in cfg.roles.iter_mut() {
+        meta.fallback =
+            meta.fallback.iter().map(|f| f.strip_prefix('@').unwrap_or(f).to_string()).filter(|f| f != name).collect();
+        if meta.delegate && meta.description.is_none() {
+            warn.push(format!(
+                "models.toml: [roles.{name}] has delegate = true but no description; the model sees only its name"
+            ));
+        }
+    }
     if let Some(active) = cfg.active() {
         match cfg.set.as_deref() {
             Some(s) if !cfg.sets.contains_key(s) => {
@@ -248,6 +276,23 @@ pub fn render(cfg: &ModelConfig) -> String {
             sets.insert(name, Item::Table(t));
         }
         doc.insert("sets", Item::Table(sets));
+    }
+    if !cfg.roles.is_empty() {
+        let mut roles = implicit();
+        for (name, meta) in &cfg.roles {
+            let mut t = Table::new();
+            if let Some(d) = &meta.description {
+                t.insert("description", value(d.as_str()));
+            }
+            if !meta.fallback.is_empty() {
+                t.insert("fallback", value(meta.fallback.iter().map(String::as_str).collect::<Array>()));
+            }
+            if meta.delegate {
+                t.insert("delegate", value(true));
+            }
+            roles.insert(name, Item::Table(t));
+        }
+        doc.insert("roles", Item::Table(roles));
     }
     if !cfg.models.is_empty() {
         let mut models = implicit();
@@ -408,6 +453,11 @@ smol = "anthropic/claude-haiku-5-5"
 [sets.openai]
 default = "openai/gpt-5.6:high"
 
+[roles.writer]
+description = "Long-form docs and prose"
+fallback = ["smol"]
+delegate = true
+
 [models."modal/a/b"]
 context_window = 1048576
 max_tokens = 65536
@@ -432,6 +482,20 @@ max_tokens = 65536
         assert_eq!(c.compaction.thresholds["openai/*"], toml::Value::String("50%".into()));
         assert_eq!(parse("cycle_order = [\"slow\"]\n").0.role_cycle(), ["slow"]);
         assert_eq!(parse("").0.role_cycle(), ["smol", "default", "slow"]);
+    }
+
+    #[test]
+    fn role_metadata_warns_about_builtins_trailing_at_and_missing_descriptions() {
+        let (c, w) = parse("[roles.default]\ndescription = \"x\"\n");
+        assert!(c.roles.is_empty() && w.len() == 1 && w[0].contains("is built in"), "{w:?}");
+        let (c, w) = parse("[roles.w]\ndelegate = true\n");
+        assert!(c.roles["w"].delegate);
+        assert!(w.len() == 1 && w[0].contains("no description"), "{w:?}");
+        let (c, w) = parse("[roles.w]\ndescription = \"d\"\nfallback = [\"@smol\", \"w\"]\n");
+        assert_eq!(c.roles["w"].fallback, ["smol"]);
+        assert!(w.is_empty(), "{w:?}");
+        let (c, w) = parse("[roles.w]\nnope = true\n");
+        assert!(c.roles.is_empty() && w.len() == 1 && w[0].contains("ignoring `roles`"), "{w:?}");
     }
 
     #[test]

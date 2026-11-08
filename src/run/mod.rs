@@ -9,7 +9,7 @@ mod signals;
 use crate::cli::Cli;
 use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none};
 use crate::workflow::{deliver, plans_cli::PlanRun};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use mu_agent::agent;
 use mu_agent::handle::{AgentSetup, build_agent};
 use mu_base::permissions::PermissionMode;
@@ -108,11 +108,19 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
             agent_def = def;
         }
         if cli.model.is_none() {
-            let role = if p["agent"] == "scout" { "scout" } else { "task" };
-            sel = match &agent_def {
-                Some(d) => agent_selector(d, &cfgs),
-                None => models::role_selector(role, &cfgs),
-            };
+            if let Some(m) = p["model"].as_str() {
+                let role = m.trim_start_matches('@');
+                sel = Some(
+                    models::role_selector(role, &cfgs)
+                        .ok_or_else(|| anyhow!(mu_base::roles::not_configured(role, &cfgs)))?,
+                );
+            } else {
+                let role = if p["agent"] == "scout" { "scout" } else { "task" };
+                sel = match &agent_def {
+                    Some(d) => agent_selector(d, &cfgs),
+                    None => models::role_selector(role, &cfgs),
+                };
+            }
         }
         task_payload = Some(p);
     } else if cli.model.is_none() {

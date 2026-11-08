@@ -300,9 +300,23 @@ pub fn role_chain(role: &str) -> Vec<String> {
     std::iter::once(role).chain(rest.iter().copied()).map(String::from).collect()
 }
 
+/// `role_chain`, plus a custom role's `[roles.<name>] fallback` list.
+pub fn role_chain_for(role: &str, cfg: &Configs) -> Vec<String> {
+    if crate::roles::is_builtin(role) {
+        return role_chain(role);
+    }
+    let mut chain = vec![role.to_string()];
+    for r in cfg.role_meta(role).unwrap_or_default().fallback {
+        if !chain.contains(&r) {
+            chain.push(r);
+        }
+    }
+    chain
+}
+
 /// First configured role in the chain, as a selector string (`@role`).
 pub fn role_selector(role: &str, cfg: &Configs) -> Option<String> {
-    role_chain(role).into_iter().find(|r| cfg.role(r).is_some()).map(|r| format!("@{r}"))
+    role_chain_for(role, cfg).into_iter().find(|r| cfg.role(r).is_some()).map(|r| format!("@{r}"))
 }
 
 /// `native_spec(provider, model)` is the spec of a natively routed model (the user has a key for
@@ -316,7 +330,7 @@ pub fn resolve(
     let (base, mut level) = split_level(sel);
     let base = match base.strip_prefix('@') {
         Some(role) => {
-            let v = cfg.role(role).ok_or_else(|| anyhow!(crate::roles::not_configured(role)))?;
+            let v = cfg.role(role).ok_or_else(|| anyhow!(crate::roles::not_configured(role, cfg)))?;
             let (m, l) = split_level(&v);
             level = level.or(l);
             m
@@ -428,5 +442,15 @@ mod tests {
         assert_eq!(role_chain("memory"), ["memory", "smol", "default"]);
         assert_eq!(role_chain("scout"), ["scout", "smol", "default"]);
         assert_eq!(role_selector("task", &cfg()).as_deref(), Some("@default"));
+    }
+
+    #[test]
+    fn a_custom_roles_fallback_extends_its_chain() {
+        let c = Configs::from_models_toml("[sets.main]\nsmol = \"a/b\"\n[roles.w]\nfallback = [\"@smol\", \"w\"]\n");
+        assert_eq!(role_chain_for("w", &c), ["w", "smol"]);
+        assert_eq!(role_chain_for("scout", &c), role_chain("scout"));
+        assert_eq!(role_selector("w", &c).as_deref(), Some("@smol"));
+        assert_eq!(role_selector("task", &c), None);
+        assert_eq!(role_chain_for("ghost", &Configs::default()), ["ghost"]);
     }
 }

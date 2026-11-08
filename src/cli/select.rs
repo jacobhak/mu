@@ -1,7 +1,7 @@
 //! Which model and thinking level a new agent gets.
 
 use anyhow::{Result, anyhow};
-use mu_base::{config, models};
+use mu_base::{config, models, roles};
 use mu_provider::provider::client::Providers;
 use mu_tools::context;
 
@@ -57,16 +57,24 @@ pub(crate) fn pick_model_or_none(
     }
 }
 
-/// First `provider/model[:level]` or configured `@role` in the agent's model list, else the role chain of
-/// `scout` for an agent of that name and of `task` for any other.
+/// First `provider/model[:level]` or usable `@role` in the agent's model list, else the role chain of
+/// `scout` for an agent of that name and of `task` for any other. An unset custom role is replaced by
+/// the first set role in its fallback chain, keeping the `:level`.
 pub(crate) fn agent_selector(def: &context::AgentDef, cfgs: &config::Configs) -> Option<String> {
     def.model
         .iter()
-        .find(|m| match m.strip_prefix('@') {
-            Some(role) => cfgs.role(models::split_level(role).0.as_str()).is_some(),
-            None => m.contains('/'),
+        .find_map(|m| match m.strip_prefix('@') {
+            Some(r) => {
+                let (role, _) = models::split_level(r);
+                let suffix = &r[role.len()..];
+                if roles::is_builtin(&role) {
+                    cfgs.role(&role).is_some().then(|| m.clone())
+                } else {
+                    models::role_selector(&role, cfgs).map(|s| format!("{s}{suffix}"))
+                }
+            }
+            None => m.contains('/').then(|| m.clone()),
         })
-        .cloned()
         .or_else(|| models::role_selector(if def.name == "scout" { "scout" } else { "task" }, cfgs))
 }
 
@@ -113,6 +121,23 @@ mod tests {
         assert_eq!(model_label(Some("@smol:high"), "a/b"), "smol · a/b");
         assert_eq!(model_label(Some("a/b:low"), "a/b"), "a/b");
         assert_eq!(model_label(None, "a/b"), "a/b");
+    }
+
+    #[test]
+    fn a_custom_role_falls_back_while_an_unset_builtin_is_skipped() {
+        let cfgs =
+            config::Configs::from_models_toml("[sets.main]\nsmol = \"a/s\"\n[roles.writer]\nfallback = [\"smol\"]\n");
+        let def = |name: &str, model: &[&str]| context::AgentDef {
+            name: name.into(),
+            description: String::new(),
+            tools: None,
+            model: model.iter().map(|m| m.to_string()).collect(),
+            thinking: None,
+            prompt: String::new(),
+            output: None,
+        };
+        assert_eq!(agent_selector(&def("docs", &["@writer:high"]), &cfgs).as_deref(), Some("@smol:high"));
+        assert_eq!(agent_selector(&def("docs", &["@plan", "a/b"]), &cfgs).as_deref(), Some("a/b"));
     }
 
     #[test]

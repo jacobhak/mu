@@ -265,7 +265,9 @@ fn model_roles_are_offered_with_what_they_are_for() {
     let plan = role("@plan").unwrap_or_else(|| panic!("{options:?}"));
     assert_eq!(plan["description"], "plan mode · anthropic/claude-sonnet-5-5:high");
     assert!(role("@default").is_some());
-    assert!(role("@review").is_none() && role("@commit").is_none(), "unset and unused roles are left out");
+    assert!(role("@review").is_none(), "unset roles are left out");
+    let commit = role("@commit").unwrap_or_else(|| panic!("{options:?}"));
+    assert_eq!(commit["description"], "custom role · anthropic/claude-haiku-5-5");
     let r = acp.call("session/set_config_option", json!({"sessionId": sid, "configId": "model", "value": "@plan"}));
     assert!(r["error"].is_null(), "{r}");
 }

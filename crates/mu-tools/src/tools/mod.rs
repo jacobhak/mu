@@ -63,6 +63,8 @@ pub struct Tools {
     session: ToolSession,
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
+    /// The `@role`s the last advertised `task` def offered, which a task's `model` may name.
+    pub delegated: std::cell::RefCell<Vec<String>>,
     pub edit_store: pi_edit::EditStore,
     /// The session's tool permissions: the gate reads it, `task` hands it to subagents.
     pub permissions: Rc<crate::permissions::Permissions>,
@@ -74,6 +76,9 @@ pub struct Tools {
     /// Test seam: the `__panic` tool panics. Only test builders turn it on.
     #[cfg(any(test, feature = "test-support"))]
     pub panic_tool: std::cell::Cell<bool>,
+    /// Test seam: the executable `task` runs instead of this process. Only test builders set it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub child_exe: Option<PathBuf>,
 }
 
 impl Tools {
@@ -92,6 +97,7 @@ impl Tools {
             interruptible_wait: false,
             session: Default::default(),
             output_schema: Default::default(),
+            delegated: Default::default(),
             edit_store: pi_edit::EditStore::new(),
             permissions: Rc::default(),
             shell: Default::default(),
@@ -99,6 +105,8 @@ impl Tools {
             shell_env: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             panic_tool: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            child_exe: None,
         }
     }
 
@@ -172,7 +180,12 @@ impl Tools {
 
     /// `async_jobs`: `task` returns job ids immediately instead of blocking.
     /// `interruptible_wait`: a job's result may be awaited with `wait` instead of ending the turn.
-    pub fn task_def(async_jobs: bool, interruptible_wait: bool, agents: &[crate::context::AgentDef]) -> ToolDef {
+    pub fn task_def(
+        async_jobs: bool,
+        interruptible_wait: bool,
+        agents: &[crate::context::AgentDef],
+        roles: &[&str],
+    ) -> ToolDef {
         let mut description = String::from(match (async_jobs, interruptible_wait) {
             (true, true) => task::ASYNC_WAIT_DESCRIPTION,
             (true, false) => task::ASYNC_DESCRIPTION,
@@ -184,7 +197,7 @@ impl Tools {
             description.push_str(&list.join("; "));
         }
         let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
-        ToolDef { name: "task".into(), description, schema: task::schema(&names) }
+        ToolDef { name: "task".into(), description, schema: task::schema(&names, roles) }
     }
 
     pub fn yield_def(output: &Value) -> ToolDef {

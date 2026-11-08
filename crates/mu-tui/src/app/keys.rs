@@ -1333,7 +1333,8 @@ pub(super) mod tests {
         app.model_cmd("@task");
         assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
         app.model_cmd("provider/model");
-        app.model_cmd("@missing");
+        app.model_cmd("@1bad");
+        assert!(transcript_text(&app).contains("role names are a letter"));
         app.model_cmd("@task:high");
         assert!(transcript_text(&app).contains("usage: /model [@role]"));
         assert_eq!(cfg.role("default").as_deref(), Some("a/old:high"));

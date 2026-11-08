@@ -26,6 +26,11 @@ fn elapsed_text(secs: u64) -> String {
 }
 
 impl Agent {
+    /// The custom roles the model may pick for a `task`'s `model`; only the top-level session has them.
+    pub(super) fn delegated_roles(&self) -> Vec<(String, String)> {
+        if self.run.subagent { Vec::new() } else { mu_base::roles::delegated(&self.ports.providers.cfg) }
+    }
+
     pub fn tool_defs(&self) -> Vec<ToolDef> {
         let mut v = self
             .memo
@@ -40,7 +45,15 @@ impl Agent {
         if self.plan.plan.is_some() {
             v.push(Tools::plan_def());
         }
-        v.push(Tools::task_def(self.tools.jobs.is_some(), self.tools.interruptible_wait_enabled(), &self.ctx.agents));
+        let roles: Vec<String> = self.delegated_roles().into_iter().map(|(n, _)| format!("@{n}")).collect();
+        *self.tools.delegated.borrow_mut() = roles.clone();
+        let role_names: Vec<&str> = roles.iter().map(String::as_str).collect();
+        v.push(Tools::task_def(
+            self.tools.jobs.is_some(),
+            self.tools.interruptible_wait_enabled(),
+            &self.ctx.agents,
+            &role_names,
+        ));
         if self.tools.jobs.is_some() {
             v.push(Tools::job_cancel_def());
         }

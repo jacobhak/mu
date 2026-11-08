@@ -1,4 +1,4 @@
-use crate::model_config::{self, Import, ModelConfig, ModelLimits};
+use crate::model_config::{self, Import, ModelConfig, ModelLimits, RoleMeta};
 use crate::permissions::{PermissionMode, RuleSet};
 use mu_common::paths;
 use serde::Deserialize;
@@ -659,6 +659,26 @@ impl Configs {
 
     pub fn role_cycle(&self) -> Vec<String> {
         self.models.borrow().role_cycle()
+    }
+
+    /// What `[roles.<name>]` says about a custom role.
+    pub fn role_meta(&self, name: &str) -> Option<RoleMeta> {
+        self.models.borrow().roles.get(name).cloned()
+    }
+
+    /// Every role mu does not use itself: the active set's keys and every `[roles.<name>]`, sorted.
+    pub fn custom_role_names(&self) -> Vec<String> {
+        let models = self.models.borrow();
+        let mut names: Vec<String> = models
+            .active()
+            .and_then(|s| models.sets.get(s))
+            .map(|roles| roles.keys().cloned().collect())
+            .unwrap_or_default();
+        names.extend(models.roles.keys().cloned());
+        names.retain(|n| !crate::roles::is_builtin(n));
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     pub fn model_limits(&self, id: &str) -> Option<ModelLimits> {

@@ -17,6 +17,8 @@ pub struct PromptInput<'a> {
     pub ask: bool,
     /// The `task` tool is offered to this run; the delegation rules are only stated then.
     pub task: bool,
+    /// Custom roles the model may pick for a `task`'s `model` (name, description).
+    pub roles: &'a [(String, String)],
     pub agent_prompt: Option<&'a str>,
     pub plugin_ctx: &'a std::collections::BTreeMap<String, String>,
     /// The MCP servers' instructions block (`PluginHost::mcp_instructions`).
@@ -105,6 +107,12 @@ When the `task` tool is available, SHOULD use it instead of doing everything inl
 - Do it yourself: a single small edit, a slice you already have open, a direct question, a prerequisite the others depend on.\n\
 - Agents start blank: give each full requirements, never rely on conversation history. NEVER spawn then idle, and NEVER serialize independent work.\n",
         );
+        if !i.roles.is_empty() {
+            s.push_str("\n- A task runs on its agent's model. Set its `model` to one of these roles only when the role's description fits that task:\n");
+            for (name, description) in i.roles {
+                s.push_str(&format!("  - `@{name}`: {}\n", description.replace('\n', " ")));
+            }
+        }
     }
     if i.subagent {
         s.push_str("\nYou are a subagent. Your final message is returned verbatim to the parent agent as your result; make it complete and self-contained.\n");
@@ -204,6 +212,7 @@ mod tests {
             agent_prompt: None,
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
+            roles: &[],
         });
         assert!(sp.contains("- alpha: first\n") && !sp.contains("- hid:") && sp.contains("<rules>\nuser rule"));
         assert!(sp.contains("never changes what the user asked for") && !sp.contains("Matching skill → MUST"));
@@ -235,6 +244,7 @@ mod tests {
             agent_prompt: None,
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
+            roles: &[],
         });
         assert!(sp.contains("<dir-context>\nSome directories may have rules; deeper rules override higher ones.\nBefore changes in these directories, MUST read:\n- a/AGENTS.md\n- a/b/c/d/AGENTS.md\n</dir-context>"));
     }
@@ -256,6 +266,7 @@ mod tests {
             agent_prompt: None,
             plugin_ctx: &plugins,
             mcp_instructions: None,
+            roles: &[],
         };
         let sp = system_prompt(&input(true));
         assert!(sp.contains("NEVER use `sed`, `perl`") && sp.contains("NEVER `cat`"));
@@ -281,6 +292,7 @@ mod tests {
             agent_prompt: None,
             plugin_ctx: &plugins,
             mcp_instructions: None,
+            roles: &[],
         };
         let on = system_prompt(&input(true));
         assert!(on.contains("every command in its own shell") && on.contains("use `wait`"));
@@ -309,10 +321,36 @@ mod tests {
             agent_prompt: None,
             plugin_ctx: &plugins,
             mcp_instructions: None,
+            roles: &[],
         };
         assert!(system_prompt(&input(true, false)).contains("# Delegation"));
         assert!(!system_prompt(&input(false, false)).contains("# Delegation"));
         assert!(!system_prompt(&input(true, true)).contains("# Delegation"));
+    }
+
+    #[test]
+    fn delegated_roles_are_listed_only_where_the_model_may_pick_them() {
+        let ctx = Context::default();
+        let plugins = std::collections::BTreeMap::new();
+        let roles = [("w".to_string(), "Docs\nand prose".to_string())];
+        let input = |task, subagent| PromptInput {
+            model: "m",
+            hashline: true,
+            interruptible_wait: false,
+            cwd: Path::new("/tmp"),
+            ctx: &ctx,
+            plan: None,
+            subagent,
+            ask: false,
+            task,
+            roles: &roles,
+            agent_prompt: None,
+            plugin_ctx: &plugins,
+            mcp_instructions: None,
+        };
+        assert!(system_prompt(&input(true, false)).contains("  - `@w`: Docs and prose\n"));
+        assert!(!system_prompt(&input(false, false)).contains("- `@w`:"));
+        assert!(!system_prompt(&input(true, true)).contains("- `@w`:"));
     }
 
     #[test]
@@ -332,6 +370,7 @@ mod tests {
             agent_prompt: None,
             plugin_ctx: &plugins,
             mcp_instructions: None,
+            roles: &[],
         };
         let on = system_prompt(&input(true));
         assert!(on.contains("# Decisions") && on.contains("MUST be asked with `ask`"));
@@ -365,6 +404,7 @@ mod tests {
             agent_prompt: Some(block),
             plugin_ctx: &Default::default(),
             mcp_instructions: None,
+            roles: &[],
         });
         assert!(sp.contains("<agent name=\"x\">\nDo it.\n</agent>"));
     }

@@ -24,6 +24,7 @@ struct T {
     name: Option<String>,
     task: String,
     agent: Option<String>,
+    model: Option<String>,
     cwd: Option<String>,
     /// JSON Schema of the result; the subagent then returns validated `data`.
     #[serde(rename = "outputSchema")]
@@ -51,17 +52,25 @@ pub const ASYNC_WAIT_DESCRIPTION: &str = concat!(
     guidance!()
 );
 
-pub fn schema(names: &[&str]) -> Value {
+pub fn schema(names: &[&str], roles: &[&str]) -> Value {
     let mut agents = vec!["task", "scout"];
     agents.extend_from_slice(names);
+    let mut item = json!({"type":"object","properties":{
+        "name":{"type":"string"},
+        "task":{"type":"string"},
+        "agent":{"type":"string","enum":agents},
+        "cwd":{"type":"string","description":"absolute path of an existing directory the task runs in (e.g. a git worktree); defaults to this session's directory"},
+        "outputSchema":{"type":"object","description":"JSON Schema for this task's result. The subagent must submit matching JSON via `yield`; you get it back as a ```json block. Omit for a free-text answer."}},"required":["task"]});
+    if !roles.is_empty() {
+        item["properties"]["model"] = json!({
+            "type": "string",
+            "enum": roles,
+            "description": "Model role for this task; omit to run on the agent's model. Roles are listed under Delegation in the system prompt."
+        });
+    }
     json!({"type":"object","properties":{
         "context":{"type":"string","description":"shared background prepended to every task"},
-        "tasks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{
-            "name":{"type":"string"},
-            "task":{"type":"string"},
-            "agent":{"type":"string","enum":agents},
-            "cwd":{"type":"string","description":"absolute path of an existing directory the task runs in (e.g. a git worktree); defaults to this session's directory"},
-            "outputSchema":{"type":"object","description":"JSON Schema for this task's result. The subagent must submit matching JSON via `yield`; you get it back as a ```json block. Omit for a free-text answer."}},"required":["task"]}}},"required":["tasks"]})
+        "tasks":{"type":"array","minItems":1,"maxItems":8,"items":item},"required":["tasks"]}})
 }
 
 pub fn depth() -> u32 {
@@ -93,15 +102,34 @@ impl Tools {
         }
         let schemas: Vec<Option<&Value>> = a.tasks.iter().map(|t| t.output_schema.as_ref()).collect();
         let plan = ctx.plan;
-        // (name, agent, task, cwd)
-        let specs: Vec<(String, String, String, PathBuf)> = match a
+        let delegated = self.delegated.borrow().clone();
+        // (name, agent, task, cwd, model)
+        let specs: Vec<(String, String, String, PathBuf, Option<String>)> = match a
             .tasks
             .iter()
             .enumerate()
             .map(|(i, t)| -> Result<_, String> {
                 let agent = if plan { "scout" } else { t.agent.as_deref().unwrap_or("task") };
                 let cwd = resolve_cwd(t.cwd.as_deref(), &self.cwd)?;
-                Ok((t.name.clone().unwrap_or_else(|| format!("Task{}", i + 1)), agent.to_string(), t.task.clone(), cwd))
+                let model =
+                    t.model.as_deref().map(|m| if m.starts_with('@') { m.to_string() } else { format!("@{m}") });
+                if let Some(m) = &model
+                    && !delegated.contains(m)
+                {
+                    let list = if delegated.is_empty() {
+                        "no model roles are offered".to_string()
+                    } else {
+                        format!("offered: {}", delegated.join(", "))
+                    };
+                    return Err(format!("task: model `{m}` is not offered; {list}"));
+                }
+                Ok((
+                    t.name.clone().unwrap_or_else(|| format!("Task{}", i + 1)),
+                    agent.to_string(),
+                    t.task.clone(),
+                    cwd,
+                    model,
+                ))
             })
             .collect::<Result<_, String>>()
         {
@@ -109,15 +137,22 @@ impl Tools {
             Err(e) => return ToolOutput::err(e),
         };
         let parent = self.session.path.borrow().clone();
-        let exe = match mu_common::paths::self_exe() {
+        #[cfg(any(test, feature = "test-support"))]
+        let self_exe = self.child_exe.clone().map_or_else(mu_common::paths::self_exe, Ok);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let self_exe = mu_common::paths::self_exe();
+        let exe = match self_exe {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),
         };
-        let payload = |agent: &str, task: &str, schema: Option<&Value>| {
+        let payload = |agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
             let mut p = json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
             p["permissions"] = self.permissions.inherit_json();
             if let Some(s) = schema {
                 p["outputSchema"] = s.clone();
+            }
+            if let Some(m) = model {
+                p["model"] = json!(m);
             }
             p
         };
@@ -127,14 +162,14 @@ impl Tools {
                 return ToolOutput::err(e);
             }
             let mut started = Vec::new();
-            for (i, (name, agent, task, cwd)) in specs.iter().enumerate() {
+            for (i, (name, agent, task, cwd, model)) in specs.iter().enumerate() {
                 let id = jobs.unique_id(name);
                 jobs.spawn(
                     id.clone(),
                     agent.clone(),
                     exe.clone(),
                     cwd.clone(),
-                    payload(agent, task, schemas[i]),
+                    payload(agent, task, schemas[i], model.as_deref()),
                     self.permissions.clone(),
                 );
                 started.push(format!("{id} ({agent})"));
@@ -154,14 +189,17 @@ impl Tools {
     }
 }
 
+/// Builds one child's task payload.
+type Payload<'a> = dyn Fn(&str, &str, Option<&Value>, Option<&str>) -> Value + 'a;
+
 /// Runs every task to completion in this call; each row's progress is reported in `details`, and an
 /// approval a task needs is asked in the parent's UI.
 #[allow(clippy::too_many_arguments)]
 async fn run_foreground(
-    specs: &[(String, String, String, PathBuf)],
+    specs: &[(String, String, String, PathBuf, Option<String>)],
     schemas: &[Option<&Value>],
     exe: &Path,
-    payload: &dyn Fn(&str, &str, Option<&Value>) -> Value,
+    payload: &Payload<'_>,
     cancel: &tokio_util::sync::CancellationToken,
     events: &EventTx,
     perms: &Rc<Permissions>,
@@ -169,7 +207,7 @@ async fn run_foreground(
     let rows = RefCell::new(
         specs
             .iter()
-            .map(|(n, a, t, c)| SubagentStatus {
+            .map(|(n, a, t, c, _)| SubagentStatus {
                 name: n.clone(),
                 agent: a.clone(),
                 tools: 0,
@@ -187,9 +225,9 @@ async fn run_foreground(
             })
             .collect::<Vec<_>>(),
     );
-    let futs = specs.iter().enumerate().map(|(i, (name, agent, task, cwd))| {
+    let futs = specs.iter().enumerate().map(|(i, (name, agent, task, cwd, model))| {
         let rows = &rows;
-        let payload = payload(agent, task, schemas[i]);
+        let payload = payload(agent, task, schemas[i], model.as_deref());
         let label = format!("{name} ({agent})");
         async move {
             let out = run_child_observed(
@@ -216,7 +254,7 @@ async fn run_foreground(
     let text = specs
         .iter()
         .zip(&outs)
-        .map(|((n, a, _, _), o)| format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, o.text))
+        .map(|((n, a, _, _, _), o)| format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, o.text))
         .collect::<Vec<_>>()
         .join("\n\n");
     let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
@@ -234,11 +272,18 @@ async fn run_foreground(
 mod schema_tests {
     #[test]
     fn schema_enum_includes_custom_agents() {
-        let s = super::schema(&["x"]);
+        let s = super::schema(&["x"], &[]);
         assert_eq!(
             s["properties"]["tasks"]["items"]["properties"]["agent"]["enum"],
             serde_json::json!(["task", "scout", "x"])
         );
+    }
+
+    #[test]
+    fn the_model_field_is_offered_only_with_roles() {
+        let s = super::schema(&[], &["@w"]);
+        assert_eq!(s["properties"]["tasks"]["items"]["properties"]["model"]["enum"], serde_json::json!(["@w"]));
+        assert!(super::schema(&[], &[])["properties"]["tasks"]["items"]["properties"].get("model").is_none());
     }
 }
 
@@ -250,7 +295,7 @@ mod cwd_tests {
 
     #[test]
     fn schema_accepts_an_optional_cwd_per_task() {
-        let s = schema(&[]);
+        let s = schema(&[], &[]);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["cwd"]["type"], "string");
         assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task"]));
     }
@@ -331,7 +376,7 @@ mod typed_tests {
 
     #[test]
     fn schema_accepts_an_optional_output_schema_per_task() {
-        let s = schema(&[]);
+        let s = schema(&[], &[]);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["outputSchema"]["type"], "object");
         assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task"]));
     }
@@ -366,6 +411,42 @@ mod typed_tests {
         )
         .await;
         assert!(!o.ok);
+    }
+
+    /// Echoes the task payload it read so the test can see it.
+    const ECHO_CHILD: &str = r#"#!/bin/sh
+IFS= read -r line
+escaped=$(printf '%s' "$line" | sed 's/"/\\"/g')
+printf '{"type":"result","text":"%s"}\n' "$escaped"
+"#;
+
+    fn ctx() -> ToolCtx {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_task_model_must_be_offered_and_reaches_the_child_payload() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, ECHO_CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut t = Tools::for_test();
+        t.child_exe = Some(exe);
+        let args = || -> Args { serde_json::from_value(json!({"tasks":[{"task":"x","model":"@nope"}]})).unwrap() };
+        let out = t.task(args(), &ctx()).await;
+        assert!(out.is_error && out.text.contains("not offered; no model roles are offered"), "{}", out.text);
+        *t.delegated.borrow_mut() = vec!["@w".into()];
+        let out = t.task(args(), &ctx()).await;
+        assert!(out.is_error && out.text.contains("not offered; offered: @w"), "{}", out.text);
+
+        let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","model":"w"}]})).unwrap();
+        let out = tokio::task::LocalSet::new().run_until(t.task(a, &ctx())).await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains(r#""model":"@w""#), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test(flavor = "current_thread")]
