@@ -891,16 +891,21 @@ fn a_print_run_does_not_fall_back_to_a_fresh_session_when_resume_fails() {
 }
 
 #[test]
-fn parking_a_plan_saves_it_and_leaves_plan_mode() {
+fn parking_a_plan_saves_it_and_leaves_plan_mode_keeping_the_model() {
     run(async {
+        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\nplan = \"a/c:high\"\n");
         let args = json!({"slug": "t", "title": "T"});
         let call = Block::ToolCall { id: "p1".into(), name: "propose_plan".into(), arguments: args };
-        let (mut a, mut rx) = agent(vec![
-            Ok(assistant(vec![call], StopReason::ToolUse)),
-            Ok(assistant(vec![Block::text("parked")], StopReason::Stop)),
-        ]);
+        let (mut a, mut rx) = agent_with(
+            vec![
+                Ok(assistant(vec![call], StopReason::ToolUse)),
+                Ok(assistant(vec![Block::text("parked")], StopReason::Stop)),
+            ],
+            cfg,
+        );
         a.cwd = tmp_dir();
         a.enter_plan().await;
+        assert_eq!((a.model.model.id.as_str(), a.model.thinking), ("a/c", Thinking::High), "plan mode uses the role");
         let r = a.tools.resolve("local://t-plan.md").unwrap();
         std::fs::create_dir_all(r.path.parent().unwrap()).unwrap();
         std::fs::write(&r.path, "do it\n").unwrap();
@@ -922,6 +927,11 @@ fn parking_a_plan_saves_it_and_leaves_plan_mode() {
         let (_, parked) = futures_util::future::join(a.turn(Some("go".to_string().into())), answer).await;
         assert_eq!(parked.as_deref(), Some("t"));
         assert!(a.plan.plan.is_none());
+        assert_eq!(
+            (a.model.model.id.as_str(), a.model.thinking),
+            ("a/c", Thinking::High),
+            "parking keeps the model it planned with"
+        );
         let store = plans::store_for(&a.cwd).await;
         let (meta, text) = store.load("t").unwrap();
         assert_eq!((meta.status, text.as_str()), (mu_base::events::Status::Pending, "do it\n"));

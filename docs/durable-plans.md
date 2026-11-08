@@ -4,7 +4,7 @@ A plan does not have to be approved in the session that wrote it. It can be park
 
 ## Parking and approving
 
-- In the plan review, **Park plan** saves the plan and ends the turn. Plan mode turns off.
+- In the plan review, **Park plan** saves the plan and ends the turn. Plan mode turns off, and the session keeps the model and thinking level it planned with; leaving plan mode with `/plan` and approving a plan still restore or switch the model.
 - `/plans` lists the repository's pending plans. Choosing one opens the same review dialog as a live plan, with **Drop plan** in place of **Park plan**. Execute, compact, keep and refine apply to the current session. Esc leaves the plan parked.
 - Execute, compact and keep on a live plan also save it, so every approved plan is in the store. A failed save never blocks approval.
 - Approving in a session does not create a worktree: the plan runs in the directory mu runs in. There is no automatic review/fix loop; a run ends when the implementer's turn ends, and `/review` works against the approved plan as usual.

@@ -20,11 +20,23 @@ impl Agent {
     }
 
     pub(super) fn exit_plan(&mut self) {
+        self.leave_plan_mode(true);
+    }
+
+    /// Leaving to park a plan: the session keeps the model and thinking level it planned with,
+    /// rather than the ones plan mode replaced. `/plan` off and an approved plan still restore.
+    pub(super) fn exit_plan_keeping_model(&mut self) {
+        self.leave_plan_mode(false);
+    }
+
+    fn leave_plan_mode(&mut self, restore: bool) {
         let Some(p) = self.plan.plan.take() else { return };
-        if let Some(m) = p.prev_model {
-            self.set_model(&m);
+        if restore {
+            if let Some(m) = p.prev_model {
+                self.set_model(&m);
+            }
+            self.set_thinking(p.prev_thinking);
         }
-        self.set_thinking(p.prev_thinking);
         if let Some(s) = self.session.as_mut() {
             s.mode_change("none", json!({}));
         }

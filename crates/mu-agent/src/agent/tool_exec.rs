@@ -449,7 +449,7 @@ impl Agent {
                 let (store, saved) = self.save_plan(d).await;
                 match saved {
                     Ok(m) => {
-                        self.exit_plan();
+                        self.exit_plan_keeping_model();
                         self.plan.stored_plan = None;
                         self.emit(AgentEvent::PlanParked { id: m.id.clone(), path: store.md_path(&m.id) });
                         out.text.push_str(&format!(
