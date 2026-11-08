@@ -2,6 +2,7 @@
 
 mod bash;
 mod glob;
+mod guard;
 mod store;
 
 pub use bash::{BashAnalysis, SimpleCmd, analyze};
@@ -218,6 +219,11 @@ impl Permissions {
             Ok(c) => c,
             Err(_) => return Verdict::Allow,
         };
+        if let Some(a) = &call.bash
+            && guard::removes_root_or_home(a, home_dir().as_deref().and_then(Path::to_str))
+        {
+            return Verdict::Deny(guard::REFUSAL.into());
+        }
         let hits = self.rule_hits(name, &call.subjects);
         if let Some((rule, source)) = hits.iter().find(|(r, _)| r.action == Action::Deny) {
             return Verdict::Deny(format!(
@@ -1021,6 +1027,14 @@ mod tests {
         p.session.borrow_mut().0.extend([allow("*"), ask_rule("git push *")]);
         assert!(matches!(verdict(&p, &t, "git push"), Verdict::Ask(_)));
         assert!(matches!(verdict(&p, &t, "git status"), Verdict::Allow));
+    }
+
+    #[test]
+    fn removing_root_or_home_is_refused_whatever_the_rules() {
+        let (p, t) = setup(PermissionMode::Yolo);
+        p.session.borrow_mut().0.push(allow("*"));
+        assert!(matches!(verdict(&p, &t, "rm -rf ~"), Verdict::Deny(m) if m == guard::REFUSAL));
+        assert!(matches!(verdict(&p, &t, "rm -rf target"), Verdict::Allow));
     }
 
     #[test]

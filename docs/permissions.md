@@ -42,6 +42,8 @@ Keys are tool-name globs, values are `allow`, `ask` or `deny`, either for every 
 
 A `deny` always wins, then an `ask`, and only then does a covering `allow` (or the read-only classifier) let the call run. `yolo` still honours `deny` and `ask` rules. A command that does not parse, or one that starts with an assignment (`FOO=1 cmd`), can never be covered by an `allow` rule.
 
+One deny is built in and no mode or rule lifts it: a recursive `rm` of `/`, `~` or `$HOME` (also written as `/*`, `~/*`, `"$HOME"`, the home path itself, behind `sudo` and the like, or inside `sh -c '…'` and `eval`).
+
 ## The prompt
 
 When a call needs approval, mu first asks how much to allow. The widths are landmarks, not every ancestor, so the list stays short however deep the path is:
