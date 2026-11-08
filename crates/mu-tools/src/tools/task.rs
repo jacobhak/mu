@@ -70,7 +70,7 @@ pub fn schema(names: &[&str], roles: &[&str]) -> Value {
     }
     json!({"type":"object","properties":{
         "context":{"type":"string","description":"shared background prepended to every task"},
-        "tasks":{"type":"array","minItems":1,"maxItems":8,"items":item},"required":["tasks"]}})
+        "tasks":{"type":"array","minItems":1,"maxItems":8,"items":item}},"required":["tasks"]})
 }
 
 pub fn depth() -> u32 {
@@ -284,6 +284,13 @@ mod schema_tests {
         let s = super::schema(&[], &["@w"]);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["model"]["enum"], serde_json::json!(["@w"]));
         assert!(super::schema(&[], &[])["properties"]["tasks"]["items"]["properties"].get("model").is_none());
+    }
+
+    #[test]
+    fn tasks_is_required_at_the_top_level() {
+        let s = super::schema(&[], &[]);
+        assert_eq!(s["required"], serde_json::json!(["tasks"]));
+        assert!(s["properties"]["tasks"].get("required").is_none());
     }
 }
 
