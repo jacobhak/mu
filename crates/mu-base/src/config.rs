@@ -663,6 +663,12 @@ impl Configs {
         self.models.borrow().models.keys().cloned().collect()
     }
 
+    /// Every set that assigns the role, sorted.
+    pub fn sets_with_role(&self, name: &str) -> Vec<String> {
+        let models = self.models.borrow();
+        models.sets.iter().filter(|(_, roles)| roles.contains_key(name)).map(|(set, _)| set.clone()).collect()
+    }
+
     pub fn set_names(&self) -> Vec<String> {
         self.models.borrow().sets.keys().cloned().collect()
     }
@@ -699,6 +705,19 @@ impl Configs {
             match model {
                 Some(model) => model_config::write_role(text, set, name, model),
                 None => model_config::remove_role(text, set, name),
+            }
+        })
+    }
+
+    /// Assigns or removes a custom role in `set` and writes its `[roles.<name>]` settings in the
+    /// same edit; empty settings remove the table, so deleting a role leaves nothing behind.
+    pub fn edit_custom_role(&self, set: &str, name: &str, model: Option<&str>, meta: &RoleMeta) -> Result<(), String> {
+        self.edit_models(|text| {
+            model_config::validate_role_target(text, set)?;
+            let text = model_config::write_role_meta(text, name, meta)?;
+            match model {
+                Some(model) => model_config::write_role(&text, set, name, model),
+                None => model_config::remove_role(&text, set, name),
             }
         })
     }
@@ -857,6 +876,18 @@ mod tests {
         std::fs::write(&path, "[sets.other]\nx = \"x/y\"\n").unwrap();
         assert!(cfg.edit_role("main", "default", Some("x/y")).is_err());
         assert_eq!(*cfg.models.borrow(), before);
+
+        std::fs::write(&path, disk).unwrap();
+        let meta = RoleMeta { description: Some("Docs".into()), fallback: vec!["smol".into()], delegate: true };
+        cfg.edit_custom_role("main", "writer", Some("w/m"), &meta).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("[sets.main]") && out.contains("[roles.writer]"), "{out}");
+        assert_eq!((cfg.role("writer").as_deref(), cfg.role_meta("writer")), (Some("w/m"), Some(meta.clone())));
+        assert_eq!(cfg.sets_with_role("writer"), ["main"]);
+        cfg.edit_custom_role("main", "writer", None, &RoleMeta::default()).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("[roles") && !out.contains("writer"), "{out}");
+        assert_eq!((cfg.role("writer"), cfg.sets_with_role("writer")), (None, vec![]));
         std::fs::remove_file(path).unwrap();
     }
 

@@ -13,6 +13,7 @@ use crate::panels::plan_review::{PlanReview, ReviewResult};
 use crate::panels::reply::{ReplyPicker, ReplyResult};
 use crate::widgets::select::{Item, Select, SelectResult};
 use mu_base::events::{Answer, AskQuestion, PlanDecision};
+use mu_base::model_config::RoleMeta;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 
 /// One entry of the `/login` picker.
@@ -211,6 +212,13 @@ pub enum OverlayEvent {
         set: String,
         role: String,
         value: Option<String>,
+        /// A custom role's `[roles.<name>]` settings; `None` for a role mu uses itself.
+        meta: Option<RoleMeta>,
+    },
+    /// Remove a custom role from this set and its `[roles.<name>]` settings.
+    DeleteRole {
+        set: String,
+        role: String,
     },
     Login(LoginTarget),
     /// The API-key picker chose this for `provider` (`Cancel` when it was dismissed).
@@ -933,8 +941,11 @@ impl Overlay {
                 RoleEditorAction::RequestModels => {
                     (Some(Overlay::ModelRoles { st }), Some(OverlayEvent::LoadRoleModels))
                 }
-                RoleEditorAction::Save { set, role, value } => {
-                    (Some(Overlay::ModelRoles { st }), Some(OverlayEvent::SaveRole { set, role, value }))
+                RoleEditorAction::Save { set, role, value, meta } => {
+                    (Some(Overlay::ModelRoles { st }), Some(OverlayEvent::SaveRole { set, role, value, meta }))
+                }
+                RoleEditorAction::Delete { set, role } => {
+                    (Some(Overlay::ModelRoles { st }), Some(OverlayEvent::DeleteRole { set, role }))
                 }
             },
             Overlay::Login { mut sel, targets } => match sel.on_key(k) {
@@ -1124,6 +1135,11 @@ mod tests {
             fallback: None,
             unset: "uses session".into(),
             agents: vec![],
+            description: None,
+            fallbacks: Vec::new(),
+            delegate: false,
+            custom: false,
+            other_sets: Vec::new(),
         };
         let st =
             crate::panels::model_roles::RoleEditor::new("main".into(), "models.toml".into(), vec![role], None).unwrap();

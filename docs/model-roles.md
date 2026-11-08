@@ -17,7 +17,7 @@ A role is a name for a model, set in mu's own `models.toml` (see [below](#models
 
 Roles in `cycle_order` are the ones offered when you approve a plan. Roles that only appear in `models.toml` and that nothing in mu or your agents refers to (omp's `commit`, say) are not listed.
 
-Enter on a role in `/model` opens its editor: **Model** (a concrete model; the list is fetched only then), **Thinking** (`No override`, or `off` to `max`), **Clear assignment** (Save then removes the key, so the fallback chain above applies again), **Save** and **Cancel**. Nothing is written until Save, and Esc or Cancel discards the draft. Changing only the model keeps the role's existing thinking suffix. Saving writes to the set that was shown when the editor opened, and never switches the current session; running sessions keep their model, and later reads of the role see the new value. Roles your agents or `cycle_order` name but mu has no use for are listed as `custom role`; an agent whose role is unset takes the `task` model.
+Enter on a role in `/model` opens its editor: **Model** (a concrete model; the list is fetched only then), **Thinking** (`No override`, or `off` to `max`), **Clear assignment** (Save then removes the key, so the fallback chain above applies again), **Save** and **Cancel**. A custom role also has **Fallbacks** — every other role, each one toggled into the chain in the order you add it, tried in that order before `@task`'s chain when the role has no model — **Description** (what the model reads when it may delegate the role; its first line is shown beside it), **Delegate** (whether the model may pick the role for a `task` subagent) and **Delete role…**, a confirmation that names the other sets that keep the role and the agents that use it before removing it from this set and dropping its `[roles.<name>]` settings. Nothing is written until Save, and Esc or Cancel discards the draft. Changing only the model keeps the role's existing thinking suffix. Saving writes to the set that was shown when the editor opened, and never switches the current session; running sessions keep their model, and later reads of the role see the new value. Roles your agents or `cycle_order` name but mu has no use for are listed as `custom role`; an agent whose role is unset takes the `task` model.
 
 `@role` that is not configured fails with a message that names what the role is for and its fallback chain.
 
@@ -36,6 +36,11 @@ smol = "anthropic/claude-haiku-5-5"
 [sets.openai]
 default = "openai/gpt-5.6:high"
 
+[roles.writer]                        # settings only a custom role has
+description = "Long-form docs"        # what the model reads when it may delegate the role
+fallback = ["smol"]                   # roles tried, in order, when @writer has no model
+delegate = true                       # the model may pick @writer for a task subagent
+
 [models."modal/a/b"]                  # the full provider/model id
 context_window = 1048576
 max_tokens = 65536
@@ -44,7 +49,7 @@ max_tokens = 65536
 "openai/*" = "50%"
 ```
 
-Every role lives in a **set**: a complete role list, usually one per provider. With one set (`main` by default) you never see sets. A role a set leaves out falls back along the chain in the table above, within that set. The active set is `set` if it names one; otherwise the only set, else `main`, else the first by name (and the file warns at startup when `set` is missing or wrong with several sets).
+Every role lives in a **set**: a complete role list, usually one per provider. With one set (`main` by default) you never see sets. A role a set leaves out falls back along the chain in the table above, within that set. The active set is `set` if it names one; otherwise the only set, else `main`, else the first by name (and the file warns at startup when `set` is missing or wrong with several sets). `[roles.<name>]` is not part of a set: a custom role's `description`, `fallback` and `delegate` belong to the role in every set, while the model it points at is per set.
 
 `/modelset` switches sets: bare it lists them, `/modelset <name>` makes one active for this profile (new sessions and subagents follow, and the current session moves to the set's `@default`, or `@plan` in plan mode). `/modelset new <name>` copies the active set and switches to it, `delete`, `rename`, and `import` complete it. `/model` edits roles in the active set.
 

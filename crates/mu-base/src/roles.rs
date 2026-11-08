@@ -2,6 +2,7 @@
 //! come from `models::role_chain`, so what is shown is what mu does.
 
 use crate::config::Configs;
+use crate::model_config::RoleMeta;
 use crate::models::{role_chain, role_chain_for, role_selector, split_level};
 
 struct Doc {
@@ -88,6 +89,16 @@ pub struct RoleView {
     pub unset: String,
     /// Agents that list the role in `model:`.
     pub agents: Vec<String>,
+    /// The role's whole `[roles.<name>].description`, for a custom role.
+    pub description: Option<String>,
+    /// The configured `[roles.<name>].fallback` list, in order.
+    pub fallbacks: Vec<String>,
+    /// The model may pick the role for a subagent (`[roles.<name>].delegate`).
+    pub delegate: bool,
+    /// Whether mu uses the role itself; only a custom role's settings can be edited.
+    pub custom: bool,
+    /// Sets other than the one being edited that also assign the role.
+    pub other_sets: Vec<String>,
 }
 
 impl RoleView {
@@ -114,6 +125,11 @@ impl RoleView {
         });
         out
     }
+
+    /// The `[roles.<name>]` settings this view shows.
+    pub fn meta(&self) -> RoleMeta {
+        RoleMeta { description: self.description.clone(), fallback: self.fallbacks.clone(), delegate: self.delegate }
+    }
 }
 
 /// Shown for a custom role that nothing refers to yet.
@@ -129,6 +145,10 @@ pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
             .map(|(name, _)| name.to_string())
             .collect()
     };
+    let active = cfg.active_set();
+    let other_sets = |name: &str| -> Vec<String> {
+        cfg.sets_with_role(name).into_iter().filter(|s| Some(s.as_str()) != active.as_deref()).collect()
+    };
     let view = |name: &str, purpose: &str, used_by: String, unset: &str, chain: Vec<String>| {
         let fallback = chain.into_iter().skip(1).find_map(|r| cfg.role(&r).map(|v| (r, v)));
         RoleView {
@@ -139,6 +159,11 @@ pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
             fallback,
             unset: unset.into(),
             agents: using(name),
+            description: None,
+            fallbacks: Vec::new(),
+            delegate: false,
+            custom: false,
+            other_sets: other_sets(name),
         }
     };
     let mut out: Vec<RoleView> =
@@ -186,7 +211,12 @@ pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
                 chain.push(r);
             }
         }
-        out.push(view(&name, purpose, used_by, "agents use @task", chain));
+        let mut v = view(&name, purpose, used_by, "agents use @task", chain);
+        v.description = meta.description;
+        v.fallbacks = meta.fallback;
+        v.delegate = meta.delegate;
+        v.custom = true;
+        out.push(v);
     }
     out
 }
@@ -201,6 +231,11 @@ pub fn unsaved(name: &str) -> RoleView {
         fallback: None,
         unset: "agents use @task".into(),
         agents: vec![],
+        description: None,
+        fallbacks: Vec::new(),
+        delegate: false,
+        custom: true,
+        other_sets: Vec::new(),
     }
 }
 
@@ -294,6 +329,15 @@ mod tests {
         let w = find(&v, "writer");
         assert_eq!((w.purpose.as_str(), w.row().as_str()), ("Long-form docs", "(unset → @smol) · Long-form docs"));
         assert!(w.used_by.contains("delegate = true"), "{}", w.used_by);
+        assert!(w.custom && w.delegate && !find(&v, "default").custom);
+        assert_eq!(
+            (w.description.as_deref(), w.fallbacks.as_slice()),
+            (Some("Long-form docs"), &["smol".to_string()][..])
+        );
+        assert_eq!(
+            w.meta(),
+            RoleMeta { description: Some("Long-form docs".into()), fallback: vec!["smol".into()], delegate: true }
+        );
         assert_eq!(find(&v, "commit").row(), "anthropic/y · Commit messages");
         assert_eq!(find(&v, "ghost").row(), "(unset) · Stale");
         assert!(find(&v, "multi").used_by.starts_with("Short\nlonger text\n"), "{:?}", find(&v, "multi").used_by);
@@ -302,6 +346,16 @@ mod tests {
         let u = unsaved("writer");
         assert_eq!((u.purpose.as_str(), u.value, u.agents.len()), ("custom role", None, 0));
         assert!(u.used_by.contains("nothing refers to it yet"));
+    }
+
+    #[test]
+    fn a_role_set_in_other_sets_says_where_else_it_is() {
+        let c =
+            cfg("set = \"main\"\n[sets.main]\nwriter = \"a/b\"\n[sets.work]\nwriter = \"c/d\"\ndefault = \"e/f\"\n");
+        let v = views(&c, &[]);
+        assert_eq!(find(&v, "writer").other_sets, ["work"]);
+        assert_eq!(find(&v, "default").other_sets, ["work"]);
+        assert!(find(&v, "writer").custom);
     }
 
     #[test]

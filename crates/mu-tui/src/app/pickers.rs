@@ -11,7 +11,7 @@ use crate::widgets::overlay::{ApproveState, LoginTarget, OverlayEvent};
 use crate::widgets::select::{Item, Select};
 use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
-use mu_base::model_config::MAIN_SET;
+use mu_base::model_config::{MAIN_SET, RoleMeta};
 use mu_base::models::GatewayModel;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_provider::provider::providers::KeyTarget;
@@ -380,16 +380,14 @@ impl App {
         self.open_queued_approval();
     }
 
-    fn save_role(&mut self, set: &str, role: &str, value: Option<&str>) {
-        match self.services.edit_role(set, role, value) {
+    fn save_role(&mut self, set: &str, role: &str, value: Option<&str>, meta: Option<&RoleMeta>) {
+        let saved = match meta {
+            Some(meta) => self.services.edit_custom_role(set, role, value, meta),
+            None => self.services.edit_role(set, role, value),
+        };
+        match saved {
             Ok(()) => {
-                let cfg = &self.services.providers.cfg;
-                let active = cfg.active_set().unwrap_or_else(|| MAIN_SET.into());
-                let roles = super::slash::role_views(cfg, &self.ctx);
-                if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
-                    st.saved(active, roles);
-                }
-                self.refresh_commands();
+                self.reload_role_views();
                 if value.is_some() {
                     self.notice(&format!("saved @{role} in set {set}"));
                 } else {
@@ -398,6 +396,27 @@ impl App {
             }
             Err(e) => self.error(&format!("could not save @{role}: {e}")),
         }
+    }
+
+    fn delete_role(&mut self, set: &str, role: &str) {
+        match self.services.edit_custom_role(set, role, None, &RoleMeta::default()) {
+            Ok(()) => {
+                self.reload_role_views();
+                self.notice(&format!("deleted @{role} from set {set}"));
+            }
+            Err(e) => self.error(&format!("could not delete @{role}: {e}")),
+        }
+    }
+
+    /// Rebuilds what the role editor and the command list show from the config just written.
+    fn reload_role_views(&mut self) {
+        let cfg = &self.services.providers.cfg;
+        let active = cfg.active_set().unwrap_or_else(|| MAIN_SET.into());
+        let roles = super::slash::role_views(cfg, &self.ctx);
+        if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
+            st.saved(active, roles);
+        }
+        self.refresh_commands();
     }
     /// Carries out what the user chose in an overlay.
     pub(super) fn on_overlay_event(&mut self, e: OverlayEvent) {
@@ -409,7 +428,10 @@ impl App {
             OverlayEvent::McpTrust(false, _) => {}
             OverlayEvent::SetModel(id) => self.send(Command::SetModel(id)),
             OverlayEvent::LoadRoleModels => self.request_role_models(),
-            OverlayEvent::SaveRole { set, role, value } => self.save_role(&set, &role, value.as_deref()),
+            OverlayEvent::SaveRole { set, role, value, meta } => {
+                self.save_role(&set, &role, value.as_deref(), meta.as_ref())
+            }
+            OverlayEvent::DeleteRole { set, role } => self.delete_role(&set, &role),
             OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ChatGpt) => self.chatgpt_row(),

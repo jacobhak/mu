@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyEvent, KeyEventKind};
-use mu_base::model_config::valid_set_name;
+use mu_base::model_config::{RoleMeta, valid_set_name};
 use mu_base::models::{Thinking, split_level};
 use mu_base::roles::{self, RoleView};
 
@@ -12,7 +12,17 @@ pub enum RoleEditorAction {
     Pending,
     Close,
     RequestModels,
-    Save { set: String, role: String, value: Option<String> },
+    /// `meta` is a custom role's `[roles.<name>]` settings; `None` for a role mu uses itself.
+    Save {
+        set: String,
+        role: String,
+        value: Option<String>,
+        meta: Option<RoleMeta>,
+    },
+    Delete {
+        set: String,
+        role: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +31,24 @@ enum Screen {
     Edit,
     Models,
     Thinking,
+    Fallbacks,
+    Description,
+    Confirm,
+}
+
+/// A row of the edit screen; the rows a role has depend on whether it is a custom one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditRow {
+    Model,
+    Thinking,
+    Fallbacks,
+    Description,
+    ClearDescription,
+    Delegate,
+    Clear,
+    Delete,
+    Save,
+    Cancel,
 }
 
 pub struct RoleEditor {
@@ -32,9 +60,17 @@ pub struct RoleEditor {
     added: bool,
     original: Option<String>,
     draft: Option<String>,
+    /// A custom role's draft `[roles.<name>]` settings; never written until Save.
+    meta: Option<RoleMeta>,
+    /// `meta` as it was when the editor opened, so an unchanged save is a no-op.
+    meta_original: Option<RoleMeta>,
     screen: Screen,
     select: Select,
+    /// The edit screen's rows, in the order they are shown.
+    rows: Vec<EditRow>,
     models: Vec<String>,
+    /// The role named by each row of the fallback screen.
+    choices: Vec<String>,
     request: Option<u64>,
     message: String,
 }
@@ -50,9 +86,13 @@ impl RoleEditor {
             added: false,
             original: None,
             draft: None,
+            meta: None,
+            meta_original: None,
             screen: Screen::Roles,
             select: Select::new("Model roles", vec![]),
+            rows: Vec::new(),
             models: Vec::new(),
+            choices: Vec::new(),
             request: None,
             message: String::new(),
         };
@@ -85,6 +125,8 @@ impl RoleEditor {
     /// Leaves Edit without saving; a role started in this session and never saved disappears.
     fn cancel_edit(&mut self) {
         self.draft = None;
+        self.meta = None;
+        self.meta_original = None;
         if self.added {
             self.roles.pop();
             self.role = None;
@@ -121,6 +163,9 @@ impl RoleEditor {
         let value = self.role.and_then(|i| self.roles[i].value.clone());
         self.original = value.clone();
         self.draft = value;
+        let role = &self.roles[self.role.expect("edit requires a role")];
+        self.meta = role.custom.then(|| role.meta());
+        self.meta_original = self.meta.clone();
         self.message.clear();
         self.show_edit();
     }
@@ -149,19 +194,66 @@ impl RoleEditor {
             model
         };
         let fallback = role.fallback.as_ref().map_or_else(|| role.unset.clone(), |(r, v)| format!("@{r} ({v})"));
-        let items = vec![
-            Item { label: "Model".into(), detail: model_detail },
-            Item { label: "Thinking".into(), detail: thinking },
+        let mut rows: Vec<(EditRow, Item)> = vec![
+            (EditRow::Model, Item { label: "Model".into(), detail: model_detail }),
+            (EditRow::Thinking, Item { label: "Thinking".into(), detail: thinking }),
+        ];
+        if let Some(meta) = &self.meta {
+            let chain = if meta.fallback.is_empty() {
+                "None · nothing is tried before @task's chain".to_string()
+            } else {
+                meta.fallback.iter().map(|r| format!("@{r}")).collect::<Vec<_>>().join(" then ")
+            };
+            rows.push((EditRow::Fallbacks, Item { label: "Fallbacks".into(), detail: chain }));
+            rows.push((
+                EditRow::Description,
+                Item {
+                    label: "Description".into(),
+                    detail: meta.description.as_deref().and_then(|d| d.lines().next()).unwrap_or("None").into(),
+                },
+            ));
+            if meta.description.is_some() {
+                rows.push((
+                    EditRow::ClearDescription,
+                    Item { label: "Clear description".into(), detail: "The model then sees only the name".into() },
+                ));
+            }
+            let delegate = if !meta.delegate {
+                "Off".to_string()
+            } else if meta.description.as_deref().is_none_or(|d| d.trim().is_empty()) {
+                "On, but there is no description: the model sees only the name".to_string()
+            } else {
+                "On: the model may pick this role for a subagent".to_string()
+            };
+            rows.push((EditRow::Delegate, Item { label: "Delegate".into(), detail: delegate }));
+        }
+        rows.push((
+            EditRow::Clear,
             Item {
                 label: "Clear assignment".into(),
                 detail: format!("Save restores the existing fallback chain: {fallback}"),
             },
+        ));
+        if role.custom {
+            rows.push((
+                EditRow::Delete,
+                Item {
+                    label: "Delete role…".into(),
+                    detail: format!("Removes it from set {} and its [roles.{}] settings", self.set, role.name),
+                },
+            ));
+        }
+        rows.push((
+            EditRow::Save,
             Item {
                 label: "Save".into(),
                 detail: self.draft.clone().unwrap_or_else(|| format!("Clear; restore {fallback}")),
             },
+        ));
+        rows.push((
+            EditRow::Cancel,
             Item { label: "Cancel".into(), detail: "Discard changes and return to roles".into() },
-        ];
+        ));
         let mut context = format!("Saved configuration · set {}\n{}\n", self.set, self.path.display());
         context.push_str(&role.detail());
         if let Some(original) = &self.original {
@@ -173,7 +265,84 @@ impl RoleEditor {
         if !self.message.is_empty() {
             context.push_str(&format!("\n{}", self.message));
         }
+        self.rows = rows.iter().map(|(row, _)| *row).collect();
+        let items = rows.into_iter().map(|(_, item)| item).collect();
         self.select = Select::new(&format!("Edit @{}", role.name), items).context(&context).back_keys(true);
+    }
+
+    /// Every role the edited one may fall back to, with its place in the chain.
+    fn show_fallbacks(&mut self, keep: Option<&str>) {
+        self.screen = Screen::Fallbacks;
+        let role = &self.roles[self.role.expect("fallbacks require a role")];
+        let (name, list) = (role.name.clone(), self.meta.as_ref().map(|m| m.fallback.clone()).unwrap_or_default());
+        let choices: Vec<String> = self.roles.iter().map(|r| r.name.clone()).filter(|r| *r != name).collect();
+        let mut items: Vec<Item> = choices
+            .iter()
+            .map(|r| {
+                let at = list.iter().position(|f| f == r);
+                let detail = match at {
+                    Some(i) => format!("Fallback {} · Enter removes it", i + 1),
+                    None => "Enter adds it at the end".into(),
+                };
+                Item { label: format!("@{r}"), detail }
+            })
+            .collect();
+        items.push(Item { label: "Done".into(), detail: "Back to the role".into() });
+        let chain = if list.is_empty() {
+            format!("No fallbacks: nothing is tried when @{name} has no model")
+        } else {
+            format!("Tried in order: {}", list.iter().map(|f| format!("@{f}")).collect::<Vec<_>>().join(" then "))
+        };
+        let context = format!(
+            "Fallbacks for @{name} · set {}\n{chain}\nThen @task's chain: agents naming @{name} use it when nothing here is set.",
+            self.set
+        );
+        let highlighted = keep
+            .and_then(|k| choices.iter().position(|c| c == k))
+            .or_else(|| list.first().and_then(|f| choices.iter().position(|c| c == f)));
+        let mut select = Select::new(&format!("Fallbacks for @{name}"), items).context(&context).back_keys(true);
+        if let Some(i) = highlighted {
+            select = select.preselect(i);
+        }
+        self.choices = choices;
+        self.select = select;
+    }
+
+    fn show_description(&mut self) {
+        self.screen = Screen::Description;
+        let role = &self.roles[self.role.expect("description requires a role")];
+        let current = self.meta.as_ref().and_then(|m| m.description.clone()).unwrap_or_default();
+        let context = format!(
+            "Description for @{}\nThe model reads it where it may pick this role for a subagent; the first line is shown beside the role.",
+            role.name
+        );
+        self.select = Select::new(&format!("Describe @{}", role.name), vec![])
+            .context(&context)
+            .free_text("Description")
+            .edit_text(&current)
+            .back_keys(true);
+    }
+
+    fn show_confirm(&mut self) {
+        self.screen = Screen::Confirm;
+        let role = &self.roles[self.role.expect("delete requires a role")];
+        let mut context = format!(
+            "Delete @{name}?\nRemoves it from set {set} and its [roles.{name}] settings.",
+            name = role.name,
+            set = self.set
+        );
+        if !role.other_sets.is_empty() {
+            context.push_str(&format!("\nIt stays set in {}.", role.other_sets.join(", ")));
+        }
+        if !role.agents.is_empty() {
+            context.push_str(&format!("\nAgents naming it: {}.", role.agents.join(", ")));
+        }
+        context.push_str("\nThis cannot be undone: models.toml is written at once.");
+        let items = vec![
+            Item { label: format!("Delete @{}", role.name), detail: "models.toml loses the role".into() },
+            Item { label: "Cancel".into(), detail: "Keep the role".into() },
+        ];
+        self.select = Select::new(&format!("Delete @{}?", role.name), items).context(&context).back_keys(true);
     }
 
     pub fn begin_models(&mut self, request: u64) {
@@ -240,6 +409,8 @@ impl RoleEditor {
         self.role = name.and_then(|name| self.roles.iter().position(|r| r.name == name));
         self.original = None;
         self.draft = None;
+        self.meta = None;
+        self.meta_original = None;
         self.open_roles();
     }
 
@@ -251,7 +422,9 @@ impl RoleEditor {
             SelectResult::Cancelled | SelectResult::Back => match self.screen {
                 Screen::Roles => return RoleEditorAction::Close,
                 Screen::Edit => self.cancel_edit(),
-                Screen::Models | Screen::Thinking => self.show_edit(),
+                Screen::Models | Screen::Thinking | Screen::Fallbacks | Screen::Description | Screen::Confirm => {
+                    self.show_edit()
+                }
             },
             SelectResult::Chosen(indices) => {
                 let Some(&i) = indices.first() else { return RoleEditorAction::Pending };
@@ -260,31 +433,69 @@ impl RoleEditor {
                         self.role = Some(i);
                         self.open_edit();
                     }
-                    Screen::Edit => match i {
-                        0 => return RoleEditorAction::RequestModels,
-                        1 if self.draft.is_some() => self.show_thinking(),
-                        1 => {
-                            self.message = "Choose a model first".into();
-                            self.show_edit();
+                    Screen::Edit => {
+                        let Some(row) = self.rows.get(i).copied() else { return RoleEditorAction::Pending };
+                        match row {
+                            EditRow::Model => return RoleEditorAction::RequestModels,
+                            EditRow::Thinking if self.draft.is_some() => self.show_thinking(),
+                            EditRow::Thinking => {
+                                self.message = "Choose a model first".into();
+                                self.show_edit();
+                            }
+                            EditRow::Fallbacks => self.show_fallbacks(None),
+                            EditRow::Description => self.show_description(),
+                            EditRow::ClearDescription => {
+                                if let Some(meta) = &mut self.meta {
+                                    meta.description = None;
+                                }
+                                self.show_edit();
+                            }
+                            EditRow::Delegate => {
+                                if let Some(meta) = &mut self.meta {
+                                    meta.delegate = !meta.delegate;
+                                }
+                                self.show_edit();
+                            }
+                            EditRow::Clear => {
+                                self.draft = None;
+                                self.show_edit();
+                            }
+                            EditRow::Delete => self.show_confirm(),
+                            EditRow::Save => {
+                                if self.draft == self.original && self.meta == self.meta_original {
+                                    self.cancel_edit();
+                                } else {
+                                    return RoleEditorAction::Save {
+                                        set: self.set.clone(),
+                                        role: self.roles[self.role.expect("edit requires a role")].name.clone(),
+                                        value: self.draft.clone(),
+                                        meta: self.meta.clone(),
+                                    };
+                                }
+                            }
+                            EditRow::Cancel => self.cancel_edit(),
                         }
-                        2 => {
-                            self.draft = None;
-                            self.show_edit();
-                        }
-                        3 => {
-                            if self.draft == self.original {
-                                self.cancel_edit();
-                            } else {
-                                return RoleEditorAction::Save {
-                                    set: self.set.clone(),
-                                    role: self.roles[self.role.expect("edit requires a role")].name.clone(),
-                                    value: self.draft.clone(),
-                                };
+                    }
+                    Screen::Fallbacks if i < self.choices.len() => {
+                        let choice = self.choices[i].clone();
+                        if let Some(meta) = &mut self.meta {
+                            match meta.fallback.iter().position(|f| *f == choice) {
+                                Some(pos) => {
+                                    meta.fallback.remove(pos);
+                                }
+                                None => meta.fallback.push(choice.clone()),
                             }
                         }
-                        4 => self.cancel_edit(),
-                        _ => {}
-                    },
+                        self.show_fallbacks(Some(&choice));
+                    }
+                    Screen::Fallbacks => self.show_edit(),
+                    Screen::Confirm if i == 0 => {
+                        return RoleEditorAction::Delete {
+                            set: self.set.clone(),
+                            role: self.roles[self.role.expect("delete requires a role")].name.clone(),
+                        };
+                    }
+                    Screen::Confirm => self.show_edit(),
                     Screen::Models if i < self.models.len() => {
                         let id = &self.models[i];
                         let suffix = self
@@ -315,6 +526,13 @@ impl RoleEditor {
                     self.open_roles();
                 }
             }
+            SelectResult::Text(text) if self.screen == Screen::Description => {
+                if let Some(meta) = &mut self.meta {
+                    let text = text.trim().to_string();
+                    meta.description = (!text.is_empty()).then_some(text);
+                }
+                self.show_edit();
+            }
             _ => {}
         }
         RoleEditorAction::Pending
@@ -335,11 +553,44 @@ mod tests {
             fallback: Some(("default".into(), "a/fallback".into())),
             unset: "uses session's model".into(),
             agents: vec!["worker".into()],
+            description: None,
+            fallbacks: Vec::new(),
+            delegate: false,
+            custom: false,
+            other_sets: Vec::new(),
+        }
+    }
+
+    /// A custom role, as `/model` lists one that a set assigns but nothing refers to.
+    fn custom(name: &str, value: Option<&str>) -> RoleView {
+        RoleView {
+            name: name.into(),
+            purpose: "custom role".into(),
+            used_by: "nothing refers to it yet".into(),
+            value: value.map(str::to_string),
+            fallback: Some(("default".into(), "a/fallback".into())),
+            unset: "agents use @task".into(),
+            agents: Vec::new(),
+            description: None,
+            fallbacks: Vec::new(),
+            delegate: false,
+            custom: true,
+            other_sets: Vec::new(),
         }
     }
 
     fn editor(value: Option<&str>) -> RoleEditor {
         RoleEditor::new("main".into(), "models.toml".into(), vec![role(value)], None).unwrap()
+    }
+
+    /// An editor on a custom @writer with the built-in @task and another custom role beside it.
+    fn custom_editor(value: Option<&str>) -> RoleEditor {
+        let roles = vec![role(None), custom("writer", value), custom("reviewer", None)];
+        RoleEditor::new("main".into(), "models.toml".into(), roles, Some("writer")).unwrap()
+    }
+
+    fn meta(e: &RoleEditor) -> RoleMeta {
+        e.meta.clone().expect("a custom role has settings")
     }
 
     fn press(e: &mut RoleEditor, code: KeyCode) -> RoleEditorAction {
@@ -416,7 +667,10 @@ mod tests {
         enter(&mut e);
         assert_eq!(e.draft, None);
         down(&mut e, 3);
-        assert_eq!(enter(&mut e), RoleEditorAction::Save { set: "main".into(), role: "task".into(), value: None });
+        assert_eq!(
+            enter(&mut e),
+            RoleEditorAction::Save { set: "main".into(), role: "task".into(), value: None, meta: None }
+        );
 
         let mut e = editor(Some("a/model:inherit"));
         enter(&mut e);
@@ -477,11 +731,118 @@ mod tests {
         assert!(e.models_loaded(9, vec![item("a/b")], vec!["a/b".into()], None));
         enter(&mut e);
         assert_eq!(e.draft.as_deref(), Some("a/b"));
-        down(&mut e, 3);
+        down(&mut e, 7);
         assert_eq!(
             enter(&mut e),
-            RoleEditorAction::Save { set: "main".into(), role: "writer".into(), value: Some("a/b".into()) }
+            RoleEditorAction::Save {
+                set: "main".into(),
+                role: "writer".into(),
+                value: Some("a/b".into()),
+                meta: Some(RoleMeta::default()),
+            }
         );
+    }
+
+    #[test]
+    fn fallbacks_are_added_in_order_and_removed_where_they_are() {
+        let mut e = custom_editor(None);
+        down(&mut e, 2);
+        enter(&mut e);
+        assert_eq!(e.screen, Screen::Fallbacks);
+        let shown = |e: &RoleEditor| texts(e).join("\n");
+        assert!(shown(&e).contains("@task  Enter adds it at the end"), "{}", shown(&e));
+
+        enter(&mut e);
+        assert_eq!(meta(&e).fallback, ["task"]);
+        assert!(shown(&e).contains("@task  Fallback 1 · Enter removes it"), "{}", shown(&e));
+
+        down(&mut e, 1);
+        enter(&mut e);
+        assert_eq!(meta(&e).fallback, ["task", "reviewer"]);
+        assert!(shown(&e).contains("Tried in order: @task then @reviewer"), "{}", shown(&e));
+
+        press(&mut e, KeyCode::Up);
+        enter(&mut e);
+        assert_eq!(meta(&e).fallback, ["reviewer"], "removing one keeps the others' order");
+
+        down(&mut e, 2);
+        enter(&mut e);
+        assert_eq!(e.screen, Screen::Edit, "Done goes back to the role");
+        assert_eq!(meta(&e).fallback, ["reviewer"]);
+        down(&mut e, 7);
+        assert_eq!(
+            enter(&mut e),
+            RoleEditorAction::Save {
+                set: "main".into(),
+                role: "writer".into(),
+                value: None,
+                meta: Some(RoleMeta { fallback: vec!["reviewer".into()], ..RoleMeta::default() }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_description_and_delegation_are_edited_and_cleared() {
+        let mut e = custom_editor(None);
+        down(&mut e, 3);
+        enter(&mut e);
+        assert_eq!(e.screen, Screen::Description);
+        assert!(e.select().is_editing());
+        for c in "Long-form docs".chars() {
+            press(&mut e, KeyCode::Char(c));
+        }
+        enter(&mut e);
+        assert_eq!(e.screen, Screen::Edit);
+        assert_eq!(meta(&e).description.as_deref(), Some("Long-form docs"));
+        let shown = |e: &RoleEditor| texts(e).join("\n");
+        assert!(shown(&e).contains("Description  Long-form docs"), "{}", shown(&e));
+
+        down(&mut e, 5);
+        assert!(shown(&e).contains("Delegate  Off"), "{}", shown(&e));
+        enter(&mut e);
+        assert!(meta(&e).delegate);
+        assert!(shown(&e).contains("Delegate  On: the model may pick this role for a subagent"), "{}", shown(&e));
+        down(&mut e, 4);
+        enter(&mut e);
+        assert_eq!(meta(&e).description, None, "Clear description drops it");
+        assert!(!shown(&e).contains("Clear description"), "{}", shown(&e));
+    }
+
+    #[test]
+    fn deleting_a_custom_role_needs_a_confirmation_naming_its_other_uses() {
+        let mut e = custom_editor(None);
+        e.roles[1].other_sets = vec!["work".into()];
+        e.roles[1].agents = vec!["docs".into()];
+        e.open_edit();
+        down(&mut e, 6);
+        enter(&mut e);
+        assert_eq!(e.screen, Screen::Confirm);
+        let shown = texts(&e).join("\n");
+        assert!(shown.contains("stays set in work") && shown.contains("Agents naming it: docs"), "{shown}");
+
+        down(&mut e, 1);
+        enter(&mut e);
+        assert_eq!(e.screen, Screen::Edit, "Cancel keeps the role");
+        down(&mut e, 6);
+        enter(&mut e);
+        assert_eq!(enter(&mut e), RoleEditorAction::Delete { set: "main".into(), role: "writer".into() });
+
+        let mut e = editor(None);
+        enter(&mut e);
+        assert!(texts(&e).iter().all(|l| !l.contains("Delete")), "{:?}", texts(&e));
+    }
+
+    #[test]
+    fn an_unchanged_custom_role_is_not_saved() {
+        let mut w = custom("writer", Some("a/m"));
+        w.description = Some("Docs".into());
+        w.fallbacks = vec!["smol".into()];
+        let mut e = RoleEditor::new("main".into(), "models.toml".into(), vec![role(None), w], Some("writer")).unwrap();
+        // Model, Thinking, Fallbacks, Description, Clear description, Delegate, Clear, Delete, Save, Cancel
+        down(&mut e, 8);
+        enter(&mut e);
+        assert_eq!(e.screen, Screen::Roles, "nothing changed, so Save is a no-op");
+        assert!(e.meta.is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The writes `App` makes outside the screen: model roles and sets, stored API keys, MCP server
 //! definitions and session control. Reads stay with their callers.
 
+use mu_base::model_config::RoleMeta;
 use mu_common::paths;
 use mu_provider::auth::store::Entry;
 use mu_provider::auth::web::WebSearch;
@@ -20,6 +21,16 @@ pub(super) struct Services {
 impl Services {
     pub(super) fn edit_role(&self, set: &str, role: &str, model: Option<&str>) -> Result<(), String> {
         self.providers.cfg.edit_role(set, role, model)
+    }
+
+    pub(super) fn edit_custom_role(
+        &self,
+        set: &str,
+        role: &str,
+        model: Option<&str>,
+        meta: &RoleMeta,
+    ) -> Result<(), String> {
+        self.providers.cfg.edit_custom_role(set, role, model, meta)
     }
 
     pub(super) fn switch_set(&self, name: &str) -> Result<(), String> {

@@ -1396,11 +1396,49 @@ pub(super) mod tests {
             set: "main".into(),
             role: "default".into(),
             value: Some("a/new:low".into()),
+            meta: None,
         });
         assert_eq!(cfg.role("default").as_deref(), Some("a/new:low"));
         assert!(std::fs::read_to_string(&path).unwrap().contains("default = \"a/new:low\""));
         assert_eq!(app.agent.status.model_id, "");
         assert!(commands.try_recv().is_err(), "role saves do not send commands to the session");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn saving_and_deleting_a_custom_role_writes_its_settings() {
+        use mu_base::config::{Configs, models_path};
+        let _guard = MODEL_CONFIG_TEST_LOCK.lock().unwrap();
+        mu_testutil::home();
+        let path = models_path();
+        let text = "[sets.main]\ndefault = \"a/old:high\"\nwriter = \"w/m\"\n";
+        std::fs::write(&path, text).unwrap();
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Rc::new(Configs::from_models_toml(text));
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
+        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
+        app.open_model_roles(Some("writer".into()));
+        let meta = mu_base::model_config::RoleMeta {
+            description: Some("Long-form docs".into()),
+            fallback: vec!["default".into()],
+            delegate: true,
+        };
+        app.on_overlay_event(OverlayEvent::SaveRole {
+            set: "main".into(),
+            role: "writer".into(),
+            value: Some("w/n".into()),
+            meta: Some(meta.clone()),
+        });
+        assert_eq!(cfg.role("writer").as_deref(), Some("w/n"));
+        assert_eq!(cfg.role_meta("writer"), Some(meta));
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(disk.contains("[roles.writer]") && disk.contains("delegate = true"), "{disk}");
+
+        app.on_overlay_event(OverlayEvent::DeleteRole { set: "main".into(), role: "writer".into() });
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!disk.contains("writer") && !disk.contains("[roles"), "{disk}");
+        assert_eq!((cfg.role("writer"), cfg.role_meta("writer")), (None, None));
+        assert!(commands.try_recv().is_err(), "role edits never reach the session");
         std::fs::remove_file(path).unwrap();
     }
 

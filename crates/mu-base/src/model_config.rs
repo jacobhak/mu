@@ -23,7 +23,7 @@ pub struct ModelConfig {
 }
 
 /// What `[roles.<name>]` says about a custom role beyond its models.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoleMeta {
     pub description: Option<String>,
@@ -186,6 +186,54 @@ pub fn remove_role(text: &str, set: &str, role: &str) -> Result<String, String> 
     if roles.remove(role).is_none() {
         return Ok(text.to_string());
     }
+    Ok(doc.to_string())
+}
+
+/// `meta` as `parse` holds it: `@` stripped, the role itself dropped, blank descriptions gone.
+fn canonical_meta(name: &str, meta: &RoleMeta) -> RoleMeta {
+    let mut fallback: Vec<String> = Vec::new();
+    for f in meta.fallback.iter().map(|f| f.strip_prefix('@').unwrap_or(f)) {
+        if f != name && !fallback.iter().any(|r| r == f) {
+            fallback.push(f.to_string());
+        }
+    }
+    RoleMeta {
+        description: meta.description.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(String::from),
+        fallback,
+        delegate: meta.delegate,
+    }
+}
+
+/// Writes `[roles.<name>]`: description, fallback list and delegate. Settings that read as they
+/// already do leave the file untouched; an empty `meta` removes the table. Other tables and
+/// comments are kept.
+pub fn write_role_meta(text: &str, name: &str, meta: &RoleMeta) -> Result<String, String> {
+    let meta = canonical_meta(name, meta);
+    if parse(text).0.roles.get(name).cloned().unwrap_or_default() == meta {
+        return Ok(text.to_string());
+    }
+    let mut doc = parse_doc(text)?;
+    let roles = doc
+        .as_table_mut()
+        .entry("roles")
+        .or_insert_with(|| Item::Table(implicit()))
+        .as_table_like_mut()
+        .ok_or_else(|| not_a_table("roles"))?;
+    if meta.description.is_none() && meta.fallback.is_empty() && !meta.delegate {
+        roles.remove(name);
+        return Ok(doc.to_string());
+    }
+    let mut t = Table::new();
+    if let Some(d) = &meta.description {
+        t.insert("description", value(d.as_str()));
+    }
+    if !meta.fallback.is_empty() {
+        t.insert("fallback", value(meta.fallback.iter().map(String::as_str).collect::<Array>()));
+    }
+    if meta.delegate {
+        t.insert("delegate", value(true));
+    }
+    roles.insert(name, Item::Table(t));
     Ok(doc.to_string())
 }
 
@@ -565,6 +613,42 @@ max_tokens = 65536
         assert!(remove_role("x = [", "main", "smol").is_err());
         assert!(remove_role("sets = 3\n", "main", "smol").is_err());
         assert!(remove_role("[sets]\nmain = 3\n", "main", "smol").is_err());
+    }
+
+    #[test]
+    fn role_meta_writes_only_the_rows_that_differ() {
+        let meta = RoleMeta {
+            description: Some("Long-form docs".into()),
+            fallback: vec!["@smol".into(), "default".into()],
+            delegate: true,
+        };
+        let text = "# keep\n[sets.main]\nwriter = \"a/b\"\n";
+        let out = write_role_meta(text, "writer", &meta).unwrap();
+        assert!(out.starts_with("# keep\n") && out.contains("[sets.main]"), "{out}");
+        assert_eq!(parse(&out).0.roles["writer"], canonical_meta("writer", &meta));
+        assert_eq!(write_role_meta(&out, "writer", &meta).unwrap(), out, "unchanged settings keep the file");
+        assert_eq!(
+            write_role_meta(&out, "writer", &RoleMeta { description: Some("Docs".into()), ..meta.clone() })
+                .unwrap()
+                .matches("[roles.writer]")
+                .count(),
+            1
+        );
+        let cleared = write_role_meta(&out, "writer", &RoleMeta::default()).unwrap();
+        assert!(!cleared.contains("[roles") && cleared.contains("[sets.main]"), "{cleared}");
+
+        let bare = write_role_meta("", "writer", &meta).unwrap();
+        assert_eq!(
+            parse(&bare).0.roles["writer"],
+            RoleMeta {
+                description: Some("Long-form docs".into()),
+                fallback: vec!["smol".into(), "default".into()],
+                delegate: true
+            }
+        );
+        assert!(write_role_meta("x = [", "writer", &meta).unwrap_err().contains("fix it by hand"));
+        assert!(write_role_meta("roles = 3\n", "writer", &meta).unwrap_err().contains("not a table"));
+        assert_eq!(write_role_meta("# only\n", "writer", &RoleMeta::default()).unwrap(), "# only\n");
     }
 
     #[test]
