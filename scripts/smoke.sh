@@ -70,9 +70,12 @@ wait_for "\$ sleep 8" 30
 check "steer reaches the model" wait_for "\$ date" 60
 wait_for "FIN" 60
 
-tmux send-keys -t "$tm" 'run bash (no pty, not async): sleep 60' Enter
-wait_for "● bash sleep 60" 30
+# Queue while the reply streams: input sent during a foreground bash call would release its wait
+# and reach the model at once, leaving nothing queued for the abort to return.
+tmux send-keys -t "$tm" 'Without tools, write a 3000-word story. Its first line is only the word KEEPER spelled backwards, in capitals.' Enter
+wait_for "REPEEK" 30
 tmux send-keys -t "$tm" 'queued text' Enter
+check "queued text waits in queue bar" wait_for "↳ steer: queued text" 5
 tmux send-keys -t "$tm" Escape
 check "abort" wait_for "[aborted]" 15
 check "queued text returns to composer" wait_for "❯ queued text" 5
