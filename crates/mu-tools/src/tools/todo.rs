@@ -32,6 +32,7 @@ pub struct Args {
     op: Option<String>,
     list: Option<Vec<InitEntry>>,
     task: Option<String>,
+    tasks: Option<Vec<String>>,
     phase: Option<String>,
     items: Option<Vec<String>>,
     reason: Option<String>,
@@ -51,10 +52,12 @@ pub fn description() -> &'static str {
 
 pub fn schema() -> Value {
     json!({"type":"object","properties":{
-        "op":{"type":"string","enum":OPS},
+        "op":{"type":"string","enum":OPS,
+            "description":"done, drop and rm with no task, tasks or phase act on every task"},
         "list":{"type":"array","description":"phases for init","items":{"type":"object","properties":{
             "phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["phase","items"]}},
-        "task":{"type":"string","description":"verbatim task content"},
+        "task":{"type":"string","description":"one task's verbatim content"},
+        "tasks":{"type":"array","items":{"type":"string"},"description":"several tasks for one done, drop, block, unblock or rm call"},
         "phase":{"type":"string"},
         "items":{"type":"array","items":{"type":"string"},"description":"tasks for flat init or append"},
         "reason":{"type":"string","description":"blocker note for block"}},"required":["op"]})
@@ -97,10 +100,31 @@ fn resolve_phase(phases: &[Phase], name: Option<&str>, errors: &mut Vec<String>)
     hit
 }
 
-/// (phase index, task index) targets for task / phase / everything.
+/// (phase index, task index) targets for tasks / phase / everything.
 fn targets(phases: &[Phase], a: &Args, errors: &mut Vec<String>) -> Vec<(usize, usize)> {
-    if a.task.is_some() {
-        return resolve_task(phases, a.task.as_deref(), errors).into_iter().collect();
+    let wanted: Vec<&str> = match (&a.task, &a.tasks) {
+        (Some(_), Some(_)) => {
+            errors.push("Pass `task` (one) or `tasks` (several), not both".into());
+            return Vec::new();
+        }
+        (Some(t), None) => vec![t.as_str()],
+        (None, Some(ts)) if ts.is_empty() => {
+            errors.push("Missing task content: `tasks` is empty".into());
+            return Vec::new();
+        }
+        (None, Some(ts)) => ts.iter().map(String::as_str).collect(),
+        (None, None) => Vec::new(),
+    };
+    if !wanted.is_empty() {
+        let mut hits = Vec::new();
+        for (i, c) in wanted.iter().enumerate() {
+            if wanted[..i].contains(c) {
+                errors.push(format!("Task \"{c}\" is listed twice in `tasks`"));
+            } else if let Some(hit) = resolve_task(phases, Some(c), errors) {
+                hits.push(hit);
+            }
+        }
+        return hits;
     }
     if a.phase.is_some() {
         return resolve_phase(phases, a.phase.as_deref(), errors)
@@ -108,6 +132,10 @@ fn targets(phases: &[Phase], a: &Args, errors: &mut Vec<String>) -> Vec<(usize, 
             .unwrap_or_default();
     }
     phases.iter().enumerate().flat_map(|(p, ph)| (0..ph.tasks.len()).map(move |t| (p, t))).collect()
+}
+
+fn has_target(a: &Args) -> bool {
+    a.task.is_some() || a.tasks.is_some() || a.phase.is_some()
 }
 
 fn normalize(phases: &mut [Phase]) {
@@ -160,6 +188,10 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
                 .collect()
         }
         "start" => {
+            if a.tasks.is_some() {
+                errors.push("start takes one task: pass it as `task`".into());
+                return phases;
+            }
             if let Some((p, t)) = resolve_task(&phases, a.task.as_deref(), errors) {
                 for (pi, ph) in phases.iter_mut().enumerate() {
                     for (ti, task) in ph.tasks.iter_mut().enumerate() {
@@ -180,7 +212,7 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
             phases
         }
         "block" => {
-            if a.task.is_none() && a.phase.is_none() {
+            if !has_target(a) {
                 errors.push("block requires a task or phase target".into());
                 return phases;
             }
@@ -199,7 +231,7 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
             phases
         }
         "unblock" => {
-            if a.task.is_none() && a.phase.is_none() {
+            if !has_target(a) {
                 errors.push("unblock requires a task or phase target".into());
                 return phases;
             }
@@ -213,9 +245,14 @@ fn apply(mut phases: Vec<Phase>, op: &str, a: &Args, errors: &mut Vec<String>) -
             phases
         }
         "rm" => {
-            if let Some(c) = &a.task {
-                if let Some((p, t)) = resolve_task(&phases, Some(c), errors) {
-                    phases[p].tasks.remove(t);
+            if a.task.is_some() || a.tasks.is_some() {
+                let hits = targets(&phases, a, errors);
+                for (p, ph) in phases.iter_mut().enumerate() {
+                    let mut idx: Vec<usize> = hits.iter().filter(|(hp, _)| *hp == p).map(|(_, t)| *t).collect();
+                    idx.sort_unstable();
+                    for t in idx.into_iter().rev() {
+                        ph.tasks.remove(t);
+                    }
                 }
             } else if a.phase.is_some() {
                 if let Some(p) = resolve_phase(&phases, a.phase.as_deref(), errors) {
@@ -430,6 +467,32 @@ mod tests {
 
     fn run(t: &Tools, v: Value) -> ToolOutput {
         t.todo(serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn several_tasks_in_one_call() {
+        let t = Tools::for_test();
+        run(&t, json!({"op":"init","list":[{"phase":"P","items":["a","b","c","d"]}]}));
+        let o = run(&t, json!({"op":"done","tasks":["a","b"]}));
+        assert!(!o.is_error && o.text.contains("Overall: 2/4 done"), "{}", o.text);
+        let before = t.todo_json();
+        let o = run(&t, json!({"op":"done","tasks":["c","nope"]}));
+        assert!(o.is_error && o.text.contains("Task \"nope\" not found"), "{}", o.text);
+        assert_eq!(t.todo_json(), before);
+        let o = run(&t, json!({"op":"block","tasks":["c","d"],"reason":"waiting"}));
+        assert!(o.text.matches("(blocked: waiting)").count() == 2, "{}", o.text);
+        let o = run(&t, json!({"op":"unblock","tasks":["c","d"]}));
+        assert!(!o.text.contains("blocked:"), "{}", o.text);
+        let o = run(&t, json!({"op":"rm","tasks":["c","d"]}));
+        assert!(!o.is_error && o.text.contains("Overall: 2/2 done"), "{}", o.text);
+        let o = run(&t, json!({"op":"start","tasks":["a","b"]}));
+        assert!(o.is_error && o.text.contains("start takes one task"), "{}", o.text);
+        let o = run(&t, json!({"op":"drop","task":"a","tasks":["b"]}));
+        assert!(o.is_error && o.text.contains("not both"), "{}", o.text);
+        let o = run(&t, json!({"op":"done","tasks":[]}));
+        assert!(o.is_error && o.text.contains("`tasks` is empty"), "{}", o.text);
+        let o = run(&t, json!({"op":"done","tasks":["b","b"]}));
+        assert!(o.is_error && o.text.contains("listed twice"), "{}", o.text);
     }
 
     #[test]
