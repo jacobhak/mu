@@ -1,4 +1,4 @@
-use super::subagent::run_child_observed;
+use super::subagent::{ArtifactAlloc, preview_result, run_child_observed};
 use super::{ToolCtx, Tools};
 use crate::permissions::Permissions;
 use futures_util::future::join_all;
@@ -13,6 +13,25 @@ use std::rc::Rc;
 /// Hard cap on tasks per call and on running background jobs.
 pub const MAX_TASKS: usize = 8;
 
+/// omp's bundled caps: a scout answers a slice, so its budget is half a worker's; a configured
+/// budget can lower these but never raise them.
+const BUNDLED_REQUEST_BUDGET: &[(&str, u32)] = &[("scout", 100), ("sonic", 100)];
+/// The bundled cap for any other agent.
+const DEFAULT_REQUEST_BUDGET: u32 = 200;
+
+/// The soft request budget of `agent`: `configured` (`[task] soft_request_budget`), lowered to the
+/// agent's bundled cap. 0 turns the guard off.
+pub fn soft_request_budget(agent: &str, configured: u32) -> u32 {
+    if configured == 0 {
+        return 0;
+    }
+    let bundled = BUNDLED_REQUEST_BUDGET
+        .iter()
+        .find(|(name, _)| *name == agent)
+        .map_or(DEFAULT_REQUEST_BUDGET, |(_, budget)| *budget);
+    configured.min(bundled)
+}
+
 #[derive(Deserialize)]
 pub struct Args {
     context: Option<String>,
@@ -23,6 +42,10 @@ pub struct Args {
 struct T {
     name: Option<String>,
     task: String,
+    /// How open-ended the child's problem is. Required, as in omp: a spawn that cannot say what is
+    /// already decided tends to hand over an open-ended survey instead of a slice.
+    #[serde(rename = "solutionSpace")]
+    _solution_space: String,
     agent: Option<String>,
     model: Option<String>,
     cwd: Option<String>,
@@ -33,7 +56,7 @@ struct T {
 
 macro_rules! guidance {
     () => {
-        " Each task runs in a fresh context with its own tools and returns its final message.\n\n# Agents\n- `task` (default): can read, edit and run commands; prefer one agent to investigate and edit its slice.\n- `scout`: read-only (read, grep, glob, web); for research over code you have not mapped yet.\n\n# Delegation\nFan genuinely independent slices out in one `tasks[]` batch; do shared prerequisites inline and sequence only true dependencies. Shared edits need one integration owner; set interfaces in `context`. Tell tasks to skip build/lint/tests mid-flight and run them once afterward. Agents start blank, so never reference the conversation.\n\n# Format\n`context`: shared background (`# Goal`, `# Contract` interfaces); do not repeat it per task.\n`name`: CamelCase label.\n`task`: self-contained (`# Target` files and non-goals, `# Change` steps and APIs, `# Acceptance` observable result)."
+        " Each task runs in a fresh context with its own tools and returns its final message.\n\n# Agents\n- `task` (default): can read, edit and run commands; prefer one agent to investigate and edit its slice.\n- `scout`: read-only (read, grep, glob, web); for research over code you have not mapped yet.\n\n# Delegation\nFan genuinely independent slices out in one `tasks[]` batch; do shared prerequisites inline and sequence only true dependencies. Shared edits need one integration owner; set interfaces in `context`. Tell tasks to skip build/lint/tests mid-flight and run them once afterward. Agents start blank, so never reference the conversation.\n\n# Format\n`context`: shared background (`# Goal`, `# Contract` interfaces); do not repeat it per task.\n`name`: CamelCase label.\n`solutionSpace`: how open-ended the child's problem is, whether the fix or design is given or which causes or designs remain open; volume of work does not widen it (`one fix: rename, names given`; `deadlock cause open, no repro`). NEVER name sibling agents or coordination.\n`task`: self-contained (`# Target` files and non-goals, `# Change` steps and APIs, `# Acceptance` observable result)."
     };
 }
 
@@ -54,8 +77,9 @@ pub fn schema(names: &[&str], roles: &[&str]) -> Value {
         "name":{"type":"string"},
         "task":{"type":"string"},
         "agent":{"type":"string","enum":agents},
+        "solutionSpace":{"type":"string","description":"How open-ended the child's problem is: the fix or design given, or which causes or designs remain open. Volume of work does not widen it."},
         "cwd":{"type":"string","description":"absolute path of an existing directory the task runs in (e.g. a git worktree); defaults to this session's directory"},
-        "outputSchema":{"type":"object","description":"JSON Schema for this task's result. The subagent must submit matching JSON via `yield`; you get it back as a ```json block. Omit for a free-text answer."}},"required":["task"]});
+        "outputSchema":{"type":"object","description":"JSON Schema for this task's result. The subagent must submit matching JSON via `yield`; you get it back as a ```json block. Omit for a free-text answer."}},"required":["task","solutionSpace"]});
     if !roles.is_empty() {
         item["properties"]["model"] = json!({
             "type": "string",
@@ -166,6 +190,7 @@ impl Tools {
                     cwd.clone(),
                     payload(agent, task, schemas[i], model.as_deref()),
                     self.permissions.clone(),
+                    self.artifact_dir(),
                 );
                 started.push(format!("{id} ({agent})"));
             }
@@ -176,7 +201,9 @@ impl Tools {
                 started.join(", ")
             ));
         }
-        run_foreground(&specs, &schemas, &exe, &payload, &ctx.cancel, &ctx.events, &self.permissions).await
+        let alloc = || self.next_artifact();
+        run_foreground(&specs, &schemas, &exe, &payload, &ctx.cancel, &ctx.events, &self.permissions, &self.cwd, &alloc)
+            .await
     }
 }
 
@@ -194,6 +221,8 @@ async fn run_foreground(
     cancel: &tokio_util::sync::CancellationToken,
     events: &EventTx,
     perms: &Rc<Permissions>,
+    cwd: &Path,
+    alloc: ArtifactAlloc<'_>,
 ) -> ToolOutput {
     let rows = RefCell::new(
         specs
@@ -245,7 +274,9 @@ async fn run_foreground(
     let text = specs
         .iter()
         .zip(&outs)
-        .map(|((n, a, _, _, _), o)| format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, o.text))
+        .map(|((n, a, _, _, _), o)| {
+            format!("## {n} ({a}) — {}\n{}", if o.ok { "ok" } else { "failed" }, preview_result(&o.text, cwd, alloc))
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     let mut res = if all_failed { ToolOutput::err(text) } else { ToolOutput::ok(text) };
@@ -295,7 +326,7 @@ mod cwd_tests {
     fn schema_accepts_an_optional_cwd_per_task() {
         let s = schema(&[], &[]);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["cwd"]["type"], "string");
-        assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task"]));
+        assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task", "solutionSpace"]));
     }
 
     #[test]
@@ -376,7 +407,7 @@ mod typed_tests {
     fn schema_accepts_an_optional_output_schema_per_task() {
         let s = schema(&[], &[]);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["outputSchema"]["type"], "object");
-        assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task"]));
+        assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task", "solutionSpace"]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -411,6 +442,26 @@ mod typed_tests {
         assert!(!o.ok);
     }
 
+    /// omp requires the spawn to say how open the child's problem is: no declaration, no spawn.
+    #[test]
+    fn a_task_must_declare_its_solution_space() {
+        let missing = serde_json::from_value::<Args>(json!({"tasks":[{"task":"x"}]}));
+        let err = missing.err().expect("solutionSpace is required").to_string();
+        assert!(err.contains("solutionSpace"), "{err}");
+        let ok = serde_json::from_value::<Args>(json!({"tasks":[{"task":"x","solutionSpace":"one fix: given"}]}));
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn a_budget_lowers_but_never_raises_the_bundled_cap() {
+        assert_eq!(soft_request_budget("scout", 200), 100, "a scout is capped at 100");
+        assert_eq!(soft_request_budget("task", 200), 200);
+        assert_eq!(soft_request_budget("scout", 50), 50, "a lower configured budget applies");
+        assert_eq!(soft_request_budget("task", 300), 200, "a worker never rises above 200");
+        assert_eq!(soft_request_budget("other", 200), 200, "an unnamed agent gets the default");
+        assert_eq!(soft_request_budget("scout", 0), 0, "0 turns the guard off");
+    }
+
     /// Echoes the task payload it read so the test can see it.
     const ECHO_CHILD: &str = r#"#!/bin/sh
 IFS= read -r line
@@ -433,14 +484,19 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut t = Tools::for_test();
         t.child_exe = Some(exe);
-        let args = || -> Args { serde_json::from_value(json!({"tasks":[{"task":"x","model":"@nope"}]})).unwrap() };
+        let args = || -> Args {
+            serde_json::from_value(json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","model":"@nope"}]}))
+                .unwrap()
+        };
         let out = t.task(args(), &ctx()).await;
         assert!(out.is_error && out.text.contains("not offered; no model roles are offered"), "{}", out.text);
         *t.delegated.borrow_mut() = vec!["@w".into()];
         let out = t.task(args(), &ctx()).await;
         assert!(out.is_error && out.text.contains("not offered; offered: @w"), "{}", out.text);
 
-        let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","model":"w"}]})).unwrap();
+        let a: Args =
+            serde_json::from_value(json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","model":"w"}]}))
+                .unwrap();
         let out = tokio::task::LocalSet::new().run_until(t.task(a, &ctx())).await;
         assert!(!out.is_error, "{}", out.text);
         assert!(out.text.contains(r#""model":"@w""#), "{}", out.text);
@@ -453,7 +509,10 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx =
             ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
-        let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","outputSchema":{"type":"bogus"}}]})).unwrap();
+        let a: Args = serde_json::from_value(
+            json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","outputSchema":{"type":"bogus"}}]}),
+        )
+        .unwrap();
         let out = t.task(a, &ctx).await;
         assert!(out.is_error && out.text.contains("outputSchema"), "{}", out.text);
     }

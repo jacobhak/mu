@@ -43,6 +43,11 @@ pub struct RunConfig {
     pub permission_mode: Option<PermissionMode>,
     /// A subagent's inherited `{"mode", "session"}` payload from its parent.
     pub inherited_permissions: Option<Value>,
+    /// Soft request budget for a subagent run (0 = no budget): a wrap-up notice at the budget, the
+    /// free-running turn stopped at 1.5x, and the run ended five requests after that.
+    pub request_budget: u32,
+    /// Whether the wrap-up notice is injected when the budget is crossed.
+    pub budget_notice: bool,
 }
 
 /// Messages queued while a turn runs, plus the turn's cancellation token. Only the agent loop touches it;

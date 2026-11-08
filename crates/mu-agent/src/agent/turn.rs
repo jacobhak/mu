@@ -211,6 +211,17 @@ impl Agent {
             if cancel.is_cancelled() {
                 return Flow::Aborted;
             }
+            let due = self.budget.as_mut().map(|b| b.step());
+            let notice = match (due, self.budget.as_ref()) {
+                (Some(d), Some(b)) => b.message(d),
+                _ => None,
+            };
+            if let Some(m) = notice {
+                self.push(Message::user(&m));
+            }
+            if due == Some(budget::Due::End) {
+                return Flow::Done;
+            }
             // Held until the reply ends: a reply that turns out to be a dismissal is never shown.
             let answering_reminder = matches!(self.messages.last(), Some(Message::User { content, .. }) if ask_nudge::is_reminder(&text_of(content)));
             let (reply, dismissed) = self.stream_reply(cancel, answering_reminder).await;
@@ -408,6 +419,11 @@ impl Agent {
         let since = std::time::SystemTime::now();
         let last = calls.len().saturating_sub(1);
         for (i, (id, name, args)) in calls.into_iter().enumerate() {
+            // Past 1.5x its budget the run only takes the result: `yield` still lands, nothing else.
+            if name != "yield" && self.budget.as_ref().is_some_and(|b| b.stopped()) {
+                self.emit_skipped(&id, &name, &args, SKIP_BUDGET);
+                continue;
+            }
             if skip.is_none() {
                 if cancel.is_cancelled() {
                     skip = Some(SKIP_ABORTED);

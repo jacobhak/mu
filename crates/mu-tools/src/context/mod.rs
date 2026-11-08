@@ -210,14 +210,29 @@ pub struct AgentDef {
 
 pub const REVIEW_LEAD: &str = "review-lead";
 
+/// The scout every `task` call gets unless it names another agent: read-only, no shell.
+pub const SCOUT: &str = "scout";
+/// The default worker of a `task` call: it reads, edits and runs commands.
+pub const TASK: &str = "task";
+
 /// Agents mu ships. They are not in `Context::agents`, so the main agent's `task` tool never offers them.
 pub fn builtin_agent(name: &str) -> Option<AgentDef> {
     let tools = |t: &[&str]| Some(t.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-    let model: Vec<String> = mu_base::models::role_chain("review").iter().map(|r| format!("@{r}")).collect();
-    let (description, tools, prompt) = match name {
+    let model =
+        |role: &str| -> Vec<String> { mu_base::models::role_chain(role).iter().map(|r| format!("@{r}")).collect() };
+    let (description, tools, role, prompt) = match name {
+        SCOUT => (
+            "Read-only research scouts",
+            tools(&["read", "grep", "glob", "web_search", "fetch"]),
+            SCOUT,
+            include_str!("../prompts/scout.md"),
+        ),
+        // No allowlist: a worker gets every tool the run offers, MCP and plugin tools included.
+        TASK => ("A worker that reads, edits and runs commands", None, TASK, include_str!("../prompts/task.md")),
         REVIEW_LEAD => (
             "Lead code reviewer",
             tools(&["read", "grep", "glob", "bash", "task"]),
+            "review",
             include_str!("../prompts/review-lead.md"),
         ),
         _ => return None,
@@ -226,7 +241,7 @@ pub fn builtin_agent(name: &str) -> Option<AgentDef> {
         name: name.into(),
         description: description.into(),
         tools,
-        model,
+        model: model(role),
         thinking: None,
         prompt: prompt.into(),
         output: None,
@@ -504,6 +519,26 @@ mod tests {
         assert_eq!(got[1].model, ["@smol", "@default"]);
         assert!(got[1].thinking.is_none());
         assert!(got.iter().all(|a| a.output.is_none()));
+    }
+
+    /// The built-in subagents carry their own instructions: without them a scout ran the main
+    /// agent's prompt and was told to use a shell it does not have.
+    #[test]
+    fn builtin_agents_carry_instructions_and_tools() {
+        let scout = builtin_agent(SCOUT).unwrap();
+        assert_eq!(
+            scout.tools.as_deref(),
+            Some(&["read".to_string(), "grep".into(), "glob".into(), "web_search".into(), "fetch".into()][..])
+        );
+        assert!(scout.prompt.contains("no shell") && scout.prompt.contains("<output>"));
+        let worker = builtin_agent(TASK).unwrap();
+        assert!(worker.tools.is_none(), "a worker gets every tool the run offers, MCP and plugin tools included");
+        assert!(worker.prompt.contains("final message is the result"));
+        assert_eq!(
+            builtin_agent(REVIEW_LEAD).unwrap().model,
+            mu_base::models::role_chain("review").iter().map(|r| format!("@{r}")).collect::<Vec<_>>()
+        );
+        assert!(builtin_agent("nope").is_none());
     }
 
     #[test]

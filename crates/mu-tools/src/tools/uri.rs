@@ -159,6 +159,30 @@ pub fn split_selector(p: &str) -> Option<(&str, &str)> {
     .then_some((head, tail))
 }
 
+/// A path whose trailing selector cannot be read as one, as the file it names and that selector.
+/// `x.rs:285:345` is the common case: two numbers where the documented form takes one range. It is
+/// returned only when the file exists, so a path that merely ends in digits stays "not found".
+pub fn bad_selector(p: &str, exists: impl Fn(&str) -> bool) -> Option<(String, String)> {
+    let selectorish = |s: &str| {
+        !s.is_empty()
+            && s.chars().any(|c| c.is_ascii_digit())
+            && s.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | ','))
+    };
+    let mut head = p;
+    let mut parts: Vec<&str> = Vec::new();
+    while let Some((h, t)) = head.rsplit_once(':') {
+        if !selectorish(t) {
+            return None;
+        }
+        parts.insert(0, t);
+        head = h;
+        if exists(head) {
+            return (parts.len() > 1).then(|| (head.to_string(), parts.join(":")));
+        }
+    }
+    None
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReadTarget {
     pub path: String,
@@ -235,5 +259,18 @@ mod read_target_tests {
         assert_eq!(read_target("a.rs:3,10-12:raw", ex), t("a.rs", Some("3,10-12"), true));
         assert_eq!(read_target("odd:raw", ex), t("odd:raw", None, false));
         assert_eq!(read_target("gone.rs:raw", ex), t("gone.rs:raw", None, false));
+    }
+
+    /// `x.rs:285:345` names a real file and a selector no form accepts: that is a selector error,
+    /// not a missing file. A path that is simply absent stays absent.
+    #[test]
+    fn two_numbers_after_a_file_are_a_bad_selector() {
+        let ex = |q: &str| q == "src/x.rs";
+        assert_eq!(bad_selector("src/x.rs:285:345", ex), Some(("src/x.rs".into(), "285:345".into())));
+        assert_eq!(bad_selector("src/x.rs:12-20", ex), None, "a good selector is read elsewhere");
+        assert_eq!(bad_selector("src/x.rs:1:2:3", ex), Some(("src/x.rs".into(), "1:2:3".into())));
+        assert_eq!(bad_selector("gone.rs:285:345", ex), None);
+        assert_eq!(bad_selector("src/x.rs", ex), None);
+        assert_eq!(bad_selector("src/x.rs:abc:def", ex), None);
     }
 }

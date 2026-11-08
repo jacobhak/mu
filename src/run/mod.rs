@@ -115,7 +115,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
                         .ok_or_else(|| anyhow!(mu_base::roles::not_configured(role, &cfgs)))?,
                 );
             } else {
-                let role = if p["agent"] == "scout" { "scout" } else { "task" };
+                let role = if p["agent"] == context::SCOUT { context::SCOUT } else { context::TASK };
                 sel = match &agent_def {
                     Some(d) => agent_selector(d, &cfgs),
                     None => models::role_selector(role, &cfgs),
@@ -171,9 +171,10 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         run.excluded = agent::HEADLESS_EXCLUDED.to_vec();
         run.parent_session = p["parentSession"].as_str().map(std::path::PathBuf::from);
         run.inherited_permissions = p.get("permissions").cloned();
-        if p["agent"] == "scout" {
-            run.allow = Some(["read", "grep", "glob", "web_search", "fetch"].map(String::from).to_vec());
-        }
+        // A budget the parent cannot raise: `[task] soft_request_budget`, capped per agent.
+        let agent_name = p["agent"].as_str().unwrap_or(context::TASK);
+        run.request_budget = mu_tools::tools::task::soft_request_budget(agent_name, cfgs.mu.task.soft_request_budget);
+        run.budget_notice = cfgs.mu.task.budget_notice;
     }
     if let Some(d) = &agent_def {
         apply_agent(&mut run, d);
@@ -331,14 +332,20 @@ async fn subagent(
     headless::subagent_mode(prompt, output_schema, cmd, ev).await
 }
 
-/// The subagent task on stdin, and the agent it names (`task` and `scout` are the built-in roles).
+/// The subagent task on stdin, and the agent it names: a project agent, else one of mu's built-in
+/// `task` and `scout`, whose tool allowlist and instructions then come from that definition.
 fn read_task(ctx: &context::Context) -> Result<(Value, Option<context::AgentDef>)> {
     // Only the first line: later lines are the parent's approval answers, read as they arrive.
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    let p: Value = serde_json::from_str(&input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
+    task_line(ctx, &input)
+}
+
+/// The first line as a payload and the agent it names; a payload without `agent` runs the worker.
+fn task_line(ctx: &context::Context, input: &str) -> Result<(Value, Option<context::AgentDef>)> {
+    let p: Value = serde_json::from_str(input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
     let mut def = None;
-    if let Some(name) = p["agent"].as_str().filter(|n| !matches!(*n, "task" | "scout")) {
+    if let Some(name) = p["agent"].as_str() {
         match ctx.agents.iter().find(|a| a.name == name).cloned().or_else(|| context::builtin_agent(name)) {
             Some(d) => def = Some(d),
             None => bail!("unknown agent `{name}`"),
@@ -351,7 +358,7 @@ fn apply_agent(run: &mut agent::RunConfig, def: &context::AgentDef) {
     run.allow = def.tools.clone();
     run.excluded = agent::HEADLESS_EXCLUDED.to_vec();
     run.agent_prompt = Some(format!(
-        "\nYou are running as the custom agent `{0}`. Follow its instructions exactly; they override your defaults.\n<agent name=\"{0}\">\n{1}\n</agent>\n",
+        "\nYou are running as the agent `{0}`. Follow its instructions exactly; they override your defaults.\n<agent name=\"{0}\">\n{1}\n</agent>\n",
         def.name,
         def.prompt.trim()
     ));
@@ -384,5 +391,25 @@ mod tests {
         );
         assert_eq!(task_output_schema(&json!({"outputSchema":null}), Some(&def)), Some(json!({"type":"object"})));
         assert_eq!(task_output_schema(&json!({}), None), None);
+    }
+
+    /// A `scout` payload carries no agent file, so the built-in one has to supply both the
+    /// instructions and the read-only allowlist; the worker gets every tool the run offers.
+    #[test]
+    fn a_scout_payload_gets_the_builtin_scout() {
+        let ctx = context::Context::default();
+        let (_, def) = task_line(&ctx, "{\"task\":\"t\",\"agent\":\"scout\"}\n").unwrap();
+        let scout = def.expect("a scout");
+        assert_eq!(scout.name, context::SCOUT);
+        assert_eq!(
+            scout.tools.as_deref(),
+            Some(&["read".to_string(), "grep".into(), "glob".into(), "web_search".into(), "fetch".into()][..])
+        );
+        assert!(scout.prompt.contains("no shell") && !scout.prompt.is_empty());
+        let (_, def) = task_line(&ctx, "{\"task\":\"t\",\"agent\":\"task\"}\n").unwrap();
+        assert!(def.expect("a worker").tools.is_none(), "a worker gets every tool the run offers");
+        let (_, def) = task_line(&ctx, "{\"task\":\"t\"}\n").unwrap();
+        assert!(def.is_none(), "no agent in the payload means the default worker");
+        assert!(task_line(&ctx, "{\"task\":\"t\",\"agent\":\"nope\"}\n").is_err());
     }
 }

@@ -1263,3 +1263,99 @@ fn without_notify_pending_files_are_ignored() {
         assert!(inbox::has_pending(&id));
     });
 }
+
+/// omp's soft request budget: the notice at the budget, the stop at 1.5x, tool calls refused after
+/// it, and the run ended five requests later, so a scout cannot survey forever.
+#[test]
+fn a_subagent_budget_steers_then_stops_the_run() {
+    run(async {
+        let reply = |i: usize| {
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: format!("t{i}"),
+                    name: "read".into(),
+                    arguments: json!({"path": "does-not-exist"}),
+                }],
+                StopReason::ToolUse,
+            ))
+        };
+        let script = (0..12).map(reply).collect();
+        let run_cfg = RunConfig { subagent: true, request_budget: 2, budget_notice: true, ..Default::default() };
+        // Requests 1: nothing, 2: the notice, 3: the stop, 4-7: refused calls, 8: the end.
+        let (mut a, _rx) = agent_run(script, Configs::default(), run_cfg);
+        a.turn(Some("go".to_string().into())).await;
+        let said: Vec<String> = a
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content, .. } => Some(text_of(content)),
+                _ => None,
+            })
+            .collect();
+        let notices: Vec<&String> = said.iter().filter(|t| t.contains("[budget notice]")).collect();
+        assert_eq!(notices.len(), 2, "one wrap-up notice and one stop: {said:?}");
+        assert!(notices[0].contains("soft budget: 2") && notices[0].contains("At 3 requests"), "{}", notices[0]);
+        assert!(notices[1].contains("no more tools will run"), "{}", notices[1]);
+        let skipped = a
+            .messages
+            .iter()
+            .filter(|m| matches!(m, Message::ToolResult { content, .. } if text_of(content).contains("past its request budget")))
+            .count();
+        assert!(skipped >= 1, "tool calls after the stop are refused: {skipped}");
+        let replies = a.messages.iter().filter(|m| matches!(m, Message::Assistant { .. })).count();
+        assert_eq!(replies, 7, "requests 1-7, then the 8th step ends the run");
+    });
+}
+
+/// The stop refuses tools, but a `yield` in the stopped reply still lands: a structured subagent
+/// delivers its result instead of failing as if it never submitted one.
+#[test]
+fn a_yield_after_the_budget_stop_still_lands() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![call("t1", "read")], StopReason::ToolUse)),
+            Ok(assistant(vec![call("t2", "read")], StopReason::ToolUse)),
+            Ok(assistant(vec![yield_call("y1", json!({"data":{"n":1}})), call("t3", "__panic")], StopReason::ToolUse)),
+        ];
+        let run_cfg = RunConfig { subagent: true, request_budget: 1, budget_notice: true, ..Default::default() };
+        let (mut a, _rx) = agent_run(script, Configs::default(), run_cfg);
+        *a.tools.output_schema.borrow_mut() =
+            Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
+        a.turn(Some("go".to_string().into())).await;
+        let r = results(&a);
+        assert!(r.iter().any(|(err, text)| !err && text.contains("Result submitted")), "{r:?}");
+        assert!(r.iter().any(|(err, text)| *err && text.contains("past its request budget")), "{r:?}");
+        assert!(!r.iter().any(|(_, text)| text.contains("panicked")), "the tool after the yield never ran: {r:?}");
+    });
+}
+
+/// The guard is for subagents only, and a budget of 0 turns it off.
+#[test]
+fn a_budget_needs_a_subagent_and_a_nonzero_ceiling() {
+    run(async {
+        let forever = || Ok(assistant(vec![call("t", "read")], StopReason::ToolUse));
+        let (mut top, _rx) = agent_run(
+            (0..10).map(|_| forever()).collect(),
+            Configs::default(),
+            RunConfig { request_budget: 1, budget_notice: true, ..Default::default() },
+        );
+        top.turn(Some("go".to_string().into())).await;
+        assert!(
+            !top.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content, .. } if text_of(content).contains("[budget notice]")))
+        );
+
+        let (mut off, _rx) = agent_run(
+            (0..10).map(|_| forever()).collect(),
+            Configs::default(),
+            RunConfig { subagent: true, request_budget: 0, budget_notice: true, ..Default::default() },
+        );
+        off.turn(Some("go".to_string().into())).await;
+        assert!(
+            !off.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content, .. } if text_of(content).contains("[budget notice]")))
+        );
+    });
+}

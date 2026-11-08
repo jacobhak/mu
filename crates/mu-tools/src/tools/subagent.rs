@@ -24,6 +24,45 @@ impl Outcome {
     }
 }
 
+/// Characters of a child's result the parent reads inline (omp's `FULL_OUTPUT_THRESHOLD`); past
+/// this the head is shown and the whole text goes to an `artifact://` file.
+pub const RESULT_PREVIEW_CHARS: usize = 5000;
+/// Names the next artifact of the parent session: its number and path.
+pub type ArtifactAlloc<'a> = &'a dyn Fn() -> (u32, std::path::PathBuf);
+
+/// What the parent reads of a child's result: `text` itself while it is short, else its head plus a
+/// pointer to the whole text. `cwd` scopes the redaction, so a secret the child echoed never lands
+/// in the artifact.
+pub fn preview_result(text: &str, cwd: &Path, alloc: impl FnOnce() -> (u32, std::path::PathBuf)) -> String {
+    let chars = text.chars().count();
+    if chars <= RESULT_PREVIEW_CHARS {
+        return text.to_string();
+    }
+    let end = text.char_indices().nth(RESULT_PREVIEW_CHARS).map_or(text.len(), |(i, _)| i);
+    let head = &text[..end];
+    // Prefer a line boundary, unless the first one is near the top (pretty-printed JSON would
+    // preview as a lone `{`).
+    let head = match head.rfind('\n') {
+        Some(i) if i >= end / 2 => &head[..i],
+        _ => head,
+    };
+    let (id, path) = alloc();
+    let saved = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, mu_base::secrets::redact(text, cwd).text))
+        .is_ok();
+    let lines = text.lines().count();
+    let kb = text.len().div_ceil(1024);
+    let more = chars - head.chars().count();
+    let note = if saved {
+        format!("[…{more} more characters; the whole result ({lines} lines, {kb} KB) is at artifact://{id}]")
+    } else {
+        format!("[…{more} more characters; this result could not be saved]")
+    };
+    format!("{head}\n\n{note}")
+}
+
 /// One line of a child's stdout: a progress event, or the final result.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -221,4 +260,45 @@ pub struct BackgroundResult {
     /// "exit 3", "timed out", "cancelled", …
     pub note: String,
     pub meta: Option<mu_base::tool::BashMeta>,
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    /// omp's envelope: a short result as is, a long one as its head plus a pointer to the artifact.
+    #[test]
+    fn a_long_result_is_previewed_and_saved() {
+        let d = std::env::temp_dir().join(format!("mu-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("7.log");
+        let alloc = || (7, path.clone());
+        let short = "x".repeat(RESULT_PREVIEW_CHARS);
+        assert_eq!(preview_result(&short, &d, alloc), short, "a result at the budget is shown whole");
+
+        let long: String = (0..400).map(|i| format!("line {i} of the report\n")).collect();
+        let text = preview_result(&long, &d, alloc);
+        assert!(text.len() < long.len(), "the preview is shorter");
+        assert!(text.contains("the whole result (400 lines"), "{}", text);
+        assert!(text.contains("artifact://7"), "{}", text);
+        assert!(text.starts_with("line 0 of the report\n"), "the head is a line boundary: {text}");
+        assert!(!text.contains("line 399"), "the tail is left to the artifact");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), long, "the artifact holds the whole text");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A secret in a child's result must not reach the artifact the parent is pointed at.
+    #[test]
+    fn the_artifact_is_redacted() {
+        let d = std::env::temp_dir().join(format!("mu-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        mu_base::secrets::register_stored("PREVIEW_TEST_KEY", "Qz9-preview-test-value");
+        let path = d.join("8.log");
+        let long = format!("{}{}\n", "x".repeat(RESULT_PREVIEW_CHARS), "Qz9-preview-test-value");
+        let _ = preview_result(&long, &d, || (8, path.clone()));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("Qz9-preview"), "{saved}");
+        assert!(saved.contains("[REDACTED:PREVIEW_TEST_KEY]"), "{saved}");
+        std::fs::remove_dir_all(&d).ok();
+    }
 }

@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::permissions::Permissions;
-use crate::tools::subagent::{BackgroundResult, Outcome, run_child_observed};
+use crate::tools::subagent::{BackgroundResult, Outcome, preview_result, run_child_observed};
 use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
@@ -441,6 +441,7 @@ impl JobsHandle {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         self: &Rc<Self>,
         id: String,
@@ -449,6 +450,7 @@ impl JobsHandle {
         cwd: PathBuf,
         payload: Value,
         perms: Rc<Permissions>,
+        artifacts: PathBuf,
     ) {
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
@@ -466,7 +468,8 @@ impl JobsHandle {
             let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
-            Finished { ok: out.ok, text: out.text, note: None, meta: None }
+            let text = preview_result(&out.text, &cwd, || crate::tools::Tools::next_artifact_in(&artifacts));
+            Finished { ok: out.ok, text, note: None, meta: None }
         });
     }
 
@@ -988,6 +991,7 @@ pub(crate) mod tests {
                     base.clone(),
                     serde_json::json!({"task": "find  x\nnow"}),
                     Rc::default(),
+                    base.join("artifacts"),
                 );
                 assert_eq!(h.finished().await.len(), 1);
             })

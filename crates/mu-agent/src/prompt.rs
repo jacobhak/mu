@@ -28,6 +28,8 @@ pub struct PromptInput<'a> {
     /// Background jobs exist (interactive sessions): an ordinary `bash` command may wait for its
     /// result instead of ending the turn (`wait` exists).
     pub jobs: bool,
+    /// The `bash` tool is offered to this run; the shell rules are only stated then.
+    pub bash: bool,
 }
 
 /// How a command that takes a while is run. Without background jobs the only way to wait is to end
@@ -35,6 +37,10 @@ pub struct PromptInput<'a> {
 const BASH_ASYNC_RULE: &str = "- Commands that may run longer than ~5 seconds MUST use `bash` with `async: true`. It returns a job id at once; when the job finishes, mu automatically starts your next turn with its result, with no user input needed. Meanwhile do other work that does not depend on it; when your next step needs the result, end your turn with a short status and no tool call. Never wait for a job in the foreground.";
 
 const BASH_WAIT_RULE: &str = "- `bash` runs every command in its own shell: pass `cwd` and the environment a command needs, and put setup that must carry over into the same command. Nothing persists between calls, and background descendants end with the call.\n- A command may run in the foreground until it finishes. When a result is needed now, use `wait` on a background job; it returns as soon as one of the jobs finishes, and a new prompt from the user releases the wait without stopping the work. Use `async: true` for independent concurrent work or a long-lived service: it returns a job id at once and its result arrives as a system notice, with no user input needed.";
+
+/// A read-only agent (`scout`) has no shell: saying what to do instead beats naming a tool it cannot call.
+const NO_SHELL_RULE: &str =
+    "- This run has no shell: read with `read`, search with `grep`/`glob`, and say when only a shell could answer.";
 
 const SYSTEM: &str = include_str!("prompts/system.md");
 
@@ -83,7 +89,13 @@ pub(crate) fn system_prompt(i: &PromptInput) -> String {
     } else {
         ""
     };
-    let bash_wait_rule = if i.jobs { BASH_WAIT_RULE } else { BASH_ASYNC_RULE };
+    let bash_wait_rule = if !i.bash {
+        NO_SHELL_RULE
+    } else if i.jobs {
+        BASH_WAIT_RULE
+    } else {
+        BASH_ASYNC_RULE
+    };
     let mut s = SYSTEM
         .replace("{edit_rule}", edit_rule)
         .replace("{bash_wait_rule}", bash_wait_rule)
@@ -204,6 +216,7 @@ mod tests {
             model: "m",
             hashline: true,
             jobs: false,
+            bash: true,
             cwd: &proj,
             ctx: &ctx,
             plan: None,
@@ -236,6 +249,7 @@ mod tests {
             model: "m",
             hashline: true,
             jobs: false,
+            bash: true,
             cwd: &proj,
             ctx: &ctx,
             plan: None,
@@ -258,6 +272,7 @@ mod tests {
             model: "m",
             hashline,
             jobs: false,
+            bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -284,6 +299,7 @@ mod tests {
             model: "m",
             hashline: true,
             jobs,
+            bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -305,6 +321,34 @@ mod tests {
         assert!(!off.contains("use `wait`"));
     }
 
+    /// A run without `bash` must not be told how to call it: `scout` has no shell at all.
+    #[test]
+    fn no_shell_rule_replaces_the_bash_rules() {
+        let ctx = Context::default();
+        let plugins = std::collections::BTreeMap::new();
+        let input = |bash| PromptInput {
+            model: "m",
+            hashline: true,
+            jobs: false,
+            bash,
+            cwd: Path::new("/tmp"),
+            ctx: &ctx,
+            plan: None,
+            subagent: true,
+            ask: false,
+            task: false,
+            agent_prompt: None,
+            plugin_ctx: &plugins,
+            mcp_instructions: None,
+            roles: &[],
+        };
+        let sp = system_prompt(&input(false));
+        assert!(sp.contains("This run has no shell"), "{sp}");
+        assert!(!sp.contains("MUST use `bash`"), "{sp}");
+        assert!(!sp.contains("use `wait`") && !sp.contains("{bash_wait_rule}"), "{sp}");
+        assert!(system_prompt(&input(true)).contains("MUST use `bash` with `async: true`"));
+    }
+
     #[test]
     fn delegation_only_when_task_is_offered_to_a_parent() {
         let ctx = Context::default();
@@ -313,6 +357,7 @@ mod tests {
             model: "m",
             hashline: true,
             jobs: false,
+            bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -338,6 +383,7 @@ mod tests {
             model: "m",
             hashline: true,
             jobs: false,
+            bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -362,6 +408,7 @@ mod tests {
             model: "m",
             hashline: true,
             jobs: false,
+            bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,
@@ -396,6 +443,7 @@ mod tests {
             model: "m",
             hashline: true,
             jobs: false,
+            bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
             plan: None,

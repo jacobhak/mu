@@ -9,9 +9,64 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-#[derive(Deserialize)]
+/// A target for `read`: the path, with any selector inline as documented.
 pub struct Args {
     path: String,
+}
+
+/// The keys models pass instead of an inline selector. They are folded into `path` when the call is
+/// read, so that one form reaches the tool: a bare `selector`/`offset`/`limit` used to be dropped
+/// silently, which returned the whole file when a range was asked for.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Raw {
+    path: String,
+    selector: Option<String>,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    raw: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for Args {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = Raw::deserialize(d)?;
+        Ok(Args { path: fold(raw).map_err(serde::de::Error::custom)? })
+    }
+}
+
+/// `path` with a `selector`, an `offset`+`limit` pair or `raw` folded into its inline selector. An
+/// inline selector in `path` wins: it is the documented form, and a caller that wrote both meant it.
+fn fold(a: Raw) -> Result<String, String> {
+    if super::uri::split_selector(&a.path).is_some() || a.path.ends_with(":raw") {
+        return Ok(a.path);
+    }
+    let sel = match a.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let s = s.strip_prefix(':').unwrap_or(s);
+            if !s.chars().any(|c| c.is_ascii_digit())
+                || !s.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | ','))
+            {
+                return Err(format!("invalid selector `{s}`: use `:N`, `:N-M`, `:N+K` or `:-K`"));
+            }
+            Some(s.to_string())
+        }
+        None => match (a.offset, a.limit) {
+            (None, None) => None,
+            (_, Some(0)) => return Err("`limit` must be at least 1".into()),
+            (Some(o), Some(k)) => Some(format!("{}+{k}", o.max(1))),
+            (Some(o), None) => Some(o.max(1).to_string()),
+            (None, Some(k)) => Some(format!("1+{k}")),
+        },
+    };
+    let mut p = a.path;
+    if let Some(s) = sel {
+        p.push(':');
+        p.push_str(&s);
+    }
+    if a.raw == Some(true) {
+        p.push_str(":raw");
+    }
+    Ok(p)
 }
 
 impl Args {
@@ -19,6 +74,11 @@ impl Args {
         vec![self.path.clone()]
     }
 }
+
+/// Identical reads of one path and selector tolerated before the model is told re-reading changes
+/// nothing (omp's threshold), and how many such reads are tracked per session.
+const REPEAT_READ_HINT: u32 = 3;
+const REPEAT_READ_TRACKER_CAP: usize = 64;
 
 const DEFAULT_LINES: usize = 300;
 const MAX_LINES: usize = 3000;
@@ -277,8 +337,8 @@ fn render(
 
 impl Tools {
     pub async fn read(&self, a: Args) -> ToolOutput {
-        let super::uri::ReadTarget { path: authored, sel, raw: raw_mode } =
-            super::uri::read_target(&a.path, |p| self.resolve(p).is_ok_and(|r| r.path.exists()));
+        let exists = |p: &str| self.resolve(p).is_ok_and(|r| r.path.exists());
+        let super::uri::ReadTarget { path: authored, sel, raw: raw_mode } = super::uri::read_target(&a.path, exists);
         let res = match self.resolve(&authored) {
             Ok(r) => r,
             Err(e) => return ToolOutput::err(e),
@@ -286,6 +346,11 @@ impl Tools {
         let abs = res.path;
         let disp = if res.scheme.is_some() { authored.to_string() } else { self.display(&abs) };
         if !abs.exists() {
+            if let Some((file, sel)) = super::uri::bad_selector(&a.path, exists) {
+                return ToolOutput::err(format!(
+                    "Invalid selector `:{sel}` in {file}: a selector takes one form, `:N`, `:N-M`, `:N+K` or `:-K`, written inline as `{file}:N-M`"
+                ));
+            }
             return ToolOutput::err(match res.scheme {
                 Some(super::uri::Scheme::Artifact) => format!("{authored} not found"),
                 _ => format!("File not found: {disp}"),
@@ -361,7 +426,38 @@ impl Tools {
         }
         let mut result = ToolOutput::ok(out);
         result.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag, plan: false }));
+        if let Some(note) = self.repeated_read(&a.path, &result.text) {
+            result.text.push_str(&note);
+        }
         result
+    }
+
+    /// The note an identical re-read earns. omp appends one after `REPEAT_READ_HINT` identical
+    /// outputs; the read still runs, but the model is told re-reading cannot change the answer.
+    fn repeated_read(&self, key: &str, text: &str) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        let fingerprint = h.finish();
+        let mut seen = self.repeats.borrow_mut();
+        if !seen.contains_key(key) && seen.len() >= REPEAT_READ_TRACKER_CAP {
+            seen.clear();
+        }
+        let count = match seen.get_mut(key) {
+            Some((fp, count)) if *fp == fingerprint => {
+                *count += 1;
+                *count
+            }
+            _ => {
+                seen.insert(key.to_string(), (fingerprint, 1));
+                1
+            }
+        };
+        (count >= REPEAT_READ_HINT).then(|| {
+            format!(
+                "\n\n[You have received this identical output {count} times. Re-reading `{key}` will not change it — narrow the selector (`:N-M`) or proceed with what you have.]"
+            )
+        })
     }
 }
 
@@ -583,6 +679,68 @@ mod tests {
         for s in ["", "a", "a\n", "a\nb", "\n\n", "a\n\nb\n", "x\n\n\n"] {
             assert_eq!(line_count(s), s.lines().count(), "{s:?}");
         }
+    }
+
+    /// A `selector`/`offset`/`limit` key and the documented inline form mean the same thing: models
+    /// pass either, and a silently dropped selector used to return a whole file.
+    #[test]
+    fn argument_style_selectors_fold_into_the_path() {
+        let path = |v: serde_json::Value| -> Result<String, String> {
+            serde_json::from_value::<Args>(v).map(|a| a.path).map_err(|e| e.to_string())
+        };
+        let ok = |v: serde_json::Value| path(v).unwrap();
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","selector":":10-20"})), "a.rs:10-20");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","selector":"10"})), "a.rs:10");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","selector":"3,5-7","raw":true})), "a.rs:3,5-7:raw");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","offset":5,"limit":10})), "a.rs:5+10");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","offset":0,"limit":1})), "a.rs:1+1");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","limit":10})), "a.rs:1+10");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","offset":40})), "a.rs:40");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs:1-5","selector":"9-10"})), "a.rs:1-5", "the inline form wins");
+        assert_eq!(ok(serde_json::json!({"path":"a.rs","raw":true})), "a.rs:raw");
+        let e = path(serde_json::json!({"path":"a.rs","selector":":285:345"})).unwrap_err();
+        assert!(e.contains("invalid selector"), "{e}");
+        assert!(path(serde_json::json!({"path":"a.rs","limit":0})).is_err());
+        let e = path(serde_json::json!({"path":"a.rs","lines":"1-5"})).unwrap_err();
+        assert!(e.contains("unknown field"), "{e}");
+    }
+
+    /// omp's loop breaker: the third identical read of one path and selector says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_third_identical_read_is_flagged() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("p.txt"), "a\nb\nc\n").unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "p.txt".into() }).await;
+        assert!(!o.text.contains("identical output"), "{}", o.text);
+        let o = t.read(Args { path: "p.txt".into() }).await;
+        assert!(!o.text.contains("identical output"), "{}", o.text);
+        let o = t.read(Args { path: "p.txt".into() }).await;
+        assert!(o.text.contains("identical output 3 times"), "{}", o.text);
+        // A different range is a different read, and a changed file starts the count over.
+        let o = t.read(Args { path: "p.txt:1-2".into() }).await;
+        assert!(!o.text.contains("identical output"), "{}", o.text);
+        std::fs::write(d.join("p.txt"), "a\nb\nc\nd\n").unwrap();
+        let o = t.read(Args { path: "p.txt".into() }).await;
+        assert!(!o.text.contains("identical output"), "{}", o.text);
+    }
+
+    /// `path:N:M` is a selector error, not a missing file: the old message sent the model looking
+    /// for a file named `x.txt:1:2`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_two_number_selector_names_the_selector() {
+        let d = std::env::temp_dir().join(format!("mu-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("p.txt"), "a\nb\nc\n").unwrap();
+        let mut t = Tools::for_test();
+        t.cwd = d.clone();
+        let o = t.read(Args { path: "p.txt:1:2".into() }).await;
+        assert!(o.is_error);
+        assert!(o.text.contains("Invalid selector `:1:2` in p.txt"), "{}", o.text);
+        let o = t.read(Args { path: "gone.txt:1:2".into() }).await;
+        assert!(o.text.contains("File not found: gone.txt:1:2"), "{}", o.text);
     }
 
     #[tokio::test(flavor = "current_thread")]

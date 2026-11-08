@@ -1,3 +1,4 @@
+mod budget;
 mod compaction;
 mod state;
 pub use state::RunConfig;
@@ -75,6 +76,8 @@ pub struct Agent {
     resumed: bool,
     user_turn: u32,
     turn_msgs: Vec<Value>,
+    /// A subagent's soft request budget; `None` on every other run.
+    budget: Option<budget::Budget>,
     /// Test seam: the executable `/review` runs as its child instead of this mu.
     #[cfg(test)]
     review_child: Option<PathBuf>,
@@ -157,6 +160,7 @@ const SKIP_ABORTED: &str = "Tool call aborted by user";
 const SKIP_STEER: &str = "Skipped: the user sent a new message";
 const SKIP_YIELDED: &str = "Skipped: the result was already submitted with `yield`";
 const SKIP_TRUNCATED: &str = "Tool call not executed: output was truncated (max_tokens)";
+const SKIP_BUDGET: &str = "Skipped: the run is past its request budget, deliver the final result";
 
 /// Tools a headless front end never offers: nobody is there to answer `ask` or approve a plan.
 pub const HEADLESS_EXCLUDED: [&str; 2] = ["ask", "propose_plan"];
@@ -257,6 +261,8 @@ impl Agent {
             permissions.set_mode(m);
         }
         tools.permissions = permissions;
+        let budget = (i.run.subagent && i.run.request_budget > 0)
+            .then(|| budget::Budget::new(i.run.request_budget, i.run.budget_notice));
         let (title_tx, title_rx) = unbounded_channel();
         Self {
             tools,
@@ -301,6 +307,7 @@ impl Agent {
             resumed: false,
             user_turn: 0,
             turn_msgs: Vec::new(),
+            budget,
             #[cfg(test)]
             review_child: None,
         }
@@ -382,6 +389,7 @@ impl Agent {
             mcp_instructions: mcp.as_deref(),
             hashline: mu_tools::tools::edit::is_hashline(),
             jobs: self.tools.jobs.is_some(),
+            bash: self.policy().permits("bash"),
         })
     }
 

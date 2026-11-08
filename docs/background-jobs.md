@@ -2,6 +2,8 @@
 
 `task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session, so a turn that has nothing else to do just ends. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
 
+A result longer than 5000 characters comes back as its head plus a pointer: the whole text is written to an `artifact://` file the notice names, which `read` opens. A subagent also runs under a soft request budget ([`[task]`](config.md)): at the budget it is told to wrap up, at 1.5x it is stopped and asked for what it has, and five requests later the run ends.
+
 `/review` runs its `review-lead` as a job too (the card says `job review`): it is listed here, Enter opens its transcript and `x` cancels it, but its result goes to the findings dialog, never to the model as a notice.
 
 A `bash` call with `async` shows in the transcript as one line, `● Bash <command>`, since all it does is start the job. Its row above the prompt carries the run time while it runs, and when the job finishes its output is printed as the usual `bash` card: the command, the tail of its output and a footer with `Wall:` and, unless it ended at exit 0, how it ended.

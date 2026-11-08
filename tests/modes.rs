@@ -107,6 +107,83 @@ fn headless_runs_the_task_payload_and_reports_its_result() {
     assert_eq!(result["isError"], false);
 }
 
+/// A scout payload carries no agent file. Without a built-in one it ran the main agent's prompt and
+/// was told to use a shell it does not have.
+#[test]
+fn a_scout_gets_its_own_prompt_and_no_shell() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        block_on(async move {
+            tx.send(fake_server(vec![sse(ANSWER)]).await).unwrap();
+            std::future::pending::<()>().await;
+        })
+    });
+    let (base, seen) = rx.recv().unwrap();
+    let home = home_with_key(&base);
+    let cwd = mu_testutil::tmp();
+    let payload = json!({"agent": "scout", "task": "say hello"}).to_string();
+    let mut c = mu(&home, &cwd);
+    let o = run_with_stdin(c.args(["--headless", "--model", MODEL]), &payload);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let result: serde_json::Value = stdout(&o).lines().map(|l| serde_json::from_str(l).unwrap()).next_back().unwrap();
+    assert_eq!(result["text"], "hello from the fake");
+    let requests = seen.lock().unwrap();
+    let body = requests.first().expect("a request");
+    assert!(body.contains("This run has no shell"), "the scout prompt: {body}");
+    assert!(!body.contains("MUST use `bash`"), "no shell rules for a scout: {body}");
+    assert!(body.contains("\"name\":\"read\""), "read is offered: {body}");
+    assert!(!body.contains("\"name\":\"bash\""), "bash is not offered: {body}");
+}
+
+/// Every line of every session file under `dir`.
+fn session_texts(dir: &Path) -> String {
+    let mut out = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "jsonl") {
+                out.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
+            }
+        }
+    }
+    out
+}
+
+/// `[task] soft_request_budget` reaches the child: a scout on a budget of 2 is steered to wrap up
+/// on its second request, and the notice is in its own session.
+#[test]
+fn a_subagent_runs_under_the_configured_request_budget() {
+    let replies = vec![
+        tool_use("t1", "read", json!({"path": "a.txt"})),
+        tool_use("t2", "read", json!({"path": "a.txt"})),
+        tool_use("t3", "read", json!({"path": "a.txt"})),
+        sse(ANSWER),
+    ];
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        block_on(async move {
+            tx.send(fake_server(replies).await).unwrap();
+            std::future::pending::<()>().await;
+        })
+    });
+    let (base, _seen) = rx.recv().unwrap();
+    let home = home_with_key(&base);
+    std::fs::write(home.join("config.toml"), "[task]\nsoft_request_budget = 2\n").unwrap();
+    let cwd = mu_testutil::tmp();
+    std::fs::write(cwd.join("a.txt"), "x\n").unwrap();
+    let payload = json!({"agent": "scout", "task": "look"}).to_string();
+    let mut c = mu(&home, &cwd);
+    let o = run_with_stdin(c.args(["--headless", "--model", MODEL]), &payload);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let sessions = session_texts(&home.join("sessions"));
+    assert!(sessions.contains("[budget notice]"), "the wrap-up notice is in the child session");
+    assert!(sessions.contains("soft budget: 2"), "the configured budget, not the bundled 100");
+    assert!(sessions.contains("no more tools will run"), "the stop follows");
+}
+
 #[test]
 fn plan_mode_without_a_parked_plan_exits_nonzero() {
     // The fake answers with text only, so the plan is never proposed and parked.

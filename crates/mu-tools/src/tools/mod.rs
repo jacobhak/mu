@@ -63,6 +63,9 @@ pub struct Tools {
     /// The `@role`s the last advertised `task` def offered, which a task's `model` may name.
     pub delegated: std::cell::RefCell<Vec<String>>,
     pub edit_store: pi_edit::EditStore,
+    /// Each read this session (path with its selector) and the fingerprint and count of what it
+    /// returned, for the repeated-read hint.
+    pub(crate) repeats: std::cell::RefCell<std::collections::HashMap<String, (u64, u32)>>,
     /// The session's tool permissions: the gate reads it, `task` hands it to subagents.
     pub permissions: Rc<crate::permissions::Permissions>,
     shell: shell::worker::ShellWorker,
@@ -95,6 +98,7 @@ impl Tools {
             output_schema: Default::default(),
             delegated: Default::default(),
             edit_store: pi_edit::EditStore::new(),
+            repeats: Default::default(),
             permissions: Rc::default(),
             shell: Default::default(),
             shell_cwd: Default::default(),

@@ -148,6 +148,7 @@ pub struct MuConfig {
     pub mcp: MuMcp,
     pub secrets: MuSecrets,
     pub status: MuStatus,
+    pub task: MuTask,
     /// `[permissions]`, parsed by `load_permissions` rather than serde.
     #[serde(skip)]
     pub permissions: MuPermissions,
@@ -270,6 +271,22 @@ pub struct MuAsk {
 impl Default for MuAsk {
     fn default() -> Self {
         Self { nudge: true }
+    }
+}
+
+/// `[task]`: a subagent's soft request budget. Crossing it steers a wrap-up notice (`budget_notice`);
+/// at 1.5x the run is stopped and asked for its partial result; 0 turns the guard off. A `scout` is
+/// capped at 100 however high the budget is, as in omp.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct MuTask {
+    pub soft_request_budget: u32,
+    pub budget_notice: bool,
+}
+
+impl Default for MuTask {
+    fn default() -> Self {
+        Self { soft_request_budget: 200, budget_notice: true }
     }
 }
 
@@ -597,6 +614,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         mcp: parse(section("mcp"), "mcp", warn),
         secrets: parse(section("secrets"), "secrets", warn),
         status,
+        task: parse(section("task"), "task", warn),
         permissions: load_permissions(&section("permissions"), warn),
         bell: parse(section("bell"), "bell", warn),
     }
@@ -951,6 +969,14 @@ mod tests {
         check_status(&mut s, &mut w);
         assert_eq!(s, MuStatus { warn_tokens: 100_000, ..MuStatus::default() });
         assert_eq!(w.len(), 2, "{w:?}");
+    }
+
+    #[test]
+    fn task_budget_defaults_and_overrides() {
+        let d = toml::from_str::<MuConfig>("").unwrap().task;
+        assert_eq!((d.soft_request_budget, d.budget_notice), (200, true));
+        let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;
+        assert_eq!((t.soft_request_budget, t.budget_notice), (50, false));
     }
 
     #[test]

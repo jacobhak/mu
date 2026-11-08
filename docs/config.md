@@ -49,6 +49,10 @@ attention = true      # a running turn asks you something or needs an approval o
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 
+[task]                # a subagent's soft request budget: cross it and it is told to wrap up, at 1.5x it is stopped and asked for what it has, and five requests later the run ends; 0 turns the guard off
+soft_request_budget = 200  # a scout is capped at 100 however high this is
+budget_notice = true       # the wrap-up notice at the budget
+
 [update]
 check = true          # daily release check at startup
 
