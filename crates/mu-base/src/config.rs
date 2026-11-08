@@ -148,18 +148,10 @@ pub struct MuConfig {
     pub mcp: MuMcp,
     pub secrets: MuSecrets,
     pub status: MuStatus,
-    pub bash: MuBash,
-    pub experimental: MuExperimental,
     /// `[permissions]`, parsed by `load_permissions` rather than serde.
     #[serde(skip)]
     pub permissions: MuPermissions,
     pub bell: MuBell,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct MuExperimental {
-    pub interruptible_wait: bool,
 }
 
 /// `[permissions]`: which tool calls may run without asking, and the rules that override it.
@@ -224,31 +216,6 @@ pub struct MuBell {
 impl Default for MuBell {
     fn default() -> Self {
         Self { turn_end: true, attention: true }
-    }
-}
-
-/// `[bash]`: while a background job runs, a model's command that starts with a sleep of at least
-/// `wait_sleep_secs` is not run and the turn ends (0 = only commands that do nothing but wait).
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct MuBash {
-    pub wait_sleep_secs: f64,
-}
-
-impl Default for MuBash {
-    fn default() -> Self {
-        Self { wait_sleep_secs: 10.0 }
-    }
-}
-
-fn check_bash(b: &mut MuBash, warn: &mut Vec<String>) {
-    let default = MuBash::default().wait_sleep_secs;
-    if !(b.wait_sleep_secs.is_finite() && b.wait_sleep_secs >= 0.0) {
-        warn.push(format!(
-            "config.toml: [bash] wait_sleep_secs {} is not 0 or more; using {default}",
-            b.wait_sleep_secs
-        ));
-        b.wait_sleep_secs = default;
     }
 }
 
@@ -604,14 +571,22 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
             models_path().display()
         ));
     }
+    if table.contains_key("bash") {
+        warn.push(
+            "config.toml: [bash] is no longer read; an ordinary `bash` call waits for its own result instead of \
+             being refused (see docs/background-jobs.md)"
+                .to_string(),
+        );
+    }
+    if table.contains_key("experimental") {
+        warn.push("config.toml: [experimental] is no longer read; `interruptible_wait` is now always on".to_string());
+    }
     let predict: MuPredict = parse(section("predict"), "predict", warn);
     check_predict(&predict, warn);
     let retry: MuRetry = parse(section("retry"), "retry", warn);
     check_retry(&retry, warn);
     let mut status: MuStatus = parse(section("status"), "status", warn);
     check_status(&mut status, warn);
-    let mut bash: MuBash = parse(section("bash"), "bash", warn);
-    check_bash(&mut bash, warn);
     MuConfig {
         predict,
         ask: parse(section("ask"), "ask", warn),
@@ -622,8 +597,6 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         mcp: parse(section("mcp"), "mcp", warn),
         secrets: parse(section("secrets"), "secrets", warn),
         status,
-        bash,
-        experimental: parse(section("experimental"), "experimental", warn),
         permissions: load_permissions(&section("permissions"), warn),
         bell: parse(section("bell"), "bell", warn),
     }
@@ -957,53 +930,17 @@ mod tests {
     }
 
     #[test]
-    fn bash_wait_sleep_defaults_and_rejects_negatives() {
-        assert_eq!(toml::from_str::<MuConfig>("").unwrap().bash, MuBash::default());
-        let mut b = toml::from_str::<MuBash>("wait_sleep_secs = 0").unwrap();
-        let mut w = Vec::new();
-        check_bash(&mut b, &mut w);
-        assert_eq!((b.wait_sleep_secs, w.len()), (0.0, 0));
-        let mut b = toml::from_str::<MuBash>("wait_sleep_secs = -3").unwrap();
-        check_bash(&mut b, &mut w);
-        assert_eq!((b, w.len()), (MuBash::default(), 1));
-    }
-
-    #[test]
-    fn experimental_interruptible_wait_deserializes() {
-        for (text, expected) in [
-            ("", false),
-            ("[experimental]\n", false),
-            ("[experimental]\ninterruptible_wait = false", false),
-            ("[experimental]\ninterruptible_wait = true", true),
-        ] {
-            assert_eq!(toml::from_str::<MuConfig>(text).unwrap().experimental.interruptible_wait, expected);
-        }
-        assert!(toml::from_str::<MuConfig>("[experimental]\ninterruptible_wait = 1").is_err());
-        assert!(toml::from_str::<MuConfig>("experimental = 1").is_err());
-    }
-
-    #[test]
-    fn load_mu_experimental_defaults_and_preserves_other_sections() {
+    fn the_removed_wait_sections_warn_and_other_sections_still_load() {
         let path = mu_testutil::home().join("config.toml");
-        for (experimental, expected, warning) in [
-            ("", false, false),
-            ("[experimental]\ninterruptible_wait = false\n", false, false),
-            ("[experimental]\ninterruptible_wait = true\n", true, false),
-            ("[experimental]\ninterruptible_wait = 'yes'\n", false, true),
-            ("experimental = 1\n", false, true),
-        ] {
-            let text = format!("{experimental}\n[ask]\nnudge = false\n[bell]\nattention = false\n");
-            std::fs::write(&path, text).unwrap();
-            let mut warnings = Vec::new();
-            let config = load_mu(&mut warnings);
-            assert_eq!(config.experimental.interruptible_wait, expected, "{experimental}");
-            assert!(!config.ask.nudge);
-            assert!(!config.bell.attention);
-            assert_eq!(warnings.len(), usize::from(warning), "{warnings:?}");
-            if warning {
-                assert!(warnings[0].contains("ignoring [experimental]"), "{warnings:?}");
-            }
-        }
+        let text = "[bash]\nwait_sleep_secs = 0\n[experimental]\ninterruptible_wait = true\n\
+                    [ask]\nnudge = false\n[bell]\nattention = false\n";
+        std::fs::write(&path, text).unwrap();
+        let mut warnings = Vec::new();
+        let config = load_mu(&mut warnings);
+        assert!(!config.ask.nudge && !config.bell.attention, "other sections still load");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("[bash] is no longer read")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("[experimental] is no longer read")), "{warnings:?}");
         std::fs::remove_file(path).unwrap();
     }
 

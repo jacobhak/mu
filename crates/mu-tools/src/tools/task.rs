@@ -42,11 +42,6 @@ pub const DESCRIPTION: &str = concat!(
     guidance!()
 );
 
-pub const ASYNC_DESCRIPTION: &str = concat!(
-    "Spawn subagents in the background; job ids return immediately. When each finishes, mu automatically starts your next turn with its result as a <system-notice> message: do other work meanwhile, and end your turn to wait for one. Stop one with `job_cancel`. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
-    guidance!()
-);
-
 pub const ASYNC_WAIT_DESCRIPTION: &str = concat!(
     "Spawn subagents in the background; job ids return immediately. Their results arrive as <system-notice> messages when they finish. Use `wait` when a job's result is needed now: it returns when one of the jobs finishes, and a new prompt from the user stops the wait without stopping the work. Stop a job with `job_cancel`. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
     guidance!()
@@ -174,11 +169,7 @@ impl Tools {
                 );
                 started.push(format!("{id} ({agent})"));
             }
-            let next = if self.interruptible_wait_enabled() {
-                "When each finishes, mu automatically starts your next turn with its result; use `wait` when you need a result now. Until then, do other work that does not depend on them."
-            } else {
-                "When each finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on them. When your next step needs a result, end your turn now with a short status and no tool call."
-            };
+            let next = "When each finishes, mu automatically starts your next turn with its result; use `wait` when you need a result now. Until then, do other work that does not depend on them.";
             return ToolOutput::ok(format!(
                 "Started {} background job(s): {}\n{next}",
                 started.len(),

@@ -214,11 +214,10 @@ impl Tools {
         {
             return self.bash_background(a, jobs).await;
         }
-        if self.interruptible_wait_enabled()
-            && !a.pty
+        if !a.pty
             && !a.r#async
-            && let Some(interrupt) = &ctx.wait_interrupt
             && let Some(jobs) = &self.jobs
+            && let Some(interrupt) = &ctx.wait_interrupt
         {
             return self.bash_interruptible(a, jobs, ctx, interrupt).await;
         }
@@ -243,15 +242,11 @@ impl Tools {
     /// `async`: the command runs as a tracked job; its result arrives as a system notice. The job
     /// starts from the persistent shell's cwd and exported environment as of launch.
     async fn bash_background(&self, a: Args, jobs: &Rc<JobsHandle>) -> ToolOutput {
-        let (id, note) = match self.start_bash_job(a, jobs, None, None, true).await {
+        let (id, note, _sink) = match self.start_bash_job(a, jobs, None, None, None).await {
             Ok(started) => started,
             Err(e) => return ToolOutput::err(e),
         };
-        let next = if self.interruptible_wait_enabled() {
-            "When it finishes, mu automatically starts your next turn with its result; use `wait` when you need it now. Until then, do other work that does not depend on it."
-        } else {
-            "When it finishes, mu automatically starts your next turn with its result; no user input is needed. Until then, do other work that does not depend on it. When your next step needs its result, end your turn now with a short status and no tool call."
-        };
+        let next = "When it finishes, mu automatically starts your next turn with its result; use `wait` when you need it now. Until then, do other work that does not depend on it.";
         let mut out = ToolOutput::ok(format!("Started background job {id}.{note}\n{next}"));
         out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
         out
@@ -264,7 +259,10 @@ impl Tools {
         ctx: &ToolCtx,
         interrupt: &CancellationToken,
     ) -> ToolOutput {
-        let (id, note) = match self.start_bash_job(a, jobs, Some(&ctx.cancel), Some(self.cwd.clone()), false).await {
+        let (id, note, sink) = match self
+            .start_bash_job(a, jobs, Some(&ctx.cancel), Some(self.cwd.clone()), Some(ctx.call_id.clone()))
+            .await
+        {
             Ok(started) => started,
             Err(e) => return ToolOutput::err(e),
         };
@@ -275,6 +273,9 @@ impl Tools {
             jobs.kill(Some(&id));
             ready = jobs.wait_ready(&ids, &CancellationToken::new(), &CancellationToken::new()).await;
         }
+        // The call is about to return: whatever the command prints from here on is a job's output,
+        // not this call's.
+        sink.detach();
         match ready {
             WaitReady::Ready(_) => {
                 if let Some(done) = jobs.take_undelivered_for(&ids).into_iter().next() {
@@ -307,16 +308,17 @@ impl Tools {
 
     /// Starts one command as a job. `base`: the directory the command starts in, when the caller has
     /// its own shell instead of inheriting the persistent one's; `cancel` is checked again just
-    /// before the spawn, so a cancelled call never launches. `listed`: the job shows as a background
-    /// job, which a foreground call's does not while the call waits for it.
+    /// before the spawn, so a cancelled call never launches. `waiting`: the tool call of a
+    /// foreground call, whose job is not listed while it waits and streams its output to that call;
+    /// `None` starts a listed background job.
     async fn start_bash_job(
         &self,
         a: Args,
         jobs: &Rc<JobsHandle>,
         cancel: Option<&CancellationToken>,
         base: Option<PathBuf>,
-        listed: bool,
-    ) -> Result<(String, String), String> {
+        waiting: Option<String>,
+    ) -> Result<(String, String, crate::jobs::OutputSink), String> {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err("Command cancelled before launch.".into());
         }
@@ -343,17 +345,16 @@ impl Tools {
                 move |s| sink.push(s),
             )
         };
-        let id = if listed {
-            jobs.spawn_bash(a.command, job_cwd, run)
-        } else {
-            jobs.spawn_bash_waiting(a.command, job_cwd, run)
+        let (id, sink) = match waiting {
+            Some(call) => jobs.spawn_bash_waiting(a.command, job_cwd, call, run),
+            None => jobs.spawn_bash(a.command, job_cwd, run),
         };
         let note = if inherited {
             String::new()
         } else {
             "\nShell state from earlier calls was not inherited (the shell was busy or did not answer in time): the job uses mu's own environment.".to_string()
         };
-        Ok((id, note))
+        Ok((id, note, sink))
     }
 
     /// The persistent shell's cwd and exported variables, from one state-neutral command. `None`
@@ -1293,13 +1294,12 @@ mod tests {
 
     type Events = (EventTx, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>);
 
-    fn experimental() -> (Tools, Rc<crate::jobs::JobsHandle>, Events) {
+    fn with_jobs() -> (Tools, Rc<crate::jobs::JobsHandle>, Events) {
         let mut tools = Tools::for_test();
         let (wake, _wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         let jobs = crate::jobs::JobsHandle::new(wake, events.clone());
         tools.jobs = Some(jobs.clone());
-        tools.interruptible_wait = true;
         (tools, jobs, (events, rx))
     }
 
@@ -1339,10 +1339,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn an_experimental_foreground_call_returns_its_output_and_claims_its_result() {
+    async fn a_foreground_call_returns_its_output_and_claims_its_result() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (tools, jobs, (events, _rx)) = experimental();
+                let (tools, jobs, (events, _rx)) = with_jobs();
                 let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
                 let out = tools.call("bash", &json!({"command": "printf 'finished\\n'"}), &ctx).await;
                 assert!(!out.is_error && out.text.contains("finished"), "{}", out.text);
@@ -1354,12 +1354,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn an_experimental_call_does_not_inherit_shell_state() {
+    async fn a_foreground_call_streams_its_output_to_its_tool_call() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tmp("stream");
+                let (mut tools, jobs, (events, mut rx)) = with_jobs();
+                tools.cwd = dir.clone();
+                let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
+                let args = json!({"command": "printf 'started\\n'; while [ ! -f release ]; do sleep 0.02; done"});
+                let call = tools.call("bash", &args, &ctx);
+                tokio::pin!(call);
+                let mut streamed = String::new();
+                loop {
+                    tokio::select! {
+                        out = call.as_mut() => panic!("the call finished before its output streamed: {}", out.text),
+                        ev = rx.recv() => {
+                            if let Some(AgentEvent::ToolOutput { id, chunk }) = ev {
+                                assert_eq!(id, "c", "the output streams to the waiting call");
+                                streamed.push_str(&chunk);
+                                if streamed.contains("started") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                std::fs::write(dir.join("release"), "go").unwrap();
+                let out = call.await;
+                assert!(!out.is_error, "{}", out.text);
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_foreground_call_does_not_inherit_shell_state() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let dir = tmp("isolated");
                 std::fs::create_dir_all(dir.join("sub")).unwrap();
-                let (mut tools, jobs, (events, _rx)) = experimental();
+                let (mut tools, jobs, (events, _rx)) = with_jobs();
                 tools.cwd = dir.clone();
                 let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
                 let a = json!({"command": "export MU_WAIT_TEST_VALUE=set; cd sub"});
@@ -1381,7 +1415,7 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let dir = tmp("interrupt");
-                let (mut tools, jobs, (events, mut rx)) = experimental();
+                let (mut tools, jobs, (events, mut rx)) = with_jobs();
                 tools.cwd = dir.clone();
                 let (ctx, wait) = wait_ctx(&jobs, events, CancellationToken::new());
                 let args = json!({"command": "printf 'started\\n'; while [ ! -f release ]; do sleep 0.02; done; printf 'finished\\n'"});
@@ -1403,16 +1437,22 @@ mod tests {
                 assert_eq!(done.len(), 1);
                 assert!(done[0].text.contains("finished"), "{}", done[0].text);
                 assert!(!jobs.has_undelivered(), "exactly one result");
+                while let Ok(ev) = rx.try_recv() {
+                    assert!(
+                        !matches!(&ev, AgentEvent::ToolOutput { id, chunk } if id == "c" && chunk.contains("finished")),
+                        "a released call's later output is not streamed to the finished call"
+                    );
+                }
                 let _ = std::fs::remove_dir_all(&dir);
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_an_experimental_call_terminates_and_claims_its_command() {
+    async fn cancelling_a_foreground_call_terminates_and_claims_its_command() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (tools, jobs, (events, mut rx)) = experimental();
+                let (tools, jobs, (events, mut rx)) = with_jobs();
                 let cancel = CancellationToken::new();
                 let (ctx, _wait) = wait_ctx(&jobs, events, cancel.clone());
                 let args = json!({"command": "printf 'started\\n'; sleep 30; printf 'done\\n'"});
@@ -1432,7 +1472,7 @@ mod tests {
     async fn a_cancelled_call_never_launches_and_a_dropped_call_kills_its_job() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (tools, jobs, (events, mut rx)) = experimental();
+                let (tools, jobs, (events, mut rx)) = with_jobs();
                 let cancelling = CancellationToken::new();
                 cancelling.cancel();
                 let (ctx, _wait) = wait_ctx(&jobs, events.clone(), cancelling);
@@ -1465,7 +1505,7 @@ mod tests {
     async fn capacity_accounts_for_the_foreground_job_and_job_cancel_releases_it() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (tools, jobs, (events, mut rx)) = experimental();
+                let (tools, jobs, (events, mut rx)) = with_jobs();
                 let (ctx, _wait) = wait_ctx(&jobs, events, CancellationToken::new());
                 for i in 0..crate::tools::task::MAX_TASKS {
                     jobs.push_running(&format!("full{i}"));

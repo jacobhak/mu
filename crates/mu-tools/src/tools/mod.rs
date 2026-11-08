@@ -19,8 +19,6 @@ pub mod web_gate;
 pub(crate) mod write;
 mod yield_;
 
-pub use shell::wait;
-
 use crate::jobs::JobsHandle;
 use crate::plugin::host::PluginHost;
 use mu_base::events::EventTx;
@@ -59,7 +57,6 @@ pub struct Tools {
     pub plugins: Rc<PluginHost>,
     /// Set in interactive sessions: `task` then runs in the background.
     pub jobs: Option<Rc<JobsHandle>>,
-    pub interruptible_wait: bool,
     session: ToolSession,
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
@@ -94,7 +91,6 @@ impl Tools {
             cwd,
             plugins,
             jobs: None,
-            interruptible_wait: false,
             session: Default::default(),
             output_schema: Default::default(),
             delegated: Default::default(),
@@ -108,10 +104,6 @@ impl Tools {
             #[cfg(any(test, feature = "test-support"))]
             child_exe: None,
         }
-    }
-
-    pub fn interruptible_wait_enabled(&self) -> bool {
-        self.interruptible_wait && self.jobs.is_some()
     }
 
     pub(crate) fn shell(&self) -> &shell::worker::ShellWorker {
@@ -150,10 +142,11 @@ impl Tools {
         BUILTINS.iter().filter_map(|b| b.def.map(|d| d())).collect()
     }
 
-    /// The `bash` tool. `interruptible_wait`: every ordinary command runs in its own shell as a
-    /// tracked job the model may wait on, so nothing carries over between calls.
-    pub fn bash_def(interruptible_wait: bool) -> ToolDef {
-        let shell = if interruptible_wait {
+    /// The `bash` tool. `jobs`: background jobs exist (interactive sessions), so every ordinary
+    /// command runs in its own shell as a tracked job the model may wait on, and nothing carries over
+    /// between calls.
+    pub fn bash_def(jobs: bool) -> ToolDef {
+        let shell = if jobs {
             " Each call runs in its own shell: pass `cwd` and any variables the command needs, and put setup that must carry over into the same command. `cmd &` and background descendants do not outlive the call. Ordinary commands may wait for their result; use `wait` when a running job's result is needed, and `async: true` for independent concurrent work or long-lived services. A new prompt from the user releases a wait without killing the work."
         } else {
             " The shell persists across calls (cwd and exported variables carry over). Any command that may take longer than ~5 seconds (builds, tests, installs, servers, watches, downloads) MUST use `async: true`, not the foreground: it runs as a tracked background job, and when it finishes mu automatically starts your next turn with its result (no user input needed). Do other work meanwhile; to wait for it, end your turn. Without `async`, `cmd &` keeps running after the call and shows in `jobs` (stop with `kill %N`); nothing reports its exit, so prefer `async`. `(cmd &)` outlives the call too but is not in `jobs`, so nothing can stop it; use `async: true` for anything long-running. An async job starts from the shell's cwd and exported environment as of launch; its own changes do not flow back, and functions and aliases are not carried over."
@@ -161,7 +154,7 @@ impl Tools {
         let description = format!(
             "Run a shell command: builds, tests, git, real binaries. NEVER use it to read files (use `read`), search (use `grep`/`glob`) or change files (use `edit`/`write`; no `sed`, `perl`, `python` or heredoc edits).{shell} Output is truncated in the middle when large. In pty mode, anything left running ends with the command. Stays available in plan mode (as in omp), where you must not change anything with it. NEVER print secret values: check that a variable is set with `[ -n \"$NAME\" ] && echo set` (or `${{#NAME}}` for its length), and keep tokens out of verbose output (`curl -v`, `set -x`, `git remote -v`). Pass secrets by variable name (`\"$NAME\"`), never by value, and never write them into files, commits or messages."
         );
-        let async_desc = if interruptible_wait {
+        let async_desc = if jobs {
             "Set for independent concurrent work or a long-lived service: runs as a background job, returns a job id at once, and when it finishes mu starts your next turn with its result; stop it with `job_cancel`. Interactive sessions only (elsewhere it runs in the foreground); not with pty."
         } else {
             "Set for any command that may take more than ~5 seconds: runs as a background job, returns a job id at once, and when it finishes mu starts your next turn with its result; stop it with `job_cancel`. Interactive sessions only (elsewhere it runs in the foreground); not with pty."
@@ -178,19 +171,10 @@ impl Tools {
         )
     }
 
-    /// `async_jobs`: `task` returns job ids immediately instead of blocking.
-    /// `interruptible_wait`: a job's result may be awaited with `wait` instead of ending the turn.
-    pub fn task_def(
-        async_jobs: bool,
-        interruptible_wait: bool,
-        agents: &[crate::context::AgentDef],
-        roles: &[&str],
-    ) -> ToolDef {
-        let mut description = String::from(match (async_jobs, interruptible_wait) {
-            (true, true) => task::ASYNC_WAIT_DESCRIPTION,
-            (true, false) => task::ASYNC_DESCRIPTION,
-            (false, _) => task::DESCRIPTION,
-        });
+    /// `async_jobs`: `task` returns job ids immediately instead of blocking, and a job's result may
+    /// be awaited with `wait` instead of ending the turn.
+    pub fn task_def(async_jobs: bool, agents: &[crate::context::AgentDef], roles: &[&str]) -> ToolDef {
+        let mut description = String::from(if async_jobs { task::ASYNC_WAIT_DESCRIPTION } else { task::DESCRIPTION });
         if !agents.is_empty() {
             let list: Vec<String> = agents.iter().map(|a| format!("`{}`: {}", a.name, a.description)).collect();
             description.push_str("\nCustom agents: ");
@@ -497,20 +481,6 @@ mod path_tests {
 #[cfg(test)]
 mod table_tests {
     use super::*;
-
-    #[test]
-    fn interruptible_wait_requires_flag_and_jobs() {
-        let mut tools = Tools::for_test();
-        assert!(!tools.interruptible_wait_enabled());
-        tools.interruptible_wait = true;
-        assert!(!tools.interruptible_wait_enabled());
-        let (wake, _wake_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        tools.jobs = Some(JobsHandle::new(wake, events));
-        assert!(tools.interruptible_wait_enabled());
-        tools.interruptible_wait = false;
-        assert!(!tools.interruptible_wait_enabled());
-    }
 
     #[test]
     fn one_table_drives_names_definitions_and_dispatch() {

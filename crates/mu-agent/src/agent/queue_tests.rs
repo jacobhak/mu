@@ -304,7 +304,6 @@ fn a_follow_up_that_starts_running_leaves_the_published_queue() {
 /// command keeps running as a job while the new message is answered first.
 fn interruptible_wait_case(cmd: fn() -> Command) {
     use crate::testing::assistant;
-    use mu_base::config::Configs;
     use mu_base::message::{Block, StopReason};
     use serde_json::json;
     run(async {
@@ -327,9 +326,7 @@ fn interruptible_wait_case(cmd: fn() -> Command) {
             Ok(assistant(vec![Block::text("handled next")], StopReason::Stop)),
             Ok(assistant(vec![Block::text("job finished")], StopReason::Stop)),
         ];
-        let mut cfg = Configs::default();
-        cfg.mu.experimental.interruptible_wait = true;
-        let (mut a, mut ev) = crate::testing::agent_with(script, cfg);
+        let (mut a, mut ev) = crate::testing::agent(script);
         a.enable_jobs();
         let (tx, rx) = unbounded_channel();
         let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
@@ -403,7 +400,6 @@ fn interruptible_wait_prompt_backgrounds_foreground_command() {
 #[test]
 fn interruptible_wait_on_a_job_is_released_by_input_and_ends_cleanly() {
     use crate::testing::assistant;
-    use mu_base::config::Configs;
     use mu_base::message::{Block, StopReason};
     use mu_tools::tools::subagent::BackgroundResult;
     use serde_json::json;
@@ -419,9 +415,7 @@ fn interruptible_wait_on_a_job_is_released_by_input_and_ends_cleanly() {
             Ok(assistant(vec![Block::text("handled next")], StopReason::Stop)),
             Ok(assistant(vec![Block::text("job done")], StopReason::Stop)),
         ];
-        let mut cfg = Configs::default();
-        cfg.mu.experimental.interruptible_wait = true;
-        let (mut a, mut ev) = crate::testing::agent_with(script, cfg);
+        let (mut a, mut ev) = crate::testing::agent(script);
         a.enable_jobs();
         let jobs = a.tools.jobs.clone().unwrap();
         let gate = release.clone();
@@ -490,7 +484,6 @@ fn interruptible_wait_on_a_job_is_released_by_input_and_ends_cleanly() {
 #[test]
 fn input_queued_before_a_wait_is_registered_relaunches_nothing_and_steers() {
     use crate::testing::assistant;
-    use mu_base::config::Configs;
     use mu_base::message::{Block, StopReason};
     use mu_tools::tools::subagent::BackgroundResult;
     use serde_json::json;
@@ -502,9 +495,7 @@ fn input_queued_before_a_wait_is_registered_relaunches_nothing_and_steers() {
             )),
             Ok(assistant(vec![Block::text("handled early")], StopReason::Stop)),
         ];
-        let mut cfg = Configs::default();
-        cfg.mu.experimental.interruptible_wait = true;
-        let (mut a, _ev) = crate::testing::agent_with(script, cfg);
+        let (mut a, _ev) = crate::testing::agent(script);
         a.enable_jobs();
         let jobs = a.tools.jobs.clone().unwrap();
         jobs.spawn_bash("never ends".into(), std::env::temp_dir(), |cancel, _| async move {

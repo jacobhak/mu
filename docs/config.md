@@ -34,9 +34,6 @@ warn_tokens = 270000
 err_percent = 70
 err_tokens = 500000
 
-[bash]
-wait_sleep_secs = 10  # while a background job runs, a model command that starts with a sleep this long or longer is not run and the turn ends (see background-jobs.md); 0 = only commands that do nothing but wait
-
 [permissions]
 mode = "yolo"          # ask | edits | yolo (see permissions.md); --permissions overrides it for one run
 readonly_bash = true   # the built-in read-only command set counts as reading; false makes every bash call ask unless a rule allows it
@@ -62,9 +59,4 @@ env = []              # extra environment variables whose values count as secret
 review = true         # review sessions in the background and save what is worth keeping (see memory.md)
 user_cap = 1500       # characters in user.md
 project_cap = 4000    # characters in a repository's memory.md
-
-[experimental]
-interruptible_wait = false  # let a model command wait for its result and a new prompt release the wait instead of ending the turn (see background-jobs.md); interactive sessions only
 ```
-
-`[experimental]` holds behaviour that may change or be removed. `interruptible_wait` is read when a session starts; a bad value warns and means `false`.

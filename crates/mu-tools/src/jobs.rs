@@ -35,6 +35,9 @@ struct SinkInner {
     id: String,
     cwd: PathBuf,
     events: EventTx,
+    /// The tool call of a foreground call that waits on this job: its output streams there too, so
+    /// the call's card shows progress. Cleared once the call stops waiting.
+    call: RefCell<Option<String>>,
     buf: RefCell<String>,
     last: Cell<Option<Instant>>,
     /// A deferred update is already waiting.
@@ -42,21 +45,30 @@ struct SinkInner {
 }
 
 impl OutputSink {
-    fn new(id: String, cwd: PathBuf, events: EventTx) -> Self {
+    fn new(id: String, cwd: PathBuf, events: EventTx, call: Option<String>) -> Self {
         Self(Rc::new(SinkInner {
             id,
             cwd,
             events,
+            call: RefCell::new(call),
             buf: RefCell::default(),
             last: Cell::new(None),
             pending: Cell::new(false),
         }))
     }
 
+    /// Stops streaming to the call that was waiting: the job runs on as a background job.
+    pub fn detach(&self) {
+        self.0.call.borrow_mut().take();
+    }
+
     /// Adds output. The first chunk after a quiet spell is sent at once; later ones wait for the
     /// throttle, so the last chunk is never left unsent.
     pub fn push(&self, s: &str) {
         let i = &self.0;
+        if let Some(call) = i.call.borrow().as_ref() {
+            let _ = i.events.send(AgentEvent::ToolOutput { id: call.clone(), chunk: s.to_string() });
+        }
         {
             let mut b = i.buf.borrow_mut();
             b.push_str(s);
@@ -546,41 +558,44 @@ impl JobsHandle {
         command: String,
         cwd: PathBuf,
         run: impl FnOnce(CancellationToken, OutputSink) -> F,
-    ) -> String
+    ) -> (String, OutputSink)
     where
         F: Future<Output = BackgroundResult> + 'static,
     {
-        self.spawn_bash_job(command, cwd, true, run)
+        self.spawn_bash_job(command, cwd, None, run)
     }
 
     /// Starts a foreground call's command: a job so an interrupted call leaves it running, but not
-    /// listed among the background jobs while the call waits for it.
+    /// listed among the background jobs while the call waits for it. Its output also streams to
+    /// `call`, the waiting tool call, until the sink is detached.
     pub(crate) fn spawn_bash_waiting<F>(
         self: &Rc<Self>,
         command: String,
         cwd: PathBuf,
+        call: String,
         run: impl FnOnce(CancellationToken, OutputSink) -> F,
-    ) -> String
+    ) -> (String, OutputSink)
     where
         F: Future<Output = BackgroundResult> + 'static,
     {
-        self.spawn_bash_job(command, cwd, false, run)
+        self.spawn_bash_job(command, cwd, Some(call), run)
     }
 
     fn spawn_bash_job<F>(
         self: &Rc<Self>,
         command: String,
         cwd: PathBuf,
-        listed: bool,
+        call: Option<String>,
         run: impl FnOnce(CancellationToken, OutputSink) -> F,
-    ) -> String
+    ) -> (String, OutputSink)
     where
         F: Future<Output = BackgroundResult> + 'static,
     {
         let id = self.unique_id(&format!("bg_{}", self.next_seq.get() + 1));
         let cancel = CancellationToken::new();
         let line = command_line(&command);
-        let sink = OutputSink::new(id.clone(), cwd.clone(), self.events.clone());
+        let listed = call.is_none();
+        let sink = OutputSink::new(id.clone(), cwd.clone(), self.events.clone(), call);
         let spec = Spec {
             id: id.clone(),
             agent: "bash".into(),
@@ -590,15 +605,16 @@ impl JobsHandle {
             command: Some(command),
         };
         let run_cancel = cancel.clone();
+        let kept = sink.clone();
         self.spawn_job(spec, line, cancel, listed, move |_| {
-            let fut = run(run_cancel, sink.clone());
+            let fut = run(run_cancel, kept.clone());
             async move {
                 let r = fut.await;
-                sink.flush();
+                kept.flush();
                 Finished { ok: r.ok, text: r.text, note: Some(r.note), meta: r.meta }
             }
         });
-        id
+        (id, sink)
     }
 
     /// Finished, undelivered jobs; marks them delivered.
@@ -1065,7 +1081,7 @@ pub(crate) mod tests {
 
     fn sink() -> (OutputSink, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
-        (OutputSink::new("bg_1".into(), PathBuf::from("/"), events), rx)
+        (OutputSink::new("bg_1".into(), PathBuf::from("/"), events, None), rx)
     }
 
     #[tokio::test(flavor = "current_thread")]

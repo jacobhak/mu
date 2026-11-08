@@ -1,5 +1,5 @@
 //! `wait`: block on background jobs until one finishes, the run is cancelled, or the user sends a
-//! new prompt. Experimental; offered only when `[experimental] interruptible_wait` is on.
+//! new prompt. Offered where background jobs exist (interactive sessions).
 
 use super::{ToolCtx, Tools};
 use crate::jobs::WaitReady;
@@ -7,7 +7,7 @@ use mu_base::tool::{ToolDef, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub const DESCRIPTION: &str = "Wait for background jobs: the named ids, or any job when `ids` is omitted. Returns as soon as one of them finishes, and the results follow in a system notice. A new prompt from the user stops the wait; the jobs keep running. Experimental: available only with `[experimental] interruptible_wait = true` and background jobs.";
+pub const DESCRIPTION: &str = "Wait for background jobs: the named ids, or any job when `ids` is omitted. Returns as soon as one of them finishes, and the results follow in a system notice. A new prompt from the user stops the wait; the jobs keep running.";
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -25,11 +25,8 @@ impl Tools {
     }
 
     pub async fn job_wait(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
-        if !self.interruptible_wait_enabled() {
-            return ToolOutput::err("wait: experimental interruptible waiting is not enabled");
-        }
         let Some(jobs) = &self.jobs else {
-            return ToolOutput::err("wait: experimental interruptible waiting is not enabled");
+            return ToolOutput::err("wait: unavailable without background jobs");
         };
         let Some(interrupt) = &ctx.wait_interrupt else {
             return ToolOutput::err("wait: no active interruptible wait");
@@ -56,9 +53,8 @@ mod tests {
     use mu_base::events::AgentEvent;
     use tokio_util::sync::CancellationToken;
 
-    fn tools(flag: bool) -> (Tools, std::rc::Rc<JobsHandle>) {
+    fn tools() -> (Tools, std::rc::Rc<JobsHandle>) {
         let mut t = Tools::for_test();
-        t.interruptible_wait = flag;
         let (wake, _wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let jobs = JobsHandle::new(wake, events);
@@ -73,13 +69,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn needs_the_experiment_and_an_active_wait() {
-        let (t, jobs) = tools(false);
-        let (c, _wait) = ctx(&jobs, CancellationToken::new());
-        let out = t.job_wait(Args { ids: vec![] }, &c).await;
-        assert!(out.is_error && out.text.contains("not enabled"), "{}", out.text);
+    async fn needs_jobs_and_an_active_wait() {
+        let plain_tools = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let no_jobs = ToolCtx {
+            events,
+            cancel: CancellationToken::new(),
+            call_id: "c".into(),
+            plan: false,
+            wait_interrupt: None,
+        };
+        let out = plain_tools.job_wait(Args { ids: vec![] }, &no_jobs).await;
+        assert!(out.is_error && out.text.contains("unavailable without background jobs"), "{}", out.text);
 
-        let (t, _jobs) = tools(true);
+        let (t, _jobs) = tools();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let plain = ToolCtx {
             events,
@@ -94,7 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_finished_job_is_named_and_left_for_the_notice() {
-        let (t, jobs) = tools(true);
+        let (t, jobs) = tools();
         jobs.push_running("A");
         jobs.finish("A", true, "ALPHA");
         let (c, _wait) = ctx(&jobs, CancellationToken::new());
@@ -110,7 +113,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_jobs_and_unknown_ids_report_plainly() {
-        let (t, jobs) = tools(true);
+        let (t, jobs) = tools();
         let (c, _wait) = ctx(&jobs, CancellationToken::new());
         let out = t.job_wait(Args { ids: vec![] }, &c).await;
         assert!(!out.is_error && out.text == "No matching background jobs running.", "{}", out.text);
@@ -120,7 +123,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_releases_the_wait_and_cancel_stops_it() {
-        let (t, jobs) = tools(true);
+        let (t, jobs) = tools();
         jobs.push_running("A");
         let (c, wait) = ctx(&jobs, CancellationToken::new());
         wait.token().cancel();

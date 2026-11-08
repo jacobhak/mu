@@ -448,17 +448,19 @@ fn the_todo_reminder_waits_for_a_running_background_job() {
 }
 
 #[test]
-fn a_wait_while_a_job_runs_is_refused_and_ends_the_turn() {
+fn a_sleeping_command_runs_while_a_job_runs_instead_of_being_refused() {
     use mu_tools::tools::subagent::BackgroundResult;
     run(async {
-        let bash = |id: &str, cmd: &str| Block::ToolCall {
-            id: id.into(),
-            name: "bash".into(),
-            arguments: json!({"command": cmd}),
-        };
         let script = vec![
-            Ok(assistant(vec![bash("w1", "sleep 60; echo"), bash("t2", "basename /x/ran")], StopReason::ToolUse)),
-            Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+            Ok(assistant(
+                vec![Block::ToolCall {
+                    id: "w1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "echo waiting"}),
+                }],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
         ];
         let (mut a, mut rx) = notify_agent(script);
         let jobs = a.tools.jobs.clone().unwrap();
@@ -469,10 +471,9 @@ fn a_wait_while_a_job_runs_is_refused_and_ends_the_turn() {
         a.turn(Some("go".to_string().into())).await;
         jobs.kill(None);
         let r = results(&a);
-        assert!(r[0].0 && r[0].1.contains("Not run: this command waits, and background job bg_"), "{:?}", r[0]);
-        assert!(!r[1].0 && r[1].1.contains("text: \"ran"), "the rest of the batch still runs: {:?}", r[1]);
-        assert_eq!(a.ports.providers.scripted.borrow().len(), 1, "no request after the refusal");
-        assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::ToolSkipped { id } if id == "w1")));
+        assert!(!r[0].0 && r[0].1.contains("text: \"waiting"), "the command runs: {:?}", r[0]);
+        assert!(!drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::ToolSkipped { id } if id == "w1")));
+        assert!(a.ports.providers.scripted.borrow().is_empty(), "the turn continues after the call");
     });
 }
 
@@ -530,45 +531,37 @@ fn delegated_roles_reach_the_top_level_prompt_and_task_schema_only() {
     });
 }
 
-fn experimental_agent(script: Vec<Result<Message, ProviderError>>) -> (Agent, UnboundedReceiver<AgentEvent>) {
-    let mut cfg = Configs::default();
-    cfg.mu.experimental.interruptible_wait = true;
-    agent_with(script, cfg)
-}
-
 fn bash_call(id: &str, args: serde_json::Value) -> Block {
     Block::ToolCall { id: id.into(), name: "bash".into(), arguments: args }
 }
 
 #[test]
-fn wait_is_offered_only_with_the_experiment_and_jobs() {
+fn wait_is_offered_only_with_jobs() {
     run(async {
         let names = |a: &Agent| a.tool_defs().into_iter().map(|d| d.name).collect::<Vec<_>>();
-        let (mut off, _rx) = agent(vec![]);
-        off.enable_jobs();
-        assert!(!names(&off).contains(&"wait".to_string()), "the experiment is off");
-
-        let (mut on, _rx) = experimental_agent(vec![]);
-        assert!(!names(&on).contains(&"wait".to_string()), "no jobs, no wait");
-        on.enable_jobs();
-        assert!(names(&on).contains(&"wait".to_string()));
-
         let bash = |a: &Agent| a.tool_defs().into_iter().find(|d| d.name == "bash").unwrap().description;
-        assert!(bash(&off).contains("The shell persists across calls"), "flag off keeps the persistent shell");
-        assert!(bash(&on).contains("Each call runs in its own shell"), "flag on describes isolated calls");
-        assert!(!bash(&on).contains("Never wait for a job in the foreground"));
+
+        let (headless, _rx) = agent(vec![]);
+        assert!(!names(&headless).contains(&"wait".to_string()), "no jobs, no wait");
+        assert!(bash(&headless).contains("The shell persists across calls"), "no jobs keeps the persistent shell");
+
+        let (mut interactive, _rx) = agent(vec![]);
+        interactive.enable_jobs();
+        assert!(names(&interactive).contains(&"wait".to_string()));
+        assert!(bash(&interactive).contains("Each call runs in its own shell"), "jobs describe isolated calls");
+        assert!(!bash(&interactive).contains("Never wait for a job in the foreground"));
     });
 }
 
 #[test]
-fn with_the_experiment_a_waiting_command_runs_and_no_end_of_turn_is_prescribed() {
+fn a_waiting_command_runs_instead_of_being_refused() {
     use mu_tools::tools::subagent::BackgroundResult;
     run(async {
         let script = vec![
             Ok(assistant(vec![bash_call("w1", json!({"command": "printf 'waited\\n'"}))], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
         ];
-        let (mut a, _rx) = experimental_agent(script);
+        let (mut a, _rx) = agent(script);
         a.enable_jobs();
         let jobs = a.tools.jobs.clone().unwrap();
         jobs.spawn_bash("cargo build".into(), std::env::temp_dir(), |cancel, _| async move {

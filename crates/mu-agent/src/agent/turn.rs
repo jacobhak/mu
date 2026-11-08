@@ -268,7 +268,7 @@ impl Agent {
                     None => continue,
                 }
             }
-            let ran = self.run_calls(calls, cancel).await;
+            let yielded = self.run_calls(calls, cancel).await;
             if cancel.is_cancelled() {
                 return Flow::Aborted;
             }
@@ -276,15 +276,12 @@ impl Agent {
                 return Flow::Stopped;
             }
             // A successful yield is the subagent's result; another request would only produce an unused reply.
-            if ran.yielded || self.plan.exec_plan.is_some() {
+            if yielded || self.plan.exec_plan.is_some() {
                 return Flow::Done;
             }
-            let steered = self.take_steer();
-            let delivered = self.take_jobs() | self.take_notify();
-            // A refused wait ends the turn: the job's result starts the next one.
-            if ran.waited && !steered && !delivered {
-                return Flow::Done;
-            }
+            self.take_steer();
+            self.take_jobs();
+            self.take_notify();
         }
     }
 
@@ -389,13 +386,8 @@ impl Agent {
         if !open.is_empty() {
             *todo_nags += 1;
             let list = open.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
-            let wait = if self.tools.interruptible_wait_enabled() {
-                ""
-            } else {
-                " Never run a command in the foreground to wait it out."
-            };
             self.push(Message::user(&format!(
-                "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work on them, marking each `done` only when you have actually finished it. Do not tick items off that you did not do. `drop` an item that is no longer needed; `block` it (with a reason) if you are waiting on the user or something external.{wait} Do not reply to this reminder.\n</system-reminder>",
+                "<system-reminder>\nYou stopped with {} open todo item(s):\n{list}\nContinue the work on them, marking each `done` only when you have actually finished it. Do not tick items off that you did not do. `drop` an item that is no longer needed; `block` it (with a reason) if you are waiting on the user or something external. Do not reply to this reminder.\n</system-reminder>",
                 open.len()
             )));
             return None;
@@ -409,10 +401,10 @@ impl Agent {
     }
 
     /// Runs a reply's tool calls in order. Once the run is cancelled, stopped, steered or a `yield`
-    /// succeeded, the rest are skipped with a result. A call that waits for a background job is not run.
-    async fn run_calls(&mut self, calls: Vec<(String, String, Value)>, cancel: &CancellationToken) -> Ran {
+    /// succeeded, the rest are skipped with a result. Returns whether a `yield` succeeded.
+    async fn run_calls(&mut self, calls: Vec<(String, String, Value)>, cancel: &CancellationToken) -> bool {
         let mut skip: Option<&str> = None;
-        let (mut yielded, mut waited) = (false, false);
+        let mut yielded = false;
         let since = std::time::SystemTime::now();
         let last = calls.len().saturating_sub(1);
         for (i, (id, name, args)) in calls.into_iter().enumerate() {
@@ -427,20 +419,15 @@ impl Agent {
                 self.emit_skipped(&id, &name, &args, reason);
                 continue;
             }
-            if let Some(reason) = self.wait_refusal(&name, &args) {
-                waited = true;
-                self.emit_skipped(&id, &name, &args, &reason);
-            } else {
-                let mut out = self.run_tool(&id, &name, args, cancel).await;
-                if i == last
-                    && name != "yield"
-                    && let Some(status) = self.job_status(since)
-                {
-                    out.text.push_str(&status);
-                }
-                self.push_result(&id, &name, &out);
-                yielded |= name == "yield" && !out.is_error;
+            let mut out = self.run_tool(&id, &name, args, cancel).await;
+            if i == last
+                && name != "yield"
+                && let Some(status) = self.job_status(since)
+            {
+                out.text.push_str(&status);
             }
+            self.push_result(&id, &name, &out);
+            yielded |= name == "yield" && !out.is_error;
             if cancel.is_cancelled() {
                 skip = Some(SKIP_ABORTED);
             } else if self.ports.inbox.borrow().stop {
@@ -451,13 +438,6 @@ impl Agent {
                 skip = Some(SKIP_STEER);
             }
         }
-        Ran { yielded, waited }
+        yielded
     }
-}
-
-struct Ran {
-    /// A `yield` succeeded.
-    yielded: bool,
-    /// A call was refused for waiting on a background job.
-    waited: bool,
 }

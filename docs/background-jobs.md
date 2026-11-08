@@ -10,25 +10,15 @@ A turn that began this way rings the terminal only when it needs you (a question
 
 ## Waiting for a job
 
-The model waits for a job by ending its turn. While a job runs, mu does not run a model's `bash` command (foreground or `async`) that only waits; it marks the call as not run and ends the turn, and the job's result starts the next one. These commands count as waits:
+In an interactive session a turn does not have to end to wait: an ordinary `bash` call (no `async`, no `pty`) runs as a tracked job and waits for its own result.
 
-- one made only of `sleep`, `echo` or `printf` with fixed text, `true`, `:`, `wait` and `cd`, such as `sleep 60; echo` or `echo waiting`;
-- one that starts, after any `cd`, with a `sleep` of at least `[bash] wait_sleep_secs` seconds (default 10; see [Config](config.md)), such as `sleep 120; ls out/`;
-- a `while`, `until` or `for` loop that sleeps.
-
-Commands you run yourself with `!` are never refused, and with no job running every command runs.
-
-## Interruptible waits (experimental)
-
-With `[experimental] interruptible_wait = true` in `config.toml` (see [Config](config.md)), a turn no longer has to end to wait. In an interactive session:
-
-- An ordinary `bash` call (no `async`, no `pty`) runs as a tracked job and waits for its result itself; the result comes back in that call, not as a separate notice. Each call runs in its own shell: pass `cwd` and the environment the command needs, group setup that must carry over into the same command, and expect `cmd &` and background descendants to end with the call.
+- The result comes back in that call, not as a separate notice. Each call runs in its own shell: pass `cwd` and the environment the command needs, group setup that must carry over into the same command, and expect `cmd &` and background descendants to end with the call.
 - It stays an ordinary `bash` card while it runs: it is not listed among the background jobs (no row above the prompt, no jobs-panel entry, no count in the status line) until a prompt releases the wait, at which point the command keeps running as a job of its own.
 - The model can also call `wait` with job ids (or none, for any job). It returns when one of those jobs finishes; their results still arrive as a notice, once.
 - A prompt you submit while the model waits releases the wait: the job keeps running and its result arrives later, and your message steers the turn at the next tool boundary. A second tool call in the same reply is skipped so your message is answered first.
 - Esc still cancels the turn, including a waiting command. Nothing else cancels a wait, and releasing a wait never cancels the work.
 
-Waiting does not apply to `pty` commands, to `async` calls (which keep returning a job id at once), to commands you run yourself with `!`, or to `-p` runs and subagents. The wait refusal above stays in force when the experiment is off.
+Waiting does not apply to `pty` commands, to `async` calls (which keep returning a job id at once), to commands you run yourself with `!`, or to `-p` runs and subagents. Those places keep a shell that persists across calls, and a model `bash` call there blocks the turn until the command ends.
 
 ## Cancelling a job
 

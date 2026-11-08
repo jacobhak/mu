@@ -246,7 +246,6 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
 impl Agent {
     pub fn new(i: AgentInit) -> Self {
         let mut tools = Tools::new(i.cwd.clone(), i.plugins.clone());
-        tools.interruptible_wait = i.providers.cfg.mu.experimental.interruptible_wait;
         tools.set_skills(i.ctx.skills.iter().map(|s| (s.name.clone(), s.dir.clone())).collect());
         tools.set_context_page(prompt::context_page(&i.ctx));
         // The flag wins over inheritance, which wins over the config.
@@ -382,7 +381,7 @@ impl Agent {
             plugin_ctx: &self.plugin_ctx,
             mcp_instructions: mcp.as_deref(),
             hashline: mu_tools::tools::edit::is_hashline(),
-            interruptible_wait: self.tools.interruptible_wait_enabled(),
+            jobs: self.tools.jobs.is_some(),
         })
     }
 

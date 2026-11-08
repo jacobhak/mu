@@ -37,9 +37,8 @@ impl Agent {
             .base_defs
             .get_or_init(|| Tools::definitions().into_iter().chain(self.ports.plugins.tool_defs()).collect())
             .clone();
-        if self.tools.interruptible_wait_enabled()
-            && let Some(d) = v.iter_mut().find(|d| d.name == "bash")
-        {
+        let jobs = self.tools.jobs.is_some();
+        if jobs && let Some(d) = v.iter_mut().find(|d| d.name == "bash") {
             *d = Tools::bash_def(true);
         }
         if self.plan.plan.is_some() {
@@ -48,16 +47,9 @@ impl Agent {
         let roles: Vec<String> = self.delegated_roles().into_iter().map(|(n, _)| format!("@{n}")).collect();
         *self.tools.delegated.borrow_mut() = roles.clone();
         let role_names: Vec<&str> = roles.iter().map(String::as_str).collect();
-        v.push(Tools::task_def(
-            self.tools.jobs.is_some(),
-            self.tools.interruptible_wait_enabled(),
-            &self.ctx.agents,
-            &role_names,
-        ));
-        if self.tools.jobs.is_some() {
+        v.push(Tools::task_def(jobs, &self.ctx.agents, &role_names));
+        if jobs {
             v.push(Tools::job_cancel_def());
-        }
-        if self.tools.interruptible_wait_enabled() {
             v.push(Tools::wait_def());
         }
         if let Some(o) = self.tools.output_schema.borrow().as_ref() {
@@ -104,38 +96,10 @@ impl Agent {
         self.push_result(id, name, &ToolOutput::err(reason));
     }
 
-    /// Why a `bash` call is not run: it waits (see `wait::waits`) while a background job runs. The
-    /// model waits for a job by ending its turn; the job's result starts the next one.
-    pub(super) fn wait_refusal(&self, name: &str, args: &Value) -> Option<String> {
-        // With the experiment on, an ordinary command may wait: `wait` is the way to do it.
-        if name != "bash" || self.tools.interruptible_wait_enabled() {
-            return None;
-        }
-        let running = self.tools.jobs.as_ref()?.running_ids();
-        let command = args["command"].as_str()?;
-        if running.is_empty()
-            || !mu_tools::tools::wait::waits(command, self.ports.providers.cfg.mu.bash.wait_sleep_secs)
-        {
-            return None;
-        }
-        let jobs = match running.as_slice() {
-            [one] => format!("background job {one} is"),
-            many => format!("background jobs {} are", many.join(", ")),
-        };
-        Some(format!(
-            "Not run: this command waits, and {jobs} still running. Your turn has ended; when a job finishes, mu \
-             automatically starts your next turn with its result. To wait for a job, end your turn with a short \
-             status and no tool call."
-        ))
-    }
-
-    /// Registers an interruptible wait for this call, when the experiment is on and the call can
-    /// wait: `wait`, or `bash` that is neither `pty` nor `async`. User input releases the wait
-    /// without cancelling the work; input queued before this call steers at once instead.
+    /// Registers an interruptible wait for this call, when the session has background jobs and the
+    /// call can wait: `wait`, or `bash` that is neither `pty` nor `async`. User input releases the
+    /// wait without cancelling the work; input queued before this call steers at once instead.
     fn wait_guard(&self, name: &str, args: &Value) -> Option<mu_tools::jobs::ActiveWait> {
-        if !self.tools.interruptible_wait_enabled() {
-            return None;
-        }
         let eligible = match name {
             "wait" => true,
             "bash" => args["pty"].as_bool() != Some(true) && args["async"].as_bool() != Some(true),
@@ -171,13 +135,8 @@ impl Agent {
             [] => return None,
             [one] => {
                 let (label, elapsed) = line(one);
-                let next = if self.tools.interruptible_wait_enabled() {
-                    "When it finishes, mu automatically starts your next turn with its result; use `wait` when you \
-                     need it now."
-                } else {
-                    "When it finishes, mu automatically starts your next turn with its result; no user input is \
-                     needed. If your next step needs it, end your turn now with a short status."
-                };
+                let next = "When it finishes, mu automatically starts your next turn with its result; use `wait` when \
+                            you need it now.";
                 format!(
                     "\n\n<background-jobs>\n{} ({label}) has been running for {elapsed}.\n{next}\n</background-jobs>",
                     one.name
@@ -191,13 +150,8 @@ impl Agent {
                         format!("- {} ({label}), {elapsed}\n", j.name)
                     })
                     .collect();
-                let next = if self.tools.interruptible_wait_enabled() {
-                    "When each finishes, mu automatically starts your next turn with its result; use `wait` when you \
-                     need one now."
-                } else {
-                    "When each finishes, mu automatically starts your next turn with its result; no user input is \
-                     needed. If your next step needs one of them, end your turn now with a short status."
-                };
+                let next = "When each finishes, mu automatically starts your next turn with its result; use `wait` \
+                            when you need one now.";
                 format!("\n\n<background-jobs>\nStill running:\n{items}{next}\n</background-jobs>")
             }
         })
