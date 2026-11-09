@@ -2,12 +2,14 @@ name: release
 on:
   push:
     tags: ['mu-*']
+  # Dry run: builds and tests both platforms without publishing a release.
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:
   # The Linux build runs in ubuntu:22.04, so the binary's glibc floor is 2.35.
   build-linux:
-    runs-on: ubuntu-24.04
+    runs-on: arc-mu
     container: ubuntu:22.04
     steps:
       - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git pkg-config python3 nodejs
@@ -30,7 +32,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-15, plat: darwin-arm64 }
+          - { os: mu-ci, plat: darwin-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +49,9 @@ jobs:
           path: dist/mu-${{ matrix.plat }}.tar.gz
   release:
     needs: [build, build-linux]
-    runs-on: ubuntu-latest
+    # A manual run exercises the matrix; only a tag publishes.
+    if: github.event_name == 'push'
+    runs-on: arc-mu
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
