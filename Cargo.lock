@@ -2635,7 +2635,7 @@ dependencies = [
 [[package]]
 name = "grep-searcher"
 version = "0.1.17"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "bstr",
  "encoding_rs",
@@ -4822,8 +4822,8 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4858,8 +4858,8 @@ dependencies = [
 
 [[package]]
 name = "pi-builtins"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "ansi-width",
  "argmax",
@@ -4939,13 +4939,13 @@ dependencies = [
 
 [[package]]
 name = "pi-diff"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 
 [[package]]
 name = "pi-edit"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -4961,8 +4961,8 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "async-trait",
  "libc",
@@ -4993,8 +4993,8 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5031,8 +5031,8 @@ dependencies = [
 
 [[package]]
 name = "pi-vcs"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "futures",
  "gix",
@@ -5047,8 +5047,8 @@ dependencies = [
 
 [[package]]
 name = "pi-vfs"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "async-trait",
  "libc",
@@ -5061,8 +5061,8 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "18.18.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+version = "18.18.2"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "flume",
  "futures",
@@ -6526,7 +6526,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.0#b5a6b2f7e5b6606b6562e678ead83f21738f34a0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "cc",
  "tree-sitter-language",
