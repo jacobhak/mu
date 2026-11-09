@@ -522,25 +522,36 @@ mod tests {
     #[test]
     fn claiming_sweeps_stale_records_but_not_live_ones() {
         home();
-        let dir = home().join("run");
-        std::fs::create_dir_all(&dir).unwrap();
+        // A private directory: another test sweeping home()/run in parallel takes a shared lock
+        // on every record it finds, so the exclusive lock below would fail with EWOULDBLOCK. That
+        // is a race in the test, not in the sweeper, and it showed up first on macOS runners.
+        let dir = tmp("sweep");
         let stale = dir.join("sweep-stale-record.json");
         std::fs::write(&stale, "{\"pid\":1}").unwrap();
         let live = dir.join("sweep-live-record.json");
         std::fs::write(&live, "{\"pid\":2}").unwrap();
         let held = File::open(&live).unwrap();
         try_flock(&held, libc::LOCK_EX).unwrap();
-        let s = SessionFile::create(Path::new("/opt/sweep"), None).unwrap();
+        sweep_stale(&dir);
         assert!(!stale.exists(), "a record nobody holds is removed");
         assert!(live.exists(), "a record under lock is kept");
+
+        // Claiming records its own file and sweeps the shared directory. The stale record it
+        // should remove may already be gone (a parallel sweep), which cannot make this fail.
+        let run = home().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let abandoned = run.join(format!("abandoned-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&abandoned, "{\"pid\":1}").unwrap();
+        let s = SessionFile::create(Path::new("/opt/sweep"), None).unwrap();
+        assert!(!abandoned.exists(), "claiming sweeps the shared directory");
         assert!(record_of(&s.path).exists(), "the claimer's own record stays");
     }
 
     #[test]
     fn sweeping_does_not_make_a_stale_record_look_live() {
         home();
-        let dir = home().join("run");
-        std::fs::create_dir_all(&dir).unwrap();
+        // Private, like the test above: the shared directory is swept by every parallel test.
+        let dir = tmp("sweep-probe");
         let stale = dir.join("sweep-shared-probe.json");
         std::fs::write(&stale, "{\"pid\":1}").unwrap();
         // A concurrent `owner()` holds a shared lock while it reads the record. An exclusive probe
