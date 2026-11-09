@@ -2,7 +2,7 @@
 
 Rust coding agent. Toolchain (with rustfmt and clippy) is pinned in `rust-toolchain.toml`; formatting in `rustfmt.toml`.
 
-CI (`.github/workflows/ci.yml`) runs `scripts/ci-checks.sh` before pushing: fmt check, clippy `-D warnings`, the workspace tests, the MCP bridge's tests and the catalog generator's tests. Run the same before pushing:
+CI (`.github/workflows/ci.yml`) runs `scripts/ci-checks.sh` before pushing: fmt check, clippy `-D warnings`, the workspace tests and the MCP bridge's tests. The catalog generator's test is a bump-time guard and runs in `scripts/maint/check.sh` instead. Run the same before pushing:
 
 ```sh
 scripts/ci-checks.sh

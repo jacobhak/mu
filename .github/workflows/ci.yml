@@ -6,37 +6,30 @@ on:
 permissions:
   contents: read
 env:
-  # Four workspace builds (clippy and test, with and without default features) must fit the runner's ~14 GB disk.
+  # Four workspace builds (clippy and test, with and without default features) must fit the runner's disk.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_INCREMENTAL: 0
 jobs:
   check:
-    runs-on: ubuntu-24.04
+    runs-on: arc-mu
+    env:
+      # This runner reserves 2 cores; cargo would otherwise use every core it can see.
+      CARGO_BUILD_JOBS: 2
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       - run: scripts/ci-checks.sh
       - run: df -h / && du -sh target
         if: always()
-  memory:
-    runs-on: ubuntu-24.04
+  macos:
+    # macOS platform coverage on the self-hosted Mac. Branch protection needs a
+    # paid plan on a private repo, so nothing here gates a merge.
+    # A JIT-provisioned runner carries only the labels it was created with, so
+    # there is no implicit self-hosted or macOS label to match on.
+    runs-on: mu-ci
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: actions/checkout@v4
-      - run: rustup toolchain install
+      - run: rustup toolchain install && rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p mu --locked
-      - run: cargo run --release -p mu-bench --locked -- check --out memory.json crates/mu-bench/scenarios/read-heavy.toml
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: memory
-          path: memory.json
+      - run: scripts/ci-checks.sh

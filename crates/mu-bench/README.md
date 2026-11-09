@@ -62,7 +62,7 @@ cargo run --release -p mu-bench -- check --update crates/mu-bench/scenarios/read
 
 `check` runs the scenario as the default command does (`--runs`, default 3; the medians are compared). For each row it takes incidental memory, `mu_anon_kB − content kB`, and compares it with the committed baseline `crates/mu-bench/baselines/<scenario>.json`. A row fails when it is above `baseline × (1 + P/100) + 1 MB`, with `P` from `--tolerance-pct` (default 20). It prints every row and exits 1 listing the ones over. A row the baseline does not have is an error: run with `--update`. `--update` writes the measured values to the baseline and exits 0.
 
-CI runs the gate in the `memory` job of `ci.yml` (on `ubuntu-24.04`, on every PR and push) and uploads `memory.json`. The baseline is measured on one machine, so a deliberate change that moves memory updates the committed baseline in the same commit. If the CI runner measures differently from the machine that wrote the baseline, copy its `incidental_kb` values from the `memory.json` artifact.
+The gate is not run in CI: it samples `Pss_Anon`, which moves with machine load and with the baseline's own machine, so every row would fail on a loaded or differently-provisioned runner. Run it on a quiet machine. The baseline is measured on one machine, so a deliberate change that moves memory updates the committed baseline in the same commit.
 
 ## Not yet
 

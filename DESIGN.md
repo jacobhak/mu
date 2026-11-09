@@ -224,7 +224,7 @@ Non-goal: running pi or omp TypeScript extensions.
 | Large tool output, images | Spilled to files; read on expand |
 | Highlighting | No bulk-loaded syntax sets (`syntect` defaults measured at +6.5 MB); per-language, lazily |
 
-**Check:** `incidental = private RAM − bytes of content held`. `mu-bench check` enforces it in CI (the `memory` job of `ci.yml`): each row of the read-heavy scenario must stay within 20% plus 1 MB of its committed baseline (`crates/mu-bench/baselines/read-heavy.json`).
+**Check:** `incidental = private RAM − bytes of content held`. `mu-bench check` enforces it by hand, on a quiet machine: each row of the read-heavy scenario must stay within 20% plus 1 MB of its committed baseline (`crates/mu-bench/baselines/read-heavy.json`).
 `mu-bench` (`crates/mu-bench`) runs scripted sessions against a fake model and reports private memory after
 each turn, split by region, and compares other harnesses; `check` is its pass/fail gate (`crates/mu-bench/README.md`).
 
