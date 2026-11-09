@@ -322,7 +322,14 @@ impl App {
             "session" => {
                 let p = self.agent.status.session_path.clone().unwrap_or_else(|| "no session yet".into());
                 let t = self.agent.status.title.clone().unwrap_or_else(|| "(untitled)".into());
-                self.notice(&format!("{p}\n{t}"));
+                let cache = self
+                    .agent
+                    .status
+                    .cache
+                    .as_ref()
+                    .map(|c| format!("\n{}", crate::status::cache_summary(c, mu_base::message::now_ms())))
+                    .unwrap_or_default();
+                self.notice(&format!("{p}\n{t}{cache}"));
             }
             "rename" if !arg.is_empty() => self.send(Command::Rename(arg.into())),
             "rename" => self.error("usage: /rename <title>"),

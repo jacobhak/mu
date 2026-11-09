@@ -144,7 +144,34 @@ pub struct StatusSnapshot {
     pub usage: Option<ProviderUsage>,
     /// Tool permissions; the status line shows it unless it is `yolo`.
     pub permissions: PermissionMode,
+    /// The provider prompt cache as of the last reply; `None` until some reply reports a cache hit.
+    pub cache: Option<CacheStatus>,
 }
+
+/// The provider prompt cache as of the last reply: what it read, and what changed since the request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CacheStatus {
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// The last reply's timestamp (ms since the epoch); the cache expires `CACHE_TTL_MS` after it.
+    pub at_ms: i64,
+    /// What changed since the last request that makes the next one miss the cache.
+    pub changed: Option<CacheBreak>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheBreak {
+    Model,
+    Thinking,
+    Tools,
+    SystemPrompt,
+    Compacted,
+}
+
+/// Anthropic's ephemeral breakpoints (the only kind mu sets) and OpenAI's automatic cache both keep
+/// an entry ~5 min.
+pub const CACHE_TTL_MS: i64 = 5 * 60_000;
 
 /// A plan's state in the plan store.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

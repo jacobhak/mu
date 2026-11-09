@@ -4,7 +4,9 @@ use crate::text::line::{Line, line_width, span, truncate};
 use crate::theme::{self, Role};
 use crossterm::style::ContentStyle;
 use mu_base::config::{MuStatus, OmpStatusLine};
-use mu_base::events::{GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus};
+use mu_base::events::{
+    CACHE_TTL_MS, CacheBreak, CacheStatus, GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus,
+};
 use mu_base::permissions::PermissionMode;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -235,6 +237,7 @@ static SEGMENTS: &[Segment] = &[
     Segment { id: "context_pct", render: seg_context_pct },
     Segment { id: "context_total", render: seg_context_total },
     Segment { id: "cost", render: seg_cost },
+    Segment { id: "cache", render: seg_cache },
     Segment { id: "subagents", render: seg_subagents },
     Segment { id: "session_name", render: seg_session_name },
 ];
@@ -337,6 +340,53 @@ fn seg_cost(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
         text.push_str(&format!(" (+{sub:.2})"));
     }
     Some(vec![span(text, st(Role::SynType))])
+}
+
+/// Why the next message will miss the prompt cache, when it will.
+fn cache_cold(c: &CacheStatus, now_ms: i64) -> Option<String> {
+    let reason = match c.changed {
+        Some(CacheBreak::Model) => "model changed",
+        Some(CacheBreak::Thinking) => "thinking level changed",
+        Some(CacheBreak::Tools) => "tool set changed",
+        Some(CacheBreak::SystemPrompt) => "system prompt changed",
+        Some(CacheBreak::Compacted) => "context was compacted",
+        None => {
+            let idle = now_ms - c.at_ms;
+            return (idle > CACHE_TTL_MS).then(|| format!("expired after {} min idle", idle / 60_000));
+        }
+    };
+    Some(reason.into())
+}
+
+/// Share of the last reply's input the provider served from cache, rounded.
+fn hit_percent(c: &CacheStatus) -> u64 {
+    let total = c.cache_read + c.cache_write + c.input;
+    (c.cache_read * 100 + total / 2).checked_div(total).unwrap_or(0)
+}
+
+fn seg_cache(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
+    let c = s.cache.as_ref()?;
+    let line = match cache_cold(c, mu_base::message::now_ms()) {
+        Some(_) => vec![span("cache cold", st(Role::Warn))],
+        None => vec![span(format!("cache {}%", hit_percent(c)), st(Role::Muted))],
+    };
+    Some(line)
+}
+
+/// `/session`'s two lines about the prompt cache: the last reply's hit, and the next request's fate.
+pub(crate) fn cache_summary(c: &CacheStatus, now_ms: i64) -> String {
+    let total = c.cache_read + c.cache_write + c.input;
+    let first = format!(
+        "Prompt cache: last reply read {}% from cache ({} of {} input tokens)",
+        hit_percent(c),
+        format_number(c.cache_read),
+        format_number(total)
+    );
+    let next = match cache_cold(c, now_ms) {
+        Some(reason) => format!("Next message: not cached — {reason}"),
+        None => "Next message: likely cached".to_string(),
+    };
+    format!("{first}\n{next}")
 }
 
 /// `◌2 ✓1 ✗1`: running, done and failed background jobs; a count of zero is left out and no jobs at
@@ -825,5 +875,40 @@ mod tests {
         let l = &render(&s, &env(&c, cwd), 40)[0];
         assert_eq!(fg(l, "dev"), theme::get().color(Role::Warn));
         assert_eq!(fg(l, "*2"), theme::get().color(Role::Warn));
+    }
+
+    fn cache(input: u64, read: u64, at_ms: i64, changed: Option<CacheBreak>) -> CacheStatus {
+        CacheStatus { input, cache_read: read, cache_write: 0, at_ms, changed }
+    }
+
+    #[test]
+    fn cache_segment_shows_the_last_hit_and_turns_cold_when_it_will_miss() {
+        let c = cfg(&["cache"], &[]);
+        let cwd = Path::new("/home/u/x");
+        let now = mu_base::message::now_ms();
+        let mut s = snap();
+        s.usage = None;
+        s.title = None;
+        let text = |s: &StatusSnapshot| line_text(&render(s, &env(&c, cwd), 80)[0]).trim().to_string();
+        s.cache = Some(cache(100, 900, now, None));
+        assert_eq!(text(&s), "cache 90%");
+        s.cache = Some(cache(100, 900, now, Some(CacheBreak::Model)));
+        assert_eq!(text(&s), "cache cold");
+        s.cache = Some(cache(100, 900, now - 6 * 60_000, None));
+        assert_eq!(text(&s), "cache cold");
+        s.cache = None;
+        assert_eq!(text(&s), "", "no cache activity, no segment");
+    }
+
+    #[test]
+    fn cache_summary_names_why_the_next_request_misses() {
+        let now = mu_base::message::now_ms();
+        let t = cache_summary(&cache(100, 900, now - 6 * 60_000, None), now);
+        assert!(t.contains("read 90% from cache (900 of 1K input tokens)"), "{t}");
+        assert!(t.contains("Next message: not cached — expired after 6 min idle"), "{t}");
+        let t = cache_summary(&cache(100, 900, now, Some(CacheBreak::Compacted)), now);
+        assert!(t.ends_with("Next message: not cached — context was compacted"), "{t}");
+        let t = cache_summary(&cache(100, 900, now, None), now);
+        assert!(t.ends_with("Next message: likely cached"), "{t}");
     }
 }

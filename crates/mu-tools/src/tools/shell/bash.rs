@@ -323,7 +323,7 @@ impl Tools {
             return Err("Command cancelled before launch.".into());
         }
         jobs.check_capacity(1)?;
-        let snapshot = self.shell_snapshot().await;
+        let snapshot = self.shell_snapshot(true).await;
         let inherited = snapshot.is_some();
         let (snap_cwd, vars) = snapshot.unwrap_or_else(|| (self.cwd.clone(), process_env()));
         let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or(base.unwrap_or(snap_cwd));
@@ -352,19 +352,25 @@ impl Tools {
         let note = if inherited {
             String::new()
         } else {
-            "\nShell state from earlier calls was not inherited (the shell was busy or did not answer in time): the job uses mu's own environment.".to_string()
+            "\nShell state from earlier calls was not inherited (the shell did not answer in time): the job uses mu's own environment.".to_string()
         };
         Ok((id, note, sink))
     }
 
     /// The persistent shell's cwd and exported variables, from one state-neutral command. `None`
-    /// when the shell does not answer within `SNAPSHOT_TIMEOUT` (a foreground command holds it) or
-    /// the answer does not parse.
-    async fn shell_snapshot(&self) -> Option<(PathBuf, Vec<(String, String)>)> {
+    /// when the shell does not answer within `SNAPSHOT_TIMEOUT` or the answer does not parse.
+    /// `fork`: ask a fork of the shell, which has its state as of the last command boundary and
+    /// answers without waiting for a running command; otherwise wait for the shell itself.
+    async fn shell_snapshot(&self, fork: bool) -> Option<(PathBuf, Vec<(String, String)>)> {
         let ms = SNAPSHOT_TIMEOUT.as_millis() as u32;
         let (tx, rx) = flume::unbounded::<String>();
         let opts = ShellRunOptions { command: SNAPSHOT_COMMAND.into(), timeout_ms: Some(ms), ..Default::default() };
-        let mut run = self.shell().spawn(opts, Some(tx), CancelToken::new(Some(ms)));
+        let cancel = CancelToken::new(Some(ms));
+        let mut run = if fork {
+            self.shell().spawn_fork(opts, Some(tx), cancel)
+        } else {
+            self.shell().spawn(opts, Some(tx), cancel)
+        };
         let res = tokio::time::timeout(SNAPSHOT_TIMEOUT, run.join()).await.ok()?.ok()?;
         if res.cancelled || res.timed_out || res.exit_code != Some(0) {
             return None;
@@ -377,7 +383,7 @@ impl Tools {
         if self.shell_env.borrow().is_some() {
             return;
         }
-        if let Some((cwd, vars)) = self.shell_snapshot().await {
+        if let Some((cwd, vars)) = self.shell_snapshot(false).await {
             *self.shell_cwd.borrow_mut() = Some(cwd);
             *self.shell_env.borrow_mut() = Some(vars.into_iter().collect());
         }
@@ -387,7 +393,7 @@ impl Tools {
     /// returns a reminder when the command set or changed an exported variable, which then stays set for every
     /// later call and for anything those start. Names only, never values.
     async fn after_foreground(&self) -> Option<String> {
-        let (cwd, vars) = self.shell_snapshot().await?;
+        let (cwd, vars) = self.shell_snapshot(false).await?;
         *self.shell_cwd.borrow_mut() = Some(cwd);
         let session: Vec<&str> = self.session_env().iter().map(|(k, _)| *k).collect();
         let now: std::collections::BTreeMap<String, String> = vars.into_iter().collect();
@@ -637,7 +643,14 @@ fn exit_code(status: Option<std::process::ExitStatus>) -> Option<i32> {
 fn finish(c: Collected, end: RunEnd) -> ToolOutput {
     let RunEnd { wall, secs, cancelled, timed_out, exit_code, quiet_wall } = end;
     let had_output = !c.body.is_empty();
-    let mut text = if had_output { c.body } else { "(no output)".to_string() };
+    let silent_success = !had_output && !cancelled && !timed_out && exit_code == Some(0);
+    let mut text = if had_output {
+        c.body
+    } else if silent_success {
+        "(no output, exit code 0)".to_string()
+    } else {
+        "(no output)".to_string()
+    };
     let output_end = if had_output { text.len() } else { 0 };
     text.push_str(&c.notes);
     if quiet_wall && !had_output {
@@ -1037,7 +1050,17 @@ mod tests {
         let quiet = tools.call("bash", &json!({"command": "true"}), &ctx).await;
         let Some(ToolMeta::Bash(q)) = &quiet.meta else { panic!() };
         assert_eq!((q.output_end, q.exit_code), (0, None));
-        assert_eq!(quiet.text, "(no output)");
+        assert_eq!(quiet.text, "(no output, exit code 0)");
+    }
+
+    /// A command that prints nothing says whether it succeeded; a failed one keeps the code.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_silent_command_reports_its_exit_code() {
+        let tools = Tools::for_test();
+        let out = tools.call("bash", &json!({"command": "true"}), &ctx()).await;
+        assert_eq!(out.text, "(no output, exit code 0)");
+        let out = tools.call("bash", &json!({"command": "exit 3"}), &ctx()).await;
+        assert_eq!(out.text, "(no output)\n\nCommand exited with code 3");
     }
 
     /// Aborting a foreground command ends the call promptly and kills the command, also after
@@ -1256,20 +1279,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A foreground command holds the persistent shell, so the snapshot times out: the job still
-    /// runs, with mu's own environment, and the call says so.
+    /// A foreground command running in the persistent shell does not hide its earlier state from a
+    /// job: the job's snapshot comes from a fork, so it neither waits for the command nor sees the
+    /// variables that command exported.
     #[tokio::test(flavor = "current_thread")]
-    async fn busy_shell_falls_back_to_mu_environment_and_says_so() {
+    async fn a_busy_shell_still_hands_its_state_to_a_job() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (tools, jobs) = tools_with_jobs();
-                let (busy, c1) = (json!({"command": "sleep 2.5"}), ctx());
-                let (job, c2) = (json!({"command": "echo fallback-ran", "async": true}), ctx());
+                let (setup, c) = (json!({"command": "cd /usr && export MU_FORK_V=kept"}), ctx());
+                assert!(!tools.call("bash", &setup, &c).await.is_error);
+                let (busy, c1) = (json!({"command": "export MU_FORK_V=during; sleep 2.5"}), ctx());
+                let (job, c2) = (json!({"command": r#"printf '%s %s' "$PWD" "$MU_FORK_V""#, "async": true}), ctx());
                 let start = async {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    tools.call("bash", &job, &c2).await
+                    let t = std::time::Instant::now();
+                    (tools.call("bash", &job, &c2).await, t.elapsed())
                 };
-                let (_, out) = tokio::join!(tools.call("bash", &busy, &c1), start);
+                let (_, (out, took)) = tokio::join!(tools.call("bash", &busy, &c1), start);
+                assert!(!out.text.contains("was not inherited"), "{}", out.text);
+                assert!(took < std::time::Duration::from_millis(1500), "the snapshot did not wait: {took:?}");
+                let done = finished(&jobs).await;
+                assert!(done[0].ok, "{}", done[0].text);
+                assert_eq!(done[0].text, "/usr kept", "state from before the busy command: {}", done[0].text);
+            })
+            .await;
+    }
+
+    /// A shell whose threads are all stuck cannot answer a snapshot: the job still runs, with mu's
+    /// own environment, and the call says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stuck_shell_falls_back_to_mu_environment_and_says_so() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                tools.shell().jam(5);
+                let (job, c) = (json!({"command": "echo fallback-ran", "async": true}), ctx());
+                let out = tools.call("bash", &job, &c).await;
                 assert!(
                     !out.is_error && out.text.contains("Shell state from earlier calls was not inherited"),
                     "{}",

@@ -9,6 +9,18 @@ pub struct ToolDef {
     pub schema: Value,
 }
 
+impl ToolDef {
+    /// Bytes this definition takes on the wire: its name, description and schema.
+    pub fn est_bytes(&self) -> usize {
+        self.name.len() + self.description.len() + crate::message::json_len(&self.schema)
+    }
+}
+
+/// Tokens the tool definitions cost in every request: about 4 bytes per token.
+pub fn tool_tokens(defs: &[ToolDef]) -> u64 {
+    defs.iter().map(ToolDef::est_bytes).sum::<usize>() as u64 / 4
+}
+
 /// Facts about a tool result that the UI needs, recorded by the tool itself so the UI never has
 /// to recover them by parsing the text the model sees. The model gets the same text as before.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -141,5 +153,16 @@ impl ToolOutput {
         let meta = details.as_ref().and_then(|d| d.get(META_KEY)).and_then(|m| serde_json::from_value(m.clone()).ok());
         let display = details.as_ref().and_then(|d| d.get("diff")).and_then(Value::as_str).map(str::to_string);
         Self { text, is_error, display, details, meta, images: Vec::new(), changes: Vec::new() }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn tool_definitions_cost_tokens_in_every_request() {
+        let def = ToolDef { name: "x".into(), description: "d".repeat(400), schema: serde_json::json!({}) };
+        assert!(tool_tokens(&[def]) >= 100);
     }
 }

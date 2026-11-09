@@ -1,5 +1,6 @@
 use crate::ask_nudge;
 use crate::events::AgentEvent;
+use crate::models::{Api, ModelSpec, same_origin};
 use crate::tool::ToolOutput;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -173,7 +174,7 @@ pub fn text_of(blocks: &[Block]) -> String {
 }
 
 /// Bytes `v` takes as JSON, counted without building the string.
-fn json_len(v: &Value) -> usize {
+pub(crate) fn json_len(v: &Value) -> usize {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -208,6 +209,46 @@ impl Block {
     }
 }
 
+/// Bytes an assistant block adds to a request to `target`: only what that wire actually sends.
+fn assistant_bytes(
+    block: &Block,
+    api: &str,
+    provider: &str,
+    model: &str,
+    stop: StopReason,
+    target: &ModelSpec,
+) -> usize {
+    match block {
+        Block::Text { text } => text.len(),
+        Block::ToolCall { id, name, arguments } => id.len() + name.len() + json_len(arguments),
+        Block::Image(_) | Block::Unknown => 0,
+        Block::Thinking { thinking, thinking_signature } => {
+            let origin = same_origin(api, provider, target);
+            match target.api {
+                // Signed same-origin thinking replays verbatim; unsigned and foreign thinking is dropped.
+                Api::AnthropicMessages => match thinking_signature {
+                    Some(sig) if origin => thinking.len() + sig.len(),
+                    _ => 0,
+                },
+                // Only the signature (a reasoning item) is replayed, and the text never is.
+                Api::OpenAiResponses => {
+                    let replayable = origin && model == target.id && stop != StopReason::Error;
+                    match thinking_signature {
+                        Some(sig) if replayable => sig.len(),
+                        _ => 0,
+                    }
+                }
+                // Same-origin thinking goes as reasoning; foreign thinking is demoted to `<think>` text.
+                Api::OpenAiCompletions => thinking.len(),
+            }
+        }
+        Block::RedactedThinking { data } => match target.api {
+            Api::AnthropicMessages if same_origin(api, provider, target) => data.len(),
+            _ => 0,
+        },
+    }
+}
+
 impl Block {
     pub fn text(text: impl Into<String>) -> Self {
         Block::Text { text: text.into() }
@@ -232,18 +273,29 @@ impl Message {
         Message::User { content, timestamp: now_ms(), synthetic: false, command: i.command.clone() }
     }
 
-    /// Token estimate of what this message adds to a request: about 4 bytes per token over its
-    /// text, thinking and tool arguments, a flat amount per image (its bytes are not counted), and
-    /// a small framing allowance. Counts lengths only; nothing is serialized into a string.
-    pub fn estimate_tokens(&self) -> u64 {
+    /// Token estimate of what this message adds to a request to `target`: about 4 bytes per token
+    /// over the text, thinking and tool arguments that wire sends, a flat amount per image (its
+    /// bytes are not counted), and a small framing allowance. Counts lengths only; nothing is
+    /// serialized into a string.
+    pub fn estimate_tokens(&self, target: &ModelSpec) -> u64 {
         let content = self.content();
         let bytes: usize = MESSAGE_OVERHEAD
-            + content.iter().map(Block::est_bytes).sum::<usize>()
+            + match self {
+                Message::Assistant { api, provider, model, stop_reason, .. } => content
+                    .iter()
+                    .map(|b| assistant_bytes(b, api, provider, model, *stop_reason, target))
+                    .sum::<usize>(),
+                _ => content.iter().map(Block::est_bytes).sum(),
+            }
             + match self {
                 Message::ToolResult { tool_call_id, tool_name, .. } => tool_call_id.len() + tool_name.len(),
                 _ => 0,
             };
-        let images = content.iter().filter(|b| matches!(b, Block::Image(_))).count() as u64;
+        // An assistant image is dropped by every wire; only user and tool-result images are sent.
+        let images = match self {
+            Message::Assistant { .. } => 0,
+            _ => content.iter().filter(|b| matches!(b, Block::Image(_))).count() as u64,
+        };
         bytes as u64 / 4 + IMAGE_TOKENS * images
     }
 
@@ -477,11 +529,30 @@ mod pair_tests {
 mod estimate_tests {
     use super::*;
 
+    fn target() -> ModelSpec {
+        ModelSpec::gateway("anthropic/x", 200_000, 32_000)
+    }
+
+    fn assistant(content: Vec<Block>, api: &str, provider: &str, model: &str) -> Message {
+        Message::Assistant {
+            content,
+            api: api.into(),
+            provider: provider.into(),
+            model: model.into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            timestamp: 0,
+            response_id: None,
+            error_message: None,
+        }
+    }
+
     #[test]
     fn counts_lengths_not_image_bytes_and_text_of_joins_lines() {
+        let target = target();
         let short = Message::user("x");
         let long = Message::user(&"y".repeat(4000));
-        assert!(long.estimate_tokens() >= short.estimate_tokens() + 999);
+        assert!(long.estimate_tokens(&target) >= short.estimate_tokens(&target) + 999);
         let with_image = Message::User {
             content: vec![
                 Block::text("hi"),
@@ -491,7 +562,7 @@ mod estimate_tests {
             synthetic: false,
             command: None,
         };
-        let est = with_image.estimate_tokens();
+        let est = with_image.estimate_tokens(&target);
         assert!((1600..1700).contains(&est), "a flat 1600 for the image, its bytes not counted: {est}");
         let call = Message::Assistant {
             content: vec![Block::ToolCall {
@@ -508,8 +579,59 @@ mod estimate_tests {
             response_id: None,
             error_message: None,
         };
-        assert!(call.estimate_tokens() >= 100, "tool arguments count");
+        assert!(call.estimate_tokens(&target) >= 100, "tool arguments count");
         assert_eq!(text_of(&[Block::text("a"), Block::Unknown, Block::text("b")]), "a\nb");
+    }
+
+    #[test]
+    fn anthropic_counts_foreign_thinking_as_nothing_on_the_wire() {
+        let target = target();
+        let signed = |provider: &str| {
+            assistant(
+                vec![
+                    Block::Thinking { thinking: "t".repeat(400), thinking_signature: Some("s".repeat(40_000)) },
+                    Block::RedactedThinking { data: "r".repeat(40_000) },
+                ],
+                "anthropic-messages",
+                provider,
+                "anthropic/x",
+            )
+        };
+        assert!(signed("openai").estimate_tokens(&target) < 200, "foreign thinking is dropped");
+        assert!(signed("anthropic").estimate_tokens(&target) > 20_000, "same-origin thinking replays");
+    }
+
+    #[test]
+    fn responses_counts_the_signature_but_not_the_thinking_text() {
+        let mut target = ModelSpec::gateway("openai/gpt-5", 200_000, 32_000);
+        target.api = Api::OpenAiResponses;
+        let sig = "s".repeat(4000);
+        let with_text = assistant(
+            vec![Block::Thinking { thinking: "t".repeat(400), thinking_signature: Some(sig.clone()) }],
+            "openai-responses",
+            "openai",
+            "openai/gpt-5",
+        );
+        let bare = assistant(
+            vec![Block::Thinking { thinking: String::new(), thinking_signature: Some(sig) }],
+            "openai-responses",
+            "openai",
+            "openai/gpt-5",
+        );
+        let est = with_text.estimate_tokens(&target);
+        assert_eq!(est, bare.estimate_tokens(&target), "the thinking text is never sent");
+        assert!((950..1100).contains(&est), "the signature is sent: {est}");
+    }
+
+    #[test]
+    fn an_assistant_image_costs_nothing() {
+        let image = assistant(
+            vec![Block::Image(Image { data: "A".repeat(1_000_000), mime_type: "image/png".into() })],
+            "anthropic-messages",
+            "anthropic",
+            "anthropic/x",
+        );
+        assert!(image.estimate_tokens(&target()) < 10, "every wire drops assistant images");
     }
 
     #[test]

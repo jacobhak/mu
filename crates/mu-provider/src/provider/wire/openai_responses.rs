@@ -3,7 +3,7 @@
 //! Replay follows omp so sessions move between the two tools: a reasoning item is kept as the
 //! thinking signature (its JSON, verbatim), a tool call id is `call_id|item_id`.
 
-use super::convert::{normalize_id, paired, same_origin, tool_list, unavailable};
+use super::convert::{normalize_id, paired, tool_list, unavailable};
 use super::usage;
 use super::{SseFrames, WireFormat};
 use crate::auth::chatgpt;
@@ -11,7 +11,7 @@ use crate::provider::retry;
 use crate::provider::sse::SseDecoder;
 use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
 use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
-use mu_base::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort};
+use mu_base::models::{ModelSpec, Thinking, ThinkingMode, clamp_effort, same_origin};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 

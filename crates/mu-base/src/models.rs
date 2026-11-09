@@ -265,6 +265,11 @@ impl ModelSpec {
     }
 }
 
+/// Thinking blocks are only replayable to the same api + provider that produced them.
+pub fn same_origin(api: &str, provider: &str, model: &ModelSpec) -> bool {
+    api == model.api.as_str() && provider == model.provider
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayModel {
     pub id: String,

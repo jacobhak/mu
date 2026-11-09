@@ -78,6 +78,25 @@ impl ShellWorker {
         Run { task, inner, slot: self.slot.clone() }
     }
 
+    /// Runs `opts` in a fork of the persistent shell: its state as of the last command boundary,
+    /// without waiting for a running command. Nothing the run sets reaches the persistent shell.
+    /// Only `Run::join` may be used on the result: `Run::hung` would kill the persistent shell's
+    /// pids, which the fork does not own.
+    pub fn spawn_fork(
+        &self,
+        opts: ShellRunOptions,
+        on_chunk: Option<flume::Sender<String>>,
+        cancel: CancelToken,
+    ) -> Run {
+        let inner = self.inner();
+        let shell = inner.shell.clone();
+        let task = inner.handle().spawn(async move {
+            let fork = shell.fork();
+            fork.run(opts, on_chunk, cancel).await.map_err(|e| e.to_string())
+        });
+        Run { task, inner, slot: self.slot.clone() }
+    }
+
     /// Test seam: stops every worker thread for `secs` seconds, as a blocking builtin would.
     #[cfg(test)]
     pub fn jam(&self, secs: u64) {
@@ -180,6 +199,26 @@ mod tests {
         run(&w, "X_WORKER_TEST=kept", 5000).join().await.unwrap();
         let r = run(&w, "test \"$X_WORKER_TEST\" = kept", 5000).join().await.unwrap();
         assert_eq!(r.exit_code, Some(0));
+    }
+
+    /// A fork starts from the state before a command that is still running, without waiting for it,
+    /// and what it sets never reaches the persistent shell.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_sees_state_from_before_a_running_command_and_changes_nothing() {
+        let w = ShellWorker::default();
+        run(&w, "X_FORK=a", 5000).join().await.unwrap();
+        let mut busy = run(&w, "X_FORK=b; sleep 2", 5000);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let opts = ShellRunOptions {
+            command: "test \"$X_FORK\" = a && X_FORK=c".into(),
+            timeout_ms: Some(5000),
+            ..Default::default()
+        };
+        let fork = w.spawn_fork(opts, None, CancelToken::new(Some(5000))).join().await.unwrap();
+        assert_eq!(fork.exit_code, Some(0), "the fork saw the pre-command state");
+        assert_eq!(busy.join().await.unwrap().exit_code, Some(0));
+        let after = run(&w, "test \"$X_FORK\" = b", 5000).join().await.unwrap();
+        assert_eq!(after.exit_code, Some(0), "the fork's change stayed in the fork");
     }
 
     /// The caller's thread keeps running while every thread of the shell is stuck; the call is given

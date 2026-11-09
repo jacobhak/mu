@@ -1,12 +1,36 @@
 use super::*;
-use mu_base::models::ThinkingMode;
+use mu_base::events::{CacheBreak, CacheStatus};
+use mu_base::models::{ThinkingMode, same_origin};
 use mu_provider::auth::chatgpt;
 use mu_provider::provider::custom::AuthMode;
 use mu_provider::provider::providers::native_def;
 
+/// What a request's prompt-cache prefix is built from. A field that changed since the last request
+/// makes the next one miss the cache.
+#[derive(Clone, PartialEq)]
+pub(super) struct PrefixKey {
+    model: String,
+    thinking: Thinking,
+    system: u64,
+    tools: u64,
+    summary: u64,
+}
+
+/// Context tokens a reply's usage reports, when it describes a request to `target`: same api,
+/// provider and model, a completed reply, and a usage that counts any input.
+fn usage_anchor(m: &Message, target: &ModelSpec) -> Option<u64> {
+    let Message::Assistant { api, provider, model, usage, stop_reason, .. } = m else { return None };
+    let input = usage.input + usage.cache_read + usage.cache_write;
+    (same_origin(api, provider, target)
+        && model == &target.id
+        && !matches!(stop_reason, StopReason::Error | StopReason::Aborted)
+        && input > 0)
+        .then_some(input + usage.output)
+}
+
 impl Agent {
-    /// Tokens of the system prompt, measured again only when what it is built from changes.
-    pub(crate) fn system_tokens(&self) -> u64 {
+    /// A hash of what the system prompt is built from, so it is only measured again when that changes.
+    pub(crate) fn system_key(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (
@@ -20,7 +44,12 @@ impl Agent {
         )
             .hash(&mut h);
         self.ports.plugins.mcp_instructions().hash(&mut h);
-        let key = h.finish();
+        h.finish()
+    }
+
+    /// Tokens of the system prompt, measured again only when what it is built from changes.
+    pub(crate) fn system_tokens(&self) -> u64 {
+        let key = self.system_key();
         let mut memo = self.memo.system.borrow_mut();
         match *memo {
             Some((k, t)) if k == key => t,
@@ -32,14 +61,18 @@ impl Agent {
         }
     }
 
-    /// Sum of the messages' estimates, kept until the message list changes.
+    /// Sum of the messages' estimates for the current model, kept until the message list or the
+    /// target model changes.
     pub(crate) fn messages_tokens(&self) -> u64 {
-        let key = (self.messages.len(), self.messages.last().map_or(0, Message::timestamp));
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.model.model.api.as_str(), &self.model.model.provider, &self.model.model.id).hash(&mut h);
+        let key = (self.messages.len(), self.messages.last().map_or(0, Message::timestamp), h.finish());
         let mut memo = self.memo.messages.borrow_mut();
         match *memo {
             Some((k, t)) if k == key => t,
             _ => {
-                let t = self.messages.iter().map(Message::estimate_tokens).sum();
+                let t = self.messages.iter().map(|m| m.estimate_tokens(&self.model.model)).sum();
                 *memo = Some((key, t));
                 t
             }
@@ -104,6 +137,7 @@ impl Agent {
             git: self.costs.git.clone(),
             usage: if self.gateway_idle() { None } else { self.costs.quota.usage_for(&self.model.model.provider) },
             permissions: self.tools.permissions.mode(),
+            cache: self.cache_status(),
         }
     }
 
@@ -161,10 +195,67 @@ impl Agent {
 
     pub(crate) fn fresh_usage_tokens(&self) -> Option<u64> {
         let msgs = self.messages.get(self.compaction.fresh_from..)?;
-        let i = msgs.iter().rposition(|m| matches!(m, Message::Assistant { .. }))?;
-        let Message::Assistant { usage, .. } = &msgs[i] else { return None };
-        let trailing: u64 = msgs[i + 1..].iter().map(Message::estimate_tokens).sum();
-        Some(usage.input + usage.cache_read + usage.cache_write + usage.output + trailing)
+        let target = &self.model.model;
+        let (i, anchor) = msgs.iter().enumerate().rev().find_map(|(i, m)| Some((i, usage_anchor(m, target)?)))?;
+        let trailing: u64 = msgs[i + 1..].iter().map(|m| m.estimate_tokens(target)).sum();
+        Some(anchor + trailing)
+    }
+
+    /// The prefix a request sent now would start with, for comparing against the last request sent.
+    pub(super) fn prefix_key(&self, defs: &[ToolDef]) -> PrefixKey {
+        use std::hash::{Hash, Hasher};
+        let mut tools = std::collections::hash_map::DefaultHasher::new();
+        for d in defs {
+            d.name.hash(&mut tools);
+            d.description.hash(&mut tools);
+            d.est_bytes().hash(&mut tools);
+        }
+        let summary = self.compaction.state.as_ref().map_or(0, |c| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            c.summary.hash(&mut h);
+            h.finish()
+        });
+        PrefixKey {
+            model: self.model.model.id.clone(),
+            thinking: self.model.live_thinking.get(),
+            system: self.system_key(),
+            tools: tools.finish(),
+            summary,
+        }
+    }
+
+    /// The prompt cache as of the last reply, with what changed since the last request. `None` when
+    /// no reply has reported a cache hit.
+    fn cache_status(&self) -> Option<CacheStatus> {
+        let (usage, at_ms) = self.messages.iter().rev().find_map(|m| match m {
+            Message::Assistant { usage, timestamp, .. } if usage.cache_read + usage.cache_write > 0 => {
+                Some((usage, *timestamp))
+            }
+            _ => None,
+        })?;
+        let changed = self.memo.sent_prefix.as_ref().and_then(|sent| {
+            let now = self.prefix_key(&self.tool_defs());
+            if sent.model != now.model {
+                Some(CacheBreak::Model)
+            } else if sent.thinking != now.thinking {
+                Some(CacheBreak::Thinking)
+            } else if sent.tools != now.tools {
+                Some(CacheBreak::Tools)
+            } else if sent.system != now.system {
+                Some(CacheBreak::SystemPrompt)
+            } else if sent.summary != now.summary {
+                Some(CacheBreak::Compacted)
+            } else {
+                None
+            }
+        });
+        Some(CacheStatus {
+            input: usage.input,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            at_ms,
+            changed,
+        })
     }
 
     pub(crate) fn set_model(&mut self, sel: &str) {
@@ -194,5 +285,37 @@ impl Agent {
             s.thinking_change(t.as_str());
         }
         self.emit_status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_base::message::Usage;
+
+    fn reply(provider: &str, model: &str, stop: StopReason, input: u64) -> Message {
+        Message::Assistant {
+            content: vec![],
+            api: "anthropic-messages".into(),
+            provider: provider.into(),
+            model: model.into(),
+            usage: Usage { input, ..Default::default() },
+            stop_reason: stop,
+            timestamp: 0,
+            response_id: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn usage_anchors_only_on_a_reply_to_the_same_target() {
+        let target = ModelSpec::gateway("anthropic/claude", 200_000, 32_000);
+        let r = |provider, model, stop, input| usage_anchor(&reply(provider, model, stop, input), &target);
+        assert_eq!(r("anthropic", "anthropic/claude", StopReason::Stop, 100), Some(100));
+        assert_eq!(r("openai", "anthropic/claude", StopReason::Stop, 100), None);
+        assert_eq!(r("anthropic", "anthropic/other", StopReason::Stop, 100), None);
+        assert_eq!(r("anthropic", "anthropic/claude", StopReason::Aborted, 100), None);
+        assert_eq!(r("anthropic", "anthropic/claude", StopReason::Error, 100), None);
+        assert_eq!(r("anthropic", "anthropic/claude", StopReason::Stop, 0), None);
     }
 }

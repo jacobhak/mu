@@ -2,7 +2,6 @@
 //! origin, and the shapes of tool lists and unavailable images.
 
 use mu_base::message::{Image, Message};
-use mu_base::models::ModelSpec;
 use mu_base::tool::ToolDef;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -43,9 +42,4 @@ pub fn normalize_id(id: &str) -> String {
 /// FNV-1a: unlike `DefaultHasher`, its output is fixed across Rust versions, so ids stay stable.
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
-}
-
-/// Thinking blocks are only replayable to the same api + provider that produced them.
-pub fn same_origin(api: &str, provider: &str, model: &ModelSpec) -> bool {
-    api == model.api.as_str() && provider == model.provider
 }

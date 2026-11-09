@@ -1,5 +1,6 @@
 //! The agent's state, grouped by concern. Fields are visible to the `agent` module tree only.
 
+use super::status::PrefixKey;
 use super::{DeliverFn, ExecPlan, PlanState};
 use mu_base::events::{EventTx, GitInfo};
 use mu_base::message::UserInput;
@@ -131,6 +132,9 @@ pub(super) struct CompactionFlow {
     pub(super) since: usize,
 }
 
+/// `(message count, last timestamp, target model hash)` and the messages' token sum.
+type MessagesKey = ((usize, i64, u64), u64);
+
 /// Derived values kept between requests.
 #[derive(Default)]
 pub(super) struct Memo {
@@ -139,6 +143,8 @@ pub(super) struct Memo {
     pub(super) base_defs: OnceCell<Vec<ToolDef>>,
     /// `(inputs hash, tokens)` of the system prompt, see `system_tokens`.
     pub(super) system: RefCell<Option<(u64, u64)>>,
-    /// `((message count, last timestamp), tokens)`, see `messages_tokens`.
-    pub(super) messages: RefCell<Option<((usize, i64), u64)>>,
+    /// See `MessagesKey`.
+    pub(super) messages: RefCell<Option<MessagesKey>>,
+    /// The prefix of the last request sent, for telling whether the next one hits the prompt cache.
+    pub(super) sent_prefix: Option<PrefixKey>,
 }

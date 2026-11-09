@@ -69,7 +69,9 @@ pub fn context_fill(req: &super::types::Request<'_>) -> f64 {
     if window == 0 {
         return 100.0;
     }
-    let tokens = req.system.len() as u64 / 4 + req.messages.iter().map(|m| m.estimate_tokens()).sum::<u64>();
+    let tokens = req.system.len() as u64 / 4
+        + mu_base::tool::tool_tokens(req.tools)
+        + req.messages.iter().map(|m| m.estimate_tokens(req.model)).sum::<u64>();
     tokens as f64 * 100.0 / window as f64
 }
 

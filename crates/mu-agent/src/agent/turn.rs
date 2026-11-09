@@ -309,6 +309,7 @@ impl Agent {
         // Every tool call in the history has its result and vice versa (`to_wire` also repairs).
         debug_assert!(mu_base::message::check_tool_pairs(&wire).is_ok(), "unpaired tool calls in the request");
         let defs = self.tool_defs();
+        self.memo.sent_prefix = Some(self.prefix_key(&defs));
         let mut held = Vec::new();
         let mut failed = Vec::new();
         let reply = {

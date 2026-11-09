@@ -478,8 +478,7 @@ async fn pump(
 #[cfg(test)]
 mod route_tests {
     use super::*;
-    use crate::provider::wire::convert::same_origin;
-    use mu_base::models::Api;
+    use mu_base::models::{Api, same_origin};
 
     #[test]
     fn api_strings_are_omps_and_sessions_stay_replayable() {

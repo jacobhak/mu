@@ -2,6 +2,7 @@ use super::Agent;
 use mu_base::config::Threshold;
 use mu_base::events::AgentEvent;
 use mu_base::message::{Block, Message, text_of};
+use mu_base::models::ModelSpec;
 use mu_session::session::format::CompactionState;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -50,12 +51,12 @@ pub(crate) fn window_and_threshold(window: u32, th: Option<Threshold>) -> (u64, 
 
 /// Index of the first kept message: the smallest user/assistant index whose suffix fits `KEEP_TOKENS`,
 /// but never past the last user/assistant message.
-pub(crate) fn cut_point(messages: &[Message]) -> usize {
+pub(crate) fn cut_point(messages: &[Message], target: &ModelSpec) -> usize {
     let Some(last) = messages.iter().rposition(|m| !matches!(m, Message::ToolResult { .. })) else { return 0 };
     let mut sum = 0;
     let mut chosen = last;
     for i in (0..messages.len()).rev() {
-        sum += messages[i].estimate_tokens();
+        sum += messages[i].estimate_tokens(target);
         if sum > KEEP_TOKENS {
             break;
         }
@@ -170,11 +171,12 @@ impl Agent {
         window_and_threshold(self.model.model.context_window, lookup(&th, &self.model.model.id))
     }
 
-    /// Estimated tokens of the next request: system prompt, summary context and messages. The
-    /// system prompt is only measured when its inputs change, and the messages' sum is reused until
-    /// a message is added or removed, so frequent status updates do not recompute either.
+    /// Estimated tokens of the next request: system prompt, tool definitions, summary context and
+    /// messages. The system prompt is only measured when its inputs change, and the messages' sum is
+    /// reused until a message is added or removed, so frequent status updates do not recompute either.
     pub(crate) fn estimate_tokens(&self) -> u64 {
         self.system_tokens()
+            + mu_base::tool::tool_tokens(&self.tool_defs())
             + self.messages_tokens()
             + self.compaction.state.as_ref().map_or(0, |c| estimate_tokens(&c.summary))
     }
@@ -205,7 +207,7 @@ impl Agent {
         if self.compaction.since == 0 {
             return Outcome::Skipped("Already compacted");
         }
-        let cut = cut_point(&self.messages);
+        let cut = cut_point(&self.messages, &self.model.model);
         if cut == 0 {
             return Outcome::Skipped("Nothing to compact");
         }
@@ -248,8 +250,9 @@ impl Agent {
         self.messages.drain(..cut);
         self.entry_ids.drain(..cut);
         let after_est = self.system_tokens()
+            + mu_base::tool::tool_tokens(&self.tool_defs())
             + estimate_tokens(&summary)
-            + self.messages.iter().map(Message::estimate_tokens).sum::<u64>();
+            + self.messages.iter().map(|m| m.estimate_tokens(&self.model.model)).sum::<u64>();
         if let Some(s) = self.session.as_mut() {
             s.compaction(&summary, &first_kept, before, after_est);
         }
@@ -360,10 +363,11 @@ mod tests {
     fn cut_keeps_recent_suffix_and_last_group() {
         let big = "x".repeat(40_000); // ~10k tokens each
         let u = |t: &str| Message::user(t);
+        let target = ModelSpec::gateway("anthropic/test", 200_000, 32_000);
         let msgs = vec![u(&big), u(&big), u(&big), u("tail")];
-        let cut = cut_point(&msgs);
+        let cut = cut_point(&msgs, &target);
         assert_eq!(cut, 2); // last two ≈ 10k + tiny fit, third does not
-        assert_eq!(cut_point(&[u("a")]), 0);
+        assert_eq!(cut_point(&[u("a")], &target), 0);
         let tr = Message::ToolResult {
             tool_call_id: "1".into(),
             tool_name: "read".into(),
@@ -373,7 +377,7 @@ mod tests {
             details: None,
         };
         let msgs = vec![u("a"), u(&big), tr.clone(), tr.clone(), tr];
-        assert_eq!(cut_point(&msgs), 1); // never lands on a tool result
+        assert_eq!(cut_point(&msgs, &target), 1); // never lands on a tool result
     }
 
     #[test]

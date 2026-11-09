@@ -1,12 +1,12 @@
 pub mod native;
 
-use super::convert::{normalize_id, paired, same_origin, tool_list, unavailable};
+use super::convert::{normalize_id, paired, tool_list, unavailable};
 use super::usage;
 use super::{SseFrames, WireFormat};
 use crate::provider::sse::SseDecoder;
 use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
 use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
-use mu_base::models::{ModelSpec, Thinking};
+use mu_base::models::{ModelSpec, Thinking, same_origin};
 use mu_base::tool::ToolDef;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;

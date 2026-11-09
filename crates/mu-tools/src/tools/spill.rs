@@ -106,6 +106,14 @@ pub struct Collector {
     head: String,
     tail: String,
     elided: usize,
+    /// Count of `\n` in everything pushed.
+    newlines: usize,
+    /// The last non-empty push did not end with `\n`.
+    ends_open: bool,
+    /// The head has reached `HEAD` bytes and is no longer filled.
+    head_done: bool,
+    /// The tail's cut fell inside a line.
+    tail_mid_line: bool,
     /// Full output spill, opened when the first byte is elided.
     spill: Option<Spill>,
     /// Why the last attempt to open the spill failed; a later elision tries again.
@@ -128,22 +136,44 @@ impl Collector {
     }
 
     pub fn push(&mut self, mut s: &str, alloc: Alloc) {
+        self.newlines += s.bytes().filter(|b| *b == b'\n').count();
+        if !s.is_empty() {
+            self.ends_open = !s.ends_with('\n');
+        }
         if let Some(sp) = self.spill.as_mut() {
             sp.write(s);
         }
-        if self.tail.is_empty() && self.elided == 0 && self.head.len() < HEAD {
+        if !self.head_done && self.elided == 0 && self.tail.is_empty() && self.head.len() < HEAD {
             let mut n = (HEAD - self.head.len()).min(s.len());
             while !s.is_char_boundary(n) {
                 n += 1;
             }
             self.head.push_str(&s[..n]);
             s = &s[n..];
+            if self.head.len() >= HEAD {
+                self.head_done = true;
+                // Keep the head on a line boundary: a partial last line moves to the tail.
+                if let Some(i) = self.head.rfind('\n') {
+                    let rest = self.head.split_off(i + 1);
+                    self.tail.push_str(&rest);
+                }
+            }
         }
         self.tail.push_str(s);
         if self.tail.len() > TAIL {
             let mut cut = self.tail.len() - TAIL;
             while !self.tail.is_char_boundary(cut) {
                 cut += 1;
+            }
+            // Prefer a cut after a newline, so no line is shown twice; the last byte is left
+            // alone so at least one line survives.
+            let limit = self.tail.len() - 1;
+            match self.tail.as_bytes()[cut..].iter().position(|b| *b == b'\n') {
+                Some(i) if cut + i < limit => {
+                    cut += i + 1;
+                    self.tail_mid_line = false;
+                }
+                _ => self.tail_mid_line = true,
             }
             if self.spill.is_none() {
                 match Spill::open(alloc, &self.cwd, SPILL_CAP) {
@@ -161,8 +191,21 @@ impl Collector {
     }
 
     pub fn finish(mut self) -> Collected {
+        // The shown line ranges, when both cuts fell on line boundaries.
+        let mut ranges = None;
         let body = if self.elided > 0 {
-            format!("{}\n[…{}B elided…]\n{}", self.head, self.elided, self.tail)
+            let head_lines = self.head.matches('\n').count();
+            let total = self.newlines + usize::from(self.ends_open);
+            let tail_lines =
+                self.tail.matches('\n').count() + usize::from(!self.tail.is_empty() && !self.tail.ends_with('\n'));
+            let tail_start = total - tail_lines + 1;
+            if self.head.ends_with('\n') && !self.tail_mid_line {
+                let n = tail_start - head_lines - 1;
+                ranges = Some((head_lines, tail_start, total));
+                format!("{}[…{n} lines elided…]\n{}", self.head, self.tail)
+            } else {
+                format!("{}\n[…{}B elided…]\n{}", self.head, self.elided, self.tail)
+            }
         } else {
             std::mem::take(&mut self.head) + &self.tail
         };
@@ -172,13 +215,21 @@ impl Collector {
         let mut error = self.open_error.take();
         if let Some(mut sp) = self.spill.take() {
             sp.flush();
-            notes.push_str(&format!("\n[full output: artifact://{}]", sp.id));
+            match ranges {
+                Some((head_lines, tail_start, total)) => notes.push_str(&format!(
+                    "\n[Showing lines 1-{head_lines} and {tail_start}-{total} of {total}; full output: artifact://{}]",
+                    sp.id
+                )),
+                None => notes.push_str(&format!("\n[full output: artifact://{}]", sp.id)),
+            }
             if sp.capped {
                 notes.push_str(" (truncated at 128 MB)");
                 spill_note = Some("spill truncated at 128 MB".to_string());
             }
             artifact = Some(sp.id);
             error = sp.error.or(error);
+        } else if let Some((head_lines, tail_start, total)) = ranges {
+            notes.push_str(&format!("\n[Showing lines 1-{head_lines} and {tail_start}-{total} of {total}]"));
         }
         if let Some(e) = error {
             notes.push_str(&format!("\n[could not save the full output: {e}]"));
@@ -230,5 +281,79 @@ mod tests {
         assert!(!text.contains("Zq8-spill"), "{text}");
         assert!(text.contains("[REDACTED:SPILL_TEST_KEY] after\nnext line\n"), "{text}");
         assert!(text.ends_with("trailing"), "the held-back tail is written at flush: {text}");
+    }
+
+    fn collector_in_temp() -> (Collector, PathBuf) {
+        let d = std::env::temp_dir().join(format!("mu-spill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        (Collector::new(d.clone()), d)
+    }
+
+    fn is_line(s: &str) -> bool {
+        s.strip_prefix("line ").is_some_and(|n| n.len() == 5 && n.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    fn is_marker(s: &str) -> bool {
+        s.strip_prefix("[…")
+            .and_then(|r| r.strip_suffix(" lines elided…]"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    /// The `Showing lines 1-h and t-total of total` numbers.
+    fn shown(notes: &str) -> (usize, usize, usize) {
+        let rest = notes.split("Showing lines 1-").nth(1).expect("no line ranges");
+        let nums: Vec<usize> =
+            rest.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse().unwrap()).collect();
+        (nums[0], nums[1], nums[2])
+    }
+
+    #[test]
+    fn a_long_stream_keeps_whole_lines_and_names_the_ranges() {
+        let (mut c, d) = collector_in_temp();
+        let alloc = move || (7, d.join("out.log"));
+        let all: String = (1..=20000).map(|i| format!("line {i:05}\n")).collect();
+        // 7-byte chunks split lines, so a cut can land mid-line.
+        for chunk in all.as_bytes().chunks(7) {
+            c.push(std::str::from_utf8(chunk).unwrap(), &alloc);
+        }
+        let out = c.finish();
+        let lines: Vec<&str> = out.body.lines().collect();
+        let marker = lines.iter().position(|l| l.starts_with("[…")).expect("no elision marker");
+        assert!(is_marker(lines[marker]), "{}", lines[marker]);
+        let elided: usize = lines[marker].trim_matches(|c: char| !c.is_ascii_digit()).parse().unwrap();
+        for (i, l) in lines.iter().enumerate() {
+            assert!(i == marker || is_line(l), "line {i} is not whole: {l:?}");
+        }
+        let (h, t, total) = shown(&out.notes);
+        assert_eq!(total, 20000);
+        assert_eq!(lines[h - 1], format!("line {h:05}"));
+        assert_eq!(lines[h + 1], format!("line {t:05}"));
+        assert_eq!(elided, t - h - 1);
+        assert_eq!(lines.len(), 20001 - elided);
+    }
+
+    #[test]
+    fn an_open_last_line_counts_as_its_own_line() {
+        let (mut c, d) = collector_in_temp();
+        let alloc = move || (7, d.join("out.log"));
+        let all: String = (1..=20000).map(|i| format!("line {i:05}\n")).collect();
+        for chunk in all.as_bytes().chunks(7) {
+            c.push(std::str::from_utf8(chunk).unwrap(), &alloc);
+        }
+        c.push("end", &alloc);
+        let out = c.finish();
+        let (_, _, total) = shown(&out.notes);
+        assert_eq!(total, 20001);
+        assert!(out.body.ends_with("end"), "{}", &out.body[out.body.len() - 40..]);
+    }
+
+    #[test]
+    fn a_single_line_without_a_newline_falls_back_to_bytes() {
+        let (mut c, d) = collector_in_temp();
+        let alloc = move || (7, d.join("out.log"));
+        c.push(&"x".repeat(100 * 1024), &alloc);
+        let out = c.finish();
+        assert!(out.body.contains("B elided…]"), "{}", &out.body[..60]);
+        assert!(!out.notes.contains("Showing lines"), "{}", out.notes);
     }
 }
