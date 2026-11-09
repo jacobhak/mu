@@ -2,9 +2,10 @@
 //! anything. Anything it is not sure about is not read-only.
 
 use pi_shell::bash::syntax::Features;
+use pi_shell::bash::syntax::tree::{Case, Comsub, For, ProcSub};
 use pi_shell::bash::syntax::{
-    AssignValue, Case, Command, CommandKind, Comsub, CondExpr, For, HereDoc, List, ParamOp, Pipeline, ProcSub, Program,
-    Redir, RedirOp, RedirTarget, Sep, Simple, Stage, Subscript, Word, WordPart, parse_all,
+    AndOr, ArithText, AssignValue, Command, CommandKind, Cond, CondExpr, HereDoc, List, ParamOp, Part, Pipeline,
+    Program, Redir, RedirOp, RedirTarget, Sep, Seq, Simple, Subscript, Word, WordPart, parse_all,
 };
 
 /// Programs whose arguments are never expanded into filesystem writes or command runs: any
@@ -141,7 +142,7 @@ pub fn analyze(cmd: &str) -> BashAnalysis {
     };
     let mut w = Walker { src, cmds: Vec::new(), bad: false };
     for c in &commands {
-        w.list(&c.list);
+        w.list(c.list());
     }
     let Walker { mut cmds, bad, .. } = w;
     if bad {
@@ -160,239 +161,228 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    fn list(&mut self, l: &List) {
-        for item in &l.items {
-            if matches!(item.sep, Sep::Amp | Sep::Disown) {
+    fn list(&mut self, l: List) {
+        for item in l.items() {
+            if matches!(item.sep(), Sep::Amp | Sep::Disown) {
                 self.bad = true;
             }
-            self.and_or(&item.and_or);
+            self.and_or(item.and_or());
         }
     }
 
-    fn and_or(&mut self, a: &pi_shell::bash::syntax::AndOr) {
-        self.pipeline(&a.first);
-        for (_, p) in &a.rest {
+    fn and_or(&mut self, a: AndOr) {
+        for p in a.pipelines() {
             self.pipeline(p);
         }
     }
 
-    fn pipeline(&mut self, p: &Pipeline) {
-        for Stage { cmd, .. } in &p.stages {
+    fn pipeline(&mut self, p: Pipeline) {
+        for cmd in p.stages() {
             self.command(cmd);
         }
     }
 
-    fn command(&mut self, c: &Command) {
-        let simple = matches!(c.kind, CommandKind::Simple(_));
-        for r in &c.redirs {
+    fn command(&mut self, c: Command) {
+        let kind = c.kind();
+        let simple = matches!(kind, CommandKind::Simple(_));
+        for r in c.redirs() {
             self.redir(r);
-            if !simple && is_output(r.op) {
+            if !simple && is_output(r.op()) {
                 self.bad = true;
             }
         }
-        match &c.kind {
+        match kind {
             CommandKind::Simple(s) => {
+                let words = s.words();
+                let as_written = |w: Word| String::from_utf8_lossy(w.span().slice(self.src)).into_owned();
                 self.cmds.push(SimpleCmd {
-                    text: s
-                        .words
-                        .iter()
-                        .map(|w| String::from_utf8_lossy(w.span.slice(self.src)).into_owned())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    words: s
-                        .words
-                        .iter()
-                        .map(|w| String::from_utf8_lossy(w.span.slice(self.src)).into_owned())
-                        .collect(),
-                    paths: s
-                        .words
+                    text: words.iter().map(as_written).collect::<Vec<_>>().join(" "),
+                    words: words.iter().map(as_written).collect(),
+                    paths: words
                         .first()
                         .and_then(literal)
-                        .map(|argv0| read_words(&argv0, &s.words[1..], &c.redirs))
+                        .map(|argv0| read_words(&argv0, words.skip(1), c.redirs()))
                         .unwrap_or_default(),
-                    argv0: s.words.first().and_then(literal),
-                    second: s.words.get(1).map(|w| String::from_utf8_lossy(w.span.slice(self.src)).into_owned()),
-                    assigns: !s.assigns.is_empty(),
-                    readonly: simple_readonly(s, &c.redirs),
+                    argv0: words.first().and_then(literal),
+                    second: words.get(1).map(as_written),
+                    assigns: !s.assigns().is_empty(),
+                    readonly: simple_readonly(s, c.redirs()),
                 });
                 self.simple_parts(s);
             }
             CommandKind::Brace(l) | CommandKind::Subshell(l) => self.list(l),
             CommandKind::If(i) => {
-                for arm in &i.arms {
-                    self.list(&arm.cond);
-                    self.list(&arm.body);
+                for arm in i.arms() {
+                    self.list(arm.cond);
+                    self.list(arm.body);
                 }
-                if let Some(e) = &i.else_body {
+                if let Some(e) = i.else_body() {
                     self.list(e);
                 }
             }
             CommandKind::While(w) => {
-                self.list(&w.cond);
-                self.list(&w.body);
+                self.list(w.cond());
+                self.list(w.body());
             }
             CommandKind::For(f) | CommandKind::Select(f) => self.for_parts(f),
             CommandKind::ArithFor(a) => {
-                self.arith(&a.init);
-                self.arith(&a.cond);
-                self.arith(&a.step);
-                self.list(&a.body);
+                self.arith(a.init());
+                self.arith(a.cond());
+                self.arith(a.step());
+                self.list(a.body());
             }
             CommandKind::Case(c) => self.case(c),
             CommandKind::Arith(a) => self.arith(a),
             CommandKind::Cond(e) => self.cond(e),
             CommandKind::FuncDef(f) => {
                 self.bad = true;
-                self.command(&f.body);
+                self.command(f.body());
             }
             CommandKind::Coproc(c) => {
                 self.bad = true;
-                self.command(&c.body);
+                self.command(c.body());
             }
             CommandKind::Repeat(r) => {
-                self.word(&r.count);
-                self.list(&r.body);
+                self.word(r.count());
+                self.list(r.body());
             }
             CommandKind::Try(t) => {
                 self.bad = true;
-                self.list(&t.body);
-                self.list(&t.always);
+                self.list(t.body());
+                self.list(t.always());
             }
             CommandKind::AnonFunc(a) => {
                 self.bad = true;
-                self.command(&a.body);
-                for w in &a.args {
+                self.command(a.body());
+                for w in a.args() {
                     self.word(w);
                 }
             }
         }
     }
 
-    fn simple_parts(&mut self, s: &Simple) {
-        for a in &s.assigns {
-            if let Some(i) = &a.index {
+    fn simple_parts(&mut self, s: Simple) {
+        for a in s.assigns() {
+            if let Some(i) = a.index() {
                 self.word(i);
             }
-            match &a.value {
+            match a.value() {
                 AssignValue::Scalar(w) => self.word(w),
                 AssignValue::Array(elems) => {
                     for e in elems {
-                        if let Some(k) = &e.key {
+                        if let Some(k) = e.key() {
                             self.word(k);
                         }
-                        self.word(&e.value);
+                        self.word(e.value());
                     }
                 }
             }
         }
-        for w in &s.words {
+        for w in s.words() {
             self.word(w);
         }
     }
 
-    fn for_parts(&mut self, f: &For) {
-        if let Some(ws) = &f.words {
+    fn for_parts(&mut self, f: For) {
+        if let Some(ws) = f.words() {
             for w in ws {
                 self.word(w);
             }
         }
-        self.list(&f.body);
+        self.list(f.body());
     }
 
-    fn case(&mut self, c: &Case) {
-        self.word(&c.word);
-        for arm in &c.arms {
-            for p in &arm.patterns {
+    fn case(&mut self, c: Case) {
+        self.word(c.word());
+        for arm in c.arms() {
+            for p in arm.patterns() {
                 self.word(p);
             }
-            self.list(&arm.body);
+            self.list(arm.body());
         }
     }
 
-    fn redir(&mut self, r: &Redir) {
-        match &r.target {
+    fn redir(&mut self, r: Redir) {
+        match r.target() {
             RedirTarget::Word(w) => self.word(w),
             RedirTarget::HereDoc(h) => self.heredoc(h),
         }
     }
 
-    fn heredoc(&mut self, h: &HereDoc) {
-        if !h.quoted && (h.text.contains(&b'$') || h.text.contains(&b'`')) {
+    fn heredoc(&mut self, h: HereDoc) {
+        let text = h.text();
+        if !h.quoted() && (text.contains(&b'$') || text.contains(&b'`')) {
             self.bad = true;
         }
     }
 
-    fn arith(&mut self, a: &pi_shell::bash::syntax::ArithText) {
-        if a.src.windows(2).any(|w| w == b"$(") || a.src.contains(&b'`') {
+    fn arith(&mut self, a: ArithText) {
+        let src = a.src();
+        if src.windows(2).any(|w| w == b"$(") || src.contains(&b'`') {
             self.bad = true;
         }
     }
 
-    fn cond(&mut self, e: &CondExpr) {
-        match e {
-            CondExpr::Unary { arg, .. } => self.word(arg),
-            CondExpr::Binary { lhs, rhs, .. } => {
+    fn cond(&mut self, e: CondExpr) {
+        match e.get() {
+            Cond::Unary { arg, .. } => self.word(arg),
+            Cond::Binary { lhs, rhs, .. } => {
                 self.word(lhs);
                 self.word(rhs);
             }
-            CondExpr::Word(w) => self.word(w),
-            CondExpr::Not(x) | CondExpr::Group(x) => self.cond(x),
-            CondExpr::And(a, b) | CondExpr::Or(a, b) => {
+            Cond::Word(w) => self.word(w),
+            Cond::Not(x) | Cond::Group(x) => self.cond(x),
+            Cond::And(a, b) | Cond::Or(a, b) => {
                 self.cond(a);
                 self.cond(b);
             }
         }
     }
 
-    fn word(&mut self, w: &Word) {
-        for p in &w.parts {
+    fn word(&mut self, w: Word) {
+        for p in w.parts() {
             self.part(p);
         }
     }
 
-    fn part(&mut self, p: &WordPart) {
-        match p {
-            WordPart::Lit(_)
-            | WordPart::Escaped(_)
-            | WordPart::SQuote(_)
-            | WordPart::AnsiC(_)
-            | WordPart::DroppedQuote
-            | WordPart::Zsh(_) => {}
-            WordPart::DQuote(ps) | WordPart::Locale(ps) => {
+    fn part(&mut self, p: WordPart) {
+        match p.get() {
+            Part::Lit(_) | Part::Escaped(_) | Part::SQuote(_) | Part::AnsiC(_) | Part::DroppedQuote | Part::Zsh(_) => {}
+            Part::DQuote(ps) | Part::Locale(ps) => {
                 for p in ps {
                     self.part(p);
                 }
             }
-            WordPart::Param(param) => {
-                if let Some(Subscript::Expr(w)) = &param.index {
+            Part::Param(param) => {
+                if let Some(Subscript::Expr(w)) = param.index() {
                     self.word(w);
                 }
-                self.param_op(&param.op);
+                self.param_op(param.op());
             }
-            WordPart::Comsub(c) => self.comsub(c),
-            WordPart::Arith(a) => self.arith(a),
-            WordPart::ProcSub(p) => self.procsub(p),
-            WordPart::Compound(elems) => {
+            Part::Comsub(c) => self.comsub(c),
+            Part::Arith(a) => self.arith(a),
+            Part::ProcSub(p) => self.procsub(p),
+            Part::Compound(elems) => {
                 for e in elems {
-                    if let Some(k) = &e.key {
+                    if let Some(k) = e.key() {
                         self.word(k);
                     }
-                    self.word(&e.value);
+                    self.word(e.value());
                 }
             }
-            WordPart::BadSubst(_) | WordPart::BadComsub(_) => self.bad = true,
+            Part::BadSubst(_) | Part::BadComsub(_) => self.bad = true,
         }
     }
 
-    fn comsub(&mut self, c: &Comsub) {
-        self.list(&c.body);
+    fn comsub(&mut self, c: Comsub) {
+        self.list(c.body());
     }
 
-    fn procsub(&mut self, p: &ProcSub) {
-        self.list(&p.body);
+    fn procsub(&mut self, p: ProcSub) {
+        self.list(p.body());
     }
 
-    fn param_op(&mut self, op: &ParamOp) {
+    fn param_op(&mut self, op: ParamOp) {
         match op {
             ParamOp::Default { word, .. } | ParamOp::Assign { word, .. } | ParamOp::Alt { word, .. } => self.word(word),
             ParamOp::Error { word, .. } => {
@@ -441,28 +431,29 @@ fn is_output(op: RedirOp) -> bool {
     )
 }
 
-fn redir_readonly(r: &Redir) -> bool {
-    let devnull = || matches!(&r.target, RedirTarget::Word(w) if literal(w).as_deref() == Some("/dev/null"));
-    match r.op {
+fn redir_readonly(r: Redir) -> bool {
+    let devnull = || matches!(r.target(), RedirTarget::Word(w) if literal(w).as_deref() == Some("/dev/null"));
+    match r.op() {
         RedirOp::In | RedirOp::DupIn | RedirOp::DupOut | RedirOp::HereString => true,
-        RedirOp::HereDoc { .. } => matches!(&r.target, RedirTarget::HereDoc(h) if h.quoted),
+        RedirOp::HereDoc { .. } => matches!(r.target(), RedirTarget::HereDoc(h) if h.quoted()),
         op if is_output(op) => devnull(),
         _ => false,
     }
 }
 
-fn simple_readonly(s: &Simple, redirs: &[Redir]) -> bool {
-    if !s.assigns.is_empty() {
+fn simple_readonly(s: Simple, redirs: Seq<Redir>) -> bool {
+    if !s.assigns().is_empty() {
         return false;
     }
     if !redirs.iter().all(redir_readonly) {
         return false;
     }
-    let Some(argv0) = s.words.first().and_then(literal) else { return false };
-    program_readonly(&argv0, &s.words[1..])
+    let words = s.words();
+    let Some(argv0) = words.first().and_then(literal) else { return false };
+    program_readonly(&argv0, words.skip(1))
 }
 
-fn program_readonly(argv0: &str, args: &[Word]) -> bool {
+fn program_readonly(argv0: &str, args: Seq<Word>) -> bool {
     if ANY_ARGS.contains(&argv0) {
         return true;
     }
@@ -565,12 +556,12 @@ fn branch_readonly(args: &[String]) -> bool {
 
 /// The text of a word when it can only mean itself: no globbing, brace expansion or tilde
 /// expansion, and no substitution. Quoted parts are literal (`AnsiC` is not: it decodes).
-fn literal(word: &Word) -> Option<String> {
+fn literal(word: Word) -> Option<String> {
     let mut out = String::new();
-    literal_parts(&word.parts, &mut out, true).then_some(out)
+    literal_parts(word.parts(), &mut out, true).then_some(out)
 }
 
-fn literal_parts(parts: &[WordPart], out: &mut String, at_start: bool) -> bool {
+fn literal_parts(parts: Seq<WordPart>, out: &mut String, at_start: bool) -> bool {
     let mut first = at_start;
     for p in parts {
         if !literal_part(p, out, first) {
@@ -581,31 +572,31 @@ fn literal_parts(parts: &[WordPart], out: &mut String, at_start: bool) -> bool {
     true
 }
 
-fn literal_part(p: &WordPart, out: &mut String, at_start: bool) -> bool {
-    match p {
-        WordPart::Lit(b) => {
+fn literal_part(p: WordPart, out: &mut String, at_start: bool) -> bool {
+    match p.get() {
+        Part::Lit(b) => {
             if b.iter().any(|c| matches!(c, b'*' | b'?' | b'[' | b'{')) || (at_start && b.first() == Some(&b'~')) {
                 return false;
             }
             out.push_str(&String::from_utf8_lossy(b));
             true
         }
-        WordPart::Escaped(b) | WordPart::SQuote(b) => {
+        Part::Escaped(b) | Part::SQuote(b) => {
             out.push_str(&String::from_utf8_lossy(b));
             true
         }
-        WordPart::DQuote(parts) => literal_parts(parts, out, false),
+        Part::DQuote(parts) => literal_parts(parts, out, false),
         _ => false,
     }
 }
 
 /// The files one simple command may open: the path words its program reads, plus the targets of
 /// its input redirections.
-fn read_words(argv0: &str, args: &[Word], redirs: &[Redir]) -> Vec<PathWord> {
+fn read_words(argv0: &str, args: Seq<Word>, redirs: Seq<Redir>) -> Vec<PathWord> {
     let mut words: Vec<PathWord> = redirs
         .iter()
-        .filter(|r| matches!(r.op, RedirOp::In))
-        .filter_map(|r| match &r.target {
+        .filter(|r| matches!(r.op(), RedirOp::In))
+        .filter_map(|r| match r.target() {
             RedirTarget::Word(w) => Some(PathWord { prefix: path_prefix(w), word: None }),
             RedirTarget::HereDoc(_) => None,
         })
@@ -632,7 +623,7 @@ fn read_words(argv0: &str, args: &[Word], redirs: &[Redir]) -> Vec<PathWord> {
 
 /// Whether a word could name a place: it has a separator, is `.`/`..`, or starts with a tilde or
 /// an expansion that might be one.
-fn looks_like_path(word: &Word) -> bool {
+fn looks_like_path(word: Word) -> bool {
     match path_prefix(word) {
         Some(p) => p.contains('/') || p == "." || p == "..",
         None => true,
@@ -651,16 +642,16 @@ fn opens_of(argv0: &str) -> Opens {
 
 /// The word's text up to its first glob, or nothing when a substitution or a leading `~` decides
 /// where it points. A glob cannot leave the directory its prefix names.
-fn path_prefix(word: &Word) -> Option<String> {
+fn path_prefix(word: Word) -> Option<String> {
     let mut out = String::new();
-    prefix_parts(&word.parts, &mut out, true).then_some(out)
+    prefix_parts(word.parts(), &mut out, true).then_some(out)
 }
 
-fn prefix_parts(parts: &[WordPart], out: &mut String, at_start: bool) -> bool {
+fn prefix_parts(parts: Seq<WordPart>, out: &mut String, at_start: bool) -> bool {
     let mut first = at_start;
     for p in parts {
-        match p {
-            WordPart::Lit(b) => {
+        match p.get() {
+            Part::Lit(b) => {
                 if first && b.first() == Some(&b'~') {
                     return false;
                 }
@@ -672,13 +663,13 @@ fn prefix_parts(parts: &[WordPart], out: &mut String, at_start: bool) -> bool {
                     None => out.push_str(&String::from_utf8_lossy(b)),
                 }
             }
-            WordPart::Escaped(b) | WordPart::SQuote(b) => out.push_str(&String::from_utf8_lossy(b)),
-            WordPart::DQuote(ps) | WordPart::Locale(ps) => {
+            Part::Escaped(b) | Part::SQuote(b) => out.push_str(&String::from_utf8_lossy(b)),
+            Part::DQuote(ps) | Part::Locale(ps) => {
                 if !prefix_parts(ps, out, false) {
                     return false;
                 }
             }
-            WordPart::DroppedQuote => {}
+            Part::DroppedQuote => {}
             _ => return false,
         }
         first = false;

@@ -108,6 +108,7 @@ mu-tools = { workspace = true, features = ["test-support"] }
 [patch.crates-io]
 tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.18.2" }
 grep-searcher = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.18.2" }
+jaq-core = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.18.2" }
 
 [profile.dev]
 debug = "line-tables-only"
