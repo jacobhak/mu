@@ -564,12 +564,10 @@ pub fn print(rows: &[Row]) {
     println!(
         "\nCAVEAT: mu is measured WITHOUT its gateway. mu normally reaches models through a shared `omp auth-broker` +"
     );
-    println!(
-        "`omp auth-gateway` pair: 239 MB total and 155 MB private idle (JIT off, as the daemon runs it; 306 / 216 MB with it on),"
-    );
+    println!("`omp auth-gateway` pair: about 306 MB total and 216 MB private idle,");
     println!("shared by every mu session, measured separately");
     println!(
-        "and NOT in the mu rows above. With it, a single mu session costs a little less than claude or omp; the saving"
+        "and NOT in the mu rows above. With it, a single mu session costs a little more than claude and less than omp; the saving"
     );
     println!(
         "appears only with several sessions. The other harnesses call their providers directly. No model, and no other"

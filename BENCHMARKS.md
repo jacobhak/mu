@@ -10,17 +10,17 @@ mu normally reaches models through a shared pair of processes, `omp auth-broker`
 
 | | total | private |
 |---|---|---|
-| broker, idle | 81 MB | 48 MB |
-| gateway, idle | 158 MB | 108 MB |
-| **pair, idle** | **239 MB** | **155 MB** |
+| broker, idle | 93 MB | 58 MB |
+| gateway, idle | 214 MB | 158 MB |
+| **pair, idle** | **306 MB** | **216 MB** |
 
-Measured 2026-11-06 in an empty `HOME` with no model traffic, 8 s after start, with Bun's JIT off (`BUN_JSC_useJIT=0`), as the daemon starts both processes. Two runs gave 238 and 240 MB total, 154 and 156 MB private. With the JIT on (`MU_GATEWAY_JIT=1`) the pair idles at about 306 MB total and 216 MB private (broker 93/58 MB, gateway 214/158 MB). The 2026-10-31 version of this table (251 / 210 MB) was measured with the JIT on and before that setting existed.
+Measured 2026-11-06 in an empty `HOME` with no model traffic, 8 s after start. The pair idles at about 306 MB total and 216 MB private (broker 93/58 MB, gateway 214/158 MB).
 
-**With a request in flight** (2026-11-06, same setup, a request sent through the gateway to a fake Anthropic key in the broker, sampled 6 s in, two runs each): JIT off 241 / 157 and 238 / 154 MB, so a request adds nothing measurable (+0 to +1 MB; a later run with `scripts/measure-gateway.sh` gave 235 / 150 MB, so expect about ±5 MB between runs). With the JIT on it fell, to 294 and 296 MB total and 203 and 205 MB private. The request was rejected by Anthropic's real API (401, invalid key), because the gateway has no way to point a real provider at a fake server (it ignores `ANTHROPIC_BASE_URL` and does not use the proxy variables for the provider call), so a held-open model stream could not be measured. A real stream may cost more. The 2026-10-31 figure of about 305 / 275 MB in flight did not reproduce in either mode; it came from one earlier run that was not repeated. `DESIGN.md` has an A/B with one request served on the real daemon (119 MB private, 153 MB total with the JIT off).
+**With a request in flight** (2026-11-06, same setup, a request sent through the gateway to a fake Anthropic key in the broker, sampled 6 s in, two runs each): 294 and 296 MB total and 203 and 205 MB private, so a request adds nothing measurable (the two runs differed by 2 MB). The request was rejected by Anthropic's real API (401, invalid key), because the gateway has no way to point a real provider at a fake server (it ignores `ANTHROPIC_BASE_URL` and does not use the proxy variables for the provider call), so a held-open model stream could not be measured. A real stream may cost more. The 2026-10-31 figure of about 305 / 275 MB in flight did not reproduce; it came from one earlier run that was not repeated.
 
 What this means, using the idle figure:
-- **One mu session, gateway included:** about 271 MB peak total (32 + 239). That is a little below claude (303 MB), below omp (380 MB) and opencode (485 MB), and above pi (173 MB).
-- **Several sessions:** the pair is paid once, so mu with the gateway is below every other harness from two sessions on. The table in [Several sessions at once](#several-sessions-at-once) has the numbers.
+- **One mu session, gateway included:** about 338 MB peak total (32 + 306). That is above claude (303 MB) and pi (173 MB), below omp (380 MB) and opencode (485 MB).
+- **Several sessions:** the pair is paid once, so mu with the gateway is below every other harness from four sessions on. The table in [Several sessions at once](#several-sessions-at-once) has the numbers.
 - The other harnesses call their providers directly and have no such pair.
 - A complete mu run through the real gateway could not be measured against the fake model: the gateway serves only catalog models and ignores `models.yml` on purpose. The combined figures are sums of separate measurements, not a measured run.
 
@@ -35,7 +35,7 @@ Since native providers, a session that talks to Anthropic, OpenAI or Baseten wit
 | **after, native Anthropic key** | **16.7 MB** | **2.4 MB** | **19.6 MB** | **2.8 MB** |
 
 What this means:
-- **One native session:** about 20 MB total while a request runs, against about 259 MB for one session through the gateway pair (19.6 + 239, above). With several sessions the gateway share falls, but a native session never pays it. The native session has no child process.
+- **One native session:** about 20 MB total while a request runs, against about 326 MB for one session through the gateway pair (19.6 + 306, above). With several sessions the gateway share falls, but a native session never pays it. The native session has no child process.
 - **Since the native-providers commit (96 commits and 7.4 MB of binary, not only the providers):** +3.0 MB total and +0.5 MB private idle through a bypassed gateway, +3.3 MB and +0.3 MB with a request in flight. The total is a real increase in every round; the private part is small. The native row is 1.6 MB below the bypassed row at idle in every round and equal in flight; the cause was not investigated.
 - **Measuring.** Leftover mu processes from earlier runs share the binary's pages and divide its `Pss`, which lowered the idle total by up to 10 MB in a first attempt. `scripts/measure-sessions.sh` aborts if another process runs the same binary. `scripts/measure-idle.sh` (no model selected, no scripted prompt) gave 20.3 to 20.8 MB total and 3.6 to 3.7 MB private on the same build, in the real `HOME`, so absolute figures depend on the config mu loads.
 - This is a fake model on loopback: it measures mu's memory, not TLS handshakes, real latency or what a real stream buffers.
@@ -49,7 +49,7 @@ How memory grows when several sessions of one harness run at once, on the same t
 | harness | 1 session | 2 | 4 | 8 | each further session | as a share of the first |
 |---|---|---|---|---|---|---|
 | **mu** (no gateway) | 32 | 37 | 46 | 64 | 4.5 | 14% |
-| **mu + gateway pair** (estimate) | 271 | 276 | 285 | 303 | 4.5 | 2% |
+| **mu + gateway pair** (estimate) | 338 | 343 | 352 | 370 | 4.5 | 1% |
 | pi | 173 | 289 | 517 | 995 | 117 | 68% |
 | claude | 303 | 461 | 756 | 1269 | 138 | 46% |
 | omp | 380 | 595 | 1015 | 1696 | 188 | 49% |
@@ -60,7 +60,7 @@ How memory grows when several sessions of one harness run at once, on the same t
 | harness | 1 session | 2 | 4 | 8 | each further session | as a share of the first |
 |---|---|---|---|---|---|---|
 | **mu** (no gateway) | 4 | 8 | 16 | 33 | 4.1 | 102% |
-| **mu + gateway pair** (estimate) | 159 | 163 | 171 | 188 | 4.1 | 3% |
+| **mu + gateway pair** (estimate) | 220 | 224 | 232 | 249 | 4.1 | 2% |
 | pi | 123 | 238 | 466 | 941 | 117 | 95% |
 | claude | 182 | 340 | 634 | 1146 | 138 | 76% |
 | omp | 245 | 461 | 879 | 1574 | 190 | 78% |
@@ -70,7 +70,7 @@ How memory grows when several sessions of one harness run at once, on the same t
 
 - **Every harness shares something.** A further session costs 14% (mu), 46% (claude), 49% (omp), 68% (pi) and 79% (opencode) of the first in total memory, because the binary and the runtime are shared. In private memory a further session costs 76 to 102% of the first: what is private is paid per session.
 - **mu's further session is the cheapest by far:** 4.5 MB, against 117 to 385 MB for the others.
-- **With the gateway** the pair is added once (239 MB total, 155 MB private, idle, from above) to the mu rows, assuming the pair does not grow with requests (it did not in the test above). mu with the gateway is above pi at one session and below every other harness from two sessions on (276 against pi's 289 at two). At 8 sessions it holds 303 MB against 995 to 3180 MB. Without the gateway (an API key in mu) it is below all of them at every count. The gateway rows are estimates, not a measured run.
+- **With the gateway** the pair is added once (306 MB total, 216 MB private, idle, from above) to the mu rows, assuming the pair does not grow with requests (it did not in the test above). mu with the gateway is above pi at one and two sessions (343 against pi's 289 at two) and below every harness from four sessions on. At 8 sessions it holds 370 MB against 995 to 3180 MB. Without the gateway (an API key in mu) it is below all of them at every count. The gateway rows are estimates, not a measured run.
 - **The comparison is conservative for mu.** The peak of a sum is lower than the sum of the peaks when the sessions do not peak together: claude's private sum at 8 sessions is 1146 MB, not 8 × 182 = 1456 MB. That understates the other harnesses a little. mu's sessions overlapped fully (its private sum, 33 MB, is 8 × 4.1 MB).
 - **At 8 sessions the 7 CPUs are the limit.** Wall time per session rises with the count (claude 1.4 s alone, 4.4 s at 8; opencode 2.0 s, 8.1 s; mu 0.08 s, 0.76 s). The sessions still overlap; whether queueing for the CPU changes what each holds was not tested.
 - **Executables are run from private copies.** A real `claude` and a node daemon were running on the machine while measuring. Pages of a file are shared by every process that maps it and `Pss` divides them, so another instance would have lowered the harness's numbers. `mu-bench` copies each harness's executable (for pi, node) and runs the copy, so only the benchmark's own sessions share it. Libraries such as libc are still shared with the rest of the machine, for every harness alike.
@@ -79,15 +79,15 @@ How memory grows when several sessions of one harness run at once, on the same t
 
 | sessions | sum, total | sum, private | per session, total | same sessions through the gateway (estimate), sum | per session |
 |---|---|---|---|---|---|
-| 1 | 19.9 MB | 2.8 MB | 19.9 MB | 259 MB | 259 MB |
-| 2 | 24.1 MB | 5.6 MB | 12.1 MB | 263 MB | 132 MB |
-| 4 | 30.6 MB | 11.3 MB | 7.6 MB | 270 MB | 68 MB |
-| 8 | 42.0 MB | 22.6 MB | 5.2 MB | 281 MB | 35 MB |
+| 1 | 19.9 MB | 2.8 MB | 19.9 MB | 326 MB | 326 MB |
+| 2 | 24.1 MB | 5.6 MB | 12.1 MB | 330 MB | 165 MB |
+| 4 | 30.6 MB | 11.3 MB | 7.6 MB | 337 MB | 84 MB |
+| 8 | 42.0 MB | 22.6 MB | 5.2 MB | 348 MB | 44 MB |
 
 - Private memory grows by about 2.8 MB per session in flight (2.4 MB idle), independent of how many others run. The rest of the total is the binary's pages, about 15 MB, held once. The marginal session costs about 3.2 MB total in flight. No session started a child process.
 - The headless task needs more (4.5 MB per further session, above) because it runs a 28-step tool loop with shell commands.
 
-**The pair does not grow with requests.** With JIT off, 1, 8 and 32 simultaneous requests left it at 242, 242 and 241 MB total (idle 239 to 241). With JIT on, 8 requests gave 295 MB. These requests are rejected at once by the real API (see above), so none was held open; `DESIGN.md` has a run with 36 concurrent requests served that was also flat.
+**The pair does not grow with requests.** 8 simultaneous requests gave 295 MB total, against an idle 306 MB. These requests are rejected at once by the real API (see above), so none was held open.
 
 ## The task
 
@@ -130,7 +130,7 @@ Reading the columns:
 - pi was installed into `~/.cache/mu-bench-tools` with `npm install --prefix`, not into the system.
 - Reproduce: `cargo build --release -p mu-bench && ./target/release/mu-bench compare crates/mu-bench/scenarios/compare-agentic.toml --runs 7 --sessions 2,4,8`. Details, the scenario format and how to probe another harness are in [`crates/mu-bench/README.md`](crates/mu-bench/README.md). Run it on a machine that is otherwise quiet: with 8 sessions of opencode it needs about 3.5 GB.
 - Native-provider and interactive tables (Linux; need `tmux` and `python3`): `scripts/measure-sessions.sh -m native target/release/mu 1 2 4 8` runs N interactive sessions against `scripts/fake-anthropic.py`, and `-m bypass` does the same through `MU_GATEWAY_URL`. A table row is the median of 5 runs with the rows interleaved (one run of each row per round). For the "before native providers" row, build the parent of that commit in a separate worktree (`git worktree add --detach <dir> <commit>^`, `CARGO_TARGET_DIR=<elsewhere> cargo build --release -p mu`) and pass its binary. The script aborts if another process runs the binary, since that would share its pages.
-- Gateway pair: `scripts/measure-gateway.sh jit-off 1` and `jit-on 8` (an empty `HOME`, `omp` on `PATH`, the network). The requests are rejected at once by the real API and no real credential is sent. A held-open model stream through the gateway cannot be measured offline (see `crates/mu-bench/README.md`).
+- Gateway pair: `scripts/measure-gateway.sh 1` and `scripts/measure-gateway.sh 8` (an empty `HOME`, `omp` on `PATH`, the network). The requests are rejected at once by the real API and no real credential is sent. A held-open model stream through the gateway cannot be measured offline (see `crates/mu-bench/README.md`).
 
 ## History
 
