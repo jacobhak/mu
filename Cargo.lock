@@ -3401,9 +3401,8 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jaq-core"
-version = "3.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "723ad9253808e95daa2d10ad5b258ac4e65c07003e223e08d1d8734c2942d606"
+version = "3.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.2#cb4801a7d6db666946a1b65fce5cdf50d2947b96"
 dependencies = [
  "dyn-clone",
  "once_cell",
@@ -3431,9 +3430,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-std"
-version = "3.0.4"
+version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56b378d4f7587d332111a92608348db6d6b9b8f7cb5ee1d2bd162ec715d7c5bf"
+checksum = "9f90e485abfd3189510c996e77be55056a51038b0fa5805e6c97b5dcf0d9ab55"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
