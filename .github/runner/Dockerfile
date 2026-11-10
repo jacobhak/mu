@@ -1,4 +1,5 @@
-# ARC runner image for mu's CI: the upstream runner, plus a linker and Rust.
+# ARC runner image for mu's CI: the upstream runner, plus a linker, Rust and `gh`
+# (the release job publishes with it; a hosted runner used to supply it).
 #
 # Build from the repo root, so the toolchain comes from rust-toolchain.toml and
 # cannot drift from the one jobs use:
@@ -12,7 +13,7 @@ USER root
 # No -sys crate in Cargo.lock links OpenSSL or needs cmake, so cc, ld and
 # pkg-config are the whole native toolchain.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential pkg-config \
+    && apt-get install -y --no-install-recommends build-essential pkg-config gh \
     && rm -rf /var/lib/apt/lists/*
 
 USER runner
