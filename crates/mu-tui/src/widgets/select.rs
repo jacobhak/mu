@@ -1,6 +1,6 @@
 //! Filterable list overlay drawn in the composer slot.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -19,7 +19,7 @@ const TITLE_MAX_LINES: usize = 6;
 /// Lines a description shows under its option, when the option is highlighted or the list fits.
 const DESC_MAX_LINES: usize = 6;
 
-/// Rows the context above the title may take.
+/// Rows the context above the title may take at once.
 const CONTEXT_MAX_LINES: usize = 8;
 
 /// Columns a description or preview is indented under its option.
@@ -60,8 +60,10 @@ enum Row {
 
 pub struct Select {
     title: String,
-    /// Dim paragraph above the title: what the question is about.
+    /// Paragraph above the title: what the question is about.
     context: String,
+    context_scroll: Cell<usize>,
+    context_scroll_max: Cell<usize>,
     items: Vec<Item>,
     multi: bool,
     free: Option<String>,
@@ -112,6 +114,8 @@ impl Select {
             rows_cache: Default::default(),
             title: title.to_string(),
             context: String::new(),
+            context_scroll: Cell::new(0),
+            context_scroll_max: Cell::new(0),
             items,
             multi: false,
             free: None,
@@ -146,7 +150,7 @@ impl Select {
         self
     }
 
-    /// A dim paragraph above the title that says what the question is about.
+    /// A paragraph above the title that says what the question is about.
     pub fn context(mut self, text: &str) -> Self {
         self.context = text.trim().to_string();
         self
@@ -289,6 +293,20 @@ impl Select {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if !self.context.is_empty() {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.context_scroll.set(self.context_scroll.get().saturating_sub(1));
+                    return SelectResult::Pending;
+                }
+                KeyCode::PageDown => {
+                    self.context_scroll
+                        .set(self.context_scroll.get().saturating_add(1).min(self.context_scroll_max.get()));
+                    return SelectResult::Pending;
+                }
+                _ => {}
+            }
+        }
         if self.editing {
             return self.text_key(key);
         }
@@ -423,17 +441,32 @@ impl Select {
 
     /// Lines (title, input, rows) fitted to `max_rows`, and the cursor (row, col).
     pub fn render(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
+        let (lines, cursor, _) = self.render_inner(width, max_rows);
+        (lines, cursor)
+    }
+
+    pub fn render_with_hint(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize), Option<Line>) {
+        let (mut lines, cursor, has_hint) = self.render_inner(width, max_rows);
+        let hint = if has_hint { lines.pop() } else { None };
+        (lines, cursor, hint)
+    }
+
+    fn render_inner(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize), bool) {
         let width = width.max(1);
         if max_rows == 0 {
-            return (Vec::new(), (0, 0));
+            self.context_scroll.set(0);
+            self.context_scroll_max.set(0);
+            return (Vec::new(), (0, 0), false);
         }
         let mut out = self.title_rows(width, max_rows);
         let rows = self.rows();
         let sel = self.sel.min(rows.len().saturating_sub(1));
         let room = max_rows - out.len();
         let mut cursor;
+        let has_hint;
         if self.editing {
             let hint = room >= 2;
+            has_hint = hint;
             let (lines, cur) = self.text.view("› ", width, room - usize::from(hint));
             cursor = (out.len() + cur.0, cur.1);
             out.extend(lines);
@@ -442,6 +475,7 @@ impl Select {
             }
         } else if self.noting {
             let hint = room >= 3;
+            has_hint = hint;
             let body = room - usize::from(hint);
             let hl = usize::from(body >= 2 && rows.get(sel).is_some());
             if let (1, Some(&row)) = (hl, rows.get(sel)) {
@@ -461,6 +495,7 @@ impl Select {
             // when one list row is left under it.
             let list_room = room - 1;
             let hint = self.hint.as_ref().filter(|_| list_room >= 2);
+            has_hint = hint.is_some();
             let avail = list_room - usize::from(hint.is_some());
             let detail = self.detail_rows(rows.get(sel).copied(), width, avail.saturating_sub(3));
             let avail = avail - detail.len();
@@ -492,7 +527,7 @@ impl Select {
         }
         cursor.1 = cursor.1.min(width - 1);
         let out = out.iter().map(|l| line::truncate(l, width)).collect();
-        (out, cursor)
+        (out, cursor, has_hint)
     }
 
     /// The highlighted item's detail text, wrapped to `width` and cut to `cap` rows (at most
@@ -526,10 +561,13 @@ impl Select {
     fn title_rows(&self, width: usize, max_rows: usize) -> Vec<Line> {
         let cap = (max_rows / 2).max(1).min(max_rows.saturating_sub(2)).min(TITLE_MAX_LINES);
         if cap == 0 {
+            self.context_scroll.set(0);
+            self.context_scroll_max.set(0);
             return Vec::new();
         }
+        let title_style = if self.described { bold() } else { accent() };
         let mut rows: Vec<Line> =
-            wrap_chs(&chs(&self.title, accent()), width).iter().map(|r| chars_to_line(r)).collect();
+            wrap_chs(&chs(&self.title, title_style), width).iter().map(|r| chars_to_line(r)).collect();
         if rows.is_empty() {
             rows.push(Vec::new());
         }
@@ -541,22 +579,37 @@ impl Select {
                 *last = line::truncate(&row, width);
             }
         }
-        let room = max_rows.saturating_sub(rows.len() + 2) / 2;
-        let ctx_cap = room.min(CONTEXT_MAX_LINES);
-        if self.context.is_empty() || ctx_cap == 0 {
+        if self.context.is_empty() {
             return rows;
         }
-        let mut ctx: Vec<Line> = wrap_chs(&chs(&self.context, dim()), width).iter().map(|r| chars_to_line(r)).collect();
-        if ctx.len() > ctx_cap {
-            ctx.truncate(ctx_cap);
-            if let Some(last) = ctx.last_mut() {
-                let mut row = last.clone();
-                row.push(span("…", dim()));
-                *last = line::truncate(&row, width);
+        let room = max_rows.saturating_sub(rows.len() + 2);
+        let ctx_cap = room.div_ceil(2).min(CONTEXT_MAX_LINES);
+        if ctx_cap == 0 {
+            self.context_scroll.set(0);
+            self.context_scroll_max.set(0);
+            if let Some(first) = rows.first_mut() {
+                first.insert(0, span("↕ ", dim()));
             }
+            return rows;
         }
-        ctx.extend(rows);
-        ctx
+        let ctx: Vec<Line> = wrap_chs(&chs(&self.context, ContentStyle::default()), width.saturating_sub(2).max(1))
+            .iter()
+            .map(|r| chars_to_line(r))
+            .collect();
+        let max_scroll = ctx.len().saturating_sub(ctx_cap);
+        self.context_scroll_max.set(max_scroll);
+        let start = self.context_scroll.get().min(max_scroll);
+        self.context_scroll.set(start);
+        let end = (start + ctx_cap).min(ctx.len());
+        let mut visible = ctx[start..end].to_vec();
+        if (start > 0 || end < ctx.len())
+            && let Some(last) = visible.last_mut()
+        {
+            *last = line::truncate(last, width.saturating_sub(2));
+            last.push(span(" ↕", dim()));
+        }
+        visible.extend(rows);
+        visible
     }
 
     /// The rows for the current filter, recomputed only when the filter changed.
@@ -943,6 +996,78 @@ pub fn clean_paste(s: &str) -> String {
 mod tests {
     use super::*;
     use mu_testutil::key;
+
+    #[test]
+    fn context_scroll_clamps_and_reverses_after_resize() {
+        let context = (0..12).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut s = Select::new("title", items(&["a"])).context(&context);
+        s.render(40, 10);
+        for _ in 0..30 {
+            s.on_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(s.context_scroll.get(), 8);
+        assert!(texts(&s.render(40, 10).0)[0].contains("line 8"));
+        s.on_key(key(KeyCode::PageUp));
+        assert_eq!(s.context_scroll.get(), 7);
+        for _ in 0..30 {
+            s.on_key(key(KeyCode::PageUp));
+        }
+        s.on_key(key(KeyCode::PageDown));
+        assert_eq!(s.context_scroll.get(), 1);
+        for _ in 0..30 {
+            s.on_key(key(KeyCode::PageDown));
+        }
+        s.render(40, 20);
+        assert_eq!(s.context_scroll.get(), 4);
+        s.on_key(key(KeyCode::PageUp));
+        assert_eq!(s.context_scroll.get(), 3);
+        s.render(40, 3);
+        assert_eq!(s.context_scroll.get(), 0);
+        s.on_key(key(KeyCode::PageDown));
+        assert_eq!(s.context_scroll.get(), 0);
+        s.render(40, 10);
+        s.on_key(key(KeyCode::PageDown));
+        assert_eq!(s.context_scroll.get(), 1);
+    }
+
+    #[test]
+    fn context_scroll_reclamps_when_width_changes() {
+        let mut s = Select::new("title", items(&["a"])).context("abcdefghij abcdefghij abcdefghij abcdefghij");
+        s.render(8, 6);
+        for _ in 0..30 {
+            s.on_key(key(KeyCode::PageDown));
+        }
+        assert!(s.context_scroll.get() > 0);
+        s.render(80, 6);
+        assert_eq!(s.context_scroll.get(), 0);
+        s.on_key(key(KeyCode::PageDown));
+        assert_eq!(s.context_scroll.get(), 0);
+        s.render(8, 6);
+        s.on_key(key(KeyCode::PageDown));
+        assert_eq!(s.context_scroll.get(), 1);
+    }
+
+    #[test]
+    fn context_scroll_works_while_editing_text_and_notes() {
+        let context = (0..12).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut text = Select::new("title", items(&["a"])).context(&context).free_text("other").edit_text("answer");
+        let mut note = Select::new("title", items(&["a"])).context(&context).notes();
+        note.on_key(key(KeyCode::Right));
+        type_str(&mut note, "note");
+        for s in [&mut text, &mut note] {
+            s.render(40, 10);
+            for _ in 0..30 {
+                s.on_key(key(KeyCode::PageDown));
+            }
+            assert_eq!(s.context_scroll.get(), 8);
+            s.on_key(key(KeyCode::PageUp));
+            assert_eq!(s.context_scroll.get(), 7);
+            assert!(texts(&s.render(40, 10).0)[0].contains("line 7"));
+        }
+        assert_eq!(text.text.text(), "answer");
+        assert_eq!(note.note.text(), "note");
+        assert!(text.editing && note.noting);
+    }
 
     #[test]
     fn code_previews_are_syntax_highlighted() {

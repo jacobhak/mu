@@ -621,7 +621,7 @@ fn todo_rows(out: &ToolOutput, width: usize) -> Option<(Vec<Line>, String)> {
     Some((rows, format!(" · {done}/{total}")))
 }
 
-/// An answered `ask`: each question's text, dim and wrapped, above the answer the tool returned for
+/// An answered `ask`: context and the emphasized question above the answer the tool returned for
 /// it (`id: answer` lines after the `User answers:` header). The model still gets only the tool text.
 fn ask_rows(args: &Value, text: &str, width: usize) -> Vec<Line> {
     let inner = width.saturating_sub(2).max(1);
@@ -636,13 +636,13 @@ fn ask_rows(args: &Value, text: &str, width: usize) -> Vec<Line> {
             None => question.to_string(),
         };
         if let Some(c) = q["context"].as_str().map(str::trim).filter(|c| !c.is_empty()) {
-            for r in markdown::wrap_chs(&markdown::chs(c, tfg(Role::Muted)), inner) {
+            for r in markdown::wrap_chs(&markdown::chs(c, ContentStyle::default()), inner) {
                 let mut row = vec![span("  ", line::dim())];
                 row.extend(markdown::chars_to_line(&r));
                 rows.push(row);
             }
         }
-        for r in markdown::wrap_chs(&markdown::chs(&question, line::dim()), inner) {
+        for r in markdown::wrap_chs(&markdown::chs(&question, bold(ContentStyle::default())), inner) {
             let mut row = vec![span("  ", line::dim())];
             row.extend(markdown::chars_to_line(&r));
             rows.push(row);
@@ -1086,8 +1086,12 @@ mod tests {
             {"id": "api", "question": "Keep it?", "context": "Three callers still use it.", "options": []}
         ]});
         let out = ToolOutput::ok("User answers:\napi: Keep");
-        let t = texts(&tool_result("ask", &args, &out, false, 40));
+        let rows = tool_result("ask", &args, &out, false, 40);
+        let t = texts(&rows);
         assert_eq!(t[1..], ["  Three callers still use it.", "  Keep it?", "  api: Keep"], "{t:?}");
+        assert_eq!(rows[1][1].style, ContentStyle::default());
+        assert_eq!(rows[2][1].style, bold(ContentStyle::default()));
+        assert_eq!(rows[3][1].style, tfg(Role::Muted));
     }
 
     #[test]

@@ -376,6 +376,9 @@ fn ask_hint(q: &AskQuestion, pos: Option<(usize, usize)>) -> String {
         hint.push_str(" · ← / ⇧Tab back");
     }
     hint.push_str(" · Esc cancel");
+    if q.context.as_ref().is_some_and(|c| !c.trim().is_empty()) {
+        hint = format!("PgUp/PgDn context · {hint}");
+    }
     hint
 }
 
@@ -899,8 +902,30 @@ impl Overlay {
                 st.render(w, avail.saturating_sub(1), std::time::SystemTime::now())
             }
             Overlay::Ask(a) => {
-                let avail = rows.saturating_sub(1).saturating_sub(used);
-                a.sel.render(w, avail.saturating_sub(1))
+                let avail = rows.saturating_sub(1).saturating_sub(used).saturating_sub(1);
+                if w < 4 || avail < 6 || a.review {
+                    a.sel.render(w, avail)
+                } else {
+                    use crate::text::line::{dim, span, styled};
+                    let (body, cur, hint) = a.sel.render_with_hint(w - 2, avail - 2);
+                    let legend = if a.qs[a.idx].context.as_ref().is_some_and(|c| !c.trim().is_empty()) && w >= 22 {
+                        " PgUp/PgDn context "
+                    } else {
+                        ""
+                    };
+                    let mut framed = vec![styled(format!("╭{legend}{}╮", "─".repeat(w - 2 - legend.len())), |_| dim())];
+                    for mut line in body {
+                        let padding = (w - 2).saturating_sub(crate::text::line::line_width(&line));
+                        line.insert(0, span("│", dim()));
+                        line.push(span(format!("{}│", " ".repeat(padding)), dim()));
+                        framed.push(line);
+                    }
+                    framed.push(styled(format!("╰{}╯", "─".repeat(w - 2)), |_| dim()));
+                    if let Some(hint) = hint {
+                        framed.push(hint);
+                    }
+                    (framed, (cur.0 + 1, cur.1 + 1))
+                }
             }
             other => match other.select() {
                 Some(sel) => sel.render(w, (rows / 2).max(6).saturating_sub(2)),
@@ -1299,6 +1324,36 @@ mod tests {
         assert!(t.iter().any(|l| l == "Keep the old API?"), "short screens keep the question: {t:?}");
     }
 
+    #[test]
+    fn ask_context_scrolls_in_the_bordered_panel() {
+        use crossterm::style::Attribute;
+
+        let q = AskQuestion {
+            context: Some((0..12).map(|i| format!("context {i}")).collect::<Vec<_>>().join("\n")),
+            ..ask_q(&["Yes", "No"], false, false, None)
+        };
+        let (mut ov, _) = ask_ov(q);
+        let (lines, _) = ov.render(40, 12, 0);
+        let text: Vec<_> = lines.iter().map(crate::text::line::line_text).collect();
+        assert!(text.iter().any(|l| l.starts_with('╭')), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("context 0")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains('↕')), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("PgUp/PgDn")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("❯ Yes")), "{text:?}");
+        let context = lines.iter().flatten().find(|s| s.text.contains("context 0")).unwrap();
+        assert!(!context.style.attributes.has(Attribute::Dim));
+        let question = lines.iter().flatten().find(|s| s.text.contains("Q?")).unwrap();
+        assert!(question.style.attributes.has(Attribute::Bold));
+        for _ in 0..12 {
+            ov = ov.on_key(key(KeyCode::PageDown)).0.expect("still open");
+        }
+        let (lines, _) = ov.render(40, 12, 0);
+        let text: Vec<_> = lines.iter().map(crate::text::line::line_text).collect();
+        assert!(text.iter().any(|l| l.contains("context 11")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("Q?")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("❯ Yes")), "{text:?}");
+    }
+
     fn ask_ov(q: AskQuestion) -> (Overlay, oneshot::Receiver<Option<Vec<Answer>>>) {
         let (tx, rx) = oneshot::channel();
         (Overlay::new_ask(vec![q], tx), rx)
@@ -1468,13 +1523,17 @@ mod tests {
         lines.iter().map(|l| crate::text::line::line_text(l).trim_end().to_string()).collect()
     }
 
+    fn panel_row(text: &str) -> String {
+        format!("│{text:<98}│")
+    }
+
     #[test]
     fn left_and_shift_tab_go_back_and_restore_the_answer() {
         let (ov, mut rx) = open(two_q());
         let ov = press(ov, &[KeyCode::Down, KeyCode::Enter]);
         let mut ov = press(ov, &[KeyCode::Left]);
         let t = screen(&mut ov);
-        assert!(t.iter().any(|l| l == "❯ B"), "the earlier answer is preselected: {t:?}");
+        assert!(t.iter().any(|l| l == &panel_row("❯ B")), "the earlier answer is preselected: {t:?}");
         assert!(t.iter().any(|l| l.contains("1/2")), "{t:?}");
         let ov = press(ov, &[KeyCode::Enter, KeyCode::Down, KeyCode::Enter]);
         let mut ov = press(ov, &[KeyCode::BackTab]);
@@ -1500,12 +1559,18 @@ mod tests {
         let ov = press(ov, &typed("why"));
         let ov = press(ov, &[KeyCode::Enter]);
         let mut ov = press(ov, &[KeyCode::BackTab]);
-        assert!(screen(&mut ov).iter().any(|l| l == "    note: why"), "the note comes back under its option");
+        assert!(
+            screen(&mut ov).iter().any(|l| l == &panel_row("    note: why")),
+            "the note comes back under its option"
+        );
         let ov = press(ov, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
         let ov = press(ov, &typed("hi"));
         let ov = press(ov, &[KeyCode::Enter]);
         let mut ov = press(ov, &[KeyCode::BackTab]);
-        assert!(screen(&mut ov).iter().any(|l| l == "❯ hi"), "the custom answer comes back on the free row");
+        assert!(
+            screen(&mut ov).iter().any(|l| l == &panel_row("❯ hi")),
+            "the custom answer comes back on the free row"
+        );
         let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter]);
         let mut ov = press(ov, &[KeyCode::Enter]);
         assert!(screen(&mut ov).iter().any(|l| l.contains("Review your answers")));
@@ -1524,7 +1589,7 @@ mod tests {
         let mut ov = press(ov, &[KeyCode::Up, KeyCode::Enter]);
         let t = screen(&mut ov);
         assert!(t.iter().any(|l| l.contains("2/2")), "{t:?}");
-        assert!(t.iter().any(|l| l == "❯ X"), "the earlier answer is preselected: {t:?}");
+        assert!(t.iter().any(|l| l == &panel_row("❯ X")), "the earlier answer is preselected: {t:?}");
         let mut ov = press(ov, &[KeyCode::Down, KeyCode::Enter]);
         assert!(screen(&mut ov).iter().any(|l| l.contains("2. Q?") && l.ends_with('Y')));
         assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
@@ -1549,10 +1614,10 @@ mod tests {
         let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter, KeyCode::Left]);
         let mut ov = ov;
         let t = screen(&mut ov);
-        assert!(t.iter().any(|l| l.contains("2/2")) && t.iter().any(|l| l == "❯ X"), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("2/2")) && t.iter().any(|l| l == &panel_row("❯ X")), "{t:?}");
         let mut ov = press(ov, &[KeyCode::Left]);
         let t = screen(&mut ov);
-        assert!(t.iter().any(|l| l.contains("1/2")) && t.iter().any(|l| l == "❯ A"), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("1/2")) && t.iter().any(|l| l == &panel_row("❯ A")), "{t:?}");
     }
 
     #[test]
@@ -1566,6 +1631,26 @@ mod tests {
         let ov = press(ov, &[KeyCode::Enter]);
         let mut ov = ov;
         assert!(screen(&mut ov).last().is_some_and(|l| l.contains("Enter reopen or submit")));
+    }
+
+    #[test]
+    fn ask_hints_are_outside_the_panel_in_each_input_mode() {
+        let (ov, _rx) = open(vec![ask_q(&["A"], false, false, None)]);
+        let mut ov = ov;
+        let t = screen(&mut ov);
+        assert!(t[t.len() - 2].starts_with('╰'));
+        assert!(t.last().unwrap().ends_with("Esc cancel"));
+
+        let mut note = press(ov, &[KeyCode::Right]);
+        let t = screen(&mut note);
+        assert!(t[t.len() - 2].starts_with('╰'));
+        assert_eq!(t.last().unwrap(), "Enter submit · Alt-Enter newline · Esc to options");
+
+        let ov = press(note, &[KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
+        let mut text = ov;
+        let t = screen(&mut text);
+        assert!(t[t.len() - 2].starts_with('╰'));
+        assert_eq!(t.last().unwrap(), "Enter submit · Alt-Enter newline · Esc to options");
     }
 
     #[test]
@@ -1584,9 +1669,9 @@ mod tests {
         let ov = press(ov, &[KeyCode::Tab, KeyCode::Down, KeyCode::Tab, KeyCode::Enter]);
         let mut ov = press(ov, &[KeyCode::BackTab]);
         let t = screen(&mut ov);
-        assert!(t.iter().any(|l| l == "❯ [x] X"), "{t:?}");
-        assert!(t.iter().any(|l| l == "  [x] Y"), "{t:?}");
-        assert!(t.iter().any(|l| l == "  [ ] Z"), "{t:?}");
+        assert!(t.iter().any(|l| l == &panel_row("❯ [x] X")), "{t:?}");
+        assert!(t.iter().any(|l| l == &panel_row("  [x] Y")), "{t:?}");
+        assert!(t.iter().any(|l| l == &panel_row("  [ ] Z")), "{t:?}");
         let ov = press(ov, &[KeyCode::Enter, KeyCode::Enter]);
         assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
         assert_eq!(answer(&mut rx), r#"[Options(["X", "Y"]), Options(["P"])]"#);
