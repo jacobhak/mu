@@ -4,7 +4,6 @@ mod fetch;
 mod github;
 mod html;
 mod net;
-mod pdf;
 mod search;
 
 use mu_common::rpc::{Request, RpcError, serve_stdio};

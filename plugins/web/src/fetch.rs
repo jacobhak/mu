@@ -1,11 +1,10 @@
 //! `fetch`: one URL to Markdown. A port of omp's `renderUrl` (`tools/fetch.ts`), limited to the
-//! classes of URL in use: GitHub handlers, PDF, JSON, text, and HTML through the markdown
+//! classes of URL in use: GitHub handlers, JSON, text, and HTML through the markdown
 //! alternates, `.md` suffix, content negotiation, native conversion and llms.txt.
 
 use crate::github;
 use crate::html;
 use crate::net::{Guard, LoadOpts, MAX_BYTES, Page, Reach, load_page};
-use crate::pdf;
 use std::time::Duration;
 use url::Url;
 
@@ -88,15 +87,6 @@ async fn render(g: &Guard, url: &str, raw: bool) -> Rendered {
     let text = page.text();
     if raw {
         return Rendered::new(&final_url, &page.content_type, "raw", notes, text);
-    }
-
-    let is_pdf = page.content_type == "application/pdf"
-        || (page.content_type == "application/octet-stream" && path_ends_with_pdf(&final_url));
-    if is_pdf {
-        match pdf::to_markdown(&page.body) {
-            Ok(md) => return Rendered::new(&final_url, &page.content_type, "pdf", notes, md),
-            Err(e) => notes.push(e),
-        }
     }
 
     if page.content_type.contains("json") {
@@ -227,10 +217,6 @@ fn llms_candidates(page: &Url) -> Vec<String> {
         out.push(format!("{origin}{scope}llms.md"));
     }
     out
-}
-
-fn path_ends_with_pdf(url: &str) -> bool {
-    Url::parse(url).is_ok_and(|u| u.path().to_ascii_lowercase().ends_with(".pdf"))
 }
 
 /// omp's `finalizeOutput`: runs of three or more newlines collapse to two, then trim.
@@ -431,19 +417,6 @@ mod tests {
         let out = run(&format!("{}/docs/app", base(port))).await;
         assert_eq!(method(&out), "native", "{out}");
         assert!(out.contains(JS_NOTE), "{out}");
-    }
-
-    #[tokio::test]
-    async fn pdf_is_converted() {
-        let pdf = pdf::fixture(&["BT /F1 12 Tf 72 720 Td (Served PDF text) Tj ET"], None);
-        let port = serve(move |req| match req.path.as_str() {
-            "/doc.pdf" => Resp::new(200, "application/pdf", pdf.clone()),
-            _ => Resp::new(404, "text/plain", ""),
-        })
-        .await;
-        let out = run(&format!("{}/doc.pdf", base(port))).await;
-        assert_eq!(method(&out), "pdf", "{out}");
-        assert!(out.contains("Served PDF text"), "{out}");
     }
 
     #[tokio::test]

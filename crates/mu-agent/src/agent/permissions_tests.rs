@@ -80,9 +80,11 @@ fn a_deny_with_a_note_does_not_run_the_call_and_the_turn_goes_on() {
 #[test]
 fn a_session_grant_covers_later_calls() {
     run(async {
+        // The calls really run, so the command has to stay cheap: a `cargo test` here built and ran
+        // the suite inside this test.
         let script = vec![
-            Ok(assistant(vec![bash_call("t1", "cargo test")], StopReason::ToolUse)),
-            Ok(assistant(vec![bash_call("t2", "cargo test --x")], StopReason::ToolUse)),
+            Ok(assistant(vec![bash_call("t1", "cargo tree")], StopReason::ToolUse)),
+            Ok(assistant(vec![bash_call("t2", "cargo tree --depth 1")], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
         let (mut a, rx) = agent_run(script, Configs::default(), ask());
@@ -93,7 +95,7 @@ fn a_session_grant_covers_later_calls() {
         })
         .await;
         assert_eq!(reqs.len(), 1, "the second call is covered by the session grant");
-        assert_eq!(reqs[0].grant.as_ref().unwrap().patterns, ["cargo test *"]);
+        assert_eq!(reqs[0].grant.as_ref().unwrap().patterns, ["cargo tree *"]);
         assert_eq!(tool_texts(&a).len(), 2);
     });
 }
