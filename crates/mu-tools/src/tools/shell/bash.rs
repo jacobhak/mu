@@ -1006,6 +1006,31 @@ mod tests {
         assert!(out.text.contains("status=7"), "{}", out.text);
     }
 
+    /// `$!` of a background pipeline is its last program's OS pid (a virtual pid before oh-my-pi
+    /// v18.18.6), so a later call can `kill` and `wait` that program by the pid it saved.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_background_pipelines_pid_is_its_last_program() {
+        let last = format!("4{:07}", std::process::id());
+        let tools = Tools::for_test();
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx =
+            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let cmd = format!("/bin/sleep 0.2 | /bin/sleep {last} & echo $!");
+        let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
+        let pid: i32 = out.text.trim().parse().unwrap_or_else(|_| panic!("no pid: {}", out.text));
+        assert!(alive_soon(&last).await, "the pipeline's last program did not start");
+        let found = std::process::Command::new("pgrep").args(["-f", &format!("sleep {last}$")]).output().unwrap();
+        let os_pid = String::from_utf8_lossy(&found.stdout).trim().to_string();
+        if os_pid != pid.to_string() {
+            let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {last}$")]).status();
+            panic!("$! was {pid}, the last program is {os_pid}");
+        }
+        let out =
+            tools.call("bash", &json!({"command": format!("kill {pid}; wait {pid}; echo status=$?")}), &ctx).await;
+        assert!(out.text.contains("status=143"), "{}", out.text);
+        assert!(!alive(&last).await, "kill $! did not stop the last program");
+    }
+
     #[test]
     fn pty_input_queue_does_not_block_exit() {
         use mu_base::events::PtyInput;
