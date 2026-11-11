@@ -9,7 +9,7 @@
 use super::*;
 use crate::custom::panel::{self, Action, Answer, Destinations, Fetch, Probe, Saved, Step};
 use crate::widgets::overlay::PanelPick;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use mu_provider::auth::store::resolve_entry;
 use mu_provider::model::discovery::{DiscoverError, custom_fetch};
 use mu_provider::provider::custom::{self, CustomProvider, KeyEdit, SaveError};
@@ -134,7 +134,7 @@ impl App {
                 self.custom_key_cancelled();
                 return true;
             }
-            let enter = k.code == KeyCode::Enter && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+            let enter = k.code == KeyCode::Enter && !crate::widgets::editor::adds_newline(k.modifiers);
             if enter {
                 let text = self.prompt.composer.secret_text();
                 self.custom_key_typed(&text);

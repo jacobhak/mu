@@ -8,7 +8,7 @@ use crate::mcp::mcp_cmd::{self, Draft, McpCmd};
 use crate::mcp::mcp_wizard::{Answer, Step, Wizard};
 use crate::widgets::overlay::{McpAction, McpPick, McpRow, Overlay};
 use crate::widgets::select::{Item, Select};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use mu_base::events::Command;
 use mu_tools::mcp::config::{self, Entry, Kind};
 use mu_tools::mcp::discover::{self, Found, Roots};
@@ -439,7 +439,7 @@ impl App {
         // An empty Enter picks the step's default, which the composer would swallow.
         if k.code == KeyCode::Enter
             && self.prompt.composer.is_empty()
-            && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            && !crate::widgets::editor::adds_newline(k.modifiers)
         {
             self.mcp_wizard_line("");
             return true;

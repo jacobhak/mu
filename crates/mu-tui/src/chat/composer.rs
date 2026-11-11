@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::text::line::{self, Line, plain, span};
 use crate::theme::{self, Role};
 use crate::widgets::complete::{self, Entry};
-use crate::widgets::editor::{Edit, Editor, normalize_paste};
+use crate::widgets::editor::{Edit, Editor, adds_newline, normalize_paste};
 use crossterm::style::ContentStyle;
 use mu_base::image;
 use mu_base::message::{Image, UserInput};
@@ -495,9 +495,7 @@ impl Composer {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('d') if ctrl && self.is_empty() => Action::None,
-            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !self.buf.masked => {
-                self.edit(|b| b.newline())
-            }
+            KeyCode::Enter if adds_newline(key.modifiers) && !self.buf.masked => self.edit(|b| b.newline()),
             KeyCode::Enter => self.submit(false),
             KeyCode::Char('q') if ctrl => self.submit(running),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && !alt && !ctrl => Action::PopQueue,
@@ -979,6 +977,9 @@ mod tests {
         press(&mut c, KeyCode::Enter, KeyModifiers::SHIFT);
         type_str(&mut c, "y");
         assert_eq!(c.text(), "x\ny");
+        assert_eq!(press(&mut c, KeyCode::Enter, KeyModifiers::CONTROL), Action::Redraw, "Ctrl+Enter is a newline");
+        assert_eq!(c.text(), "x\ny\n");
+        press(&mut c, KeyCode::Backspace, KeyModifiers::NONE);
         press(&mut c, KeyCode::Backspace, KeyModifiers::NONE);
         press(&mut c, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(c.text(), "x");

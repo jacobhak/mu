@@ -30,7 +30,7 @@ const PREVIEW_MAX_LINES: usize = 16;
 /// Rows a highlighted item's detail text may take under the list.
 const DETAIL_MAX_LINES: usize = 6;
 
-const TEXT_HINT: &str = "Enter submit · Alt-Enter newline · Esc to options";
+const TEXT_HINT: &str = "Enter submit · Shift/Alt/Ctrl-Enter newline · Esc to options";
 
 pub struct Item {
     pub label: String,
@@ -376,7 +376,7 @@ impl Select {
                 self.editing = false;
                 SelectResult::Pending
             }
-            KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            KeyCode::Enter if !editor::adds_newline(key.modifiers) => {
                 if self.text.is_blank() {
                     SelectResult::Pending
                 } else if self.multi && !self.checked.is_empty() {
@@ -401,7 +401,7 @@ impl Select {
                 self.note = Editor::from_text(&self.note_before);
                 SelectResult::Pending
             }
-            KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            KeyCode::Enter if !editor::adds_newline(key.modifiers) => {
                 self.noting = false;
                 let rows = self.rows();
                 self.choose(&rows)

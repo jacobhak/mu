@@ -1644,13 +1644,13 @@ mod tests {
         let mut note = press(ov, &[KeyCode::Right]);
         let t = screen(&mut note);
         assert!(t[t.len() - 2].starts_with('╰'));
-        assert_eq!(t.last().unwrap(), "Enter submit · Alt-Enter newline · Esc to options");
+        assert_eq!(t.last().unwrap(), "Enter submit · Shift/Alt/Ctrl-Enter newline · Esc to options");
 
         let ov = press(note, &[KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
         let mut text = ov;
         let t = screen(&mut text);
         assert!(t[t.len() - 2].starts_with('╰'));
-        assert_eq!(t.last().unwrap(), "Enter submit · Alt-Enter newline · Esc to options");
+        assert_eq!(t.last().unwrap(), "Enter submit · Shift/Alt/Ctrl-Enter newline · Esc to options");
     }
 
     #[test]

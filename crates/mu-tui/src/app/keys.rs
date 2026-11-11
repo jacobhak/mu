@@ -333,7 +333,7 @@ impl App {
             self.cancel_key_flow();
             return true;
         }
-        if k.code == KeyCode::Enter && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+        if k.code == KeyCode::Enter && !crate::widgets::editor::adds_newline(k.modifiers) {
             self.finish_typing();
             return true;
         }

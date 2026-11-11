@@ -8,6 +8,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::text::line::{self, Line, plain};
 use mu_base::text::grapheme_width;
 
+/// Whether an Enter with these modifiers is a newline rather than a submit. Ctrl+Enter only
+/// arrives distinct from Enter on terminals with the kitty keyboard protocol.
+pub fn adds_newline(m: KeyModifiers) -> bool {
+    m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+}
+
 /// What a key did to the text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edit {
@@ -330,9 +336,8 @@ impl Editor {
     pub fn key(&mut self, key: KeyEvent, multiline: bool) -> Edit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
-            KeyCode::Enter if multiline && (shift || alt) => self.ed(Self::newline),
+            KeyCode::Enter if multiline && adds_newline(key.modifiers) => self.ed(Self::newline),
             KeyCode::Char('j') if ctrl && multiline => self.ed(Self::newline),
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.insert_str(&c.to_string());
@@ -574,8 +579,9 @@ mod tests {
         let mut e = at("a");
         assert_eq!(e.key(alt(KeyCode::Enter), true), Edit::Changed);
         assert_eq!(e.key(key(KeyCode::Enter, KeyModifiers::SHIFT), true), Edit::Changed);
+        assert_eq!(e.key(key(KeyCode::Enter, KeyModifiers::CONTROL), true), Edit::Changed);
         assert_eq!(e.key(ctrl('j'), true), Edit::Changed);
-        assert_eq!(e.text(), "a\n\n\n");
+        assert_eq!(e.text(), "a\n\n\n\n");
         assert_eq!(
             e.key(key(KeyCode::Enter, KeyModifiers::NONE), true),
             Edit::Unhandled,

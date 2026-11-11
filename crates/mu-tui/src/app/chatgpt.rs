@@ -3,9 +3,10 @@
 //! `mu_provider::auth::chatgpt`; this file drives them and shows the results.
 
 use super::*;
+use crate::widgets::editor::adds_newline;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::select::{Item, Select};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use mu_provider::auth::chatgpt::{self, Account, LABEL, PROVIDER_ID, USAGE_URL, oauth, signin};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -129,7 +130,7 @@ impl App {
             self.cancel_chatgpt();
             return true;
         }
-        if k.code == KeyCode::Enter && !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+        if k.code == KeyCode::Enter && !adds_newline(k.modifiers) {
             self.send_redirect();
             return true;
         }
