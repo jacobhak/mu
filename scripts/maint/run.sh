@@ -44,6 +44,19 @@ pr_create() {
   ghw pr create -R "$REPO" --base main --head "$branch" --title "$title" --body-file "$body" "${labels[@]}"
 }
 
+# pr_update <number> <title> <bodyfile> <label>...: retitle an open PR and swap its maint status labels.
+# REST, not `gh pr edit`: older gh releases fail that command on the retired classic-projects query.
+pr_update() {
+  local n="$1" title="$2" body="$3"; shift 3
+  local add=() l
+  ghw api --silent -X PATCH "repos/$REPO/pulls/$n" -f title="$title" -F body=@"$body"
+  for l in maint:auto maint:needs-review maint:red; do
+    [[ " $* " == *" $l "* ]] || ghw api --silent -X DELETE "repos/$REPO/issues/$n/labels/$l" 2>/dev/null || true
+  done
+  for l in "$@"; do add+=(-f "labels[]=$l"); done
+  ghw api --silent -X POST "repos/$REPO/issues/$n/labels" "${add[@]}"
+}
+
 nightly() {
   local result=uptodate published=no checked_sha pinned latest wt rc
 
@@ -95,27 +108,31 @@ P
   if [ -n "$latest" ] && [ "$latest" != "$pinned" ]; then
     if [ -n "${MU_MAINT_FORCE_LATEST:-}" ] || [ "$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -1)" = "$latest" ]; then go=1; fi
   fi
+  # One bump PR at a time: a newer release rebuilds the open PR's branch instead of opening another.
+  local pr="" branch="maint/omp-bump" had=""
   if [ "$go" = 1 ]; then
     local open head n
-    open="$(gh pr list -R "$REPO" -l maint:bump --state open --json number,headRefName -q '.[] | "\(.number) \(.headRefName)"')"
+    open="$(gh pr list -R "$REPO" -l maint:bump --state open --json number,headRefName -q 'sort_by(-.number) | .[] | select(.headRefName | startswith("maint/omp")) | "\(.number) \(.headRefName)"')"
     while read -r n head; do
       [ -z "$n" ] && continue
-      if [ "$head" = "maint/omp-$latest" ]; then
-        log "bump PR #$n for v$latest already open"
-        go=0
+      if [ -z "$pr" ]; then
+        pr="$n"; branch="$head"
+      else
+        ghw pr close "$n" -R "$REPO" --comment "Superseded by #$pr" --delete-branch
       fi
     done <<< "$open"
-    if [ "$go" = 1 ]; then
-      while read -r n head; do
-        [ -z "$n" ] && continue
-        ghw pr close "$n" -R "$REPO" --comment "Superseded by v$latest" --delete-branch
-      done <<< "$open"
+    if [ -n "$pr" ]; then
+      had="$(git -C "$CLONE" show "origin/$branch:upstream.toml" 2>/dev/null | sed -n 's/^omp = "\(.*\)"/\1/p' || true)"
+      if [ "$had" = "$latest" ]; then
+        log "bump PR #$pr for v$latest already open"
+        go=0
+      fi
     fi
   fi
   # Run in a background subshell so its failure (ERR trap, set -e) is reported but must not stop
   # the publish below: a broken bump must never block the nightly build of main.
   if [ "$go" = 1 ]; then
-    rc=0; ( bump_flow "$pinned" "$latest" ) & wait $! || rc=$?
+    rc=0; ( bump_flow "$pinned" "$latest" "$branch" "$pr" "$had" ) & wait $! || rc=$?
     [ -f "$RUN/result" ] && result="$(cat "$RUN/result")"
     if [ "$rc" != 0 ]; then result=bump-error; log "bump flow failed (exit $rc); publishing main anyway"; fi
   fi
@@ -124,15 +141,18 @@ P
   log "maint: result=$result published=$published spend=\$$(run_spend)"
 }
 
-# bump_flow <pinned> <latest>; sets result
+# bump_flow <pinned> <latest> <branch> [open-pr] [its-omp-version]; writes $RUN/result
 bump_flow() {
-  local pinned="$1" latest="$2" branch="maint/omp-$2" bwt="$MAINT/wt/bump" rc
+  local pinned="$1" latest="$2" branch="$3" pr="${4:-}" had="${5:-}" bwt="$MAINT/wt/bump" rc pinfail=0
   worktree bump origin/main "$branch"
   rc=0; "$here/bump.sh" "$bwt" "$latest" > "$RUN/bump.log" 2>&1 || rc=$?
   if [ "$rc" = 75 ]; then
     log "omp release not published yet; retry next run"
     result=waiting-release; echo "$result" > "$RUN/result"
     return 0
+  elif [ "$rc" = 76 ]; then
+    log "cargo cannot resolve the v$latest pin; handing it to the fixer"
+    pinfail=1
   elif [ "$rc" != 0 ]; then
     tail -n 50 "$RUN/bump.log" >&2
     return "$rc"
@@ -141,8 +161,16 @@ bump_flow() {
   git -C "$bwt" commit -q -m "Bump oh-my-pi to v$latest"
 
   mkdir -p "$RUN/bump"
-  local green=0
-  "$here/check.sh" "$bwt" "$RUN/bump" 9>&- > "$RUN/bump/check.out" 2>&1 && green=1
+  local green=0 smokeonly=0
+  if [ "$pinfail" = 1 ]; then
+    printf 'bump FAILED\nbuild skipped\ntest skipped\ncontract skipped\nsmoke skipped\n' > "$RUN/bump/check.txt"
+    cp "$RUN/bump.log" "$RUN/bump/bump.log"
+  elif "$here/check.sh" "$bwt" "$RUN/bump" 9>&- > "$RUN/bump/check.out" 2>&1; then
+    green=1
+  elif [ "$(tr '\n' ' ' < "$RUN/bump/check.txt")" = "build ok test ok contract ok smoke FAILED " ]; then
+    # The smoke stage drives a live model and flakes; nothing for the fixer to repair from a log alone.
+    smokeonly=1
+  fi
 
   "$here/material.sh" "$pinned" "$latest" "$RUN/material"
   local tprompt="$RUN/triage-prompt.md" tout="$RUN/triage.md" change=true summary="triage unavailable" risk=unknown fyi=""
@@ -161,24 +189,27 @@ P
     fi
   fi
 
-  local labels sev fixout="" fixrc=0 edited=0 review=0 findings="$RUN/fixer-findings.md"
+  local labels sev fixout="" fixrc=0 edited=0 testonly=0 review=0 findings="$RUN/fixer-findings.md"
   local fprompt="$RUN/fix-prompt.md" fout="$RUN/fixer.md"
   if [ "$green" = 1 ] && [ "$change" = false ]; then
-    result=s2; sev="S2 — green bump, no behaviour change; auto-merged"; labels=(maint:bump maint:auto)
+    result=s2; sev="S2 — green bump, nothing in mu needs to change; auto-merged"; labels=(maint:bump maint:auto)
+  elif [ "$smokeonly" = 1 ]; then
+    result=s1-smoke; sev="S1 — bump fails only the live smoke stage; the fixer was not run"; labels=(maint:bump maint:needs-review maint:red)
   else
     if [ "$green" = 1 ]; then
-      result=s2r; review=1; sev="S2r — green bump, behaviour change; needs review"; labels=(maint:bump maint:needs-review)
+      result=s2r; review=1; sev="S2r — green bump, the release leaves something in mu wrong; needs review"; labels=(maint:bump maint:needs-review)
       cat > "$fprompt" <<P
-MODE: behaviour review (checks are GREEN; do not go looking for failures). Triage found these user-visible behaviour changes in oh-my-pi v$latest (bumped from v$pinned):
+MODE: behaviour review (checks are GREEN; do not go looking for failures). Triage found that these changes in oh-my-pi v$latest (bumped from v$pinned) leave something in mu wrong:
 
 $summary
 
 Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
 
-For each listed change, decide whether mu must change to accommodate it (tool descriptions or prompts in src/, error handling, docs/README, tests or contract tests that should now cover the new behaviour). Make those changes. If a change needs no mu change, do not invent one. Follow the final-message format for behaviour review in your agent instructions.
+For each listed change, decide whether mu's own code, prompts, tool descriptions or docs are now wrong, stale or incomplete because of it, and fix those. If nothing in mu is, make no change: do not add a test that only pins upstream behaviour. Follow the final-message format for behaviour review in your agent instructions.
 P
     else
       result=s1; sev="S1 — bump fails checks"; labels=(maint:bump maint:needs-review)
+      [ "$pinfail" = 0 ] || sev="S1 — cargo cannot resolve the v$latest pin"
       cat > "$fprompt" <<P
 Adapt mu to oh-my-pi v$latest (bumped from v$pinned). The failing check run is in $RUN/bump (check.txt and one log per stage). Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
 P
@@ -190,27 +221,42 @@ P
     fixout="$(cat "$RUN/fixer-body.md")"
     if [ "$rc" = 0 ] && tree_changed "$bwt"; then
       edited=1
-      git -C "$bwt" add -A
-      git -C "$bwt" commit -q -m "Adapt to oh-my-pi v$latest" -m "$fixout"
-      mkdir -p "$RUN/bump-fixed"
-      if "$here/check.sh" "$bwt" "$RUN/bump-fixed" 9>&- > "$RUN/bump-fixed/check.out" 2>&1; then
-        green=1
-      else
-        green=0
+      if [ "$pinfail" = 1 ]; then
+        # The first run stopped at cargo fetch: finish the pin (lockfile, catalog) on the fixer's manifest.
+        rc=0; "$here/bump.sh" "$bwt" "$latest" > "$RUN/bump/bump.log" 2>&1 || rc=$?
+        if [ "$rc" = 0 ]; then pinfail=0; fi
       fi
-      cp "$RUN/bump-fixed/check.txt" "$RUN/bump/check.txt"
+      git -C "$bwt" add -A
+      # $here, not the worktree's copy: the fixer must not be able to edit the gate that merges its own diff.
+      if [ "$review" = 1 ] && "$here/test-only.sh" "$bwt" 2> "$RUN/test-only.log"; then testonly=1; fi
+      git -C "$bwt" commit -q -m "Adapt to oh-my-pi v$latest" -m "$fixout"
+      if [ "$pinfail" = 0 ]; then
+        mkdir -p "$RUN/bump-fixed"
+        if "$here/check.sh" "$bwt" "$RUN/bump-fixed" 9>&- > "$RUN/bump-fixed/check.out" 2>&1; then
+          green=1
+        else
+          green=0
+        fi
+        cp "$RUN/bump-fixed/check.txt" "$RUN/bump/check.txt"
+      fi
     fi
     [ "$green" = 1 ] || labels+=(maint:red)
-    if [ "$review" = 1 ] && [ "$green" = 1 ] && [ "$fixrc" = 0 ] && [ "$edited" = 0 ]; then
-      result=s2; sev="S2 — green bump; the fixer reviewed the behaviour changes and found no mu change needed; auto-merged"; labels=(maint:bump maint:auto)
+    if [ "$review" = 1 ] && [ "$green" = 1 ] && [ "$fixrc" = 0 ]; then
+      if [ "$edited" = 0 ]; then
+        result=s2; sev="S2 — green bump; the fixer reviewed the changes and found no mu change needed; auto-merged"; labels=(maint:bump maint:auto)
+      elif [ "$testonly" = 1 ]; then
+        result=s2; sev="S2 — green bump; the fixer changed only tests or docs; auto-merged"; labels=(maint:bump maint:auto)
+      fi
     fi
   fi
 
   {
     echo "## Severity"; echo "$sev"; echo
-    echo "## Checks"; echo '```'; cat "$RUN/bump/check.txt"; echo '```'; echo
+    echo "## Checks"
+    if [ "$smokeonly" = 1 ] || [ "$pinfail" = 1 ]; then failing_tail "$RUN/bump"; else echo '```'; cat "$RUN/bump/check.txt"; echo '```'; fi
+    echo
     echo "## Upstream changes"; echo "$summary"; echo
-    [ -z "$fyi" ] || { echo "## Also in this release (inside omp, no mu change)"; echo "$fyi"; echo; }
+    [ -z "$fyi" ] || { echo "## Also in this release (no mu change needed)"; echo "$fyi"; echo; }
     echo "Risk: $risk"; echo
     if [ "$fixrc" != 0 ]; then
       echo "## Fixer"; echo "**The fixer did not finish (exit $fixrc; 10 = monthly budget, 124 = timeout). No adaptation was made; any partial edits were discarded.**"; echo
@@ -222,7 +268,13 @@ P
   echo "$result" > "$RUN/result"
   pushw "$bwt" push -f -u origin "$branch"
   local url
-  url="$(pr_create "$branch" "Bump oh-my-pi to v$latest" "$RUN/pr-body.md" "${labels[@]}")"
+  if [ -n "$pr" ]; then
+    pr_update "$pr" "Bump oh-my-pi to v$latest" "$RUN/pr-body.md" "${labels[@]}"
+    ghw pr comment "$pr" -R "$REPO" --body "Rebuilt for v$latest${had:+ (was v$had)}. The branch was reset to main, so earlier commits on it are gone."
+    url="$(gh pr view "$pr" -R "$REPO" --json url -q .url)"
+  else
+    url="$(pr_create "$branch" "Bump oh-my-pi to v$latest" "$RUN/pr-body.md" "${labels[@]}")"
+  fi
   [ -z "$url" ] || echo "$url"
   if [ -s "$findings" ]; then
     { echo "Found by the maintenance bot while reviewing the bump to v$latest (${url:-$branch}). The bump did not cause it."; echo; cat "$findings"; } > "$RUN/finding.md"

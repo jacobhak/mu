@@ -9,11 +9,13 @@ You fix the mu repository (the current directory) so its checks pass again. mu i
 
 Your prompt names a run directory. It holds `check.txt` (one `stage ok|FAILED|skipped` line per stage: build, test, contract, smoke) and `<stage>.log` files. Read check.txt, then the logs of the failing stages. If the prompt names material (changelog and source diffs of the omp upgrade), use it to see what changed upstream.
 
-If the prompt says `MODE: behaviour review`, checks already pass. Your job is to accommodate the listed upstream behaviour changes in mu (and add test coverage where practical), or state per change why none is needed. Making no edits is acceptable only with a stated reason for each change.
+A failed `bump` stage means the version pin itself could not be completed: `bump.log` is the output of `scripts/maint/bump.sh`, usually `cargo fetch` rejecting a `[patch]` entry or a dependency version that the new omp tag no longer provides. Fix `Cargo.toml` so `cargo fetch` succeeds; the bot then reruns the bump script and the checks.
+
+If the prompt says `MODE: behaviour review`, checks already pass. Your job is to fix what the listed upstream changes made wrong in mu (code, prompts, tool descriptions, docs), or state per change why nothing is. Making no edits is the expected outcome when mu only passes the behaviour through. Do not add a test whose purpose is to pin omp's behaviour: omp tests its own crates. Add a test only alongside a mu code change you make.
 
 Rules:
 - Make the failing stages pass with the smallest change that is correct. Fix the cause, never weaken or delete a test or contract test to get green.
-- NEVER edit `.github/`, `upstream.toml`, the oh-my-pi `tag`/`rev` entries in `Cargo.toml`. The bot owns those.
+- NEVER edit `.github/` or `upstream.toml`, and never change the version an oh-my-pi `tag`/`rev` entry in `Cargo.toml` points at. The bot owns those. Adding or removing a whole oh-my-pi `[patch]` entry is allowed when the new release starts or stops vendoring that crate.
 - Do not commit, push, or create branches. Leave changes in the working tree.
 - The smoke stage spends real money; do not run `scripts/smoke.sh`. Reason from its log instead.
 - Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. Contract tests need `MU_OMP` pointing at the pinned omp, which the prompt gives when relevant.

@@ -96,12 +96,14 @@ A local systemd timer keeps mu current with oh-my-pi; everything is reported thr
 | Level | Trigger | Action |
 |---|---|---|
 | S0 | `scripts/maint/check.sh` fails on `origin/main` | issue `maint:s0`; fixer PR `maint:needs-review`; no bump or publish |
-| S1 | new omp release, bump fails checks | fixer adapts mu; PR `maint:bump` + `maint:needs-review` (+ `maint:red`) |
-| S2 | green bump, no behaviour change reaching mu | PR `maint:bump` + `maint:auto`, squash-merged |
-| S2r | green bump, behaviour change reaching mu | fixer reviews it; PR `maint:bump` + `maint:needs-review`, not merged. If the fixer makes no edit the PR is merged as S2 |
+| S1 | new omp release, bump fails checks or cargo cannot resolve the new pin | fixer adapts mu; PR `maint:bump` + `maint:needs-review` (+ `maint:red`). If only the live smoke stage fails the fixer is not run and the PR carries the smoke log |
+| S2 | green bump, nothing in mu is wrong after it | PR `maint:bump` + `maint:auto`, squash-merged. Upstream changes mu only passes through are listed in the PR |
+| S2r | green bump, the release leaves mu's own code, prompts or docs wrong | fixer corrects it; PR `maint:bump` + `maint:needs-review`, not merged. If the fixer makes no edit, or edits only tests and docs (`scripts/maint/test-only.sh`), the PR is merged as S2 |
 | S3 | weekly | issue `maint:digest` with omp changes worth porting |
 | finding | the fixer notices a problem in mu the bump did not cause | issue `maint:finding` |
 | publish | `origin/main` is green and newer than the last release | tag `mu-YYYYMMDD-<sha7>`; `.github/workflows/release.yml` builds and releases; the bot reinstalls unless a dev build is installed |
+
+There is one bump PR at a time, on the branch `maint/omp-bump`. A newer omp release rebuilds that branch from `main` and updates the open PR in place, so commits pushed to it are lost; closing the PR unmerged makes the next nightly open a fresh one.
 
 Nightly runs at 03:30, the digest on Mondays 05:00. The bot never edits `.github/`.
 
