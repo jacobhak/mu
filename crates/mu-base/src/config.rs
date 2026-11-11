@@ -312,8 +312,8 @@ pub const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 /// `[retry]`: when to wait out a provider's `Retry-After` (a 429, mostly). A request is retried when
-/// the wait is at most `max_wait` (`"90s"`, `"30m"`, `"2h"`, `"1d"`; default `"2m"`) or when its
-/// context is less than `context_below` percent full (default: never). `[retry.providers.<id>]`
+/// the wait is at most `max_wait` (`"90s"`, `"30m"`, `"2h"`, `"1d"`, `"1h30m"`; default `"2m"`) or
+/// when its context is less than `context_below` percent full (default: never). `[retry.providers.<id>]`
 /// overrides both for one provider. `max_attempts` (1 to 20, default 5) bounds the attempts per request.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -374,19 +374,29 @@ impl MuRetry {
     }
 }
 
-/// `"90s"`, `"30m"`, `"2h"` or `"1d"`: a whole number and one unit.
+/// `"90s"`, `"30m"`, `"2h"`, `"1d"`, or several of them run together (`"1h30m"`, `"2d3h"`): groups
+/// of a whole number and one unit, no space inside.
 pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
-    let s = s.trim();
-    let unit = s.chars().last()?;
-    let n: u64 = s[..s.len() - unit.len_utf8()].parse().ok()?;
-    let secs = match unit {
-        's' => 1,
-        'm' => 60,
-        'h' => 3600,
-        'd' => 86400,
-        _ => return None,
-    };
-    n.checked_mul(secs).map(std::time::Duration::from_secs)
+    let mut rest = s.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let n: u64 = rest.get(..digits)?.parse().ok()?;
+        let unit = rest.get(digits..)?.chars().next()?;
+        let secs = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86400,
+            _ => return None,
+        };
+        total = total.checked_add(n.checked_mul(secs)?)?;
+        rest = rest.get(digits + unit.len_utf8()..)?;
+    }
+    Some(std::time::Duration::from_secs(total))
 }
 
 fn check_retry(r: &MuRetry, warn: &mut Vec<String>) {
@@ -399,7 +409,7 @@ fn check_retry(r: &MuRetry, warn: &mut Vec<String>) {
     for (name, wait, below) in rules {
         if let Some(w) = wait.filter(|w| parse_duration(w).is_none()) {
             warn.push(format!(
-                "config.toml: {name} max_wait {w:?} is not a number and a unit (s, m, h, d); using the default"
+                "config.toml: {name} max_wait {w:?} is not a duration such as 90s, 30m or 1h30m; using the default"
             ));
         }
         if let Some(b) = below.filter(|b| !(b.is_finite() && *b > 0.0 && *b <= 100.0)) {
@@ -1032,15 +1042,19 @@ mod tests {
     }
 
     #[test]
-    fn durations_need_a_number_and_one_unit() {
+    fn durations_are_groups_of_a_number_and_one_unit() {
         use std::time::Duration;
         assert_eq!(parse_duration("90s"), Some(Duration::from_secs(90)));
         assert_eq!(parse_duration("30m"), Some(Duration::from_secs(1800)));
         assert_eq!(parse_duration(" 2h "), Some(Duration::from_secs(7200)));
         assert_eq!(parse_duration("1d"), Some(Duration::from_secs(86400)));
-        for bad in ["", "5", "m", "1.5h", "-1m", "2x", "1h30m", "5é"] {
+        assert_eq!(parse_duration("1h30m"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_duration("2d3h"), Some(Duration::from_secs(183_600)));
+        assert_eq!(parse_duration("1s1s"), Some(Duration::from_secs(2)));
+        for bad in ["", "  ", "5", "m", "1.5h", "-1m", "2x", "5é", "1h30", "1h 30m", "h1", "1h-30m"] {
             assert_eq!(parse_duration(bad), None, "{bad}");
         }
+        assert_eq!(parse_duration("18446744073709551615d"), None, "an overflowing count is not a duration");
         let r = toml::from_str::<MuRetry>("max_wait = \"soon\"\ncontext_below = 150\n[providers.x]\nmax_wait = \"1h\"")
             .unwrap();
         let mut w = Vec::new();

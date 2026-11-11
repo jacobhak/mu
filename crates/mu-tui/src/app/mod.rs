@@ -1,10 +1,10 @@
 //! The TUI's event loop and the state it runs on. The method groups live in the sibling files:
 //! `agent_view` (the agent-event reducer), `ui_msgs` (results of background work and the tick),
-//! `slash` (what the composer submits), `pickers` (overlays), `child` (programs that take the
-//! terminal), `keys` (input routing and API keys), `mcp` (`/mcp`),
-//! `memory` (`/memory`), `model_sets` (`/modelset`), `custom_providers` (the custom-endpoint panel),
-//! and `services` (the writes that leave the screen: config, stored keys, MCP
-//! definitions, session control).
+//! `slash` (what the composer submits), `schedule` (prompts sent at a later time), `pickers`
+//! (overlays), `child` (programs that take the terminal), `keys` (input routing and API keys),
+//! `mcp` (`/mcp`), `memory` (`/memory`), `model_sets` (`/modelset`), `custom_providers` (the
+//! custom-endpoint panel), and `services` (the writes that leave the screen: config, stored keys,
+//! MCP definitions, session control).
 
 mod agent_view;
 mod chatgpt;
@@ -15,6 +15,7 @@ mod mcp;
 mod memory;
 mod model_sets;
 mod pickers;
+mod schedule;
 mod services;
 mod slash;
 mod ui_msgs;
@@ -23,6 +24,7 @@ mod web;
 use self::agent_view::{AgentView, error_lines, notice_lines};
 use self::chatgpt::ChatgptFlow;
 use self::keys::KeyFlow;
+use self::schedule::Schedule;
 use self::services::Services;
 pub use self::slash::interactive_reference;
 use self::slash::{command_entries, custom_completion_ids};
@@ -88,6 +90,8 @@ struct App {
     screen: Screen,
     prompt: Prompt,
     overlay: Option<Overlay>,
+    /// Prompts that go out later; see `schedule`.
+    schedule: Schedule,
     /// Tool calls waiting for approval, oldest first; one is on screen at a time.
     approvals: VecDeque<(ApprovalRequest, tokio::sync::oneshot::Sender<ApprovalDecision>)>,
     flows: Flows,
@@ -202,6 +206,7 @@ pub async fn run(init: AppInit) -> i32 {
             held_back: Vec::new(),
         },
         overlay: None,
+        schedule: Schedule::default(),
         approvals: VecDeque::new(),
         flows: Flows {
             model_request_seq: 0,
@@ -254,6 +259,8 @@ pub async fn run(init: AppInit) -> i32 {
         }
     };
     let mut tick = tokio::time::interval(Duration::from_millis(80));
+    // The countdown above the composer while a prompt waits for its time.
+    let mut clock = tokio::time::interval(Duration::from_secs(1));
     let mut signals = term::Shutdown::new().ok();
     let mut draw_failed = false;
     loop {
@@ -300,6 +307,7 @@ pub async fn run(init: AppInit) -> i32 {
             Some(n) = notice_rx.recv() => app.notice(&n),
             Some(m) = ui_rx.recv() => app.on_ui(m),
             _ = tick.tick(), if app.busy() => app.on_tick(),
+            _ = clock.tick(), if app.schedule_pending() => app.screen.dirty = true,
             _ = tokio::time::sleep_until(due.into()), if app.screen.dirty => {}
         }
         app.sync_key_flow();
@@ -378,6 +386,10 @@ impl App {
             return;
         }
         self.quitting = true;
+        match self.schedule.clear() {
+            0 => {}
+            n => self.notice(&format!("{n} scheduled prompt(s) dropped")),
+        }
         self.send(Command::Cancel);
         self.notice("exiting…");
         self.send(Command::Exit);
@@ -412,6 +424,7 @@ impl App {
         vp.extend(live);
         vp.extend(self.agent.todo_hud(w));
         vp.extend(self.queue_bar(w));
+        vp.extend(self.schedule_bar(w));
         let mut env = status::StatusEnv::new(&self.cwd, &self.screen.status_cfg);
         env.expanded = self.agent.expanded;
         env.turn_elapsed = self.agent.turn_started.map(|t| t.elapsed());

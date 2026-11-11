@@ -24,6 +24,8 @@ Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal`
 
 While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
 
+A prompt can also be sent later, without staying at the keyboard: `/schedule 10m <prompt>` (see [Scheduled prompts](schedule.md)).
+
 Ctrl+C only exits: the first press says so and changes nothing else, and the second exits mu whatever is on screen (a running turn, a panel, a wizard, an embedded terminal). Esc is what backs out of those, one screen at a time, and in an embedded terminal it kills the command instead of being typed into it.
 
 Shift+Enter inserts a newline only in terminals with the kitty keyboard protocol. In tmux and other terminals, use Ctrl+J or Alt+Enter.

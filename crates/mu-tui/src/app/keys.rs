@@ -974,6 +974,7 @@ pub(super) mod tests {
                 held_back: vec![],
             },
             overlay: None,
+            schedule: Schedule::default(),
             approvals: VecDeque::new(),
             flows: Flows {
                 model_request_seq: 0,

@@ -90,6 +90,8 @@ pub(super) enum UiMsg {
         short: String,
         r: Result<Value, String>,
     },
+    /// A scheduled prompt reached its deadline; the app decides when it goes out.
+    ScheduleDue(u64),
 }
 
 impl App {
@@ -148,6 +150,7 @@ impl App {
             UiMsg::MemoryLog(r) => self.show_memory_log(r),
             UiMsg::MemoryShown(r) => self.on_memory_shown(r),
             UiMsg::MemoryReverted { short, r } => self.on_memory_reverted(&short, r),
+            UiMsg::ScheduleDue(id) => self.on_schedule_due(id),
             UiMsg::LoginProviders(r) => {
                 self.leave_custom_wizard();
                 let (mut items, mut targets) = self.api_key_rows();

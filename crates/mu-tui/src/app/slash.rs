@@ -13,7 +13,7 @@ use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
 
-const BUILTIN_DESC: [(&str, &str, bool); 31] = [
+const BUILTIN_DESC: [(&str, &str, bool); 32] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -42,6 +42,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 31] = [
     ("reply", "Quote parts of the last reply into the composer", false),
     ("image", "Attach an image file", true),
     ("jobs", "Show background jobs and other mu sessions", false),
+    ("schedule", "Send a prompt later [<delay> <prompt> | list | cancel [N|all]]", true),
     ("plans", "Approve, refine or drop a parked plan", false),
     ("memory", "Show and edit memory: files, notes and history; revert a commit", false),
     ("deliver", "Implement, review and commit a parked plan in a worktree [id]", false),
@@ -110,6 +111,7 @@ pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs
                 "permissions" => (PermissionMode::NAMES.iter().map(|s| s.to_string()).collect(), vec![]),
                 "copy" => (["code", "cmd", "link"].map(String::from).to_vec(), vec![]),
                 "jobs" => (vec!["kill".to_string()], vec![]),
+                "schedule" => (vec!["list".to_string(), "cancel".to_string()], vec![]),
                 "model" => role_views(cfg, ctx).into_iter().map(|r| (format!("@{}", r.name), r.row())).unzip(),
                 "modelset" => {
                     let subs = [
@@ -271,6 +273,7 @@ impl App {
                 | "reply"
                 | "image"
                 | "jobs"
+                | "schedule"
         );
         if self.agent.running && !allowed_busy {
             return self.notice("busy — Esc to abort first");
@@ -360,6 +363,7 @@ impl App {
             "reply" => self.open_reply(),
             "image" => self.image_cmd(arg),
             "jobs" => self.jobs_cmd(arg),
+            "schedule" => self.schedule_cmd(arg),
             "memory" => self.open_memory(),
             _ => {
                 let typed = |text: String| UserInput { text, images: Vec::new(), command: Some(format!("/{cmd}")) };

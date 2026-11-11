@@ -577,6 +577,8 @@ impl App {
                 if matches!(&self.overlay, Some(Overlay::Approve(a)) if a.reply_closed()) {
                     self.overlay = None;
                 }
+                // Prompts whose deadline passed during the turn go out now.
+                self.deliver_scheduled();
             }
             Effect::Restore { queued } => {
                 if !self.agent.turn_aborted {

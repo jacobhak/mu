@@ -21,7 +21,7 @@ nudge = true         # when a turn ends with a decision question in prose, remin
 mode = "hashline"     # or "sloppy": find/replace by text, no line tags
 
 [retry]               # waiting out a provider's Retry-After (a 429, mostly); a request is retried when either holds
-max_wait = "2m"       # Retry-After up to this: "90s", "30m", "2h", "1d". Longer fails at once
+max_wait = "2m"       # Retry-After up to this: "90s", "30m", "2h", "1d", "1h30m". Longer fails at once
 # context_below = 50  # or the context is less than this percent full (default: off)
 max_attempts = 5     # attempts per request, retries included: 1 to 20; any other value warns and means 5
 # [retry.providers.anthropic]   # both keys again, for one provider
