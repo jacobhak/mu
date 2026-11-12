@@ -301,7 +301,7 @@ The remaining gate findings belong here too:
 | S13f `/mcp reconnect` | Refuse to reconnect a server whose entry is no longer in the trusted set, and say why. | No alternative worth weighing. |
 | S13g tool-call hooks | (1) Run hooks in a fixed order, each on the previous one's arguments, and let a hook be marked required so that its failure or timeout blocks the call. (2) Keep them concurrent and make two different rewrites an error. (3) Document the current behaviour. | 1. Whether a failing hook lets the call through is a decision (section 6). |
 
-For S6 (`@` imports) the choices are: (1) confine imports to the project and mu's own directories, read only regular files under a size cap, and treat anything else as an outside read that needs a rule; (2) keep them unrestricted and list every outside import in a startup notice; (3) pass the system prompt through redaction. Recommended: 1 and 3 together. 3 alone only hides secrets that match a known shape. Decided: 1 only.
+For S6 (`@` imports) the choices are: (1) confine imports to the project and mu's own directories, read only regular files under a size cap, and treat anything else as an outside read that needs a rule; (2) keep them unrestricted and list every outside import in a startup notice; (3) pass the system prompt through redaction. Recommended: 1 and 3 together. 3 alone only hides secrets that match a known shape. Decided: 1 and 3.
 
 ### C. Stop failures from turning into empty values (S to M)
 
@@ -429,7 +429,7 @@ All were made on 2026-11-12. Where a decision differs from a recommendation in s
 1. **What `ask` and `edits` promise** (section 5B): option 2, one parse shared with the executor. Inside it:
    - S7: fix the seven listed forms (`rg` and `tree` get allowed-flag lists; a flag that names a file is a path subject or makes the command not read-only). No allow-list for every program.
    - S8: `deny` and `ask` rules also see inside a literal `sh -c '...'`, `bash -c` and `eval`; the inner line is analysed like the outer one. How a non-literal `-c` string is treated is for the implementation plan.
-2. **`@` imports** (S6): confine. Only the project and mu's own directories, regular files under a size cap; anything else needs a permission rule. The system prompt is not passed through redaction, so `docs/secrets.md:3` has to be corrected instead.
+2. **`@` imports** (S6): confine. Only the project and mu's own directories, regular files under a size cap; anything else needs a permission rule. The assembled system prompt (context files, rules, MCP instructions) also goes through the same secret redaction as messages and tool results, which makes `docs/secrets.md:3` true.
 3. **`fetch` in `ask` mode**: ask per host, with hosts returned by `web_search` in the same session exempt.
 4. **The bot's gate** (C1, C2): `check.sh` runs `ci-checks.sh`, and the bot also waits for the PR's CI run before the squash. A fixer diff that removes a test or lowers the assertion count is not test-only and goes to review.
 5. **Error rule** (section 5E): option 1. `anyhow` inside a crate, a typed enum where a caller branches on the kind, `String` only at display and RPC boundaries.
