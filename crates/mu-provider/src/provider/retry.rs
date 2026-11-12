@@ -34,10 +34,10 @@ pub fn hint(msg: &str) -> Option<Duration> {
         }
         let num: String = msg[from..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
         if let Ok(ms) = num.parse::<f64>()
-            && ms.is_finite()
             && ms >= 0.0
+            && let Ok(d) = Duration::try_from_secs_f64(ms / 1000.0)
         {
-            return Some(Duration::from_secs_f64(ms / 1000.0));
+            return Some(d);
         }
     }
     None
@@ -235,6 +235,12 @@ pub fn classify_http(status: u16, retry_after: Option<Duration>, body: &str, nat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflowing_hint_does_not_panic() {
+        let msg = format!("retry-after-ms={}", "9".repeat(40));
+        assert_eq!(hint(&msg), None);
+    }
 
     #[test]
     fn backoff_schedule() {

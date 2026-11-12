@@ -156,7 +156,7 @@ fn run_with_timeout(cmd: &mut Command, limit: Duration) -> bool {
 
 fn env_secs(key: &str, default: f64) -> Duration {
     let secs = std::env::var(key).ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v >= 0.0).unwrap_or(default);
-    Duration::from_secs_f64(secs)
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::from_secs_f64(default))
 }
 
 fn serve() -> Result<i32, String> {

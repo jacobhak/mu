@@ -92,11 +92,13 @@ pub struct SimpleCmd {
     pub words: Vec<String>,
     /// The files a read-only command may open: its path words and input redirections.
     pub paths: Vec<PathWord>,
+    /// The files its output redirections (and those of the groups around it) may write.
+    pub writes: Vec<PathWord>,
 }
 
 /// A word that may name a file a read-only command opens. Only its text up to the first glob is
 /// known, and nothing at all when an expansion could point it anywhere.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathWord {
     /// `None` for `$DIR/x` and `~/x`; otherwise the literal prefix, so `src/*.rs` is `src/`.
     pub prefix: Option<String>,
@@ -137,10 +139,11 @@ pub fn analyze(cmd: &str) -> BashAnalysis {
                 readonly: false,
                 words: Vec::new(),
                 paths: Vec::new(),
+                writes: Vec::new(),
             }],
         };
     };
-    let mut w = Walker { src, cmds: Vec::new(), bad: false };
+    let mut w = Walker { src, cmds: Vec::new(), bad: false, group_writes: Vec::new() };
     for c in &commands {
         w.list(c.list());
     }
@@ -158,6 +161,8 @@ struct Walker<'a> {
     cmds: Vec<SimpleCmd>,
     /// A program-level construct makes every command in the line not read-only.
     bad: bool,
+    /// Output redirection targets of the compound commands being walked.
+    group_writes: Vec<PathWord>,
 }
 
 impl Walker<'_> {
@@ -185,10 +190,14 @@ impl Walker<'_> {
     fn command(&mut self, c: Command) {
         let kind = c.kind();
         let simple = matches!(kind, CommandKind::Simple(_));
+        let mark = self.group_writes.len();
         for r in c.redirs() {
             self.redir(r);
             if !simple && is_output(r.op()) {
                 self.bad = true;
+            }
+            if !simple && let Some(w) = write_target(r) {
+                self.group_writes.push(w);
             }
         }
         match kind {
@@ -203,6 +212,12 @@ impl Walker<'_> {
                         .and_then(literal)
                         .map(|argv0| read_words(&argv0, words.skip(1), c.redirs()))
                         .unwrap_or_default(),
+                    writes: c
+                        .redirs()
+                        .iter()
+                        .filter_map(write_target)
+                        .chain(self.group_writes.iter().cloned())
+                        .collect(),
                     argv0: words.first().and_then(literal),
                     second: words.get(1).map(as_written),
                     assigns: !s.assigns().is_empty(),
@@ -259,6 +274,7 @@ impl Walker<'_> {
                 }
             }
         }
+        self.group_writes.truncate(mark);
     }
 
     fn simple_parts(&mut self, s: Simple) {
@@ -431,10 +447,30 @@ fn is_output(op: RedirOp) -> bool {
     )
 }
 
+/// `>&word` duplicates a descriptor only for a number or `-` (optionally `N-`); any other word is
+/// `&>word`, which writes the file.
+fn is_fd_word(w: Word) -> bool {
+    literal(w).is_some_and(|s| {
+        let digits = s.strip_suffix('-').unwrap_or(&s);
+        s == "-" || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// The file an output redirection may write; `/dev/null` and descriptor duplications write none.
+fn write_target(r: Redir) -> Option<PathWord> {
+    let RedirTarget::Word(w) = r.target() else { return None };
+    let writes = match r.op() {
+        RedirOp::DupOut => !is_fd_word(w),
+        op => is_output(op) && literal(w).as_deref() != Some("/dev/null"),
+    };
+    writes.then(|| PathWord { prefix: path_prefix(w), word: None })
+}
+
 fn redir_readonly(r: Redir) -> bool {
     let devnull = || matches!(r.target(), RedirTarget::Word(w) if literal(w).as_deref() == Some("/dev/null"));
     match r.op() {
-        RedirOp::In | RedirOp::DupIn | RedirOp::DupOut | RedirOp::HereString => true,
+        RedirOp::DupOut => write_target(r).is_none(),
+        RedirOp::In | RedirOp::DupIn | RedirOp::HereString => true,
         RedirOp::HereDoc { .. } => matches!(r.target(), RedirTarget::HereDoc(h) if h.quoted()),
         op if is_output(op) => devnull(),
         _ => false,

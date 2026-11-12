@@ -182,10 +182,13 @@ fn load_permissions(v: &toml::Value, warn: &mut Vec<String>) -> MuPermissions {
             let s = v.as_str();
             match s.and_then(PermissionMode::parse) {
                 Some(m) => p.mode = m,
-                None => warn.push(format!(
-                    "config.toml: [permissions] mode \"{}\" is not ask, edits or yolo; using yolo",
-                    s.map_or_else(|| v.to_string(), str::to_string)
-                )),
+                None => {
+                    p.mode = PermissionMode::Ask;
+                    warn.push(format!(
+                        "config.toml: [permissions] mode \"{}\" is not ask, edits or yolo; using ask",
+                        s.map_or_else(|| v.to_string(), str::to_string)
+                    ));
+                }
             }
         }
     }
@@ -1022,7 +1025,7 @@ mod tests {
         let text: toml::Table =
             "mode = \"nope\"\nreadonly_bash = 3\n[rules]\nbash = { \"git push *\" = \"deny\" }".parse().unwrap();
         let p = load_permissions(&toml::Value::Table(text), &mut w);
-        assert_eq!(p.mode, PermissionMode::Yolo, "a bad mode falls back to yolo");
+        assert_eq!(p.mode, PermissionMode::Ask, "a bad mode falls back to ask");
         assert!(p.readonly_bash, "a bad readonly_bash falls back to true");
         assert_eq!(p.rules.0.len(), 1);
         assert_eq!(w.len(), 2, "{w:?}");

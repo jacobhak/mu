@@ -319,7 +319,7 @@ impl Permissions {
                     text: c.text.clone(),
                     abs: None,
                     classified: c.readonly && self.readonly_bash && !*outside,
-                    no_allow: c.assigns || !analysis.parsed,
+                    no_allow: c.assigns || !analysis.parsed || writes_escape(tools, &root, c),
                 })
                 .collect();
             call.bash = Some(analysis);
@@ -341,6 +341,10 @@ impl Permissions {
                     classified: false,
                     no_allow: false,
                 });
+            }
+            if paths.is_empty() {
+                // A payload that names no target we can read is one the editor may read differently.
+                tier = Tier::Exec;
             }
             call.tier = tier;
             return Ok(call);
@@ -671,6 +675,15 @@ fn target_kind(tools: &Tools, root: &Path, raw: &str) -> Tier {
     }
 }
 
+/// Whether an output redirection of the command may write somewhere a command grant must not
+/// cover: outside the project, a protected place, or a target an expansion decides.
+fn writes_escape(tools: &Tools, root: &Path, c: &SimpleCmd) -> bool {
+    c.writes.iter().any(|w| match &w.prefix {
+        Some(p) => target_kind(tools, root, p) != Tier::Write,
+        None => true,
+    })
+}
+
 /// Whether a path a tool names lies outside the project; internal URLs always stay inside.
 fn reach_of_path(tools: &Tools, root: &Path, raw: &str) -> Reach {
     match tools.resolve(raw) {
@@ -722,26 +735,29 @@ fn path_subject(root: &Path, tools: &Tools, raw: &str) -> String {
     }
 }
 
-/// Canonicalises the nearest existing ancestor and appends the rest, so symlinks resolve.
+/// Resolves symlinks in the existing part of `p` and folds `.` and `..` in order, so a `..` after a
+/// missing directory cannot leave the place the path reaches.
 fn canonical_nearest(p: &Path) -> PathBuf {
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = p;
-    loop {
-        if let Ok(c) = cur.canonicalize() {
-            let mut out = c;
-            for r in rest.iter().rev() {
-                out.push(r);
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => out.push(comp),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
             }
-            return out;
-        }
-        match (cur.parent(), cur.file_name()) {
-            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
-                rest.push(name.to_os_string());
-                cur = parent;
+            Component::Normal(n) => {
+                out.push(n);
+                if let Ok(c) = out.canonicalize() {
+                    out = c;
+                }
             }
-            _ => return p.to_path_buf(),
         }
     }
+    out
 }
 
 fn body(name: &str, args: &Value) -> String {
@@ -968,9 +984,58 @@ mod tests {
         let Verdict::Ask(req) = p.check(&t, "write", &json!({"path": "a/b.txt", "content": "x"})) else { panic!() };
         p.remember(&req.grant.unwrap(), ApprovalScope::Session, false).unwrap();
         assert!(matches!(p.check(&t, "write", &json!({"path": "a/b.txt", "content": "y"})), Verdict::Allow));
-        let edit = |path: &str| json!({"input": format!("*** Edit File: {path}\n*** Find\nx\n*** Replace\ny")});
+        let edit = |path: &str| json!({"input": format!("[{path}#AB12]\n1ab|x")});
         assert!(matches!(p.check(&t, "edit", &edit("a/b.txt")), Verdict::Allow), "editing the file the grant names");
         assert!(matches!(p.check(&t, "edit", &edit("a/c.txt")), Verdict::Ask(_)), "another file");
+    }
+
+    #[test]
+    fn dot_dot_after_a_missing_directory_does_not_leave_the_project() {
+        let (p, t) = setup(PermissionMode::Edits);
+        let root = t.cwd.clone();
+        for path in [
+            "zz_missing/../../outside.txt".to_string(),
+            root.join("zz_missing/../.git/config").to_string_lossy().into_owned(),
+        ] {
+            let v = p.check(&t, "write", &json!({"path": path, "content": "x"}));
+            assert!(matches!(v, Verdict::Ask(_)), "{path}");
+        }
+        let v = p.check(&t, "write", &json!({"path": "zz_missing/../ok.txt", "content": "x"}));
+        assert!(matches!(v, Verdict::Allow), "a `..` that stays inside is fine");
+    }
+
+    #[test]
+    fn an_enveloped_edit_header_is_gated_by_the_file_it_targets() {
+        let (p, t) = setup(PermissionMode::Edits);
+        let outside = outside("envelope").join("zz");
+        let input = format!("[*** Begin Patch] [{}#AB12]\n1ab|x", outside.display());
+        assert!(matches!(p.check(&t, "edit", &json!({"input": input})), Verdict::Ask(_)));
+        let v = p.check(&t, "edit", &json!({"input": "nothing recognisable"}));
+        assert!(matches!(v, Verdict::Ask(_)), "a payload with no target fails closed");
+        std::fs::remove_dir_all(outside.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_redirect_to_a_file_is_not_read_only_and_not_covered_by_a_command_grant() {
+        let (p, t) = setup(PermissionMode::Ask);
+        for cmd in ["echo x >&out.txt", "echo x >&~/.bashrc", "echo x > out.txt"] {
+            assert!(matches!(verdict(&p, &t, cmd), Verdict::Ask(_)), "{cmd}");
+        }
+        assert!(matches!(verdict(&p, &t, "ls 2>&1"), Verdict::Allow), "a descriptor duplication writes nothing");
+
+        let Verdict::Ask(req) = verdict(&p, &t, "cargo test") else { panic!() };
+        p.remember(&req.grant.unwrap(), ApprovalScope::Session, false).unwrap();
+        assert!(matches!(verdict(&p, &t, "cargo test -q"), Verdict::Allow));
+        assert!(matches!(verdict(&p, &t, "cargo test -q > out.log"), Verdict::Allow), "a file in the project");
+        for cmd in [
+            "cargo test -q > ~/.bashrc",
+            "cargo test -q > /etc/zz",
+            "cargo test -q &> ../x",
+            "{ cargo test -q; } > ../x",
+            "cargo test -q > $OUT",
+        ] {
+            assert!(matches!(verdict(&p, &t, cmd), Verdict::Ask(_)), "{cmd}");
+        }
     }
 
     #[test]

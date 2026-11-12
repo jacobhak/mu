@@ -220,7 +220,8 @@ async fn fetch_chain(g: &Guard, url: &str, ua: Option<&str>, opts: &LoadOpts) ->
         headers.insert(name, header_value(v)?);
     }
 
-    let mut current = url.to_string();
+    // The checked and the requested URL must be the same parse.
+    let mut current = Url::parse(url).map_err(|e| Failure::Refused(format!("invalid URL {url}: {e}")))?.to_string();
     let mut redirects = 0;
     let mut prev_host: Option<String> = None;
     // Once a hop leaves the LAN, no later hop may come back to it.
@@ -303,7 +304,7 @@ fn retry_after_delay(value: Option<&str>) -> Duration {
         return Duration::from_secs(1);
     };
     let delay = match v.parse::<f64>() {
-        Ok(secs) if secs.is_finite() => Duration::from_secs_f64(secs.max(0.0)),
+        Ok(secs) if secs.is_finite() => Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(RETRY_AFTER_CAP),
         _ => match httpdate::parse_http_date(v) {
             Ok(at) => at.duration_since(SystemTime::now()).unwrap_or_default(),
             Err(_) => return Duration::from_secs(1),
@@ -382,29 +383,18 @@ fn meta_charset(body: &[u8]) -> Option<String> {
     None
 }
 
-/// Splits `scheme://[user@]host[:port]/…` into host and port.
+/// Host and port as the HTTP client will read them: both come from the same `Url` parse.
 fn host_port(url: &str) -> Option<(String, u16)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let default = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
-    let auth = rest.split(['/', '?', '#']).next()?;
-    let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
-    let (host, port) = if let Some(v6) = auth.strip_prefix('[') {
-        let (h, after) = v6.split_once(']')?;
-        (h, after.strip_prefix(':'))
-    } else {
-        match auth.split_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (auth, None),
-        }
-    };
-    if host.is_empty() {
+    let u = Url::parse(url).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
         return None;
     }
-    let port = match port.filter(|p| !p.is_empty()) {
-        Some(p) => p.parse().ok()?,
-        None => default,
+    let host = match u.host()? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(a) => a.to_string(),
+        url::Host::Ipv6(a) => a.to_string(),
     };
-    Some((host.to_string(), port))
+    Some((host, u.port_or_known_default()?))
 }
 
 /// LAN addresses: RFC 1918, IPv6 unique-local and CGNAT (Tailscale).
@@ -723,7 +713,18 @@ mod tests {
         assert_eq!(host_port("http://a.com/x"), Some(("a.com".into(), 80)));
         assert_eq!(host_port("https://u:p@a.com:8443/x?y"), Some(("a.com".into(), 8443)));
         assert_eq!(host_port("http://[::1]:9000/"), Some(("::1".into(), 9000)));
-        assert_eq!(host_port("http:///x"), None);
+        assert_eq!(host_port("http://"), None);
+        assert_eq!(host_port("ftp://a.com/"), None);
+    }
+
+    #[test]
+    fn host_port_agrees_with_the_client_on_backslash() {
+        assert_eq!(host_port("http://127.0.0.1:9\\@8.8.8.8/"), Some(("127.0.0.1".into(), 9)));
+    }
+
+    #[test]
+    fn huge_retry_after_is_capped() {
+        assert_eq!(retry_after_delay(Some("1e30")), RETRY_AFTER_CAP);
     }
 
     #[tokio::test]

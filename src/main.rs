@@ -20,6 +20,7 @@ fn main() {
 }
 
 fn dispatch() -> Result<i32> {
+    mu_common::paths::check_home().map_err(anyhow::Error::msg)?;
     mu_provider::net::install_crypto();
     secrets::set_stored_refresh(mu_provider::auth::store::sync_redaction);
     cli::docs::register();

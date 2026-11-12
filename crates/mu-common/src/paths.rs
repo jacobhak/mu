@@ -53,6 +53,16 @@ pub fn omp_bin() -> PathBuf {
     if own.is_file() { own } else { PathBuf::from("omp") }
 }
 
+/// Errors when neither `MU_HOME` nor `HOME` names a directory, so state is never written relative to the cwd.
+pub fn check_home() -> Result<(), String> {
+    let set = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    if set("MU_HOME") || set("HOME") {
+        Ok(())
+    } else {
+        Err("neither HOME nor MU_HOME is set; mu needs one to know where to keep its state".to_string())
+    }
+}
+
 pub fn mu_home() -> PathBuf {
     match std::env::var_os("MU_HOME") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
