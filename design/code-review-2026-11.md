@@ -301,7 +301,7 @@ The remaining gate findings belong here too:
 | S13f `/mcp reconnect` | Refuse to reconnect a server whose entry is no longer in the trusted set, and say why. | No alternative worth weighing. |
 | S13g tool-call hooks | (1) Run hooks in a fixed order, each on the previous one's arguments, and let a hook be marked required so that its failure or timeout blocks the call. (2) Keep them concurrent and make two different rewrites an error. (3) Document the current behaviour. | 1. Whether a failing hook lets the call through is a decision (section 6). |
 
-For S6 (`@` imports) the choices are: (1) confine imports to the project and mu's own directories, read only regular files under a size cap, and treat anything else as an outside read that needs a rule; (2) keep them unrestricted and list every outside import in a startup notice; (3) pass the system prompt through redaction. Recommended: 1 and 3 together. 3 alone only hides secrets that match a known shape.
+For S6 (`@` imports) the choices are: (1) confine imports to the project and mu's own directories, read only regular files under a size cap, and treat anything else as an outside read that needs a rule; (2) keep them unrestricted and list every outside import in a startup notice; (3) pass the system prompt through redaction. Recommended: 1 and 3 together. 3 alone only hides secrets that match a known shape. Decided: 1 only.
 
 ### C. Stop failures from turning into empty values (S to M)
 
@@ -323,7 +323,7 @@ For S6 (`@` imports) the choices are: (1) confine imports to the project and mu'
 
 ### D. One gate (S)
 
-- `scripts/maint/check.sh` calls `scripts/ci-checks.sh` for its build and test stages, so the bot, CI and `ship.sh` run one list (C1). Options beyond that: (1) also wait for the PR's CI run before the squash; (2) leave as is. I would start without the wait: the bot would then run the same checks itself.
+- `scripts/maint/check.sh` calls `scripts/ci-checks.sh` for its build and test stages, so the bot, CI and `ship.sh` run one list (C1). Options beyond that: (1) also wait for the PR's CI run before the squash; (2) leave as is. Decided: 1, wait for CI.
 - `test-only.sh` rejects a diff that removes a `#[test]` or lowers the count of assertions in a touched module (C2); such a bump goes to review.
 - Move lint levels into `[workspace.lints]` (C3). Option: add `clippy::unwrap_used` as a warning outside tests and count before deciding whether to enforce it.
 - Add shellcheck for `scripts/`. `cargo deny` is optional; the git-pinned dependencies are the argument for it.
@@ -332,7 +332,7 @@ For S6 (`@` imports) the choices are: (1) confine imports to the project and mu'
 - The release workflow runs `scripts/ci-checks.sh` instead of its own test and build list, so fmt and clippy also gate a release (C3).
 - `ship.sh` exits non-zero when it could not fast-forward the main checkout, instead of installing an older commit and reporting success (B14c).
 - `-dirty` (B14b). Options: (1) make `build.rs` rerun on every build, which rebuilds the top crate each time; (2) have `mu update` and `install.sh --skip-if-dev` ask git themselves instead of trusting the suffix. Recommended: 2.
-- The memory gate (C7). It was taken out of CI in `829c1cd`. Options: (1) run `mu-bench check` in the release dry run; (2) run it on a schedule; (3) leave it manual and say so in `DESIGN.md`. This is a decision (section 6); I would take 1.
+- The memory gate (C7). It was taken out of CI in `829c1cd`. Options: (1) run `mu-bench check` in the release dry run; (2) run it on a schedule; (3) leave it manual and say so in `DESIGN.md`. Decided: 3. The baseline is calibrated to one machine, which is why it left CI.
 
 ### E. A written rule for errors (M, then gradual)
 
@@ -422,22 +422,29 @@ Small fixes in this area, each S:
 5. F1 and F2.
 6. The rest of F and G as the files come up for other reasons, the small-fix tables in any order; E's rule before any of them touches error types.
 
-## 6. Decisions for you
+## 6. Decisions
 
-1. **What `ask` and `edits` promise** (section 5B): guard rails, a real check shared with the executor, or an OS boundary later. Decided: option 2. Still open inside it: how far the classifier goes on flags (S7) and whether `sh -c` lines are parsed for `deny` rules (S8).
-2. **`@` imports** (S6): confine, list, or leave.
-3. **`fetch` in `ask` mode**: keep it unasked, or ask per host.
-4. **The bot's gate** (C1, C2): run `ci-checks.sh` only, or also wait for CI; and whether a fixer diff that removes tests may still auto-merge.
-5. **Error rule** (section 5E): option 1, 2 or 3.
-6. **`HOME` unset** (S10): fail, or fall back to the passwd entry. Decided with A: mu fails at startup.
-7. **Session directory names** (B14g): keep omp's scheme and its collisions, or diverge.
-8. **Product questions** in 4.6: Ctrl+C in a pty, confirms for `X`, `r` and marked-job `k`/`x`, `-c` stopping a live run, concurrent read-only tool calls.
-9. **The other product questions** in 4.6:
-   - Ghost text reading omp's and Claude's histories: keep and correct the docs, make it a setting, or read mu's history only.
-   - The gateway pair's 30-minute linger: document it, or also make it configurable.
-   - Filtering: substring in lists and fuzzy in the slash menu, or one rule for both.
-   - ACP `initialize` with version 0: keep the error, or answer with the supported version as the protocol asks.
-10. **Tool-call hooks** (S13g): may a hook that fails or times out let the call through, as now, or can a hook be marked required?
-11. **The memory gate** (C7): release dry run, a schedule, or manual.
-12. **The installer's check** (S13l): an attestation or signature, or the same-release checksum with its limit stated.
-13. **Which workstreams to plan in detail.** I have not written implementation plans; say which ones you want and I will.
+All were made on 2026-11-12. Where a decision differs from a recommendation in section 5, the decision holds.
+
+1. **What `ask` and `edits` promise** (section 5B): option 2, one parse shared with the executor. Inside it:
+   - S7: fix the seven listed forms (`rg` and `tree` get allowed-flag lists; a flag that names a file is a path subject or makes the command not read-only). No allow-list for every program.
+   - S8: `deny` and `ask` rules also see inside a literal `sh -c '...'`, `bash -c` and `eval`; the inner line is analysed like the outer one. How a non-literal `-c` string is treated is for the implementation plan.
+2. **`@` imports** (S6): confine. Only the project and mu's own directories, regular files under a size cap; anything else needs a permission rule. The system prompt is not passed through redaction, so `docs/secrets.md:3` has to be corrected instead.
+3. **`fetch` in `ask` mode**: ask per host, with hosts returned by `web_search` in the same session exempt.
+4. **The bot's gate** (C1, C2): `check.sh` runs `ci-checks.sh`, and the bot also waits for the PR's CI run before the squash. A fixer diff that removes a test or lowers the assertion count is not test-only and goes to review.
+5. **Error rule** (section 5E): option 1. `anyhow` inside a crate, a typed enum where a caller branches on the kind, `String` only at display and RPC boundaries.
+6. **`HOME` unset** (S10): mu fails at startup (done with A).
+7. **Session directory names** (B14g): keep omp's naming; stored grants record the project's absolute path and apply only when it matches.
+8. **Product questions** in 4.6:
+   - Ctrl+C in a pty: stays as it is.
+   - Confirms: `X` (cancel every job) asks. `r` in the memory log and `k`/`x` on a marked job stay one key.
+   - `mu -c` and `--resume` on a session held by a live run: ask before stopping it. What a non-interactive caller gets is for the implementation plan.
+   - Read-only tool calls in one message run concurrently. To be planned, after the loop-level tests in G.
+   - Ghost text: reading other tools' histories becomes a setting, and the docs say what is read.
+   - The gateway pair's 30-minute linger: document it.
+   - Filtering: substring in lists and fuzzy in the slash menu stay.
+   - ACP `initialize` with version 0: answer with the supported version.
+9. **Tool-call hooks** (S13g): fail-open stays the default; a hook can be marked required, and then its failure or timeout blocks the call. Hooks run in a fixed order, each on the previous one's arguments.
+10. **The memory gate** (C7): manual, and `DESIGN.md` says so. `829c1cd` took it out of CI because its baseline is calibrated to one machine.
+11. **The installer's check** (S13l): the release job attests the tarballs and the installer verifies the attestation when `gh` is present, with the checksum as the fallback.
+12. **Detailed plans**: workstream C next. None for D to I yet.
