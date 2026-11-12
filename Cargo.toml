@@ -109,6 +109,8 @@ mu-tools = { workspace = true, features = ["test-support"] }
 tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.19.0" }
 grep-searcher = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.19.0" }
 jaq-core = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.19.0" }
+jaq-json = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.19.0" }
+jaq-std = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.19.0" }
 
 [profile.dev]
 debug = "line-tables-only"
