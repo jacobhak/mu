@@ -364,6 +364,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "libbz2-rs-sys",
+]
+
+[[package]]
 name = "calendrical_calculations"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2533,7 +2542,7 @@ dependencies = [
 [[package]]
 name = "grep-searcher"
 version = "0.1.17"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "bstr",
  "encoding_rs",
@@ -3271,7 +3280,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jaq-core"
 version = "3.1.1"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "dyn-clone",
  "once_cell",
@@ -3553,6 +3562,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "libbz2-rs-sys"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32f454fd6831a29c0e827ed075bca2a15be201bd57f4168f0fd1041124eab17e"
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3669,6 +3684,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "lzma-rust2"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1d73c59a56771343712b22ea5615092c612c16ba291c0979e3105dfeec4890"
+dependencies = [
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -4631,8 +4655,8 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4667,8 +4691,8 @@ dependencies = [
 
 [[package]]
 name = "pi-builtins"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "ansi-width",
  "argmax",
@@ -4676,6 +4700,7 @@ dependencies = [
  "base64 0.23.1",
  "bigdecimal",
  "bstr",
+ "bzip2",
  "chrono",
  "clap",
  "dns-lookup",
@@ -4707,6 +4732,7 @@ dependencies = [
  "libc",
  "lscolors",
  "lz4_flex",
+ "lzma-rust2",
  "md-5",
  "md4",
  "memchr",
@@ -4727,6 +4753,7 @@ dependencies = [
  "rand 0.10.3",
  "rayon",
  "regex",
+ "regex-automata",
  "rustc-hash",
  "rustix 1.1.5",
  "self_cell",
@@ -4734,6 +4761,8 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "smallvec",
+ "stacker",
+ "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4748,13 +4777,13 @@ dependencies = [
 
 [[package]]
 name = "pi-diff"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 
 [[package]]
 name = "pi-edit"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -4770,8 +4799,8 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "async-trait",
  "libc",
@@ -4802,8 +4831,8 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4840,8 +4869,8 @@ dependencies = [
 
 [[package]]
 name = "pi-vcs"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "futures",
  "gix",
@@ -4856,8 +4885,8 @@ dependencies = [
 
 [[package]]
 name = "pi-vfs"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "async-trait",
  "libc",
@@ -4870,8 +4899,8 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "18.18.6"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+version = "18.19.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "flume",
  "futures",
@@ -5940,6 +5969,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6318,7 +6357,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v18.18.6#9058ab9d229663e229e2867824ba6df6f21e9e59"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v18.19.0#04cd1a7549a02d62ad1d24826198d52507595683"
 dependencies = [
  "cc",
  "tree-sitter-language",
