@@ -1,4 +1,4 @@
-use super::uri::Scheme;
+use super::uri::{Scheme, physical};
 use super::{Tools, diff};
 use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
 use pi_edit::{path_policy::canonical_key, text};
@@ -35,18 +35,15 @@ impl Tools {
         }
         let abs = res.path;
         let disp = if res.scheme.is_some() { a.path.clone() } else { self.display(&abs) };
+        // A symlink is written through, so the link survives the rename that ends the write; a
+        // dangling link is written through to where it points. The gate judged this same file.
+        let target = physical(&abs);
         // The filesystem work runs on a blocking thread; `content` moves in and comes back.
         let (path, content) = (abs.clone(), a.content);
         let done = tokio::task::spawn_blocking(move || -> Result<(Option<String>, bool, String), String> {
-            if let Some(parent) = path.parent() {
+            if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
             }
-            // A symlink is written through, so the link survives the rename that ends the write.
-            // A dangling link is written through to where it points.
-            let target = std::fs::canonicalize(&path).unwrap_or_else(|_| match std::fs::read_link(&path) {
-                Ok(l) => path.parent().map_or(l.clone(), |p| p.join(&l)),
-                Err(_) => path.clone(),
-            });
             let (old, too_big, crlf) = match std::fs::metadata(&target) {
                 Ok(m) if m.len() <= CHANGE_TEXT_MAX as u64 => {
                     let bytes = std::fs::read(&target).ok();

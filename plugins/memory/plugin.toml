@@ -7,6 +7,7 @@ hooks = ["prompt_submit", "pre_compaction", "session_end"]
 name = "memory"
 description = "Long-term memory kept as short markdown files in git: who the user is, how they want work done, and facts about this repository that the code does not show. `read` shows the current state or one note; `edit` applies a batch of add/replace/remove/write_note/delete_note ops at once. Save only what is durable and was said or confirmed by the user."
 schema = "schemas/memory.json"
+tier = "read"
 
 [[tools]]
 name = "session_search"

@@ -161,7 +161,7 @@ impl RuleSet {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Grant {
     pub tool: String,
-    /// Subjects matched as-is; empty grants the whole tool.
+    /// Subjects matched as-is; `["*"]` grants every call of the tool.
     pub patterns: Vec<String>,
     /// The widths above the exact one, narrowest first: the directory, the checkout it sits in,
     /// the checkouts beside it, `~`, and `/`. Empty when the grant cannot widen.

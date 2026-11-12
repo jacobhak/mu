@@ -3,6 +3,7 @@
 use super::manifest::{self, Lifetime, Manifest};
 use super::process::Proc;
 use crate::mcp;
+use crate::permissions::Access;
 use mu_base::tool::{ToolDef, ToolOutput};
 use mu_provider::provider::client::Providers;
 use serde_json::{Value, json};
@@ -257,6 +258,16 @@ impl PluginHost {
                 Kind::Native { manifest } => manifest.tools.iter().any(|t| t.name == name),
             })
             .cloned()
+    }
+
+    /// How the gate judges a plugin's tool: its manifest's tier. `None` for an unknown tool; an MCP
+    /// server's tools may change things, whatever they claim.
+    pub(crate) fn tool_access(&self, name: &str) -> Option<Access> {
+        let slot = self.slot_for_tool(name)?;
+        match &slot.kind {
+            Kind::Mcp(_) => Some(Access::Exec),
+            Kind::Native { manifest } => manifest.tools.iter().find(|t| t.name == name).map(|t| t.access),
+        }
     }
 
     pub(crate) fn has_tool(&self, name: &str) -> bool {

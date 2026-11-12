@@ -8,7 +8,7 @@ mod job_cancel;
 mod job_wait;
 mod pathnote;
 mod plan;
-mod read;
+pub(crate) mod read;
 pub(crate) mod shell;
 mod spill;
 pub mod subagent;
@@ -20,6 +20,7 @@ pub(crate) mod write;
 mod yield_;
 
 use crate::jobs::JobsHandle;
+use crate::permissions::Access;
 use crate::plugin::host::PluginHost;
 use mu_base::events::EventTx;
 use mu_base::text::truncate_text as trunc;
@@ -201,6 +202,15 @@ impl Tools {
         ToolDef { name: "propose_plan".into(), description: plan::DESCRIPTION.into(), schema: plan::schema() }
     }
 
+    /// How the permission gate judges a tool: a built-in's own declaration, a plugin's manifest, and
+    /// anything else (an MCP tool, an unknown name) as one that may change things.
+    pub(crate) fn access(&self, name: &str) -> Access {
+        match BUILTINS.iter().find(|b| b.name == name) {
+            Some(b) => b.access,
+            None => self.plugins.tool_access(name).unwrap_or(Access::Exec),
+        }
+    }
+
     pub async fn call(&self, name: &str, args: &Value, ctx: &ToolCtx) -> ToolOutput {
         if let Some(raw) = args.get("__invalid_json") {
             return ToolOutput::err(format!("Invalid arguments for {name}: arguments were not valid JSON: {raw}"));
@@ -245,6 +255,8 @@ type CallFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ToolOut
 /// dispatcher. Everything that lists or runs built-ins reads this table.
 pub struct Builtin {
     pub name: &'static str,
+    /// How the permission gate judges it: by its arguments, or as a reader.
+    pub access: Access,
     pub def: Option<fn() -> ToolDef>,
     call: for<'a> fn(&'a Tools, &'a Value, &'a ToolCtx) -> CallFuture<'a>,
 }
@@ -281,6 +293,7 @@ macro_rules! dispatch {
 pub static BUILTINS: &[Builtin] = &[
     Builtin {
         name: "read",
+        access: Access::ByArgs,
         def: Some(|| {
             tool_def(
                 "read",
@@ -293,6 +306,7 @@ pub static BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "write",
+        access: Access::ByArgs,
         def: Some(|| {
             tool_def(
                 "write",
@@ -308,6 +322,7 @@ pub static BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "edit",
+        access: Access::ByArgs,
         def: Some(|| {
             tool_def(
                 "edit",
@@ -316,15 +331,20 @@ pub static BUILTINS: &[Builtin] = &[
                     "input":{"type":"string","description":"The edit payload, in the format described above"}},"required":["input"]}),
             )
         }),
-        call: dispatch!("edit", async |t, a: edit::Args, c| t.noted(a.paths(), t.edit(a, c.plan))),
+        call: dispatch!("edit", async |t, a: edit::Args, c| async {
+            let paths = a.authored(t);
+            t.noted(paths, t.edit(a, c.plan)).await
+        }),
     },
     Builtin {
         name: "bash",
+        access: Access::ByArgs,
         def: Some(|| Tools::bash_def(false)),
         call: dispatch!("bash", async |t, a: shell::bash::Args, c| t.bash(a, c)),
     },
     Builtin {
         name: "grep",
+        access: Access::ByArgs,
         def: Some(|| {
             tool_def(
                 "grep",
@@ -338,6 +358,7 @@ pub static BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "glob",
+        access: Access::ByArgs,
         def: Some(|| {
             tool_def(
                 "glob",
@@ -350,24 +371,47 @@ pub static BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "todo",
+        access: Access::Read,
         def: Some(|| tool_def("todo", todo::description(), todo::schema())),
         call: dispatch!("todo", |t, a: todo::Args| t.todo(a)),
     },
     Builtin {
         name: "ask",
+        access: Access::Read,
         def: Some(|| tool_def("ask", ask::description(), ask::schema())),
         call: dispatch!("ask", async |t, a: ask::Args, c| t.ask(a, c)),
     },
     // Offered per session (plan mode, jobs, custom agents), so no static definition.
     Builtin {
         name: "propose_plan",
+        access: Access::Read,
         def: None,
         call: dispatch!("propose_plan", async |t, a: plan::Args, c| t.propose_plan(a, c)),
     },
-    Builtin { name: "task", def: None, call: dispatch!("task", async |t, a: task::Args, c| t.task(a, c)) },
-    Builtin { name: "job_cancel", def: None, call: dispatch!("job_cancel", |t, a: job_cancel::Args| t.job_cancel(a)) },
-    Builtin { name: "wait", def: None, call: dispatch!("wait", async |t, a: job_wait::Args, c| t.job_wait(a, c)) },
-    Builtin { name: "yield", def: None, call: dispatch!("yield", |t, a: yield_::Args| t.yield_result(a)) },
+    Builtin {
+        name: "task",
+        access: Access::Read,
+        def: None,
+        call: dispatch!("task", async |t, a: task::Args, c| t.task(a, c)),
+    },
+    Builtin {
+        name: "job_cancel",
+        access: Access::Read,
+        def: None,
+        call: dispatch!("job_cancel", |t, a: job_cancel::Args| t.job_cancel(a)),
+    },
+    Builtin {
+        name: "wait",
+        access: Access::Read,
+        def: None,
+        call: dispatch!("wait", async |t, a: job_wait::Args, c| t.job_wait(a, c)),
+    },
+    Builtin {
+        name: "yield",
+        access: Access::Read,
+        def: None,
+        call: dispatch!("yield", |t, a: yield_::Args| t.yield_result(a)),
+    },
 ];
 
 /// Whether `name` is a built-in tool.
@@ -503,5 +547,16 @@ mod table_tests {
             let out = rt.block_on(t.call(b.name, &json!({"__nonsense": true}), &ctx));
             assert!(!out.text.contains("Unknown tool"), "{}: {}", b.name, out.text);
         }
+    }
+
+    /// The gate has an argument reading for exactly these tools; any other built-in declares its tier.
+    #[test]
+    fn only_the_file_and_shell_tools_are_judged_by_their_arguments() {
+        let by_args: Vec<&str> = BUILTINS.iter().filter(|b| b.access == Access::ByArgs).map(|b| b.name).collect();
+        assert_eq!(by_args, ["read", "write", "edit", "bash", "grep", "glob"]);
+        assert!(
+            BUILTINS.iter().all(|b| b.access != Access::Exec),
+            "a built-in that may act is judged by its arguments"
+        );
     }
 }

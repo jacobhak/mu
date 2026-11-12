@@ -15,82 +15,6 @@ fn is_relative_file_path(p: &str) -> bool {
     !p.is_empty() && !p.starts_with('~') && !p.contains("://") && !Path::new(p).is_absolute()
 }
 
-/// The paths an `edit` payload names, read the way the active edit format reads its headers.
-/// An empty result means the payload names nothing recognisable; the permission gate then asks.
-pub(super) fn edit_paths(input: &str) -> Vec<String> {
-    edit_paths_in(super::edit::mode(), input)
-}
-
-fn edit_paths_in(mode: pi_edit::EditMode, input: &str) -> Vec<String> {
-    match mode {
-        pi_edit::EditMode::Sloppy => sloppy_paths(input),
-        _ => hashline_paths(input),
-    }
-}
-
-/// `*** Edit File: <path> [all]`, with any run of blanks between the words, as pi-edit's header regex has it.
-fn sloppy_paths(input: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in input.lines() {
-        let Some(rest) = line.trim().strip_prefix("***") else { continue };
-        if !rest.starts_with([' ', '\t']) {
-            continue;
-        }
-        let rest = rest.trim_start();
-        let Some(rest) = strip_word(rest, "edit").map(str::trim_start).and_then(|r| strip_word(r, "file")) else {
-            continue;
-        };
-        let rest = rest.trim_start_matches(':').trim();
-        let rest = match rest.rsplit_once(char::is_whitespace) {
-            Some((p, flag)) if flag.eq_ignore_ascii_case("all") => p.trim_end(),
-            _ => rest,
-        };
-        out.push(rest.trim_matches('"').to_string());
-    }
-    out
-}
-
-/// `s` without a leading `word` (any case) that ends at a blank, a colon or the end.
-fn strip_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
-    let head = s.get(..word.len())?;
-    let tail = &s[word.len()..];
-    (head.eq_ignore_ascii_case(word) && (tail.is_empty() || tail.starts_with([' ', '\t', ':']))).then_some(tail)
-}
-
-const ENVELOPE_MARKERS: [&str; 3] = ["*** Begin Patch", "*** End Patch", "*** Abort"];
-
-/// A whole-line `[<path>#<tag>]` header, after the `apply_patch` envelope markers pi-edit unwraps in front of it.
-fn hashline_paths(input: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in input.lines() {
-        let mut rest = line.trim();
-        while let Some(inner) = rest.strip_prefix('[').map(str::trim_start)
-            && let Some(marker) = ENVELOPE_MARKERS.iter().find(|m| inner.starts_with(**m))
-        {
-            let tail = inner[marker.len()..].trim_start();
-            rest = tail.strip_prefix(']').unwrap_or(tail).trim_start();
-        }
-        let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else { continue };
-        let mut path = inner.trim();
-        if path.starts_with("***")
-            && let Some((_, after)) = path.split_once(':')
-        {
-            path = after.trim();
-        }
-        if let Some((p, tag)) = path.rsplit_once('#')
-            && !tag.is_empty()
-            && tag.chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            path = p;
-        }
-        let path = path.trim().trim_matches(['"', '\'']);
-        if !path.is_empty() {
-            out.push(path.to_string());
-        }
-    }
-    out
-}
-
 impl Tools {
     /// Warns about relative `paths` when the bash shell's directory differs from the session's.
     pub(super) fn cwd_note(&self, paths: &[String]) -> Option<String> {
@@ -123,28 +47,6 @@ impl Tools {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    #[test]
-    fn finds_paths_in_both_edit_formats() {
-        use pi_edit::EditMode::{Hashline, Sloppy};
-        let sloppy =
-            "*** Edit File: src/a.rs\n*** Find\nx\n*** Replace\ny\n*** Edit File: \"b c.rs\" all\n*** Find\nz\n";
-        assert_eq!(edit_paths_in(Sloppy, sloppy), ["src/a.rs", "b c.rs"]);
-        assert_eq!(edit_paths_in(Hashline, "[crates/x/y.rs#AB12]\n1ab|foo\n"), ["crates/x/y.rs"]);
-        assert!(edit_paths_in(Hashline, "no header here\n").is_empty());
-    }
-
-    #[test]
-    fn the_paths_are_read_as_the_editor_reads_them() {
-        use pi_edit::EditMode::{Hashline, Sloppy};
-        assert_eq!(edit_paths_in(Hashline, "[*** Begin Patch] [/etc/zz#AB12]\nx\n"), ["/etc/zz"]);
-        assert_eq!(edit_paths_in(Hashline, "[*** Begin Patch [/etc/zz#AB12]\nx\n"), ["/etc/zz"]);
-        assert_eq!(edit_paths_in(Hashline, "[/etc/zz]\nx\n"), ["/etc/zz"], "an untagged header still targets");
-        assert_eq!(edit_paths_in(Hashline, "[*** Update File: /etc/zz#AB12]\n"), ["/etc/zz"]);
-        assert_eq!(edit_paths_in(Sloppy, "***  Edit   File: /abs/x\n"), ["/abs/x"]);
-        assert_eq!(edit_paths_in(Sloppy, "***\tEdit\tFile:\t/abs/y all\n"), ["/abs/y"]);
-        assert_eq!(edit_paths_in(Sloppy, "*** EDIT FILE /abs/z\n"), ["/abs/z"]);
-    }
 
     #[test]
     fn only_relative_file_paths_count() {

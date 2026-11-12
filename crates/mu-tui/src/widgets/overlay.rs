@@ -561,7 +561,12 @@ impl ApproveState {
     /// The widths on offer: the exact grant, then each named one above it.
     fn widths(req: &ApprovalRequest) -> Vec<(String, Vec<String>)> {
         let Some(g) = &req.grant else { return Vec::new() };
-        let mut out = vec![("what it asked for".to_string(), g.patterns.clone())];
+        let mut out = Vec::new();
+        if g.patterns == ["*"] {
+            out.push((format!("every call of {}", g.tool), g.patterns.clone()));
+        } else if !g.patterns.is_empty() {
+            out.push(("what it asked for".to_string(), g.patterns.clone()));
+        }
         out.extend(g.wider.iter().map(|w| (w.label.clone(), w.patterns.clone())));
         out
     }
@@ -1172,6 +1177,28 @@ mod tests {
         assert!(ov.select().is_some());
         assert!(ov.select_mut().is_some());
         assert!(ov.on_key(key(KeyCode::Enter)).1.is_none(), "enter opens edit, not assignment");
+    }
+
+    #[test]
+    fn a_grant_with_nothing_to_scope_it_is_named_by_its_tool() {
+        let req = |patterns: &[&str]| ApprovalRequest {
+            tool: "mcp__x__y".into(),
+            call_id: "c".into(),
+            title: "mcp__x__y".into(),
+            reason: "ask mode: mcp__x__y needs approval".into(),
+            body: String::new(),
+            from: None,
+            grant: Some(mu_base::permissions::Grant {
+                tool: "mcp__x__y".into(),
+                patterns: patterns.iter().map(|p| p.to_string()).collect(),
+                wider: Vec::new(),
+            }),
+        };
+        let widths = ApproveState::widths(&req(&["*"]));
+        assert_eq!(widths, [("every call of mcp__x__y".to_string(), vec!["*".to_string()])]);
+        let widths = ApproveState::widths(&req(&["touch *"]));
+        assert_eq!(widths[0].0, "what it asked for");
+        assert!(ApproveState::widths(&req(&[])).is_empty(), "nothing to remember, no row");
     }
 
     #[test]

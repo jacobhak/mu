@@ -99,6 +99,7 @@ The tools-to-provider edge exists because the plugin host serves `core/complete`
   name = "fetch"
   description = "Fetch a URL and return it as markdown"
   schema = "schemas/fetch.json"
+  tier = "read"                   # read | exec (default): a read tool needs no approval in any mode
   ```
 
 - **Activation:** a plugin process starts on the first call to one of its tools or commands, or the first

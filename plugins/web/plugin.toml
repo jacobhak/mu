@@ -7,8 +7,10 @@ hooks = []
 name = "web_search"
 description = "Search the web with the backend the user chose in /web. Returns sources (and an answer for Anthropic/OpenAI backends)."
 schema = "schemas/web_search.json"
+tier = "read"
 
 [[tools]]
 name = "fetch"
 description = "Fetch a URL and return it as markdown (HTML is converted; raw=true returns the raw body)."
 schema = "schemas/fetch.json"
+tier = "read"

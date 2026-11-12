@@ -70,15 +70,19 @@ fn write_grant(path: &Path, section: &[&str], root: Option<&Path>, g: &Grant) ->
             format!("{}: [{}] is not a table; add the rule by hand", path.display(), section[..=i].join("."))
         })?;
     }
-    let patterns = super::grant_patterns(&g.patterns);
-    for tool in super::grant_tools(&g.tool) {
+    let patterns = super::grant::grant_patterns(&g.patterns);
+    for tool in super::grant::grant_tools(&g.tool) {
         add_rule(table, section, tool, &patterns, path)?;
     }
     fs::write_atomic(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Adds `allow` for every pattern under `tool`, keeping what the file already says there.
+/// Adds `allow` for every pattern under `tool`, keeping what the file already says there. No
+/// patterns grant nothing; the one pattern `*` is every call of the tool, written as `tool = "allow"`.
 fn add_rule(table: &mut Table, section: &[&str], tool: &str, patterns: &[String], path: &Path) -> Result<(), String> {
+    if patterns.is_empty() {
+        return Ok(());
+    }
     match table.get_mut(tool) {
         // An action already decides every call of this tool.
         Some(Item::Value(Value::String(_))) => {}
@@ -100,7 +104,7 @@ fn add_rule(table: &mut Table, section: &[&str], tool: &str, patterns: &[String]
             ));
         }
         None => {
-            let item = if patterns.is_empty() {
+            let item = if patterns == ["*"] {
                 Item::Value(Value::from("allow"))
             } else {
                 let mut t = toml_edit::InlineTable::new();
@@ -147,10 +151,14 @@ mod tests {
         assert_eq!(rules["git push *"].as_str(), Some("allow"));
 
         // A tool-wide grant is the string form.
-        add_global(&grant("probefetch", &[])).unwrap();
+        add_global(&grant("probefetch", &["*"])).unwrap();
         let text = std::fs::read_to_string(&config).unwrap();
         let table: toml::Table = text.parse().unwrap();
         assert_eq!(table["permissions"]["rules"]["probefetch"].as_str(), Some("allow"));
+
+        // A grant of nothing leaves the file as it is.
+        add_global(&grant("probenothing", &[])).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
 
         // A hand-written rule is left alone.
         add_global(&grant("probebash", &["git push *"])).unwrap();

@@ -1,3 +1,4 @@
+use crate::permissions::Access;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -48,11 +49,18 @@ pub struct ToolSpec {
     /// built for a request, not at startup.
     pub schema_path: PathBuf,
     schema: std::cell::OnceCell<Result<Value, String>>,
+    /// How the permission gate judges it: `Read` only when the manifest says its tier is `read`.
+    pub access: Access,
 }
 
 impl ToolSpec {
     pub fn new(name: String, description: String, schema_path: PathBuf) -> Self {
-        Self { name, description, schema_path, schema: Default::default() }
+        Self { name, description, schema_path, schema: Default::default(), access: Access::Exec }
+    }
+
+    pub fn with_access(mut self, access: Access) -> Self {
+        self.access = access;
+        self
     }
 
     /// The parsed schema (cached after the first call), or why it could not be read.
@@ -112,6 +120,9 @@ struct RawTool {
     name: String,
     description: String,
     schema: String,
+    /// `"read"` for a tool that only reads, `"exec"` (the default) for one that may change things.
+    #[serde(default)]
+    tier: Option<String>,
 }
 
 fn load_one(dir: &Path) -> Result<Manifest, String> {
@@ -135,7 +146,12 @@ fn load_one(dir: &Path) -> Result<Manifest, String> {
         if !p.is_file() {
             return Err(format!("{}: no such file", p.display()));
         }
-        tools.push(ToolSpec::new(t.name, t.description, p));
+        let access = match t.tier.as_deref() {
+            None | Some("exec") => Access::Exec,
+            Some("read") => Access::Read,
+            Some(other) => return Err(format!("bad tier `{other}`")),
+        };
+        tools.push(ToolSpec::new(t.name, t.description, p).with_access(access));
     }
     Ok(Manifest {
         name: raw.name,
@@ -198,6 +214,29 @@ mod tests {
         assert_eq!(load_with("timeout = \"90s\"\n").unwrap().timeout, Duration::from_secs(90));
         let err = load_with("timeout = \"soon\"\n").unwrap_err();
         assert_eq!(err, "bad timeout `soon`");
+    }
+
+    #[test]
+    fn a_tool_declares_its_tier() {
+        let tool = |tier: &str| {
+            let d = std::env::temp_dir().join(format!("mu-man-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("s.json"), "{}").unwrap();
+            std::fs::write(
+                d.join("plugin.toml"),
+                format!(
+                    "name = \"x\"\ncommand = [\"x\"]\n[[tools]]\nname = \"t\"\ndescription = \"d\"\nschema = \"s.json\"\n{tier}"
+                ),
+            )
+            .unwrap();
+            let m = load_one(&d);
+            let _ = std::fs::remove_dir_all(d);
+            m.map(|m| m.tools[0].access)
+        };
+        assert_eq!(tool("").unwrap(), Access::Exec, "no tier is exec");
+        assert_eq!(tool("tier = \"exec\"\n").unwrap(), Access::Exec);
+        assert_eq!(tool("tier = \"read\"\n").unwrap(), Access::Read);
+        assert_eq!(tool("tier = \"maybe\"\n").unwrap_err(), "bad tier `maybe`");
     }
 
     #[test]

@@ -207,6 +207,18 @@ impl Drop for ForegroundJobGuard {
 }
 
 impl Tools {
+    /// Where a bash call starts: mirrors `bash_interruptible`, `bash_pty`, `bash_plain` and
+    /// `start_bash_job`, so the gate resolves relative words from the directory the command runs in.
+    pub(crate) fn bash_dir(&self, cwd: Option<&str>, pty: bool, asynchronous: bool) -> PathBuf {
+        if let Some(c) = cwd {
+            return self.abs(c);
+        }
+        if pty || (self.jobs.is_some() && !asynchronous) {
+            return self.cwd.clone();
+        }
+        self.shell_cwd.borrow().clone().unwrap_or_else(|| self.cwd.clone())
+    }
+
     pub async fn bash(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
         if let Some(jobs) = &self.jobs
             && a.r#async

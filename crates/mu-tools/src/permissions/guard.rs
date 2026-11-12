@@ -1,58 +1,13 @@
 //! The built-in deny no mode or rule can lift: a recursive `rm` of `/`, `~` or `$HOME`.
 
-use super::bash::{BashAnalysis, analyze};
+use super::bash::{BashAnalysis, unquote, unwrapped};
 
 pub const REFUSAL: &str =
     "Not run: mu never runs a recursive rm of /, ~ or $HOME, whatever the permission mode or rules.";
 
-/// Programs that run the command named in their arguments.
-const WRAPPERS: &[&str] =
-    &["sudo", "doas", "command", "builtin", "exec", "env", "nice", "nohup", "time", "timeout", "xargs"];
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
-/// How deep `sh -c '…'` and `eval` strings are followed.
-const MAX_DEPTH: usize = 3;
-
 /// Some simple command of the line removes the filesystem root or the home directory recursively.
 pub fn removes_root_or_home(a: &BashAnalysis, home: Option<&str>) -> bool {
-    removes(a, home, 0)
-}
-
-fn removes(a: &BashAnalysis, home: Option<&str>, depth: usize) -> bool {
-    a.cmds.iter().any(|c| command_removes(&c.words, home, depth))
-}
-
-fn command_removes(words: &[String], home: Option<&str>, depth: usize) -> bool {
-    let Some(first) = words.first() else { return false };
-    let mut prog = program(first);
-    let mut at = 0;
-    if WRAPPERS.contains(&prog.as_str()) {
-        // Wrapper options can take values (`sudo -u root`), so look for the program by name.
-        let Some(i) = words.iter().skip(1).position(|w| {
-            let p = program(w);
-            p == "rm" || p == "eval" || SHELLS.contains(&p.as_str())
-        }) else {
-            return false;
-        };
-        at = i + 1;
-        prog = program(&words[at]);
-    }
-    let args = &words[at + 1..];
-    match prog.as_str() {
-        "rm" => rm_removes(args, home),
-        "eval" if depth < MAX_DEPTH => {
-            nested(&args.iter().map(|w| unquote(w)).collect::<Vec<_>>().join(" "), home, depth)
-        }
-        p if SHELLS.contains(&p) && depth < MAX_DEPTH => args
-            .iter()
-            .position(|w| w.len() > 1 && w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
-            .and_then(|i| args.get(i + 1))
-            .is_some_and(|script| nested(&unquote(script), home, depth)),
-        _ => false,
-    }
-}
-
-fn nested(script: &str, home: Option<&str>, depth: usize) -> bool {
-    removes(&analyze(script), home, depth + 1)
+    a.cmds.iter().any(|c| unwrapped(&c.plain, 0).iter().any(|w| w[0] == "rm" && rm_removes(&w[1..], home)))
 }
 
 fn rm_removes(args: &[String], home: Option<&str>) -> bool {
@@ -102,20 +57,10 @@ fn is_root_or_home(target: &str, home: Option<&str>) -> bool {
     t.is_empty() || t == "~"
 }
 
-/// A program word's name: quotes and a leading `\` dropped, directories stripped (`/bin/rm`).
-fn program(word: &str) -> String {
-    let w = unquote(word);
-    let w = w.trim_start_matches('\\');
-    w.rsplit('/').next().unwrap_or(w).to_string()
-}
-
-fn unquote(word: &str) -> String {
-    word.chars().filter(|c| *c != '\'' && *c != '"').collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::analyze;
 
     fn removes(cmd: &str) -> bool {
         removes_root_or_home(&analyze(cmd), Some("/home/u"))

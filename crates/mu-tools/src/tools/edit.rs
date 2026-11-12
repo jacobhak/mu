@@ -1,22 +1,44 @@
 use super::Tools;
 use super::uri::Scheme;
+use super::uri::physical;
+use crate::permissions::Gate;
 use async_trait::async_trait;
 use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
+use pi_edit::modes::hashline::input::{Patch, SplitOptions};
+use pi_edit::modes::hashline::types::FileOp as HashlineOp;
+use pi_edit::modes::sloppy::parse::split_sloppy_sections;
 use pi_edit::{
     ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, UrlResolution, WriteRequest,
     WriteResponse, engine::FileOp, session::SessionConfig,
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 pub struct Args {
     input: String,
 }
 
+/// One file an edit payload writes, as pi-edit addresses it.
+pub(crate) struct Target {
+    pub authored: String,
+    /// Where pi-edit writes it; `None` when it refuses the target.
+    pub abs: Option<PathBuf>,
+    /// An internal URL (`local://`), which stays inside mu's own pages.
+    pub internal: bool,
+}
+
 impl Args {
-    pub(crate) fn paths(&self) -> Vec<String> {
-        super::pathnote::edit_paths(&self.input)
+    /// The files the payload names: the same splitting and resolving the editor does.
+    pub(crate) fn targets(&self, t: &Tools) -> Result<Vec<Target>, String> {
+        t.edit_targets(&self.input)
+    }
+
+    /// The paths as written; empty when the payload cannot be split.
+    pub(crate) fn authored(&self, t: &Tools) -> Vec<String> {
+        self.targets(t).map(|v| v.into_iter().map(|x| x.authored).collect()).unwrap_or_default()
     }
 }
 
@@ -178,10 +200,14 @@ pub fn is_hashline() -> bool {
     mode() == EditMode::Hashline
 }
 
-/// Writes the files an edit changes and keeps each file's text before and after.
-#[derive(Default)]
+/// Writes the files an edit changes and keeps each file's text before and after. A file the
+/// payload did not name (pi-edit rebinds a section whose path is missing onto another file with the
+/// same tag) is written only where the gate would let a write of it run.
 struct FsWriter {
     changes: std::sync::Mutex<Vec<FileChange>>,
+    /// The physical paths the payload names, which the gate judged before the call ran.
+    named: HashSet<PathBuf>,
+    gate: Gate,
 }
 
 fn werr(e: impl std::fmt::Display) -> EditError {
@@ -198,6 +224,25 @@ async fn snapshot(p: &std::path::Path) -> Option<Option<String>> {
 }
 
 impl FsWriter {
+    fn new(named: HashSet<PathBuf>, gate: Gate) -> Self {
+        Self { changes: Default::default(), named, gate }
+    }
+
+    /// Refuses a write to a file the payload did not name and the gate would ask about.
+    fn check(&self, r: &WriteRequest) -> EditResult<()> {
+        for path in std::iter::once(&r.absolute).chain(r.move_to.as_ref()) {
+            let p = physical(path);
+            if !(self.named.contains(&p) || self.gate.allows_write("edit", &p)) {
+                return Err(werr(format!(
+                    "{} resolved to {}, a file this edit did not name; it was not changed. Repeat the edit with that path.",
+                    r.display,
+                    p.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn record(&self, path: &std::path::Path, old: Option<Option<String>>, new: Option<&str>) {
         let Some(old) = old else { return };
         if new.is_some_and(|n| n.len() > CHANGE_TEXT_MAX) {
@@ -212,6 +257,9 @@ impl FsWriter {
 #[async_trait]
 impl EditWriter for FsWriter {
     async fn write(&self, r: WriteRequest) -> EditResult<WriteResponse> {
+        if r.op != FileOp::Noop {
+            self.check(&r)?;
+        }
         match r.op {
             FileOp::Delete => {
                 let old = snapshot(&r.absolute).await;
@@ -242,11 +290,8 @@ impl EditWriter for FsWriter {
 }
 
 impl Tools {
-    pub async fn edit(&self, a: Args, plan: bool) -> ToolOutput {
-        if let Some(refusal) = refuse_malformed(mode(), &a.input) {
-            return refusal;
-        }
-        let policy = PathPolicy {
+    fn edit_policy(&self, plan: bool) -> PathPolicy {
+        PathPolicy {
             cwd: self.cwd.clone(),
             home_dir: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
             url_schemes: vec!["local".into(), "artifact".into(), "skill".into()],
@@ -254,7 +299,71 @@ impl Tools {
             plan_writable_roots: vec![self.local_root()],
             plan_active: plan,
             block_auto_generated: true,
+        }
+    }
+
+    fn url_resolution(&self, url: &str) -> UrlResolution {
+        match self.resolve(url) {
+            Ok(r) => match r.scheme {
+                Some(Scheme::Local) => UrlResolution { absolute: Some(r.path), error: None, plan_writable: true },
+                Some(sc) => UrlResolution {
+                    absolute: None,
+                    error: Some(format!("{}:// is read-only", sc.name())),
+                    plan_writable: false,
+                },
+                None => UrlResolution { absolute: Some(r.path), error: None, plan_writable: false },
+            },
+            Err(e) => UrlResolution { absolute: None, error: Some(e), plan_writable: false },
+        }
+    }
+
+    /// The files `input` writes: split by the active format's own splitter and resolved by the
+    /// editor's own policy, so the gate reads a payload as the editor does.
+    pub(crate) fn edit_targets(&self, input: &str) -> Result<Vec<Target>, String> {
+        self.edit_targets_in(mode(), input)
+    }
+
+    fn edit_targets_in(&self, mode: EditMode, input: &str) -> Result<Vec<Target>, String> {
+        let authored: Vec<String> = if mode == EditMode::Sloppy {
+            split_sloppy_sections(input).map_err(|e| e.to_string())?.into_iter().map(|s| s.path).collect()
+        } else {
+            let patch =
+                Patch::parse(input, &SplitOptions { cwd: Some(&self.cwd), path: None }).map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            for s in &patch.sections {
+                out.push(s.path.clone());
+                if let Ok(Some(HashlineOp::Move { dest })) = s.file_op() {
+                    out.push(dest.clone());
+                }
+            }
+            out
         };
+        let policy = self.edit_policy(false);
+        Ok(authored
+            .into_iter()
+            .map(|a| {
+                let mut urls = HashMap::new();
+                if let Some(url) = policy.url_target(&a) {
+                    urls.insert(url.to_string(), self.url_resolution(&url));
+                }
+                let abs = policy.resolve(&a, &urls).ok().map(|r| r.absolute);
+                Target { internal: policy.is_internal_url(&a), abs, authored: a }
+            })
+            .collect())
+    }
+
+    pub async fn edit(&self, a: Args, plan: bool) -> ToolOutput {
+        if let Some(refusal) = refuse_malformed(mode(), &a.input) {
+            return refusal;
+        }
+        let policy = self.edit_policy(plan);
+        let named: HashSet<PathBuf> = self
+            .edit_targets(&a.input)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| t.abs)
+            .map(|p| physical(&p))
+            .collect();
         let cfg = SessionConfig {
             mode: mode(),
             policy,
@@ -268,21 +377,10 @@ impl Tools {
         s.set_args_json(&json!({"input": a.input}).to_string());
         s.finish();
         for url in s.begin_apply_url_targets() {
-            let r = match self.resolve(&url) {
-                Ok(r) => match r.scheme {
-                    Some(Scheme::Local) => UrlResolution { absolute: Some(r.path), error: None, plan_writable: true },
-                    Some(sc) => UrlResolution {
-                        absolute: None,
-                        error: Some(format!("{}:// is read-only", sc.name())),
-                        plan_writable: false,
-                    },
-                    None => UrlResolution { absolute: Some(r.path), error: None, plan_writable: false },
-                },
-                Err(e) => UrlResolution { absolute: None, error: Some(e), plan_writable: false },
-            };
+            let r = self.url_resolution(&url);
             s.provide(url, r);
         }
-        let writer = FsWriter::default();
+        let writer = FsWriter::new(named, self.permissions.gate(&self.cwd));
         match s.apply(ApplyRequest::default(), &writer).await {
             Ok(o) => {
                 let mut out = ToolOutput::ok(o.text);
@@ -305,6 +403,73 @@ impl Tools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::Permissions;
+    use mu_base::config::MuPermissions;
+    use mu_base::permissions::{PermissionMode, RuleSet};
+
+    fn tools_in(dir: &std::path::Path) -> Tools {
+        let mut t = Tools::for_test();
+        t.cwd = dir.to_path_buf();
+        t
+    }
+
+    #[test]
+    fn targets_are_the_files_the_editor_resolves() {
+        let t = tools_in(std::path::Path::new("/work"));
+        let abs = |input: &str, mode| -> Vec<Option<PathBuf>> {
+            t.edit_targets_in(mode, input).unwrap().into_iter().map(|x| x.abs).collect()
+        };
+        let some = |p: &str| Some(PathBuf::from(p));
+        for header in ["file:///etc/zz#1A2B", "@/etc/zz", ":/etc/zz", "/etc/zz#1A2B"] {
+            let input = format!("[{header}]\nPUT 1:\n+x");
+            assert_eq!(abs(&input, EditMode::Hashline), [some("/etc/zz")], "{header}");
+        }
+        assert_eq!(
+            abs("[a.ts#1A2B]\nMV ../moved.ts", EditMode::Hashline),
+            [some("/work/a.ts"), some("/moved.ts")],
+            "a move names its destination"
+        );
+        let sloppy = "***  Edit   File: /abs/x\n*** Find\na\n*** Replace\nb";
+        let targets = t.edit_targets_in(EditMode::Sloppy, sloppy).unwrap();
+        assert_eq!(targets.iter().map(|x| x.authored.as_str()).collect::<Vec<_>>(), ["/abs/x"]);
+        assert!(t.edit_targets_in(EditMode::Hashline, "[local://plan.md#1A2B]\nPUT 1:\n+x").unwrap()[0].internal);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_the_edit_did_not_name_is_written_only_where_the_gate_allows() {
+        let d = std::env::temp_dir().join(format!("mu-fswriter-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let file = d.join("other.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let request = || WriteRequest {
+            absolute: file.clone(),
+            display: "other.txt".into(),
+            op: FileOp::Update,
+            move_to: None,
+            content: Some("new\n".into()),
+            flush_lsp: false,
+            lsp_batch_id: None,
+        };
+        let asking = Permissions::new(&MuPermissions {
+            mode: PermissionMode::Ask,
+            readonly_bash: true,
+            rules: RuleSet::default(),
+        });
+        let writer = FsWriter::new(HashSet::new(), asking.gate(&d));
+        let err = writer.write(request()).await.unwrap_err().to_string();
+        assert!(err.contains("did not name"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+
+        let named = HashSet::from([physical(&file)]);
+        FsWriter::new(named, asking.gate(&d)).write(request()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+
+        std::fs::write(&file, "old\n").unwrap();
+        let yolo = Permissions::default();
+        FsWriter::new(HashSet::new(), yolo.gate(&d)).write(request()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     #[test]
     fn near_miss_headers_are_found_and_real_ones_are_not() {

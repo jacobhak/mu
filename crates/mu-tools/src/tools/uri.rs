@@ -136,6 +136,42 @@ impl Tools {
     }
 }
 
+/// The file `p` reaches: symlinks in its existing part resolved (a dangling link to where it points),
+/// and `.` and `..` folded in order, so a `..` after a missing directory cannot leave the place the
+/// path reaches. A write goes here, and so does the gate's judgement of it.
+pub fn physical(p: &Path) -> PathBuf {
+    physical_in(p, 40)
+}
+
+fn physical_in(p: &Path, links: u32) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => out.push(comp),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(n) => {
+                out.push(n);
+                match out.canonicalize() {
+                    Ok(c) => out = c,
+                    Err(_) if links > 0 => {
+                        if let Ok(link) = std::fs::read_link(&out) {
+                            let at = out.parent().map(|d| d.join(&link)).unwrap_or(link);
+                            out = physical_in(&at, links - 1);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `abs`, found under a search `root`, as shown to the model: under the URL `prefix` the search
 /// started from when it was an internal URL, else relative to `cwd`.
 pub(super) fn shown(cwd: &Path, root: &Path, prefix: Option<&str>, abs: &Path) -> String {
@@ -225,6 +261,20 @@ pub fn read_target(p: &str, exists: impl Fn(&str) -> bool) -> ReadTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_follows_a_dangling_link_and_folds_dots_after_a_missing_directory() {
+        let d = std::env::temp_dir().join(format!("mu-physical-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::create_dir_all(d.join("b")).unwrap();
+        let d = d.canonicalize().unwrap();
+        std::os::unix::fs::symlink("missing-target", d.join("link")).unwrap();
+        assert_eq!(physical(&d.join("link/x")), d.join("missing-target/x"));
+        assert_eq!(physical(&d.join("a/zz/../b")), d.join("a/b"));
+        std::os::unix::fs::symlink("loop", d.join("loop")).unwrap();
+        assert_eq!(physical(&d.join("loop")), d.join("loop"), "a link that points at itself stays put");
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     #[test]
     fn selectors_and_schemes() {

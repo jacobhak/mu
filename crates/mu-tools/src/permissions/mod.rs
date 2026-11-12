@@ -1,21 +1,25 @@
 //! The tool permission gate: tiers, rules, grants and the approval prompt.
 
 mod bash;
+mod classify;
 mod glob;
+mod grant;
 mod guard;
 mod store;
+mod verdict;
 
 pub use bash::{BashAnalysis, SimpleCmd, analyze};
 pub use glob::glob_match;
 pub use store::{add_global, add_project, load_project, project_file};
+pub use verdict::Gate;
 
 use crate::tools::Tools;
 use crate::tools::summary;
+use crate::tools::uri::physical;
 use mu_base::config::MuPermissions;
 use mu_base::events::{AgentEvent, EventTx};
 use mu_base::permissions::{
-    Action, ApprovalDecision, ApprovalRequest, ApprovalScope, Capability, Grant, GrantWidth, PermissionMode, Rule,
-    RuleSet,
+    ApprovalDecision, ApprovalRequest, ApprovalScope, Capability, Grant, PermissionMode, RuleSet,
 };
 use mu_common::paths;
 use serde_json::{Value, json};
@@ -23,20 +27,17 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tokio::sync::oneshot;
+use verdict::Outcome;
 
-/// How much one call may change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tier {
-    Read,
-    Write,
-    Exec,
-}
-
-/// How far a read reaches: inside the project, or anywhere else on the machine.
+/// How the gate judges a tool, declared with the tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reach {
-    Project,
-    Outside,
+pub enum Access {
+    /// It only reads.
+    Read,
+    /// It may run commands or change things.
+    Exec,
+    /// Judged from its arguments by `classify`: the file and shell tools.
+    ByArgs,
 }
 
 /// What the gate decided for one call.
@@ -45,46 +46,6 @@ pub enum Verdict {
     Deny(String),
     Ask(ApprovalRequest),
 }
-
-/// Tools that only read.
-const READ_TOOLS: &[&str] = &[
-    "read",
-    "grep",
-    "glob",
-    "todo",
-    "ask",
-    "propose_plan",
-    "yield",
-    "job_cancel",
-    "wait",
-    "task",
-    "web_search",
-    "fetch",
-    "memory",
-];
-
-/// Programs whose grant pattern keeps the subcommand: `cargo test --release` grants `cargo test *`.
-const SUBCOMMAND_PROGRAMS: &[&str] = &[
-    "git",
-    "cargo",
-    "npm",
-    "pnpm",
-    "yarn",
-    "bun",
-    "go",
-    "docker",
-    "kubectl",
-    "make",
-    "just",
-    "uv",
-    "pip",
-    "gh",
-    "rustup",
-    "brew",
-    "systemctl",
-];
-
-static EMPTY: RuleSet = RuleSet(Vec::new());
 
 /// One project's resolved state: its root, the key grants are stored under, and its rules.
 struct Project {
@@ -143,7 +104,7 @@ impl Permissions {
             return;
         }
         let root = mu_base::git::repo_root(cwd).await.unwrap_or_else(|_| cwd.to_path_buf());
-        let root = canonical_nearest(&root);
+        let root = physical(&root);
         let key = mu_base::git::main_checkout(cwd).await;
         let rules = store::load_project(&key, warn);
         let _ = self.project.set(Project { root, key, rules: RefCell::new(rules) });
@@ -163,7 +124,7 @@ impl Permissions {
             ApprovalScope::Global => &self.global,
             ApprovalScope::Once => return Ok(()),
         };
-        let grant_rules = grant_rules(g);
+        let grant_rules = grant::grant_rules(g);
         rules.borrow_mut().0.extend(grant_rules);
         match scope {
             ApprovalScope::Project if persist => store::add_project(&self.project.get().unwrap().key, g),
@@ -213,44 +174,61 @@ impl Permissions {
         out_rx
     }
 
+    /// What the rules and the mode decide, as of now, for a project at `cwd`.
+    pub fn gate(&self, cwd: &Path) -> Gate {
+        let root = match self.project.get() {
+            Some(p) => p.root.clone(),
+            None => physical(cwd),
+        };
+        let project = self.project.get().map(|p| p.rules.borrow().clone()).unwrap_or_default();
+        Gate {
+            mode: self.mode.get(),
+            readonly_bash: self.readonly_bash,
+            root,
+            mu_home: physical(&paths::mu_home()),
+            rules: [
+                (self.global.borrow().clone(), "~/.mu/config.toml"),
+                (project, "project permissions"),
+                (self.session.borrow().clone(), "this session"),
+            ],
+        }
+    }
+
     /// Decides one model tool call.
     pub fn check(&self, tools: &Tools, name: &str, args: &Value) -> Verdict {
-        let call = match self.call(tools, name, args) {
+        let gate = self.gate(&tools.cwd);
+        let call = match classify::classify(tools, &gate, name, args) {
             Ok(c) => c,
             Err(_) => return Verdict::Allow,
         };
         if let Some(a) = &call.bash
-            && guard::removes_root_or_home(a, home_dir().as_deref().and_then(Path::to_str))
+            && guard::removes_root_or_home(a, grant::home_dir().as_deref().and_then(Path::to_str))
         {
             return Verdict::Deny(guard::REFUSAL.into());
         }
-        let hits = self.rule_hits(name, &call.subjects);
-        if let Some((rule, source)) = hits.iter().find(|(r, _)| r.action == Action::Deny) {
-            return Verdict::Deny(format!(
-                "Not run: permission rule \"{}\" = \"deny\" for {name} ({source}).",
-                rule.pattern
-            ));
-        }
-        let ask = hits.iter().find(|(r, _)| r.action == Action::Ask);
-        let covered = !call.subjects.is_empty()
-            && call.subjects.iter().all(|s| {
-                s.classified || (!s.no_allow && hits.iter().any(|(r, _)| r.action == Action::Allow && hit(r, s)))
-            });
-        if ask.is_none() && covered {
-            return Verdict::Allow;
-        }
-        let capability = call.capability();
-        if ask.is_none() && self.mode.get().allows(capability) {
-            return Verdict::Allow;
-        }
-        let reason = match ask {
-            Some((rule, source)) => format!("rule \"{}\" = ask ({source})", rule.pattern),
-            None if capability == Capability::ReadOutside => {
-                format!("{} mode: reading outside the project needs approval", self.mode.get().as_str())
+        let (outcome, hits) = gate.decide(&call.subjects);
+        let mode = gate.mode.as_str();
+        let (rule, open) = match outcome {
+            Outcome::Allow => return Verdict::Allow,
+            Outcome::Deny(h) => {
+                return Verdict::Deny(format!(
+                    "Not run: permission rule \"{}\" = \"deny\" for {} ({}).",
+                    h.rule.pattern, call.subjects[h.subject].tool, h.source
+                ));
             }
-            None => format!("{} mode: {name} needs approval", self.mode.get().as_str()),
+            Outcome::Ask { rule, open } => (rule, open),
         };
-        let grant = call.grant(tools, name, args, &hits);
+        let reason = match rule {
+            Some(h) => format!("rule \"{}\" = ask ({})", h.rule.pattern, h.source),
+            None if open.iter().all(|&i| call.subjects[i].needs == Capability::ReadOutside) => {
+                format!("{mode} mode: reading outside the project needs approval")
+            }
+            None if open.iter().all(|&i| call.subjects[i].tool != name) => {
+                format!("{mode} mode: writing {} needs approval", call.subjects[open[0]].text)
+            }
+            None => format!("{mode} mode: {name} needs approval"),
+        };
+        let grant = grant::grant(&gate, &call, name, args, &hits);
         Verdict::Ask(ApprovalRequest {
             tool: name.to_string(),
             call_id: String::new(),
@@ -261,503 +239,6 @@ impl Permissions {
             grant,
         })
     }
-
-    fn rule_hits(&self, name: &str, subjects: &[Subject]) -> Vec<(Rule, &'static str)> {
-        let global = self.global.borrow();
-        let project = self.project.get().map(|p| p.rules.borrow());
-        let session = self.session.borrow();
-        let sets: [(&RuleSet, &'static str); 3] = [
-            (&global, "~/.mu/config.toml"),
-            (project.as_deref().unwrap_or(&EMPTY), "project permissions"),
-            (&session, "this session"),
-        ];
-        let mut hits = Vec::new();
-        for (set, source) in sets {
-            for (tool, rule) in &set.0 {
-                if glob_match(tool, name) && subjects.iter().any(|s| hit(rule, s)) {
-                    hits.push((rule.clone(), source));
-                }
-            }
-        }
-        hits
-    }
-
-    /// The subjects and tier of one call; `Err(())` when the arguments do not fit the tool, which
-    /// is the tool's own error to report.
-    fn call(&self, tools: &Tools, name: &str, args: &Value) -> Result<Call, ()> {
-        let root = match self.project.get() {
-            Some(p) => p.root.clone(),
-            None => canonical_nearest(&tools.cwd),
-        };
-        let mut call =
-            Call { subjects: Vec::new(), tier: Tier::Read, reach: Reach::Project, root: root.clone(), bash: None };
-        if name == "bash" {
-            let Some(cmd) = args["command"].as_str() else { return Err(()) };
-            let analysis = analyze(cmd);
-            call.tier = if self.readonly_bash
-                && analysis.parsed
-                && !analysis.cmds.is_empty()
-                && analysis.cmds.iter().all(|c| c.readonly)
-            {
-                Tier::Read
-            } else {
-                Tier::Exec
-            };
-            let outside: Vec<bool> = analysis
-                .cmds
-                .iter()
-                .map(|c| c.readonly && self.readonly_bash && reads_outside(tools, &root, c))
-                .collect();
-            if outside.iter().any(|o| *o) {
-                call.reach = Reach::Outside;
-            }
-            call.subjects = analysis
-                .cmds
-                .iter()
-                .zip(&outside)
-                .map(|(c, outside)| Subject {
-                    text: c.text.clone(),
-                    abs: None,
-                    classified: c.readonly && self.readonly_bash && !*outside,
-                    no_allow: c.assigns || !analysis.parsed || writes_escape(tools, &root, c),
-                })
-                .collect();
-            call.bash = Some(analysis);
-            return Ok(call);
-        }
-        if matches!(name, "write" | "edit") {
-            let paths = if name == "write" {
-                serde_json::from_value::<crate::tools::write::Args>(args.clone()).map_err(|_| ())?.paths()
-            } else {
-                serde_json::from_value::<crate::tools::edit::Args>(args.clone()).map_err(|_| ())?.paths()
-            };
-            let mut tier = Tier::Read;
-            for raw in &paths {
-                let kind = target_kind(tools, &root, raw);
-                tier = tier.max(kind);
-                call.subjects.push(Subject {
-                    text: path_subject(&root, tools, raw),
-                    abs: abs_of(tools, raw),
-                    classified: false,
-                    no_allow: false,
-                });
-            }
-            if paths.is_empty() {
-                // A payload that names no target we can read is one the editor may read differently.
-                tier = Tier::Exec;
-            }
-            call.tier = tier;
-            return Ok(call);
-        }
-        if matches!(name, "read" | "grep" | "glob") {
-            let raw = match name {
-                "read" => args["path"].as_str().unwrap_or(""),
-                _ => args["path"].as_str().unwrap_or("."),
-            };
-            call.reach = reach_of_path(tools, &root, raw);
-            call.subjects.push(Subject {
-                text: path_subject(&root, tools, raw),
-                abs: abs_of(tools, raw),
-                classified: false,
-                no_allow: false,
-            });
-            call.tier = Tier::Read;
-            return Ok(call);
-        }
-        if name == "fetch" {
-            call.subjects.push(Subject {
-                text: args["url"].as_str().unwrap_or("").to_string(),
-                abs: None,
-                classified: false,
-                no_allow: false,
-            });
-        } else {
-            call.subjects.push(Subject { text: String::new(), abs: None, classified: false, no_allow: false });
-        }
-        call.tier = if READ_TOOLS.contains(&name) { Tier::Read } else { Tier::Exec };
-        Ok(call)
-    }
-}
-
-struct Call {
-    subjects: Vec<Subject>,
-    tier: Tier,
-    reach: Reach,
-    /// The project root, and the key grants are stored under.
-    root: PathBuf,
-    bash: Option<BashAnalysis>,
-}
-
-/// A rule matches a subject by its displayed text (relative inside the project) or by its absolute
-/// path, so a grant can name the directory a path sits in either way.
-fn hit(rule: &Rule, s: &Subject) -> bool {
-    glob_match(&rule.pattern, &s.text) || s.abs.as_deref().is_some_and(|a| glob_match(&rule.pattern, a))
-}
-
-struct Subject {
-    text: String,
-    /// The resolved path, as text, when the subject is a file. Widths and absolute rules use it.
-    abs: Option<String>,
-    /// The read-only classifier covers it (bash only, with `readonly_bash` on).
-    classified: bool,
-    /// An `allow` rule can never cover it (leading assignments, or a line that does not parse).
-    no_allow: bool,
-}
-
-impl Call {
-    /// What the mode has to grant for this call to run unasked.
-    fn capability(&self) -> Capability {
-        match (self.tier, self.reach) {
-            (Tier::Read, Reach::Project) => Capability::ReadProject,
-            (Tier::Read, Reach::Outside) => Capability::ReadOutside,
-            (Tier::Write, _) => Capability::WriteProject,
-            (Tier::Exec, _) => Capability::Exec,
-        }
-    }
-
-    /// What "don't ask again" would remember.
-    fn grant(&self, tools: &Tools, name: &str, args: &Value, hits: &[(Rule, &'static str)]) -> Option<Grant> {
-        let allow = |s: &Subject| hits.iter().any(|(r, _)| r.action == Action::Allow && hit(r, s));
-        match name {
-            "bash" => {
-                let analysis = self.bash.as_ref()?;
-                if !analysis.parsed {
-                    return None;
-                }
-                // Each line with the widths above it: a read-only line widens by its path words,
-                // a command only keeps the program and subcommand.
-                let mut parts: Vec<(String, Vec<GrantWidth>)> = Vec::new();
-                for (i, c) in analysis.cmds.iter().enumerate() {
-                    if self.subjects.get(i).is_some_and(|s| s.classified || allow(s)) {
-                        continue;
-                    }
-                    let part = if self.tier == Tier::Read {
-                        (c.text.clone(), bash_widths(tools, &self.root, c))
-                    } else {
-                        (bash_pattern(c)?, Vec::new())
-                    };
-                    if !parts.iter().any(|(p, _)| *p == part.0) {
-                        parts.push(part);
-                    }
-                }
-                if parts.is_empty() {
-                    return None;
-                }
-                Some(Grant {
-                    tool: name.to_string(),
-                    wider: merge_widths(&parts),
-                    patterns: parts.into_iter().map(|(p, _)| p).collect(),
-                })
-            }
-            "write" | "edit" | "read" | "grep" | "glob" => {
-                // The subjects are the paths, so the grant remembers exactly what was reached.
-                let taken: Vec<&Subject> = self.subjects.iter().filter(|s| !s.classified && !allow(s)).collect();
-                if taken.is_empty() {
-                    return None;
-                }
-                Some(Grant {
-                    tool: name.to_string(),
-                    wider: path_widths(&taken),
-                    patterns: taken.iter().map(|s| s.text.clone()).collect(),
-                })
-            }
-            "fetch" => Some(Grant {
-                tool: name.to_string(),
-                patterns: fetch_patterns(args["url"].as_str().unwrap_or("")),
-                wider: Vec::new(),
-            }),
-            _ => {
-                let _ = tools;
-                Some(Grant { tool: name.to_string(), patterns: Vec::new(), wider: Vec::new() })
-            }
-        }
-    }
-}
-
-/// The widths of a plain path grant: its directory, the checkout it sits in, the checkouts beside
-/// that, `~`, and `/`. They are named by their absolute paths, which a rule matches through the
-/// subject's resolved path as well as its displayed one.
-fn path_widths(subjects: &[&Subject]) -> Vec<GrantWidth> {
-    let parts: Vec<(String, Vec<GrantWidth>)> = subjects
-        .iter()
-        .map(|s| (s.text.clone(), widths_of(s.abs.as_deref().and_then(|a| path_ladder(Path::new(a))))))
-        .collect();
-    merge_widths(&parts)
-}
-
-/// The read-only command at each width: its outside path words replaced by their landmark
-/// directories (`cat /etc/*`, then `cat /home/*`).
-fn bash_widths(tools: &Tools, root: &Path, c: &SimpleCmd) -> Vec<GrantWidth> {
-    let mut ladders: Vec<(usize, Vec<(&'static str, PathBuf)>)> = Vec::new();
-    for w in &c.paths {
-        let (Some(prefix), Some(i)) = (&w.prefix, w.word) else { continue };
-        if reach_of_path(tools, root, prefix) != Reach::Outside {
-            continue;
-        }
-        if let Ok(r) = tools.resolve(prefix)
-            && r.scheme.is_none()
-            && let Some(ladder) = path_ladder(&r.path)
-        {
-            ladders.push((i, ladder));
-        }
-    }
-    let mut out: Vec<GrantWidth> = Vec::new();
-    let mut n = 0;
-    while ladders.iter().any(|(_, ladder)| ladder.len() > n) {
-        let mut words = c.words.clone();
-        for (i, ladder) in &ladders {
-            if let Some((_, dir)) = ladder.get(n).or(ladder.last()) {
-                words[*i] = glob_of(dir);
-            }
-        }
-        let label = ladders.iter().find_map(|(_, l)| l.get(n)).map(|(label, _)| *label).unwrap_or("");
-        let width = GrantWidth { label: label.to_string(), patterns: vec![words.join(" ")] };
-        if out.last() != Some(&width) {
-            out.push(width);
-        }
-        n += 1;
-    }
-    out
-}
-
-/// The widths of several parts (one per command) at once: each keeps its own last width when it
-/// runs out, and a width that changes nothing is dropped.
-fn merge_widths(parts: &[(String, Vec<GrantWidth>)]) -> Vec<GrantWidth> {
-    let mut out: Vec<GrantWidth> = Vec::new();
-    let mut n = 0;
-    while parts.iter().any(|(_, w)| w.len() > n) {
-        let patterns: Vec<String> = parts
-            .iter()
-            .map(|(exact, w)| {
-                w.get(n).or(w.last()).and_then(|g| g.patterns.first().cloned()).unwrap_or_else(|| exact.clone())
-            })
-            .collect();
-        let label = parts.iter().find_map(|(_, w)| w.get(n)).map(|g| g.label.clone()).unwrap_or_default();
-        let width = GrantWidth { label, patterns };
-        if out.last() != Some(&width) {
-            out.push(width);
-        }
-        n += 1;
-    }
-    out
-}
-
-/// The named widths of one ladder, as the grant wants them.
-fn widths_of(ladder: Option<Vec<(&'static str, PathBuf)>>) -> Vec<GrantWidth> {
-    let Some(ladder) = ladder else { return Vec::new() };
-    ladder
-        .into_iter()
-        .map(|(label, dir)| GrantWidth { label: label.to_string(), patterns: vec![glob_of(&dir)] })
-        .collect()
-}
-
-/// The directories a path can widen to, meaningfully: its own, the checkout around it, the
-/// checkouts beside that, home, and the filesystem root. Unnamed ancestors are not offered.
-fn path_ladder(path: &Path) -> Option<Vec<(&'static str, PathBuf)>> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let start = if path.is_dir() { path } else { path.parent()? };
-    let mut out: Vec<(&'static str, PathBuf)> = vec![("its directory", start.to_path_buf())];
-    if let Some(repo) = checkout_root(start) {
-        if repo != start {
-            out.push(("this checkout", repo));
-        }
-        if let Some(parent) = out.last().and_then(|(_, d)| d.parent()) {
-            if let Some(home) = home_dir() {
-                if parent != home {
-                    out.push(("the checkouts beside it", parent.to_path_buf()));
-                }
-            } else {
-                out.push(("the checkouts beside it", parent.to_path_buf()));
-            }
-        }
-    }
-    if let Some(home) = home_dir()
-        && start.starts_with(&home)
-        && out.last().is_some_and(|(_, d)| *d != home)
-    {
-        out.push(("all of ~", home));
-    }
-    if out.last().is_some_and(|(_, d)| *d != Path::new("/")) {
-        out.push(("everything", PathBuf::from("/")));
-    }
-    out.dedup_by(|a, b| a.1 == b.1);
-    Some(out)
-}
-
-/// The checkout a directory belongs to: the nearest ancestor holding a `.git` entry.
-fn checkout_root(dir: &Path) -> Option<PathBuf> {
-    dir.ancestors().find(|d| d.join(".git").exists()).map(Path::to_path_buf)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
-}
-
-/// `<dir>/*`, which matches everything below it; `*` crosses `/`.
-fn glob_of(dir: &Path) -> String {
-    let text = dir.to_string_lossy();
-    if text.ends_with('/') { format!("{text}*") } else { format!("{text}/*") }
-}
-
-/// The rules one grant becomes: each pattern, plus the directory itself when it names `<dir>/*`,
-/// so searching the granted directory is covered too.
-fn grant_rules(g: &Grant) -> Vec<(String, Rule)> {
-    let patterns = grant_patterns(&g.patterns);
-    let patterns = if patterns.is_empty() { vec!["*".to_string()] } else { patterns };
-    grant_tools(&g.tool)
-        .into_iter()
-        .flat_map(|tool| {
-            patterns
-                .iter()
-                .map(move |p| (tool.to_string(), Rule { pattern: p.clone(), action: Action::Allow }))
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-/// The tools a grant covers. Reads are one family and changes another: `read`, `grep` and `glob`
-/// reach the same bytes, and `write` and `edit` change the same paths, so a decision about one
-/// holds for its siblings. The two families stay apart, since approving a read outside the project
-/// must not allow writing there, and a write approval must not open reads.
-fn grant_tools(tool: &str) -> Vec<&str> {
-    match tool {
-        "read" | "grep" | "glob" => vec!["read", "grep", "glob"],
-        "write" | "edit" => vec!["write", "edit"],
-        other => vec![other],
-    }
-}
-
-/// A grant's patterns, each widened to include the directory itself: `…/mu/*` also grants `…/mu`.
-fn grant_patterns(patterns: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for p in patterns {
-        if let Some(head) = p.strip_suffix("/*")
-            && !head.is_empty()
-            && !out.iter().any(|s| s == head)
-        {
-            out.push(head.to_string());
-        }
-        if !out.iter().any(|s| s == p) {
-            out.push(p.clone());
-        }
-    }
-    out
-}
-
-fn bash_pattern(c: &SimpleCmd) -> Option<String> {
-    let argv0 = c.argv0.as_ref()?;
-    let sub = c.second.as_deref().filter(|s| !s.starts_with('-') && SUBCOMMAND_PROGRAMS.contains(&argv0.as_str()));
-    Some(match sub {
-        Some(s) => format!("{argv0} {s} *"),
-        None => format!("{argv0} *"),
-    })
-}
-
-fn fetch_patterns(url: &str) -> Vec<String> {
-    let Some((scheme, rest)) = url.split_once("://") else { return Vec::new() };
-    let host = rest.split('/').next().unwrap_or("");
-    if host.is_empty() { Vec::new() } else { vec![format!("{scheme}://{host}/*")] }
-}
-
-/// A target's tier: `local://` and the read-only schemes are read, an in-project path is write,
-/// anything else is exec.
-fn target_kind(tools: &Tools, root: &Path, raw: &str) -> Tier {
-    match tools.resolve(raw) {
-        Ok(r) if r.scheme.is_some() => Tier::Read,
-        Err(_) if raw.contains("://") => Tier::Exec,
-        Ok(r) => {
-            let c = canonical_nearest(&r.path);
-            if c.starts_with(root) && !protected(root, &c) { Tier::Write } else { Tier::Exec }
-        }
-        Err(_) => Tier::Exec,
-    }
-}
-
-/// Whether an output redirection of the command may write somewhere a command grant must not
-/// cover: outside the project, a protected place, or a target an expansion decides.
-fn writes_escape(tools: &Tools, root: &Path, c: &SimpleCmd) -> bool {
-    c.writes.iter().any(|w| match &w.prefix {
-        Some(p) => target_kind(tools, root, p) != Tier::Write,
-        None => true,
-    })
-}
-
-/// Whether a path a tool names lies outside the project; internal URLs always stay inside.
-fn reach_of_path(tools: &Tools, root: &Path, raw: &str) -> Reach {
-    match tools.resolve(raw) {
-        Ok(r) if r.scheme.is_some() => Reach::Project,
-        Ok(r) if canonical_nearest(&r.path).starts_with(root) => Reach::Project,
-        _ => Reach::Outside,
-    }
-}
-
-/// Whether a read-only command may open something outside the project.
-fn reads_outside(tools: &Tools, root: &Path, c: &SimpleCmd) -> bool {
-    c.paths.iter().any(|w| match &w.prefix {
-        Some(prefix) => reach_of_path(tools, root, prefix) == Reach::Outside,
-        None => true,
-    })
-}
-
-/// `.git` of the project and mu's own home are never edited by an `edits`-mode call.
-fn protected(root: &Path, c: &Path) -> bool {
-    if c.starts_with(root.join(".git")) {
-        return true;
-    }
-    c.starts_with(canonical_nearest(&paths::mu_home()))
-}
-
-/// A subject's resolved path as text, for widths and absolute rules. `None` when it names no file:
-/// a `local://` page, or text that does not resolve at all.
-fn abs_of(tools: &Tools, raw: &str) -> Option<String> {
-    let r = tools.resolve(raw).ok()?;
-    if r.scheme.is_some() {
-        return None;
-    }
-    Some(canonical_nearest(&r.path).to_string_lossy().into_owned())
-}
-
-/// The subject of a path: relative to the project root when inside it, else absolute.
-fn path_subject(root: &Path, tools: &Tools, raw: &str) -> String {
-    match tools.resolve(raw) {
-        Ok(r) if r.scheme.is_some() => raw.to_string(),
-        Ok(r) => {
-            let c = canonical_nearest(&r.path);
-            match c.strip_prefix(root) {
-                Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
-                Ok(rel) => rel.to_string_lossy().into_owned(),
-                Err(_) => c.to_string_lossy().into_owned(),
-            }
-        }
-        Err(_) => raw.to_string(),
-    }
-}
-
-/// Resolves symlinks in the existing part of `p` and folds `.` and `..` in order, so a `..` after a
-/// missing directory cannot leave the place the path reaches.
-fn canonical_nearest(p: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::Prefix(_) | Component::RootDir => out.push(comp),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() && !out.has_root() {
-                    out.push("..");
-                }
-            }
-            Component::Normal(n) => {
-                out.push(n);
-                if let Ok(c) = out.canonicalize() {
-                    out = c;
-                }
-            }
-        }
-    }
-    out
 }
 
 fn body(name: &str, args: &Value) -> String {
@@ -786,6 +267,7 @@ fn truncate_body(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_base::permissions::{Action, Rule};
     use mu_testutil::{block_on, repo};
 
     fn allow(pattern: &str) -> (String, Rule) {
@@ -984,7 +466,7 @@ mod tests {
         let Verdict::Ask(req) = p.check(&t, "write", &json!({"path": "a/b.txt", "content": "x"})) else { panic!() };
         p.remember(&req.grant.unwrap(), ApprovalScope::Session, false).unwrap();
         assert!(matches!(p.check(&t, "write", &json!({"path": "a/b.txt", "content": "y"})), Verdict::Allow));
-        let edit = |path: &str| json!({"input": format!("[{path}#AB12]\n1ab|x")});
+        let edit = |path: &str| json!({"input": format!("[{path}#1A2B]\nPUT 1:\n+x")});
         assert!(matches!(p.check(&t, "edit", &edit("a/b.txt")), Verdict::Allow), "editing the file the grant names");
         assert!(matches!(p.check(&t, "edit", &edit("a/c.txt")), Verdict::Ask(_)), "another file");
     }
@@ -1008,11 +490,30 @@ mod tests {
     fn an_enveloped_edit_header_is_gated_by_the_file_it_targets() {
         let (p, t) = setup(PermissionMode::Edits);
         let outside = outside("envelope").join("zz");
-        let input = format!("[*** Begin Patch] [{}#AB12]\n1ab|x", outside.display());
+        let input = format!("[*** Begin Patch] [{}#1A2B]\nPUT 1:\n+x", outside.display());
         assert!(matches!(p.check(&t, "edit", &json!({"input": input})), Verdict::Ask(_)));
         let v = p.check(&t, "edit", &json!({"input": "nothing recognisable"}));
         assert!(matches!(v, Verdict::Ask(_)), "a payload with no target fails closed");
         std::fs::remove_dir_all(outside.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_edit_is_gated_by_the_file_the_editor_writes() {
+        let outside = outside("edit-targets");
+        let out = outside.display();
+        let (p, t) = setup(PermissionMode::Edits);
+        let edit = |input: String| p.check(&t, "edit", &json!({"input": input}));
+        for header in [format!("file://{out}/zz#1A2B"), format!("@{out}/zz"), format!(":{out}/zz")] {
+            let v = edit(format!("[{header}]\nPUT 1:\n+x"));
+            assert!(matches!(v, Verdict::Ask(_)), "{header}");
+        }
+        let v = edit("[a.txt#1A2B]\nMV ../moved.txt".into());
+        assert!(matches!(v, Verdict::Ask(_)), "a move out of the project");
+        let v = edit("[a.txt#1A2B]\nMV b.txt".into());
+        assert!(matches!(v, Verdict::Allow), "a move inside it");
+        let v = edit("[a.txt#1A2B]\nPUT 1:\n+x".into());
+        assert!(matches!(v, Verdict::Allow));
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
@@ -1026,7 +527,15 @@ mod tests {
         let Verdict::Ask(req) = verdict(&p, &t, "cargo test") else { panic!() };
         p.remember(&req.grant.unwrap(), ApprovalScope::Session, false).unwrap();
         assert!(matches!(verdict(&p, &t, "cargo test -q"), Verdict::Allow));
+        let Verdict::Ask(req) = verdict(&p, &t, "cargo test -q > out.log") else {
+            panic!("the file is a write of its own, and ask mode asks about writes")
+        };
+        let g = req.grant.unwrap();
+        assert_eq!((g.tool.as_str(), g.patterns.as_slice()), ("write", ["out.log".to_string()].as_slice()));
+        assert_eq!(req.reason, "ask mode: writing out.log needs approval");
+        p.set_mode(PermissionMode::Edits);
         assert!(matches!(verdict(&p, &t, "cargo test -q > out.log"), Verdict::Allow), "a file in the project");
+        p.set_mode(PermissionMode::Ask);
         for cmd in [
             "cargo test -q > ~/.bashrc",
             "cargo test -q > /etc/zz",
@@ -1194,6 +703,164 @@ mod tests {
         assert_eq!(req.grant.as_ref().unwrap().patterns, ["./run.sh *"]);
         let Verdict::Ask(req) = verdict(&p, &t, "$PROG x") else { panic!() };
         assert!(req.grant.is_none(), "a non-literal program word cannot be granted");
+    }
+
+    #[test]
+    fn a_write_goes_where_the_gate_judged_it() {
+        let outside = outside("dangling");
+        let (p, t) = setup(PermissionMode::Edits);
+        std::os::unix::fs::symlink(outside.join("missing/file"), t.cwd.join("dangling")).unwrap();
+        let v = p.check(&t, "write", &json!({"path": "dangling", "content": "x"}));
+        assert!(matches!(v, Verdict::Ask(_)), "a dangling link out of the project is outside");
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn a_read_is_judged_by_the_file_it_opens() {
+        let outside = outside("read-selector");
+        std::fs::write(outside.join("secret"), "x").unwrap();
+        let (p, t) = setup(PermissionMode::Ask);
+        std::os::unix::fs::symlink(outside.join("secret"), t.cwd.join("link")).unwrap();
+        let v = p.check(&t, "read", &json!({"path": "link:1"}));
+        assert!(matches!(v, Verdict::Ask(_)), "the selector is not part of the file name");
+        let v = p.check(&t, "read", &json!({"path": "src/lib.rs:1-5"}));
+        assert!(matches!(v, Verdict::Allow));
+        std::fs::remove_dir_all(&outside).ok();
+    }
+    #[test]
+    fn a_bash_call_is_judged_from_where_it_runs() {
+        let outside = outside("bash-cwd");
+        let dir = outside.to_string_lossy().into_owned();
+        let (p, t) = setup(PermissionMode::Ask);
+        let call = |args: Value| p.check(&t, "bash", &args);
+        assert!(matches!(call(json!({"command": "cat passwd", "cwd": &dir})), Verdict::Ask(_)));
+        assert!(matches!(call(json!({"command": "cat passwd"})), Verdict::Allow));
+        let Verdict::Ask(req) = call(json!({"command": "ls", "pty": true})) else { panic!() };
+        assert!(req.grant.is_none(), "the login shell's grammar is not the classifier's");
+        assert!(matches!(verdict(&p, &t, "cd .. && cat ../x"), Verdict::Ask(_)));
+        assert!(matches!(verdict(&p, &t, "cd src && ls"), Verdict::Allow));
+        assert!(matches!(verdict(&p, &t, "cd src && cat lib.rs"), Verdict::Ask(_)), "after a cd, nothing is placed");
+        assert!(matches!(verdict(&p, &t, "cd src && cat /nowhere"), Verdict::Ask(_)));
+        assert!(matches!(verdict(&p, &t, "echo x > out.txt"), Verdict::Ask(_)));
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn an_output_redirect_is_a_write_the_write_rules_see() {
+        let outside = outside("redirect");
+        let (p, t) = setup(PermissionMode::Edits);
+        assert!(matches!(verdict(&p, &t, "echo x > out.txt"), Verdict::Ask(_)), "the command itself");
+        let g = Grant { tool: "bash".into(), patterns: vec!["echo *".into()], wider: vec![] };
+        p.remember(&g, ApprovalScope::Session, false).unwrap();
+        assert!(matches!(verdict(&p, &t, "echo x > out.txt"), Verdict::Allow), "edits mode runs the write");
+        assert!(matches!(verdict(&p, &t, &format!("echo x > {}/log", outside.display())), Verdict::Ask(_)));
+
+        let (p, t) = setup(PermissionMode::Yolo);
+        p.session.borrow_mut().0.push(("write".into(), Rule { pattern: "*.env".into(), action: Action::Deny }));
+        match verdict(&p, &t, "echo x > a.env") {
+            Verdict::Deny(msg) => assert!(msg.contains("for write"), "{msg}"),
+            _ => panic!("a write rule must see a redirect"),
+        }
+        assert!(matches!(verdict(&p, &t, "echo x > a.txt"), Verdict::Allow));
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn deny_and_ask_rules_see_through_wrappers_and_shell_strings() {
+        let (p, t) = setup(PermissionMode::Yolo);
+        p.session.borrow_mut().0.push(deny_rule("git push *"));
+        for cmd in [
+            "git push origin",
+            "\"git\" push origin",
+            "/usr/bin/git push origin",
+            "env git push origin",
+            "sudo -u x git push origin",
+            "sh -c 'git push origin'",
+            "eval git push origin",
+            "timeout 5 bash -c \"git push origin\"",
+        ] {
+            assert!(matches!(verdict(&p, &t, cmd), Verdict::Deny(_)), "{cmd}");
+        }
+        for cmd in ["git status", "echo git push origin", "git log --grep 'git push origin'"] {
+            assert!(matches!(verdict(&p, &t, cmd), Verdict::Allow), "{cmd}");
+        }
+
+        // An allow rule matches the line as written, never the form under a wrapper.
+        let (p, t) = setup(PermissionMode::Ask);
+        p.session.borrow_mut().0.push(allow("cargo test *"));
+        assert!(matches!(verdict(&p, &t, "cargo test -q"), Verdict::Allow));
+        assert!(matches!(verdict(&p, &t, "env cargo test -q"), Verdict::Ask(_)));
+        assert!(matches!(verdict(&p, &t, "/usr/bin/cargo test -q"), Verdict::Ask(_)));
+    }
+
+    /// A `Tools` whose plugin host serves the tools `names`, each declared with `access`.
+    fn plugin_tools(names: &[&str], access: Option<Access>, cwd: PathBuf) -> Tools {
+        use crate::plugin::{host::PluginHost, manifest};
+        let tools = names
+            .iter()
+            .map(|n| {
+                let spec = manifest::ToolSpec::with_schema(n, json!({}));
+                match access {
+                    Some(a) => spec.with_access(a),
+                    None => spec,
+                }
+            })
+            .collect();
+        let m = manifest::Manifest {
+            name: "probe".into(),
+            command: vec!["true".into()],
+            lifetime: manifest::Lifetime::parse("session").unwrap(),
+            hooks: vec![],
+            provider: None,
+            tools,
+            timeout: std::time::Duration::from_secs(5),
+            dir: cwd.clone(),
+        };
+        let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
+        Tools::new(cwd, PluginHost::new(vec![m], vec![], ntx, Default::default()))
+    }
+
+    #[test]
+    fn a_plugin_tool_declares_whether_it_only_reads() {
+        let (p, t) = setup(PermissionMode::Ask);
+        let reader = plugin_tools(&["probe"], Some(Access::Read), t.cwd.clone());
+        assert!(matches!(p.check(&reader, "probe", &json!({})), Verdict::Allow));
+        let undeclared = plugin_tools(&["probe"], None, t.cwd.clone());
+        let Verdict::Ask(req) = p.check(&undeclared, "probe", &json!({})) else { panic!() };
+        assert_eq!(req.grant.unwrap().patterns, ["*"], "the one row: every call of the tool");
+        let Verdict::Ask(_) = p.check(&t, "nosuchtool", &json!({})) else { panic!("an unknown tool may do anything") };
+    }
+
+    #[test]
+    fn a_grant_for_every_call_of_a_tool_is_remembered_as_a_rule() {
+        let (p, t) = setup(PermissionMode::Ask);
+        let undeclared = plugin_tools(&["probe"], None, t.cwd.clone());
+        let Verdict::Ask(req) = p.check(&undeclared, "probe", &json!({})) else { panic!() };
+        p.remember(&req.grant.unwrap(), ApprovalScope::Session, false).unwrap();
+        assert!(matches!(p.check(&undeclared, "probe", &json!({})), Verdict::Allow));
+    }
+
+    #[test]
+    fn a_fetch_with_no_host_is_asked_about_without_a_grant() {
+        let (p, t) = setup(PermissionMode::Ask);
+        let web = plugin_tools(&["fetch"], Some(Access::Read), t.cwd.clone());
+        p.session.borrow_mut().0.push(("fetch".into(), Rule { pattern: "*".into(), action: Action::Ask }));
+        let Verdict::Ask(req) = p.check(&web, "fetch", &json!({"url": "example.com"})) else { panic!() };
+        assert!(req.grant.is_none());
+        let Verdict::Ask(req) = p.check(&web, "fetch", &json!({"url": "https://example.com/a"})) else { panic!() };
+        assert_eq!(req.grant.unwrap().patterns, ["https://example.com/*"]);
+    }
+
+    #[test]
+    fn a_mixed_line_is_granted_part_by_part() {
+        let outside = outside("mixed-line");
+        let dir = outside.to_string_lossy().into_owned();
+        let (p, t) = setup(PermissionMode::Ask);
+        let Verdict::Ask(req) = verdict(&p, &t, &format!("cat {dir}/x && touch y")) else { panic!() };
+        assert_eq!(req.grant.unwrap().patterns, [format!("cat {dir}/x"), "touch *".to_string()]);
+        let Verdict::Ask(req) = verdict(&p, &t, "FOO=1 cargo test") else { panic!() };
+        assert!(req.grant.is_none(), "an assignment is never covered by a grant");
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

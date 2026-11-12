@@ -90,10 +90,24 @@ pub struct SimpleCmd {
     pub readonly: bool,
     /// Its words as written, one per entry of `text`; a grant can replace one to widen itself.
     pub words: Vec<String>,
+    /// Its words with quotes taken off: what the shell passes on, where that is known.
+    pub plain: Vec<String>,
+    /// The other ways the same command reads once wrappers and `sh -c`/`eval` strings are taken off
+    /// (`env git push` also reads `git push`). `deny` and `ask` rules match these too.
+    pub forms: Vec<String>,
     /// The files a read-only command may open: its path words and input redirections.
     pub paths: Vec<PathWord>,
     /// The files its output redirections (and those of the groups around it) may write.
-    pub writes: Vec<PathWord>,
+    pub writes: Vec<WriteWord>,
+}
+
+/// The target of an output redirection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteWord {
+    /// As written.
+    pub text: String,
+    /// The file it names when the word can only mean itself: no expansion, glob or tilde.
+    pub path: Option<String>,
 }
 
 /// A word that may name a file a read-only command opens. Only its text up to the first glob is
@@ -123,10 +137,83 @@ pub struct BashAnalysis {
     /// The line parsed. An unparseable line has one command holding the raw text.
     pub parsed: bool,
     pub cmds: Vec<SimpleCmd>,
+    /// Commands from this index on run in a directory the gate does not know: an earlier command
+    /// changes it (`cd`, a word that decides the program), or a loop or an unparsed line may.
+    pub unplaced_from: Option<usize>,
+}
+
+/// Programs that run the command named in their arguments.
+const WRAPPERS: &[&str] =
+    &["sudo", "doas", "command", "builtin", "exec", "env", "nice", "nohup", "time", "timeout", "xargs"];
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+/// How deep `sh -c '…'` and `eval` strings are followed.
+const MAX_DEPTH: usize = 3;
+
+/// A program word's name: quotes and a leading `\` dropped, directories stripped (`/bin/rm`).
+pub(super) fn program(word: &str) -> String {
+    let w = unquote(word);
+    let w = w.trim_start_matches('\\');
+    w.rsplit('/').next().unwrap_or(w).to_string()
+}
+
+pub(super) fn unquote(word: &str) -> String {
+    word.chars().filter(|c| *c != '\'' && *c != '"').collect()
+}
+
+/// The commands `plain` may run: itself, and what its wrappers and shell strings run. Wrapper
+/// options can take values (`sudo -u root rm`), so every later word that is not an option is tried
+/// as the start of the command. Each form has its program word reduced to its name.
+pub(super) fn unwrapped(plain: &[String], depth: usize) -> Vec<Vec<String>> {
+    let Some(first) = plain.first() else { return Vec::new() };
+    let mut starts = vec![0];
+    if WRAPPERS.contains(&program(first).as_str()) {
+        starts.extend((1..plain.len().min(32)).filter(|&i| !plain[i].starts_with('-')));
+    }
+    let mut out = Vec::new();
+    for start in starts {
+        let mut form = plain[start..].to_vec();
+        let prog = program(&form[0]);
+        form[0] = prog.clone();
+        if depth < MAX_DEPTH {
+            let script = if prog == "eval" {
+                Some(form[1..].join(" "))
+            } else if SHELLS.contains(&prog.as_str()) {
+                form[1..]
+                    .iter()
+                    .position(|w| w.len() > 1 && w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
+                    .and_then(|i| form.get(i + 2))
+                    .map(|s| unquote(s))
+            } else {
+                None
+            };
+            if let Some(script) = script {
+                for c in walk(&script).cmds {
+                    out.extend(unwrapped(&c.plain, depth + 1));
+                }
+            }
+        }
+        out.push(form);
+    }
+    out
 }
 
 /// Splits `cmd` into its simple commands and decides which of them are read-only.
 pub fn analyze(cmd: &str) -> BashAnalysis {
+    let mut a = walk(cmd);
+    for c in &mut a.cmds {
+        let mut forms: Vec<String> = Vec::new();
+        for f in unwrapped(&c.plain, 0) {
+            let form = f.join(" ");
+            if form != c.text && !forms.contains(&form) {
+                forms.push(form);
+            }
+        }
+        c.forms = forms;
+    }
+    a
+}
+
+fn walk(cmd: &str) -> BashAnalysis {
     let src = cmd.as_bytes();
     let Ok(Program { commands }) = parse_all(src, Features::NONE) else {
         return BashAnalysis {
@@ -138,22 +225,25 @@ pub fn analyze(cmd: &str) -> BashAnalysis {
                 assigns: false,
                 readonly: false,
                 words: Vec::new(),
+                plain: Vec::new(),
+                forms: Vec::new(),
                 paths: Vec::new(),
                 writes: Vec::new(),
             }],
+            unplaced_from: Some(0),
         };
     };
-    let mut w = Walker { src, cmds: Vec::new(), bad: false, group_writes: Vec::new() };
+    let mut w = Walker { src, cmds: Vec::new(), bad: false, group_writes: Vec::new(), loops: 0, unplaced: None };
     for c in &commands {
         w.list(c.list());
     }
-    let Walker { mut cmds, bad, .. } = w;
+    let Walker { mut cmds, bad, unplaced, .. } = w;
     if bad {
         for c in &mut cmds {
             c.readonly = false;
         }
     }
-    BashAnalysis { parsed: true, cmds }
+    BashAnalysis { parsed: true, cmds, unplaced_from: if bad { Some(0) } else { unplaced } }
 }
 
 struct Walker<'a> {
@@ -162,7 +252,10 @@ struct Walker<'a> {
     /// A program-level construct makes every command in the line not read-only.
     bad: bool,
     /// Output redirection targets of the compound commands being walked.
-    group_writes: Vec<PathWord>,
+    group_writes: Vec<WriteWord>,
+    /// How many loops the walk is inside.
+    loops: usize,
+    unplaced: Option<usize>,
 }
 
 impl Walker<'_> {
@@ -187,41 +280,67 @@ impl Walker<'_> {
         }
     }
 
+    /// Notes that the command about to be pushed may leave the directory it started in.
+    fn moves(&mut self) {
+        let n = if self.loops > 0 { 0 } else { self.cmds.len() + 1 };
+        self.unplaced = Some(self.unplaced.map_or(n, |u| u.min(n)));
+    }
+
+    /// Walks a loop's parts: a command in it may run again after a later one has moved.
+    fn looped(&mut self, f: impl FnOnce(&mut Self)) {
+        self.loops += 1;
+        f(self);
+        self.loops -= 1;
+    }
+
     fn command(&mut self, c: Command) {
         let kind = c.kind();
         let simple = matches!(kind, CommandKind::Simple(_));
         let mark = self.group_writes.len();
+        let src = self.src;
         for r in c.redirs() {
             self.redir(r);
-            if !simple && is_output(r.op()) {
+            if !simple && (is_output(r.op()) || writes_file(r).is_some()) {
                 self.bad = true;
             }
-            if !simple && let Some(w) = write_target(r) {
+            if !simple && let Some(w) = write_target(src, r) {
                 self.group_writes.push(w);
             }
         }
         match kind {
             CommandKind::Simple(s) => {
                 let words = s.words();
-                let as_written = |w: Word| String::from_utf8_lossy(w.span().slice(self.src)).into_owned();
+                let as_written = |w: Word| String::from_utf8_lossy(w.span().slice(src)).into_owned();
+                let argv0 = words.first().and_then(literal);
+                let readonly = simple_readonly(s, c.redirs());
+                let moving = words.first().is_some()
+                    && match argv0.as_deref() {
+                        None | Some("cd" | "pushd" | "popd") => true,
+                        Some("builtin" | "command" | "eval" | "." | "source") => !readonly,
+                        Some(_) => false,
+                    };
+                if moving {
+                    self.moves();
+                }
                 self.cmds.push(SimpleCmd {
                     text: words.iter().map(as_written).collect::<Vec<_>>().join(" "),
                     words: words.iter().map(as_written).collect(),
-                    paths: words
-                        .first()
-                        .and_then(literal)
-                        .map(|argv0| read_words(&argv0, words.skip(1), c.redirs()))
+                    plain: words.iter().map(|w| literal(w).unwrap_or_else(|| unquote(&as_written(w)))).collect(),
+                    forms: Vec::new(),
+                    paths: argv0
+                        .as_deref()
+                        .map(|argv0| read_words(argv0, words.skip(1), c.redirs()))
                         .unwrap_or_default(),
                     writes: c
                         .redirs()
                         .iter()
-                        .filter_map(write_target)
+                        .filter_map(|r| write_target(src, r))
                         .chain(self.group_writes.iter().cloned())
                         .collect(),
-                    argv0: words.first().and_then(literal),
+                    argv0,
                     second: words.get(1).map(as_written),
                     assigns: !s.assigns().is_empty(),
-                    readonly: simple_readonly(s, c.redirs()),
+                    readonly,
                 });
                 self.simple_parts(s);
             }
@@ -235,17 +354,17 @@ impl Walker<'_> {
                     self.list(e);
                 }
             }
-            CommandKind::While(w) => {
-                self.list(w.cond());
-                self.list(w.body());
-            }
-            CommandKind::For(f) | CommandKind::Select(f) => self.for_parts(f),
-            CommandKind::ArithFor(a) => {
-                self.arith(a.init());
-                self.arith(a.cond());
-                self.arith(a.step());
-                self.list(a.body());
-            }
+            CommandKind::While(w) => self.looped(|s| {
+                s.list(w.cond());
+                s.list(w.body());
+            }),
+            CommandKind::For(f) | CommandKind::Select(f) => self.looped(|s| s.for_parts(f)),
+            CommandKind::ArithFor(a) => self.looped(|s| {
+                s.arith(a.init());
+                s.arith(a.cond());
+                s.arith(a.step());
+                s.list(a.body());
+            }),
             CommandKind::Case(c) => self.case(c),
             CommandKind::Arith(a) => self.arith(a),
             CommandKind::Cond(e) => self.cond(e),
@@ -257,10 +376,10 @@ impl Walker<'_> {
                 self.bad = true;
                 self.command(c.body());
             }
-            CommandKind::Repeat(r) => {
-                self.word(r.count());
-                self.list(r.body());
-            }
+            CommandKind::Repeat(r) => self.looped(|s| {
+                s.word(r.count());
+                s.list(r.body());
+            }),
             CommandKind::Try(t) => {
                 self.bad = true;
                 self.list(t.body());
@@ -456,20 +575,26 @@ fn is_fd_word(w: Word) -> bool {
     })
 }
 
-/// The file an output redirection may write; `/dev/null` and descriptor duplications write none.
-fn write_target(r: Redir) -> Option<PathWord> {
+/// The word of a redirection that may write a file; `/dev/null` and descriptor duplications write
+/// none. `<>` opens its file for writing too.
+fn writes_file(r: Redir) -> Option<Word> {
     let RedirTarget::Word(w) = r.target() else { return None };
     let writes = match r.op() {
         RedirOp::DupOut => !is_fd_word(w),
-        op => is_output(op) && literal(w).as_deref() != Some("/dev/null"),
+        op => (is_output(op) || matches!(op, RedirOp::ReadWrite)) && literal(w).as_deref() != Some("/dev/null"),
     };
-    writes.then(|| PathWord { prefix: path_prefix(w), word: None })
+    writes.then_some(w)
+}
+
+fn write_target(src: &[u8], r: Redir) -> Option<WriteWord> {
+    let w = writes_file(r)?;
+    Some(WriteWord { text: String::from_utf8_lossy(w.span().slice(src)).into_owned(), path: literal(w) })
 }
 
 fn redir_readonly(r: Redir) -> bool {
     let devnull = || matches!(r.target(), RedirTarget::Word(w) if literal(w).as_deref() == Some("/dev/null"));
     match r.op() {
-        RedirOp::DupOut => write_target(r).is_none(),
+        RedirOp::DupOut => writes_file(r).is_none(),
         RedirOp::In | RedirOp::DupIn | RedirOp::HereString => true,
         RedirOp::HereDoc { .. } => matches!(r.target(), RedirTarget::HereDoc(h) if h.quoted()),
         op if is_output(op) => devnull(),
@@ -806,6 +931,34 @@ mod tests {
 
     fn some(p: &str) -> Option<String> {
         Some(p.to_string())
+    }
+
+    #[test]
+    fn commands_after_one_that_moves_are_not_placed() {
+        assert_eq!(analyze("cat a; cd b; cat c").unplaced_from, Some(2));
+        assert_eq!(analyze("cat a && ls").unplaced_from, None);
+        assert_eq!(analyze("for i in 1 2; do cat ../x; cd ..; done").unplaced_from, Some(0), "a loop comes round");
+        assert_eq!(analyze("cat a; $PROG b; cat c").unplaced_from, Some(2), "a program word decides");
+        assert_eq!(analyze("command -v rg; cat c").unplaced_from, None);
+        assert_eq!(analyze("eval cd ..; cat c").unplaced_from, Some(1));
+        assert_eq!(analyze("ls \"unterminated").unplaced_from, Some(0));
+        assert_eq!(analyze("FOO=1; cat c").unplaced_from, None, "an assignment alone moves nothing");
+    }
+
+    #[test]
+    fn a_file_redirect_is_a_write_target() {
+        let w = |cmd: &str| -> Vec<(String, Option<String>)> {
+            analyze(cmd).cmds.iter().flat_map(|c| c.writes.iter().map(|w| (w.text.clone(), w.path.clone()))).collect()
+        };
+        let some = |t: &str, p: Option<&str>| (t.to_string(), p.map(String::from));
+        assert_eq!(w("echo x > out.txt"), [some("out.txt", Some("out.txt"))]);
+        assert_eq!(w("echo x > \"a b\""), [some("\"a b\"", Some("a b"))]);
+        assert_eq!(w("echo x > $OUT"), [some("$OUT", None)]);
+        assert_eq!(w("echo x <> f"), [some("f", Some("f"))], "read-write creates the file");
+        assert_eq!(w("{ echo x; } >&f"), [some("f", Some("f"))]);
+        assert!(w("echo x > /dev/null 2>&1").is_empty());
+        assert!(!analyze("echo x <> f").cmds[0].readonly);
+        assert!(!analyze("{ echo x; } <> f").cmds[0].readonly, "a group with a write is no longer read-only");
     }
 
     #[test]
