@@ -264,7 +264,9 @@ These are behaviours a user may find surprising. Several are deliberate and test
 
 Sizes are relative: **S** is one or two files and a test, **M** is several files in one crate, **L** crosses crates or changes a public shape. Each workstream is independent unless it says otherwise.
 
-### A. Close the reproduced holes (S each; do first)
+Every finding in section 4 has a place below: in a workstream, or in section 6 as a decision. Status on 2026-11-12: A is merged (`8e3e6c3`); B is in progress on `feat/gate-one-parse` with option 2.
+
+### A. Close the reproduced holes (S each; done, merged as `8e3e6c3`)
 
 One PR per item, each with the probe turned into a regression test.
 
@@ -279,7 +281,7 @@ One PR per item, each with the probe turned into a regression test.
 | S10 `HOME` | (1) Fail at startup with a message when neither `HOME` nor `MU_HOME` is set. (2) Fall back to the passwd entry. | 1. One function, and it turns a silent misplacement into an error. |
 | S11 bad mode | (1) Keep `yolo` only when `mode` is absent; an unparseable value falls back to `ask`. (2) Refuse to start. | 1. A broken config should not block every session, and should not open everything either. |
 
-### B. The permission gate: what it is, and how it is built (decision needed)
+### B. The permission gate: what it is, and how it is built (option 2 chosen; in progress)
 
 A is patching. The question behind it is what `ask` and `edits` are meant to be.
 
@@ -288,6 +290,16 @@ A is patching. The question behind it is what `ask` and `edits` are meant to be.
 - **Option 3: an OS-level boundary for `bash`** (Landlock on Linux, Seatbelt on macOS), with the classifier kept for prompts. The only option that holds against a hostile command line. Cost: L, two platforms, a project of its own.
 
 Recommended: 2, taken in steps after A, and the honest sentence from 1 in the docs now, since a flag-by-flag classifier (S7) will always have gaps. Leave 3 until there is a concrete need.
+
+The remaining gate findings belong here too:
+
+| Item | Options | Recommended |
+|---|---|---|
+| S7 flags the classifier lets through | (1) Give `rg` and `tree` an allowed-flag list like the other programs, and make a flag that names a file (`-f`, `--files0-from`, `-o`, `-O`, `--pre`, `--compress-program`) either a path subject or a reason the command is not read-only. (2) Leave it to the sentence in the docs. | 1 for the seven forms in S7, as a step of option 2. The docs sentence stays: other flags will exist. |
+| S8 `deny` rules | Covered by option 2 (rules matched against the unwrapped, normalised program name as well as the text). `sh -c '...'` needs the inner line parsed too; if that is not done, `docs/permissions.md:43` should say which forms a `deny` sees. | |
+| S9 `rm` guard | (1) Correct the comment at `guard.rs:77` to match the docs. (2) Also resolve `..` lexically, so `rm -rf /..` and `rm -rf ~/../..` are refused. (3) Follow `cd`, variables and pipes. | 1 and 2. 3 is a shell interpreter; option 3 of this workstream is the real answer to it. |
+| S13f `/mcp reconnect` | Refuse to reconnect a server whose entry is no longer in the trusted set, and say why. | No alternative worth weighing. |
+| S13g tool-call hooks | (1) Run hooks in a fixed order, each on the previous one's arguments, and let a hook be marked required so that its failure or timeout blocks the call. (2) Keep them concurrent and make two different rewrites an error. (3) Document the current behaviour. | 1. Whether a failing hook lets the call through is a decision (section 6). |
 
 For S6 (`@` imports) the choices are: (1) confine imports to the project and mu's own directories, read only regular files under a size cap, and treat anything else as an outside read that needs a rule; (2) keep them unrestricted and list every outside import in a startup notice; (3) pass the system prompt through redaction. Recommended: 1 and 3 together. 3 alone only hides secrets that match a known shape.
 
@@ -303,6 +315,11 @@ For S6 (`@` imports) the choices are: (1) confine imports to the project and mu'
 | B12 memory queue | Move a failed job to the back, or give up after N attempts with one notice; separate "the model's reply was rejected" from infrastructure errors. | Both. |
 | B5 `edit` | Use `write_atomic`, as `write` does. | |
 | B4 bash drains | On leader exit, terminate the group first and then drain under a hard cap, in both paths. | Fits the tool's documented rule that background descendants do not outlive the call. |
+| B13 gateway daemon start | (1) Derive the starter's wait from the daemon's own step limits, kill the omp children's process groups as well as the daemon, and give the children a portable parent-death signal (a pipe they see close) for macOS. (2) Only raise the 30 s and fix the comment. | 1. 2 leaves the orphans on macOS. |
+| B14d mcp-http bridge | Check first whether the next call respawns the bridge. If not: retry a transport error once inside the bridge, and report it as a call error, not an exit. | |
+| B14e subagent output | Report an unparseable child line as the result's error, with the line; bound the wait for stderr. | |
+| B14j grant not written | Return what was written, and say "already covered by ..." when nothing was. | |
+| B14n agent task panic under ACP | Check the task result as headless does, and answer the pending `session/prompt` with an error. | |
 
 ### D. One gate (S)
 
@@ -312,6 +329,10 @@ For S6 (`@` imports) the choices are: (1) confine imports to the project and mu'
 - Add shellcheck for `scripts/`. `cargo deny` is optional; the git-pinned dependencies are the argument for it.
 - Fix the drift in section 4.5 in one pass, `AGENTS.md` first, since agents act on it.
 - Record a retried smoke pass as such.
+- The release workflow runs `scripts/ci-checks.sh` instead of its own test and build list, so fmt and clippy also gate a release (C3).
+- `ship.sh` exits non-zero when it could not fast-forward the main checkout, instead of installing an older commit and reporting success (B14c).
+- `-dirty` (B14b). Options: (1) make `build.rs` rerun on every build, which rebuilds the top crate each time; (2) have `mu update` and `install.sh --skip-if-dev` ask git themselves instead of trusting the suffix. Recommended: 2.
+- The memory gate (C7). It was taken out of CI in `829c1cd`. Options: (1) run `mu-bench check` in the release dry run; (2) run it on a schedule; (3) leave it manual and say so in `DESIGN.md`. This is a decision (section 6); I would take 1.
 
 ### E. A written rule for errors (M, then gradual)
 
@@ -320,6 +341,8 @@ For S6 (`@` imports) the choices are: (1) confine imports to the project and mu'
 - **Option 3:** write down the current practice and stop there.
 
 Recommended: 1. Independent of that choice: give JSON-RPC errors a machine-readable kind and stop matching on message text between the core and a plugin (M10), print `{e:#}` in `main` (B14a), and return an error from set-once globals on a second set.
+
+The rest of M12 goes with it: library code returns a warning to its caller instead of printing to stderr (`agent/plans.rs:96`), and the owner state in statics moves into a value that is passed in (reported; read it before planning).
 
 ### F. TUI structure (M each, in this order)
 
@@ -331,38 +354,90 @@ Recommended: 1. Independent of that choice: give JSON-RPC errors a machine-reada
 6. **Jobs panel data behind a source** in `mu-session` that returns snapshots, so the panel only renders and the tests need no real run directory (M5, M13). Whether the reads then move off the UI thread is a separate choice: the design note says no worker. I would measure first.
 7. Paste markers as atomic tokens in the editor (B7).
 
+Small TUI fixes, each S and independent of the steps above:
+
+| Item | Options | Recommended |
+|---|---|---|
+| B6 retry notice | Carry `max_attempts` in the retry event and print it. | |
+| B8 failed attempt's text | (1) `reset_stream` also drops the attempt's text from `block_text`, as the comment at `transcript.rs:246` says. (2) Keep the failed attempt on screen, marked as discarded, and leave it out of `/copy`. | 1. |
+| B14h render cache key | Key the live-render cache by block identity or a generation counter, not by text length. | |
+| B14i fallback screen text | Delete the "nothing is tried" line; the `@task` line is what the code does. Take the preview's rule from `mu-base/src/roles.rs` instead of restating it (M5). | |
+| B14p editor cursor | Keep the cursor's column offset instead of recounting from the line start. | Measure first; it is from reading. |
+| B14q open code fence | Highlight only the lines added since the last pass, when the highlighter's state allows it. | Measure first; reported, not read. |
+
 ### G. Tools, agent and entry points (M each)
 
 - **Bash paths**: one spawn, collect and finish sequence shared by the four paths, with the kill and drain policy in one place (M2, B4). Give a foreground command its own slot outside the eight-job limit, or count only background work.
 - **Agent loop**: name the loop's states instead of five flags; mark reminders with a field instead of matching their text; one vector of `(message, entry id)` (M6). Add loop-level tests for compaction and overflow before touching it.
 - **`run()`**: one small function per mode, with the mode's data inside the enum variant, so the `expect`s disappear (M7).
 - **Shared helpers into `mu-common`**: truncate, `~` expansion, ANSI stripping, a `FileLock` with timeout and try (M11). The plugins can use them.
-- **`mu-base`**: make internal modules `pub(crate)` as `mu-agent` does; split `config.rs` by section. Lower priority.
-- **Provider**: one cache helper for the three model and pricing caches; one error classifier with per-wire inputs (M9).
+- **`mu-base`**: make internal modules `pub(crate)` as `mu-agent` does; split `config.rs` by section (M8). Lower priority.
+- **Provider**: one cache helper for the three model and pricing caches; one error classifier with per-wire inputs (M9). Split `provider/custom.rs` into schema, registry writes and the save workflow, with the UI labels moved to the TUI (M9).
+- **`Job`**: an enum per kind (subagent, bash) instead of shared fields and flags, with completion written in one place (M2).
+- **`src/cli/auth.rs` and `src/workflow/deliver.rs`** (M7): move the no-echo terminal layer and the login flow out of the clap file; split `deliver.rs` into the record, the steps and the loop. Both as the files come up.
+- **The other synchronous I/O sites** (M13): `/mcp` config loads, session cost on job completion, ACP `session/delete` and setup, context loading at startup. Measure each; move the ones that show up to `spawn_blocking`. For the ACP ones, fix the comment if the code stays (4.5).
+
+Small fixes in this area, each S:
+
+| Item | Options | Recommended |
+|---|---|---|
+| B14f `models.toml` | Take `FileLock` around the read-modify-write, as the provider registry does. | |
+| B14k pre-flight model fetch | Give it an overall timeout; use its result or stop making the request. | |
+| B14l request body | (1) Drop the JSON tree once it is serialised. (2) Serialise straight into the request stream. (3) Correct `DESIGN.md:219` to describe what happens. | 1, and 3 until 2 is worth doing. |
+| B14m tool pairing check | Check pairing over borrowed messages; no clone. | |
+| B14o web fetch | Four separate fixes: give the `llms.txt` probe its own short budget; leave blank lines alone under `raw=true`; refuse or describe a binary GitHub blob; run the HTML conversion on a blocking thread. | Reported; read each before fixing. |
+| B14r session search | Open a read transaction and write only for files that changed. | Reported. |
+| B14s schema validator | (1) Implement `pattern` and treat `format` as an annotation. (2) Warn once per tool for a constraint keyword that is not checked. (3) Document the supported set. | 3 now, 2 if a tool depends on one. |
+| B14t macOS paths | `self_exe()` falls back to `std::env::current_exe()`; the OS release comes from `uname` where `/proc` is absent. | Needed for the "both platforms" rule in `AGENTS.md`. |
 
 ### H. Tests (S to M, alongside the others)
 
 - Replace fixed sleeps with waits on observable state, starting with the files named in C4; track test children by pid instead of `pkill -f`.
 - Pass the home directory into the code under test instead of setting environment variables from test threads. This is the same change as making `paths::home()` fallible (A, S10).
-- Put `run_omp_blocking` and the `__panic` tool behind `test-support`.
+- Put `run_omp_blocking` and the `__panic` tool behind `test-support` (C6).
 - A frame-level test of `App::draw` with an injectable writer.
+- Tests for `src/workflow/take.rs` (C5). The jobs panel test stops reading the real `$MU_HOME/run` once F6 gives the panel a source.
+- Pass the hang grace in as a value, so tests set a short one explicitly instead of `cfg!(test)` changing a constant (C6).
+
+### I. Smaller security items (S each, independent)
+
+| Item | Options | Recommended |
+|---|---|---|
+| S13a file modes | (1) Create session files and `history.jsonl` with 0600 and `~/.mu` with 0700. (2) Only the directory. | 1. Whether to tighten files that already exist is a small choice; I would do it when a file is next opened for append. |
+| S13b sign-in callback | Check `state` before anything else, and answer with fixed text instead of echoing the `error` parameter. | |
+| S13c client fallback | Return the builder's error instead of falling back to `reqwest::Client::new()`. | |
+| S13h plugin requests | A timeout and a cancel path for `core/complete`; a cap on concurrent requests per plugin. | The cap's value needs a look at what plugins send. |
+| S13i late-exported secrets | (1) Refresh the redactor's snapshot from the shell's exported variables after a `bash` call. (2) Document the limit in `docs/secrets.md`. | 1 if the shell exposes its exports cheaply (needs a look); otherwise 2. |
+| S13j `signal_pid` | Refuse pid <= 0. | |
+| S13k internal addresses | Add `100.100.100.200` and the whole of `0.0.0.0/8`. | |
+| S13l release | Give `contents: write` to the publish job only. For the installer: (1) verify a GitHub artifact attestation or a signature; (2) keep the same-release checksum and say it detects corruption, not tampering. | The permissions change now. The installer is a decision (section 6). |
+| S13m wizard summary | (1) Pass `args` through the redactor. (2) Mask every argument. | 1. Reported; read it first. |
 
 ### Suggested order
 
-1. A (all items), with the docs sentence from B option 1.
-2. C: B1, B2, B10, B5 first.
-3. D.
-4. B option 2 in steps, F1 and F2.
-5. The rest of F and G as the files come up for other reasons; E's rule before any of them touches error types.
+1. A (all items), with the docs sentence from B option 1. Done.
+2. B option 2 in steps. In progress; S7, S9, S13f and S13g join it.
+3. C: B1, B2, B10, B5 first.
+4. D, and I (each item is a small PR).
+5. F1 and F2.
+6. The rest of F and G as the files come up for other reasons, the small-fix tables in any order; E's rule before any of them touches error types.
 
 ## 6. Decisions for you
 
-1. **What `ask` and `edits` promise** (section 5B): guard rails, a real check shared with the executor, or an OS boundary later. This decides how much of S7 to S9 is code and how much is documentation.
+1. **What `ask` and `edits` promise** (section 5B): guard rails, a real check shared with the executor, or an OS boundary later. Decided: option 2. Still open inside it: how far the classifier goes on flags (S7) and whether `sh -c` lines are parsed for `deny` rules (S8).
 2. **`@` imports** (S6): confine, list, or leave.
 3. **`fetch` in `ask` mode**: keep it unasked, or ask per host.
 4. **The bot's gate** (C1, C2): run `ci-checks.sh` only, or also wait for CI; and whether a fixer diff that removes tests may still auto-merge.
 5. **Error rule** (section 5E): option 1, 2 or 3.
-6. **`HOME` unset** (S10): fail, or fall back to the passwd entry.
+6. **`HOME` unset** (S10): fail, or fall back to the passwd entry. Decided with A: mu fails at startup.
 7. **Session directory names** (B14g): keep omp's scheme and its collisions, or diverge.
 8. **Product questions** in 4.6: Ctrl+C in a pty, confirms for `X`, `r` and marked-job `k`/`x`, `-c` stopping a live run, concurrent read-only tool calls.
-9. **Which workstreams to plan in detail.** I have not written implementation plans; say which ones you want and I will.
+9. **The other product questions** in 4.6:
+   - Ghost text reading omp's and Claude's histories: keep and correct the docs, make it a setting, or read mu's history only.
+   - The gateway pair's 30-minute linger: document it, or also make it configurable.
+   - Filtering: substring in lists and fuzzy in the slash menu, or one rule for both.
+   - ACP `initialize` with version 0: keep the error, or answer with the supported version as the protocol asks.
+10. **Tool-call hooks** (S13g): may a hook that fails or times out let the call through, as now, or can a hook be marked required?
+11. **The memory gate** (C7): release dry run, a schedule, or manual.
+12. **The installer's check** (S13l): an attestation or signature, or the same-release checksum with its limit stated.
+13. **Which workstreams to plan in detail.** I have not written implementation plans; say which ones you want and I will.
