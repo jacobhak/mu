@@ -30,6 +30,8 @@ jobs:
         with:
           name: mu-linux-x64
           path: dist/mu-linux-x64.tar.gz
+          # Only the release job reads it; the published copy is the release asset.
+          retention-days: 1
   build:
     strategy:
       fail-fast: false
@@ -53,6 +55,7 @@ jobs:
         with:
           name: mu-${{ matrix.plat }}
           path: dist/mu-${{ matrix.plat }}.tar.gz
+          retention-days: 1
   release:
     needs: [build, build-linux]
     # A manual run exercises the matrix; only a tag publishes.
