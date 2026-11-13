@@ -1,6 +1,7 @@
 //! What a custom endpoint's models cost: the `cost` rates in `providers.toml` are the only price
 //! such a model has, and turns without one wait for a table that names them. One test, because every
 //! test in a binary shares one profile home and the rates are read from that file.
+#![allow(clippy::unwrap_used)] // integration-test helper outside any #[test] fn
 
 use mu_base::message::Usage;
 use mu_provider::model::cost::CostLedger;

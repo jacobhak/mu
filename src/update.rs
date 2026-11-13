@@ -19,7 +19,7 @@ pub enum Status {
         tag: String,
         ahead: u64,
     },
-    /// The installed build is dirty, unknown, or not on the release lineage.
+    /// The installed build is dirty (by its sha or by the installer's marker), unknown, or not on the release lineage.
     Dev {
         sha: String,
     },
@@ -54,6 +54,20 @@ fn installed_sha() -> &'static str {
 
 fn is_dev_sha(sha: &str) -> bool {
     sha == "unknown" || sha.ends_with("-dirty") || sha.is_empty()
+}
+
+/// `install.sh --from-source` writes this when it built a tree with uncommitted changes. The sha alone
+/// cannot say: build.rs does not rerun for an unstaged edit, so such a build carries a clean-looking sha.
+fn dev_marker() -> std::path::PathBuf {
+    paths::mu_home().join("dev-build")
+}
+
+fn is_dev_build(sha: &str) -> bool {
+    is_dev_build_at(sha, &dev_marker())
+}
+
+fn is_dev_build_at(sha: &str, marker: &std::path::Path) -> bool {
+    is_dev_sha(sha) || marker.exists()
 }
 
 /// Last `-`-separated part of `mu-YYYYMMDD-<sha7>`.
@@ -147,7 +161,7 @@ fn gh(args: &[&str]) -> Option<String> {
 /// Queries GitHub. Blocking; call from a thread or before the runtime starts.
 pub fn check() -> Status {
     let sha = installed_sha();
-    if is_dev_sha(sha) {
+    if is_dev_build(sha) {
         return Status::Dev { sha: sha.into() };
     }
     let tag = match api(&format!("repos/{REPO}/releases/latest")) {
@@ -202,7 +216,7 @@ fn parse_cache(s: &str, sha: &str, at: u64) -> Option<Option<(String, u64)>> {
 /// Blocking.
 pub fn startup_notice() -> Option<String> {
     let sha = installed_sha();
-    if is_dev_sha(sha) {
+    if is_dev_build(sha) {
         return None;
     }
     let cached = std::fs::read_to_string(cache_path()).ok().and_then(|s| parse_cache(&s, sha, now()));
@@ -326,6 +340,14 @@ mod tests {
         assert!(is_dev_sha("unknown"));
         assert!(is_dev_sha("abc123-dirty"));
         assert!(!is_dev_sha("799ca34873a1"));
+    }
+
+    #[test]
+    fn marker_makes_a_clean_sha_a_dev_build() {
+        let marker = mu_testutil::tmp().join("dev-build");
+        assert!(!is_dev_build_at("799ca34873a1", &marker));
+        std::fs::write(&marker, "799ca34873a1\n").unwrap();
+        assert!(is_dev_build_at("799ca34873a1", &marker));
     }
 
     #[test]

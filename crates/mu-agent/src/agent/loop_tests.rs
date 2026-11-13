@@ -80,6 +80,19 @@ fn secrets_are_replaced_explained_and_never_written_back() {
 }
 
 #[test]
+fn a_secret_in_a_context_file_does_not_reach_the_system_prompt() {
+    run(async {
+        let tok = format!("ghp_{}", "c3D4".repeat(9));
+        let (mut a, _rx) = agent(vec![]);
+        let files = &mut Rc::get_mut(&mut a.ctx).expect("sole owner").files;
+        files.push(mu_tools::context::ContextFile { path: "AGENTS.md".into(), content: format!("deploy with {tok}") });
+        let sp = a.system();
+        assert!(sp.contains("deploy with [REDACTED:github-token]"), "{sp}");
+        assert!(!sp.contains(&tok));
+    });
+}
+
+#[test]
 fn truncated_reply_with_calls_stays_paired() {
     run(async {
         let script = vec![

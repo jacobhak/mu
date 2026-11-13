@@ -21,10 +21,17 @@ export MU_OMP="$omp"
 
 stages=(build test contract smoke)
 cmd_build() { cargo build --release --workspace --locked && scripts/build-mcp-http.sh build && scripts/maint/gen-catalog.sh --check && node --test scripts/maint/gen-catalog.test.mjs && scripts/maint/test-only.test.sh; }
-cmd_test() { cargo test --workspace --locked && scripts/build-mcp-http.sh test; }
+# The same list CI, ship.sh and the release run: fmt, clippy, the workspace tests, the MCP bridge's tests.
+cmd_test() { scripts/ci-checks.sh; }
 cmd_contract() { cargo test --workspace --locked -- --ignored contract_; }
-cmd_smoke() { scripts/smoke.sh "$CARGO_TARGET_DIR/release/mu" || scripts/smoke.sh "$CARGO_TARGET_DIR/release/mu"; }
+# The smoke stage drives a live model and flakes: it gets one retry, and a pass on the retry is recorded as such.
+cmd_smoke() {
+  scripts/smoke.sh "$CARGO_TARGET_DIR/release/mu" && return 0
+  touch "$out/smoke.retried"
+  scripts/smoke.sh "$CARGO_TARGET_DIR/release/mu"
+}
 
+rm -f "$out"/*.retried
 : > "$out/check.txt"
 failed=0
 cd "$wt" || exit 1
@@ -34,7 +41,7 @@ for s in "${stages[@]}"; do
     continue
   fi
   if "cmd_$s" > "$out/$s.log" 2>&1; then
-    echo "$s ok" >> "$out/check.txt"
+    if [ -e "$out/$s.retried" ]; then echo "$s ok (retried)" >> "$out/check.txt"; else echo "$s ok" >> "$out/check.txt"; fi
   else
     echo "$s FAILED" >> "$out/check.txt"
     failed=1

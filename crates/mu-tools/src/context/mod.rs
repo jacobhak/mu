@@ -35,8 +35,10 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     }
     near_first.reverse();
     near_first.extend(non_empty(&agent_dir.join("AGENTS.md")));
+    let roots = [cwd.to_path_buf(), agent_dir.to_path_buf(), home.join(".omp"), mu_common::paths::mu_home()];
     for f in &mut near_first {
-        f.content = at_imports::expand(&f.content, &f.path, home, &mut |w| WARNINGS.with(|x| x.borrow_mut().push(w)));
+        f.content =
+            at_imports::expand(&f.content, &f.path, home, &roots, &mut |w| WARNINGS.with(|x| x.borrow_mut().push(w)));
     }
     near_first
 }
@@ -405,7 +407,7 @@ impl SlashCommand {
                 had = true;
                 i += 2;
             } else {
-                let c = rest.chars().next().unwrap();
+                let c = rest.chars().next().expect("rest is non-empty");
                 out.push(c);
                 i += c.len_utf8();
             }

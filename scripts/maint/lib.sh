@@ -13,7 +13,7 @@ if [ -f "$MAINT/config.env" ]; then set -a; . "$MAINT/config.env"; set +a; fi
 : "${MU_MAINT_FIX_USD:=5}"
 : "${MU_MAINT_DIGEST_USD:=2}"
 : "${MU_MAINT_DRY_RUN:=0}"
-export MAINT CLONE OMPSRC CARGO_TARGET_DIR MU
+export MAINT CLONE OMPSRC CARGO_TARGET_DIR MU OMP_REPO
 REPO=jacobhak/mu
 OMP_REPO=can1357/oh-my-pi
 MODE="${MODE:-adhoc}"
@@ -96,7 +96,8 @@ run_agent() {
 
 # worktree <name> <ref> [branch]
 worktree() {
-  local name="$1" ref="$2" branch="${3:-}" p="$MAINT/wt/$1"
+  local name="$1" ref="$2" branch="${3:-}" p
+  p="$MAINT/wt/$name"
   if [ -e "$p" ]; then
     git -C "$CLONE" worktree remove --force "$p" 2>/dev/null || rm -rf "$p"
   fi

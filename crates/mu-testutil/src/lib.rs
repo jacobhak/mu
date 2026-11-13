@@ -1,5 +1,6 @@
 //! Helpers shared by mu's test suites. Dev-only: nothing here ships in the binary.
 
+#![allow(clippy::unwrap_used)] // test-only helpers: panicking on failure is the point
 use std::future::Future;
 use std::path::{Path, PathBuf};
 

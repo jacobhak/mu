@@ -11,8 +11,11 @@ jobs:
   build-linux:
     runs-on: arc-mu
     container: ubuntu:22.04
+    env:
+      # The container installs shellcheck below, so here a missing one is a failure.
+      MU_REQUIRE_SHELLCHECK: 1
     steps:
-      - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git pkg-config python3 nodejs
+      - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git pkg-config python3 nodejs shellcheck
       - run: curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
@@ -21,8 +24,7 @@ jobs:
         with:
           # See ci.yml: cache-bin prunes the runner's own ~/.cargo/bin.
           cache-bin: false
-      - run: cargo test --workspace --locked
-      - run: scripts/build-mcp-http.sh test
+      - run: scripts/ci-checks.sh
       - run: cargo build --release --workspace --locked
       - run: scripts/build-mcp-http.sh build
       - run: scripts/package.sh linux-x64
@@ -46,8 +48,7 @@ jobs:
         with:
           # See ci.yml: cache-bin prunes the runner's own ~/.cargo/bin.
           cache-bin: false
-      - run: cargo test --workspace --locked
-      - run: scripts/build-mcp-http.sh test
+      - run: scripts/ci-checks.sh
       - run: cargo build --release --workspace --locked
       - run: scripts/build-mcp-http.sh build
       - run: scripts/package.sh ${{ matrix.plat }}

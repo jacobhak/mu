@@ -56,3 +56,6 @@ objc2-app-kit.workspace = true
 mu-testutil.workspace = true
 mu-provider = { workspace = true, features = ["test-support"] }
 mu-tools = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

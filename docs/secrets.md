@@ -1,6 +1,6 @@
 # Secrets
 
-mu replaces recognisable secrets with placeholders such as `[REDACTED:GEMINI_API_KEY]` before it stores or sends text. This covers tool results, your messages, plugin context such as the memory snapshot, full output saved to `artifact://` files, and sessions opened with `--resume` (old sessions may hold raw values). Nothing with a secret it recognises reaches the provider, the session file, memory or a subagent's result.
+mu replaces recognisable secrets with placeholders such as `[REDACTED:GEMINI_API_KEY]` before it stores or sends text. This covers tool results, your messages, the system prompt (context files, rules and MCP server instructions), plugin context such as the memory snapshot, full output saved to `artifact://` files, and sessions opened with `--resume` (old sessions may hold raw values). Nothing with a secret it recognises reaches the provider, the session file, memory or a subagent's result.
 
 What counts as a secret:
 

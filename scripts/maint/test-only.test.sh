@@ -72,6 +72,18 @@ expect 0 "a test added inside the trailing test module"
 base; sed -i 's/assert_eq!(one(), 1);/assert!(one() == 1);/' crates/a/src/lib.rs
 expect 0 "a test changed inside the trailing test module"
 
+base; sed -i '9,12d' crates/a/src/lib.rs
+expect 1 "a test removed from the trailing test module"
+
+base; sed -i 's/assert_eq!(one(), 1);/let _ = one();/' crates/a/src/lib.rs
+expect 1 "an assertion removed from a test"
+
+base; line 9 '    #[ignore]' crates/a/src/lib.rs
+expect 1 "a test ignored"
+
+base; line 12 '    #[tokio::test] async fn again() { assert!(true); }' crates/a/src/lib.rs
+expect 0 "a tokio test added"
+
 base; sed -i 's/^    1$/    1 + 0/' crates/a/src/lib.rs
 expect 1 "code changed above the test module"
 

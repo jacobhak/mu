@@ -1,5 +1,6 @@
 //! Scripted agents for tests: the agent loop's tests here and the binary's headless tests build on
 //! the same builder, so a scripted run behaves the same wherever it is driven from.
+#![allow(clippy::unwrap_used)] // test scaffolding compiled into the lib so other crates' tests can use it
 
 use crate::agent::{Agent, AgentInit, DeliverFn, RunConfig};
 use crate::plans;

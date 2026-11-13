@@ -1,5 +1,6 @@
 //! `mu-bench`: runs mu in a terminal against a fake model server and measures resource use.
 //! No real model is involved, so a run costs nothing and repeats.
+#![allow(clippy::unwrap_used)] // benchmark harness: a failed setup step should abort the run
 mod check;
 mod compare;
 mod driver;

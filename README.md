@@ -10,7 +10,7 @@ mu keeps most of what omp does and changes where the memory goes. A session hold
 
 - **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3.6 MB of private memory (about 20 MB counting the binary's shared pages).
 - **Features start on use.** Web, memory and prediction are separate processes, and so is the model gateway, which only providers without an API key or ChatGPT sign-in in mu need. Each starts on first use and exits after a few idle minutes. A session that talks only to Anthropic, OpenAI or Baseten with your own key, or to OpenAI on your ChatGPT plan, starts no omp process at all. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
-- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 240 MB while they run, idle). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
+- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 306 MB total, 216 MB private, while they run, idle). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
 - **Works with your omp setup.** mu uses omp's config, models, MCP setup, context files and skills, and its login for OAuth providers. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup: the installer bundles omp for the providers that need it, and Anthropic, OpenAI and Baseten work with just an API key (OpenAI models also run on a ChatGPT plan).
 
@@ -45,13 +45,13 @@ scripts/install.sh --from-source .            # build and install a checkout
 
 If the repo is private (or you install from a private fork), the public URLs return 404. `install.sh` and `mu update` then fall back to an authenticated `gh`; fetch the script itself with `gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash`.
 
-This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Installing `--from-source` needs only a Rust toolchain; no Bun. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
+This installs `mu`, the plugins and a pinned `omp` under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Installing `--from-source` needs only a Rust toolchain; no Bun. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `--from-source` asks git whether the tree has uncommitted changes and records the answer in `~/.mu/dev-build` (removed by any other install), because the version's `-dirty` suffix misses an unstaged edit. `mu --version` prints `mu 0.1.0 (<sha>) omp <version>`.
 
 Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu auth add <provider>`; those models then run without omp. Or sign in with ChatGPT (`/login`, or `mu auth login openai-chatgpt` from a shell) to run OpenAI models on your plan. omp is only needed for subscription (OAuth) logins, the other providers, web search and fetch, and MCP OAuth: log in with `/login` for those, or `~/.mu/bin/omp login` for `mu -p`.
 
 ### Updating
 
-`mu update` installs the latest release by running the repo's `install.sh`. `mu update --check` only reports; `--tag mu-YYYYMMDD-<sha7>` picks a release; `--force` replaces a dev build, which is otherwise refused. On startup the TUI checks for a newer release at most once a day (cached in `~/.mu/update-check`) and shows a notice; it stays silent when offline or on a dev build. Turn it off with `[update] check = false` in config.toml. Checks use the unauthenticated GitHub API (60 requests an hour), or `gh` when the repo is private.
+`mu update` installs the latest release by running the repo's `install.sh`. A dev build is also one that `~/.mu/dev-build` marks. `mu update --check` only reports; `--tag mu-YYYYMMDD-<sha7>` picks a release; `--force` replaces a dev build, which is otherwise refused. On startup the TUI checks for a newer release at most once a day (cached in `~/.mu/update-check`) and shows a notice; it stays silent when offline or on a dev build. Turn it off with `[update] check = false` in config.toml. Checks use the unauthenticated GitHub API (60 requests an hour), or `gh` when the repo is private.
 
 ### Pinned omp
 
@@ -98,7 +98,7 @@ A local systemd timer keeps mu current with oh-my-pi; everything is reported thr
 |---|---|---|
 | S0 | `scripts/maint/check.sh` fails on `origin/main` | issue `maint:s0`; fixer PR `maint:needs-review`; no bump or publish |
 | S1 | new omp release, bump fails checks or cargo cannot resolve the new pin | fixer adapts mu; PR `maint:bump` + `maint:needs-review` (+ `maint:red`). If only the live smoke stage fails the fixer is not run and the PR carries the smoke log |
-| S2 | green bump, nothing in mu is wrong after it | PR `maint:bump` + `maint:auto`, squash-merged. Upstream changes mu only passes through are listed in the PR |
+| S2 | green bump, nothing in mu is wrong after it | PR `maint:bump` + `maint:auto`, squash-merged once the PR's own CI run (the `check` job) passes; if that fails or does not finish within `MU_MAINT_CI_WAIT_SECS` (default 3600) it is labelled `maint:needs-review` and left open. Upstream changes mu only passes through are listed in the PR |
 | S2r | green bump, the release leaves mu's own code, prompts or docs wrong | fixer corrects it; PR `maint:bump` + `maint:needs-review`, not merged. If the fixer makes no edit, or edits only tests and docs (`scripts/maint/test-only.sh`), the PR is merged as S2 |
 | S3 | weekly | issue `maint:digest` with omp changes worth porting |
 | finding | the fixer notices a problem in mu the bump did not cause | issue `maint:finding` |

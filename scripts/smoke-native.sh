@@ -5,7 +5,8 @@
 # Usage: scripts/smoke-native.sh [path-to-mu]   Needs: tmux, python3.
 set -uo pipefail
 mu="$(readlink -f "${1:-target/release/mu}")"
-export MU_HOME="$(mktemp -d)"
+MU_HOME="$(mktemp -d)"
+export MU_HOME
 export OMP_PROFILE="mutest-$$"
 work="$(mktemp -d)"
 tm="mu-native-smoke-$$"

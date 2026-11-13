@@ -64,7 +64,7 @@ Stream rules stay in the core because they run on every streamed token; a proces
 
 ## Crates and layers
 
-The core is a workspace of crates. Each depends only on the ones above it in this table, and the compiler rejects a cycle; a new edge is a `Cargo.toml` change that shows up in review. `mu-common` is shared with the plugins; `mu-testutil` is a dev-dependency only.
+The core is a workspace of crates. Each depends only on the ones above it in this table, and the compiler rejects a cycle; a new edge is a `Cargo.toml` change that shows up in review. `mu-common` is shared with the plugins; `mu-testutil` is a dev-dependency, and an optional dependency of `mu-agent` and `mu-provider` behind their `test-support` feature, which only test builds enable.
 
 | Crate | Holds | Depends on |
 |---|---|---|
@@ -225,7 +225,7 @@ Non-goal: running pi or omp TypeScript extensions.
 | Large tool output, images | Spilled to files; read on expand |
 | Highlighting | No bulk-loaded syntax sets (`syntect` defaults measured at +6.5 MB); per-language, lazily |
 
-**Check:** `incidental = private RAM − bytes of content held`. `mu-bench check` enforces it by hand, on a quiet machine: each row of the read-heavy scenario must stay within 20% plus 1 MB of its committed baseline (`crates/mu-bench/baselines/read-heavy.json`).
+**Check:** `incidental = private RAM − bytes of content held`. `mu-bench check` enforces it by hand, on a quiet machine (neither CI nor the release runs it: the baseline is calibrated to one machine): each row of the read-heavy scenario must stay within 20% plus 1 MB of its committed baseline (`crates/mu-bench/baselines/read-heavy.json`).
 `mu-bench` (`crates/mu-bench`) runs scripted sessions against a fake model and reports private memory after
 each turn, split by region, and compares other harnesses; `check` is its pass/fail gate (`crates/mu-bench/README.md`).
 

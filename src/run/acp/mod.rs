@@ -208,7 +208,8 @@ struct Server {
     sessions: HashMap<String, Session>,
     ev_tx: UnboundedSender<(String, u64, AgentEvent)>,
     next_epoch: u64,
-    /// Results of work that runs off the request loop (opening sessions, listing, model lists).
+    /// Results of work that runs in its own task instead of inline in the request loop (opening sessions,
+    /// listing, model lists).
     done_tx: UnboundedSender<Done>,
     /// Requests the agent makes of the client.
     rpc: Rpc,
@@ -844,7 +845,8 @@ impl Server {
 }
 
 /// Starts an agent for `cwd` and waits until its session file exists. Replayed history, if
-/// requested, is streamed before this returns. Runs off the request loop. `elicit`: the client
+/// requested, is streamed before this returns. Runs as its own local task, so the request loop keeps
+/// turning while it waits; `setup` is synchronous and does block that thread. `elicit`: the client
 /// can ask the user a form, so the model may use `ask`.
 #[allow(clippy::too_many_arguments)]
 async fn open_session(

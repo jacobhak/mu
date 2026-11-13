@@ -35,3 +35,6 @@ uuid.workspace = true
 mu-testutil.workspace = true
 mu-session.workspace = true
 serde_yaml_ng.workspace = true
+
+[lints]
+workspace = true

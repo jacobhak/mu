@@ -2,7 +2,7 @@
 
 Rust coding agent. Toolchain (with rustfmt and clippy) is pinned in `rust-toolchain.toml`; formatting in `rustfmt.toml`.
 
-CI (`.github/workflows/ci.yml`) runs `scripts/ci-checks.sh` before pushing: fmt check, clippy `-D warnings`, the workspace tests and the MCP bridge's tests. The catalog generator's test is a bump-time guard and runs in `scripts/maint/check.sh` instead. Run the same before pushing:
+CI (`.github/workflows/ci.yml`) runs `scripts/ci-checks.sh` before pushing: fmt check, shellcheck (warnings and above, over every tracked shell script; skipped with a note when it is not installed, a failure when `MU_REQUIRE_SHELLCHECK=1`, which the Linux release build sets), cargo-deny (`licenses bans sources` from `deny.toml`; skipped with a note when not installed, a failure when `MU_REQUIRE_CARGO_DENY=1`; run `cargo deny check advisories` by hand now and then), clippy `-D warnings`, the workspace tests and the MCP bridge's tests. The release workflow and the maintenance bot's `scripts/maint/check.sh` run the same script, so every gate runs one list. The catalog generator's test is a bump-time guard and runs in `scripts/maint/check.sh` instead. Run the same before pushing:
 
 ```sh
 scripts/ci-checks.sh
@@ -14,6 +14,6 @@ A full run is ~90 s with sccache warm (~240 s with its cache empty), almost all 
 
 PR checks run on the PR merged with `main`; if CI fails on files you didn't touch, merge `origin/main`, fix, and push.
 
-Release builds also run the tests on macOS (darwin-arm64), but `ci.yml` only runs on Linux, so a macOS-only failure first shows up when a release is tagged. Be careful about platform specifics: `/proc`, `/sys`, `readlink -f`, GNU `sed`/`date`/`stat` flags, `/tmp` vs `$TMPDIR`, case-insensitive filesystems and Linux-only syscalls. mu supports Linux and macOS equally: use portable APIs, and where the platforms differ, implement both rather than skipping one.
+`ci.yml` has a `macos` job on the self-hosted Mac as well as the Linux one, and release builds run `scripts/ci-checks.sh` on both platforms. Nothing gates a merge on either job (branch protection needs a paid plan on a private repo), so a red job is a signal to act on, not a block. Be careful about platform specifics: `/proc`, `/sys`, `readlink -f`, GNU `sed`/`date`/`stat` flags, `/tmp` vs `$TMPDIR`, case-insensitive filesystems and Linux-only syscalls. mu supports Linux and macOS equally: use portable APIs, and where the platforms differ, implement both rather than skipping one.
 
 Enable the pre-commit fmt check once per clone: `git config core.hooksPath .githooks`.

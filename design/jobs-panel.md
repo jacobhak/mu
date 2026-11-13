@@ -1,6 +1,6 @@
 # Jobs panel — design
 
-Status: proposal. Nothing here is implemented.
+Status: implemented (phases 1 to 5 under Phasing). Where the proposal text differs from a phase's notes, the notes win.
 
 ## Problem
 
@@ -47,7 +47,7 @@ title. The body is a list on top and a detail pane below; the split gives the li
  ● read src/tui/blocks.rs 650-700
  ⠙ …
 ── follow ────────────────────────────────────────────────────────
- j/k move  Enter full view  x kill  f follow  y copy result  Tab tab  q close
+ j/k move  Enter full view  x kill  f follow  Tab tab  q close
 ```
 
 Colours follow `design/theme/README.md`: state mark `accent`/`ok`/`err`, id `text`, the rest `muted`,
@@ -69,7 +69,7 @@ Detail pane, by job kind:
 Keys: `j k` / arrows move the list; `Enter` opens the detail full height (`q`/`Esc` back); in the detail
 `j k PgUp PgDn g G` scroll; `f` toggles follow (default on while running, off once you scroll up);
 `x` kills the highlighted job (confirm-free: it is a cancel, not a delete); `X` kills all running jobs;
-`y` copies the result text; `Tab` switches tab; `q`/`Esc` closes.
+`Tab` switches tab; `q`/`Esc` closes. (A copy-result key was proposed and not built.)
 
 ## Sessions tab (other mu processes)
 

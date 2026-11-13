@@ -243,7 +243,8 @@ impl Transcript {
         self.live_text.clear();
     }
 
-    /// A request is being retried: drop everything streamed so far in this attempt.
+    /// A request is being retried: drop the live text, thinking and reveal state of this attempt. Lines
+    /// already committed to the scrollback stay (review B8).
     pub fn reset_stream(&mut self) {
         self.live_text.clear();
         self.thinking = None;

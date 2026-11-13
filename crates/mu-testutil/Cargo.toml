@@ -9,3 +9,6 @@ publish = false
 uuid.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
 crossterm.workspace = true
+
+[lints]
+workspace = true

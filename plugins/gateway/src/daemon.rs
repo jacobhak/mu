@@ -363,8 +363,8 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Re
     }
     let tag = args.join(" ");
     let (tx, rx) = mpsc::channel::<String>();
-    let out = child.stdout.take().unwrap();
-    let err = child.stderr.take().unwrap();
+    let out = child.stdout.take().expect("stdout is piped");
+    let err = child.stderr.take().expect("stderr is piped");
     for r in [Box::new(out) as Box<dyn Read + Send>, Box::new(err)] {
         let (tx, tag) = (tx.clone(), tag.clone());
         thread::spawn(move || {

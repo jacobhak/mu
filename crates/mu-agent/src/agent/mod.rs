@@ -375,7 +375,7 @@ impl Agent {
     pub fn system(&self) -> String {
         let mcp = self.ports.plugins.mcp_instructions();
         let roles = self.delegated_roles();
-        prompt::system_prompt(&PromptInput {
+        let prompt = prompt::system_prompt(&PromptInput {
             model: &self.model.model.id,
             cwd: &self.cwd,
             ctx: &self.ctx,
@@ -390,7 +390,8 @@ impl Agent {
             hashline: mu_tools::tools::edit::is_hashline(),
             jobs: self.tools.jobs.is_some(),
             bash: self.policy().permits("bash"),
-        })
+        });
+        secrets::redact(&prompt, &self.cwd).text
     }
 
     pub async fn run(mut self, rx: UnboundedReceiver<Command>) {

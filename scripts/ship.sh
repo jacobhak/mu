@@ -60,18 +60,21 @@ done
 [ "$shipped" = 1 ] || die "gave up after 3 attempts"
 
 git fetch --quiet origin
+stale=0
 if [ "$main_dir" != "$top" ]; then
   if [ "$(git -C "$main_dir" symbolic-ref --quiet --short HEAD)" = main ] \
     && git -C "$main_dir" merge --quiet --ff-only origin/main; then
     say "fast-forwarded main in $main_dir"
   else
     say "main in $main_dir not updated (not on main, or diverged)"
+    stale=1
   fi
 elif [ "$branch" = main ]; then
   git merge --quiet --ff-only origin/main
 fi
 
-if [ "$install" = 1 ]; then
+# Installing from a checkout that is not at origin/main would install an older commit.
+if [ "$install" = 1 ] && [ "$stale" = 0 ]; then
   "$main_dir/scripts/install.sh" --from-source "$main_dir"
 fi
 
@@ -81,4 +84,7 @@ if [ "$keep" = 0 ] && [ "$main_dir" != "$top" ] && [ "$branch" != main ]; then
   git worktree remove "$top"
   git branch --quiet -d "$branch" 2>/dev/null || git branch --quiet -D "$branch"
   say "removed worktree $top and branch $branch"
+fi
+if [ "$stale" = 1 ]; then
+  die "pushed to origin/main, but main in $main_dir is not at origin/main: nothing installed (update it, then scripts/install.sh --from-source $main_dir)"
 fi

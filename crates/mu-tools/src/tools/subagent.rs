@@ -139,7 +139,7 @@ pub async fn run_child_observed(
         Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
     };
     let pid = child.id().unwrap_or(0) as i32;
-    let mut stdin = child.stdin.take().unwrap();
+    let mut stdin = child.stdin.take().expect("stdin is piped");
     // The task payload, then one line per approval answer, for as long as the child reads them.
     let (wtx, mut wrx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let task = payload.to_string();
@@ -153,7 +153,7 @@ pub async fn run_child_observed(
         }
         let _ = stdin.shutdown().await;
     });
-    let stderr = child.stderr.take().unwrap();
+    let stderr = child.stderr.take().expect("stderr is piped");
     let err_task = tokio::task::spawn_local(async move {
         let mut tail: std::collections::VecDeque<String> = Default::default();
         let mut lines = BufReader::new(stderr).lines();
@@ -165,7 +165,7 @@ pub async fn run_child_observed(
         }
         tail.into_iter().collect::<Vec<_>>().join("\n")
     });
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
     let mut result: Option<ChildResult> = None;
     let mut cancelled = false;
     let mut bad_line: Option<String> = None;

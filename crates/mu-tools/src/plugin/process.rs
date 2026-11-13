@@ -26,7 +26,7 @@ fn live_groups() -> &'static Mutex<Vec<i32>> {
 /// SIGKILLs every running plugin's process group, and every process group mu started itself (background
 /// jobs, subagents, foreground commands).
 pub(crate) fn kill_all_groups() {
-    for g in live_groups().lock().unwrap().iter() {
+    for g in live_groups().lock().expect("live groups lock poisoned").iter() {
         mu_base::process::kill_group(*g, libc::SIGKILL);
     }
     let me = std::process::id() as i32;
@@ -198,7 +198,8 @@ impl Proc {
         self.last.set(Instant::now());
         // Runs on every exit, including this future being dropped (a cancelled call).
         let _guard = InflightGuard { proc: self, id };
-        let line = serde_json::to_string(&Request::new(Some(self.wire_id(id)), method, params)).unwrap();
+        let line =
+            serde_json::to_string(&Request::new(Some(self.wire_id(id)), method, params)).expect("request serializes");
         let gone =
             |r: Result<Result<Value, String>, _>| r.unwrap_or_else(|_| Err(format!("plugin {} exited", self.name)));
         // The write sits inside the timeout and the cancel race: a plugin that stops reading stdin
@@ -233,8 +234,11 @@ impl Proc {
         if self.mcp().is_some() {
             let n =
                 Request::new(None, "notifications/cancelled", json!({"requestId": self.wire_id(id), "reason": why}));
-            let _ = tokio::time::timeout(Duration::from_secs(2), self.write_line(&serde_json::to_string(&n).unwrap()))
-                .await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.write_line(&serde_json::to_string(&n).expect("notification serializes")),
+            )
+            .await;
         }
         Err(match why {
             "cancelled" => "Tool call aborted by user".to_string(),
@@ -244,7 +248,7 @@ impl Proc {
 
     pub(super) async fn shutdown(&self) {
         if self.mcp().is_none() {
-            let line = serde_json::to_string(&Request::new(None, "shutdown", json!({}))).unwrap();
+            let line = serde_json::to_string(&Request::new(None, "shutdown", json!({}))).expect("request serializes");
             let _ = tokio::time::timeout(Duration::from_secs(2), self.write_line(&line)).await;
         }
         let Ok(mut stdin) = tokio::time::timeout(Duration::from_secs(2), self.stdin.lock()).await else {
@@ -314,7 +318,7 @@ async fn read_loop(
         mu_base::process::kill_group(proc.pid as i32, libc::SIGKILL);
         let _ = child.wait().await;
     }
-    live_groups().lock().unwrap().retain(|g| *g != proc.pid as i32);
+    live_groups().lock().expect("live groups lock poisoned").retain(|g| *g != proc.pid as i32);
     let _ = proc.dead.send(true);
 }
 
@@ -373,7 +377,7 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
             }
             Err(e) => Response::err(id, -32601, e),
         };
-        let _ = proc.write_line(&serde_json::to_string(&resp).unwrap()).await;
+        let _ = proc.write_line(&serde_json::to_string(&resp).expect("response serializes")).await;
     }
 }
 
@@ -417,8 +421,8 @@ impl PluginHost {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log);
         let mut child = mu_base::process::spawn_grouped(&mut cmd, true)
             .map_err(|e| format!("cannot start plugin {name} ({}): {e}", slot.program()))?;
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
+        let stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
         let (dead, _) = watch::channel(false);
         let dialect = match &slot.kind {
             Kind::Native { .. } => Dialect::Native,
@@ -439,7 +443,7 @@ impl PluginHost {
             dead,
             dialect,
         });
-        live_groups().lock().unwrap().push(proc.pid as i32);
+        live_groups().lock().expect("live groups lock poisoned").push(proc.pid as i32);
         *slot.proc.borrow_mut() = Some(proc.clone());
         tokio::task::spawn_local(read_loop(proc.clone(), slot.clone(), self.shared.clone(), stdout, child));
         let handshake = match &slot.kind {

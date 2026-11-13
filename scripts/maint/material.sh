@@ -26,7 +26,7 @@ stat crates.stat crates/pi-edit crates/pi-shell crates/pi-diff crates/pi-walker 
 cat > "$out/touchpoints.md" <<'TP'
 # omp touchpoints in mu
 
-- Rust crates pinned in Cargo.toml by tag: `pi-edit`, `pi-shell`, `pi-diff`, `pi-walker`, plus patched `brush-core`, `brush-parser`, `tree-sitter-go`.
+- Rust crates pinned in Cargo.toml by tag: `pi-edit`, `pi-shell`, `pi-diff`, `pi-walker`, plus the patched `tree-sitter-go`, `grep-searcher`, `jaq-core`, `jaq-json`, `jaq-std` (`[patch.crates-io]`).
 - The `omp` CLI, run as a subprocess (the pinned copy at ~/.mu/bin/omp): `auth-broker`, `auth-gateway`, `models ls --json`, `login`, `search`, `read`, `--version`.
 - Provider APIs reached through the omp gateway.
 - omp config read by mu: `config.yml` status line, theme, skills; `.omp/agents`, `.omp/commands`, `AGENTS.md`.

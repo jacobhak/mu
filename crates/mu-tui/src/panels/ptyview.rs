@@ -13,7 +13,7 @@ pub struct PtyView {
 }
 
 fn nz(n: u16) -> NonZeroU16 {
-    NonZeroU16::new(n.max(1)).unwrap()
+    NonZeroU16::new(n.max(1)).expect("max(1) is non-zero")
 }
 
 impl PtyView {

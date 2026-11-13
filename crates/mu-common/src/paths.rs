@@ -138,7 +138,7 @@ pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot run omp");
-    let mut stdout = child.stdout.take().unwrap();
+    let mut stdout = child.stdout.take().expect("stdout is piped");
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
@@ -156,7 +156,7 @@ pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
             None => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
     }
-    String::from_utf8_lossy(&reader.join().unwrap()).into_owned()
+    String::from_utf8_lossy(&reader.join().expect("reader thread does not panic")).into_owned()
 }
 
 #[cfg(test)]

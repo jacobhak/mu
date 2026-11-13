@@ -14,3 +14,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util", "sync", "fs"] }
 toml = "1"
 uuid = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,8 +1,11 @@
 //! `@path` imports in AGENTS.md-style files (port of omp's `discovery/at-imports.ts`).
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const MAX_DEPTH: usize = 5;
+/// The most an imported file may hold; a larger one is skipped, not truncated.
+pub const MAX_IMPORT_BYTES: u64 = 256 * 1024;
 
 type Warn<'a> = &'a mut dyn FnMut(String);
 
@@ -10,11 +13,50 @@ fn key(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Expands `@path` imports in `content`, which was read from `file`.
-pub fn expand(content: &str, file: &Path, home: &Path, warn: &mut dyn FnMut(String)) -> String {
+/// What an import may resolve against: `~` and the canonical directories it may read from.
+struct Scope<'a> {
+    home: &'a Path,
+    roots: Vec<PathBuf>,
+}
+
+enum Fail {
+    Read(String),
+    Refused(String),
+}
+
+/// Reads a canonical path through the opened file, never a FIFO or device: `O_NONBLOCK` keeps the
+/// open from waiting on a FIFO, and the type and size are checked on the handle that is then read.
+fn read_import(path: &Path) -> Result<String, Fail> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NONBLOCK);
+    let f = o.open(path).map_err(|e| Fail::Read(e.to_string()))?;
+    let md = f.metadata().map_err(|e| Fail::Read(e.to_string()))?;
+    if !md.is_file() {
+        return Err(Fail::Refused("not a regular file".into()));
+    }
+    let too_big = || Fail::Refused(format!("larger than {} KiB", MAX_IMPORT_BYTES / 1024));
+    if md.len() > MAX_IMPORT_BYTES {
+        return Err(too_big());
+    }
+    let mut buf = Vec::new();
+    f.take(MAX_IMPORT_BYTES + 1).read_to_end(&mut buf).map_err(|e| Fail::Read(e.to_string()))?;
+    if buf.len() as u64 > MAX_IMPORT_BYTES {
+        return Err(too_big());
+    }
+    String::from_utf8(buf).map_err(|_| Fail::Read("stream did not contain valid UTF-8".into()))
+}
+
+/// Expands `@path` imports in `content`, which was read from `file`. Only files under `roots` or
+/// `file`'s own directory are read; any other import is replaced by a notice saying it was skipped.
+pub fn expand(content: &str, file: &Path, home: &Path, roots: &[PathBuf], warn: &mut dyn FnMut(String)) -> String {
     let mut visited = HashSet::from([key(file)]);
     let base = file.parent().unwrap_or(Path::new("."));
-    expand_at(content, base, 0, file, home, &mut visited, warn)
+    let mut roots: Vec<PathBuf> = roots.iter().chain(std::iter::once(&base.to_path_buf())).map(|r| key(r)).collect();
+    roots.dedup();
+    let scope = Scope { home, roots };
+    expand_at(content, base, 0, file, &scope, &mut visited, warn)
 }
 
 fn fence_of(line: &str) -> Option<(char, usize)> {
@@ -29,7 +71,7 @@ fn expand_at(
     base: &Path,
     depth: usize,
     importer: &Path,
-    home: &Path,
+    scope: &Scope,
     visited: &mut HashSet<PathBuf>,
     warn: Warn,
 ) -> String {
@@ -49,7 +91,7 @@ fn expand_at(
                 out.push_str(line);
             }
             (Some(_), _) => out.push_str(line),
-            (None, None) => out.push_str(&expand_line(line, base, depth, importer, home, visited, warn)),
+            (None, None) => out.push_str(&expand_line(line, base, depth, importer, scope, visited, warn)),
         }
     }
     out
@@ -73,7 +115,7 @@ fn expand_line(
     base: &Path,
     depth: usize,
     importer: &Path,
-    home: &Path,
+    scope: &Scope,
     visited: &mut HashSet<PathBuf>,
     warn: Warn,
 ) -> String {
@@ -114,29 +156,40 @@ fn expand_line(
         }
         let raw = token.replace("\\ ", " ");
         let resolved = if raw == "~" {
-            home.to_path_buf()
+            scope.home.to_path_buf()
         } else if let Some(r) = raw.strip_prefix("~/") {
-            home.join(r)
+            scope.home.join(r)
         } else if Path::new(&raw).is_absolute() {
             PathBuf::from(&raw)
         } else {
             base.join(&raw)
         };
         let original = &line[p..span_end];
-        if visited.contains(&key(&resolved)) {
+        let canon = std::fs::canonicalize(&resolved);
+        if canon.as_ref().is_ok_and(|c| visited.contains(c)) {
             out.push_str(original);
         } else {
-            match std::fs::read_to_string(&resolved) {
-                Err(e) => {
+            let result = match &canon {
+                Err(e) => Err(Fail::Read(e.to_string())),
+                Ok(c) if scope.roots.iter().any(|r| c.starts_with(r)) => read_import(c),
+                Ok(_) => Err(Fail::Refused("outside the project and mu's directories".into())),
+            };
+            let canon = canon.unwrap_or_else(|_| resolved.clone());
+            match result {
+                Err(Fail::Read(e)) => {
                     if ["./", "../", "/", "~"].iter().any(|s| raw.starts_with(s)) {
                         warn(format!("{}: cannot read @-import {}: {e}", importer.display(), resolved.display()));
                     }
                     out.push_str(original);
                 }
+                Err(Fail::Refused(why)) => {
+                    warn(format!("{}: skipped @-import {}: {why}", importer.display(), canon.display()));
+                    out.push_str(&format!("[@-import {} skipped: {why}]", canon.display()));
+                }
                 Ok(text) => {
-                    visited.insert(key(&resolved));
-                    let dir = resolved.parent().unwrap_or(Path::new(".")).to_path_buf();
-                    let inner = expand_at(&text, &dir, depth + 1, &resolved, home, visited, warn);
+                    visited.insert(canon.clone());
+                    let dir = canon.parent().unwrap_or(Path::new(".")).to_path_buf();
+                    let inner = expand_at(&text, &dir, depth + 1, &canon, scope, visited, warn);
                     out.push_str(inner.trim_end_matches(['\n', '\r']));
                 }
             }
@@ -158,8 +211,93 @@ mod tests {
     }
     fn run(dir: &Path, name: &str, input: &str, home: &Path) -> (String, Vec<String>) {
         let mut warns = Vec::new();
-        let out = expand(input, &dir.join(name), home, &mut |x| warns.push(x));
+        let out = expand(input, &dir.join(name), home, &[home.to_path_buf()], &mut |x| warns.push(x));
         (out, warns)
+    }
+
+    fn confined(project: &Path, input: &str) -> (String, Vec<String>) {
+        let mut warns = Vec::new();
+        let out = expand(input, &project.join("AGENTS.md"), project, &[], &mut |x| warns.push(x));
+        (out, warns)
+    }
+
+    fn skipped(o: &str, warns: &[String], secret: &str, why: &str) {
+        assert!(!o.contains(secret), "{o}");
+        assert!(o.contains("skipped") && o.contains(why), "{o}");
+        assert!(warns.len() == 1 && warns[0].contains(why), "{warns:?}");
+    }
+
+    #[test]
+    fn absolute_path_outside_is_skipped() {
+        let d = tmp();
+        w(&d.join("out/key"), "SECRET-KEY");
+        let input = format!("@{}\n", d.join("out/key").display());
+        let (o, warns) = confined(&d.join("proj"), &input);
+        skipped(&o, &warns, "SECRET-KEY", "outside");
+    }
+
+    #[test]
+    fn dotdot_escape_is_skipped() {
+        let d = tmp();
+        w(&d.join("out/key"), "SECRET-KEY");
+        std::fs::create_dir_all(d.join("proj")).unwrap();
+        let (o, warns) = confined(&d.join("proj"), "@../out/key\n");
+        skipped(&o, &warns, "SECRET-KEY", "outside");
+    }
+
+    #[test]
+    fn home_import_outside_roots_is_skipped() {
+        let d = tmp();
+        w(&d.join("home/.ssh/id"), "SECRET-KEY");
+        std::fs::create_dir_all(d.join("proj")).unwrap();
+        let mut warns = Vec::new();
+        let o = expand("@~/.ssh/id\n", &d.join("proj/AGENTS.md"), &d.join("home"), &[d.join("home/.omp")], &mut |x| {
+            warns.push(x)
+        });
+        skipped(&o, &warns, "SECRET-KEY", "outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_skipped() {
+        let d = tmp();
+        w(&d.join("out/key"), "SECRET-KEY");
+        std::fs::create_dir_all(d.join("proj")).unwrap();
+        std::os::unix::fs::symlink(d.join("out/key"), d.join("proj/link.md")).unwrap();
+        let (o, warns) = confined(&d.join("proj"), "@./link.md\n");
+        skipped(&o, &warns, "SECRET-KEY", "outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_skipped_without_blocking() {
+        let d = tmp();
+        std::fs::create_dir_all(d.join("proj")).unwrap();
+        let fifo = std::ffi::CString::new(d.join("proj/pipe.md").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (o, warns) = confined(&d.join("proj"), "@./pipe.md\n");
+        skipped(&o, &warns, "@./pipe.md\n", "not a regular file");
+    }
+
+    #[test]
+    fn oversize_file_is_skipped() {
+        let d = tmp();
+        w(&d.join("proj/big.md"), &"x".repeat(MAX_IMPORT_BYTES as usize + 1));
+        let (o, warns) = confined(&d.join("proj"), "@./big.md\n");
+        skipped(&o, &warns, "xxxx", "larger than");
+        w(&d.join("proj/ok.md"), &"y".repeat(MAX_IMPORT_BYTES as usize));
+        let (o, warns) = confined(&d.join("proj"), "@./ok.md\n");
+        assert!(o.starts_with("yyyy") && warns.is_empty());
+    }
+
+    #[test]
+    fn in_project_import_still_works() {
+        let d = tmp();
+        w(&d.join("proj/rules/a.md"), "RULE-A @../b.md");
+        w(&d.join("proj/b.md"), "RULE-B");
+        let (o, warns) = confined(&d.join("proj"), "@./rules/a.md\n");
+        assert_eq!(o, "RULE-A RULE-B\n");
+        assert!(warns.is_empty());
     }
 
     #[test]

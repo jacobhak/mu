@@ -15,7 +15,7 @@ static OUTBOX: Mutex<Option<mpsc::UnboundedSender<String>>> = Mutex::new(None);
 pub fn notify(method: &str, params: Value) {
     let g = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = g.as_ref() {
-        let _ = tx.send(serde_json::to_string(&Request::new(None, method, params)).unwrap());
+        let _ = tx.send(serde_json::to_string(&Request::new(None, method, params)).expect("request serializes"));
     }
 }
 
@@ -31,7 +31,7 @@ fn pending() -> &'static Pending {
 pub async fn request(method: &str, params: Value) -> Result<Value, String> {
     let tx = OUTBOX.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("not serving")?;
     let (id, rx) = pending().register();
-    let line = serde_json::to_string(&Request::new(Some(Value::from(id)), method, params)).unwrap();
+    let line = serde_json::to_string(&Request::new(Some(Value::from(id)), method, params)).expect("request serializes");
     if tx.send(line).is_err() {
         pending().cancel(id);
         return Err("host closed".into());
@@ -201,7 +201,7 @@ struct PendingInner {
 impl Pending {
     /// A new id and the receiver its reply arrives on.
     pub fn register(&self) -> (u64, oneshot::Receiver<Result<Value, String>>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().expect("pending lock poisoned");
         g.next += 1;
         let id = g.next;
         let (tx, rx) = oneshot::channel();
@@ -211,25 +211,25 @@ impl Pending {
 
     /// Delivers `result` to the waiter for `id`, if it is still waiting.
     pub fn resolve(&self, id: u64, result: Result<Value, String>) {
-        if let Some(tx) = self.inner.lock().unwrap().waiting.remove(&id) {
+        if let Some(tx) = self.inner.lock().expect("pending lock poisoned").waiting.remove(&id) {
             let _ = tx.send(result);
         }
     }
 
     /// Forgets `id` (its caller gave up).
     pub fn cancel(&self, id: u64) {
-        self.inner.lock().unwrap().waiting.remove(&id);
+        self.inner.lock().expect("pending lock poisoned").waiting.remove(&id);
     }
 
     /// Fails every waiter, e.g. when the connection ended.
     pub fn fail_all(&self, message: &str) {
-        for (_, tx) in self.inner.lock().unwrap().waiting.drain() {
+        for (_, tx) in self.inner.lock().expect("pending lock poisoned").waiting.drain() {
             let _ = tx.send(Err(message.to_string()));
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().waiting.is_empty()
+        self.inner.lock().expect("pending lock poisoned").waiting.is_empty()
     }
 }
 
@@ -271,7 +271,7 @@ where
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e.code, e.message),
                 };
-                let _ = tx.send(serde_json::to_string(&resp).unwrap());
+                let _ = tx.send(serde_json::to_string(&resp).expect("response serializes"));
             }
         });
         if stop {

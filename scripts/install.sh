@@ -45,6 +45,10 @@ resolved_path() {
 }
 
 # 1. Source
+# build.rs reruns only when git's HEAD or index change, so a build made from an unstaged edit can carry a
+# clean-looking sha. The tree is asked here instead, and the answer recorded for `mu update` and --skip-if-dev.
+dirty=0
+if [ -n "$src" ] && [ -n "$(git -C "$src" status --porcelain --untracked-files=no 2>/dev/null)" ]; then dirty=1; fi
 if [ -n "$src" ]; then
   (cd "$src" && cargo build --release --workspace --locked && scripts/build-mcp-http.sh build)
   . "$src/scripts/lib-layout.sh"
@@ -74,6 +78,10 @@ stage="$tmp/mu"
 
 # 2. Dev-build guard
 if [ "$skip_dev" = 1 ] && [ -x "$home/bin/mu" ]; then
+  if [ -e "$home/dev-build" ]; then
+    echo "install: skipped, installed mu was built from uncommitted changes"
+    exit 0
+  fi
   sha="$("$home/bin/mu" --version 2>/dev/null | sed -n 's/.*(\([0-9a-f]*\(-dirty\)\{0,1\}\|unknown\)).*/\1/p' | head -1)"
   if [ -n "$sha" ]; then
     dev=0
@@ -119,6 +127,12 @@ done
 # The memory plugin used to be a Bun daemon; its socket and lock are all it left in $MU_HOME/memory.
 rm -f "$home/bin/mu-memory-daemon" "$home/memory/sock" "$home/memory/lock"
 rmdir "$home/memory" 2>/dev/null || true
+
+if [ "$dirty" = 1 ]; then
+  git -C "$src" rev-parse --short=12 HEAD > "$home/dev-build"
+else
+  rm -f "$home/dev-build"
+fi
 
 # 4. Link
 if [ "$link" = 1 ]; then

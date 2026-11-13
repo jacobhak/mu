@@ -127,7 +127,7 @@ impl Permissions {
         let grant_rules = grant::grant_rules(g);
         rules.borrow_mut().0.extend(grant_rules);
         match scope {
-            ApprovalScope::Project if persist => store::add_project(&self.project.get().unwrap().key, g),
+            ApprovalScope::Project if persist => store::add_project(&self.project.get().expect("checked above").key, g),
             ApprovalScope::Global if persist => store::add_global(g),
             _ => Ok(GrantOutcome::Written),
         }

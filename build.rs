@@ -25,5 +25,8 @@ fn main() {
         .unwrap_or("unknown");
     println!("cargo:rustc-env=MU_GIT_SHA={sha}");
     println!("cargo:rustc-env=MU_OMP_VERSION={omp}");
-    println!("cargo:rustc-env=MU_VERSION={} ({sha}) omp {omp}", std::env::var("CARGO_PKG_VERSION").unwrap());
+    println!(
+        "cargo:rustc-env=MU_VERSION={} ({sha}) omp {omp}",
+        std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION")
+    );
 }

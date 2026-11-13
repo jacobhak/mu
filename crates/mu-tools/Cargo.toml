@@ -38,3 +38,6 @@ uuid.workspace = true
 [dev-dependencies]
 mu-testutil.workspace = true
 mu-provider = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

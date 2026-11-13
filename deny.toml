@@ -1,0 +1,36 @@
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+# `cargo deny check licenses bans sources` runs in scripts/ci-checks.sh. Advisories change without a
+# commit, so they would turn CI red on their own: run `cargo deny check advisories` by hand now and then.
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is archived; serde_yaml_ng (config and session YAML) has no maintained replacement in the tree" },
+]
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "bzip2-1.0.6",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/can1357/oh-my-pi"]

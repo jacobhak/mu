@@ -112,6 +112,12 @@ jaq-core = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.20.0" }
 jaq-json = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.20.0" }
 jaq-std = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.20.0" }
 
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+
 [profile.dev]
 debug = "line-tables-only"
 

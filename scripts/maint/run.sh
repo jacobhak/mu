@@ -69,7 +69,8 @@ nightly() {
   if ! "$here/check.sh" "$wt" "$RUN/main" 9>&- > "$RUN/main/check.out" 2>&1; then
     result=s0
     log "baseline red"
-    local body="$RUN/s0-issue.md" branch="maint/fix-main-$(date +%Y%m%d)"
+    local body="$RUN/s0-issue.md" branch
+    branch="maint/fix-main-$(date +%Y%m%d)"
     { echo "\`check.sh\` fails on origin/main (${checked_sha:0:7}) with the pinned omp."; echo; failing_tail "$RUN/main"; } > "$body"
     issue_upsert maint:s0 "S0: main is broken" "$body"
     worktree fix origin/main "$branch"
@@ -84,7 +85,8 @@ P
       if "$here/check.sh" "$fixwt" "$RUN/fix" 9>&- > "$RUN/fix/check.out" 2>&1; then green=1; fi
     fi
     if [ "$green" = 1 ]; then
-      local title="Fix main: $(first_line "$fout")"
+      local title
+      title="Fix main: $(first_line "$fout")"
       git -C "$fixwt" add -A
       git -C "$fixwt" commit -q -m "$title" -m "$(cat "$fout")"
       pushw "$fixwt" push -f -u origin "$branch"
@@ -139,6 +141,22 @@ P
 
   publish
   log "maint: result=$result published=$published spend=\$$(run_spend)"
+}
+
+# ci_wait <branch>: waits for the PR's `check` job (the macos job gates nothing). Exit 0 when it passed,
+# 1 when it failed or was cancelled, 2 when it had not finished within MU_MAINT_CI_WAIT_SECS.
+ci_wait() {
+  local branch="$1" deadline bucket
+  deadline=$((SECONDS + ${MU_MAINT_CI_WAIT_SECS:-3600}))
+  while :; do
+    bucket="$(gh pr checks "$branch" -R "$REPO" --json name,bucket -q '[.[] | select(.name == "check")] | .[0].bucket // ""' 2> /dev/null || true)"
+    case "$bucket" in
+      pass) return 0 ;;
+      fail | cancel) return 1 ;;
+    esac
+    [ "$SECONDS" -lt "$deadline" ] || return 2
+    sleep 30
+  done
 }
 
 # bump_flow <pinned> <latest> <branch> [open-pr] [its-omp-version]; writes $RUN/result
@@ -281,7 +299,22 @@ P
     ghw issue create -R "$REPO" --label maint:finding --title "maint finding (found while bumping omp to v$latest)" --body-file "$RUN/finding.md"
   fi
   if [ "$result" = s2 ]; then
-    ghw pr merge "$branch" -R "$REPO" --squash --delete-branch
+    # check.sh already ran the same list as CI, but on this machine only: the PR's own run is the second opinion.
+    local ci=0
+    dry || ci_wait "$branch" || ci=$?
+    if [ "$ci" = 0 ]; then
+      ghw pr merge "$branch" -R "$REPO" --squash --delete-branch
+    else
+      local why="the PR's CI run failed"
+      [ "$ci" = 1 ] || why="the PR's CI run did not finish within ${MU_MAINT_CI_WAIT_SECS:-3600} s"
+      log "bump PR $branch not merged: $why"
+      result=s2-ci
+      echo "$result" > "$RUN/result"
+      local num="${pr:-${url##*/}}"
+      ghw api --silent -X POST "repos/$REPO/issues/$num/labels" -f "labels[]=maint:needs-review"
+      ghw api --silent -X DELETE "repos/$REPO/issues/$num/labels/maint:auto" 2> /dev/null || true
+      ghw pr comment "$num" -R "$REPO" --body "Not auto-merged: $why. The local checks were green."
+    fi
   fi
 }
 

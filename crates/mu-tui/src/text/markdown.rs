@@ -443,7 +443,7 @@ impl<'a> R<'a> {
                     if rows.is_empty() {
                         rows.push((false, Vec::new()));
                     }
-                    rows.last_mut().unwrap().1.push(c);
+                    rows.last_mut().expect("a row was pushed above").1.push(c);
                 }
                 _ => self.pos += 1,
             }

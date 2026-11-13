@@ -4,7 +4,8 @@
 set -uo pipefail
 mu="$(readlink -f "${1:-target/release/mu}")"
 root="$(cd "$(dirname "$0")/.." && pwd)"
-export MU_HOME="$(mktemp -d)"
+MU_HOME="$(mktemp -d)"
+export MU_HOME
 profile="${OMP_PROFILE:-${PI_PROFILE:-}}"
 state="$MU_HOME${profile:+/profiles/$profile}" # mu's per-profile state (paths::profile_home)
 mkdir -p "$MU_HOME/plugins" && ln -s "$root/plugins/gateway" "$MU_HOME/plugins/gateway"

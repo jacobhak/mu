@@ -77,7 +77,7 @@ fn base36(mut n: u64) -> String {
         n /= 36;
     }
     out.reverse();
-    String::from_utf8(out).unwrap()
+    String::from_utf8(out).expect("base36 digits are ASCII")
 }
 
 /// Lowercase, runs of anything outside `[a-z0-9_]` become `_`, `_` runs collapse, ends are trimmed.

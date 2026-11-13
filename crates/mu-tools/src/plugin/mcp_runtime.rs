@@ -479,6 +479,6 @@ impl PluginHost {
         w.tools_cap.set(r["capabilities"].get("tools").is_some_and(|t| !t.is_null()));
         *w.instructions.borrow_mut() = r["instructions"].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
         let n = Request::new(None, "notifications/initialized", json!({}));
-        proc.write_line(&serde_json::to_string(&n).unwrap()).await
+        proc.write_line(&serde_json::to_string(&n).expect("notification serializes")).await
     }
 }

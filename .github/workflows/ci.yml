@@ -6,7 +6,8 @@ on:
 permissions:
   contents: read
 env:
-  # Four workspace builds (clippy and test, with and without default features) must fit the runner's disk.
+  # The workspace builds once, in the dev profile, and clippy runs in that same build; no debug info keeps it
+  # within the runner's disk.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_INCREMENTAL: 0
 jobs:
