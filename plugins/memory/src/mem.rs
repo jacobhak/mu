@@ -64,6 +64,32 @@ pub struct Edited {
     pub history: bool,
 }
 
+#[derive(Debug)]
+pub enum EditError {
+    /// The ops do not apply to the current state; a model can correct them.
+    Rejected(String),
+    /// The lock, the files or git failed; the ops may be fine.
+    Failed(String),
+}
+
+impl EditError {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Rejected(m) | Self::Failed(m) => m,
+        }
+    }
+}
+
+fn read_entries(p: &Path) -> Result<Vec<String>, String> {
+    match std::fs::read(p) {
+        Ok(b) => String::from_utf8(b).map(|t| store::parse_entries(&t)).map_err(|_| {
+            format!("{}: not valid UTF-8, so memory was left untouched; fix or remove the file", p.display())
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", p.display())),
+    }
+}
+
 pub struct LockGuard(std::fs::File);
 
 impl Drop for LockGuard {
@@ -111,9 +137,9 @@ impl Mem {
         }
     }
 
-    /// The current state on disk. A missing file is empty.
-    pub fn load(&self) -> State {
-        let entries = |p: PathBuf| store::parse_entries(&std::fs::read_to_string(p).unwrap_or_default());
+    /// The current state on disk. A missing file is empty; one that exists but cannot be read or decoded is an
+    /// error, so nothing rewrites it from empty state.
+    pub fn load(&self) -> Result<State, String> {
         let mut notes = std::collections::BTreeMap::new();
         if let Ok(rd) = std::fs::read_dir(self.notes_dir()) {
             for e in rd.flatten() {
@@ -131,7 +157,7 @@ impl Mem {
                 }
             }
         }
-        State { user: entries(self.user_path()), project: entries(self.project_path()), notes }
+        Ok(State { user: read_entries(&self.user_path())?, project: read_entries(&self.project_path())?, notes })
     }
 
     /// Takes the exclusive lock, waiting up to 30 s. Concurrent sessions serialise on it.
@@ -165,17 +191,23 @@ impl Mem {
     }
 
     /// Applies `ops` under the lock and commits as `<prefix>: <summary>`.
-    pub async fn edit(&self, mut ops: Vec<Op>, cwd: &Path, prefix: &str) -> Result<Edited, String> {
+    pub async fn edit(&self, ops: Vec<Op>, cwd: &Path, prefix: &str) -> Result<Edited, String> {
+        self.edit_classified(ops, cwd, prefix).await.map_err(EditError::into_message)
+    }
+
+    /// `edit`, telling an op the store rejects from a failure of the machinery around it.
+    pub async fn edit_classified(&self, mut ops: Vec<Op>, cwd: &Path, prefix: &str) -> Result<Edited, EditError> {
         let redacted = redact_ops(&mut ops, cwd);
-        let _guard = self.lock().await?;
+        let _guard = self.lock().await.map_err(EditError::Failed)?;
         let history = self.prepare().await;
-        let (next, outcome) = store::apply(&self.load(), &ops, &self.cfg.caps)?;
+        let current = self.load().map_err(EditError::Failed)?;
+        let (next, outcome) = store::apply(&current, &ops, &self.cfg.caps).map_err(EditError::Rejected)?;
         if outcome.changed() {
-            self.write(&next, &outcome)?;
+            self.write(&next, &outcome).map_err(EditError::Failed)?;
             if history {
                 let msg = format!("{prefix}: {}", outcome.summary);
                 if let Err(e) = gitx::commit_all(&self.root, &msg).await {
-                    return Err(format!("saved, but the commit failed: {e}"));
+                    return Err(EditError::Failed(format!("saved, but the commit failed: {e}")));
                 }
             }
         }
@@ -279,7 +311,7 @@ mod tests {
             assert_eq!(log[0].message, "tool s1: add user, add project, write_note rel");
             assert!(log[0].files.iter().any(|f| f == "user.md"));
             assert!(log[0].files.iter().any(|f| f.ends_with("notes/rel.md")));
-            assert_eq!(m.load(), e.state);
+            assert_eq!(m.load().unwrap(), e.state);
             assert!(std::fs::read_to_string(m.root.join(".gitignore")).unwrap().contains(".state/"));
             // A no-op edit commits nothing.
             let e = m.edit(vec![add(File::User, "Prefers terse replies")], &d, "tool s1").await.unwrap();
@@ -296,7 +328,7 @@ mod tests {
             m.edit(vec![add(File::User, "One")], &d, "tool s").await.unwrap();
             std::fs::write(m.user_path(), "One\n§\nHand written\n").unwrap();
             m.edit(vec![add(File::User, "Two")], &d, "tool s").await.unwrap();
-            assert_eq!(m.load().user, ["One", "Hand written", "Two"]);
+            assert_eq!(m.load().unwrap().user, ["One", "Hand written", "Two"]);
             let log = gitx::log(&m.root, 10).await.unwrap();
             let msgs: Vec<&str> = log.iter().map(|c| c.message.as_str()).collect();
             assert_eq!(msgs, ["tool s: add user", "manual edit", "tool s: add user", "init"]);
@@ -314,7 +346,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(e.contains("hits no entry"));
-            assert_eq!(m.load().user, ["One"]);
+            assert_eq!(m.load().unwrap().user, ["One"]);
         });
     }
 
@@ -333,7 +365,7 @@ mod tests {
             for t in tasks {
                 t.await.unwrap();
             }
-            assert_eq!(m.load().project.len(), 6);
+            assert_eq!(m.load().unwrap().project.len(), 6);
             assert_eq!(gitx::log(&m.root, 20).await.unwrap().len(), 7);
         });
     }
@@ -348,7 +380,23 @@ mod tests {
             let log = gitx::log(&m.root, 10).await.unwrap();
             let _g = m.lock().await.unwrap();
             gitx::revert(&m.root, &log[0].sha).await.unwrap();
-            assert_eq!(m.load().user, ["One"]);
+            assert_eq!(m.load().unwrap().user, ["One"]);
+        });
+    }
+
+    #[test]
+    fn an_undecodable_entry_file_refuses_the_edit_and_stays_untouched() {
+        let d = tmp("utf8");
+        let m = mem_in(&d);
+        rt().block_on(async {
+            m.edit(vec![add(File::User, "One")], &d, "t").await.unwrap();
+            let bytes = b"One\n\xff\xfe broken\n".to_vec();
+            std::fs::write(m.user_path(), &bytes).unwrap();
+            let e = m.edit(vec![add(File::Project, "Two")], &d, "t").await.unwrap_err();
+            assert!(e.contains("user.md") && e.contains("UTF-8"), "{e}");
+            assert_eq!(std::fs::read(m.user_path()).unwrap(), bytes);
+            assert!(!m.project_path().exists());
+            assert!(m.load().is_err());
         });
     }
 }

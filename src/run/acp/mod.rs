@@ -619,7 +619,7 @@ impl Server {
                     return fail(&id, INVALID_REQUEST, "session is already open");
                 }
                 let epoch = session.epoch;
-                tokio::task::spawn_local(forward(sid.clone(), epoch, ev_rx, self.ev_tx.clone(), |e| e));
+                tokio::task::spawn_local(forward_events(sid.clone(), epoch, ev_rx, self.ev_tx.clone()));
                 tokio::task::spawn_local(forward(
                     sid.clone(),
                     epoch,
@@ -940,6 +940,18 @@ async fn open_session(
     Ok(Box::new(Opened { sid, session, ev_rx, notice_rx, providers }))
 }
 
+/// Forwards a session's events. A closed channel without a prior `Exit` means the agent task died
+/// (a panic drops its sender), so it ends the session as an exit would and answers the pending request.
+async fn forward_events(
+    sid: String,
+    epoch: u64,
+    rx: UnboundedReceiver<AgentEvent>,
+    tx: UnboundedSender<(String, u64, AgentEvent)>,
+) {
+    forward(sid.clone(), epoch, rx, tx.clone(), |e| e).await;
+    let _ = tx.send((sid, epoch, AgentEvent::Exit));
+}
+
 async fn forward<T: 'static>(
     sid: String,
     epoch: u64,
@@ -993,6 +1005,21 @@ fn user_input(blocks: &Value) -> UserInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_dead_agent_task_ends_its_session() {
+        let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let _etx = etx;
+            panic!("agent died");
+        });
+        assert!(task.await.is_err());
+        forward_events("s".into(), 3, erx, tx).await;
+        let (sid, epoch, e) = rx.recv().await.expect("an event");
+        assert_eq!((sid.as_str(), epoch), ("s", 3));
+        assert!(matches!(e, AgentEvent::Exit));
+    }
 
     #[test]
     fn prompt_blocks_flatten_to_text_and_images() {

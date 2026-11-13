@@ -13,6 +13,10 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("daemon") {
         std::process::exit(daemon::run());
     }
+    if std::env::args().nth(1).as_deref() == Some("guard") {
+        let pgid = std::env::args().nth(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+        std::process::exit(daemon::guard(pgid));
+    }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     rt.block_on(rpc::serve_stdio(handle));
 }

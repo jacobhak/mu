@@ -2,7 +2,7 @@ use super::*;
 use crate::review;
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope, PermissionMode};
-use mu_tools::permissions::Verdict;
+use mu_tools::permissions::{GrantOutcome, Verdict};
 use std::time::SystemTime;
 
 /// The model's reason when nobody can approve a call.
@@ -300,9 +300,14 @@ impl Agent {
                             ApprovalDecision::Allow { scope, note, patterns } => {
                                 if scope != ApprovalScope::Once
                                     && let Some(g) = grant
-                                    && let Err(e) = self.tools.permissions.remember(&g.picked(patterns), scope, true)
                                 {
-                                    self.notice(format!("could not save the approval: {e}"));
+                                    match self.tools.permissions.remember(&g.picked(patterns), scope, true) {
+                                        Ok(GrantOutcome::AlreadyCovered(why)) => {
+                                            self.notice(format!("approval not saved: already covered ({why})"));
+                                        }
+                                        Ok(GrantOutcome::Written) => {}
+                                        Err(e) => self.notice(format!("could not save the approval: {e}")),
+                                    }
                                 }
                                 user_note = note;
                             }

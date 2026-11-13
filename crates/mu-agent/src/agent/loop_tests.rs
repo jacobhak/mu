@@ -969,6 +969,28 @@ fn a_stored_plan_starts_in_the_current_session() {
 }
 
 #[test]
+fn a_failed_reopen_of_the_current_session_keeps_it_and_its_conversation() {
+    use std::os::unix::fs::PermissionsExt;
+    run(async {
+        let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
+        a.ensure_session().await;
+        a.turn(Some("hi".to_string().into())).await;
+        let path = a.session.as_ref().unwrap().path.clone();
+        let before = a.messages.len();
+        assert!(before > 0);
+        // Loads fine, but cannot be opened for appending.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        drain(&mut rx);
+        let ok = a.load_session(&path).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!ok);
+        assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::Error(_))));
+        assert_eq!(a.messages.len(), before);
+        assert_eq!(a.session.as_ref().map(|s| s.path.clone()), Some(path));
+    });
+}
+
+#[test]
 fn messages_waiting_at_open_are_announced_and_go_out_with_the_next_prompt() {
     run(async {
         let (mut a, mut rx) = notify_agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
@@ -1141,6 +1163,35 @@ fn fork_continues_in_a_copy_and_leaves_the_original_alone() {
         a.turn(Some("only in the fork".to_string().into())).await;
         assert_eq!(mu_session::session::format::load(&forked).unwrap().messages.len(), 4);
         assert_eq!(mu_session::session::format::load(&original).unwrap().messages.len(), 2);
+    });
+}
+
+#[test]
+fn a_failed_compaction_is_not_retried_every_tool_round() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![Block::text("hello")], StopReason::Stop)),
+            Err(ProviderError::Fatal("summariser down".into())),
+            Ok(assistant(vec![call("t1", "read")], StopReason::ToolUse)),
+            Ok(assistant(vec![call("t2", "read")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let cfg = Configs::from_models_toml("[compaction.thresholds]\n\"anthropic/m\" = \"f1000\"\n");
+        let (mut a, mut rx) = agent_with(script, cfg);
+        a.turn(Some("hi".to_string().into())).await;
+        let big = "x".repeat(8_000);
+        for _ in 0..3 {
+            a.push(Message::user(&big));
+        }
+        drain(&mut rx);
+        a.turn(Some("go".to_string().into())).await;
+        let failures = drain(&mut rx)
+            .into_iter()
+            .filter(|e| matches!(e, AgentEvent::Error(m) if m.starts_with("compaction failed")))
+            .count();
+        assert_eq!(failures, 1, "one summariser request and one error line for the whole turn");
+        assert!(a.compaction.failed_at.is_some());
+        assert_eq!(results(&a).len(), 2, "the turn went on through both tool rounds");
     });
 }
 

@@ -44,20 +44,27 @@ pub(crate) fn window_and_threshold(window: u32, th: Option<Threshold>) -> (u64, 
         Some(Threshold::Fixed(n)) => fixed = Some(n as u64),
         None => {}
     }
+    // Large windows keep a reserve of max(15%, 16384); small ones fall back to 85% (capped at 16384)
+    // so the result never drops as the window grows.
     let reserve = w * 15 / 100;
-    let default = if 16384 >= w - reserve { w - reserve } else { w - reserve.max(16384) };
+    let default = w.saturating_sub(reserve.max(16384)).max((w - reserve).min(16384));
     (w, fixed.unwrap_or(default))
 }
 
-/// Index of the first kept message: the smallest user/assistant index whose suffix fits `KEEP_TOKENS`,
+/// Tokens of tail a compaction keeps: `KEEP_TOKENS`, but at most half the threshold so the context ends under it.
+fn keep_tokens(threshold: u64) -> u64 {
+    KEEP_TOKENS.min(threshold / 2)
+}
+
+/// Index of the first kept message: the smallest user/assistant index whose suffix fits `keep` tokens,
 /// but never past the last user/assistant message.
-pub(crate) fn cut_point(messages: &[Message], target: &ModelSpec) -> usize {
+pub(crate) fn cut_point(messages: &[Message], target: &ModelSpec, keep: u64) -> usize {
     let Some(last) = messages.iter().rposition(|m| !matches!(m, Message::ToolResult { .. })) else { return 0 };
     let mut sum = 0;
     let mut chosen = last;
     for i in (0..messages.len()).rev() {
         sum += messages[i].estimate_tokens(target);
-        if sum > KEEP_TOKENS {
+        if sum > keep {
             break;
         }
         if !matches!(messages[i], Message::ToolResult { .. }) {
@@ -190,6 +197,24 @@ impl Agent {
         self.context_tokens() + extra > self.thresholds().1
     }
 
+    /// Over the threshold, and not a repeat of a failed attempt: after a failure the context must
+    /// first grow by a margin (a new prompt clears the memo).
+    pub(crate) fn compaction_due(&self, extra: u64) -> bool {
+        if !self.needs_compaction(extra) {
+            return false;
+        }
+        let margin = (self.thresholds().1 / 10).max(1_000);
+        self.compaction.failed_at.is_none_or(|at| self.context_tokens() >= at + margin)
+    }
+
+    /// Compacts and reports a failure once, remembering the context size it failed at.
+    pub(super) async fn compact_reporting(&mut self, cancel: &CancellationToken) {
+        if let Outcome::Failed(e) = self.compact(None, cancel).await {
+            self.compaction.failed_at = Some(self.context_tokens());
+            self.report_compaction_failure(e, cancel);
+        }
+    }
+
     /// Messages as sent to the provider: the summary context first when compacted.
     pub(crate) fn wire_messages(&self) -> Vec<Message> {
         let mut v = Vec::with_capacity(self.messages.len() + 1);
@@ -207,7 +232,7 @@ impl Agent {
         if self.compaction.since == 0 {
             return Outcome::Skipped("Already compacted");
         }
-        let cut = cut_point(&self.messages, &self.model.model);
+        let cut = cut_point(&self.messages, &self.model.model, keep_tokens(self.thresholds().1));
         if cut == 0 {
             return Outcome::Skipped("Nothing to compact");
         }
@@ -259,6 +284,7 @@ impl Agent {
         self.compaction.state = Some(CompactionState { summary });
         self.compaction.fresh_from = self.messages.len();
         self.compaction.since = 0;
+        self.compaction.failed_at = None;
         self.emit(AgentEvent::Compacted { before, after: after_est });
         self.emit_status();
         Outcome::Done
@@ -345,7 +371,8 @@ mod tests {
         assert_eq!(window_and_threshold(200_000, None), (200_000, 170_000));
         assert_eq!(window_and_threshold(1_000_000, None), (1_000_000, 850_000));
         assert_eq!(window_and_threshold(10_000, None), (10_000, 8_500));
-        assert_eq!(window_and_threshold(20_000, None), (20_000, 3_616));
+        assert_eq!(window_and_threshold(19_000, None), (19_000, 16_150));
+        assert_eq!(window_and_threshold(20_000, None), (20_000, 16_384));
         assert_eq!(window_and_threshold(200_000, Some(Threshold::Window(100_000))), (100_000, 83_616));
         assert_eq!(window_and_threshold(200_000, Some(Threshold::Percent(50))), (200_000, 100_000));
         assert_eq!(window_and_threshold(200_000, Some(Threshold::Fixed(20_000))), (200_000, 20_000));
@@ -360,14 +387,35 @@ mod tests {
     }
 
     #[test]
+    fn default_threshold_never_drops_as_the_window_grows() {
+        let mut prev = 0;
+        for w in (1_000..=2_000_000u32).step_by(100) {
+            let t = window_and_threshold(w, None).1;
+            assert!(t >= prev, "window {w}: {t} < {prev}");
+            assert!(t < w as u64);
+            prev = t;
+        }
+    }
+
+    #[test]
+    fn kept_tail_is_under_the_threshold_on_small_windows() {
+        for w in (1_000..=40_000u32).step_by(500) {
+            let t = window_and_threshold(w, None).1;
+            assert!(keep_tokens(t) < t, "window {w}");
+        }
+        assert_eq!(keep_tokens(window_and_threshold(200_000, None).1), KEEP_TOKENS);
+    }
+
+    #[test]
     fn cut_keeps_recent_suffix_and_last_group() {
         let big = "x".repeat(40_000); // ~10k tokens each
         let u = |t: &str| Message::user(t);
         let target = ModelSpec::gateway("anthropic/test", 200_000, 32_000);
         let msgs = vec![u(&big), u(&big), u(&big), u("tail")];
-        let cut = cut_point(&msgs, &target);
+        let cut = cut_point(&msgs, &target, KEEP_TOKENS);
         assert_eq!(cut, 2); // last two ≈ 10k + tiny fit, third does not
-        assert_eq!(cut_point(&[u("a")], &target), 0);
+        assert_eq!(cut_point(&msgs, &target, 5_000), 3); // a smaller budget keeps only the tail
+        assert_eq!(cut_point(&[u("a")], &target, KEEP_TOKENS), 0);
         let tr = Message::ToolResult {
             tool_call_id: "1".into(),
             tool_name: "read".into(),
@@ -377,7 +425,7 @@ mod tests {
             details: None,
         };
         let msgs = vec![u("a"), u(&big), tr.clone(), tr.clone(), tr];
-        assert_eq!(cut_point(&msgs, &target), 1); // never lands on a tool result
+        assert_eq!(cut_point(&msgs, &target, KEEP_TOKENS), 1); // never lands on a tool result
     }
 
     #[test]

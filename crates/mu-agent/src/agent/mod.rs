@@ -301,7 +301,7 @@ impl Agent {
             },
             run: i.run,
             costs: Costs { cost: CostLedger::default(), quota: QuotaTracker::default(), git: None },
-            compaction: CompactionFlow { state: None, fresh_from: 0, since: 0 },
+            compaction: CompactionFlow { state: None, fresh_from: 0, since: 0, failed_at: None },
             memo: Memo::default(),
             plugin_ctx: BTreeMap::new(),
             resumed: false,

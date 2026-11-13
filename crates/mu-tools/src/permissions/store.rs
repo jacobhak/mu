@@ -41,16 +41,24 @@ pub fn load_project(key: &Path, warn: &mut Vec<String>) -> RuleSet {
     }
 }
 
-pub fn add_project(key: &Path, g: &Grant) -> Result<(), String> {
+/// What a grant did to the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantOutcome {
+    Written,
+    /// Nothing was written: the file already decides every rule of the grant, as described.
+    AlreadyCovered(String),
+}
+
+pub fn add_project(key: &Path, g: &Grant) -> Result<GrantOutcome, String> {
     write_grant(&project_file(key), &["rules"], Some(key), g)
 }
 
-pub fn add_global(g: &Grant) -> Result<(), String> {
+pub fn add_global(g: &Grant) -> Result<GrantOutcome, String> {
     write_grant(&paths::mu_home().join("config.toml"), &["permissions", "rules"], None, g)
 }
 
 /// Adds `allow` rules for `g` under `section`, keeping everything else in the file.
-fn write_grant(path: &Path, section: &[&str], root: Option<&Path>, g: &Grant) -> Result<(), String> {
+fn write_grant(path: &Path, section: &[&str], root: Option<&Path>, g: &Grant) -> Result<GrantOutcome, String> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let lock_path = path.with_file_name(format!("{name}.lock"));
     let _lock = FileLock::exclusive(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?;
@@ -71,29 +79,65 @@ fn write_grant(path: &Path, section: &[&str], root: Option<&Path>, g: &Grant) ->
         })?;
     }
     let patterns = super::grant::grant_patterns(&g.patterns);
+    let mut covered = Vec::new();
+    let mut written = false;
     for tool in super::grant::grant_tools(&g.tool) {
-        add_rule(table, section, tool, &patterns, path)?;
+        written |= add_rule(table, section, tool, &patterns, path, &mut covered)?;
     }
-    fs::write_atomic(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    if !written {
+        covered.dedup();
+        let why = if covered.is_empty() { "the grant names no patterns".to_string() } else { covered.join("; ") };
+        return Ok(GrantOutcome::AlreadyCovered(why));
+    }
+    fs::write_atomic(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(GrantOutcome::Written)
 }
 
-/// Adds `allow` for every pattern under `tool`, keeping what the file already says there. No
-/// patterns grant nothing; the one pattern `*` is every call of the tool, written as `tool = "allow"`.
-fn add_rule(table: &mut Table, section: &[&str], tool: &str, patterns: &[String], path: &Path) -> Result<(), String> {
+fn describe(item: &Item) -> String {
+    item.as_str().map(str::to_string).unwrap_or_else(|| "a rule".into())
+}
+
+/// Adds `allow` for every pattern under `tool`, keeping what the file already says there; true when
+/// something was added, else `covered` gets what already decides the calls. No patterns grant
+/// nothing; the one pattern `*` is every call of the tool, written as `tool = "allow"`.
+fn add_rule(
+    table: &mut Table,
+    section: &[&str],
+    tool: &str,
+    patterns: &[String],
+    path: &Path,
+    covered: &mut Vec<String>,
+) -> Result<bool, String> {
+    let mut wrote = false;
     if patterns.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     match table.get_mut(tool) {
-        // An action already decides every call of this tool.
-        Some(Item::Value(Value::String(_))) => {}
+        Some(Item::Value(Value::String(action))) => {
+            covered.push(format!("{tool} is already \"{}\" for every call", action.value()));
+        }
         Some(Item::Value(Value::InlineTable(t))) => {
             for p in patterns {
-                t.entry(p).or_insert(Value::from("allow"));
+                match t.get(p) {
+                    Some(v) => {
+                        covered.push(format!("{tool} \"{p}\" is already \"{}\"", describe(&Item::Value(v.clone()))))
+                    }
+                    None => {
+                        t.insert(p, Value::from("allow"));
+                        wrote = true;
+                    }
+                }
             }
         }
         Some(Item::Table(t)) => {
             for p in patterns {
-                t.entry(p).or_insert(Item::Value(Value::from("allow")));
+                match t.get(p) {
+                    Some(v) => covered.push(format!("{tool} \"{p}\" is already \"{}\"", describe(v))),
+                    None => {
+                        t.insert(p, Item::Value(Value::from("allow")));
+                        wrote = true;
+                    }
+                }
             }
         }
         Some(_) => {
@@ -114,9 +158,10 @@ fn add_rule(table: &mut Table, section: &[&str], tool: &str, patterns: &[String]
                 Item::Value(Value::InlineTable(t))
             };
             table.insert(tool, item);
+            wrote = true;
         }
     }
-    Ok(())
+    Ok(wrote)
 }
 
 fn implicit() -> Table {
@@ -178,6 +223,28 @@ mod tests {
         let text = std::fs::read_to_string(project_file(key)).unwrap();
         assert!(text.contains("root = "), "{text}");
         assert_eq!(text.matches("a/*.txt").count(), 2, "once per tool, not once per add: {text}");
+    }
+
+    #[test]
+    fn a_grant_the_file_already_decides_says_so_and_writes_nothing() {
+        mu_testutil::home();
+        let key = std::path::Path::new("/tmp/project-grants-covered-test");
+        let file = project_file(key);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let text = "[rules]\nprobeask = \"ask\"\nprobebash = { \"git push *\" = \"ask\" }\n";
+        std::fs::write(&file, text).unwrap();
+
+        let whole = add_project(key, &grant("probeask", &["x *"])).unwrap();
+        assert!(
+            matches!(&whole, GrantOutcome::AlreadyCovered(w) if w.contains("probeask") && w.contains("ask")),
+            "{whole:?}"
+        );
+        let same = add_project(key, &grant("probebash", &["git push *"])).unwrap();
+        assert!(matches!(&same, GrantOutcome::AlreadyCovered(w) if w.contains("git push *")), "{same:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+        assert_eq!(add_project(key, &grant("probebash", &["git pull *"])).unwrap(), GrantOutcome::Written);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("git pull *"));
     }
 
     #[test]

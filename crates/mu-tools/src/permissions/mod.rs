@@ -10,7 +10,7 @@ mod verdict;
 
 pub use bash::{BashAnalysis, SimpleCmd, analyze};
 pub use glob::glob_match;
-pub use store::{add_global, add_project, load_project, project_file};
+pub use store::{GrantOutcome, add_global, add_project, load_project, project_file};
 pub use verdict::Gate;
 
 use crate::tools::Tools;
@@ -111,25 +111,25 @@ impl Permissions {
     }
 
     /// A `Grant` is added to a rule set and, when `persist`, written to disk first.
-    pub fn remember(&self, g: &Grant, scope: ApprovalScope, persist: bool) -> Result<(), String> {
+    pub fn remember(&self, g: &Grant, scope: ApprovalScope, persist: bool) -> Result<GrantOutcome, String> {
         if scope == ApprovalScope::Once {
-            return Ok(());
+            return Ok(GrantOutcome::Written);
         }
         let rules = match scope {
             ApprovalScope::Session => &self.session,
             ApprovalScope::Project => match self.project.get() {
                 Some(p) => &p.rules,
-                None => return Ok(()),
+                None => return Ok(GrantOutcome::Written),
             },
             ApprovalScope::Global => &self.global,
-            ApprovalScope::Once => return Ok(()),
+            ApprovalScope::Once => return Ok(GrantOutcome::Written),
         };
         let grant_rules = grant::grant_rules(g);
         rules.borrow_mut().0.extend(grant_rules);
         match scope {
             ApprovalScope::Project if persist => store::add_project(&self.project.get().unwrap().key, g),
             ApprovalScope::Global if persist => store::add_global(g),
-            _ => Ok(()),
+            _ => Ok(GrantOutcome::Written),
         }
     }
 

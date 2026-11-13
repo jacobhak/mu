@@ -126,6 +126,27 @@ impl SessionFile {
         Ok(Self { path: path.into(), file: Some(file), owner, leaf, ids, failures: 0, torn, on_error: None })
     }
 
+    /// Reopens this session's file from disk. The new handle needs the lock this one holds, so
+    /// the lock is let go for the attempt; on failure it is taken back and `self` keeps appending.
+    /// On success `self` no longer holds the lock and must be dropped.
+    pub fn reopen(&mut self) -> Result<Self> {
+        if let Some(f) = self.file.as_ref() {
+            let _ = try_flock(f, libc::LOCK_UN);
+        }
+        // The record is unlinked on drop, so it goes before the new handle claims the same one.
+        self.owner = None;
+        match Self::open_append(&self.path) {
+            Ok(new) => Ok(new),
+            Err(e) => {
+                if let Some(f) = self.file.as_ref() {
+                    let _ = lock(f, &self.path);
+                }
+                self.owner = OwnerRecord::claim(&self.path, None, None);
+                Err(e)
+            }
+        }
+    }
+
     pub fn id(&self) -> String {
         id_of(&self.path)
     }
@@ -512,6 +533,17 @@ mod tests {
         let l = load(&path).unwrap();
         assert_eq!(l.messages.len(), 1);
         assert!(matches!(&l.messages[0], Message::User { content, .. } if format!("{content:?}").contains("two")));
+    }
+
+    #[test]
+    fn a_failed_reopen_returns_the_old_handle_still_writing() {
+        home();
+        let mut s = SessionFile::create(Path::new("/opt/reopen"), None).unwrap();
+        s.message(&Message::user("one"));
+        let path = s.path.clone();
+        std::fs::remove_file(&path).unwrap();
+        assert!(s.reopen().is_err());
+        assert!(s.message(&Message::user("two")).is_some());
     }
 
     #[test]

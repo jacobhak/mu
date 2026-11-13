@@ -2,7 +2,7 @@
 //! `Mem::edit`, the same path as the `memory` tool. `pre_compaction` starts a review; `session_end` queues the
 //! session, and the first hook of the next process drains the queue.
 
-use crate::mem::{Config, Mem};
+use crate::mem::{Config, EditError, Mem};
 use crate::store::{self, Caps, Op, State};
 use crate::transcript::{self, CAP};
 use fs4::FileExt;
@@ -21,6 +21,8 @@ const PROMPT: &str = include_str!("../prompts/review.md");
 const DRAIN_LIMIT: usize = 3;
 /// A rejected reply gets one more try, with the error appended to the prompt.
 const ATTEMPTS: usize = 2;
+/// Failed drains after which a queued session is dropped, with one notice.
+const MAX_FAILED_DRAINS: u32 = 3;
 const MAX_TOKENS: u64 = 2048;
 const NO_MODEL: &str = "no model is configured for the memory role (set @smol or @default)";
 
@@ -29,6 +31,9 @@ pub struct Job {
     pub session_file: PathBuf,
     pub session_id: String,
     pub cwd: PathBuf,
+    /// Drains of this queue entry that failed.
+    #[serde(default)]
+    pub failed: u32,
 }
 
 #[derive(Debug, PartialEq)]
@@ -124,7 +129,7 @@ where
         return Ok(Done::Skipped);
     };
     let prefix = format!("review {} turns {}-{}", job.session_id, t.first_turn, t.last_turn);
-    let base = user_prompt(&mem.load(), &mem.cfg.caps, &t.text);
+    let base = user_prompt(&mem.load()?, &mem.cfg.caps, &t.text);
     let mut prompt = base.clone();
     let mut attempt = 1;
     loop {
@@ -134,23 +139,25 @@ where
                 write_cursor(root, &job.session_id, &t.last_entry)?;
                 return Ok(Done::Reviewed);
             }
-            Err(e) if attempt < ATTEMPTS => {
+            Err(EditError::Rejected(e)) if attempt < ATTEMPTS => {
                 attempt += 1;
                 prompt = format!(
                     "{base}\n\nYour previous reply was rejected: {e}\nPrevious reply:\n{reply}\n\nReply again with only the corrected JSON array."
                 );
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into_message()),
         }
     }
 }
 
-async fn apply(mem: &Mem, job: &Job, prefix: &str, reply: &str) -> Result<(), String> {
-    let ops = parse_ops(reply)?;
+/// A reply that does not parse or whose ops do not apply is `Rejected`; a failure of the lock, files or git is
+/// `Failed` and says nothing about the reply.
+async fn apply(mem: &Mem, job: &Job, prefix: &str, reply: &str) -> Result<(), EditError> {
+    let ops = parse_ops(reply).map_err(EditError::Rejected)?;
     if ops.is_empty() {
         return Ok(());
     }
-    mem.edit(ops, &job.cwd, prefix).await.map(|_| ())
+    mem.edit_classified(ops, &job.cwd, prefix).await.map(|_| ())
 }
 
 /// The ops in a reply: the whole reply, a code fence's body, or the outermost array, in that order.
@@ -315,8 +322,25 @@ fn lock_sync(root: &Path) -> Result<SyncLock, String> {
     Err("the memory directory is busy, so the session was not queued for review".into())
 }
 
-/// Reviews the first `DRAIN_LIMIT` queued sessions in turn. An entry leaves the queue once its review succeeds
-/// or its session file is gone; failures stay queued and are reported.
+/// Moves a failed entry to the back of the queue with its failure count raised, so later sessions are reached.
+/// Returns `true` when the entry was dropped for failing `MAX_FAILED_DRAINS` times.
+async fn requeue_failed(root: &Path, cfg: &Config, session_id: &str) -> Result<bool, String> {
+    let _lock = at(root, cfg).lock().await?;
+    let mut jobs = read_queue(root);
+    let Some(i) = jobs.iter().position(|j| j.session_id == session_id) else { return Ok(false) };
+    let mut job = jobs.remove(i);
+    job.failed += 1;
+    let dropped = job.failed >= MAX_FAILED_DRAINS;
+    if !dropped {
+        jobs.push(job);
+    }
+    write_queue(root, &jobs)?;
+    Ok(dropped)
+}
+
+/// Reviews the first `DRAIN_LIMIT` queued sessions in turn. An entry leaves the queue once its review succeeds,
+/// its session file is gone, or it has failed `MAX_FAILED_DRAINS` drains (one notice); other failures go to the
+/// back of the queue and are reported. A missing model counts for nothing: it is not the session's fault.
 async fn drain<C, Fut, N>(root: &Path, cfg: &Config, complete: &C, notify: &N)
 where
     C: Fn(String, String) -> Fut,
@@ -324,12 +348,22 @@ where
     N: Fn(&str),
 {
     for job in read_queue(root).into_iter().take(DRAIN_LIMIT) {
-        let done = match run_job(root, &job, cfg, complete).await {
-            Ok(_) => dequeue(root, cfg, &job.session_id).await,
-            Err(e) => Err(e),
+        let failure = match run_job(root, &job, cfg, complete).await {
+            Ok(_) => dequeue(root, cfg, &job.session_id).await.err(),
+            Err(e) => Some(e),
         };
-        if let Err(e) = done {
+        let Some(e) = failure else { continue };
+        if e == NO_MODEL {
             report(notify, &job.session_id, &e);
+            continue;
+        }
+        match requeue_failed(root, cfg, &job.session_id).await {
+            Ok(true) => notify(&format!(
+                "giving up on session {} after {MAX_FAILED_DRAINS} failed attempts: {e}",
+                job.session_id
+            )),
+            Ok(false) => report(notify, &job.session_id, &e),
+            Err(q) => report(notify, &job.session_id, &format!("{e} (and the queue could not be updated: {q})")),
         }
     }
 }
@@ -371,7 +405,7 @@ mod tests {
             })
             .collect();
         write(&file, &entries);
-        Job { session_file: file, session_id: id.into(), cwd: env.cwd.clone() }
+        Job { session_file: file, session_id: id.into(), cwd: env.cwd.clone(), failed: 0 }
     }
 
     /// Replies in order; the last one repeats. Records every prompt.
@@ -413,7 +447,7 @@ mod tests {
         let model = |_: String, p: String| std::future::ready(fake.answer(p));
         rt().block_on(async {
             assert_eq!(run_job(&env.root, &job, &cfg(), &model).await.unwrap(), Done::Reviewed);
-            assert_eq!(at(&env.root, &cfg()).load().user, ["Prefers tabs"]);
+            assert_eq!(at(&env.root, &cfg()).load().unwrap().user, ["Prefers tabs"]);
             let log = gitx::log(&env.root, 5).await.unwrap();
             assert_eq!(log[0].message, "review s1 turns 1-2: add user");
             assert_eq!(read_cursor(&env.root, "s1").as_deref(), Some("e4"));
@@ -465,7 +499,10 @@ mod tests {
             assert_eq!(fake.calls(), 2);
             let retry = fake.prompts.borrow()[1].clone();
             assert!(retry.contains("rejected") && retry.contains("not a JSON array"), "{retry}");
-            assert_eq!(open_at(&env.root, &env.cwd, &cfg()).await.load().project, ["Releases are cut from main"]);
+            assert_eq!(
+                open_at(&env.root, &env.cwd, &cfg()).await.load().unwrap().project,
+                ["Releases are cut from main"]
+            );
         });
     }
 
@@ -553,7 +590,8 @@ mod tests {
     #[test]
     fn drain_takes_three_oldest_and_drops_done_and_gone_entries() {
         let env = env("drain");
-        let gone = Job { session_file: env.dir.join("gone.jsonl"), session_id: "x".into(), cwd: env.cwd.clone() };
+        let gone =
+            Job { session_file: env.dir.join("gone.jsonl"), session_id: "x".into(), cwd: env.cwd.clone(), failed: 0 };
         let jobs = [gone, session(&env, "a", 2), session(&env, "b", 2), session(&env, "c", 2), session(&env, "d", 2)];
         for j in &jobs {
             enqueue_in(&env.root, j).unwrap();
@@ -582,6 +620,64 @@ mod tests {
         let seen = seen.borrow();
         assert_eq!(seen.len(), 1);
         assert!(seen[0].contains("could not review session f"), "{}", seen[0]);
+    }
+
+    #[test]
+    fn failing_sessions_at_the_head_do_not_starve_later_ones() {
+        let env = env("starve");
+        for id in ["a", "b", "c", "d"] {
+            enqueue_in(&env.root, &session(&env, id, 2)).unwrap();
+        }
+        let ids = || read_queue(&env.root).into_iter().map(|j| j.session_id).collect::<Vec<_>>();
+        let bad = Fake::new(&[Some("garbage")]);
+        let model = |_: String, p: String| std::future::ready(bad.answer(p));
+        let seen = RefCell::new(Vec::<String>::new());
+        let notify = |m: &str| seen.borrow_mut().push(m.to_string());
+        rt().block_on(drain(&env.root, &cfg(), &model, &notify));
+        assert_eq!(ids(), ["d", "a", "b", "c"]);
+        assert!(read_queue(&env.root).iter().skip(1).all(|j| j.failed == 1));
+        let good = Fake::new(&[Some("[]")]);
+        let model = |_: String, p: String| std::future::ready(good.answer(p));
+        rt().block_on(drain(&env.root, &cfg(), &model, &notify));
+        assert_eq!(ids(), ["c"], "d was reached on the second drain");
+    }
+
+    #[test]
+    fn a_session_that_keeps_failing_is_dropped_with_one_notice() {
+        let env = env("giveup");
+        enqueue_in(&env.root, &session(&env, "f", 2)).unwrap();
+        let fake = Fake::new(&[Some("garbage")]);
+        let model = |_: String, p: String| std::future::ready(fake.answer(p));
+        let seen = RefCell::new(Vec::<String>::new());
+        let notify = |m: &str| seen.borrow_mut().push(m.to_string());
+        for _ in 0..MAX_FAILED_DRAINS {
+            rt().block_on(drain(&env.root, &cfg(), &model, &notify));
+        }
+        assert_eq!(queue_len_in(&env.root), 0);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), MAX_FAILED_DRAINS as usize);
+        assert_eq!(seen.iter().filter(|m| m.contains("giving up")).count(), 1);
+    }
+
+    #[test]
+    fn an_infrastructure_error_is_not_fed_back_as_a_rejected_reply() {
+        let env = env("infra");
+        let job = session(&env, "s9", 2);
+        let calls = RefCell::new(Vec::<String>::new());
+        let model = |_: String, p: String| {
+            calls.borrow_mut().push(p);
+            // The memory file becomes unreadable between the prompt and the edit.
+            std::fs::create_dir_all(&env.root).unwrap();
+            std::fs::write(env.root.join("user.md"), b"\xff\xfe").unwrap();
+            std::future::ready(Ok::<_, String>(Some(r#"[{"op": "add", "file": "user", "text": "x"}]"#.to_string())))
+        };
+        rt().block_on(async {
+            let e = run_job(&env.root, &job, &cfg(), &model).await.unwrap_err();
+            assert!(e.contains("user.md"), "{e}");
+            assert!(!e.contains("rejected"), "{e}");
+        });
+        assert_eq!(calls.borrow().len(), 1, "no second attempt with the error as feedback");
+        assert!(read_cursor(&env.root, "s9").is_none());
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub async fn call(args: &Value, ctx: &Ctx) -> (String, bool) {
 }
 
 fn read(mem: &Mem, note: Option<&str>) -> Result<String, String> {
-    let state = mem.load();
+    let state = mem.load()?;
     match note.map(str::trim).filter(|n| !n.is_empty()) {
         Some(slug) => match state.notes.get(slug) {
             Some(n) => Ok(format!("# {slug} ({})\n{}\n\n{}", n.kind.name(), n.description, n.body)),

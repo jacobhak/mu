@@ -11,12 +11,51 @@ use super::{
 use crate::auth::store::{Store, check_base_url};
 use anyhow::{Context, Result, anyhow, bail};
 use mu_common::fs::FileLock;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Serializes refreshes within this process; the lock file does it across processes.
 static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const SIGN_IN_HINT: &str = "run /login (or `mu auth login openai-chatgpt`) to sign in again";
+
+/// A refreshed token set that could not be saved, by store file. The refresh token on disk is
+/// spent, so this process keeps using the new set until the file moves on or a save succeeds.
+struct Unsaved {
+    client_id: String,
+    spent_refresh: String,
+    tokens: Tokens,
+    error: String,
+}
+
+static UNSAVED: Mutex<Option<HashMap<PathBuf, Unsaved>>> = Mutex::new(None);
+
+fn with_unsaved<R>(f: impl FnOnce(&mut HashMap<PathBuf, Unsaved>) -> R) -> R {
+    f(UNSAVED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+}
+
+/// Replaces the active account's tokens with the unsaved refreshed set while the file still holds
+/// the spent refresh token; forgets the set once the file has moved on.
+pub(crate) fn overlay_unsaved(path: &Path, c: &mut ChatgptData) {
+    with_unsaved(|m| {
+        let Some(u) = m.get(path) else { return };
+        let id = u.client_id.clone();
+        let slot = c.accounts.iter_mut().find(|a| a.client_id == id).and_then(|a| a.tokens.as_mut());
+        match slot {
+            Some(t) if t.refresh_token == u.spent_refresh => *t = u.tokens.clone(),
+            _ => {
+                m.remove(path);
+            }
+        }
+    });
+}
+
+/// The error of a refreshed sign-in that is not saved, if any.
+pub(crate) fn unsaved_error(path: &Path) -> Option<String> {
+    with_unsaved(|m| m.get(path).map(|u| u.error.clone()))
+}
 
 /// Registers every stored token for redaction, under its own label.
 pub(crate) fn register_tokens(c: &ChatgptData) {
@@ -44,7 +83,7 @@ pub(crate) fn api_base_of(c: &ChatgptData) -> String {
 }
 
 fn access_of(t: &Tokens, a: &Account) -> Access {
-    Access { token: t.access_token.clone(), label: a.label() }
+    Access { token: t.access_token.clone(), label: a.label(), warning: None }
 }
 
 fn now_secs() -> i64 {
@@ -162,7 +201,9 @@ impl Store {
         let lock = tokio::task::spawn_blocking(move || FileLock::exclusive(&path)).await?;
         let _file = lock.context("locking the key store")?;
 
-        let data = self.chatgpt_fresh()?;
+        let mut data = self.chatgpt_fresh()?;
+        let disk_refresh = data.active_account().and_then(|a| a.tokens.as_ref()).map(|t| t.refresh_token.clone());
+        overlay_unsaved(self.path(), &mut data);
         register_tokens(&data);
         let account = data.active_account().cloned().ok_or_else(not_signed_in)?;
         let tokens = account.tokens.clone().ok_or_else(not_signed_in)?;
@@ -182,17 +223,30 @@ impl Store {
             }
             Err(e @ RefreshError::Transient(_)) => return Err(anyhow::Error::new(e)),
         };
-        let access = access_of(&fresh, &account);
+        let mut access = access_of(&fresh, &account);
         register_token_set(&fresh);
-        // The old refresh token is spent by now: a failed save loses the rotated one, so it is an error.
+        // The old refresh token is spent by now: a failed save must not lose the rotated one.
         let id = account.client_id.clone();
-        self.update_chatgpt_locked(|c| {
+        let kept = fresh.clone();
+        let saved = self.update_chatgpt_locked(|c| {
             if let Some(a) = c.accounts.iter_mut().find(|a| a.client_id == id) {
                 a.tokens = Some(fresh);
             }
             true
-        })
-        .context("saving the refreshed ChatGPT sign-in")?;
+        });
+        match saved {
+            Ok(_) => with_unsaved(|m| {
+                m.remove(self.path());
+            }),
+            Err(e) => {
+                let error = format!("saving the refreshed ChatGPT sign-in failed: {e:#}");
+                access.warning = Some(error.clone());
+                let spent_refresh = disk_refresh.unwrap_or_else(|| tokens.refresh_token.clone());
+                with_unsaved(|m| {
+                    m.insert(self.path().to_path_buf(), Unsaved { client_id: id, spent_refresh, tokens: kept, error });
+                });
+            }
+        }
         Ok(access)
     }
 }
@@ -397,6 +451,27 @@ mod tests {
             let e = s.chatgpt_access(false).await.unwrap_err().to_string();
             assert!(e.contains("mu auth login openai-chatgpt"), "{e}");
             assert_eq!(s.chatgpt_account().unwrap().tokens.unwrap().access_token, ACCESS, "the caller decides");
+            let _ = std::fs::remove_dir_all(d);
+        });
+    }
+
+    #[test]
+    fn a_failed_save_after_a_refresh_keeps_the_fresh_token_for_the_session() {
+        block_on(async {
+            let (auth, hits) = fake_server(vec![token_reply(NEW_ACCESS)]).await;
+            let (api, _) = fake_server(vec![Reply::new(200, "{}")]).await;
+            let (s, d) = store("unsaved");
+            signed_in(&s, &auth, &api, DUE);
+            // A directory where `write_private` puts its temp file makes the save fail.
+            let tmp = d.join(format!("auth.json.tmp.{}", std::process::id()));
+            std::fs::create_dir(&tmp).unwrap();
+            let first = s.chatgpt_access(false).await.unwrap();
+            assert!(first.warning.as_deref().is_some_and(|w| w.contains("saving the refreshed")), "{first:?}");
+            assert!(s.check().unwrap_err().to_string().contains("saving the refreshed"));
+            assert_eq!(s.chatgpt_account().unwrap().tokens.unwrap().access_token, NEW_ACCESS);
+            let again = s.chatgpt_access(false).await.unwrap();
+            assert_eq!(again.token, NEW_ACCESS, "the spent refresh token is not used again");
+            assert_eq!(hits.lock().unwrap().len(), 1);
             let _ = std::fs::remove_dir_all(d);
         });
     }

@@ -59,7 +59,8 @@ async fn dispatch(req: Request) -> Result<Value, RpcError> {
             let c = ctx::get();
             let cfg = Config::load();
             if let (true, false, Some(file)) = (cfg.review, c.subagent, c.session_file.clone()) {
-                review::spawn_review(review::Job { session_file: file, session_id: c.session_id, cwd: c.cwd }, cfg);
+                let job = review::Job { session_file: file, session_id: c.session_id, cwd: c.cwd, failed: 0 };
+                review::spawn_review(job, cfg);
             }
             Ok(json!({}))
         }
@@ -67,7 +68,7 @@ async fn dispatch(req: Request) -> Result<Value, RpcError> {
             let c = ctx::get();
             let cfg = Config::load();
             if let (true, false, Some(file)) = (cfg.review, c.subagent, c.session_file.clone()) {
-                let job = review::Job { session_file: file, session_id: c.session_id, cwd: c.cwd };
+                let job = review::Job { session_file: file, session_id: c.session_id, cwd: c.cwd, failed: 0 };
                 if let Err(e) = review::enqueue(&job, &cfg) {
                     mu_common::rpc::notify(
                         "ui/notify",
@@ -94,5 +95,14 @@ async fn prompt_submit(p: &Value) -> Value {
         return json!({});
     }
     let mem = Mem::open(&c.cwd, cfg).await;
-    json!({ "context": snapshot::render(&mem.load(), &mem.checkout) })
+    match mem.load() {
+        Ok(state) => json!({ "context": snapshot::render(&state, &mem.checkout) }),
+        Err(e) => {
+            mu_common::rpc::notify(
+                "ui/notify",
+                json!({"level": "warning", "message": format!("memory: not loaded: {e}")}),
+            );
+            json!({})
+        }
+    }
 }

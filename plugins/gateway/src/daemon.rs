@@ -12,9 +12,15 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const START_TIMEOUT: Duration = Duration::from_secs(30);
-const POLL: Duration = Duration::from_millis(200);
+/// How long `spawn_omp` waits for the child to report its URL.
+const SPAWN_WAIT: Duration = Duration::from_secs(20);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Slack for the daemon's own startup on top of its steps.
+const START_MARGIN: Duration = Duration::from_secs(5);
+/// The daemon's steps run one after the other: broker spawn, token command, gateway spawn.
+const START_TIMEOUT: Duration =
+    Duration::from_secs(2 * SPAWN_WAIT.as_secs() + TOKEN_TIMEOUT.as_secs() + START_MARGIN.as_secs());
+const POLL: Duration = Duration::from_millis(200);
 const STOP_GRACE: Duration = Duration::from_secs(2);
 const STOP_POLL: Duration = Duration::from_millis(200);
 
@@ -58,13 +64,18 @@ pub fn start(dir: &Path) -> Result<String, String> {
         }
         if Instant::now() >= deadline {
             // Still starting after the deadline: it is not coming up, so do not leave it running.
-            // SAFETY: the daemon called setsid, so -pid is its own process group.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
+            // The omp children sit in their own groups, so the daemon's group does not reach them.
+            let mut kids = omp_children(pid as i32);
+            signal_group(pid as i32, libc::SIGTERM);
             thread::sleep(STOP_GRACE.min(Duration::from_millis(500)));
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
+            for k in omp_children(pid as i32) {
+                if !kids.contains(&k) {
+                    kids.push(k);
+                }
+            }
+            signal_group(pid as i32, libc::SIGKILL);
+            for k in kids {
+                signal_group(k, libc::SIGKILL);
             }
             return Err(fail());
         }
@@ -92,6 +103,62 @@ fn stop_orphaned_pair(dir: &Path) {
 /// Whether a `ps -o command=` line is one of the omp pair's processes.
 fn is_omp_pair(cmdline: &str) -> bool {
     cmdline.contains("auth-broker") || cmdline.contains("auth-gateway")
+}
+
+/// The omp pair's pids among the direct children of `parent` (each is its own group leader).
+fn omp_children(parent: i32) -> Vec<i32> {
+    match Command::new("ps").args(["-A", "-o", "pid=,ppid=,command="]).output() {
+        Ok(out) => parse_omp_children(&String::from_utf8_lossy(&out.stdout), parent),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn parse_omp_children(ps: &str, parent: i32) -> Vec<i32> {
+    ps.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: i32 = it.next()?.parse().ok()?;
+            let ppid: i32 = it.next()?.parse().ok()?;
+            (ppid == parent && is_omp_pair(l)).then_some(pid)
+        })
+        .collect()
+}
+
+/// `mu-gateway guard <pgid>`: blocks on stdin, whose write end the daemon holds. When the daemon
+/// dies by any means, stdin reaches EOF and the guard stops the omp group. Works on Linux and macOS.
+pub fn guard(pgid: i32) -> i32 {
+    watch_group(pgid, std::io::stdin());
+    0
+}
+
+fn watch_group(pgid: i32, mut pipe: impl Read) {
+    let mut buf = [0u8; 64];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    signal_group(pgid, libc::SIGTERM);
+    let deadline = Instant::now() + STOP_GRACE;
+    while group_alive(pgid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    signal_group(pgid, libc::SIGKILL);
+}
+
+/// Starts a guard for the omp group `pgid`; it lives in its own session so it outlives the daemon.
+fn spawn_guard(pgid: u32) -> Option<Child> {
+    let exe = paths::self_exe().ok()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(["guard", &pgid.to_string()]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    cmd.spawn().ok()
 }
 
 /// Sends `sig` to the process group `pgid`. The omp children are spawned with `process_group(0)`, so
@@ -172,8 +239,8 @@ fn serve() -> Result<i32, String> {
     }
 
     // Dropping `kids` (on any early return) terminates the children.
-    let mut kids = Kids(Vec::new());
-    let (broker, broker_url) = spawn_omp(&["auth-broker", "serve", "--bind=127.0.0.1:0"], &[])?;
+    let mut kids = Kids(Vec::new(), Vec::new());
+    let (broker, broker_url) = spawn_omp(&["auth-broker", "serve", "--bind=127.0.0.1:0"], &[], &mut kids.1)?;
     kids.0.push(broker);
     run_with_timeout(
         Command::new(mu_common::paths::omp_bin())
@@ -191,6 +258,7 @@ fn serve() -> Result<i32, String> {
     let (gw, gw_url) = spawn_omp(
         &["auth-gateway", "serve", "--bind=127.0.0.1:0"],
         &[("OMP_AUTH_BROKER_URL", &broker_url), ("OMP_AUTH_BROKER_TOKEN", &token)],
+        &mut kids.1,
     )?;
     kids.0.push(gw);
     let kid_pids: Vec<i32> = kids.0.iter().map(|c| c.id() as i32).collect();
@@ -226,8 +294,8 @@ fn serve() -> Result<i32, String> {
     }
 }
 
-/// Owns the omp children; terminates them on drop.
-struct Kids(Vec<Child>);
+/// Owns the omp children and their guards; terminates them on drop.
+struct Kids(Vec<Child>, Vec<Child>);
 
 impl Kids {
     /// True when any child has exited (reaps it).
@@ -260,6 +328,11 @@ impl Kids {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // Groups are gone: stop the guards before their pipes close and they signal a reused pid.
+        for mut g in std::mem::take(&mut self.1) {
+            let _ = g.kill();
+            let _ = g.wait();
+        }
     }
 }
 
@@ -270,8 +343,9 @@ impl Drop for Kids {
 }
 
 /// Spawns `omp <args>` on an ephemeral loopback port and returns the URL it reports.
-/// Output is forwarded to the daemon log; the child dies with the daemon (PDEATHSIG).
-fn spawn_omp(args: &[&str], env: &[(&str, &str)]) -> Result<(Child, String), String> {
+/// Output is forwarded to the daemon log. The child dies with the daemon: PDEATHSIG on Linux, and on
+/// every platform a guard process that kills the child's group when the daemon's pipe to it closes.
+fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Result<(Child, String), String> {
     let mut cmd = Command::new(mu_common::paths::omp_bin());
     cmd.args(args).envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.process_group(0);
@@ -283,6 +357,10 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)]) -> Result<(Child, String), Str
         });
     }
     let mut child = cmd.spawn().map_err(|e| format!("cannot run `omp` ({e})"))?;
+    match spawn_guard(child.id()) {
+        Some(g) => guards.push(g),
+        None => eprintln!("mu-gateway daemon: no guard for `omp {}`", args.join(" ")),
+    }
     let tag = args.join(" ");
     let (tx, rx) = mpsc::channel::<String>();
     let out = child.stdout.take().unwrap();
@@ -299,7 +377,7 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)]) -> Result<(Child, String), Str
     drop(tx);
     let mut seen = String::new();
     loop {
-        match rx.recv_timeout(Duration::from_secs(20)) {
+        match rx.recv_timeout(SPAWN_WAIT) {
             Ok(line) => {
                 if let Some(url) = listen_url(&line) {
                     return Ok((child, url));
@@ -344,6 +422,50 @@ mod tests {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn the_start_wait_covers_every_daemon_step() {
+        assert!(START_TIMEOUT >= SPAWN_WAIT * 2 + TOKEN_TIMEOUT);
+        assert!(START_TIMEOUT > Duration::from_secs(30));
+    }
+
+    #[test]
+    fn omp_children_are_picked_by_parent_and_command() {
+        let ps = "  10     1 mu-gateway daemon\n  11    10 omp auth-broker serve --bind=127.0.0.1:0\n  \
+                  12    10 mu-gateway guard 11\n  13    99 omp auth-gateway serve\n  14    10 omp auth-gateway serve\n";
+        assert_eq!(parse_omp_children(ps, 10), vec![11, 14]);
+        assert!(parse_omp_children("garbage\n\n", 10).is_empty());
+    }
+
+    fn wait_exit(child: &mut Child) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn the_guard_kills_the_group_when_its_pipe_closes() {
+        let mut leader = Command::new("sleep").arg("60").process_group(0).spawn().unwrap();
+        let pgid = leader.id() as i32;
+        let (reader, writer) = std::io::pipe().unwrap();
+        let guard = thread::spawn(move || watch_group(pgid, reader));
+        thread::sleep(Duration::from_millis(200));
+        assert!(matches!(leader.try_wait(), Ok(None)), "the group lives while the pipe is open");
+        drop(writer);
+        guard.join().unwrap();
+        assert!(wait_exit(&mut leader), "the group's leader is gone after EOF");
+    }
+    #[test]
+    fn signal_group_reaches_a_child_in_its_own_group() {
+        let mut child = Command::new("sleep").arg("60").process_group(0).spawn().unwrap();
+        signal_group(child.id() as i32, libc::SIGKILL);
+        assert!(wait_exit(&mut child));
+    }
 
     #[test]
     fn a_hung_command_is_killed() {

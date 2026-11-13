@@ -170,6 +170,8 @@ impl ChatgptData {
 pub struct Access {
     pub token: String,
     pub label: String,
+    /// Set when the token was refreshed but could not be saved: it works for this process only.
+    pub warning: Option<String>,
 }
 
 /// The token is never printed.

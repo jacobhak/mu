@@ -130,6 +130,8 @@ pub(super) struct CompactionFlow {
     /// Index into `messages` from which assistant usage reflects the current context.
     pub(super) fresh_from: usize,
     pub(super) since: usize,
+    /// Context tokens when the last automatic compaction failed, until a success or a new prompt.
+    pub(super) failed_at: Option<u64>,
 }
 
 /// `(message count, last timestamp, target model hash)` and the messages' token sum.

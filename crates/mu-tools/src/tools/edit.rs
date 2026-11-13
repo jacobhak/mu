@@ -275,7 +275,13 @@ impl EditWriter for FsWriter {
                 if let Some(p) = dest.parent() {
                     tokio::fs::create_dir_all(p).await.map_err(werr)?;
                 }
-                tokio::fs::write(dest, &content).await.map_err(werr)?;
+                // Through a symlink: the rename must replace the target, not the link.
+                let target = physical(dest);
+                let bytes = content.clone().into_bytes();
+                tokio::task::spawn_blocking(move || mu_common::fs::write_atomic(&target, &bytes))
+                    .await
+                    .map_err(werr)?
+                    .map_err(werr)?;
                 if r.move_to.is_some() {
                     if let Ok(m) = tokio::fs::metadata(&r.absolute).await {
                         let _ = tokio::fs::set_permissions(dest, m.permissions()).await;
@@ -467,6 +473,42 @@ mod tests {
         std::fs::write(&file, "old\n").unwrap();
         let yolo = Permissions::default();
         FsWriter::new(HashSet::new(), yolo.gate(&d)).write(request()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_write_leaves_the_file_and_a_symlink_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("mu-fswriter-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let locked = d.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let file = locked.join("a.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let request = |path: &std::path::Path| WriteRequest {
+            absolute: path.to_path_buf(),
+            display: "a.txt".into(),
+            op: FileOp::Update,
+            move_to: None,
+            content: Some("new\n".into()),
+            flush_lsp: false,
+            lsp_batch_id: None,
+        };
+        let writer = FsWriter::new(HashSet::new(), Permissions::default().gate(&d));
+        let probe = std::fs::File::create(locked.join("probe")).is_ok();
+        let res = writer.write(request(&file)).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !probe {
+            assert!(res.is_err(), "a write that cannot create its temp file must fail");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+        }
+
+        let link = d.join("link.txt");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        writer.write(request(&link)).await.unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
         std::fs::remove_dir_all(&d).ok();
     }

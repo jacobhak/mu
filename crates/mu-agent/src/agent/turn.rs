@@ -129,6 +129,7 @@ impl Agent {
                     self.emit(AgentEvent::UserPrompt(input.text.clone()));
                 }
                 self.user_turn += 1;
+                self.compaction.failed_at = None;
                 let prompt = secrets::redact(&input.text, &self.cwd).text;
                 let res = self
                     .ports
@@ -143,10 +144,8 @@ impl Agent {
             }
             Step::Wake => 0,
         };
-        if self.needs_compaction(extra)
-            && let Outcome::Failed(e) = self.compact(None, cancel).await
-        {
-            self.report_compaction_failure(e, cancel);
+        if self.needs_compaction(extra) {
+            self.compact_reporting(cancel).await;
         }
         match step {
             Step::Prompt { input, synthetic } => {
@@ -196,11 +195,8 @@ impl Agent {
         let mut todo_nags = 0u8;
         let mut compacted_for_overflow = false;
         loop {
-            if !first
-                && self.needs_compaction(0)
-                && let Outcome::Failed(e) = self.compact(None, cancel).await
-            {
-                self.report_compaction_failure(e, cancel);
+            if !first && self.compaction_due(0) {
+                self.compact_reporting(cancel).await;
             }
             first = false;
             // MCP servers without a cached tool list are started and listed once, before the first request.

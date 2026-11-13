@@ -7,7 +7,7 @@
 //! others without a restart. Writes hold a lock file, re-read, and replace the file atomically.
 
 use super::chatgpt::ChatgptData;
-use super::chatgpt::store::register_tokens;
+use super::chatgpt::store::{overlay_unsaved, register_tokens, unsaved_error};
 use super::web::WebSearch;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -155,6 +155,9 @@ struct FileData {
     web: Option<WebSearch>,
     #[serde(default, skip_serializing_if = "chatgpt_unset")]
     chatgpt: ChatgptData,
+    /// Why the file could not be read, set only on a snapshot of a bad file.
+    #[serde(skip)]
+    error: Option<String>,
 }
 
 fn chatgpt_unset(c: &ChatgptData) -> bool {
@@ -228,8 +231,8 @@ impl Store {
         Ok(data)
     }
 
-    /// The parsed file, re-read when its stamp changed. A bad file reads as empty here; `check`
-    /// reports why.
+    /// The parsed file, re-read when its stamp changed. A bad file reads as empty with `error` set;
+    /// it is never written back from this snapshot.
     fn snapshot(&self) -> Arc<FileData> {
         let stamp = self.stamp();
         let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -239,7 +242,9 @@ impl Store {
         {
             return d.clone();
         }
-        let data = Arc::new(self.read_fresh().unwrap_or_default());
+        let data = Arc::new(
+            self.read_fresh().unwrap_or_else(|e| FileData { error: Some(format!("{e:#}")), ..FileData::default() }),
+        );
         for (provider, e) in &data.providers {
             if let Some(k) = &e.key {
                 mu_base::secrets::register_stored(&label(provider), k);
@@ -254,6 +259,9 @@ impl Store {
     /// mu ignores (no usable key or reference, or a base URL it refuses), named by provider.
     pub fn check(&self) -> Result<()> {
         let data = self.read_fresh()?;
+        if let Some(e) = unsaved_error(&self.path) {
+            bail!("{e}");
+        }
         if [data.chatgpt.auth_base.as_deref(), data.chatgpt.api_base.as_deref()]
             .into_iter()
             .flatten()
@@ -408,7 +416,13 @@ impl Store {
     /// The key for `provider`: the stored literal, `$NAME`'s value, or the output of `!command`.
     /// A reference that cannot be resolved is an error: it never falls back to the reference text.
     pub async fn resolve(&self, provider: &str) -> Result<Resolved> {
-        let entry = self.get(provider).ok_or_else(|| anyhow!("no API key stored for {provider}"))?;
+        let entry = match self.get(provider) {
+            Some(e) => e,
+            None => match self.snapshot().error.clone() {
+                Some(e) => bail!("cannot read the stored key for {provider}: {e}"),
+                None => bail!("no API key stored for {provider}"),
+            },
+        };
         resolve_entry_in(&self.path, provider, &entry).await
     }
 }
@@ -416,7 +430,9 @@ impl Store {
 impl Store {
     /// The cached `chatgpt` section (see `read_fresh` for a re-read under the lock).
     pub(crate) fn chatgpt_cached(&self) -> ChatgptData {
-        self.snapshot().chatgpt.clone()
+        let mut c = self.snapshot().chatgpt.clone();
+        overlay_unsaved(&self.path, &mut c);
+        c
     }
 
     /// The `chatgpt` section as the file holds it now. Callers that write must hold `lock_path`.
@@ -543,6 +559,22 @@ mod tests {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text).unwrap();
         std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_file_is_reported_by_resolve_and_never_overwritten() {
+        let (s, d) = store("corrupt");
+        let text = r#"{"version":2,"providers":{"#;
+        replace_file(s.path(), text);
+        let e = format!("{:#}", rt(s.resolve("anthropic")).err().expect("a corrupt file is not an empty store"));
+        assert!(e.contains("not valid JSON") && e.contains("anthropic") && !e.contains("no API key stored"), "{e}");
+        assert!(s.set("anthropic", Entry::literal("sk-ant-test-0123456789")).is_err());
+        assert!(s.set_web(None).is_err() && s.remove("anthropic").is_err());
+        assert_eq!(std::fs::read_to_string(s.path()).unwrap(), text, "the file is untouched");
+        replace_file(s.path(), r#"{"version":99}"#);
+        let e = format!("{:#}", rt(s.resolve("anthropic")).err().unwrap());
+        assert!(e.contains("newer than this mu"), "{e}");
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

@@ -168,6 +168,7 @@ pub async fn run_child_observed(
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut result: Option<ChildResult> = None;
     let mut cancelled = false;
+    let mut bad_line: Option<String> = None;
     let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
@@ -196,7 +197,13 @@ pub async fn run_child_observed(
                             });
                         }
                         Ok(ChildEvent::Result(r)) => result = Some(r),
-                        Err(_) => {}
+                        Err(_) => {
+                            let text = String::from_utf8_lossy(&line);
+                            let text = text.trim();
+                            if bad_line.is_none() && !text.is_empty() {
+                                bad_line = Some(text.chars().take(BAD_LINE_CHARS).collect());
+                            }
+                        }
                     }
                 }
                 Err(_) => {
@@ -221,12 +228,28 @@ pub async fn run_child_observed(
         mu_base::process::kill_group(pid, libc::SIGKILL);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
     }
-    let stderr_tail = err_task.await.unwrap_or_default();
-    outcome(result, payload, cancelled, stderr_tail)
+    // A descendant that inherited stderr can hold it open after the child is gone.
+    let err_abort = err_task.abort_handle();
+    let stderr_tail = match tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await {
+        Ok(tail) => tail.unwrap_or_default(),
+        Err(_) => {
+            err_abort.abort();
+            String::new()
+        }
+    };
+    outcome(result, payload, cancelled, stderr_tail, bad_line)
 }
 
+const BAD_LINE_CHARS: usize = 300;
+
 /// What the child's final result, or its lack of one, means to the caller.
-fn outcome(result: Option<ChildResult>, payload: &Value, cancelled: bool, stderr_tail: String) -> Outcome {
+fn outcome(
+    result: Option<ChildResult>,
+    payload: &Value,
+    cancelled: bool,
+    stderr_tail: String,
+    bad_line: Option<String>,
+) -> Outcome {
     match result {
         Some(r) => {
             let ok = !r.is_error;
@@ -245,6 +268,8 @@ fn outcome(result: Option<ChildResult>, payload: &Value, cancelled: bool, stderr
         }
         None => Outcome::failed(if cancelled {
             "cancelled".to_string()
+        } else if let Some(line) = bad_line {
+            format!("subagent sent a line that is not a valid event or result: {line}")
         } else if stderr_tail.is_empty() {
             "subagent exited without a result".to_string()
         } else {
@@ -260,6 +285,47 @@ pub struct BackgroundResult {
     /// "exit 3", "timed out", "cancelled", …
     pub note: String,
     pub meta: Option<mu_base::tool::BashMeta>,
+}
+
+#[cfg(test)]
+mod child_line_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    async fn run(script: &str) -> Outcome {
+        let base = std::env::temp_dir().join(format!("mu-child-line-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = tokio::task::LocalSet::new()
+            .run_until(run_child(&exe, &base, &json!({}), &CancellationToken::new(), |_, _| {}))
+            .await;
+        let _ = std::fs::remove_dir_all(&base);
+        out
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_malformed_result_line_is_the_error() {
+        let out = run("#!/bin/sh\necho '{\"type\":\"result\",\"isError\":\"nope\",\"text\":\"lost\"}'\n").await;
+        assert!(!out.ok);
+        assert!(out.text.contains("lost") && out.text.contains("not a valid"), "{}", out.text);
+        assert!(!out.text.contains("without a result"), "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stray_line_does_not_hide_a_good_result() {
+        let out = run("#!/bin/sh\necho 'stray'\necho '{\"type\":\"result\",\"text\":\"fine\"}'\n").await;
+        assert!(out.ok && out.text == "fine", "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_descendant_holding_stderr_does_not_hold_the_result() {
+        let started = std::time::Instant::now();
+        let out = run("#!/bin/sh\nsleep 20 >/dev/null &\necho '{\"type\":\"result\",\"text\":\"fine\"}'\n").await;
+        assert!(out.ok && out.text == "fine", "{}", out.text);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
 }
 
 #[cfg(test)]

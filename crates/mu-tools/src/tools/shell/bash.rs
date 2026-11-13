@@ -146,14 +146,45 @@ impl PtyRun {
                 }
             }
         }
-        // Drain: until EOF, or 300 ms without data (a background descendant may hold the slave open).
+        self.drain(tools, ctx).await;
+    }
+
+    /// After the leader is gone: whatever it left in the group is terminated first, then the
+    /// remaining output is read until EOF, `DRAIN_IDLE` without data, `DRAIN_CAP` in all, or cancel.
+    async fn drain(&mut self, tools: &Tools, ctx: &ToolCtx) {
+        if self.eof {
+            return;
+        }
+        self.io.signal(libc::SIGTERM);
+        let now = tokio::time::Instant::now();
+        let (kill_at, cap_at) = (now + KILL_AFTER, now + DRAIN_CAP);
+        let mut killed = false;
+        let mut idle_at = now + DRAIN_IDLE;
         while !self.eof {
-            match tokio::time::timeout(std::time::Duration::from_millis(300), self.io.read(&mut self.buf)).await {
-                Ok(Ok(n)) if n > 0 => {
-                    let raw = self.decoder.push(&self.buf[..n]);
-                    self.emit(raw, ctx, tools);
+            let wake = if killed { cap_at.min(idle_at) } else { kill_at.min(cap_at).min(idle_at) };
+            tokio::select! {
+                r = self.io.read(&mut self.buf) => match r {
+                    Ok(n) if n > 0 => {
+                        let raw = self.decoder.push(&self.buf[..n]);
+                        self.emit(raw, ctx, tools);
+                        idle_at = tokio::time::Instant::now() + DRAIN_IDLE;
+                    }
+                    _ => self.eof = true,
+                },
+                _ = tokio::time::sleep_until(wake) => {
+                    let t = tokio::time::Instant::now();
+                    if t >= cap_at || t >= idle_at {
+                        break;
+                    }
+                    if !killed && t >= kill_at {
+                        killed = true;
+                        self.io.signal(libc::SIGKILL);
+                    }
                 }
-                _ => break,
+                _ = ctx.cancel.cancelled(), if !self.cancelled => {
+                    self.cancelled = true;
+                    break;
+                }
             }
         }
     }
@@ -161,6 +192,10 @@ impl PtyRun {
 
 const KILL_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 const GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_millis(800);
+/// After the leader exits: the hard cap on reading what its descendants still write, and how long
+/// a quiet pipe is waited on.
+const DRAIN_CAP: std::time::Duration = std::time::Duration::from_millis(1000);
+const DRAIN_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 impl PtyRun {
     /// Starts termination; false when it had already started.
@@ -694,9 +729,9 @@ fn finish(c: Collected, end: RunEnd) -> ToolOutput {
     out
 }
 
-/// Quiet time after the command exits before its pipes are given up: a background descendant
-/// may hold them open.
-const IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+/// Hard cap on how long the pipes are read after the command exits: a background descendant may
+/// hold them open and keep writing. The group is terminated at once; this bounds what is left.
+const BACKGROUND_DRAIN_CAP: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Reads from a pipe, or never completes once the pipe is closed (`None`).
 async fn read_or_pending<R: AsyncRead + Unpin>(r: &mut Option<R>, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -753,6 +788,8 @@ pub async fn run_background(
     let mut terminating: Option<tokio::task::JoinHandle<()>> = None;
     let timeout_sleep = tokio::time::sleep(limits.timeout.unwrap_or_default());
     tokio::pin!(timeout_sleep);
+    let drain_cap = tokio::time::sleep(std::time::Duration::MAX);
+    tokio::pin!(drain_cap);
     loop {
         tokio::select! {
             r = read_or_pending(&mut stdout, &mut obuf) => match r {
@@ -771,18 +808,30 @@ pub async fn run_background(
                 }
                 _ => stderr = None,
             },
-            st = child.wait(), if status.is_none() => status = st.ok(),
+            st = child.wait(), if status.is_none() => {
+                status = st.ok();
+                // Whatever the command left running goes now; the drain below is capped.
+                if terminating.is_none() {
+                    terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
+                }
+                drain_cap.as_mut().reset(tokio::time::Instant::now() + BACKGROUND_DRAIN_CAP);
+            }
             _ = cancel.cancelled(), if !stopping => {
                 cancelled = true;
                 stopping = true;
-                terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
+                if terminating.is_none() {
+                    terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
+                }
+                if status.is_some() {
+                    break;
+                }
             }
-            _ = &mut timeout_sleep, if !stopping && limits.timeout.is_some() => {
+            _ = &mut timeout_sleep, if !stopping && status.is_none() && limits.timeout.is_some() => {
                 timed_out = true;
                 stopping = true;
                 terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
             }
-            _ = tokio::time::sleep(IDLE), if status.is_some() => break,
+            _ = &mut drain_cap, if status.is_some() => break,
         }
         if status.is_some() && stdout.is_none() && stderr.is_none() {
             break;
@@ -884,6 +933,64 @@ mod tests {
         let (from, to) = (t0 + Duration::from_millis(50), t0 + Duration::from_millis(180));
         let during_grace = seen.borrow().iter().filter(|t| **t > from && **t < to).count();
         assert!(during_grace > 0, "no output was read during the SIGTERM grace");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_writing_descendant_does_not_hold_a_background_run_open() {
+        let t = Instant::now();
+        let r = run_background(
+            "(while :; do echo tick; sleep 0.02; done) & echo leader-done".into(),
+            std::env::temp_dir(),
+            std::env::vars().collect(),
+            Some(30.0),
+            CancellationToken::new(),
+            || (0, std::env::temp_dir()),
+            |_| {},
+        )
+        .await;
+        assert!(t.elapsed() < Duration::from_secs(5), "held open for {:?}", t.elapsed());
+        assert!(r.ok && r.note == "exit 0", "{} / {}", r.note, r.text);
+        assert!(r.text.contains("leader-done"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_writing_descendant_does_not_hold_a_pty_run_open_and_cancel_ends_the_drain() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(tokio::task::LocalSet::new().run_until(async {
+            let tools = Tools::for_test();
+            let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::task::spawn_local(async move {
+                while let Some(e) = rx.recv().await {
+                    if let AgentEvent::PtyOpen { input, reply, .. } = e {
+                        let _ = reply.send((80, 24));
+                        std::mem::forget(input);
+                    }
+                }
+            });
+            let cmd = json!({
+                "command": "trap '' TERM; (trap '' TERM; while :; do echo tick; sleep 0.01; done) & echo leader-done",
+                "pty": true,
+                "timeout": 30
+            });
+            let ctx =
+                ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+            let t = Instant::now();
+            let out = tools.call("bash", &cmd, &ctx).await;
+            assert!(t.elapsed() < Duration::from_secs(5), "held open for {:?}", t.elapsed());
+            assert!(!out.is_error, "{}", out.text.chars().take(200).collect::<String>());
+            assert!(out.text.contains("leader-done"), "{}", out.text.chars().take(200).collect::<String>());
+
+            let cancel = CancellationToken::new();
+            let ctx = ToolCtx { cancel: cancel.clone(), ..ctx };
+            let canceller = async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                cancel.cancel();
+            };
+            let t = Instant::now();
+            let (out, ()) = tokio::join!(tools.call("bash", &cmd, &ctx), canceller);
+            assert!(t.elapsed() < Duration::from_secs(5), "cancel took {:?}", t.elapsed());
+            drop(out);
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]

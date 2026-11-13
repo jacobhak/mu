@@ -163,6 +163,8 @@ struct Scan {
     by_id: HashMap<String, usize>,
     /// The last entry written: the leaf of the active chain.
     last: Option<usize>,
+    /// 1-based line numbers, with offsets, of lines that did not parse or carry no id.
+    damaged: Vec<(usize, u64)>,
 }
 
 impl Scan {
@@ -179,6 +181,19 @@ impl Scan {
         }
         chain.reverse();
         chain
+    }
+
+    /// A warning when the walk from the leaf ended at a parent that is not indexed: the entries
+    /// before it are cut off. Names the last damaged line before the chain's first entry.
+    fn cut_warning(&self, chain: &[usize]) -> Option<String> {
+        let root = &self.index[*chain.first()?];
+        let parent = root.parent.as_deref()?;
+        let unreachable = self.index.iter().filter(|e| e.offset < root.offset).count();
+        let cause = match self.damaged.iter().rev().find(|(_, off)| *off < root.offset) {
+            Some((line, _)) => format!("line {line} is damaged"),
+            None => format!("parent {parent} of entry {} is missing", root.id),
+        };
+        Some(format!("{unreachable} earlier entries are unreachable ({cause})"))
     }
 }
 
@@ -207,6 +222,8 @@ fn scan(path: &Path) -> Result<Scan> {
     let mut index: Vec<Index> = Vec::new();
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut last: Option<usize> = None;
+    let mut damaged: Vec<(usize, u64)> = Vec::new();
+    let mut line_no = 0usize;
     loop {
         buf.clear();
         let start = offset;
@@ -215,6 +232,7 @@ fn scan(path: &Path) -> Result<Scan> {
             break;
         }
         offset += n as u64;
+        line_no += 1;
         if buf.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -236,7 +254,10 @@ fn scan(path: &Path) -> Result<Scan> {
             header_seen = true;
             continue;
         }
-        let Ok(p) = serde_json::from_slice::<Probe>(&buf) else { continue };
+        let Some(p) = serde_json::from_slice::<Probe>(&buf).ok().filter(|p| p.id.is_some()) else {
+            damaged.push((line_no, start));
+            continue;
+        };
         let Some(id) = p.id else { continue };
         let kind = p.kind.unwrap_or_default();
         let todo = kind == "message"
@@ -250,7 +271,7 @@ fn scan(path: &Path) -> Result<Scan> {
     if !header_seen {
         bail!("not a v3 session file: {}", path.display());
     }
-    Ok(Scan { title, index, by_id, last })
+    Ok(Scan { title, index, by_id, last, damaged })
 }
 
 /// Two passes over the file. The first (`scan`) keeps only an index; the second deserializes just
@@ -261,9 +282,11 @@ pub(super) fn parse(path: &Path) -> Result<Parsed> {
     use std::io::BufReader;
     let scan = scan(path)?;
     let chain = scan.chain();
+    let cut = scan.cut_warning(&chain);
     let Scan { title, index, .. } = scan;
     let mut rd = BufReader::new(File::open(path)?);
     let mut loaded = Loaded { title, ..Default::default() };
+    loaded.warnings.extend(cut);
     // Entries before the latest compaction's first kept entry are summarized away.
     let comp = chain.iter().rposition(|&i| index[i].kind == "compaction");
     let mut start = 0;
@@ -364,6 +387,19 @@ mod tests {
         std::fs::write(&p, format!("{garbage}{header}\n{msg}\n")).unwrap();
         let l = load(&p).unwrap();
         assert_eq!((l.title, l.messages.len()), (None, 1));
+    }
+
+    #[test]
+    fn a_damaged_middle_line_is_reported_with_its_line_and_the_entries_it_cuts_off() {
+        let d = tmp("damaged");
+        let p = d.join("s.jsonl");
+        let header = json!({"type":"session","version":3,"id":"a","timestamp":"t","cwd":"/"});
+        let msg = |id: &str, parent: Option<&str>| json!({"type":"message","id":id,"parentId":parent,"message":{"role":"user","content":id,"timestamp":1}});
+        let (m1, m2, m4) = (msg("1", None), msg("2", Some("1")), msg("4", Some("3")));
+        std::fs::write(&p, format!("{header}\n{m1}\n{m2}\n{{\"type\":\"message\",\"id\":\"3\",\n{m4}\n")).unwrap();
+        let l = load(&p).unwrap();
+        assert_eq!(l.messages.len(), 1);
+        assert_eq!(l.warnings, vec!["2 earlier entries are unreachable (line 4 is damaged)".to_string()]);
     }
 
     #[test]

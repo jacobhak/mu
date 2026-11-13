@@ -152,13 +152,15 @@ impl Agent {
                 return false;
             }
         };
-        // Re-opening the session that is current: release its lock first.
+        // The current session is let go only once the new handle is open: a failure leaves it
+        // (and the conversation on screen) as it was.
         let same = self.session.as_ref().is_some_and(|c| c.path == path);
-        if same {
-            self.end_session().await;
-            self.session = None;
-        }
-        let mut s = match SessionFile::open_append(path) {
+        let opened = match self.session.as_mut().filter(|_| same) {
+            // The new handle needs the lock the old one holds on this same file.
+            Some(old) => old.reopen(),
+            None => SessionFile::open_append(path),
+        };
+        let mut s = match opened {
             Ok(mut s) => {
                 self.attach_error_sink(&mut s);
                 s
@@ -168,8 +170,14 @@ impl Agent {
                 return false;
             }
         };
-        // Only now, with the target loaded and open, does the current session end.
-        if !same {
+        if same {
+            // `end_session` runs the hooks of the session held in `self.session`.
+            let old = self.session.replace(s);
+            self.end_session().await;
+            drop(old);
+            let Some(held) = self.session.take() else { return false };
+            s = held;
+        } else {
             self.end_session().await;
         }
         if !loaded.warnings.is_empty() {
