@@ -18,8 +18,13 @@ impl Agent {
         }
         let id = self.session.as_mut().and_then(|s| s.message(&m)).unwrap_or_default();
         self.entry_ids.push(id);
+        // A reply's status goes out from `record_reply`, once its quota is applied.
+        let reply = matches!(m, Message::Assistant { .. });
         self.messages.push(m);
         self.compaction.since += 1;
+        if !reply {
+            self.emit_status();
+        }
     }
 
     /// One turn. `first` is `None` for a wake-up that only delivers finished background jobs.

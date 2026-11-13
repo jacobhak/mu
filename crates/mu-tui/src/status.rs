@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Segments shown when `statusLine` lists none (omp's `default` preset).
-const DEFAULT_LEFT: &[&str] = &["pi", "model", "mode", "path", "git", "context_pct", "cost"];
+const DEFAULT_LEFT: &[&str] = &["pi", "model", "mode", "path", "git", "context_pct", "cost", "cache"];
 const DEFAULT_RIGHT: &[&str] = &["session_name"];
 const ACTIVITY_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_ADVANCE_MS: u128 = 80;
@@ -356,6 +356,17 @@ fn cache_cold(c: &CacheStatus, now_ms: i64) -> Option<String> {
         }
     };
     Some(reason.into())
+}
+
+/// How long until a warm cache expires, so the footer can redraw as it does; `None` when the next
+/// request already misses (expired or something changed) or the cache is not in use.
+pub(crate) fn cache_expires_in(c: &CacheStatus, now_ms: i64) -> Option<Duration> {
+    if c.changed.is_some() {
+        return None;
+    }
+    let left = c.at_ms + CACHE_TTL_MS - now_ms;
+    // `cache_cold` flips once the idle time is *over* the TTL: land just past it.
+    (left >= 0).then(|| Duration::from_millis(left as u64 + 50))
 }
 
 /// Share of the last reply's input the provider served from cache, rounded.
@@ -898,6 +909,16 @@ mod tests {
         assert_eq!(text(&s), "cache cold");
         s.cache = None;
         assert_eq!(text(&s), "", "no cache activity, no segment");
+    }
+
+    #[test]
+    fn cache_expiry_timer_lands_after_the_ttl_and_only_for_a_warm_cache() {
+        let now = mu_base::message::now_ms();
+        let wait = cache_expires_in(&cache(1, 9, now - 60_000, None), now).unwrap();
+        assert!(wait > Duration::from_secs(239) && wait < Duration::from_secs(241), "{wait:?}");
+        assert!(cache_cold(&cache(1, 9, now - CACHE_TTL_MS, None), now + wait.as_millis() as i64).is_some());
+        assert_eq!(cache_expires_in(&cache(1, 9, now - 6 * 60_000, None), now), None);
+        assert_eq!(cache_expires_in(&cache(1, 9, now, Some(CacheBreak::Tools)), now), None);
     }
 
     #[test]

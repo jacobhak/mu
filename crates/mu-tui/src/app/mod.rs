@@ -286,6 +286,7 @@ pub async fn run(init: AppInit) -> i32 {
             }
         }
         let due = app.screen.last_draw + FRAME;
+        let cache_expiry = app.cache_expires_in();
         tokio::select! {
             inp = reader.next(), if !app.screen.child_busy => match inp {
                 Some(Input::Term(e)) => app.on_terminal(e),
@@ -308,6 +309,8 @@ pub async fn run(init: AppInit) -> i32 {
             Some(m) = ui_rx.recv() => app.on_ui(m),
             _ = tick.tick(), if app.busy() => app.on_tick(),
             _ = clock.tick(), if app.schedule_pending() => app.screen.dirty = true,
+            // The footer turns `cache cold` when the cache's TTL passes, with nothing else to redraw it.
+            () = async { match cache_expiry { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => app.screen.dirty = true,
             _ = tokio::time::sleep_until(due.into()), if app.screen.dirty => {}
         }
         app.sync_key_flow();
@@ -412,6 +415,10 @@ impl App {
             }
         }
         out
+    }
+
+    fn cache_expires_in(&self) -> Option<Duration> {
+        status::cache_expires_in(self.agent.status.cache.as_ref()?, mu_base::message::now_ms())
     }
 
     fn draw(&mut self) -> std::io::Result<()> {
