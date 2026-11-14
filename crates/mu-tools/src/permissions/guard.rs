@@ -29,7 +29,8 @@ fn rm_removes(args: &[String], home: Option<&str>) -> bool {
     recursive && targets.iter().any(|t| is_root_or_home(t, home))
 }
 
-/// `/`, `/*`, `~`, `~/`, `~/*`, `$HOME`, `${HOME}/.` and the home path itself, however written.
+/// `/`, `/*`, `~`, `~/*`, `$HOME`, `${HOME}/.` and the home path itself, with `.` and `..` resolved
+/// lexically (`/..`, `~/../..`). What a variable, a `cd` or a pipe makes of a word is not followed.
 fn is_root_or_home(target: &str, home: Option<&str>) -> bool {
     if target.is_empty() {
         return false;
@@ -41,20 +42,33 @@ fn is_root_or_home(target: &str, home: Option<&str>) -> bool {
             break;
         }
     }
-    if let Some(h) = home.map(|h| h.trim_end_matches('/')).filter(|h| !h.is_empty())
-        && let Some(rest) = t.strip_prefix(h)
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        t = format!("~{rest}");
-    }
-    loop {
-        let trimmed = t.strip_suffix("/*").or_else(|| t.strip_suffix("/.")).or_else(|| t.strip_suffix('/'));
-        match trimmed {
-            Some(s) => t = s.to_string(),
-            None => break,
+    // With no home known, `~` stands for itself: climbing out of it reaches the root.
+    let home_parts: Vec<&str> = match home.map(|h| h.split('/').filter(|c| !c.is_empty()).collect::<Vec<_>>()) {
+        Some(p) if !p.is_empty() => p,
+        _ => vec!["~"],
+    };
+    let (mut stack, rest) = if let Some(rest) = t.strip_prefix('/') {
+        (Vec::new(), rest)
+    } else if t == "~" {
+        (home_parts.clone(), "")
+    } else if let Some(rest) = t.strip_prefix("~/") {
+        (home_parts.clone(), rest)
+    } else {
+        return false;
+    };
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            p => stack.push(p),
         }
     }
-    t.is_empty() || t == "~"
+    while stack.last() == Some(&"*") {
+        stack.pop();
+    }
+    stack.is_empty() || stack == home_parts
 }
 
 #[cfg(test)]
@@ -91,6 +105,13 @@ mod tests {
             "sh -ec \"rm -rf /\"",
             "eval rm -rf '~'",
             "rm -rf build ~",
+            "rm -rf /..",
+            "rm -rf /../*",
+            "rm -rf ~/../..",
+            "rm -rf ~/x/../../..",
+            "rm -rf /home/u/./",
+            "rm -rf /home/u/x/..",
+            "rm -rf $HOME/../..",
         ] {
             assert!(removes(cmd), "{cmd}");
         }
@@ -105,6 +126,9 @@ mod tests {
             "rm -rf /tmp/x",
             "rm -rf /home/u2",
             "rm -rf /home/uv",
+            "rm -rf ~/..",
+            "rm -rf /home/u/x/../y",
+            "rm -rf /tmp/../tmp/x",
             "rm ~",
             "rm -f /",
             "rm -rf \"\"",

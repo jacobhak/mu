@@ -27,13 +27,15 @@ edit = { "*.lock" = "ask" }
 
 `readonly_bash = false` makes every `bash` call ask unless a rule allows it. The read-only set covers programs such as `ls`, `cat`, `grep`, `git status`, `git log`, `git diff`, `find` without `-delete`/`-exec`, and pipelines and loops made only of those; anything the classifier is not sure about is not read-only.
 
-A read-only command is judged by the files it may open — its path words and its input redirections — so `cat README.md` and `grep -r TODO src/` stay quiet while `cat /etc/passwd`, `cat < /etc/passwd` and `grep -r x /etc` ask. A glob is judged by its prefix (`src/*.rs` cannot leave `src/`), but a `$VAR`, a leading `~` or an absolute path that leaves the root counts as outside, because mu cannot know where it points. Relative paths are resolved against the session's directory: mu does not track the shell's own `cd`, so a relative read after `cd /etc` is not caught.
+A read-only command is judged by the files it may open — its path words and its input redirections — so `cat README.md` and `grep -r TODO src/` stay quiet while `cat /etc/passwd`, `cat < /etc/passwd` and `grep -r x /etc` ask. A glob is judged by its prefix (`src/*.rs` cannot leave `src/`), but a `$VAR`, a leading `~` or an absolute path that leaves the root counts as outside, because mu cannot know where it points. Relative paths are resolved against the session's directory: mu does not track the shell's own `cd`, so a relative read after `cd /etc` is not caught. A flag that names a file (`grep -f`, `rg -f`, `wc --files0-from`, `date -f`) makes that file a path word; `rg` and `tree` run quietly only with flags from a list (no `rg --pre`, no `tree -o`), and `sort --compress-program`, `sort -o` and `git grep -O` are not read-only.
+
+The modes prevent mistakes; they are not a boundary against a model that is trying to get past them. The classifier knows the common forms of each program, and a program will have flags it does not know yet: anything it does not recognise asks, but a flag it recognises wrongly is a gap. Do not rely on `ask` or `edits` to contain code you do not trust.
 
 ## Rules
 
 Keys are tool-name globs, values are `allow`, `ask` or `deny`, either for every call of the tool (`"mcp__github_*" = "allow"`) or for commands and paths that match a pattern:
 
-- `bash`: every simple command of the line, as written (`cargo test --release`), including those inside `$(…)`, loops and subshells.
+- `bash`: every simple command of the line, as written (`cargo test --release`), including those inside `$(…)`, loops and subshells. A `deny` or `ask` rule also sees the command with quotes, a directory on the program (`/usr/bin/git`) and the wrappers `sudo`, `doas`, `command`, `builtin`, `exec`, `env`, `nice`, `nohup`, `time`, `timeout` and `xargs` taken off, and the commands inside a literal `sh -c '…'`, `bash -c` or `eval` string (three levels deep), so `"git push *" = "deny"` also stops `env git push` and `sh -c 'git push'`. It does not see through a variable, a `cd` or a string built at run time.
 - `write`, `edit`, `read`, `grep`, `glob`: each target path, matched either as it is shown (relative to the project when inside it) or by its absolute path, so `src/*` and `/home/jacob/code/private/mu/src/*` both cover `src/a.rs`.
 - `fetch`: the URL.
 - Other tools: only `"*"` and whole-tool string values match.
@@ -42,7 +44,7 @@ Keys are tool-name globs, values are `allow`, `ask` or `deny`, either for every 
 
 A `deny` always wins, then an `ask`, and only then does a covering `allow` (or the read-only classifier) let the call run. `yolo` still honours `deny` and `ask` rules. A command that does not parse, or one that starts with an assignment (`FOO=1 cmd`), can never be covered by an `allow` rule.
 
-One deny is built in and no mode or rule lifts it: a recursive `rm` of `/`, `~` or `$HOME` (also written as `/*`, `~/*`, `"$HOME"`, the home path itself, behind `sudo` and the like, or inside `sh -c '…'` and `eval`).
+One deny is built in and no mode or rule lifts it: a recursive `rm` of `/`, `~` or `$HOME` (also written as `/*`, `~/*`, `"$HOME"`, the home path itself, with `..` resolved so `/..` and `~/../..` count, behind `sudo` and the like, or inside `sh -c '…'` and `eval`). It reads the literal command: `cd / && rm -rf *`, `X=/; rm -rf $X` and `echo ~ | xargs rm -rf` are not caught.
 
 ## The prompt
 

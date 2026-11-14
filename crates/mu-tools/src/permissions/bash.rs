@@ -79,6 +79,164 @@ const GIT_READONLY: &[&str] = &[
     "grep",
 ];
 
+/// `rg` and `tree` run only with flags from these lists: `rg --pre CMD` runs CMD and `tree -o FILE`
+/// writes FILE. Plain letters take no value, valued letters take the rest of the word or the next one.
+const RG_PLAIN: &str = "PFisSvwxUauLNnbHIlcoqpVh0.";
+const RG_VALUED: &str = "efgmdtTABCErMj";
+const RG_LONG: &[&str] = &[
+    "regexp",
+    "file",
+    "no-search-zip",
+    "engine",
+    "pcre2",
+    "no-pcre2",
+    "encoding",
+    "no-encoding",
+    "crlf",
+    "no-crlf",
+    "no-unicode",
+    "unicode",
+    "fixed-strings",
+    "no-fixed-strings",
+    "ignore-case",
+    "case-sensitive",
+    "smart-case",
+    "invert-match",
+    "word-regexp",
+    "line-regexp",
+    "max-count",
+    "multiline",
+    "multiline-dotall",
+    "no-multiline",
+    "text",
+    "binary",
+    "no-binary",
+    "unrestricted",
+    "follow",
+    "no-follow",
+    "glob",
+    "iglob",
+    "glob-case-insensitive",
+    "no-glob-case-insensitive",
+    "hidden",
+    "no-hidden",
+    "no-ignore",
+    "ignore",
+    "ignore-file",
+    "no-ignore-dot",
+    "ignore-dot",
+    "no-ignore-exclude",
+    "ignore-exclude",
+    "no-ignore-files",
+    "no-ignore-global",
+    "ignore-global",
+    "no-ignore-parent",
+    "ignore-parent",
+    "no-ignore-vcs",
+    "ignore-vcs",
+    "no-ignore-messages",
+    "ignore-messages",
+    "no-require-git",
+    "require-git",
+    "one-file-system",
+    "no-one-file-system",
+    "max-depth",
+    "maxdepth",
+    "max-filesize",
+    "mmap",
+    "no-mmap",
+    "type",
+    "type-not",
+    "type-add",
+    "type-clear",
+    "type-list",
+    "after-context",
+    "before-context",
+    "context",
+    "context-separator",
+    "no-context-separator",
+    "field-context-separator",
+    "field-match-separator",
+    "line-number",
+    "no-line-number",
+    "column",
+    "no-column",
+    "byte-offset",
+    "with-filename",
+    "no-filename",
+    "files-with-matches",
+    "files-without-match",
+    "count",
+    "count-matches",
+    "include-zero",
+    "only-matching",
+    "replace",
+    "json",
+    "quiet",
+    "vimgrep",
+    "null",
+    "null-data",
+    "line-buffered",
+    "no-line-buffered",
+    "block-buffered",
+    "no-block-buffered",
+    "stop-on-nonmatch",
+    "files",
+    "no-messages",
+    "messages",
+    "sort",
+    "sortr",
+    "sort-files",
+    "no-sort-files",
+    "passthru",
+    "trim",
+    "no-trim",
+    "max-columns",
+    "max-columns-preview",
+    "no-max-columns-preview",
+    "color",
+    "colors",
+    "heading",
+    "no-heading",
+    "pretty",
+    "stats",
+    "no-stats",
+    "no-config",
+    "threads",
+    "path-separator",
+    "dfa-size-limit",
+    "regex-size-limit",
+    "help",
+    "version",
+    "pcre2-version",
+];
+
+const TREE_PLAIN: &str = "aACdDfFghilnNpqQrsSuUvxJXt";
+const TREE_VALUED: &str = "ILPTH";
+const TREE_LONG: &[&str] = &[
+    "help",
+    "version",
+    "inodes",
+    "device",
+    "noreport",
+    "nolinks",
+    "dirsfirst",
+    "filesfirst",
+    "du",
+    "si",
+    "prune",
+    "matchdirs",
+    "ignore-case",
+    "gitignore",
+    "charset",
+    "timefmt",
+    "sort",
+    "filelimit",
+];
+
+/// The flags that name a file a program reads: `--file=F`, `grep -fF`, `date -f F`.
+const FILE_LONG: &[&str] = &["file", "files0-from", "from-file", "exclude-from", "ignore-file"];
+
 /// One simple command of the line.
 pub struct SimpleCmd {
     /// Its words as written, joined by single spaces, without leading assignments.
@@ -615,6 +773,11 @@ fn simple_readonly(s: Simple, redirs: Seq<Redir>) -> bool {
 }
 
 fn program_readonly(argv0: &str, args: Seq<Word>) -> bool {
+    match argv0 {
+        "rg" => return flags_allowed(args, RG_LONG, RG_PLAIN, RG_VALUED),
+        "tree" => return flags_allowed(args, TREE_LONG, TREE_PLAIN, TREE_VALUED),
+        _ => {}
+    }
     if ANY_ARGS.contains(&argv0) {
         return true;
     }
@@ -628,11 +791,52 @@ fn program_readonly(argv0: &str, args: Seq<Word>) -> bool {
     restricted(argv0, &lits)
 }
 
+/// Whether every literal flag of `args` is on the program's list. A short cluster is read letter by
+/// letter up to a letter that takes a value, which swallows the rest of the word. A word that is
+/// not literal may be anything, which the path words already judge.
+fn flags_allowed(args: Seq<Word>, long: &[&str], plain: &str, valued: &str) -> bool {
+    for a in args {
+        let Some(a) = literal(a) else { continue };
+        if a == "--" {
+            break;
+        }
+        if let Some(l) = a.strip_prefix("--") {
+            if !long.contains(&l.split('=').next().unwrap_or(l)) {
+                return false;
+            }
+        } else if let Some(cluster) = a.strip_prefix('-') {
+            for c in cluster.chars() {
+                if valued.contains(c) {
+                    break;
+                }
+                if !plain.contains(c) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `arg` is `name` or an abbreviation of it that getopt_long still accepts (`--out` for `--output`).
+fn long_flag(arg: &str, name: &str) -> bool {
+    let Some(given) = arg.strip_prefix("--") else { return false };
+    let given = given.split('=').next().unwrap_or(given);
+    !given.is_empty() && name.strip_prefix("--").is_some_and(|n| n.starts_with(given))
+}
+
+/// A short-option cluster (`-no`) that holds `letter`.
+fn short_flag(arg: &str, letter: char) -> bool {
+    arg.strip_prefix('-').is_some_and(|c| !c.starts_with('-') && c.contains(letter))
+}
+
 fn restricted(program: &str, args: &[String]) -> bool {
     match program {
         "env" | "hostname" => args.is_empty(),
-        "date" => !args.iter().any(|a| a == "-s" || a.starts_with("-s") || a.starts_with("--set")),
-        "sort" => !args.iter().any(|a| a.starts_with("-o") || a.starts_with("--output")),
+        "date" => !args.iter().any(|a| short_flag(a, 's') || long_flag(a, "--set")),
+        "sort" => {
+            !args.iter().any(|a| short_flag(a, 'o') || long_flag(a, "--output") || long_flag(a, "--compress-program"))
+        }
         "uniq" | "xxd" => args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
         "yq" => !args.iter().any(|a| matches!(a.as_str(), "-i" | "--inplace" | "--in-place")),
         "fd" => !args.iter().any(|a| matches!(a.as_str(), "-x" | "-X" | "--exec" | "--exec-batch")),
@@ -680,6 +884,7 @@ fn git_readonly(args: &[String]) -> bool {
         "stash" => matches!(rest.first().map(String::as_str), Some("list" | "show")),
         "worktree" => matches!(rest.first().map(String::as_str), Some("list")),
         "reflog" => rest.is_empty() || rest[0] == "show",
+        "grep" => !rest.iter().any(|a| short_flag(a, 'O') || long_flag(a, "--open-files-in-pager")),
         _ if GIT_READONLY.contains(&sub) => true,
         _ => false,
     }
@@ -762,14 +967,29 @@ fn read_words(argv0: &str, args: Seq<Word>, redirs: Seq<Redir>) -> Vec<PathWord>
             RedirTarget::HereDoc(_) => None,
         })
         .collect();
+    let mut value_of = vec![false; args.len()];
+    let mut patterns_from_file = false;
+    for (i, a) in args.iter().enumerate() {
+        let Some((flag, patterns)) = literal(a).and_then(|t| file_flag(argv0, &t)) else { continue };
+        patterns_from_file |= patterns;
+        match (flag, args.get(i + 1)) {
+            (Some(v), _) => words.push(PathWord { prefix: text_prefix(&v), word: None }),
+            (None, Some(next)) => {
+                value_of[i + 1] = true;
+                words.push(PathWord { prefix: path_prefix(next), word: Some(i + 2) });
+            }
+            (None, None) => {}
+        }
+    }
     let opens = opens_of(argv0);
     if opens == Opens::Nothing {
         return words;
     }
-    let mut positional = 0;
+    // A pattern read from a file leaves no pattern word: the first positional is already a path.
+    let mut positional = usize::from(patterns_from_file);
     for (i, a) in args.iter().enumerate() {
         let text = literal(a);
-        if text.as_deref().is_some_and(|t| t.starts_with('-')) {
+        if value_of[i] || text.as_deref().is_some_and(|t| t.starts_with('-')) {
             continue;
         }
         positional += 1;
@@ -780,6 +1000,30 @@ fn read_words(argv0: &str, args: Seq<Word>, redirs: Seq<Redir>) -> Vec<PathWord>
         }
     }
     words
+}
+
+/// The value of a flag that names a file the program reads: `Some(value)` when it is attached to
+/// the flag, `None` when it is the next word; `None` for any other word. The flag also says whether
+/// it takes the place of the pattern word (`grep -f`).
+fn file_flag(argv0: &str, arg: &str) -> Option<(Option<String>, bool)> {
+    if let Some(long) = arg.strip_prefix("--") {
+        let (name, value) = long.split_once('=').map_or((long, None), |(n, v)| (n, Some(v.to_string())));
+        return FILE_LONG.contains(&name).then_some((value, matches!(name, "file" | "from-file")));
+    }
+    if !matches!(argv0, "grep" | "egrep" | "fgrep" | "rg" | "date") {
+        return None;
+    }
+    let cluster = arg.strip_prefix('-')?;
+    let rest = &cluster[cluster.find('f')? + 1..];
+    Some(((!rest.is_empty()).then(|| rest.to_string()), true))
+}
+
+/// `path_prefix` for a word known only as text.
+fn text_prefix(text: &str) -> Option<String> {
+    if text.starts_with('~') {
+        return None;
+    }
+    Some(text.split(['*', '?', '[', '{']).next().unwrap_or_default().to_string())
 }
 
 /// Whether a word could name a place: it has a separator, is `.`/`..`, or starts with a tilde or
@@ -897,6 +1141,57 @@ mod tests {
         ] {
             assert!(!ro(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn flags_that_run_or_write_are_not_read_only() {
+        for cmd in [
+            "rg --pre cat foo .",
+            "rg --pre=cat foo .",
+            "rg --hostname-bin=sh foo",
+            "rg -z foo",
+            "tree -o out.txt",
+            "tree --output=out.txt",
+            "git grep -O foo",
+            "git grep --open-files-in-pager=sh foo",
+            "git grep -nO foo",
+            "sort --compress-program=sh README.md",
+            "sort --compress=sh README.md",
+            "sort --out=x README.md",
+            "sort -no x README.md",
+            "date --set=2020-01-01",
+        ] {
+            assert!(!ro(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn rg_and_tree_run_with_their_listed_flags() {
+        for cmd in [
+            "rg -n --glob '*.rs' -t rust foo src",
+            "rg -inw -A3 -B 2 foo",
+            "rg --files --hidden",
+            "rg -e foo -e bar",
+            "rg -- -foo",
+            "tree -L 2 -a -I target",
+            "tree -d --dirsfirst --noreport",
+            "date -u +%s",
+        ] {
+            assert!(ro(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_flag_that_names_a_file_is_a_path_word() {
+        assert_eq!(paths("wc --files0-from=/etc/shadow"), [some("/etc/shadow")]);
+        assert_eq!(paths("wc --files0-from /etc/shadow"), [some("/etc/shadow")]);
+        assert_eq!(paths("grep -f/etc/shadow x README.md"), [some("/etc/shadow"), some("x"), some("README.md")]);
+        assert_eq!(paths("grep -rf /etc/shadow src"), [some("/etc/shadow"), some("src")]);
+        assert_eq!(paths("grep --file=/etc/shadow x"), [some("/etc/shadow"), some("x")]);
+        assert_eq!(paths("rg -f /etc/shadow ."), [some("/etc/shadow"), some(".")]);
+        assert_eq!(paths("date -f /etc/shadow"), [some("/etc/shadow")]);
+        assert_eq!(paths("date --file=~/x"), [None]);
+        assert_eq!(paths("sort --files0-from=list"), [some("list")]);
     }
 
     #[test]
