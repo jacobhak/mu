@@ -71,7 +71,7 @@ const DOCS: [Doc; 8] = [
 ];
 
 /// The role an agent's `model:` entry names (`@slow`, `@slow:high`), if it is a role.
-pub fn agent_role(entry: &str) -> Option<String> {
+pub(crate) fn agent_role(entry: &str) -> Option<String> {
     entry.strip_prefix('@').map(|r| split_level(r).0)
 }
 

@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 
 /// How long a retryable error with a `Retry-After` is waited out when it is a request's turn to be
 /// retried: `Retry-After` up to this is waited for, anything longer fails at once.
-pub const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Attempts per request, retries included, when `[retry] max_attempts` is not set.
-pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 /// `[retry]`: when to wait out a provider's `Retry-After` (a 429, mostly). A request is retried when
 /// the wait is at most `max_wait` (`"90s"`, `"30m"`, `"2h"`, `"1d"`, `"1h30m"`; default `"2m"`) or

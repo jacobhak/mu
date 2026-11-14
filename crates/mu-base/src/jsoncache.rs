@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// A cache is refreshed when it is older than this.
-pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+pub(crate) const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 /// A failed fetch is retried after this, not after `MAX_AGE`.
-pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
+pub(crate) const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 
 /// Whether a cache last filled at `last_ok` (Unix ms) is due a refresh: never filled, older than
 /// `MAX_AGE`, or, when the latest attempt (`failed_at`) failed, `RETRY_AFTER_FAILURE` old.

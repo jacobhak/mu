@@ -6,13 +6,12 @@ use std::cell::RefCell;
 mod mu;
 mod retry;
 
-pub use mu::{
-    Cards, MuAsk, MuBell, MuConfig, MuEdit, MuMcp, MuPermissions, MuPredict, MuSecrets, MuStatus, MuTask, MuTheme,
-    MuUpdate,
-};
-use mu::{check_predict, check_status, load_permissions};
+pub use mu::{Cards, MuBell, MuConfig, MuPermissions, MuStatus, MuTheme};
+use mu::{MuPredict, check_predict, check_status, load_permissions};
 use retry::check_retry;
-pub use retry::{DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_WAIT, MuRetry, RetryPolicy, RetryRule, parse_duration};
+#[cfg(test)]
+use retry::{DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_WAIT, RetryPolicy};
+pub use retry::{MuRetry, RetryRule, parse_duration};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -323,7 +322,7 @@ impl Configs {
     }
 
     /// Every role mu does not use itself: the active set's keys and every `[roles.<name>]`, sorted.
-    pub fn custom_role_names(&self) -> Vec<String> {
+    pub(crate) fn custom_role_names(&self) -> Vec<String> {
         let models = self.models.borrow();
         let mut names: Vec<String> = models
             .active()
@@ -337,7 +336,7 @@ impl Configs {
         names
     }
 
-    pub fn model_limits(&self, id: &str) -> Option<ModelLimits> {
+    pub(crate) fn model_limits(&self, id: &str) -> Option<ModelLimits> {
         self.models.borrow().models.get(id).copied()
     }
 
@@ -347,7 +346,7 @@ impl Configs {
     }
 
     /// Every set that assigns the role, sorted.
-    pub fn sets_with_role(&self, name: &str) -> Vec<String> {
+    pub(crate) fn sets_with_role(&self, name: &str) -> Vec<String> {
         let models = self.models.borrow();
         models.sets.iter().filter(|(_, roles)| roles.contains_key(name)).map(|(set, _)| set.clone()).collect()
     }

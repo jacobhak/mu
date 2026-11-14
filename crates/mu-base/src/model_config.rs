@@ -160,7 +160,7 @@ fn sets_mut(doc: &mut DocumentMut) -> Result<&mut dyn TableLike, String> {
 }
 
 /// Sets `sets.<set>.<role> = value`, creating what is missing.
-pub fn write_role(text: &str, set: &str, role: &str, v: &str) -> Result<String, String> {
+pub(crate) fn write_role(text: &str, set: &str, role: &str, v: &str) -> Result<String, String> {
     let mut doc = parse_doc(text)?;
     sets_mut(&mut doc)?
         .entry(set)
@@ -172,7 +172,7 @@ pub fn write_role(text: &str, set: &str, role: &str, v: &str) -> Result<String, 
 }
 
 /// Removes a role without creating a missing set or removing its table.
-pub fn remove_role(text: &str, set: &str, role: &str) -> Result<String, String> {
+pub(crate) fn remove_role(text: &str, set: &str, role: &str) -> Result<String, String> {
     let mut doc = parse_doc(text)?;
     let Some(sets) = doc.get_mut("sets") else { return Ok(text.to_string()) };
     let sets = sets.as_table_like_mut().ok_or_else(|| not_a_table("sets"))?;
@@ -207,7 +207,7 @@ fn canonical_meta(name: &str, meta: &RoleMeta) -> RoleMeta {
 /// Writes `[roles.<name>]`: description, fallback list and delegate. Settings that read as they
 /// already do leave the file untouched; an empty `meta` removes the table. Other tables and
 /// comments are kept.
-pub fn write_role_meta(text: &str, name: &str, meta: &RoleMeta) -> Result<String, String> {
+pub(crate) fn write_role_meta(text: &str, name: &str, meta: &RoleMeta) -> Result<String, String> {
     let meta = canonical_meta(name, meta);
     if parse(text).0.roles.get(name).cloned().unwrap_or_default() == meta {
         return Ok(text.to_string());
@@ -238,7 +238,7 @@ pub fn write_role_meta(text: &str, name: &str, meta: &RoleMeta) -> Result<String
 }
 
 /// Checks the on-disk sets before editing a specific target.
-pub fn validate_role_target(text: &str, set: &str) -> Result<(), String> {
+pub(crate) fn validate_role_target(text: &str, set: &str) -> Result<(), String> {
     let doc = parse_doc(text)?;
     let Some(item) = doc.get("sets") else {
         return if set == MAIN_SET { Ok(()) } else { Err(format!("no model set `{set}`")) };
@@ -257,14 +257,14 @@ pub fn validate_role_target(text: &str, set: &str) -> Result<(), String> {
 }
 
 /// Sets the top-level `set = "<name>"`.
-pub fn write_active(text: &str, name: &str) -> Result<String, String> {
+pub(crate) fn write_active(text: &str, name: &str) -> Result<String, String> {
     let mut doc = parse_doc(text)?;
     doc.insert("set", value(name));
     Ok(doc.to_string())
 }
 
 /// Adds `[sets.<name>]` holding `roles`.
-pub fn write_set(text: &str, name: &str, roles: &BTreeMap<String, String>) -> Result<String, String> {
+pub(crate) fn write_set(text: &str, name: &str, roles: &BTreeMap<String, String>) -> Result<String, String> {
     let mut doc = parse_doc(text)?;
     let sets = sets_mut(&mut doc)?;
     if sets.contains_key(name) {
@@ -278,7 +278,7 @@ pub fn write_set(text: &str, name: &str, roles: &BTreeMap<String, String>) -> Re
     Ok(doc.to_string())
 }
 
-pub fn remove_set(text: &str, name: &str) -> Result<String, String> {
+pub(crate) fn remove_set(text: &str, name: &str) -> Result<String, String> {
     let mut doc = parse_doc(text)?;
     sets_mut(&mut doc)?.remove(name).ok_or_else(|| format!("no model set `{name}`"))?;
     Ok(doc.to_string())
@@ -383,7 +383,7 @@ fn yaml_u32(v: &Yaml, key: &str) -> Option<u32> {
 
 /// Reads omp's model config into a `models.toml` config. `mu_thresholds` (from mu's old
 /// `config.toml`) win over omp's per key. `None` when there is nothing to copy.
-pub fn build_import(
+pub(crate) fn build_import(
     config: &Mapping,
     models: &Mapping,
     mu_thresholds: &BTreeMap<String, toml::Value>,
