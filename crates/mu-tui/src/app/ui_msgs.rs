@@ -5,9 +5,7 @@ use super::*;
 use crate::chat::blocks;
 use mu_base::events::SubagentStatus;
 use mu_base::message::Image;
-use mu_provider::auth::chatgpt::Account;
 use mu_session::session::tree_cost::TreeCost;
-use serde_json::Value;
 
 pub(super) enum UiMsg {
     ChildDone {
@@ -27,33 +25,6 @@ pub(super) enum UiMsg {
     Spend(Box<TreeCost>),
     /// A finished subagent's session was read: its row, and what the session cost (`None` if the read failed).
     SubagentCost(Box<SubagentStatus>, Option<f64>),
-    /// A ChatGPT sign-in is waiting: the authorization URL to show.
-    ChatgptUrl {
-        flow: u64,
-        url: String,
-    },
-    /// A ChatGPT sign-in finished: the account, or why it did not.
-    ChatgptDone {
-        flow: u64,
-        r: Result<Account, String>,
-    },
-    /// A ChatGPT sign-in reports a line while it waits.
-    ChatgptNotice {
-        flow: u64,
-        text: String,
-    },
-    /// Revoking a signed-out ChatGPT sign-in finished.
-    ChatgptRevoked(Result<(), String>),
-    /// The `/memory` picker's files and notes, or why they could not be read.
-    MemoryFiles(Result<Value, String>),
-    MemoryLog(Result<Value, String>),
-    /// A commit's message and diff.
-    MemoryShown(Result<Value, String>),
-    /// A revert finished; `short` names the commit.
-    MemoryReverted {
-        short: String,
-        r: Result<Value, String>,
-    },
     /// A scheduled prompt reached its deadline; the app decides when it goes out.
     ScheduleDue(u64),
     /// The host answered a call that took a while (`App::host_call`): what to do with the reply.
@@ -81,14 +52,6 @@ impl App {
                 Ok(n) => self.notice(&n),
                 Err(e) => self.error(&format!("copy failed: {e}")),
             },
-            UiMsg::ChatgptUrl { flow, url } => self.on_chatgpt_url(flow, &url),
-            UiMsg::ChatgptDone { flow, r } => self.on_chatgpt_done(flow, r),
-            UiMsg::ChatgptNotice { flow, text } => self.on_chatgpt_notice(flow, &text),
-            UiMsg::ChatgptRevoked(r) => self.on_chatgpt_revoked(r),
-            UiMsg::MemoryFiles(r) => self.show_memory(r),
-            UiMsg::MemoryLog(r) => self.show_memory_log(r),
-            UiMsg::MemoryShown(r) => self.on_memory_shown(r),
-            UiMsg::MemoryReverted { short, r } => self.on_memory_reverted(&short, r),
             UiMsg::ScheduleDue(id) => self.on_schedule_due(id),
             UiMsg::Host(then) => then(self),
             UiMsg::ClipboardImage(r) => match r {

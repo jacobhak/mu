@@ -35,6 +35,9 @@ impl App {
         self.screen.dirty = true;
         #[allow(clippy::match_single_binding)]
         match p.name.as_str() {
+            crate::host::chatgpt::URL | crate::host::chatgpt::NOTICE | crate::host::chatgpt::DONE => {
+                self.on_chatgpt_pushed(p)
+            }
             _ => {}
         }
     }

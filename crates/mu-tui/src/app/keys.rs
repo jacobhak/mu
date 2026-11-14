@@ -855,10 +855,8 @@ pub(super) mod tests {
 
     #[test]
     fn a_late_chatgpt_result_is_ignored_and_escape_ends_the_sign_in() {
-        use tokio_util::sync::CancellationToken;
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let (paste, _paste_rx) = unbounded_channel();
-        app.flows.active = Active::Chatgpt(chatgpt::ChatgptFlow { id: 2, cancel: CancellationToken::new(), paste });
+        app.flows.active = Active::Chatgpt(chatgpt::ChatgptFlow { id: 2 });
         app.on_chatgpt_done(1, Err("late".into()));
         assert_eq!(app.flows.chatgpt().map(|f| f.id), Some(2), "the current sign-in survives");
         assert!(app.typing(), "the composer is locked to the redirect URL");

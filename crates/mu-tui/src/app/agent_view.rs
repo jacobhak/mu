@@ -368,6 +368,7 @@ impl AgentView {
             }
             AgentEvent::PlanReview { title, uri, file, content, stored, note, reply } => {
                 self.ring_if_attention(&mut fx);
+                crate::host::plans::hand_out(&file);
                 fx.push(Effect::PlanReview { title, uri, file, content, stored, note, reply });
             }
             AgentEvent::PlanParked { id, path } => {
