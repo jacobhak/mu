@@ -148,6 +148,14 @@ impl Agent {
         self.settle_prices();
     }
 
+    pub(super) async fn refresh_status(&mut self) {
+        if !self.gateway_idle() {
+            self.costs.quota.force_refresh(&self.model.model.provider);
+        }
+        self.costs.git = git::git_status(&self.cwd).await;
+        self.emit_status();
+    }
+
     /// Native models have no gateway quota to poll.
     pub(super) fn tick_quota(&mut self) {
         if self.gateway_idle() {

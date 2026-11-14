@@ -1321,6 +1321,22 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn refresh_is_discoverable_and_queues_when_busy() {
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        assert!(super::super::slash::interactive_reference().contains("`/refresh`"));
+        app.submit(UserInput::from("/refresh"), false);
+        assert!(matches!(commands.try_recv(), Ok(Command::RefreshStatus)));
+        assert!(!app.agent.running);
+        app.agent.running = true;
+        app.submit(UserInput::from("/refresh status"), false);
+        assert!(matches!(commands.try_recv(), Ok(Command::RefreshStatus)));
+        assert!(transcript_text(&app).contains("status refresh queued until the current turn finishes"));
+        app.submit(UserInput::from("/refresh invalid"), false);
+        assert!(commands.try_recv().is_err());
+        assert!(transcript_text(&app).contains("usage: /refresh [status]"));
+    }
+
+    #[test]
     fn model_editor_is_independent_of_session_switching_and_discovery() {
         use mu_base::config::Configs;
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));

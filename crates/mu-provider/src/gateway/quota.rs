@@ -104,6 +104,8 @@ pub struct QuotaTracker {
     /// The last fetch found no running gateway (cheap to re-check, so retried on a short fixed interval).
     no_gateway: bool,
     inflight: bool,
+    /// A manual refresh requested while a fetch was in flight.
+    refresh_pending: bool,
     /// Native models are metered by API key: nothing to fetch, and nothing to wake for.
     paused: bool,
     /// Quota is fetched only for the top-level interactive agent.
@@ -123,6 +125,7 @@ impl Default for QuotaTracker {
             failures: 0,
             no_gateway: false,
             inflight: false,
+            refresh_pending: false,
             paused: false,
             enabled: false,
             slot: Rc::new(RefCell::new(None)),
@@ -168,6 +171,19 @@ impl QuotaTracker {
         }
     }
 
+    /// Fetch now, or once more after the current fetch completes, regardless of the normal cadence.
+    pub fn force_refresh(&mut self, provider: &str) {
+        if !self.enabled || self.paused {
+            return;
+        }
+        if self.inflight {
+            self.refresh_pending = true;
+        } else {
+            self.at = None;
+            self.tick(provider);
+        }
+    }
+
     /// Time until the next fetch is due. Long while one is in flight: its completion wakes the run loop.
     pub fn wait(&self) -> Duration {
         if !self.enabled || self.paused || self.inflight {
@@ -199,9 +215,10 @@ impl QuotaTracker {
                 }
             }
             // Fetched for a provider the session has since switched away from: fetch again now.
-            if fetched_for != provider {
+            if fetched_for != provider || self.refresh_pending {
                 self.at = None;
             }
+            self.refresh_pending = false;
         }
         if self.inflight || !self.wait().is_zero() {
             return;
@@ -274,6 +291,50 @@ mod tests {
         q.provider_changed();
         assert!(q.is_subscription("openai"));
         assert_eq!(q.wait(), Duration::from_secs(3600), "disabled: nothing to wait for");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_bypasses_cadence() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut q = QuotaTracker { enabled: true, at: Some(Instant::now()), ..Default::default() };
+                assert!(!q.wait().is_zero());
+                q.force_refresh("anthropic");
+                assert!(q.inflight);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_during_fetch_starts_another_after_completion() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut q = QuotaTracker { enabled: true, inflight: true, ..Default::default() };
+                q.force_refresh("anthropic");
+                assert!(q.refresh_pending);
+                *q.slot.borrow_mut() = Some(("anthropic".into(), Fetch::Failed));
+                q.tick("anthropic");
+                assert!(q.inflight);
+                assert!(!q.refresh_pending);
+                assert_eq!(q.failures, 1);
+            })
+            .await;
+    }
+
+    #[test]
+    fn force_refresh_respects_disabled_and_paused() {
+        let mut q = QuotaTracker { at: Some(Instant::now()), ..Default::default() };
+        q.force_refresh("anthropic");
+        assert!(!q.inflight);
+        assert!(q.at.is_some());
+        q.enabled = true;
+        q.set_paused(true);
+        q.force_refresh("anthropic");
+        assert!(!q.inflight);
+        assert!(q.at.is_some());
+        q.inflight = true;
+        q.force_refresh("anthropic");
+        assert!(!q.refresh_pending);
     }
 
     #[test]

@@ -474,6 +474,9 @@ impl Agent {
                 self.refresh_model_meta();
                 self.emit_status();
             }
+            Command::RefreshStatus => {
+                self.refresh_status().await;
+            }
             Command::SetThinking(t) => self.set_thinking(t),
             Command::CycleThinking => self.set_thinking(self.model.live_thinking.get().cycle()),
             Command::SetPermissionMode(m) => {

@@ -33,6 +33,8 @@ pub enum Command {
     SetModel(String),
     /// Re-resolve the current model: a key was added or removed, so its route may have changed.
     RefreshModel,
+    /// Refresh external Git and gateway quota status without a model turn.
+    RefreshStatus,
     SetThinking(Thinking),
     CycleThinking,
     /// `/permissions` or `--permissions`: the mode applies to the next tool call.

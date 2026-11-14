@@ -119,6 +119,38 @@ fn rapid_thinking_cycles_follow_command_order_during_a_turn() {
 }
 
 #[test]
+fn refresh_status_reads_git_and_emits_without_a_turn() {
+    run(async {
+        let dir = crate::testing::git_repo();
+        let (mut a, mut events) = crate::testing::agent_in(vec![], Default::default(), Default::default(), dir.clone());
+        let (_tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        assert!(a.command(Command::RefreshStatus, &mut q).await);
+        assert!(
+            drain(&mut events).iter().any(
+                |event| matches!(event, AgentEvent::Status(s) if s.git.as_ref().is_some_and(|git| git.dirty == 1))
+            )
+        );
+        assert!(a.messages.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    });
+}
+
+#[test]
+fn refresh_status_waits_in_the_backlog_during_a_turn() {
+    run(async {
+        let (tx, rx) = unbounded_channel();
+        let (events, _erx) = unbounded_channel();
+        let inbox = new_inbox();
+        let mut q = queue(rx, &inbox, events);
+        tx.send(Command::RefreshStatus).unwrap();
+        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        assert!(matches!(q.backlog.pop_front(), Some(Command::RefreshStatus)));
+    });
+}
+
+#[test]
 fn idle_thinking_cycles_ignore_intervening_status_events() {
     run(async {
         let (mut a, mut events) = crate::testing::agent(vec![]);

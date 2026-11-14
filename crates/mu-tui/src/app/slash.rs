@@ -13,7 +13,7 @@ use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::tools::todo::Status;
 
-const BUILTIN_DESC: [(&str, &str, bool); 32] = [
+const BUILTIN_DESC: [(&str, &str, bool); 33] = [
     ("exit", "Exit mu", false),
     ("quit", "Exit mu", false),
     ("new", "Start a new session", false),
@@ -31,6 +31,7 @@ const BUILTIN_DESC: [(&str, &str, bool); 32] = [
     ("compact", "Compact the context [focus]", false),
     ("plan", "Toggle plan mode", false),
     ("review", "Review changes against the approved plan [focus]", false),
+    ("refresh", "Refresh Git and gateway quota status", false),
     ("session", "Show the session file and title", false),
     ("rename", "Rename this session", true),
     ("todo", "Show the todo list", false),
@@ -269,6 +270,7 @@ impl App {
                 | "skills"
                 | "plugins"
                 | "session"
+                | "refresh"
                 | "copy"
                 | "reply"
                 | "image"
@@ -322,6 +324,13 @@ impl App {
                 self.agent.running = true;
                 self.send(Command::Review((!arg.is_empty()).then(|| arg.to_string())));
             }
+            "refresh" if arg.is_empty() || arg == "status" => {
+                self.send(Command::RefreshStatus);
+                if self.agent.running {
+                    self.notice("status refresh queued until the current turn finishes");
+                }
+            }
+            "refresh" => self.error("usage: /refresh [status]"),
             "session" => {
                 let p = self.agent.status.session_path.clone().unwrap_or_else(|| "no session yet".into());
                 let t = self.agent.status.title.clone().unwrap_or_else(|| "(untitled)".into());
