@@ -60,8 +60,7 @@ struct PtyRun {
     /// Keystrokes waiting for the pty to accept them; writing never blocks reads, cancel or timeout.
     pending_in: std::collections::VecDeque<u8>,
     write_buf: Vec<u8>,
-    decoder: pi_shell::output_decode::OutputDecoder,
-    cleaner: mu_base::pty::Cleaner,
+    stream: Stream,
     collector: Collector,
     buf: Vec<u8>,
     eof: bool,
@@ -85,12 +84,11 @@ async fn write_some(
 
 impl PtyRun {
     /// Appends raw output: the UI gets it raw, the model gets it cleaned (and spilled when long).
-    fn emit(&mut self, raw: String, ctx: &ToolCtx, tools: &Tools) {
+    fn emit(&mut self, (raw, clean): (String, String), ctx: &ToolCtx, tools: &Tools) {
         if !raw.is_empty() {
-            let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: raw.clone() });
-            let clean = self.cleaner.push(&raw);
-            self.collector.push(&clean, &|| tools.next_artifact());
+            let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: raw });
         }
+        self.collector.push(&clean, &|| tools.next_artifact());
     }
 
     /// Runs the command until it exits, or until it is cancelled or times out and has been terminated.
@@ -109,8 +107,8 @@ impl PtyRun {
                 r = self.io.read(&mut self.buf), if !self.eof => match r {
                     Ok(0) | Err(_) => self.eof = true,
                     Ok(n) => {
-                        let raw = self.decoder.push(&self.buf[..n]);
-                        self.emit(raw, ctx, tools);
+                        let text = self.stream.push(&self.buf[..n]);
+                        self.emit(text, ctx, tools);
                     }
                 },
                 w = write_some(&self.io, &self.pending_in, &mut self.write_buf), if !self.pending_in.is_empty() && self.term_at.is_none() => match w {
@@ -150,33 +148,31 @@ impl PtyRun {
     }
 
     /// After the leader is gone: whatever it left in the group is terminated first, then the
-    /// remaining output is read until EOF, `DRAIN_IDLE` without data, `DRAIN_CAP` in all, or cancel.
+    /// remaining output is read under `Drain`'s policy.
     async fn drain(&mut self, tools: &Tools, ctx: &ToolCtx) {
         if self.eof {
             return;
         }
         self.io.signal(libc::SIGTERM);
-        let now = tokio::time::Instant::now();
-        let (kill_at, cap_at) = (now + KILL_AFTER, now + DRAIN_CAP);
+        let kill_at = tokio::time::Instant::now() + KILL_AFTER;
+        let mut drain = Drain::start();
         let mut killed = false;
-        let mut idle_at = now + DRAIN_IDLE;
         while !self.eof {
-            let wake = if killed { cap_at.min(idle_at) } else { kill_at.min(cap_at).min(idle_at) };
+            let wake = if killed { drain.ends_at() } else { kill_at.min(drain.ends_at()) };
             tokio::select! {
                 r = self.io.read(&mut self.buf) => match r {
                     Ok(n) if n > 0 => {
-                        let raw = self.decoder.push(&self.buf[..n]);
-                        self.emit(raw, ctx, tools);
-                        idle_at = tokio::time::Instant::now() + DRAIN_IDLE;
+                        let text = self.stream.push(&self.buf[..n]);
+                        self.emit(text, ctx, tools);
+                        drain.touch();
                     }
                     _ => self.eof = true,
                 },
                 _ = tokio::time::sleep_until(wake) => {
-                    let t = tokio::time::Instant::now();
-                    if t >= cap_at || t >= idle_at {
+                    if drain.over() {
                         break;
                     }
-                    if !killed && t >= kill_at {
+                    if !killed && tokio::time::Instant::now() >= kill_at {
                         killed = true;
                         self.io.signal(libc::SIGKILL);
                     }
@@ -192,10 +188,39 @@ impl PtyRun {
 
 const KILL_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 const GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_millis(800);
-/// After the leader exits: the hard cap on reading what its descendants still write, and how long
-/// a quiet pipe is waited on.
-const DRAIN_CAP: std::time::Duration = std::time::Duration::from_millis(1000);
-const DRAIN_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The one policy for the output a command's descendants write after the leader has exited, for
+/// the pty and the piped runs alike: whatever is left in the group is terminated at once, and the
+/// output is read until EOF, `IDLE` without data, `CAP` in all, or cancel.
+#[derive(Clone, Copy)]
+struct Drain {
+    cap_at: tokio::time::Instant,
+    idle_at: tokio::time::Instant,
+}
+
+impl Drain {
+    const CAP: std::time::Duration = std::time::Duration::from_millis(1000);
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    fn start() -> Self {
+        let now = tokio::time::Instant::now();
+        Self { cap_at: now + Self::CAP, idle_at: now + Self::IDLE }
+    }
+
+    /// Data arrived: the quiet period starts over.
+    fn touch(&mut self) {
+        self.idle_at = tokio::time::Instant::now() + Self::IDLE;
+    }
+
+    /// When the drain ends if nothing more arrives.
+    fn ends_at(&self) -> tokio::time::Instant {
+        self.cap_at.min(self.idle_at)
+    }
+
+    fn over(&self) -> bool {
+        tokio::time::Instant::now() >= self.ends_at()
+    }
+}
 
 impl PtyRun {
     /// Starts termination; false when it had already started.
@@ -486,8 +511,7 @@ impl Tools {
             input_open: true,
             pending_in: Default::default(),
             write_buf: Vec::new(),
-            decoder: pi_shell::output_decode::OutputDecoder::new(),
-            cleaner: mu_base::pty::Cleaner::default(),
+            stream: Stream::default(),
             collector: Collector::new(cwd),
             buf: vec![0u8; 64 * 1024],
             eof: false,
@@ -502,10 +526,8 @@ impl Tools {
         // The command is over. Anything it left running in the background goes with it; the
         // group is gone once the leader is reaped only if nothing else is in it.
         mu_base::process::terminate_group(run.io.pid()).await;
-        let raw = run.decoder.finish();
-        run.emit(raw, ctx, self);
-        let tail = run.cleaner.finish();
-        run.collector.push(&tail, &|| self.next_artifact());
+        let rest = run.stream.finish();
+        run.emit(rest, ctx, self);
         let wall = start.elapsed().as_secs_f64();
         let end = RunEnd {
             wall,
@@ -674,6 +696,31 @@ fn job_shell() -> PathBuf {
     mu_base::pty::bash_on_path().unwrap_or_else(|| "/bin/sh".into())
 }
 
+/// One output stream on its way to the result: bytes are decoded to text (the pty view and the live
+/// tail get it raw), then cleaned for the model. Each stream holds its own escape state and
+/// unfinished line, so a run with two streams has two.
+#[derive(Default)]
+struct Stream {
+    decoder: pi_shell::output_decode::OutputDecoder,
+    cleaner: mu_base::pty::Cleaner,
+}
+
+impl Stream {
+    /// `(raw, clean)` for the bytes read.
+    fn push(&mut self, bytes: &[u8]) -> (String, String) {
+        let raw = self.decoder.push(bytes);
+        let clean = self.cleaner.push(&raw);
+        (raw, clean)
+    }
+
+    /// What the decoder and cleaner still hold, at the end of the stream.
+    fn finish(&mut self) -> (String, String) {
+        let raw = self.decoder.finish();
+        let clean = self.cleaner.push(&raw) + &self.cleaner.finish();
+        (raw, clean)
+    }
+}
+
 /// How a run ended: what `finish` words into the result.
 struct RunEnd {
     wall: f64,
@@ -736,10 +783,6 @@ fn finish(c: Collected, end: RunEnd) -> ToolOutput {
     out
 }
 
-/// Hard cap on how long the pipes are read after the command exits: a background descendant may
-/// hold them open and keep writing. The group is terminated at once; this bounds what is left.
-const BACKGROUND_DRAIN_CAP: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// Reads from a pipe, or never completes once the pipe is closed (`None`).
 async fn read_or_pending<R: AsyncRead + Unpin>(r: &mut Option<R>, buf: &mut [u8]) -> std::io::Result<usize> {
     match r {
@@ -785,10 +828,7 @@ pub async fn run_background(
     };
     let pid = child.id().unwrap_or(0) as i32;
     let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
-    let (mut out_dec, mut err_dec) =
-        (pi_shell::output_decode::OutputDecoder::new(), pi_shell::output_decode::OutputDecoder::new());
-    // One per stream: each holds its own escape state and unfinished line.
-    let (mut out_clean, mut err_clean) = (mu_base::pty::Cleaner::default(), mu_base::pty::Cleaner::default());
+    let (mut out_stream, mut err_stream) = (Stream::default(), Stream::default());
     let (mut obuf, mut ebuf) = (vec![0u8; 8192], vec![0u8; 8192]);
     let mut collector = Collector::new(cwd.clone());
     let mut status: Option<std::process::ExitStatus> = None;
@@ -797,23 +837,31 @@ pub async fn run_background(
     let mut terminating: Option<tokio::task::JoinHandle<()>> = None;
     let timeout_sleep = tokio::time::sleep(limits.timeout.unwrap_or_default());
     tokio::pin!(timeout_sleep);
-    let drain_cap = tokio::time::sleep(std::time::Duration::MAX);
-    tokio::pin!(drain_cap);
+    let mut drain: Option<Drain> = None;
     loop {
+        let ends_at = drain.map(|d| d.ends_at());
+        let drain_end = async {
+            match ends_at {
+                Some(t) => tokio::time::sleep_until(t).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             r = read_or_pending(&mut stdout, &mut obuf) => match r {
                 Ok(n) if n > 0 => {
-                    let text = out_dec.push(&obuf[..n]);
-                    on_output(&text);
-                    collector.push(&out_clean.push(&text), &alloc)
+                    let (raw, clean) = out_stream.push(&obuf[..n]);
+                    on_output(&raw);
+                    collector.push(&clean, &alloc);
+                    drain.iter_mut().for_each(Drain::touch);
                 }
                 _ => stdout = None,
             },
             r = read_or_pending(&mut stderr, &mut ebuf) => match r {
                 Ok(n) if n > 0 => {
-                    let text = err_dec.push(&ebuf[..n]);
-                    on_output(&text);
-                    collector.push(&err_clean.push(&text), &alloc)
+                    let (raw, clean) = err_stream.push(&ebuf[..n]);
+                    on_output(&raw);
+                    collector.push(&clean, &alloc);
+                    drain.iter_mut().for_each(Drain::touch);
                 }
                 _ => stderr = None,
             },
@@ -823,8 +871,9 @@ pub async fn run_background(
                 if terminating.is_none() {
                     terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
                 }
-                drain_cap.as_mut().reset(tokio::time::Instant::now() + BACKGROUND_DRAIN_CAP);
+                drain = Some(Drain::start());
             }
+            _ = drain_end, if drain.is_some() => break,
             _ = cancel.cancelled(), if !stopping => {
                 cancelled = true;
                 stopping = true;
@@ -840,7 +889,6 @@ pub async fn run_background(
                 stopping = true;
                 terminating = Some(tokio::spawn(mu_base::process::terminate_group(pid)));
             }
-            _ = &mut drain_cap, if status.is_some() => break,
         }
         if status.is_some() && stdout.is_none() && stderr.is_none() {
             break;
@@ -852,10 +900,8 @@ pub async fn run_background(
         }
         None => mu_base::process::terminate_group(pid).await,
     }
-    let out_rest = out_clean.push(&out_dec.finish()) + &out_clean.finish();
-    collector.push(&out_rest, &alloc);
-    let err_rest = err_clean.push(&err_dec.finish()) + &err_clean.finish();
-    collector.push(&err_rest, &alloc);
+    collector.push(&out_stream.finish().1, &alloc);
+    collector.push(&err_stream.finish().1, &alloc);
     let code = exit_code(status);
     let end = RunEnd {
         wall: start.elapsed().as_secs_f64(),
@@ -981,6 +1027,51 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(5), "held open for {:?}", t.elapsed());
         assert!(r.ok && r.note == "exit 0", "{} / {}", r.note, r.text);
         assert!(r.text.contains("leader-done"), "{}", r.text);
+    }
+
+    #[test]
+    fn one_drain_policy_bounds_pty_and_piped_runs_alike() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut d = Drain::start();
+            let start = d.cap_at - Drain::CAP;
+            assert_eq!(d.ends_at(), start + Drain::IDLE, "a quiet pipe ends at the idle limit");
+            // A steady writer keeps the idle limit moving but never past the cap.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            d.touch();
+            assert!(d.ends_at() > start + Drain::IDLE);
+            d.idle_at = d.cap_at + Duration::from_secs(10);
+            assert_eq!(d.ends_at(), d.cap_at);
+            assert!(!d.over());
+        });
+        assert!(Drain::IDLE < Drain::CAP);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_background_run_stops_reading_a_descendant_that_has_gone_quiet() {
+        let t = Instant::now();
+        let r = run_background(
+            "(trap '' TERM; echo once; sleep 30) & echo leader-done".into(),
+            std::env::temp_dir(),
+            std::env::vars().collect(),
+            Some(60.0),
+            CancellationToken::new(),
+            || (0, std::env::temp_dir()),
+            |_| {},
+        )
+        .await;
+        assert!(t.elapsed() < Drain::CAP + Duration::from_secs(3), "drain took {:?}", t.elapsed());
+        assert!(r.ok && r.text.contains("leader-done") && r.text.contains("once"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_stream_holds_its_own_unfinished_line_and_flushes_it_at_the_end() {
+        let mut a = Stream::default();
+        let mut b = Stream::default();
+        assert_eq!(a.push(b"par").1, "");
+        assert_eq!(b.push(b"other\n").1, "other\n");
+        assert_eq!(a.push(b"tial").1, "");
+        assert_eq!(a.finish().1, "partial");
     }
 
     #[test]
