@@ -5,6 +5,7 @@ mu replaces recognisable secrets with placeholders such as `[REDACTED:GEMINI_API
 What counts as a secret:
 
 - Environment variables whose name says they hold one (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*PASSWORD`, `*_PAT`, …), but not ones about one (`*_KEY_PATH`, `*_KEY_ID`, `SSH_AUTH_SOCK`). The value must be at least 8 characters and look like a credential rather than a word or path.
+- The same for variables exported inside the `bash` tool's persistent shell (`export FOO_TOKEN=…`): they count from the next time mu reads the shell's exports, which is during the same call, before its output is redacted. Values `bash` jobs set for themselves are not exports of that shell.
 - The same for `.env` and `.env.*` files in the working directory (not `.env.example`, `.sample`, `.template`). Changes to them are picked up.
 - The password in any `scheme://user:password@host` value of those variables.
 - Keys in an unambiguous format, wherever they appear: GitHub (`ghp_`, `github_pat_`, …), Anthropic (`sk-ant-`), OpenAI (`sk-`), AWS access key ids, Google API keys (`AIza`), Slack (`xox?-`), Stripe live keys and private key blocks.

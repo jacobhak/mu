@@ -412,11 +412,17 @@ fn is_lan(ip: IpAddr) -> bool {
 }
 
 /// Addresses a fetch never reaches: loopback, link-local (which holds cloud metadata services),
-/// unspecified, broadcast and multicast.
+/// "this network" (`0.0.0.0/8`, which some stacks route to the host), broadcast, multicast and
+/// Alibaba Cloud's metadata address, which sits inside the CGNAT range the LAN rule allows.
 fn is_internal(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
-            v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast() || v.is_multicast()
+            v.is_loopback()
+                || v.is_link_local()
+                || v.octets()[0] == 0
+                || v.is_broadcast()
+                || v.is_multicast()
+                || v.octets() == [100, 100, 100, 200]
         }
         IpAddr::V6(v) => {
             if let Some(m) = v.to_ipv4_mapped() {
@@ -698,12 +704,32 @@ mod tests {
 
     #[test]
     fn internal_addresses_are_refused_and_lan_ones_allowed() {
-        for ip in ["127.0.0.1", "169.254.169.254", "0.0.0.0", "::1", "fe80::1", "::ffff:127.0.0.1", "::"] {
+        for ip in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "0.1.2.3",
+            "0.255.255.255",
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+            "::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::",
+        ] {
             assert!(is_internal(ip.parse().unwrap()), "{ip}");
         }
-        for ip in
-            ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "10.0.0.1", "172.16.0.1", "192.168.1.80", "fd00::1", "100.64.0.1"]
-        {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700::1111",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.80",
+            "fd00::1",
+            "100.64.0.1",
+            "100.100.100.201",
+        ] {
             assert!(!is_internal(ip.parse().unwrap()), "{ip}");
         }
     }

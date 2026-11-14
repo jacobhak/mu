@@ -72,6 +72,21 @@ else
     echo "install.sh: mu-$plat.tar.gz does not match SHA256SUMS (or the release has none); not installing" >&2
     exit 1
   fi
+  # The checksum comes from the same release as the tarball, so it catches a bad download and not a
+  # replaced release. A build attestation, signed by the release workflow, catches that too; it exists
+  # only where the repo supports them, so a tarball without one is checked by its checksum alone.
+  if has_gh; then
+    n="$(gh api "repos/$REPO/attestations/sha256:$got" -q '.attestations | length' 2>/dev/null || true)"
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+      if ! gh attestation verify "$tmp/mu-$plat.tar.gz" -R "$REPO" >/dev/null 2>&1; then
+        echo "install.sh: the attestation for mu-$plat.tar.gz does not verify; not installing" >&2
+        exit 1
+      fi
+      echo "install: build attestation verified"
+    else
+      echo "install: no build attestation for this release; checked its checksum only" >&2
+    fi
+  fi
   tar -C "$tmp" -xzf "$tmp/mu-$plat.tar.gz"
 fi
 stage="$tmp/mu"

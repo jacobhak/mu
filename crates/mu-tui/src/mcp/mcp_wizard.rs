@@ -367,9 +367,11 @@ impl Wizard {
         if http {
             lines.push(format!("  url: {}", display_url(e["url"].as_str().unwrap_or_default())));
         } else {
-            let mut cmd = vec![quote(e["command"].as_str().unwrap_or_default())];
+            // Arguments are shown as typed, except what the redactor recognises as a key.
+            let shown = |a: &str| quote(&mu_base::secrets::redact_keys(a));
+            let mut cmd = vec![shown(e["command"].as_str().unwrap_or_default())];
             if let Some(args) = e["args"].as_array() {
-                cmd.extend(args.iter().map(|a| quote(a.as_str().unwrap_or_default())));
+                cmd.extend(args.iter().map(|a| shown(a.as_str().unwrap_or_default())));
             }
             lines.push(format!("  command: {}", cmd.join(" ")));
         }
@@ -602,6 +604,24 @@ mod tests {
         assert!(!summary.concat().contains("abc"));
         pick(&mut w, 0);
         assert_eq!(done(&w), Draft { level: Level::Project, name: "fs".into(), entry: stdio_found().entry });
+    }
+
+    #[test]
+    fn a_key_typed_as_an_argument_is_not_shown_in_the_summary() {
+        let key = format!("ghp_{}", "a1B2".repeat(9));
+        let mut w = wiz(vec![found(
+            "Claude Code",
+            "gh",
+            json!({"type": "stdio", "command": "gh-mcp", "args": ["--token", key]}),
+        )]);
+        pick(&mut w, 0);
+        pick(&mut w, 0);
+        w.take_notes();
+        pick(&mut w, 0);
+        text(&mut w, "");
+        let summary = w.take_notes();
+        assert_eq!(summary[1], "  command: gh-mcp --token [REDACTED:github-token]");
+        assert!(!summary.concat().contains(&key));
     }
 
     #[test]

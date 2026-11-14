@@ -78,11 +78,17 @@ impl SessionFile {
 
     fn create_with(cwd: &Path, parent_session: Option<&Path>, forked_from: Option<&Path>) -> Result<Self> {
         let dir = paths::session_dir(cwd);
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        // Session files hold the conversation: the state home and the session directory are owner-only.
+        mu_common::fs::create_private_dir(&paths::profile_home())
+            .and_then(|()| mu_common::fs::create_private_dir(&dir))
+            .with_context(|| format!("create {}", dir.display()))?;
         let id = uuid::Uuid::now_v7();
         let ts = jiff::Timestamp::now().strftime("%Y-%m-%dT%H-%M-%S-%3fZ").to_string();
         let path = dir.join(format!("{ts}_{id}.jsonl"));
-        let mut file = OpenOptions::new().create_new(true).append(true).open(&path)?;
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new().create_new(true).append(true).mode(0o600).open(&path)?
+        };
         lock(&file, &path)?;
         let mut header =
             json!({"type":"session","version":3,"id":id.to_string(),"timestamp":iso_ms(),"cwd":cwd.to_string_lossy()});
@@ -109,6 +115,7 @@ impl SessionFile {
     /// Opens an existing session for appending after `load`.
     pub fn open_append(path: &Path) -> Result<Self> {
         let mut file = OpenOptions::new().append(true).read(true).open(path)?;
+        mu_common::fs::tighten(&file);
         lock(&file, path)?;
         let owner = OwnerRecord::claim(path, None, None);
         let (_, leaf, ids) = parse(path)?;
@@ -333,6 +340,21 @@ mod tests {
         r.message(&Message::user("third"));
         assert_eq!(load(&path).unwrap().messages.len(), 3);
         assert_eq!(latest_for(Path::new("/opt/proj")), Some(path.clone()));
+    }
+
+    #[test]
+    fn a_session_file_is_owner_only_and_an_older_one_is_tightened_on_reopen() {
+        use std::os::unix::fs::PermissionsExt;
+        home();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let s = SessionFile::create(Path::new("/opt/modes"), None).unwrap();
+        let path = s.path.clone();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        drop(s);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let _s = SessionFile::open_append(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]

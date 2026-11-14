@@ -92,12 +92,23 @@ pub(super) enum Dialect {
     Mcp(McpWire),
 }
 
+/// Requests from one plugin served at once. A plugin sends one model call at a time and the odd
+/// notification; more than this is a runaway loop, and each request is a task.
+const MAX_SERVING: u32 = 64;
+/// A plugin's `core/complete` is cut off after this long: a model call that never answers must not
+/// hold the plugin's request (and the task serving it) forever.
+const COMPLETE_TIMEOUT: Duration = Duration::from_secs(600);
+
 pub(super) struct Proc {
     pub(super) name: String,
     pub(super) pid: u32,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     pub(super) pending: Pending,
     pub(super) inflight: Cell<u32>,
+    /// Plugin-to-core requests being served now.
+    serving: Cell<u32>,
+    /// Cancelled when the plugin's stdout closes: nobody is left to read the answer to what it asked.
+    gone: CancellationToken,
     pub(super) last: Cell<Instant>,
     pub(super) dead: watch::Sender<bool>,
     pub(super) dialect: Dialect,
@@ -134,6 +145,22 @@ fn resolve_command(m: &Manifest) -> std::path::PathBuf {
         return sib;
     }
     c.into()
+}
+
+/// Counts a plugin request as served until dropped.
+struct ServingGuard<'a>(&'a Proc);
+
+impl<'a> ServingGuard<'a> {
+    fn enter(proc: &'a Proc) -> Self {
+        proc.serving.set(proc.serving.get() + 1);
+        Self(proc)
+    }
+}
+
+impl Drop for ServingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.serving.set(self.0.serving.get().saturating_sub(1));
+    }
 }
 
 /// Undoes `Proc::request`'s bookkeeping however the request ends.
@@ -309,6 +336,7 @@ async fn read_loop(
     }
     // Stdout is gone (EOF or a read error). Fail what is waiting, forget the process, then make
     // sure it is really gone before reaping it: a plugin can close stdout and keep running.
+    proc.gone.cancel();
     proc.pending.fail_all(&format!("plugin {} exited", proc.name));
     slot.detach(&proc);
     proc.stdin.lock().await.take();
@@ -323,6 +351,14 @@ async fn read_loop(
 }
 
 async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared>, req: Request) {
+    if proc.serving.get() >= MAX_SERVING {
+        if let Some(id) = req.id {
+            let busy = Response::err(id, -32000, format!("too many concurrent requests (limit {MAX_SERVING})"));
+            let _ = proc.write_line(&serde_json::to_string(&busy).expect("response serializes")).await;
+        }
+        return;
+    }
+    let _serving = ServingGuard::enter(&proc);
     let p = &req.params;
     let result: Result<Value, String> = match slot.as_mcp() {
         Some(m) if req.method == "notifications/tools/list_changed" => {
@@ -338,17 +374,19 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
                 let target = p["model"].as_str().or(p["role"].as_str()).unwrap_or("smol").to_string();
                 let providers = shared.providers.borrow().upgrade();
                 match providers {
-                    Some(pr) => pr
-                        .complete(
+                    Some(pr) => {
+                        let call = pr.complete(
                             &target,
                             p["system"].as_str().unwrap_or(""),
                             p["prompt"].as_str().unwrap_or(""),
                             p["maxTokens"].as_u64().unwrap_or(2048) as u32,
-                            &CancellationToken::new(),
-                        )
-                        .await
-                        .map(|text| json!({"text": text}))
-                        .map_err(|e| e.to_string()),
+                            &proc.gone,
+                        );
+                        match tokio::time::timeout(COMPLETE_TIMEOUT, call).await {
+                            Ok(r) => r.map(|text| json!({"text": text})).map_err(|e| e.to_string()),
+                            Err(_) => Err(format!("core/complete timed out after {}s", COMPLETE_TIMEOUT.as_secs())),
+                        }
+                    }
                     None => Err(format!("no model configured for role {target}")),
                 }
             }
@@ -439,6 +477,8 @@ impl PluginHost {
             stdin: tokio::sync::Mutex::new(Some(stdin)),
             pending: Pending::default(),
             inflight: Cell::new(0),
+            serving: Cell::new(0),
+            gone: CancellationToken::new(),
             last: Cell::new(Instant::now()),
             dead,
             dialect,

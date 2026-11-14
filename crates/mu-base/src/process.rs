@@ -9,7 +9,8 @@ const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
 
 /// Sends `kill(pid, sig)` to that one pid (never a group). `Err` carries the errno.
 pub fn signal_pid(pid: u32, sig: libc::c_int) -> std::io::Result<()> {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+    // pid 0 would signal the caller's own group.
+    let Ok(pid @ 1..) = libc::pid_t::try_from(pid) else {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     };
     // SAFETY: plain syscall, no memory involved.
@@ -137,6 +138,13 @@ mod tests {
         assert_eq!(unsafe { libc::getpgid(pid) }, pid);
         rt.block_on(terminate_group(pid));
         assert!(!rt.block_on(child.wait()).unwrap().success());
+    }
+
+    #[test]
+    fn signal_pid_refuses_pid_zero() {
+        // Signal 0 only checks; pid 0 would address the caller's own group.
+        assert_eq!(signal_pid(0, 0).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(signal_pid(std::process::id(), 0).is_ok());
     }
 
     #[test]

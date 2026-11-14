@@ -346,8 +346,26 @@ fn paste_must_be_this_listeners_callback() {
     ] {
         assert!(matches!(callback::read_paste(bad, 4242, &expect), callback::Step::Retry(_)), "{bad}");
     }
-    let err = "http://127.0.0.1:4242/auth/callback?error=access_denied";
+    let err = "http://127.0.0.1:4242/auth/callback?error=access_denied&state=st";
     assert!(matches!(callback::read_paste(err, 4242, &expect), callback::Step::Fail(_)));
+    let stateless = "http://127.0.0.1:4242/auth/callback?error=access_denied";
+    assert!(matches!(callback::read_paste(stateless, 4242, &expect), callback::Step::Retry(_)));
+}
+
+#[test]
+fn an_error_callback_needs_this_sign_ins_state_and_is_not_echoed() {
+    let expect = Expect { state: "st".into(), known: None };
+    let q = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    };
+    for params in [q(&[("error", "<b>x</b>")]), q(&[("error", "x"), ("state", "other")])] {
+        assert!(matches!(callback::read_callback(&params, &expect), callback::Step::Retry(_)));
+    }
+    let callback::Step::Fail(msg) = callback::read_callback(&q(&[("error", "<b>evil</b>"), ("state", "st")]), &expect)
+    else {
+        panic!("an error with the right state ends the attempt");
+    };
+    assert!(!msg.contains("evil"), "{msg}");
 }
 
 #[tokio::test]
@@ -438,7 +456,9 @@ async fn access_denied_ends_the_attempt() {
     let issuer = Issuer::start().await;
     let out = attempt(&issuer, None, |mut rx, _ptx, _iss| async move {
         let a = authz(&mut rx).await;
-        let resp = get(a.port, "/auth/callback?error=access_denied").await;
+        let stray = get(a.port, "/auth/callback?error=access_denied").await;
+        assert!(stray.starts_with("HTTP/1.1 400"), "{stray}");
+        let resp = get(a.port, &format!("/auth/callback?error=access_denied&state={}", a.state)).await;
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
     })
     .await;
@@ -451,7 +471,7 @@ async fn pasted_error_ends_the_attempt() {
     let issuer = Issuer::start().await;
     let out = attempt(&issuer, None, |mut rx, ptx, _iss| async move {
         let a = authz(&mut rx).await;
-        let _ = ptx.send(format!("http://127.0.0.1:{}/auth/callback?error=access_denied", a.port));
+        let _ = ptx.send(format!("http://127.0.0.1:{}/auth/callback?error=access_denied&state={}", a.port, a.state));
     })
     .await;
     assert!(out.result.unwrap_err().to_string().contains("not approved"));

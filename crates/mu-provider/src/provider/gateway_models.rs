@@ -21,7 +21,7 @@ impl Providers {
         }
         let ep = self.endpoint().await.map_err(|e| anyhow!("{e}"))?;
         let text = self
-            .client()
+            .client()?
             .get(format!("{}/v1/models", ep.base))
             .bearer_auth(&ep.token)
             .send()

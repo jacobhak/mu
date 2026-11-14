@@ -39,6 +39,30 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Drops group and other permissions from an open file (best effort), for files that held user
+/// text and were created before they were made private.
+pub fn tighten(file: &std::fs::File) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(m) = file.metadata() {
+        let mode = m.permissions().mode();
+        if mode & 0o077 != 0 {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode & !0o077));
+        }
+    }
+}
+
+/// Opens `path` for appending, creating it with mode 0600 (and its directory with 0700). A file that
+/// already exists is tightened to owner-only.
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_private_dir(dir)?;
+    }
+    let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    tighten(&f);
+    Ok(f)
+}
+
 /// Like `write_atomic`, for secrets: the temp file is created with mode 0600, so the contents
 /// are never readable by others, not even briefly; the result keeps that mode.
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -123,6 +147,21 @@ mod private_tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1, "no temp file left");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_private_append_creates_0600_and_tightens_an_existing_file() {
+        let d = dir("append");
+        let p = d.join("history.jsonl");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        writeln!(open_private_append(&p).unwrap(), "one").unwrap();
+        assert_eq!(mode(&p), 0o600);
+        assert_eq!(mode(&d), 0o700);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        writeln!(open_private_append(&p).unwrap(), "two").unwrap();
+        assert_eq!(mode(&p), 0o600);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\ntwo\n");
         let _ = std::fs::remove_dir_all(&d);
     }
 

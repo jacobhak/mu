@@ -57,6 +57,28 @@ const DOTENV_RECHECK: Duration = Duration::from_secs(2);
 static EMITTED: Mutex<BTreeSet<Hit>> = Mutex::new(BTreeSet::new());
 /// Provider API keys mu stores or resolves, registered under the provider's variable name.
 static STORED: Mutex<Vec<Known>> = Mutex::new(Vec::new());
+/// Secret-named variables exported inside the shell after the process environment was read.
+static EXPORTED: Mutex<Vec<Known>> = Mutex::new(Vec::new());
+
+/// Adds the shell's exported variables that `ENV` has not seen: a value exported by a command is
+/// redacted from then on, under the same rules as the process environment (name, value shape, `[secrets] env`).
+pub fn register_exported(vars: impl Iterator<Item = (String, String)>) {
+    let known = known_from(vars, Source::Env, extra_env());
+    if known.is_empty() {
+        return;
+    }
+    if let Ok(mut s) = EXPORTED.lock() {
+        for k in known {
+            if !s.iter().any(|e| e.value == k.value) {
+                s.push(k);
+            }
+        }
+    }
+}
+
+fn exported() -> Vec<Known> {
+    EXPORTED.lock().map(|s| s.clone()).unwrap_or_default()
+}
 
 /// Redacts `value` (a provider key) from now on as `[REDACTED:<label>]`. Values under 8 bytes are
 /// ignored: they would match ordinary text.
@@ -103,7 +125,8 @@ pub fn redact(text: &str, cwd: &Path) -> Redacted {
     let dot = dotenv_for(cwd);
     refresh_stored();
     let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
-    let r = apply(text, env.iter().chain(dot.iter()).chain(stored.iter()));
+    let exported = exported();
+    let r = apply(text, env.iter().chain(dot.iter()).chain(stored.iter()).chain(exported.iter()));
     if !r.hits.is_empty()
         && let Ok(mut e) = EMITTED.lock()
     {
@@ -118,7 +141,8 @@ pub fn redact_keys(text: &str) -> String {
     let env = ENV.get_or_init(|| known_from(std::env::vars(), Source::Env, extra_env()));
     refresh_stored();
     let stored = STORED.lock().map(|s| s.clone()).unwrap_or_default();
-    apply(text, env.iter().chain(stored.iter())).text
+    let exported = exported();
+    apply(text, env.iter().chain(stored.iter()).chain(exported.iter())).text
 }
 
 /// Every string in `v`, in place. Returns the distinct hits.
@@ -505,6 +529,16 @@ mod tests {
     fn extra_names_from_config_count_regardless_of_name() {
         let k = known_from(vars(&[("WEIRD", "zzzz9")]), Source::Env, &["WEIRD".into()]);
         assert_eq!(apply("x zzzz9 y", k.iter()).text, "x [REDACTED:WEIRD] y");
+    }
+
+    #[test]
+    fn a_value_exported_in_the_shell_is_redacted_from_then_on() {
+        let value = "Sh3ll-exp0rted-v4lue";
+        assert_eq!(redact_keys(&format!("x {value}")), format!("x {value}"));
+        register_exported(vars(&[("SHELL_TEST_TOKEN", value), ("HOME", "/home/x")]));
+        assert_eq!(redact_keys(&format!("x {value} /home/x")), "x [REDACTED:SHELL_TEST_TOKEN] /home/x");
+        register_exported(vars(&[("SHELL_TEST_TOKEN", value)]));
+        assert_eq!(EXPORTED.lock().unwrap().iter().filter(|k| k.value == value).count(), 1);
     }
 
     #[test]

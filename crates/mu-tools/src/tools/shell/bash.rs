@@ -422,7 +422,10 @@ impl Tools {
         if res.cancelled || res.timed_out || res.exit_code != Some(0) {
             return None;
         }
-        parse_snapshot(&rx.drain().collect::<String>())
+        let snapshot = parse_snapshot(&rx.drain().collect::<String>())?;
+        // A value exported inside the shell is unknown to the redactor's environment snapshot.
+        mu_base::secrets::register_exported(snapshot.1.iter().cloned());
+        Some(snapshot)
     }
 
     /// Before the first foreground command: what the shell starts with, so later changes are the command's.

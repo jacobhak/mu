@@ -53,18 +53,20 @@ pub(super) async fn bind(port: Option<u16>, reauth: bool) -> Result<TcpListener>
     }
 }
 
-/// Maps the query of a callback URL to a step. `error` wins, then `state`, then `code`.
+/// Maps the query of a callback URL to a step. `state` is checked first, so a request that does not
+/// carry this sign-in's state (any local page can reach the port) never ends it; then `error`, then
+/// `code`. The provider's `error` text is never echoed.
 pub(super) fn read_callback(params: &[(String, String)], expect: &Expect) -> Step {
     let get = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
+    if get("state") != Some(expect.state.as_str()) {
+        return Step::Retry("That callback belongs to another sign-in; keep waiting for this one.".into());
+    }
     if let Some(err) = get("error") {
         return Step::Fail(if err == "access_denied" {
             "ChatGPT sign-in was not approved.".to_string()
         } else {
-            format!("ChatGPT sign-in failed: {err}.")
+            "ChatGPT sign-in failed; the provider reported an error.".to_string()
         });
-    }
-    if get("state") != Some(expect.state.as_str()) {
-        return Step::Retry("That callback belongs to another sign-in; keep waiting for this one.".into());
     }
     let Some(code) = get("code") else {
         return Step::Retry("The callback has no authorization code.".into());

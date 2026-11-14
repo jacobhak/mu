@@ -138,9 +138,14 @@ impl Providers {
     }
 
     /// One shared client: a 10 s connect timeout, no redirects, no overall timeout (streams are
-    /// long-lived; `STREAM_IDLE` guards them instead).
-    pub(super) fn client(&self) -> &reqwest::Client {
-        self.client.get_or_init(|| net::http_client().unwrap_or_else(|_| reqwest::Client::new()))
+    /// long-lived; `STREAM_IDLE` guards them instead). A builder failure is returned, never replaced by
+    /// a default client, which would follow redirects with the key attached.
+    pub(super) fn client(&self) -> reqwest::Result<&reqwest::Client> {
+        if let Some(c) = self.client.get() {
+            return Ok(c);
+        }
+        let client = net::http_client()?;
+        Ok(self.client.get_or_init(|| client))
     }
 
     pub fn store(&self) -> &crate::auth::store::Store {
@@ -329,7 +334,8 @@ impl Providers {
         format: &dyn WireFormat,
         body: &Value,
     ) -> Result<reqwest::RequestBuilder, ProviderError> {
-        let mut rb = self.client().post(format.url(&route.base)).header("content-type", "application/json");
+        let client = self.client().map_err(|e| ProviderError::Fatal(format!("cannot build the HTTP client: {e}")))?;
+        let mut rb = client.post(format.url(&route.base)).header("content-type", "application/json");
         for (k, v) in format.headers(req) {
             rb = rb.header(k, v);
         }

@@ -1,7 +1,6 @@
 //! Multi-line prompt buffer: editing keys, input history, paste markers.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -792,11 +791,8 @@ impl Composer {
             return;
         }
         if let Some(path) = &self.history_path {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            // Best effort: history persistence must not block the prompt.
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            // Best effort: history persistence must not block the prompt. Prompts are private text.
+            if let Ok(mut f) = mu_common::fs::open_private_append(path) {
                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 let row = serde_json::json!({ "text": text, "cwd": self.cwd, "ts": ts });
                 let _ = writeln!(f, "{row}");
