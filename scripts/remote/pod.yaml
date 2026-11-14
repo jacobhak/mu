@@ -1,0 +1,40 @@
+# Pod template for scripts/remote/pod-run.sh. The script replaces every @NAME@ placeholder itself (no envsubst);
+# string values arrive already escaped for a double-quoted YAML scalar.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "@NAME@"
+  namespace: "@NAMESPACE@"
+  labels:
+    app: mu-task
+    mu/parent: "@PARENT@"
+  annotations:
+    mu/host: "@HOST@"
+    mu/pid: "@PID@"
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  activeDeadlineSeconds: @DEADLINE@
+  containers:
+    - name: worker
+      image: "@IMAGE@"
+      imagePullPolicy: "@PULL_POLICY@"
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - {name: HOME, value: /root}
+@ENV@
+      envFrom:
+        - secretRef:
+            name: "@SCCACHE_SECRET@"
+            optional: true
+      resources:
+        requests:
+          cpu: "@CPU@"
+          memory: "@MEMORY@"
+      volumeMounts:
+        - {name: home, mountPath: /root}
+        - {name: workspace, mountPath: "@ROOT@"}
+  volumes:
+    - {name: home, emptyDir: {}}
+    - {name: workspace, emptyDir: {}}

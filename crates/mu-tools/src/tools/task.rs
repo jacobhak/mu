@@ -1,4 +1,4 @@
-use super::subagent::{ArtifactAlloc, preview_result, run_child_observed};
+use super::subagent::{ArtifactAlloc, ChildCmd, Outcome, prepare_launch, preview_result, run_child_observed};
 use super::{ToolCtx, Tools};
 use crate::permissions::Permissions;
 use futures_util::future::join_all;
@@ -156,6 +156,8 @@ impl Tools {
             Err(e) => return ToolOutput::err(e),
         };
         let parent = self.session.path.borrow().clone();
+        let session = self.session_env().into_iter().find(|(k, _)| *k == "PI_SESSION_ID").map(|(_, v)| v);
+        let session = session.unwrap_or_default();
         #[cfg(any(test, feature = "test-support"))]
         let self_exe = self.child_exe.clone().map_or_else(mu_common::paths::self_exe, Ok);
         #[cfg(not(any(test, feature = "test-support")))]
@@ -180,13 +182,32 @@ impl Tools {
             if let Err(e) = jobs.check_capacity(specs.len()) {
                 return ToolOutput::err(e);
             }
+            // Ids and launches first: a launch that fails then starts nothing, and drops the others'
+            // task refs.
+            let mut ids: Vec<String> = Vec::new();
+            let mut children = Vec::new();
+            for (name, _, _, cwd, _) in &specs {
+                let id = (1..)
+                    .map(|n| if n == 1 { name.clone() } else { format!("{name}-{n}") })
+                    .find(|c| jobs.unique_id(c) == *c && !ids.contains(c))
+                    .unwrap_or_default();
+                children.push(if self.launcher.is_empty() {
+                    ChildCmd::Local(exe.clone())
+                } else {
+                    match prepare_launch(&self.launcher, cwd, &id, &session).await {
+                        Ok(l) => ChildCmd::Launched(l),
+                        Err(e) => return ToolOutput::err(e),
+                    }
+                });
+                ids.push(id);
+            }
             let mut started = Vec::new();
-            for (i, (name, agent, task, cwd, model)) in specs.iter().enumerate() {
-                let id = jobs.unique_id(name);
+            for (i, ((_, agent, task, cwd, model), child)) in specs.iter().zip(children).enumerate() {
+                let id = ids[i].clone();
                 jobs.spawn(
                     id.clone(),
                     agent.clone(),
-                    exe.clone(),
+                    child,
                     cwd.clone(),
                     payload(agent, task, schemas[i], model.as_deref()),
                     self.permissions.clone(),
@@ -202,9 +223,19 @@ impl Tools {
             ));
         }
         let alloc = || self.next_artifact();
-        run_foreground(&specs, &schemas, &exe, &payload, &ctx.cancel, &ctx.events, &self.permissions, &self.cwd, &alloc)
+        let how = Starter { exe: &exe, launcher: &self.launcher, session: &session };
+        run_foreground(&specs, &schemas, &how, &payload, &ctx.cancel, &ctx.events, &self.permissions, &self.cwd, &alloc)
             .await
     }
+}
+
+/// What starts a foreground task's child: this executable, or the launcher, which needs a launch
+/// prepared per task.
+struct Starter<'a> {
+    exe: &'a Path,
+    launcher: &'a [String],
+    /// The parent's session id.
+    session: &'a str,
 }
 
 /// Builds one child's task payload.
@@ -216,7 +247,7 @@ type Payload<'a> = dyn Fn(&str, &str, Option<&Value>, Option<&str>) -> Value + '
 async fn run_foreground(
     specs: &[(String, String, String, PathBuf, Option<String>)],
     schemas: &[Option<&Value>],
-    exe: &Path,
+    how: &Starter<'_>,
     payload: &Payload<'_>,
     cancel: &tokio_util::sync::CancellationToken,
     events: &EventTx,
@@ -250,8 +281,19 @@ async fn run_foreground(
         let payload = payload(agent, task, schemas[i], model.as_deref());
         let label = format!("{name} ({agent})");
         async move {
+            let child = if how.launcher.is_empty() {
+                ChildCmd::Local(how.exe.to_path_buf())
+            } else {
+                match prepare_launch(how.launcher, cwd, name, how.session).await {
+                    Ok(l) => ChildCmd::Launched(l),
+                    Err(e) => {
+                        rows.borrow_mut()[i].state = SubagentState::Failed;
+                        return Outcome::failed(e);
+                    }
+                }
+            };
             let out = run_child_observed(
-                exe,
+                child,
                 cwd,
                 &payload,
                 cancel,
@@ -367,7 +409,7 @@ mod cwd_tests {
         let seen = RefCell::new(Vec::new());
         let out = tokio::task::LocalSet::new()
             .run_until(run_child_observed(
-                &exe,
+                ChildCmd::Local(exe),
                 &base,
                 &json!({}),
                 &CancellationToken::new(),
@@ -504,6 +546,19 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_launch_prepare_is_that_rows_failure() {
+        let mut t = Tools::for_test();
+        t.launcher = vec!["/nonexistent/launcher".into()];
+        let dir = mu_testutil::tmp();
+        let a: Args = serde_json::from_value(
+            json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","cwd":dir.to_str().unwrap()}]}),
+        )
+        .unwrap();
+        let out = t.task(a, &ctx()).await;
+        assert!(out.is_error && out.text.contains("needs a git repository"), "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn bad_output_schema_is_rejected_before_spawning() {
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -548,7 +603,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         answer: Option<&dyn Fn(ApprovalRequest) -> tokio::sync::oneshot::Receiver<ApprovalDecision>>,
     ) -> String {
         run_child_observed(
-            &fake(base),
+            ChildCmd::Local(fake(base)),
             base,
             &json!({"task": "go"}),
             &CancellationToken::new(),

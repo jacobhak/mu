@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::permissions::Permissions;
-use crate::tools::subagent::{BackgroundResult, Outcome, preview_result, run_child_observed};
+use crate::tools::subagent::{BackgroundResult, ChildCmd, Outcome, preview_result, run_child_observed};
 use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
@@ -499,7 +499,7 @@ impl JobsHandle {
         self: &Rc<Self>,
         id: String,
         agent: String,
-        exe: PathBuf,
+        child: ChildCmd,
         cwd: PathBuf,
         payload: Value,
         perms: Rc<Permissions>,
@@ -511,7 +511,7 @@ impl JobsHandle {
         let spec = Spec { id, agent, cwd: cwd.clone(), task: command_line(payload["task"].as_str().unwrap_or("")) };
         let me = self.clone();
         self.spawn_job(spec, Work::subagent(), String::new(), cancel, true, move |seq| async move {
-            let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
+            let out = me.run_subagent(seq, child, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
             let text = preview_result(&out.text, &cwd, || crate::tools::Tools::next_artifact_in(&artifacts));
@@ -544,7 +544,9 @@ impl JobsHandle {
             task: command_line(payload["task"].as_str().unwrap_or("")),
         };
         let seq = self.start(spec, Work::subagent(), String::new(), own.clone(), false, true);
-        let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool, &perms, "review").await;
+        let out = self
+            .run_subagent(seq, ChildCmd::Local(exe.to_path_buf()), cwd, payload, &own, on_tool, &perms, "review")
+            .await;
         self.complete(seq, Finished { ok: out.ok, text: String::new(), note: None, meta: None }, true);
         out
     }
@@ -555,7 +557,7 @@ impl JobsHandle {
     async fn run_subagent(
         &self,
         seq: u64,
-        exe: &Path,
+        child: ChildCmd,
         cwd: &Path,
         payload: &Value,
         cancel: &CancellationToken,
@@ -564,7 +566,7 @@ impl JobsHandle {
         from: &str,
     ) -> Outcome {
         run_child_observed(
-            exe,
+            child,
             cwd,
             payload,
             cancel,
@@ -1011,7 +1013,7 @@ pub(crate) mod tests {
                 h.spawn(
                     "A".into(),
                     "scout".into(),
-                    exe,
+                    ChildCmd::Local(exe),
                     base.clone(),
                     serde_json::json!({"task": "find  x\nnow"}),
                     Rc::default(),

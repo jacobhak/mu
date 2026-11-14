@@ -1,11 +1,13 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
 use super::task::depth;
+use mu_base::git::{git, prune_refs, repo_root, short_sha, snapshot_tree};
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +21,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn failed(text: impl Into<String>) -> Self {
+    pub(super) fn failed(text: impl Into<String>) -> Self {
         Self { ok: false, text: text.into(), data: None }
     }
 }
@@ -63,6 +65,87 @@ pub fn preview_result(text: &str, cwd: &Path, alloc: impl FnOnce() -> (u32, std:
     format!("{head}\n\n{note}")
 }
 
+/// How long a launched task's result ref and a dead parent's task ref are kept.
+const REF_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 3600);
+
+/// A pod name, a label value and a ref component all accept the result: a slug of `name` (at most
+/// 40 characters) and 8 random hex digits.
+pub fn launch_id(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.truncate(40);
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "task" } else { slug };
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    format!("{slug}-{}", &random[..8])
+}
+
+/// A subagent started through `[task] launcher`. Dropping it deletes the task ref, so the ref goes
+/// on every way out of the run, including a launcher that never started.
+pub struct Launch {
+    argv: Vec<String>,
+    id: String,
+    root: PathBuf,
+    session: String,
+    task_ref: String,
+    result_ref: String,
+}
+
+impl Drop for Launch {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "-d", &self.task_ref])
+            .current_dir(&self.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// How a subagent is started: `mu --headless` here, or the launcher.
+pub enum ChildCmd {
+    Local(PathBuf),
+    Launched(Launch),
+}
+
+/// Commits the parent's working tree (untracked files included) as `refs/mu/task/<id>` for the
+/// launcher to ship. `session` is the parent's session id, empty when it has no file yet.
+pub async fn prepare_launch(launcher: &[String], cwd: &Path, name: &str, session: &str) -> Result<Launch, String> {
+    if launcher.is_empty() {
+        return Err("task: the launcher is empty".into());
+    }
+    let root = repo_root(cwd).await.map_err(|_| "task: a launched subagent needs a git repository".to_string())?;
+    for prefix in ["refs/mu/result/", "refs/mu/task/"] {
+        let _ = prune_refs(&root, prefix, REF_MAX_AGE).await;
+    }
+    let id = launch_id(name);
+    let tree = snapshot_tree(&root).await?;
+    let message = format!("mu task {id}");
+    let mut args = vec!["-c", "user.name=mu", "-c", "user.email=mu@localhost", "commit-tree", &tree];
+    if git(&root, &["rev-parse", "--verify", "-q", "HEAD"], None).await.is_ok() {
+        args.extend(["-p", "HEAD"]);
+    }
+    args.extend(["-m", &message]);
+    let commit = git(&root, &args, None).await?;
+    let task_ref = format!("refs/mu/task/{id}");
+    git(&root, &["update-ref", &task_ref, commit.trim()], None).await?;
+    Ok(Launch {
+        argv: launcher.to_vec(),
+        result_ref: format!("refs/mu/result/{id}"),
+        id,
+        root,
+        session: session.to_string(),
+        task_ref,
+    })
+}
+
 /// One line of a child's stdout: a progress event, or the final result.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -87,6 +170,13 @@ enum ChildEvent {
         request: ApprovalRequest,
     },
     Result(ChildResult),
+    /// A launcher's report of the worker's changes, after the `result` line.
+    Changes {
+        r#ref: String,
+        base: String,
+        #[serde(default)]
+        files: u64,
+    },
 }
 
 #[derive(Deserialize)]
@@ -109,7 +199,7 @@ pub async fn run_child(
     cancel: &CancellationToken,
     on_tool: impl FnMut(&str, &str),
 ) -> Outcome {
-    run_child_observed(exe, cwd, payload, cancel, on_tool, |_| {}, |_| {}, None).await
+    run_child_observed(ChildCmd::Local(exe.to_path_buf()), cwd, payload, cancel, on_tool, |_| {}, |_| {}, None).await
 }
 
 /// `run_child` that also reports the child's session file to `on_session(path)` as soon as the child
@@ -117,7 +207,7 @@ pub async fn run_child(
 /// `approve` answers the child's approval requests; `None` means nobody can.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_child_observed(
-    exe: &Path,
+    child: ChildCmd,
     cwd: &Path,
     payload: &Value,
     cancel: &CancellationToken,
@@ -126,9 +216,33 @@ pub async fn run_child_observed(
     mut on_model: impl FnMut(&str),
     approve: Option<&dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision>>,
 ) -> Outcome {
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("--headless")
-        .current_dir(cwd)
+    let launched = matches!(child, ChildCmd::Launched(_));
+    let mut cmd = match &child {
+        ChildCmd::Local(exe) => {
+            let mut cmd = tokio::process::Command::new(exe);
+            cmd.arg("--headless");
+            cmd
+        }
+        ChildCmd::Launched(l) => {
+            let Some((program, args)) = l.argv.split_first() else {
+                return Outcome::failed("cannot start subagent: the launcher is empty");
+            };
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args)
+                .env("MU_TASK_NAME", &l.id)
+                .env("MU_TASK_ROOT", &l.root)
+                .env("MU_TASK_CWD", cwd)
+                .env("MU_TASK_REF", &l.task_ref)
+                .env("MU_TASK_RESULT_REF", &l.result_ref)
+                .env("MU_TASK_SESSION", &l.session)
+                .env("MU_TASK_PARENT_PID", std::process::id().to_string())
+                .env("MU_TASK_MU_HOME", mu_common::paths::mu_home())
+                .env("MU_TASK_PROFILE_HOME", mu_common::paths::profile_home())
+                .env("MU_TASK_AGENT_DIR", mu_common::paths::omp_agent_dir());
+            cmd
+        }
+    };
+    cmd.current_dir(cwd)
         .env("MU_TASK_DEPTH", (depth() + 1).to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -169,6 +283,7 @@ pub async fn run_child_observed(
     let mut result: Option<ChildResult> = None;
     let mut cancelled = false;
     let mut bad_line: Option<String> = None;
+    let mut changes: Option<(String, String, u64)> = None;
     let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
@@ -179,7 +294,12 @@ pub async fn run_child_observed(
                     // Bytes, not `lines()`: a stray invalid UTF-8 byte must not end the read.
                     match serde_json::from_slice::<ChildEvent>(&line) {
                         Ok(ChildEvent::Tool { name, summary }) => on_tool(&name, &summary),
-                        Ok(ChildEvent::Session { path }) => on_session(&path),
+                        // A launched child's session file is on the worker.
+                        Ok(ChildEvent::Session { path }) => {
+                            if !launched {
+                                on_session(&path)
+                            }
+                        }
                         Ok(ChildEvent::Model { label }) => on_model(&label),
                         Ok(ChildEvent::Approve { id, request }) => {
                             let rx = match approve {
@@ -197,6 +317,7 @@ pub async fn run_child_observed(
                             });
                         }
                         Ok(ChildEvent::Result(r)) => result = Some(r),
+                        Ok(ChildEvent::Changes { r#ref, base, files }) => changes = Some((r#ref, base, files)),
                         Err(_) => {
                             let text = String::from_utf8_lossy(&line);
                             let text = text.trim();
@@ -237,7 +358,16 @@ pub async fn run_child_observed(
             String::new()
         }
     };
-    outcome(result, payload, cancelled, stderr_tail, bad_line)
+    let mut out = outcome(result, payload, cancelled, stderr_tail, bad_line);
+    if let Some((r#ref, base, files)) = changes {
+        out.text.push_str(&format!(
+            "\n[changes: {files} files at {}, base {}; see git diff {base} {}]",
+            r#ref,
+            short_sha(&base),
+            r#ref
+        ));
+    }
+    out
 }
 
 const BAD_LINE_CHARS: usize = 300;
@@ -325,6 +455,187 @@ mod child_line_tests {
         let out = run("#!/bin/sh\nsleep 20 >/dev/null &\necho '{\"type\":\"result\",\"text\":\"fine\"}'\n").await;
         assert!(out.ok && out.text == "fine", "{}", out.text);
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use mu_testutil::{pid_in, repo, sh, tmp, wait_gone};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
+
+    fn script(dir: &Path, body: &str) -> String {
+        let path = dir.join("launcher");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    fn task_refs(root: &Path) -> String {
+        sh(root, &["for-each-ref", "refs/mu/task/"])
+    }
+
+    #[test]
+    fn launch_ids_are_valid_pod_names_and_differ() {
+        let long = "x".repeat(200);
+        for name in ["Review Auth!", "Task1", "", "!!!", long.as_str(), "-a--b-"] {
+            let id = launch_id(name);
+            assert!(id.len() <= 49, "{id}");
+            assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'), "{id}");
+            assert!(!id.starts_with('-') && !id.contains("--"), "{id}");
+            assert_ne!(id, launch_id(name));
+        }
+        assert!(launch_id("Review Auth!").starts_with("review-auth-"));
+        assert!(launch_id("Task1").starts_with("task1-"));
+        assert!(launch_id("").starts_with("task-"));
+        assert_eq!(launch_id(&long).len(), 40 + 1 + 8);
+    }
+
+    const FAKE: &str = r#"#!/bin/sh
+IFS= read -r line
+echo '{"type":"session","path":"/s/worker.jsonl"}'
+echo '{"type":"tool","name":"read","summary":"x"}'
+snap=$(git -C "$MU_TASK_ROOT" show "$MU_TASK_REF:new.txt")
+printf '{"type":"result","text":"args=%s name=%s root=%s cwd=%s ref=%s result=%s session=%s ppid=%s depth=%s snap=%s home=%s"}\n' \
+  "$#" "$MU_TASK_NAME" "$MU_TASK_ROOT" "$MU_TASK_CWD" "$MU_TASK_REF" "$MU_TASK_RESULT_REF" "$MU_TASK_SESSION" \
+  "$MU_TASK_PARENT_PID" "$MU_TASK_DEPTH" "$snap" "$(test -n "$MU_TASK_MU_HOME$MU_TASK_PROFILE_HOME$MU_TASK_AGENT_DIR" && echo set)"
+echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","files":2}'
+"#;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launcher_gets_the_environment_and_a_snapshot_commit_and_reports_changes() {
+        let root = repo();
+        std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+        let bin = tmp();
+        let launcher = vec![script(&bin, FAKE)];
+        let sessions = std::cell::RefCell::new(Vec::new());
+        let tools = std::cell::Cell::new(0);
+        let out = tokio::task::LocalSet::new()
+            .run_until(async {
+                let launch = prepare_launch(&launcher, &root, "Review Auth!", "sess-1").await.unwrap();
+                assert!(task_refs(&root).contains(&launch.task_ref), "{}", task_refs(&root));
+                run_child_observed(
+                    ChildCmd::Launched(launch),
+                    &root,
+                    &json!({"task": "go"}),
+                    &CancellationToken::new(),
+                    |_, _| tools.set(tools.get() + 1),
+                    |p| sessions.borrow_mut().push(p.to_string()),
+                    |_| {},
+                    None,
+                )
+                .await
+            })
+            .await;
+        assert!(out.ok, "{}", out.text);
+        let first = out.text.lines().next().unwrap();
+        let id = first.split(" name=").nth(1).unwrap().split(' ').next().unwrap();
+        assert!(id.starts_with("review-auth-"), "{first}");
+        for want in [
+            "args=0 ".to_string(),
+            format!("root={} ", root.display()),
+            format!("cwd={} ", root.display()),
+            format!("ref=refs/mu/task/{id} "),
+            format!("result=refs/mu/result/{id} "),
+            "session=sess-1 ".to_string(),
+            format!("ppid={} ", std::process::id()),
+            "depth=".to_string(),
+            "snap=untracked ".to_string(),
+            "home=set".to_string(),
+        ] {
+            assert!(first.contains(&want), "{want} not in {first}");
+        }
+        assert_eq!(
+            out.text.lines().last().unwrap(),
+            "[changes: 2 files at refs/mu/result/x, base 0123456; see git diff 0123456789abcdef refs/mu/result/x]"
+        );
+        assert!(sessions.borrow().is_empty(), "a launched child's session is on the worker");
+        assert_eq!(tools.get(), 1);
+        assert_eq!(task_refs(&root), "", "the task ref is gone after the run");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_task_ref_is_gone_when_the_launcher_cannot_start() {
+        let root = repo();
+        let launcher = vec!["/nonexistent/mu-launcher".to_string()];
+        let out = tokio::task::LocalSet::new()
+            .run_until(async {
+                let launch = prepare_launch(&launcher, &root, "t", "").await.unwrap();
+                assert_ne!(task_refs(&root), "");
+                run_child_observed(
+                    ChildCmd::Launched(launch),
+                    &root,
+                    &json!({}),
+                    &CancellationToken::new(),
+                    |_, _| {},
+                    |_| {},
+                    |_| {},
+                    None,
+                )
+                .await
+            })
+            .await;
+        assert!(!out.ok && out.text.contains("cannot start subagent"), "{}", out.text);
+        assert_eq!(task_refs(&root), "");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_needs_a_git_repository() {
+        let err = prepare_launch(&["x".to_string()], &tmp(), "t", "").await.err().unwrap();
+        assert!(err.contains("needs a git repository"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_repository_with_no_commit_gets_a_parentless_snapshot() {
+        let root = tmp();
+        sh(&root, &["init", "-q"]);
+        std::fs::write(root.join("f"), "x\n").unwrap();
+        let launch = prepare_launch(&["x".to_string()], &root, "t", "").await.unwrap();
+        let parents = sh(&root, &["rev-list", "--parents", "-n1", &launch.task_ref]);
+        assert_eq!(parents.split_whitespace().count(), 1, "{parents}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_ends_the_launchers_process_group() {
+        let root = repo();
+        let bin = tmp();
+        let (p1, p2) = (bin.join("launcher.pid"), bin.join("sleep.pid"));
+        let body = format!(
+            "#!/bin/sh\nIFS= read -r line\necho $$ > {}\nsleep 60 &\necho $! > {}\nwait\n",
+            p1.display(),
+            p2.display()
+        );
+        let launcher = vec![script(&bin, &body)];
+        let cancel = CancellationToken::new();
+        let out = tokio::task::LocalSet::new()
+            .run_until(async {
+                let launch = prepare_launch(&launcher, &root, "t", "").await.unwrap();
+                let run = tokio::task::spawn_local({
+                    let cancel = cancel.clone();
+                    async move {
+                        run_child_observed(
+                            ChildCmd::Launched(launch),
+                            &root,
+                            &json!({}),
+                            &cancel,
+                            |_, _| {},
+                            |_| {},
+                            |_| {},
+                            None,
+                        )
+                        .await
+                    }
+                });
+                let (a, b) = (pid_in(&p1).await, pid_in(&p2).await);
+                cancel.cancel();
+                let out = run.await.unwrap();
+                wait_gone(a).await;
+                wait_gone(b).await;
+                out
+            })
+            .await;
+        assert!(!out.ok && out.text == "cancelled", "{}", out.text);
     }
 }
 

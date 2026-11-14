@@ -862,6 +862,7 @@ async fn open_session(
         pin_model: model.is_some() && resume.is_some(),
         pin_thinking: thinking.is_some() && resume.is_some(),
         permission_mode: permissions,
+        task_launcher: cfgs.mu.task.launcher.clone(),
         // Plans are approved through `session/request_permission`, which every client has.
         excluded: if elicit { vec![] } else { vec!["ask"] },
         ..Default::default()

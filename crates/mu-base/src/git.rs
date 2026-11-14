@@ -77,6 +77,47 @@ pub(crate) async fn git_for(
     }
 }
 
+/// A tree sha of the whole working tree, untracked non-ignored files included. Uses a copy of the
+/// index, so neither the real index nor the working tree is touched.
+pub async fn snapshot_tree(cwd: &Path) -> Result<String, String> {
+    let real = git(cwd, &["rev-parse", "--git-path", "index"], None).await?;
+    let real = cwd.join(real.trim());
+    let tmp = std::env::temp_dir().join(format!("mu-snapshot-index-{}", uuid::Uuid::new_v4()));
+    let res = async {
+        if real.exists() {
+            std::fs::copy(&real, &tmp).map_err(|e| format!("cannot copy index: {e}"))?;
+            // Git's racy-entry check compares index entries with the index file's mtime; the copy must keep
+            // the real index's mtime, or a same-tick rewrite of a tracked file looks unchanged.
+            let mtime =
+                std::fs::metadata(&real).and_then(|m| m.modified()).map_err(|e| format!("cannot stat index: {e}"))?;
+            std::fs::File::options()
+                .write(true)
+                .open(&tmp)
+                .and_then(|f| f.set_modified(mtime))
+                .map_err(|e| format!("cannot stamp index copy: {e}"))?;
+        }
+        git(cwd, &["add", "-A"], Some(&tmp)).await?;
+        Ok(git(cwd, &["write-tree"], Some(&tmp)).await?)
+    }
+    .await;
+    let _ = std::fs::remove_file(&tmp);
+    res.map(|s| s.trim().to_string())
+}
+
+/// Deletes every ref under `prefix` whose commit is older than `max_age`.
+pub async fn prune_refs(root: &Path, prefix: &str, max_age: Duration) -> Result<(), GitError> {
+    let listing = git(root, &["for-each-ref", "--format=%(committerdate:unix) %(refname)", prefix], None).await?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    for line in listing.lines() {
+        let Some((when, name)) = line.split_once(' ') else { continue };
+        let Ok(when) = when.parse::<u64>() else { continue };
+        if now.saturating_sub(when) > max_age.as_secs() {
+            git(root, &["update-ref", "-d", name], None).await?;
+        }
+    }
+    Ok(())
+}
+
 /// The top level of the working tree `cwd` is in.
 pub async fn repo_root(cwd: &Path) -> Result<PathBuf, GitError> {
     git(cwd, &["rev-parse", "--show-toplevel"], None).await.map(|s| PathBuf::from(s.trim()))
@@ -173,6 +214,25 @@ mod tests {
             assert_eq!(main_checkout(&outside).await, outside);
             assert!(repo_root(&outside).await.is_err());
         });
+    }
+
+    #[test]
+    fn prune_refs_deletes_old_refs_and_keeps_recent_ones() {
+        use mu_testutil::{block_on, repo, sh};
+        let dir = repo();
+        let tree = sh(&dir, &["rev-parse", "HEAD^{tree}"]);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for (name, days) in [("refs/mu/result/old", 15), ("refs/mu/result/new", 1)] {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree.trim(), "-m", "x"])
+                .env("GIT_COMMITTER_DATE", format!("{} +0000", now - days * 86400))
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            sh(&dir, &["update-ref", name, String::from_utf8_lossy(&out.stdout).trim()]);
+        }
+        block_on(prune_refs(&dir, "refs/mu/result/", Duration::from_secs(14 * 86400))).unwrap();
+        assert_eq!(sh(&dir, &["for-each-ref", "--format=%(refname)", "refs/mu/result/"]).trim(), "refs/mu/result/new");
     }
 
     #[test]

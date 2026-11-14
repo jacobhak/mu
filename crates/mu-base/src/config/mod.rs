@@ -493,6 +493,10 @@ impl Configs {
         if let Some(t) = std::env::var("MU_THEME").ok().filter(|t| !t.is_empty()) {
             mu.theme.source = t;
         }
+        // `MU_TASK_LAUNCHER` replaces `[task] launcher` with one program path.
+        if let Some(l) = std::env::var("MU_TASK_LAUNCHER").ok().filter(|l| !l.is_empty()) {
+            mu.task.launcher = vec![l];
+        }
         let omp = load_omp(&mut warnings);
         let path = models_path();
         let mut models = ModelConfig::default();
@@ -645,6 +649,9 @@ mod tests {
     fn task_budget_defaults_and_overrides() {
         let d = toml::from_str::<MuConfig>("").unwrap().task;
         assert_eq!((d.soft_request_budget, d.budget_notice), (200, true));
+        assert!(d.launcher.is_empty());
+        let t = toml::from_str::<MuConfig>("[task]\nlauncher = [\"/bin/run\", \"-x\"]").unwrap().task;
+        assert_eq!(t.launcher, ["/bin/run", "-x"]);
         let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;
         assert_eq!((t.soft_request_budget, t.budget_notice), (50, false));
     }

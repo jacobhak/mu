@@ -1159,7 +1159,7 @@ fn a_stored_plan_starts_in_the_current_session() {
             title: "T".into(),
             uri: "local://t-plan.md".into(),
             decision: PlanDecision::Keep { model: None },
-            base: crate::review::facts::snapshot_tree(&a.cwd).await.ok(),
+            base: mu_base::git::snapshot_tree(&a.cwd).await.ok(),
             approved_at: 1,
             stored: Some("t".into()),
         }))

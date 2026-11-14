@@ -165,6 +165,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     if let Some(p) = &task {
         apply_task(&mut run, p, &cfgs);
     }
+    run.task_launcher = task_launcher(task.as_ref(), &cfgs.mu.task.launcher);
     if let Some(d) = &agent_def {
         apply_agent(&mut run, d);
     }
@@ -324,6 +325,12 @@ fn apply_task(run: &mut agent::RunConfig, p: &Value, cfgs: &mu_base::config::Con
     run.budget_notice = cfgs.mu.task.budget_notice;
 }
 
+/// The launcher `task` subagents start through. A worker (it has a task payload) gets none: it
+/// holds a copy of its parent's config and spawns its own children locally.
+fn task_launcher(task: Option<&Value>, configured: &[String]) -> Vec<String> {
+    if task.is_some() { Vec::new() } else { configured.to_vec() }
+}
+
 fn require_output_schema(run: &mut agent::RunConfig, s: &Value) -> Result<()> {
     if let Err(e) = schema::check_schema(s) {
         bail!("bad subagent input: {e}");
@@ -434,6 +441,13 @@ fn task_output_schema(payload: &Value, def: Option<&context::AgentDef>) -> Optio
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_process_started_with_a_task_payload_spawns_locally() {
+        let configured = vec!["/bin/launch".to_string()];
+        assert!(task_launcher(Some(&json!({"task": "t"})), &configured).is_empty());
+        assert_eq!(task_launcher(None, &configured), configured);
+    }
 
     #[test]
     fn task_output_schema_prefers_caller_then_agent() {

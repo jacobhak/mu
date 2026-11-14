@@ -72,6 +72,8 @@ pub struct Tools {
     pub(crate) repeats: std::cell::RefCell<std::collections::HashMap<String, (u64, u32)>>,
     /// The session's tool permissions: the gate reads it, `task` hands it to subagents.
     pub permissions: Rc<crate::permissions::Permissions>,
+    /// `[task] launcher`: when set, `task` subagents start through it instead of `mu --headless`.
+    pub launcher: Vec<String>,
     shell: shell::worker::ShellWorker,
     /// Where the persistent shell was after the last foreground bash call; see `pathnote`.
     shell_cwd: std::cell::RefCell<Option<PathBuf>>,
@@ -107,6 +109,7 @@ impl Tools {
             edit_store: pi_edit::EditStore::new(),
             repeats: Default::default(),
             permissions: Rc::default(),
+            launcher: Vec::new(),
             shell: Default::default(),
             shell_cwd: Default::default(),
             shell_env: Default::default(),

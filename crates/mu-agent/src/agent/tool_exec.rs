@@ -467,7 +467,7 @@ impl Agent {
         let decision = plan_decision(d);
         let (base, now) = match decision {
             Some(PlanDecision::Execute { .. } | PlanDecision::Compact { .. } | PlanDecision::Keep { .. }) => {
-                (crate::review::facts::snapshot_tree(&self.cwd).await.ok(), now_ms())
+                (mu_base::git::snapshot_tree(&self.cwd).await.ok(), now_ms())
             }
             _ => (None, 0),
         };

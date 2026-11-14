@@ -53,6 +53,7 @@ lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 [task]                # a subagent's soft request budget: cross it and it is told to wrap up, at 1.5x it is stopped and asked for what it has, and five requests later the run ends; 0 turns the guard off
 soft_request_budget = 200  # a scout is capped at 100 however high this is
 budget_notice = true       # the wrap-up notice at the budget
+# launcher = ["/path/to/pod-run.sh"]  # run every `task` subagent through this command instead of `mu --headless`; MU_TASK_LAUNCHER overrides it with one program path; see below
 
 [update]
 check = true          # daily release check at startup
@@ -65,3 +66,5 @@ review = true         # review sessions in the background and save what is worth
 user_cap = 1500       # characters in user.md
 project_cap = 4000    # characters in a repository's memory.md
 ```
+
+With `[task] launcher` set, every `task` subagent (not `/review`) runs through that command in the task's directory, with the same stdin and stdout as `mu --headless` and no `--headless` argument. Before each launch mu commits the working tree, untracked files included, as `refs/mu/task/<id>` and deletes the ref when the run ends. The command gets `MU_TASK_NAME` (the launch id), `MU_TASK_ROOT`, `MU_TASK_CWD`, `MU_TASK_REF`, `MU_TASK_RESULT_REF`, `MU_TASK_SESSION`, `MU_TASK_PARENT_PID`, `MU_TASK_MU_HOME`, `MU_TASK_PROFILE_HOME`, `MU_TASK_AGENT_DIR` and `MU_TASK_DEPTH`. After the `result` line it may print `{"type":"changes","ref":"refs/mu/result/<id>","base":"<sha>","files":N}`; the task's result then ends with a line pointing at that ref, which mu never applies itself. `refs/mu/result/*` older than 14 days are deleted before each launch. A subagent ignores the setting: its own subagents spawn locally.

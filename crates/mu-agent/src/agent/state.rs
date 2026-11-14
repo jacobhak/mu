@@ -49,6 +49,8 @@ pub struct RunConfig {
     pub request_budget: u32,
     /// Whether the wrap-up notice is injected when the budget is crossed.
     pub budget_notice: bool,
+    /// `[task] launcher`: the command `task` subagents start through. Empty in a subagent.
+    pub task_launcher: Vec<String>,
 }
 
 /// Messages queued while a turn runs, plus the turn's cancellation token. Only the agent loop touches it;

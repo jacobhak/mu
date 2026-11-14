@@ -147,17 +147,19 @@ impl Default for MuAsk {
 
 /// `[task]`: a subagent's soft request budget. Crossing it steers a wrap-up notice (`budget_notice`);
 /// at 1.5x the run is stopped and asked for its partial result; 0 turns the guard off. A `scout` is
-/// capped at 100 however high the budget is, as in omp.
+/// capped at 100 however high the budget is, as in omp. `launcher` is a command (program and
+/// arguments) run in place of `mu --headless` for every `task` subagent; empty spawns locally.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct MuTask {
     pub soft_request_budget: u32,
     pub budget_notice: bool,
+    pub launcher: Vec<String>,
 }
 
 impl Default for MuTask {
     fn default() -> Self {
-        Self { soft_request_budget: 200, budget_notice: true }
+        Self { soft_request_budget: 200, budget_notice: true, launcher: Vec::new() }
     }
 }
 

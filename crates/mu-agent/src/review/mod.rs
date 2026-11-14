@@ -182,7 +182,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (head, snap, stats) = rt.block_on(async {
             let head = head_tree(&dir).await.unwrap();
-            let snap = snapshot_tree(&dir).await.unwrap();
+            let snap = mu_base::git::snapshot_tree(&dir).await.unwrap();
             let stats = numstat(&dir, &head, &snap).await.unwrap();
             (head, snap, stats)
         });

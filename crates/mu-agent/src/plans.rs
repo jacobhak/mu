@@ -1,9 +1,9 @@
 //! Durable plans: a plan written in plan mode can be parked and approved later, in another session.
 //! Each plan is `<id>.md` (the text as written) plus `<id>.json` (metadata) under
 //! `<profile home>/plans/<repo-key>/` (`paths::profile_home`). All worktrees of one clone share a store.
-use crate::review::facts::{numstat, repo_root, snapshot_tree};
+use crate::review::facts::{numstat, repo_root};
 use mu_base::events::{Approval, Base, PlanMeta, Status};
-use mu_base::git::{git, short_sha};
+use mu_base::git::{git, short_sha, snapshot_tree};
 use mu_base::message::{Message, tool_calls};
 use mu_common::fs::write_atomic;
 use mu_common::paths::{encode_cwd, profile_home};
