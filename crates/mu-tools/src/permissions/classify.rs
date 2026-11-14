@@ -1,8 +1,8 @@
 //! The subjects of one call: what it reads, writes or runs, each with what the mode must grant for it.
 
-use super::Access;
 use super::bash::{BashAnalysis, analyze};
 use super::verdict::{Gate, Subject};
+use super::{Access, Permissions};
 use crate::tools::Tools;
 use crate::tools::uri::physical;
 use mu_base::permissions::Capability;
@@ -34,6 +34,31 @@ pub(super) fn classify(tools: &Tools, gate: &Gate, name: &str, args: &Value) -> 
     };
     let subject = Subject::new(name, text, needs);
     Ok(Call { subjects: vec![subject], bash: None, bash_dir: tools.cwd.clone() })
+}
+
+impl Permissions {
+    /// Whether a call only reads and may run beside other such calls: the file readers, a bash line
+    /// of read-only commands (no `cd`, assignment, redirect, `pty` or `async`), and a plugin tool
+    /// whose manifest tier is `read`. Everything else (`ask`, `task`, `web_search`, which may prompt,
+    /// the other built-ins) runs alone. Whether the call needs approval is `check`'s verdict, not this.
+    pub fn runs_concurrently(&self, tools: &Tools, name: &str, args: &Value) -> bool {
+        match name {
+            "read" | "grep" | "glob" => true,
+            "bash" => {
+                if args["pty"].as_bool() == Some(true) || args["async"].as_bool() == Some(true) {
+                    return false;
+                }
+                let Some(cmd) = args["command"].as_str() else { return false };
+                let a = analyze(cmd);
+                a.parsed
+                    && !a.cmds.is_empty()
+                    && a.unplaced_from.is_none()
+                    && a.cmds.iter().all(|c| c.readonly && !c.assigns && c.writes.is_empty())
+            }
+            "web_search" => false,
+            _ => !crate::tools::is_builtin(name) && tools.access(name) == Access::Read,
+        }
+    }
 }
 
 /// The file and shell tools, judged from their arguments; `None` for a name that is not one of them.
@@ -148,5 +173,27 @@ pub(super) fn word_outside(gate: &Gate, dir: &Path, a: &BashAnalysis, i: usize, 
     match prefix {
         Some(p) => !placed(a, i, p) || !gate.inside(&place(dir, p)),
         None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_readers_run_concurrently() {
+        let (t, p) = (Tools::for_test(), Permissions::default());
+        let runs = |name: &str, args: Value| p.runs_concurrently(&t, name, &args);
+        assert!(runs("read", json!({"path": "a"})) && runs("grep", json!({"pattern": "a"})));
+        assert!(runs("bash", json!({"command": "ls | wc -l"})));
+        for command in ["touch a", "ls > out", "cd src && ls", "X=1 ls", "ls $(touch a)"] {
+            assert!(!runs("bash", json!({ "command": command })), "{command}");
+        }
+        assert!(!runs("bash", json!({"command": "ls", "async": true})));
+        assert!(!runs("bash", json!({"command": "ls", "pty": true})));
+        for name in ["write", "edit", "todo", "ask", "task", "wait", "yield", "web_search", "mcp__x__y"] {
+            assert!(!runs(name, json!({})), "{name}");
+        }
     }
 }
