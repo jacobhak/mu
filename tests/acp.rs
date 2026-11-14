@@ -607,9 +607,7 @@ fn initialize_negotiates_the_protocol_version() {
     let r = acp.call("initialize", json!({"protocolVersion": "1"}));
     assert_eq!(r["error"]["code"], -32602, "a version must be a number: {r}");
     let r = acp.call("initialize", json!({"protocolVersion": 0}));
-    assert_eq!(r["error"]["code"], -32022, "{r}");
-    assert_eq!(r["error"]["message"], "Unsupported protocol version");
-    assert_eq!(r["error"]["data"], json!({"requested": 0, "supported": [1]}));
+    assert_eq!(r["result"]["protocolVersion"], 1, "version 0 is answered with the supported version: {r}");
     // Version 2 is not spoken yet: a v1 answer, as the spec asks of agents without v2.
     let r = acp.call("initialize", json!({"protocolVersion": 2}));
     assert_eq!(r["result"]["protocolVersion"], 1, "{r}");

@@ -6,6 +6,8 @@ mu reaches a model one of three ways:
 - **Natively, on your ChatGPT plan**, for `openai-chatgpt/*` models after [Sign in with ChatGPT](#sign-in-with-chatgpt). Requests go straight to `api.openai.com`. No omp process runs.
 - **Through the omp gateway** for everything else: subscription logins (Claude Pro/Max, Codex), every other omp provider, and any of the three providers you have not given a key to. The gateway holds those credentials; log in with omp (`/login` lists omp's providers too).
 
+The gateway is one `omp auth-broker` and `omp auth-gateway` pair shared by every mu process. It starts with the first request that needs it. Each mu process that asks for it holds a lease, refreshed on every ask. The pair stops itself, checked every 30 seconds (`MU_GATEWAY_TICK_SECS`), once no live mu process has asked for 30 minutes (`MU_GATEWAY_IDLE_SECS`, in seconds); the lease of a process that has exited is dropped at once, so it does not hold the pair. The `omp` broker and gateway processes you see in `ps` are this pair; the next request starts a new one.
+
 Model ids are omp's (`anthropic/claude-sonnet-5-5`, `openai/gpt-5.5`, `baseten/moonshotai/Kimi-K3`), so the roles you copy from omp (`mu models import`) work in both tools. Plan models are `openai-chatgpt/<model>` (`openai-chatgpt/gpt-6.1-sol`): the same models as `openai/<model>`, billed to your ChatGPT plan instead of a key.
 
 ## How routing is decided

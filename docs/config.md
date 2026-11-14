@@ -13,6 +13,7 @@ enabled = true
 threshold = 0.3       # minimum confidence for ghost text; 0.15 saves a few more keystrokes but shows about 55% more wrong ghosts
 engine = "ngram"     # or "smollm" (opt-in, see ghost-text.md); any other value warns and means "ngram"
 threads = 4          # CPU threads for SmolLM; 0 = all cores. Linux only: macOS runs SmolLM on the GPU
+other_histories = true  # also learn from omp's history.db and Claude Code's history.jsonl (read-only); false = mu's own history only
 
 [ask]
 nudge = true         # when a turn ends with a decision question in prose, remind the model to use `ask` instead

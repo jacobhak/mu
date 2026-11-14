@@ -1,4 +1,4 @@
-//! Prompt corpus: omp's history.db, Claude Code's history.jsonl and mu's own history.
+//! Prompt corpus: mu's own history, and unless turned off omp's history.db and Claude Code's history.jsonl.
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -95,11 +95,14 @@ fn mu_rows(profile_home: &Path, out: &mut Recent) {
     }
 }
 
-/// All rows from every readable source, oldest first. Missing sources are skipped.
-pub fn load_corpus(agent_dir: &Path, profile_home: &Path, home: &Path) -> Vec<Row> {
+/// All rows from every readable source, oldest first. Missing sources are skipped; the other tools'
+/// histories are read only when `other_histories`.
+pub fn load_corpus(agent_dir: &Path, profile_home: &Path, home: &Path, other_histories: bool) -> Vec<Row> {
     let mut recent = Recent::default();
-    omp_rows(agent_dir, &mut recent);
-    claude_rows(home, &mut recent);
+    if other_histories {
+        omp_rows(agent_dir, &mut recent);
+        claude_rows(home, &mut recent);
+    }
     mu_rows(profile_home, &mut recent);
     let mut rows = recent.into_rows();
     rows.retain(|r| !r.text.trim().is_empty());
@@ -110,6 +113,20 @@ pub fn load_corpus(agent_dir: &Path, profile_home: &Path, home: &Path) -> Vec<Ro
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+
+    #[test]
+    fn other_tools_histories_are_read_only_when_allowed() {
+        let dir = std::env::temp_dir().join(format!("mu-corpus-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/history.jsonl"), "{\"display\":\"from claude\",\"project\":\"/p\"}\n")
+            .unwrap();
+        std::fs::write(dir.join("history.jsonl"), "{\"text\":\"from mu\"}\n").unwrap();
+        let texts =
+            |other| -> Vec<String> { load_corpus(&dir, &dir, &dir, other).into_iter().map(|r| r.text).collect() };
+        assert!(texts(true).contains(&"from claude".to_string()));
+        assert_eq!(texts(false), ["from mu"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn keeps_only_the_most_recent_per_cwd() {

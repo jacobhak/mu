@@ -36,8 +36,6 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL: i64 = -32603;
-/// The protocol version asked for is not one this server speaks.
-const UNSUPPORTED_VERSION: i64 = -32022;
 /// Sessions per `session/list` page.
 const PAGE: usize = 100;
 
@@ -319,16 +317,9 @@ impl Server {
         let sid = p["sessionId"].as_str().unwrap_or("");
         match (method, id) {
             ("initialize", Some(id)) => {
-                let Some(requested) = p["protocolVersion"].as_u64() else {
+                // Only v1 is spoken, and the answer names it whatever version was asked for, 0 included.
+                if p["protocolVersion"].as_u64().is_none() {
                     return fail(&id, INVALID_PARAMS, "protocolVersion must be a non-negative integer");
-                };
-                // Only v1 is spoken. A client asking for something older than 1 gets the supported versions.
-                if requested == 0 {
-                    return send(&json!({"jsonrpc": "2.0", "id": id, "error": {
-                        "code": UNSUPPORTED_VERSION,
-                        "message": "Unsupported protocol version",
-                        "data": {"requested": 0, "supported": [1]},
-                    }}));
                 }
                 self.notices = p["clientCapabilities"]["session"]["notices"].is_object();
                 self.elicit = p["clientCapabilities"]["elicitation"]["form"].is_object();

@@ -11,11 +11,12 @@ pub const DEFAULT_THREADS: usize = 4;
 struct Section {
     engine: String,
     threads: usize,
+    other_histories: bool,
 }
 
 impl Default for Section {
     fn default() -> Self {
-        Self { engine: "ngram".into(), threads: DEFAULT_THREADS }
+        Self { engine: "ngram".into(), threads: DEFAULT_THREADS, other_histories: true }
     }
 }
 
@@ -25,6 +26,8 @@ pub struct Settings {
     pub smollm: bool,
     /// CPU threads for SmolLM; `None` means all cores (`threads = 0`).
     pub threads: Option<usize>,
+    /// Learn from omp's `history.db` and Claude Code's `history.jsonl` as well as mu's own.
+    pub other_histories: bool,
 }
 
 pub fn parse(text: &str) -> Settings {
@@ -34,7 +37,11 @@ pub fn parse(text: &str) -> Settings {
         .and_then(|t| t.get("predict").cloned())
         .and_then(|v| v.try_into::<Section>().ok())
         .unwrap_or_default();
-    Settings { smollm: section.engine == "smollm", threads: (section.threads > 0).then_some(section.threads) }
+    Settings {
+        smollm: section.engine == "smollm",
+        threads: (section.threads > 0).then_some(section.threads),
+        other_histories: section.other_histories,
+    }
 }
 
 pub fn read(mu_home: &Path) -> Settings {
@@ -47,14 +54,24 @@ mod tests {
 
     #[test]
     fn defaults_are_ngram_and_four_threads() {
-        assert_eq!(parse(""), Settings { smollm: false, threads: Some(4) });
-        assert_eq!(parse("[predict]\nenabled = true\n"), Settings { smollm: false, threads: Some(4) });
+        assert_eq!(parse(""), Settings { smollm: false, threads: Some(4), other_histories: true });
+        assert_eq!(
+            parse("[predict]\nenabled = true\n"),
+            Settings { smollm: false, threads: Some(4), other_histories: true }
+        );
+    }
+
+    #[test]
+    fn other_tools_histories_can_be_turned_off() {
+        assert!(!parse("[predict]\nother_histories = false\n").other_histories);
+        assert!(parse("[predict]\nother_histories = true\n").other_histories);
     }
 
     #[test]
     fn smollm_and_threads() {
-        assert_eq!(parse("[predict]\nengine = \"smollm\"\nthreads = 2\n"), Settings { smollm: true, threads: Some(2) });
-        assert_eq!(parse("[predict]\nengine = \"smollm\"\nthreads = 0\n"), Settings { smollm: true, threads: None });
+        let s = |smollm, threads| Settings { smollm, threads, other_histories: true };
+        assert_eq!(parse("[predict]\nengine = \"smollm\"\nthreads = 2\n"), s(true, Some(2)));
+        assert_eq!(parse("[predict]\nengine = \"smollm\"\nthreads = 0\n"), s(true, None));
     }
 
     #[test]
@@ -67,7 +84,7 @@ mod tests {
     fn a_bad_section_is_ignored_as_a_whole() {
         assert_eq!(
             parse("[predict]\nengine = \"smollm\"\nthreads = -1\n"),
-            Settings { smollm: false, threads: Some(4) }
+            Settings { smollm: false, threads: Some(4), other_histories: true }
         );
     }
 }

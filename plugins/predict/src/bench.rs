@@ -107,7 +107,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             _ => return Err(format!("unknown option {a}")),
         }
     }
-    let rows = load_corpus(&omp_agent_dir(), &profile_home(), &mu_common::paths::home());
+    let other = crate::settings::read(&mu_common::paths::mu_home()).other_histories;
+    let rows = load_corpus(&omp_agent_dir(), &profile_home(), &mu_common::paths::home(), other);
     let dir = std::env::temp_dir().join(format!("mu-predict-bench-{}", std::process::id()));
     if let Some(n) = latency {
         let model = model.ok_or("--latency needs --smollm DIR")?;

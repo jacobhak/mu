@@ -8,6 +8,8 @@
 
 Each session runs its own agent in the `cwd` it was opened with.
 
+`initialize` answers `protocolVersion: 1`, the only version spoken, whatever number the client asked for (0 and 2 included); a missing or non-numeric version is an invalid-params error.
+
 ## Sessions
 
 `session/new`, `load` (replays history), `resume`, `list`, `close`, `delete` (removes the session file; deleting one that is gone succeeds), `prompt` (text, images, embedded resources), `cancel` and `$/cancel_request` (a cancelled prompt answers `cancelled`). `set_config_option` and `set_mode` are rejected while a prompt runs.

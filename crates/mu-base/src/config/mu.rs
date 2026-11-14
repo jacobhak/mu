@@ -233,11 +233,13 @@ pub struct MuPredict {
     pub engine: String,
     /// CPU threads for SmolLM; 0 means all cores.
     pub threads: usize,
+    /// Also learn from omp's and Claude Code's prompt histories; read by the predict plugin.
+    pub other_histories: bool,
 }
 
 impl Default for MuPredict {
     fn default() -> Self {
-        Self { enabled: true, threshold: 0.3, engine: "ngram".into(), threads: 4 }
+        Self { enabled: true, threshold: 0.3, engine: "ngram".into(), threads: 4, other_histories: true }
     }
 }
 

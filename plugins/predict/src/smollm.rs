@@ -145,13 +145,14 @@ mod tests {
     fn startup_plan_falls_back_with_a_reason_when_weights_are_missing() {
         let dir = std::env::temp_dir().join(format!("mu-predict-plan-{}", std::process::id()));
         let files = [Pinned { name: "w.bin", repo: "r", revision: "v", size: 3, sha256: "" }];
-        let on = Settings { smollm: true, threads: Some(4) };
+        let on = Settings { smollm: true, threads: Some(4), other_histories: true };
         let Start::Fallback(note) = start(&on, &dir, &files, &dir, &[]) else { panic!("expected a fallback") };
         assert!(
             note.contains("w.bin") && note.contains("mu predict setup smollm") && note.contains("n-gram"),
             "{note}"
         );
-        assert!(matches!(start(&Settings { smollm: false, threads: None }, &dir, &files, &dir, &[]), Start::Ngram));
+        let off = Settings { smollm: false, threads: None, other_histories: true };
+        assert!(matches!(start(&off, &dir, &files, &dir, &[]), Start::Ngram));
     }
 
     #[test]
@@ -161,7 +162,7 @@ mod tests {
         std::fs::write(dir.join("w.bin"), b"abc").unwrap();
         let files = [Pinned { name: "w.bin", repo: "r", revision: "v", size: 3, sha256: "" }];
         let rows = [row("hello there")];
-        let on = Settings { smollm: true, threads: None };
+        let on = Settings { smollm: true, threads: None, other_histories: true };
         let Start::Load { history } = start(&on, &dir, &files, &dir.join("state"), &rows) else {
             panic!("expected load")
         };

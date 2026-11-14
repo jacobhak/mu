@@ -37,11 +37,11 @@ fn initialize(agent_dir: &Path, mu_home: &Path) -> Result<(), String> {
     let profile_home = mu_common::paths::profile_home();
     let state_dir = profile_home.join("predict");
     let mut st = State::open(&state_dir)?;
-    let rows = corpus::load_corpus(agent_dir, &profile_home, &mu_common::paths::home());
+    let cfg = settings::read(mu_home);
+    let rows = corpus::load_corpus(agent_dir, &profile_home, &mu_common::paths::home(), cfg.other_histories);
     for r in &rows {
         st.observe_n(&r.text, &r.cwd, r.count);
     }
-    let cfg = settings::read(mu_home);
     let mb = Arc::new(Mailbox::default());
     let smollm_dir = state_dir.join("smollm");
     let loading = match smollm::start(&cfg, &weights::model_dir(mu_home), &weights::FILES, &smollm_dir, &rows) {
