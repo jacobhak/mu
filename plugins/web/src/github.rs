@@ -99,7 +99,12 @@ pub async fn handle(g: &Guard, ep: &Endpoints, url: &str) -> Option<Rendered> {
             if !page.ok {
                 return None;
             }
-            Some(Rendered::new(&raw, "text/plain", "github-raw", vec![format!("Fetched raw: {raw}")], page.text()))
+            let notes = vec![format!("Fetched raw: {raw}")];
+            if page.looks_binary() {
+                let notice = format!("Binary content ({} bytes) not shown.", page.body.len());
+                return Some(Rendered::new(&raw, &page.content_type, "binary", notes, notice));
+            }
+            Some(Rendered::new(&raw, "text/plain", "github-raw", notes, page.text()))
         }
         Kind::Tree { git_ref, path } => {
             let info: RepoInfo = api_json(g, ep, &base).await?;
@@ -506,6 +511,15 @@ mod tests {
         assert_eq!(out.method, "github-raw");
         assert_eq!(out.content, "# Hello");
         assert_eq!(out.final_url, format!("http://127.0.0.1:{port}/o/r/main/docs/a.md"));
+    }
+
+    #[tokio::test]
+    async fn binary_blob_is_described_not_decoded() {
+        let port = serve(|_| Resp::new(200, "application/octet-stream", vec![0u8, 159, 146, 150])).await;
+        let url = "https://github.com/o/r/blob/main/logo.png";
+        let out = handle(&Guard::allow_all(), &endpoints(port), url).await.unwrap();
+        assert_eq!(out.method, "binary");
+        assert_eq!(out.content, "Binary content (4 bytes) not shown.");
     }
 
     #[tokio::test]

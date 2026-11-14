@@ -153,6 +153,10 @@ fn index_file(conn: &mut Connection, path: &Path, keys: &HashMap<PathBuf, String
     let Ok(meta) = std::fs::metadata(path) else { return Ok(Step::Same) };
     let (size, mtime) = (meta.len(), mtime_ns(&meta));
     let key = path_key(path);
+    // An unchanged file is the common case: decide it on a read, without taking the write lock.
+    if load_row(conn, &key)?.is_some_and(|r| r.size == size && r.mtime == mtime) {
+        return Ok(Step::Same);
+    }
     // Immediate: two sessions indexing at once must not both read the same offset.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
     let row = load_row(&tx, &key)?;

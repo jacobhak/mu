@@ -13,7 +13,8 @@ const LLMS_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_CAP: usize = 100 * 1024;
 const NEGOTIATE_ACCEPT: &str = "text/markdown, text/plain;q=0.9, text/html;q=0.8";
 const JS_NOTE: &str = "Page appears to require JavaScript or is mostly navigation";
-const BINARY_SNIFF: usize = 8 * 1024;
+/// The whole llms.txt probe: each candidate has `LLMS_TIMEOUT`, but many candidates must not eat the page's budget.
+const LLMS_PROBE: Duration = Duration::from_secs(8);
 
 pub struct Rendered {
     pub final_url: String,
@@ -25,13 +26,18 @@ pub struct Rendered {
 
 impl Rendered {
     pub fn new(final_url: &str, content_type: &str, method: &'static str, notes: Vec<String>, content: String) -> Self {
-        Self {
-            final_url: final_url.into(),
-            content_type: content_type.into(),
-            method,
-            notes,
-            content: finalize(&content),
-        }
+        Self::verbatim(final_url, content_type, method, notes, finalize(&content))
+    }
+
+    /// `content` as given: no blank-line collapsing, no trim.
+    fn verbatim(
+        final_url: &str,
+        content_type: &str,
+        method: &'static str,
+        notes: Vec<String>,
+        content: String,
+    ) -> Self {
+        Self { final_url: final_url.into(), content_type: content_type.into(), method, notes, content }
     }
 }
 
@@ -86,7 +92,7 @@ async fn render(g: &Guard, url: &str, raw: bool) -> Rendered {
     }
     let text = page.text();
     if raw {
-        return Rendered::new(&final_url, &page.content_type, "raw", notes, text);
+        return Rendered::verbatim(&final_url, &page.content_type, "raw", notes, text);
     }
 
     if page.content_type.contains("json") {
@@ -106,7 +112,7 @@ async fn render(g: &Guard, url: &str, raw: bool) -> Rendered {
         return html_flow(g, url, &page, text, notes).await;
     }
 
-    if page.body[..page.body.len().min(BINARY_SNIFF)].contains(&0) {
+    if page.looks_binary() {
         let notice = format!("Binary content ({}, {} bytes) not shown.", page.content_type, page.body.len());
         return Rendered::new(&final_url, &page.content_type, "binary", notes, notice);
     }
@@ -145,7 +151,13 @@ async fn html_flow(g: &Guard, url: &str, page: &Page, html: String, mut notes: V
         }
     }
 
-    let native = html::to_markdown(&html).ok().map(|md| html::strip_data_uri_images(&md));
+    // Conversion of a large page is CPU-bound: keep it off the runtime thread.
+    let source = html.clone();
+    let native =
+        tokio::task::spawn_blocking(move || html::to_markdown(&source).ok().map(|md| html::strip_data_uri_images(&md)))
+            .await
+            .ok()
+            .flatten();
     let native_len = native.as_deref().map_or(0, |md| md.trim().chars().count());
     if let Some(md) = &native
         && native_len > 100
@@ -154,12 +166,18 @@ async fn html_flow(g: &Guard, url: &str, page: &Page, html: String, mut notes: V
         return Rendered::new(final_url, mime, "native", notes, md.clone());
     }
 
-    for candidate in llms_candidates(&page_url) {
-        let opts = derived(page, LoadOpts { timeout: LLMS_TIMEOUT, ..Default::default() });
-        if let Some(body) = accepted(g, &candidate, opts).await {
-            notes.push(format!("Used llms.txt fallback: {candidate}"));
-            return Rendered::new(final_url, "text/plain", "llms-txt", notes, body);
+    let probe = async {
+        for candidate in llms_candidates(&page_url) {
+            let opts = derived(page, LoadOpts { timeout: LLMS_TIMEOUT, ..Default::default() });
+            if let Some(body) = accepted(g, &candidate, opts).await {
+                return Some((candidate, body));
+            }
         }
+        None
+    };
+    if let Ok(Some((candidate, body))) = tokio::time::timeout(LLMS_PROBE, probe).await {
+        notes.push(format!("Used llms.txt fallback: {candidate}"));
+        return Rendered::new(final_url, "text/plain", "llms-txt", notes, body);
     }
 
     match native {
@@ -441,6 +459,13 @@ mod tests {
         let out = fetch(&Guard::allow_all(), &format!("{}/x", base(port)), true).await.unwrap();
         assert_eq!(method(&out), "raw");
         assert!(out.ends_with(DOCS), "{out}");
+    }
+
+    #[tokio::test]
+    async fn raw_keeps_blank_lines() {
+        let port = serve(|_| Resp::new(200, "text/plain", "a\n\n\n\nb\n")).await;
+        let out = fetch(&Guard::allow_all(), &format!("{}/x", base(port)), true).await.unwrap();
+        assert!(out.ends_with("---\n\na\n\n\n\nb\n"), "{out}");
     }
 
     #[tokio::test]

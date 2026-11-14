@@ -127,6 +127,11 @@ impl Page {
         }
     }
 
+    /// A NUL byte in the first 8 KiB: not text, so not worth decoding.
+    pub fn looks_binary(&self) -> bool {
+        self.body[..self.body.len().min(8 * 1024)].contains(&0)
+    }
+
     /// Decodes the body with the header's charset, else a `<meta charset>` in the first 2 KiB
     /// when the body is HTML or untyped, else UTF-8. Invalid sequences become U+FFFD.
     pub fn text(&self) -> String {
