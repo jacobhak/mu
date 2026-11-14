@@ -542,14 +542,14 @@ impl Tools {
         );
         tokio::pin!(run);
         let mut c = Collector::new(run_cwd.clone());
-        // The live tail shows cleaned text; only the pty view gets raw bytes.
+        // Only the pty view gets raw bytes; the live tail and the model get cleaned text.
         let mut cleaner = mu_base::pty::Cleaner::default();
         let mut feed = |s: String| {
             let clean = cleaner.push(&s);
             if !clean.is_empty() {
+                c.push(&clean, &|| self.next_artifact());
                 let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: clean });
             }
-            c.push(&s, &|| self.next_artifact());
         };
         // Not "until the channel closes": a hung shell keeps its end open for good.
         let res = loop {
@@ -561,6 +561,7 @@ impl Tools {
         rx.drain().for_each(&mut feed);
         let rest = cleaner.finish();
         if !rest.is_empty() {
+            c.push(&rest, &|| self.next_artifact());
             let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: rest });
         }
         let output = c.finish();
@@ -783,6 +784,8 @@ pub async fn run_background(
     let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
     let (mut out_dec, mut err_dec) =
         (pi_shell::output_decode::OutputDecoder::new(), pi_shell::output_decode::OutputDecoder::new());
+    // One per stream: each holds its own escape state and unfinished line.
+    let (mut out_clean, mut err_clean) = (mu_base::pty::Cleaner::default(), mu_base::pty::Cleaner::default());
     let (mut obuf, mut ebuf) = (vec![0u8; 8192], vec![0u8; 8192]);
     let mut collector = Collector::new(cwd.clone());
     let mut status: Option<std::process::ExitStatus> = None;
@@ -799,7 +802,7 @@ pub async fn run_background(
                 Ok(n) if n > 0 => {
                     let text = out_dec.push(&obuf[..n]);
                     on_output(&text);
-                    collector.push(&text, &alloc)
+                    collector.push(&out_clean.push(&text), &alloc)
                 }
                 _ => stdout = None,
             },
@@ -807,7 +810,7 @@ pub async fn run_background(
                 Ok(n) if n > 0 => {
                     let text = err_dec.push(&ebuf[..n]);
                     on_output(&text);
-                    collector.push(&text, &alloc)
+                    collector.push(&err_clean.push(&text), &alloc)
                 }
                 _ => stderr = None,
             },
@@ -846,8 +849,10 @@ pub async fn run_background(
         }
         None => mu_base::process::terminate_group(pid).await,
     }
-    collector.push(&out_dec.finish(), &alloc);
-    collector.push(&err_dec.finish(), &alloc);
+    let out_rest = out_clean.push(&out_dec.finish()) + &out_clean.finish();
+    collector.push(&out_rest, &alloc);
+    let err_rest = err_clean.push(&err_dec.finish()) + &err_clean.finish();
+    collector.push(&err_rest, &alloc);
     let code = exit_code(status);
     let end = RunEnd {
         wall: start.elapsed().as_secs_f64(),
@@ -909,6 +914,25 @@ mod tests {
         assert!(r.ok, "{}", r.text);
         let seen = seen.into_inner();
         assert!(seen.contains("first") && seen.contains("second"), "{seen:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_background_run_gives_the_model_clean_text_and_the_ui_raw_text() {
+        let seen = std::cell::RefCell::new(String::new());
+        let r = run_background(
+            r"printf '\033[31mred\033[0m\n10%%\r100%%\n'; printf 'err\033[1m!\033[0m' >&2".into(),
+            std::env::temp_dir(),
+            std::env::vars().collect(),
+            None,
+            CancellationToken::new(),
+            || (0, std::env::temp_dir()),
+            |s| seen.borrow_mut().push_str(s),
+        )
+        .await;
+        assert!(r.ok, "{}", r.text);
+        assert!(r.text.starts_with("red\n100%\nerr!"), "{:?}", r.text);
+        assert!(!r.text.contains('\x1b') && !r.text.contains('\r'), "{:?}", r.text);
+        assert!(seen.into_inner().contains("\x1b[31m"));
     }
 
     #[tokio::test(flavor = "current_thread")]

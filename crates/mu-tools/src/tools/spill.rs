@@ -4,8 +4,8 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-const HEAD: usize = 20 * 1024;
-const TAIL: usize = 30 * 1024;
+pub const HEAD: usize = 8 * 1024;
+pub const TAIL: usize = 16 * 1024;
 /// A streamed command's spill file stops growing here.
 const SPILL_CAP: u64 = 128 * 1024 * 1024;
 /// Plugin output above this keeps its head in `cap_text`.
