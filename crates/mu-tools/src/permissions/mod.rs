@@ -835,6 +835,7 @@ mod tests {
             command: vec!["true".into()],
             lifetime: manifest::Lifetime::parse("session").unwrap(),
             hooks: vec![],
+            required_hooks: vec![],
             provider: None,
             tools,
             timeout: std::time::Duration::from_secs(5),

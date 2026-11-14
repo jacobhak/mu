@@ -93,6 +93,7 @@ The tools-to-provider edge exists because the plugin host serves `core/complete`
   command = ["mu-web"]
   lifetime = "idle:10m"           # session | idle:<duration> | call
   hooks = []                      # e.g. ["tool_result:write"]
+  required_hooks = []             # subset of hooks; see Hooks
   timeout = "300s"                # native tool calls; default 300s
 
   [[tools]]
@@ -130,6 +131,8 @@ The tools-to-provider edge exists because the plugin host serves `core/complete`
 | `turn_end` | Assistant turn completes | Observe the turn | advisor |
 | `pre_compaction` | Before compaction | Return context to preserve | memory (starts a background review) |
 | `session_end` | Session closes | Flush state | memory (queues a review) |
+
+Hooks other than `tool_call` run concurrently under one deadline (30 s; 10 s for `session_end`). `tool_call` hooks run one at a time in plugin-name order, each on the arguments the previous one returned, so rewrites compose and never race; a block stops the chain. A hook that fails or times out is skipped with a notice (a timeout also skips that plugin's hooks for 5 minutes): the call goes ahead. A plugin that lists `tool_call` in `required_hooks` (it must also be in `hooks`) is fail-closed instead: its failure or timeout blocks the call, and it is never skipped.
 
 ### Plugin ↔ core calls
 

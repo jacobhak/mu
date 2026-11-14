@@ -92,6 +92,8 @@ pub struct Manifest {
     pub command: Vec<String>,
     pub lifetime: Lifetime,
     pub hooks: Vec<String>,
+    /// Subscriptions (a subset of `hooks`) whose failure or timeout blocks the call they guard.
+    pub required_hooks: Vec<String>,
     pub provider: Option<String>,
     pub tools: Vec<ToolSpec>,
     /// Limit on one native `tool/call`.
@@ -107,6 +109,8 @@ struct Raw {
     lifetime: Option<String>,
     #[serde(default)]
     hooks: Vec<String>,
+    #[serde(default)]
+    required_hooks: Vec<String>,
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
@@ -130,6 +134,9 @@ fn load_one(dir: &Path) -> Result<Manifest, String> {
     let raw: Raw = toml::from_str(&text).map_err(|e| e.to_string())?;
     if raw.command.is_empty() {
         return Err("empty command".into());
+    }
+    if let Some(h) = raw.required_hooks.iter().find(|h| !raw.hooks.contains(h)) {
+        return Err(format!("required hook `{h}` is not in `hooks`"));
     }
     let lifetime = match raw.lifetime.as_deref() {
         None => Lifetime::Session,
@@ -158,6 +165,7 @@ fn load_one(dir: &Path) -> Result<Manifest, String> {
         command: raw.command,
         lifetime,
         hooks: raw.hooks,
+        required_hooks: raw.required_hooks,
         provider: raw.provider,
         tools,
         timeout,

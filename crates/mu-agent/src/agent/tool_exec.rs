@@ -266,14 +266,9 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> ToolOutput {
         let mut blocked = None;
-        for (plugin, v) in self.ports.plugins.hook("tool_call", json!({"name": name, "arguments": args})).await {
-            if let Some(b) = v["block"].as_str() {
-                blocked = Some(format!("Blocked by plugin {plugin}: {b}"));
-                break;
-            }
-            if v["arguments"].is_object() {
-                args = v["arguments"].clone();
-            }
+        match self.ports.plugins.tool_call_hook(name, args.clone()).await {
+            Ok(a) => args = a,
+            Err(b) => blocked = Some(b),
         }
         self.emit(AgentEvent::ToolStart { id: id.into(), name: name.into(), args: args.clone() });
         let denied = self.policy().check(name).err().or_else(|| secrets::guard(name, &args).err());

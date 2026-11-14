@@ -402,15 +402,25 @@ impl PluginHost {
             .ok_or_else(|| format!("no MCP server {name}"))?;
         let m = slot.as_mcp().expect("an mcp slot");
         let cwd = self.shared.init.borrow().cwd.clone();
-        let (servers, _) = mcp::config::load(std::path::Path::new(&cwd), &mu_common::paths::omp_agent_dir());
+        let (entries, _) = mcp::config::load_all(std::path::Path::new(&cwd), &mu_common::paths::omp_agent_dir());
         let mut relist = !m.listed.get();
-        if let Some(s) = servers.into_iter().find(|s| s.name == name) {
-            let hash = mcp::cache::config_hash(&s, &cwd);
-            if hash != *m.hash.borrow() {
-                *m.hash.borrow_mut() = hash;
-                relist = true;
+        match entries.into_iter().find(|e| e.server.name == name) {
+            Some(e) if !e.trusted => {
+                return Err(format!(
+                    "{name} is defined in {}, which is not trusted any more (its servers changed or trust was revoked); /mcp trust to start it again",
+                    e.file.display()
+                ));
             }
-            *m.server.borrow_mut() = s;
+            Some(e) => {
+                let s = e.server;
+                let hash = mcp::cache::config_hash(&s, &cwd);
+                if hash != *m.hash.borrow() {
+                    *m.hash.borrow_mut() = hash;
+                    relist = true;
+                }
+                *m.server.borrow_mut() = s;
+            }
+            None => {}
         }
         let running = slot.proc.borrow().clone();
         if let Some(p) = running {

@@ -87,6 +87,13 @@ impl Slot {
         }
     }
 
+    pub(super) fn requires(&self, sub: &str) -> bool {
+        match &self.kind {
+            Kind::Native { manifest } => manifest.required_hooks.iter().any(|h| h == sub),
+            Kind::Mcp(_) => false,
+        }
+    }
+
     /// Forgets `proc` as this slot's process, so the next call starts a fresh one.
     pub(super) fn detach(&self, proc: &Rc<Proc>) {
         let mut cur = self.proc.borrow_mut();
@@ -431,6 +438,60 @@ impl PluginHost {
             }
         }
         out
+    }
+
+    /// Runs the `tool_call` hooks one at a time in name order, each on the arguments the previous
+    /// one returned. `Ok` is the final arguments; `Err` is the reason to block the call: a hook's
+    /// own block, or the failure or timeout of a required hook. Other failures are notices, as in
+    /// `hook`; a required hook is never skipped after an earlier timeout.
+    pub async fn tool_call_hook(&self, name: &str, mut args: Value) -> Result<Value, String> {
+        const SKIP_AFTER_TIMEOUT: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        let slots: Vec<Rc<Slot>> = self
+            .slots
+            .borrow()
+            .iter()
+            .filter(|s| s.hooks().iter().any(|h| h == "tool_call"))
+            .filter(|s| s.requires("tool_call") || s.skip_hooks_until.get().is_none_or(|t| now >= t))
+            .cloned()
+            .collect();
+        for slot in slots {
+            let plugin = slot.name();
+            let params = json!({"name": name, "arguments": args});
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let run = async {
+                let p = self.ensure(&slot).await?;
+                p.request("hook/tool_call", params, None).await
+            };
+            let required = slot.requires("tool_call");
+            match tokio::time::timeout_at(deadline, run).await {
+                Ok(Ok(v)) => {
+                    if let Some(b) = v["block"].as_str() {
+                        return Err(format!("Blocked by plugin {plugin}: {b}"));
+                    }
+                    if v["arguments"].is_object() {
+                        args = v["arguments"].clone();
+                    }
+                }
+                Ok(Err(e)) if required => {
+                    return Err(format!("Blocked by plugin {plugin}: its required tool_call hook failed: {e}"));
+                }
+                Ok(Err(e)) => {
+                    let _ = self.shared.notices.send(format!("plugin {plugin}: hook tool_call failed: {e}"));
+                }
+                Err(_) if required => {
+                    return Err(format!("Blocked by plugin {plugin}: its required tool_call hook timed out"));
+                }
+                Err(_) => {
+                    slot.skip_hooks_until.set(Some(Instant::now() + SKIP_AFTER_TIMEOUT));
+                    let _ = self
+                        .shared
+                        .notices
+                        .send(format!("plugin {plugin}: hook tool_call timed out; skipping its hooks for 5 minutes"));
+                }
+            }
+        }
+        Ok(args)
     }
 
     pub(crate) async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {

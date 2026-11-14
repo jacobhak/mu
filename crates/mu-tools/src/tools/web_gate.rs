@@ -135,6 +135,7 @@ mod tests {
             command: vec!["sh".into(), "-c".into(), "touch started; cat".into()],
             lifetime: manifest::Lifetime::parse("session").unwrap(),
             hooks: vec![],
+            required_hooks: vec![],
             provider: None,
             tools: vec![manifest::ToolSpec::with_schema("web_search", serde_json::json!({}))],
             timeout: std::time::Duration::from_secs(300),

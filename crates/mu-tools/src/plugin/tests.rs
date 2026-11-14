@@ -47,6 +47,7 @@ done
         command: vec!["sh".into(), "p.sh".into()],
         lifetime: manifest::Lifetime::parse(lifetime).unwrap(),
         hooks: vec![],
+        required_hooks: vec![],
         provider: None,
         tools: vec![manifest::ToolSpec::with_schema("slow", json!({}))],
         timeout: std::time::Duration::from_secs(300),
@@ -478,6 +479,7 @@ while :; do sleep 100 & wait; done
             command: vec!["sh".into(), "p.sh".into()],
             lifetime: manifest::Lifetime::parse("session").unwrap(),
             hooks: vec![],
+            required_hooks: vec![],
             provider: None,
             tools: vec![manifest::ToolSpec::with_schema("slow", json!({}))],
             timeout: std::time::Duration::from_secs(300),
@@ -492,5 +494,116 @@ while :; do sleep 100 & wait; done
         mu_testutil::wait_until("the process group to end", || !group_running(pid)).await;
         assert!(!group_running(pid), "the process group is gone");
         let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+/// A native plugin subscribed to `tool_call`; `on_hook` is shell run on each `hook/tool_call`
+/// (`$id` is the request id, `$line` the request).
+fn hook_plugin(dir: &std::path::Path, name: &str, required: bool, on_hook: &str) -> Manifest {
+    let script = format!(
+        r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"shutdown"'*) exit 0 ;;
+    *'"hook/tool_call"'*) {on_hook} ;;
+  esac
+done
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.sh")), script).unwrap();
+    Manifest {
+        name: name.into(),
+        command: vec!["sh".into(), format!("{name}.sh")],
+        lifetime: manifest::Lifetime::Session,
+        hooks: vec!["tool_call".into()],
+        required_hooks: if required { vec!["tool_call".into()] } else { vec![] },
+        provider: None,
+        tools: vec![],
+        timeout: std::time::Duration::from_secs(300),
+        dir: dir.into(),
+    }
+}
+
+fn hook_host(plugins: Vec<Manifest>) -> (Rc<PluginHost>, mpsc::UnboundedReceiver<String>) {
+    let (ntx, nrx) = mpsc::unbounded_channel();
+    (PluginHost::new(plugins, vec![], ntx, Default::default()), nrx)
+}
+
+fn hook_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mu-hook-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn tool_call_hooks_run_in_order_each_on_the_previous_arguments() {
+    run(async {
+        let dir = hook_dir();
+        let add = |c: &str| {
+            format!(
+                r#"v=$(printf '%s' "$line" | sed -n 's/.*"arguments":{{"v":"\([a-z]*\)".*/\1/p'); printf '{{"jsonrpc":"2.0","id":%s,"result":{{"arguments":{{"v":"%s{c}"}}}}}}\n' "$id" "$v""#
+            )
+        };
+        let (h, _n) = hook_host(vec![
+            hook_plugin(&dir, "a", false, &add("a")),
+            hook_plugin(&dir, "b", false, &add("b")),
+            hook_plugin(&dir, "c", false, &add("c")),
+        ]);
+        assert_eq!(h.tool_call_hook("t", json!({"v": "x"})).await, Ok(json!({"v": "xabc"})));
+        h.shutdown_all().await;
+    });
+}
+
+#[test]
+fn a_failing_optional_hook_lets_the_call_through_and_a_required_one_blocks_it() {
+    run(async {
+        let dir = hook_dir();
+        let fail = r#"printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-1,"message":"boom"}}\n' "$id""#;
+        let (h, mut n) = hook_host(vec![hook_plugin(&dir, "opt", false, fail)]);
+        assert_eq!(h.tool_call_hook("t", json!({"v": 1})).await, Ok(json!({"v": 1})), "fail-open by default");
+        assert!(n.try_recv().unwrap().contains("hook tool_call failed"));
+        h.shutdown_all().await;
+
+        let (h, _n) = hook_host(vec![hook_plugin(&dir, "req", true, fail)]);
+        let e = h.tool_call_hook("t", json!({"v": 1})).await.unwrap_err();
+        assert!(e.contains("Blocked by plugin req") && e.contains("required") && e.contains("boom"), "{e}");
+        h.shutdown_all().await;
+    });
+}
+
+#[test]
+fn a_hook_block_stops_the_later_hooks() {
+    run(async {
+        let dir = hook_dir();
+        let block = r#"printf '{"jsonrpc":"2.0","id":%s,"result":{"block":"no"}}\n' "$id""#;
+        let mark = dir.join("ran");
+        let after = format!(r#"touch {}; printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id""#, mark.display());
+        let (h, _n) = hook_host(vec![hook_plugin(&dir, "a", false, block), hook_plugin(&dir, "b", false, &after)]);
+        assert_eq!(h.tool_call_hook("t", json!({})).await, Err("Blocked by plugin a: no".into()));
+        assert!(!mark.exists(), "the second hook never ran");
+        h.shutdown_all().await;
+    });
+}
+
+#[test]
+fn reconnect_refuses_a_server_whose_project_file_is_not_trusted() {
+    run(async {
+        let fx = McpFx::new();
+        let (h, _n) = fx.host("", "");
+        h.list_missing().await;
+        std::fs::create_dir_all(fx.dir.join(".omp")).unwrap();
+        std::fs::write(
+            fx.dir.join(".omp/mcp.json"),
+            r#"{"mcpServers":{"proj":{"command":"sh","args":["server.sh"]}}}"#,
+        )
+        .unwrap();
+        let (servers, _) = mcp::config::load_all(&fx.dir, &fx.dir.join("agent"));
+        let proj = servers.into_iter().find(|e| e.server.name == "proj").expect("the project server is configured");
+        assert!(!proj.trusted);
+        h.mcp_sync(vec![proj.server]).await;
+        let e = h.mcp_reconnect("proj").await.unwrap_err();
+        assert!(e.contains("not trusted") && e.contains("/mcp trust"), "{e}");
+        h.shutdown_all().await;
     });
 }
