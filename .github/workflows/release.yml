@@ -19,6 +19,9 @@ jobs:
       - run: curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
+      # The checkout is owned by another uid inside the container; without this every git command
+      # (scripts/shellcheck.sh's `git ls-files`) fails with "dubious ownership".
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
