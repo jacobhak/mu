@@ -3,6 +3,7 @@
 
 use super::config::{Entry, Kind, connection_key, parse_entry};
 use super::store::check_name;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,7 @@ pub struct Roots {
     pub agent_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Found {
     /// Human label of the source: `Claude Code`, `omp (profile work)`, `Codex`, ...
     pub tool: String,
@@ -24,7 +25,7 @@ pub struct Found {
     /// Converted to omp's format, with an explicit `type` (`stdio` or `http`).
     pub entry: Value,
     /// `stdio` or `http`.
-    pub kind: &'static str,
+    pub kind: String,
     /// What it runs or talks to, safe to display: the command, or `scheme://host` of the url.
     pub target: String,
 }
@@ -59,8 +60,8 @@ pub fn scan(roots: &Roots, configured: &[Entry]) -> Vec<Found> {
             }
             keys.push(key);
             let (kind, target) = match &server.kind {
-                Kind::Stdio { command, .. } => ("stdio", command.clone()),
-                Kind::Http { url, .. } => ("http", http_target(url)),
+                Kind::Stdio { command, .. } => ("stdio".to_string(), command.clone()),
+                Kind::Http { url, .. } => ("http".to_string(), http_target(url)),
             };
             found
                 .push((src.group, Found { tool: src.tool.clone(), file: src.file.clone(), name, entry, kind, target }));
