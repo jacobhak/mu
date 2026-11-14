@@ -105,7 +105,7 @@ fn head(path: &Path) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::home_guard::HomeGuard;
+    use mu_common::paths::Home;
     use std::path::PathBuf;
 
     fn dir() -> PathBuf {
@@ -172,8 +172,8 @@ mod tests {
         let d = dir();
         let home = d.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let _h = HomeGuard::set(&home);
-        let t = tools(&d);
+        let mut t = tools(&d);
+        t.home = Home::at(&home);
         let o = t.write(Args { path: "~/sub/note.txt".into(), content: "hi\n".into() }, false).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read_to_string(home.join("sub/note.txt")).unwrap(), "hi\n");

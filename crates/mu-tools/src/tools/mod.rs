@@ -59,6 +59,8 @@ pub struct Tools {
     pub plugins: Rc<PluginHost>,
     /// Set in interactive sessions: `task` then runs in the background.
     pub jobs: Option<Rc<JobsHandle>>,
+    /// Where `~` points; resolved once from the environment, set directly by tests.
+    pub(crate) home: mu_common::paths::Home,
     session: ToolSession,
     /// Set in a subagent started with an `outputSchema`: it must finish through `yield`.
     pub output_schema: std::cell::RefCell<Option<Value>>,
@@ -98,6 +100,7 @@ impl Tools {
             cwd,
             plugins,
             jobs: None,
+            home: mu_common::paths::Home::from_env(),
             session: Default::default(),
             output_schema: Default::default(),
             delegated: Default::default(),
@@ -126,11 +129,9 @@ impl Tools {
         vec![("PI_SESSION_FILE", file), ("PI_SESSION_ID", id)]
     }
 
-    /// `~` and `~/…` are `$HOME`; other paths are absolute or relative to `cwd`.
+    /// `~` and `~/…` are the home directory; other paths are absolute or relative to `cwd`.
     pub fn abs(&self, p: &str) -> PathBuf {
-        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
-            && let Some(expanded) = mu_common::paths::expand_tilde(p, &home)
-        {
+        if let Some(expanded) = self.home.expand_tilde(p) {
             return expanded;
         }
         let p = Path::new(p);
@@ -478,63 +479,23 @@ pub fn summary(name: &str, args: &Value) -> String {
     trunc(s, 120)
 }
 
-/// Tests that read or set `HOME` run one at a time.
-#[cfg(test)]
-pub(crate) mod home_guard {
-    use std::ffi::OsString;
-    use std::path::Path;
-    use std::sync::{Mutex, MutexGuard};
-
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    /// Points `HOME` at `home` until dropped (`""` unsets it for `abs`).
-    pub(crate) struct HomeGuard {
-        old: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl HomeGuard {
-        pub(crate) fn set(home: &Path) -> Self {
-            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let old = std::env::var_os("HOME");
-            // SAFETY: HOME is only changed while LOCK is held.
-            unsafe { std::env::set_var("HOME", home) };
-            Self { old, _lock: lock }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: as in `set`.
-            unsafe {
-                match self.old.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod path_tests {
     use super::*;
-    use home_guard::HomeGuard;
+    use mu_common::paths::Home;
 
     #[test]
     fn tilde_paths_are_home_relative() {
         let home = std::env::temp_dir().join(format!("mu-home-{}", uuid::Uuid::new_v4()));
         let mut t = Tools::for_test();
         t.cwd = PathBuf::from("/work");
-        {
-            let _h = HomeGuard::set(&home);
-            assert_eq!(t.abs("~/x"), home.join("x"));
-            assert_eq!(t.abs("~"), home);
-            assert_eq!(t.abs("~user/x"), PathBuf::from("/work/~user/x"));
-            assert_eq!(t.abs("a/b"), PathBuf::from("/work/a/b"));
-            assert_eq!(t.abs("/etc/x"), PathBuf::from("/etc/x"));
-        }
-        let _h = HomeGuard::set(Path::new(""));
+        t.home = Home::at(&home);
+        assert_eq!(t.abs("~/x"), home.join("x"));
+        assert_eq!(t.abs("~"), home);
+        assert_eq!(t.abs("~user/x"), PathBuf::from("/work/~user/x"));
+        assert_eq!(t.abs("a/b"), PathBuf::from("/work/a/b"));
+        assert_eq!(t.abs("/etc/x"), PathBuf::from("/etc/x"));
+        t.home = Home::at("");
         assert_eq!(t.abs("~/x"), PathBuf::from("/work/~/x"), "an empty HOME leaves the path alone");
     }
 }

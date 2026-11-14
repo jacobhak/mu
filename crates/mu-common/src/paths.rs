@@ -1,7 +1,74 @@
 use std::path::{Path, PathBuf};
 
+/// The roots mu derives its paths from. Production reads them from the environment (`Home::from_env`);
+/// code that takes a `Home` is tested with `Home::at`, without touching process-wide variables.
+#[derive(Clone, Debug)]
+pub struct Home {
+    home: PathBuf,
+    mu_home: PathBuf,
+    profile: Option<String>,
+}
+
+impl Home {
+    /// `$HOME`, `$MU_HOME` (default `<home>/.mu`) and the active omp profile.
+    pub fn from_env() -> Self {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let mu_home = match std::env::var_os("MU_HOME") {
+            Some(d) if !d.is_empty() => PathBuf::from(d),
+            _ => home.join(".mu"),
+        };
+        Self { home, mu_home, profile: profile() }
+    }
+
+    /// `home` as the user's home with mu's state under `<home>/.mu` and no profile.
+    pub fn at(home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
+        Self { mu_home: home.join(".mu"), home, profile: None }
+    }
+
+    /// Keeps the home directory but keeps mu's state in `mu_home` (what `MU_HOME` does).
+    pub fn with_mu_home(mut self, mu_home: impl Into<PathBuf>) -> Self {
+        self.mu_home = mu_home.into();
+        self
+    }
+
+    /// The user's home directory; empty when `HOME` is unset.
+    pub fn dir(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn mu_home(&self) -> &Path {
+        &self.mu_home
+    }
+
+    /// See `profile_home`.
+    pub fn profile_home(&self) -> PathBuf {
+        profile_subdir(self.mu_home.clone(), self.profile.as_deref())
+    }
+
+    pub fn encode_cwd(&self, cwd: &Path) -> String {
+        if let Ok(rel) = cwd.strip_prefix(std::env::temp_dir()) {
+            return format!("-tmp-{}", dashed(rel));
+        }
+        if let Ok(rel) = cwd.strip_prefix(&self.home) {
+            return format!("-{}", dashed(rel));
+        }
+        let s = cwd.to_string_lossy();
+        format!("--{}--", s.trim_start_matches('/').replace('/', "-"))
+    }
+
+    pub fn session_dir(&self, cwd: &Path) -> PathBuf {
+        self.profile_home().join("sessions").join(self.encode_cwd(cwd))
+    }
+
+    /// `~` and `~/…` under the home directory; `None` for any other path or when no home is set.
+    pub fn expand_tilde(&self, p: &str) -> Option<PathBuf> {
+        if self.home.as_os_str().is_empty() { None } else { expand_tilde(p, &self.home) }
+    }
+}
+
 pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+    Home::from_env().home
 }
 
 /// `~` and `~/…` under `home`; `None` for any other path.
@@ -72,10 +139,7 @@ pub fn check_home() -> Result<(), String> {
 }
 
 pub fn mu_home() -> PathBuf {
-    match std::env::var_os("MU_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => home().join(".mu"),
-    }
+    Home::from_env().mu_home
 }
 
 /// Per-profile state: `$MU_HOME`, or `$MU_HOME/profiles/<name>` under an omp profile. Everything that belongs
@@ -83,7 +147,7 @@ pub fn mu_home() -> PathBuf {
 /// credentials, model and price caches), so profiles never see or overwrite each other's. Install-wide files
 /// (bin, plugins, logs, config.toml, themes, model weights) stay in `mu_home()`.
 pub fn profile_home() -> PathBuf {
-    profile_subdir(mu_home(), profile().as_deref())
+    Home::from_env().profile_home()
 }
 
 /// The dirs and files `profile_home()` holds that existed in `$MU_HOME` itself before state was per profile.
@@ -116,7 +180,7 @@ pub fn self_exe() -> std::io::Result<PathBuf> {
 }
 
 pub fn session_dir(cwd: &Path) -> PathBuf {
-    profile_home().join("sessions").join(encode_cwd(cwd))
+    Home::from_env().session_dir(cwd)
 }
 
 fn dashed(rel: &Path) -> String {
@@ -124,14 +188,7 @@ fn dashed(rel: &Path) -> String {
 }
 
 pub fn encode_cwd(cwd: &Path) -> String {
-    if let Ok(rel) = cwd.strip_prefix(std::env::temp_dir()) {
-        return format!("-tmp-{}", dashed(rel));
-    }
-    if let Ok(rel) = cwd.strip_prefix(home()) {
-        return format!("-{}", dashed(rel));
-    }
-    let s = cwd.to_string_lossy();
-    format!("--{}--", s.trim_start_matches('/').replace('/', "-"))
+    Home::from_env().encode_cwd(cwd)
 }
 
 /// Runs the real `omp_bin()` with `args` (stdin null, 60 s limit) and returns its stdout. For contract tests.
@@ -183,9 +240,20 @@ mod tests {
 
     #[test]
     fn encode() {
-        let h = home();
-        assert_eq!(encode_cwd(&h.join("code/private/mu")), "-code-private-mu");
-        assert_eq!(encode_cwd(&h), "-");
-        assert_eq!(encode_cwd(Path::new("/opt/x")), "--opt-x--");
+        let home = Home::at("/home/u");
+        assert_eq!(home.encode_cwd(Path::new("/home/u/code/private/mu")), "-code-private-mu");
+        assert_eq!(home.encode_cwd(Path::new("/home/u")), "-");
+        assert_eq!(home.encode_cwd(Path::new("/opt/x")), "--opt-x--");
+    }
+
+    #[test]
+    fn an_explicit_home_roots_state_without_the_environment() {
+        let home = Home::at("/home/u");
+        assert_eq!(home.mu_home(), Path::new("/home/u/.mu"));
+        assert_eq!(home.session_dir(Path::new("/opt/x")), PathBuf::from("/home/u/.mu/sessions/--opt-x--"));
+        let moved = Home::at("/home/u").with_mu_home("/state");
+        assert_eq!(moved.profile_home(), PathBuf::from("/state"));
+        assert_eq!(Home::at("").expand_tilde("~/x"), None, "an empty home leaves the path alone");
+        assert_eq!(home.expand_tilde("~/x"), Some(PathBuf::from("/home/u/x")));
     }
 }
