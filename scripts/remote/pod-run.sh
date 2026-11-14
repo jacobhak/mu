@@ -89,7 +89,7 @@ sweep() {
   while IFS='|' read -r name host pid; do
     [ -n "$name" ] && [ "$host" = "$HOST" ] || continue
     case $pid in '' | *[!0-9]*) continue ;; esac
-    if ! kill -0 "$pid" 2> /dev/null; then
+    if ! ps -p "$pid" > /dev/null 2>&1; then
       log "orphan sweep: deleting $name (pid $pid is gone)"
       kc delete pod "$name" --wait=false --ignore-not-found > /dev/null 2>&1 || true
     fi
