@@ -1404,6 +1404,153 @@ fn a_failed_compaction_is_not_retried_every_tool_round() {
     });
 }
 
+fn summary_reply(text: &str) -> Result<Message, ProviderError> {
+    Ok(assistant(vec![Block::text(text)], StopReason::Stop))
+}
+
+/// A first turn, then three large messages (about 25k tokens each), so history is long enough to cut
+/// while the default threshold is not yet reached.
+async fn long_history(
+    script: Vec<Result<Message, ProviderError>>,
+    cfg: Configs,
+) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    let mut s = vec![Ok(assistant(vec![Block::text("hello")], StopReason::Stop))];
+    s.extend(script);
+    let (mut a, mut rx) = agent_with(s, cfg);
+    a.turn(Some("hi".to_string().into())).await;
+    let big = "x".repeat(100_000);
+    for _ in 0..3 {
+        a.push(Message::user(&big));
+    }
+    drain(&mut rx);
+    (a, rx)
+}
+
+/// The history and the session file agree: same messages, same entry ids, same summary.
+fn assert_matches_session(a: &Agent) {
+    let loaded = mu_session::session::format::load(&a.session.as_ref().unwrap().path).unwrap();
+    assert_eq!(loaded.messages.len(), a.messages.len());
+    assert_eq!(loaded.entry_ids, a.entry_ids);
+    assert_eq!(loaded.compaction.map(|c| c.summary), a.compaction.state.as_ref().map(|c| c.summary.clone()));
+}
+
+fn errors(events: &[AgentEvent]) -> Vec<&str> {
+    events.iter().filter_map(|e| if let AgentEvent::Error(m) = e { Some(m.as_str()) } else { None }).collect()
+}
+
+#[test]
+fn a_prompt_over_the_threshold_is_compacted_before_it_is_sent() {
+    run(async {
+        let cfg = Configs::from_models_toml("[compaction.thresholds]\n\"anthropic/m\" = \"f1000\"\n");
+        let script = vec![summary_reply("SUMMARY"), Ok(assistant(vec![Block::text("done")], StopReason::Stop))];
+        let (mut a, mut rx) = long_history(script, cfg).await;
+        a.turn(Some("go".to_string().into())).await;
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacting)));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })));
+        assert!(errors(&events).is_empty() && !events.iter().any(|e| matches!(e, AgentEvent::TurnFailed)));
+        assert_eq!(a.compaction.state.as_ref().map(|c| c.summary.as_str()), Some("SUMMARY"));
+        assert_eq!(user_texts(&a).last().map(String::as_str), Some("go"), "the prompt follows the kept tail");
+        assert_eq!(a.messages.len(), 3, "one kept message, the prompt and the reply");
+        assert!(a.ports.providers.scripted.borrow().is_empty());
+        assert_matches_session(&a);
+    });
+}
+
+#[test]
+fn a_tool_round_over_the_threshold_compacts_again_before_the_next_request() {
+    run(async {
+        let cfg = Configs::from_models_toml("[compaction.thresholds]\n\"anthropic/m\" = \"f1000\"\n");
+        let script = vec![
+            summary_reply("FIRST"),
+            Ok(assistant(vec![call("t1", "__panic")], StopReason::ToolUse)),
+            summary_reply("SECOND"),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = long_history(script, cfg).await;
+        a.turn(Some("go".to_string().into())).await;
+        let events = drain(&mut rx);
+        let compacted = events.iter().filter(|e| matches!(e, AgentEvent::Compacted { .. })).count();
+        assert_eq!(compacted, 2);
+        assert_eq!(a.compaction.state.as_ref().map(|c| c.summary.as_str()), Some("SECOND"));
+        assert!(matches!(a.messages.last(), Some(Message::Assistant { .. })));
+        assert!(a.ports.providers.scripted.borrow().is_empty());
+        assert_matches_session(&a);
+    });
+}
+
+#[test]
+fn overflow_compacts_once_and_the_request_is_retried() {
+    run(async {
+        let script = vec![
+            Err(ProviderError::Overflow("prompt is too long".into())),
+            summary_reply("SUMMARY"),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = long_history(script, Configs::default()).await;
+        a.turn(Some("go".to_string().into())).await;
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })));
+        assert!(errors(&events).is_empty() && !events.iter().any(|e| matches!(e, AgentEvent::TurnFailed)));
+        assert!(matches!(a.messages.last(), Some(Message::Assistant { .. })));
+        assert_eq!(a.compaction.state.as_ref().map(|c| c.summary.as_str()), Some("SUMMARY"));
+        assert_eq!(a.messages.len(), 2, "the prompt and the reply survive the cut");
+        assert!(a.ports.providers.scripted.borrow().is_empty());
+        assert_matches_session(&a);
+    });
+}
+
+#[test]
+fn a_second_overflow_after_compaction_fails_the_turn() {
+    run(async {
+        let script = vec![
+            Err(ProviderError::Overflow("prompt is too long".into())),
+            summary_reply("SUMMARY"),
+            Err(ProviderError::Overflow("prompt is too long".into())),
+            Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = long_history(script, Configs::default()).await;
+        a.turn(Some("go".to_string().into())).await;
+        let events = drain(&mut rx);
+        assert_eq!(errors(&events), ["context overflow after compaction"]);
+        let failed = events.iter().position(|e| matches!(e, AgentEvent::TurnFailed)).expect("TurnFailed");
+        let ended = events.iter().position(|e| matches!(e, AgentEvent::TurnEnd { .. })).expect("TurnEnd");
+        assert!(failed < ended);
+        assert_eq!(a.ports.providers.scripted.borrow().len(), 1, "no third request");
+        assert_matches_session(&a);
+    });
+}
+
+#[test]
+fn overflow_with_nothing_to_compact_reports_the_provider_error() {
+    run(async {
+        let (mut a, mut rx) = agent(vec![Err(ProviderError::Overflow("prompt is too long".into()))]);
+        a.turn(Some("go".to_string().into())).await;
+        let events = drain(&mut rx);
+        assert_eq!(errors(&events), ["error: prompt is too long"]);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnFailed)));
+        assert!(a.compaction.state.is_none());
+    });
+}
+
+#[test]
+fn overflow_with_a_failing_summariser_fails_the_turn_once() {
+    run(async {
+        let script = vec![
+            Err(ProviderError::Overflow("prompt is too long".into())),
+            Err(ProviderError::Fatal("summariser down".into())),
+        ];
+        let (mut a, mut rx) = long_history(script, Configs::default()).await;
+        a.turn(Some("go".to_string().into())).await;
+        let events = drain(&mut rx);
+        let failures = errors(&events).iter().filter(|m| m.starts_with("compaction failed")).count();
+        assert_eq!(failures, 1);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnFailed)));
+        assert!(a.compaction.state.is_none());
+        assert_matches_session(&a);
+    });
+}
+
 #[test]
 fn the_real_loop_wakes_on_the_channel() {
     run(async {
