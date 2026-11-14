@@ -137,7 +137,9 @@ for d in agents skills; do
   [ ! -d "${MU_TASK_AGENT_DIR:-}/$d" ] || cp -RL "$MU_TASK_AGENT_DIR/$d" "$stage/.omp/agent/"
 done
 find "$stage" \( -iname 'auth.json' -o -iname '*token*' \) -exec rm -rf {} + 2> /dev/null || true
-tar -cf - -C "$stage" . | kc exec -i "$POD" -- sh -c 'tar -xf - -C "$HOME"' > /dev/null
+# Without the "." entry: the worker owns the files but not the mount point, so extracting "." fails on its mode.
+# shellcheck disable=SC2046
+tar -cf - -C "$stage" -- $(ls -A "$stage") | kc exec -i "$POD" -- sh -c 'tar -xf - -C "$HOME"' > /dev/null
 
 # 3. Repository: the task commit as a bundle, fetched into the same absolute path and checked out.
 git -C "$MU_TASK_ROOT" bundle create - "$MU_TASK_REF" > "$TMP/out.bundle" 2> /dev/null

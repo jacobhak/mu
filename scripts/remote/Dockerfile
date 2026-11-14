@@ -14,7 +14,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_INCREMENTAL=0
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libssl-dev pkg-config shellcheck \
+ && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libssl-dev pkg-config procps shellcheck \
  && rm -rf /var/lib/apt/lists/*
 
 # The worker runs as an unprivileged user, so the image builds as that user too (a later chown would copy every

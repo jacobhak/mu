@@ -111,10 +111,11 @@ has "$T/log.jsonl" '"exit":0'
 
 # Config tar: what is sent, and no credentials.
 tar -tf "$FAKE/config.tar" > "$T/tar.list"
-has "$T/tar.list" ./.mu/config.toml
-has "$T/tar.list" ./.mu/models.toml
-has "$T/tar.list" ./.omp/agent/AGENTS.md
-has "$T/tar.list" ./.omp/agent/skills/s/SKILL.md
+has "$T/tar.list" .mu/config.toml
+has "$T/tar.list" .mu/models.toml
+has "$T/tar.list" .omp/agent/AGENTS.md
+has "$T/tar.list" .omp/agent/skills/s/SKILL.md
+lacks "$T/tar.list" './'
 lacks "$T/tar.list" auth.json
 lacks "$T/tar.list" token
 

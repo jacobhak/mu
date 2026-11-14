@@ -25,10 +25,11 @@ spec:
         runAsNonRoot: true
         allowPrivilegeEscalation: false
         capabilities: {drop: ["ALL"]}
+      # The workspace mount point is owned by root, which git refuses without safe.directory.
       # A cluster CA may sign the certificate of the object store sccache connects to; appended to a copy of the
       # system roots (the image is not writable by the worker) so crate downloads keep the public ones.
       command: ["sh", "-c"]
-      args: ["cp /etc/ssl/certs/ca-certificates.crt \"$HOME/ca-bundle.crt\"; [ ! -f /etc/mu-ca/ca.crt ] || cat /etc/mu-ca/ca.crt >> \"$HOME/ca-bundle.crt\"; exec sleep infinity"]
+      args: ["git config --global --add safe.directory '*'; cp /etc/ssl/certs/ca-certificates.crt \"$HOME/ca-bundle.crt\"; [ ! -f /etc/mu-ca/ca.crt ] || cat /etc/mu-ca/ca.crt >> \"$HOME/ca-bundle.crt\"; exec sleep infinity"]
       env:
         - {name: HOME, value: /home/worker}
         - {name: SSL_CERT_FILE, value: /home/worker/ca-bundle.crt}
