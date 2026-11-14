@@ -58,7 +58,7 @@ fn names(items: impl IntoIterator<Item = String>) -> (Vec<String>, Vec<String>) 
 }
 
 fn complete_model(c: &CompleteCtx) -> (Vec<String>, Vec<String>) {
-    super::slash::role_views(c.cfg, c.ctx).into_iter().map(|r| (format!("@{}", r.name), r.row())).unzip()
+    crate::host::models::role_views(c.cfg, c.ctx).into_iter().map(|r| (format!("@{}", r.name), r.row())).unzip()
 }
 
 fn complete_modelset(c: &CompleteCtx) -> (Vec<String>, Vec<String>) {

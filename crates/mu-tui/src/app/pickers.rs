@@ -2,6 +2,7 @@
 
 use super::child::ChildThen;
 use super::*;
+use crate::host::models::{self as models_host, ModelKind, ModelRow, ModelRows, RoleTable};
 use crate::panels::jobs_panel::JobsPanel;
 use crate::panels::model_roles::RoleEditor;
 use crate::panels::plan_review::Tier;
@@ -12,8 +13,7 @@ use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
-use mu_base::model_config::{MAIN_SET, RoleMeta};
-use mu_base::models::GatewayModel;
+use mu_base::model_config::RoleMeta;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_provider::provider::providers::KeyTarget;
 use tokio::sync::oneshot;
@@ -27,6 +27,30 @@ fn ago(t: std::time::SystemTime) -> String {
         3600..=86399 => format!("{}h ago", s / 3600),
         _ => format!("{}d ago", s / 86400),
     }
+}
+
+/// The picker's rows for the host's model list: the label and what is said beside it, and the ids.
+fn model_items(rows: Vec<ModelRow>) -> (Vec<Item>, Vec<String>) {
+    let mut ids = Vec::with_capacity(rows.len());
+    let items = rows
+        .into_iter()
+        .map(|m| {
+            let detail = match &m.kind {
+                ModelKind::Direct { provider, key } => key.map_or_else(
+                    || chatgpt::native_label(provider).into(),
+                    |k| crate::labels::key_state_word(k).to_string(),
+                ),
+                ModelKind::Gateway { native: Some(p), .. } => chatgpt::native_label(p).into(),
+                ModelKind::Gateway { native: None, context_length } => {
+                    context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000))
+                }
+                ModelKind::Listed => "models.toml".into(),
+            };
+            ids.push(m.id.clone());
+            Item { label: m.id, detail }
+        })
+        .collect();
+    (items, ids)
 }
 
 impl App {
@@ -91,8 +115,7 @@ impl App {
         self.flows.model_request_seq += 1;
         let request = self.flows.model_request_seq;
         self.leave_custom_wizard();
-        let gateway = self.services.providers.cached_models();
-        self.open_session_model_picker(request, &gateway);
+        self.open_session_model_picker(request);
         self.fetch_models(request);
     }
 
@@ -104,98 +127,83 @@ impl App {
         } else {
             return;
         }
-        let gateway = self.services.providers.cached_models();
-        self.show_role_models(request, &gateway);
+        self.show_role_models(request);
         self.fetch_models(request);
     }
 
-    /// Fills the role editor's list for `request`; false when it is no longer waiting for it.
-    pub(super) fn show_role_models(&mut self, request: u64, gateway: &[GatewayModel]) -> bool {
-        let (items, ids, error) = self.concrete_model_rows(gateway);
+    /// Fills the role editor's list for `request` once the host's rows arrive; nothing changes when
+    /// the editor is no longer waiting for it.
+    pub(super) fn show_role_models(&mut self, request: u64) {
+        self.host_call(models_host::MODEL_ROWS, &(), move |app, r: Result<ModelRows, String>| {
+            app.fill_role_models(request, r);
+        });
+    }
+
+    /// False when the role editor is no longer waiting for `request`.
+    fn fill_role_models(&mut self, request: u64, r: Result<ModelRows, String>) -> bool {
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                self.error(&format!("cannot list models: {e}"));
+                return false;
+            }
+        };
+        let (items, ids) = model_items(r.rows);
         match &mut self.overlay {
-            Some(Overlay::ModelRoles { st }) => st.models_loaded(request, items, ids, error.as_deref()),
+            Some(Overlay::ModelRoles { st }) => st.models_loaded(request, items, ids, r.error.as_deref()),
             _ => false,
         }
     }
 
-    /// Refreshes what the pickers list, each source in its own task: the gateway, then every custom
-    /// endpoint that discovers. Each answer is a `ModelsRefreshed` for `request`, and a failure
-    /// keeps the rows already listed.
-    fn fetch_models(&self, request: u64) {
-        let providers = self.services.providers.clone();
-        let tx = self.ui_tx.clone();
-        let (p, t) = (providers.clone(), tx.clone());
-        tokio::task::spawn_local(async move {
-            let diag = p.gateway_models().await.err().map(|e| format!("gateway models unavailable: {e:#}"));
-            let _ = t.send(UiMsg::ModelsRefreshed { request, diag });
+    /// Refreshes what the pickers list, each source in its own call: the gateway, then every custom
+    /// endpoint that discovers. Each answer rebuilds the rows for `request`, and a failure keeps
+    /// the rows already listed.
+    fn fetch_models(&mut self, request: u64) {
+        self.host_call(models_host::REFRESH_SOURCES, &(), move |app, r: Result<Vec<String>, String>| {
+            for source in r.unwrap_or_default() {
+                app.host_call(models_host::REFRESH_SOURCE, &source, move |app, r: Result<Option<String>, String>| {
+                    let diag = r.unwrap_or_else(|e| Some(format!("models were not refreshed: {e}")));
+                    app.on_models_refreshed(request, diag);
+                });
+            }
         });
-        // A providers.toml that does not read is shown by the picker; there is nothing to fetch.
-        let Ok(custom) = providers.custom_registry().snapshot() else { return };
-        for c in custom.into_values().filter(|c| c.discover) {
-            let (p, t) = (providers.clone(), tx.clone());
-            tokio::task::spawn_local(async move {
-                let diag = c
-                    .refresh_models(p.store())
-                    .await
-                    .err()
-                    .map(|e| format!("{}: its models were not refreshed: {e:#}", c.label()));
-                let _ = t.send(UiMsg::ModelsRefreshed { request, diag });
-            });
-        }
     }
 
-    /// The rows of the concrete models: direct and custom ones, then the gateway's, then
-    /// `models.toml`'s. A `providers.toml` that does not read is returned as the error, with the rows
-    /// that do not depend on it.
-    pub(super) fn concrete_model_rows(&self, gateway: &[GatewayModel]) -> (Vec<Item>, Vec<String>, Option<String>) {
-        let providers = &self.services.providers;
-        let (direct, error) = match providers.direct_models() {
-            Ok(d) => (d, None),
-            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
-        };
-        let mut items = Vec::new();
-        let mut ids = Vec::new();
-        for m in direct {
-            if !ids.contains(&m.id) {
-                let detail = m.key.map_or_else(
-                    || chatgpt::native_label(&m.provider).into(),
-                    |k| crate::labels::key_state_word(k).to_string(),
-                );
-                items.push(Item { label: m.id.clone(), detail });
-                ids.push(m.id);
+    /// One source answered: the picker for `request` rebuilds its rows from what the host has now.
+    pub(super) fn on_models_refreshed(&mut self, request: u64, diag: Option<String>) {
+        self.host_call(models_host::MODEL_ROWS, &(), move |app, r: Result<ModelRows, String>| {
+            let session = matches!(&app.overlay, Some(Overlay::Model { request: active, .. }) if *active == request);
+            if session {
+                app.fill_session_model_picker(request, r);
+            } else if !app.fill_role_models(request, r) {
+                return;
             }
-        }
-        for g in gateway {
-            if ids.contains(&g.id) {
-                continue;
+            if let Some(d) = diag {
+                app.notice(&d);
             }
-            let native = g.id.split_once('/').filter(|(p, _)| providers.is_direct(p));
-            let detail = match native {
-                Some((p, _)) => chatgpt::native_label(p).into(),
-                None => g.context_length.map_or(String::new(), |c| format!("{}k ctx", c / 1000)),
-            };
-            items.push(Item { label: g.id.clone(), detail });
-            ids.push(g.id.clone());
-        }
-        for id in providers.cfg.listed_models() {
-            if !ids.contains(&id) {
-                items.push(Item { label: id.clone(), detail: "models.toml".into() });
-                ids.push(id);
-            }
-        }
-        (items, ids, error)
+        });
     }
 
     /// Lists the session's models for `request`, keeping the highlighted one when the list is
     /// rebuilt by a refresh.
-    pub(super) fn open_session_model_picker(&mut self, request: u64, gateway: &[GatewayModel]) {
+    pub(super) fn open_session_model_picker(&mut self, request: u64) {
+        self.host_call(models_host::MODEL_ROWS, &(), move |app, r: Result<ModelRows, String>| {
+            app.fill_session_model_picker(request, r);
+        });
+    }
+
+    fn fill_session_model_picker(&mut self, request: u64, r: Result<ModelRows, String>) {
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => return self.error(&format!("cannot list models: {e}")),
+        };
         let kept = match &self.overlay {
             Some(Overlay::Model { pick, .. }) => pick.highlighted().cloned(),
             _ => None,
         };
         let mut rows = Vec::new();
         let mut details = Vec::new();
-        for role in super::slash::role_views(&self.services.providers.cfg, &self.ctx) {
+        for role in r.roles {
             if role.value.is_none() {
                 continue;
             }
@@ -203,10 +211,10 @@ impl App {
             rows.push((Item { label: id.clone(), detail: role.row() }, id));
             details.push(Some(format!("{}\nEnter switches this session to it.", role.detail())));
         }
-        let (concrete, concrete_ids, error) = self.concrete_model_rows(gateway);
+        let (concrete, concrete_ids) = model_items(r.rows);
         rows.extend(concrete.into_iter().zip(concrete_ids));
         details.resize(rows.len(), None);
-        let context = match error {
+        let context = match r.error {
             Some(e) => e,
             None if rows.is_empty() => "No models available; use /login to configure a provider".into(),
             None => "Session-only model switch".into(),
@@ -224,13 +232,13 @@ impl App {
     }
 
     pub(super) fn open_model_roles(&mut self, role: Option<String>) {
-        let cfg = &self.services.providers.cfg;
-        let set = cfg.active_set().unwrap_or_else(|| MAIN_SET.into());
-        let path = mu_base::config::models_path();
-        match RoleEditor::new(set, path, super::slash::role_views(cfg, &self.ctx), role.as_deref()) {
-            Ok(st) => self.open_overlay(Overlay::ModelRoles { st: Box::new(st) }),
-            Err(e) => self.error(&e),
-        }
+        self.host_call(models_host::ROLE_TABLE, &(), move |app, r: Result<RoleTable, String>| match r {
+            Ok(t) => match RoleEditor::new(t.set, t.path, t.roles, role.as_deref()) {
+                Ok(st) => app.open_overlay(Overlay::ModelRoles { st: Box::new(st) }),
+                Err(e) => app.error(&e),
+            },
+            Err(e) => app.error(&format!("cannot read the model roles: {e}")),
+        });
     }
 
     /// Opens the picker at once with a loading row; the (capped, sorted) listing is read on a
@@ -382,21 +390,16 @@ impl App {
         }
     }
 
-    /// Roles from `cycle_order` that can be switched to when implementing an approved plan.
-    pub(super) fn plan_tiers(&self) -> Vec<Tier> {
-        let providers = &self.services.providers;
-        let cfg = &providers.cfg;
-        let mut out = Vec::new();
-        for r in cfg.role_cycle() {
-            match cfg.role(&r) {
-                Some(v) if providers.resolve(&format!("@{r}")).is_ok() => {
-                    out.push(Tier { model: Some(format!("@{r}")), detail: v, role: r });
-                }
-                None if r == "default" => out.push(Tier { role: r, detail: "current model".into(), model: None }),
-                _ => {}
+    /// Roles from `cycle_order` that can be switched to when implementing an approved plan; the
+    /// plan review opens with them (none when the host cannot say).
+    pub(super) fn with_plan_tiers(&mut self, then: impl FnOnce(&mut App, Vec<Tier>) + 'static) {
+        self.host_call(models_host::PLAN_TIERS, &(), move |app, r: Result<Vec<Tier>, String>| match r {
+            Ok(tiers) => then(app, tiers),
+            Err(e) => {
+                app.error(&format!("cannot list the plan tiers: {e}"));
+                then(app, Vec::new());
             }
-        }
-        out
+        });
     }
 
     pub(super) fn overlay_key(&mut self, k: KeyEvent) {
@@ -410,42 +413,61 @@ impl App {
     }
 
     fn save_role(&mut self, set: &str, role: &str, value: Option<&str>, meta: Option<&RoleMeta>) {
-        let saved = match meta {
-            Some(meta) => self.services.edit_custom_role(set, role, value, meta),
-            None => self.services.edit_role(set, role, value),
-        };
-        match saved {
+        let (set, role, value) = (set.to_string(), role.to_string(), value.map(String::from));
+        let (args_set, args_role, model) = (set.clone(), role.clone(), value.clone());
+        let done = move |app: &mut App, saved: Result<(), String>| match saved {
             Ok(()) => {
-                self.reload_role_views();
+                app.reload_role_views();
                 if value.is_some() {
-                    self.notice(&format!("saved @{role} in set {set}"));
+                    app.notice(&format!("saved @{role} in set {set}"));
                 } else {
-                    self.notice(&format!("cleared @{role} in set {set}"));
+                    app.notice(&format!("cleared @{role} in set {set}"));
                 }
             }
-            Err(e) => self.error(&format!("could not save @{role}: {e}")),
+            Err(e) => app.error(&format!("could not save @{role}: {e}")),
+        };
+        match meta {
+            Some(meta) => {
+                let args = models_host::EditCustomRole { set: args_set, role: args_role, model, meta: meta.clone() };
+                self.host_call(models_host::EDIT_CUSTOM_ROLE, &args, done);
+            }
+            None => {
+                let args = models_host::EditRole { set: args_set, role: args_role, model };
+                self.host_call(models_host::EDIT_ROLE, &args, done);
+            }
         }
     }
 
     fn delete_role(&mut self, set: &str, role: &str) {
-        match self.services.edit_custom_role(set, role, None, &RoleMeta::default()) {
+        let args = models_host::EditCustomRole {
+            set: set.to_string(),
+            role: role.to_string(),
+            model: None,
+            meta: RoleMeta::default(),
+        };
+        let (set, role) = (set.to_string(), role.to_string());
+        self.host_call(models_host::EDIT_CUSTOM_ROLE, &args, move |app, r: Result<(), String>| match r {
             Ok(()) => {
-                self.reload_role_views();
-                self.notice(&format!("deleted @{role} from set {set}"));
+                app.reload_role_views();
+                app.notice(&format!("deleted @{role} from set {set}"));
             }
-            Err(e) => self.error(&format!("could not delete @{role}: {e}")),
-        }
+            Err(e) => app.error(&format!("could not delete @{role}: {e}")),
+        });
     }
 
     /// Rebuilds what the role editor and the command list show from the config just written.
     fn reload_role_views(&mut self) {
-        let cfg = &self.services.providers.cfg;
-        let active = cfg.active_set().unwrap_or_else(|| MAIN_SET.into());
-        let roles = super::slash::role_views(cfg, &self.ctx);
-        if let Some(Overlay::ModelRoles { st }) = &mut self.overlay {
-            st.saved(active, roles);
-        }
-        self.refresh_commands();
+        self.host_call(models_host::ROLE_TABLE, &(), |app, r: Result<RoleTable, String>| {
+            match r {
+                Ok(t) => {
+                    if let Some(Overlay::ModelRoles { st }) = &mut app.overlay {
+                        st.saved(t.set, t.roles);
+                    }
+                }
+                Err(e) => app.error(&format!("cannot read the model roles: {e}")),
+            }
+            app.refresh_commands();
+        });
     }
     /// Carries out what the user chose in an overlay.
     pub(super) fn on_overlay_event(&mut self, e: OverlayEvent) {

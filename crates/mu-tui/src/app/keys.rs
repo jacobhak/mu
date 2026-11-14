@@ -1424,21 +1424,20 @@ pub(super) mod tests {
             ..CustomProvider::new("http://127.0.0.1:9")
         };
         app.services.providers.custom_registry().add("modal", modal.validated("modal").unwrap()).unwrap();
-        let report = |request: u64, diag: &str| UiMsg::ModelsRefreshed { request, diag: Some(diag.into()) };
         in_local(async {
             app.request_models();
             let a = app.flows.model_request_seq;
             app.overlay = None;
-            app.on_ui(UiMsg::ModelsRefreshed { request: a, diag: None });
+            app.on_models_refreshed(a, None);
             assert!(app.overlay.is_none(), "a cancelled picker is not reopened");
 
             app.open_model_roles(Some("default".into()));
             app.overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             let b = app.flows.model_request_seq;
             assert_eq!(b, a + 1);
-            app.on_ui(report(a, "late"));
+            app.on_models_refreshed(a, Some("late".into()));
             assert!(!transcript_text(&app).contains("late"), "a stale report is not shown");
-            app.on_ui(UiMsg::ModelsRefreshed { request: b, diag: None });
+            app.on_models_refreshed(b, None);
             let Some(Overlay::ModelRoles { st }) = &app.overlay else { panic!("editor gone") };
             assert!(st.select().highlighted().is_some(), "the matching list filled the sub-picker");
         });
@@ -1526,7 +1525,11 @@ pub(super) mod tests {
         assert_eq!(cfg.active_set().as_deref(), Some("openai"));
         assert_eq!(cfg.role("default").as_deref(), Some("a/b"));
 
-        app.services.edit_role("openai", "smol", Some("c/d")).unwrap();
+        app.host_call(
+            crate::host::models::EDIT_ROLE,
+            &crate::host::models::EditRole { set: "openai".into(), role: "smol".into(), model: Some("c/d".into()) },
+            |_, r: Result<(), String>| r.unwrap(),
+        );
         let disk = on_disk();
         assert_eq!(disk.sets["openai"]["smol"], "c/d");
         assert!(!disk.sets["main"].contains_key("smol"));
@@ -1550,5 +1553,168 @@ pub(super) mod tests {
         app.modelset_cmd("delete oa");
         assert_eq!(on_disk().sets.keys().collect::<Vec<_>>(), ["main"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Answers every host call later, as a remote host does; the UI messages the answers become arrive
+    /// on the returned receiver.
+    fn deferred(app: &mut App) -> UnboundedReceiver<UiMsg> {
+        let (ui_tx, ui_rx) = unbounded_channel();
+        app.ui_tx = ui_tx;
+        app.host = Rc::new(crate::host::Deferred(crate::host::local::LocalHost::new(
+            app.services.providers.clone(),
+            app.ctx.clone(),
+            app.plugins.clone(),
+            app.cwd.clone(),
+        )));
+        ui_rx
+    }
+
+    /// Carries the answers to the app until none has arrived for a while.
+    async fn pump(app: &mut App, ui: &mut UnboundedReceiver<UiMsg>) {
+        while let Ok(Some(m)) = tokio::time::timeout(std::time::Duration::from_millis(50), ui.recv()).await {
+            app.on_ui(m);
+        }
+    }
+
+    #[test]
+    fn the_model_pickers_fill_from_a_deferred_host() {
+        use mu_base::config::Configs;
+        use mu_provider::provider::custom::{CustomModel, CustomProvider};
+        use mu_provider::provider::endpoint::{GatewaySource, start_fn};
+        let (mut app, _commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Rc::new(Configs::from_models_toml("[sets.main]\ndefault = \"a/old\"\n"));
+        let gateway = GatewaySource::new(start_fn(|| async { Err::<(String, String), String>("no gateway".into()) }));
+        app.use_providers(Rc::new(test_providers(cfg, gateway)));
+        let modal = CustomProvider {
+            models: std::collections::BTreeMap::from([("x/b".to_string(), CustomModel::default())]),
+            discover: false,
+            ..CustomProvider::new("http://127.0.0.1:9")
+        };
+        app.services.providers.custom_registry().add("modal", modal.validated("modal").unwrap()).unwrap();
+        let mut ui = deferred(&mut app);
+        in_local(async {
+            app.request_models();
+            assert!(app.overlay.is_none(), "the rows are not here before the host answers");
+            pump(&mut app, &mut ui).await;
+            let Some(Overlay::Model { pick, .. }) = &app.overlay else { panic!("no model picker") };
+            assert!(pick.values().contains(&"@default".to_string()));
+            assert!(pick.values().contains(&"modal/x/b".to_string()));
+            assert!(transcript_text(&app).contains("gateway models unavailable"), "{}", transcript_text(&app));
+
+            app.overlay = None;
+            app.open_model_roles(Some("default".into()));
+            assert!(app.overlay.is_none());
+            pump(&mut app, &mut ui).await;
+            assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
+            app.on_overlay_event(OverlayEvent::LoadRoleModels);
+            pump(&mut app, &mut ui).await;
+            let Some(Overlay::ModelRoles { st }) = &app.overlay else { panic!("editor gone") };
+            assert!(st.select().highlighted().is_some(), "the list filled the sub-picker");
+        });
+    }
+
+    #[test]
+    fn saving_a_role_through_a_deferred_host_reloads_the_editor() {
+        use mu_base::config::{Configs, models_path};
+        let _guard = MODEL_CONFIG_TEST_LOCK.lock().unwrap();
+        mu_testutil::home();
+        let path = models_path();
+        let text = "[sets.main]\ndefault = \"a/old:high\"\n";
+        std::fs::write(&path, text).unwrap();
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Rc::new(Configs::from_models_toml(text));
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
+        app.use_providers(Rc::new(test_providers(cfg.clone(), gateway)));
+        let mut ui = deferred(&mut app);
+        in_local(async {
+            app.open_model_roles(Some("default".into()));
+            pump(&mut app, &mut ui).await;
+            app.on_overlay_event(OverlayEvent::SaveRole {
+                set: "main".into(),
+                role: "default".into(),
+                value: Some("a/new:low".into()),
+                meta: None,
+            });
+            assert!(!transcript_text(&app).contains("saved @default"), "nothing is said before the answer");
+            pump(&mut app, &mut ui).await;
+            assert_eq!(cfg.role("default").as_deref(), Some("a/new:low"));
+            assert!(transcript_text(&app).contains("saved @default in set main"));
+            assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
+
+            app.on_overlay_event(OverlayEvent::DeleteRole { set: "main".into(), role: "writer".into() });
+            pump(&mut app, &mut ui).await;
+            assert!(transcript_text(&app).contains("deleted @writer from set main"));
+        });
+        assert!(std::fs::read_to_string(&path).unwrap().contains("default = \"a/new:low\""));
+        assert!(commands.try_recv().is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn modelset_commands_work_through_a_deferred_host() {
+        use mu_base::config::{Configs, models_path};
+        let _guard = MODEL_CONFIG_TEST_LOCK.lock().unwrap();
+        mu_testutil::home();
+        let path = models_path();
+        let text = "[sets.main]\ndefault = \"a/b\"\n";
+        std::fs::write(&path, text).unwrap();
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let cfg = Rc::new(Configs::from_models_toml(text));
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
+        app.use_providers(Rc::new(test_providers(cfg.clone(), gateway)));
+        let mut ui = deferred(&mut app);
+        in_local(async {
+            app.modelset_cmd("new openai");
+            assert!(!transcript_text(&app).contains("created"), "nothing is said before the answer");
+            pump(&mut app, &mut ui).await;
+            assert_eq!(cfg.active_set().as_deref(), Some("openai"));
+            assert!(transcript_text(&app).contains("model set openai created from main and active"));
+
+            app.modelset_cmd("");
+            pump(&mut app, &mut ui).await;
+            let Some(Overlay::ModelSet { pick }) = &app.overlay else { panic!("no set picker") };
+            assert_eq!(pick.values(), &["main", "openai"]);
+            app.overlay = None;
+
+            app.modelset_cmd("main");
+            pump(&mut app, &mut ui).await;
+            assert_eq!(cfg.active_set().as_deref(), Some("main"));
+            assert!(matches!(commands.try_recv(), Ok(Command::SetModel(id)) if id == "@default"));
+            assert!(transcript_text(&app).contains("model set main: @default = a/b"));
+
+            app.modelset_cmd("delete main");
+            app.modelset_cmd("rename openai oa");
+            pump(&mut app, &mut ui).await;
+            assert!(transcript_text(&app).contains("`main` is the active model set"));
+            assert_eq!(cfg.set_names(), ["main", "oa"]);
+            assert!(transcript_text(&app).contains("model set openai renamed to oa"));
+            app.modelset_cmd("delete oa");
+            pump(&mut app, &mut ui).await;
+            assert_eq!(cfg.set_names(), ["main"]);
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plan_tiers_come_from_a_deferred_host_as_from_a_local_one() {
+        let (mut app, _commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = |seen: &Rc<std::cell::RefCell<Vec<(String, String)>>>| {
+            let seen = seen.clone();
+            move |_: &mut App, tiers: Vec<crate::panels::plan_review::Tier>| {
+                *seen.borrow_mut() = tiers.into_iter().map(|t| (t.role, t.detail)).collect();
+            }
+        };
+        app.with_plan_tiers(record(&seen));
+        let local = seen.borrow().clone();
+        assert!(!local.is_empty());
+        seen.borrow_mut().clear();
+        let mut ui = deferred(&mut app);
+        in_local(async {
+            app.with_plan_tiers(record(&seen));
+            assert!(seen.borrow().is_empty());
+            pump(&mut app, &mut ui).await;
+        });
+        assert_eq!(*seen.borrow(), local);
     }
 }

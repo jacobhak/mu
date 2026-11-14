@@ -567,11 +567,12 @@ impl App {
                     .context_tokens
                     .filter(|_| self.agent.status.context_window > 0)
                     .map(|t| (t, self.agent.status.context_window as u64));
-                let tiers = self.plan_tiers();
-                let review = crate::panels::plan_review::PlanReview::new(
-                    title, uri, file, content, context, tiers, stored, note,
-                );
-                self.open_overlay(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
+                self.with_plan_tiers(move |app, tiers| {
+                    let review = crate::panels::plan_review::PlanReview::new(
+                        title, uri, file, content, context, tiers, stored, note,
+                    );
+                    app.open_overlay(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
+                });
             }
             Effect::PlanList(list) => self.show_plans(list),
             Effect::RewindPoints(list) => self.show_rewind(list),
