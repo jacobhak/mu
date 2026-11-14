@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 
 /// How long past a timeout or an abort a call may stay unanswered before the shell is declared
 /// hung. The shell honours both itself within moments unless a thread of it is stuck.
-pub const HANG_GRACE: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5000 });
+pub const HANG_GRACE: Duration = Duration::from_secs(5);
 
 /// Two threads: a builtin that blocks one still leaves the other to run the stage it waits for.
 const WORKERS: usize = 2;
@@ -59,12 +59,23 @@ impl Drop for Inner {
     }
 }
 
-#[derive(Default)]
 pub struct ShellWorker {
     slot: Rc<RefCell<Option<Arc<Inner>>>>,
+    grace: Duration,
+}
+
+impl Default for ShellWorker {
+    fn default() -> Self {
+        Self::with_grace(HANG_GRACE)
+    }
 }
 
 impl ShellWorker {
+    /// A worker whose runs get `grace` past a timeout or abort before the shell is declared hung.
+    pub fn with_grace(grace: Duration) -> Self {
+        Self { slot: Default::default(), grace }
+    }
+
     fn inner(&self) -> Arc<Inner> {
         self.slot.borrow_mut().get_or_insert_with(|| Arc::new(Inner::start())).clone()
     }
@@ -75,7 +86,7 @@ impl ShellWorker {
         let shell = inner.shell.clone();
         let task =
             inner.handle().spawn(async move { shell.run(opts, on_chunk, cancel).await.map_err(|e| e.to_string()) });
-        Run { task, inner, slot: self.slot.clone() }
+        Run { task, inner, slot: self.slot.clone(), grace: self.grace }
     }
 
     /// Runs `opts` in a fork of the persistent shell: its state as of the last command boundary,
@@ -94,7 +105,7 @@ impl ShellWorker {
             let fork = shell.fork();
             fork.run(opts, on_chunk, cancel).await.map_err(|e| e.to_string())
         });
-        Run { task, inner, slot: self.slot.clone() }
+        Run { task, inner, slot: self.slot.clone(), grace: self.grace }
     }
 
     /// Test seam: stops every worker thread for `secs` seconds, as a blocking builtin would.
@@ -117,6 +128,7 @@ pub struct Run {
     task: JoinHandle<RunResult>,
     inner: Arc<Inner>,
     slot: Rc<RefCell<Option<Arc<Inner>>>>,
+    grace: Duration,
 }
 
 impl Drop for Run {
@@ -133,7 +145,7 @@ impl Run {
     }
 
     /// Waits for the run. `cancelled` completing (once) calls `on_cancel`, the caller's cue to
-    /// abort the run; the run then has `HANG_GRACE` to end. `limit` is how long the run may take
+    /// abort the run; the run then has the worker's grace to end. `limit` is how long the run may take
     /// at all, its own timeout included. An expired wait declares the shell hung: it is abandoned
     /// and the next run starts a new one (its directory and variables reset).
     pub async fn finish(
@@ -144,7 +156,7 @@ impl Run {
     ) -> RunResult {
         let hung = async {
             match limit {
-                Some(d) => tokio::time::sleep(d + HANG_GRACE).await,
+                Some(d) => tokio::time::sleep(d + self.grace).await,
                 None => std::future::pending().await,
             }
         };
@@ -155,7 +167,7 @@ impl Run {
         }
         tokio::select! {
             r = &mut self.task => joined(r),
-            () = tokio::time::sleep(HANG_GRACE) => self.hung(),
+            () = tokio::time::sleep(self.grace) => self.hung(),
         }
     }
 
@@ -207,8 +219,10 @@ mod tests {
     async fn a_fork_sees_state_from_before_a_running_command_and_changes_nothing() {
         let w = ShellWorker::default();
         run(&w, "X_FORK=a", 5000).join().await.unwrap();
-        let mut busy = run(&w, "X_FORK=b; sleep 2", 5000);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::env::temp_dir().join(format!("mu-worker-fork-{}", uuid::Uuid::new_v4()));
+        let mut busy = run(&w, &format!("X_FORK=b; touch {}; sleep 2", started.display()), 5000);
+        mu_testutil::wait_until("the busy command to start", || started.exists()).await;
+        let _ = std::fs::remove_file(&started);
         let opts = ShellRunOptions {
             command: "test \"$X_FORK\" = a && X_FORK=c".into(),
             timeout_ms: Some(5000),
@@ -225,7 +239,7 @@ mod tests {
     /// up on once its limit and grace pass, and the next call gets a working shell.
     #[tokio::test(flavor = "current_thread")]
     async fn a_hung_shell_is_given_up_on_and_replaced() {
-        let w = ShellWorker::default();
+        let w = ShellWorker::with_grace(Duration::from_millis(200));
         w.jam(30);
         let mut r = run(&w, "true", 1000);
         let err = r.finish(std::future::pending(), || {}, Some(Duration::from_millis(100))).await.unwrap_err();
@@ -236,7 +250,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_abort_the_shell_never_answers_is_given_up_on() {
-        let w = ShellWorker::default();
+        let w = ShellWorker::with_grace(Duration::from_millis(200));
         w.jam(30);
         let mut r = run(&w, "true", 60_000);
         let mut cued = false;

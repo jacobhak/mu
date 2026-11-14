@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 uuid.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "time"] }
 crossterm.workspace = true
 
 [lints]

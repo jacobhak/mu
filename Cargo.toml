@@ -100,6 +100,7 @@ anyhow.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+mu-common = { workspace = true, features = ["test-support"] }
 mu-testutil.workspace = true
 mu-agent = { workspace = true, features = ["test-support"] }
 mu-provider = { workspace = true, features = ["test-support"] }

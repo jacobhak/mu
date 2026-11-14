@@ -32,6 +32,7 @@ toml_edit.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+mu-common = { workspace = true, features = ["test-support"] }
 mu-testutil.workspace = true
 mu-session.workspace = true
 serde_yaml_ng.workspace = true

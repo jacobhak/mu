@@ -146,6 +146,39 @@ pub fn block_on_local<F: Future>(f: F) -> F::Output {
     rt().block_on(tokio::task::LocalSet::new().run_until(f))
 }
 
+/// Polls `ready` every 10 ms until it is true; panics naming `what` after 10 s. For waiting on
+/// observable state (a file, a pid) instead of sleeping a fixed time.
+pub async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Waits for `file` to hold a pid (a script's `echo $$ > file`) and returns it.
+pub async fn pid_in(file: &Path) -> i32 {
+    wait_until(&format!("a pid in {}", file.display()), || {
+        std::fs::read_to_string(file).is_ok_and(|s| s.trim().parse::<i32>().is_ok())
+    })
+    .await;
+    std::fs::read_to_string(file).unwrap().trim().parse().unwrap()
+}
+
+/// Whether process `pid` is running: gone, or a zombie nothing reaps (a container whose PID 1 does
+/// not reap, as in the release build), is not.
+pub fn pid_running(pid: i32) -> bool {
+    let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim_start().starts_with('Z')
+}
+
+/// Waits until process `pid` is gone.
+pub async fn wait_gone(pid: i32) {
+    wait_until(&format!("pid {pid} to end"), || !pid_running(pid)).await;
+}
+
 /// A key press with no modifiers.
 pub fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)

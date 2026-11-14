@@ -53,6 +53,7 @@ objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 
 [dev-dependencies]
+mu-common = { workspace = true, features = ["test-support"] }
 mu-testutil.workspace = true
 mu-provider = { workspace = true, features = ["test-support"] }
 mu-tools = { workspace = true, features = ["test-support"] }

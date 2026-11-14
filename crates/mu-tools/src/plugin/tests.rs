@@ -82,7 +82,7 @@ fn a_plugin_that_exits_mid_call_fails_the_call_and_frees_the_slot() {
         let (h, dir) = host("exit 3", "session");
         let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
         assert!(r.is_error, "{}", r.text);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        mu_testutil::wait_until("the slot to clear", || h.slot(0).proc.borrow().is_none()).await;
         assert!(h.slot(0).proc.borrow().is_none(), "slot cleared so the next call restarts it");
         let _ = std::fs::remove_dir_all(dir);
     });
@@ -96,7 +96,7 @@ fn a_call_during_idle_shutdown_gets_a_fresh_process() {
         let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
         assert_eq!(r.text, "ok");
         let first = h.slot(0).proc.borrow().clone().unwrap().pid;
-        tokio::time::sleep(Duration::from_millis(1600)).await;
+        mu_testutil::wait_gone(first as i32).await;
         let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
         assert_eq!(r.text, "ok", "{}", r.text);
         let second = h.slot(0).proc.borrow().clone().unwrap().pid;
@@ -386,11 +386,13 @@ fn mcp_cancel_sends_notifications_cancelled_and_shutdown_leaves_no_process_group
         });
         let r = h.call_tool("mcp__srv_hang", &json!({}), &cancel).await;
         assert!(r.is_error && r.text.contains("aborted"), "{}", r.text);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(fx.log().contains(r#""method":"notifications/cancelled""#), "{}", fx.log());
+        mu_testutil::wait_until("the cancel notification", || {
+            fx.log().contains(r#""method":"notifications/cancelled""#)
+        })
+        .await;
         let pid = slot.proc.borrow().clone().unwrap().pid as i32;
         h.shutdown_all().await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        mu_testutil::wait_until("the process group to end", || !group_running(pid)).await;
         assert!(!group_running(pid), "the process group is gone");
     });
 }
@@ -487,7 +489,7 @@ while :; do sleep 100 & wait; done
         let pid = proc.pid as i32;
         proc.shutdown().await;
         assert!(marker.exists(), "the group got SIGTERM before SIGKILL");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        mu_testutil::wait_until("the process group to end", || !group_running(pid)).await;
         assert!(!group_running(pid), "the process group is gone");
         let _ = std::fs::remove_dir_all(dir);
     });

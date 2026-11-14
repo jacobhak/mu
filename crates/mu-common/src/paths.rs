@@ -127,6 +127,7 @@ pub fn encode_cwd(cwd: &Path) -> String {
 }
 
 /// Runs the real `omp_bin()` with `args` (stdin null, 60 s limit) and returns its stdout. For contract tests.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
     use std::io::Read;
     use std::process::{Command, Stdio};

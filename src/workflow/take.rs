@@ -123,3 +123,35 @@ fn resume(path: &Path) -> anyhow::Result<i32> {
     eprintln!("mu take: cannot exec mu: {err}");
     Ok(1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_session::session::file::SessionFile;
+    use mu_testutil::home;
+
+    #[test]
+    fn an_unknown_session_is_refused_before_anything_is_signalled() {
+        home();
+        assert_eq!(run(Path::new("no-such-session-zzz"), &std::env::temp_dir()).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_free_session_needs_no_release() {
+        home();
+        let s = SessionFile::create(Path::new("/opt/take-free"), None).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        assert_eq!(release(&path, "mu take").unwrap(), None);
+    }
+
+    /// This process holds the session without being a `-p` run: `release` refuses and, being
+    /// ourselves, would have signalled this test had it tried.
+    #[test]
+    fn a_session_open_in_an_interactive_mu_is_refused() {
+        home();
+        let s = SessionFile::create(Path::new("/opt/take-held"), None).unwrap();
+        assert_eq!(release(&s.path, "mu take").unwrap(), Some(1));
+        drop(s);
+    }
+}

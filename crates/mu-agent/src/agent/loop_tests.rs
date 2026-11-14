@@ -182,12 +182,7 @@ fn job_cancel_is_offered_where_jobs_exist_and_stops_a_background_bash_job() {
         let id = jobs.running_ids().remove(0);
         let out = a.run_tool("c1", "job_cancel", json!({"id": id}), &cancel).await;
         assert!(!out.is_error && out.text.contains("Cancelled"), "{}", out.text);
-        for _ in 0..100 {
-            if jobs.has_undelivered() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        mu_testutil::wait_until("the cancelled job's result", || jobs.has_undelivered()).await;
         let done = jobs.take_undelivered();
         assert!(done.len() == 1 && !done[0].ok, "the job ended, cancelled, long before 30 s");
         assert!(jobs.running_ids().is_empty());
@@ -257,7 +252,9 @@ fn stop_skips_the_rest_of_the_batch_and_ends_the_turn() {
 #[test]
 fn stop_during_a_tool_lets_it_finish_and_skips_the_next() {
     run(async {
-        let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": "sleep 1"}) };
+        let started = mu_testutil::tmp().join("started");
+        let command = format!("touch {}; sleep 1", started.display());
+        let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![
             Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("never")], StopReason::Stop)),
@@ -265,7 +262,7 @@ fn stop_during_a_tool_lets_it_finish_and_skips_the_next() {
         let (mut a, mut rx) = agent(script);
         let inbox = a.ports.inbox.clone();
         tokio::task::spawn_local(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            mu_testutil::wait_until("the tool to start", || started.exists()).await;
             inbox.borrow_mut().stop = true;
         });
         a.turn(Some("go".to_string().into())).await;
@@ -299,14 +296,16 @@ fn stop_with_a_plain_reply_ends_normally() {
 #[test]
 fn stop_plus_cancel_is_an_abort_and_stays_paired() {
     run(async {
-        let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": "sleep 5"}) };
+        let started = mu_testutil::tmp().join("started");
+        let command = format!("touch {}; sleep 5", started.display());
+        let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse))];
         let (mut a, mut rx) = agent(script);
         let inbox = a.ports.inbox.clone();
         tokio::task::spawn_local(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            mu_testutil::wait_until("the tool to start", || started.exists()).await;
             inbox.borrow_mut().stop = true;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::task::yield_now().await;
             inbox.borrow().cancel.cancel();
         });
         a.turn(Some("go".to_string().into())).await;
@@ -846,8 +845,9 @@ fn a_wake_delivers_the_queued_message_and_empties_the_inbox() {
 #[test]
 fn a_message_during_a_turn_joins_that_turn() {
     run(async {
-        let sleep =
-            Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": "sleep 0.3"}) };
+        let started = mu_testutil::tmp().join("started");
+        let command = format!("touch {}; sleep 0.3", started.display());
+        let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![
             Ok(assistant(vec![sleep], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("one")], StopReason::Stop)),
@@ -856,7 +856,7 @@ fn a_message_during_a_turn_joins_that_turn() {
         a.ensure_session().await;
         let id = a.session_id();
         tokio::task::spawn_local(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            mu_testutil::wait_until("the tool to start", || started.exists()).await;
             enqueue(&id, "steward", "also HELLO").unwrap();
         });
         a.turn(Some("go".to_string().into())).await;

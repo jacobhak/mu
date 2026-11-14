@@ -88,7 +88,9 @@ impl Tools {
     pub fn for_test() -> Self {
         mu_testutil::home(); // spilled output and image blobs go to a private MU_HOME
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        Self::new(PathBuf::from("/tmp"), PluginHost::new(vec![], vec![], tx, Default::default()))
+        let mut tools = Self::new(PathBuf::from("/tmp"), PluginHost::new(vec![], vec![], tx, Default::default()));
+        tools.shell = shell::worker::ShellWorker::with_grace(std::time::Duration::from_millis(200));
+        tools
     }
 
     pub fn new(cwd: PathBuf, plugins: Rc<PluginHost>) -> Self {

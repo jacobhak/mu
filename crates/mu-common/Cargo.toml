@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Helpers only tests call (contract tests that run the real omp).
+test-support = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

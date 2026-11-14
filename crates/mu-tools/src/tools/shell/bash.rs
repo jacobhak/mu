@@ -1087,47 +1087,38 @@ mod tests {
         assert!(!tools.call("glob", &glob, &ctx).await.text.contains("[mu:"));
     }
 
-    /// True if a live process has exactly `sleep {arg}` as its command line. `$` anchors the
-    /// match so the wrapping shell (whose command line also contains the text) is not counted.
-    async fn alive(arg: &str) -> bool {
-        std::process::Command::new("pgrep").args(["-f", &format!("sleep {arg}$")]).output().unwrap().status.success()
+    /// A file for a test process to write its pid to, and the command that does: it records its
+    /// own pid, then becomes `sleep 600`. Tests follow the process by that pid, never by pattern.
+    fn sleeper() -> (PathBuf, String) {
+        let file = std::env::temp_dir().join(format!("mu-bash-pid-{}", uuid::Uuid::new_v4()));
+        let cmd = format!("/bin/sh -c 'echo $$ > {}; exec /bin/sleep 600'", file.display());
+        (file, cmd)
     }
 
-    /// `alive`, after up to 5 s: a background process may not have exec'd yet when the call returns.
-    async fn alive_soon(arg: &str) -> bool {
-        for _ in 0..50 {
-            if alive(arg).await {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        false
+    fn kill_pid(pid: i32) {
+        // SAFETY: SIGKILL to a pid this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn background_processes_in_plain_mode() {
-        // `pgrep`/`pkill -f` see every process on the machine, so the sleep durations carry this
-        // process's pid: concurrent test runs cannot match or kill each other's sleeps. BSD `sleep`
-        // rejects more than i32::MAX seconds, so the durations stay below it for any pid.
-        let pid = std::process::id();
-        let (quiet, kept) = (format!("2{pid:07}"), format!("3{pid:07}"));
         let tools = Tools::for_test();
-        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
-        let cmd = format!("(/bin/sleep {quiet} &); nohup /bin/sleep {kept} >/dev/null 2>&1 & echo started");
-        let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
+        let (quiet_file, quiet) = sleeper();
+        let (kept_file, kept) = sleeper();
+        let cmd = format!("({quiet} &); nohup {kept} >/dev/null 2>&1 & echo started");
+        let out = tools.call("bash", &json!({"command": cmd}), &ctx()).await;
         assert!(out.text.contains("started"), "{}", out.text);
         // A subshell's background external outlives the call, as it does in bash (oh-my-pi v18.18
         // stopped ending it), and so does a `nohup` job, which pi-shell detaches from the session.
-        assert!(alive_soon(&quiet).await, "the subshell's job did not outlive the call");
-        assert!(alive_soon(&kept).await, "the nohup job did not outlive the call");
+        let (quiet_pid, kept_pid) = (mu_testutil::pid_in(&quiet_file).await, mu_testutil::pid_in(&kept_file).await);
+        assert!(mu_testutil::pid_running(quiet_pid), "the subshell's job did not outlive the call");
+        assert!(mu_testutil::pid_running(kept_pid), "the nohup job did not outlive the call");
         // The subshell's job is not in the table, so nothing mu exposes can stop it; `nohup … &` is.
-        let jobs = tools.call("bash", &json!({"command": "jobs"}), &ctx).await;
-        assert!(!jobs.text.contains(&quiet) && jobs.text.contains(&kept), "{}", jobs.text);
-        for arg in [&quiet, &kept] {
-            let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {arg}$")]).status();
-        }
+        let jobs = tools.call("bash", &json!({"command": "jobs"}), &ctx()).await;
+        let (q, k) = (quiet_file.display().to_string(), kept_file.display().to_string());
+        assert!(!jobs.text.contains(&q) && jobs.text.contains(&k), "{}", jobs.text);
+        kill_pid(quiet_pid);
+        kill_pid(kept_pid);
     }
 
     /// mu's runtime is current-thread: the persistent shell must still reap a finished `&` child
@@ -1156,25 +1147,21 @@ mod tests {
     /// v18.18.6), so a later call can `kill` and `wait` that program by the pid it saved.
     #[tokio::test(flavor = "current_thread")]
     async fn a_background_pipelines_pid_is_its_last_program() {
-        let last = format!("4{:07}", std::process::id());
+        let (file, last) = sleeper();
         let tools = Tools::for_test();
-        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
-        let cmd = format!("/bin/sleep 0.2 | /bin/sleep {last} & echo $!");
+        let ctx = ctx();
+        let cmd = format!("/bin/sleep 0.2 | {last} & echo $!");
         let out = tools.call("bash", &json!({"command": cmd}), &ctx).await;
         let pid: i32 = out.text.trim().parse().unwrap_or_else(|_| panic!("no pid: {}", out.text));
-        assert!(alive_soon(&last).await, "the pipeline's last program did not start");
-        let found = std::process::Command::new("pgrep").args(["-f", &format!("sleep {last}$")]).output().unwrap();
-        let os_pid = String::from_utf8_lossy(&found.stdout).trim().to_string();
-        if os_pid != pid.to_string() {
-            let _ = std::process::Command::new("pkill").args(["-f", &format!("sleep {last}$")]).status();
+        let os_pid = mu_testutil::pid_in(&file).await;
+        if os_pid != pid {
+            kill_pid(os_pid);
             panic!("$! was {pid}, the last program is {os_pid}");
         }
         let out =
             tools.call("bash", &json!({"command": format!("kill {pid}; wait {pid}; echo status=$?")}), &ctx).await;
         assert!(out.text.contains("status=143"), "{}", out.text);
-        assert!(!alive(&last).await, "kill $! did not stop the last program");
+        mu_testutil::wait_gone(pid).await;
     }
 
     #[test]
@@ -1238,7 +1225,7 @@ mod tests {
     /// earlier calls have run in the persistent shell.
     #[tokio::test(flavor = "current_thread")]
     async fn abort_ends_a_foreground_command_promptly() {
-        let arg = format!("6{}", std::process::id());
+        let (file, sleep) = sleeper();
         let tools = Tools::for_test();
         for cmd in ["sleep 0.2; echo done", "date"] {
             assert!(!tools.call("bash", &json!({"command": cmd}), &ctx()).await.is_error);
@@ -1246,16 +1233,17 @@ mod tests {
         let c = ctx();
         let cancel = c.cancel.clone();
         let t = std::time::Instant::now();
+        let pid = std::cell::Cell::new(0);
         let abort = async {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            pid.set(mu_testutil::pid_in(&file).await);
             cancel.cancel();
         };
-        let cmd = json!({"command": format!("sleep {arg}")});
+        let cmd = json!({"command": sleep});
         let (out, ()) = tokio::join!(tools.call("bash", &cmd, &c), abort);
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "abort took {:?}", t.elapsed());
         let Some(ToolMeta::Bash(m)) = &out.meta else { panic!("no meta: {:?}", out.text) };
         assert!(m.cancelled, "{}", out.text);
-        assert!(!alive(&arg).await);
+        mu_testutil::wait_gone(pid.get()).await;
         let next = tools.call("bash", &json!({"command": "echo after"}), &ctx()).await;
         assert_eq!(next.text.trim(), "after");
     }
@@ -1329,32 +1317,32 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn timeout_kills_the_background_command() {
-        // The duration carries this pid so `alive` sees only this test's sleep.
-        let arg = format!("4{}", std::process::id());
+        let (file, sleep) = sleeper();
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (tools, jobs) = tools_with_jobs();
-                let cmd = json!({"command": format!("sleep {arg}"), "async": true, "timeout": 1});
+                let cmd = json!({"command": sleep, "async": true, "timeout": 2});
                 tools.call("bash", &cmd, &ctx()).await;
                 let done = finished(&jobs).await;
                 assert!(!done[0].ok && done[0].note.as_deref() == Some("timed out"), "{:?}", done[0].note);
-                assert!(done[0].text.contains("[Command timed out after 1 seconds]"), "{}", done[0].text);
-                assert!(!alive(&arg).await);
+                assert!(done[0].text.contains("[Command timed out after 2 seconds]"), "{}", done[0].text);
+                mu_testutil::wait_gone(mu_testutil::pid_in(&file).await).await;
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_kills_the_background_command() {
-        let arg = format!("5{}", std::process::id());
+        let (file, sleep) = sleeper();
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (tools, jobs) = tools_with_jobs();
-                tools.call("bash", &json!({"command": format!("sleep {arg}"), "async": true}), &ctx()).await;
+                tools.call("bash", &json!({"command": sleep, "async": true}), &ctx()).await;
+                let pid = mu_testutil::pid_in(&file).await;
                 assert_eq!(jobs.kill(None), 1);
                 let done = finished(&jobs).await;
                 assert!(!done[0].ok && done[0].note.as_deref() == Some("cancelled"), "{:?}", done[0].note);
-                assert!(!alive(&arg).await);
+                mu_testutil::wait_gone(pid).await;
             })
             .await;
     }
@@ -1460,10 +1448,12 @@ mod tests {
                 let (tools, jobs) = tools_with_jobs();
                 let (setup, c) = (json!({"command": "cd /usr && export MU_FORK_V=kept"}), ctx());
                 assert!(!tools.call("bash", &setup, &c).await.is_error);
-                let (busy, c1) = (json!({"command": "export MU_FORK_V=during; sleep 2.5"}), ctx());
+                let started = std::env::temp_dir().join(format!("mu-bash-busy-{}", uuid::Uuid::new_v4()));
+                let busy_cmd = format!("export MU_FORK_V=during; touch {}; sleep 2.5", started.display());
+                let (busy, c1) = (json!({"command": busy_cmd}), ctx());
                 let (job, c2) = (json!({"command": r#"printf '%s %s' "$PWD" "$MU_FORK_V""#, "async": true}), ctx());
                 let start = async {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    mu_testutil::wait_until("the busy command to start", || started.exists()).await;
                     let t = std::time::Instant::now();
                     (tools.call("bash", &job, &c2).await, t.elapsed())
                 };
