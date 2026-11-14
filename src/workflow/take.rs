@@ -24,15 +24,16 @@ pub fn run(arg: &Path, cwd: &Path) -> anyhow::Result<i32> {
         eprintln!("mu take: needs a terminal on stdin and stdout; nothing was signalled");
         return Ok(1);
     }
-    if let Some(code) = release(&path, "mu take")? {
+    if let Some(code) = release(&path, "mu take", false)? {
         return Ok(code);
     }
     resume(&path)
 }
 
 /// Makes `path` free to open: a running `-p` is stopped after its current step and waited for.
+/// With `ask`, stopping it needs a yes on the terminal; without a terminal it is refused.
 /// `Ok(Some(code))`: stop with that exit code (the reason is printed, prefixed with `who`).
-pub fn release(path: &Path, who: &str) -> anyhow::Result<Option<i32>> {
+pub fn release(path: &Path, who: &str, ask: bool) -> anyhow::Result<Option<i32>> {
     match owner(path) {
         Owner::Free => Ok(None),
         Owner::Live { pid, print_run: false, .. } => {
@@ -45,8 +46,36 @@ pub fn release(path: &Path, who: &str) -> anyhow::Result<Option<i32>> {
             );
             Ok(Some(1))
         }
-        Owner::Live { pid, print_run: true, started, .. } => stop_and_wait(path, pid, &started),
+        Owner::Live { pid, print_run: true, started, .. } => {
+            if ask {
+                let tty = std::io::stdin().is_terminal();
+                if let Some(code) = confirm_stop(who, pid, tty, &mut std::io::stdin().lock()) {
+                    return Ok(Some(code));
+                }
+            }
+            stop_and_wait(path, pid, &started)
+        }
     }
+}
+
+/// `None`: the user agreed to stop the run. `Some(code)`: leave it running and exit with `code`.
+fn confirm_stop(who: &str, pid: u32, tty: bool, input: &mut impl std::io::BufRead) -> Option<i32> {
+    if !tty {
+        eprintln!(
+            "{who}: pid {pid} is a running `mu -p` on this session; stopping it needs a yes on a terminal, and stdin is not one. Nothing was signalled; `mu take <session>` stops it without asking"
+        );
+        return Some(1);
+    }
+    eprint!(
+        "{who}: pid {pid} is running `mu -p` on this session. Stop it after its current step and take over? [y/N] "
+    );
+    let mut line = String::new();
+    let _ = input.read_line(&mut line);
+    if matches!(line.trim(), "y" | "Y" | "yes") {
+        return None;
+    }
+    eprintln!("{who}: not stopped; the run continues");
+    Some(1)
 }
 
 /// `Ok(None)`: the session is free, go on. `Ok(Some(code))`: stop with that exit code.
@@ -142,7 +171,17 @@ mod tests {
         let s = SessionFile::create(Path::new("/opt/take-free"), None).unwrap();
         let path = s.path.clone();
         drop(s);
-        assert_eq!(release(&path, "mu take").unwrap(), None);
+        assert_eq!(release(&path, "mu take", true).unwrap(), None, "nothing to ask about");
+    }
+
+    #[test]
+    fn stopping_a_live_run_needs_a_yes_and_a_terminal() {
+        let ask = |tty: bool, answer: &str| confirm_stop("mu", 7, tty, &mut answer.as_bytes());
+        assert_eq!(ask(true, "y\n"), None);
+        assert_eq!(ask(true, "yes\n"), None);
+        assert_eq!(ask(true, "\n"), Some(1), "the default is no");
+        assert_eq!(ask(true, ""), Some(1), "end of input is no");
+        assert_eq!(ask(false, "y\n"), Some(1), "no terminal: refused whatever is piped in");
     }
 
     /// This process holds the session without being a `-p` run: `release` refuses and, being
@@ -151,7 +190,7 @@ mod tests {
     fn a_session_open_in_an_interactive_mu_is_refused() {
         home();
         let s = SessionFile::create(Path::new("/opt/take-held"), None).unwrap();
-        assert_eq!(release(&s.path, "mu take").unwrap(), Some(1));
+        assert_eq!(release(&s.path, "mu take", true).unwrap(), Some(1));
         drop(s);
     }
 }

@@ -149,8 +149,8 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         bail!("mu: interactive mode needs a terminal; use -p");
     }
     if let (true, Some(p)) = (interactive, &resume) {
-        // As `mu take`: a `-p` run that has the session is stopped after its current step, then it is ours.
-        if let Some(code) = crate::workflow::take::release(p, "mu")? {
+        // As `mu take`, but asked first: a `-p` run that has the session is stopped after its current step.
+        if let Some(code) = crate::workflow::take::release(p, "mu", true)? {
             return Ok(code);
         }
     }

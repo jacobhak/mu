@@ -99,6 +99,8 @@ pub struct JobsPanel {
     input: Option<Compose>,
     /// A terminate waiting for `y`.
     confirm: Option<Confirm>,
+    /// `X` waiting for `y`.
+    confirm_kill_all: bool,
     /// What the last action did, shown in place of the key line until the next key.
     status: Option<String>,
     /// The newest output of each bash job, as the app last sent it.
@@ -214,6 +216,7 @@ impl JobsPanel {
             view: None,
             input: None,
             confirm: None,
+            confirm_kill_all: false,
             status: None,
             outputs: HashMap::new(),
             source: Box::new(RunDir::profile()),
@@ -500,6 +503,9 @@ impl JobsPanel {
             return JobsResult::Pending;
         }
         self.status = None;
+        if std::mem::take(&mut self.confirm_kill_all) {
+            return if k.code == KeyCode::Char('y') { JobsResult::Kill(None) } else { JobsResult::Pending };
+        }
         if self.confirm.is_some() {
             return self.confirm_key(k);
         }
@@ -538,7 +544,7 @@ impl JobsPanel {
                     return JobsResult::Kill(Some(j.name.clone()));
                 }
             }
-            KeyCode::Char('X') if self.running() > 0 => return JobsResult::Kill(None),
+            KeyCode::Char('X') if self.running() > 0 => self.confirm_kill_all = true,
             _ => {}
         }
         JobsResult::Pending
@@ -642,10 +648,13 @@ impl JobsPanel {
             empty: "  no background jobs",
             detail_title,
             detail: detail_rows,
-            footer: line::styled(
-                "j/k move · Enter transcript · x kill · X kill all · Tab sessions · q close",
-                |_| dim(),
-            ),
+            footer: if self.confirm_kill_all {
+                vec![span(format!("cancel all {run} running jobs? · y to confirm, any other key cancels"), accent())]
+            } else {
+                line::styled("j/k move · Enter transcript · x kill · X kill all · Tab sessions · q close", |_| {
+                    dim()
+                })
+            },
             footer_cursor: None,
         }
     }
@@ -1067,13 +1076,23 @@ mod tests {
         p.on_key(key(KeyCode::Char('j')));
         assert_eq!(p.at, 1);
         assert!(matches!(p.on_key(key(KeyCode::Char('x'))), JobsResult::Pending), "a finished job is not killed");
-        assert!(matches!(p.on_key(key(KeyCode::Char('X'))), JobsResult::Kill(None)));
+        assert!(matches!(p.on_key(key(KeyCode::Char('X'))), JobsResult::Pending), "X asks first");
+        assert!(matches!(p.on_key(key(KeyCode::Char('y'))), JobsResult::Kill(None)));
         p.on_key(key(KeyCode::Down));
         assert_eq!(p.at, 1, "stops at the last job");
         p.on_key(key(KeyCode::Char('k')));
         assert_eq!(p.at, 0);
         assert!(matches!(p.on_key(key(KeyCode::Char('q'))), JobsResult::Close));
         assert!(matches!(p.on_key(key(KeyCode::Esc)), JobsResult::Close));
+    }
+
+    #[test]
+    fn kill_all_is_cancelled_by_any_key_but_y() {
+        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]);
+        p.on_key(key(KeyCode::Char('X')));
+        assert!(text(&mut p, 80, 10).iter().any(|r| r.contains("cancel all 1 running")));
+        assert!(matches!(p.on_key(key(KeyCode::Char('n'))), JobsResult::Pending));
+        assert!(matches!(p.on_key(key(KeyCode::Char('y'))), JobsResult::Pending), "the question is gone");
     }
 
     #[test]
