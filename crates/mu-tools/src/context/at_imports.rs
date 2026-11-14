@@ -155,10 +155,8 @@ fn expand_line(
             continue;
         }
         let raw = token.replace("\\ ", " ");
-        let resolved = if raw == "~" {
-            scope.home.to_path_buf()
-        } else if let Some(r) = raw.strip_prefix("~/") {
-            scope.home.join(r)
+        let resolved = if let Some(h) = mu_common::paths::expand_tilde(&raw, scope.home) {
+            h
         } else if Path::new(&raw).is_absolute() {
             PathBuf::from(&raw)
         } else {

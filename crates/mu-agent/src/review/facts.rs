@@ -103,10 +103,6 @@ pub(crate) fn excluded_reason(path: &str, binary: bool) -> Option<&'static str> 
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
-}
-
 /// What the user told the implementer since the plan was approved.
 pub(crate) fn user_notes(messages: &[Message], since: i64) -> Vec<String> {
     let mut out: Vec<String> = messages
@@ -115,7 +111,7 @@ pub(crate) fn user_notes(messages: &[Message], since: i64) -> Vec<String> {
             Message::User { content, timestamp, synthetic: false, .. } if *timestamp >= since => {
                 let t = text_of(content);
                 let t = t.trim();
-                (!t.is_empty() && !is_injected(t)).then(|| truncate(t, 1500))
+                (!t.is_empty() && !is_injected(t)).then(|| mu_common::text::truncate_chars(t, 1500))
             }
             _ => None,
         })

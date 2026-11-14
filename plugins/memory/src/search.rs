@@ -104,8 +104,5 @@ fn render(q: &str, repo_scope: bool, found: &[query::Session], note: Option<Stri
 /// `s` with whitespace collapsed, cut to `max` characters (with `…` when cut).
 fn clip(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    match flat.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &flat[..i]),
-        None => flat,
-    }
+    mu_common::text::truncate_chars(&flat, max)
 }

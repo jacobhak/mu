@@ -262,8 +262,9 @@ impl App {
         if arg.is_empty() {
             return self.error("usage: /image <path>");
         }
-        let path = match arg.strip_prefix("~/") {
-            Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let path = match mu_common::paths::expand_tilde(arg, &home) {
+            Some(p) => p,
             None => self.cwd.join(arg),
         };
         match image::load(&path) {

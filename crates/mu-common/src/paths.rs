@@ -4,6 +4,14 @@ pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
 
+/// `~` and `~/…` under `home`; `None` for any other path.
+pub fn expand_tilde(p: &str, home: &Path) -> Option<PathBuf> {
+    if p == "~" {
+        return Some(home.to_path_buf());
+    }
+    p.strip_prefix("~/").map(|rest| home.join(rest))
+}
+
 /// The active omp profile name (`OMP_PROFILE`, else `PI_PROFILE`), if any.
 pub fn profile() -> Option<String> {
     std::env::var("OMP_PROFILE").ok().or_else(|| std::env::var("PI_PROFILE").ok()).filter(|s| !s.is_empty())
@@ -163,6 +171,15 @@ pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_expands_only_at_the_start_as_a_whole_component() {
+        let h = Path::new("/h");
+        assert_eq!(expand_tilde("~", h), Some(PathBuf::from("/h")));
+        assert_eq!(expand_tilde("~/a/b", h), Some(PathBuf::from("/h/a/b")));
+        assert_eq!(expand_tilde("~x", h), None);
+        assert_eq!(expand_tilde("a/~", h), None);
+    }
 
     #[test]
     fn encode() {

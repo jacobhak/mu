@@ -97,24 +97,53 @@ pub struct FileLock(std::fs::File);
 impl FileLock {
     /// Blocks until the lock on `path` (created 0600 if missing) is held.
     pub fn exclusive(path: &Path) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            create_private_dir(dir)?;
-        }
-        let f =
-            std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)?;
+        let f = open_lock_file(path)?;
         loop {
-            // SAFETY: `f` owns a valid descriptor for the duration of the call.
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(Self(f));
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e);
+            match flock(&f, libc::LOCK_EX) {
+                Ok(()) => return Ok(Self(f)),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
             }
         }
     }
+
+    /// The lock if it is free now, `None` if another holder has it.
+    pub fn try_exclusive(path: &Path) -> std::io::Result<Option<Self>> {
+        let f = open_lock_file(path)?;
+        match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => Ok(Some(Self(f))),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Polls for the lock every 50 ms for up to `wait`; `None` when it stayed held. Blocks the thread.
+    pub fn exclusive_within(path: &Path, wait: std::time::Duration) -> std::io::Result<Option<Self>> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(lock) = Self::try_exclusive(path)? {
+                return Ok(Some(lock));
+            }
+            if start.elapsed() >= wait {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_private_dir(dir)?;
+    }
+    std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)
+}
+
+fn flock(f: &std::fs::File, op: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `f` owns a valid descriptor for the duration of the call.
+    if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 impl Drop for FileLock {
@@ -177,6 +206,18 @@ mod private_tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&child), 0o700);
         assert_eq!(mode(&parent), 0o755);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_held_lock_is_not_taken_by_try_or_within_and_is_free_after_drop() {
+        let d = dir("try");
+        let lock = d.join("x.lock");
+        let held = FileLock::try_exclusive(&lock).unwrap().expect("free");
+        assert!(FileLock::try_exclusive(&lock).unwrap().is_none());
+        assert!(FileLock::exclusive_within(&lock, std::time::Duration::from_millis(120)).unwrap().is_none());
+        drop(held);
+        assert!(FileLock::exclusive_within(&lock, std::time::Duration::from_millis(120)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&d);
     }
 

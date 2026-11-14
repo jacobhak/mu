@@ -124,10 +124,10 @@ fn image_path(line: &str) -> Option<PathBuf> {
         None => s.to_string(),
     };
     p = p.replace("\\ ", " ");
-    if let Some(rest) = p.strip_prefix("~/") {
-        p = format!("{}/{rest}", std::env::var("HOME").ok()?.trim_end_matches('/'));
+    let mut path = PathBuf::from(&p);
+    if p.starts_with("~/") {
+        path = mu_common::paths::expand_tilde(&p, Path::new(&std::env::var_os("HOME")?))?;
     }
-    let path = PathBuf::from(p);
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     (path.is_absolute() && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") && path.is_file())
         .then_some(path)

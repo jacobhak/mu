@@ -5,8 +5,7 @@
 use crate::mem::{Config, EditError, Mem};
 use crate::store::{self, Caps, Op, State};
 use crate::transcript::{self, CAP};
-use fs4::FileExt;
-use mu_common::fs::write_atomic;
+use mu_common::fs::{FileLock, write_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -292,34 +291,14 @@ async fn dequeue(root: &Path, cfg: &Config, session_id: &str) -> Result<(), Stri
     write_queue(root, &jobs)
 }
 
-struct SyncLock(std::fs::File);
-
-impl Drop for SyncLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
-    }
-}
-
 /// The store lock for `enqueue`, which runs in a synchronous hook. It waits about a second at most: the
 /// runtime is blocked meanwhile, so a review of this process holding the lock could not finish.
-fn lock_sync(root: &Path) -> Result<SyncLock, String> {
-    let dir = root.join(".state");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("lock"))
-        .map_err(|e| format!("cannot open the memory lock: {e}"))?;
-    for _ in 0..20 {
-        match FileExt::try_lock(&f) {
-            Ok(()) => return Ok(SyncLock(f)),
-            Err(fs4::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(50)),
-            Err(fs4::TryLockError::Error(e)) => return Err(format!("cannot lock the memory directory: {e}")),
-        }
+fn lock_sync(root: &Path) -> Result<FileLock, String> {
+    match FileLock::exclusive_within(&root.join(".state").join("lock"), Duration::from_secs(1)) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err("the memory directory is busy, so the session was not queued for review".into()),
+        Err(e) => Err(format!("cannot lock the memory directory: {e}")),
     }
-    Err("the memory directory is busy, so the session was not queued for review".into())
 }
 
 /// Moves a failed entry to the back of the queue with its failure count raised, so later sessions are reached.

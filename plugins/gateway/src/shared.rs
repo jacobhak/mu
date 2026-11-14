@@ -2,10 +2,10 @@
 //! plugin process and the daemon. The daemon serves one profile's credentials and `models.yml`, so each
 //! profile gets its own.
 
-use fs4::FileExt;
+use mu_common::fs::FileLock;
 use mu_common::paths;
 use serde_json::{Value, json};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -29,25 +29,14 @@ pub fn daemon_log() -> PathBuf {
     logs_dir().join("gateway-daemon.log")
 }
 
-/// Exclusive lock on `gateway/lock`; released when the returned file drops.
-pub fn lock(dir: &Path) -> io::Result<File> {
-    let f = open_lock(dir)?;
-    FileExt::lock(&f)?;
-    Ok(f)
+/// Exclusive lock on `gateway/lock`; released when the returned guard drops.
+pub fn lock(dir: &Path) -> io::Result<FileLock> {
+    FileLock::exclusive(&dir.join("lock"))
 }
 
 /// Non-blocking variant; `None` when another process holds the lock.
-pub fn try_lock(dir: &Path) -> io::Result<Option<File>> {
-    let f = open_lock(dir)?;
-    match FileExt::try_lock(&f) {
-        Ok(()) => Ok(Some(f)),
-        Err(fs4::TryLockError::WouldBlock) => Ok(None),
-        Err(fs4::TryLockError::Error(e)) => Err(e),
-    }
-}
-
-fn open_lock(dir: &Path) -> io::Result<File> {
-    OpenOptions::new().create(true).read(true).write(true).truncate(false).open(dir.join("lock"))
+pub fn try_lock(dir: &Path) -> io::Result<Option<FileLock>> {
+    FileLock::try_exclusive(&dir.join("lock"))
 }
 
 pub struct State {

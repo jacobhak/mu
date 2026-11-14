@@ -243,10 +243,7 @@ fn load_palette(source: &str) -> Result<Palette, String> {
         return file(&mu_common::paths::home().join(".local/state/omarchy/current/theme/colors.toml"));
     }
     if source.contains('/') || source.ends_with(".toml") {
-        let p = match source.strip_prefix("~/") {
-            Some(rest) => mu_common::paths::home().join(rest),
-            None => source.into(),
-        };
+        let p = mu_common::paths::expand_tilde(source, &mu_common::paths::home()).unwrap_or_else(|| source.into());
         return file(&p);
     }
     let user = mu_common::paths::mu_home().join("themes").join(format!("{source}.toml"));

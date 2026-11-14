@@ -3,8 +3,7 @@
 
 use crate::gitx;
 use crate::store::{self, Caps, File, Op, Outcome, State};
-use fs4::FileExt;
-use mu_common::fs::write_atomic;
+use mu_common::fs::{FileLock, write_atomic};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -90,14 +89,6 @@ fn read_entries(p: &Path) -> Result<Vec<String>, String> {
     }
 }
 
-pub struct LockGuard(std::fs::File);
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
-    }
-}
-
 impl Mem {
     /// The memory of the repository `cwd` is in, in this profile.
     pub async fn open(cwd: &Path, cfg: Config) -> Self {
@@ -161,23 +152,15 @@ impl Mem {
     }
 
     /// Takes the exclusive lock, waiting up to 30 s. Concurrent sessions serialise on it.
-    pub async fn lock(&self) -> Result<LockGuard, String> {
-        std::fs::create_dir_all(self.state_dir()).map_err(|e| format!("{}: {e}", self.state_dir().display()))?;
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.state_dir().join("lock"))
-            .map_err(|e| format!("cannot open the memory lock: {e}"))?;
-        for _ in 0..600 {
-            match FileExt::try_lock(&f) {
-                Ok(()) => return Ok(LockGuard(f)),
-                Err(fs4::TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(50)).await,
-                Err(fs4::TryLockError::Error(e)) => return Err(format!("cannot lock the memory directory: {e}")),
-            }
+    pub async fn lock(&self) -> Result<FileLock, String> {
+        let path = self.state_dir().join("lock");
+        let waited = tokio::task::spawn_blocking(move || FileLock::exclusive_within(&path, Duration::from_secs(30)));
+        match waited.await {
+            Ok(Ok(Some(lock))) => Ok(lock),
+            Ok(Ok(None)) => Err("the memory directory is locked by another session".into()),
+            Ok(Err(e)) => Err(format!("cannot lock the memory directory: {e}")),
+            Err(e) => Err(format!("cannot lock the memory directory: {e}")),
         }
-        Err("the memory directory is locked by another session".into())
     }
 
     /// Initialises git and commits hand edits as `manual edit`, so they are history before ours.

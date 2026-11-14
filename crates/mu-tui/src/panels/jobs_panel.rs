@@ -828,7 +828,7 @@ fn mark(state: &SubagentState) -> (char, Role) {
 fn output_lines(text: &str, width: usize) -> Vec<Line> {
     let muted = theme::get().fg(Role::Muted);
     let mut out: Vec<Line> = Vec::new();
-    for raw in strip_ansi(text).lines() {
+    for raw in mu_common::text::strip_ansi(text).lines() {
         let l = raw.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("");
         if l.is_empty() {
             out.push(Vec::new());
@@ -837,44 +837,6 @@ fn output_lines(text: &str, width: usize) -> Vec<Line> {
         let chars: Vec<char> = l.chars().collect();
         for c in chars.chunks(width.max(1)) {
             out.push(vec![span(c.iter().collect::<String>(), muted)]);
-        }
-    }
-    out
-}
-
-/// `s` without CSI and OSC sequences and lone escapes.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut it = s.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match it.peek() {
-            Some('[') => {
-                it.next();
-                for n in it.by_ref() {
-                    if ('@'..='~').contains(&n) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                it.next();
-                while let Some(n) = it.next() {
-                    if n == '\u{7}' {
-                        break;
-                    }
-                    if n == '\u{1b}' {
-                        it.next();
-                        break;
-                    }
-                }
-            }
-            _ => {
-                it.next();
-            }
         }
     }
     out
@@ -1274,7 +1236,7 @@ mod tests {
 
     #[test]
     fn escapes_and_carriage_returns_are_cleaned_from_output() {
-        assert_eq!(strip_ansi("a\u{1b}[1;31mb\u{1b}[0mc\u{1b}]0;title\u{7}d\u{1b}Ze"), "abcde");
+        assert_eq!(mu_common::text::strip_ansi("a\u{1b}[1;31mb\u{1b}[0mc\u{1b}]0;title\u{7}d\u{1b}Ze"), "abcde");
         let rows: Vec<String> = output_lines("10%\r50%\r100%\nnext\n\nlast", 80).iter().map(line_text).collect();
         assert_eq!(rows, ["100%", "next", "", "last"]);
         let wrapped = output_lines(&"x".repeat(25), 10);
