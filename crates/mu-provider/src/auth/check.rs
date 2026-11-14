@@ -5,10 +5,11 @@ use crate::net;
 use crate::provider::custom::{self, AuthMode, CustomProvider};
 use crate::provider::providers::{Credential, KeyTarget, ProviderDef};
 use crate::provider::types::Auth;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// The outcome of asking a provider whether a key works.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Check {
     Valid,
     /// 401/403: the provider refused the key.

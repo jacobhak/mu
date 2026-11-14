@@ -5,16 +5,16 @@
 
 use super::*;
 use crate::chat::composer::Action;
+use crate::host::keys::{KeyFacts, KeyInfo, LoginList, LogoutList, TargetKind};
 use crate::term::clipboard;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mu_provider::auth::chatgpt::PROVIDER_ID;
-use mu_provider::auth::check::{self, Check};
+use mu_provider::auth::check::Check;
 use mu_provider::auth::store::Entry;
-use mu_provider::provider::custom::AuthMode;
-use mu_provider::provider::providers::{self, KeyTarget, SEARCH_KEYS};
+use mu_provider::provider::providers::{self, SEARCH_KEYS};
 
 /// What the composer holds while a key flow waits for text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub(super) enum KeyThen {
 pub(super) struct KeyFlow {
     /// Tells a late check result from the current flow's.
     pub(super) id: u64,
-    pub(super) target: KeyTarget,
+    pub(super) target: KeyInfo,
     /// Whether the provider's chat models use the key, when already decided (anthropic and openai ask).
     pub(super) chat: Option<bool>,
     pub(super) then: Option<KeyThen>,
@@ -46,11 +46,6 @@ pub(super) struct KeyFlow {
     pub(super) pending: Option<Entry>,
     /// A check is in flight.
     pub(super) checking: bool,
-}
-
-/// Whether `name` is set to a value other than blanks.
-fn env_is_set(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
 }
 
 /// The status of a provider's key in `/login`.
@@ -85,8 +80,8 @@ fn api_key_items(
 }
 
 /// The two answers to "does chat use this key?"; `current` marks the stored choice.
-fn chat_rows(target: &KeyTarget, current: Option<bool>) -> Vec<(Item, KeyOption)> {
-    let id = target.id();
+fn chat_rows(target: &KeyInfo, current: Option<bool>) -> Vec<(Item, KeyOption)> {
+    let id = &target.id;
     let row = |label: String, detail: &str, on: bool| {
         let item = Item { label, detail: if current == Some(on) { "current".into() } else { detail.into() } };
         (item, KeyOption::Chat(on))
@@ -307,18 +302,34 @@ impl App {
         if let Some(name) = provider.strip_prefix("mcp:") {
             return self.run_mcp_login(name);
         }
-        match KeyTarget::find(provider, self.services.providers.custom_registry()) {
-            Ok(Some(target)) => return self.begin_key(target),
-            Ok(None) => {}
-            Err(e) => return self.error(&format!("{e:#}")),
-        }
-        if !provider.is_empty() {
-            return self.run_login(&[provider], None);
-        }
-        self.notice("listing login providers…");
-        let tx = self.ui_tx.clone();
-        tokio::task::spawn_local(async move {
-            let _ = tx.send(UiMsg::LoginProviders(list_login_providers().await));
+        let name = provider.to_string();
+        self.host_call(host::keys::KEY_TARGET, &provider, move |app, r: Result<Option<KeyInfo>, String>| match r {
+            Ok(Some(target)) => app.begin_key(target),
+            Ok(None) if !name.is_empty() => app.run_login(&[name.as_str()], None),
+            Ok(None) => {
+                app.notice("listing login providers…");
+                app.host_call(host::keys::LOGIN_PROVIDERS, &(), |app, r: Result<LoginList, String>| app.show_login(r));
+            }
+            Err(e) => app.error(&e),
+        });
+    }
+
+    /// The `/login` picker: the key rows, then omp's providers and the MCP servers that need auth.
+    fn show_login(&mut self, r: Result<LoginList, String>) {
+        self.leave_custom_wizard();
+        let list = r.unwrap_or_else(|e| LoginList { error: Some(e), ..Default::default() });
+        self.with_api_key_rows(move |app, mut rows| {
+            for (n, name) in list.providers.into_iter().filter(|(_, name)| !is_baseten(name)) {
+                rows.push((Item { label: name, detail: String::new() }, LoginTarget::Provider(n)));
+            }
+            // The API-key rows and MCP servers stay usable without omp.
+            if let Some(e) = list.error {
+                app.error(&format!("cannot list omp's login providers: {e}"));
+            }
+            for (name, url) in list.mcp {
+                rows.push((Item { label: format!("mcp:{name}"), detail: url }, LoginTarget::Mcp(name)));
+            }
+            app.overlay = Some(Overlay::Login { pick: Picker::from_rows(rows, |items| Select::new("Log in", items)) });
         });
     }
 
@@ -434,72 +445,70 @@ impl App {
     /// The API-key rows that open `/login`: the chat providers, ChatGPT and the search services, then
     /// each custom endpoint (its key state, or that it takes none), then the row that adds one. A
     /// `providers.toml` that does not read is reported, and its endpoints are left out.
-    pub(super) fn api_key_rows(&mut self) -> Vec<(Item, LoginTarget)> {
-        let customs = match self.services.providers.custom_registry().snapshot() {
-            Ok(c) => c,
-            Err(e) => {
-                self.error(&format!("{e:#}"));
-                Default::default()
+    pub(super) fn with_api_key_rows(&mut self, then: impl FnOnce(&mut App, Vec<(Item, LoginTarget)>) + 'static) {
+        self.host_call(host::keys::KEY_ROWS, &(), move |app, r: Result<KeyFacts, String>| {
+            let facts = r.unwrap_or_else(|e| KeyFacts { error: Some(e), ..Default::default() });
+            if let Some(e) = &facts.error {
+                app.error(e);
             }
-        };
-        let store = self.services.providers.store();
-        let mut rows = api_key_items(|p| store.has(p), env_is_set, |p| store.get(p).is_some_and(|e| e.routes_chat()));
-        rows.insert(0, chatgpt::login_item(store.chatgpt_account().as_ref()));
-        for c in customs.values() {
-            let label = if c.auth == AuthMode::None {
-                format!("Custom endpoint: {}", c.label())
-            } else {
-                format!("API key: {} (custom)", c.label())
-            };
-            rows.push((
-                Item { label, detail: crate::labels::key_state_word(c.key_state(store)).into() },
-                LoginTarget::ApiKey(c.id.clone()),
-            ));
-            let edit = Item {
-                label: format!("Edit custom endpoint: {}", c.label()),
-                detail: "address, key, models, reasoning".into(),
-            };
-            rows.push((edit, LoginTarget::CustomProvider(Some(c.id.clone()))));
-        }
-        let add = Item { label: "+ Add a custom endpoint…".into(), detail: "guided: address, key, models".into() };
-        rows.push((add, LoginTarget::CustomProvider(None)));
-        rows
+            let stored = |p: &str| facts.stored.iter().any(|(id, _)| id == p);
+            let routes_chat = |p: &str| facts.stored.iter().any(|(id, chat)| id == p && *chat);
+            let env_set = |n: &str| facts.env_set.iter().any(|e| e == n);
+            let mut rows = api_key_items(stored, env_set, routes_chat);
+            rows.insert(0, chatgpt::login_item(facts.chatgpt.as_ref()));
+            for c in &facts.customs {
+                let label = if c.keyless {
+                    format!("Custom endpoint: {}", c.label)
+                } else {
+                    format!("API key: {} (custom)", c.label)
+                };
+                rows.push((
+                    Item { label, detail: crate::labels::key_state_word(c.state).into() },
+                    LoginTarget::ApiKey(c.id.clone()),
+                ));
+                let edit = Item {
+                    label: format!("Edit custom endpoint: {}", c.label),
+                    detail: "address, key, models, reasoning".into(),
+                };
+                rows.push((edit, LoginTarget::CustomProvider(Some(c.id.clone()))));
+            }
+            let add =
+                Item { label: "+ Add a custom endpoint…".into(), detail: "guided: address, key, models".into() };
+            rows.push((add, LoginTarget::CustomProvider(None)));
+            then(app, rows);
+        });
     }
 
     /// `/login <id>` or a `/login` row: a key already stored for anthropic or openai opens a menu
     /// (chat use, replace); anything else starts the key flow.
-    pub(super) fn begin_key(&mut self, target: KeyTarget) {
-        if target.is_keyless() {
+    pub(super) fn begin_key(&mut self, target: KeyInfo) {
+        if target.keyless {
             return self.notice(&format!(
                 "{} takes no key (auth = \"none\" in {}); `Edit custom endpoint: {}` changes that",
-                target.label(),
-                self.services.providers.custom_registry().path().display(),
-                target.label()
+                target.label,
+                target.providers_path.display(),
+                target.label
             ));
         }
-        let stored = self.services.providers.store().get(target.id());
-        let Some(entry) = stored.filter(|_| target.asks_chat()) else {
+        let Some(chat) = target.stored_chat.filter(|_| target.asks_chat) else {
             return self.start_key_flow(target, None, None);
         };
-        let mut rows = chat_rows(&target, Some(entry.routes_chat()));
+        let mut rows = chat_rows(&target, Some(chat));
         let replace = Item { label: "Replace the key".into(), detail: "paste, use a variable or a command".into() };
         rows.push((replace, KeyOption::Replace));
         rows.push((Item { label: "Cancel".into(), detail: "nothing changes".into() }, KeyOption::Cancel));
-        let pick = Picker::from_rows(rows, |items| Select::new(&format!("{} API key", target.label()), items));
-        self.open_overlay(Overlay::KeyChoice { pick, provider: target.id().into() });
+        let pick = Picker::from_rows(rows, |items| Select::new(&format!("{} API key", target.label), items));
+        self.open_overlay(Overlay::KeyChoice { pick, provider: target.id });
     }
 
     /// Says where to get a key, then offers the ways to give one.
     /// `chat` presets the answer to "does chat use this key?", `then` resumes another flow at the end.
-    pub(super) fn start_key_flow(&mut self, target: KeyTarget, chat: Option<bool>, then: Option<KeyThen>) {
+    pub(super) fn start_key_flow(&mut self, target: KeyInfo, chat: Option<bool>, then: Option<KeyThen>) {
         self.leave_custom_wizard();
         self.flows.key_flow_seq += 1;
-        let (label, id, hint, url) = (
-            target.label().to_string(),
-            target.id().to_string(),
-            target.env_hint().to_string(),
-            target.key_url().to_string(),
-        );
+        let (label, id, hint, url) =
+            (target.label.clone(), target.id.clone(), target.env_hint.clone(), target.key_url.clone());
+        let env_set = target.env_set;
         let web = if then == Some(KeyThen::WebWizard) { self.flows.end_web().map(Box::new) } else { None };
         self.flows.begin(Active::Key(Box::new(KeyFlow {
             id: self.flows.key_flow_seq,
@@ -516,7 +525,7 @@ impl App {
         }
         let mut rows =
             vec![(Item { label: "Paste a key".into(), detail: "shown as bullets".into() }, KeyOption::Paste)];
-        if env_is_set(&hint) {
+        if env_set {
             rows.push((Item { label: format!("Use ${hint}"), detail: "already set".into() }, KeyOption::Env(hint)));
         }
         let command = Item { label: "Use a command".into(), detail: "a command that prints the key".into() };
@@ -530,16 +539,19 @@ impl App {
         if provider == PROVIDER_ID {
             return self.on_chatgpt_choice(choice);
         }
-        let target = match KeyTarget::find(provider, self.services.providers.custom_registry()) {
-            Ok(Some(t)) => t,
-            Ok(None) => return,
-            Err(e) => return self.error(&format!("{e:#}")),
-        };
+        self.host_call(host::keys::KEY_TARGET, &provider, move |app, r: Result<Option<KeyInfo>, String>| match r {
+            Ok(Some(target)) => app.key_chosen(target, choice),
+            Ok(None) => {}
+            Err(e) => app.error(&e),
+        });
+    }
+
+    fn key_chosen(&mut self, target: KeyInfo, choice: KeyOption) {
         match choice {
             KeyOption::Paste => {
                 self.set_typing(Some(Typing::Key));
                 self.prompt.composer.set_masked(true);
-                self.notice(&format!("paste the {} key and press Enter (Esc cancels)", target.label()));
+                self.notice(&format!("paste the {} key and press Enter (Esc cancels)", target.label));
             }
             KeyOption::Command => {
                 self.set_typing(Some(Typing::Command));
@@ -557,25 +569,28 @@ impl App {
             },
             KeyOption::Chat(on) => match self.flows.key_mut().and_then(|f| f.pending.take()) {
                 Some(entry) => self.save_key(target, Entry { chat: Some(on), ..entry }),
-                None => match self.services.set_chat(target.id(), on) {
-                    Ok(true) => {
-                        let msg = if on {
-                            format!(
-                                "{id}/* models now use your API key (billed per token) instead of omp.",
-                                id = target.id()
-                            )
-                        } else {
-                            format!(
-                                "{id}/* chat models go through omp again; the key stays for web search",
-                                id = target.id()
-                            )
-                        };
-                        self.notice(&msg);
-                        self.send(Command::RefreshModel);
-                    }
-                    Ok(false) => self.notice(&format!("no {} key is stored", target.label())),
-                    Err(e) => self.error(&format!("could not update the {} key: {e}", target.label())),
-                },
+                None => {
+                    let args = (target.id.clone(), on);
+                    self.host_call(host::keys::SET_CHAT, &args, move |app, r: Result<bool, String>| match r {
+                        Ok(true) => {
+                            let msg = if on {
+                                format!(
+                                    "{id}/* models now use your API key (billed per token) instead of omp.",
+                                    id = target.id
+                                )
+                            } else {
+                                format!(
+                                    "{id}/* chat models go through omp again; the key stays for web search",
+                                    id = target.id
+                                )
+                            };
+                            app.notice(&msg);
+                            app.send(Command::RefreshModel);
+                        }
+                        Ok(false) => app.notice(&format!("no {} key is stored", target.label)),
+                        Err(e) => app.error(&format!("could not update the {} key: {e}", target.label)),
+                    });
+                }
             },
             KeyOption::Replace => self.start_key_flow(target, None, None),
             KeyOption::SignIn => self.start_chatgpt(),
@@ -586,19 +601,18 @@ impl App {
     }
 
     /// Resolves the entry and asks the provider whether it works. Nothing is saved yet.
-    fn check_key(&mut self, target: KeyTarget, entry: Entry) {
+    fn check_key(&mut self, target: KeyInfo, entry: Entry) {
         let Some(f) = self.flows.key_mut() else { return };
         f.checking = true;
         let flow = f.id;
-        self.notice(&format!("checking the key with {}…", target.label()));
-        let tx = self.ui_tx.clone();
-        tokio::task::spawn_local(async move {
-            let r = check::check_target(&target, &entry).await;
-            let _ = tx.send(UiMsg::KeyChecked { flow, target, entry, r });
+        self.notice(&format!("checking the key with {}…", target.label));
+        let args = (target.id.clone(), entry.clone());
+        self.host_call(host::keys::CHECK_KEY, &args, move |app, r: Result<Check, String>| {
+            app.on_key_checked(flow, target, entry, r)
         });
     }
 
-    pub(super) fn on_key_checked(&mut self, flow: u64, target: KeyTarget, entry: Entry, r: Result<Check, String>) {
+    pub(super) fn on_key_checked(&mut self, flow: u64, target: KeyInfo, entry: Entry, r: Result<Check, String>) {
         match self.flows.key_mut() {
             Some(f) if f.id == flow => f.checking = false,
             // The flow was cancelled or replaced while the check ran.
@@ -609,7 +623,7 @@ impl App {
             Ok(Check::Unchecked) => {
                 self.notice(&format!(
                     "saved without checking: {} has no free way to test a key; a bad key shows on the first search",
-                    target.label()
+                    target.label
                 ));
                 self.confirm_key(target, entry);
             }
@@ -630,8 +644,8 @@ impl App {
                     (Item { label: "Cancel".into(), detail: "nothing is saved".into() }, KeyOption::Cancel),
                 ];
                 let pick =
-                    Picker::from_rows(rows, |items| Select::new(&format!("{} did not answer", target.label()), items));
-                self.open_overlay(Overlay::KeyChoice { pick, provider: target.id().into() });
+                    Picker::from_rows(rows, |items| Select::new(&format!("{} did not answer", target.label), items));
+                self.open_overlay(Overlay::KeyChoice { pick, provider: target.id });
             }
             Err(e) => {
                 self.end_key_flow(false);
@@ -646,55 +660,58 @@ impl App {
     }
 
     /// A key that works is saved, after asking whether chat uses it when the user has not said.
-    fn confirm_key(&mut self, target: KeyTarget, entry: Entry) {
+    fn confirm_key(&mut self, target: KeyInfo, entry: Entry) {
         let undecided = self.flows.key().is_some_and(|f| f.chat.is_none());
-        if !(target.asks_chat() && undecided) {
+        if !(target.asks_chat && undecided) {
             return self.save_key(target, entry);
         }
         if let Some(f) = self.flows.key_mut() {
             f.pending = Some(entry);
         }
-        let title = format!("Use this {} key for chat models?", target.label());
+        let title = format!("Use this {} key for chat models?", target.label);
         let pick = Picker::from_rows(chat_rows(&target, None), |items| Select::new(&title, items));
-        self.open_overlay(Overlay::KeyChoice { pick, provider: target.id().into() });
+        self.open_overlay(Overlay::KeyChoice { pick, provider: target.id });
     }
 
-    fn save_key(&mut self, target: KeyTarget, mut entry: Entry) {
+    fn save_key(&mut self, target: KeyInfo, mut entry: Entry) {
         let flow = self.flows.end_key();
         let then = flow.as_ref().and_then(|f| f.then);
-        entry.chat = match &target {
+        entry.chat = match target.kind {
             // A search-only key has no chat flag; Baseten's only use is chat.
-            KeyTarget::Search(_) => None,
+            TargetKind::Search => None,
             // A custom endpoint's key is for chat and nothing else; it never carries a base URL.
-            KeyTarget::Custom(_) => Some(true),
-            KeyTarget::Provider(_) if !target.asks_chat() => Some(true),
+            TargetKind::Custom => Some(true),
+            TargetKind::Provider if !target.asks_chat => Some(true),
             // Never left unset: an unset flag would route chat.
-            KeyTarget::Provider(_) => Some(entry.chat.or(flow.and_then(|f| f.chat)).unwrap_or(false)),
+            TargetKind::Provider => Some(entry.chat.or(flow.and_then(|f| f.chat)).unwrap_or(false)),
         };
-        if matches!(target, KeyTarget::Custom(_)) {
+        if target.kind == TargetKind::Custom {
             entry.base_url = None;
         }
         let chat = entry.chat.unwrap_or(false);
-        match self.services.save_key(target.id(), entry) {
+        let args = (target.id.clone(), entry);
+        self.host_call(host::keys::SAVE_KEY, &args, move |app, r: Result<(), String>| match r {
             Ok(()) => {
-                match &target {
-                    KeyTarget::Provider(def) => {
-                        self.notice(&providers::saved_notice(def, chat));
-                        self.send(Command::RefreshModel);
+                match target.kind {
+                    TargetKind::Provider => {
+                        if let Some(def) = providers::native_def(&target.id) {
+                            app.notice(&providers::saved_notice(def, chat));
+                        }
+                        app.send(Command::RefreshModel);
                     }
-                    KeyTarget::Search(d) => self.notice(&format!("saved the {} key", d.label)),
-                    KeyTarget::Custom(c) => {
-                        self.notice(&format!("saved the {} key; {}/* models use it.", c.label(), c.id));
-                        self.send(Command::RefreshModel);
+                    TargetKind::Search => app.notice(&format!("saved the {} key", target.label)),
+                    TargetKind::Custom => {
+                        app.notice(&format!("saved the {} key; {}/* models use it.", target.label, target.id));
+                        app.send(Command::RefreshModel);
                     }
                 }
-                self.key_flow_ended(then, true);
+                app.key_flow_ended(then, true);
             }
             Err(e) => {
-                self.error(&format!("could not save the {} key: {e}", target.label()));
-                self.key_flow_ended(then, false);
+                app.error(&format!("could not save the {} key: {e}", target.label));
+                app.key_flow_ended(then, false);
             }
-        }
+        });
     }
 
     /// `/logout [provider]`: removes the given key, or picks one of the stored keys.
@@ -702,94 +719,69 @@ impl App {
         if !arg.is_empty() {
             return self.logout(arg);
         }
-        let custom = match self.services.providers.custom_registry().snapshot() {
-            Ok(c) => c,
-            Err(e) => {
-                self.error(&format!("{e:#}"));
-                Default::default()
+        self.host_call(host::keys::LOGOUT_LIST, &(), |app, r: Result<LogoutList, String>| {
+            let list = match r {
+                Ok(l) => l,
+                Err(e) => return app.error(&e),
+            };
+            if let Some(e) = &list.error {
+                app.error(e);
             }
-        };
-        let mut providers: Vec<String> = self
-            .services
-            .providers
-            .store()
-            .list()
-            .into_iter()
-            .map(|(p, _)| p)
-            .filter(|p| KeyTarget::builtin(p).is_some() || custom.contains_key(p))
-            .collect();
-        if self.services.providers.store().chatgpt_account().is_some_and(|a| a.signed_in()) {
-            providers.push(PROVIDER_ID.into());
-        }
-        if providers.is_empty() {
-            return self.notice("no API keys are stored; /login adds one");
-        }
-        let rows = providers
-            .into_iter()
-            .map(|p| {
-                if chatgpt::is_chatgpt(&p) {
-                    return (Item { label: "ChatGPT sign-in".into(), detail: "sign out and revoke".into() }, p);
-                }
-                let item = Item {
-                    label: KeyTarget::builtin(&p)
-                        .map(|t| t.label().to_string())
-                        .or_else(|| custom.get(&p).map(|c| c.label().to_string()))
-                        .unwrap_or_else(|| p.clone()),
-                    detail: "remove this key".into(),
-                };
-                (item, p)
-            })
-            .collect();
-        let pick = Picker::from_rows(rows, |items| Select::new("Remove a key or sign out", items));
-        self.open_overlay(Overlay::Logout { pick });
+            if list.rows.is_empty() {
+                return app.notice("no API keys are stored; /login adds one");
+            }
+            let rows = list
+                .rows
+                .into_iter()
+                .map(|r| {
+                    if chatgpt::is_chatgpt(&r.id) {
+                        return (Item { label: "ChatGPT sign-in".into(), detail: "sign out and revoke".into() }, r.id);
+                    }
+                    (Item { label: r.label, detail: "remove this key".into() }, r.id)
+                })
+                .collect();
+            let pick = Picker::from_rows(rows, |items| Select::new("Remove a key or sign out", items));
+            app.open_overlay(Overlay::Logout { pick });
+        });
     }
 
     pub(super) fn logout(&mut self, provider: &str) {
         if chatgpt::is_chatgpt(provider) {
             return self.chatgpt_sign_out();
         }
-        let target = match KeyTarget::find(provider, self.services.providers.custom_registry()) {
-            Ok(Some(t)) => t,
-            Ok(None) => return self.error(&format!("no API key support for `{provider}`")),
-            Err(e) => return self.error(&format!("{e:#}")),
-        };
-        if target.is_keyless() {
+        let name = provider.to_string();
+        self.host_call(host::keys::KEY_TARGET, &provider, move |app, r: Result<Option<KeyInfo>, String>| match r {
+            Ok(Some(target)) => app.remove_key(target),
+            Ok(None) => app.error(&format!("no API key support for `{name}`")),
+            Err(e) => app.error(&e),
+        });
+    }
+
+    fn remove_key(&mut self, target: KeyInfo) {
+        if target.keyless {
             return self.notice(&format!(
                 "{} takes no key, so there is none to remove; remove its definition with `mu providers rm {}`",
-                target.label(),
-                target.id()
+                target.label, target.id
             ));
         }
-        if matches!(target, KeyTarget::Custom(_)) {
-            return match self.services.remove_key(target.id()) {
-                Ok(true) => {
-                    self.notice(&format!(
-                        "removed the {} key; {}/* models now need a key (/login {})",
-                        target.label(),
-                        target.id(),
-                        target.id()
-                    ));
-                    self.send(Command::RefreshModel);
-                }
-                Ok(false) => self.notice(&format!("no {} key is stored", target.label())),
-                Err(e) => self.error(&format!("could not remove the {} key: {e}", target.label())),
-            };
-        }
-        let was_chat = matches!(target, KeyTarget::Provider(_))
-            && self.services.providers.store().get(target.id()).is_some_and(|e| e.routes_chat());
-        match self.services.remove_key(target.id()) {
-            Ok(true) if was_chat => {
-                self.notice(&format!(
-                    "removed the {} key; {}/* models go through omp again",
-                    target.label(),
-                    target.id()
+        let was_chat = target.kind == TargetKind::Provider && target.stored_chat == Some(true);
+        let id = target.id.clone();
+        self.host_call(host::keys::REMOVE_KEY, &id, move |app, r: Result<bool, String>| match r {
+            Ok(true) if target.kind == TargetKind::Custom => {
+                app.notice(&format!(
+                    "removed the {} key; {}/* models now need a key (/login {})",
+                    target.label, target.id, target.id
                 ));
-                self.send(Command::RefreshModel);
+                app.send(Command::RefreshModel);
             }
-            Ok(true) => self.notice(&format!("removed the {} key", target.label())),
-            Ok(false) => self.notice(&format!("no {} key is stored", target.label())),
-            Err(e) => self.error(&format!("could not remove the {} key: {e}", target.label())),
-        }
+            Ok(true) if was_chat => {
+                app.notice(&format!("removed the {} key; {}/* models go through omp again", target.label, target.id));
+                app.send(Command::RefreshModel);
+            }
+            Ok(true) => app.notice(&format!("removed the {} key", target.label)),
+            Ok(false) => app.notice(&format!("no {} key is stored", target.label)),
+            Err(e) => app.error(&format!("could not remove the {} key: {e}", target.label)),
+        });
     }
 }
 
@@ -800,54 +792,8 @@ pub(super) fn is_baseten(name: &str) -> bool {
         .is_some_and(|w| w.eq_ignore_ascii_case("baseten"))
 }
 
-/// Provider menu of `omp login`, scraped from its numbered prompt (omp has no machine-readable list).
-async fn list_login_providers() -> Result<Vec<(usize, String)>, String> {
-    let out = tokio::process::Command::new(mu_common::paths::omp_bin())
-        .arg("login")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(parse_login_menu(&String::from_utf8_lossy(&out.stdout)))
-}
-
-fn parse_login_menu(text: &str) -> Vec<(usize, String)> {
-    let mut plain = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for n in chars.by_ref() {
-                if n.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            plain.push(c);
-        }
-    }
-    plain
-        .lines()
-        .filter_map(|l| {
-            let (n, name) = l.trim().split_once(". ")?;
-            Some((n.parse().ok()?, name.trim().to_string())).filter(|(_, name): &(usize, String)| !name.is_empty())
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod login_tests {
-    use super::parse_login_menu;
-
-    #[test]
-    fn menu_numbers_and_names_survive_ansi_and_noise() {
-        let t = "Select a provider:\n\n  1. ChatGPT Plus/Pro (Codex)\n\x1b[2m  12. Z.AI (GLM · Sign in)\x1b[0m\nEnter number: ";
-        assert_eq!(
-            parse_login_menu(t),
-            vec![(1, "ChatGPT Plus/Pro (Codex)".into()), (12, "Z.AI (GLM · Sign in)".into())]
-        );
-    }
-
     #[test]
     fn baseten_is_the_only_omp_row_mu_drops() {
         use super::is_baseten;
@@ -855,13 +801,6 @@ mod login_tests {
         assert!(is_baseten(" Baseten (API key)"));
         assert!(!is_baseten("Basetenx"));
         assert!(!is_baseten("Z.AI (GLM · Sign in)"));
-    }
-
-    #[test]
-    #[ignore]
-    fn contract_omp_login_menu() {
-        let out = mu_common::paths::run_omp_blocking(&["login"], &[]);
-        assert!(!parse_login_menu(&out).is_empty(), "no providers parsed from: {out}");
     }
 }
 
@@ -932,6 +871,14 @@ pub(super) mod tests {
     }
 
     impl App {
+        /// The `/login` key rows, asked of the host and read back; for a host that answers at once.
+        pub(in crate::app) fn api_key_rows(&mut self) -> Vec<(Item, LoginTarget)> {
+            let out = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let got = out.clone();
+            self.with_api_key_rows(move |_, rows| *got.borrow_mut() = rows);
+            out.take()
+        }
+
         /// Swaps the provider registry, for the app and for the host that answers for it.
         pub(in crate::app) fn use_providers(&mut self, providers: Rc<mu_provider::provider::client::Providers>) {
             self.host = Rc::new(crate::host::local::LocalHost::new(
@@ -1057,7 +1004,7 @@ pub(super) mod tests {
         let hist = std::env::temp_dir().join(format!("mu-keyflow-{}", uuid::Uuid::new_v4())).join("history.jsonl");
         let mut app = test_app(hist.clone());
         in_local(async {
-            app.start_key_flow(KeyTarget::builtin("anthropic").unwrap(), None, None);
+            app.start_key_flow(KeyInfo::builtin("anthropic").unwrap(), None, None);
             app.on_key_choice("anthropic", KeyOption::Paste);
             app.overlay = None;
             for c in "sk-ab".chars() {
@@ -1240,7 +1187,7 @@ pub(super) mod tests {
     #[test]
     fn a_late_check_result_of_an_old_flow_is_ignored() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let t = KeyTarget::builtin("anthropic").unwrap();
+        let t = KeyInfo::builtin("anthropic").unwrap();
         app.start_key_flow(t.clone(), None, None);
         app.flows.end_key();
         app.start_key_flow(t.clone(), None, None);
@@ -1251,7 +1198,7 @@ pub(super) mod tests {
     #[test]
     fn a_valid_openai_key_asks_about_chat_and_saves_the_answer() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let t = KeyTarget::builtin("openai").unwrap();
+        let t = KeyInfo::builtin("openai").unwrap();
         app.start_key_flow(t.clone(), None, None);
         app.on_key_checked(1, t.clone(), Entry::literal("sk-test-0123456789"), Ok(Check::Valid));
         let Some(Overlay::KeyChoice { pick, .. }) = &app.overlay else { panic!("no chat question") };
@@ -1263,7 +1210,7 @@ pub(super) mod tests {
         assert_eq!(saved.chat, Some(false));
         assert!(!app.services.providers.is_direct("openai"));
         // The existing-key menu changes the answer without a new key.
-        app.begin_key(t);
+        app.begin_key(host_target(&app, "openai"));
         let Some(Overlay::KeyChoice { pick, .. }) = &app.overlay else { panic!("no menu") };
         assert_eq!(pick.values().len(), 4);
         app.on_key_choice("openai", KeyOption::Chat(true));
@@ -1274,7 +1221,7 @@ pub(super) mod tests {
     #[test]
     fn a_search_key_is_saved_without_a_chat_question() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        let t = KeyTarget::builtin("exa").unwrap();
+        let t = KeyInfo::builtin("exa").unwrap();
         app.start_key_flow(t.clone(), None, None);
         app.overlay = None;
         app.on_key_checked(1, t, Entry::literal("exa-test-0123456789"), Ok(Check::Unchecked));
@@ -1321,7 +1268,7 @@ pub(super) mod tests {
         // Exa (API key) has no key in the isolated home: the key flow opens, for search only.
         app.on_web_pick(Some(3));
         let f = app.flows.key().expect("a key flow");
-        assert_eq!((f.target.id(), f.chat, f.then), ("exa", Some(false), Some(KeyThen::WebWizard)));
+        assert_eq!((f.target.id.as_str(), f.chat, f.then), ("exa", Some(false), Some(KeyThen::WebWizard)));
         assert!(matches!(&app.overlay, Some(Overlay::KeyChoice { provider, .. }) if provider == "exa"));
         // Cancelling the key flow returns to the backend choice.
         app.on_key_choice("exa", KeyOption::Cancel);
@@ -1332,7 +1279,7 @@ pub(super) mod tests {
     #[test]
     fn a_flow_whose_overlay_was_replaced_is_dropped() {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        app.start_key_flow(KeyTarget::builtin("anthropic").unwrap(), None, None);
+        app.start_key_flow(KeyInfo::builtin("anthropic").unwrap(), None, None);
         app.sync_key_flow();
         assert!(app.flows.key().is_some(), "the key choice is still open");
         app.overlay = Some(Overlay::Logout { pick: Picker::placeholder(vec![], |items| Select::new("t", items)) });
@@ -1346,6 +1293,170 @@ pub(super) mod tests {
         app.login("anthropic");
         assert!(matches!(&app.overlay, Some(Overlay::KeyChoice { provider, .. }) if provider == "anthropic"));
         assert!(app.flows.key().is_some());
+    }
+
+    /// What the host says a provider id stands for, from a host that answers at once.
+    fn host_target(app: &App, id: &str) -> KeyInfo {
+        let crate::host::Answer::Ready(Ok(v)) = app.host.call(host::keys::KEY_TARGET, serde_json::json!(id)) else {
+            panic!("no immediate answer")
+        };
+        serde_json::from_value::<Option<KeyInfo>>(v).unwrap().unwrap()
+    }
+
+    /// An app whose host answers every call later, and the messages those answers arrive as.
+    fn deferred_app() -> (App, UnboundedReceiver<UiMsg>) {
+        let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        let (ui_tx, ui_rx) = unbounded_channel();
+        app.ui_tx = ui_tx;
+        app.host = Rc::new(crate::host::Deferred(crate::host::local::LocalHost::new(
+            app.services.providers.clone(),
+            app.ctx.clone(),
+            app.plugins.clone(),
+            app.cwd.clone(),
+        )));
+        (app, ui_rx)
+    }
+
+    /// Hands the next answer of the host to the app.
+    async fn pump(app: &mut App, ui_rx: &mut UnboundedReceiver<UiMsg>) {
+        let m = ui_rx.recv().await.expect("the host answers");
+        app.on_ui(m);
+    }
+
+    #[test]
+    fn a_deferred_host_opens_the_key_flow_after_its_answer() {
+        let (mut app, mut rx) = deferred_app();
+        in_local(async {
+            app.login("anthropic");
+            assert!(app.overlay.is_none() && app.flows.key().is_none(), "nothing before the answer");
+            pump(&mut app, &mut rx).await;
+            assert!(matches!(&app.overlay, Some(Overlay::KeyChoice { provider, .. }) if provider == "anthropic"));
+            assert!(app.flows.key().is_some());
+
+            // Choosing "paste" asks the host for the target again, then locks the composer to the key.
+            app.on_key_choice("anthropic", KeyOption::Paste);
+            assert!(!app.typing());
+            pump(&mut app, &mut rx).await;
+            assert!(app.typing());
+            assert!(transcript_text(&app).contains("paste the Anthropic key"));
+
+            // A keyless endpoint and an unknown id are told apart by the same call.
+            app.on_key_choice("nope", KeyOption::Cancel);
+            pump(&mut app, &mut rx).await;
+            assert!(app.typing(), "an unknown id changes nothing");
+        });
+    }
+
+    #[test]
+    fn a_deferred_check_saves_a_search_key_and_reports_an_unreadable_one() {
+        let (mut app, mut rx) = deferred_app();
+        in_local(async {
+            let store = app.services.providers.store().clone();
+            let t = KeyInfo::builtin("exa").unwrap();
+            app.start_key_flow(t.clone(), None, None);
+            app.overlay = None;
+            app.check_key(t.clone(), Entry::literal("exa-test-0123456789"));
+            assert!(app.flows.key().is_some_and(|f| f.checking), "the check is in flight");
+            assert!(store.get("exa").is_none());
+            pump(&mut app, &mut rx).await; // the check
+            assert!(app.flows.key().is_none(), "the flow ends when the save is asked for");
+            pump(&mut app, &mut rx).await; // the save
+            assert_eq!(store.get("exa").unwrap().chat, None);
+            assert!(transcript_text(&app).contains("saved the Exa key"));
+            store.remove("exa").unwrap();
+
+            app.start_key_flow(t.clone(), None, None);
+            app.overlay = None;
+            app.check_key(t, Entry::reference("$MU_NO_SUCH_KEY_VARIABLE").unwrap());
+            pump(&mut app, &mut rx).await;
+            assert!(app.flows.key().is_none());
+            assert!(transcript_text(&app).contains("MU_NO_SUCH_KEY_VARIABLE"), "{}", transcript_text(&app));
+        });
+    }
+
+    #[test]
+    fn a_deferred_chat_choice_and_logout_change_the_store() {
+        let (mut app, mut rx) = deferred_app();
+        in_local(async {
+            let store = app.services.providers.store().clone();
+            store.set("openai", Entry { chat: Some(false), ..Entry::literal("sk-test-0123456789") }).unwrap();
+            app.login("openai");
+            pump(&mut app, &mut rx).await;
+            let Some(Overlay::KeyChoice { pick, .. }) = &app.overlay else { panic!("no menu") };
+            assert_eq!(pick.values().len(), 4, "the existing-key menu");
+            app.on_key_choice("openai", KeyOption::Chat(true));
+            pump(&mut app, &mut rx).await; // the target
+            pump(&mut app, &mut rx).await; // set_chat
+            assert!(app.services.providers.is_direct("openai"));
+            assert!(transcript_text(&app).contains("openai/* models now use your API key"));
+
+            app.logout_cmd("");
+            pump(&mut app, &mut rx).await;
+            let Some(Overlay::Logout { pick }) = &app.overlay else { panic!("no logout list") };
+            assert_eq!(pick.values(), &["openai"]);
+            app.overlay = None;
+
+            app.logout("openai");
+            pump(&mut app, &mut rx).await; // the target
+            pump(&mut app, &mut rx).await; // remove_key
+            assert!(store.get("openai").is_none());
+            assert!(transcript_text(&app).contains("removed the OpenAI key; openai/* models go through omp again"));
+            app.logout("openai");
+            pump(&mut app, &mut rx).await;
+            pump(&mut app, &mut rx).await;
+            assert!(transcript_text(&app).contains("no OpenAI key is stored"));
+        });
+    }
+
+    #[test]
+    fn a_deferred_login_list_has_the_key_rows_omp_providers_and_mcp_servers() {
+        use crate::host::keys::LoginList;
+        let (mut app, mut rx) = deferred_app();
+        in_local(async {
+            let list = LoginList {
+                providers: vec![(1, "Z.AI".into()), (2, "Baseten".into())],
+                error: Some("no omp".into()),
+                mcp: vec![("docs".into(), "https://docs.example".into())],
+            };
+            app.show_login(Ok(list));
+            assert!(app.overlay.is_none());
+            pump(&mut app, &mut rx).await;
+            let Some(Overlay::Login { pick }) = &app.overlay else { panic!("no login list") };
+            let labels: Vec<&LoginTarget> = pick.values().iter().collect();
+            assert!(labels.contains(&&LoginTarget::Provider(1)) && !labels.contains(&&LoginTarget::Provider(2)));
+            assert!(labels.contains(&&LoginTarget::Mcp("docs".into())));
+            assert!(labels.contains(&&LoginTarget::ChatGpt));
+            assert!(labels.contains(&&LoginTarget::CustomProvider(None)));
+            assert!(transcript_text(&app).contains("cannot list omp's login providers: no omp"));
+        });
+    }
+
+    #[test]
+    fn a_deferred_web_wizard_reads_and_saves_the_choice() {
+        let (mut app, mut rx) = deferred_app();
+        in_local(async {
+            let store = app.services.providers.store().clone();
+            let (tx, mut reply) = tokio::sync::oneshot::channel();
+            app.start_web_wizard(Some(tx));
+            assert!(app.overlay.is_none() && app.flows.web().is_none());
+            pump(&mut app, &mut rx).await;
+            assert!(matches!(app.overlay, Some(Overlay::Web { .. })));
+            app.on_web_pick(Some(6)); // Off
+            assert_eq!(reply.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+            pump(&mut app, &mut rx).await;
+            assert_eq!(reply.try_recv(), Ok(false));
+            assert_eq!(store.web(), Some(mu_provider::auth::web::WebSearch::off()));
+            store.set_web(None).unwrap();
+
+            // A keyed backend without a key asks for it through the host too.
+            app.start_web_wizard(None);
+            pump(&mut app, &mut rx).await;
+            app.on_web_pick(Some(3));
+            assert!(app.flows.key().is_none());
+            pump(&mut app, &mut rx).await;
+            let f = app.flows.key().expect("a key flow");
+            assert_eq!((f.target.id.as_str(), f.then), ("exa", Some(KeyThen::WebWizard)));
+        });
     }
 
     #[test]

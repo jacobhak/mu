@@ -2,6 +2,7 @@
 
 use super::child::ChildThen;
 use super::*;
+use crate::host::keys::KeyInfo;
 use crate::host::models::{self as models_host, ModelKind, ModelRow, ModelRows, RoleTable};
 use crate::panels::jobs_panel::JobsPanel;
 use crate::panels::model_roles::RoleEditor;
@@ -15,7 +16,6 @@ use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
 use mu_base::model_config::RoleMeta;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
-use mu_provider::provider::providers::KeyTarget;
 use tokio::sync::oneshot;
 
 /// How long ago `t` was, in words for the session picker.
@@ -489,11 +489,11 @@ impl App {
             OverlayEvent::Login(LoginTarget::CustomProvider(None)) => self.start_custom_wizard(),
             OverlayEvent::Login(LoginTarget::CustomProvider(Some(id))) => self.start_custom_edit(&id),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {
-                match KeyTarget::find(&id, self.services.providers.custom_registry()) {
-                    Ok(Some(target)) => self.begin_key(target),
+                self.host_call(host::keys::KEY_TARGET, &id, |app, r: Result<Option<KeyInfo>, String>| match r {
+                    Ok(Some(target)) => app.begin_key(target),
                     Ok(None) => {}
-                    Err(e) => self.error(&format!("{e:#}")),
-                }
+                    Err(e) => app.error(&e),
+                })
             }
             OverlayEvent::Key { provider, choice } => self.on_key_choice(&provider, choice),
             OverlayEvent::Logout(provider) => self.logout(&provider),
