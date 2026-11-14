@@ -42,7 +42,7 @@ pub fn release(path: &Path, who: &str, ask: bool) -> anyhow::Result<Option<i32>>
         }
         Owner::Unknown => {
             eprintln!(
-                "{who}: the session is locked by a process that left no owner record (an older mu, or another MU_HOME); stop it yourself"
+                "{who}: the session is locked by a process that left no owner record (an older mu, another MU_HOME, or a mirror of a remote subagent's session that is still running); stop it yourself or wait for it"
             );
             Ok(Some(1))
         }

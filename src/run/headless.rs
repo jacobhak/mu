@@ -192,6 +192,7 @@ const NUDGE: &str = "You have not submitted a result. Call the `yield` tool now 
 pub async fn subagent_mode(
     prompt: String,
     output_schema: Option<serde_json::Value>,
+    mirror: bool,
     cmd: UnboundedSender<Command>,
     ev: UnboundedReceiver<AgentEvent>,
 ) -> i32 {
@@ -211,14 +212,52 @@ pub async fn subagent_mode(
             }
         }
     });
-    let (result, code) = run_subagent(prompt, output_schema.is_some(), cmd, ev, line_rx, |l| println!("{l}")).await;
+    let (result, code) =
+        run_subagent(prompt, output_schema.is_some(), mirror, cmd, ev, line_rx, |l| println!("{l}")).await;
     println!("{result}");
     code
 }
 
+/// How often a mirrored run sends the lines its session file gained.
+const MIRROR_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A session file whose lines go to the parent as `entry` lines, in order and each once.
+struct Mirrored {
+    path: std::path::PathBuf,
+    name: String,
+    offset: u64,
+}
+
+impl Mirrored {
+    /// Sends every complete line the file gained since the last call; a partial last line waits.
+    fn flush(&mut self, out: &dyn Fn(serde_json::Value)) {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut buf = Vec::new();
+        let read = std::fs::File::open(&self.path)
+            .and_then(|mut f| f.seek(SeekFrom::Start(self.offset)).and_then(|_| f.read_to_end(&mut buf)));
+        let Some(end) = read.ok().and_then(|_| buf.iter().rposition(|&b| b == b'\n')) else { return };
+        self.offset += end as u64 + 1;
+        for line in buf[..end].split(|&b| b == b'\n') {
+            out(serde_json::json!({"type": "entry", "file": self.name, "line": String::from_utf8_lossy(line)}));
+        }
+    }
+}
+
+async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// `mirror`: the parent asked for the session file over the stream, as `entry` lines instead of a
+/// `session` line.
 pub(crate) async fn run_subagent(
     prompt: String,
     structured: bool,
+    mirror: bool,
     cmd: UnboundedSender<Command>,
     mut ev: UnboundedReceiver<AgentEvent>,
     mut lines: UnboundedReceiver<String>,
@@ -238,8 +277,20 @@ pub(crate) async fn run_subagent(
         Default::default();
     let mut next_id: u64 = 0;
     let mut stdin_open = true;
+    let mut mirrored: Option<Mirrored> = None;
+    let mut tick = mirror.then(|| {
+        let mut t = tokio::time::interval(MIRROR_EVERY);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    });
     loop {
         let e = tokio::select! {
+            _ = next_tick(&mut tick), if mirrored.is_some() => {
+                if let Some(m) = &mut mirrored {
+                    m.flush(&out);
+                }
+                continue;
+            }
             e = ev.recv() => match e {
                 Some(e) => e,
                 None => break,
@@ -290,9 +341,22 @@ pub(crate) async fn run_subagent(
             }
             AgentEvent::Status(s) => {
                 if let (Some(p), None) = (&s.session_path, &session) {
-                    out(json!({"type": "session", "path": p}));
+                    if mirror {
+                        let path = std::path::PathBuf::from(p);
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        mirrored = Some(Mirrored { path, name, offset: 0 });
+                    } else {
+                        out(json!({"type": "session", "path": p}));
+                    }
                 }
                 session = s.session_path.or(session);
+            }
+            AgentEvent::ChildEntry { file, line } => {
+                // The child's own lines go first, so its mirror is the first file the parent sees.
+                if let Some(m) = &mut mirrored {
+                    m.flush(&out);
+                }
+                out(json!({"type": "entry", "file": file, "line": line}));
             }
             AgentEvent::Retry { attempt, max_attempts, delay, reason } => {
                 eprintln!("{}", retry_notice(attempt, max_attempts, delay, &reason))
@@ -320,6 +384,9 @@ pub(crate) async fn run_subagent(
             AgentEvent::Exit => break,
             _ => {}
         }
+    }
+    if let Some(m) = &mut mirrored {
+        m.flush(&out);
     }
     if !acc.exited {
         is_error = true;
@@ -374,7 +441,7 @@ mod tests {
         let (ctx, _crx) = unbounded_channel();
         let (etx, erx) = unbounded_channel();
         drop(etx); // the agent task died before sending Exit
-        assert_eq!(rt.block_on(subagent_mode("x".into(), None, ctx, erx)), 1);
+        assert_eq!(rt.block_on(subagent_mode("x".into(), None, false, ctx, erx)), 1);
         let (ctx, _crx) = unbounded_channel();
         let (etx, erx) = unbounded_channel();
         drop(etx);
@@ -519,7 +586,7 @@ mod tests {
             etx.send(e).unwrap();
         }
         let (_line_tx, line_rx) = unbounded_channel();
-        let (r, code) = rt.block_on(run_subagent("x".into(), structured, ctx, erx, line_rx, |_| {}));
+        let (r, code) = rt.block_on(run_subagent("x".into(), structured, false, ctx, erx, line_rx, |_| {}));
         let mut cmds = Vec::new();
         while let Ok(c) = crx.try_recv() {
             cmds.push(c);
@@ -543,11 +610,149 @@ mod tests {
         }
         let lines = std::cell::RefCell::new(Vec::new());
         let (_line_tx, line_rx) = unbounded_channel();
-        rt.block_on(run_subagent("x".into(), false, ctx, erx, line_rx, |l| lines.borrow_mut().push(l)));
+        rt.block_on(run_subagent("x".into(), false, false, ctx, erx, line_rx, |l| lines.borrow_mut().push(l)));
         let lines = lines.into_inner();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0], serde_json::json!({"type": "session", "path": "/s/a.jsonl"}));
         assert_eq!(lines[1]["type"], "tool");
+    }
+
+    /// A session file as a child writes it, in the session directory of a fresh cwd.
+    fn child_session(parent: Option<&Path>, text: &str) -> mu_session::session::file::SessionFile {
+        let mut s = mu_session::session::file::SessionFile::create(&mu_testutil::tmp(), parent).unwrap();
+        s.message(&mu_base::message::Message::user(text));
+        s
+    }
+
+    fn file_lines(p: &Path) -> Vec<String> {
+        std::fs::read_to_string(p).unwrap().lines().map(String::from).collect()
+    }
+
+    fn entry_lines(lines: &[serde_json::Value]) -> Vec<String> {
+        lines.iter().filter(|l| l["type"] == "entry").map(|l| l["line"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn a_mirrored_run_sends_its_session_file_as_entries_and_no_session_line() {
+        mu_testutil::home();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let mut s = child_session(None, "first");
+        let (path, name) = (s.path.clone(), s.path.file_name().unwrap().to_string_lossy().into_owned());
+        let (ctx, _crx) = unbounded_channel();
+        let (etx, erx) = unbounded_channel();
+        let (_line_tx, line_rx) = unbounded_channel();
+        let lines = std::cell::RefCell::new(Vec::new());
+        let driver = async {
+            etx.send(status(0.0, path.to_str())).unwrap();
+            tokio::time::sleep(MIRROR_EVERY * 3).await;
+            let before = lines.borrow().len();
+            assert_eq!(before, 3, "title slot, header and the first message went out on the interval");
+            s.message(&mu_base::message::Message::user("second"));
+            etx.send(AgentEvent::Exit).unwrap();
+            before
+        };
+        let run = run_subagent("x".into(), false, true, ctx, erx, line_rx, |l| lines.borrow_mut().push(l));
+        let (before, _) = rt.block_on(async { tokio::join!(driver, run) });
+        let lines = lines.into_inner();
+        assert_eq!(lines.len(), before + 1, "the line written just before exit is not lost: {lines:?}");
+        assert!(lines.iter().all(|l| l["type"] == "entry" && l["file"] == name.as_str()), "{lines:?}");
+        assert_eq!(entry_lines(&lines), file_lines(&path));
+        assert_eq!(entry_lines(&lines)[0].len(), 255, "the title slot is the first line");
+    }
+
+    #[test]
+    fn forwarded_child_entries_are_written_out_after_this_runs_own_lines() {
+        mu_testutil::home();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let s = child_session(None, "mine");
+        let path = s.path.clone();
+        let (ctx, _crx) = unbounded_channel();
+        let (etx, erx) = unbounded_channel();
+        let (_line_tx, line_rx) = unbounded_channel();
+        for e in [
+            status(0.0, path.to_str()),
+            AgentEvent::ChildEntry { file: "g.jsonl".into(), line: "{\"a\":1}".into() },
+            AgentEvent::Exit,
+        ] {
+            etx.send(e).unwrap();
+        }
+        let lines = std::cell::RefCell::new(Vec::new());
+        rt.block_on(run_subagent("x".into(), false, true, ctx, erx, line_rx, |l| lines.borrow_mut().push(l)));
+        let lines = lines.into_inner();
+        let own = file_lines(&path).len();
+        assert_eq!(lines.len(), own + 1, "{lines:?}");
+        assert!(lines[..own].iter().all(|l| l["file"] != "g.jsonl"));
+        assert_eq!(lines[own], json!({"type": "entry", "file": "g.jsonl", "line": "{\"a\":1}"}));
+        // Unmirrored, a forwarded line still goes out unchanged.
+        let (ctx, _crx) = unbounded_channel();
+        let (etx, erx) = unbounded_channel();
+        let (_line_tx, line_rx) = unbounded_channel();
+        for e in [AgentEvent::ChildEntry { file: "g.jsonl".into(), line: "x".into() }, AgentEvent::Exit] {
+            etx.send(e).unwrap();
+        }
+        let lines = std::cell::RefCell::new(Vec::new());
+        rt.block_on(run_subagent("x".into(), false, false, ctx, erx, line_rx, |l| lines.borrow_mut().push(l)));
+        assert_eq!(lines.into_inner(), [json!({"type": "entry", "file": "g.jsonl", "line": "x"})]);
+    }
+
+    #[test]
+    fn two_levels_of_mirroring_reach_the_top_parent_and_the_cost_scan() {
+        use mu_session::session::tree_cost::{Child, TreeCost};
+        use mu_tools::tools::subagent::{ChildCmd, Mirror, run_child_observed};
+        use std::os::unix::fs::PermissionsExt;
+        mu_testutil::home();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let root = child_session(None, "root");
+        let kid = child_session(Some(&root.path), "kid");
+        // The grandchild ran in a directory of its own.
+        let grand = child_session(Some(&kid.path), "grand");
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let (ctx, _crx) = unbounded_channel();
+        let (etx, erx) = unbounded_channel();
+        let (_line_tx, line_rx) = unbounded_channel();
+        etx.send(status(0.0, kid.path.to_str())).unwrap();
+        for l in file_lines(&grand.path) {
+            etx.send(AgentEvent::ChildEntry { file: name(&grand.path), line: l }).unwrap();
+        }
+        etx.send(AgentEvent::Exit).unwrap();
+        let sent = std::cell::RefCell::new(Vec::new());
+        rt.block_on(run_subagent("x".into(), false, true, ctx, erx, line_rx, |l| sent.borrow_mut().push(l)));
+        let stream: String = sent.into_inner().iter().map(|l| format!("{l}\n")).collect();
+
+        let dir = mu_testutil::tmp();
+        std::fs::write(dir.join("stream.ndjson"), stream).unwrap();
+        let exe = dir.join("fake-mu");
+        let body = format!(
+            "#!/bin/sh\ncat '{}'\necho '{{\"type\":\"result\",\"text\":\"ok\"}}'\n",
+            dir.join("stream.ndjson").display()
+        );
+        std::fs::write(&exe, body).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let top_cwd = mu_testutil::tmp();
+        let started = std::cell::RefCell::new(Vec::new());
+        let out = tokio::task::LocalSet::new().block_on(
+            &rt,
+            run_child_observed(
+                ChildCmd::Local(exe),
+                &top_cwd,
+                &json!({}),
+                &tokio_util::sync::CancellationToken::new(),
+                |_, _| {},
+                |p| started.borrow_mut().push(p.to_string()),
+                |_| {},
+                None,
+                Mirror::Write,
+            ),
+        );
+        assert!(out.ok && out.text == "ok", "{}", out.text);
+        let beside = mu_common::paths::session_dir(&top_cwd);
+        let (kid_mirror, grand_mirror) = (beside.join(name(&kid.path)), beside.join(name(&grand.path)));
+        assert_eq!(*started.borrow(), [kid_mirror.to_string_lossy()]);
+        assert_eq!(file_lines(&kid_mirror), file_lines(&kid.path));
+        assert_eq!(file_lines(&grand_mirror), file_lines(&grand.path));
+        let mut t = TreeCost::default();
+        t.poll(Some(&root.path), &[Child { path: kid_mirror.clone(), running: false }]);
+        assert!(t.costs().contains_key(&grand_mirror) && t.costs().contains_key(&kid_mirror), "{:?}", t.costs());
     }
 
     fn yielded(details: serde_json::Value) -> AgentEvent {
@@ -632,7 +837,7 @@ mod tests {
             }
         };
         let (_line_tx, line_rx) = unbounded_channel();
-        let (_, r) = tokio::join!(agent_side, run_subagent("go".into(), structured, ctx, rx, line_rx, |_| {}));
+        let (_, r) = tokio::join!(agent_side, run_subagent("go".into(), structured, false, ctx, rx, line_rx, |_| {}));
         r
     }
 

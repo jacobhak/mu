@@ -455,6 +455,11 @@ pub enum AgentEvent {
         reason: String,
     },
     Notice(String),
+    /// A line of a nested child's session file, passing through a mirrored worker to its parent.
+    ChildEntry {
+        file: String,
+        line: String,
+    },
     Error(String),
     Compacting,
     Compacted {

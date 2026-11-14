@@ -74,6 +74,8 @@ pub struct Tools {
     pub permissions: Rc<crate::permissions::Permissions>,
     /// `[task] launcher`: when set, `task` subagents start through it instead of `mu --headless`.
     pub launcher: Vec<String>,
+    /// This process's session file is mirrored by its parent, so its children's lines go there too.
+    pub mirror: bool,
     shell: shell::worker::ShellWorker,
     /// Where the persistent shell was after the last foreground bash call; see `pathnote`.
     shell_cwd: std::cell::RefCell<Option<PathBuf>>,
@@ -110,6 +112,7 @@ impl Tools {
             repeats: Default::default(),
             permissions: Rc::default(),
             launcher: Vec::new(),
+            mirror: false,
             shell: Default::default(),
             shell_cwd: Default::default(),
             shell_env: Default::default(),

@@ -291,21 +291,68 @@ impl SessionFile {
     /// Rewrites the fixed title slot in place (only if line 1 really is one) and records a
     /// `title_change` entry, which `load` also honours.
     pub fn set_title(&mut self, title: &str, source: TitleSource) {
-        use std::os::unix::fs::FileExt;
-        let slot = title_slot(title, Some(source.as_str()));
-        let wrote = OpenOptions::new().read(true).write(true).open(&self.path).and_then(|f| {
-            let mut head = [0u8; TITLE_SLOT_BYTES];
-            let is_slot = f.read_exact_at(&mut head, 0).is_ok()
-                && head[TITLE_SLOT_BYTES - 1] == b'\n'
-                && !head[..TITLE_SLOT_BYTES - 1].contains(&b'\n')
-                && serde_json::from_slice::<Value>(&head).is_ok_and(|v| v["type"] == "title");
-            if is_slot { f.write_all_at(slot.as_bytes(), 0) } else { Ok(()) }
-        });
-        if let Err(e) = wrote {
+        if let Err(e) = rewrite_title_slot(&self.path, title, source.as_str()) {
             self.report(format!("title write failed: {e}"));
         }
         self.append(EntryKind::TitleChange, json!({"title":title,"source":source.as_str()}));
         self.sync();
+    }
+}
+
+/// Rewrites the fixed title slot of the session file at `path` in place, only if line 1 really is
+/// one. `source` is `"user"` or `"auto"`.
+pub fn rewrite_title_slot(path: &Path, title: &str, source: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let slot = title_slot(title, Some(source));
+    let f = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut head = [0u8; TITLE_SLOT_BYTES];
+    let is_slot = f.read_exact_at(&mut head, 0).is_ok()
+        && head[TITLE_SLOT_BYTES - 1] == b'\n'
+        && !head[..TITLE_SLOT_BYTES - 1].contains(&b'\n')
+        && serde_json::from_slice::<Value>(&head).is_ok_and(|v| v["type"] == "title");
+    if is_slot { f.write_all_at(slot.as_bytes(), 0) } else { Ok(()) }
+}
+
+/// A copy of a remote child's session file, written line by line as the child sends them. It holds
+/// the session lock for its life but claims no owner record: nothing lists it as a live session,
+/// and `--resume` and `mu take` refuse it until the run ends.
+pub struct MirrorFile {
+    pub path: PathBuf,
+    file: File,
+}
+
+impl MirrorFile {
+    /// Creates `name` (a plain `*.jsonl` file name) in the session directory of `cwd`; an existing
+    /// file is an error.
+    pub fn create(cwd: &Path, name: &str) -> Result<Self> {
+        if !super::list::valid_file_name(name) {
+            bail!("not a session file name: {name:?}");
+        }
+        let dir = paths::session_dir(cwd);
+        mu_common::fs::create_private_dir(&paths::profile_home())
+            .and_then(|()| mu_common::fs::create_private_dir(&dir))
+            .with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join(name);
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new().create_new(true).append(true).mode(0o600).open(&path)?
+        };
+        lock(&file, &path)?;
+        Ok(Self { path, file })
+    }
+
+    /// Appends `line` and a newline. A `title_change` entry also rewrites the title slot, as
+    /// `set_title` did in the child.
+    pub fn append_line(&mut self, line: &str) -> Result<()> {
+        self.file.write_all(format!("{line}\n").as_bytes())?;
+        if line.contains("\"title_change\"")
+            && let Ok(v) = serde_json::from_str::<Value>(line)
+            && v["type"] == "title_change"
+            && let (Some(title), Some(source)) = (v["title"].as_str(), v["source"].as_str())
+        {
+            rewrite_title_slot(&self.path, title, source)?;
+        }
+        Ok(())
     }
 }
 

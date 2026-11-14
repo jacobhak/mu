@@ -323,6 +323,12 @@ fn apply_task(run: &mut agent::RunConfig, p: &Value, cfgs: &mu_base::config::Con
     let agent_name = p["agent"].as_str().unwrap_or(context::TASK);
     run.request_budget = mu_tools::tools::task::soft_request_budget(agent_name, cfgs.mu.task.soft_request_budget);
     run.budget_notice = cfgs.mu.task.budget_notice;
+    run.mirror_session = mirrors_session(p);
+}
+
+/// Whether the parent asked for this run's session file over the stream.
+fn mirrors_session(p: &Value) -> bool {
+    p["mirrorSession"] == true
 }
 
 /// The launcher `task` subagents start through. A worker (it has a task payload) gets none: it
@@ -397,7 +403,7 @@ async fn subagent(
     let task = p["task"].as_str().unwrap_or("");
     let prompt = extra.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
     println!("{}", json!({"type": "model", "label": model_label}));
-    headless::subagent_mode(prompt, output_schema, cmd, ev).await
+    headless::subagent_mode(prompt, output_schema, mirrors_session(p), cmd, ev).await
 }
 
 /// The subagent task on stdin, and the agent it names: a project agent, else one of mu's built-in

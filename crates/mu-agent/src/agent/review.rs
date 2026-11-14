@@ -213,6 +213,7 @@ impl Agent {
                     cancel,
                     progress,
                     self.tools.permissions.clone(),
+                    mu_tools::tools::subagent::Mirror::Off,
                 )
                 .await
             }

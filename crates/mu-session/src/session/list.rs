@@ -36,6 +36,16 @@ pub fn latest_for(cwd: &Path) -> Option<PathBuf> {
     })
 }
 
+/// A session file name is one path component ending in `.jsonl`, with characters from
+/// `[A-Za-z0-9._-]` and no leading dot.
+pub fn valid_file_name(name: &str) -> bool {
+    name.strip_suffix(".jsonl").is_some_and(|stem| {
+        !stem.is_empty()
+            && !stem.starts_with('.')
+            && stem.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    })
+}
+
 /// A session id is `[A-Za-z0-9-]+`: nothing that could name a path.
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
@@ -191,6 +201,14 @@ mod tests {
     use super::*;
     use crate::session::file::SessionFile;
     use mu_testutil::home;
+
+    #[test]
+    fn a_session_file_name_is_one_plain_jsonl_component() {
+        assert!(valid_file_name("2026-11-14T10-00-00-000Z_0192abcd-ef.jsonl"));
+        for bad in ["", ".jsonl", ".hidden.jsonl", "a.txt", "a/b.jsonl", "../a.jsonl", "a b.jsonl", "a\\b.jsonl"] {
+            assert!(!valid_file_name(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn id_validation_and_lookup() {

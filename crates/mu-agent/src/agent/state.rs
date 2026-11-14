@@ -51,6 +51,9 @@ pub struct RunConfig {
     pub budget_notice: bool,
     /// `[task] launcher`: the command `task` subagents start through. Empty in a subagent.
     pub task_launcher: Vec<String>,
+    /// The parent asked for this run's session file over the stream: its own children's lines pass
+    /// on to the parent too.
+    pub mirror_session: bool,
 }
 
 /// Messages queued while a turn runs, plus the turn's cancellation token. Only the agent loop touches it;

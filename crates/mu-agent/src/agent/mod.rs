@@ -264,6 +264,7 @@ impl Agent {
         }
         tools.permissions = permissions;
         tools.launcher = i.run.task_launcher.clone();
+        tools.mirror = i.run.mirror_session;
         let budget = (i.run.subagent && i.run.request_budget > 0)
             .then(|| budget::Budget::new(i.run.request_budget, i.run.budget_notice));
         let (title_tx, title_rx) = unbounded_channel();

@@ -217,6 +217,7 @@ impl AgentView {
                 | AgentEvent::Todo(_)
                 | AgentEvent::TurnStart
                 | AgentEvent::Retry { .. }
+                | AgentEvent::ChildEntry { .. }
         ) {
             self.tr.flush_reveal(w);
         }
@@ -396,7 +397,10 @@ impl AgentView {
             AgentEvent::Queue(q) => self.queued = q,
             AgentEvent::QueuedDropped(queued) => fx.push(Effect::Restore { queued }),
             AgentEvent::QueuePopped(p) => fx.push(Effect::Popped(p)),
-            AgentEvent::Exit | AgentEvent::TurnFailed | AgentEvent::ToolSkipped { .. } => {}
+            AgentEvent::Exit
+            | AgentEvent::TurnFailed
+            | AgentEvent::ToolSkipped { .. }
+            | AgentEvent::ChildEntry { .. } => {}
         }
         fx
     }

@@ -1,4 +1,4 @@
-use super::subagent::{ArtifactAlloc, ChildCmd, Outcome, prepare_launch, preview_result, run_child_observed};
+use super::subagent::{ArtifactAlloc, ChildCmd, Mirror, Outcome, prepare_launch, preview_result, run_child_observed};
 use super::{ToolCtx, Tools};
 use crate::permissions::Permissions;
 use futures_util::future::join_all;
@@ -166,9 +166,21 @@ impl Tools {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),
         };
+        // A launched child's session file is on another machine, and a mirrored worker's children's
+        // lines must reach its own parent: both ask their child to send its lines.
+        let mirror = if self.mirror {
+            Mirror::Forward(ctx.events.clone())
+        } else if self.launcher.is_empty() {
+            Mirror::Off
+        } else {
+            Mirror::Write
+        };
         let payload = |agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
             let mut p = json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
             p["permissions"] = self.permissions.inherit_json();
+            if self.mirror || !self.launcher.is_empty() {
+                p["mirrorSession"] = json!(true);
+            }
             if let Some(s) = schema {
                 p["outputSchema"] = s.clone();
             }
@@ -212,6 +224,7 @@ impl Tools {
                     payload(agent, task, schemas[i], model.as_deref()),
                     self.permissions.clone(),
                     self.artifact_dir(),
+                    mirror.clone(),
                 );
                 started.push(format!("{id} ({agent})"));
             }
@@ -223,7 +236,7 @@ impl Tools {
             ));
         }
         let alloc = || self.next_artifact();
-        let how = Starter { exe: &exe, launcher: &self.launcher, session: &session };
+        let how = Starter { exe: &exe, launcher: &self.launcher, session: &session, mirror };
         run_foreground(&specs, &schemas, &how, &payload, &ctx.cancel, &ctx.events, &self.permissions, &self.cwd, &alloc)
             .await
     }
@@ -236,6 +249,7 @@ struct Starter<'a> {
     launcher: &'a [String],
     /// The parent's session id.
     session: &'a str,
+    mirror: Mirror,
 }
 
 /// Builds one child's task payload.
@@ -305,6 +319,7 @@ async fn run_foreground(
                 |_| {},
                 |model| rows.borrow_mut()[i].model = Some(model.to_string()),
                 Some(&|r| perms.forward(events, &label, r)),
+                how.mirror.clone(),
             )
             .await;
             rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
@@ -417,6 +432,7 @@ mod cwd_tests {
                 |p| seen.borrow_mut().push(format!("session {p}")),
                 |m| seen.borrow_mut().push(format!("model {m}")),
                 None,
+                Mirror::Off,
             ))
             .await;
         assert!(out.ok, "{}", out.text);
@@ -546,6 +562,27 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn only_a_mirrored_parent_asks_its_local_child_for_the_session_lines() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-mirror-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, ECHO_CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut t = Tools::for_test();
+        t.child_exe = Some(exe);
+        let args = || -> Args {
+            serde_json::from_value(json!({"tasks":[{"task":"x","solutionSpace":"one fix: given"}]})).unwrap()
+        };
+        let out = tokio::task::LocalSet::new().run_until(t.task(args(), &ctx())).await;
+        assert!(!out.text.contains("mirrorSession"), "{}", out.text);
+        t.mirror = true;
+        let out = tokio::task::LocalSet::new().run_until(t.task(args(), &ctx())).await;
+        assert!(out.text.contains(r#""mirrorSession":true"#), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_failed_launch_prepare_is_that_rows_failure() {
         let mut t = Tools::for_test();
         t.launcher = vec!["/nonexistent/launcher".into()];
@@ -611,6 +648,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
             |_| {},
             |_| {},
             answer,
+            Mirror::Off,
         )
         .await
         .text

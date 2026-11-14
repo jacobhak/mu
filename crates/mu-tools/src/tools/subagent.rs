@@ -1,10 +1,13 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
 use super::task::depth;
+use mu_base::events::{AgentEvent, EventTx};
 use mu_base::git::{git, prune_refs, repo_root, short_sha, snapshot_tree};
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
+use mu_session::session::file::MirrorFile;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -164,6 +167,13 @@ enum ChildEvent {
         #[serde(default)]
         label: String,
     },
+    /// One line of a mirrored child's session file (`file` names it), sent when the payload asked.
+    Entry {
+        #[serde(default)]
+        file: String,
+        #[serde(default)]
+        line: String,
+    },
     /// A tool call needs approval; the parent answers with an `approval` line on stdin.
     Approve {
         id: u64,
@@ -190,6 +200,57 @@ struct ChildResult {
     schema_ok: Option<bool>,
 }
 
+/// What a parent does with a child's `entry` lines.
+#[derive(Clone)]
+pub enum Mirror {
+    /// A local child of an unmirrored parent: they are dropped.
+    Off,
+    /// The top parent: each file is written beside the local sessions.
+    Write,
+    /// A mirrored worker: they pass on to its own parent through its events.
+    Forward(EventTx),
+}
+
+/// The mirror files of one run. The first is the child's own session; later ones are its children's,
+/// written beside it so the cost scan, which reads the child's directory, finds them.
+#[derive(Default)]
+struct Mirrors {
+    /// `None` once mirroring that file ended.
+    files: HashMap<String, Option<MirrorFile>>,
+    first: bool,
+}
+
+impl Mirrors {
+    /// Appends `line` to the mirror of `file`. Returns the path of the child's own mirror when this
+    /// call created it, and a notice when mirroring `file` ends.
+    fn write(&mut self, cwd: &Path, file: &str, line: &str) -> (Option<String>, Option<String>) {
+        let mut created = None;
+        if !self.files.contains_key(file) {
+            match MirrorFile::create(cwd, file) {
+                Ok(m) => {
+                    if !self.first {
+                        created = Some(m.path.to_string_lossy().into_owned());
+                        self.first = true;
+                    }
+                    self.files.insert(file.to_string(), Some(m));
+                }
+                Err(e) => {
+                    self.files.insert(file.to_string(), None);
+                    return (None, Some(format!("[session mirror of {file} not kept: {e}]")));
+                }
+            }
+        }
+        let Some(Some(m)) = self.files.get_mut(file) else { return (created, None) };
+        match m.append_line(line) {
+            Ok(()) => (created, None),
+            Err(e) => {
+                self.files.insert(file.to_string(), None);
+                (created, Some(format!("[session mirror of {file} stopped: {e}]")))
+            }
+        }
+    }
+}
+
 /// Runs one `mu --headless` subagent in `cwd`, reporting each tool call to `on_tool(name, summary)`.
 /// `cancel` terminates the child's process group.
 pub async fn run_child(
@@ -199,12 +260,24 @@ pub async fn run_child(
     cancel: &CancellationToken,
     on_tool: impl FnMut(&str, &str),
 ) -> Outcome {
-    run_child_observed(ChildCmd::Local(exe.to_path_buf()), cwd, payload, cancel, on_tool, |_| {}, |_| {}, None).await
+    run_child_observed(
+        ChildCmd::Local(exe.to_path_buf()),
+        cwd,
+        payload,
+        cancel,
+        on_tool,
+        |_| {},
+        |_| {},
+        None,
+        Mirror::Off,
+    )
+    .await
 }
 
 /// `run_child` that also reports the child's session file to `on_session(path)` as soon as the child
 /// has opened it, and its model label to `on_model` (older children never say, so either may not run).
-/// `approve` answers the child's approval requests; `None` means nobody can.
+/// `approve` answers the child's approval requests; `None` means nobody can. `mirror` says what
+/// to do with the child's `entry` lines; a mirrored file's local path goes to `on_session`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_child_observed(
     child: ChildCmd,
@@ -215,6 +288,7 @@ pub async fn run_child_observed(
     mut on_session: impl FnMut(&str),
     mut on_model: impl FnMut(&str),
     approve: Option<&dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision>>,
+    mirror: Mirror,
 ) -> Outcome {
     let launched = matches!(child, ChildCmd::Launched(_));
     let mut cmd = match &child {
@@ -284,6 +358,8 @@ pub async fn run_child_observed(
     let mut cancelled = false;
     let mut bad_line: Option<String> = None;
     let mut changes: Option<(String, String, u64)> = None;
+    let mut mirrors = Mirrors::default();
+    let mut notices: Vec<String> = Vec::new();
     let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
@@ -301,6 +377,19 @@ pub async fn run_child_observed(
                             }
                         }
                         Ok(ChildEvent::Model { label }) => on_model(&label),
+                        Ok(ChildEvent::Entry { file, line }) => match &mirror {
+                            Mirror::Off => {}
+                            Mirror::Forward(tx) => {
+                                let _ = tx.send(AgentEvent::ChildEntry { file, line });
+                            }
+                            Mirror::Write => {
+                                let (created, notice) = mirrors.write(cwd, &file, &line);
+                                if let Some(path) = created {
+                                    on_session(&path);
+                                }
+                                notices.extend(notice);
+                            }
+                        },
                         Ok(ChildEvent::Approve { id, request }) => {
                             let rx = match approve {
                                 Some(f) => f(request),
@@ -358,7 +447,12 @@ pub async fn run_child_observed(
             String::new()
         }
     };
+    drop(mirrors);
     let mut out = outcome(result, payload, cancelled, stderr_tail, bad_line);
+    for n in notices {
+        out.text.push('\n');
+        out.text.push_str(&n);
+    }
     if let Some((r#ref, base, files)) = changes {
         out.text.push_str(&format!(
             "\n[changes: {files} files at {}, base {}; see git diff {base} {}]",
@@ -524,6 +618,7 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
                     |p| sessions.borrow_mut().push(p.to_string()),
                     |_| {},
                     None,
+                    Mirror::Off,
                 )
                 .await
             })
@@ -572,6 +667,7 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
                     |_| {},
                     |_| {},
                     None,
+                    Mirror::Off,
                 )
                 .await
             })
@@ -623,6 +719,7 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
                             |_| {},
                             |_| {},
                             None,
+                            Mirror::Off,
                         )
                         .await
                     }
@@ -677,5 +774,168 @@ mod preview_tests {
         assert!(!saved.contains("Qz9-preview"), "{saved}");
         assert!(saved.contains("[REDACTED:PREVIEW_TEST_KEY]"), "{saved}");
         std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+    use mu_base::process::try_flock;
+    use mu_session::session::file::SessionFile;
+    use mu_session::session::tail::Tail;
+    use mu_session::session::tree_cost::{Child, TreeCost, session_cost};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
+
+    /// A session file as a child would have written it: title slot, header, one reply costing `cost`.
+    fn source(cwd: &Path, parent: Option<&Path>, cost: f64) -> PathBuf {
+        let s = SessionFile::create(cwd, parent).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let m = json!({"role":"assistant","content":[{"type":"text","text":"hi"}],"api":"a","provider":"p","model":"m","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,
+            "totalTokens":2,"cost":{"total":cost}},"stopReason":"stop","timestamp":1});
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{}", json!({"type":"message","id":"x","parentId":null,"message":m})).unwrap();
+        path
+    }
+
+    fn name(p: &Path) -> String {
+        p.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    /// The `entry` lines a child sends for `lines` of the file `file`.
+    fn entries(file: &str, lines: &[String]) -> Vec<String> {
+        lines.iter().map(|l| json!({"type": "entry", "file": file, "line": l}).to_string()).collect()
+    }
+
+    fn lines_of(p: &Path) -> Vec<String> {
+        std::fs::read_to_string(p).unwrap().lines().map(String::from).collect()
+    }
+
+    /// A child that prints `stream`, then a result.
+    fn child(dir: &Path, stream: &[String]) -> PathBuf {
+        let data = dir.join("stream.ndjson");
+        std::fs::write(&data, stream.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let exe = dir.join("fake-mu");
+        let body = format!("#!/bin/sh\ncat '{}'\necho '{{\"type\":\"result\",\"text\":\"ok\"}}'\n", data.display());
+        std::fs::write(&exe, body).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    async fn run(exe: PathBuf, cwd: &Path, on_session: impl FnMut(&str)) -> Outcome {
+        tokio::task::LocalSet::new()
+            .run_until(run_child_observed(
+                ChildCmd::Local(exe),
+                cwd,
+                &json!({}),
+                &CancellationToken::new(),
+                |_, _| {},
+                on_session,
+                |_| {},
+                None,
+                Mirror::Write,
+            ))
+            .await
+    }
+
+    fn locked(path: &Path) -> bool {
+        let f = std::fs::File::open(path).unwrap();
+        try_flock(&f, libc::LOCK_EX).is_err()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn entries_become_a_locked_session_file_beside_the_local_ones() {
+        mu_testutil::home();
+        let (src, cwd, dir) = (mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp());
+        let remote = source(&src, None, 0.25);
+        let lines = lines_of(&remote);
+        let exe = child(&dir, &entries(&name(&remote), &lines));
+        let seen = std::cell::RefCell::new(Vec::new());
+        let held = std::cell::Cell::new(false);
+        let out = run(exe, &cwd, |p| {
+            held.set(locked(Path::new(p)));
+            seen.borrow_mut().push(p.to_string());
+        })
+        .await;
+        assert!(out.ok && out.text == "ok", "{}", out.text);
+        let mirror = mu_common::paths::session_dir(&cwd).join(name(&remote));
+        assert_eq!(*seen.borrow(), [mirror.to_string_lossy()]);
+        assert!(held.get(), "the file is locked while the run goes");
+        assert!(!locked(&mirror), "and free after it");
+        assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&remote).unwrap());
+        assert!((session_cost(&mirror) - 0.25).abs() < 1e-9);
+        let mut tail = Tail::new(&mirror, 10);
+        tail.poll();
+        assert_eq!(tail.messages().len(), 1);
+        // A finished mirror is an ordinary session.
+        let open = SessionFile::open_append(&mirror).unwrap();
+        assert_eq!(mu_session::session::format::load(&open.path).unwrap().messages.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_title_change_entry_rewrites_the_title_slot() {
+        mu_testutil::home();
+        let (src, cwd, dir) = (mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp());
+        let remote = source(&src, None, 0.0);
+        let mut lines = lines_of(&remote);
+        lines.push(
+            json!({"type":"title_change","id":"t","parentId":null,"timestamp":"x","title":"A new title","source":"auto"})
+                .to_string(),
+        );
+        let exe = child(&dir, &entries(&name(&remote), &lines));
+        assert!(run(exe, &cwd, |_| {}).await.ok);
+        let mirror = mu_common::paths::session_dir(&cwd).join(name(&remote));
+        let written = lines_of(&mirror);
+        assert_eq!(written.len(), lines.len(), "no second title_change was appended");
+        assert_eq!(&written[1..], &lines[1..]);
+        let slot: Value = serde_json::from_str(&written[0]).unwrap();
+        assert_eq!((slot["type"].as_str(), slot["title"].as_str()), (Some("title"), Some("A new title")));
+        assert_eq!(std::fs::read(&mirror).unwrap()[255], b'\n');
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bad_or_taken_name_ends_that_mirror_with_one_notice() {
+        mu_testutil::home();
+        let (src, cwd, dir) = (mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp());
+        let remote = source(&src, None, 0.0);
+        let lines = lines_of(&remote);
+        let taken = mu_common::paths::session_dir(&cwd).join(name(&remote));
+        std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+        std::fs::write(&taken, "mine\n").unwrap();
+        let mut stream = entries(&name(&remote), &lines);
+        stream.extend(entries("../escape.jsonl", &lines));
+        stream.extend(entries("notes.txt", &lines));
+        let exe = child(&dir, &stream);
+        let called = std::cell::Cell::new(0);
+        let out = run(exe, &cwd, |_| called.set(called.get() + 1)).await;
+        assert!(out.ok && out.text.starts_with("ok"), "{}", out.text);
+        assert_eq!(out.text.matches("not kept").count(), 3, "{}", out.text);
+        assert_eq!(called.get(), 0);
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "mine\n", "an existing file is left alone");
+        assert!(!mu_common::paths::session_dir(&cwd).join("../escape.jsonl").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_nested_mirror_is_counted_with_its_parent_whatever_its_own_cwd() {
+        mu_testutil::home();
+        let (root_cwd, kid_cwd, grand_cwd, cwd, dir) =
+            (mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp());
+        let root = source(&root_cwd, None, 5.0);
+        let kid = source(&kid_cwd, Some(&root), 0.25);
+        let grand = source(&grand_cwd, Some(&kid), 0.125);
+        let mut stream = entries(&name(&kid), &lines_of(&kid));
+        stream.extend(entries(&name(&grand), &lines_of(&grand)));
+        let exe = child(&dir, &stream);
+        let seen = std::cell::RefCell::new(Vec::new());
+        assert!(run(exe, &cwd, |p| seen.borrow_mut().push(p.to_string())).await.ok);
+        let beside = mu_common::paths::session_dir(&cwd);
+        let (kid_mirror, grand_mirror) = (beside.join(name(&kid)), beside.join(name(&grand)));
+        assert_eq!(*seen.borrow(), [kid_mirror.to_string_lossy()], "only the child's own file is its session");
+        assert!(grand_mirror.exists());
+        let mut t = TreeCost::default();
+        t.poll(Some(&root), &[Child { path: kid_mirror, running: false }]);
+        assert!((t.total() - 0.375).abs() < 1e-9, "{}", t.total());
     }
 }
