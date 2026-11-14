@@ -19,8 +19,10 @@ spec:
     - name: worker
       image: "@IMAGE@"
       imagePullPolicy: "@PULL_POLICY@"
-      command: ["sleep"]
-      args: ["infinity"]
+      # A cluster CA may sign the certificate of the object store sccache connects to; appended to the system roots
+      # so crate downloads keep the public ones.
+      command: ["sh", "-c"]
+      args: ["[ ! -f /etc/mu-ca/ca.crt ] || cat /etc/mu-ca/ca.crt >> /etc/ssl/certs/ca-certificates.crt; exec sleep infinity"]
       env:
         - {name: HOME, value: /root}
 @ENV@
@@ -35,6 +37,11 @@ spec:
       volumeMounts:
         - {name: home, mountPath: /root}
         - {name: workspace, mountPath: "@ROOT@"}
+        - {name: cluster-ca, mountPath: /etc/mu-ca, readOnly: true}
   volumes:
     - {name: home, emptyDir: {}}
     - {name: workspace, emptyDir: {}}
+    - name: cluster-ca
+      configMap:
+        name: kube-root-ca.crt
+        optional: true
