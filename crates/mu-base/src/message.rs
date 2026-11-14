@@ -466,8 +466,31 @@ pub fn repair_tool_pairs(messages: &mut Vec<Message>) -> Vec<String> {
 
 /// Every `tool_use` has exactly one later `tool_result` and every `tool_result` has a `tool_use`.
 pub fn check_tool_pairs(messages: &[Message]) -> Result<(), String> {
-    let mut m = messages.to_vec();
-    let notes = repair_tool_pairs(&mut m);
+    let mut notes = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for m in messages {
+        match m {
+            Message::ToolResult { tool_call_id, .. } => match pending.iter().position(|id| *id == tool_call_id) {
+                Some(p) => {
+                    pending.remove(p);
+                }
+                None => notes.push(format!("dropped orphaned tool result {tool_call_id}")),
+            },
+            _ => {
+                notes.extend(pending.drain(..).map(|id| format!("added error result for unanswered tool call {id}")));
+                if let Message::Assistant { content, .. } = m {
+                    pending = content
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::ToolCall { id, .. } => Some(id.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+    notes.extend(pending.into_iter().map(|id| format!("added error result for unanswered tool call {id}")));
     if notes.is_empty() { Ok(()) } else { Err(notes.join("; ")) }
 }
 

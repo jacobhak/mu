@@ -712,6 +712,11 @@ impl Configs {
     /// kept), writes the result and reloads from it.
     fn edit_models(&self, f: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
         let path = models_path();
+        // Held to the end: another session's read-modify-write must not interleave with ours.
+        let mut lock_name = path.file_name().unwrap_or_default().to_os_string();
+        lock_name.push(".lock");
+        let _lock = mu_common::fs::FileLock::exclusive(&path.with_file_name(lock_name))
+            .map_err(|e| format!("{}: locking: {e}", path.display()))?;
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

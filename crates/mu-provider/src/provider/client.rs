@@ -78,6 +78,9 @@ pub(super) struct Endpoint {
 /// No bytes for this long on a response stream: treat the connection as dead and retry.
 const STREAM_IDLE: Duration = Duration::from_secs(90);
 
+/// The model-list refresh before a gateway request only updates the cache; a slow gateway must not hold the turn.
+const MODEL_REFRESH: Duration = Duration::from_secs(10);
+
 #[cfg(test)]
 pub(super) fn no_gateway() -> endpoint::GatewaySource {
     endpoint::GatewaySource::new(endpoint::start_fn(|| async {
@@ -269,7 +272,7 @@ impl Providers {
         }
         if !req.model.native && !self.gw_fresh.get() {
             tokio::select! {
-                _ = self.gateway_models() => {}
+                _ = tokio::time::timeout(MODEL_REFRESH, self.gateway_models()) => {}
                 _ = cancel.cancelled() => return Err(ProviderError::Aborted),
             }
         }
@@ -312,9 +315,12 @@ impl Providers {
             _ = cancel.cancelled() => return Err(ProviderError::Aborted),
         };
         let format = wire::select(req.model, &route);
-        let body = format.body(req);
-        dump_request(req, &body);
-        let rb = self.build(req, &route, format.as_ref(), &body)?;
+        let tree = format.body(req);
+        dump_request(req, &tree);
+        // The JSON tree is a second copy of the whole history: drop it before the request is sent.
+        let body = tree.to_string();
+        drop(tree);
+        let rb = self.build(req, &route, format.as_ref(), body)?;
         let resp = send(rb, &route, cancel).await?;
         // Decided per request: the policy of this provider, and how full the context is right now.
         let limit = if resp.status().is_success() {
@@ -332,14 +338,14 @@ impl Providers {
         req: &Request<'_>,
         route: &Route,
         format: &dyn WireFormat,
-        body: &Value,
+        body: String,
     ) -> Result<reqwest::RequestBuilder, ProviderError> {
         let client = self.client().map_err(|e| ProviderError::Fatal(format!("cannot build the HTTP client: {e}")))?;
         let mut rb = client.post(format.url(&route.base)).header("content-type", "application/json");
         for (k, v) in format.headers(req) {
             rb = rb.header(k, v);
         }
-        route.auth.apply(rb.body(body.to_string()))
+        route.auth.apply(rb.body(body))
     }
 }
 
