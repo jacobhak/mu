@@ -1137,7 +1137,7 @@ pub(super) mod tests {
             }
         });
         assert!((app.agent.subagent_cost - 0.25).abs() < 1e-9, "{}", app.agent.subagent_cost);
-        assert!(app.agent.spend.is_some(), "the reader is back for the next read");
+        assert!(!app.agent.spend.asked, "the read is back for the next one");
     }
 
     #[test]

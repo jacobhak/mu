@@ -11,6 +11,7 @@ pub fn profile_flag() -> String {
     std::env::var("OMP_PROFILE").ok().filter(|p| !p.is_empty()).map(|p| format!("--profile {p} ")).unwrap_or_default()
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub path: PathBuf,
     pub title: Option<String>,

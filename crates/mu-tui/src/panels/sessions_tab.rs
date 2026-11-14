@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::host::sessions::LiveRow;
 use crate::text::line::{self, Line, dim, span};
 use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
@@ -59,45 +60,44 @@ impl Row {
     }
 }
 
-fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
-
-/// The rows, in tree order: roots oldest first, each followed by its children. Left out: this process
-/// and its own session (the Jobs tab is that), and nothing else. `titles` caches titles by path.
+/// The rows, in tree order: roots oldest first, each followed by its children. Left out: this
+/// session (the Jobs tab is that), and nothing else. `titles` caches titles by path; `canon` has the
+/// canonical form of the paths the host was asked about (a path not in it stands for itself).
 pub fn build(
-    lives: Vec<LiveSession>,
+    lives: Vec<LiveRow>,
     titles: &HashMap<PathBuf, String>,
     jobs: &[SubagentStatus],
     own: Option<&Path>,
+    canon: &HashMap<PathBuf, PathBuf>,
 ) -> Vec<Row> {
+    let canon = |p: &Path| canon.get(p).cloned().unwrap_or_else(|| p.to_path_buf());
     let own = own.map(canon);
     let job_of: Vec<(PathBuf, &str)> =
         jobs.iter().filter_map(|j| j.session.as_deref().map(|p| (canon(p), j.name.as_str()))).collect();
-    let me = std::process::id();
-    let lives: Vec<LiveSession> =
-        lives.into_iter().filter(|l| l.pid != me && own.as_deref() != Some(l.path.as_path())).collect();
-    let paths: Vec<PathBuf> = lives.iter().map(|l| l.path.clone()).collect();
-    let parent_of = |l: &LiveSession| l.parent.as_deref().map(canon).filter(|p| paths.contains(p));
+    let lives: Vec<LiveRow> = lives.into_iter().filter(|l| own.as_deref() != Some(l.live.path.as_path())).collect();
+    let paths: Vec<PathBuf> = lives.iter().map(|l| l.live.path.clone()).collect();
+    let parent_of = |l: &LiveRow| l.parent.clone().filter(|p| paths.contains(p));
     let mut order: Vec<usize> = (0..lives.len()).collect();
-    order.sort_by(|&a, &b| (&lives[a].started, &lives[a].path).cmp(&(&lives[b].started, &lives[b].path)));
+    order.sort_by(|&a, &b| {
+        (&lives[a].live.started, &lives[a].live.path).cmp(&(&lives[b].live.started, &lives[b].live.path))
+    });
     let mut out: Vec<Row> = Vec::with_capacity(lives.len());
     let mut stack: Vec<(usize, usize)> =
         order.iter().rev().filter(|&&i| parent_of(&lives[i]).is_none()).map(|&i| (i, 0)).collect();
     while let Some((i, depth)) = stack.pop() {
         let l = &lives[i];
         for &c in order.iter().rev() {
-            if parent_of(&lives[c]).as_deref() == Some(l.path.as_path()) {
+            if parent_of(&lives[c]).as_deref() == Some(l.live.path.as_path()) {
                 stack.push((c, depth + 1));
             }
         }
-        let job = job_of.iter().find(|(p, _)| *p == l.path).map(|(_, n)| n.to_string());
+        let job = job_of.iter().find(|(p, _)| *p == l.live.path).map(|(_, n)| n.to_string());
         out.push(Row {
-            live: l.clone(),
-            title: titles.get(&l.path).cloned().unwrap_or_default(),
+            live: l.live.clone(),
+            title: titles.get(&l.live.path).cloned().unwrap_or_default(),
             depth,
             job,
-            modified: std::fs::metadata(&l.path).and_then(|m| m.modified()).ok(),
+            modified: l.modified,
         });
     }
     out
@@ -136,15 +136,20 @@ pub fn short_path(p: &Path, home: Option<&str>, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn home() -> Option<String> {
-    std::env::var("HOME").ok()
-}
-
-/// One list row: a live mark, kind and agent, pid, cost, age, directory and title.
-pub fn list_row(r: &Row, selected: bool, label_w: usize, cost: &str, width: usize, now: SystemTime) -> Line {
+/// One list row: a live mark, kind and agent, pid, cost, age, directory and title. `home` is the
+/// host's home directory.
+pub fn list_row(
+    r: &Row,
+    selected: bool,
+    label_w: usize,
+    cost: &str,
+    width: usize,
+    now: SystemTime,
+    home: Option<&str>,
+) -> Line {
     let t = theme::get();
     let started = age(&r.live.started, now).map(age_text).unwrap_or_default();
-    let cwd = r.live.cwd.as_deref().map(|c| short_path(c, home().as_deref(), 24)).unwrap_or_default();
+    let cwd = r.live.cwd.as_deref().map(|c| short_path(c, home, 24)).unwrap_or_default();
     let indent = "  ".repeat(r.depth);
     let label = pad(&format!("{indent}{}", r.label()), label_w);
     let mut name = t.fg(Role::Strong);
@@ -231,6 +236,13 @@ mod tests {
         }
     }
 
+    fn rows_of(lives: Vec<LiveSession>) -> Vec<LiveRow> {
+        lives
+            .into_iter()
+            .map(|live| LiveRow { parent: live.parent.clone(), modified: None, title: None, live })
+            .collect()
+    }
+
     fn names(rows: &[Row]) -> Vec<(String, usize)> {
         rows.iter().map(|r| (r.live.path.display().to_string(), r.depth)).collect()
     }
@@ -246,17 +258,18 @@ mod tests {
         let mut orphan = live("/s/orphan.jsonl", "subagent", "2026-01-01T00:00:09Z");
         orphan.parent = Some(PathBuf::from("/s/gone.jsonl"));
         let rows = build(
-            vec![
+            rows_of(vec![
                 orphan,
                 grand,
                 live("/s/root-new.jsonl", "print", "2026-01-01T00:00:05Z"),
                 child_a,
                 live("/s/root-old.jsonl", "print", "2026-01-01T00:00:01Z"),
                 child_b,
-            ],
+            ]),
             &HashMap::new(),
             &[],
             None,
+            &HashMap::new(),
         );
         assert_eq!(
             names(&rows),
@@ -294,7 +307,13 @@ mod tests {
             session: Some(PathBuf::from("/s/sub.jsonl")),
             model: None,
         };
-        let rows = build(vec![mine, sub, other], &HashMap::new(), &[job], Some(Path::new("/s/mine.jsonl")));
+        let rows = build(
+            rows_of(vec![mine, sub, other]),
+            &HashMap::new(),
+            &[job],
+            Some(Path::new("/s/mine.jsonl")),
+            &HashMap::new(),
+        );
         assert_eq!(names(&rows), [("/s/sub.jsonl".to_string(), 0), ("/s/other.jsonl".to_string(), 0)]);
         assert_eq!(rows[0].job.as_deref(), Some("scout-1"));
         assert_eq!(rows[1].job, None);
@@ -347,7 +366,7 @@ mod tests {
             modified: None,
         };
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600 + 3700);
-        let row = list_row(&r, true, 24, "$0.12", 80, now);
+        let row = list_row(&r, true, 24, "$0.12", 80, now, None);
         let text = line_text(&row);
         assert!(text.contains("subagent review-lead") && text.contains("$0.12") && text.contains("1h"), "{text}");
         assert!(line_width(&row) <= 80);

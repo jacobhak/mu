@@ -3,18 +3,15 @@
 use super::child::ChildThen;
 use super::keys::is_baseten;
 use super::*;
-use crate::chat::blocks;
 use crate::custom::panel::Fetch;
 use crate::widgets::overlay::LoginTarget;
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
-use mu_base::events::SubagentStatus;
 use mu_base::message::Image;
 use mu_provider::auth::chatgpt::Account;
 use mu_provider::auth::check::Check;
 use mu_provider::auth::store::Entry;
 use mu_provider::provider::providers::KeyTarget;
-use mu_session::session::tree_cost::TreeCost;
 use serde_json::Value;
 
 pub(super) enum UiMsg {
@@ -22,7 +19,6 @@ pub(super) enum UiMsg {
         then: ChildThen,
         status: Result<std::process::ExitStatus, String>,
     },
-    Sessions(Vec<mu_session::session::list::SessionInfo>),
     /// The result of a clipboard copy: the notice to show, or the error.
     Copied(Result<String, String>),
     /// One source of the model pickers answered (the gateway, or one custom endpoint). The picker
@@ -57,10 +53,6 @@ pub(super) enum UiMsg {
         text: String,
         ghost: String,
     },
-    /// The subagents' session files were read: the reader, handed back.
-    Spend(Box<TreeCost>),
-    /// A finished subagent's session was read: its row, and what the session cost (`None` if the read failed).
-    SubagentCost(Box<SubagentStatus>, Option<f64>),
     /// An API key was checked: the outcome, and the entry to save when it holds.
     KeyChecked {
         flow: u64,
@@ -106,18 +98,6 @@ impl App {
         self.screen.dirty = true;
         match m {
             UiMsg::ChildDone { then, status } => self.on_child_done(then, status),
-            UiMsg::Sessions(list) => self.show_sessions(list),
-            UiMsg::Spend(t) => {
-                self.agent.subagent_cost = t.total();
-                self.agent.child_costs = t.costs();
-                self.agent.spend = Some(*t);
-                // The jobs or the session may have moved on while the files were read.
-                self.poll_spend();
-            }
-            UiMsg::SubagentCost(row, cost) => {
-                let lines = blocks::subagent_rows(std::slice::from_ref(&row), ' ', |_| cost);
-                self.agent.tr.commit(lines);
-            }
             UiMsg::Copied(r) => match r {
                 Ok(n) => self.notice(&n),
                 Err(e) => self.error(&format!("copy failed: {e}")),
@@ -200,9 +180,12 @@ impl App {
     /// panel read the sessions it follows (the panel itself only draws what it has read).
     pub(super) fn on_tick(&mut self) {
         self.screen.dirty = true;
-        self.poll_spend();
+        if self.agent.spend.due() {
+            self.poll_spend();
+        }
         if let Some(Overlay::Jobs { st }) = &mut self.overlay {
             st.poll();
         }
+        self.service_panel();
     }
 }

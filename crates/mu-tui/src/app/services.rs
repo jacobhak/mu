@@ -8,7 +8,6 @@ use mu_provider::auth::web::WebSearch;
 use mu_provider::model::discovery::{self, CustomRow};
 use mu_provider::provider::client::Providers;
 use mu_provider::provider::custom::{self, CustomProvider, KeyEdit, SaveError};
-use mu_session::session::{control, inbox};
 use mu_tools::mcp::store::{self, Level};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -105,17 +104,5 @@ impl Services {
 
     pub(super) fn mcp_set_enabled(&self, cwd: &Path, name: &str, on: bool) -> Result<bool, String> {
         store::set_enabled(cwd, &paths::omp_agent_dir(), name, on)
-    }
-
-    pub(super) fn send_message(&self, session: &Path, cwd: &Path, text: &str) -> Result<String, String> {
-        inbox::send(session, Some("mu jobs panel"), text, cwd)
-    }
-
-    pub(super) fn stop_session(&self, session: &Path, pid: u32, started: &str, kind: &str) -> Result<String, String> {
-        control::stop_session(session, pid, started, kind).map_err(|e| e.to_string())
-    }
-
-    pub(super) fn terminate_session(&self, session: &Path, pid: u32, started: &str) -> Result<String, String> {
-        control::terminate_session(session, pid, started).map_err(|e| e.to_string())
     }
 }

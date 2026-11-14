@@ -78,7 +78,7 @@ pub fn set_run_info(kind: RunKind, agent: Option<&str>) {
 }
 
 /// Who has a session open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Owner {
     Free,
     Live {
@@ -148,7 +148,7 @@ pub(super) fn live_record(session: &Path) -> Option<LiveRecord> {
 }
 
 /// A live mu process with a session open, from its owner record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LiveSession {
     pub path: PathBuf,
     pub pid: u32,

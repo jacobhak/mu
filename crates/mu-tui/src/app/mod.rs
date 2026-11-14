@@ -498,14 +498,15 @@ pub async fn run(init: AppInit) -> i32 {
         }
         let _ = app.screen.renderer.finish();
         if !term::is_lost()
-            && let Some(path) = app.agent.status.session_path.as_deref().filter(|p| std::path::Path::new(p).exists())
+            && let Some(path) = app.agent.status.session_path.as_deref()
+            && let Ok(host::sessions::Exists { exists: true, profile_flag: profile }) =
+                host::call(app.host.as_ref(), host::sessions::SESSION_EXISTS, &path).await
         {
             let id = std::path::Path::new(path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .and_then(|s| s.rsplit_once('_'))
                 .map_or(path, |(_, id)| id);
-            let profile = mu_session::session::list::profile_flag();
             term::say_err(format_args!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n"));
         }
     }

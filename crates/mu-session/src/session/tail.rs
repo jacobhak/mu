@@ -27,6 +27,8 @@ pub struct Tail {
     tokens: u64,
     /// The last poll reached the end of the file.
     caught_up: bool,
+    /// The last poll found the file shorter than what was read and started over.
+    reset: bool,
 }
 
 impl Tail {
@@ -40,7 +42,13 @@ impl Tail {
             cost: 0.0,
             tokens: 0,
             caught_up: false,
+            reset: false,
         }
+    }
+
+    /// A reader that carries on from `offset`, for a caller that keeps the messages and totals itself.
+    pub fn resume(path: impl Into<PathBuf>, keep: usize, offset: u64, caught_up: bool) -> Self {
+        Self { offset, caught_up, ..Self::new(path, keep) }
     }
 
     /// The newest kept messages, oldest first.
@@ -63,6 +71,11 @@ impl Tail {
         self.tokens
     }
 
+    /// Whether the last poll started over because the file shrank.
+    pub fn was_reset(&self) -> bool {
+        self.reset
+    }
+
     /// Bytes consumed so far: whole lines read, or skipped for being longer than one read.
     pub fn offset(&self) -> u64 {
         self.offset
@@ -79,8 +92,10 @@ impl Tail {
         let Ok(mut f) = File::open(&self.path) else { return false };
         let Ok(len) = f.metadata().map(|m| m.len()) else { return false };
         let mut changed = false;
+        self.reset = false;
         if len < self.offset {
             *self = Self::new(std::mem::take(&mut self.path), self.keep);
+            self.reset = true;
             changed = true;
         }
         if f.seek(SeekFrom::Start(self.offset)).is_err() {
@@ -246,6 +261,7 @@ mod tests {
         assert_eq!(t.cost(), 2.0);
         std::fs::write(&p, user("new")).unwrap();
         assert!(t.poll());
+        assert!(t.was_reset());
         assert_eq!((t.messages().len(), t.cost()), (1, 0.0));
     }
 

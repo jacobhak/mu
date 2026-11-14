@@ -7,6 +7,7 @@ use super::ui_msgs::UiMsg;
 use crate::chat::blocks;
 use crate::chat::partial_json::Partial;
 use crate::chat::transcript::{Stream, Transcript};
+use crate::host::sessions::{self, Spend, TreeArgs};
 use crate::panels::ptyview::PtyView;
 use crate::term::bell::WokenBell;
 use crate::text::line::{Line, dim, styled};
@@ -21,7 +22,7 @@ use mu_base::message::UserInput;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_base::text::truncate_text as trunc;
 use mu_base::tool::ToolOutput;
-use mu_session::session::tree_cost::{Child, TreeCost, session_cost};
+use mu_session::session::tree_cost::Child;
 use mu_tools::tools::todo::{Phase, Status};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -105,6 +106,22 @@ pub(super) enum Effect {
     },
 }
 
+/// Where the read of the subagents' costs stands: one is asked for at a time.
+#[derive(Default)]
+pub(super) struct SpendRead {
+    pub(super) asked: bool,
+    /// The jobs or the session moved on while it was out.
+    again: bool,
+    last: Option<Instant>,
+}
+
+impl SpendRead {
+    /// Has it been a while since the last ask (the host reads children that are still running).
+    pub(super) fn due(&self) -> bool {
+        self.last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+    }
+}
+
 pub(super) struct AgentView {
     /// The streamed conversation: committed lines, open text and thinking, smooth reveal.
     pub(super) tr: Transcript,
@@ -113,9 +130,8 @@ pub(super) struct AgentView {
     pub(super) calls: Vec<StreamingCall>,
     /// Latest background-job snapshot, and finished jobs already printed to the transcript.
     pub(super) jobs: Vec<SubagentStatus>,
-    /// Reads the subagents' session files for the status line's cost. `None` while that read runs on
-    /// a blocking thread, which hands it back in `UiMsg::Spend`.
-    pub(super) spend: Option<TreeCost>,
+    /// The host's read of the subagents' session files for the status line's cost.
+    pub(super) spend: SpendRead,
     /// What the subagents have spent, as the last read found it.
     pub(super) subagent_cost: f64,
     /// What each subagent session has cost by itself, as the last read found it, for the running rows.
@@ -156,7 +172,7 @@ impl AgentView {
             tools: Vec::new(),
             calls: Vec::new(),
             jobs: Vec::new(),
-            spend: Some(TreeCost::default()),
+            spend: SpendRead::default(),
             subagent_cost: 0.0,
             child_costs: HashMap::new(),
             jobs_committed: HashSet::new(),
@@ -528,9 +544,13 @@ impl App {
         }
     }
 
-    /// Starts reading the subagents' session files on a blocking thread when that is due; the total
-    /// comes back in `UiMsg::Spend`, so no file I/O runs on the draw path.
+    /// Asks the host for what the subagents have spent; it reads their session files when that is
+    /// due and answers with the total.
     pub(super) fn poll_spend(&mut self) {
+        if self.agent.spend.asked {
+            self.agent.spend.again = true;
+            return;
+        }
         let root = self.agent.status.session_path.as_deref().map(PathBuf::from);
         let children: Vec<Child> = self
             .agent
@@ -539,17 +559,25 @@ impl App {
             .filter(|j| j.kind == JobKind::Subagent)
             .filter_map(|j| Some(Child { path: j.session.clone()?, running: j.state == SubagentState::Running }))
             .collect();
-        let Some(mut tracker) = self.agent.spend.take_if(|t| t.due(root.as_deref(), &children)) else { return };
-        let tx = self.ui_tx.clone();
-        tokio::task::spawn_local(async move {
-            let tracker = tokio::task::spawn_blocking(move || {
-                tracker.poll(root.as_deref(), &children);
-                tracker
-            })
-            .await
-            .unwrap_or_default();
-            let _ = tx.send(UiMsg::Spend(Box::new(tracker)));
+        self.agent.spend.asked = true;
+        self.agent.spend.last = Some(Instant::now());
+        self.host_call(sessions::TREE_COST, &TreeArgs { root, children }, |app, r: Result<Spend, String>| {
+            app.agent.spend.asked = false;
+            if let Ok(s) = r {
+                app.agent.subagent_cost = s.total;
+                app.agent.child_costs = s.costs.into_iter().collect();
+            }
+            // The jobs or the session may have moved on while the files were read.
+            if std::mem::take(&mut app.agent.spend.again) {
+                app.poll_spend();
+            }
         });
+    }
+
+    /// Shows a finished subagent's row with what its session cost (`None` when that is unknown).
+    fn commit_subagent(&mut self, row: SubagentStatus, cost: Option<f64>) {
+        let lines = blocks::subagent_rows(std::slice::from_ref(&row), ' ', |_| cost);
+        self.agent.tr.commit(lines);
     }
 
     fn apply(&mut self, effect: Effect) {
@@ -574,17 +602,14 @@ impl App {
             }
             Effect::PlanList(list) => self.show_plans(list),
             Effect::RewindPoints(list) => self.show_rewind(list),
-            Effect::SubagentCost(row) => {
-                let tx = self.ui_tx.clone();
-                tokio::task::spawn_local(async move {
-                    let path = row.session.clone();
-                    let cost = match path {
-                        Some(p) => tokio::task::spawn_blocking(move || session_cost(&p)).await.ok(),
-                        None => None,
-                    };
-                    let _ = tx.send(UiMsg::SubagentCost(Box::new(row), cost));
-                });
-            }
+            Effect::SubagentCost(row) => match row.session.clone() {
+                Some(p) => self.host_call(sessions::SESSION_COST, &p, |app, r: Result<f64, String>| {
+                    app.commit_subagent(row, r.ok())
+                }),
+                None => {
+                    let _ = self.ui_tx.send(UiMsg::Host(Box::new(move |app| app.commit_subagent(row, None))));
+                }
+            },
             Effect::JobsChanged => {
                 if let Some(Overlay::Jobs { st }) = &mut self.overlay {
                     st.set_jobs(self.agent.jobs.clone());
@@ -1232,5 +1257,74 @@ mod tests {
         press(&mut app, crossterm::event::KeyCode::Esc);
         assert!(matches!(app.overlay, Some(Overlay::Logout { .. })), "the queued picker opens next");
         assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
+    }
+
+    fn subagent_session(cost: f64) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-subcost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("2026-01-01T00-00-01-000Z_kid.jsonl");
+        let reply = json!({"role":"assistant","content":[],"usage":{"input":1,"output":1,"cacheRead":0,
+            "cacheWrite":0,"totalTokens":2,"cost":{"total":cost}},"stopReason":"stop","timestamp":1});
+        let entry = json!({"type":"message","id":"a","parentId":null,"message":reply});
+        std::fs::write(&path, format!("{{\"type\":\"session\",\"id\":\"kid\"}}\n{entry}\n")).unwrap();
+        path
+    }
+
+    fn with_host(app: &mut App, deferred: bool) -> tokio::sync::mpsc::UnboundedReceiver<UiMsg> {
+        use crate::host::{Deferred, local::LocalHost};
+        use std::rc::Rc;
+        let local = LocalHost::new(app.services.providers.clone(), app.ctx.clone(), app.plugins.clone(), "/".into());
+        app.host = if deferred { Rc::new(Deferred(local)) } else { Rc::new(local) };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.ui_tx = tx;
+        rx
+    }
+
+    #[test]
+    fn a_finished_subagents_cost_is_read_through_the_host_with_either_host() {
+        for deferred in [false, true] {
+            let mut app = test_app(std::env::temp_dir().join("mu-subcost-history.jsonl"));
+            let mut rx = with_host(&mut app, deferred);
+            let row = SubagentStatus {
+                session: Some(subagent_session(0.25)),
+                state: SubagentState::Done,
+                ..job("scout", SubagentState::Done, JobKind::Subagent)
+            };
+            super::super::keys::tests::in_local(async {
+                app.apply(Effect::SubagentCost(row));
+                while !pending(&app.agent).contains("0.25") {
+                    let m = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+                    app.on_ui(m);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn the_subagent_spend_comes_back_through_the_host_and_one_read_is_out_at_a_time() {
+        use mu_base::events::AgentEvent;
+        let kid = subagent_session(0.25);
+        let root = kid.with_file_name("2026-01-01T00-00-00-000Z_root.jsonl");
+        std::fs::write(&root, "{\"type\":\"session\",\"id\":\"root\"}\n").unwrap();
+        let mut app = test_app(std::env::temp_dir().join("mu-spend-history.jsonl"));
+        let mut rx = with_host(&mut app, true);
+        let child = SubagentStatus {
+            session: Some(kid),
+            state: SubagentState::Done,
+            ..job("scout", SubagentState::Done, JobKind::Subagent)
+        };
+        super::super::keys::tests::in_local(async {
+            let status =
+                StatusSnapshot { session_path: Some(root.to_string_lossy().into_owned()), ..Default::default() };
+            app.on_agent(AgentEvent::Status(status));
+            assert!(app.agent.spend.asked, "the read is out");
+            app.on_agent(AgentEvent::Jobs(vec![child]));
+            while app.agent.subagent_cost == 0.0 {
+                let m = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+                app.on_ui(m);
+            }
+        });
+        assert!((app.agent.subagent_cost - 0.25).abs() < 1e-9);
+        assert!(!app.agent.spend.asked);
     }
 }
