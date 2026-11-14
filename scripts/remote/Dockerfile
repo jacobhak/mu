@@ -5,7 +5,7 @@
 # launcher's own and reads a Kubernetes secret for the key).
 FROM debian:bookworm-slim
 
-ARG SCCACHE_VERSION=0.8.2
+ARG SCCACHE_VERSION=0.19.0
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
