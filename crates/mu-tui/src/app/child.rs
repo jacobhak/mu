@@ -61,11 +61,21 @@ impl App {
             ChildThen::McpLogin(name) => match status {
                 Ok(s) if s.success() => {
                     self.notice(&format!("mcp:{name}: logged in; loading tools…"));
-                    let (plugins, tx) = (self.plugins.clone(), self.ui_tx.clone());
-                    tokio::task::spawn_local(async move {
-                        let r = plugins.after_login(&name).await;
-                        let _ = tx.send(UiMsg::McpLoggedIn(name, r));
-                    });
+                    self.host_call(
+                        crate::host::mcp::MCP_AFTER_LOGIN,
+                        &name.clone(),
+                        move |app, r: Result<(usize, bool), String>| match r {
+                            Ok((n, changed)) => {
+                                app.notice(&format!("mcp:{name}: logged in, {n} tools"));
+                                if changed {
+                                    app.send(Command::RefreshTools);
+                                }
+                            }
+                            Err(e) => {
+                                app.error(&format!("mcp:{name}: logged in, but its tools could not be listed: {e}"))
+                            }
+                        },
+                    );
                 }
                 Ok(s) => self.error(&format!("omp /mcp reauth {name} exited with {s}")),
                 Err(e) => self.error(&format!("cannot run omp: {e}")),
@@ -138,21 +148,24 @@ impl App {
     /// Runs omp's own MCP OAuth flow (`omp -p --no-session '/mcp reauth <name>'`) on the real terminal,
     /// then makes the server usable in this session (`PluginHost::after_login`).
     pub(super) fn run_mcp_login(&mut self, name: &str) {
-        if !self.plugins.mcp_names().iter().any(|n| n == name) {
-            return self.error(&format!("no MCP server `{name}` is configured"));
-        }
-        let (cwd, name) = (self.cwd.clone(), name.to_string());
-        self.start_child(ChildThen::McpLogin(name.clone()), move || {
-            let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
-            cmd.args(["-p", "--no-session"]).arg(format!("/mcp reauth {name}")).current_dir(&cwd);
-            extern "C" fn noop(_: libc::c_int) {}
-            // As in `run_login`: Ctrl-C reaches omp, not mu.
-            // SAFETY: installs a no-op handler; restored to the default below.
-            unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
-            let status = cmd.status();
-            // SAFETY: back to the default disposition.
-            unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
-            status
+        let name = name.to_string();
+        self.host_call(crate::host::mcp::MCP_NAMES, &(), move |app, r: Result<Vec<String>, String>| {
+            if !r.unwrap_or_default().contains(&name) {
+                return app.error(&format!("no MCP server `{name}` is configured"));
+            }
+            let cwd = app.cwd.clone();
+            app.start_child(ChildThen::McpLogin(name.clone()), move || {
+                let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
+                cmd.args(["-p", "--no-session"]).arg(format!("/mcp reauth {name}")).current_dir(&cwd);
+                extern "C" fn noop(_: libc::c_int) {}
+                // As in `run_login`: Ctrl-C reaches omp, not mu.
+                // SAFETY: installs a no-op handler; restored to the default below.
+                unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+                let status = cmd.status();
+                // SAFETY: back to the default disposition.
+                unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+                status
+            });
         });
     }
 

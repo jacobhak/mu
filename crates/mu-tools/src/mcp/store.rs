@@ -8,7 +8,7 @@ use super::{JsonError, read_json};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Level {
     /// `<agentDir>/mcp.json`
     User,

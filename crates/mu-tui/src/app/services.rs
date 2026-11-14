@@ -2,16 +2,13 @@
 //! definitions and session control. Reads stay with their callers.
 
 use mu_base::model_config::RoleMeta;
-use mu_common::paths;
 use mu_provider::auth::store::Entry;
 use mu_provider::auth::web::WebSearch;
 use mu_provider::model::discovery::{self, CustomRow};
 use mu_provider::provider::client::Providers;
 use mu_provider::provider::custom::{self, CustomProvider, KeyEdit, SaveError};
 use mu_session::session::{control, inbox};
-use mu_tools::mcp::store::{self, Level};
-use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 pub(super) struct Services {
@@ -93,18 +90,6 @@ impl Services {
 
     pub(super) fn remove_key(&self, provider: &str) -> Result<bool, String> {
         self.providers.store().remove(provider).map_err(|e| e.to_string())
-    }
-
-    pub(super) fn mcp_add(&self, level: Level, cwd: &Path, name: &str, entry: Value) -> Result<PathBuf, String> {
-        store::add(level, cwd, &paths::omp_agent_dir(), name, entry)
-    }
-
-    pub(super) fn mcp_remove(&self, cwd: &Path, name: &str) -> Result<Vec<PathBuf>, String> {
-        store::remove(cwd, &paths::omp_agent_dir(), name)
-    }
-
-    pub(super) fn mcp_set_enabled(&self, cwd: &Path, name: &str, on: bool) -> Result<bool, String> {
-        store::set_enabled(cwd, &paths::omp_agent_dir(), name, on)
     }
 
     pub(super) fn send_message(&self, session: &Path, cwd: &Path, text: &str) -> Result<String, String> {

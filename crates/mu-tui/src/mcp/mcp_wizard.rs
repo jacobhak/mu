@@ -77,7 +77,7 @@ impl Wizard {
     /// Starts at the choice of source: discovered servers (when `found` is not empty), popular
     /// presets, a custom command or a custom url. `env_set` tells whether an environment
     /// variable is set (used to default tokens to `${VAR}`).
-    pub fn new(found: Vec<Found>, cwd: &Path, env_set: fn(&str) -> bool) -> Self {
+    pub fn new(found: Vec<Found>, cwd: &Path, env_set: impl Fn(&str) -> bool) -> Self {
         Self {
             found,
             presets: presets(cwd, env_set),
@@ -95,7 +95,7 @@ impl Wizard {
     }
 
     /// Starts at the picker of discovered servers (at the choice of source when there are none).
-    pub fn import(found: Vec<Found>, cwd: &Path, env_set: fn(&str) -> bool) -> Self {
+    pub fn import(found: Vec<Found>, cwd: &Path, env_set: impl Fn(&str) -> bool) -> Self {
         let mut w = Self::new(found, cwd, env_set);
         if !w.found.is_empty() {
             w.phase = Phase::Discovered;
@@ -481,7 +481,7 @@ mod tests {
             tool: tool.into(),
             file: PathBuf::from("/x/mcp.json"),
             name: name.into(),
-            kind: if http { "http" } else { "stdio" },
+            kind: if http { "http" } else { "stdio" }.into(),
             target: if http { "https://h".into() } else { entry["command"].as_str().unwrap().into() },
             entry,
         }

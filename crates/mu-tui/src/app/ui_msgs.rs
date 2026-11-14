@@ -37,20 +37,6 @@ pub(super) enum UiMsg {
         r: Fetch,
     },
     LoginProviders(Result<Vec<(usize, String)>, String>),
-    /// An MCP login finished: tool count and whether the tool set changed.
-    McpLoggedIn(String, Result<(usize, bool), String>),
-    /// An `/mcp` change was applied: what to tell the user, and whether the tool list changed.
-    McpApplied {
-        lines: Vec<String>,
-        refresh: bool,
-    },
-    /// `/mcp reconnect` or `/mcp test` finished.
-    McpReconnected {
-        name: String,
-        verbose: bool,
-        ms: u128,
-        result: Result<(usize, bool), String>,
-    },
     ClipboardImage(Result<Option<Image>, String>),
     Ghost {
         seq: u64,
@@ -136,22 +122,6 @@ impl App {
                 }
             }
             UiMsg::CustomFetched { flow, r } => self.on_custom_fetched(flow, r),
-            UiMsg::McpLoggedIn(name, r) => match r {
-                Ok((n, changed)) => {
-                    self.notice(&format!("mcp:{name}: logged in, {n} tools"));
-                    if changed {
-                        self.send(Command::RefreshTools);
-                    }
-                }
-                Err(e) => self.error(&format!("mcp:{name}: logged in, but its tools could not be listed: {e}")),
-            },
-            UiMsg::McpApplied { lines, refresh } => {
-                self.notice(&lines.join("\n"));
-                if refresh {
-                    self.send(Command::RefreshTools);
-                }
-            }
-            UiMsg::McpReconnected { name, verbose, ms, result } => self.on_mcp_reconnected(&name, verbose, ms, result),
             UiMsg::KeyChecked { flow, target, entry, r } => self.on_key_checked(flow, target, entry, r),
             UiMsg::ChatgptUrl { flow, url } => self.on_chatgpt_url(flow, &url),
             UiMsg::ChatgptDone { flow, r } => self.on_chatgpt_done(flow, r),
