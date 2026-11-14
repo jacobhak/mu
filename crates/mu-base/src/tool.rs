@@ -70,7 +70,7 @@ pub struct FileMeta {
 
 /// One file a tool wrote, with its text before and after, for front ends that show a real diff.
 /// Not stored in the session.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileChange {
     /// Absolute.
     pub path: std::path::PathBuf,
@@ -83,6 +83,7 @@ pub struct FileChange {
 /// Texts over this size are left out of a `FileChange`; the change is then not reported.
 pub const CHANGE_TEXT_MAX: usize = 512 * 1024;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
@@ -91,6 +92,7 @@ pub struct ToolOutput {
     pub details: Option<Value>,
     pub meta: Option<ToolMeta>,
     /// Images the model sees after the text (e.g. `read` of a png). Not shown in the transcript.
+    #[serde(skip)]
     pub images: Vec<crate::message::Image>,
     /// Files the call wrote (`write`, `edit`).
     pub changes: Vec<FileChange>,

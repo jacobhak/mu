@@ -21,3 +21,4 @@ pub mod schema;
 pub mod secrets;
 pub mod text;
 pub mod tool;
+pub mod wire;
