@@ -203,6 +203,8 @@ impl AgentView {
 
     /// Applies one agent event. `size` is the screen's (columns, rows).
     pub(super) fn on_event(&mut self, e: AgentEvent, size: (usize, usize)) -> Vec<Effect> {
+        #[cfg(test)]
+        let e = if mu_base::wire::loopback_on() { mu_base::wire::roundtrip_event(e) } else { e };
         let w = size.0;
         if !matches!(
             e,

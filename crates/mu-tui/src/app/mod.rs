@@ -515,6 +515,8 @@ impl App {
     }
 
     fn send(&mut self, c: Command) {
+        #[cfg(test)]
+        let c = if mu_base::wire::loopback_on() { mu_base::wire::roundtrip_command(c) } else { c };
         let _ = self.link.cmd_tx.send(c);
     }
 

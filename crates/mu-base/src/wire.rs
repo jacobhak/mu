@@ -319,6 +319,113 @@ impl ClientAdapter {
     }
 }
 
+/// Whether `MU_WIRE_LOOPBACK=1`: the ordinary one-process mu sends every command and event through
+/// this module's lines, so day-to-day use and the UI tests exercise the wire types.
+pub fn loopback_on() -> bool {
+    std::env::var_os("MU_WIRE_LOOPBACK").is_some_and(|v| v == "1")
+}
+
+/// A command as the agent receives it from a client.
+pub fn roundtrip_command(c: Command) -> Command {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let line = to_line(&ClientAdapter::new(tx).command(c));
+    match from_line::<WireCommand>(&line).ok().and_then(|w| AgentAdapter::new().command(w)) {
+        Some(c) => c,
+        None => unreachable!("a command line decodes to a command"),
+    }
+}
+
+/// An event as a client receives it. The five that carry a reply handle are returned as they are:
+/// a handle cannot be rebuilt without a runtime to wait on it (`ClientAdapter` does that).
+pub fn roundtrip_event(e: AgentEvent) -> AgentEvent {
+    if matches!(
+        e,
+        AgentEvent::Ask { .. }
+            | AgentEvent::Approve { .. }
+            | AgentEvent::WebSetup { .. }
+            | AgentEvent::PlanReview { .. }
+            | AgentEvent::PtyOpen { .. }
+    ) {
+        return e;
+    }
+    let line = to_line(&AgentAdapter::new().event(e));
+    match from_line::<WireEvent>(&line) {
+        Ok(WireEvent::Event(mut ev)) => {
+            event_inputs(&mut ev, keep);
+            ev
+        }
+        _ => unreachable!("an event line decodes to an event"),
+    }
+}
+
+/// Runs both ends of a wire inside this process and joins them with in-memory lines: the agent's
+/// channels in, the channels a front end uses out. Needs a Tokio runtime.
+pub fn loopback(
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    mut ev_rx: mpsc::UnboundedReceiver<AgentEvent>,
+) -> (mpsc::UnboundedSender<Command>, mpsc::UnboundedReceiver<AgentEvent>) {
+    let (to_agent, mut at_agent) = mpsc::unbounded_channel::<String>();
+    let (to_client, mut at_client) = mpsc::unbounded_channel::<String>();
+    let (ui_cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel::<Command>();
+    let (ui_ev_tx, ui_ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    tokio::spawn(async move {
+        let mut adapter = AgentAdapter::new();
+        loop {
+            tokio::select! {
+                ev = ev_rx.recv() => {
+                    let Some(ev) = ev else { break };
+                    if to_client.send(to_line(&adapter.event(ev))).is_err() {
+                        break;
+                    }
+                }
+                line = at_agent.recv() => match line {
+                    Some(line) => {
+                        if let Some(c) = from_line::<WireCommand>(&line).ok().and_then(|w| adapter.command(w)) {
+                            let _ = cmd_tx.send(c);
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let adapter = ClientAdapter::new(replies_tx);
+        loop {
+            tokio::select! {
+                c = ui_cmd_rx.recv() => {
+                    let Some(c) = c else { break };
+                    if to_agent.send(to_line(&adapter.command(c))).is_err() {
+                        break;
+                    }
+                }
+                Some(r) = replies.recv() => {
+                    if to_agent.send(to_line(&r)).is_err() {
+                        break;
+                    }
+                }
+                line = at_client.recv() => match line {
+                    Some(line) => {
+                        let ev = match from_line::<WireEvent>(&line) {
+                            Ok(w) => adapter.event(w),
+                            Err(e) => AgentEvent::Error(format!("wire: unreadable event: {e}")),
+                        };
+                        if ui_ev_tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+
+    (ui_cmd_tx, ui_ev_rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +712,61 @@ mod tests {
         deliver(&mut agent, &mut out).await;
         assert!(matches!(rx.await.unwrap(), PlanDecision::Refine(t) if t == "more"));
         assert_eq!(agent.parked(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_loopback_carries_commands_events_and_replies() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let (ui_cmd, mut ui_ev) = loopback(cmd_tx, ev_rx);
+
+        // The scripted agent: a prompt starts a turn that needs one approval, then ends; Exit ends it.
+        let agent = tokio::spawn(async move {
+            let mut approved = None;
+            while let Some(c) = cmd_rx.recv().await {
+                match c {
+                    Command::Prompt(p) => {
+                        let _ = ev_tx.send(AgentEvent::UserPrompt(p.text));
+                        let (reply, rx) = oneshot::channel();
+                        let _ = ev_tx.send(AgentEvent::Approve { request: request(), reply });
+                        approved = Some(rx.await);
+                        let _ = ev_tx.send(AgentEvent::TurnEnd { aborted: false });
+                    }
+                    Command::Exit => {
+                        let _ = ev_tx.send(AgentEvent::Exit);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            approved
+        });
+
+        ui_cmd.send(Command::Prompt("hello".into())).unwrap();
+        assert!(matches!(ui_ev.recv().await, Some(AgentEvent::UserPrompt(t)) if t == "hello"));
+        let Some(AgentEvent::Approve { request, reply }) = ui_ev.recv().await else { panic!("no approval") };
+        assert_eq!(request.tool, "bash");
+        reply.send(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None }).unwrap();
+        assert!(matches!(ui_ev.recv().await, Some(AgentEvent::TurnEnd { aborted: false })));
+        ui_cmd.send(Command::Exit).unwrap();
+        assert!(matches!(ui_ev.recv().await, Some(AgentEvent::Exit)));
+        assert!(matches!(agent.await.unwrap(), Some(Ok(ApprovalDecision::Allow { .. }))));
+        assert!(ui_ev.recv().await.is_none(), "the events end with the agent");
+    }
+
+    #[test]
+    fn the_test_round_trips_return_what_went_in() {
+        let c = roundtrip_command(Command::Bash { cmd: "ls".into(), include: true });
+        assert!(matches!(c, Command::Bash { cmd, include: true } if cmd == "ls"));
+        let e = roundtrip_event(AgentEvent::Retry {
+            attempt: 1,
+            max_attempts: 3,
+            delay: Duration::from_millis(250),
+            reason: "r".into(),
+        });
+        assert!(matches!(e, AgentEvent::Retry { delay, .. } if delay == Duration::from_millis(250)));
+        let (reply, _rx) = oneshot::channel();
+        assert!(matches!(roundtrip_event(AgentEvent::WebSetup { reply }), AgentEvent::WebSetup { .. }));
     }
 
     #[tokio::test]

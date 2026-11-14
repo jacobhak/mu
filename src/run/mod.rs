@@ -253,7 +253,12 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
             Armed::Tui { pick_session } => {
                 signals::cancel_turn_on_sigusr1(handle.cmd.clone());
                 let ui = Ui { cfgs: cfgs_ui, providers: providers_ui, ctx: ctx_ui, cwd: cwd_ui, pick_session };
-                (tui(&host, ui, handle.cmd, handle.ev, notice_rx).await, None)
+                let (cmd, ev) = if mu_base::wire::loopback_on() {
+                    mu_base::wire::loopback(handle.cmd, handle.ev)
+                } else {
+                    (handle.cmd, handle.ev)
+                };
+                (tui(&host, ui, cmd, ev, notice_rx).await, None)
             }
             Armed::Subagent { task } => {
                 let printer = spawn_notice_printer(notice_rx);

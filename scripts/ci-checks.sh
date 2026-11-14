@@ -13,4 +13,6 @@ scripts/cargo-deny.sh
 # `cargo test` compiles the whole dependency tree twice. The wrapper makes clippy lints fail the same
 # rustc run that produces the test binaries; the workspace has no examples or benches to miss.
 RUSTC_WORKSPACE_WRAPPER="$PWD/scripts/clippy-workspace.sh" cargo test --workspace --locked
+# The terminal UI's tests again with every command and event sent through the wire form (see mu_base::wire).
+MU_WIRE_LOOPBACK=1 RUSTC_WORKSPACE_WRAPPER="$PWD/scripts/clippy-workspace.sh" cargo test -p mu-tui --lib --locked
 scripts/build-mcp-http.sh test
