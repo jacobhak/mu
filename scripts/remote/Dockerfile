@@ -14,7 +14,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_INCREMENTAL=0
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config shellcheck \
+ && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libssl-dev pkg-config shellcheck \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
