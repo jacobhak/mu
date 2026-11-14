@@ -1679,7 +1679,7 @@ pub(super) mod tests {
     }
 
     /// Carries the answers to the app until none has arrived for a while.
-    async fn pump(app: &mut App, ui: &mut UnboundedReceiver<UiMsg>) {
+    async fn pump_all(app: &mut App, ui: &mut UnboundedReceiver<UiMsg>) {
         while let Ok(Some(m)) = tokio::time::timeout(std::time::Duration::from_millis(50), ui.recv()).await {
             app.on_ui(m);
         }
@@ -1704,7 +1704,7 @@ pub(super) mod tests {
         in_local(async {
             app.request_models();
             assert!(app.overlay.is_none(), "the rows are not here before the host answers");
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             let Some(Overlay::Model { pick, .. }) = &app.overlay else { panic!("no model picker") };
             assert!(pick.values().contains(&"@default".to_string()));
             assert!(pick.values().contains(&"modal/x/b".to_string()));
@@ -1713,10 +1713,10 @@ pub(super) mod tests {
             app.overlay = None;
             app.open_model_roles(Some("default".into()));
             assert!(app.overlay.is_none());
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
             app.on_overlay_event(OverlayEvent::LoadRoleModels);
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             let Some(Overlay::ModelRoles { st }) = &app.overlay else { panic!("editor gone") };
             assert!(st.select().highlighted().is_some(), "the list filled the sub-picker");
         });
@@ -1737,7 +1737,7 @@ pub(super) mod tests {
         let mut ui = deferred(&mut app);
         in_local(async {
             app.open_model_roles(Some("default".into()));
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             app.on_overlay_event(OverlayEvent::SaveRole {
                 set: "main".into(),
                 role: "default".into(),
@@ -1745,13 +1745,13 @@ pub(super) mod tests {
                 meta: None,
             });
             assert!(!transcript_text(&app).contains("saved @default"), "nothing is said before the answer");
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             assert_eq!(cfg.role("default").as_deref(), Some("a/new:low"));
             assert!(transcript_text(&app).contains("saved @default in set main"));
             assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
 
             app.on_overlay_event(OverlayEvent::DeleteRole { set: "main".into(), role: "writer".into() });
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             assert!(transcript_text(&app).contains("deleted @writer from set main"));
         });
         assert!(std::fs::read_to_string(&path).unwrap().contains("default = \"a/new:low\""));
@@ -1775,30 +1775,30 @@ pub(super) mod tests {
         in_local(async {
             app.modelset_cmd("new openai");
             assert!(!transcript_text(&app).contains("created"), "nothing is said before the answer");
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             assert_eq!(cfg.active_set().as_deref(), Some("openai"));
             assert!(transcript_text(&app).contains("model set openai created from main and active"));
 
             app.modelset_cmd("");
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             let Some(Overlay::ModelSet { pick }) = &app.overlay else { panic!("no set picker") };
             assert_eq!(pick.values(), &["main", "openai"]);
             app.overlay = None;
 
             app.modelset_cmd("main");
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             assert_eq!(cfg.active_set().as_deref(), Some("main"));
             assert!(matches!(commands.try_recv(), Ok(Command::SetModel(id)) if id == "@default"));
             assert!(transcript_text(&app).contains("model set main: @default = a/b"));
 
             app.modelset_cmd("delete main");
             app.modelset_cmd("rename openai oa");
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             assert!(transcript_text(&app).contains("`main` is the active model set"));
             assert_eq!(cfg.set_names(), ["main", "oa"]);
             assert!(transcript_text(&app).contains("model set openai renamed to oa"));
             app.modelset_cmd("delete oa");
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
             assert_eq!(cfg.set_names(), ["main"]);
         });
         let _ = std::fs::remove_file(&path);
@@ -1822,7 +1822,7 @@ pub(super) mod tests {
         in_local(async {
             app.with_plan_tiers(record(&seen));
             assert!(seen.borrow().is_empty());
-            pump(&mut app, &mut ui).await;
+            pump_all(&mut app, &mut ui).await;
         });
         assert_eq!(*seen.borrow(), local);
     }
