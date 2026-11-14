@@ -7,12 +7,11 @@
 //! it is checked.
 
 use super::*;
-use crate::custom::panel::{self, Action, Answer, Destinations, Fetch, Probe, Saved, Step};
+use crate::custom::panel::{self, Action, Answer, Fetch, Probe, Saved, Step};
+use crate::host::custom::{CUSTOM_ENV, CUSTOM_FETCH, CUSTOM_GET, CUSTOM_OPEN, CUSTOM_SAVE, Edit, Open, Outcome};
 use crate::widgets::overlay::PanelPick;
 use crossterm::event::{KeyCode, KeyEvent};
-use mu_provider::auth::store::resolve_entry;
-use mu_provider::model::discovery::{DiscoverError, custom_fetch};
-use mu_provider::provider::custom::{self, CustomProvider, KeyEdit, SaveError};
+use mu_provider::provider::custom;
 
 /// The panel in progress, and the composer text it displaced (put back when it ends).
 pub(super) struct CustomFlow {
@@ -20,7 +19,7 @@ pub(super) struct CustomFlow {
     id: u64,
     panel: panel::Panel,
     draft: String,
-    /// A `/models` read is running; keys wait for its answer.
+    /// A `/models` read or a host question is running; keys wait for its answer.
     checking: bool,
 }
 
@@ -44,37 +43,31 @@ impl App {
         if self.custom_wizard_active() {
             return;
         }
-        let registry = self.services.providers.custom_registry();
-        let names: Vec<String> = match registry.snapshot() {
-            Ok(defs) => defs.into_keys().collect(),
-            Err(e) => return self.error(&format!("{e:#}")),
-        };
-        let store = self.services.providers.store().clone();
-        let dests =
-            Destinations { providers: registry.path().display().to_string(), auth: store.path().display().to_string() };
-        let taken = move |id: &str| names.iter().any(|n| n == id) || store.has(id);
-        self.open_custom_panel(panel::Panel::new(dests, taken));
+        self.host_call(CUSTOM_OPEN, &(), |app, r: Result<Open, String>| match r {
+            Ok(Open { names, keys, dests }) => {
+                let taken = move |id: &str| names.iter().chain(&keys).any(|n| n == id);
+                app.open_custom_panel(panel::Panel::new(dests, taken));
+            }
+            Err(e) => app.error(&e),
+        });
     }
 
     /// Opens the panel on an existing endpoint: its definition, models and reasoning as saved, and
     /// the key it takes now. Save replaces the definition; the key is written only when it is chosen.
     pub(super) fn start_custom_edit(&mut self, id: &str) {
-        let registry = self.services.providers.custom_registry();
-        let def = match registry.get(id) {
-            Ok(Some(def)) => def,
-            Ok(None) => {
-                return self.error(&format!(
-                    "no custom endpoint `{id}` in {}; `+ Add a custom endpoint…` starts a new one",
-                    registry.path().display()
-                ));
+        let id = id.to_string();
+        self.host_call(CUSTOM_GET, &id.clone(), move |app, r: Result<Edit, String>| match r {
+            Ok(Edit { def: Some(mut def), entry, dests }) => {
+                // The id is the table's key, not a field, so it does not travel with the definition.
+                def.id = id;
+                app.open_custom_panel(panel::Panel::edited(dests, &def, entry));
             }
-            Err(e) => return self.error(&format!("{e:#}")),
-        };
-        let store = self.services.providers.store().clone();
-        let dests =
-            Destinations { providers: registry.path().display().to_string(), auth: store.path().display().to_string() };
-        let panel = panel::Panel::edited(dests, &def, store.get(id));
-        self.open_custom_panel(panel);
+            Ok(Edit { def: None, dests, .. }) => app.error(&format!(
+                "no custom endpoint `{id}` in {}; `+ Add a custom endpoint…` starts a new one",
+                dests.providers
+            )),
+            Err(e) => app.error(&e),
+        });
     }
 
     /// Shows `panel` as the flow on screen, taking the composer's draft aside until it ends.
@@ -91,6 +84,9 @@ impl App {
 
     /// Shows the panel's current step.
     fn custom_show(&mut self) {
+        if let Some(name) = self.flows.custom().and_then(|f| f.panel.env_wanted()) {
+            return self.custom_ask_env(name);
+        }
         self.custom_notes();
         // The previous step's screen is replaced or dropped, never left on display.
         if matches!(self.overlay, Some(Overlay::Custom { .. })) {
@@ -108,6 +104,22 @@ impl App {
                 self.notice("paste the key and press Enter (shown as bullets; Esc goes back)");
             }
         }
+    }
+
+    /// Asks the host whether the variable the auth screen names is set, then shows the screen.
+    fn custom_ask_env(&mut self, name: String) {
+        let Some(flow) = self.flows.custom_mut().map(|f| {
+            f.checking = true;
+            f.id
+        }) else {
+            return;
+        };
+        self.host_call(CUSTOM_ENV, &name.clone(), move |app, r: Result<bool, String>| {
+            let Some(f) = app.flows.custom_mut().filter(|f| f.id == flow) else { return };
+            f.checking = false;
+            f.panel.env_known(&name, r.unwrap_or(false));
+            app.custom_show();
+        });
     }
 
     /// Prints what the panel has to say; it is drained whenever the panel moves on.
@@ -264,73 +276,38 @@ impl App {
             mu_base::secrets::register_stored(&custom::env_hint(&probe.id), key);
         }
         self.notice(&format!("checking {}/models…", probe.base_url));
-        let tx = self.ui_tx.clone();
-        tokio::task::spawn_local(async move {
-            let r = read_listing(&probe).await;
-            let _ = tx.send(UiMsg::CustomFetched { flow, r });
+        self.host_call(CUSTOM_FETCH, &probe, move |app, r: Result<Fetch, String>| {
+            app.on_custom_fetched(flow, r.unwrap_or_else(Fetch::Failed));
         });
     }
 
     /// Only Save reaches here. The definition and key are written, then the listing is cached.
     fn custom_save(&mut self, saved: Saved) {
         self.end_custom_wizard();
-        let Saved { id, provider, entry, editing, key_changed, listed } = saved;
-        let written = if editing {
-            // An edit only writes the key it was given; otherwise the stored one stays.
-            let key = match (key_changed, entry) {
-                (true, Some(entry)) => KeyEdit::Set(entry),
-                _ => KeyEdit::Keep,
-            };
-            self.services.update_custom(&id, provider, key)
-        } else {
-            self.services.save_custom(&id, provider, entry)
-        };
-        match written {
-            Ok(p) => {
-                if let Some(rows) = listed {
-                    self.services.commit_custom(&p, rows);
-                }
-                self.notice(if editing {
+        let editing = saved.editing;
+        self.host_call(CUSTOM_SAVE, &saved, move |app, r: Result<Outcome, String>| match r {
+            Ok(Outcome::Saved) => {
+                app.notice(if editing {
                     "Endpoint updated; use /switch to try it or /model to save a role."
                 } else {
                     "Provider configured; use /switch to try it or /model to save a role."
                 });
-                self.custom_written();
+                app.custom_written();
             }
-            Err(e) => {
+            Ok(Outcome::Failed { message, written }) => {
                 // A definition saved without its key still counts as configured.
-                let written = matches!(e, SaveError::KeyNotSaved { .. });
-                self.error(&e.to_string());
+                app.error(&message);
                 if written {
-                    self.custom_written();
+                    app.custom_written();
                 }
             }
-        }
+            Err(e) => app.error(&e),
+        });
     }
 
     fn custom_written(&mut self) {
         self.refresh_commands();
         self.send(Command::RefreshModel);
-    }
-}
-
-/// The endpoint's `/models` with the draft's credential. Nothing is written.
-async fn read_listing(probe: &Probe) -> Fetch {
-    let provider = match CustomProvider::new(&probe.base_url).validated(&probe.id) {
-        Ok(p) => p,
-        Err(e) => return Fetch::Failed(mu_base::secrets::redact_keys(&format!("{e:#}"))),
-    };
-    let key = match &probe.credential {
-        Some(entry) => match resolve_entry(&probe.id, entry).await {
-            Ok(r) => Some(r.key),
-            Err(e) => return Fetch::Credential(mu_base::secrets::redact_keys(&format!("{e:#}"))),
-        },
-        None => None,
-    };
-    match custom_fetch(&provider, key.as_deref()).await {
-        Ok(rows) => Fetch::Listed(rows),
-        Err(DiscoverError::Rejected(m)) => Fetch::Rejected(m),
-        Err(DiscoverError::Failed(m)) => Fetch::Failed(m),
     }
 }
 
@@ -604,8 +581,8 @@ mod tests {
             app.login("custom");
             let new = app.flows.custom_wizard_seq;
             assert_ne!(old, new);
-            app.on_ui(UiMsg::CustomFetched { flow: old, r: Fetch::Listed(vec![]) });
-            app.on_ui(UiMsg::CustomFetched { flow: old, r: Fetch::Rejected("late".into()) });
+            app.on_custom_fetched(old, Fetch::Listed(vec![]));
+            app.on_custom_fetched(old, Fetch::Rejected("late".into()));
             assert_eq!(app.flows.custom().map(|f| f.id), Some(new), "the new panel survives");
             assert!(app.overlay.is_some() && !app.custom_typing(), "still at its fields");
             assert!(!app.services.providers.custom_registry().path().exists());
@@ -821,6 +798,162 @@ mod tests {
             );
             assert!(matches!(cmds.try_recv(), Ok(Command::RefreshModel)));
         });
+    }
+
+    /// Answers every host call later, as a remote host does.
+    fn deferred(app: &mut App) {
+        app.host = Rc::new(crate::host::Deferred(crate::host::local::LocalHost::new(
+            app.services.providers.clone(),
+            app.ctx.clone(),
+            app.plugins.clone(),
+            app.cwd.clone(),
+        )));
+    }
+
+    #[test]
+    fn with_a_deferred_host_add_check_and_save_come_out_the_same() {
+        let (mut app, mut cmds, mut ui) = app_with("[sets.main]\ndefault = \"a/old\"\n");
+        deferred(&mut app);
+        in_local(async {
+            let (base, _seen) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
+            app.login("custom");
+            assert!(!app.custom_wizard_active(), "the panel waits for the host");
+            settle(&mut app, &mut ui, |a| screen(a).contains("Provider id")).await;
+            choose(&mut app, 0);
+            line(&mut app, "modal");
+            choose(&mut app, 2);
+            line(&mut app, &base);
+            choose(&mut app, 3);
+            settle(&mut app, &mut ui, |a| screen(a).contains("How does the endpoint take its key?")).await;
+            choose(&mut app, 3); // No authentication
+            choose(&mut app, 4); // Models: reads the endpoint
+            settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
+            choose(&mut app, 0);
+            choose(&mut app, 4); // Add it
+            esc(&mut app);
+            choose(&mut app, 5); // Save
+            settle(&mut app, &mut ui, |a| transcript_text(a).contains("Provider configured")).await;
+
+            let saved = app.services.providers.custom_registry().get("modal").unwrap().expect("saved");
+            assert_eq!(saved.models["org/model"].context_window, Some(65536), "the listed limits");
+            assert!(matches!(cmds.try_recv(), Ok(Command::RefreshModel)));
+            assert_eq!(app.services.providers.cfg.role("default").as_deref(), Some("a/old"));
+            app.request_models();
+            assert!(screen(&app).contains("modal/org/model"), "{}", screen(&app));
+        });
+    }
+
+    #[test]
+    fn with_a_deferred_host_a_taken_id_is_refused() {
+        let (mut app, _cmds, mut ui) = app_with("");
+        let registry = app.services.providers.custom_registry().clone();
+        registry.add("modal", CustomProvider::new("http://127.0.0.1:9").validated("modal").unwrap()).unwrap();
+        deferred(&mut app);
+        in_local(async {
+            app.login("custom");
+            settle(&mut app, &mut ui, |a| screen(a).contains("Provider id")).await;
+            choose(&mut app, 0);
+            line(&mut app, "modal");
+            assert!(transcript_text(&app).contains("`modal` is already in use"), "{}", transcript_text(&app));
+        });
+    }
+
+    #[test]
+    fn with_a_deferred_host_the_auth_screen_waits_for_the_variable_lookup() {
+        let (mut app, _cmds, mut ui) = app_with("");
+        deferred(&mut app);
+        in_local(async {
+            app.login("custom");
+            settle(&mut app, &mut ui, |a| screen(a).contains("Provider id")).await;
+            choose(&mut app, 0);
+            line(&mut app, "lab");
+            choose(&mut app, 3); // Key
+            assert!(app.custom_busy(), "the host is asked, and keys wait");
+            settle(&mut app, &mut ui, |a| screen(a).contains("How does the endpoint take its key?")).await;
+            assert!(screen(&app).contains("$LAB_API_KEY is not set"), "{}", screen(&app));
+            assert!(!app.custom_busy());
+        });
+    }
+
+    #[test]
+    fn with_a_deferred_host_an_edit_opens_and_saves_and_an_unknown_id_is_an_error() {
+        let (mut app, _cmds, mut ui) = app_with("");
+        in_local(async {
+            let (base, _seen) = mu_testutil::fake_server(vec![listing(ONE_MODEL)]).await;
+            let registry = app.services.providers.custom_registry().clone();
+            registry.add("modal", CustomProvider::new(&base).validated("modal").unwrap()).unwrap();
+            let store = app.services.providers.store().clone();
+            store.set("modal", mu_provider::auth::store::Entry::literal("stored-key-0123456789")).unwrap();
+            deferred(&mut app);
+
+            app.login("custom modal");
+            settle(&mut app, &mut ui, |a| screen(a).contains("Edit custom endpoint modal")).await;
+            assert!(screen(&app).contains("the stored key (not shown)"), "{}", screen(&app));
+            choose(&mut app, 3); // Models
+            settle(&mut app, &mut ui, |a| screen(a).contains("org/model")).await;
+            choose(&mut app, 0);
+            choose(&mut app, 4); // Save org/model
+            esc(&mut app);
+            choose(&mut app, 4); // Save
+            settle(&mut app, &mut ui, |a| transcript_text(a).contains("Endpoint updated")).await;
+            assert!(registry.get("modal").unwrap().expect("there").models.contains_key("org/model"));
+            assert_eq!(store.get("modal").and_then(|e| e.key).as_deref(), Some("stored-key-0123456789"));
+
+            app.login("custom nosuch");
+            settle(&mut app, &mut ui, |a| transcript_text(a).contains("no custom endpoint `nosuch`")).await;
+            assert!(app.overlay.is_none());
+        });
+    }
+
+    #[test]
+    fn the_host_reports_an_environment_variable_as_set_only_when_it_is_not_blank() {
+        let (app, _cmds, _ui) = app_with("");
+        in_local(async {
+            let ask = |name: &str| {
+                let r = app.host.call(CUSTOM_ENV, serde_json::json!(name));
+                match r {
+                    crate::host::Answer::Ready(Ok(v)) => v.as_bool(),
+                    _ => None,
+                }
+            };
+            assert_eq!(ask("PATH"), Some(true));
+            assert_eq!(ask(&format!("MU_TEST_UNSET_{}", uuid::Uuid::new_v4().simple())), Some(false));
+        });
+    }
+
+    #[test]
+    fn the_panel_types_survive_the_wire() {
+        use mu_provider::auth::store::Entry;
+        use mu_provider::model::discovery::CustomRow;
+        fn round<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(v: T) {
+            let back: T = serde_json::from_value(serde_json::to_value(&v).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&v).unwrap());
+        }
+        let row = CustomRow { id: "m".into(), context_length: Some(8), max_completion_tokens: None };
+        let mut provider = CustomProvider::new("http://127.0.0.1:9");
+        let mut model = CustomModel { context_window: Some(8192), ..Default::default() };
+        model.extra_body = serde_json::from_value(serde_json::json!({"a": {"b": true, "n": 3, "x": 1.5}})).unwrap();
+        provider.models.insert("org/m".into(), model.clone());
+        let provider = provider.validated("modal").unwrap();
+        let wire: CustomProvider = serde_json::from_value(serde_json::to_value(&provider).unwrap()).unwrap();
+        assert_eq!(wire.models["org/m"], model, "a definition's nested switches survive JSON");
+        round(Probe {
+            id: "modal".into(),
+            base_url: "http://x".into(),
+            credential: Some(Entry::literal("k-1234567890")),
+        });
+        round(Saved {
+            id: "modal".into(),
+            provider,
+            entry: Some(Entry::reference("$MODAL_KEY").unwrap()),
+            editing: true,
+            key_changed: false,
+            listed: Some(vec![row.clone()]),
+        });
+        round(Fetch::Listed(vec![row]));
+        round(Fetch::Credential("not set".into()));
+        round(Outcome::Failed { message: "m".into(), written: true });
+        round(Outcome::Saved);
     }
 
     #[test]
