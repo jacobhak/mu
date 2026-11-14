@@ -167,11 +167,6 @@ fn is_zero(n: &f64) -> bool {
 }
 
 impl Cost {
-    /// The input and output rates as the model lists show them: `$0.3/M in, $1.2/M out`.
-    pub fn summary(&self) -> String {
-        format!("${}/M in, ${}/M out", self.input, self.output)
-    }
-
     fn validate(&self) -> Result<()> {
         for (name, rate) in [
             ("input", self.input),
@@ -651,18 +646,6 @@ pub enum KeyState {
     /// Stored but not enabled for chat.
     Disabled,
     Missing,
-}
-
-impl KeyState {
-    /// The short word picker rows and status lines show.
-    pub fn word(self) -> &'static str {
-        match self {
-            Self::NotNeeded => "no auth",
-            Self::Saved => "key",
-            Self::Disabled => "key not for chat",
-            Self::Missing => "key missing",
-        }
-    }
 }
 
 /// The environment variable a provider's key conventionally comes from; also its redaction label.

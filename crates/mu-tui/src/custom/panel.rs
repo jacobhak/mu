@@ -820,7 +820,8 @@ impl Panel {
             ),
             Row::Costs => (
                 "Costs".to_string(),
-                self.cost().map_or_else(|| "not set; the model is unpriced".to_string(), |c| c.summary()),
+                self.cost()
+                    .map_or_else(|| "not set; the model is unpriced".to_string(), |c| crate::labels::cost_summary(&c)),
             ),
             Row::CostInput => ("Input".to_string(), self.cost_rate_text(Field::CostInput)),
             Row::CostOutput => ("Output".to_string(), self.cost_rate_text(Field::CostOutput)),
@@ -1054,7 +1055,7 @@ impl Panel {
     fn listed_detail(&self, row: &CustomRow) -> String {
         let limits = limits_of(row);
         let Some(m) = self.models.get(&row.id) else { return limits };
-        let cost = m.cost.map(|c| format!(" · {}", c.summary())).unwrap_or_default();
+        let cost = m.cost.map(|c| format!(" · {}", crate::labels::cost_summary(&c))).unwrap_or_default();
         let added = format!(
             "added: {} ctx · {} out · {}{cost}",
             m.context_window.unwrap_or(DEFAULT_CONTEXT),

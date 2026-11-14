@@ -455,7 +455,10 @@ impl App {
             } else {
                 format!("API key: {} (custom)", c.label())
             };
-            rows.push((Item { label, detail: c.key_state(store).word().into() }, LoginTarget::ApiKey(c.id.clone())));
+            rows.push((
+                Item { label, detail: crate::labels::key_state_word(c.key_state(store)).into() },
+                LoginTarget::ApiKey(c.id.clone()),
+            ));
             let edit = Item {
                 label: format!("Edit custom endpoint: {}", c.label()),
                 detail: "address, key, models, reasoning".into(),

@@ -3,6 +3,7 @@
 pub mod app;
 pub(crate) mod chat;
 pub(crate) mod custom;
+pub mod labels;
 pub(crate) mod mcp;
 pub(crate) mod panels;
 pub(crate) mod render;

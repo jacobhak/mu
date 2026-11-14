@@ -157,7 +157,10 @@ impl App {
         let mut ids = Vec::new();
         for m in direct {
             if !ids.contains(&m.id) {
-                let detail = m.key.map_or_else(|| chatgpt::native_label(&m.provider).into(), |k| k.word().to_string());
+                let detail = m.key.map_or_else(
+                    || chatgpt::native_label(&m.provider).into(),
+                    |k| crate::labels::key_state_word(k).to_string(),
+                );
                 items.push(Item { label: m.id.clone(), detail });
                 ids.push(m.id);
             }

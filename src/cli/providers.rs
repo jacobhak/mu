@@ -422,7 +422,7 @@ fn list(registry: &Registry, store: &Store, out: &mut impl Write) -> Result<()> 
     for (id, c) in &defs {
         let credential = match c.auth {
             AuthMode::None => "no auth".to_string(),
-            AuthMode::Bearer => format!("bearer, {}", c.key_state(store).word()),
+            AuthMode::Bearer => format!("bearer, {}", mu_tui::labels::key_state_word(c.key_state(store))),
         };
         let discovery = if c.discover { "discovery on" } else { "discovery off" };
         writeln!(
@@ -490,7 +490,7 @@ fn model_rows(c: &CustomProvider, listed: &[CustomRow]) -> Vec<String> {
                 Reasoning::Template => "  reasoning by request switches".to_string(),
             });
             let cost = c.models.get(*m).and_then(|x| x.cost);
-            let cost = cost.map_or(String::new(), |k| format!("  cost {}", k.summary()));
+            let cost = cost.map_or(String::new(), |k| format!("  cost {}", mu_tui::labels::cost_summary(&k)));
             format!("{}/{m}  {source}{context}{reasoning}{cost}", c.id)
         })
         .collect()
