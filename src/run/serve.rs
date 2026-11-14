@@ -16,7 +16,7 @@ use mu_session::session::format;
 use mu_tui::host::Host;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
@@ -60,6 +60,43 @@ struct Server {
     socket: Option<PathBuf>,
     listener: Option<UnixListener>,
     client: Option<Client>,
+    /// Open tunnels, by id: where the client's lines for each go.
+    tunnels: std::collections::HashMap<u64, UnboundedSender<String>>,
+}
+
+/// `{path}`: takes the session over for a client that has no terminal here: a `mu -p` run holding it is
+/// stopped after its current step, then `mu agent --resume` starts on it, and its session id comes back
+/// once it listens. That agent is an ordinary one: it runs until its client quits it or it is signalled.
+async fn take(args: serde_json::Value) -> Result<serde_json::Value, String> {
+    use tokio::io::AsyncBufReadExt;
+    let path = args["path"].as_str().map(PathBuf::from).ok_or("take needs a session path")?;
+    let quiet = path.clone();
+    tokio::task::spawn_blocking(move || crate::workflow::take::release_quiet(&quiet))
+        .await
+        .map_err(|e| e.to_string())??;
+    let exe = paths::self_exe().map_err(|e| format!("cannot locate mu: {e}"))?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("agent").arg("--resume").arg(&path).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
+    if let Some(dir) = mu_session::session::list::header_cwd(&path).filter(|d| d.is_dir()) {
+        cmd.current_dir(dir);
+    }
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| format!("cannot start the agent: {e}"))?;
+    let stdout = child.stdout.take().ok_or("the agent has no stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(60), lines.next_line()).await;
+    let line = match first {
+        Ok(Ok(Some(l))) => l,
+        _ => return Err("the agent did not start; see its log".into()),
+    };
+    // Its pipe and its exit status belong to it until it ends.
+    tokio::task::spawn_local(async move {
+        let _keep = lines;
+        let _ = child.wait().await;
+    });
+    let v: serde_json::Value =
+        serde_json::from_str(&line).map_err(|e| format!("unreadable start line {line:?}: {e}"))?;
+    Ok(serde_json::json!({ "session": v["session"] }))
 }
 
 pub fn socket_path(session: &Path) -> Result<PathBuf, String> {
@@ -97,6 +134,51 @@ impl Server {
         self.listener = Some(listener);
         self.session = Some(session.to_path_buf());
         Ok(())
+    }
+
+    /// The client left: what it started for itself goes with it (programs on a terminal, tunnels).
+    fn client_gone(&mut self) {
+        self.client = None;
+        self.tunnels.clear();
+        mu_tui::host::program::kill_all();
+    }
+
+    /// A tunnel to the agent of `session`, which runs on this host: its lines go both ways untouched.
+    fn open_tunnel(&mut self, id: u64, session: &str) {
+        let Some(client) = &self.client else { return };
+        let out = client.writer.clone();
+        let closed = move |error: Option<String>| {
+            let _ = out.send(to_line(&AgentLine::TunnelClose { id, error }));
+        };
+        if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return closed(Some(format!("`{session}` is not a session id")));
+        }
+        let socket = paths::profile_home().join("run").join(format!("{session}.sock"));
+        let (tx, mut to_socket) = unbounded_channel::<String>();
+        self.tunnels.insert(id, tx);
+        let lines_out = client.writer.clone();
+        tokio::task::spawn_local(async move {
+            let stream = match UnixStream::connect(&socket).await {
+                Ok(s) => s,
+                Err(e) => return closed(Some(format!("cannot connect to {}: {e}", socket.display()))),
+            };
+            let (read, mut write) = stream.into_split();
+            tokio::task::spawn_local(async move {
+                while let Some(line) = to_socket.recv().await {
+                    if write.write_all(line.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() {
+                        return;
+                    }
+                }
+                let _ = write.shutdown().await;
+            });
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if lines_out.send(to_line(&AgentLine::TunnelLine { id, line })).is_err() {
+                    return;
+                }
+            }
+            closed(None);
+        });
     }
 
     fn send(&self, line: &AgentLine) {
@@ -147,6 +229,8 @@ impl Server {
 
     fn join(&mut self, id: u64, writer: UnboundedSender<String>, written: oneshot::Receiver<()>) {
         if let Some(old) = self.client.take() {
+            self.tunnels.clear();
+            mu_tui::host::program::kill_all();
             let _ = old.writer.send(to_line(&AgentLine::Event(WireEvent::Detached {
                 reason: "another client took this session".into(),
             })));
@@ -174,7 +258,24 @@ impl Server {
                     let _ = self.cmd.send(c);
                 }
             }
-            ClientLine::Detach => self.client = None,
+            ClientLine::Detach => self.client_gone(),
+            ClientLine::Host { id, call, args } if call == "take" => {
+                let Some(client) = &self.client else { return };
+                let writer = client.writer.clone();
+                tokio::task::spawn_local(async move {
+                    let result = take(args).await;
+                    let _ = writer.send(to_line(&AgentLine::HostReply { id, result }));
+                });
+            }
+            ClientLine::TunnelOpen { id, session } => self.open_tunnel(id, &session),
+            ClientLine::TunnelLine { id, line } => {
+                if let Some(tx) = self.tunnels.get(&id) {
+                    let _ = tx.send(line);
+                }
+            }
+            ClientLine::TunnelClose { id } => {
+                self.tunnels.remove(&id);
+            }
             ClientLine::Host { id, call, args } => {
                 let Some(client) = &self.client else { return };
                 let reply = move |result| to_line(&AgentLine::HostReply { id, result });
@@ -239,8 +340,16 @@ async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>) 
 
 pub async fn run(init: Init) -> i32 {
     let Init { host, cmd, mut ev, mut notices, resumed } = init;
-    let mut server =
-        Server { host, cmd, catchup: Catchup::new(), session: None, socket: None, listener: None, client: None };
+    let mut server = Server {
+        host,
+        cmd,
+        catchup: Catchup::new(),
+        session: None,
+        socket: None,
+        listener: None,
+        client: None,
+        tunnels: Default::default(),
+    };
     // Before the socket exists: whoever reads the first line may signal at once.
     let (mut term, mut hup, mut int) = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -307,7 +416,7 @@ pub async fn run(init: Init) -> i32 {
                 Inbox::Line(id, line) => server.on_line(id, line),
                 Inbox::Closed(id) => {
                     if server.client.as_ref().map(|c| c.id) == Some(id) {
-                        server.client = None;
+                        server.client_gone();
                     }
                 }
             },

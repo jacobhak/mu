@@ -58,6 +58,26 @@ pub fn release(path: &Path, who: &str, ask: bool) -> anyhow::Result<Option<i32>>
     }
 }
 
+/// `release` for a caller with no terminal and no stderr anyone reads (the agent serving an attached client):
+/// the reason a session cannot be had comes back as the error. Never asks.
+pub fn release_quiet(path: &Path) -> Result<(), String> {
+    match owner(path) {
+        Owner::Free => Ok(()),
+        Owner::Live { pid, print_run: false, .. } => {
+            Err(format!("pid {pid} has the session open in an interactive mu (or a subagent/ACP); close it there"))
+        }
+        Owner::Unknown => Err("the session is locked by a process that left no owner record (an older mu, another \
+                               MU_HOME, or a mirror of a remote subagent's session that is still running); stop it \
+                               yourself or wait for it"
+            .into()),
+        Owner::Live { pid, print_run: true, started, .. } => match stop_and_wait(path, pid, &started) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(format!("could not stop the `mu -p` run (pid {pid}); see the agent's log")),
+            Err(e) => Err(e.to_string()),
+        },
+    }
+}
+
 /// `None`: the user agreed to stop the run. `Some(code)`: leave it running and exit with `code`.
 fn confirm_stop(who: &str, pid: u32, tty: bool, input: &mut impl std::io::BufRead) -> Option<i32> {
     if !tty {

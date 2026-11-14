@@ -68,6 +68,7 @@ impl LocalHost {
         super::sessions::register(&mut registry);
         super::plans::register(&mut registry);
         super::memory::register(&mut registry);
+        super::program::register(&mut registry);
         Self {
             local: Rc::new(Local { providers, ctx, plugins, cwd, push }),
             info,

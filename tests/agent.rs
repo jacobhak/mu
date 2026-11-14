@@ -69,7 +69,12 @@ struct Agent {
 
 impl Agent {
     fn start(home: &Path, cwd: &Path, extra: &[&str]) -> Agent {
+        Agent::start_env(home, cwd, extra, &[])
+    }
+
+    fn start_env(home: &Path, cwd: &Path, extra: &[&str], env: &[(&str, &Path)]) -> Agent {
         let mut child = mu(home, cwd)
+            .envs(env.iter().copied())
             .args(["agent", "--model", MODEL, "--permissions", "yolo"])
             .args(extra)
             .stdin(Stdio::null())
@@ -302,5 +307,289 @@ fn attach_with_nothing_running_says_so() {
         String::from_utf8_lossy(&o.stderr).contains("no agent is running"),
         "{}",
         String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+fn text_reply(text: &str) -> String {
+    ANSWER.replace("hello from the fake", text)
+}
+
+fn tool_use_body(id: &str, name: &str, input: &Value) -> String {
+    format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m1\"}}}}\n\n\
+         event: content_block_start\ndata: {}\n\n\
+         event: content_block_delta\ndata: {}\n\n\
+         event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}\n\n\
+         event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}),
+    )
+}
+
+/// A fake model that answers by request body (mu also sends title requests whose timing is not fixed):
+/// the first real request calls `bash` on a terminal, the one after its result says it is done.
+fn pty_model() -> String {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let call = json!({"command": "echo from-the-pty", "pty": true});
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            let call = call.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    let Some(p) = text.find("\r\n\r\n") else {
+                        if n == 0 {
+                            return;
+                        }
+                        continue;
+                    };
+                    let len = text[..p]
+                        .to_lowercase()
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                        .unwrap_or(0);
+                    if buf.len() >= p + 4 + len || n == 0 {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).into_owned();
+                let body = if req.contains("3–7 word title") {
+                    text_reply("A title")
+                } else if req.contains("\"tool_result\"") {
+                    text_reply("the terminal said it")
+                } else {
+                    tool_use_body("t1", "bash", &call)
+                };
+                let out = format!(
+                    "HTTP/1.1 200 X\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(out.as_bytes());
+            });
+        }
+    });
+    base
+}
+
+#[test]
+fn a_terminal_call_is_sized_and_fed_by_the_client() {
+    let home = home_with_key(&pty_model());
+    let cwd = mu_testutil::tmp();
+    let agent = Agent::start(&home, &cwd, &[]);
+    let mut c = Client::connect(&agent.socket);
+    c.hello();
+    c.until(caught_up);
+    c.command(AgentCommand::Prompt("run it".into()));
+    let open = c.until(|v| v["event"].get("PtyOpen").is_some()).pop().unwrap();
+    let id = open["event"]["PtyOpen"]["id"].as_u64().unwrap();
+    assert_eq!(open["event"]["PtyOpen"]["tool"], "t1");
+    c.send(&ClientLine::Command(WireCommand::PtySize { id, cols: 80, rows: 24 }));
+    let seen = c.until(|v| event_is(v, "TurnEnd"));
+    let out: String = seen.iter().filter_map(|v| v["event"]["Event"]["ToolOutput"]["chunk"].as_str()).collect();
+    assert!(out.contains("from-the-pty"), "the terminal's output reaches the client: {seen:?}");
+    assert!(seen.iter().any(|v| v["event"]["Event"].get("ToolEnd").is_some()));
+}
+
+/// A stand-in for omp that prints a prompt, reads one line and exits with 3.
+fn fake_omp(dir: &Path) -> PathBuf {
+    let path = dir.join("fake-omp");
+    std::fs::write(&path, "#!/bin/sh\nprintf 'READY\\n'\nread x\nprintf 'got:%s\\n' \"$x\"\nexit 3\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn a_host_program_runs_on_a_terminal_with_its_output_pushed_and_its_input_taken() {
+    use base64::Engine;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let (home, cwd) = fixture();
+    let omp = fake_omp(&home);
+    let agent = Agent::start_env(&home, &cwd, &[], &[("MU_OMP", omp.as_path())]);
+    let mut c = Client::connect(&agent.socket);
+    c.hello();
+    c.until(caught_up);
+    let run = json!({"id": 5, "program": {"McpLogin": {"name": "x"}}, "cols": 80, "rows": 24});
+    c.send(&ClientLine::Host { id: 1, call: "program_run".into(), args: run });
+    let mut seen = String::new();
+    let pushed = |v: &Value| v["pushed"]["name"] == "program_output";
+    let text = |v: &Value| {
+        String::from_utf8_lossy(&b64.decode(v["pushed"]["data"]["data"].as_str().unwrap()).unwrap()).into_owned()
+    };
+    while !seen.contains("READY") {
+        let lines = c.until(pushed);
+        seen.push_str(&text(lines.last().unwrap()));
+    }
+    let keys = json!({"id": 5, "data": b64.encode(b"hello\n")});
+    c.send(&ClientLine::Host { id: 2, call: "program_input".into(), args: keys });
+    let mut done = None;
+    while done.is_none() {
+        let v = c.next().expect("the stream goes on");
+        if pushed(&v) {
+            seen.push_str(&text(&v));
+        } else if v["hostReply"]["id"] == 1 {
+            done = Some(v);
+        }
+    }
+    assert!(seen.contains("got:hello"), "the keystrokes reached the program: {seen:?}");
+    assert_eq!(done.unwrap()["hostReply"]["result"]["Ok"]["code"], 3);
+}
+
+#[test]
+fn a_program_ends_with_the_client_that_started_it() {
+    let (home, cwd) = fixture();
+    let marker = home.join("hung-up");
+    let omp = home.join("waiting-omp");
+    std::fs::write(
+        &omp,
+        // Builtins only: the agent's PATH is empty in these tests.
+        format!("#!/bin/sh\ntrap ': > \"{}\"; exit 1' HUP\nprintf 'READY\\n'\nread x\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let agent = Agent::start_env(&home, &cwd, &[], &[("MU_OMP", omp.as_path())]);
+    let mut c = Client::connect(&agent.socket);
+    c.hello();
+    c.until(caught_up);
+    c.send(&ClientLine::Host {
+        id: 1,
+        call: "program_run".into(),
+        args: json!({"id": 9, "program": {"McpLogin": {"name": "x"}}, "cols": 80, "rows": 24}),
+    });
+    let mut seen = String::new();
+    while !seen.contains("READY") {
+        let line = c.until(|v| v["pushed"]["name"] == "program_output").pop().unwrap();
+        let data = line["pushed"]["data"]["data"].as_str().unwrap();
+        seen.push_str(&String::from_utf8_lossy(
+            &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).unwrap(),
+        ));
+    }
+    // The program waits for a line nobody will send; its client leaves.
+    c.send(&ClientLine::Detach);
+    for _ in 0..100 {
+        if marker.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("the program was not hung up when its client left");
+}
+
+/// The session file of `id` under a test home.
+fn session_file(home: &Path, id: &str) -> PathBuf {
+    let mut stack = vec![home.join("sessions")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&format!("_{id}.jsonl"))) {
+                return p;
+            }
+        }
+    }
+    panic!("no session file for {id}");
+}
+
+#[test]
+fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
+    let (home, cwd) = fixture();
+    // A session with one exchange in it, whose agent has ended.
+    let mut first = Agent::start(&home, &cwd, &[]);
+    let mut c = Client::connect(&first.socket);
+    c.hello();
+    c.until(caught_up);
+    c.command(AgentCommand::Prompt("an earlier question".into()));
+    c.until(|v| event_is(v, "TurnEnd"));
+    c.command(AgentCommand::Exit);
+    assert!(first.wait_exit().success());
+    let file = session_file(&home, &first.session);
+
+    // Another agent's client takes it over: the host starts an agent on it and a tunnel reaches it.
+    let other = Agent::start(&home, &mu_testutil::tmp(), &[]);
+    let mut c = Client::connect(&other.socket);
+    c.hello();
+    c.until(caught_up);
+    c.send(&ClientLine::Host { id: 1, call: "take".into(), args: json!({"path": file}) });
+    let reply = c.until(|v| v["hostReply"]["id"] == 1).pop().unwrap();
+    let session =
+        reply["hostReply"]["result"]["Ok"]["session"].as_str().unwrap_or_else(|| panic!("{reply}")).to_string();
+    assert_eq!(session, first.session, "the resumed agent has the same session");
+
+    c.send(&ClientLine::TunnelOpen { id: 7, session });
+    let hello = to_line(&ClientLine::Hello { wire: WIRE, version: "nested".into() });
+    c.send(&ClientLine::TunnelLine { id: 7, line: hello });
+    let tunnelled: Vec<Value> = {
+        let mut got = Vec::new();
+        loop {
+            let v = c.next().expect("the tunnel carries lines");
+            if let Some(line) = v["tunnelLine"]["line"].as_str() {
+                let inner: Value = serde_json::from_str(line).unwrap();
+                let done = inner["event"] == "CaughtUp";
+                got.push(inner);
+                if done {
+                    break;
+                }
+            }
+        }
+        got
+    };
+    assert!(tunnelled[0].get("hello").is_some(), "the second agent answers the nested hello: {tunnelled:?}");
+    assert!(
+        tunnelled.iter().any(|v| v["event"]["Event"]["UserPrompt"] == "an earlier question"),
+        "and replays the conversation taken over: {tunnelled:?}"
+    );
+
+    // End the nested agent through the tunnel, then close it.
+    let exit = to_line(&ClientLine::Command(WireCommand::Command(AgentCommand::Exit)));
+    c.send(&ClientLine::TunnelLine { id: 7, line: exit });
+    let closed = c.until(|v| v.get("tunnelClose").is_some()).pop().unwrap();
+    assert_eq!(closed["tunnelClose"]["id"], 7);
+}
+
+#[test]
+fn a_tunnel_to_nothing_closes_with_a_reason() {
+    let (home, cwd) = fixture();
+    let agent = Agent::start(&home, &cwd, &[]);
+    let mut c = Client::connect(&agent.socket);
+    c.hello();
+    c.until(caught_up);
+    c.send(&ClientLine::TunnelOpen { id: 1, session: "no-such-agent".into() });
+    let closed = c.until(|v| v.get("tunnelClose").is_some()).pop().unwrap();
+    assert!(closed["tunnelClose"]["error"].as_str().unwrap().contains("cannot connect"), "{closed}");
+    c.send(&ClientLine::TunnelOpen { id: 2, session: "../../etc".into() });
+    let closed = c.until(|v| v.get("tunnelClose").is_some()).pop().unwrap();
+    assert!(closed["tunnelClose"]["error"].as_str().unwrap().contains("not a session id"), "{closed}");
+}
+
+#[test]
+fn a_terminal_nobody_attends_waits_in_the_agent_and_a_late_client_is_asked_again() {
+    let home = home_with_key(&pty_model());
+    let cwd = mu_testutil::tmp();
+    let agent = Agent::start(&home, &cwd, &[]);
+    let mut first = Client::connect(&agent.socket);
+    first.hello();
+    first.until(caught_up);
+    first.command(AgentCommand::Prompt("run it".into()));
+    first.until(|v| v["event"].get("PtyOpen").is_some());
+    first.send(&ClientLine::Detach);
+
+    let mut late = Client::connect(&agent.socket);
+    late.hello();
+    let lines = late.until(caught_up);
+    let asked = lines.iter().find(|v| v["event"].get("PtyOpen").is_some()).expect("the request is sent again");
+    let id = asked["event"]["PtyOpen"]["id"].as_u64().unwrap();
+    late.send(&ClientLine::Command(WireCommand::PtySize { id, cols: 100, rows: 30 }));
+    let seen = late.until(|v| event_is(v, "TurnEnd"));
+    assert!(
+        seen.iter()
+            .any(|v| v["event"]["Event"]["ToolOutput"]["chunk"].as_str().is_some_and(|c| c.contains("from-the-pty")))
     );
 }

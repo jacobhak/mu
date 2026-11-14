@@ -4,6 +4,10 @@
 use super::ui_msgs::UiMsg;
 use super::*;
 use crate::host::plans::{READ_FILE, ReadFile, WRITE_FILE, WriteFile};
+use crate::host::program::{
+    Done as ProgramDone, Input as ProgramInput, Output as ProgramOutput, PROGRAM_INPUT, PROGRAM_RUN, PROGRAM_SIZE,
+    Program, Run as ProgramRun, Size as ProgramSize,
+};
 use crate::render::Renderer;
 use crate::term::term;
 
@@ -178,6 +182,9 @@ impl App {
     pub(super) fn run_login(&mut self, args: &[&str], pick: Option<usize>) {
         use std::process::Stdio;
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        if self.host.is_remote() {
+            return self.run_host_program(Program::Login { args, pick }, ChildThen::Login);
+        }
         self.start_child(ChildThen::Login, move || {
             let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
             cmd.arg("login").args(&args);
@@ -207,6 +214,9 @@ impl App {
             if !r.unwrap_or_default().contains(&name) {
                 return app.error(&format!("no MCP server `{name}` is configured"));
             }
+            if app.host.is_remote() {
+                return app.run_host_program(Program::McpLogin { name: name.clone() }, ChildThen::McpLogin(name));
+            }
             let cwd = app.cwd.clone();
             app.start_child(ChildThen::McpLogin(name.clone()), move || {
                 let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
@@ -221,6 +231,74 @@ impl App {
                 status
             });
         });
+    }
+
+    /// Runs a program on the host (it is on another machine) and shows it on this terminal: the host
+    /// sends its output, and this side sends back the keystrokes and the size of the window.
+    pub(super) fn run_host_program(&mut self, program: Program, then: ChildThen) {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if self.screen.child_busy {
+            return self.notice("another program already has the terminal");
+        }
+        let committed = std::mem::take(&mut self.agent.tr.pending);
+        let _ = self.screen.renderer.draw(&committed, &[], (0, 0));
+        let _ = self.screen.renderer.finish();
+        let _ = term::suspend();
+        if !cfg!(test) {
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
+        self.screen.child_busy = true;
+        static PROGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = PROGRAMS.fetch_add(1, Ordering::SeqCst);
+        let (cols, rows) = if cfg!(test) { (80, 24) } else { crossterm::terminal::size().unwrap_or((80, 24)) };
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        if !cfg!(test) {
+            let stop = stop.clone();
+            std::thread::spawn(move || tty_pump(&stop, &keys_tx));
+        }
+        let host = self.host.clone();
+        tokio::task::spawn_local(async move {
+            use base64::Engine;
+            let mut winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok();
+            loop {
+                tokio::select! {
+                    k = keys.recv() => match k {
+                        Some(k) => {
+                            let data = base64::engine::general_purpose::STANDARD.encode(k);
+                            drop(host.call(PROGRAM_INPUT, crate::host::encode(&ProgramInput { id, data })));
+                        }
+                        None => break,
+                    },
+                    Some(()) = async { match winch.as_mut() { Some(w) => w.recv().await, None => std::future::pending().await } } => {
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        drop(host.call(PROGRAM_SIZE, crate::host::encode(&ProgramSize { id, cols, rows })));
+                    }
+                }
+            }
+        });
+        let args = ProgramRun { id, program, cols, rows };
+        self.host_call(PROGRAM_RUN, &args, move |app, r: Result<ProgramDone, String>| {
+            stop.store(true, Ordering::SeqCst);
+            let status = r.map(|d| match d.code {
+                Some(c) => std::process::ExitStatus::from_raw(c << 8),
+                None => std::process::ExitStatus::from_raw(libc::SIGHUP),
+            });
+            app.on_child_done(then, status);
+        });
+    }
+
+    /// Output of the host program on this terminal.
+    pub(super) fn on_program_output(&mut self, p: crate::host::Pushed) {
+        use base64::Engine;
+        use std::io::Write;
+        let Ok(o) = serde_json::from_value::<ProgramOutput>(p.data) else { return };
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(o.data) {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&bytes).and_then(|()| out.flush());
+        }
     }
 
     /// Runs `$VISUAL`/`$EDITOR` on `path` with the terminal handed over.
@@ -246,6 +324,9 @@ impl App {
             Ok(e) => e,
             Err(e) => return self.error(&format!("cannot locate mu: {e}")),
         };
+        if self.host.is_remote() {
+            return self.take_remote(path, exe);
+        }
         self.start_child(ChildThen::Take, move || {
             extern "C" fn noop(_: libc::c_int) {}
             // As in `run_login`: Ctrl-C reaches `mu take`, not this mu.
@@ -256,6 +337,107 @@ impl App {
             unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
             status
         });
+    }
+
+    /// Takes over a `-p` run beside a remote host. The agent stops the run and starts an agent on its session;
+    /// this side opens a tunnel to that agent, serves it on a private socket and runs a nested client on
+    /// that socket with the terminal, as `mu take` runs a nested mu locally. The first session is back when
+    /// it ends.
+    fn take_remote(&mut self, path: PathBuf, exe: PathBuf) {
+        self.notice("taking the session over on the host: a running `mu -p` is stopped after its current step…");
+        self.host_call(
+            "take",
+            &serde_json::json!({ "path": path }),
+            move |app, r: Result<serde_json::Value, String>| {
+                let session = match r {
+                    Ok(v) => v["session"].as_str().unwrap_or_default().to_string(),
+                    Err(e) => return app.error(&format!("cannot take the session over: {e}")),
+                };
+                let tunnel = match app.host.tunnel(&session) {
+                    Ok(t) => t,
+                    Err(e) => return app.error(&format!("cannot reach the agent: {e}")),
+                };
+                let sock = private_socket_path();
+                let listener = match tokio::net::UnixListener::bind(&sock) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tunnel.close();
+                        return app.error(&format!("cannot listen on {}: {e}", sock.display()));
+                    }
+                };
+                tokio::task::spawn_local(bridge(listener, tunnel, sock.clone()));
+                let command = format!(
+                    "{} attach --socket {}",
+                    crate::host::program::quote(&exe.to_string_lossy()),
+                    crate::host::program::quote(&sock.to_string_lossy())
+                );
+                app.start_child(ChildThen::Take, move || {
+                    extern "C" fn noop(_: libc::c_int) {}
+                    // SAFETY: installs a no-op handler; restored to the default below.
+                    unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+                    let status = std::process::Command::new(&exe).arg("--attach").arg(command).status();
+                    // SAFETY: back to the default disposition.
+                    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+                    status
+                });
+            },
+        );
+    }
+}
+
+/// Copies lines between the nested client's connection to `listener` and the tunnel, until either ends.
+async fn bridge(listener: tokio::net::UnixListener, mut tunnel: crate::host::Tunnel, sock: PathBuf) {
+    use crate::host::TunnelIn;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    // Only the nested client this process starts connects: give it a while to.
+    if let Ok(Ok((stream, _))) = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await {
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        loop {
+            tokio::select! {
+                line = lines.next_line() => match line {
+                    Ok(Some(l)) => tunnel.send(l),
+                    _ => break,
+                },
+                from_agent = tunnel.rx.recv() => match from_agent {
+                    Some(TunnelIn::Line(l)) => {
+                        if write.write_all(l.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                },
+            }
+        }
+    }
+    tunnel.close();
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// A socket path only this user can reach, for the nested client of a take-over.
+fn private_socket_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("mu-take-{}.sock", &uuid::Uuid::new_v4().simple().to_string()[..8]))
+}
+
+/// Reads the keystrokes of the terminal for a program on the host, until `stop` is set.
+fn tty_pump(stop: &std::sync::atomic::AtomicBool, tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+    let Some(fd) = term::tty() else { return };
+    let mut buf = [0u8; 1024];
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut p, 1, 100) };
+        if ready > 0 && p.revents & libc::POLLIN != 0 {
+            // SAFETY: `buf` is a live, writable buffer of the given length.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 && tx.send(buf[..n as usize].to_vec()).is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -323,6 +505,117 @@ fn private_temp_file(content: &str) -> std::io::Result<PathBuf> {
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
     f.write_all(content.as_bytes())?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod remote_program_tests {
+    use super::*;
+    use crate::app::keys::tests::{in_local, test_app_with_commands, transcript_text};
+    use crate::host::{Answer, Host, HostInfo, Pushed};
+    use serde_json::Value;
+    use std::cell::RefCell;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    /// A host on "another machine": it answers `program_run` when the test says, and records every call.
+    struct Remote {
+        info: HostInfo,
+        calls: Rc<RefCell<Vec<(String, Value)>>>,
+        finish: RefCell<Option<oneshot::Receiver<Value>>>,
+    }
+
+    impl Host for Remote {
+        fn info(&self) -> &HostInfo {
+            &self.info
+        }
+
+        fn is_remote(&self) -> bool {
+            true
+        }
+
+        fn call(&self, name: &str, args: Value) -> Answer {
+            self.calls.borrow_mut().push((name.to_string(), args));
+            if name != PROGRAM_RUN {
+                return Answer::Ready(Ok(Value::Null));
+            }
+            let rx = self.finish.borrow_mut().take();
+            Answer::Pending(Box::pin(async move {
+                match rx {
+                    Some(rx) => rx.await.map_err(|e| e.to_string()),
+                    None => Err("no gate".into()),
+                }
+            }))
+        }
+
+        fn pushed(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Pushed>> {
+            None
+        }
+    }
+
+    type Calls = Rc<RefCell<Vec<(String, Value)>>>;
+
+    fn remote_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<UiMsg>, Calls, oneshot::Sender<Value>) {
+        let (mut app, _cmds) = test_app_with_commands(std::env::temp_dir().join("mu-remote-program-history"));
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.ui_tx = ui_tx;
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (gate, rx) = oneshot::channel();
+        app.host = Rc::new(Remote { info: HostInfo::default(), calls: calls.clone(), finish: RefCell::new(Some(rx)) });
+        (app, ui_rx, calls, gate)
+    }
+
+    #[test]
+    fn a_login_beside_a_remote_host_runs_there_and_ends_with_its_exit_status() {
+        let (mut app, mut ui_rx, calls, gate) = remote_app();
+        in_local(async {
+            app.run_login(&["--x"], Some(2));
+            assert!(app.screen.child_busy, "this terminal is handed to the program");
+            let (name, args) = calls.borrow()[0].clone();
+            assert_eq!(name, PROGRAM_RUN);
+            assert_eq!(args["program"], serde_json::json!({"Login": {"args": ["--x"], "pick": 2}}));
+            gate.send(serde_json::json!({"code": 0})).unwrap();
+            let m = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv()).await.unwrap().unwrap();
+            app.on_ui(m);
+            assert!(!app.screen.child_busy);
+            assert!(transcript_text(&app).contains("login finished"), "{}", transcript_text(&app));
+        });
+    }
+
+    #[test]
+    fn taking_a_session_over_beside_a_remote_host_asks_the_host_to_take_it() {
+        let (mut app, _ui_rx, calls, _gate) = remote_app();
+        in_local(async {
+            app.take_session("/s/a_b.jsonl".into());
+            let (name, args) = calls.borrow()[0].clone();
+            assert_eq!((name.as_str(), &args["path"]), ("take", &serde_json::json!("/s/a_b.jsonl")));
+            assert!(!app.screen.child_busy, "the terminal stays with this UI until the host has answered");
+        });
+    }
+
+    #[test]
+    fn a_failing_program_is_reported_with_its_status() {
+        let (mut app, mut ui_rx, _calls, gate) = remote_app();
+        in_local(async {
+            app.run_host_program(Program::Login { args: vec![], pick: None }, ChildThen::Login);
+            gate.send(serde_json::json!({"code": 3})).unwrap();
+            let m = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv()).await.unwrap().unwrap();
+            app.on_ui(m);
+            assert!(transcript_text(&app).contains("omp login exited with"), "{}", transcript_text(&app));
+        });
+    }
+
+    #[test]
+    fn output_pushed_by_the_host_reaches_the_terminal_and_a_garbled_chunk_is_ignored() {
+        let (mut app, _ui_rx, _calls, _gate) = remote_app();
+        app.on_pushed(Pushed {
+            name: crate::host::program::PROGRAM_OUTPUT.into(),
+            data: serde_json::json!({"id": 1, "data": "aGk="}),
+        });
+        app.on_pushed(Pushed {
+            name: crate::host::program::PROGRAM_OUTPUT.into(),
+            data: serde_json::json!("nonsense"),
+        });
+    }
 }
 
 #[cfg(test)]

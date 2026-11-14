@@ -5,7 +5,7 @@
 //! (`reply`) and the values the agent pushes (`push`). While there is no connection a call fails at once,
 //! and a call that was waiting when the connection dropped fails with it.
 
-use super::{Answer, Host, HostInfo, Pushed, Reply};
+use super::{Answer, Host, HostInfo, Pushed, Reply, Tunnel, TunnelIn};
 use mu_base::wire::ClientLine;
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
@@ -23,6 +23,7 @@ pub struct RemoteHost {
     waiting: RefCell<HashMap<u64, oneshot::Sender<Reply>>>,
     push_tx: UnboundedSender<Pushed>,
     push_rx: RefCell<Option<UnboundedReceiver<Pushed>>>,
+    tunnels: RefCell<HashMap<u64, UnboundedSender<TunnelIn>>>,
 }
 
 impl RemoteHost {
@@ -35,6 +36,7 @@ impl RemoteHost {
             waiting: RefCell::new(HashMap::new()),
             push_tx,
             push_rx: RefCell::new(Some(push_rx)),
+            tunnels: RefCell::new(HashMap::new()),
         })
     }
 
@@ -46,6 +48,9 @@ impl RemoteHost {
     /// The connection is gone: calls that wait for it fail, and new ones fail until `connect`.
     pub fn disconnect(&self) {
         *self.out.borrow_mut() = None;
+        for (_, tx) in self.tunnels.borrow_mut().drain() {
+            let _ = tx.send(TunnelIn::Closed(Some(LOST.into())));
+        }
         for (_, tx) in self.waiting.borrow_mut().drain() {
             let _ = tx.send(Err(LOST.into()));
         }
@@ -60,11 +65,40 @@ impl RemoteHost {
     pub fn push(&self, name: String, data: Value) {
         let _ = self.push_tx.send(Pushed { name, data });
     }
+
+    pub fn tunnel_line(&self, id: u64, line: String) {
+        if let Some(tx) = self.tunnels.borrow().get(&id) {
+            let _ = tx.send(TunnelIn::Line(line));
+        }
+    }
+
+    pub fn tunnel_closed(&self, id: u64, error: Option<String>) {
+        if let Some(tx) = self.tunnels.borrow_mut().remove(&id) {
+            let _ = tx.send(TunnelIn::Closed(error));
+        }
+    }
 }
 
 impl Host for RemoteHost {
     fn info(&self) -> &HostInfo {
         &self.info
+    }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn tunnel(&self, session: &str) -> Result<Tunnel, String> {
+        let Some(out) = self.out.borrow().clone() else { return Err("not connected to the agent".into()) };
+        let id = self.next.get() + 1;
+        self.next.set(id);
+        let (tx, rx) = unbounded_channel();
+        self.tunnels.borrow_mut().insert(id, tx);
+        if out.send(ClientLine::TunnelOpen { id, session: session.into() }).is_err() {
+            self.tunnels.borrow_mut().remove(&id);
+            return Err(LOST.into());
+        }
+        Ok(Tunnel { id, out, rx })
     }
 
     fn call(&self, name: &str, args: Value) -> Answer {

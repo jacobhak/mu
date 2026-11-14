@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod plans;
+pub mod program;
 pub mod remote;
 pub mod sessions;
 pub mod startup;
@@ -36,7 +37,7 @@ use serde_json::Value;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub type Reply = Result<Value, String>;
 
@@ -94,8 +95,40 @@ pub(crate) fn host_profile() -> Option<String> {
     .filter(|p| !p.is_empty())
 }
 
+/// What comes back through a tunnel to another agent on the host.
+pub enum TunnelIn {
+    Line(String),
+    /// The other end closed it, or it could not be opened (the reason).
+    Closed(Option<String>),
+}
+
+/// A line-for-line pipe to the socket of another agent on the host, carried by the connection to this one.
+pub struct Tunnel {
+    pub(crate) id: u64,
+    pub(crate) out: UnboundedSender<mu_base::wire::ClientLine>,
+    pub rx: UnboundedReceiver<TunnelIn>,
+}
+
+impl Tunnel {
+    pub fn send(&self, line: String) {
+        let _ = self.out.send(mu_base::wire::ClientLine::TunnelLine { id: self.id, line });
+    }
+
+    pub fn close(&self) {
+        let _ = self.out.send(mu_base::wire::ClientLine::TunnelClose { id: self.id });
+    }
+}
+
 pub trait Host {
     fn info(&self) -> &HostInfo;
+    /// Opens a tunnel to the agent of `session` on the host: only a remote host has one.
+    fn tunnel(&self, _session: &str) -> Result<Tunnel, String> {
+        Err("not attached to an agent".into())
+    }
+    /// The host is on another machine: programs that take the terminal run there, not here.
+    fn is_remote(&self) -> bool {
+        false
+    }
     fn call(&self, name: &str, args: Value) -> Answer;
     /// The stream of pushed values. Taken once, by the UI, when it starts.
     fn pushed(&self) -> Option<UnboundedReceiver<Pushed>>;
@@ -116,6 +149,14 @@ pub struct Deferred<H>(pub H);
 impl<H: Host> Host for Deferred<H> {
     fn info(&self) -> &HostInfo {
         self.0.info()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.0.is_remote()
+    }
+
+    fn tunnel(&self, session: &str) -> Result<Tunnel, String> {
+        self.0.tunnel(session)
     }
 
     fn call(&self, name: &str, args: Value) -> Answer {

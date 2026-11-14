@@ -113,6 +113,20 @@ pub enum ClientLine {
     },
     /// Leave the agent running and close the connection.
     Detach,
+    /// Opens a byte-for-byte tunnel to the agent of `session` that runs on the same host (a session taken
+    /// over from a `-p` run): what the client sends as `TunnelLine` goes to that agent's socket, and what
+    /// the agent writes comes back as `AgentLine::TunnelLine`. The tunnel's lines do not enter the turn log.
+    TunnelOpen {
+        id: u64,
+        session: String,
+    },
+    TunnelLine {
+        id: u64,
+        line: String,
+    },
+    TunnelClose {
+        id: u64,
+    },
 }
 
 /// The lines the agent sends.
@@ -134,6 +148,15 @@ pub enum AgentLine {
     Pushed {
         name: String,
         data: serde_json::Value,
+    },
+    TunnelLine {
+        id: u64,
+        line: String,
+    },
+    /// The tunnel ended, from the other end or because it could not be opened (`error`).
+    TunnelClose {
+        id: u64,
+        error: Option<String>,
     },
     /// The agent refuses the connection (a different `wire`) and closes it.
     Error(String),

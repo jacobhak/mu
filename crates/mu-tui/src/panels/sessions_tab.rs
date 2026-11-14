@@ -39,14 +39,15 @@ impl Row {
     pub fn can_stop(&self) -> bool {
         match self.live.kind.as_deref() {
             Some("print" | "subagent") => true,
-            Some("tui") => self.live.abort,
+            Some("tui" | "agent") => self.live.abort,
             _ => false,
         }
     }
 
-    /// `S` can terminate it: an interactive mu, after a confirmation.
+    /// `S` can terminate it: an interactive mu or an agent (it ends its session the proper way), after a
+    /// confirmation. An agent is joined with `mu attach`, not taken over, so `t` is not offered for it.
     pub fn can_terminate(&self) -> bool {
-        self.live.kind.as_deref() == Some("tui")
+        matches!(self.live.kind.as_deref(), Some("tui" | "agent"))
     }
 
     /// `t` can take it over: only a `-p` run hands its session over.
@@ -202,7 +203,7 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
     if r.can_stop() {
         keys.push(match r.live.kind.as_deref() {
             Some("print") => "s stop after its step",
-            Some("tui") => "s abort its turn",
+            Some("tui" | "agent") => "s abort its turn",
             _ => "s terminate",
         });
     }
@@ -336,6 +337,12 @@ mod tests {
         modern.live.abort = true;
         assert!(modern.can_stop() && !modern.can_take());
         assert!(!row("acp").can_stop() && !row("acp").can_terminate());
+        // An agent is joined with `mu attach`, not taken over; it can be told to abort or to end.
+        let mut agent = row("agent");
+        assert!(agent.can_terminate() && !agent.can_take() && !agent.can_stop());
+        agent.live.abort = true;
+        assert!(agent.can_stop());
+        assert_eq!(agent.label(), "agent");
         let mut r = row("subagent");
         r.live.agent = Some("review-lead".into());
         assert_eq!(r.label(), "subagent review-lead");

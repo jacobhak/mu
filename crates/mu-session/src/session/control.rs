@@ -102,9 +102,9 @@ pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<
             Recheck::Free => Err(StopError::Gone),
             Recheck::Changed => Err(StopError::Changed),
         },
-        "tui" => {
+        "tui" | "agent" => {
             let l = live_run(path, pid, started)?;
-            if l.kind.as_deref() != Some("tui") || !l.abort {
+            if !matches!(l.kind.as_deref(), Some("tui" | "agent")) || !l.abort {
                 return Err(StopError::Unsupported(
                     "that mu does not take abort requests (an older version); use S to terminate it",
                 ));
@@ -121,8 +121,8 @@ pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<
 /// its terminal on the way out). Only for the run the user saw, and only an interactive mu.
 pub fn terminate_session(path: &Path, pid: u32, started: &str) -> Result<String, StopError> {
     let l = live_run(path, pid, started)?;
-    if l.kind.as_deref() != Some("tui") {
-        return Err(StopError::Unsupported("only an interactive mu can be terminated from here"));
+    if !matches!(l.kind.as_deref(), Some("tui" | "agent")) {
+        return Err(StopError::Unsupported("only an interactive mu or an agent can be terminated from here"));
     }
     mu_base::process::signal_pid(pid, libc::SIGTERM)
         .map(|()| format!("asked pid {pid} to exit"))

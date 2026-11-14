@@ -142,6 +142,8 @@ async fn session(conn: &mut Conn, w: &mut Wires) -> End {
                 },
                 Some(AgentLine::HostReply { id, result }) => w.host.reply(id, result),
                 Some(AgentLine::Pushed { name, data }) => w.host.push(name, data),
+                Some(AgentLine::TunnelLine { id, line }) => w.host.tunnel_line(id, line),
+                Some(AgentLine::TunnelClose { id, error }) => w.host.tunnel_closed(id, error),
                 Some(AgentLine::Error(e)) => {
                     let _ = w.events.send(AgentEvent::Error(e));
                 }
