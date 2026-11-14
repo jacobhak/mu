@@ -19,12 +19,19 @@ spec:
     - name: worker
       image: "@IMAGE@"
       imagePullPolicy: "@PULL_POLICY@"
-      # A cluster CA may sign the certificate of the object store sccache connects to; appended to the system roots
-      # so crate downloads keep the public ones.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities: {drop: ["ALL"]}
+      # A cluster CA may sign the certificate of the object store sccache connects to; appended to a copy of the
+      # system roots (the image is not writable by the worker) so crate downloads keep the public ones.
       command: ["sh", "-c"]
-      args: ["[ ! -f /etc/mu-ca/ca.crt ] || cat /etc/mu-ca/ca.crt >> /etc/ssl/certs/ca-certificates.crt; exec sleep infinity"]
+      args: ["cp /etc/ssl/certs/ca-certificates.crt \"$HOME/ca-bundle.crt\"; [ ! -f /etc/mu-ca/ca.crt ] || cat /etc/mu-ca/ca.crt >> \"$HOME/ca-bundle.crt\"; exec sleep infinity"]
       env:
-        - {name: HOME, value: /root}
+        - {name: HOME, value: /home/worker}
+        - {name: SSL_CERT_FILE, value: /home/worker/ca-bundle.crt}
 @ENV@
       envFrom:
         - secretRef:
@@ -35,7 +42,7 @@ spec:
           cpu: "@CPU@"
           memory: "@MEMORY@"
       volumeMounts:
-        - {name: home, mountPath: /root}
+        - {name: home, mountPath: /home/worker}
         - {name: workspace, mountPath: "@ROOT@"}
         - {name: cluster-ca, mountPath: /etc/mu-ca, readOnly: true}
   volumes:

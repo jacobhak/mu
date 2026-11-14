@@ -17,8 +17,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential ca-certificates curl git libssl-dev pkg-config shellcheck \
  && rm -rf /var/lib/apt/lists/*
 
+# The worker runs as an unprivileged user, so the image builds as that user too (a later chown would copy every
+# file into a new layer): cargo needs to write its registry cache, and a root-run test suite hides permission bugs.
+RUN useradd --uid 1000 --create-home --shell /bin/sh worker \
+ && mkdir /src /usr/local/cargo /usr/local/rustup \
+ && chown worker:worker /src /usr/local/cargo /usr/local/rustup
+USER worker
 WORKDIR /src
-COPY . /src
+COPY --chown=worker:worker . /src
 
 # rustup reads rust-toolchain.toml from /src, so the pinned channel and components are what gets installed.
 # RUSTC_WRAPPER is unset for the build steps: there is no bucket at build time.
@@ -27,9 +33,9 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-to
  && RUSTC_WRAPPER= cargo install sccache --locked --version "$SCCACHE_VERSION" \
  && RUSTC_WRAPPER= cargo fetch --locked \
  && RUSTC_WRAPPER= cargo build --release --locked \
- && install -m 0755 target/release/mu /usr/local/bin/mu \
+ && install -m 0755 target/release/mu /usr/local/cargo/bin/mu \
  && rm -rf /src/target
 
 WORKDIR /
-RUN rm -rf /src
+RUN find /src -mindepth 1 -delete
 CMD ["sleep", "infinity"]
