@@ -509,7 +509,7 @@ impl App {
         for effect in fx {
             self.apply(effect);
         }
-        self.open_queued_approval();
+        self.open_next_dialog();
         if spend {
             self.poll_spend();
         }
@@ -557,7 +557,7 @@ impl App {
                 let review = crate::panels::plan_review::PlanReview::new(
                     title, uri, file, content, context, tiers, stored, note,
                 );
-                self.overlay = Some(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
+                self.open_overlay(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
             }
             Effect::PlanList(list) => self.show_plans(list),
             Effect::RewindPoints(list) => self.show_rewind(list),
@@ -1171,5 +1171,22 @@ mod tests {
         press(&mut app, crossterm::event::KeyCode::Esc);
         assert!(app.overlay.is_none() && app.approvals.is_empty());
         assert!(matches!(second.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
+    }
+
+    #[test]
+    fn a_picker_opened_over_an_approval_waits_and_the_approval_is_not_answered() {
+        use crate::widgets::picker::Picker;
+        use crate::widgets::select::Select;
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut rx = open_approval(&mut app, approval("bash", "touch a.txt"));
+        let picker = || Overlay::Logout { pick: Picker::placeholder(vec![], |items| Select::new("t", items)) };
+        app.open_overlay(picker());
+        app.open_overlay(picker());
+        assert!(matches!(app.overlay, Some(Overlay::Approve(_))), "the approval stays on screen");
+        assert_eq!(app.parked.len(), 1, "one picker per kind is kept");
+        assert!(rx.try_recv().is_err(), "the approval is unanswered");
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(matches!(app.overlay, Some(Overlay::Logout { .. })), "the queued picker opens next");
+        assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
     }
 }

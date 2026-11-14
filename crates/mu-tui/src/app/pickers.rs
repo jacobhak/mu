@@ -36,23 +36,40 @@ impl App {
             return;
         }
         self.set_aside_approval();
-        self.overlay = Some(Overlay::new_ask(qs, reply));
+        self.open_overlay(Overlay::new_ask(qs, reply));
+    }
+
+    /// Opens `ov`, or queues it behind a pending approval, ask or plan review so the dialog
+    /// on screen is not replaced (and its reply is not dropped). One queued dialog per kind,
+    /// except asks and reviews, which each keep a reply.
+    pub(super) fn open_overlay(&mut self, ov: Overlay) {
+        if !matches!(self.overlay, Some(Overlay::Approve(_) | Overlay::Ask(_) | Overlay::Review { .. })) {
+            self.overlay = Some(ov);
+            return;
+        }
+        let replies = matches!(ov, Overlay::Ask(_) | Overlay::Review { .. });
+        match self.parked.iter_mut().find(|p| !replies && std::mem::discriminant(*p) == std::mem::discriminant(&ov)) {
+            Some(p) => *p = ov,
+            None => self.parked.push_back(ov),
+        }
     }
 
     /// Queues an approval and shows it unless another dialog is up.
     pub(super) fn start_approve(&mut self, request: ApprovalRequest, reply: oneshot::Sender<ApprovalDecision>) {
         self.approvals.push_back((request, reply));
-        self.open_queued_approval();
+        self.open_next_dialog();
     }
 
-    /// Shows the oldest queued approval once no other dialog is up, dropping the ones whose turn
-    /// is over.
-    pub(super) fn open_queued_approval(&mut self) {
+    /// Shows the next queued dialog once none is up: a queued picker, ask or review first, then
+    /// the oldest approval (those whose turn is over are dropped).
+    pub(super) fn open_next_dialog(&mut self) {
         self.approvals.retain(|(_, reply)| !reply.is_closed());
         if self.overlay.is_some() {
             return;
         }
-        if let Some((req, reply)) = self.approvals.pop_front() {
+        if let Some(ov) = self.parked.pop_front() {
+            self.overlay = Some(ov);
+        } else if let Some((req, reply)) = self.approvals.pop_front() {
             self.overlay = Some(Overlay::Approve(Box::new(ApproveState::new(req, reply))));
         }
     }
@@ -200,7 +217,7 @@ impl App {
                 None => sel,
             }
         });
-        self.overlay = Some(Overlay::Model { pick, request });
+        self.open_overlay(Overlay::Model { pick, request });
     }
 
     pub(super) fn open_model_roles(&mut self, role: Option<String>) {
@@ -208,7 +225,7 @@ impl App {
         let set = cfg.active_set().unwrap_or_else(|| MAIN_SET.into());
         let path = mu_base::config::models_path();
         match RoleEditor::new(set, path, super::slash::role_views(cfg, &self.ctx), role.as_deref()) {
-            Ok(st) => self.overlay = Some(Overlay::ModelRoles { st: Box::new(st) }),
+            Ok(st) => self.open_overlay(Overlay::ModelRoles { st: Box::new(st) }),
             Err(e) => self.error(&e),
         }
     }
@@ -218,7 +235,7 @@ impl App {
     pub(super) fn open_session_picker(&mut self) {
         let items = vec![Item { label: "Loading…".into(), detail: String::new() }];
         let pick = Picker::placeholder(items, |items| Select::new("Resume session", items));
-        self.overlay = Some(Overlay::Session { pick });
+        self.open_overlay(Overlay::Session { pick });
         let (cwd, tx) = (self.cwd.clone(), self.ui_tx.clone());
         tokio::task::spawn_local(async move {
             let list =
@@ -250,7 +267,7 @@ impl App {
             })
             .collect();
         let pick = Picker::from_rows(rows, |items| Select::new("Resume session", items));
-        self.overlay = Some(Overlay::Session { pick });
+        self.open_overlay(Overlay::Session { pick });
     }
 
     /// The prompts that can be taken back and the replies that can be returned to, the newest
@@ -273,7 +290,7 @@ impl App {
             .collect();
         let title =
             format!("Rewind to before a prompt (you) or after a reply (agent) ({total}); files stay as they are");
-        self.overlay = Some(Overlay::Rewind { pick: Picker::from_rows(rows, |items| Select::new(&title, items)) });
+        self.open_overlay(Overlay::Rewind { pick: Picker::from_rows(rows, |items| Select::new(&title, items)) });
     }
 
     pub(super) fn show_plans(&mut self, list: Vec<mu_base::events::PlanMeta>) {
@@ -300,7 +317,7 @@ impl App {
     /// Opens the reply picker on the newest reply, or says there is none.
     pub(super) fn open_reply(&mut self) {
         match ReplyPicker::open(&self.agent.tr.replies) {
-            Some(st) => self.overlay = Some(Overlay::Reply { st: Box::new(st) }),
+            Some(st) => self.open_overlay(Overlay::Reply { st: Box::new(st) }),
             None => self.notice("no reply to quote yet"),
         }
     }
@@ -333,7 +350,7 @@ impl App {
         if rows.is_empty() {
             return self.notice("nothing to copy yet");
         }
-        self.overlay = Some(Overlay::Copy { pick: Picker::from_rows(rows, |items| Select::new("Copy", items)) });
+        self.open_overlay(Overlay::Copy { pick: Picker::from_rows(rows, |items| Select::new("Copy", items)) });
     }
 
     /// The panel as this session sees it: its jobs, their output, and itself left out of the sessions.
@@ -347,11 +364,11 @@ impl App {
     pub(super) fn open_jobs(&mut self) {
         let mut panel = if self.agent.jobs.is_empty() { self.jobs_panel().on_sessions() } else { self.jobs_panel() };
         panel.poll();
-        self.overlay = Some(Overlay::Jobs { st: Box::new(panel) });
+        self.open_overlay(Overlay::Jobs { st: Box::new(panel) });
     }
 
     pub(super) fn open_sessions(&mut self) {
-        self.overlay = Some(Overlay::Jobs { st: Box::new(self.jobs_panel().on_sessions()) });
+        self.open_overlay(Overlay::Jobs { st: Box::new(self.jobs_panel().on_sessions()) });
     }
 
     /// Says what a panel action did, in the panel when it is open.
@@ -386,7 +403,7 @@ impl App {
         if let Some(e) = event {
             self.on_overlay_event(e);
         }
-        self.open_queued_approval();
+        self.open_next_dialog();
     }
 
     fn save_role(&mut self, set: &str, role: &str, value: Option<&str>, meta: Option<&RoleMeta>) {

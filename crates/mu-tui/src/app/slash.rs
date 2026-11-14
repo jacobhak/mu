@@ -41,7 +41,7 @@ impl App {
     }
 
     pub(super) fn submit(&mut self, mut input: UserInput, follow_up: bool) {
-        if self.flows.mcp_wizard.is_some() && input.images.is_empty() {
+        if self.flows.mcp().is_some() && input.images.is_empty() {
             let line = input.text.trim().to_string();
             return self.mcp_wizard_line(&line);
         }

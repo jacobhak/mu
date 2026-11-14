@@ -22,7 +22,7 @@ impl App {
     pub(super) fn open_memory(&mut self) {
         let items = vec![Item { label: "Loading…".into(), detail: String::new() }];
         let pick = Picker::placeholder(items, |items| Select::new("Memory", items));
-        self.overlay = Some(Overlay::Memory { pick });
+        self.open_overlay(Overlay::Memory { pick });
         self.memory_request("memory/files", json!({ "cwd": self.cwd }), UiMsg::MemoryFiles);
     }
 
@@ -35,7 +35,7 @@ impl App {
                 let (rows, context) = memory_rows(&v);
                 let pick =
                     Picker::from_rows(rows, |items| Select::new("Memory", items).context(&context).hint(MEMORY_HINT));
-                self.overlay = Some(Overlay::Memory { pick });
+                self.open_overlay(Overlay::Memory { pick });
             }
             Ok(_) => {}
             Err(e) => {
@@ -66,7 +66,7 @@ impl App {
         }
         let title = format!("Memory history ({} commits)", rows.len());
         let pick = Picker::from_rows(rows, |items| Select::new(&title, items).hint(HISTORY_HINT));
-        self.overlay = Some(Overlay::MemoryLog { pick });
+        self.open_overlay(Overlay::MemoryLog { pick });
     }
 
     /// Opens a memory file in `$VISUAL` or `$EDITOR`. Without either the path is said instead.

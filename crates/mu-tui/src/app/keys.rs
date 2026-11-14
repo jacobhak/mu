@@ -39,6 +39,8 @@ pub(super) struct KeyFlow {
     /// Whether the provider's chat models use the key, when already decided (anthropic and openai ask).
     pub(super) chat: Option<bool>,
     pub(super) then: Option<KeyThen>,
+    /// The `/web` wizard that asked for this key; it is active again when the flow ends.
+    pub(super) web: Option<Box<WebFlow>>,
     pub(super) typing: Option<Typing>,
     /// The entry a check could not confirm, waiting for "save anyway".
     pub(super) pending: Option<Entry>,
@@ -138,11 +140,7 @@ impl App {
     /// Asks the predict plugin for a ghost when the composer wants one. Failures are silent.
     fn request_ghost(&mut self) {
         let cfg = &self.services.providers.cfg.mu.predict;
-        if !cfg.enabled
-            || self.prompt.composer.has_ghost()
-            || self.flows.mcp_wizard.is_some()
-            || self.key_flow_pending()
-        {
+        if !cfg.enabled || self.prompt.composer.has_ghost() || self.flows.mcp().is_some() || self.key_flow_pending() {
             return;
         }
         let Some(q) = self.prompt.composer.predict_query() else { return };
@@ -222,7 +220,7 @@ impl App {
             if self.overlay.is_some() {
                 return self.overlay_key(k);
             }
-            if self.flows.mcp_wizard.is_some() && self.mcp_wizard_key(k) {
+            if self.flows.mcp().is_some() && self.mcp_wizard_key(k) {
                 return;
             }
         }
@@ -343,7 +341,7 @@ impl App {
 
     /// Enter in the masked or command input: the text becomes an entry and is checked.
     fn finish_typing(&mut self) {
-        let Some(f) = self.flows.key_flow.as_ref() else { return };
+        let Some(f) = self.flows.key() else { return };
         let (target, typing) = (f.target.clone(), f.typing);
         let text = self.prompt.composer.secret_text().trim().to_string();
         if text.is_empty() {
@@ -391,7 +389,7 @@ impl App {
     }
 
     fn set_typing(&mut self, t: Option<Typing>) {
-        if let Some(f) = self.flows.key_flow.as_mut() {
+        if let Some(f) = self.flows.key_mut() {
             f.typing = t;
         }
     }
@@ -399,21 +397,19 @@ impl App {
     /// Whether a key or command is being typed (or a custom endpoint's text or check is waiting):
     /// the composer is locked to it.
     pub(super) fn typing(&self) -> bool {
-        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some())
-            || self.chatgpt_typing()
-            || self.custom_typing()
+        self.flows.key().is_some_and(|f| f.typing.is_some()) || self.chatgpt_typing() || self.custom_typing()
     }
 
     /// A key is being typed or a choice waits for the user: no prediction is asked for.
     pub(super) fn key_flow_pending(&self) -> bool {
-        self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_some() || f.pending.is_some())
+        self.flows.key().is_some_and(|f| f.typing.is_some() || f.pending.is_some())
             || self.chatgpt_typing()
             || self.custom_typing()
     }
 
     /// Ends the key flow without saving. A flow that began elsewhere (the wizard) resumes there.
     fn cancel_key_flow(&mut self) {
-        let flow = self.flows.key_flow.take();
+        let flow = self.flows.end_key();
         if flow.as_ref().is_some_and(|f| f.typing.is_some()) {
             self.end_typing();
         }
@@ -431,9 +427,10 @@ impl App {
     /// Drops a flow whose overlay was replaced by another one, so it cannot hold the ghost off or
     /// take a late result. A flow that is typing or checking is left alone.
     pub(super) fn sync_key_flow(&mut self) {
-        let owned = matches!(self.overlay, Some(Overlay::KeyChoice { .. }));
-        if self.flows.key_flow.as_ref().is_some_and(|f| f.typing.is_none() && !f.checking) && !owned {
-            let then = self.flows.key_flow.take().and_then(|f| f.then);
+        let owned = matches!(self.overlay, Some(Overlay::KeyChoice { .. }))
+            || self.parked.iter().any(|o| matches!(o, Overlay::KeyChoice { .. }));
+        if self.flows.key().is_some_and(|f| f.typing.is_none() && !f.checking) && !owned {
+            let then = self.flows.end_key().and_then(|f| f.then);
             self.key_flow_ended(then, false);
         }
     }
@@ -490,7 +487,7 @@ impl App {
         rows.push((replace, KeyOption::Replace));
         rows.push((Item { label: "Cancel".into(), detail: "nothing changes".into() }, KeyOption::Cancel));
         let pick = Picker::from_rows(rows, |items| Select::new(&format!("{} API key", target.label()), items));
-        self.overlay = Some(Overlay::KeyChoice { pick, provider: target.id().into() });
+        self.open_overlay(Overlay::KeyChoice { pick, provider: target.id().into() });
     }
 
     /// Says where to get a key, then offers the ways to give one.
@@ -504,15 +501,17 @@ impl App {
             target.env_hint().to_string(),
             target.key_url().to_string(),
         );
-        self.flows.key_flow = Some(KeyFlow {
+        let web = if then == Some(KeyThen::WebWizard) { self.flows.end_web().map(Box::new) } else { None };
+        self.flows.begin(Active::Key(Box::new(KeyFlow {
             id: self.flows.key_flow_seq,
             target,
             chat,
             then,
+            web,
             typing: None,
             pending: None,
             checking: false,
-        });
+        })));
         if !url.is_empty() {
             self.notice(&format!("{label} API keys: create one at {url}"));
         }
@@ -524,7 +523,7 @@ impl App {
         let command = Item { label: "Use a command".into(), detail: "a command that prints the key".into() };
         rows.push((command, KeyOption::Command));
         let pick = Picker::from_rows(rows, |items| Select::new(&format!("{label} API key"), items));
-        self.overlay = Some(Overlay::KeyChoice { pick, provider: id });
+        self.open_overlay(Overlay::KeyChoice { pick, provider: id });
     }
 
     /// What the picker chose for `provider`, or `Cancel` when it was dismissed.
@@ -553,11 +552,11 @@ impl App {
                 Ok(entry) => self.check_key(target, entry),
                 Err(e) => self.error(&e.to_string()),
             },
-            KeyOption::SaveAnyway => match self.flows.key_flow.as_mut().and_then(|f| f.pending.take()) {
+            KeyOption::SaveAnyway => match self.flows.key_mut().and_then(|f| f.pending.take()) {
                 Some(entry) => self.confirm_key(target, entry),
                 None => self.cancel_key_flow(),
             },
-            KeyOption::Chat(on) => match self.flows.key_flow.as_mut().and_then(|f| f.pending.take()) {
+            KeyOption::Chat(on) => match self.flows.key_mut().and_then(|f| f.pending.take()) {
                 Some(entry) => self.save_key(target, Entry { chat: Some(on), ..entry }),
                 None => match self.services.set_chat(target.id(), on) {
                     Ok(true) => {
@@ -589,7 +588,7 @@ impl App {
 
     /// Resolves the entry and asks the provider whether it works. Nothing is saved yet.
     fn check_key(&mut self, target: KeyTarget, entry: Entry) {
-        let Some(f) = self.flows.key_flow.as_mut() else { return };
+        let Some(f) = self.flows.key_mut() else { return };
         f.checking = true;
         let flow = f.id;
         self.notice(&format!("checking the key with {}…", target.label()));
@@ -601,7 +600,7 @@ impl App {
     }
 
     pub(super) fn on_key_checked(&mut self, flow: u64, target: KeyTarget, entry: Entry, r: Result<Check, String>) {
-        match self.flows.key_flow.as_mut() {
+        match self.flows.key_mut() {
             Some(f) if f.id == flow => f.checking = false,
             // The flow was cancelled or replaced while the check ran.
             _ => return,
@@ -621,7 +620,7 @@ impl App {
             }
             Ok(Check::Unreachable(m)) => {
                 self.notice(&format!("{m}; the key is not confirmed"));
-                if let Some(f) = self.flows.key_flow.as_mut() {
+                if let Some(f) = self.flows.key_mut() {
                     f.pending = Some(entry);
                 }
                 let rows = vec![
@@ -633,7 +632,7 @@ impl App {
                 ];
                 let pick =
                     Picker::from_rows(rows, |items| Select::new(&format!("{} did not answer", target.label()), items));
-                self.overlay = Some(Overlay::KeyChoice { pick, provider: target.id().into() });
+                self.open_overlay(Overlay::KeyChoice { pick, provider: target.id().into() });
             }
             Err(e) => {
                 self.end_key_flow(false);
@@ -643,26 +642,26 @@ impl App {
     }
 
     fn end_key_flow(&mut self, saved: bool) {
-        let then = self.flows.key_flow.take().and_then(|f| f.then);
+        let then = self.flows.end_key().and_then(|f| f.then);
         self.key_flow_ended(then, saved);
     }
 
     /// A key that works is saved, after asking whether chat uses it when the user has not said.
     fn confirm_key(&mut self, target: KeyTarget, entry: Entry) {
-        let undecided = self.flows.key_flow.as_ref().is_some_and(|f| f.chat.is_none());
+        let undecided = self.flows.key().is_some_and(|f| f.chat.is_none());
         if !(target.asks_chat() && undecided) {
             return self.save_key(target, entry);
         }
-        if let Some(f) = self.flows.key_flow.as_mut() {
+        if let Some(f) = self.flows.key_mut() {
             f.pending = Some(entry);
         }
         let title = format!("Use this {} key for chat models?", target.label());
         let pick = Picker::from_rows(chat_rows(&target, None), |items| Select::new(&title, items));
-        self.overlay = Some(Overlay::KeyChoice { pick, provider: target.id().into() });
+        self.open_overlay(Overlay::KeyChoice { pick, provider: target.id().into() });
     }
 
     fn save_key(&mut self, target: KeyTarget, mut entry: Entry) {
-        let flow = self.flows.key_flow.take();
+        let flow = self.flows.end_key();
         let then = flow.as_ref().and_then(|f| f.then);
         entry.chat = match &target {
             // A search-only key has no chat flag; Baseten's only use is chat.
@@ -743,7 +742,7 @@ impl App {
             })
             .collect();
         let pick = Picker::from_rows(rows, |items| Select::new("Remove a key or sign out", items));
-        self.overlay = Some(Overlay::Logout { pick });
+        self.open_overlay(Overlay::Logout { pick });
     }
 
     pub(super) fn logout(&mut self, provider: &str) {
@@ -921,14 +920,14 @@ pub(super) mod tests {
         use tokio_util::sync::CancellationToken;
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let (paste, _paste_rx) = unbounded_channel();
-        app.flows.chatgpt = Some(chatgpt::ChatgptFlow { id: 2, cancel: CancellationToken::new(), paste });
+        app.flows.active = Active::Chatgpt(chatgpt::ChatgptFlow { id: 2, cancel: CancellationToken::new(), paste });
         app.on_chatgpt_done(1, Err("late".into()));
-        assert_eq!(app.flows.chatgpt.as_ref().map(|f| f.id), Some(2), "the current sign-in survives");
+        assert_eq!(app.flows.chatgpt().map(|f| f.id), Some(2), "the current sign-in survives");
         assert!(app.typing(), "the composer is locked to the redirect URL");
         app.on_terminal(press(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.prompt.composer.text(), "x");
         app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.flows.chatgpt.is_none() && !app.typing());
+        assert!(app.flows.chatgpt().is_none() && !app.typing());
         assert_eq!(app.prompt.composer.text(), "", "the typed text is cleared");
         assert!(transcript_text(&app).contains("sign-in cancelled"));
     }
@@ -969,18 +968,15 @@ pub(super) mod tests {
                 held_back: vec![],
             },
             overlay: None,
+            parked: VecDeque::new(),
             schedule: Schedule::default(),
             approvals: VecDeque::new(),
             flows: Flows {
                 model_request_seq: 0,
                 pick_deliver: false,
-                mcp_wizard: None,
-                web_wizard: None,
-                key_flow: None,
+                active: Active::None,
                 key_flow_seq: 0,
-                chatgpt: None,
                 chatgpt_seq: 0,
-                custom_wizard: None,
                 custom_wizard_seq: 0,
             },
             quitting: false,
@@ -1033,7 +1029,7 @@ pub(super) mod tests {
             app.restore_queued(vec![UserInput::from("queued")]);
             assert_eq!(app.prompt.composer.text(), "sk-abPASTED", "the key is untouched");
             app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
-            assert!(app.flows.key_flow.is_none());
+            assert!(app.flows.key().is_none());
             assert_eq!(app.prompt.composer.text(), "queued");
         });
         let shown = transcript_text(&app);
@@ -1189,10 +1185,10 @@ pub(super) mod tests {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let t = KeyTarget::builtin("anthropic").unwrap();
         app.start_key_flow(t.clone(), None, None);
-        app.flows.key_flow = None;
+        app.flows.end_key();
         app.start_key_flow(t.clone(), None, None);
         app.on_key_checked(1, t, Entry::literal("sk-x"), Ok(Check::Valid));
-        assert_eq!(app.flows.key_flow.as_ref().map(|f| f.id), Some(2), "the current flow survives");
+        assert_eq!(app.flows.key().map(|f| f.id), Some(2), "the current flow survives");
     }
 
     #[test]
@@ -1243,7 +1239,7 @@ pub(super) mod tests {
         app.on_web_pick(Some(6));
         assert_eq!(rx.try_recv(), Ok(false));
         assert_eq!(store.web(), Some(mu_provider::auth::web::WebSearch::off()));
-        assert!(app.flows.web_wizard.is_none());
+        assert!(app.flows.web().is_none());
         store.set_web(None).unwrap();
 
         // Esc cancels, and a second wizard releases the first one's call.
@@ -1267,12 +1263,12 @@ pub(super) mod tests {
         app.on_web_pick(Some(1));
         // Exa (API key) has no key in the isolated home: the key flow opens, for search only.
         app.on_web_pick(Some(3));
-        let f = app.flows.key_flow.as_ref().expect("a key flow");
+        let f = app.flows.key().expect("a key flow");
         assert_eq!((f.target.id(), f.chat, f.then), ("exa", Some(false), Some(KeyThen::WebWizard)));
         assert!(matches!(&app.overlay, Some(Overlay::KeyChoice { provider, .. }) if provider == "exa"));
         // Cancelling the key flow returns to the backend choice.
         app.on_key_choice("exa", KeyOption::Cancel);
-        assert!(app.flows.key_flow.is_none());
+        assert!(app.flows.key().is_none());
         assert!(matches!(&app.overlay, Some(Overlay::Web { .. })));
     }
 
@@ -1281,10 +1277,10 @@ pub(super) mod tests {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
         app.start_key_flow(KeyTarget::builtin("anthropic").unwrap(), None, None);
         app.sync_key_flow();
-        assert!(app.flows.key_flow.is_some(), "the key choice is still open");
+        assert!(app.flows.key().is_some(), "the key choice is still open");
         app.overlay = Some(Overlay::Logout { pick: Picker::placeholder(vec![], |items| Select::new("t", items)) });
         app.sync_key_flow();
-        assert!(app.flows.key_flow.is_none());
+        assert!(app.flows.key().is_none());
     }
 
     #[test]
@@ -1292,7 +1288,7 @@ pub(super) mod tests {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
         app.login("anthropic");
         assert!(matches!(&app.overlay, Some(Overlay::KeyChoice { provider, .. }) if provider == "anthropic"));
-        assert!(app.flows.key_flow.is_some());
+        assert!(app.flows.key().is_some());
     }
 
     #[test]

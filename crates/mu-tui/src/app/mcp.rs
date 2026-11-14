@@ -166,7 +166,7 @@ impl App {
         if !warnings.is_empty() {
             self.notice(&warnings.iter().map(|w| format!("warning: {w}")).collect::<Vec<_>>().join("\n"));
         }
-        self.overlay = Some(Overlay::Mcp { sel: Select::new("MCP servers", items), pick: McpPick::Servers(rows) });
+        self.open_overlay(Overlay::Mcp { sel: Select::new("MCP servers", items), pick: McpPick::Servers(rows) });
     }
 
     fn open_mcp_actions(&mut self, name: String) {
@@ -193,7 +193,7 @@ impl App {
         }
         add("Remove…", "delete it from the config", McpAction::Remove);
         let title = format!("mcp:{name} · {}", self.state_of(entry));
-        self.overlay = Some(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::Actions(name, acts) });
+        self.open_overlay(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::Actions(name, acts) });
     }
 
     /// The startup offer to trust a project's MCP servers before they start. `files` are what
@@ -212,7 +212,7 @@ impl App {
             Item { label: "Not now".into(), detail: "they stay off; /mcp trust starts them later".into() },
         ];
         let sel = Select::new("Trust this project's MCP servers?", items).context(context.trim_end());
-        self.overlay = Some(Overlay::McpTrust { sel, files });
+        self.open_overlay(Overlay::McpTrust { sel, files });
     }
 
     fn open_mcp_confirm_remove(&mut self, name: String) {
@@ -221,7 +221,7 @@ impl App {
             Item { label: "Keep".into(), detail: String::new() },
         ];
         let title = format!("Remove mcp:{name}?");
-        self.overlay = Some(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::ConfirmRemove(name) });
+        self.open_overlay(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::ConfirmRemove(name) });
     }
 
     pub(super) fn on_mcp_pick(&mut self, pick: McpPick, row: Option<usize>) {
@@ -389,14 +389,14 @@ impl App {
         }
         let wizard =
             if import { Wizard::import(found, &self.cwd, env_set) } else { Wizard::new(found, &self.cwd, env_set) };
-        self.flows.mcp_wizard = Some(wizard);
+        self.flows.begin(Active::Mcp(Box::new(wizard)));
         self.prompt.composer.set_private(true);
         self.mcp_wizard_show();
     }
 
     /// Prints what the wizard has to say, then shows its current step.
     fn mcp_wizard_show(&mut self) {
-        let Some(w) = self.flows.mcp_wizard.as_mut() else { return };
+        let Some(w) = self.flows.mcp_mut() else { return };
         let notes = w.take_notes();
         let step = w.step();
         if !notes.is_empty() {
@@ -405,7 +405,7 @@ impl App {
         match step {
             Step::Pick { title, items } => {
                 let items = items.into_iter().map(|i| Item { label: i.label, detail: i.detail }).collect();
-                self.overlay = Some(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::Wizard });
+                self.open_overlay(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::Wizard });
             }
             Step::Text { prompt, .. } => self.notice(&format!("{prompt}   (Esc cancels)")),
             Step::Done(draft) => {
@@ -417,7 +417,7 @@ impl App {
     }
 
     fn mcp_wizard_answer(&mut self, a: Answer) {
-        let Some(w) = self.flows.mcp_wizard.as_mut() else { return };
+        let Some(w) = self.flows.mcp_mut() else { return };
         if let Err(e) = w.answer(a) {
             self.error(&e);
         }
@@ -453,7 +453,7 @@ impl App {
 
     /// Answers may be tokens: the composer keeps them out of the history while a wizard runs.
     fn end_mcp_wizard(&mut self) {
-        self.flows.mcp_wizard = None;
+        self.flows.end_mcp();
         self.prompt.composer.set_private(false);
     }
 }

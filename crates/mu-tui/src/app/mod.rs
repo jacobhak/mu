@@ -93,6 +93,8 @@ struct App {
     screen: Screen,
     prompt: Prompt,
     overlay: Option<Overlay>,
+    /// Dialogs opened while an approval, ask or plan review was up; see `open_overlay`.
+    parked: VecDeque<Overlay>,
     /// Prompts that go out later; see `schedule`.
     schedule: Schedule,
     /// Tool calls waiting for approval, oldest first; one is on screen at a time.
@@ -133,23 +135,170 @@ struct Prompt {
     held_back: Vec<UserInput>,
 }
 
+/// The `/web` wizard, and who is waiting for it: a `web_search` call that found no backend.
+type WebFlow = (crate::web::wizard::Wizard, Option<tokio::sync::oneshot::Sender<bool>>);
+
+/// The multi-step flow that owns input, if any. Starting one replaces the last.
+#[derive(Default)]
+enum Active {
+    #[default]
+    None,
+    /// An `/mcp add` wizard is collecting answers; the composer's lines go to it.
+    Mcp(Box<Wizard>),
+    /// An API-key flow in progress; while it types, the composer takes its text. A `/web` wizard
+    /// that asked for the key waits inside it.
+    Key(Box<KeyFlow>),
+    /// A ChatGPT sign-in in progress; while it waits the composer takes the redirect URL.
+    Chatgpt(ChatgptFlow),
+    Web(Box<WebFlow>),
+    /// The custom-endpoint wizard in progress.
+    Custom(Box<custom_providers::CustomFlow>),
+}
+
 /// Multi-step interactions that take over input.
 struct Flows {
     model_request_seq: u64,
     pick_deliver: bool,
-    /// An `/mcp add` wizard is collecting answers; the composer's lines go to it.
-    mcp_wizard: Option<Wizard>,
-    /// An API-key flow in progress; while it types, the composer takes its text.
-    key_flow: Option<KeyFlow>,
+    active: Active,
     key_flow_seq: u64,
-    /// A ChatGPT sign-in in progress; while it waits the composer takes the redirect URL.
-    chatgpt: Option<ChatgptFlow>,
+    /// Tells a late sign-in result from another's.
     chatgpt_seq: u64,
-    /// The `/web` wizard, and who is waiting for it: a `web_search` call that found no backend.
-    web_wizard: Option<(crate::web::wizard::Wizard, Option<tokio::sync::oneshot::Sender<bool>>)>,
-    /// The custom-endpoint wizard in progress, and the id that tells its late answers from another's.
-    custom_wizard: Option<custom_providers::CustomFlow>,
+    /// Tells a late custom-endpoint answer from another's.
     custom_wizard_seq: u64,
+}
+
+impl Flows {
+    fn mcp(&self) -> Option<&Wizard> {
+        match &self.active {
+            Active::Mcp(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    fn mcp_mut(&mut self) -> Option<&mut Wizard> {
+        match &mut self.active {
+            Active::Mcp(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    fn key(&self) -> Option<&KeyFlow> {
+        match &self.active {
+            Active::Key(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn key_mut(&mut self) -> Option<&mut KeyFlow> {
+        match &mut self.active {
+            Active::Key(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn chatgpt(&self) -> Option<&ChatgptFlow> {
+        match &self.active {
+            Active::Chatgpt(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn web(&self) -> Option<&WebFlow> {
+        match &self.active {
+            Active::Web(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn web_mut(&mut self) -> Option<&mut WebFlow> {
+        match &mut self.active {
+            Active::Web(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn custom(&self) -> Option<&custom_providers::CustomFlow> {
+        match &self.active {
+            Active::Custom(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn custom_mut(&mut self) -> Option<&mut custom_providers::CustomFlow> {
+        match &mut self.active {
+            Active::Custom(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Makes `next` the active flow. A `/web` wizard it displaces (or that waits inside a key
+    /// flow it displaces) releases its waiting call.
+    fn begin(&mut self, next: Active) {
+        let web = match std::mem::replace(&mut self.active, next) {
+            Active::Web(w) => Some(w),
+            Active::Key(f) => f.web,
+            _ => None,
+        };
+        if let Some(reply) = web.and_then(|w| w.1) {
+            let _ = reply.send(false);
+        }
+    }
+
+    fn end_mcp(&mut self) -> Option<Wizard> {
+        match std::mem::take(&mut self.active) {
+            Active::Mcp(w) => Some(*w),
+            other => {
+                self.active = other;
+                None
+            }
+        }
+    }
+
+    /// Ends the key flow; the `/web` wizard that was waiting on it becomes active again.
+    fn end_key(&mut self) -> Option<KeyFlow> {
+        match std::mem::take(&mut self.active) {
+            Active::Key(mut f) => {
+                if let Some(w) = f.web.take() {
+                    self.active = Active::Web(w);
+                }
+                Some(*f)
+            }
+            other => {
+                self.active = other;
+                None
+            }
+        }
+    }
+
+    fn end_chatgpt(&mut self) -> Option<ChatgptFlow> {
+        match std::mem::take(&mut self.active) {
+            Active::Chatgpt(f) => Some(f),
+            other => {
+                self.active = other;
+                None
+            }
+        }
+    }
+
+    fn end_web(&mut self) -> Option<WebFlow> {
+        match std::mem::take(&mut self.active) {
+            Active::Web(f) => Some(*f),
+            other => {
+                self.active = other;
+                None
+            }
+        }
+    }
+
+    fn end_custom(&mut self) -> Option<custom_providers::CustomFlow> {
+        match std::mem::take(&mut self.active) {
+            Active::Custom(f) => Some(*f),
+            other => {
+                self.active = other;
+                None
+            }
+        }
+    }
 }
 
 pub async fn run(init: AppInit) -> i32 {
@@ -209,18 +358,15 @@ pub async fn run(init: AppInit) -> i32 {
             held_back: Vec::new(),
         },
         overlay: None,
+        parked: VecDeque::new(),
         schedule: Schedule::default(),
         approvals: VecDeque::new(),
         flows: Flows {
             model_request_seq: 0,
             pick_deliver: false,
-            mcp_wizard: None,
-            web_wizard: None,
-            key_flow: None,
+            active: Active::None,
             key_flow_seq: 0,
-            chatgpt: None,
             chatgpt_seq: 0,
-            custom_wizard: None,
             custom_wizard_seq: 0,
         },
         quitting: false,

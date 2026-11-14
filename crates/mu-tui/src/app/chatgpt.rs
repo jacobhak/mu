@@ -72,7 +72,7 @@ pub(super) fn native_label(provider: &str) -> &'static str {
 impl App {
     /// Whether a ChatGPT sign-in is waiting; the composer is locked to it meanwhile.
     pub(super) fn chatgpt_typing(&self) -> bool {
-        self.flows.chatgpt.is_some()
+        self.flows.chatgpt().is_some()
     }
 
     /// Starts the browser sign-in, as `/login chatgpt` and the `/login` row do.
@@ -92,7 +92,7 @@ impl App {
         let id = self.flows.chatgpt_seq;
         let cancel = CancellationToken::new();
         let (paste, mut paste_rx) = unbounded_channel();
-        self.flows.chatgpt = Some(ChatgptFlow { id, cancel: cancel.clone(), paste });
+        self.flows.begin(Active::Chatgpt(ChatgptFlow { id, cancel: cancel.clone(), paste }));
         self.prompt.composer.set_private(true);
         self.prompt.composer.set_closed(true);
         self.notice("signing in with ChatGPT…");
@@ -115,14 +115,14 @@ impl App {
 
     /// A line the sign-in reports while it waits: a callback or pasted URL that did not match it.
     pub(super) fn on_chatgpt_notice(&mut self, flow: u64, text: &str) {
-        if self.flows.chatgpt.as_ref().is_some_and(|f| f.id == flow) {
+        if self.flows.chatgpt().is_some_and(|f| f.id == flow) {
             self.notice(text);
         }
     }
 
     /// Shows the authorization link the browser was asked to open, and how to finish by hand.
     pub(super) fn on_chatgpt_url(&mut self, flow: u64, url: &str) {
-        if self.flows.chatgpt.as_ref().is_some_and(|f| f.id == flow) {
+        if self.flows.chatgpt().is_some_and(|f| f.id == flow) {
             self.notice(&format!(
                 "A browser should open to sign in with ChatGPT. If it does not, open this link:\n{url}\n\
                  If the browser can't reach this machine, paste the final redirect URL here and press Enter (Esc cancels)."
@@ -151,7 +151,7 @@ impl App {
             return;
         }
         self.prompt.composer.take_secret();
-        if let Some(f) = self.flows.chatgpt.as_ref() {
+        if let Some(f) = self.flows.chatgpt() {
             let _ = f.paste.send(text);
         }
         self.notice("checking the redirect URL…");
@@ -159,17 +159,17 @@ impl App {
 
     /// Esc while a sign-in waits: the flow ends, and its late result is ignored.
     fn cancel_chatgpt(&mut self) {
-        let Some(f) = self.flows.chatgpt.take() else { return };
+        let Some(f) = self.flows.end_chatgpt() else { return };
         f.cancel.cancel();
         self.unlock_composer();
         self.notice("sign-in cancelled; nothing changed");
     }
 
     pub(super) fn on_chatgpt_done(&mut self, flow: u64, r: Result<Account, String>) {
-        if !self.flows.chatgpt.as_ref().is_some_and(|f| f.id == flow) {
+        if !self.flows.chatgpt().is_some_and(|f| f.id == flow) {
             return;
         }
-        self.flows.chatgpt = None;
+        self.flows.end_chatgpt();
         self.unlock_composer();
         match r {
             Ok(account) => self.save_chatgpt(account),
@@ -205,7 +205,7 @@ impl App {
             return self.start_chatgpt();
         };
         let pick = Picker::from_rows(chatgpt_menu(signed_in), |items| Select::new("ChatGPT sign-in", items));
-        self.overlay = Some(Overlay::KeyChoice { pick, provider: PROVIDER_ID.into() });
+        self.open_overlay(Overlay::KeyChoice { pick, provider: PROVIDER_ID.into() });
     }
 
     /// What the ChatGPT menu chose.

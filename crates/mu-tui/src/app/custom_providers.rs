@@ -26,17 +26,17 @@ pub(super) struct CustomFlow {
 
 impl App {
     pub(super) fn custom_wizard_active(&self) -> bool {
-        self.flows.custom_wizard.is_some()
+        self.flows.custom().is_some()
     }
 
     /// Whether the composer is locked to the panel: it takes the key, or a check runs.
     pub(super) fn custom_typing(&self) -> bool {
-        self.flows.custom_wizard.as_ref().is_some_and(|f| f.panel.awaits_key() || f.checking)
+        self.flows.custom().is_some_and(|f| f.panel.awaits_key() || f.checking)
     }
 
     /// Whether a check is running; nothing typed or pasted goes anywhere until it answers.
     pub(super) fn custom_busy(&self) -> bool {
-        self.flows.custom_wizard.as_ref().is_some_and(|f| f.checking)
+        self.flows.custom().is_some_and(|f| f.checking)
     }
 
     /// Opens the panel at its fields. One that is already open is left alone.
@@ -85,7 +85,7 @@ impl App {
         let draft = self.prompt.composer.take_secret();
         self.prompt.composer.set_private(true);
         self.prompt.composer.set_closed(true);
-        self.flows.custom_wizard = Some(CustomFlow { id, panel, draft, checking: false });
+        self.flows.begin(Active::Custom(Box::new(CustomFlow { id, panel, draft, checking: false })));
         self.custom_show();
     }
 
@@ -96,12 +96,12 @@ impl App {
         if matches!(self.overlay, Some(Overlay::Custom { .. })) {
             self.overlay = None;
         }
-        let Some(f) = self.flows.custom_wizard.as_ref() else { return };
+        let Some(f) = self.flows.custom() else { return };
         let step = f.panel.step();
         match step {
             Step::Pick(sel) => {
                 self.prompt.composer.set_masked(false);
-                self.overlay = Some(Overlay::Custom { sel: *sel });
+                self.open_overlay(Overlay::Custom { sel: *sel });
             }
             Step::Key => {
                 self.prompt.composer.set_masked(true);
@@ -112,7 +112,7 @@ impl App {
 
     /// Prints what the panel has to say; it is drained whenever the panel moves on.
     fn custom_notes(&mut self) {
-        let Some(f) = self.flows.custom_wizard.as_mut() else { return };
+        let Some(f) = self.flows.custom_mut() else { return };
         let notes = f.panel.take_notes();
         if !notes.is_empty() {
             self.notice(&notes.join("\n"));
@@ -121,7 +121,7 @@ impl App {
 
     /// Keys the panel takes before the composer and the overlay. True when the key was used up here.
     pub(super) fn custom_key(&mut self, k: KeyEvent) -> bool {
-        let Some(f) = self.flows.custom_wizard.as_ref() else { return false };
+        let Some(f) = self.flows.custom() else { return false };
         // A check is running: Esc gives up on it, and its late answer is ignored.
         if f.checking {
             if k.code == KeyCode::Esc {
@@ -161,7 +161,7 @@ impl App {
 
     /// The key or command the panel asked for: Enter in the masked composer.
     fn custom_key_typed(&mut self, text: &str) {
-        let Some(f) = self.flows.custom_wizard.as_mut() else { return };
+        let Some(f) = self.flows.custom_mut() else { return };
         match f.panel.key_typed(text) {
             Ok(()) => {
                 self.prompt.composer.take_secret();
@@ -192,7 +192,7 @@ impl App {
 
     /// Feeds one answer to the panel and carries out what it asks for.
     fn custom_answer(&mut self, a: Answer) {
-        let Some(f) = self.flows.custom_wizard.as_mut() else { return };
+        let Some(f) = self.flows.custom_mut() else { return };
         let action = f.panel.answer(a);
         match action {
             Action::Pending => self.custom_show(),
@@ -212,7 +212,7 @@ impl App {
 
     /// A `/models` check answered. Only the panel that started it hears the answer.
     pub(super) fn on_custom_fetched(&mut self, flow: u64, r: Fetch) {
-        let Some(f) = self.flows.custom_wizard.as_mut().filter(|f| f.id == flow) else { return };
+        let Some(f) = self.flows.custom_mut().filter(|f| f.id == flow) else { return };
         f.checking = false;
         let action = f.panel.fetched(r);
         match action {
@@ -236,7 +236,7 @@ impl App {
     /// Ends the panel: its screen goes, and the composer gets its modes and its text back. Writes
     /// nothing. False when no panel was open.
     fn end_custom_wizard(&mut self) -> bool {
-        let Some(flow) = self.flows.custom_wizard.take() else { return false };
+        let Some(flow) = self.flows.end_custom() else { return false };
         if matches!(self.overlay, Some(Overlay::Custom { .. })) {
             self.overlay = None;
         }
@@ -254,7 +254,7 @@ impl App {
     /// Starts the check: the draft key is registered for redaction, then the endpoint's `/models`
     /// is read in the background. The answer comes back as `UiMsg::CustomFetched`.
     fn custom_check(&mut self, probe: Probe) {
-        let Some(flow) = self.flows.custom_wizard.as_mut().map(|f| {
+        let Some(flow) = self.flows.custom_mut().map(|f| {
             f.checking = true;
             f.id
         }) else {
@@ -607,7 +607,7 @@ mod tests {
             assert_ne!(old, new);
             app.on_ui(UiMsg::CustomFetched { flow: old, r: Fetch::Listed(vec![]) });
             app.on_ui(UiMsg::CustomFetched { flow: old, r: Fetch::Rejected("late".into()) });
-            assert_eq!(app.flows.custom_wizard.as_ref().map(|f| f.id), Some(new), "the new panel survives");
+            assert_eq!(app.flows.custom().map(|f| f.id), Some(new), "the new panel survives");
             assert!(app.overlay.is_some() && !app.custom_typing(), "still at its fields");
             assert!(!app.services.providers.custom_registry().path().exists());
             assert!(!transcript_text(&app).contains("late"));

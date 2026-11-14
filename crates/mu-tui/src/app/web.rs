@@ -13,22 +13,19 @@ impl App {
     /// `reply` is the waiting `web_search` call, told whether web search is now ready.
     pub(super) fn start_web_wizard(&mut self, reply: Option<tokio::sync::oneshot::Sender<bool>>) {
         self.leave_custom_wizard();
-        if let Some((_, Some(old))) = self.flows.web_wizard.take() {
-            let _ = old.send(false);
-        }
         let store = self.services.providers.store().clone();
         let wizard = Wizard::new(store.web(), move |id| store.has(id));
-        self.flows.web_wizard = Some((wizard, reply));
+        self.flows.begin(Active::Web(Box::new((wizard, reply))));
         self.web_wizard_show();
     }
 
     fn web_wizard_show(&mut self) {
-        let Some((w, _)) = self.flows.web_wizard.as_ref() else { return };
+        let Some((w, _)) = self.flows.web() else { return };
         match w.step() {
             Step::Pick { title, context, items } => {
                 let about = items.iter().map(|i| Some(i.about.clone()).filter(|a| !a.is_empty())).collect();
                 let rows = items.into_iter().map(|i| Item { label: i.label, detail: i.detail }).collect();
-                self.overlay = Some(Overlay::Web { sel: Select::new(&title, rows).context(&context).details(about) });
+                self.open_overlay(Overlay::Web { sel: Select::new(&title, rows).context(&context).details(about) });
             }
             Step::NeedKey(id) => match KeyTarget::builtin(id) {
                 // A key added here serves web search only; chat use is a separate, explicit choice.
@@ -41,7 +38,7 @@ impl App {
     }
 
     fn web_wizard_answer(&mut self, a: Answer) {
-        if let Some((w, _)) = self.flows.web_wizard.as_mut() {
+        if let Some((w, _)) = self.flows.web_mut() {
             w.answer(a);
             self.web_wizard_show();
         }
@@ -57,7 +54,7 @@ impl App {
     }
 
     fn web_wizard_finish(&mut self, chosen: Option<WebSearch>) {
-        let Some((_, reply)) = self.flows.web_wizard.take() else { return };
+        let Some((_, reply)) = self.flows.end_web() else { return };
         let ready = match chosen {
             Some(w) => match self.services.set_web(w.clone()) {
                 Ok(()) => {
