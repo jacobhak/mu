@@ -3,11 +3,12 @@
 
 mod acp;
 mod headless;
+mod relay;
 pub mod setup;
 mod signals;
 
 use crate::cli::Cli;
-use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none};
+use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none, pick_model_with};
 use crate::workflow::{deliver, plans_cli::PlanRun};
 use anyhow::{Result, anyhow, bail};
 use mu_agent::agent;
@@ -137,10 +138,29 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     let def_thinking = agent_def.as_ref().and_then(|d| d.thinking.as_deref()).and_then(models::Thinking::parse);
     let role_sel = sel.clone();
     let level = cli_thinking.or(def_thinking);
-    let (spec, thinking) = if interactive {
+    // A relayed worker has no credentials: its parent resolves the selector, before any runtime exists.
+    let stdio = task.as_ref().filter(|p| relays(p)).map(|_| Rc::new(relay::StdioRelay::new()));
+    let (spec, thinking) = if let Some(r) = &stdio {
+        let picked = pick_model_with(&cfgs, sel, level, |s| {
+            let resolved = relay::resolve_first(s)?;
+            providers.remember_relayed(s, &resolved.spec, resolved.thinking);
+            Ok((resolved.spec, resolved.thinking))
+        })?;
+        providers.set_relay(r.clone());
+        picked
+    } else if interactive {
         pick_model_or_none(&cfgs, &providers, sel, level)?
     } else {
         pick_model(&cfgs, &providers, sel, level)?
+    };
+    if stdio.is_some() {
+        host.set_relay_tools(task.as_ref().and_then(|p| p.get("relayTools")));
+    }
+    // The one reader of stdin, from here on: relay answers go to the relay, the rest to the subagent run.
+    let lines = if task.is_some() {
+        relay::spawn_reader(stdio.as_ref().map(|r| r.routes()))
+    } else {
+        tokio::sync::mpsc::unbounded_channel().1
     };
     let model_label = model_label(role_sel.as_deref(), &spec.id);
 
@@ -238,7 +258,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
             Armed::Subagent { task } => {
                 let printer = spawn_notice_printer(notice_rx);
                 plugin::process::exit_on_signals();
-                (subagent(&task, model_label, output_schema, handle.cmd, handle.ev).await, Some(printer))
+                (subagent(&task, model_label, output_schema, handle.cmd, handle.ev, lines).await, Some(printer))
             }
             Armed::Print { run, stop } => {
                 let printer = spawn_notice_printer(notice_rx);
@@ -326,6 +346,11 @@ fn apply_task(run: &mut agent::RunConfig, p: &Value, cfgs: &mu_base::config::Con
     run.mirror_session = mirrors_session(p);
 }
 
+/// Whether the parent asked this run to send its model calls to it.
+fn relays(p: &Value) -> bool {
+    p["relay"] == true
+}
+
 /// Whether the parent asked for this run's session file over the stream.
 fn mirrors_session(p: &Value) -> bool {
     p["mirrorSession"] == true
@@ -398,12 +423,13 @@ async fn subagent(
     output_schema: Option<Value>,
     cmd: UnboundedSender<events::Command>,
     ev: UnboundedReceiver<events::AgentEvent>,
+    lines: UnboundedReceiver<String>,
 ) -> i32 {
     let extra = p["context"].as_str().filter(|c| !c.is_empty());
     let task = p["task"].as_str().unwrap_or("");
     let prompt = extra.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
     println!("{}", json!({"type": "model", "label": model_label}));
-    headless::subagent_mode(prompt, output_schema, mirrors_session(p), cmd, ev).await
+    headless::subagent_mode(prompt, output_schema, mirrors_session(p), cmd, ev, lines).await
 }
 
 /// The subagent task on stdin, and the agent it names: a project agent, else one of mu's built-in

@@ -10,6 +10,7 @@ mod job_wait;
 mod pathnote;
 mod plan;
 pub(crate) mod read;
+pub mod relay;
 pub(crate) mod shell;
 mod spill;
 pub mod subagent;
@@ -221,7 +222,9 @@ impl Tools {
     pub(crate) fn access(&self, name: &str) -> Access {
         match BUILTINS.iter().find(|b| b.name == name) {
             Some(b) => b.access,
-            None => self.plugins.tool_access(name).unwrap_or(Access::Exec),
+            None => {
+                self.plugins.tool_access(name).or_else(|| self.plugins.relay_tool_access(name)).unwrap_or(Access::Exec)
+            }
         }
     }
 
@@ -250,7 +253,22 @@ impl Tools {
             }
             return out;
         }
+        if self.plugins.relay_tool_access(name).is_some() {
+            return self.call_relayed(args, ctx).await;
+        }
         ToolOutput::err(format!("Unknown tool: {name}"))
+    }
+
+    /// A call to a tool whose plugin is on the parent: the parent runs it as a `search`.
+    async fn call_relayed(&self, args: &Value, ctx: &ToolCtx) -> ToolOutput {
+        let Some(relay) = self.plugins.providers().and_then(|p| p.relay()) else {
+            return ToolOutput::err("this tool is served by the parent, and there is no relay to it");
+        };
+        match relay.search(args.clone(), &ctx.cancel).await {
+            Ok(r) if r.is_error => ToolOutput::err(r.text),
+            Ok(r) => ToolOutput::ok(r.text),
+            Err(e) => ToolOutput::err(e.msg),
+        }
     }
 }
 

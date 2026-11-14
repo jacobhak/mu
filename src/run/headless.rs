@@ -195,25 +195,12 @@ pub async fn subagent_mode(
     mirror: bool,
     cmd: UnboundedSender<Command>,
     ev: UnboundedReceiver<AgentEvent>,
+    lines: UnboundedReceiver<String>,
 ) -> i32 {
-    // The parent answers this child's approvals on stdin, one JSON line each; a closed stdin means
-    // nobody can. The task payload was the first line, already read.
-    let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::stdin().lock().lines() {
-            match line {
-                Ok(l) => {
-                    if line_tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    // `lines` are the parent's approval answers, one JSON line each (see `relay::spawn_reader`); a
+    // closed stdin means nobody can answer.
     let (result, code) =
-        run_subagent(prompt, output_schema.is_some(), mirror, cmd, ev, line_rx, |l| println!("{l}")).await;
+        run_subagent(prompt, output_schema.is_some(), mirror, cmd, ev, lines, |l| println!("{l}")).await;
     println!("{result}");
     code
 }
@@ -441,7 +428,8 @@ mod tests {
         let (ctx, _crx) = unbounded_channel();
         let (etx, erx) = unbounded_channel();
         drop(etx); // the agent task died before sending Exit
-        assert_eq!(rt.block_on(subagent_mode("x".into(), None, false, ctx, erx)), 1);
+        let (_ltx, lrx) = unbounded_channel();
+        assert_eq!(rt.block_on(subagent_mode("x".into(), None, false, ctx, erx, lrx)), 1);
         let (ctx, _crx) = unbounded_channel();
         let (etx, erx) = unbounded_channel();
         drop(etx);
@@ -742,6 +730,7 @@ mod tests {
                 |_| {},
                 None,
                 Mirror::Write,
+                None,
             ),
         );
         assert!(out.ok && out.text == "ok", "{}", out.text);

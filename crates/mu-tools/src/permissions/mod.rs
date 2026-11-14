@@ -41,6 +41,26 @@ pub enum Access {
     ByArgs,
 }
 
+impl Access {
+    /// The lowercase name a relayed tool's class travels under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Exec => "exec",
+            Self::ByArgs => "byargs",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "read" => Some(Self::Read),
+            "exec" => Some(Self::Exec),
+            "byargs" => Some(Self::ByArgs),
+            _ => None,
+        }
+    }
+}
+
 /// What the gate decided for one call.
 pub enum Verdict {
     Allow,

@@ -14,6 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::permissions::Permissions;
+use crate::tools::relay::RelayServer;
 use crate::tools::subagent::{BackgroundResult, ChildCmd, Mirror, Outcome, preview_result, run_child_observed};
 use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
@@ -505,6 +506,7 @@ impl JobsHandle {
         perms: Rc<Permissions>,
         artifacts: PathBuf,
         mirror: Mirror,
+        relay: Option<RelayServer>,
     ) {
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
@@ -512,8 +514,20 @@ impl JobsHandle {
         let spec = Spec { id, agent, cwd: cwd.clone(), task: command_line(payload["task"].as_str().unwrap_or("")) };
         let me = self.clone();
         self.spawn_job(spec, Work::subagent(), String::new(), cancel, true, move |seq| async move {
-            let out =
-                me.run_subagent(seq, child, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label, mirror).await;
+            let out = me
+                .run_subagent(
+                    seq,
+                    child,
+                    &cwd,
+                    &payload,
+                    &child_cancel,
+                    |_, _| {},
+                    &perms,
+                    &label,
+                    mirror,
+                    relay.as_ref(),
+                )
+                .await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
             let text = preview_result(&out.text, &cwd, || crate::tools::Tools::next_artifact_in(&artifacts));
@@ -558,6 +572,7 @@ impl JobsHandle {
                 &perms,
                 "review",
                 mirror,
+                None,
             )
             .await;
         self.complete(seq, Finished { ok: out.ok, text: String::new(), note: None, meta: None }, true);
@@ -578,6 +593,7 @@ impl JobsHandle {
         perms: &Rc<Permissions>,
         from: &str,
         mirror: Mirror,
+        relay: Option<&RelayServer>,
     ) -> Outcome {
         run_child_observed(
             child,
@@ -612,6 +628,7 @@ impl JobsHandle {
             },
             Some(&|r| perms.forward(&self.events, from, r)),
             mirror,
+            relay,
         )
         .await
     }
@@ -1034,6 +1051,7 @@ pub(crate) mod tests {
                     Rc::default(),
                     base.join("artifacts"),
                     Mirror::Off,
+                    None,
                 );
                 assert_eq!(h.finished().await.len(), 1);
             })

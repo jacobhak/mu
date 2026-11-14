@@ -145,6 +145,8 @@ pub struct PluginHost {
     pub(super) mcp_lifetime: Lifetime,
     /// Built-in tool names: a plugin or MCP tool may not take one.
     pub(super) reserved: fn(&str) -> bool,
+    /// Tools a relayed process offers whose plugin is on its parent: calls go over the relay.
+    relay_tools: RefCell<Vec<(ToolDef, Access)>>,
 }
 
 impl PluginHost {
@@ -212,11 +214,72 @@ impl PluginHost {
             cache_dir,
             interactive: Cell::new(false),
         });
-        Rc::new(Self { slots: RefCell::new(slots), shared, warnings, seen: RefCell::new(seen), mcp_lifetime, reserved })
+        Rc::new(Self {
+            slots: RefCell::new(slots),
+            shared,
+            warnings,
+            seen: RefCell::new(seen),
+            mcp_lifetime,
+            reserved,
+            relay_tools: RefCell::new(Vec::new()),
+        })
     }
 
     pub fn set_providers(&self, p: &Rc<Providers>) {
         *self.shared.providers.borrow_mut() = Rc::downgrade(p);
+    }
+
+    pub fn providers(&self) -> Option<Rc<Providers>> {
+        self.shared.providers.borrow().upgrade()
+    }
+
+    /// Takes the `relayTools` of a task payload (`null` or absent: none). An entry that does not
+    /// parse is skipped.
+    pub fn set_relay_tools(&self, list: Option<&Value>) {
+        let tools = list
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| {
+                let def = ToolDef {
+                    name: t.get("name")?.as_str()?.to_string(),
+                    description: t.get("description")?.as_str()?.to_string(),
+                    schema: t.get("parameters")?.clone(),
+                };
+                Some((def, Access::parse(t.get("access")?.as_str()?)?))
+            })
+            .collect();
+        *self.relay_tools.borrow_mut() = tools;
+    }
+
+    /// The relayed tools this process has no plugin for.
+    pub fn relay_tool_defs(&self) -> Vec<ToolDef> {
+        let tools = self.relay_tools.borrow();
+        tools.iter().filter(|(d, _)| !self.has_tool(&d.name)).map(|(d, _)| d.clone()).collect()
+    }
+
+    pub(crate) fn relay_tool_access(&self, name: &str) -> Option<Access> {
+        if self.has_tool(name) {
+            return None;
+        }
+        self.relay_tools.borrow().iter().find(|(d, _)| d.name == name).map(|(_, a)| *a)
+    }
+
+    /// The `relayTools` of a child's task payload: this process's own `web_search` when its web
+    /// search is ready, else what it was given itself (a relayed process passes them on).
+    pub fn relay_tools_payload(&self) -> Vec<Value> {
+        let entry = |d: &ToolDef, a: Access| json!({"name": d.name, "description": d.description, "parameters": d.schema, "access": a.as_str()});
+        if let Some(access) = self.tool_access("web_search") {
+            let ready = self.providers().is_some_and(|p| {
+                matches!(mu_provider::auth::web::status(p.store()), mu_provider::auth::web::WebStatus::Ready(_))
+            });
+            let def = self.tool_defs().into_iter().find(|d| d.name == "web_search");
+            return match (ready, def) {
+                (true, Some(d)) => vec![entry(&d, access)],
+                _ => Vec::new(),
+            };
+        }
+        self.relay_tools.borrow().iter().map(|(d, a)| entry(d, *a)).collect()
     }
 
     pub fn set_session(&self, init: InitParams) {

@@ -222,7 +222,11 @@ fn plan_mode_without_a_parked_plan_exits_nonzero() {
 }
 
 fn tool_use(id: &str, name: &str, input: serde_json::Value) -> Reply {
-    let sse_body = format!(
+    sse(&tool_use_body(id, name, &input))
+}
+
+fn tool_use_body(id: &str, name: &str, input: &serde_json::Value) -> String {
+    format!(
         "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m1\"}}}}\n\n\
          event: content_block_start\ndata: {}\n\n\
          event: content_block_delta\ndata: {}\n\n\
@@ -231,8 +235,7 @@ fn tool_use(id: &str, name: &str, input: serde_json::Value) -> Reply {
          event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
         json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
         json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}),
-    );
-    sse(&sse_body)
+    )
 }
 
 #[test]
@@ -257,4 +260,135 @@ fn the_model_can_search_mu_docs_with_grep() {
     let second = requests.get(1).expect("a second request carries the tool result");
     assert!(second.contains("mu://reference/cli.md:"), "{second}");
     assert!(home.join("docs").is_dir(), "the docs were written under MU_HOME");
+}
+
+fn text_reply(text: &str) -> String {
+    ANSWER.replace("hello from the fake", text)
+}
+
+/// A fake model that routes on the request body, since mu also sends title requests whose timing
+/// is not fixed: a title, the parent's first call (answers with a `task` call), the parent's call
+/// after the task result, and otherwise the child's.
+fn relay_model(child_says: &str) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::Read;
+    let child_says = child_says.to_string();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let call =
+        json!({"tasks": [{"name": "Relayed", "task": "say the word", "agent": "task", "solutionSpace": "one word"}]});
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            let (call, child_says, seen) = (call.clone(), child_says.clone(), log.clone());
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    let Some(p) = text.find("\r\n\r\n") else {
+                        if n == 0 {
+                            return;
+                        }
+                        continue;
+                    };
+                    let len = text[..p]
+                        .to_lowercase()
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                        .unwrap_or(0);
+                    if buf.len() >= p + 4 + len || n == 0 {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).into_owned();
+                let body = if req.contains("3–7 word title") {
+                    text_reply("A title")
+                } else if req.contains("\"tool_result\"") {
+                    text_reply("parent finished")
+                } else if req.contains("delegate it") {
+                    tool_use_body("t1", "task", &call)
+                } else {
+                    text_reply(&child_says)
+                };
+                seen.lock().unwrap().push(req);
+                let out = format!(
+                    "HTTP/1.1 200 X\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(out.as_bytes());
+            });
+        }
+    });
+    (base, seen)
+}
+
+/// A parent home pointed at `relay_model`, a git cwd and the requests the server saw.
+fn relay_fixture(child_says: &str) -> (PathBuf, PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let (base, seen) = relay_model(child_says);
+    let home = home_with_key(&base);
+    std::fs::write(home.join("models.toml"), format!("[sets.main]\ndefault = \"{MODEL}\"\n")).unwrap();
+    (home, mu_testutil::repo(), seen)
+}
+
+/// What the server saw split by who sent it: the child's requests carry the task text and no
+/// parent prompt.
+fn child_requests(seen: &[String]) -> Vec<&String> {
+    seen.iter()
+        .filter(|r| r.contains("say the word") && !r.contains("delegate it") && !r.contains("3–7 word title"))
+        .collect()
+}
+
+/// A launched child has no credentials and no gateway: its model calls reach the server only
+/// through the parent.
+#[test]
+fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
+    let (home, cwd, seen) = relay_fixture("relayed child result");
+    let bare = mu_testutil::tmp();
+    std::fs::create_dir_all(bare.join("empty-bin")).unwrap();
+    std::fs::copy(home.join("models.toml"), bare.join("models.toml")).unwrap();
+    // The parent's PATH is empty, but launching a task commits the tree with git.
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join("git"))
+        .find(|g| g.is_file())
+        .expect("git on PATH");
+    std::os::unix::fs::symlink(git, home.join("empty-bin/git")).unwrap();
+    let launcher = home.join("launcher.sh");
+    let script = format!(
+        "#!/bin/sh\nunset MU_GATEWAY_URL ANTHROPIC_API_KEY\nexport MU_HOME='{b}' HOME='{b}' MU_TEST_HOME='{b}' PATH='{b}/empty-bin'\nexec '{mu}' --headless --model {MODEL}\n",
+        b = bare.display(),
+        mu = env!("CARGO_BIN_EXE_mu"),
+    );
+    std::fs::write(&launcher, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(home.join("config.toml"), format!("[task]\nlauncher = [\"{}\"]\n", launcher.display())).unwrap();
+    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let requests = seen.lock().unwrap();
+    assert!(!child_requests(&requests).is_empty(), "the server saw the child's request: {requests:?}");
+    assert!(
+        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("relayed child result")),
+        "the child's result reaches the parent's next request"
+    );
+    assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
+    assert!(!bare.join("auth.json").exists(), "the child never held a key store");
+}
+
+/// `MU_TASK_RELAY=1` relays for a local child too.
+#[test]
+fn a_local_child_is_relayed_when_the_environment_asks() {
+    let (home, cwd, seen) = relay_fixture("local relayed result");
+    let o = mu(&home, &cwd).env("MU_TASK_RELAY", "1").args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let requests = seen.lock().unwrap();
+    assert!(!child_requests(&requests).is_empty(), "the server saw the child's request: {requests:?}");
+    assert!(
+        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("local relayed result")),
+        "the child's result reaches the parent's next request"
+    );
+    assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
 }

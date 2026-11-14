@@ -1,9 +1,11 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
+use super::relay::RelayServer;
 use super::task::depth;
 use mu_base::events::{AgentEvent, EventTx};
 use mu_base::git::{git, prune_refs, repo_root, short_sha, snapshot_tree};
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
+use mu_provider::provider::relay::Call;
 use mu_session::session::file::MirrorFile;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -179,6 +181,8 @@ enum ChildEvent {
         id: u64,
         request: ApprovalRequest,
     },
+    /// A model or search call of a relayed child; the line is read again as a `Call`.
+    Relay(serde::de::IgnoredAny),
     Result(ChildResult),
     /// A launcher's report of the worker's changes, after the `result` line.
     Changes {
@@ -270,6 +274,7 @@ pub async fn run_child(
         |_| {},
         None,
         Mirror::Off,
+        None,
     )
     .await
 }
@@ -278,6 +283,7 @@ pub async fn run_child(
 /// has opened it, and its model label to `on_model` (older children never say, so either may not run).
 /// `approve` answers the child's approval requests; `None` means nobody can. `mirror` says what
 /// to do with the child's `entry` lines; a mirrored file's local path goes to `on_session`.
+/// `relay`, when set, serves the child's model and search calls; without it they are dropped.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_child_observed(
     child: ChildCmd,
@@ -289,6 +295,7 @@ pub async fn run_child_observed(
     mut on_model: impl FnMut(&str),
     approve: Option<&dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision>>,
     mirror: Mirror,
+    relay: Option<&RelayServer>,
 ) -> Outcome {
     let launched = matches!(child, ChildCmd::Launched(_));
     let mut cmd = match &child {
@@ -330,6 +337,7 @@ pub async fn run_child_observed(
     let mut stdin = child.stdin.take().expect("stdin is piped");
     // The task payload, then one line per approval answer, for as long as the child reads them.
     let (wtx, mut wrx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let relay = relay.map(|r| r.start(wtx.clone()));
     let task = payload.to_string();
     tokio::task::spawn_local(async move {
         let _ = stdin.write_all(task.as_bytes()).await;
@@ -405,6 +413,12 @@ pub async fn run_child_observed(
                                 let _ = out.send(json!({"type": "approval", "id": id, "decision": d}).to_string());
                             });
                         }
+                        Ok(ChildEvent::Relay(_)) => {
+                            let call = serde_json::from_slice::<Value>(&line).ok().and_then(|v| Call::parse(&v));
+                            if let (Some(run), Some((id, call))) = (&relay, call) {
+                                run.handle(id, call);
+                            }
+                        }
                         Ok(ChildEvent::Result(r)) => result = Some(r),
                         Ok(ChildEvent::Changes { r#ref, base, files }) => changes = Some((r#ref, base, files)),
                         Err(_) => {
@@ -432,6 +446,7 @@ pub async fn run_child_observed(
             }
         }
     }
+    drop(relay);
     drop(wtx);
     // A child that ignores everything must not hang the parent: bound the wait, then kill.
     if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await.is_err() {
@@ -619,6 +634,7 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
                     |_| {},
                     None,
                     Mirror::Off,
+                    None,
                 )
                 .await
             })
@@ -668,6 +684,7 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
                     |_| {},
                     None,
                     Mirror::Off,
+                    None,
                 )
                 .await
             })
@@ -720,6 +737,7 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
                             |_| {},
                             None,
                             Mirror::Off,
+                            None,
                         )
                         .await
                     }
@@ -836,6 +854,7 @@ mod mirror_tests {
                 |_| {},
                 None,
                 Mirror::Write,
+                None,
             ))
             .await
     }

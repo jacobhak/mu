@@ -232,10 +232,15 @@ impl Providers {
     pub async fn resolve_relayed(&self, sel: &str) -> Result<(ModelSpec, Option<Thinking>)> {
         let Some(relay) = self.relay() else { return self.resolve(sel) };
         let Resolved { spec, thinking } = relay.resolve(sel).await.map_err(RelayError::into_anyhow)?;
+        self.remember_relayed(sel, &spec, thinking);
+        Ok((spec, thinking))
+    }
+
+    /// Records an answer the relay gave outside `resolve_relayed` (the worker's first, blocking one).
+    pub fn remember_relayed(&self, sel: &str, spec: &ModelSpec, thinking: Option<Thinking>) {
         let mut known = self.relayed.borrow_mut();
         known.insert(spec.id.clone(), (spec.clone(), thinking));
         known.insert(sel.to_string(), (spec.clone(), thinking));
-        Ok((spec, thinking))
     }
 
     fn chatgpt_sign_in_needed(&self) -> String {

@@ -35,7 +35,10 @@ impl Agent {
         let mut v = self
             .memo
             .base_defs
-            .get_or_init(|| Tools::definitions().into_iter().chain(self.ports.plugins.tool_defs()).collect())
+            .get_or_init(|| {
+                let plugins = &self.ports.plugins;
+                Tools::definitions().into_iter().chain(plugins.tool_defs()).chain(plugins.relay_tool_defs()).collect()
+            })
             .clone();
         let jobs = self.tools.jobs.is_some();
         if jobs && let Some(d) = v.iter_mut().find(|d| d.name == "bash") {

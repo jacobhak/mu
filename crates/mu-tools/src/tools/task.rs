@@ -1,3 +1,4 @@
+use super::relay::RelayServer;
 use super::subagent::{ArtifactAlloc, ChildCmd, Mirror, Outcome, prepare_launch, preview_result, run_child_observed};
 use super::{ToolCtx, Tools};
 use crate::permissions::Permissions;
@@ -175,8 +176,22 @@ impl Tools {
         } else {
             Mirror::Write
         };
+        // A launched child has no credentials, and a relayed process has none to lend: the child's
+        // model calls go to this process.
+        let relayed = !self.launcher.is_empty()
+            || std::env::var("MU_TASK_RELAY").is_ok_and(|v| v == "1")
+            || self.plugins.providers().is_some_and(|p| p.is_relayed());
+        let relay =
+            relayed.then(|| RelayServer { plugins: self.plugins.clone(), permissions: self.permissions.clone() });
+        let relay_tools = if relayed { self.plugins.relay_tools_payload() } else { Vec::new() };
         let payload = |agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
             let mut p = json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
+            if relayed {
+                p["relay"] = json!(true);
+                if !relay_tools.is_empty() {
+                    p["relayTools"] = json!(relay_tools);
+                }
+            }
             p["permissions"] = self.permissions.inherit_json();
             if self.mirror || !self.launcher.is_empty() {
                 p["mirrorSession"] = json!(true);
@@ -225,6 +240,7 @@ impl Tools {
                     self.permissions.clone(),
                     self.artifact_dir(),
                     mirror.clone(),
+                    relay.clone(),
                 );
                 started.push(format!("{id} ({agent})"));
             }
@@ -237,8 +253,19 @@ impl Tools {
         }
         let alloc = || self.next_artifact();
         let how = Starter { exe: &exe, launcher: &self.launcher, session: &session, mirror };
-        run_foreground(&specs, &schemas, &how, &payload, &ctx.cancel, &ctx.events, &self.permissions, &self.cwd, &alloc)
-            .await
+        run_foreground(
+            &specs,
+            &schemas,
+            &how,
+            &payload,
+            &ctx.cancel,
+            &ctx.events,
+            &self.permissions,
+            relay.as_ref(),
+            &self.cwd,
+            &alloc,
+        )
+        .await
     }
 }
 
@@ -266,6 +293,7 @@ async fn run_foreground(
     cancel: &tokio_util::sync::CancellationToken,
     events: &EventTx,
     perms: &Rc<Permissions>,
+    relay: Option<&RelayServer>,
     cwd: &Path,
     alloc: ArtifactAlloc<'_>,
 ) -> ToolOutput {
@@ -320,6 +348,7 @@ async fn run_foreground(
                 |model| rows.borrow_mut()[i].model = Some(model.to_string()),
                 Some(&|r| perms.forward(events, &label, r)),
                 how.mirror.clone(),
+                relay,
             )
             .await;
             rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
@@ -433,6 +462,7 @@ mod cwd_tests {
                 |m| seen.borrow_mut().push(format!("model {m}")),
                 None,
                 Mirror::Off,
+                None,
             ))
             .await;
         assert!(out.ok, "{}", out.text);
@@ -649,6 +679,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
             |_| {},
             answer,
             Mirror::Off,
+            None,
         )
         .await
         .text
