@@ -352,6 +352,12 @@ impl Agent {
         let _ = self.ports.events.send(e);
     }
 
+    /// Starts a turn for the front end: where the session stands, then `TurnStart`.
+    pub(super) fn emit_turn_start(&self) {
+        self.emit(AgentEvent::TurnMark { leaf: self.session.as_ref().and_then(|s| s.leaf().map(String::from)) });
+        self.emit(AgentEvent::TurnStart);
+    }
+
     pub fn notice(&self, s: impl Into<String>) {
         self.emit(AgentEvent::Notice(s.into()));
     }

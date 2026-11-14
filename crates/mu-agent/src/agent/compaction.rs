@@ -315,7 +315,7 @@ impl Agent {
     pub(super) async fn manual_compact(&mut self, focus: Option<String>) {
         let cancel = CancellationToken::new();
         self.ports.inbox.borrow_mut().cancel = cancel.clone();
-        self.emit(AgentEvent::TurnStart);
+        self.emit_turn_start();
         match self.compact(focus.as_deref(), &cancel).await {
             Outcome::Done => {}
             Outcome::Skipped(why) => self.notice(why),

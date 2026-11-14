@@ -89,7 +89,7 @@ impl Agent {
         }
         let cancel = CancellationToken::new();
         self.ports.inbox.borrow_mut().cancel = cancel.clone();
-        self.emit(AgentEvent::TurnStart);
+        self.emit_turn_start();
         let mut aborted = false;
         let mut next = match start {
             Start::User(input) => Some(Step::Prompt { input, synthetic: false }),

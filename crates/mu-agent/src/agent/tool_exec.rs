@@ -227,7 +227,7 @@ impl Agent {
         }
         let cancel = CancellationToken::new();
         self.ports.inbox.borrow_mut().cancel = cancel.clone();
-        self.emit(AgentEvent::TurnStart);
+        self.emit_turn_start();
         let args = json!({"command": cmd});
         let id = "user-bash".to_string();
         self.emit(AgentEvent::ToolStart { id: id.clone(), name: "bash".into(), args: args.clone() });

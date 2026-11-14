@@ -225,6 +225,7 @@ impl AgentView {
         }
         let mut fx = Vec::new();
         match e {
+            AgentEvent::TurnMark { .. } => {}
             AgentEvent::TurnStart => {
                 self.running = true;
                 self.turn_started = Some(Instant::now());

@@ -2,6 +2,7 @@
 //! Nothing here starts a model request, a tool or a session.
 
 pub mod ask_nudge;
+pub mod catchup;
 pub mod config;
 pub mod events;
 pub mod git;

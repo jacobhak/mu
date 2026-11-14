@@ -404,6 +404,12 @@ pub enum PtyInput {
 /// `serde(skip)`: they cross a wire as `wire::WireEvent` requests with an id.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
+    /// Sent immediately before every `TurnStart`: the session entry the turn begins after (`None`
+    /// with no session file yet). A client that attaches mid-turn shows history up to here and
+    /// replays the turn's events after it.
+    TurnMark {
+        leaf: Option<String>,
+    },
     TurnStart,
     /// Sent right after `TurnStart` when the turn began without user input (a background job
     /// finished or a `mu notify` message arrived).

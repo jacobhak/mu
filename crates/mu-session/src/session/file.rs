@@ -158,6 +158,11 @@ impl SessionFile {
         id_of(&self.path)
     }
 
+    /// The newest entry's id: where the next entry attaches.
+    pub fn leaf(&self) -> Option<&str> {
+        self.leaf.as_deref()
+    }
+
     fn report(&self, msg: String) {
         match &self.on_error {
             Some(f) => f(msg),

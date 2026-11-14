@@ -86,6 +86,57 @@ pub enum WireEvent {
         id: u64,
         tool: String,
     },
+    /// Everything the client missed has been sent: from here on events are live. Until it arrives the
+    /// client does not ring the bell or notify for what it is shown.
+    CaughtUp,
+    /// Another client took the session, or the agent ended the connection: the client prints the
+    /// reason and exits.
+    Detached {
+        reason: String,
+    },
+}
+
+/// The lines a client sends, over the one stream that also carries the host requests.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClientLine {
+    Hello {
+        wire: u32,
+        version: String,
+    },
+    Command(WireCommand),
+    /// A request for host state; answered by an `AgentLine::HostReply` with the same id.
+    Host {
+        id: u64,
+        call: String,
+        args: serde_json::Value,
+    },
+    /// Leave the agent running and close the connection.
+    Detach,
+}
+
+/// The lines the agent sends.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)] // one value per line on the wire, never stored
+pub enum AgentLine {
+    Hello {
+        wire: u32,
+        version: String,
+        /// What the client needs to know about the host (`HostInfo`, in the UI crate's terms).
+        host: serde_json::Value,
+    },
+    Event(WireEvent),
+    HostReply {
+        id: u64,
+        result: Result<serde_json::Value, String>,
+    },
+    Pushed {
+        name: String,
+        data: serde_json::Value,
+    },
+    /// The agent refuses the connection (a different `wire`) and closes it.
+    Error(String),
 }
 
 pub fn to_line<T: Serialize>(v: &T) -> String {
@@ -158,6 +209,10 @@ impl AgentAdapter {
     /// Requests that still wait for an answer.
     pub fn parked(&self) -> usize {
         self.parked.len()
+    }
+
+    pub fn is_parked(&self, id: u64) -> bool {
+        self.parked.contains_key(&id)
     }
 
     fn park(&mut self, p: Parked) -> u64 {
@@ -246,6 +301,13 @@ impl AgentAdapter {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // passed straight on, never stored
+pub enum Incoming {
+    Event(AgentEvent),
+    CaughtUp,
+    Detached(String),
+}
+
 /// The front end's side: turns wire events back into events with fresh local reply handles, whose
 /// answers go out as reply commands.
 ///
@@ -275,8 +337,20 @@ impl ClientAdapter {
         });
     }
 
+    /// What a wire event is to the front end: an event, or one of the two that end or settle a connection.
+    pub fn incoming(&self, w: WireEvent) -> Incoming {
+        match w {
+            WireEvent::CaughtUp => Incoming::CaughtUp,
+            WireEvent::Detached { reason } => Incoming::Detached(reason),
+            w => Incoming::Event(self.event(w)),
+        }
+    }
+
+    /// The event a wire event stands for. `CaughtUp` and `Detached` are not events (see `incoming`):
+    /// they come out as an empty notice.
     pub fn event(&self, w: WireEvent) -> AgentEvent {
         match w {
+            WireEvent::CaughtUp | WireEvent::Detached { .. } => AgentEvent::Notice(String::new()),
             WireEvent::Event(mut ev) => {
                 event_inputs(&mut ev, keep);
                 ev
