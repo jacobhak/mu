@@ -1,7 +1,8 @@
 use super::*;
 use crate::agent::RunConfig;
 use crate::testing::{
-    agent, agent_run, agent_with, assistant, call, drain, git_repo, results, save_plan_in, tmp_dir, yield_call,
+    agent, agent_in, agent_run, agent_with, assistant, call, drain, git_repo, results, save_plan_in, tmp_dir,
+    yield_call,
 };
 use mu_base::config::Configs;
 use mu_base::permissions::{ApprovalDecision, ApprovalScope};
@@ -1732,6 +1733,180 @@ fn a_yield_after_the_budget_stop_still_lands() {
         assert!(r.iter().any(|(err, text)| !err && text.contains("Result submitted")), "{r:?}");
         assert!(r.iter().any(|(err, text)| *err && text.contains("past its request budget")), "{r:?}");
         assert!(!r.iter().any(|(_, text)| text.contains("panicked")), "the tool after the yield never ran: {r:?}");
+    });
+}
+
+fn fifo(dir: &Path, name: &str) -> PathBuf {
+    let p = dir.join(name);
+    let ok = std::process::Command::new("mkfifo").arg(&p).status().unwrap().success();
+    assert!(ok, "mkfifo {}", p.display());
+    p
+}
+
+/// A write to a FIFO returns once a reader has it open and takes the text.
+async fn feed(path: &Path, text: &'static str) {
+    let p = path.to_owned();
+    tokio::task::spawn_blocking(move || std::fs::write(p, text)).await.unwrap().unwrap();
+}
+
+fn cat_call(id: &str, path: &Path) -> Block {
+    bash_call(id, json!({"command": format!("cat {}", path.display())}))
+}
+
+fn call_events(events: Vec<AgentEvent>) -> Vec<String> {
+    events
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolStart { id, .. } => Some(format!("start {id}")),
+            AgentEvent::ToolEnd { id, .. } => Some(format!("end {id}")),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(30), f).await.expect("the turn hung")
+}
+
+#[test]
+fn read_only_calls_run_together_and_results_keep_call_order() {
+    run(async {
+        let dir = tmp_dir();
+        let (f1, f2) = (fifo(&dir, "f1"), fifo(&dir, "f2"));
+        let script = vec![
+            Ok(assistant(vec![cat_call("t1", &f1), cat_call("t2", &f2)], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = agent_in(script, Configs::default(), RunConfig::default(), dir);
+        a.enable_jobs(); // foreground bash then runs as its own process; the headless shell runs one line at a time
+        // Run one after the other, t1 would wait for its text forever: t2 must finish first.
+        let feeder = async {
+            feed(&f2, "two").await;
+            feed(&f1, "one").await;
+        };
+        within(futures_util::future::join(a.turn(Some("go".to_string().into())), feeder)).await;
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
+        let r = results(&a);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].1.contains("one") && r[1].1.contains("two"), "call order, not finish order: {r:?}");
+        assert_eq!(call_events(drain(&mut rx)), ["start t1", "start t2", "end t1", "end t2"]);
+    });
+}
+
+#[test]
+fn a_write_between_reads_is_a_barrier() {
+    run(async {
+        let dir = tmp_dir();
+        let (f1, f2) = (fifo(&dir, "f1"), fifo(&dir, "f2"));
+        let marker = dir.join("marker");
+        let write = bash_call("t2", json!({"command": format!("touch {}", marker.display())}));
+        let script = vec![
+            Ok(assistant(vec![cat_call("t1", &f1), write, cat_call("t3", &f2)], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = agent_in(script, Configs::default(), RunConfig::default(), dir);
+        a.enable_jobs();
+        let feeder = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let early = marker.exists();
+            feed(&f1, "one").await;
+            // t3 reads f2 only once the write has run.
+            mu_testutil::wait_until("the write", || marker.exists()).await;
+            feed(&f2, "three").await;
+            early
+        };
+        let ((), early) = within(futures_util::future::join(a.turn(Some("go".to_string().into())), feeder)).await;
+        assert!(!early, "the write waited for the read before it");
+        let r = results(&a);
+        assert_eq!(r.len(), 3, "{r:?}");
+        assert!(r[0].1.contains("one") && r[2].1.contains("three"), "{r:?}");
+        assert_eq!(call_events(drain(&mut rx)), ["start t1", "end t1", "start t2", "end t2", "start t3", "end t3"]);
+    });
+}
+
+#[test]
+fn abort_cancels_every_call_in_flight() {
+    run(async {
+        let dir = tmp_dir();
+        let (f1, f2) = (fifo(&dir, "f1"), fifo(&dir, "f2"));
+        let script = vec![Ok(assistant(vec![cat_call("t1", &f1), cat_call("t2", &f2)], StopReason::ToolUse))];
+        let (mut a, mut rx) = agent_in(script, Configs::default(), RunConfig::default(), dir);
+        a.enable_jobs();
+        let inbox = a.ports.inbox.clone();
+        let feeder = async {
+            // Both writers open only once both readers run; holding them keeps the readers waiting.
+            let open =
+                |p: PathBuf| tokio::task::spawn_blocking(move || std::fs::OpenOptions::new().write(true).open(p));
+            let (w1, w2) = futures_util::future::join(open(f1.clone()), open(f2.clone())).await;
+            inbox.borrow().cancel.cancel();
+            (w1.unwrap().unwrap(), w2.unwrap().unwrap())
+        };
+        let ((), _held) = within(futures_util::future::join(a.turn(Some("go".to_string().into())), feeder)).await;
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
+        assert_eq!(results(&a).len(), 2);
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd { aborted: true })));
+        assert_eq!(call_events(events), ["start t1", "start t2", "end t1", "end t2"]);
+    });
+}
+
+/// A read-only call that needs approval waits for the calls before it, then asks alone.
+async fn asking_read_after_a_running_read(answer: ApprovalDecision) -> (Vec<(bool, String)>, usize) {
+    let dir = tmp_dir();
+    let outside = tmp_dir().join("x.txt");
+    std::fs::write(&outside, "outside").unwrap();
+    let f1 = fifo(&dir, "f1");
+    let script = vec![
+        Ok(assistant(
+            vec![cat_call("t1", &f1), bash_call("t2", json!({"command": format!("cat {}", outside.display())}))],
+            StopReason::ToolUse,
+        )),
+        Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+    ];
+    let run_cfg = RunConfig { permission_mode: Some(mu_base::permissions::PermissionMode::Ask), ..Default::default() };
+    let (mut a, mut rx) = agent_in(script, Configs::default(), run_cfg, dir);
+    a.enable_jobs();
+    let asked = Rc::new(Cell::new(0usize));
+    let asked_in = asked.clone();
+    let answers = async move {
+        while let Some(e) = rx.recv().await {
+            match e {
+                AgentEvent::Approve { reply, .. } => {
+                    asked_in.set(asked_in.get() + 1);
+                    let _ = reply.send(answer.clone());
+                }
+                AgentEvent::TurnEnd { .. } => break,
+                _ => {}
+            }
+        }
+    };
+    let early = Rc::new(Cell::new(usize::MAX));
+    let feeder = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        early.set(asked.get());
+        feed(&f1, "one").await;
+    };
+    within(futures_util::future::join3(a.turn(Some("go".to_string().into())), answers, feeder)).await;
+    assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
+    (results(&a), early.get())
+}
+
+#[test]
+fn a_call_that_needs_approval_runs_after_the_reads_before_it() {
+    run(async {
+        let (r, asked_early) = asking_read_after_a_running_read(allow_once()).await;
+        assert_eq!(asked_early, 0, "asked while the read before it was still running");
+        assert!(r.len() == 2 && r[0].1.contains("one") && !r[1].0 && r[1].1.contains("outside"), "{r:?}");
+    });
+}
+
+#[test]
+fn a_denied_call_keeps_its_place_in_the_results() {
+    run(async {
+        let (r, asked_early) =
+            asking_read_after_a_running_read(ApprovalDecision::Deny { note: Some("no".into()) }).await;
+        assert_eq!(asked_early, 0);
+        assert!(r.len() == 2 && r[0].1.contains("one") && r[1].0 && r[1].1.contains("denied"), "{r:?}");
     });
 }
 
