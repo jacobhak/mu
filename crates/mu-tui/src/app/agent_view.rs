@@ -132,7 +132,7 @@ pub(super) struct AgentView {
     pub(super) running: bool,
     pub(super) compacting: bool,
     /// A retry wait long enough to count down in the viewport: its end and the attempt that failed.
-    retry_wait: Option<(Instant, u32)>,
+    retry_wait: Option<(Instant, u32, u32)>,
     pub(super) turn_started: Option<Instant>,
     pub(super) expanded: bool,
     pub(super) queued: QueueState,
@@ -296,12 +296,13 @@ impl AgentView {
                     .unwrap_or(Value::Null);
                 self.commit_tool_result(&name, &args, &output, w);
             }
-            AgentEvent::Retry { attempt, delay, reason } => {
+            AgentEvent::Retry { attempt, max_attempts, delay, reason } => {
                 self.tr.reset_stream();
                 self.calls.clear();
-                let msg = format!("↻ {}", mu_base::events::retry_notice(attempt, delay, &reason));
+                let msg = format!("↻ {}", mu_base::events::retry_notice(attempt, max_attempts, delay, &reason));
                 self.tr.commit(notice_lines(&msg));
-                self.retry_wait = (delay >= RETRY_COUNTDOWN_FROM).then(|| (Instant::now() + delay, attempt));
+                self.retry_wait =
+                    (delay >= RETRY_COUNTDOWN_FROM).then(|| (Instant::now() + delay, attempt, max_attempts));
             }
             AgentEvent::Notice(s) => self.tr.commit(notice_lines(&s)),
             AgentEvent::Error(s) => self.tr.commit(error_lines(&s)),
@@ -469,9 +470,9 @@ impl AgentView {
         if self.compacting {
             out.push(styled(format!("{spin} Compacting context…"), |_| theme::get().fg(Role::Warn)));
         }
-        if let Some((until, attempt)) = self.retry_wait.filter(|(u, _)| *u > Instant::now()) {
+        if let Some((until, attempt, max)) = self.retry_wait.filter(|(u, ..)| *u > Instant::now()) {
             let left = mu_base::events::wait_text(until - Instant::now());
-            let text = format!("{spin} Retrying in {left} (attempt {attempt}/5) · Esc cancels");
+            let text = format!("{spin} Retrying in {left} (attempt {attempt}/{max}) · Esc cancels");
             out.push(styled(trunc(&text, w), |_| theme::get().fg(Role::Warn)));
         }
         (out, pty_cursor)
@@ -800,22 +801,32 @@ mod tests {
         });
         v.on_event(AgentEvent::Error("boom".into()), SIZE);
         assert!(pending(&v).contains("boom"));
-        v.on_event(AgentEvent::Retry { attempt: 2, delay: Duration::from_secs(4), reason: "timeout".into() }, SIZE);
-        assert!(pending(&v).contains("retrying in 4s (timeout) [attempt 2/5]"));
+        v.on_event(
+            AgentEvent::Retry { attempt: 2, max_attempts: 7, delay: Duration::from_secs(4), reason: "timeout".into() },
+            SIZE,
+        );
+        assert!(pending(&v).contains("retrying in 4s (timeout) [attempt 2/7]"));
         assert!(v.calls.is_empty());
     }
 
     #[test]
     fn a_long_retry_wait_counts_down_until_it_ends() {
         let mut v = view();
-        v.on_event(AgentEvent::Retry { attempt: 1, delay: Duration::from_secs(3600), reason: "429".into() }, SIZE);
+        let retry = |attempt, secs| AgentEvent::Retry {
+            attempt,
+            max_attempts: 3,
+            delay: Duration::from_secs(secs),
+            reason: "429".into(),
+        };
+        v.on_event(retry(1, 3600), SIZE);
         assert!(pending(&v).contains("retrying in 1h"));
         let rows = |v: &AgentView| v.live_lines(80, '*').0.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rows(&v).contains("Retrying in 59m") && rows(&v).contains("Esc cancels"), "{}", rows(&v));
+        assert!(rows(&v).contains("Retrying in 59m") && rows(&v).contains("(attempt 1/3)"), "{}", rows(&v));
+        assert!(rows(&v).contains("Esc cancels"), "{}", rows(&v));
         v.on_event(AgentEvent::TurnEnd { aborted: true }, SIZE);
         assert!(!rows(&v).contains("Retrying"));
         // A short wait only gets the notice.
-        v.on_event(AgentEvent::Retry { attempt: 1, delay: Duration::from_secs(4), reason: "x".into() }, SIZE);
+        v.on_event(retry(1, 4), SIZE);
         assert!(!rows(&v).contains("Retrying"));
     }
 

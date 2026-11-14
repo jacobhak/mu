@@ -67,6 +67,7 @@ pub enum StreamEvent<'a> {
     },
     Retry {
         attempt: u32,
+        max_attempts: u32,
         delay: Duration,
         reason: String,
     },

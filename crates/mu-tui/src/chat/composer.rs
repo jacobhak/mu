@@ -129,8 +129,13 @@ pub enum Action {
     Redraw,
 }
 
+/// First of the private-use chars that stand for pasted blocks in the editor, so a block is one
+/// char: the cursor cannot enter it and one delete removes it (review B7).
+const TOKEN_BASE: u32 = 0xF0000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Paste {
+    token: char,
     marker: String,
     content: String,
 }
@@ -160,6 +165,39 @@ impl DerefMut for Buf {
 impl Buf {
     fn from_text(s: &str) -> Self {
         Buf { ed: Editor::from_text(s), pastes: vec![], images: vec![] }
+    }
+
+    /// `s` with each paste token swapped for its marker (`content` false) or its pasted text.
+    fn swap_tokens(&self, s: &str, content: bool) -> String {
+        s.chars().fold(String::with_capacity(s.len()), |mut out, c| {
+            match self.pastes.iter().find(|p| p.token == c) {
+                Some(p) => out.push_str(if content { &p.content } else { &p.marker }),
+                None => out.push(c),
+            }
+            out
+        })
+    }
+
+    /// The text with paste markers in place of the tokens.
+    fn marked_text(&self) -> String {
+        self.swap_tokens(&self.ed.text(), false)
+    }
+
+    /// The text with pasted blocks expanded.
+    fn expanded_text(&self) -> String {
+        self.swap_tokens(&self.ed.text(), true)
+    }
+
+    /// The editor as drawn: tokens replaced by their markers, the cursor column moved to match.
+    fn shown(&self) -> Editor {
+        let mut ed = self.ed.clone();
+        if self.pastes.is_empty() {
+            return ed;
+        }
+        let before: String = self.ed.cur().chars().take(self.ed.col).collect();
+        ed.col = self.swap_tokens(&before, false).chars().count();
+        ed.lines = self.ed.lines.iter().map(|l| self.swap_tokens(l, false)).collect();
+        ed
     }
 }
 
@@ -267,11 +305,7 @@ impl Composer {
 
     /// The typed text with paste markers expanded (a secret is never a marker; a command may be).
     pub fn secret_text(&self) -> String {
-        let mut text = self.buf.text();
-        for p in &self.buf.pastes {
-            text = text.replace(&p.marker, &p.content);
-        }
-        text
+        self.buf.expanded_text()
     }
 
     /// The typed text, cleared from the buffer without going to the history.
@@ -574,13 +608,14 @@ impl Composer {
         if lines > PASTE_MAX_LINES || chars > PASTE_MAX_CHARS {
             self.paste_count += 1;
             let n = self.paste_count;
+            let token = char::from_u32(TOKEN_BASE + n as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
             let marker = if lines > 1 {
                 format!("[Paste #{n}, +{} lines]", lines - 1)
             } else {
                 format!("[Paste #{n}, {chars} chars]")
             };
-            self.buf.insert_str(&marker);
-            self.buf.pastes.push(Paste { marker, content: text });
+            self.buf.insert_str(&token.to_string());
+            self.buf.pastes.push(Paste { token, marker, content: text });
         } else {
             self.buf.insert_str(&text);
         }
@@ -591,7 +626,7 @@ impl Composer {
     /// An empty buffer shows a placeholder.
     pub fn render(&self, width: usize) -> (Vec<Line>, (usize, usize)) {
         let avail = width.saturating_sub(PAD + PREFIX_W).max(1);
-        let (rows, cursor) = self.buf.wrap(avail);
+        let (rows, cursor) = self.buf.shown().wrap(avail);
         let pad = " ".repeat(PAD);
         let accent = theme::get().fg(Role::Accent);
         let mut body: Vec<Line> = rows
@@ -658,7 +693,7 @@ impl Composer {
 
     /// Raw buffer text; paste markers are unexpanded.
     pub fn text(&self) -> String {
-        self.buf.text()
+        self.buf.marked_text()
     }
 
     /// Replaces the buffer and keeps the cursor at the end. Paste and image markers still in the
@@ -670,7 +705,8 @@ impl Composer {
         let pastes = std::mem::take(&mut self.buf.pastes);
         let images = std::mem::take(&mut self.buf.images);
         let masked = self.buf.masked;
-        self.buf = Buf::from_text(s);
+        let s = pastes.iter().fold(s.to_owned(), |s, p| s.replace(&p.marker, &p.token.to_string()));
+        self.buf = Buf::from_text(&s);
         self.buf.masked = masked;
         self.buf.pastes = pastes;
         self.buf.images = images;
@@ -701,10 +737,7 @@ impl Composer {
     /// Returns the buffer with paste markers expanded and the images whose markers survive, in
     /// order of first appearance; records the text in history and clears the composer.
     pub fn take_for_submit(&mut self) -> UserInput {
-        let mut text = self.buf.text();
-        for p in &self.buf.pastes {
-            text = text.replace(&p.marker, &p.content);
-        }
+        let text = self.buf.expanded_text();
         let mut found: Vec<(usize, Image)> = std::mem::take(&mut self.buf.images)
             .into_iter()
             .filter_map(|(m, img)| text.find(&m).map(|at| (at, img)))
@@ -731,7 +764,7 @@ impl Composer {
         if self.locked() {
             return Err(items);
         }
-        let mut text = self.buf.text();
+        let mut text = self.buf.marked_text();
         let mut attached = Vec::new();
         for item in items {
             let mut t = String::new();
@@ -1304,15 +1337,47 @@ mod tests {
         // Two pastes get distinct numbers.
         c.on_paste(&"y".repeat(1500), &[]).unwrap();
         assert_eq!(c.text(), "[Paste #1, 1500 chars]tail[Paste #2, 1500 chars]");
+    }
 
-        // Editing a marker makes it literal text; the broken marker is not expanded.
+    #[test]
+    fn a_paste_marker_is_one_unit_in_the_editor() {
+        // One Backspace removes the whole marker and its content.
         let mut c = Composer::new(None);
         c.on_paste(&"z".repeat(1500), &[]).unwrap();
         press(&mut c, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(c.text(), "");
+        assert_eq!(press(&mut c, KeyCode::Enter, KeyModifiers::NONE), Action::None);
+
+        // The cursor steps over the marker in one key, and typing beside it keeps the content.
+        let mut c = Composer::new(None);
+        c.on_paste(&"z".repeat(1500), &[]).unwrap();
+        press(&mut c, KeyCode::Left, KeyModifiers::NONE);
+        type_str(&mut c, "a");
+        press(&mut c, KeyCode::End, KeyModifiers::NONE);
+        type_str(&mut c, "b");
+        assert_eq!(c.text(), "a[Paste #1, 1500 chars]b");
         match press(&mut c, KeyCode::Enter, KeyModifiers::NONE) {
-            Action::Submit(s) => assert_eq!(s.text, "[Paste #1, 1500 chars"),
+            Action::Submit(s) => assert_eq!(s.text, format!("a{}b", "z".repeat(1500))),
             other => panic!("unexpected {other:?}"),
         }
+
+        // Marker text inside one paste is not expanded as another paste's marker.
+        let mut c = Composer::new(None);
+        c.on_paste(&"y".repeat(1500), &[]).unwrap();
+        c.on_paste(&format!("[Paste #2, 1501 chars]{}", "x".repeat(1500)), &[]).unwrap();
+        let inner = format!("[Paste #2, 1501 chars]{}", "x".repeat(1500));
+        match press(&mut c, KeyCode::Enter, KeyModifiers::NONE) {
+            Action::Submit(s) => assert_eq!(s.text, format!("{}{inner}", "y".repeat(1500))),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // The cursor is drawn after the marker's displayed text; an edited-outside marker still expands.
+        let mut c = Composer::new(None);
+        c.on_paste(&"z".repeat(1500), &[]).unwrap();
+        let (_, cur) = c.render(60);
+        assert_eq!(cur.1, PAD + PREFIX_W + "[Paste #1, 1500 chars]".len());
+        c.set_text("see [Paste #1, 1500 chars]");
+        assert_eq!(c.take_for_submit().text, format!("see {}", "z".repeat(1500)));
     }
 
     #[test]

@@ -116,8 +116,8 @@ pub async fn print_mode(
                 let (_, head) = skipped.take().unwrap_or_default();
                 eprintln!("○ {head} (not run: {})", output.text)
             }
-            AgentEvent::Retry { attempt, delay, reason } => {
-                eprintln!("↻ {}", retry_notice(attempt, delay, &reason))
+            AgentEvent::Retry { attempt, max_attempts, delay, reason } => {
+                eprintln!("↻ {}", retry_notice(attempt, max_attempts, delay, &reason))
             }
             AgentEvent::Compacted { before, after } => eprintln!("── compacted {before}→{after} tokens"),
             AgentEvent::Notice(s) => eprintln!("{s}"),
@@ -294,8 +294,8 @@ pub(crate) async fn run_subagent(
                 }
                 session = s.session_path.or(session);
             }
-            AgentEvent::Retry { attempt, delay, reason } => {
-                eprintln!("{}", retry_notice(attempt, delay, &reason))
+            AgentEvent::Retry { attempt, max_attempts, delay, reason } => {
+                eprintln!("{}", retry_notice(attempt, max_attempts, delay, &reason))
             }
             AgentEvent::Notice(s) => eprintln!("{s}"),
             AgentEvent::Error(s) => {
@@ -474,7 +474,12 @@ mod tests {
     fn a_retry_discards_the_partial_reply() {
         let mut acc = Accum::default();
         acc.fold(&AgentEvent::Text("partial".into()));
-        acc.fold(&AgentEvent::Retry { attempt: 1, delay: std::time::Duration::ZERO, reason: "slow down".into() });
+        acc.fold(&AgentEvent::Retry {
+            attempt: 1,
+            max_attempts: 5,
+            delay: std::time::Duration::ZERO,
+            reason: "slow down".into(),
+        });
         acc.fold(&AgentEvent::Text("full".into()));
         acc.fold(&AgentEvent::BlockEnd);
         assert_eq!(acc.text(), "full");

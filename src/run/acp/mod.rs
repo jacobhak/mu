@@ -748,7 +748,7 @@ impl Server {
                 }
             }
             AgentEvent::Notice(m) => notice(notices, s.prompt.is_some(), sid, "info", m),
-            AgentEvent::Retry { attempt, delay, reason } => {
+            AgentEvent::Retry { attempt, max_attempts, delay, reason } => {
                 if std::mem::take(&mut s.streamed) {
                     update(
                         sid,
@@ -760,7 +760,7 @@ impl Server {
                     s.prompt.is_some(),
                     sid,
                     "warning",
-                    mu_base::events::retry_notice(attempt, delay, &reason),
+                    mu_base::events::retry_notice(attempt, max_attempts, delay, &reason),
                 )
             }
             AgentEvent::Compacted { before, after } => {

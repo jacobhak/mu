@@ -23,8 +23,8 @@ fn reveal_step(backlog: usize) -> usize {
     backlog.div_ceil(REVEAL_CATCHUP_FRAMES).max(REVEAL_MIN_STEP)
 }
 
-/// `((width, text length, refs length), rendered lines)`.
-type LiveCache = ((usize, usize, usize), Vec<Line>);
+/// `((width, live generation), rendered lines)`.
+type LiveCache = ((usize, u64), Vec<Line>);
 
 pub struct Transcript {
     /// Lines committed since the last draw; the renderer prints them into scrollback.
@@ -40,6 +40,8 @@ pub struct Transcript {
     /// Reference definitions (`[x]: url`) from text already committed in this block, prepended
     /// when later chunks are rendered so their `[x]` links still resolve.
     md_refs: String,
+    /// Bumped whenever `live_text` or `md_refs` changes, so the cache cannot match stale text.
+    live_gen: u64,
     /// Rendered lines of the open (uncommitted) text.
     live_cache: std::cell::RefCell<Option<LiveCache>>,
     /// Assistant text blocks (newest last, capped), for `/copy`.
@@ -64,6 +66,7 @@ impl Transcript {
             thinking_shown: false,
             block_text: String::new(),
             md_refs: String::new(),
+            live_gen: 0,
             live_cache: Default::default(),
             replies: Vec::new(),
             show_thinking,
@@ -118,6 +121,7 @@ impl Transcript {
     pub fn commit_text(&mut self, text: &str, blank_after: bool, w: usize) {
         let mut lines = markdown::render(&format!("{}{text}", self.md_refs), w);
         self.md_refs.push_str(&markdown::reference_defs(text));
+        self.live_gen += 1;
         if blank_after {
             lines.push(vec![]);
         }
@@ -128,6 +132,7 @@ impl Transcript {
     fn ingest_text(&mut self, s: &str, w: usize) {
         self.finish_thinking(w);
         self.live_text.push_str(s);
+        self.live_gen += 1;
         self.block_text.push_str(s);
         // A block can only become complete at a line end; skip the parse for mid-line deltas.
         if !s.contains('\n') {
@@ -220,6 +225,7 @@ impl Transcript {
         }
         self.live_text.clear();
         self.md_refs.clear();
+        self.live_gen += 1;
         let block = std::mem::take(&mut self.block_text);
         if !block.trim().is_empty() {
             if self.replies.len() == REPLIES_KEPT {
@@ -241,12 +247,15 @@ impl Transcript {
             self.commit_text(t.trim_end(), false, w);
         }
         self.live_text.clear();
+        self.live_gen += 1;
     }
 
     /// A request is being retried: drop the live text, thinking and reveal state of this attempt. Lines
     /// already committed to the scrollback stay (review B8).
     pub fn reset_stream(&mut self) {
         self.live_text.clear();
+        self.live_gen += 1;
+        self.block_text.clear();
         self.thinking = None;
         self.thinking_shown = false;
         self.reveal.clear();
@@ -267,7 +276,7 @@ impl Transcript {
         if !self.live_text.is_empty() {
             // The open block is rendered (and its fence highlighted) once per change, not per frame.
             let mut cache = self.live_cache.borrow_mut();
-            let key = (w, self.live_text.len(), self.md_refs.len());
+            let key = (w, self.live_gen);
             if cache.as_ref().is_none_or(|(k, _)| *k != key) {
                 let lines = markdown::render(&format!("{}{}", self.md_refs, self.live_text), w);
                 *cache = Some((key, lines));
@@ -307,6 +316,20 @@ mod tests {
         t.end_block(40);
         assert_eq!(t.replies, ["first\n\nsecond"]);
         assert!(t.live_lines(40, '⠋').is_empty());
+    }
+
+    #[test]
+    fn a_retry_drops_the_failed_attempts_text_from_copy_and_the_live_rows() {
+        let mut t = Transcript::new(true, false);
+        t.queue_reveal(Stream::Text, "first try".into(), 40);
+        let shown = |t: &Transcript| t.live_lines(40, '⠋').iter().map(crate::text::line::line_text).collect::<String>();
+        assert!(shown(&t).contains("first try"));
+        t.reset_stream();
+        // Same length as the dropped text: a cache keyed by length would still show the old rows.
+        t.queue_reveal(Stream::Text, "retry now".into(), 40);
+        assert!(shown(&t).contains("retry now") && !shown(&t).contains("first try"), "{}", shown(&t));
+        t.end_block(40);
+        assert_eq!(t.replies, ["retry now"]);
     }
 
     #[test]

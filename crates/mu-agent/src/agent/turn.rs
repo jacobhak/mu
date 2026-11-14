@@ -334,7 +334,9 @@ impl Agent {
                     StreamEvent::ToolCallDelta { id, json } => {
                         AgentEvent::ToolCallDelta { id: id.into(), json: json.into() }
                     }
-                    StreamEvent::Retry { attempt, delay, reason } => AgentEvent::Retry { attempt, delay, reason },
+                    StreamEvent::Retry { attempt, max_attempts, delay, reason } => {
+                        AgentEvent::Retry { attempt, max_attempts, delay, reason }
+                    }
                     StreamEvent::Notice(m) => AgentEvent::Notice(m),
                     StreamEvent::FailedAttemptUsage(u) => {
                         failed.push(u);

@@ -22,8 +22,8 @@ pub fn wait_text(d: Duration) -> String {
 }
 
 /// The retry notice every front end shows: `retrying in 4s (timeout) [attempt 2/5]`.
-pub fn retry_notice(attempt: u32, delay: Duration, reason: &str) -> String {
-    format!("retrying in {} ({reason}) [attempt {attempt}/5]", wait_text(delay))
+pub fn retry_notice(attempt: u32, max_attempts: u32, delay: Duration, reason: &str) -> String {
+    format!("retrying in {} ({reason}) [attempt {attempt}/{max_attempts}]", wait_text(delay))
 }
 
 pub enum Command {
@@ -450,6 +450,7 @@ pub enum AgentEvent {
     },
     Retry {
         attempt: u32,
+        max_attempts: u32,
         delay: Duration,
         reason: String,
     },

@@ -291,7 +291,7 @@ impl Providers {
                         }
                     }
                     let delay = retry::backoff(attempt, retry_after);
-                    ev(StreamEvent::Retry { attempt, delay, reason: msg });
+                    ev(StreamEvent::Retry { attempt, max_attempts, delay, reason: msg });
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = cancel.cancelled() => return Err(ProviderError::Aborted),

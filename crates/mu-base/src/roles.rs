@@ -3,7 +3,7 @@
 
 use crate::config::Configs;
 use crate::model_config::RoleMeta;
-use crate::models::{role_chain, role_chain_for, role_selector, split_level};
+use crate::models::{role_chain, role_selector, split_level};
 
 struct Doc {
     name: &'static str,
@@ -137,6 +137,23 @@ impl RoleView {
     }
 }
 
+/// A custom role's chain: itself, its `fallback` list, then `@task` and its chain, because an agent
+/// whose role is unset takes the `task` model.
+pub fn custom_chain(name: &str, fallback: &[String]) -> Vec<String> {
+    let mut chain = vec![name.to_string()];
+    for r in fallback.iter().cloned().chain(role_chain("task")) {
+        if !chain.contains(&r) {
+            chain.push(r);
+        }
+    }
+    chain
+}
+
+/// The first role after the first in `chain` that has a model, with that model.
+pub fn first_set(chain: &[String], value: impl Fn(&str) -> Option<String>) -> Option<(String, String)> {
+    chain.iter().skip(1).find_map(|r| value(r).map(|v| (r.clone(), v)))
+}
+
 /// Shown for a custom role that nothing refers to yet.
 const NOT_REFERENCED: &str = "nothing refers to it yet: /switch @<name>, --model @<name> or an agent's `model:`";
 
@@ -155,7 +172,7 @@ pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
         cfg.sets_with_role(name).into_iter().filter(|s| Some(s.as_str()) != active.as_deref()).collect()
     };
     let view = |name: &str, purpose: &str, used_by: String, unset: &str, chain: Vec<String>| {
-        let fallback = chain.into_iter().skip(1).find_map(|r| cfg.role(&r).map(|v| (r, v)));
+        let fallback = first_set(&chain, |r| cfg.role(r));
         RoleView {
             name: name.into(),
             purpose: purpose.into(),
@@ -209,13 +226,7 @@ pub fn views(cfg: &Configs, agents: &[(&str, &[String])]) -> Vec<RoleView> {
         {
             used_by = format!("{}\n{used_by}", d.trim());
         }
-        // An agent whose role is unset takes the `task` model.
-        let mut chain = role_chain_for(&name, cfg);
-        for r in role_chain("task") {
-            if !chain.contains(&r) {
-                chain.push(r);
-            }
-        }
+        let chain = custom_chain(&name, &meta.fallback);
         let mut v = view(&name, purpose, used_by, "agents use @task", chain);
         v.description = meta.description;
         v.fallbacks = meta.fallback;
@@ -379,6 +390,15 @@ mod tests {
         assert!(f.used_by.contains("cycle_order") && f.agents.is_empty(), "{f:?}");
         assert_eq!(f.row(), "(unset) · custom role");
         assert!(f.detail().contains("agents use @task"));
+    }
+
+    #[test]
+    fn a_custom_chain_ends_in_the_task_chain_and_the_first_set_role_wins() {
+        let chain = custom_chain("writer", &["smol".to_string(), "task".to_string()]);
+        assert_eq!(chain, ["writer", "smol", "task", "default"]);
+        let value = |r: &str| (r == "default").then(|| "p/m".to_string());
+        assert_eq!(first_set(&chain, value), Some(("default".into(), "p/m".into())));
+        assert_eq!(first_set(&chain, |r| (r == "writer").then(|| "x".to_string())), None, "the role itself is skipped");
     }
 
     #[test]

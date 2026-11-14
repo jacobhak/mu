@@ -294,18 +294,12 @@ impl RoleEditor {
 
     /// The role this one runs on when it has no model of its own: the first set role in its chain.
     /// A custom role's `fallback` list is read from the draft, so a fallback added here counts
-    /// before it is saved; `@task`'s own chain follows it, as `roles::views` orders it. A built-in
-    /// role keeps the chain it was listed with.
+    /// before it is saved, in the chain `roles::custom_chain` builds. A built-in role keeps the chain
+    /// it was listed with.
     fn effective_fallback(&self, role: &RoleView) -> Option<(String, String)> {
         let Some(meta) = &self.meta else { return role.fallback.clone() };
         let set = |name: &str| self.roles.iter().find(|r| r.name == name).and_then(|r| r.value.clone());
-        for r in meta.fallback.iter().filter(|r| **r != role.name) {
-            if let Some(v) = set(r) {
-                return Some((r.clone(), v));
-            }
-        }
-        let task = self.roles.iter().find(|r| r.name == "task")?;
-        task.value.clone().map(|v| ("task".to_string(), v)).or_else(|| task.fallback.clone())
+        roles::first_set(&roles::custom_chain(&role.name, &meta.fallback), set)
     }
 
     /// Every role the edited one may fall back to, with its place in the chain.
@@ -327,7 +321,7 @@ impl RoleEditor {
             .collect();
         items.push(Item { label: "Done".into(), detail: "Back to the role".into() });
         let chain = if list.is_empty() {
-            format!("No fallbacks: nothing is tried when @{name} has no model")
+            "No fallbacks of its own".to_string()
         } else {
             format!("Tried in order: {}", list.iter().map(|f| format!("@{f}")).collect::<Vec<_>>().join(" then "))
         };
@@ -789,6 +783,7 @@ mod tests {
         assert_eq!(e.screen, Screen::Fallbacks);
         let shown = |e: &RoleEditor| texts(e).join("\n");
         assert!(shown(&e).contains("@task  Enter adds it at the end"), "{}", shown(&e));
+        assert!(shown(&e).contains("No fallbacks of its own") && !shown(&e).contains("nothing is tried"));
 
         enter(&mut e);
         assert_eq!(meta(&e).fallback, ["task"]);
