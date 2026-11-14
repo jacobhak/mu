@@ -501,9 +501,12 @@ impl AgentView {
             out.extend(blocks::tool_streaming(&c.name, &c.args, spin, w));
         }
         for j in self.jobs.iter().filter(|j| j.state == SubagentState::Running) {
-            let mut rows = blocks::subagent_rows(std::slice::from_ref(j), spin, |j| {
-                j.session.as_ref().and_then(|p| self.child_costs.get(p)).copied()
-            });
+            let mut rows = blocks::job_rows(
+                std::slice::from_ref(j),
+                spin,
+                |j| j.session.as_ref().and_then(|p| self.child_costs.get(p)).copied(),
+                !self.expanded,
+            );
             if self.job_focus.as_deref() == Some(j.name.as_str()) {
                 rows = rows.into_iter().flat_map(|r| blocks::focused_job(r, w)).collect();
             }

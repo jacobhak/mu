@@ -708,6 +708,16 @@ pub fn pty_live(
 /// Subagent rows: state mark, name, tool count, cost and the last activity. `cost` says what a row's
 /// session has spent; none, or nothing yet, leaves the figure out (omp does the same).
 pub fn subagent_rows(rows: &[SubagentStatus], spin: char, cost: impl Fn(&SubagentStatus) -> Option<f64>) -> Vec<Line> {
+    job_rows(rows, spin, cost, true)
+}
+
+/// `subagent_rows`; `with_last: false` leaves the last activity out, for a caller that shows it in full below.
+pub fn job_rows(
+    rows: &[SubagentStatus],
+    spin: char,
+    cost: impl Fn(&SubagentStatus) -> Option<f64>,
+    with_last: bool,
+) -> Vec<Line> {
     rows.iter()
         .map(|r| {
             let (mark, style) = match r.state {
@@ -730,7 +740,9 @@ pub fn subagent_rows(rows: &[SubagentStatus], spin: char, cost: impl Fn(&Subagen
                 row.push(span(" · ", tfg(Role::Muted)));
                 row.push(span(format!("${c:.2}"), tfg(Role::SynType)));
             }
-            row.push(span(format!(" · {}", trunc(&r.last, 80)), tfg(Role::Muted)));
+            if with_last {
+                row.push(span(format!(" · {}", trunc(&r.last, 80)), tfg(Role::Muted)));
+            }
             row
         })
         .collect()
@@ -750,23 +762,26 @@ pub fn focused_job(mut row: Line, width: usize) -> Vec<Line> {
 /// Most lines of a bash job's newest output shown under its row when expanded.
 const JOB_TAIL: usize = 8;
 
-/// Rows under a job's row when expanded: its task, agent, run time and directory, the full last
-/// activity and, for a bash job, the tail of its output.
+/// Rows under a job's row when expanded: its whole task, agent, run time and directory, the full
+/// last activity and, for a bash job, the tail of its output. Long lines wrap, none is cut.
 pub fn job_details(r: &SubagentStatus, out: Option<&str>, width: usize) -> Vec<Line> {
     let inner = width.saturating_sub(6);
-    let row =
-        |text: String| vec![span("    │ ".to_string(), tfg(Role::Faint)), span(trunc(&text, inner), tfg(Role::Muted))];
     let mut rows = Vec::new();
-    if let Some(first) = r.task.lines().next().filter(|t| !t.is_empty()) {
-        rows.push(row(first.to_string()));
-    }
-    rows.push(row(format!("{} · {} · {}", r.agent, run_time(job_secs(r)), r.cwd.display())));
+    let mut row = |text: &str| {
+        let body = vec![span(text.replace('\t', "    "), tfg(Role::Muted))];
+        rows.extend(wrap(&body, inner).into_iter().map(|mut l| {
+            l.insert(0, span("    │ ".to_string(), tfg(Role::Faint)));
+            l
+        }));
+    };
+    r.task.lines().filter(|t| !t.is_empty()).for_each(&mut row);
+    row(&format!("{} · {} · {}", r.agent, run_time(job_secs(r)), r.cwd.display()));
     if r.kind == JobKind::Subagent && !r.last.is_empty() {
-        rows.push(row(format!("last: {}", r.last)));
+        row(&format!("last: {}", r.last));
     }
     if let Some(out) = out {
         let lines: Vec<&str> = out.lines().collect();
-        rows.extend(lines[lines.len().saturating_sub(JOB_TAIL)..].iter().map(|l| row(l.to_string())));
+        lines[lines.len().saturating_sub(JOB_TAIL)..].iter().for_each(|l| row(l));
     }
     rows
 }
@@ -878,6 +893,23 @@ mod tests {
         assert_eq!(text.len(), 2 + JOB_TAIL);
         assert!(text.last().unwrap().contains("l19"));
         assert!(!text.iter().any(|l| l.contains("l11")));
+    }
+
+    #[test]
+    fn job_details_wrap_a_long_task_whole_and_every_task_line() {
+        let mut r = bash_job(SubagentState::Running, 0.0);
+        r.task = format!("cd /w && {}\nsecond line", "x".repeat(100));
+        let text: Vec<String> = job_details(&r, None, 40).iter().map(text_of).collect();
+        assert!(
+            text.iter().all(|l| l.starts_with("    │ ") && !l.contains('…') && l.chars().count() <= 40),
+            "{text:?}"
+        );
+        let task: String =
+            text.iter().take_while(|l| !l.contains("second")).map(|l| &l[l.find('│').unwrap() + 4..]).collect();
+        assert_eq!(task, r.task.lines().next().unwrap());
+        assert!(text.iter().any(|l| l.contains("second line")));
+        let row = |with_last| text_of(&job_rows(&[r.clone()], '⠋', |_| None, with_last)[0]);
+        assert_eq!(row(false), "  ⠋ bg_1 · 0.0s");
     }
 
     #[test]
