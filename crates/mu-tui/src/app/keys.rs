@@ -985,6 +985,44 @@ pub(super) mod tests {
         (app, cmd_rx)
     }
 
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_frame_is_drawn_to_the_injected_writer_at_the_injected_size() {
+        let hist = std::env::temp_dir().join(format!("mu-draw-{}", uuid::Uuid::new_v4())).join("history.jsonl");
+        let mut app = test_app(hist.clone());
+        let sink = Sink::default();
+        app.screen.renderer = Renderer::fixed(sink.clone(), (40, 10));
+        in_local(async {
+            for c in "hello".chars() {
+                app.on_terminal(press(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+        });
+        app.draw().unwrap();
+        let out = String::from_utf8(std::mem::take(&mut *sink.0.lock().unwrap())).unwrap();
+        assert!(out.contains("hello"), "{out:?}");
+        let rows = out.matches("\r\n").count() + 1;
+        assert!(rows < 10, "the viewport leaves a row of the 10: {rows}");
+
+        app.agent.tr.pending.push(crate::text::line::styled("scrolled up", |s| s));
+        app.draw().unwrap();
+        let out = String::from_utf8(std::mem::take(&mut *sink.0.lock().unwrap())).unwrap();
+        assert!(out.contains("scrolled up") && out.contains("hello"), "{out:?}");
+        let _ = std::fs::remove_dir_all(hist.parent().unwrap());
+    }
+
     pub(in crate::app) fn press(code: KeyCode, mods: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, mods))
     }

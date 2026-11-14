@@ -20,6 +20,14 @@ pub struct Renderer {
     cursor: (usize, usize),
     /// What the last draw put on screen, to skip a redraw that would write the same thing.
     last: Option<Frame>,
+    /// A stand-in for the terminal; `None` is stdout and the real size.
+    fixed: Option<Fixed>,
+}
+
+/// An output and screen size that replace the terminal.
+struct Fixed {
+    out: Box<dyn Write + Send>,
+    size: (usize, usize),
 }
 
 /// The viewport as last drawn: one entry per physical row (wrapped to the width), as ANSI text.
@@ -62,10 +70,41 @@ impl Renderer {
         Self::default()
     }
 
+    /// A renderer that writes to `out` and sees a screen of `size` (cols, rows).
+    #[cfg(test)]
+    pub fn fixed(out: impl Write + Send + 'static, size: (usize, usize)) -> Self {
+        Self { fixed: Some(Fixed { out: Box::new(out), size }), ..Self::default() }
+    }
+
     /// (cols, rows), queried fresh.
     pub fn size(&self) -> (usize, usize) {
+        if let Some(f) = &self.fixed {
+            return f.size;
+        }
         let (c, r) = terminal::size().unwrap_or((80, 24));
         (c.max(1) as usize, r.max(1) as usize)
+    }
+
+    fn emit(&mut self, buf: &[u8]) -> io::Result<()> {
+        match &mut self.fixed {
+            Some(f) => {
+                f.out.write_all(buf)?;
+                f.out.flush()
+            }
+            None => {
+                let mut out = io::stdout().lock();
+                out.write_all(buf)?;
+                out.flush()
+            }
+        }
+    }
+
+    /// Tells the panic hook how far below the cursor the viewport reaches; a stand-in screen has no
+    /// terminal for it to move in.
+    fn set_rows_below(&self, n: usize) {
+        if self.fixed.is_none() {
+            crate::term::term::set_rows_below(n);
+        }
     }
 
     /// Draws committed lines (scrolled into scrollback) followed by the viewport. The cursor is
@@ -132,11 +171,9 @@ impl Renderer {
             queue!(buf, Show, EndSynchronizedUpdate)?;
             self.drawn = widths;
             self.cursor = frame.cursor;
-            crate::term::term::set_rows_below(frame.rows.len().saturating_sub(1).saturating_sub(frame.cursor.0));
+            self.set_rows_below(frame.rows.len().saturating_sub(1).saturating_sub(frame.cursor.0));
             self.last = None;
-            let mut out = io::stdout().lock();
-            out.write_all(&buf)?;
-            out.flush()?;
+            self.emit(&buf)?;
             self.last = Some(frame);
             return Ok(());
         }
@@ -173,12 +210,10 @@ impl Renderer {
         queue!(buf, MoveToColumn(self.cursor.1 as u16))?;
         queue!(buf, Show)?;
         queue!(buf, EndSynchronizedUpdate)?;
-        crate::term::term::set_rows_below(total.saturating_sub(1).saturating_sub(cur));
+        self.set_rows_below(total.saturating_sub(1).saturating_sub(cur));
 
         self.last = None;
-        let mut out = io::stdout().lock();
-        out.write_all(&buf)?;
-        out.flush()?;
+        self.emit(&buf)?;
         self.last = Some(frame);
         Ok(())
     }
@@ -196,9 +231,7 @@ impl Renderer {
         } else {
             buf.push(b'\r');
         }
-        let mut out = io::stdout().lock();
-        out.write_all(&buf)?;
-        out.flush()?;
+        self.emit(&buf)?;
         self.drawn.clear();
         self.cursor = (0, 0);
         self.last = None;
@@ -254,7 +287,7 @@ mod tests {
 
     #[test]
     fn positions_account_for_reflow_on_shrink() {
-        let r = Renderer { drawn: vec![10, 3], cursor: (1, 2), last: None };
+        let r = Renderer { drawn: vec![10, 3], cursor: (1, 2), ..Renderer::default() };
         // At 4 cols the 10-wide row takes 3 physical rows; cursor row starts after it.
         assert_eq!(r.positions(4), (3, 4));
         assert_eq!(r.positions(20), (1, 2));
