@@ -3,6 +3,7 @@
 
 use super::ui_msgs::UiMsg;
 use super::*;
+use crate::host::plans::{READ_FILE, ReadFile, WRITE_FILE, WriteFile};
 use crate::render::Renderer;
 use crate::term::term;
 
@@ -13,12 +14,19 @@ pub(super) enum ChildThen {
     McpLogin(String),
     /// The external editor was run on the composer text kept in this file.
     ComposerEdit(PathBuf),
-    /// The editor was run on the plan file shown in the review overlay.
-    PlanEdit(PathBuf),
-    /// The editor was run on a memory file from `/memory`; the file is read on the next use.
-    MemoryEdit,
+    /// The editor was run on a private copy of the plan file shown in the review overlay.
+    PlanEdit(HostEdit),
+    /// The editor was run on a private copy of a memory file from `/memory`.
+    MemoryEdit(HostEdit),
     /// `mu take` ran on the terminal for a session picked in the jobs panel.
     Take,
+}
+
+/// A host file being edited on this machine: the copy the editor works on, and the text it had.
+pub(super) struct HostEdit {
+    host: PathBuf,
+    tmp: PathBuf,
+    before: String,
 }
 
 impl App {
@@ -90,22 +98,68 @@ impl App {
                 }
                 self.open_sessions();
             }
-            ChildThen::MemoryEdit => {
-                if let Err(e) = status {
-                    self.error(&format!("editor failed: {e}"));
+            ChildThen::MemoryEdit(edit) => self.finish_host_edit(edit, status, "memory file", |_, _| {}),
+            ChildThen::PlanEdit(edit) => self.finish_host_edit(edit, status, "plan", |app, text| {
+                if let Some(Overlay::Review { review, .. }) = &mut app.overlay {
+                    review.set_content(text);
                 }
-            }
-            ChildThen::PlanEdit(path) => {
-                if let Err(e) = status {
-                    self.error(&format!("editor failed: {e}"));
-                }
-                match (std::fs::read_to_string(&path), &mut self.overlay) {
-                    (Ok(t), Some(Overlay::Review { review, .. })) => review.set_content(t),
-                    (Err(e), _) => self.error(&format!("cannot read plan: {e}")),
-                    _ => {}
-                }
-            }
+            }),
         }
+    }
+
+    /// Edits a file of the host in `$EDITOR` here: the host sends the text, the editor works on a
+    /// private temp copy, and a successful exit writes the changed text back to the host.
+    pub(super) fn edit_host_file(
+        &mut self,
+        host: PathBuf,
+        missing_ok: bool,
+        what: &'static str,
+        then: fn(HostEdit) -> ChildThen,
+    ) {
+        let args = ReadFile { path: host.clone(), missing_ok };
+        self.host_call(READ_FILE, &args, move |app, r: Result<String, String>| {
+            let before = match r {
+                Ok(t) => t,
+                Err(e) => return app.error(&format!("cannot read {what}: {e}")),
+            };
+            if app.screen.child_busy {
+                return app.notice("another program already has the terminal");
+            }
+            let tmp = match private_temp_file(&before) {
+                Ok(p) => p,
+                Err(e) => return app.error(&format!("cannot create temp file: {e}")),
+            };
+            app.run_editor(&tmp.clone(), then(HostEdit { host, tmp, before }));
+        });
+    }
+
+    fn finish_host_edit(
+        &mut self,
+        edit: HostEdit,
+        status: Result<std::process::ExitStatus, String>,
+        what: &'static str,
+        done: fn(&mut App, String),
+    ) {
+        let HostEdit { host, tmp, before } = edit;
+        let text = std::fs::read_to_string(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(_) => return,
+            Err(e) => return self.error(&format!("editor failed: {e}")),
+        }
+        let text = match text {
+            Ok(t) => t,
+            Err(e) => return self.error(&format!("cannot read {what}: {e}")),
+        };
+        if text == before {
+            return;
+        }
+        let args = WriteFile { path: host, text: text.clone() };
+        self.host_call(WRITE_FILE, &args, move |app, r: Result<(), String>| match r {
+            Ok(()) => done(app, text),
+            Err(e) => app.error(&format!("cannot write {what}: {e}")),
+        });
     }
 
     /// Runs `omp login` on the real terminal. With `pick`, omp's own provider menu is swallowed and
@@ -256,6 +310,132 @@ fn private_temp_file(content: &str) -> std::io::Result<PathBuf> {
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
     f.write_all(content.as_bytes())?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod host_edit_tests {
+    use super::*;
+    use crate::app::keys::tests::{in_local, test_app_with_commands, transcript_text};
+    use crate::host::plans::hand_out;
+    use crate::host::{Deferred, local::LocalHost};
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::Duration;
+
+    fn scratch(text: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mu-host-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plan.md");
+        std::fs::write(&file, text).unwrap();
+        (dir, file)
+    }
+
+    /// Runs `ask` on an app with the local host, then on one wrapped in `Deferred`, pumping the
+    /// replies until `settled` holds; returns each transcript.
+    fn both_hosts(ask: impl Fn(&mut App), settled: impl Fn(&App) -> bool) -> (String, String) {
+        let mut said = Vec::new();
+        for deferred in [false, true] {
+            let (mut app, _cmds) = test_app_with_commands(std::env::temp_dir().join("mu-host-edit-history"));
+            let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+            app.ui_tx = ui_tx;
+            if deferred {
+                app.host = Rc::new(Deferred(LocalHost::new(
+                    app.services.providers.clone(),
+                    app.ctx.clone(),
+                    app.plugins.clone(),
+                    app.cwd.clone(),
+                )));
+            }
+            in_local(async {
+                ask(&mut app);
+                while !settled(&app) {
+                    let m = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv()).await.unwrap().unwrap();
+                    app.on_ui(m);
+                }
+            });
+            said.push(transcript_text(&app));
+        }
+        (said.remove(0), said.remove(0))
+    }
+
+    #[test]
+    fn a_file_the_host_did_not_hand_out_is_refused_and_left_alone() {
+        let (dir, file) = scratch("secret");
+        let (now, later) = both_hosts(
+            |app| app.edit_host_file(file.clone(), false, "plan", ChildThen::PlanEdit),
+            |app| transcript_text(app).contains("cannot read plan"),
+        );
+        assert!(now.contains("cannot read plan: ") && now.contains("not a file the host offered"), "{now}");
+        assert_eq!(now, later);
+        let (now, later) = both_hosts(
+            |app| {
+                let args = WriteFile { path: file.clone(), text: "overwritten".into() };
+                app.host_call(WRITE_FILE, &args, |app, r: Result<(), String>| app.notice(&r.unwrap_err()));
+            },
+            |app| transcript_text(app).contains("not a file"),
+        );
+        assert!(now.contains("not a file the host offered"), "{now}");
+        assert_eq!(now, later);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "secret");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_handed_out_file_reads_and_a_missing_one_reads_empty_only_when_asked() {
+        let (dir, file) = scratch("the plan");
+        let absent = dir.join("absent.md");
+        hand_out(&file);
+        hand_out(&absent);
+        let read = |path: PathBuf, missing_ok: bool| {
+            both_hosts(
+                move |app| {
+                    let args = ReadFile { path: path.clone(), missing_ok };
+                    app.host_call(READ_FILE, &args, |app, r: Result<String, String>| {
+                        app.notice(&format!("{r:?}"));
+                    });
+                },
+                |app| transcript_text(app).contains("Ok(") || transcript_text(app).contains("Err("),
+            )
+        };
+        let (now, later) = read(file.clone(), false);
+        assert!(now.contains("Ok(\"the plan\")"), "{now}");
+        assert_eq!(now, later);
+        let (now, later) = read(absent.clone(), true);
+        assert!(now.contains("Ok(\"\")"), "{now}");
+        assert_eq!(now, later);
+        let (now, later) = read(absent, false);
+        assert!(now.contains("Err("), "{now}");
+        assert_eq!(now, later);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_successful_edit_is_written_back_and_other_outcomes_are_not() {
+        let (dir, file) = scratch("before");
+        hand_out(&file);
+        let run = |code: i32, text: &'static str, wait_for: &'static str| {
+            let file = file.clone();
+            both_hosts(
+                move |app| {
+                    std::fs::write(&file, "before").unwrap();
+                    let tmp = private_temp_file(text).unwrap();
+                    let status = std::process::ExitStatus::from_raw(code << 8);
+                    let edit = HostEdit { host: file.clone(), tmp: tmp.clone(), before: "before".into() };
+                    app.finish_host_edit(edit, Ok(status), "plan", |app, t| app.notice(&format!("saved {t}")));
+                    assert!(!tmp.exists(), "the temp copy is removed");
+                },
+                move |app| transcript_text(app).contains(wait_for),
+            )
+        };
+        let (now, later) = run(0, "after", "saved after");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "after");
+        assert_eq!(now, later);
+        let (now, later) = run(1, "failed", "");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before", "a failed editor writes nothing");
+        assert!(!now.contains("saved") && now == later);
+        let (now, _) = run(0, "before", "");
+        assert!(!now.contains("saved"), "an unchanged text is not written back");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]

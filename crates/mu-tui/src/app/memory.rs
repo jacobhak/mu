@@ -1,9 +1,9 @@
 //! `/memory`: the memory files and notes the `memory` plugin keeps, its commit history, and the
-//! diff and revert of a commit. Every request goes to the plugin and its answer comes back as a
-//! `UiMsg`.
+//! diff and revert of a commit. Every request goes to the host, which asks the plugin.
 
 use super::child::ChildThen;
 use super::*;
+use crate::host::memory::{PLUGIN_REQUEST, PluginRequest};
 use crate::widgets::overlay::MemoryPick;
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
@@ -23,7 +23,7 @@ impl App {
         let items = vec![Item { label: "Loading…".into(), detail: String::new() }];
         let pick = Picker::placeholder(items, |items| Select::new("Memory", items));
         self.open_overlay(Overlay::Memory { pick });
-        self.memory_request("memory/files", json!({ "cwd": self.cwd }), UiMsg::MemoryFiles);
+        self.memory_request("memory/files", json!({ "cwd": self.cwd }), |app, r| app.show_memory(r));
     }
 
     /// Fills the picker that `open_memory` opened. A reply that comes after the picker was closed
@@ -75,20 +75,20 @@ impl App {
         if !set("VISUAL") && !set("EDITOR") {
             return self.notice(&format!("no $EDITOR set; the memory file is {}", path.display()));
         }
-        self.run_editor(&path, ChildThen::MemoryEdit);
+        self.edit_host_file(path, true, "memory file", ChildThen::MemoryEdit);
     }
 
     pub(super) fn open_memory_history(&mut self) {
-        self.memory_request("memory/log", json!({ "limit": LOG_LIMIT }), UiMsg::MemoryLog);
+        self.memory_request("memory/log", json!({ "limit": LOG_LIMIT }), |app, r| app.show_memory_log(r));
     }
 
     pub(super) fn show_memory_commit(&mut self, sha: String) {
-        self.memory_request("memory/show", json!({ "sha": sha }), UiMsg::MemoryShown);
+        self.memory_request("memory/show", json!({ "sha": sha }), |app, r| app.on_memory_shown(r));
     }
 
     pub(super) fn revert_memory_commit(&mut self, sha: String) {
         let short = short(&sha).to_string();
-        self.memory_request("memory/revert", json!({ "sha": sha }), move |r| UiMsg::MemoryReverted { short, r });
+        self.memory_request("memory/revert", json!({ "sha": sha }), move |app, r| app.on_memory_reverted(&short, r));
     }
 
     /// The commit's message, stat and diff, as a notice in the transcript.
@@ -111,16 +111,14 @@ impl App {
     }
 
     fn memory_request(
-        &self,
+        &mut self,
         method: &'static str,
         params: Value,
-        then: impl FnOnce(Result<Value, String>) -> UiMsg + 'static,
+        then: impl FnOnce(&mut App, Result<Value, String>) + 'static,
     ) {
-        let (plugins, tx) = (self.plugins.clone(), self.ui_tx.clone());
-        tokio::task::spawn_local(async move {
-            let r = plugins.request("memory", method, params, TIMEOUT).await;
-            let _ = tx.send(then(r));
-        });
+        let args =
+            PluginRequest { plugin: "memory".into(), method: method.into(), params, timeout_secs: TIMEOUT.as_secs() };
+        self.host_call(PLUGIN_REQUEST, &args, then);
     }
 }
 
@@ -176,6 +174,69 @@ fn memory_commits(v: &Value) -> Vec<(Item, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::keys::tests::{in_local, test_app_with_commands, transcript_text};
+    use crate::host::{Deferred, local::LocalHost};
+
+    /// Runs `ask` on an app whose host is the local one, then on one wrapped in `Deferred`, pumping
+    /// the replies; returns what each transcript says.
+    fn both_hosts(ask: impl Fn(&mut App)) -> (String, String) {
+        let mut said = Vec::new();
+        for deferred in [false, true] {
+            let (mut app, _cmds) = test_app_with_commands(std::env::temp_dir().join("mu-memory-test"));
+            let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+            app.ui_tx = ui_tx;
+            if deferred {
+                app.host = Rc::new(Deferred(LocalHost::new(
+                    app.services.providers.clone(),
+                    app.ctx.clone(),
+                    app.plugins.clone(),
+                    app.cwd.clone(),
+                )));
+            }
+            in_local(async {
+                ask(&mut app);
+                let m = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv()).await.unwrap().unwrap();
+                app.on_ui(m);
+            });
+            said.push(transcript_text(&app));
+        }
+        (said.remove(0), said.remove(0))
+    }
+
+    #[test]
+    fn a_memory_request_says_why_it_failed_the_same_with_a_deferred_host() {
+        let (now, later) = both_hosts(|app| app.show_memory_commit("0123456789".into()));
+        assert!(now.contains("memory: no plugin memory"), "{now}");
+        assert_eq!(now, later);
+    }
+
+    #[test]
+    fn the_log_and_the_revert_report_the_same_with_a_deferred_host() {
+        let (now, later) = both_hosts(|app| app.revert_memory_commit("0123456789abc".into()));
+        assert!(now.contains("memory: could not revert 0123456: no plugin memory"), "{now}");
+        assert_eq!(now, later);
+        let (now, later) = both_hosts(|app| app.open_memory_history());
+        assert!(now.contains("memory: no plugin memory"), "{now}");
+        assert_eq!(now, later);
+    }
+
+    #[test]
+    fn a_non_memory_plugin_is_refused_by_the_host() {
+        let (now, later) = both_hosts(|app| {
+            let args =
+                PluginRequest { plugin: "predict".into(), method: "x".into(), params: json!({}), timeout_secs: 1 };
+            app.host_call(PLUGIN_REQUEST, &args, |app, r: Result<Value, String>| app.notice(&r.unwrap_err()));
+        });
+        assert!(now.contains("memory plugin only, not predict"), "{now}");
+        assert_eq!(now, later);
+    }
+
+    #[test]
+    fn opening_the_picker_closes_it_again_when_the_files_cannot_be_read() {
+        let (now, later) = both_hosts(|app| app.open_memory());
+        assert!(now.contains("memory: no plugin memory"), "{now}");
+        assert_eq!(now, later);
+    }
 
     #[test]
     fn picker_rows_follow_the_plugin_status() {

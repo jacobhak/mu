@@ -491,7 +491,7 @@ impl App {
             }
             OverlayEvent::Rewind(id) => self.send(Command::Rewind(id)),
             OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
-            OverlayEvent::EditPlan(file) => self.run_editor(&file.clone(), ChildThen::PlanEdit(file)),
+            OverlayEvent::EditPlan(file) => self.edit_host_file(file, false, "plan", ChildThen::PlanEdit),
             OverlayEvent::PlanCancelled { stored: true } => self.notice("plan left parked"),
             OverlayEvent::PlanCancelled { stored: false } => {
                 self.send(Command::Cancel);
