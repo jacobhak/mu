@@ -38,6 +38,13 @@ fn dispatch() -> Result<i32> {
             Ok(r) => run::run(&cli, Some(r)),
             Err(other) => Ok(plans_cli::run_cli(other, &std::env::current_dir()?)),
         },
+        Some(Sub::Agent { model, thinking, resume, continue_latest }) => {
+            cli.model = model.or(cli.model.take());
+            cli.thinking = thinking.or(cli.thinking.take());
+            cli.resume = resume.map(Some).or(cli.resume.take());
+            cli.continue_latest |= continue_latest;
+            run::run_agent(&cli)
+        }
         Some(sub) => subcommand(sub),
     }
 }
@@ -57,7 +64,9 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Models { cmd } => cli::models::run(cmd),
         Sub::Predict { cmd } => cli::predict::run(cmd),
         Sub::MigrateProfile { name, dry_run } => workflow::migrate::run(&name, dry_run),
+        Sub::Attach { session, socket } => cli::attach::run(session.as_deref(), socket),
         Sub::Plan { .. } => unreachable!("`mu plan` is routed in dispatch"),
+        Sub::Agent { .. } => unreachable!("`mu agent` is routed in dispatch"),
     }
 }
 

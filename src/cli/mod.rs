@@ -1,5 +1,6 @@
 //! The `mu` command line: the flags and subcommands. Model selection lives in `select`.
 
+pub mod attach;
 pub mod auth;
 mod chatgpt_login;
 pub mod docs;
@@ -124,6 +125,29 @@ pub enum Sub {
         #[arg(long)]
         markdown: bool,
     },
+    /// Run the agent of a session with no terminal. It prints `{"session":ID,"socket":PATH}` and serves one
+    /// client at a time on that Unix socket (see `mu attach`); it keeps running when the client leaves.
+    Agent {
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(mu_base::models::Thinking::NAMES))]
+        thinking: Option<String>,
+        /// Resume this session (id or path) instead of starting a new one.
+        #[arg(long)]
+        resume: Option<PathBuf>,
+        /// Resume the latest session for this directory.
+        #[arg(short = 'c', long = "continue")]
+        continue_latest: bool,
+    },
+    /// Join a running `mu agent` from this terminal's stdin and stdout: copies lines to and from its socket.
+    /// With no session it finds the one agent running in this directory.
+    Attach {
+        /// Session id (prefix).
+        session: Option<String>,
+        /// A socket path, instead of a session.
+        #[arg(long, conflicts_with = "session")]
+        socket: Option<PathBuf>,
+    },
     /// Take over a running `mu -p` session: stop it after its current step, then resume it here.
     Take {
         /// Session file or id (prefix).
@@ -168,5 +192,14 @@ mod tests {
         assert!(Cli::try_parse_from(["mu", "--acp", "--resume", "abc"]).is_err());
         assert!(Cli::try_parse_from(["mu", "--acp", "-p", "x"]).is_err());
         assert!(Cli::try_parse_from(["mu", "--acp", "--model", "a/b"]).is_ok());
+    }
+
+    #[test]
+    fn agent_and_attach_take_their_own_flags() {
+        assert!(Cli::try_parse_from(["mu", "agent", "--model", "a/b", "--resume", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "-c", "--permissions", "yolo"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach", "abc", "--socket", "/x"]).is_err());
     }
 }

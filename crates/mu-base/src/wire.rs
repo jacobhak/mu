@@ -144,6 +144,11 @@ pub fn to_line<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }
 
+/// A wire event as the agent's line for it.
+pub fn event_line(w: WireEvent) -> String {
+    to_line(&AgentLine::Event(w))
+}
+
 pub fn from_line<T: DeserializeOwned>(line: &str) -> Result<T, serde_json::Error> {
     serde_json::from_str(line)
 }

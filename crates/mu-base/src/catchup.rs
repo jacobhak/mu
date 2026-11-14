@@ -7,7 +7,7 @@
 //! still waiting for an answer, then `CaughtUp`.
 
 use crate::events::{AgentEvent, Command};
-use crate::wire::{AgentAdapter, WireCommand, WireEvent, to_line};
+use crate::wire::{AgentAdapter, WireCommand, WireEvent, event_line};
 use std::collections::BTreeMap;
 
 /// The turn log is bounded: past either limit whole blocks are dropped from the front.
@@ -69,16 +69,20 @@ impl Catchup {
         let mark = if let AgentEvent::TurnMark { leaf } = &ev { Some(leaf.clone()) } else { None };
         let ends = matches!(ev, AgentEvent::TurnEnd { .. } | AgentEvent::TurnFailed);
         let wire = self.adapter.event(ev);
-        let line = to_line(&wire);
-        match &wire {
+        let request = match &wire {
             WireEvent::Ask { id, .. }
             | WireEvent::Approve { id, .. }
             | WireEvent::WebSetup { id }
             | WireEvent::PlanReview { id, .. }
-            | WireEvent::PtyOpen { id, .. } => {
-                self.requests.insert(*id, line.clone());
+            | WireEvent::PtyOpen { id, .. } => Some(*id),
+            _ => None,
+        };
+        let line = event_line(wire);
+        match request {
+            Some(id) => {
+                self.requests.insert(id, line.clone());
             }
-            _ => {
+            None => {
                 if let Some(leaf) = mark {
                     self.turn.clear();
                     self.turn_bytes = 0;
@@ -134,12 +138,12 @@ impl Catchup {
     pub fn catch_up(&self, history: Vec<String>) -> Vec<String> {
         let mut out = history;
         if self.cut {
-            out.push(to_line(&WireEvent::Event(AgentEvent::Notice(TRUNCATED.into()))));
+            out.push(event_line(WireEvent::Event(AgentEvent::Notice(TRUNCATED.into()))));
         }
         out.extend(self.turn.iter().map(|(_, l)| l.clone()));
         out.extend(self.last.values().cloned());
         out.extend(self.requests.values().cloned());
-        out.push(to_line(&WireEvent::CaughtUp));
+        out.push(event_line(WireEvent::CaughtUp));
         out
     }
 
@@ -155,7 +159,7 @@ mod tests {
     use crate::events::{QueueState, StatusSnapshot};
     use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
     use crate::tool::ToolOutput;
-    use crate::wire::{ClientAdapter, Incoming, from_line};
+    use crate::wire::{AgentLine, ClientAdapter, Incoming, from_line};
     use tokio::sync::{mpsc, oneshot};
 
     fn text(t: &str) -> AgentEvent {
@@ -173,20 +177,25 @@ mod tests {
         let client = ClientAdapter::new(tx);
         lines
             .iter()
-            .map(|l| match client.incoming(from_line(l).unwrap()) {
-                Incoming::Event(AgentEvent::Text(t)) => format!("text:{t}"),
-                Incoming::Event(AgentEvent::Notice(n)) => format!("notice:{n}"),
-                Incoming::Event(AgentEvent::Status(s)) => format!("status:{}", s.model_id),
-                Incoming::Event(AgentEvent::Approve { request, .. }) => format!("approve:{}", request.tool),
-                Incoming::Event(AgentEvent::Queue(q)) => format!("queue:{}", q.steer.len()),
-                Incoming::Event(AgentEvent::PtyOpen { id, .. }) => format!("pty:{id}"),
-                Incoming::Event(e) => match serde_json::to_value(&e).unwrap() {
-                    serde_json::Value::String(s) => format!("event:{s}"),
-                    serde_json::Value::Object(o) => format!("event:{}", o.keys().next().unwrap()),
-                    _ => "event:?".into(),
-                },
-                Incoming::CaughtUp => "caught-up".into(),
-                Incoming::Detached(r) => format!("detached:{r}"),
+            .map(|l| {
+                match client.incoming(match from_line::<AgentLine>(l).unwrap() {
+                    AgentLine::Event(w) => w,
+                    other => panic!("not an event line: {}", crate::wire::to_line(&other)),
+                }) {
+                    Incoming::Event(AgentEvent::Text(t)) => format!("text:{t}"),
+                    Incoming::Event(AgentEvent::Notice(n)) => format!("notice:{n}"),
+                    Incoming::Event(AgentEvent::Status(s)) => format!("status:{}", s.model_id),
+                    Incoming::Event(AgentEvent::Approve { request, .. }) => format!("approve:{}", request.tool),
+                    Incoming::Event(AgentEvent::Queue(q)) => format!("queue:{}", q.steer.len()),
+                    Incoming::Event(AgentEvent::PtyOpen { id, .. }) => format!("pty:{id}"),
+                    Incoming::Event(e) => match serde_json::to_value(&e).unwrap() {
+                        serde_json::Value::String(s) => format!("event:{s}"),
+                        serde_json::Value::Object(o) => format!("event:{}", o.keys().next().unwrap()),
+                        _ => "event:?".into(),
+                    },
+                    Incoming::CaughtUp => "caught-up".into(),
+                    Incoming::Detached(r) => format!("detached:{r}"),
+                }
             })
             .collect()
     }
@@ -217,7 +226,7 @@ mod tests {
         });
         c.event(text("two"));
 
-        let lines = c.catch_up(vec![to_line(&WireEvent::Event(AgentEvent::UserPrompt("hist".into())))]);
+        let lines = c.catch_up(vec![event_line(WireEvent::Event(AgentEvent::UserPrompt("hist".into())))]);
         let got = shown(&lines);
         assert_eq!(got[0], "event:UserPrompt");
         let rest: Vec<&str> = got[1..].iter().map(String::as_str).collect();

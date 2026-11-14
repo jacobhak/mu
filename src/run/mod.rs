@@ -4,6 +4,7 @@
 mod acp;
 mod headless;
 mod relay;
+mod serve;
 pub mod setup;
 mod signals;
 
@@ -31,6 +32,8 @@ enum Mode {
     Print(PrintRun),
     /// `--headless`: one subagent task read from stdin, NDJSON on stdout.
     Subagent { task: Value },
+    /// `mu agent`: the agent with no terminal, serving a client over a Unix socket.
+    Agent { resumed: bool },
 }
 
 struct PrintRun {
@@ -44,12 +47,15 @@ enum Armed {
     Tui { pick_session: bool },
     Print { run: PrintRun, stop: UnboundedReceiver<()> },
     Subagent { task: Value },
+    Agent { resumed: bool },
 }
 
 impl Mode {
-    /// `task` is the subagent task, read exactly when `--headless` is set.
-    fn of(cli: &Cli, plan: Option<PlanRun>, task: Option<Value>) -> Self {
-        if let Some(task) = task {
+    /// `task` is the subagent task, read exactly when `--headless` is set; `agent` is `mu agent`.
+    fn of(cli: &Cli, plan: Option<PlanRun>, task: Option<Value>, agent: bool, resumed: bool) -> Self {
+        if agent {
+            Self::Agent { resumed }
+        } else if let Some(task) = task {
             Self::Subagent { task }
         } else if let Some(prompt) = &cli.print {
             Self::Print(PrintRun {
@@ -69,10 +75,10 @@ impl Mode {
         !cli.headless && cli.print.is_none() && !plan
     }
 
-    /// The agent's own mode: only the TUI keeps background jobs and `mu notify` delivery.
+    /// The agent's own mode: only the TUI and `mu agent` keep background jobs and `mu notify` delivery.
     fn agent_mode(&self) -> mu_agent::handle::Mode {
         match self {
-            Self::Tui { .. } => mu_agent::handle::Mode::Tui,
+            Self::Tui { .. } | Self::Agent { .. } => mu_agent::handle::Mode::Tui,
             _ => mu_agent::handle::Mode::Headless,
         }
     }
@@ -81,6 +87,7 @@ impl Mode {
     fn run_kind(&self) -> owner::RunKind {
         match self {
             Self::Tui { .. } => owner::RunKind::Tui,
+            Self::Agent { .. } => owner::RunKind::Agent,
             Self::Subagent { .. } => owner::RunKind::Subagent,
             Self::Print(_) => owner::RunKind::Print,
         }
@@ -94,26 +101,39 @@ impl Mode {
             Self::Tui { pick_session } => Armed::Tui { pick_session },
             Self::Print(run) => Armed::Print { run, stop: signals::print_run_stop()? },
             Self::Subagent { task } => Armed::Subagent { task },
+            Self::Agent { resumed } => Armed::Agent { resumed },
         })
     }
 }
 
 /// Runs the front end `cli` asks for. `plan` is the first step of a `mu plan` command, if that is what ran.
 pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
+    run_as(cli, plan, false)
+}
+
+/// `mu agent`: the agent of a session, with no terminal.
+pub fn run_agent(cli: &Cli) -> Result<i32> {
+    run_as(cli, None, true)
+}
+
+fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
     let permissions = cli.permissions.as_deref().and_then(PermissionMode::parse);
     if cli.acp {
         return acp::run(cli.model.clone(), cli_thinking, permissions);
     }
-    let interactive = Mode::interactive(cli, plan.is_some());
-    if matches!(cli.resume, Some(None)) && !interactive {
+    // `terminal`: the TUI. `interactive`: someone can answer a question or an approval, here or
+    // through a client (the TUI and `mu agent`).
+    let terminal = Mode::interactive(cli, plan.is_some()) && !agent;
+    let interactive = terminal || agent;
+    if matches!(cli.resume, Some(None)) && !terminal {
         bail!(
             "--resume without a session opens the session picker, which needs the interactive mode; pass a session id or path"
         );
     }
     let cwd = std::env::current_dir()?;
     let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
-    if interactive && cfgs.mu.update.check {
+    if terminal && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
         let tx = notice_tx.clone();
         std::thread::spawn(move || {
@@ -165,12 +185,13 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     let model_label = model_label(role_sel.as_deref(), &spec.id);
 
     let resume = find_resume(cli, &cwd)?;
-    if interactive && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if terminal && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("mu: interactive mode needs a terminal; use -p");
     }
     if let (true, Some(p)) = (interactive, &resume) {
-        // As `mu take`, but asked first: a `-p` run that has the session is stopped after its current step.
-        if let Some(code) = crate::workflow::take::release(p, "mu", true)? {
+        // As `mu take`, asked first when there is a terminal to ask on: a `-p` run that has the session
+        // is stopped after its current step.
+        if let Some(code) = crate::workflow::take::release(p, "mu", terminal)? {
             return Ok(code);
         }
     }
@@ -206,7 +227,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     }
     let name = task.as_ref().and_then(|p| p["agent"].as_str()).or(agent_def.as_ref().map(|d| d.name.as_str()));
     let name = name.map(String::from);
-    let mode = Mode::of(cli, plan, task);
+    let mode = Mode::of(cli, plan, task, agent, resume.is_some());
     owner::set_run_info(mode.run_kind(), name.as_deref());
 
     let cfgs_ui = cfgs.clone();
@@ -259,6 +280,14 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
                     (handle.cmd, handle.ev)
                 };
                 (tui(&host, ui, cmd, ev, notice_rx).await, None)
+            }
+            Armed::Agent { resumed } => {
+                signals::cancel_turn_on_sigusr1(handle.cmd.clone());
+                host.set_interactive();
+                let local = mu_tui::host::local::LocalHost::new(providers_ui, ctx_ui, host.clone(), cwd_ui);
+                let init =
+                    serve::Init { host: Rc::new(local), cmd: handle.cmd, ev: handle.ev, notices: notice_rx, resumed };
+                (serve::run(init).await, None)
             }
             Armed::Subagent { task } => {
                 let printer = spawn_notice_printer(notice_rx);

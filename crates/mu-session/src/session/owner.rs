@@ -48,11 +48,14 @@ pub enum RunKind {
     Print,
     Subagent,
     Acp,
+    /// `mu agent`: the agent of a session, with a client attached or not.
+    Agent,
 }
 
 impl RunKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Agent => "agent",
             Self::Tui => "tui",
             Self::Print => "print",
             Self::Subagent => "subagent",
@@ -492,9 +495,13 @@ mod tests {
     #[test]
     fn the_run_kind_is_recorded_by_name() {
         home();
-        for (kind, name) in
-            [(RunKind::Tui, "tui"), (RunKind::Print, "print"), (RunKind::Subagent, "subagent"), (RunKind::Acp, "acp")]
-        {
+        for (kind, name) in [
+            (RunKind::Tui, "tui"),
+            (RunKind::Print, "print"),
+            (RunKind::Subagent, "subagent"),
+            (RunKind::Acp, "acp"),
+            (RunKind::Agent, "agent"),
+        ] {
             let d = tmp("run-kind");
             let path = d.join(format!("x_run-kind-{}.jsonl", uuid::Uuid::new_v4()));
             std::fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"k\"}\n").unwrap();
