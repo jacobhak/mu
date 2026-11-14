@@ -867,7 +867,7 @@ mod tests {
         app.prompt.composer.set_text("kept");
         app.login("custom");
         assert!(app.custom_wizard_active());
-        app.start_key_flow(mu_provider::provider::providers::KeyTarget::builtin("anthropic").unwrap(), None, None);
+        app.start_key_flow(crate::host::keys::KeyInfo::builtin("anthropic").unwrap(), None, None);
         assert!(!app.custom_wizard_active(), "the key flow replaces it");
         assert_eq!(app.prompt.composer.text(), "kept", "the draft comes back");
     }

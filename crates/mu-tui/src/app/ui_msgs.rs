@@ -1,19 +1,12 @@
 //! Results of work that runs off the event loop (pickers' data, clipboard, plugins, child programs,
 //! key checks), and the periodic tick that keeps the screen current.
 use super::child::ChildThen;
-use super::keys::is_baseten;
 use super::*;
 use crate::chat::blocks;
 use crate::custom::panel::Fetch;
-use crate::widgets::overlay::LoginTarget;
-use crate::widgets::picker::Picker;
-use crate::widgets::select::{Item, Select};
 use mu_base::events::SubagentStatus;
 use mu_base::message::Image;
 use mu_provider::auth::chatgpt::Account;
-use mu_provider::auth::check::Check;
-use mu_provider::auth::store::Entry;
-use mu_provider::provider::providers::KeyTarget;
 use mu_session::session::tree_cost::TreeCost;
 use serde_json::Value;
 
@@ -36,7 +29,6 @@ pub(super) enum UiMsg {
         flow: u64,
         r: Fetch,
     },
-    LoginProviders(Result<Vec<(usize, String)>, String>),
     /// An MCP login finished: tool count and whether the tool set changed.
     McpLoggedIn(String, Result<(usize, bool), String>),
     /// An `/mcp` change was applied: what to tell the user, and whether the tool list changed.
@@ -61,13 +53,6 @@ pub(super) enum UiMsg {
     Spend(Box<TreeCost>),
     /// A finished subagent's session was read: its row, and what the session cost (`None` if the read failed).
     SubagentCost(Box<SubagentStatus>, Option<f64>),
-    /// An API key was checked: the outcome, and the entry to save when it holds.
-    KeyChecked {
-        flow: u64,
-        target: KeyTarget,
-        entry: Entry,
-        r: Result<Check, String>,
-    },
     /// A ChatGPT sign-in is waiting: the authorization URL to show.
     ChatgptUrl {
         flow: u64,
@@ -152,7 +137,6 @@ impl App {
                 }
             }
             UiMsg::McpReconnected { name, verbose, ms, result } => self.on_mcp_reconnected(&name, verbose, ms, result),
-            UiMsg::KeyChecked { flow, target, entry, r } => self.on_key_checked(flow, target, entry, r),
             UiMsg::ChatgptUrl { flow, url } => self.on_chatgpt_url(flow, &url),
             UiMsg::ChatgptDone { flow, r } => self.on_chatgpt_done(flow, r),
             UiMsg::ChatgptNotice { flow, text } => self.on_chatgpt_notice(flow, &text),
@@ -163,24 +147,6 @@ impl App {
             UiMsg::MemoryReverted { short, r } => self.on_memory_reverted(&short, r),
             UiMsg::ScheduleDue(id) => self.on_schedule_due(id),
             UiMsg::Host(then) => then(self),
-            UiMsg::LoginProviders(r) => {
-                self.leave_custom_wizard();
-                let mut rows = self.api_key_rows();
-                match r {
-                    Ok(list) => {
-                        for (n, name) in list.into_iter().filter(|(_, name)| !is_baseten(name)) {
-                            rows.push((Item { label: name, detail: String::new() }, LoginTarget::Provider(n)));
-                        }
-                    }
-                    // The API-key rows and MCP servers stay usable without omp.
-                    Err(e) => self.error(&format!("cannot list omp's login providers: {e}")),
-                }
-                for (name, url) in self.plugins.needs_login() {
-                    rows.push((Item { label: format!("mcp:{name}"), detail: url }, LoginTarget::Mcp(name)));
-                }
-                self.overlay =
-                    Some(Overlay::Login { pick: Picker::from_rows(rows, |items| Select::new("Log in", items)) });
-            }
             UiMsg::ClipboardImage(r) => match r {
                 Ok(Some(_)) if self.typing() => self.notice("image paste ignored while typing"),
                 Ok(Some(img)) if self.overlay.is_none() => self.prompt.composer.attach_image(img),
