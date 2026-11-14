@@ -120,7 +120,7 @@ struct Spec {
     id: String,
     agent: String,
     cwd: PathBuf,
-    /// The task prompt or command, truncated; kept for the jobs panel.
+    /// The task prompt (truncated) or the command (whole up to `COMMAND_KEEP`); kept for the jobs panel.
     task: String,
 }
 
@@ -644,7 +644,7 @@ impl JobsHandle {
         let line = command_line(&command);
         let listed = call.is_none();
         let sink = OutputSink::new(id.clone(), cwd.clone(), self.events.clone(), call);
-        let spec = Spec { id: id.clone(), agent: "bash".into(), cwd, task: line.clone() };
+        let spec = Spec { id: id.clone(), agent: "bash".into(), cwd, task: one_line(&command, COMMAND_KEEP) };
         let run_cancel = cancel.clone();
         let kept = sink.clone();
         self.spawn_job(spec, Work::bash(command), line, cancel, listed, move |_| {
@@ -806,9 +806,17 @@ impl JobsHandle {
     }
 }
 
+/// Most characters of a bash job's command the jobs panel keeps: it wraps the command, so it is
+/// shown whole unless it is huge.
+const COMMAND_KEEP: usize = 4000;
+
+fn one_line(text: &str, max: usize) -> String {
+    truncate_text(&text.split_whitespace().collect::<Vec<_>>().join(" "), max)
+}
+
 /// A command on one line for headings and the jobs list.
 fn command_line(command: &str) -> String {
-    truncate_text(&command.split_whitespace().collect::<Vec<_>>().join(" "), 120)
+    one_line(command, 120)
 }
 
 /// One job's result in the same shape the blocking `task` result uses. A bash job's heading names
@@ -1105,6 +1113,14 @@ pub(crate) mod tests {
             })
             .await;
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_long_command_is_cut_for_headings_but_not_for_the_panel() {
+        let cmd = format!("cd /w &&\n{}", "x".repeat(300));
+        assert!(command_line(&cmd).chars().count() <= 120);
+        let whole = one_line(&cmd, COMMAND_KEEP);
+        assert_eq!(whole, format!("cd /w && {}", "x".repeat(300)));
     }
 
     fn sink() -> (OutputSink, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
