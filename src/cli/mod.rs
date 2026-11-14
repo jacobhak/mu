@@ -58,6 +58,11 @@ pub struct Cli {
     /// Abort `-p` once the session has cost more than this many USD.
     #[arg(long, requires = "print")]
     pub max_cost: Option<f64>,
+    /// Run the terminal UI as a client of the `mu agent` that this shell command reaches: its stdin and
+    /// stdout carry the protocol (`'ssh host mu attach'`, `'kubectl exec -i pod -- mu attach'`). The
+    /// command is run again, with growing pauses, when the connection drops.
+    #[arg(long, value_name = "COMMAND", conflicts_with_all = ["resume", "continue_latest", "print", "headless", "acp"])]
+    pub attach: Option<String>,
     /// Serve the Agent Client Protocol over stdio.
     #[arg(long, conflicts_with_all = ["resume", "continue_latest", "print", "headless"])]
     pub acp: bool,

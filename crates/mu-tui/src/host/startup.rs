@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 pub const STARTUP: &str = "startup";
+/// `/detach`: leave the agent running and end this client. Only an attached client has anyone to leave.
+pub const DETACH: &str = "detach";
 
 /// One MCP server of an untrusted project file, with its definition as written.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +56,7 @@ fn as_written(s: &McpServer) -> String {
 
 pub(super) fn register(r: &mut Registry) {
     r.add(STARTUP, startup);
+    r.add(DETACH, |_, _| Answer::Ready(Err("not attached: /detach applies to a client of `mu agent`".into())));
 }
 
 fn startup(l: &Rc<Local>, args: serde_json::Value) -> Answer {

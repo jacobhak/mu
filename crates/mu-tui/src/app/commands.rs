@@ -99,9 +99,10 @@ fn strings(items: &[&str]) -> (Vec<String>, Vec<String>) {
     names(items.iter().map(|s| s.to_string()))
 }
 
-pub(super) static BUILTIN: [Builtin; 33] = [
+pub(super) static BUILTIN: [Builtin; 34] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
+    cmd("detach", "Leave the agent running and close this client (mu --attach)", |a, _| a.cmd_detach()).busy_ok(),
     cmd("new", "Start a new session", App::cmd_new),
     cmd("resume", "Resume a session from this directory", |a, _| a.open_session_picker()),
     cmd("fork", "Continue in a copy of this session; the original stays as it is", |a, _| a.send(Command::Fork)),
@@ -245,6 +246,7 @@ mod tests {
         assert_eq!(
             busy,
             [
+                "detach",
                 "thinking",
                 "permissions",
                 "refresh",

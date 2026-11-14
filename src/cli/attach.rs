@@ -62,7 +62,7 @@ pub fn run(session: Option<&str>, socket: Option<PathBuf>) -> Result<i32> {
         None => find_socket(session, &std::env::current_dir()?)?,
     };
     let rt = mu_base::runtime::current_thread_runtime()?;
-    rt.block_on(async move {
+    let result = rt.block_on(async move {
         let stream = match UnixStream::connect(&socket).await {
             Ok(s) => s,
             Err(e) => bail!("cannot connect to {}: {e}", socket.display()),
@@ -78,12 +78,19 @@ pub fn run(session: Option<&str>, socket: Option<PathBuf>) -> Result<i32> {
             let _ = out.flush().await;
             r
         };
-        // The agent closing the connection ends the attach; so does the client closing its stdin once
-        // the agent has answered.
-        let (_, down) = tokio::join!(up, down);
+        // The agent closing the connection ends the attach at once, whatever stdin is doing. The client
+        // closing its stdin only half-closes the socket: the agent's last lines are still copied.
+        tokio::pin!(up, down);
+        let down = tokio::select! {
+            d = &mut down => d,
+            () = &mut up => down.await,
+        };
         match down {
             Ok(_) => Ok(0),
             Err(e) => bail!("connection to {} lost: {e}", socket.display()),
         }
-    })
+    });
+    // Stdin's reader is a blocking thread that only ends with stdin: dropping the runtime would wait for it.
+    rt.shutdown_background();
+    result
 }

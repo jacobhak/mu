@@ -404,6 +404,10 @@ pub enum PtyInput {
 /// `serde(skip)`: they cross a wire as `wire::WireEvent` requests with an id.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
+    /// Only a client that joins a running agent over a wire sees this, never the agent itself:
+    /// `Replay(true)` before what it missed (the view starts afresh and stays quiet: no bell), and
+    /// `Replay(false)` when it is caught up.
+    Replay(bool),
     /// Sent immediately before every `TurnStart`: the session entry the turn begins after (`None`
     /// with no session file yet). A client that attaches mid-turn shows history up to here and
     /// replays the turn's events after it.

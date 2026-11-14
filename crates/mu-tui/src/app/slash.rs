@@ -218,6 +218,14 @@ impl App {
         }
     }
 
+    pub(super) fn cmd_detach(&mut self) {
+        self.host_call(host::startup::DETACH, &(), |app, r: Result<(), String>| {
+            if let Err(e) = r {
+                app.error(&e);
+            }
+        });
+    }
+
     pub(super) fn cmd_skills(&mut self, _: &str) {
         self.host_call(host::completion::SKILLS, &(), |app, r: Result<Vec<SkillRow>, String>| match r {
             Ok(rows) => {

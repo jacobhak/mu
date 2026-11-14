@@ -63,6 +63,8 @@ pub(super) struct StreamingCall {
 pub(super) enum Effect {
     /// The turn is waiting for the user: ring the terminal, if the setting is on.
     Ring,
+    /// The view starts afresh (a client about to replay a conversation): clear the terminal too.
+    ClearScreen,
     Ask {
         questions: Vec<AskQuestion>,
         reply: oneshot::Sender<Option<Vec<Answer>>>,
@@ -158,6 +160,10 @@ pub(super) struct AgentView {
     pub(super) turn_aborted: bool,
     bell: WokenBell,
     bell_cfg: MuBell,
+    /// A client is being shown what it missed: nothing rings.
+    pub(super) catching_up: bool,
+    /// `show_thinking` and `smooth`, for a view that starts afresh.
+    fresh: (bool, bool),
 }
 
 impl AgentView {
@@ -191,6 +197,8 @@ impl AgentView {
             turn_aborted: false,
             bell: WokenBell::default(),
             bell_cfg: MuBell::default(),
+            catching_up: false,
+            fresh: (show_thinking, smooth),
         }
     }
 
@@ -242,6 +250,13 @@ impl AgentView {
         let mut fx = Vec::new();
         match e {
             AgentEvent::TurnMark { .. } => {}
+            AgentEvent::Replay(true) => {
+                let (bell_cfg, (show, smooth)) = (self.bell_cfg, self.fresh);
+                *self = AgentView::new(show, smooth).with_bell(bell_cfg);
+                self.catching_up = true;
+                fx.push(Effect::ClearScreen);
+            }
+            AgentEvent::Replay(false) => self.catching_up = false,
             AgentEvent::TurnStart => {
                 self.running = true;
                 self.turn_started = Some(Instant::now());
@@ -584,7 +599,14 @@ impl App {
 
     fn apply(&mut self, effect: Effect) {
         match effect {
-            Effect::Ring => self.ring(),
+            Effect::Ring => {
+                if !self.agent.catching_up {
+                    self.ring();
+                }
+            }
+            Effect::ClearScreen => {
+                let _ = self.screen.renderer.clear_all();
+            }
             Effect::Ask { questions, reply } => self.start_ask(questions, reply),
             Effect::Approve { request, reply } => self.start_approve(request, reply),
             Effect::WebSetup { reply } => self.start_web_wizard(Some(reply)),

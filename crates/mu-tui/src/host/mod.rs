@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod plans;
+pub mod remote;
 pub mod sessions;
 pub mod startup;
 pub mod web;

@@ -2,6 +2,7 @@
 //! it to that mode's function.
 
 mod acp;
+mod attach;
 mod headless;
 mod relay;
 mod serve;
@@ -121,6 +122,9 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     let permissions = cli.permissions.as_deref().and_then(PermissionMode::parse);
     if cli.acp {
         return acp::run(cli.model.clone(), cli_thinking, permissions);
+    }
+    if let Some(command) = &cli.attach {
+        return attach::run(command);
     }
     // `terminal`: the TUI. `interactive`: someone can answer a question or an approval, here or
     // through a client (the TUI and `mu agent`).

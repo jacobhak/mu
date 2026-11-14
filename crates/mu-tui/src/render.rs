@@ -218,6 +218,16 @@ impl Renderer {
         Ok(())
     }
 
+    /// Clears the screen and its scrollback and forgets what was drawn, so the next draw starts at the
+    /// top: for a client that is about to replay a whole conversation.
+    pub fn clear_all(&mut self) -> io::Result<()> {
+        self.emit(b"\x1b[3J\x1b[2J\x1b[H")?;
+        self.drawn.clear();
+        self.cursor = (0, 0);
+        self.last = None;
+        Ok(())
+    }
+
     /// Moves below the viewport and ends the line so the shell prompt resumes cleanly.
     pub fn finish(&mut self) -> io::Result<()> {
         let (cols, _) = self.size();
