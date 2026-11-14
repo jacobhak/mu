@@ -2,7 +2,7 @@
 //! TUI. Each command takes its registry and key store explicitly, so the tests use their own files.
 
 use super::approved;
-use super::auth::read_secret;
+use super::secret::read_secret;
 use anyhow::{Context, Result, anyhow, bail};
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::{Entry, Store, resolve_entry};

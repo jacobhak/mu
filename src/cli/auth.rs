@@ -1,16 +1,17 @@
 //! `mu auth`: manage provider API keys and the ChatGPT sign-in without the TUI (see
 //! `mu_provider::auth::store` and `mu_provider::auth::chatgpt`).
 
+use super::chatgpt_login::{chatgpt_test, login, logout};
+use super::secret::read_secret;
 use anyhow::{Result, anyhow, bail};
-use mu_provider::auth::chatgpt::{self, Account, PROVIDER_ID, USAGE_URL, oauth, signin};
+use mu_provider::auth::chatgpt::{Account, PROVIDER_ID};
 use mu_provider::auth::check::{self, Check};
 use mu_provider::auth::store::{Entry, Origin, Store};
 use mu_provider::provider::custom::{AuthMode, CustomProvider, KeyState, Registry};
 use mu_provider::provider::providers;
 use mu_provider::provider::providers::{KeyTarget, SEARCH_KEYS};
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Read, Write};
-use tokio_util::sync::CancellationToken;
+use std::io::Write;
 
 #[derive(clap::Subcommand)]
 pub enum Cmd {
@@ -336,137 +337,6 @@ fn chatgpt_only(cmd: &str, provider: Option<&str>) -> Result<()> {
     }
 }
 
-/// Signs in through the browser. On a terminal the pasted redirect URL is accepted too, for machines
-/// the browser's callback cannot reach. The sign-in is saved only when it is the registered account.
-fn login(store: &Store, out: &mut impl Write) -> Result<i32> {
-    let host = store.chatgpt_host_id()?;
-    let endpoints = store.chatgpt_endpoints();
-    let req = oauth::LoginRequest {
-        endpoints: &endpoints,
-        host_id: &host,
-        known: store.chatgpt_known(),
-        cancel: CancellationToken::new(),
-    };
-    let tty = std::io::stdin().is_terminal();
-    // The sender lives until the sign-in ends: a closed channel would fail the wait for the browser.
-    let (paste_tx, mut paste_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    if tty {
-        let tx = paste_tx.clone();
-        std::thread::spawn(move || {
-            for line in std::io::stdin().lines().map_while(std::result::Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    let mut on_url = |url: &str| {
-        eprintln!("Sign in with ChatGPT. A browser should open; if it does not, open this link:\n\n{url}\n");
-        if tty {
-            eprintln!("If the browser cannot reach this machine, paste the final redirect URL here and press Enter.");
-        }
-        let _ = chatgpt::browser::open_browser(url);
-    };
-    let mut notice = |text: &str| eprintln!("{text}");
-    let rt = mu_base::runtime::current_thread_runtime()?;
-    let account = match rt.block_on(oauth::login(req, &mut on_url, &mut notice, &mut paste_rx)) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("sign-in did not finish: {e}; nothing saved");
-            return Ok(1);
-        }
-    };
-    let saved = match signin::save(store, account) {
-        Ok(s) => s,
-        Err(m) => {
-            eprintln!("{m}");
-            return Ok(1);
-        }
-    };
-    writeln!(out, "signed in as {}", saved.label)?;
-    if !saved.plan_usage {
-        eprintln!(
-            "plan usage is not enabled for this sign-in, so {PROVIDER_ID}/* models cannot run yet. Run `mu auth login {PROVIDER_ID}` again and approve the plan permission."
-        );
-        return Ok(1);
-    }
-    writeln!(out, "{PROVIDER_ID}/* models now run on your ChatGPT plan.")?;
-    if saved.welcome {
-        writeln!(out, "You're using your ChatGPT plan. Manage usage: {USAGE_URL}")?;
-    }
-    Ok(0)
-}
-
-/// Drops the tokens, then revokes the refresh token at the issuer. `forget` drops the registration too.
-fn logout(store: &Store, out: &mut impl Write, forget: bool) -> Result<i32> {
-    if forget {
-        return forget_registration(store, out);
-    }
-    let Some(account) = signin::sign_out(store).map_err(|e| anyhow!("{e}"))? else {
-        eprintln!("not signed in with ChatGPT");
-        return Ok(1);
-    };
-    writeln!(
-        out,
-        "signed out of ChatGPT ({}); {PROVIDER_ID}/* models stop running until you sign in again",
-        account.label()
-    )?;
-    if let Err(m) = mu_base::runtime::current_thread_runtime()?.block_on(signin::revoke(store, &account)) {
-        eprintln!(
-            "could not confirm that the sign-in was revoked ({m}). Disconnect mu under your ChatGPT settings, apps."
-        );
-    }
-    Ok(0)
-}
-
-/// Drops the registration and its tokens, then revokes the refresh token at the issuer. The app stays
-/// listed in ChatGPT settings, so that is said too.
-fn forget_registration(store: &Store, out: &mut impl Write) -> Result<i32> {
-    let Some(account) = signin::forget(store).map_err(|e| anyhow!("{e}"))? else {
-        eprintln!("no ChatGPT sign-in is saved");
-        return Ok(1);
-    };
-    writeln!(
-        out,
-        "forgot the ChatGPT registration ({}); {PROVIDER_ID}/* models stop running until you sign in again",
-        account.label()
-    )?;
-    writeln!(
-        out,
-        "The next `mu auth login {PROVIDER_ID}` registers a new client and may sign in as a different ChatGPT account."
-    )?;
-    writeln!(out, "The old app stays listed under your ChatGPT settings, apps, until you disconnect it there.")?;
-    let revoked = if account.signed_in() {
-        mu_base::runtime::current_thread_runtime()?.block_on(signin::revoke(store, &account))
-    } else {
-        Ok(())
-    };
-    if let Err(m) = revoked {
-        eprintln!(
-            "could not confirm that the sign-in was revoked ({m}). Disconnect mu under your ChatGPT settings, apps."
-        );
-    }
-    Ok(0)
-}
-
-/// Asks the ChatGPT plan whether the sign-in works: the model list is fetched with it.
-fn chatgpt_test(store: &Store, out: &mut impl Write) -> Result<i32> {
-    if !store.chatgpt_account().is_some_and(|a| a.signed_in()) {
-        eprintln!("not signed in with ChatGPT; run `mu auth login {PROVIDER_ID}`");
-        return Ok(1);
-    }
-    match mu_base::runtime::current_thread_runtime()?.block_on(chatgpt::store::check(store)) {
-        Ok(models) => {
-            writeln!(out, "{PROVIDER_ID}: the plan answers; {} models", models.len())?;
-            Ok(0)
-        }
-        Err(m) => {
-            eprintln!("{PROVIDER_ID}: {m}");
-            Ok(1)
-        }
-    }
-}
-
 /// What each stored key is used for, from the store and the registry; `render` only formats it. A
 /// custom id with no definition is an orphan, and an unreadable registry leaves custom rows unknown.
 fn uses(
@@ -583,133 +453,6 @@ fn key_hint(t: &KeyTarget) -> String {
     }
 }
 
-/// A secret from stdin: a no-echo prompt on a terminal (after `hint`, when given), else the piped
-/// text. Shared by `mu auth add` and `mu providers add`; a key is never a command argument.
-pub(crate) fn read_secret(hint: &str, prompt: &str) -> Result<String> {
-    let stdin = std::io::stdin();
-    if !stdin.is_terminal() {
-        let mut s = String::new();
-        stdin.lock().read_to_string(&mut s)?;
-        return Ok(s.trim().to_string());
-    }
-    if !hint.is_empty() {
-        eprintln!("{hint}");
-    }
-    eprint!("{prompt} (input is hidden): ");
-    std::io::stderr().flush()?;
-    let key = with_echo_off(|| {
-        let mut lock = stdin.lock();
-        Ok(collect_key(|| {
-            let mut b = [0u8];
-            loop {
-                match lock.read(&mut b) {
-                    Ok(1) => return Some(b[0]),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    _ => return None,
-                }
-            }
-        }))
-    })?;
-    eprintln!();
-    key.ok_or_else(|| anyhow!("cancelled; nothing saved"))
-}
-
-/// Reads a typed key up to a newline, one byte at a time (echo and line editing are off). `None`
-/// when cancelled: Ctrl-C, or Ctrl-D on an empty line.
-fn collect_key(mut next: impl FnMut() -> Option<u8>) -> Option<String> {
-    let mut key = Vec::new();
-    while let Some(b) = next() {
-        match b {
-            b'\n' | b'\r' => break,
-            0x03 => return None,
-            0x04 if key.is_empty() => return None,
-            0x04 => {}
-            0x08 | 0x7f => {
-                key.pop();
-            }
-            b => key.push(b),
-        }
-    }
-    Some(String::from_utf8_lossy(&key).trim().to_string())
-}
-
-/// The termios state to put back if a signal ends the process while echo is off.
-static SAVED_TERMIOS: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
-
-/// Signals that would otherwise leave the terminal without echo.
-const RESTORE_ON: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
-
-extern "C" fn restore_and_reraise(sig: libc::c_int) {
-    if let Some(t) = SAVED_TERMIOS.get() {
-        // SAFETY: tcsetattr is async-signal-safe, and the saved state is never changed once set.
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
-    }
-    // SAFETY: default action, then re-raise so the exit status still reports the signal.
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
-}
-
-/// Echo and signal keys are off on stdin while this lives. Dropping it, or one of `RESTORE_ON`
-/// arriving, puts the terminal back.
-struct NoEcho {
-    saved: libc::termios,
-    handlers: Vec<(libc::c_int, libc::sighandler_t)>,
-}
-
-impl NoEcho {
-    fn start() -> std::io::Result<Self> {
-        // SAFETY: tcgetattr fills the zeroed struct when it succeeds.
-        let saved: libc::termios = unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(0, &mut t) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            t
-        };
-        let _ = SAVED_TERMIOS.set(saved);
-        let mut quiet = saved;
-        // Byte at a time with no signals from keys: Ctrl-C and Ctrl-D reach `collect_key` as bytes.
-        quiet.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG);
-        quiet.c_cc[libc::VMIN] = 1;
-        quiet.c_cc[libc::VTIME] = 0;
-        // SAFETY: `quiet` is `saved` with these flags changed.
-        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &quiet) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut guard = Self { saved, handlers: Vec::new() };
-        let handler = restore_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        for sig in RESTORE_ON {
-            // SAFETY: the handler only makes async-signal-safe calls.
-            let prev = unsafe { libc::signal(sig, handler) };
-            if prev != libc::SIG_ERR {
-                guard.handlers.push((sig, prev));
-            }
-        }
-        Ok(guard)
-    }
-}
-
-impl Drop for NoEcho {
-    fn drop(&mut self) {
-        for (sig, prev) in self.handlers.drain(..) {
-            // SAFETY: reinstalls the handler that was there before.
-            unsafe { libc::signal(sig, prev) };
-        }
-        // SAFETY: the state tcgetattr returned at start.
-        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.saved) } != 0 {
-            eprintln!("warning: could not restore terminal echo; run `stty echo`");
-        }
-    }
-}
-
-/// Runs `f` with terminal echo off on stdin, restored afterwards (also on error and on signals).
-fn with_echo_off<T>(f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    let _guard = NoEcho::start()?;
-    f()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,20 +539,6 @@ mod tests {
         assert!(lines[2].ends_with("web search"), "{lines:?}");
     }
 
-    fn feed(s: &'static [u8]) -> impl FnMut() -> Option<u8> {
-        let mut it = s.iter().copied();
-        move || it.next()
-    }
-
-    #[test]
-    fn typed_keys_are_read_bytewise_and_ctrl_c_cancels() {
-        assert_eq!(collect_key(feed(b"sk-abc\r")).as_deref(), Some("sk-abc"));
-        assert_eq!(collect_key(feed(b"sk\x7f\x7fx-1\n")).as_deref(), Some("x-1"));
-        assert_eq!(collect_key(feed(b"ab\x04\n")).as_deref(), Some("ab"));
-        assert_eq!(collect_key(feed(b"sk-ab\x03\n")), None);
-        assert_eq!(collect_key(feed(b"\x04")), None);
-    }
-
     #[test]
     fn a_base_url_is_checked_before_a_key_is_sent() {
         assert!(parse_base_url(Some("http://example.com".into())).is_err());
@@ -826,6 +555,7 @@ mod tests {
 #[cfg(test)]
 mod chatgpt_tests {
     use super::*;
+    use crate::cli::chatgpt_login::forget_registration;
     use clap::Parser;
     use mu_provider::auth::chatgpt::{DIRECT_SCOPE, Tokens};
 
