@@ -13,6 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::text::accent;
 use crate::text::line::{self, Line, dim, span};
 use crate::theme::{self, Role};
+use crate::widgets::frame::Frame;
 
 /// Columns the marker gutter takes at the left of every body row.
 const GUTTER: usize = 2;
@@ -942,10 +943,29 @@ impl View {
     /// visible, a closing rule and a two-row footer when there is room. `which` is
     /// `(index, count)` for the title.
     fn render(&mut self, width: usize, max_rows: usize, which: (usize, usize)) -> (Vec<Line>, (usize, usize)) {
-        let header = usize::from(max_rows >= 3);
-        let bottom = usize::from(max_rows >= 5);
-        let footer = if max_rows >= 9 { 2 } else { 0 };
-        let h = max_rows.saturating_sub(header + bottom + footer).max(1);
+        let mut frame = Frame::default();
+        if max_rows >= 3 {
+            let selecting = if self.anchor.is_some() { " · selecting" } else { "" };
+            let switch = if which.1 > 1 { " · [ ] Tab replies" } else { "" };
+            let title = format!("reply {}/{} · {} marked{selecting}{switch}", which.0, which.1, self.marks.len());
+            frame.header.push(rule(Some(&title), width));
+        }
+        if max_rows >= 5 {
+            frame.footer.push(rule(None, width));
+        }
+        if max_rows >= 9 {
+            let (a, b) = if self.anchor.is_some() {
+                ("Shift+←→ word · Shift+↑↓ unit · Space mark", "Enter quote · Esc drop selection · Ctrl+G close")
+            } else {
+                (
+                    "↑↓ jk unit · ←→ hl word · Shift+move select · gg G { } ^D ^U ^N ^P ^F ^B",
+                    "Space mark · c clear · Enter quote · [ ] Tab reply (3[ jumps) · Esc close",
+                )
+            };
+            frame.footer.push(line::styled(a, |_| dim()));
+            frame.footer.push(line::styled(b, |_| dim()));
+        }
+        let h = frame.body_rows(max_rows, 1);
         let w = width.saturating_sub(GUTTER).max(1);
         let n = self.doc.units.len();
 
@@ -1008,33 +1028,11 @@ impl View {
         self.unit_rows = unit_rows;
         self.word_row = word_row;
 
-        let mut out: Vec<Line> = Vec::new();
-        if header == 1 {
-            let selecting = if self.anchor.is_some() { " · selecting" } else { "" };
-            let switch = if which.1 > 1 { " · [ ] Tab replies" } else { "" };
-            let title = format!("reply {}/{} · {} marked{selecting}{switch}", which.0, which.1, self.marks.len());
-            out.push(rule(Some(&title), width));
-        }
+        let header = frame.header.len();
         let end = (self.top + h).min(total);
-        out.extend(all[self.top..end].iter().cloned());
-        if bottom == 1 {
-            out.push(rule(None, width));
-        }
-        if footer == 2 {
-            let (a, b) = if self.anchor.is_some() {
-                ("Shift+←→ word · Shift+↑↓ unit · Space mark", "Enter quote · Esc drop selection · Ctrl+G close")
-            } else {
-                (
-                    "↑↓ jk unit · ←→ hl word · Shift+move select · gg G { } ^D ^U ^N ^P ^F ^B",
-                    "Space mark · c clear · Enter quote · [ ] Tab reply (3[ jumps) · Esc close",
-                )
-            };
-            out.push(line::styled(a, |_| dim()));
-            out.push(line::styled(b, |_| dim()));
-        }
+        let body = all[self.top..end].to_vec();
         let cursor_row = if cr >= self.top && cr < self.top + h { header + cr - self.top } else { header };
-        let out = out.iter().map(|l| line::truncate(l, width)).collect();
-        (out, (cursor_row, 0))
+        (frame.finish(body, width), (cursor_row, 0))
     }
 }
 

@@ -15,8 +15,10 @@ use crate::panels::sessions_tab::{self, Row};
 use crate::text::line::{self, Line, dim, span};
 use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
+use crate::widgets::frame::Frame;
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_session::session::owner::LiveSession;
+use mu_session::session::runs::{RunDir, SessionSource};
 use mu_session::session::tail::Tail;
 
 /// Most list rows shown at once.
@@ -101,6 +103,8 @@ pub struct JobsPanel {
     status: Option<String>,
     /// The newest output of each bash job, as the app last sent it.
     outputs: HashMap<String, String>,
+    /// Where the Sessions tab's list of live sessions comes from.
+    source: Box<dyn SessionSource>,
 }
 
 /// A listed session's totals, and whether it can still change.
@@ -212,7 +216,15 @@ impl JobsPanel {
             confirm: None,
             status: None,
             outputs: HashMap::new(),
+            source: Box::new(RunDir::profile()),
         }
+    }
+
+    /// Reads the live sessions from `source` instead of this profile's run directory.
+    #[cfg(test)]
+    pub fn with_source(mut self, source: Box<dyn SessionSource>) -> Self {
+        self.source = source;
+        self
     }
 
     /// Starts with the output the app already has for its bash jobs.
@@ -255,7 +267,7 @@ impl JobsPanel {
 
     /// The live sessions, read now from the owner records.
     fn refresh_sessions(&mut self) {
-        self.set_sessions(mu_session::session::owner::live_sessions());
+        self.set_sessions(self.source.live_sessions());
     }
 
     /// A fresh list of live sessions: the selection stays on the same one when it is still there.
@@ -263,12 +275,9 @@ impl JobsPanel {
         self.polled_totals = Some(Instant::now());
         for l in &lives {
             if !self.titles.contains_key(&l.path)
-                && let Some(i) = mu_session::session::list::info(&l.path)
+                && let Some(t) = self.source.title(&l.path)
             {
-                let t = i.title.filter(|t| !t.is_empty()).unwrap_or(i.first_prompt);
-                if !t.is_empty() {
-                    self.titles.insert(l.path.clone(), t);
-                }
+                self.titles.insert(l.path.clone(), t);
             }
         }
         let keep = self.rows.get(self.s_at).map(|r| r.live.path.clone());
@@ -598,21 +607,21 @@ impl JobsPanel {
         if self.view.is_some() {
             return self.render_view(width, max_rows, now);
         }
-        let mut frame = match self.tab {
+        let mut screen = match self.tab {
             Tab::Jobs => self.jobs_frame(width, now),
             Tab::Sessions => self.sessions_frame(width, now),
         };
         if let Some(s) = &self.status {
-            frame.footer = vec![span(s.clone(), accent())];
+            screen.footer = vec![span(s.clone(), accent())];
         }
         let (top, page) = match self.tab {
             Tab::Jobs => (&mut self.top, &mut self.page),
             Tab::Sessions => (&mut self.s_top, &mut self.s_page),
         };
-        draw(frame, top, page, width, max_rows)
+        draw(screen, top, page, width, max_rows)
     }
 
-    fn jobs_frame(&self, width: usize, now: SystemTime) -> Frame {
+    fn jobs_frame(&self, width: usize, now: SystemTime) -> Screen {
         let name_w = self.jobs.iter().map(|j| j.name.chars().count()).max().unwrap_or(0).min(NAME_MAX);
         let agent_w = self.jobs.iter().map(|j| j.agent.chars().count()).max().unwrap_or(0).min(AGENT_MAX);
         let rows = self
@@ -626,7 +635,7 @@ impl JobsPanel {
             Some(j) => (Some(format!("{} · {}", j.name, j.agent)), detail(j, &self.cost_cell(j), width, now)),
             None => (None, Vec::new()),
         };
-        Frame {
+        Screen {
             title: format!("jobs · {run} running · {done} finished"),
             rows,
             at: self.at,
@@ -641,7 +650,7 @@ impl JobsPanel {
         }
     }
 
-    fn sessions_frame(&self, width: usize, now: SystemTime) -> Frame {
+    fn sessions_frame(&self, width: usize, now: SystemTime) -> Screen {
         let label_w = self.rows.iter().map(|r| r.depth * 2 + r.label().chars().count()).max().unwrap_or(0).min(26);
         let rows = self
             .rows
@@ -679,7 +688,7 @@ impl JobsPanel {
                 None,
             ),
         };
-        Frame {
+        Screen {
             title: format!("sessions · {} live", self.rows.len()),
             rows,
             at: self.s_at,
@@ -693,9 +702,6 @@ impl JobsPanel {
 
     /// The transcript of the open job: a titled rule, the window of lines, a closing rule and keys.
     fn render_view(&mut self, width: usize, max_rows: usize, now: SystemTime) -> (Vec<Line>, (usize, usize)) {
-        let header = usize::from(max_rows >= 3);
-        let footer = if max_rows >= 5 { 2 } else { 0 };
-        let h = max_rows.saturating_sub(header + footer).max(1);
         let job = self
             .view
             .as_ref()
@@ -704,12 +710,8 @@ impl JobsPanel {
             .cloned();
         let output = self.view.as_ref().and_then(|v| self.outputs.get(&v.name)).map(String::as_str);
         let Some(v) = self.view.as_mut() else { return (Vec::new(), (0, 0)) };
-        v.build(width, output);
-        v.body_h = h;
-        v.max_top = v.lines.len().saturating_sub(h);
-        let top = if v.follow { v.max_top } else { v.top.min(v.max_top) };
-        let mut out: Vec<Line> = Vec::new();
-        if header == 1 {
+        let mut frame = Frame::default();
+        if max_rows >= 3 {
             let mut title = v.label.clone().unwrap_or_else(|| v.name.clone());
             if let Some(j) = &job {
                 title.push_str(&format!(" · {} · {} {}", j.agent, mark(&j.state).0, clock(elapsed(j, now))));
@@ -721,28 +723,32 @@ impl JobsPanel {
                 title.push_str(&format!(" · {} tok", short_count(t.tokens())));
             }
             title.push_str(if v.follow { " · following" } else { " · paused" });
-            out.push(rule(Some(&title), width));
+            frame.header.push(rule(Some(&title), width));
         }
-        let end = (top + h).min(v.lines.len());
-        out.extend(v.lines[top..end].iter().cloned());
-        out.extend(std::iter::repeat_n(Vec::new(), h - (end - top)));
-        if footer == 2 {
-            out.push(rule(None, width));
+        if max_rows >= 5 {
             let keys = if v.label.is_some() {
                 "j/k scroll · PgUp/PgDn · g/G top/bottom · f follow · q back"
             } else {
                 "j/k scroll · PgUp/PgDn · g/G top/bottom · f follow · x kill · q back"
             };
-            out.push(line::styled(keys, |_| dim()));
+            frame.footer = vec![rule(None, width), line::styled(keys, |_| dim())];
         }
-        let out: Vec<Line> = out.iter().map(|l| line::truncate(l, width)).collect();
-        (out, (header, 0))
+        let h = frame.body_rows(max_rows, 1);
+        v.build(width, output);
+        v.body_h = h;
+        v.max_top = v.lines.len().saturating_sub(h);
+        let top = if v.follow { v.max_top } else { v.top.min(v.max_top) };
+        let end = (top + h).min(v.lines.len());
+        let mut body: Vec<Line> = v.lines[top..end].to_vec();
+        body.resize(h, Vec::new());
+        let cursor = (frame.header.len(), 0);
+        (frame.finish(body, width), cursor)
     }
 }
 
 /// One tab's screen: a title, the list rows (all of them) and which is selected, the selected row's
 /// details, and the key line. `draw` fits it to the rows there are.
-struct Frame {
+struct Screen {
     title: String,
     rows: Vec<Line>,
     at: usize,
@@ -754,19 +760,25 @@ struct Frame {
     footer_cursor: Option<usize>,
 }
 
-/// Lays a frame out in `max_rows`: a titled rule, a window of the list, the details between rules and
+/// Lays a screen out in `max_rows`: a titled rule, a window of the list, the details between rules and
 /// the key line; with too few rows only the list. `top` and `page` are the tab's scroll state.
-fn draw(f: Frame, top: &mut usize, page: &mut usize, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
+fn draw(f: Screen, top: &mut usize, page: &mut usize, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
     let n = f.rows.len();
-    let header = usize::from(max_rows >= 2);
     let split = max_rows >= CHROME + 1 + DETAIL_MIN;
-    let (list_h, detail_h, tail) = if split {
-        let body = max_rows - CHROME;
-        let list_h = n.clamp(1, LIST_MAX).min(body - DETAIL_MIN);
-        (list_h, (body - list_h).min(DETAIL_MAX), CHROME - 1)
+    let mut frame = Frame::default();
+    if max_rows >= 2 {
+        frame.header.push(rule(Some(&f.title), width));
+    }
+    if split || max_rows >= 3 {
+        frame.footer.push(f.footer);
+    }
+    // The detail block's two rules are part of the body.
+    let body = frame.body_rows(max_rows, 1);
+    let (list_h, detail_h) = if split {
+        let list_h = n.clamp(1, LIST_MAX).min(body - 2 - DETAIL_MIN);
+        (list_h, (body - 2 - list_h).min(DETAIL_MAX))
     } else {
-        let footer = usize::from(max_rows >= 3);
-        (max_rows.saturating_sub(header + footer).max(1), 0, footer)
+        (body, 0)
     };
     *page = list_h;
     if f.at < *top {
@@ -778,9 +790,6 @@ fn draw(f: Frame, top: &mut usize, page: &mut usize, width: usize, max_rows: usi
     *top = (*top).min(n.saturating_sub(list_h));
 
     let mut out: Vec<Line> = Vec::new();
-    if header == 1 {
-        out.push(rule(Some(&f.title), width));
-    }
     if n == 0 {
         out.push(vec![span(f.empty, dim())]);
     }
@@ -797,16 +806,13 @@ fn draw(f: Frame, top: &mut usize, page: &mut usize, width: usize, max_rows: usi
         out.extend(d);
         out.push(rule(None, width));
     }
+    let header = frame.header.len();
     let mut cursor = (header + f.at.saturating_sub(*top).min(list_h.saturating_sub(1)), 0);
-    if tail >= 1 {
-        if let Some(col) = f.footer_cursor {
-            cursor = (out.len(), col.min(width.saturating_sub(1)));
-        }
-        out.push(f.footer);
+    if let (Some(col), false) = (f.footer_cursor, frame.footer.is_empty()) {
+        cursor = (header + out.len(), col.min(width.saturating_sub(1)));
     }
-    out.truncate(max_rows);
-    let out: Vec<Line> = out.iter().map(|l| line::truncate(l, width)).collect();
-    (out, cursor)
+    out.truncate(max_rows.saturating_sub(header + frame.footer.len()));
+    (frame.finish(out, width), cursor)
 }
 
 fn mark(state: &SubagentState) -> (char, Role) {
@@ -1330,9 +1336,18 @@ mod tests {
         }
     }
 
+    /// A source with no live sessions, so no test reads `$MU_HOME/run`.
+    struct NoRuns;
+
+    impl SessionSource for NoRuns {
+        fn live_sessions(&self) -> Vec<LiveSession> {
+            Vec::new()
+        }
+    }
+
     /// A panel on the Sessions tab with these sessions, not reading `$MU_HOME`.
     fn sessions_panel(lives: Vec<LiveSession>) -> JobsPanel {
-        let mut p = JobsPanel::new(vec![]);
+        let mut p = JobsPanel::new(vec![]).with_source(Box::new(NoRuns));
         p.tab = Tab::Sessions;
         p.set_sessions(lives);
         p
@@ -1340,12 +1355,11 @@ mod tests {
 
     #[test]
     fn tab_switches_between_jobs_and_sessions() {
-        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]);
+        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]).with_source(Box::new(NoRuns));
         p.polled_totals = Some(Instant::now());
         assert!(text(&mut p, 80, 14)[0].starts_with("── jobs ·"));
         p.on_key(key(KeyCode::Tab));
         assert_eq!(p.tab, Tab::Sessions);
-        // Not reading the real run directory: the tab switch did that once; what it found is replaced.
         p.set_sessions(vec![lived(&session_path(), "print", "2026-01-01T00:00:00Z")]);
         let rows = text(&mut p, 80, 14);
         assert!(rows[0].starts_with("── sessions · 1 live"), "{rows:?}");

@@ -1,36 +1,15 @@
 //! Filterable list overlay drawn in the composer slot.
 
+mod layout;
+mod preview;
+
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::text::accent;
-use crate::text::line::{self, Line, bold, dim, span};
-use crate::text::markdown::{chars_to_line, chs, wrap_chs};
-use crate::theme::{self, Role};
 use crate::widgets::editor::{self, Editor};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::ContentStyle;
 use mu_base::events::PreviewKind;
-
-/// Rows the title may take; a longer one ends in `…`.
-const TITLE_MAX_LINES: usize = 6;
-
-/// Lines a description shows under its option, when the option is highlighted or the list fits.
-const DESC_MAX_LINES: usize = 6;
-
-/// Rows the context above the title may take at once.
-const CONTEXT_MAX_LINES: usize = 8;
-
-/// Columns a description or preview is indented under its option.
-const INDENT: usize = 4;
-
-/// Rows a highlighted option's preview may take, the truncation marker included.
-const PREVIEW_MAX_LINES: usize = 16;
-/// Rows a highlighted item's detail text may take under the list.
-const DETAIL_MAX_LINES: usize = 6;
-
-const TEXT_HINT: &str = "Enter submit · Shift/Alt/Ctrl-Enter newline · Esc to options";
 
 pub struct Item {
     pub label: String,
@@ -58,6 +37,17 @@ enum Row {
     Skip,
 }
 
+/// What the keys go to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    /// The filter and the list.
+    List,
+    /// The free-text answer.
+    Text,
+    /// The note on the highlighted row.
+    Note,
+}
+
 pub struct Select {
     title: String,
     /// Paragraph above the title: what the question is about.
@@ -75,8 +65,7 @@ pub struct Select {
     sel: usize,
     /// Original indices toggled (multi) or preselected.
     checked: BTreeSet<usize>,
-    /// True while typing into the free-text row.
-    editing: bool,
+    mode: Mode,
     /// The free-text answer. Kept after Esc, so the row shows it and Enter edits it again.
     text: Editor,
     /// Lowercased `label detail` of each item, built once.
@@ -85,8 +74,6 @@ pub struct Select {
     rows_cache: RefCell<Option<(String, Rc<Vec<Row>>)>>,
     /// Note key enabled: Right (with the filter empty), or Tab in single-select, edits a note.
     notes: bool,
-    /// True while typing the note.
-    noting: bool,
     note: Editor,
     /// The note before the edit, restored by Esc.
     note_before: String,
@@ -123,10 +110,9 @@ impl Select {
             filter: Editor::default(),
             sel: 0,
             checked: BTreeSet::new(),
-            editing: false,
+            mode: Mode::List,
             text: Editor::default(),
             notes: false,
-            noting: false,
             note: Editor::default(),
             note_before: String::new(),
             quick: Vec::new(),
@@ -208,7 +194,7 @@ impl Select {
         if self.free.is_some() {
             self.text = Editor::from_text(s);
             self.sel = self.items.len();
-            self.editing = true;
+            self.mode = Mode::Text;
         }
         self
     }
@@ -274,12 +260,12 @@ impl Select {
 
     /// Whether the free-text row is open for typing.
     pub fn is_editing(&self) -> bool {
-        self.editing
+        self.mode == Mode::Text
     }
 
     /// The note or the free-text row takes keystrokes, so they are not shortcuts.
     pub fn is_typing(&self) -> bool {
-        self.editing || self.noting
+        self.mode != Mode::List
     }
 
     /// Moves the highlight to item `idx`; dialogs that use it keep the filter empty.
@@ -307,11 +293,10 @@ impl Select {
                 _ => {}
             }
         }
-        if self.editing {
-            return self.text_key(key);
-        }
-        if self.noting {
-            return self.note_key(key);
+        match self.mode {
+            Mode::Text => return self.text_key(key),
+            Mode::Note => return self.note_key(key),
+            Mode::List => {}
         }
         let rows = self.rows();
         let n = rows.len();
@@ -373,7 +358,7 @@ impl Select {
     fn text_key(&mut self, key: KeyEvent) -> SelectResult {
         match key.code {
             KeyCode::Esc => {
-                self.editing = false;
+                self.mode = Mode::List;
                 SelectResult::Pending
             }
             KeyCode::Enter if !editor::adds_newline(key.modifiers) => {
@@ -397,12 +382,12 @@ impl Select {
     fn note_key(&mut self, key: KeyEvent) -> SelectResult {
         match key.code {
             KeyCode::Esc => {
-                self.noting = false;
+                self.mode = Mode::List;
                 self.note = Editor::from_text(&self.note_before);
                 SelectResult::Pending
             }
             KeyCode::Enter if !editor::adds_newline(key.modifiers) => {
-                self.noting = false;
+                self.mode = Mode::List;
                 let rows = self.rows();
                 self.choose(&rows)
             }
@@ -415,7 +400,7 @@ impl Select {
 
     fn start_note(&mut self, rows: &[Row]) -> SelectResult {
         if matches!(rows.get(self.sel), Some(Row::Item(_))) {
-            self.noting = true;
+            self.mode = Mode::Note;
             self.note_before = self.note.text();
         }
         SelectResult::Pending
@@ -429,187 +414,14 @@ impl Select {
     /// Pasted text. The free-text answer and the note keep line breaks; the filter takes spaces.
     pub fn on_paste(&mut self, s: &str) {
         let text = editor::normalize_paste(s);
-        if self.editing {
-            self.text.insert_str(&text);
-        } else if self.noting {
-            self.note.insert_str(&text);
-        } else {
-            self.filter.insert_str(&text.replace('\n', " "));
-            self.sel = 0;
-        }
-    }
-
-    /// Lines (title, input, rows) fitted to `max_rows`, and the cursor (row, col).
-    pub fn render(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize)) {
-        let (lines, cursor, _) = self.render_inner(width, max_rows);
-        (lines, cursor)
-    }
-
-    pub fn render_with_hint(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize), Option<Line>) {
-        let (mut lines, cursor, has_hint) = self.render_inner(width, max_rows);
-        let hint = if has_hint { lines.pop() } else { None };
-        (lines, cursor, hint)
-    }
-
-    fn render_inner(&self, width: usize, max_rows: usize) -> (Vec<Line>, (usize, usize), bool) {
-        let width = width.max(1);
-        if max_rows == 0 {
-            self.context_scroll.set(0);
-            self.context_scroll_max.set(0);
-            return (Vec::new(), (0, 0), false);
-        }
-        let mut out = self.title_rows(width, max_rows);
-        let rows = self.rows();
-        let sel = self.sel.min(rows.len().saturating_sub(1));
-        let room = max_rows - out.len();
-        let mut cursor;
-        let has_hint;
-        if self.editing {
-            let hint = room >= 2;
-            has_hint = hint;
-            let (lines, cur) = self.text.view("› ", width, room - usize::from(hint));
-            cursor = (out.len() + cur.0, cur.1);
-            out.extend(lines);
-            if hint {
-                out.push(line::styled(TEXT_HINT, |_| dim()));
-            }
-        } else if self.noting {
-            let hint = room >= 3;
-            has_hint = hint;
-            let body = room - usize::from(hint);
-            let hl = usize::from(body >= 2 && rows.get(sel).is_some());
-            if let (1, Some(&row)) = (hl, rows.get(sel)) {
-                out.push(self.row_line(row, true, width));
-            }
-            let (lines, cur) = self.note.view("note › ", width, body - hl);
-            cursor = (out.len() + cur.0, cur.1);
-            out.extend(lines);
-            if hint {
-                out.push(line::styled(TEXT_HINT, |_| dim()));
-            }
-        } else {
-            let (line, col) = self.filter.view_line("› ", width);
-            cursor = (out.len(), col);
-            out.push(line);
-            // The list budget is the room after the filter line; the hint takes the last row only
-            // when one list row is left under it.
-            let list_room = room - 1;
-            let hint = self.hint.as_ref().filter(|_| list_room >= 2);
-            has_hint = hint.is_some();
-            let avail = list_room - usize::from(hint.is_some());
-            let detail = self.detail_rows(rows.get(sel).copied(), width, avail.saturating_sub(3));
-            let avail = avail - detail.len();
-            if rows.is_empty() {
-                if avail > 0 {
-                    out.push(line::styled("  no matches", |_| dim()));
-                }
-            } else if avail > 0 {
-                if self.described {
-                    out.extend(self.described_list(&rows, sel, width, avail));
-                } else {
-                    let n = rows.len();
-                    let (a, b, ind) = window(n, sel, avail);
-                    if ind && a > 0 {
-                        out.push(line::styled(format!("  … {a} more"), |_| dim()));
-                    }
-                    for (pos, &row) in rows.iter().enumerate().take(b).skip(a) {
-                        out.push(self.row_line(row, pos == sel, width));
-                    }
-                    if ind && b < n {
-                        out.push(line::styled(format!("  … {} more", n - b), |_| dim()));
-                    }
-                }
-            }
-            out.extend(detail);
-            if let Some(h) = hint {
-                out.push(line::styled(format!("  {h}"), |_| dim()));
+        match self.mode {
+            Mode::Text => self.text.insert_str(&text),
+            Mode::Note => self.note.insert_str(&text),
+            Mode::List => {
+                self.filter.insert_str(&text.replace('\n', " "));
+                self.sel = 0;
             }
         }
-        cursor.1 = cursor.1.min(width - 1);
-        let out = out.iter().map(|l| line::truncate(l, width)).collect();
-        (out, cursor, has_hint)
-    }
-
-    /// The highlighted item's detail text, wrapped to `width` and cut to `cap` rows (at most
-    /// `DETAIL_MAX_LINES`).
-    fn detail_rows(&self, row: Option<Row>, width: usize, cap: usize) -> Vec<Line> {
-        let Some(Row::Item(i)) = row else { return Vec::new() };
-        let Some(Some(text)) = self.details.get(i) else { return Vec::new() };
-        let cap = cap.min(DETAIL_MAX_LINES);
-        if cap == 0 {
-            return Vec::new();
-        }
-        let mut rows: Vec<Line> =
-            wrap_chs(&chs(text, dim()), width.saturating_sub(2)).iter().map(|r| chars_to_line(r)).collect();
-        if rows.len() > cap {
-            rows.truncate(cap);
-            if let Some(last) = rows.last_mut() {
-                last.push(span("…", dim()));
-            }
-        }
-        rows.into_iter()
-            .map(|mut l| {
-                l.insert(0, span("  ", dim()));
-                l
-            })
-            .collect()
-    }
-
-    /// The title wrapped to `width`, honouring its newlines. It takes at most half of `max_rows`
-    /// (and `TITLE_MAX_LINES`), and always leaves two rows for the input and the highlighted row. A
-    /// cut title ends in `…`.
-    fn title_rows(&self, width: usize, max_rows: usize) -> Vec<Line> {
-        let cap = (max_rows / 2).max(1).min(max_rows.saturating_sub(2)).min(TITLE_MAX_LINES);
-        if cap == 0 {
-            self.context_scroll.set(0);
-            self.context_scroll_max.set(0);
-            return Vec::new();
-        }
-        let title_style = if self.described { bold() } else { accent() };
-        let mut rows: Vec<Line> =
-            wrap_chs(&chs(&self.title, title_style), width).iter().map(|r| chars_to_line(r)).collect();
-        if rows.is_empty() {
-            rows.push(Vec::new());
-        }
-        if rows.len() > cap {
-            rows.truncate(cap);
-            if let Some(last) = rows.last_mut() {
-                let mut row = last.clone();
-                row.push(span("…", accent()));
-                *last = line::truncate(&row, width);
-            }
-        }
-        if self.context.is_empty() {
-            return rows;
-        }
-        let room = max_rows.saturating_sub(rows.len() + 2);
-        let ctx_cap = room.div_ceil(2).min(CONTEXT_MAX_LINES);
-        if ctx_cap == 0 {
-            self.context_scroll.set(0);
-            self.context_scroll_max.set(0);
-            if let Some(first) = rows.first_mut() {
-                first.insert(0, span("↕ ", dim()));
-            }
-            return rows;
-        }
-        let ctx: Vec<Line> = wrap_chs(&chs(&self.context, ContentStyle::default()), width.saturating_sub(2).max(1))
-            .iter()
-            .map(|r| chars_to_line(r))
-            .collect();
-        let max_scroll = ctx.len().saturating_sub(ctx_cap);
-        self.context_scroll_max.set(max_scroll);
-        let start = self.context_scroll.get().min(max_scroll);
-        self.context_scroll.set(start);
-        let end = (start + ctx_cap).min(ctx.len());
-        let mut visible = ctx[start..end].to_vec();
-        if (start > 0 || end < ctx.len())
-            && let Some(last) = visible.last_mut()
-        {
-            *last = line::truncate(last, width.saturating_sub(2));
-            last.push(span(" ↕", dim()));
-        }
-        visible.extend(rows);
-        visible
     }
 
     /// The rows for the current filter, recomputed only when the filter changed.
@@ -635,97 +447,6 @@ impl Select {
         rows
     }
 
-    /// The described list: each option's label, its description under it, then its note (the
-    /// highlighted one) and preview box. Heights are planned to fit `avail` rows. The highlighted
-    /// option keeps its label, full description and as much preview as fits; the others' previews
-    /// and descriptions give way first (shorter, then one line, then none).
-    fn described_list(&self, rows: &[Row], sel: usize, width: usize, avail: usize) -> Vec<Line> {
-        let n = rows.len();
-        let detail = |pos: usize| match rows[pos] {
-            Row::Item(i) => self.items[i].detail.as_str(),
-            Row::Free | Row::Skip => "",
-        };
-        let note = (!self.note.is_blank()).then(|| self.note.text().replace('\n', " "));
-        let note_h = usize::from(note.is_some() && avail >= 2);
-        let hl_cap = DESC_MAX_LINES.min(avail.saturating_sub(1 + note_h));
-        let full: Vec<Vec<Line>> =
-            (0..n).map(|pos| desc_rows(detail(pos), width, if pos == sel { hl_cap } else { DESC_MAX_LINES })).collect();
-        let short: Vec<Vec<Line>> =
-            (0..n).map(|pos| if pos == sel { full[pos].clone() } else { desc_rows(detail(pos), width, 1) }).collect();
-        let hl_base = 1 + full.get(sel).map_or(0, Vec::len) + note_h;
-        let hl_box_cap = (PREVIEW_MAX_LINES + 2).min(avail.saturating_sub(hl_base));
-        let boxes = |other_cap: usize| -> Vec<Vec<Line>> {
-            (0..n)
-                .map(|pos| match rows[pos] {
-                    Row::Item(i) => match self.previews.get(i) {
-                        Some(Some(text)) => preview_box(
-                            text,
-                            self.kinds.get(i).copied().flatten(),
-                            width.saturating_sub(INDENT),
-                            if pos == sel { hl_box_cap } else { other_cap },
-                            pos == sel,
-                        ),
-                        _ => Vec::new(),
-                    },
-                    Row::Free | Row::Skip => Vec::new(),
-                })
-                .collect()
-        };
-        let desc_of = |mode: usize, pos: usize| -> usize {
-            match mode {
-                _ if pos == sel => full[pos].len(),
-                0 => full[pos].len(),
-                1 => short[pos].len(),
-                _ => 0,
-            }
-        };
-        let heights = |mode: usize, bx: &[Vec<Line>]| -> Vec<usize> {
-            (0..n)
-                .map(|pos| {
-                    1 + desc_of(mode, pos) + if pos == sel { note_h } else { 0 } + bx.get(pos).map_or(0, Vec::len)
-                })
-                .collect()
-        };
-        // (description mode, rows the other options' preview boxes may take); the last always applies.
-        let plans = [(0, PREVIEW_MAX_LINES + 2), (0, 8), (1, 8), (1, 4), (2, 4), (2, 0)];
-        let (mode, bx, h) = plans
-            .iter()
-            .enumerate()
-            .find_map(|(k, &(mode, cap))| {
-                let bx = boxes(cap);
-                let h = heights(mode, &bx);
-                (h.iter().sum::<usize>() <= avail || k + 1 == plans.len()).then_some((mode, bx, h))
-            })
-            .unwrap_or_else(|| (2, Vec::new(), heights(2, &[])));
-        let (a, b, ind) = window_by(&h, sel, avail);
-        let mut out: Vec<Line> = Vec::new();
-        if ind && a > 0 {
-            out.push(line::styled(format!("  … {a} more"), |_| dim()));
-        }
-        for pos in a..b {
-            out.push(self.row_line(rows[pos], pos == sel, width));
-            let d: &[Line] = match mode {
-                _ if pos == sel => &full[pos],
-                0 => &full[pos],
-                1 => &short[pos],
-                _ => &[],
-            };
-            out.extend(d.iter().cloned());
-            if pos == sel
-                && let Some(text) = &note
-            {
-                out.push(line::styled(format!("{}note: {text}", " ".repeat(INDENT)), |_| dim()));
-            }
-            if let Some(block) = bx.get(pos) {
-                out.extend(block.iter().cloned());
-            }
-        }
-        if ind && b < n {
-            out.push(line::styled(format!("  … {} more", n - b), |_| dim()));
-        }
-        out
-    }
-
     fn step(&mut self, delta: isize, n: usize) {
         if n > 0 {
             self.sel = (self.sel as isize + delta).rem_euclid(n as isize) as usize;
@@ -744,7 +465,7 @@ impl Select {
         match rows.get(self.sel) {
             Some(Row::Item(i)) => self.finish(vec![*i]),
             Some(Row::Free) => {
-                self.editing = true;
+                self.mode = Mode::Text;
                 SelectResult::Pending
             }
             Some(Row::Skip) | None => SelectResult::Pending,
@@ -756,230 +477,6 @@ impl Select {
         let note = self.note.text().trim().to_string();
         if self.notes && !note.is_empty() { SelectResult::Noted(picks, note) } else { SelectResult::Chosen(picks) }
     }
-
-    /// The free row's label: its own label, or the answer typed so far.
-    fn free_label(&self) -> String {
-        if self.text.is_blank() { self.free.clone().unwrap_or_default() } else { self.text.text().replace('\n', " ") }
-    }
-
-    fn row_line(&self, row: Row, selected: bool, width: usize) -> Line {
-        let emphasis = if selected { bold() } else { ContentStyle::default() };
-        let marker = if selected { theme::get().fg(Role::Accent) } else { ContentStyle::default() };
-        let mut l: Line = vec![span(if selected { "❯ " } else { "  " }, marker)];
-        match row {
-            Row::Item(i) => {
-                let it = &self.items[i];
-                if self.multi {
-                    let on = self.checked.contains(&i);
-                    l.push(span(if on { "[x] " } else { "[ ] " }, ContentStyle::default()));
-                }
-                l.push(span(it.label.clone(), emphasis));
-                if !it.detail.is_empty() && !self.described {
-                    l.push(span("  ", ContentStyle::default()));
-                    l.push(span(it.detail.clone(), dim()));
-                }
-            }
-            Row::Free => {
-                if self.multi {
-                    l.push(span("    ", ContentStyle::default()));
-                }
-                l.push(span(self.free_label(), emphasis));
-            }
-            Row::Skip => {
-                if self.multi {
-                    l.push(span("    ", ContentStyle::default()));
-                }
-                l.push(span(self.skip.clone().unwrap_or_default(), if selected { emphasis } else { dim() }));
-            }
-        }
-        if selected {
-            l = line::fill(&l, width, theme::get().color(Role::Selected));
-        }
-        l
-    }
-}
-
-/// Item range `[a, b)` around `sel` that fits `avail` rows including "… N more" indicators.
-/// The flag is false when indicators are omitted (only the selected row fits).
-fn window(n: usize, sel: usize, avail: usize) -> (usize, usize, bool) {
-    window_by(&vec![1; n], sel, avail)
-}
-
-/// `window` for rows of differing heights `h`: the range around `sel` whose heights and indicators
-/// fit `avail`. The selected row is always in it, so `h[sel]` must fit on its own.
-fn window_by(h: &[usize], sel: usize, avail: usize) -> (usize, usize, bool) {
-    let n = h.len();
-    if h.iter().sum::<usize>() <= avail {
-        return (0, n, false);
-    }
-    let cost = |a: usize, b: usize| h[a..b].iter().sum::<usize>() + (a > 0) as usize + (b < n) as usize;
-    if cost(sel, sel + 1) > avail {
-        return (sel, sel + 1, false);
-    }
-    let (mut a, mut b) = (sel, sel + 1);
-    loop {
-        let mut grew = false;
-        if b < n && cost(a, b + 1) <= avail {
-            b += 1;
-            grew = true;
-        }
-        if a > 0 && cost(a - 1, b) <= avail {
-            a -= 1;
-            grew = true;
-        }
-        if !grew {
-            break;
-        }
-    }
-    (a, b, true)
-}
-
-/// A description as rows under an option, wrapped to the width past the indent, at most `max`
-/// rows. A cut row ends in `…` within the width.
-fn desc_rows(detail: &str, width: usize, max: usize) -> Vec<Line> {
-    if detail.trim().is_empty() || max == 0 {
-        return Vec::new();
-    }
-    let tw = width.saturating_sub(INDENT).max(1);
-    let rows = wrap_chs(&chs(detail, dim()), tw);
-    let mut out: Vec<Line> = rows.iter().map(|r| chars_to_line(r)).collect();
-    if out.len() > max {
-        out.truncate(max);
-        if let Some(last) = out.last_mut() {
-            // `truncate` supplies its own `…` when it cuts, so append it first and cut to the width.
-            let mut cut = last.clone();
-            cut.push(span("…", dim()));
-            *last = line::truncate(&cut, tw);
-        }
-    }
-    out.into_iter().map(|l| indented(l, INDENT)).collect()
-}
-
-/// `l` after `by` spaces.
-fn indented(l: Line, by: usize) -> Line {
-    let mut row = vec![span(" ".repeat(by), ContentStyle::default())];
-    row.extend(l);
-    row
-}
-
-/// What a preview shows: the declared kind, else a guess from the text.
-fn preview_kind(text: &str, hint: Option<PreviewKind>) -> PreviewKind {
-    if let Some(k) = hint {
-        return k;
-    }
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let n = lines.len();
-    let count = |p: &dyn Fn(&str) -> bool| lines.iter().filter(|l| p(l)).count();
-    let add = count(&|l| l.starts_with('+'));
-    let del = count(&|l| l.starts_with('-'));
-    if lines.iter().any(|l| l.starts_with("@@") || l.starts_with("diff --git"))
-        || (add > 0 && del > 0 && (add + del) * 2 >= n)
-    {
-        return PreviewKind::Diff;
-    }
-    if text.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c)) || count(&|l| l.trim_start().starts_with('|')) >= 2
-    {
-        return PreviewKind::Layout;
-    }
-    const STARTS: [&str; 12] =
-        ["fn ", "def ", "let ", "const ", "import ", "use ", "class ", "if ", "for ", "return ", "//", "#"];
-    let code = count(&|l| {
-        let t = l.trim();
-        t.ends_with([';', '{', '}', '(', ')', ',']) || STARTS.iter().any(|s| t.starts_with(s))
-    });
-    if n > 0 && code * 2 >= n { PreviewKind::Code } else { PreviewKind::Text }
-}
-
-fn preview_row_style(kind: PreviewKind, row: &str) -> ContentStyle {
-    let t = theme::get();
-    match kind {
-        PreviewKind::Diff if row.starts_with('+') => t.fg(Role::Ok),
-        PreviewKind::Diff if row.starts_with('-') => t.fg(Role::Err),
-        PreviewKind::Diff if row.starts_with("@@") => t.fg(Role::Accent),
-        PreviewKind::Text => t.fg(Role::Muted),
-        _ => ContentStyle::default(),
-    }
-}
-
-/// The tree-sitter language of a code preview, guessed from its text; only languages mu compiles in.
-fn guess_lang(code: &str) -> Option<&'static str> {
-    let has = |s: &str| code.contains(s);
-    let starts = |ps: &[&str]| code.lines().any(|l| ps.iter().any(|p| l.trim_start().starts_with(p)));
-    let t = code.trim_start();
-    if (t.starts_with('{') || t.starts_with('[')) && has("\":") {
-        Some("json")
-    } else if starts(&["fn ", "pub fn ", "let mut ", "impl ", "struct ", "pub struct ", "enum ", "use std"])
-        || has("println!")
-    {
-        Some("rust")
-    } else if starts(&["def ", "import ", "elif ", "print("]) || (starts(&["from "]) && has(" import ")) {
-        Some("python")
-    } else if starts(&["function ", "const ", "let "]) || has("=>") || has("console.") {
-        Some("javascript")
-    } else if t.starts_with("#!") || starts(&["$ ", "cargo ", "git "]) {
-        Some("bash")
-    } else {
-        None
-    }
-}
-
-/// A preview in a labelled box `width` columns wide and at most `cap` rows tall, indented under its
-/// option. Past the cap the last body row says how many lines were cut. Empty when it can't fit.
-fn preview_box(text: &str, hint: Option<PreviewKind>, width: usize, cap: usize, highlighted: bool) -> Vec<Line> {
-    if cap < 3 || width < 6 {
-        return Vec::new();
-    }
-    let kind = preview_kind(text, hint);
-    let (role, label) = match kind {
-        PreviewKind::Code => (Role::SynFunction, "code"),
-        PreviewKind::Diff => (Role::Warn, "diff"),
-        PreviewKind::Layout => (Role::Tool, "layout"),
-        PreviewKind::Text => (Role::Muted, "text"),
-    };
-    let mut border = theme::get().fg(role);
-    if highlighted {
-        border.attributes.set(crossterm::style::Attribute::Bold);
-    }
-    let inner = width - 4;
-    let clean = mu_base::text::sanitize(text.trim_end_matches('\n'));
-    let src: Vec<&str> = clean.split('\n').collect();
-    let max = cap - 2;
-    let keep = if src.len() > max { max - 1 } else { src.len() };
-    let hl = (kind == PreviewKind::Code)
-        .then(|| guess_lang(&clean))
-        .flatten()
-        .and_then(|lang| crate::text::highlight::highlight(&clean, lang))
-        .filter(|h| h.len() == src.len());
-    let mut body: Vec<Line> = src[..keep]
-        .iter()
-        .enumerate()
-        .map(|(i, r)| match &hl {
-            Some(h) => line::truncate(&h[i], inner),
-            None => vec![span(mu_base::text::truncate_text(r, inner), preview_row_style(kind, r))],
-        })
-        .collect();
-    if keep < src.len() {
-        body.push(line::styled(
-            mu_base::text::truncate_text(&format!("… {} more lines", src.len() - keep), inner),
-            |_| dim(),
-        ));
-    }
-    let title = format!(" {label} ");
-    let top = if title.len() + 3 <= width {
-        format!("┌─{title}{}┐", "─".repeat(width - 3 - title.len()))
-    } else {
-        format!("┌{}┐", "─".repeat(width - 2))
-    };
-    let mut out = vec![indented(vec![span(top, border)], INDENT)];
-    for l in body {
-        let pad = inner.saturating_sub(line::line_width(&l));
-        let mut row = vec![span("│ ", border)];
-        row.extend(l);
-        row.push(span(format!("{} │", " ".repeat(pad)), border));
-        out.push(indented(row, INDENT));
-    }
-    out.push(indented(vec![span(format!("└{}┘", "─".repeat(width - 2)), border)], INDENT));
-    out
 }
 
 pub fn clean_paste(s: &str) -> String {
@@ -994,7 +491,11 @@ pub fn clean_paste(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::layout::{TITLE_MAX_LINES, window};
+    use super::preview::{PREVIEW_MAX_LINES, preview_kind};
     use super::*;
+    use crate::text::line::{self, Line};
+    use crate::theme::{self, Role};
     use mu_testutil::key;
 
     #[test]
@@ -1066,7 +567,7 @@ mod tests {
         }
         assert_eq!(text.text.text(), "answer");
         assert_eq!(note.note.text(), "note");
-        assert!(text.editing && note.noting);
+        assert!(text.mode == Mode::Text && note.mode == Mode::Note);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::panels::jobs_panel::{JobsPanel, JobsResult};
 use crate::panels::model_roles::{RoleEditor, RoleEditorAction};
 use crate::panels::plan_review::{PlanReview, ReviewResult};
 use crate::panels::reply::{ReplyPicker, ReplyResult};
+use crate::widgets::frame::free_rows;
 use crate::widgets::picker::{HasSelect, Pick, Picker};
 use crate::widgets::select::{Item, Select, SelectResult};
 use mu_base::events::{Answer, AskQuestion, PlanDecision};
@@ -901,20 +902,11 @@ impl Overlay {
     /// rows the transcript and status already take; the plan review fits itself to what is left.
     pub fn render(&mut self, w: usize, rows: usize, used: usize) -> (Vec<crate::text::line::Line>, (usize, usize)) {
         let (body, cur) = match self {
-            Overlay::Review { review, .. } => {
-                let avail = rows.saturating_sub(1).saturating_sub(used);
-                review.render(w, avail.saturating_sub(1))
-            }
-            Overlay::Reply { st } => {
-                let avail = rows.saturating_sub(1).saturating_sub(used);
-                st.render(w, avail.saturating_sub(1))
-            }
-            Overlay::Jobs { st } => {
-                let avail = rows.saturating_sub(1).saturating_sub(used);
-                st.render(w, avail.saturating_sub(1), std::time::SystemTime::now())
-            }
+            Overlay::Review { review, .. } => review.render(w, free_rows(rows, used)),
+            Overlay::Reply { st } => st.render(w, free_rows(rows, used)),
+            Overlay::Jobs { st } => st.render(w, free_rows(rows, used), std::time::SystemTime::now()),
             Overlay::Ask(a) => {
-                let avail = rows.saturating_sub(1).saturating_sub(used).saturating_sub(1);
+                let avail = free_rows(rows, used);
                 if w < 4 || avail < 6 || a.review {
                     a.sel.render(w, avail)
                 } else {
@@ -940,7 +932,7 @@ impl Overlay {
                 }
             }
             other => match other.select() {
-                Some(sel) => sel.render(w, (rows / 2).max(6).saturating_sub(2)),
+                Some(sel) => sel.render(w, ((rows / 2).max(6).saturating_sub(2)).min(free_rows(rows, used)).max(3)),
                 None => (Vec::new(), (0, 0)),
             },
         };

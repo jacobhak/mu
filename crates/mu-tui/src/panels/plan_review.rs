@@ -3,6 +3,7 @@ use crate::text::accent;
 use crate::text::line::{self, Line, dim, span, styled};
 use crate::text::markdown;
 use crate::theme::{self, Role};
+use crate::widgets::frame::Frame;
 use crate::widgets::select::clean_paste;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::ContentStyle;
@@ -230,28 +231,35 @@ impl PlanReview {
             self.cache_w = width;
         }
         let n = self.lines.len();
-        let slider = self.slider();
-        let chrome = 1 + 1 + usize::from(self.note.is_some()) + if slider { 2 } else { 0 } + 4 + 1;
-        self.body_h = n.max(1).min(max_rows.saturating_sub(chrome).max(3));
+        let (footer, first_action, edit_cursor) = self.footer(width);
+        let mut frame = Frame { header: vec![Vec::new()], footer };
+        if let Some(note) = &self.note {
+            frame.header.push(styled(note.clone(), |_| dim()));
+        }
+        self.body_h = n.max(1).min(frame.body_rows(max_rows, 3));
         self.scroll = self.scroll.min(n.saturating_sub(self.body_h));
 
-        let mut out: Vec<Line> = Vec::new();
         let pos = if n == 0 {
             " · (empty plan)".to_string()
         } else {
             format!(" · {} · {}–{}/{}", self.uri, self.scroll + 1, (self.scroll + self.body_h).min(n), n)
         };
-        let mut title = vec![span(format!("Plan review: {}", self.title), accent())];
-        title.push(span(pos, dim()));
-        out.push(line::truncate(&title, width));
-        if let Some(n) = &self.note {
-            out.push(line::truncate(&styled(n.clone(), |_| dim()), width));
-        }
-        for l in self.lines.iter().skip(self.scroll).take(self.body_h) {
-            out.push(line::truncate(l, width));
-        }
-        out.push(styled("─".repeat(width), |_| dim()));
-        if slider {
+        frame.header[0] = vec![span(format!("Plan review: {}", self.title), accent()), span(pos, dim())];
+        let body: Vec<Line> = self.lines.iter().skip(self.scroll).take(self.body_h).cloned().collect();
+        let first_action = frame.header.len() + body.len() + first_action;
+        let cur = match edit_cursor.filter(|_| self.editing) {
+            Some((row, col)) => (frame.header.len() + body.len() + row, col),
+            None => (first_action + self.sel, 0),
+        };
+        (frame.finish(body, width), cur)
+    }
+
+    /// The rows under the plan: a rule, the model slider, the actions and the key line. Also the row
+    /// of the first action in them and, while feedback is typed, where the text cursor goes
+    /// (measured as the row is built, so it cannot drift from what is drawn).
+    fn footer(&self, width: usize) -> (Vec<Line>, usize, Option<(usize, usize)>) {
+        let mut out: Vec<Line> = vec![styled("─".repeat(width), |_| dim())];
+        if self.slider() {
             let accent = theme::get().fg(Role::Accent);
             let arrow = |on: bool| if on { accent } else { dim() };
             let last = self.tiers.len() - 1;
@@ -267,8 +275,6 @@ impl PlanReview {
             out.push(line::truncate(&styled(format!("  ↳ {}", self.tiers[self.tier].detail), |_| dim()), width));
         }
         let first_action = out.len();
-        // Where the text cursor goes: measured on the row as it is built, so it cannot drift from
-        // what is drawn.
         let mut edit_cursor: Option<(usize, usize)> = None;
         for (i, (label, off, act)) in self.actions.iter().enumerate() {
             let selected = i == self.sel;
@@ -306,19 +312,14 @@ impl PlanReview {
             vec!["↑↓ scroll", "PgUp/PgDn page", "g/G ends", "c copy", "Ctrl+G edit", "Tab actions", "Esc cancel"]
         } else {
             let mut h = vec!["↑↓ select", "Enter confirm"];
-            if slider {
+            if self.slider() {
                 h.push("←→ model");
             }
             h.extend(["c copy", "Ctrl+G edit", "Tab plan", "Esc cancel"]);
             h
         };
-        out.push(line::truncate(&styled(help.join(" · "), |_| dim()), width));
-
-        let cur = match edit_cursor.filter(|_| self.editing) {
-            Some(c) => c,
-            None => (first_action + self.sel, 0),
-        };
-        (out, cur)
+        out.push(styled(help.join(" · "), |_| dim()));
+        (out, first_action, edit_cursor)
     }
 }
 
@@ -339,6 +340,20 @@ mod tests {
             .iter()
             .map(|r| Tier { role: r.to_string(), detail: "d".into(), model: Some(format!("@{r}")) })
             .collect()
+    }
+
+    #[test]
+    fn the_review_fits_the_rows_it_was_given() {
+        let body = (0..80).map(|i| format!("line {i}\n")).collect::<String>();
+        for (tiers, note) in [(vec![], false), (tiers(), false), (tiers(), true)] {
+            let mut r = review(&body, None, tiers);
+            r.note = note.then(|| "a note".to_string());
+            for max in [14, 20, 40] {
+                let (rows, cur) = r.render(60, max);
+                assert!(rows.len() <= max, "{} rows in {max}", rows.len());
+                assert!(cur.0 < rows.len());
+            }
+        }
     }
 
     #[test]
