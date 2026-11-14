@@ -20,7 +20,13 @@
 //! enable_thinking = true
 //! ```
 
-use crate::auth::store::{self, Entry, EntryExists, Store};
+mod registry;
+mod workflow;
+
+pub use registry::Registry;
+pub use workflow::{KeyEdit, SaveError, save, update};
+
+use crate::auth::store::{self, Store};
 use crate::provider::providers::{PROVIDERS, SEARCH_KEYS};
 use crate::provider::wire::openai_completions::REASONING_FIELDS;
 use anyhow::{Context, Result, anyhow, bail};
@@ -29,7 +35,6 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 /// Defaults of a custom model whose limits nobody configured or discovered.
 pub const DEFAULT_CONTEXT: u32 = 32_768;
@@ -665,296 +670,11 @@ pub fn env_hint(id: &str) -> String {
     format!("{}_API_KEY", id.to_ascii_uppercase().replace('-', "_"))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileDoc {
-    #[serde(default)]
-    providers: BTreeMap<String, CustomProvider>,
-}
-
-/// The profile's custom-provider definitions (`providers.toml`), read fresh on every call.
-#[derive(Debug, Clone)]
-pub struct Registry {
-    path: PathBuf,
-}
-
-impl Registry {
-    pub fn new() -> Self {
-        Self { path: mu_common::paths::profile_home().join("providers.toml") }
-    }
-
-    pub fn at(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn lock_path(&self) -> PathBuf {
-        let mut n = self.path.file_name().unwrap_or_default().to_os_string();
-        n.push(".lock");
-        self.path.with_file_name(n)
-    }
-
-    fn read_text(&self) -> Result<String> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(t) => Ok(t),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", self.path.display())),
-        }
-    }
-
-    fn parse(&self, text: &str) -> Result<BTreeMap<String, CustomProvider>> {
-        let doc: FileDoc = toml::from_str(text).with_context(|| {
-            format!("{} is not valid custom-provider configuration; fix the file", self.path.display())
-        })?;
-        doc.providers
-            .into_iter()
-            .map(|(id, p)| {
-                let p = p
-                    .validated(&id)
-                    .with_context(|| format!("{}: [providers.{id}] is invalid; fix the file", self.path.display()))?;
-                Ok((id, p))
-            })
-            .collect()
-    }
-
-    /// Every definition as the file holds it now. A missing file is empty; one that cannot be read
-    /// or does not validate is an error naming the file and the entry.
-    pub fn snapshot(&self) -> Result<BTreeMap<String, CustomProvider>> {
-        self.parse(&self.read_text()?)
-    }
-
-    pub fn get(&self, id: &str) -> Result<Option<CustomProvider>> {
-        Ok(self.snapshot()?.remove(id))
-    }
-
-    /// Adds a definition, keeping the file's comments and other entries. Refuses an existing id
-    /// and a file that does not parse.
-    pub fn add(&self, id: &str, provider: CustomProvider) -> Result<()> {
-        self.write_entry(id, provider, false)
-    }
-
-    /// Replaces a definition's entry as an edit, keeping the file's comments, the other entries and
-    /// the position of this one. Refuses an id that is not there and a file that does not parse.
-    pub fn set(&self, id: &str, provider: CustomProvider) -> Result<()> {
-        self.write_entry(id, provider, true)
-    }
-
-    fn write_entry(&self, id: &str, provider: CustomProvider, replace: bool) -> Result<()> {
-        let provider = provider.validated(id)?;
-        let _lock = mu_common::fs::FileLock::exclusive(&self.lock_path())
-            .with_context(|| format!("locking {}", self.lock_path().display()))?;
-        let text = self.read_text()?;
-        let exists = self.parse(&text)?.contains_key(id);
-        match (replace, exists) {
-            (false, true) => bail!("custom provider `{id}` already exists in {}", self.path.display()),
-            (true, false) => bail!("custom provider `{id}` is not in {}", self.path.display()),
-            _ => {}
-        }
-        let mut doc: toml_edit::DocumentMut =
-            text.parse().with_context(|| format!("{} is not valid TOML", self.path.display()))?;
-        let mut table = toml::to_string(&provider)
-            .context("serializing the provider")?
-            .parse::<toml_edit::DocumentMut>()
-            .context("serializing the provider")?
-            .as_table()
-            .clone();
-        clear_positions(&mut table);
-        let providers = doc
-            .as_table_mut()
-            .entry("providers")
-            .or_insert_with(|| {
-                let mut t = toml_edit::Table::new();
-                t.set_implicit(true);
-                toml_edit::Item::Table(t)
-            })
-            .as_table_mut()
-            .ok_or_else(|| anyhow!("`providers` in {} is not a table", self.path.display()))?;
-        // An entry being replaced keeps its place in the file and the comment above it.
-        let old = providers.remove(id);
-        let mut item = toml_edit::Item::Table(table);
-        if let Some(toml_edit::Item::Table(old)) = old
-            && let Some(new) = item.as_table_mut()
-        {
-            new.set_position(old.position());
-            *new.decor_mut() = old.decor().clone();
-        }
-        providers.insert(id, item);
-        self.write(&doc.to_string())
-    }
-
-    /// Removes a definition; `false` when there was none. Other content is kept.
-    pub fn remove(&self, id: &str) -> Result<bool> {
-        let _lock = mu_common::fs::FileLock::exclusive(&self.lock_path())
-            .with_context(|| format!("locking {}", self.lock_path().display()))?;
-        let text = self.read_text()?;
-        if !self.parse(&text)?.contains_key(id) {
-            return Ok(false);
-        }
-        let mut doc: toml_edit::DocumentMut =
-            text.parse().with_context(|| format!("{} is not valid TOML", self.path.display()))?;
-        let removed =
-            doc.get_mut("providers").and_then(|p| p.as_table_like_mut()).is_some_and(|p| p.remove(id).is_some());
-        if removed {
-            self.write(&doc.to_string())?;
-        }
-        Ok(removed)
-    }
-
-    fn write(&self, text: &str) -> Result<()> {
-        mu_common::fs::write_private(&self.path, text.as_bytes())
-            .with_context(|| format!("writing {}", self.path.display()))
-    }
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Tables built in another document carry its positions; without them they follow the file's own.
-fn clear_positions(t: &mut toml_edit::Table) {
-    t.set_position(None);
-    for (_, item) in t.iter_mut() {
-        if let Some(sub) = item.as_table_mut() {
-            clear_positions(sub);
-        }
-    }
-}
-
-/// What a failed `save` left behind.
-#[derive(Debug)]
-pub enum SaveError {
-    /// Nothing was written.
-    Rejected(anyhow::Error),
-    /// The definition is saved; its credential is not.
-    KeyNotSaved { id: String, raced: bool, error: anyhow::Error },
-}
-
-impl std::fmt::Display for SaveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rejected(e) => write!(f, "{e:#}"),
-            Self::KeyNotSaved { id, raced: true, .. } => write!(
-                f,
-                "provider `{id}` saved; another credential for it appeared meanwhile and was kept (check it with `mu auth test {id}`)"
-            ),
-            Self::KeyNotSaved { id, error, .. } => write!(
-                f,
-                "provider `{id}` saved, but its credential was not saved: {error:#}; add one with /login {id} or `mu auth add {id}`"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SaveError {}
-
-/// Saves a new custom provider: preflight (schema, collisions with another definition or a stored
-/// credential), the definition, then its credential. The two files are not one transaction: when
-/// the credential write fails the definition stays, unrunnable without a key, and nothing another
-/// writer stored is ever removed or replaced. A bearer provider needs `entry` (stored for chat,
-/// never with a base URL of its own); a keyless one takes none.
-pub fn save(
-    registry: &Registry,
-    store: &Store,
-    id: &str,
-    provider: CustomProvider,
-    entry: Option<Entry>,
-) -> Result<CustomProvider, SaveError> {
-    let reject = |e: anyhow::Error| SaveError::Rejected(e);
-    let provider = provider.validated(id).map_err(reject)?;
-    let entry = match (provider.auth, entry) {
-        (AuthMode::None, None) => None,
-        (AuthMode::None, Some(_)) => return Err(reject(anyhow!("a keyless provider takes no credential"))),
-        (AuthMode::Bearer, None) => return Err(reject(anyhow!("a bearer provider needs a credential"))),
-        (AuthMode::Bearer, Some(mut e)) => {
-            if e.origin().is_none() {
-                return Err(reject(anyhow!("the credential needs a key or a reference")));
-            }
-            if e.base_url.is_some() {
-                return Err(reject(anyhow!("a custom provider's base URL comes from its definition")));
-            }
-            e.chat = Some(true);
-            Some(e)
-        }
-    };
-    if registry.snapshot().map_err(reject)?.contains_key(id) {
-        return Err(reject(anyhow!("custom provider `{id}` already exists")));
-    }
-    if provider.auth == AuthMode::Bearer && store.get(id).is_some() {
-        return Err(reject(anyhow!(
-            "a credential for `{id}` already exists; remove it with `mu auth rm {id}` or pick another id"
-        )));
-    }
-    registry.add(id, provider.clone()).map_err(reject)?;
-    if let Some(entry) = entry
-        && let Err(error) = store.set_if_absent(id, entry)
-    {
-        let raced = error.downcast_ref::<EntryExists>().is_some();
-        return Err(SaveError::KeyNotSaved { id: id.to_string(), raced, error });
-    }
-    Ok(provider)
-}
-
-/// What an edit does with the endpoint's credential.
-#[derive(Debug, Clone, PartialEq)]
-pub enum KeyEdit {
-    /// The endpoint keeps the credential the store holds (or none, for a keyless endpoint).
-    Keep,
-    /// The endpoint takes this newly chosen credential instead.
-    Set(Entry),
-}
-
-/// Saves an edit of an existing definition: the same checks as [`save`], but the id must already be
-/// there, the entry is replaced rather than added, and a stored credential is only written by
-/// [`KeyEdit::Set`], so editing a model's reasoning never touches the key. A definition saved as
-/// keyless leaves any stored credential in place; removing it stays `mu auth rm`.
-pub fn update(
-    registry: &Registry,
-    store: &Store,
-    id: &str,
-    provider: CustomProvider,
-    key: KeyEdit,
-) -> Result<CustomProvider, SaveError> {
-    let reject = |e: anyhow::Error| SaveError::Rejected(e);
-    let provider = provider.validated(id).map_err(reject)?;
-    let entry = match (provider.auth, key) {
-        (AuthMode::None, KeyEdit::Set(_)) => {
-            return Err(reject(anyhow!("a keyless provider takes no credential")));
-        }
-        (AuthMode::Bearer, KeyEdit::Set(mut e)) => {
-            if e.origin().is_none() {
-                return Err(reject(anyhow!("the credential needs a key or a reference")));
-            }
-            if e.base_url.is_some() {
-                return Err(reject(anyhow!("a custom provider's base URL comes from its definition")));
-            }
-            e.chat = Some(true);
-            Some(e)
-        }
-        _ => None,
-    };
-    if registry.get(id).map_err(reject)?.is_none() {
-        return Err(reject(anyhow!(
-            "custom provider `{id}` does not exist in {}; add it with /login custom or `mu providers add`",
-            registry.path().display()
-        )));
-    }
-    registry.set(id, provider.clone()).map_err(reject)?;
-    if let Some(entry) = entry
-        && let Err(error) = store.set(id, entry)
-    {
-        return Err(SaveError::KeyNotSaved { id: id.to_string(), raced: false, error });
-    }
-    Ok(provider)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::store::Entry;
+    use std::path::PathBuf;
 
     fn dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("mu-custom-{tag}-{}", uuid::Uuid::new_v4()))

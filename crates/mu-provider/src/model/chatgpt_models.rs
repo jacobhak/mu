@@ -11,9 +11,6 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
-/// A failed fetch is retried after this, not after a day.
-const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A model the account can use: its slug (the id sent on the wire) and the name to show.
@@ -57,16 +54,7 @@ pub fn cached(subject: &str) -> Vec<Listed> {
 pub fn stale(subject: &str) -> bool {
     let f = load();
     let k = key(subject);
-    let old = |at: i64, max: Duration| {
-        let age = mu_base::message::now_ms().saturating_sub(at);
-        age < 0 || age as u128 > max.as_millis()
-    };
-    let last_ok = f.fetched_at.get(&k).copied();
-    match (f.failed_at.get(&k).copied(), last_ok) {
-        (Some(failed), ok) if ok.is_none_or(|t| failed > t) => old(failed, RETRY_AFTER_FAILURE),
-        (_, Some(t)) => old(t, MAX_AGE),
-        (_, None) => true,
-    }
+    mu_base::jsoncache::due(f.failed_at.get(&k).copied(), f.fetched_at.get(&k).copied())
 }
 
 /// Maps a `/models` body to its `visibility == "list"` models, in server order.

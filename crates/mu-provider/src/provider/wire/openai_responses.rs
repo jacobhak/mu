@@ -460,17 +460,16 @@ fn texts_of(parts: &Value, sep: &str) -> String {
 /// Maps an in-stream error by OpenAI's error code.
 fn stream_failure(code: &str, msg: &str, param: &str) -> ProviderError {
     if let Some((retryable, text)) = retry::chatgpt_text(code, msg, param) {
-        return if retryable {
-            ProviderError::Retryable { msg: text, retry_after: None }
-        } else {
-            ProviderError::Fatal(text)
-        };
+        return retry::classify(text, None, retryable, false);
     }
-    match code {
-        "rate_limit_exceeded" | "server_error" => ProviderError::Retryable { msg: msg.into(), retry_after: None },
-        "context_length_exceeded" => ProviderError::Overflow(msg.into()),
-        _ => ProviderError::Fatal(format!("{}: {msg}", if code.is_empty() { "unknown" } else { code })),
-    }
+    let retryable = matches!(code, "rate_limit_exceeded" | "server_error");
+    let overflow = code == "context_length_exceeded";
+    let text = if retryable || overflow {
+        msg.into()
+    } else {
+        format!("{}: {msg}", if code.is_empty() { "unknown" } else { code })
+    };
+    retry::classify(text, None, retryable, overflow)
 }
 
 fn failed_response(r: &Value) -> ProviderError {

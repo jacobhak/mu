@@ -7,14 +7,11 @@
 use crate::provider::custom::CustomProvider;
 use crate::provider::providers::{ProviderDef, native_def};
 use crate::provider::types::Auth;
+use mu_base::jsoncache::due;
 use mu_base::models::{Api, CompletionsCompat, ModelSpec, ThinkingMode, ThinkingSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-
-const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
-/// A failed fetch is retried after this, not after a day.
-const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 
 /// One model as the provider lists it. Prices are dollars per million tokens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,18 +159,6 @@ pub fn find(provider: &str, id: &str) -> Option<Discovered> {
 pub fn stale(provider: &str) -> bool {
     let f = load();
     due(f.failed_at.get(provider).copied(), f.fetched_at.get(provider).copied())
-}
-
-fn due(failed_at: Option<i64>, last_ok: Option<i64>) -> bool {
-    let old = |at: i64, max: Duration| {
-        let age = mu_base::message::now_ms().saturating_sub(at);
-        age < 0 || age as u128 > max.as_millis()
-    };
-    match (failed_at, last_ok) {
-        (Some(failed), ok) if ok.is_none_or(|t| failed > t) => old(failed, RETRY_AFTER_FAILURE),
-        (_, Some(t)) => old(t, MAX_AGE),
-        (_, None) => true,
-    }
 }
 
 /// The cache key of a custom endpoint: its id and a hash of its base URL, so a changed endpoint
@@ -578,15 +563,5 @@ mod custom_tests {
             // Returning to the first base finds its cache again.
             assert_eq!(custom_cached(&provider("disc-a", &base)).len(), 2);
         });
-    }
-
-    #[test]
-    fn a_stale_check_follows_the_daily_and_hourly_rules() {
-        assert!(due(None, None));
-        let now = mu_base::message::now_ms();
-        assert!(!due(None, Some(now)));
-        assert!(due(None, Some(now - 25 * 3_600_000)));
-        assert!(!due(Some(now), Some(now - 3_600_000)), "a fresh failure waits an hour");
-        assert!(due(Some(now - 2 * 3_600_000), Some(now - 3 * 3_600_000)));
     }
 }

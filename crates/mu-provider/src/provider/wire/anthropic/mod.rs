@@ -3,6 +3,7 @@ pub mod native;
 use super::convert::{normalize_id, paired, tool_list, unavailable};
 use super::usage;
 use super::{SseFrames, WireFormat};
+use crate::provider::retry;
 use crate::provider::sse::SseDecoder;
 use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
 use mu_base::message::{Block, Message, StopReason, Usage, now_ms};
@@ -60,15 +61,9 @@ fn permanent(kind: &str, msg: &str) -> bool {
 
 /// Maps an in-stream error event to a retry class by its error type name.
 pub fn stream_error(kind: &str, msg: &str) -> ProviderError {
-    if permanent(kind, msg) {
-        return ProviderError::Fatal(msg.into());
-    }
-    match kind {
-        "overloaded_error" | "rate_limit_error" | "api_error" | "upstream_error" => {
-            ProviderError::Retryable { msg: msg.into(), retry_after: None }
-        }
-        _ => ProviderError::Fatal(msg.into()),
-    }
+    let retryable = !permanent(kind, msg)
+        && matches!(kind, "overloaded_error" | "rate_limit_error" | "api_error" | "upstream_error");
+    retry::classify(msg.into(), None, retryable, false)
 }
 
 /// The thinking budget must leave room for the answer: at most `max_tokens - 1024`, and

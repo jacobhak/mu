@@ -3,14 +3,38 @@ use crate::auth::chatgpt;
 use mu_base::events::wait_text;
 use std::time::{Duration, SystemTime};
 
-const OVERFLOW: [&str; 6] = [
+const OVERFLOW: [&str; 7] = [
     "prompt is too long",
     "context_length_exceeded",
-    "maximum context length",
+    "maximum context",
+    "context length",
     "exceeds the context window",
     "input is too long",
     "too many tokens",
 ];
+
+/// Statuses worth retrying: timeouts, conflicts, rate limits and server faults.
+pub(crate) fn retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Whether `text` says the request overflowed the context window.
+pub(crate) fn overflows(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    OVERFLOW.iter().any(|p| lower.contains(p))
+}
+
+/// The one place a class becomes an error. Each wire decides `retryable` and `overflow` from what
+/// it sees (a status, an error code or type, the text); overflow wins.
+pub(crate) fn classify(msg: String, retry_after: Option<Duration>, retryable: bool, overflow: bool) -> ProviderError {
+    if overflow {
+        ProviderError::Overflow(msg)
+    } else if retryable {
+        ProviderError::Retryable { msg, retry_after }
+    } else {
+        ProviderError::Fatal(msg)
+    }
+}
 
 /// Delay before attempt `attempt + 1`: `retry-after` when given (already within the user's limit,
 /// see `too_long`), else 2^attempt s capped at 60 s, with ±20% jitter on the computed backoff.
@@ -129,8 +153,7 @@ pub fn chatgpt_error(
     let named = if code.is_empty() { String::new() } else { format!(" ({code})") };
     let detail = format!("\nHTTP {status}{named}: {shown}{id}");
     match chatgpt_text(code, msg, param) {
-        Some((true, t)) => ProviderError::Retryable { msg: t + &detail, retry_after },
-        Some((false, t)) => ProviderError::Fatal(t + &detail),
+        Some((retryable, t)) => classify(t + &detail, retry_after, retryable, false),
         None => match status {
             503 => {
                 ProviderError::Retryable { msg: format!("ChatGPT plan routing is unavailable{detail}"), retry_after }
@@ -218,18 +241,7 @@ pub fn classify_http(status: u16, retry_after: Option<Duration>, body: &str, nat
         }
         Some(_) => {}
     }
-    match status {
-        408 | 409 | 429 | 500 | 502 | 503 | 504 | 529 => ProviderError::Retryable { msg, retry_after },
-        400 | 413 => {
-            let lower = body.to_lowercase();
-            if OVERFLOW.iter().any(|p| lower.contains(p)) {
-                ProviderError::Overflow(msg)
-            } else {
-                ProviderError::Fatal(msg)
-            }
-        }
-        _ => ProviderError::Fatal(msg),
-    }
+    classify(msg, retry_after, retryable_status(status), matches!(status, 400 | 413) && overflows(body))
 }
 
 #[cfg(test)]

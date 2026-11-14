@@ -128,10 +128,10 @@ impl Tools {
 
     /// `~` and `~/…` are `$HOME`; other paths are absolute or relative to `cwd`.
     pub fn abs(&self, p: &str) -> PathBuf {
-        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) {
-            if let Some(expanded) = mu_common::paths::expand_tilde(p, &home) {
-                return expanded;
-            }
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+            && let Some(expanded) = mu_common::paths::expand_tilde(p, &home)
+        {
+            return expanded;
         }
         let p = Path::new(p);
         if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) }

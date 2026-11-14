@@ -8,9 +8,8 @@ use mu_common::paths;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-const MAX_CACHE_AGE: Duration = Duration::from_secs(24 * 3600);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -308,18 +307,10 @@ fn heuristic_name(model_id: &str) -> String {
     if out.is_empty() { model_id.to_string() } else { out }
 }
 
-fn cache_fresh(path: &std::path::Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age < MAX_CACHE_AGE)
-}
-
-/// Refreshes the cached catalogue when it is missing or older than a day. Failures keep the old cache.
-/// Runs `omp models ls --json` at most once per day; never called from the draw path.
+/// Refreshes the cached catalogue when it is missing or older than a day, and an hour after a failure.
+/// Failures keep the old cache. Runs `omp models ls --json`; never called from the draw path.
 pub async fn refresh() {
-    if !cache_fresh(&paths::profile_home().join("pricing.json")) {
+    if cache().due() {
         fetch().await;
     }
 }
@@ -333,26 +324,32 @@ pub async fn refresh_missing() {
 }
 
 async fn fetch() {
+    if !try_fetch().await {
+        cache().mark_failed();
+    }
+}
+
+async fn try_fetch() -> bool {
     let out = tokio::process::Command::new(mu_common::paths::omp_bin())
         .args(["models", "ls", "--json"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .output();
-    let Ok(Ok(out)) = tokio::time::timeout(REFRESH_TIMEOUT, out).await else { return };
+    let Ok(Ok(out)) = tokio::time::timeout(REFRESH_TIMEOUT, out).await else { return false };
     if !out.status.success() {
-        return;
+        return false;
     }
-    let Ok(text) = String::from_utf8(out.stdout) else { return };
-    let Some(parsed) = Table::from_json(&text) else { return };
-    if parsed.entries.is_empty() {
-        return;
+    let Ok(text) = String::from_utf8(out.stdout) else { return false };
+    let Some(parsed) = Table::from_json(&text) else { return false };
+    if parsed.entries.is_empty() || !cache().save(&text) {
+        return false;
     }
-    if cache().save(&text)
-        && let Ok(mut g) = TABLE.write()
-    {
+    cache().clear_failed();
+    if let Ok(mut g) = TABLE.write() {
         *g = Some(Arc::new(parsed));
     }
+    true
 }
 
 #[cfg(test)]

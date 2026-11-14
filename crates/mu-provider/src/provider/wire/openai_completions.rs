@@ -4,6 +4,7 @@
 use super::convert::{normalize_id, paired, tool_list, unavailable};
 use super::usage;
 use super::{SseFrames, WireFormat};
+use crate::provider::retry;
 use crate::provider::sse::SseDecoder;
 use crate::provider::types::{Decoder, ProviderError, Request, StreamEvent};
 use mu_base::message::{Block, Image, Message, Usage, now_ms};
@@ -514,14 +515,9 @@ fn stream_failure(e: &Value) -> ProviderError {
     let msg = e.as_str().or_else(|| e["message"].as_str()).unwrap_or("unknown stream error");
     let kind = format!("{} {}", e["code"].as_str().unwrap_or(""), e["type"].as_str().unwrap_or("")).to_lowercase();
     let status = e["code"].as_u64().or_else(|| e["code"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
-    let lower = msg.to_lowercase();
-    if kind.contains("context_length") || lower.contains("context length") || lower.contains("maximum context") {
-        ProviderError::Overflow(msg.into())
-    } else if status == 429 || (500..600).contains(&status) || RETRYABLE.iter().any(|k| kind.contains(k)) {
-        ProviderError::Retryable { msg: msg.into(), retry_after: None }
-    } else {
-        ProviderError::Fatal(msg.into())
-    }
+    let retryable =
+        u16::try_from(status).is_ok_and(retry::retryable_status) || RETRYABLE.iter().any(|k| kind.contains(k));
+    retry::classify(msg.into(), None, retryable, kind.contains("context_length") || retry::overflows(msg))
 }
 
 #[cfg(test)]
