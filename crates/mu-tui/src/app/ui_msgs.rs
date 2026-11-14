@@ -97,6 +97,8 @@ pub(super) enum UiMsg {
     },
     /// A scheduled prompt reached its deadline; the app decides when it goes out.
     ScheduleDue(u64),
+    /// The host answered a call that took a while (`App::host_call`): what to do with the reply.
+    Host(Box<dyn FnOnce(&mut App)>),
 }
 
 impl App {
@@ -160,6 +162,7 @@ impl App {
             UiMsg::MemoryShown(r) => self.on_memory_shown(r),
             UiMsg::MemoryReverted { short, r } => self.on_memory_reverted(&short, r),
             UiMsg::ScheduleDue(id) => self.on_schedule_due(id),
+            UiMsg::Host(then) => then(self),
             UiMsg::LoginProviders(r) => {
                 self.leave_custom_wizard();
                 let mut rows = self.api_key_rows();

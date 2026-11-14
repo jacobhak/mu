@@ -337,7 +337,6 @@ async fn read_listing(probe: &Probe) -> Fetch {
 #[cfg(test)]
 mod tests {
     use super::super::keys::tests::{in_local, press, test_providers, transcript_text};
-    use super::super::services::Services;
     use super::*;
     use crate::text::line::line_text;
     use crate::widgets::overlay::{LoginTarget, OverlayEvent};
@@ -364,7 +363,7 @@ mod tests {
     fn app_with(cfg: &str) -> (App, UnboundedReceiver<Command>, UnboundedReceiver<UiMsg>) {
         let (mut app, cmds) = super::super::keys::tests::test_app_with_commands(history());
         let cfg = Rc::new(Configs::from_models_toml(cfg));
-        app.services = Services { providers: Rc::new(test_providers(cfg, no_gateway())) };
+        app.use_providers(Rc::new(test_providers(cfg, no_gateway())));
         let (ui_tx, ui_rx) = unbounded_channel();
         app.ui_tx = ui_tx;
         (app, cmds, ui_rx)

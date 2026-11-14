@@ -12,6 +12,7 @@ mod chatgpt;
 mod child;
 mod commands;
 mod custom_providers;
+mod hostcall;
 mod keys;
 mod mcp;
 mod memory;
@@ -25,14 +26,17 @@ mod web;
 
 use self::agent_view::{AgentView, error_lines, notice_lines};
 use self::chatgpt::ChatgptFlow;
-use self::commands::command_entries;
+pub(crate) use self::commands::command_entries;
 pub use self::commands::interactive_reference;
 use self::keys::KeyFlow;
 use self::schedule::Schedule;
 use self::services::Services;
-use self::slash::custom_completion_ids;
+pub(crate) use self::slash::custom_completion_ids;
 use self::ui_msgs::UiMsg;
 use crate::chat::composer::Composer;
+use crate::host::completion::{self, Completions, Expanded, PluginRow, SkillRow};
+use crate::host::startup::{self, ImportOffer, Startup, UntrustedFile};
+use crate::host::{self, Host};
 use crate::mcp::mcp_wizard::Wizard;
 use crate::render::Renderer;
 use crate::status;
@@ -64,6 +68,8 @@ const FRAME: Duration = Duration::from_millis(33);
 const CTRL_C_HINT: &str = "  (press Ctrl-C again to exit)";
 
 pub struct AppInit {
+    /// Where the host's state is: this process (`host::local::LocalHost`) or a remote one.
+    pub host: Rc<dyn Host>,
     pub cmd_tx: UnboundedSender<Command>,
     pub ev_rx: UnboundedReceiver<AgentEvent>,
     pub providers: Rc<Providers>,
@@ -80,10 +86,16 @@ pub struct AppInit {
     pub notify: bool,
     /// Which events ring (`[bell]` in config.toml); `notify` off silences all of them.
     pub bell: mu_base::config::MuBell,
+    /// `hide_thinking_block`, `smooth_streaming` and the `[status]` levels: they describe this
+    /// terminal, so they come from the client's own config, not from the host.
+    pub hide_thinking: bool,
+    pub smooth_streaming: bool,
+    pub status_levels: mu_base::config::MuStatus,
 }
 
 struct App {
     agent: AgentView,
+    host: Rc<dyn Host>,
     services: Services,
     link: Link,
     ctx: Rc<Context>,
@@ -121,6 +133,7 @@ struct Screen {
     child_busy: bool,
     started: Instant,
     status_cfg: mu_base::config::OmpStatusLine,
+    status_levels: mu_base::config::MuStatus,
     notify: bool,
 }
 
@@ -129,6 +142,8 @@ struct Screen {
 struct Prompt {
     composer: Composer,
     commands: Vec<Entry>,
+    /// Ghost-text prediction is on (the host's setting, told at start-up).
+    predict: bool,
     ghost_seq: u64,
     ghost_asked: String,
     /// Queued inputs that could not go back into the composer while a key was typed.
@@ -311,6 +326,7 @@ pub async fn run(init: AppInit) -> i32 {
     };
     term::install_panic_hook();
     let AppInit {
+        host,
         cmd_tx,
         mut ev_rx,
         providers,
@@ -323,18 +339,25 @@ pub async fn run(init: AppInit) -> i32 {
         theme,
         notify,
         bell,
+        hide_thinking,
+        smooth_streaming,
+        status_levels,
     } = init;
     let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
-    let (custom_ids, custom_err) = match custom_completion_ids(&providers) {
-        Ok(ids) => (ids, None),
-        Err(e) => (Vec::new(), Some(e)),
+    let completions: Completions = crate::host::call(&*host, completion::COMPLETIONS, &()).await.unwrap_or_else(|e| {
+        Completions { entries: Vec::new(), error: Some(format!("cannot read the completion list: {e}")) }
+    });
+    let startup: Startup = match crate::host::call(&*host, startup::STARTUP, &()).await {
+        Ok(s) => s,
+        Err(e) => {
+            term::say_err(format_args!("mu: the host did not answer: {e}\n"));
+            return 1;
+        }
     };
-    let commands = command_entries(&plugins, &ctx, &providers.cfg, &custom_ids);
-    let show_thinking = !providers.cfg.omp.hide_thinking_block;
-    let smooth = providers.cfg.omp.display.smooth_streaming;
     let mut app = App {
-        agent: AgentView::new(show_thinking, smooth).with_bell(bell),
+        agent: AgentView::new(!hide_thinking, smooth_streaming).with_bell(bell),
+        host,
         services: Services { providers },
         link: Link { cmd_tx },
         ctx,
@@ -348,14 +371,16 @@ pub async fn run(init: AppInit) -> i32 {
             child_busy: false,
             started: Instant::now(),
             status_cfg,
+            status_levels,
             notify,
         },
         prompt: Prompt {
             composer: Composer::new(Some(paths::profile_home().join("history.jsonl"))).with_cwd(&cwd),
-            commands,
+            commands: completions.entries,
             ghost_seq: 0,
             ghost_asked: String::new(),
             held_back: Vec::new(),
+            predict: startup.predict,
         },
         overlay: None,
         parked: VecDeque::new(),
@@ -372,27 +397,22 @@ pub async fn run(init: AppInit) -> i32 {
         quitting: false,
         ctrl_c_armed: false,
     };
-    let store_warning = app.services.providers.store().permission_warning();
-    let store_check = app.services.providers.store().check().err().map(|e| e.to_string());
-    for w in
-        theme_warnings.iter().chain(app.plugins.warnings.iter()).chain(store_warning.iter()).chain(store_check.iter())
-    {
+    for w in theme_warnings.iter().chain(startup.warnings.iter()) {
         app.agent.tr.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
     }
-    if let Some(e) = custom_err {
+    if let Some(e) = completions.error {
         app.error(&e);
     }
-    if app.services.providers.cfg.import_offer.borrow().is_some() {
+    if let Some(offer) = startup.import_offer {
         if pick_session {
             app.notice("omp's model config was not copied: /modelset import");
         } else {
-            app.open_import_offer();
+            app.open_import_offer(&offer);
         }
     }
-    let untrusted = mu_tools::mcp::config::untrusted_files(&cwd, &paths::omp_agent_dir());
-    if !untrusted.is_empty() {
+    if !startup.untrusted_mcp.is_empty() {
         if app.overlay.is_none() && !pick_session {
-            app.open_mcp_trust(untrusted);
+            app.open_mcp_trust(startup.untrusted_mcp);
         } else {
             app.notice("this project's MCP servers are off until you trust them: /mcp trust");
         }
@@ -407,6 +427,7 @@ pub async fn run(init: AppInit) -> i32 {
             return 1;
         }
     };
+    let mut pushed = app.host.pushed();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     // The countdown above the composer while a prompt waits for its time.
     let mut clock = tokio::time::interval(Duration::from_secs(1));
@@ -456,6 +477,7 @@ pub async fn run(init: AppInit) -> i32 {
             }
             Some(n) = notice_rx.recv() => app.notice(&n),
             Some(m) = ui_rx.recv() => app.on_ui(m),
+            Some(p) = async { match pushed.as_mut() { Some(r) => r.recv().await, None => std::future::pending().await } } => app.on_pushed(p),
             _ = tick.tick(), if app.busy() => app.on_tick(),
             _ = clock.tick(), if app.schedule_pending() => app.screen.dirty = true,
             // The footer turns `cache cold` when the cache's TTL passes, with nothing else to redraw it.
@@ -588,7 +610,7 @@ impl App {
         env.turn_elapsed = self.agent.turn_started.map(|t| t.elapsed());
         env.jobs = status::JobCounts::of(&self.agent.jobs);
         env.subagent_cost = self.agent.subagent_cost;
-        env.levels = self.services.providers.cfg.mu.status;
+        env.levels = self.screen.status_levels;
         let status_lines = status::render(&self.agent.status, &env, w);
         let pty_open = self.agent.pty.is_some();
         let (lines, cur) = match &mut self.overlay {

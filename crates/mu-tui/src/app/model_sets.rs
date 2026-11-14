@@ -106,16 +106,13 @@ impl App {
     }
 
     /// Asks once at startup whether to copy omp's model config; declining asks again next start.
-    pub(super) fn open_import_offer(&mut self) {
-        let lines = match self.services.providers.cfg.import_offer.borrow().as_ref() {
-            Some(offer) => offer.lines.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"),
-            None => return,
-        };
+    pub(super) fn open_import_offer(&mut self, offer: &ImportOffer) {
+        let lines = offer.lines.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
         let items = vec![
             Item { label: "Import".into(), detail: "copy it into models.toml".into() },
             Item { label: "Not now".into(), detail: "ask again next start; /modelset import copies it later".into() },
         ];
-        let context = format!("mu now keeps model roles in {}. Found in omp:\n{lines}", models_path().display());
+        let context = format!("mu now keeps model roles in {}. Found in omp:\n{lines}", offer.models_path.display());
         self.overlay =
             Some(Overlay::ModelImport { sel: Select::new("Import model config from omp?", items).context(&context) });
     }

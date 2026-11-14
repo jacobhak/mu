@@ -51,14 +51,6 @@ fn tool_names(info: &McpInfo) -> String {
     s
 }
 
-/// A server as its file writes it (an untrusted entry is shown unexpanded): a command with its arguments, or a url.
-fn as_written(s: &config::McpServer) -> String {
-    match &s.kind {
-        Kind::Stdio { command, args, .. } => format!("{command} {}", args.join(" ")).trim_end().to_string(),
-        Kind::Http { url, .. } => url.clone(),
-    }
-}
-
 impl App {
     pub(super) fn mcp_cmd(&mut self, arg: &str) {
         if arg.trim().is_empty() {
@@ -198,15 +190,16 @@ impl App {
 
     /// The startup offer to trust a project's MCP servers before they start. `files` are what
     /// `config::untrusted_files` found; the context shows each file's servers as written.
-    pub(super) fn open_mcp_trust(&mut self, files: Vec<(PathBuf, String, Vec<String>)>) {
-        let (all, _) = config::load_all_with(&self.cwd, &paths::omp_agent_dir(), &|_| None);
+    pub(super) fn open_mcp_trust(&mut self, found: Vec<UntrustedFile>) {
         let mut context = String::new();
-        for (file, _, _) in &files {
-            context.push_str(&format!("{}\n", file.display()));
-            for e in all.iter().filter(|e| !e.trusted && e.file == *file) {
-                context.push_str(&format!("  {}: {}\n", e.server.name, as_written(&e.server)));
+        for f in &found {
+            context.push_str(&format!("{}\n", f.file.display()));
+            for s in &f.servers {
+                context.push_str(&format!("  {}: {}\n", s.name, s.written));
             }
         }
+        let files =
+            found.into_iter().map(|f| (f.file, f.digest, f.servers.into_iter().map(|s| s.name).collect())).collect();
         let items = vec![
             Item { label: "Trust".into(), detail: "start them; asked again if the file's servers change".into() },
             Item { label: "Not now".into(), detail: "they stay off; /mcp trust starts them later".into() },

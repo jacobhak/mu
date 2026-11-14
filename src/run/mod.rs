@@ -394,7 +394,12 @@ async fn tui(
     notice_rx: UnboundedReceiver<String>,
 ) -> i32 {
     host.set_interactive();
+    let local = mu_tui::host::local::LocalHost::new(ui.providers.clone(), ui.ctx.clone(), host.clone(), ui.cwd.clone());
+    // Loopback: every host call answers later, as a remote host's do.
+    let host_for_ui: Rc<dyn mu_tui::host::Host> =
+        if mu_base::wire::loopback_on() { Rc::new(mu_tui::host::Deferred(local)) } else { Rc::new(local) };
     mu_tui::app::run(mu_tui::app::AppInit {
+        host: host_for_ui,
         cmd_tx,
         ev_rx,
         providers: ui.providers,
@@ -407,6 +412,9 @@ async fn tui(
         theme: ui.cfgs.mu.theme.clone(),
         notify: ui.cfgs.omp.completion.notify,
         bell: ui.cfgs.mu.bell,
+        hide_thinking: ui.cfgs.omp.hide_thinking_block,
+        smooth_streaming: ui.cfgs.omp.display.smooth_streaming,
+        status_levels: ui.cfgs.mu.status,
     })
     .await
 }

@@ -139,8 +139,11 @@ impl App {
 
     /// Asks the predict plugin for a ghost when the composer wants one. Failures are silent.
     fn request_ghost(&mut self) {
-        let cfg = &self.services.providers.cfg.mu.predict;
-        if !cfg.enabled || self.prompt.composer.has_ghost() || self.flows.mcp().is_some() || self.key_flow_pending() {
+        if !self.prompt.predict
+            || self.prompt.composer.has_ghost()
+            || self.flows.mcp().is_some()
+            || self.key_flow_pending()
+        {
             return;
         }
         let Some(q) = self.prompt.composer.predict_query() else { return };
@@ -155,16 +158,9 @@ impl App {
             let skip = r.chars().count().saturating_sub(4000);
             r.chars().skip(skip).collect()
         };
-        let params = json!({ "text": q, "cwd": self.cwd, "assistant": assistant, "threshold": cfg.threshold });
-        let (plugins, tx) = (self.plugins.clone(), self.ui_tx.clone());
-        tokio::task::spawn_local(async move {
-            let ghost = plugins
-                .request("predict", "predict/complete", params, Duration::from_millis(300))
-                .await
-                .ok()
-                .and_then(|v| v["ghost"].as_str().map(String::from))
-                .unwrap_or_default();
-            let _ = tx.send(UiMsg::Ghost { seq, text: q, ghost });
+        self.host_call(host::completion::GHOST, &(q.clone(), assistant), move |app, r: Result<String, String>| {
+            let ghost = r.unwrap_or_default();
+            app.on_ui(UiMsg::Ghost { seq, text: q, ghost });
         });
     }
 
@@ -935,6 +931,19 @@ pub(super) mod tests {
         assert!(transcript_text(&app).contains("sign-in cancelled"));
     }
 
+    impl App {
+        /// Swaps the provider registry, for the app and for the host that answers for it.
+        pub(in crate::app) fn use_providers(&mut self, providers: Rc<mu_provider::provider::client::Providers>) {
+            self.host = Rc::new(crate::host::local::LocalHost::new(
+                providers.clone(),
+                self.ctx.clone(),
+                self.plugins.clone(),
+                self.cwd.clone(),
+            ));
+            self.services = Services { providers };
+        }
+    }
+
     pub(in crate::app) fn test_app(history: std::path::PathBuf) -> App {
         test_app_with_commands(history).0
     }
@@ -946,12 +955,17 @@ pub(super) mod tests {
         let (ntx, _nrx) = unbounded_channel();
         let plugins = mu_tools::plugin::host::PluginHost::new(vec![], vec![], ntx, Default::default());
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
+        let providers = Rc::new(test_providers(Rc::new(Configs::default()), gateway));
+        let ctx = Rc::new(Context::default());
+        let host =
+            Rc::new(crate::host::local::LocalHost::new(providers.clone(), ctx.clone(), plugins.clone(), "/".into()));
         let app = App {
             agent: AgentView::new(true, false),
-            services: Services { providers: Rc::new(test_providers(Rc::new(Configs::default()), gateway)) },
+            host,
+            services: Services { providers },
             link: Link { cmd_tx },
-            ctx: Rc::new(Context::default()),
-            plugins,
+            ctx: ctx.clone(),
+            plugins: plugins.clone(),
             ui_tx,
             cwd: PathBuf::from("/"),
             screen: Screen {
@@ -961,11 +975,13 @@ pub(super) mod tests {
                 child_busy: false,
                 started: Instant::now(),
                 status_cfg: Default::default(),
+                status_levels: Default::default(),
                 notify: false,
             },
             prompt: Prompt {
                 composer: Composer::new(Some(history)),
                 commands: vec![],
+                predict: false,
                 ghost_seq: 0,
                 ghost_asked: String::new(),
                 held_back: vec![],
@@ -1374,7 +1390,7 @@ pub(super) mod tests {
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let cfg = Rc::new(Configs::from_models_toml("[sets.main]\ndefault = \"a/old:high\"\n"));
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
-        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
+        app.use_providers(Rc::new(test_providers(cfg.clone(), gateway)));
 
         app.model_cmd("");
         assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
@@ -1439,7 +1455,7 @@ pub(super) mod tests {
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let cfg = Rc::new(Configs::from_models_toml(text));
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
-        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
+        app.use_providers(Rc::new(test_providers(cfg.clone(), gateway)));
         app.open_model_roles(Some("default".into()));
         app.on_overlay_event(OverlayEvent::SaveRole {
             set: "main".into(),
@@ -1465,7 +1481,7 @@ pub(super) mod tests {
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let cfg = Rc::new(Configs::from_models_toml(text));
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
-        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
+        app.use_providers(Rc::new(test_providers(cfg.clone(), gateway)));
         app.open_model_roles(Some("writer".into()));
         let meta = mu_base::model_config::RoleMeta {
             description: Some("Long-form docs".into()),
@@ -1503,7 +1519,7 @@ pub(super) mod tests {
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
         let cfg = Rc::new(Configs::from_models_toml(text));
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(app.plugins.gateway_start());
-        app.services = Services { providers: Rc::new(test_providers(cfg.clone(), gateway)) };
+        app.use_providers(Rc::new(test_providers(cfg.clone(), gateway)));
         let on_disk = || model_config::parse(&std::fs::read_to_string(&path).unwrap()).0;
 
         app.modelset_cmd("new openai");

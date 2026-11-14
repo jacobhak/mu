@@ -189,7 +189,7 @@ pub fn interactive_reference() -> String {
 
 /// The completion list of the composer: the built-in commands with their arguments, then the
 /// commands and skills that come from the context.
-pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs, custom_ids: &[String]) -> Vec<Entry> {
+pub(crate) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs, custom_ids: &[String]) -> Vec<Entry> {
     let cc = CompleteCtx { plugins, ctx, cfg, custom_ids };
     let mut commands: Vec<Entry> = BUILTIN
         .iter()
