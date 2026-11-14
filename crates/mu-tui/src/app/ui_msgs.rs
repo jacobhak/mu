@@ -4,7 +4,6 @@ use super::child::ChildThen;
 use super::keys::is_baseten;
 use super::*;
 use crate::chat::blocks;
-use crate::custom::panel::Fetch;
 use crate::widgets::overlay::LoginTarget;
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
@@ -30,11 +29,6 @@ pub(super) enum UiMsg {
     ModelsRefreshed {
         request: u64,
         diag: Option<String>,
-    },
-    /// The custom-endpoint wizard's model check answered, for the wizard `flow`.
-    CustomFetched {
-        flow: u64,
-        r: Fetch,
     },
     LoginProviders(Result<Vec<(usize, String)>, String>),
     /// An MCP login finished: tool count and whether the tool set changed.
@@ -135,7 +129,6 @@ impl App {
                     self.notice(&d);
                 }
             }
-            UiMsg::CustomFetched { flow, r } => self.on_custom_fetched(flow, r),
             UiMsg::McpLoggedIn(name, r) => match r {
                 Ok((n, changed)) => {
                     self.notice(&format!("mcp:{name}: logged in, {n} tools"));

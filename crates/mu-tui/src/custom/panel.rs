@@ -12,10 +12,11 @@ use mu_provider::model::discovery::CustomRow;
 use mu_provider::provider::custom::{
     self, AuthMode, Cost, CustomModel, CustomProvider, DEFAULT_CONTEXT, DEFAULT_OUTPUT, EFFORT_LADDER, Reasoning,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The files a save writes, named on the first screen.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Destinations {
     pub providers: String,
     pub auth: String,
@@ -23,7 +24,7 @@ pub struct Destinations {
 
 /// What the endpoint's `/models` check reads: the endpoint, and its credential (`None` when it
 /// takes none).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Probe {
     pub id: String,
     pub base_url: String,
@@ -31,7 +32,7 @@ pub struct Probe {
 }
 
 /// What Save writes. `listed` is the listing that was read; it is cached once the definition is saved.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Saved {
     pub id: String,
     pub provider: CustomProvider,
@@ -43,7 +44,7 @@ pub struct Saved {
     pub listed: Option<Vec<CustomRow>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Fetch {
     Listed(Vec<CustomRow>),
     /// The credential could not be resolved: a variable is not set, a command failed.
@@ -219,6 +220,8 @@ pub struct Panel {
     entry: String,
     /// The auth screen waits for the key in the masked composer.
     pending: bool,
+    /// Environment variables the host was asked about, and whether each is set.
+    env_set: BTreeMap<String, bool>,
     /// What the app must print; drained by `take_notes`.
     notes: Vec<String>,
 }
@@ -244,6 +247,7 @@ impl Panel {
             limits: None,
             entry: String::new(),
             pending: false,
+            env_set: BTreeMap::new(),
             notes: Vec::new(),
         }
     }
@@ -264,6 +268,17 @@ impl Panel {
             (AuthMode::Bearer, None) => None,
         };
         p
+    }
+
+    /// The variable the screen on show says is set or not, when the host has not been asked yet.
+    pub fn env_wanted(&self) -> Option<String> {
+        let env = self.env_default();
+        (self.screen == Screen::Auth && !self.pending && !env.is_empty() && !self.env_set.contains_key(&env))
+            .then_some(env)
+    }
+
+    pub fn env_known(&mut self, name: &str, set: bool) {
+        self.env_set.insert(name.to_string(), set);
     }
 
     pub fn take_notes(&mut self) -> Vec<String> {
@@ -962,7 +977,11 @@ impl Panel {
         if env.is_empty() {
             return "read when mu needs it; Enter to name it".into();
         }
-        if env_is_set(&env) { format!("${env} is set") } else { format!("${env} is not set; read when mu needs it") }
+        if self.env_set.get(&env).copied().unwrap_or(false) {
+            format!("${env} is set")
+        } else {
+            format!("${env} is not set; read when mu needs it")
+        }
     }
 
     fn auth_text(&self) -> String {
@@ -1206,10 +1225,6 @@ fn entry_source(entry: &Entry) -> String {
 
 fn or<'a>(v: &'a str, then: &'a str) -> String {
     if v.is_empty() { then.to_string() } else { v.to_string() }
-}
-
-fn env_is_set(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
 }
 
 /// A positive token count; an empty answer takes `default`.
