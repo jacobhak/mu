@@ -2,6 +2,7 @@ use super::custom::{self, Registry};
 use super::endpoint;
 use super::gateway_models::load_cache;
 use super::providers::{Credential, DirectProvider, direct_spec, native_def};
+use super::relay::{Relay, RelayError, Resolved};
 use super::retry;
 use super::types::{Auth, Decoder, ProviderError, Request, StreamEvent};
 use super::wire::{self, WireFormat};
@@ -18,6 +19,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 use std::time::Duration;
@@ -101,6 +103,10 @@ pub struct Providers {
     /// Test seam: scripted replies, popped in order by `stream`.
     #[cfg(any(test, feature = "test-support"))]
     pub scripted: RefCell<std::collections::VecDeque<Result<Message, ProviderError>>>,
+    /// Set in a worker: model calls go to the parent instead of a provider.
+    relay: RefCell<Option<Rc<dyn Relay>>>,
+    /// What the relay has resolved, by selector and by id; `resolve` answers from it in a worker.
+    relayed: RefCell<HashMap<String, (ModelSpec, Option<Thinking>)>>,
 }
 
 impl Providers {
@@ -137,7 +143,21 @@ impl Providers {
             registry,
             #[cfg(any(test, feature = "test-support"))]
             scripted: Default::default(),
+            relay: RefCell::new(None),
+            relayed: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn set_relay(&self, relay: Rc<dyn Relay>) {
+        *self.relay.borrow_mut() = Some(relay);
+    }
+
+    pub fn relay(&self) -> Option<Rc<dyn Relay>> {
+        self.relay.borrow().clone()
+    }
+
+    pub fn is_relayed(&self) -> bool {
+        self.relay.borrow().is_some()
     }
 
     /// One shared client: a 10 s connect timeout, no redirects, no overall timeout (streams are
@@ -163,6 +183,14 @@ impl Providers {
     /// Resolves a selector. A malformed `providers.toml` fails every resolution until it is
     /// fixed: it never reads as "no custom endpoints", nor routes a custom id to the gateway.
     pub fn resolve(&self, sel: &str) -> Result<(ModelSpec, Option<Thinking>)> {
+        if self.is_relayed() {
+            return self
+                .relayed
+                .borrow()
+                .get(sel)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("model {sel} is not resolved in a relayed worker"));
+        }
         let custom = self.registry.snapshot()?;
         let failure = RefCell::new(None);
         let direct = |p: &str, m: &str| {
@@ -198,6 +226,16 @@ impl Providers {
             return Err(anyhow::anyhow!(self.chatgpt_sign_in_needed()));
         }
         Ok((spec, level))
+    }
+
+    /// `resolve`, asking the relay when there is one and remembering its answer for `resolve`.
+    pub async fn resolve_relayed(&self, sel: &str) -> Result<(ModelSpec, Option<Thinking>)> {
+        let Some(relay) = self.relay() else { return self.resolve(sel) };
+        let Resolved { spec, thinking } = relay.resolve(sel).await.map_err(RelayError::into_anyhow)?;
+        let mut known = self.relayed.borrow_mut();
+        known.insert(spec.id.clone(), (spec.clone(), thinking));
+        known.insert(sel.to_string(), (spec.clone(), thinking));
+        Ok((spec, thinking))
     }
 
     fn chatgpt_sign_in_needed(&self) -> String {
@@ -266,6 +304,9 @@ impl Providers {
                 }
             }
             return r;
+        }
+        if let Some(relay) = self.relay() {
+            return relay.stream(req, cancel, ev).await;
         }
         if req.model.is_unselected() {
             return Err(ProviderError::Fatal("no model chosen: pick one with /switch".into()));

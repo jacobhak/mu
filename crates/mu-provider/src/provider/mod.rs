@@ -12,6 +12,7 @@ mod custom_tests;
 pub mod endpoint;
 pub(crate) mod gateway_models;
 pub mod providers;
+pub mod relay;
 pub(crate) mod retry;
 pub(crate) mod sse;
 pub mod types;

@@ -37,23 +37,45 @@ pub(crate) fn is_ref(data: &str) -> bool {
         .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
-/// Writes `bytes` to the content-addressed blob store (idempotent: the file is named by its hash,
-/// so the same image is stored once) and returns its reference. Messages keep only the reference.
-fn store(bytes: &[u8]) -> std::io::Result<String> {
+/// The hash of a blob reference, `None` for inline base64.
+pub fn blob_hash(data: &str) -> Option<&str> {
+    data.strip_prefix(BLOB_PREFIX).filter(|_| is_ref(data))
+}
+
+fn hash_of(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let hash: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
-    let path = blob_dir().join(&hash);
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn write_blob(hash: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let path = blob_dir().join(hash);
     if !std::fs::metadata(&path).is_ok_and(|m| m.len() == bytes.len() as u64) {
         std::fs::create_dir_all(blob_dir())?;
         mu_common::fs::write_atomic(&path, bytes)?;
     }
+    Ok(())
+}
+
+/// Writes `bytes` to the content-addressed blob store (idempotent: the file is named by its hash,
+/// so the same image is stored once) and returns its reference. Messages keep only the reference.
+fn store(bytes: &[u8]) -> std::io::Result<String> {
+    let hash = hash_of(bytes);
+    write_blob(&hash, bytes)?;
     Ok(format!("{BLOB_PREFIX}{hash}"))
+}
+
+/// Stores bytes that arrived under `hash` (a relayed image). Refuses bytes that do not hash to it.
+pub fn store_blob(hash: &str, bytes: &[u8]) -> std::io::Result<()> {
+    if hash_of(bytes) != hash {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "blob bytes do not match their hash"));
+    }
+    write_blob(hash, bytes)
 }
 
 /// The base64 an API request needs for `data`: inline data as is, a reference read back from the
 /// blob store (mu's own, then omp's, which writes the same references). `None` if the blob is gone.
 pub fn resolve(data: &str) -> Option<String> {
-    let Some(hash) = data.strip_prefix(BLOB_PREFIX).filter(|_| is_ref(data)) else { return Some(data.to_string()) };
+    let Some(hash) = blob_hash(data) else { return Some(data.to_string()) };
     let dirs = [blob_dir(), mu_common::paths::omp_agent_dir().join("blobs")];
     let bytes = dirs.iter().find_map(|d| std::fs::read(d.join(hash)).ok())?;
     Some(STANDARD.encode(bytes))
@@ -207,6 +229,14 @@ mod tests {
         // Inline data from older sessions passes through, and a missing blob is reported, not sent.
         assert_eq!(resolve("QUJD").as_deref(), Some("QUJD"));
         assert_eq!(resolve(&format!("{BLOB_PREFIX}{}", "0".repeat(64))), None);
+        // A relayed blob is stored under its hash, and only if the bytes match.
+        let hash = blob_hash(&img.data).unwrap().to_string();
+        assert!(store_blob(&"1".repeat(64), &png).is_err());
+        assert!(store_blob(&hash, b"other").is_err());
+        store_blob(&hash, &png).unwrap();
+        store_blob(&hash, &png).unwrap();
+        assert_eq!(resolve(&img.data).unwrap(), STANDARD.encode(&png));
+        assert_eq!(blob_hash("QUJD"), None);
         // Inline data can be moved into the store.
         let moved = externalize(Image { data: STANDARD.encode(&png), mime_type: "image/png".into() });
         assert_eq!(moved.data, img.data);

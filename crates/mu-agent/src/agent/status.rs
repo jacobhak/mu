@@ -191,7 +191,7 @@ impl Agent {
     /// so a native-only session never starts omp.
     pub(super) fn sync_model_state(&mut self) {
         self.costs.quota.set_paused(self.gateway_idle());
-        if !self.gateway_idle() && !self.model.pricing_checked {
+        if !self.gateway_idle() && !self.model.pricing_checked && !self.ports.providers.is_relayed() {
             self.model.pricing_checked = true;
             tokio::task::spawn_local(pricing::refresh());
         }

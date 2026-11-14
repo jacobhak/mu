@@ -1,7 +1,8 @@
 use crate::config::Configs;
 use anyhow::{Result, anyhow, bail};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Thinking {
     Off,
     Low,
@@ -55,10 +56,13 @@ impl Thinking {
 
 /// Wire protocol of a request. The strings are omp's (`Message::Assistant.api`), so sessions stay
 /// readable by omp in both directions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Api {
+    #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
+    #[serde(rename = "openai-responses")]
     OpenAiResponses,
+    #[serde(rename = "openai-completions")]
     OpenAiCompletions,
 }
 
@@ -82,7 +86,8 @@ impl Api {
 }
 
 /// How a model takes its reasoning level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ThinkingMode {
     /// Gateway-routed: mu sends a budget and `output_config.effort`, the gateway adapts them.
     #[default]
@@ -116,7 +121,7 @@ impl ThinkingMode {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ThinkingSpec {
     pub mode: ThinkingMode,
     /// The efforts the model accepts, lowest first, as omp names them (`minimal`..`max`).
@@ -200,12 +205,12 @@ impl Default for CompletionsCompat {
 }
 
 /// Per-model flags for the native Anthropic wire, from omp's catalog.
-#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AnthropicQuirks {
     /// `thinking.supportsDisplay`: adaptive thinking may ask for `display: "summarized"`.
     /// `None` means unknown, which budget thinking treats as supported.
-    #[serde(skip)]
+    // Travels with a relayed spec; the catalog's own value is set after `anthropicCompat` is read (`Row::spec`).
     pub supports_display: Option<bool>,
     /// The model's lowest thinking setting is `between_tools`; it rejects `disabled`.
     pub supports_between_tools_thinking: bool,
@@ -218,7 +223,7 @@ pub struct AnthropicQuirks {
     pub supports_context_management: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelSpec {
     /// `provider/model`
     pub id: String,

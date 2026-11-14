@@ -20,6 +20,16 @@ fn ceiling(max_tokens: u32) -> Duration {
 #[derive(Debug)]
 pub struct NoModel(String);
 
+impl NoModel {
+    pub(super) fn new(role: String) -> Self {
+        Self(role)
+    }
+
+    pub(super) fn role(&self) -> &str {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for NoModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "no model configured for role {}", self.0)
@@ -39,6 +49,12 @@ impl Providers {
         max_tokens: u32,
         cancel: &CancellationToken,
     ) -> Result<String> {
+        if let Some(relay) = self.relay() {
+            return relay
+                .complete(role_or_model, system, prompt, max_tokens, cancel)
+                .await
+                .map_err(|e| e.into_anyhow());
+        }
         let sels: Vec<String> = if role_or_model.contains('/') {
             vec![role_or_model.to_string()]
         } else {

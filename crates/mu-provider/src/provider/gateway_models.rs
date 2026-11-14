@@ -14,6 +14,9 @@ impl Providers {
 
     /// Gateway `/v1/models` rows (context windows). `None` when the gateway is not running or unreachable.
     pub async fn gateway_models(&self) -> Result<Vec<GatewayModel>> {
+        if self.is_relayed() {
+            return Ok(self.cached_models());
+        }
         if self.gw_fresh.get()
             && let Some(m) = self.gw_models.borrow().as_ref()
         {

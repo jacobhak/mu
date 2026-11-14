@@ -2,7 +2,7 @@
 //! Shared by the tools, providers, plugins and the event protocol; it depends on std, serde and `message` only.
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,

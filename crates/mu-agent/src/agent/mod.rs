@@ -398,7 +398,7 @@ impl Agent {
     }
 
     pub async fn run(mut self, rx: UnboundedReceiver<Command>) {
-        self.costs.quota.enabled = true;
+        self.costs.quota.enabled = !self.ports.providers.is_relayed();
         self.sync_model_state();
         let providers = self.ports.providers.clone();
         tokio::task::spawn_local(async move {
