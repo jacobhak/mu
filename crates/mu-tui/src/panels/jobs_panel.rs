@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::host::sessions::{Live, LiveArgs, TailArgs, TailDelta};
 use crate::panels::reply::rule;
 use crate::panels::session_view;
 use crate::panels::sessions_tab::{self, Row};
@@ -17,9 +18,7 @@ use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
 use crate::widgets::frame::Frame;
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
-use mu_session::session::owner::LiveSession;
-use mu_session::session::runs::{RunDir, SessionSource};
-use mu_session::session::tail::Tail;
+use mu_base::message::Message;
 
 /// Most list rows shown at once.
 const LIST_MAX: usize = 8;
@@ -38,6 +37,21 @@ const VIEW_KEEP: usize = 500;
 /// How often the open transcript, and the cost of every listed session, are read again.
 const VIEW_POLL: Duration = Duration::from_millis(250);
 const TOTALS_POLL: Duration = Duration::from_secs(2);
+
+/// What the panel needs read from the host; the app makes the call and hands the reply back.
+pub enum Want {
+    Sessions(LiveArgs),
+    Tail { target: TailFor, args: TailArgs },
+}
+
+/// Whose tail a reply belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TailFor {
+    /// The cost column of a listed job or session.
+    Total,
+    /// The open transcript.
+    View,
+}
 
 pub enum JobsResult {
     Pending,
@@ -91,6 +105,10 @@ pub struct JobsPanel {
     titles: HashMap<PathBuf, String>,
     /// This session, which the Sessions tab leaves out (the Jobs tab is its children).
     own: Option<PathBuf>,
+    /// Canonical form of the paths the host was asked about (this session, the jobs' sessions).
+    canon: HashMap<PathBuf, PathBuf>,
+    /// `$HOME` on the host, which the Sessions tab shortens directories with.
+    home: Option<String>,
     /// Running totals of each listed session, for the cost column.
     totals: HashMap<PathBuf, Totals>,
     polled_totals: Option<Instant>,
@@ -105,13 +123,103 @@ pub struct JobsPanel {
     status: Option<String>,
     /// The newest output of each bash job, as the app last sent it.
     outputs: HashMap<String, String>,
-    /// Where the Sessions tab's list of live sessions comes from.
-    source: Box<dyn SessionSource>,
+    /// Reads the panel waits to have made, taken by the app after each key and tick.
+    wants: Vec<Want>,
+    /// The list of live sessions was asked for and has not come back.
+    live_asked: bool,
+}
+
+/// A session file as far as the host has been read: what `Tail` keeps, built from the host's deltas.
+struct Followed {
+    path: PathBuf,
+    keep: usize,
+    offset: u64,
+    messages: Vec<Message>,
+    dropped: usize,
+    cost: f64,
+    tokens: u64,
+    caught_up: bool,
+    /// A read was asked for and has not come back.
+    asked: bool,
+}
+
+impl Followed {
+    fn new(path: PathBuf, keep: usize) -> Self {
+        Self {
+            path,
+            keep,
+            offset: 0,
+            messages: Vec::new(),
+            dropped: 0,
+            cost: 0.0,
+            tokens: 0,
+            caught_up: false,
+            asked: false,
+        }
+    }
+
+    fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+
+    fn tokens(&self) -> u64 {
+        self.tokens
+    }
+
+    fn caught_up(&self) -> bool {
+        self.caught_up
+    }
+
+    /// The read to ask the host for, unless one is out already.
+    fn ask(&mut self) -> Option<TailArgs> {
+        if self.asked {
+            return None;
+        }
+        self.asked = true;
+        Some(TailArgs {
+            path: self.path.clone(),
+            offset: self.offset,
+            caught_up: self.caught_up,
+            messages: self.keep > 0,
+        })
+    }
+
+    /// Takes what the host read. A reply to a read from another offset is dropped.
+    fn take(&mut self, d: TailDelta) {
+        self.asked = false;
+        if d.from != self.offset {
+            return;
+        }
+        if d.reset {
+            *self = Self::new(std::mem::take(&mut self.path), self.keep);
+        }
+        for m in d.messages {
+            self.messages.push(m);
+            if self.messages.len() > self.keep {
+                // Drop in blocks so a long run does not shift the vector on every message.
+                let cut = (self.messages.len() - self.keep).max(self.keep / 4).min(self.messages.len());
+                self.messages.drain(..cut);
+                self.dropped += cut;
+            }
+        }
+        self.cost += d.cost;
+        self.tokens += d.tokens;
+        self.offset = d.offset;
+        self.caught_up = d.caught_up;
+    }
 }
 
 /// A listed session's totals, and whether it can still change.
 struct Totals {
-    tail: Tail,
+    tail: Followed,
     /// Read to the end after its job finished.
     settled: bool,
 }
@@ -139,7 +247,7 @@ struct View {
     /// Set for a session of the Sessions tab: what to call it in the title.
     label: Option<String>,
     /// The session being followed; `None` for a bash job.
-    tail: Option<Tail>,
+    tail: Option<Followed>,
     settled: bool,
     polled: Option<Instant>,
     lines: Vec<Line>,
@@ -211,6 +319,8 @@ impl JobsPanel {
             s_page: LIST_MAX,
             titles: HashMap::new(),
             own: None,
+            canon: HashMap::new(),
+            home: None,
             totals: HashMap::new(),
             polled_totals: None,
             view: None,
@@ -219,15 +329,20 @@ impl JobsPanel {
             confirm_kill_all: false,
             status: None,
             outputs: HashMap::new(),
-            source: Box::new(RunDir::profile()),
+            wants: Vec::new(),
+            live_asked: false,
         }
     }
 
-    /// Reads the live sessions from `source` instead of this profile's run directory.
-    #[cfg(test)]
-    pub fn with_source(mut self, source: Box<dyn SessionSource>) -> Self {
-        self.source = source;
+    /// `$HOME` on the host, so directories of other sessions show as `~/…`.
+    pub fn with_home(mut self, home: &std::path::Path) -> Self {
+        self.home = Some(home.to_string_lossy().into_owned());
         self
+    }
+
+    /// The reads the panel is waiting for, to be made by the app.
+    pub fn take_wants(&mut self) -> Vec<Want> {
+        std::mem::take(&mut self.wants)
     }
 
     /// Starts with the output the app already has for its bash jobs.
@@ -268,23 +383,38 @@ impl JobsPanel {
         self.prune_totals();
     }
 
-    /// The live sessions, read now from the owner records.
+    /// Asks for the live sessions, unless that is under way.
     fn refresh_sessions(&mut self) {
-        self.set_sessions(self.source.live_sessions());
+        if self.live_asked {
+            return;
+        }
+        self.live_asked = true;
+        let mut canon: Vec<PathBuf> = self.own.iter().cloned().collect();
+        canon.extend(self.jobs.iter().filter_map(|j| j.session.clone()));
+        self.wants.push(Want::Sessions(LiveArgs { titled: self.titles.keys().cloned().collect(), canon }));
+    }
+
+    /// The host's answer to the request for the live sessions.
+    pub fn on_live(&mut self, r: Result<Live, String>) {
+        self.live_asked = false;
+        if let Ok(live) = r {
+            self.set_sessions(live);
+            // The new rows' costs are asked for with the list.
+            self.refresh();
+        }
     }
 
     /// A fresh list of live sessions: the selection stays on the same one when it is still there.
-    pub fn set_sessions(&mut self, lives: Vec<LiveSession>) {
+    pub fn set_sessions(&mut self, live: Live) {
         self.polled_totals = Some(Instant::now());
-        for l in &lives {
-            if !self.titles.contains_key(&l.path)
-                && let Some(t) = self.source.title(&l.path)
-            {
-                self.titles.insert(l.path.clone(), t);
+        self.canon = live.canon.into_iter().collect();
+        for r in &live.rows {
+            if let Some(t) = &r.title {
+                self.titles.entry(r.live.path.clone()).or_insert_with(|| t.clone());
             }
         }
         let keep = self.rows.get(self.s_at).map(|r| r.live.path.clone());
-        self.rows = sessions_tab::build(lives, &self.titles, &self.jobs, self.own.as_deref());
+        self.rows = sessions_tab::build(live.rows, &self.titles, &self.jobs, self.own.as_deref(), &self.canon);
         self.s_at = keep
             .and_then(|p| self.rows.iter().position(|r| r.live.path == p))
             .unwrap_or_else(|| self.s_at.min(self.rows.len().saturating_sub(1)));
@@ -298,9 +428,9 @@ impl JobsPanel {
         self.totals.retain(|p, _| live.contains(&p));
     }
 
-    /// Reads what the sessions gained since the last read: the open transcript and the cost of every
-    /// listed subagent and session. `poll` calls it on a timer; tests call it directly. (The list of
-    /// live sessions is read by `refresh_sessions`, from `poll`.)
+    /// Asks for what the sessions gained since the last read: the open transcript and the cost of
+    /// every listed subagent and session. `poll` calls it on a timer. (The list of live sessions is
+    /// asked for by `refresh_sessions`, from `poll`.)
     pub fn refresh(&mut self) {
         self.polled_totals = Some(Instant::now());
         for j in &self.jobs {
@@ -308,33 +438,65 @@ impl JobsPanel {
             let t = self
                 .totals
                 .entry(p.clone())
-                .or_insert_with(|| Totals { tail: Tail::new(p.clone(), 0), settled: false });
-            if !t.settled {
-                t.tail.poll();
-                t.settled = j.state != SubagentState::Running && t.tail.caught_up();
+                .or_insert_with(|| Totals { tail: Followed::new(p.clone(), 0), settled: false });
+            if !t.settled
+                && let Some(args) = t.tail.ask()
+            {
+                self.wants.push(Want::Tail { target: TailFor::Total, args });
             }
         }
         for r in &self.rows {
             let t = self
                 .totals
                 .entry(r.live.path.clone())
-                .or_insert_with(|| Totals { tail: Tail::new(r.live.path.clone(), 0), settled: false });
-            t.tail.poll();
+                .or_insert_with(|| Totals { tail: Followed::new(r.live.path.clone(), 0), settled: false });
+            if let Some(args) = t.tail.ask() {
+                self.wants.push(Want::Tail { target: TailFor::Total, args });
+            }
         }
-        // A job's transcript is done once the job is and the file is read; a session's never is.
-        let job_state = self
-            .view
-            .as_ref()
-            .filter(|v| v.label.is_none())
-            .and_then(|v| self.jobs.iter().find(|j| j.name == v.name))
-            .map(|j| j.state.clone());
         if let Some(v) = &mut self.view {
             v.polled = Some(Instant::now());
             if !v.settled
                 && let Some(t) = &mut v.tail
+                && let Some(args) = t.ask()
             {
-                t.poll();
-                v.settled = job_state.is_some_and(|s| s != SubagentState::Running) && t.caught_up();
+                self.wants.push(Want::Tail { target: TailFor::View, args });
+            }
+        }
+    }
+
+    /// The host's answer to a read of `path`.
+    pub fn on_tail(&mut self, target: TailFor, path: &std::path::Path, r: Result<TailDelta, String>) {
+        match target {
+            TailFor::Total => {
+                let Some(t) = self.totals.get_mut(path) else { return };
+                match r {
+                    Ok(d) => t.tail.take(d),
+                    Err(_) => t.tail.asked = false,
+                }
+                if !t.settled
+                    && let Some(j) = self.jobs.iter().find(|j| j.session.as_deref() == Some(path))
+                {
+                    t.settled = j.state != SubagentState::Running && t.tail.caught_up();
+                }
+            }
+            TailFor::View => {
+                // A job's transcript is done once the job is and the file is read; a session's never is.
+                let job_state = self
+                    .view
+                    .as_ref()
+                    .filter(|v| v.label.is_none())
+                    .and_then(|v| self.jobs.iter().find(|j| j.name == v.name))
+                    .map(|j| j.state.clone());
+                let Some(v) = &mut self.view else { return };
+                let Some(t) = v.tail.as_mut().filter(|t| t.path == path) else { return };
+                match r {
+                    Ok(d) => t.take(d),
+                    Err(_) => t.asked = false,
+                }
+                if !v.settled {
+                    v.settled = job_state.is_some_and(|s| s != SubagentState::Running) && t.caught_up();
+                }
             }
         }
     }
@@ -372,7 +534,7 @@ impl JobsPanel {
         self.jobs.iter().filter(|j| j.state == SubagentState::Running).count()
     }
 
-    fn new_view(name: String, label: Option<String>, tail: Option<Tail>) -> View {
+    fn new_view(name: String, label: Option<String>, tail: Option<Followed>) -> View {
         View {
             name,
             label,
@@ -393,7 +555,7 @@ impl JobsPanel {
     fn open_view(&mut self) {
         let Some(j) = self.jobs.get(self.at) else { return };
         let tail = match (&j.session, j.kind) {
-            (Some(path), _) => Some(Tail::new(path.clone(), VIEW_KEEP)),
+            (Some(path), _) => Some(Followed::new(path.clone(), VIEW_KEEP)),
             (None, JobKind::Bash) => None,
             (None, JobKind::Subagent) => return,
         };
@@ -405,7 +567,7 @@ impl JobsPanel {
     fn open_session_view(&mut self) {
         let Some(r) = self.rows.get(self.s_at) else { return };
         let label = format!("{} · pid {}", r.label(), r.live.pid);
-        self.view = Some(Self::new_view(r.id(), Some(label), Some(Tail::new(r.live.path.clone(), VIEW_KEEP))));
+        self.view = Some(Self::new_view(r.id(), Some(label), Some(Followed::new(r.live.path.clone(), VIEW_KEEP))));
         self.refresh();
     }
 
@@ -666,7 +828,8 @@ impl JobsPanel {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                sessions_tab::list_row(r, i == self.s_at, label_w, &self.cost_of(Some(&r.live.path)), width, now)
+                let cost = self.cost_of(Some(&r.live.path));
+                sessions_tab::list_row(r, i == self.s_at, label_w, &cost, width, now, self.home.as_deref())
             })
             .collect();
         let (detail_title, detail_rows) = match self.rows.get(self.s_at) {
@@ -960,7 +1123,9 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::sessions::LiveRow;
     use crate::text::line::line_text;
+    use mu_session::session::owner::LiveSession;
     use mu_testutil::key;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -989,8 +1154,29 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1012)
     }
 
+    /// Does what the app does with the panel's wants, with the host's own readers.
+    fn serve(p: &mut JobsPanel) {
+        for w in p.take_wants() {
+            match w {
+                Want::Tail { target, args } => {
+                    let path = args.path.clone();
+                    p.on_tail(target, &path, Ok(crate::host::sessions::read_tail(args)));
+                }
+                // Tests set the list themselves.
+                Want::Sessions(_) => p.on_live(Err(String::new())),
+            }
+        }
+    }
+
     fn text(p: &mut JobsPanel, w: usize, h: usize) -> Vec<String> {
+        serve(p);
         p.render(w, h, now()).0.iter().map(line_text).collect()
+    }
+
+    fn live_of(lives: Vec<LiveSession>) -> Live {
+        let rows =
+            lives.into_iter().map(|live| LiveRow { parent: live.parent.clone(), modified: None, title: None, live });
+        Live { rows: rows.collect(), canon: Vec::new() }
     }
 
     #[test]
@@ -1317,31 +1503,22 @@ mod tests {
         }
     }
 
-    /// A source with no live sessions, so no test reads `$MU_HOME/run`.
-    struct NoRuns;
-
-    impl SessionSource for NoRuns {
-        fn live_sessions(&self) -> Vec<LiveSession> {
-            Vec::new()
-        }
-    }
-
-    /// A panel on the Sessions tab with these sessions, not reading `$MU_HOME`.
+    /// A panel on the Sessions tab with these sessions.
     fn sessions_panel(lives: Vec<LiveSession>) -> JobsPanel {
-        let mut p = JobsPanel::new(vec![]).with_source(Box::new(NoRuns));
+        let mut p = JobsPanel::new(vec![]);
         p.tab = Tab::Sessions;
-        p.set_sessions(lives);
+        p.set_sessions(live_of(lives));
         p
     }
 
     #[test]
     fn tab_switches_between_jobs_and_sessions() {
-        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]).with_source(Box::new(NoRuns));
+        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]);
         p.polled_totals = Some(Instant::now());
         assert!(text(&mut p, 80, 14)[0].starts_with("── jobs ·"));
         p.on_key(key(KeyCode::Tab));
         assert_eq!(p.tab, Tab::Sessions);
-        p.set_sessions(vec![lived(&session_path(), "print", "2026-01-01T00:00:00Z")]);
+        p.set_sessions(live_of(vec![lived(&session_path(), "print", "2026-01-01T00:00:00Z")]));
         let rows = text(&mut p, 80, 14);
         assert!(rows[0].starts_with("── sessions · 1 live"), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("print") && r.contains("4242")), "{rows:?}");
@@ -1452,9 +1629,9 @@ mod tests {
         p.s_at = 1;
         let mut c = lived(&session_path(), "print", "2026-01-01T00:00:00Z");
         c.pid = 1;
-        p.set_sessions(vec![lived(&b, "print", tb), c, lived(&a, "print", ta)]);
+        p.set_sessions(live_of(vec![lived(&b, "print", tb), c, lived(&a, "print", ta)]));
         assert_eq!(p.rows[p.s_at].live.path, b);
-        p.set_sessions(vec![]);
+        p.set_sessions(live_of(vec![]));
         assert_eq!(p.s_at, 0);
     }
 

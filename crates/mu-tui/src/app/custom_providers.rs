@@ -839,6 +839,7 @@ mod tests {
             assert!(matches!(cmds.try_recv(), Ok(Command::RefreshModel)));
             assert_eq!(app.services.providers.cfg.role("default").as_deref(), Some("a/old"));
             app.request_models();
+            settle(&mut app, &mut ui, |a| screen(a).contains("modal/org/model")).await;
             assert!(screen(&app).contains("modal/org/model"), "{}", screen(&app));
         });
     }

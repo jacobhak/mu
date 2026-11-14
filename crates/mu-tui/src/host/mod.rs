@@ -60,6 +60,37 @@ pub struct HostInfo {
     pub profile_home: PathBuf,
     pub tmp: PathBuf,
     pub cwd: PathBuf,
+    /// The profile name on the host (`OMP_PROFILE`), shown in the status line.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+static FACTS: std::sync::OnceLock<HostInfo> = std::sync::OnceLock::new();
+
+/// Records what the host said about itself, for the code that shortens host paths on screen.
+pub(crate) fn set_facts(info: HostInfo) {
+    let _ = FACTS.set(info);
+}
+
+/// The host's home directory, to show a path under it as `~`. Without facts (tests), this process's.
+pub(crate) fn host_home() -> Option<String> {
+    match FACTS.get() {
+        Some(i) => Some(i.home.display().to_string()),
+        None => std::env::var("HOME").ok(),
+    }
+    .filter(|h| !h.is_empty())
+}
+
+pub(crate) fn host_tmp() -> PathBuf {
+    FACTS.get().map_or_else(std::env::temp_dir, |i| i.tmp.clone())
+}
+
+pub(crate) fn host_profile() -> Option<String> {
+    match FACTS.get() {
+        Some(i) => i.profile.clone(),
+        None => std::env::var("OMP_PROFILE").or_else(|_| std::env::var("PI_PROFILE")).ok(),
+    }
+    .filter(|p| !p.is_empty())
 }
 
 pub trait Host {

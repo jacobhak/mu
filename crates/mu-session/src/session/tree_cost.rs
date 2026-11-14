@@ -20,7 +20,7 @@ const SCAN_EVERY: Duration = Duration::from_secs(3);
 const CATCH_UP: usize = 16;
 
 /// A subagent this session started, as its jobs list knows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Child {
     pub path: PathBuf,
     pub running: bool,

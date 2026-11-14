@@ -115,6 +115,10 @@ impl Server {
         if matches!(ev, AgentEvent::Exit) {
             return None;
         }
+        // The client may edit the plan file; the host answers `read_file`/`write_file` only for paths it sent.
+        if let AgentEvent::PlanReview { file, .. } = &ev {
+            mu_tui::host::plans::hand_out(file);
+        }
         let line = self.catchup.event(ev);
         if let Some(c) = &self.client {
             let _ = c.writer.send(line);

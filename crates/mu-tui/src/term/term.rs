@@ -224,13 +224,16 @@ pub fn install_panic_hook() {
 
 /// Leaves raw mode and the extra modes, e.g. around an external editor.
 pub fn suspend() -> io::Result<()> {
-    off();
+    // A test never owns the terminal: raw mode on the developer's tty stops a background test run.
+    if !cfg!(test) {
+        off();
+    }
     Ok(())
 }
 
 /// Re-applies the modes after `suspend`. No-op if already applied.
 pub fn resume() -> io::Result<()> {
-    on()
+    if cfg!(test) { Ok(()) } else { on() }
 }
 
 #[cfg(test)]

@@ -51,6 +51,10 @@ impl LocalHost {
             profile_home: paths::profile_home(),
             tmp: std::env::temp_dir(),
             cwd: cwd.clone(),
+            profile: std::env::var("OMP_PROFILE")
+                .or_else(|_| std::env::var("PI_PROFILE"))
+                .ok()
+                .filter(|p| !p.is_empty()),
         };
         let mut registry = Registry::default();
         super::startup::register(&mut registry);

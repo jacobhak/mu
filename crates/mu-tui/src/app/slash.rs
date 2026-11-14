@@ -7,6 +7,7 @@ use crate::text::markdown;
 use mu_base::image;
 use mu_base::models::Thinking;
 use mu_base::permissions::PermissionMode;
+use mu_provider::provider::client::Providers;
 use mu_tools::tools::todo::Status;
 
 pub(super) const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Shift+↑  edit last queued

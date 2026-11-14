@@ -95,7 +95,7 @@ fn prompt_rows(text: &str, inner: usize) -> Vec<Line> {
     let Some(call) = skill_call(text) else {
         return markdown::render(&end_quotes(text), inner);
     };
-    let home = std::env::var("HOME").ok();
+    let home = crate::host::host_home();
     let head = vec![
         span(format!("/skill:{}", call.name), name_style()),
         span(format!(" · {}", tilde(call.path, home.as_deref())), tfg(Role::Faint)),

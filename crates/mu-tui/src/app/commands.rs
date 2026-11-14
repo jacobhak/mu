@@ -9,6 +9,8 @@ use mu_base::models::Thinking;
 use mu_base::permissions::PermissionMode;
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
+use mu_tools::context::Context;
+use mu_tools::plugin::host::PluginHost;
 
 /// What the completion lists of the built-in commands are built from.
 pub(super) struct CompleteCtx<'a> {

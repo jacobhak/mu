@@ -19,6 +19,7 @@ mod memory;
 mod model_sets;
 mod pickers;
 mod schedule;
+#[cfg(test)]
 mod services;
 mod slash;
 mod ui_msgs;
@@ -30,6 +31,7 @@ pub(crate) use self::commands::command_entries;
 pub use self::commands::interactive_reference;
 use self::keys::KeyFlow;
 use self::schedule::Schedule;
+#[cfg(test)]
 use self::services::Services;
 pub(crate) use self::slash::custom_completion_ids;
 use self::ui_msgs::UiMsg;
@@ -52,8 +54,9 @@ use mu_base::message::UserInput;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_base::text::truncate_text as trunc;
 use mu_common::paths;
-use mu_provider::provider::client::Providers;
+#[cfg(test)]
 use mu_tools::context::Context;
+#[cfg(test)]
 use mu_tools::plugin::host::PluginHost;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -72,9 +75,6 @@ pub struct AppInit {
     pub host: Rc<dyn Host>,
     pub cmd_tx: UnboundedSender<Command>,
     pub ev_rx: UnboundedReceiver<AgentEvent>,
-    pub providers: Rc<Providers>,
-    pub ctx: Rc<Context>,
-    pub plugins: Rc<PluginHost>,
     pub notice_rx: UnboundedReceiver<String>,
     pub cwd: PathBuf,
     pub pick_session: bool,
@@ -96,10 +96,13 @@ pub struct AppInit {
 struct App {
     agent: AgentView,
     host: Rc<dyn Host>,
+    /// The tests' way to the objects the host answers from, to set them up and to check what was written.
+    #[cfg(test)]
     services: Services,
     link: Link,
-    #[allow(dead_code)] // no surface reads it any more; removed once every surface has moved
+    #[cfg(test)]
     ctx: Rc<Context>,
+    #[cfg(test)]
     plugins: Rc<PluginHost>,
     ui_tx: UnboundedSender<UiMsg>,
     cwd: PathBuf,
@@ -116,6 +119,12 @@ struct App {
     quitting: bool,
     /// The first Ctrl-C was pressed: the next one exits, whatever the screen holds.
     ctrl_c_armed: bool,
+}
+
+/// `run` is never called by a test, which builds its `App` and the handles itself.
+#[cfg(test)]
+fn test_handles() -> (Services, Rc<Context>, Rc<PluginHost>) {
+    unreachable!("the tests build their own App")
 }
 
 /// The channels to the agent.
@@ -330,9 +339,6 @@ pub async fn run(init: AppInit) -> i32 {
         host,
         cmd_tx,
         mut ev_rx,
-        providers,
-        ctx,
-        plugins,
         mut notice_rx,
         cwd,
         pick_session,
@@ -344,6 +350,7 @@ pub async fn run(init: AppInit) -> i32 {
         smooth_streaming,
         status_levels,
     } = init;
+    crate::host::set_facts(host.info().clone());
     let theme_warnings = theme::init(&theme);
     let (ui_tx, mut ui_rx) = unbounded_channel();
     let completions: Completions = crate::host::call(&*host, completion::COMPLETIONS, &()).await.unwrap_or_else(|e| {
@@ -356,12 +363,17 @@ pub async fn run(init: AppInit) -> i32 {
             return 1;
         }
     };
+    #[cfg(test)]
+    let (services, ctx, plugins) = test_handles();
     let mut app = App {
         agent: AgentView::new(!hide_thinking, smooth_streaming).with_bell(bell),
         host,
-        services: Services { providers },
+        #[cfg(test)]
+        services,
         link: Link { cmd_tx },
+        #[cfg(test)]
         ctx,
+        #[cfg(test)]
         plugins,
         ui_tx,
         cwd: cwd.clone(),
@@ -499,14 +511,15 @@ pub async fn run(init: AppInit) -> i32 {
         }
         let _ = app.screen.renderer.finish();
         if !term::is_lost()
-            && let Some(path) = app.agent.status.session_path.as_deref().filter(|p| std::path::Path::new(p).exists())
+            && let Some(path) = app.agent.status.session_path.as_deref()
+            && let Ok(host::sessions::Exists { exists: true, profile_flag: profile }) =
+                host::call(app.host.as_ref(), host::sessions::SESSION_EXISTS, &path).await
         {
             let id = std::path::Path::new(path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .and_then(|s| s.rsplit_once('_'))
                 .map_or(path, |(_, id)| id);
-            let profile = mu_session::session::list::profile_flag();
             term::say_err(format_args!("\r\n\x1b[2mResume this session with\r\nmu {profile}--resume {id}\x1b[0m\r\n"));
         }
     }
