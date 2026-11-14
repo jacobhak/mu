@@ -78,10 +78,25 @@ pub(crate) fn context_page(ctx: &Context) -> String {
     s
 }
 
+/// Kernel release: `/proc` where it exists (Linux), `uname -r` elsewhere (macOS).
+fn os_release() -> String {
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        return s;
+    }
+    std::process::Command::new("uname")
+        .arg("-r")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
 pub(crate) fn system_prompt(i: &PromptInput) -> String {
     // The kernel release does not change under a running process: read it once.
     static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let os = OS.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
+    let os = OS.get_or_init(os_release);
     let date = jiff::Zoned::now().strftime("%Y-%m-%d");
     // The edit tool's own description covers its format; this adds only the cross-call rule.
     let edit_rule = if i.hashline {

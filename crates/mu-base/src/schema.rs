@@ -3,7 +3,9 @@
 //! Covers what result schemas use: type, enum, const, properties/required/additionalProperties,
 //! items/minItems/maxItems, minimum/maximum, minLength/maxLength, anyOf/oneOf/allOf. `$ref` is
 //! rejected (never resolved, so a model-written schema cannot reach files or the network).
-//! Unknown keywords are ignored.
+//! Every other keyword is ignored, not checked: notably `pattern`, `format`, `not`, `if`/`then`/`else`,
+//! `uniqueItems`, `multipleOf`, `exclusiveMinimum`/`exclusiveMaximum`, `patternProperties`,
+//! `propertyNames`, `dependentRequired`, `contains` and `prefixItems`. A value that breaks one still passes.
 
 use serde_json::Value;
 
