@@ -25,12 +25,6 @@ pub(super) enum UiMsg {
     Sessions(Vec<mu_session::session::list::SessionInfo>),
     /// The result of a clipboard copy: the notice to show, or the error.
     Copied(Result<String, String>),
-    /// One source of the model pickers answered (the gateway, or one custom endpoint). The picker
-    /// for `request` rebuilds its rows from what is cached now; `diag` says what failed.
-    ModelsRefreshed {
-        request: u64,
-        diag: Option<String>,
-    },
     /// The custom-endpoint wizard's model check answered, for the wizard `flow`.
     CustomFetched {
         flow: u64,
@@ -122,19 +116,6 @@ impl App {
                 Ok(n) => self.notice(&n),
                 Err(e) => self.error(&format!("copy failed: {e}")),
             },
-            UiMsg::ModelsRefreshed { request, diag } => {
-                let gateway = self.services.providers.cached_models();
-                let session =
-                    matches!(&self.overlay, Some(Overlay::Model { request: active, .. }) if *active == request);
-                if session {
-                    self.open_session_model_picker(request, &gateway);
-                } else if !self.show_role_models(request, &gateway) {
-                    return;
-                }
-                if let Some(d) = diag {
-                    self.notice(&d);
-                }
-            }
             UiMsg::CustomFetched { flow, r } => self.on_custom_fetched(flow, r),
             UiMsg::McpLoggedIn(name, r) => match r {
                 Ok((n, changed)) => {

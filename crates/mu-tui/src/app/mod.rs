@@ -98,6 +98,7 @@ struct App {
     host: Rc<dyn Host>,
     services: Services,
     link: Link,
+    #[allow(dead_code)] // no surface reads it any more; removed once every surface has moved
     ctx: Rc<Context>,
     plugins: Rc<PluginHost>,
     ui_tx: UnboundedSender<UiMsg>,

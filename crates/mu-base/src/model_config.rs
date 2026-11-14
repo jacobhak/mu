@@ -1,7 +1,7 @@
 //! `models.toml`: model roles grouped in named sets, per-model limits and compaction thresholds.
 //! Parsing and text edits are pure; `Configs` does the reading and writing.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use std::collections::BTreeMap;
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, value};
@@ -23,7 +23,7 @@ pub struct ModelConfig {
 }
 
 /// What `[roles.<name>]` says about a custom role beyond its models.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoleMeta {
     pub description: Option<String>,

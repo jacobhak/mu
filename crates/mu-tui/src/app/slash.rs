@@ -4,11 +4,9 @@
 use super::*;
 use crate::term::clipboard;
 use crate::text::markdown;
-use mu_base::config::Configs;
 use mu_base::image;
 use mu_base::models::Thinking;
 use mu_base::permissions::PermissionMode;
-use mu_base::roles::{self, RoleView};
 use mu_tools::tools::todo::Status;
 
 pub(super) const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Shift+↑  edit last queued
@@ -16,11 +14,6 @@ Shift+Enter / Ctrl+Enter / Ctrl+J / Alt+Enter  newline      Esc  abort turn · l
 Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand jobs and output      Alt+M  model roles      Alt+J  background jobs      Alt+↓/↑  mark a running job (then k cancels it, Esc unmarks)      Alt+K  cancel the marked or only job      Ctrl+R  quote parts of a reply
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
-
-pub(super) fn role_views(cfg: &Configs, ctx: &Context) -> Vec<RoleView> {
-    let agents: Vec<(&str, &[String])> = ctx.agents.iter().map(|a| (a.name.as_str(), a.model.as_slice())).collect();
-    roles::views(cfg, &agents)
-}
 
 /// The custom endpoint ids in `providers.toml`, for completion. A file that does not read is its error.
 pub(crate) fn custom_completion_ids(providers: &Providers) -> Result<Vec<String>, String> {

@@ -639,7 +639,7 @@ impl CustomProvider {
 }
 
 /// The state of a custom endpoint's credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyState {
     NotNeeded,
     Saved,

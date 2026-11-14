@@ -10,6 +10,7 @@ use crossterm::style::ContentStyle;
 use mu_base::events::PlanDecision;
 use std::path::PathBuf;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Tier {
     pub role: String,
     pub detail: String,

@@ -4,6 +4,7 @@
 use crate::config::Configs;
 use crate::model_config::RoleMeta;
 use crate::models::{role_chain, role_selector, split_level};
+use serde::{Deserialize, Serialize};
 
 struct Doc {
     name: &'static str,
@@ -76,7 +77,7 @@ pub(crate) fn agent_role(entry: &str) -> Option<String> {
 }
 
 /// A role as shown to the user.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoleView {
     pub name: String,
     pub purpose: String,
