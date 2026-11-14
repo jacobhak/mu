@@ -79,9 +79,11 @@ impl Store {
         write_atomic(&p, &bytes).map_err(|e| format!("cannot write {}: {e}", p.display()))
     }
 
-    pub fn list(&self, all: bool) -> Vec<PlanMeta> {
-        let Ok(rd) = std::fs::read_dir(&self.dir) else { return vec![] };
+    /// The plans, newest first, and one warning per file that could not be read.
+    pub fn list(&self, all: bool) -> (Vec<PlanMeta>, Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return (vec![], vec![]) };
         let mut out = Vec::new();
+        let mut skipped = Vec::new();
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().is_none_or(|x| x != "json") {
@@ -93,11 +95,11 @@ impl Store {
             match parsed {
                 Ok(m) if all || m.status == Status::Pending => out.push(m),
                 Ok(_) => {}
-                Err(e) => eprintln!("warning: skipping {}: {e}", p.display()),
+                Err(e) => skipped.push(format!("skipping {}: {e}", p.display())),
             }
         }
         out.sort_by(|a, b| b.updated.cmp(&a.updated));
-        out
+        (out, skipped)
     }
 
     pub fn load(&self, id: &str) -> Result<(PlanMeta, String), String> {
@@ -405,8 +407,8 @@ mod tests {
         assert_eq!(s.drop("p").unwrap_err(), "plan 'p' is approved, not pending");
         s.drop("q").unwrap();
         assert_eq!(s.drop("q").unwrap_err(), "plan 'q' is dropped, not pending");
-        assert!(s.list(false).is_empty());
-        assert_eq!(s.list(true).len(), 2);
+        assert!(s.list(false).0.is_empty());
+        assert_eq!(s.list(true).0.len(), 2);
         assert!(s.load("zz").unwrap_err().starts_with("plan 'zz' not found in "));
     }
 

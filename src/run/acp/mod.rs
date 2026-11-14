@@ -394,7 +394,7 @@ impl Server {
                 let Some(cwd) = self.cwd_param(&id, p) else { return };
                 let path = match list::find_id(&cwd, sid) {
                     Ok(p) => p,
-                    Err(e) => return fail(&id, INVALID_PARAMS, e),
+                    Err(e) => return fail(&id, INVALID_PARAMS, e.to_string()),
                 };
                 if self.sessions.contains_key(&list::id_of(&path)) {
                     return fail(&id, INVALID_REQUEST, "session is already open");

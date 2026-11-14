@@ -144,7 +144,11 @@ impl Agent {
 
     pub(super) async fn list_plans(&self) {
         let store = plans::store_for(&self.cwd).await;
-        self.emit(AgentEvent::PlanList(store.list(false)));
+        let (plans, warnings) = store.list(false);
+        for w in warnings {
+            self.notice(format!("warning: {w}"));
+        }
+        self.emit(AgentEvent::PlanList(plans));
     }
 
     /// `/deliver`: runs the injected `DeliverFn`, which wakes this session when the delivery finishes.

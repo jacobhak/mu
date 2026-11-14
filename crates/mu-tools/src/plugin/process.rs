@@ -3,8 +3,8 @@
 
 use super::host::{Kind, PluginHost, Shared, Slot, stop_slot};
 use super::manifest::{Lifetime, Manifest};
-use super::mcp_runtime::{mcp_request, refresh_listing};
-use mu_common::rpc::{Frame, Framed, Line, Pending, Request, Response};
+use super::mcp_runtime::{McpError, mcp_request, refresh_listing};
+use mu_common::rpc::{Frame, Framed, Line, Pending, Request, Response, RpcError, kind};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::process::Stdio;
@@ -227,8 +227,10 @@ impl Proc {
         let _guard = InflightGuard { proc: self, id };
         let line =
             serde_json::to_string(&Request::new(Some(self.wire_id(id)), method, params)).expect("request serializes");
-        let gone =
-            |r: Result<Result<Value, String>, _>| r.unwrap_or_else(|_| Err(format!("plugin {} exited", self.name)));
+        let gone = |r: Result<Result<Value, RpcError>, _>| match r {
+            Ok(r) => r.map_err(|e| e.message),
+            Err(_) => Err(format!("plugin {} exited", self.name)),
+        };
         // The write sits inside the timeout and the cancel race: a plugin that stops reading stdin
         // must not hold the call.
         let exchange = async {
@@ -322,7 +324,7 @@ async fn read_loop(
                 proc.pending.resolve(
                     id,
                     match r.error {
-                        Some(e) => Err(e.message),
+                        Some(e) => Err(e),
                         None => Ok(r.result.unwrap_or(Value::Null)),
                     },
                 );
@@ -360,6 +362,8 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
     }
     let _serving = ServingGuard::enter(&proc);
     let p = &req.params;
+    let mut err_kind = None;
+    let mut not_found = false;
     let result: Result<Value, String> = match slot.as_mcp() {
         Some(m) if req.method == "notifications/tools/list_changed" => {
             // Re-list in the background and rewrite the cache; the change applies next session.
@@ -368,7 +372,13 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
             }
             Ok(Value::Null)
         }
-        Some(m) => mcp_request(&proc, m, &shared, &req).await,
+        Some(m) => mcp_request(&proc, m, &shared, &req).await.map_err(|e| match e {
+            McpError::NotFound(s) => {
+                not_found = true;
+                s
+            }
+            McpError::Failed(s) => s,
+        }),
         None => match req.method.as_str() {
             "core/complete" => {
                 let target = p["model"].as_str().or(p["role"].as_str()).unwrap_or("smol").to_string();
@@ -383,11 +393,19 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
                             &proc.gone,
                         );
                         match tokio::time::timeout(COMPLETE_TIMEOUT, call).await {
-                            Ok(r) => r.map(|text| json!({"text": text})).map_err(|e| e.to_string()),
+                            Ok(r) => r.map(|text| json!({"text": text})).map_err(|e| {
+                                if e.is::<mu_provider::provider::NoModel>() {
+                                    err_kind = Some(kind::NO_MODEL);
+                                }
+                                e.to_string()
+                            }),
                             Err(_) => Err(format!("core/complete timed out after {}s", COMPLETE_TIMEOUT.as_secs())),
                         }
                     }
-                    None => Err(format!("no model configured for role {target}")),
+                    None => {
+                        err_kind = Some(kind::NO_MODEL);
+                        Err(format!("no model configured for role {target}"))
+                    }
                 }
             }
             "core/webSearch" if proc.name == "web" => {
@@ -409,9 +427,9 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
             // A token that could not be fetched is a failed request, not a missing method.
             Err(e)
                 if matches!(req.method.as_str(), "core/mcpToken" | "core/webSearch" | "core/complete")
-                    && !e.starts_with("method not found") =>
+                    && !not_found =>
             {
-                Response::err(id, -32603, e)
+                Response::err_kind(id, -32603, e, err_kind)
             }
             Err(e) => Response::err(id, -32601, e),
         };

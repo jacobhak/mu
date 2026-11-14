@@ -98,8 +98,8 @@ static REFRESH_STORED: OnceLock<fn()> = OnceLock::new();
 
 /// Sets the function `redact` calls first to bring `register_stored` up to date; the auth store
 /// sits above this module, so it cannot be called directly.
-pub fn set_stored_refresh(f: fn()) {
-    let _ = REFRESH_STORED.set(f);
+pub fn set_stored_refresh(f: fn()) -> Result<(), String> {
+    REFRESH_STORED.set(f).map_err(|_| "the stored-key refresh was already set".to_string())
 }
 
 fn refresh_stored() {
@@ -108,9 +108,14 @@ fn refresh_stored() {
     }
 }
 
-/// `[secrets]` from config. Unconfigured (tests, early errors) means no extra variables.
-pub fn configure(extra_env: Vec<String>) {
-    let _ = EXTRA_ENV.set(extra_env);
+/// `[secrets]` from config. Unconfigured (tests, early errors) means no extra variables. Setting the
+/// same list again is fine (each ACP session loads the config); a different one is an error.
+pub fn configure(extra_env: Vec<String>) -> Result<(), String> {
+    match EXTRA_ENV.set(extra_env) {
+        Ok(()) => Ok(()),
+        Err(again) if EXTRA_ENV.get() == Some(&again) => Ok(()),
+        Err(_) => Err("[secrets] env changed since mu started; restart mu to apply it".into()),
+    }
 }
 
 fn extra_env() -> &'static [String] {

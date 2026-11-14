@@ -49,75 +49,108 @@ pub fn signal(pid: u32) -> Result<(), std::io::Error> {
     mu_base::process::signal_pid(pid, libc::SIGUSR1)
 }
 
-const GONE: &str = "it has already finished";
-const CHANGED: &str = "the session changed hands; nothing was signalled";
+/// Why a stop or terminate request did nothing.
+#[derive(Debug)]
+pub enum StopError {
+    /// The run finished before the request.
+    Gone,
+    /// The session's owner is no longer the run the caller saw.
+    Changed,
+    /// The run cannot be stopped this way; the text says what to do instead.
+    Unsupported(&'static str),
+    NotLeader(u32),
+    BadPid,
+    Signal {
+        pid: u32,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for StopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gone => f.write_str("it has already finished"),
+            Self::Changed => f.write_str("the session changed hands; nothing was signalled"),
+            Self::Unsupported(why) => f.write_str(why),
+            Self::NotLeader(pid) => {
+                write!(f, "pid {pid} does not lead its own process group; nothing was signalled")
+            }
+            Self::BadPid => f.write_str("bad pid"),
+            Self::Signal { pid, source } => write!(f, "cannot signal pid {pid}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for StopError {}
 
 /// `s` in the jobs panel: stops the run the user saw, without taking it over. A `-p` run gets SIGUSR1
 /// and stops after its current step; a subagent's process group gets SIGTERM, which is how its parent
 /// cancels it; an interactive mu that said it handles SIGUSR1 cancels its current turn and keeps
 /// running. Nothing is signalled unless the session's owner is still that run (same pid and start
 /// time).
-pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<String, String> {
+pub fn stop_session(path: &Path, pid: u32, started: &str, kind: &str) -> Result<String, StopError> {
     match kind {
         "print" => match recheck(owner(path), pid, started, Want::PrintRun) {
             Recheck::Same => signal(pid)
                 .map(|()| format!("asked pid {pid} to stop after its current step"))
-                .map_err(|e| format!("cannot signal pid {pid}: {e}")),
-            Recheck::Free => Err(GONE.into()),
-            Recheck::Changed => Err(CHANGED.into()),
+                .map_err(|source| StopError::Signal { pid, source }),
+            Recheck::Free => Err(StopError::Gone),
+            Recheck::Changed => Err(StopError::Changed),
         },
         "subagent" => match recheck(owner(path), pid, started, Want::NotPrint) {
             Recheck::Same => terminate_leader(pid),
-            Recheck::Free => Err(GONE.into()),
-            Recheck::Changed => Err(CHANGED.into()),
+            Recheck::Free => Err(StopError::Gone),
+            Recheck::Changed => Err(StopError::Changed),
         },
         "tui" => {
             let l = live_run(path, pid, started)?;
             if l.kind.as_deref() != Some("tui") || !l.abort {
-                return Err("that mu does not take abort requests (an older version); use S to terminate it".into());
+                return Err(StopError::Unsupported(
+                    "that mu does not take abort requests (an older version); use S to terminate it",
+                ));
             }
             signal(pid)
                 .map(|()| format!("asked pid {pid} to abort its current turn"))
-                .map_err(|e| format!("cannot signal pid {pid}: {e}"))
+                .map_err(|source| StopError::Signal { pid, source })
         }
-        _ => Err("only -p runs, subagents and interactive mu can be stopped from here".into()),
+        _ => Err(StopError::Unsupported("only -p runs, subagents and interactive mu can be stopped from here")),
     }
 }
 
 /// `S` in the jobs panel, after a confirmation: asks an interactive mu to exit (SIGTERM; it restores
 /// its terminal on the way out). Only for the run the user saw, and only an interactive mu.
-pub fn terminate_session(path: &Path, pid: u32, started: &str) -> Result<String, String> {
+pub fn terminate_session(path: &Path, pid: u32, started: &str) -> Result<String, StopError> {
     let l = live_run(path, pid, started)?;
     if l.kind.as_deref() != Some("tui") {
-        return Err("only an interactive mu can be terminated from here".into());
+        return Err(StopError::Unsupported("only an interactive mu can be terminated from here"));
     }
     mu_base::process::signal_pid(pid, libc::SIGTERM)
         .map(|()| format!("asked pid {pid} to exit"))
-        .map_err(|e| format!("cannot signal pid {pid}: {e}"))
+        .map_err(|source| StopError::Signal { pid, source })
 }
 
 /// The live owner record of `path`, if it is still the run (pid and start time) the caller saw.
-fn live_run(path: &Path, pid: u32, started: &str) -> Result<LiveSession, String> {
+fn live_run(path: &Path, pid: u32, started: &str) -> Result<LiveSession, StopError> {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     match live_sessions().into_iter().find(|l| l.path == abs) {
         Some(l) if l.pid == pid && l.started == started => Ok(l),
-        Some(_) => Err(CHANGED.into()),
-        None => Err(GONE.into()),
+        Some(_) => Err(StopError::Changed),
+        None => Err(StopError::Gone),
     }
 }
 
 /// SIGTERM to the process group `pid` leads. A pid that leads no group of its own is left alone: its
 /// group is someone else's.
-fn terminate_leader(pid: u32) -> Result<String, String> {
-    let p = libc::pid_t::try_from(pid).map_err(|_| "bad pid".to_string())?;
+fn terminate_leader(pid: u32) -> Result<String, StopError> {
+    let p = libc::pid_t::try_from(pid).map_err(|_| StopError::BadPid)?;
     // SAFETY: plain syscalls on integers.
     if unsafe { libc::getpgid(p) } != p {
-        return Err(format!("pid {pid} does not lead its own process group; nothing was signalled"));
+        return Err(StopError::NotLeader(pid));
     }
     if mu_base::process::kill_group(p, libc::SIGTERM) {
         Ok(format!("asked pid {pid} to terminate"))
     } else {
-        Err(format!("cannot signal pid {pid}: {}", std::io::Error::last_os_error()))
+        Err(StopError::Signal { pid, source: std::io::Error::last_os_error() })
     }
 }
 
@@ -157,11 +190,11 @@ mod tests {
     fn stopping_refuses_other_kinds_and_sessions_nobody_has() {
         let t = "2026-01-01T00:00:00.000Z";
         let missing = Path::new("/definitely/not/a/session_x.jsonl");
-        assert!(stop_session(missing, 7, t, "acp").unwrap_err().contains("can be stopped from here"));
-        assert!(stop_session(missing, 7, t, "tui").unwrap_err().contains("already finished"));
-        assert!(terminate_session(missing, 7, t).unwrap_err().contains("already finished"));
-        assert!(stop_session(missing, 7, t, "print").unwrap_err().contains("already finished"));
-        assert!(stop_session(missing, 7, t, "subagent").unwrap_err().contains("already finished"));
+        assert!(matches!(stop_session(missing, 7, t, "acp").unwrap_err(), StopError::Unsupported(_)));
+        assert!(matches!(stop_session(missing, 7, t, "tui").unwrap_err(), StopError::Gone));
+        assert!(matches!(terminate_session(missing, 7, t).unwrap_err(), StopError::Gone));
+        assert!(matches!(stop_session(missing, 7, t, "print").unwrap_err(), StopError::Gone));
+        assert!(matches!(stop_session(missing, 7, t, "subagent").unwrap_err(), StopError::Gone));
     }
 
     #[test]
@@ -171,9 +204,9 @@ mod tests {
         let me = std::process::id();
         // Another pid, or another start time: the record is somebody else's now. Never our own pid
         // with the right start time here, which would signal this test process.
-        assert!(stop_session(&s.path, me + 1, "x", "tui").unwrap_err().contains("changed hands"));
-        assert!(terminate_session(&s.path, me + 1, "x").unwrap_err().contains("changed hands"));
-        assert!(stop_session(&s.path, me, "not the start time", "tui").unwrap_err().contains("changed hands"));
+        assert!(matches!(stop_session(&s.path, me + 1, "x", "tui").unwrap_err(), StopError::Changed));
+        assert!(matches!(terminate_session(&s.path, me + 1, "x").unwrap_err(), StopError::Changed));
+        assert!(matches!(stop_session(&s.path, me, "not the start time", "tui").unwrap_err(), StopError::Changed));
         drop(s);
     }
 
@@ -189,7 +222,7 @@ mod tests {
         // Shares this test's group, so it is not a leader.
         let mut follower = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let err = terminate_leader(follower.id()).unwrap_err();
-        assert!(err.contains("does not lead its own process group"), "{err}");
+        assert!(matches!(err, StopError::NotLeader(_)), "{err}");
         assert!(follower.try_wait().unwrap().is_none(), "it was not signalled");
         let _ = follower.kill();
         let _ = follower.wait();

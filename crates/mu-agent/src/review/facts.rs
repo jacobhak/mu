@@ -33,7 +33,7 @@ pub(crate) async fn snapshot_tree(cwd: &Path) -> Result<String, String> {
                 .map_err(|e| format!("cannot stamp index copy: {e}"))?;
         }
         git(cwd, &["add", "-A"], Some(&tmp)).await?;
-        git(cwd, &["write-tree"], Some(&tmp)).await
+        Ok(git(cwd, &["write-tree"], Some(&tmp)).await?)
     }
     .await;
     let _ = std::fs::remove_file(&tmp);
@@ -43,7 +43,7 @@ pub(crate) async fn snapshot_tree(cwd: &Path) -> Result<String, String> {
 pub(crate) async fn head_tree(cwd: &Path) -> Result<String, String> {
     match git(cwd, &["rev-parse", "HEAD^{tree}"], None).await {
         Ok(s) => Ok(s.trim().to_string()),
-        Err(_) => git(cwd, &["hash-object", "-t", "tree", "/dev/null"], None).await.map(|s| s.trim().to_string()),
+        Err(_) => Ok(git(cwd, &["hash-object", "-t", "tree", "/dev/null"], None).await?.trim().to_string()),
     }
 }
 
@@ -62,7 +62,7 @@ impl FileStat {
 }
 
 pub(crate) async fn numstat(root: &Path, base: &str, cur: &str) -> Result<Vec<FileStat>, String> {
-    git(root, &["diff", "--numstat", "-z", "--no-renames", base, cur], None).await.map(|s| parse_numstat(&s))
+    Ok(parse_numstat(&git(root, &["diff", "--numstat", "-z", "--no-renames", base, cur], None).await?))
 }
 
 pub(crate) fn parse_numstat(raw: &str) -> Vec<FileStat> {

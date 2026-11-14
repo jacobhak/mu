@@ -67,7 +67,7 @@ pub async fn has_commits(root: &Path) -> bool {
 /// The commit's message, files and diff.
 pub async fn show(root: &Path, sha: &str) -> Result<String, String> {
     check_sha(sha)?;
-    git(root, &["show", "--format=%s%n%aI%n", "--stat", "--patch", sha], None).await
+    Ok(git(root, &["show", "--format=%s%n%aI%n", "--stat", "--patch", sha], None).await?)
 }
 
 /// `git revert` of one commit. A conflict aborts the revert and is reported.

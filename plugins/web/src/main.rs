@@ -30,11 +30,11 @@ async fn dispatch(req: Request) -> Result<Value, RpcError> {
             let (content, is_error) = match name {
                 "web_search" => search::search(&args).await,
                 "fetch" => fetch_tool(&args).await,
-                other => return Err(RpcError { code: -32601, message: format!("unknown tool {other}") }),
+                other => return Err(RpcError::new(-32601, format!("unknown tool {other}"))),
             };
             Ok(json!({ "content": content, "isError": is_error }))
         }
-        other => Err(RpcError { code: -32601, message: format!("unknown method {other}") }),
+        other => Err(RpcError::new(-32601, format!("unknown method {other}"))),
     }
 }
 

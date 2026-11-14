@@ -79,6 +79,10 @@ The core is a workspace of crates. Each depends only on the ones above it in thi
 
 The tools-to-provider edge exists because the plugin host serves `core/complete` through the provider client. Nothing depends on `mu-tui` or `mu`. Test-only hooks sit behind a `test-support` feature of the crate that owns them, enabled from `[dev-dependencies]` so release builds never contain them.
 
+### Errors
+
+Inside a crate, errors are `anyhow`. Where a caller branches on the kind (a session lookup that is ambiguous, a stop request that found the run gone, a missing model), the function returns a typed enum with a `Display` impl, and callers match on the variant, never on message text. `String` is for display and RPC boundaries only: a tool result, a status line, a JSON-RPC message. A JSON-RPC error that a peer may branch on carries a machine-readable `kind` next to its `message` (`mu_common::rpc::kind`; today only `no_model`).
+
 ## Plugins
 
 ### Protocol
@@ -138,7 +142,7 @@ Hooks other than `tool_call` run concurrently under one deadline (30 s; 10 s for
 
 | Direction | Call | Purpose |
 |---|---|---|
-| plugin → core | `core/complete` | One-off model call through the configured providers (memory summaries, advisor, commit messages) |
+| plugin → core | `core/complete` | One-off model call through the configured providers (memory summaries, advisor, commit messages). An error with no model for the role carries `kind: "no_model"` |
 | plugin → core | `core/tool` | Invoke a built-in tool. *Not yet implemented; add it when a plugin needs it.* |
 | plugin → core | `ui/notify`, `ui/confirm`, `ui/select`, `ui/input` | User interaction (the subset pi's RPC extension UI proves workable). Only `ui/notify` is implemented; `ui/confirm`, `ui/select` and `ui/input` are *not yet implemented* — add them when a plugin needs them. |
 | plugin → core | `core/mcpToken` | Only from an MCP http bridge: an OAuth access token for its server, fetched with `omp token` (through the auth broker when the gateway is running) |

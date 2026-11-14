@@ -49,7 +49,7 @@ async fn handle(req: rpc::Request) -> Result<Value, rpc::RpcError> {
 }
 
 fn err(code: i64, message: impl Into<String>) -> rpc::RpcError {
-    rpc::RpcError { code, message: message.into() }
+    rpc::RpcError::new(code, message)
 }
 
 /// Returns a live gateway URL (starting the daemon if needed) and its bearer token; touches the client's lease.

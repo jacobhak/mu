@@ -16,6 +16,18 @@ fn ceiling(max_tokens: u32) -> Duration {
     Duration::from_secs(60u64.max(u64::from(max_tokens) / 20))
 }
 
+/// No model serves the role asked for; callers (the plugin host) branch on it by downcast.
+#[derive(Debug)]
+pub struct NoModel(String);
+
+impl std::fmt::Display for NoModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no model configured for role {}", self.0)
+    }
+}
+
+impl std::error::Error for NoModel {}
+
 impl Providers {
     /// One-shot completion without tools or thinking. `role_or_model` is a model id, or a role
     /// (optionally `@`-prefixed) whose fallback chain is tried until one model answers.
@@ -37,7 +49,7 @@ impl Providers {
                 .collect()
         };
         if sels.is_empty() {
-            return Err(anyhow!("no model configured for role {role_or_model}"));
+            return Err(NoModel(role_or_model.to_string()).into());
         }
         let limit = ceiling(max_tokens);
         let mut last = anyhow!("no model");

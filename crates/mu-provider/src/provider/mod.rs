@@ -5,6 +5,7 @@
 
 pub mod client;
 pub(crate) mod complete;
+pub use complete::NoModel;
 pub mod custom;
 #[cfg(test)]
 mod custom_tests;

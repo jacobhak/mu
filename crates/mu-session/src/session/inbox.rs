@@ -218,7 +218,7 @@ pub(crate) fn deliver(path: &Path) -> Delivery {
 
 /// Queues `text` for the session at `arg` and wakes it when it is live. Returns the outcome line.
 pub fn send(arg: &Path, from: Option<&str>, text: &str, cwd: &Path) -> Result<String, String> {
-    let path = find(cwd, arg).map(|p| std::fs::canonicalize(&p).unwrap_or(p))?;
+    let path = find(cwd, arg).map(|p| std::fs::canonicalize(&p).unwrap_or(p)).map_err(|e| e.to_string())?;
     if text.trim().is_empty() {
         return Err("empty message".into());
     }

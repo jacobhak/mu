@@ -24,7 +24,7 @@ async fn main() {
 }
 
 fn rpc_err(code: i64, message: impl Into<String>) -> RpcError {
-    RpcError { code, message: message.into() }
+    RpcError::new(code, message)
 }
 
 async fn dispatch(req: Request) -> Result<Value, RpcError> {

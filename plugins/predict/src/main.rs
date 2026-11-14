@@ -21,7 +21,7 @@ use worker::{Job, Mailbox};
 static MAILBOX: OnceLock<Arc<Mailbox<Job>>> = OnceLock::new();
 
 fn rpc_err(code: i64, message: impl Into<String>) -> RpcError {
-    RpcError { code, message: message.into() }
+    RpcError::new(code, message)
 }
 
 fn mailbox() -> Result<&'static Arc<Mailbox<Job>>, RpcError> {

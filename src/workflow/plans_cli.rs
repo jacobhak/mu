@@ -72,7 +72,10 @@ async fn cli(cmd: PlanCmd, cwd: &Path) -> i32 {
     let store = store_for(cwd).await;
     match cmd {
         PlanCmd::List { all, json } => {
-            let list = store.list(all);
+            let (list, warnings) = store.list(all);
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
             if json {
                 let arr: Vec<_> = list
                     .iter()

@@ -92,8 +92,8 @@ async fn complete_rpc(system: String, prompt: String) -> Result<Option<String>, 
     .await;
     match r {
         Ok(r) => Ok(r["text"].as_str().map(str::to_string)),
-        Err(e) if e.starts_with("no model configured") => Ok(None),
-        Err(e) => Err(e),
+        Err(e) if e.kind.as_deref() == Some(mu_common::rpc::kind::NO_MODEL) => Ok(None),
+        Err(e) => Err(e.message),
     }
 }
 

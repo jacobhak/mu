@@ -13,7 +13,7 @@ fn main() {
     match dispatch() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{e:#}");
             std::process::exit(1);
         }
     }
@@ -22,8 +22,8 @@ fn main() {
 fn dispatch() -> Result<i32> {
     mu_common::paths::check_home().map_err(anyhow::Error::msg)?;
     mu_provider::net::install_crypto();
-    secrets::set_stored_refresh(mu_provider::auth::store::sync_redaction);
-    cli::docs::register();
+    secrets::set_stored_refresh(mu_provider::auth::store::sync_redaction).map_err(anyhow::Error::msg)?;
+    cli::docs::register()?;
     let mut cli = Cli::parse();
     if let Some(p) = &cli.profile {
         // Single-threaded here: no runtime or plugin has started yet.

@@ -5,10 +5,11 @@ use super::Cli;
 use clap::CommandFactory;
 use mu_tools::tools::docs;
 
-pub fn register() {
-    docs::set_version(env!("MU_VERSION"));
+pub fn register() -> anyhow::Result<()> {
+    docs::set_version(env!("MU_VERSION")).map_err(anyhow::Error::msg)?;
     docs::register("reference/cli.md", cli_reference);
     docs::register("reference/interactive.md", mu_tui::app::interactive_reference);
+    Ok(())
 }
 
 fn cli_reference() -> String {

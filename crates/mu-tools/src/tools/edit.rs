@@ -188,8 +188,11 @@ pub fn set_mode(configured: &str) -> Result<(), String> {
         "sloppy" => EditMode::Sloppy,
         other => return Err(format!("unknown edit mode {other:?}; use \"hashline\" or \"sloppy\"")),
     };
-    let _ = MODE.set(m);
-    Ok(())
+    match MODE.set(m) {
+        Ok(()) => Ok(()),
+        Err(again) if MODE.get() == Some(&again) => Ok(()),
+        Err(_) => Err(format!("the edit mode is already {:?}; restart mu to change it", mode())),
+    }
 }
 
 pub fn mode() -> EditMode {

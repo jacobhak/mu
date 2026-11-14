@@ -41,10 +41,36 @@ pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// Why no single session file matched.
+#[derive(Debug)]
+pub enum FindError {
+    Empty,
+    Invalid(String),
+    NotFound(String),
+    Ambiguous { id: String, matches: Vec<String> },
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for FindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("empty session argument"),
+            Self::Invalid(id) => write!(f, "invalid session id `{id}`"),
+            Self::NotFound(id) => write!(f, "session {id} not found"),
+            Self::Ambiguous { id, matches } => {
+                write!(f, "session id `{id}` is ambiguous; matches: {}", matches.join(", "))
+            }
+            Self::Io(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FindError {}
+
 /// Session file for `arg`: an existing `.jsonl` file, else a session id (or id prefix).
-pub fn find(cwd: &Path, arg: &Path) -> Result<PathBuf, String> {
+pub fn find(cwd: &Path, arg: &Path) -> Result<PathBuf, FindError> {
     let Some(s) = arg.to_str().filter(|s| !s.trim().is_empty()) else {
-        return Err("empty session argument".into());
+        return Err(FindError::Empty);
     };
     if arg.is_file() && arg.extension().is_some_and(|x| x == "jsonl") {
         return Ok(arg.to_path_buf());
@@ -54,12 +80,12 @@ pub fn find(cwd: &Path, arg: &Path) -> Result<PathBuf, String> {
 
 /// Session file for an id or unique id prefix, searched in `cwd`'s sessions first and then in
 /// every other project's. Never treats `id` as a path.
-pub fn find_id(cwd: &Path, id: &str) -> Result<PathBuf, String> {
+pub fn find_id(cwd: &Path, id: &str) -> Result<PathBuf, FindError> {
     if !valid_id(id) {
-        return Err(format!("invalid session id `{id}`"));
+        return Err(FindError::Invalid(id.to_string()));
     }
     let own = paths::session_dir(cwd);
-    let root = own.parent().ok_or("no session directory")?;
+    let root = own.parent().ok_or_else(|| FindError::NotFound(id.to_string()))?;
     let matches_in = |d: &Path| -> Vec<PathBuf> {
         let Ok(rd) = std::fs::read_dir(d) else { return vec![] };
         let mut v: Vec<PathBuf> = rd
@@ -75,18 +101,15 @@ pub fn find_id(cwd: &Path, id: &str) -> Result<PathBuf, String> {
     };
     let mut found = matches_in(&own);
     if found.is_empty() {
-        let others = std::fs::read_dir(root).map_err(|e| e.to_string())?;
+        let others = std::fs::read_dir(root).map_err(FindError::Io)?;
         for d in others.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| *p != own && p.is_dir()) {
             found.extend(matches_in(&d));
         }
     }
     match found.len() {
-        0 => Err(format!("session {id} not found")),
+        0 => Err(FindError::NotFound(id.to_string())),
         1 => Ok(found.remove(0)),
-        _ => {
-            let list: Vec<String> = found.iter().map(|p| id_of(p)).collect();
-            Err(format!("session id `{id}` is ambiguous; matches: {}", list.join(", ")))
-        }
+        _ => Err(FindError::Ambiguous { id: id.to_string(), matches: found.iter().map(|p| id_of(p)).collect() }),
     }
 }
 
@@ -190,7 +213,7 @@ mod tests {
         let common = ia.chars().zip(ib.chars()).take_while(|(x, y)| x == y).count();
         if common > 0 {
             let e = find_id(cwd, &ia[..common]).unwrap_err();
-            assert!(e.contains("ambiguous"), "{e}");
+            assert!(matches!(e, FindError::Ambiguous { .. }), "{e}");
         }
     }
 

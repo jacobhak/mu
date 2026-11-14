@@ -28,22 +28,23 @@ fn pending() -> &'static Pending {
 
 /// Calls a host method (such as `core/webSearch`) and waits for the reply. `Err` carries the
 /// host's error message, `"not serving"` outside `serve_stdio`, or `"host closed"`.
-pub async fn request(method: &str, params: Value) -> Result<Value, String> {
-    let tx = OUTBOX.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("not serving")?;
+pub async fn request(method: &str, params: Value) -> Result<Value, RpcError> {
+    let tx =
+        OUTBOX.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or_else(|| RpcError::new(-32000, "not serving"))?;
     let (id, rx) = pending().register();
     let line = serde_json::to_string(&Request::new(Some(Value::from(id)), method, params)).expect("request serializes");
     if tx.send(line).is_err() {
         pending().cancel(id);
-        return Err("host closed".into());
+        return Err(RpcError::new(-32000, "host closed"));
     }
-    rx.await.unwrap_or_else(|_| Err("host closed".into()))
+    rx.await.unwrap_or_else(|_| Err(RpcError::new(-32000, "host closed")))
 }
 
 /// Hands a host reply to the `request` waiting for it.
 fn route_response(p: &Pending, r: Response) {
     let Some(id) = r.id.as_u64() else { return };
     let result = match r.error {
-        Some(e) => Err(e.message),
+        Some(e) => Err(e),
         None => Ok(r.result.unwrap_or(Value::Null)),
     };
     p.resolve(id, result);
@@ -63,6 +64,32 @@ pub struct Request {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// Machine-readable cause (see `kind`); `message` is for display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// Values of `RpcError::kind` that a caller branches on.
+pub mod kind {
+    /// `core/complete`: no model serves the requested role.
+    pub const NO_MODEL: &str = "no_model";
+}
+
+impl RpcError {
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
+        Self { code, message: message.into(), kind: None }
+    }
+
+    pub fn with_kind(mut self, kind: Option<&str>) -> Self {
+        self.kind = kind.map(str::to_string);
+        self
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +113,10 @@ impl Response {
         Self { jsonrpc: "2.0".into(), id, result: Some(result), error: None }
     }
     pub fn err(id: Value, code: i64, message: impl Into<String>) -> Self {
-        Self { jsonrpc: "2.0".into(), id, result: None, error: Some(RpcError { code, message: message.into() }) }
+        Self { jsonrpc: "2.0".into(), id, result: None, error: Some(RpcError::new(code, message)) }
+    }
+    pub fn err_kind(id: Value, code: i64, message: impl Into<String>, kind: Option<&str>) -> Self {
+        Self { jsonrpc: "2.0".into(), id, result: None, error: Some(RpcError::new(code, message).with_kind(kind)) }
     }
 }
 
@@ -195,12 +225,12 @@ pub struct Pending {
 #[derive(Default)]
 struct PendingInner {
     next: u64,
-    waiting: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
+    waiting: HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>,
 }
 
 impl Pending {
     /// A new id and the receiver its reply arrives on.
-    pub fn register(&self) -> (u64, oneshot::Receiver<Result<Value, String>>) {
+    pub fn register(&self) -> (u64, oneshot::Receiver<Result<Value, RpcError>>) {
         let mut g = self.inner.lock().expect("pending lock poisoned");
         g.next += 1;
         let id = g.next;
@@ -210,7 +240,7 @@ impl Pending {
     }
 
     /// Delivers `result` to the waiter for `id`, if it is still waiting.
-    pub fn resolve(&self, id: u64, result: Result<Value, String>) {
+    pub fn resolve(&self, id: u64, result: Result<Value, RpcError>) {
         if let Some(tx) = self.inner.lock().expect("pending lock poisoned").waiting.remove(&id) {
             let _ = tx.send(result);
         }
@@ -224,7 +254,7 @@ impl Pending {
     /// Fails every waiter, e.g. when the connection ended.
     pub fn fail_all(&self, message: &str) {
         for (_, tx) in self.inner.lock().expect("pending lock poisoned").waiting.drain() {
-            let _ = tx.send(Err(message.to_string()));
+            let _ = tx.send(Err(RpcError::new(-32000, message)));
         }
     }
 
@@ -295,13 +325,14 @@ mod tests {
     fn a_request_to_the_host_gets_its_reply_or_its_error() {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(async {
-            assert_eq!(request("core/x", json!({})).await.unwrap_err(), "not serving");
+            assert_eq!(request("core/x", json!({})).await.unwrap_err().message, "not serving");
             let (tx, mut out) = mpsc::unbounded_channel::<String>();
             OUTBOX.lock().unwrap().replace(tx);
             let host = async {
                 for reply in [
                     |id: Value| Response::ok(id, json!({"backend": "exa"})),
                     |id: Value| Response::err(id, -32603, "no key"),
+                    |id: Value| Response::err_kind(id, -32603, "none", Some(kind::NO_MODEL)),
                 ] {
                     let line = out.recv().await.unwrap();
                     let sent: Request = serde_json::from_str(&line).unwrap();
@@ -312,11 +343,14 @@ mod tests {
             let calls = async {
                 let a = request("core/webSearch", json!({})).await;
                 let b = request("core/webSearch", json!({})).await;
-                (a, b)
+                let c = request("core/webSearch", json!({})).await;
+                (a, b, c)
             };
-            let ((a, b), ()) = tokio::join!(calls, host);
+            let ((a, b, c), ()) = tokio::join!(calls, host);
             assert_eq!(a.unwrap(), json!({"backend": "exa"}));
-            assert_eq!(b.unwrap_err(), "no key");
+            let b = b.unwrap_err();
+            assert_eq!((b.message.as_str(), b.kind), ("no key", None));
+            assert_eq!(c.unwrap_err().kind.as_deref(), Some(kind::NO_MODEL));
             // A reply nobody waits for is dropped; closing the host fails the waiters.
             route_response(pending(), Response::ok(json!(999), Value::Null));
             OUTBOX.lock().unwrap().take();
@@ -362,7 +396,7 @@ mod tests {
         p.fail_all("gone");
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         assert_eq!(rt.block_on(rx).unwrap().unwrap(), json!(5));
-        assert_eq!(rt.block_on(rx2).unwrap().unwrap_err(), "gone");
+        assert_eq!(rt.block_on(rx2).unwrap().unwrap_err().message, "gone");
         assert!(p.is_empty());
     }
 }

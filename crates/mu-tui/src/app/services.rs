@@ -112,10 +112,10 @@ impl Services {
     }
 
     pub(super) fn stop_session(&self, session: &Path, pid: u32, started: &str, kind: &str) -> Result<String, String> {
-        control::stop_session(session, pid, started, kind)
+        control::stop_session(session, pid, started, kind).map_err(|e| e.to_string())
     }
 
     pub(super) fn terminate_session(&self, session: &Path, pid: u32, started: &str) -> Result<String, String> {
-        control::terminate_session(session, pid, started)
+        control::terminate_session(session, pid, started).map_err(|e| e.to_string())
     }
 }

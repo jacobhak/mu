@@ -271,14 +271,14 @@ async fn body<S: Steps>(steps: &mut S, job: &Job, rec: &mut Record) {
             Ok(s) if !s.trim().is_empty() => s,
             _ => match git(&rec.repo, &["rev-parse", "HEAD"], None).await {
                 Ok(s) => s,
-                Err(e) => return fail_with(rec, Outcome::Error, e),
+                Err(e) => return fail_with(rec, Outcome::Error, e.to_string()),
             },
         };
         let base = base.trim().to_string();
         let wt = rec.worktree.display().to_string();
         eprintln!("== worktree {wt} on {branch}");
         if let Err(e) = git(&rec.repo, &["worktree", "add", "-q", "-b", branch, &wt, &base], None).await {
-            return fail_with(rec, Outcome::Error, e);
+            return fail_with(rec, Outcome::Error, e.to_string());
         }
         rec.base = base;
         rec.created_worktree = true;
@@ -462,7 +462,7 @@ async fn current_branch(top: &Path) -> String {
 async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
     let top = repo_root(cwd).await.map_err(|_| "mu deliver needs a git repository".to_string())?;
     let notify = match &a.notify {
-        Some(p) => Some(list::find(cwd, p)?),
+        Some(p) => Some(list::find(cwd, p).map_err(|e| e.to_string())?),
         None => std::env::var_os("PI_SESSION_FILE")
             .filter(|v| !v.is_empty())
             .and_then(|v| list::find(cwd, Path::new(&v)).ok()),
@@ -546,7 +546,7 @@ async fn prepare(a: &DeliverArgs, cwd: &Path) -> Result<(Job, Record), String> {
             let (Some(s), Some(b)) = (&a.session, &a.base) else {
                 return Err("--loop without a delivery id needs --session and --base".into());
             };
-            let session = list::find(cwd, s)?;
+            let session = list::find(cwd, s).map_err(|e| e.to_string())?;
             let session = std::fs::canonicalize(&session).unwrap_or(session);
             let base = git(&top, &["rev-parse", "--verify", "--quiet", &format!("{b}^{{commit}}")], None)
                 .await

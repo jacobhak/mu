@@ -7,9 +7,43 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Why a git command gave no output.
+#[derive(Debug)]
+pub enum GitError {
+    /// Git did not start.
+    Spawn {
+        cmd: String,
+        source: std::io::Error,
+    },
+    TimedOut {
+        cmd: String,
+    },
+    /// Git ran and failed; the text is its first stderr line.
+    Failed(String),
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn { cmd, source } => write!(f, "git {cmd}: {source}"),
+            Self::TimedOut { cmd } => write!(f, "git {cmd} timed out"),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for GitError {}
+
+/// For callers whose own error is display text (tool output, RPC messages).
+impl From<GitError> for String {
+    fn from(e: GitError) -> Self {
+        e.to_string()
+    }
+}
+
 /// Runs git in `dir` with `GIT_INDEX_FILE` set to `index` when given. Stdout on success, git's
 /// first stderr line otherwise.
-pub async fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
+pub async fn git(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<String, GitError> {
     git_for(dir, args, index, TIMEOUT).await
 }
 
@@ -19,7 +53,7 @@ pub(crate) async fn git_for(
     args: &[&str],
     index: Option<&Path>,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<String, GitError> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args)
         .current_dir(dir)
@@ -32,19 +66,19 @@ pub(crate) async fn git_for(
     let name = args.first().copied().unwrap_or("");
     let out = match tokio::time::timeout(timeout, cmd.output()).await {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("git {name}: {e}")),
-        Err(_) => return Err(format!("git {name} timed out")),
+        Ok(Err(source)) => return Err(GitError::Spawn { cmd: name.to_string(), source }),
+        Err(_) => return Err(GitError::TimedOut { cmd: name.to_string() }),
     };
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
-        Err(err.lines().next().unwrap_or("git failed").trim().to_string())
+        Err(GitError::Failed(err.lines().next().unwrap_or("git failed").trim().to_string()))
     }
 }
 
 /// The top level of the working tree `cwd` is in.
-pub async fn repo_root(cwd: &Path) -> Result<PathBuf, String> {
+pub async fn repo_root(cwd: &Path) -> Result<PathBuf, GitError> {
     git(cwd, &["rev-parse", "--show-toplevel"], None).await.map(|s| PathBuf::from(s.trim()))
 }
 

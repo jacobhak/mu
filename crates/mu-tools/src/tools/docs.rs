@@ -56,8 +56,12 @@ pub fn register(path: &'static str, page: Page) {
 static VERSION: OnceLock<&'static str> = OnceLock::new();
 
 /// The version string shown on the index and in `mu://state/session.md`.
-pub fn set_version(v: &'static str) {
-    let _ = VERSION.set(v);
+pub fn set_version(v: &'static str) -> Result<(), String> {
+    match VERSION.set(v) {
+        Ok(()) => Ok(()),
+        Err(again) if VERSION.get() == Some(&again) => Ok(()),
+        Err(_) => Err("the version was already set to a different string".into()),
+    }
 }
 
 fn version() -> &'static str {

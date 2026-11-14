@@ -24,6 +24,12 @@ fn file_uri(path: &str) -> String {
     out
 }
 
+/// Why `mcp_request` has no result: the method is not one the client serves, or serving it failed.
+pub(super) enum McpError {
+    NotFound(String),
+    Failed(String),
+}
+
 /// What an MCP server may ask of the client: `ping`, `roots/list` and notifications; the http
 /// bridge also asks for OAuth tokens (`core/mcpToken`).
 pub(super) async fn mcp_request(
@@ -31,7 +37,7 @@ pub(super) async fn mcp_request(
     m: &mcp::McpSlot,
     shared: &Shared,
     req: &Request,
-) -> Result<Value, String> {
+) -> Result<Value, McpError> {
     match req.method.as_str() {
         "ping" => Ok(json!({})),
         "roots/list" => {
@@ -50,7 +56,7 @@ pub(super) async fn mcp_request(
                 }
                 None => {
                     m.needs_login.set(true);
-                    Err(format!("no credential for mcp:{}", server.name))
+                    Err(McpError::Failed(format!("no credential for mcp:{}", server.name)))
                 }
             }
         }
@@ -63,7 +69,7 @@ pub(super) async fn mcp_request(
             }
             Ok(Value::Null)
         }
-        other => Err(format!("method not found: {other}")),
+        other => Err(McpError::NotFound(format!("method not found: {other}"))),
     }
 }
 
