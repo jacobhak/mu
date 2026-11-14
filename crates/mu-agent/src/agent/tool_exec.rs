@@ -97,7 +97,7 @@ impl Agent {
     /// Registers an interruptible wait for this call, when the session has background jobs and the
     /// call can wait: `wait`, or `bash` that is neither `pty` nor `async`. User input releases the
     /// wait without cancelling the work; input queued before this call steers at once instead.
-    fn wait_guard(&self, name: &str, args: &Value) -> Option<mu_tools::jobs::ActiveWait> {
+    pub(super) fn wait_guard(&self, name: &str, args: &Value) -> Option<mu_tools::jobs::ActiveWait> {
         let eligible = match name {
             "wait" => true,
             "bash" => args["pty"].as_bool() != Some(true) && args["async"].as_bool() != Some(true),
@@ -258,13 +258,21 @@ impl Agent {
         }
     }
 
+    /// Runs one call alone: hooks, gate, approval, the tool, the hooks after it.
     pub(super) async fn run_tool(
         &mut self,
         id: &str,
         name: &str,
-        mut args: Value,
+        args: Value,
         cancel: &CancellationToken,
     ) -> ToolOutput {
+        let (args, stop) = self.open_tool(id, name, args).await;
+        self.run_opened(id, name, args, stop, None, cancel).await
+    }
+
+    /// The `tool_call` hooks and the start event, then the run's own limits. `Some` is the output
+    /// of a call that will not run. Returns the arguments the hooks left.
+    pub(super) async fn open_tool(&mut self, id: &str, name: &str, mut args: Value) -> (Value, Option<ToolOutput>) {
         let mut blocked = None;
         match self.ports.plugins.tool_call_hook(name, args.clone()).await {
             Ok(a) => args = a,
@@ -272,87 +280,142 @@ impl Agent {
         }
         self.emit(AgentEvent::ToolStart { id: id.into(), name: name.into(), args: args.clone() });
         let denied = self.policy().check(name).err().or_else(|| secrets::guard(name, &args).err());
+        (args, blocked.or(denied).map(ToolOutput::err))
+    }
+
+    /// What the permission gate says about a call that is to run.
+    pub(super) async fn verdict_for(&mut self, name: &str, args: &Value) -> Verdict {
+        let mut warns = Vec::new();
+        self.tools.permissions.ensure_project(&self.cwd, &mut warns).await;
+        for w in warns {
+            self.notice(w);
+        }
+        self.tools.permissions.check(&self.tools, name, args)
+    }
+
+    /// Acts on a verdict: asks the user for an `Ask`. Returns the output of a call that must not run,
+    /// and the user's note on an approved one.
+    async fn settle_verdict(
+        &mut self,
+        id: &str,
+        name: &str,
+        verdict: Verdict,
+        cancel: &CancellationToken,
+    ) -> (Option<ToolOutput>, Option<String>) {
         let mut user_note = None;
-        let mut out = match blocked.or(denied) {
-            Some(b) => ToolOutput::err(b),
-            None => {
-                let mut warns = Vec::new();
-                self.tools.permissions.ensure_project(&self.cwd, &mut warns).await;
-                for w in warns {
-                    self.notice(w);
-                }
-                let mut stop = None;
-                match self.tools.permissions.check(&self.tools, name, &args) {
-                    Verdict::Allow => {}
-                    Verdict::Deny(msg) => stop = Some(ToolOutput::err(msg)),
-                    Verdict::Ask(mut req) => {
-                        req.call_id = id.into();
-                        let grant = req.grant.clone();
-                        let reason = req.reason.clone();
-                        match self.approve(req, cancel).await {
-                            ApprovalDecision::Allow { scope, note, patterns } => {
-                                if scope != ApprovalScope::Once
-                                    && let Some(g) = grant
-                                {
-                                    match self.tools.permissions.remember(&g.picked(patterns), scope, true) {
-                                        Ok(GrantOutcome::AlreadyCovered(why)) => {
-                                            self.notice(format!("approval not saved: already covered ({why})"));
-                                        }
-                                        Ok(GrantOutcome::Written) => {}
-                                        Err(e) => self.notice(format!("could not save the approval: {e}")),
-                                    }
+        let mut stop = None;
+        match verdict {
+            Verdict::Allow => {}
+            Verdict::Deny(msg) => stop = Some(ToolOutput::err(msg)),
+            Verdict::Ask(mut req) => {
+                req.call_id = id.into();
+                let grant = req.grant.clone();
+                let reason = req.reason.clone();
+                match self.approve(req, cancel).await {
+                    ApprovalDecision::Allow { scope, note, patterns } => {
+                        if scope != ApprovalScope::Once
+                            && let Some(g) = grant
+                        {
+                            match self.tools.permissions.remember(&g.picked(patterns), scope, true) {
+                                Ok(GrantOutcome::AlreadyCovered(why)) => {
+                                    self.notice(format!("approval not saved: already covered ({why})"));
                                 }
-                                user_note = note;
-                            }
-                            ApprovalDecision::Deny { note: Some(n) } => {
-                                stop = Some(ToolOutput::err(format!("Not run: the user denied this {name} call: {n}")));
-                            }
-                            ApprovalDecision::Deny { note: None } => {
-                                cancel.cancel();
-                                stop = Some(ToolOutput::err("Not run: the user denied this call."));
-                            }
-                            ApprovalDecision::Unavailable => {
-                                stop = Some(ToolOutput::err(approval_unavailable(
-                                    name,
-                                    &reason,
-                                    self.tools.permissions.mode(),
-                                )));
+                                Ok(GrantOutcome::Written) => {}
+                                Err(e) => self.notice(format!("could not save the approval: {e}")),
                             }
                         }
+                        user_note = note;
+                    }
+                    ApprovalDecision::Deny { note: Some(n) } => {
+                        stop = Some(ToolOutput::err(format!("Not run: the user denied this {name} call: {n}")));
+                    }
+                    ApprovalDecision::Deny { note: None } => {
+                        cancel.cancel();
+                        stop = Some(ToolOutput::err("Not run: the user denied this call."));
+                    }
+                    ApprovalDecision::Unavailable => {
+                        stop =
+                            Some(ToolOutput::err(approval_unavailable(name, &reason, self.tools.permissions.mode())));
                     }
                 }
+            }
+        }
+        (stop, user_note)
+    }
+
+    /// The tool itself; a panic becomes an error result. `wait` releases an interruptible wait.
+    pub(super) async fn exec_tool(
+        &self,
+        id: &str,
+        name: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+        wait: Option<CancellationToken>,
+    ) -> ToolOutput {
+        let ctx = ToolCtx {
+            events: self.ports.events.clone(),
+            cancel: cancel.clone(),
+            call_id: id.into(),
+            plan: self.plan.plan.is_some(),
+            wait_interrupt: wait,
+        };
+        use futures_util::FutureExt;
+        match std::panic::AssertUnwindSafe(self.tools.call(name, args, &ctx)).catch_unwind().await {
+            Ok(o) => o,
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                ToolOutput::err(format!("tool panicked: {msg}"))
+            }
+        }
+    }
+
+    /// The rest of `run_tool` for a call `open_tool` has started. `stop`: it will not run. `verdict`:
+    /// the gate's answer when the caller already asked it.
+    pub(super) async fn run_opened(
+        &mut self,
+        id: &str,
+        name: &str,
+        args: Value,
+        stop: Option<ToolOutput>,
+        verdict: Option<Verdict>,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        let mut user_note = None;
+        let out = match stop {
+            Some(o) => o,
+            None => {
+                let verdict = match verdict {
+                    Some(v) => v,
+                    None => self.verdict_for(name, &args).await,
+                };
+                let (stop, note) = self.settle_verdict(id, name, verdict, cancel).await;
+                user_note = note;
                 match stop {
                     Some(o) => o,
                     None => {
                         // Only the call itself is interruptible: the approval above is not.
                         let guard = self.wait_guard(name, &args);
-                        let ctx = ToolCtx {
-                            events: self.ports.events.clone(),
-                            cancel: cancel.clone(),
-                            call_id: id.into(),
-                            plan: self.plan.plan.is_some(),
-                            wait_interrupt: guard.as_ref().map(|g| g.token()),
-                        };
-                        use futures_util::FutureExt;
-                        let out =
-                            match std::panic::AssertUnwindSafe(self.tools.call(name, &args, &ctx)).catch_unwind().await
-                            {
-                                Ok(o) => o,
-                                Err(p) => {
-                                    let msg = p
-                                        .downcast_ref::<&str>()
-                                        .map(|s| s.to_string())
-                                        .or_else(|| p.downcast_ref::<String>().cloned())
-                                        .unwrap_or_else(|| "unknown panic".into());
-                                    ToolOutput::err(format!("tool panicked: {msg}"))
-                                }
-                            };
-                        drop(guard);
-                        out
+                        self.exec_tool(id, name, &args, cancel, guard.as_ref().map(|g| g.token())).await
                     }
                 }
             }
         };
+        self.end_tool(id, name, args, user_note, out).await
+    }
+
+    /// Redaction, the `tool_result` hooks, plan and todo effects and the end event for a finished call.
+    pub(super) async fn end_tool(
+        &mut self,
+        id: &str,
+        name: &str,
+        args: Value,
+        user_note: Option<String>,
+        mut out: ToolOutput,
+    ) -> ToolOutput {
         if let Some(n) = user_note {
             out.text.push_str(&format!("\n\nUser note: {n}"));
         }

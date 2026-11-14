@@ -1,4 +1,5 @@
 use super::*;
+use mu_tools::permissions::Verdict;
 
 /// Whether the loop compacts before its next request.
 #[derive(Clone, Copy, PartialEq)]
@@ -451,49 +452,143 @@ impl Agent {
         Some(Flow::Done)
     }
 
-    /// Runs a reply's tool calls in order. Once the run is cancelled, stopped, steered or a `yield`
+    /// Runs a reply's tool calls in order. Calls that only read and need no approval run together,
+    /// up to `MAX_CONCURRENT_CALLS`; any other call waits for the ones before it and runs alone.
+    /// Results land in call order. Once the run is cancelled, stopped, steered or a `yield`
     /// succeeded, the rest are skipped with a result. Returns whether a `yield` succeeded.
     async fn run_calls(&mut self, calls: Vec<(String, String, Value)>, cancel: &CancellationToken) -> bool {
-        let mut skip: Option<&str> = None;
-        let mut yielded = false;
-        let since = std::time::SystemTime::now();
-        let last = calls.len().saturating_sub(1);
+        let mut pass = CallPass {
+            skip: None,
+            yielded: false,
+            since: std::time::SystemTime::now(),
+            last: calls.len().saturating_sub(1),
+            cancel: cancel.clone(),
+        };
+        let mut batch: Vec<Pending> = Vec::new();
         for (i, (id, name, args)) in calls.into_iter().enumerate() {
-            // Past 1.5x its budget the run only takes the result: `yield` still lands, nothing else.
-            if name != "yield" && self.budget.as_ref().is_some_and(|b| b.stopped()) {
-                self.emit_skipped(&id, &name, &args, SKIP_BUDGET);
+            let runnable = pass.skip.is_none()
+                && !cancel.is_cancelled()
+                && !self.ports.inbox.borrow().stop
+                && !self.budget.as_ref().is_some_and(|b| b.stopped());
+            let together = runnable && self.tools.permissions.runs_concurrently(&self.tools, &name, &args);
+            if !together {
+                self.run_batch(&mut batch, cancel, &mut pass).await;
+                self.run_alone(i, id, name, args, cancel, &mut pass).await;
                 continue;
             }
-            if skip.is_none() {
-                if cancel.is_cancelled() {
-                    skip = Some(SKIP_ABORTED);
-                } else if self.ports.inbox.borrow().stop {
-                    skip = Some(SKIP_STOPPED);
+            let (args, stop) = self.open_tool(&id, &name, args).await;
+            if stop.is_some() {
+                self.run_batch(&mut batch, cancel, &mut pass).await;
+                let out = self.run_opened(&id, &name, args, stop, None, cancel).await;
+                self.after_call(i, &id, &name, out, &mut pass);
+                continue;
+            }
+            match self.verdict_for(&name, &args).await {
+                Verdict::Allow => batch.push(Pending { i, id, name, args }),
+                verdict => {
+                    self.run_batch(&mut batch, cancel, &mut pass).await;
+                    let out = self.run_opened(&id, &name, args, None, Some(verdict), cancel).await;
+                    self.after_call(i, &id, &name, out, &mut pass);
                 }
             }
-            if let Some(reason) = skip {
-                self.emit_skipped(&id, &name, &args, reason);
-                continue;
-            }
-            let mut out = self.run_tool(&id, &name, args, cancel).await;
-            if i == last
-                && name != "yield"
-                && let Some(status) = self.job_status(since)
-            {
-                out.text.push_str(&status);
-            }
-            self.push_result(&id, &name, &out);
-            yielded |= name == "yield" && !out.is_error;
+        }
+        self.run_batch(&mut batch, cancel, &mut pass).await;
+        pass.yielded
+    }
+
+    /// One call on its own, or its skip result.
+    async fn run_alone(
+        &mut self,
+        i: usize,
+        id: String,
+        name: String,
+        args: Value,
+        cancel: &CancellationToken,
+        pass: &mut CallPass,
+    ) {
+        // Past 1.5x its budget the run only takes the result: `yield` still lands, nothing else.
+        if name != "yield" && self.budget.as_ref().is_some_and(|b| b.stopped()) {
+            self.emit_skipped(&id, &name, &args, SKIP_BUDGET);
+            return;
+        }
+        if pass.skip.is_none() {
             if cancel.is_cancelled() {
-                skip = Some(SKIP_ABORTED);
+                pass.skip = Some(SKIP_ABORTED);
             } else if self.ports.inbox.borrow().stop {
-                skip = Some(SKIP_STOPPED);
-            } else if yielded {
-                skip = Some(SKIP_YIELDED);
-            } else if !self.ports.inbox.borrow().steer.is_empty() {
-                skip = Some(SKIP_STEER);
+                pass.skip = Some(SKIP_STOPPED);
             }
         }
-        yielded
+        if let Some(reason) = pass.skip {
+            self.emit_skipped(&id, &name, &args, reason);
+            return;
+        }
+        let out = self.run_tool(&id, &name, args, cancel).await;
+        self.after_call(i, &id, &name, out, pass);
     }
+
+    /// Runs the calls gathered so far at once and records their results in call order.
+    async fn run_batch(&mut self, batch: &mut Vec<Pending>, cancel: &CancellationToken, pass: &mut CallPass) {
+        if batch.is_empty() {
+            return;
+        }
+        let items = std::mem::take(batch);
+        // One interruptible wait for the group: only the latest registered wait hears the user.
+        let guard = items.iter().find_map(|p| self.wait_guard(&p.name, &p.args));
+        let wait = guard.as_ref().map(|g| g.token());
+        let outs: Vec<ToolOutput> = {
+            use futures_util::StreamExt;
+            let this = &*self;
+            futures_util::stream::iter(&items)
+                .map(|p| this.exec_tool(&p.id, &p.name, &p.args, cancel, wait.clone()))
+                .buffered(MAX_CONCURRENT_CALLS)
+                .collect()
+                .await
+        };
+        drop(guard);
+        for (p, out) in items.into_iter().zip(outs) {
+            let out = self.end_tool(&p.id, &p.name, p.args, None, out).await;
+            self.after_call(p.i, &p.id, &p.name, out, pass);
+        }
+    }
+
+    /// Records a finished call's result and decides whether the rest of the message is skipped.
+    fn after_call(&mut self, i: usize, id: &str, name: &str, mut out: ToolOutput, pass: &mut CallPass) {
+        if i == pass.last
+            && name != "yield"
+            && let Some(status) = self.job_status(pass.since)
+        {
+            out.text.push_str(&status);
+        }
+        self.push_result(id, name, &out);
+        pass.yielded |= name == "yield" && !out.is_error;
+        if pass.cancel.is_cancelled() {
+            pass.skip = Some(SKIP_ABORTED);
+        } else if self.ports.inbox.borrow().stop {
+            pass.skip = Some(SKIP_STOPPED);
+        } else if pass.yielded {
+            pass.skip = Some(SKIP_YIELDED);
+        } else if !self.ports.inbox.borrow().steer.is_empty() {
+            pass.skip = Some(SKIP_STEER);
+        }
+    }
+}
+
+/// The most read-only calls of one message that run at the same time.
+const MAX_CONCURRENT_CALLS: usize = 8;
+
+/// How far a message's calls have got.
+struct CallPass {
+    skip: Option<&'static str>,
+    yielded: bool,
+    since: std::time::SystemTime,
+    last: usize,
+    cancel: CancellationToken,
+}
+
+/// A call that has started and passed the gate, waiting for its group to run.
+struct Pending {
+    i: usize,
+    id: String,
+    name: String,
+    args: Value,
 }
