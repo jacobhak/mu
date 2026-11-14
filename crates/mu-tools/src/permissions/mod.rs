@@ -196,6 +196,18 @@ impl Permissions {
 
     /// Decides one model tool call.
     pub fn check(&self, tools: &Tools, name: &str, args: &Value) -> Verdict {
+        // Before `classify`, so no mode, rule or grant (`yolo` included) can allow it silently.
+        if name == "enter_plan" {
+            return Verdict::Ask(ApprovalRequest {
+                tool: name.to_string(),
+                call_id: String::new(),
+                title: "enter_plan: switch to plan mode".into(),
+                reason: "Plan mode makes this session read-only until a plan is approved or parked, and switches to the plan model if one is set.".into(),
+                body: args["reason"].as_str().unwrap_or("").to_string(),
+                from: None,
+                grant: None,
+            });
+        }
         let gate = self.gate(&tools.cwd);
         let call = match classify::classify(tools, &gate, name, args) {
             Ok(c) => c,
@@ -318,6 +330,18 @@ mod tests {
         assert!(matches!(v, Verdict::Ask(_)), ".git is protected");
         let v = p.check(&t, "write", &json!({"path": "local://p.md", "content": "x"}));
         assert!(matches!(v, Verdict::Allow), "local:// is read tier");
+    }
+
+    #[test]
+    fn enter_plan_asks_in_every_mode_and_offers_no_grant() {
+        for mode in [PermissionMode::Ask, PermissionMode::Edits, PermissionMode::Yolo] {
+            let (p, t) = setup(mode);
+            let Verdict::Ask(req) = p.check(&t, "enter_plan", &json!({"reason": "big change"})) else {
+                panic!("{mode:?} must ask")
+            };
+            assert!(req.grant.is_none(), "{mode:?}");
+            assert_eq!((req.title.as_str(), req.body.as_str()), ("enter_plan: switch to plan mode", "big change"));
+        }
     }
 
     #[test]

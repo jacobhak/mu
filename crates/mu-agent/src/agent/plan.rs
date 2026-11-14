@@ -3,15 +3,21 @@ use crate::review;
 
 impl Agent {
     pub(super) async fn enter_plan(&mut self) {
+        self.enter_plan_as(false).await;
+    }
+
+    /// `by_model`: the model asked for plan mode through `enter_plan`, rather than the user.
+    pub(super) async fn enter_plan_as(&mut self, by_model: bool) {
         self.ensure_session().await;
-        let prev = PlanState { prev_model: Some(self.model.model.id.clone()), prev_thinking: self.model.thinking };
+        let prev =
+            PlanState { prev_model: Some(self.model.model.id.clone()), prev_thinking: self.model.thinking, by_model };
         if self.ports.providers.cfg.role("plan").is_some() {
             self.set_model("@plan");
         }
         if let Some(s) = self.session.as_mut() {
             s.mode_change(
                 "plan",
-                json!({"planFilePath": "local://", "prevModel": prev.prev_model, "prevThinking": prev.prev_thinking.as_str()}),
+                json!({"planFilePath": "local://", "prevModel": prev.prev_model, "prevThinking": prev.prev_thinking.as_str(), "byModel": by_model}),
             );
         }
         self.plan.plan = Some(prev);

@@ -135,6 +135,33 @@ fn a_scout_gets_its_own_prompt_and_no_shell() {
     assert!(!body.contains("\"name\":\"bash\""), "bash is not offered: {body}");
 }
 
+/// Nobody can approve `enter_plan` in a print run or a subagent, and a subagent cannot plan at all.
+#[test]
+fn print_and_headless_runs_are_offered_neither_plan_tool() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        block_on(async move {
+            tx.send(fake_server(vec![sse(ANSWER), sse(ANSWER)]).await).unwrap();
+            std::future::pending::<()>().await;
+        })
+    });
+    let (base, seen) = rx.recv().unwrap();
+    let home = home_with_key(&base);
+    let cwd = mu_testutil::tmp();
+    let o = mu(&home, &cwd).args(["-p", "hello", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let payload = json!({"agent": "task", "task": "say hello"}).to_string();
+    let mut c = mu(&home, &cwd);
+    let o = run_with_stdin(c.args(["--headless", "--model", MODEL]), &payload);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for body in requests.iter() {
+        assert!(body.contains("\"name\":\"read\""), "tools are offered: {body}");
+        assert!(!body.contains("\"name\":\"enter_plan\"") && !body.contains("\"name\":\"propose_plan\""), "{body}");
+    }
+}
+
 /// Every line of every session file under `dir`.
 fn session_texts(dir: &Path) -> String {
     let mut out = String::new();

@@ -36,6 +36,9 @@ impl ToolPolicy {
         if name == "propose_plan" && !self.plan {
             return Err("Tool `propose_plan` is only available in plan mode.".into());
         }
+        if name == "enter_plan" && self.plan {
+            return Err("Plan mode is already on.".into());
+        }
         Ok(())
     }
 
@@ -65,5 +68,14 @@ mod tests {
         assert!(p.check("propose_plan").is_err());
         assert!(ToolPolicy { plan: true, ..Default::default() }.check("propose_plan").is_ok());
         assert!(ToolPolicy { plan: true, ..Default::default() }.check("bash").is_ok());
+    }
+
+    #[test]
+    fn enter_plan_only_outside_plan_mode() {
+        assert!(ToolPolicy::default().check("enter_plan").is_ok());
+        let on = ToolPolicy { plan: true, ..Default::default() }.check("enter_plan");
+        assert_eq!(on, Err("Plan mode is already on.".into()));
+        let excluded = ToolPolicy { excluded: vec!["enter_plan"], ..Default::default() };
+        assert!(excluded.check("enter_plan").is_err());
     }
 }

@@ -2,6 +2,7 @@ mod ask;
 mod diff;
 pub mod docs;
 pub mod edit;
+mod enter_plan;
 mod glob;
 pub(crate) mod grep;
 mod job_cancel;
@@ -202,6 +203,11 @@ impl Tools {
         ToolDef { name: "propose_plan".into(), description: plan::DESCRIPTION.into(), schema: plan::schema() }
     }
 
+    /// Offered outside plan mode, where the user can approve it.
+    pub fn enter_plan_def() -> ToolDef {
+        ToolDef { name: "enter_plan".into(), description: enter_plan::DESCRIPTION.into(), schema: enter_plan::schema() }
+    }
+
     /// How the permission gate judges a tool: a built-in's own declaration, a plugin's manifest, and
     /// anything else (an MCP tool, an unknown name) as one that may change things.
     pub(crate) fn access(&self, name: &str) -> Access {
@@ -387,6 +393,12 @@ pub static BUILTINS: &[Builtin] = &[
         access: Access::Read,
         def: None,
         call: dispatch!("propose_plan", async |t, a: plan::Args, c| t.propose_plan(a, c)),
+    },
+    Builtin {
+        name: "enter_plan",
+        access: Access::Read,
+        def: None,
+        call: dispatch!("enter_plan", |t, a: enter_plan::Args| t.enter_plan(a)),
     },
     Builtin {
         name: "task",

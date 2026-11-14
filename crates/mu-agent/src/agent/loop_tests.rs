@@ -4,6 +4,7 @@ use crate::testing::{
     agent, agent_run, agent_with, assistant, call, drain, git_repo, results, save_plan_in, tmp_dir, yield_call,
 };
 use mu_base::config::Configs;
+use mu_base::permissions::{ApprovalDecision, ApprovalScope};
 use mu_provider::provider::types::ProviderError;
 use mu_session::session::inbox;
 use mu_session::session::inbox::enqueue;
@@ -948,6 +949,201 @@ fn parking_a_plan_saves_it_and_leaves_plan_mode_keeping_the_model() {
         let store = plans::store_for(&a.cwd).await;
         let (meta, text) = store.load("t").unwrap();
         assert_eq!((meta.status, text.as_str()), (mu_base::events::Status::Pending, "do it\n"));
+    });
+}
+
+fn enter_call(id: &str) -> Block {
+    Block::ToolCall { id: id.into(), name: "enter_plan".into(), arguments: json!({"reason": "a big change"}) }
+}
+
+fn propose_call(id: &str, slug: &str) -> Block {
+    Block::ToolCall { id: id.into(), name: "propose_plan".into(), arguments: json!({"slug": slug, "title": slug}) }
+}
+
+fn allow_once() -> ApprovalDecision {
+    ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None }
+}
+
+/// Answers every approval with `answer()` and parks every plan review; returns the approval
+/// requests and the ids of the parked plans.
+async fn answer_plans(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    answer: impl Fn() -> ApprovalDecision,
+) -> (Vec<mu_base::permissions::ApprovalRequest>, Vec<String>) {
+    let (mut asked, mut parked) = (Vec::new(), Vec::new());
+    while let Some(e) = rx.recv().await {
+        match e {
+            AgentEvent::Approve { request, reply } => {
+                asked.push(request);
+                let _ = reply.send(answer());
+            }
+            AgentEvent::PlanReview { reply, .. } => {
+                let _ = reply.send(PlanDecision::Park);
+            }
+            AgentEvent::PlanParked { id, .. } => parked.push(id),
+            AgentEvent::TurnEnd { .. } => break,
+            _ => {}
+        }
+    }
+    (asked, parked)
+}
+
+fn write_plan(a: &Agent, slug: &str) {
+    let r = a.tools.resolve(&format!("local://{slug}-plan.md")).unwrap();
+    std::fs::create_dir_all(r.path.parent().unwrap()).unwrap();
+    std::fs::write(&r.path, "do it\n").unwrap();
+}
+
+fn tool_names(a: &Agent) -> Vec<String> {
+    a.tool_defs().into_iter().map(|d| d.name).collect()
+}
+
+#[test]
+fn an_approved_enter_plan_turns_plan_mode_on_for_the_rest_of_the_turn() {
+    run(async {
+        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\nplan = \"a/c:high\"\n");
+        let script = vec![
+            Ok(assistant(vec![enter_call("e1")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("planning")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_with(script, cfg);
+        a.cwd = tmp_dir();
+        a.title.requested = true; // the title request would take a scripted reply
+        assert!(tool_names(&a).contains(&"enter_plan".to_string()));
+        assert!(!tool_names(&a).contains(&"propose_plan".to_string()));
+        let turn = a.turn(Some("go".to_string().into()));
+        let ((), (asked, _)) = futures_util::future::join(turn, answer_plans(rx, allow_once)).await;
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].title, "enter_plan: switch to plan mode");
+        assert_eq!(asked[0].body, "a big change");
+        assert!(asked[0].grant.is_none());
+        assert!(a.plan.plan.as_ref().is_some_and(|p| p.by_model));
+        assert_eq!((a.model.model.id.as_str(), a.model.thinking), ("a/c", Thinking::High));
+        let names = tool_names(&a);
+        assert!(names.contains(&"propose_plan".to_string()) && !names.contains(&"enter_plan".to_string()));
+        assert!(a.ports.providers.scripted.borrow().is_empty(), "the turn went on to a second request");
+    });
+}
+
+#[test]
+fn a_denied_enter_plan_leaves_plan_mode_off_and_returns_the_note() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![enter_call("e1")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent(script);
+        let deny = || ApprovalDecision::Deny { note: Some("just do it".into()) };
+        futures_util::future::join(a.turn(Some("go".to_string().into())), answer_plans(rx, deny)).await;
+        assert!(a.plan.plan.is_none());
+        let r = results(&a);
+        assert!(r[0].0 && r[0].1.contains("just do it"), "{r:?}");
+        assert!(a.ports.providers.scripted.borrow().is_empty(), "the model answered the denial");
+    });
+}
+
+#[test]
+fn enter_plan_asks_even_when_every_call_is_allowed() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![enter_call("e1")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let run_cfg =
+            RunConfig { permission_mode: Some(mu_base::permissions::PermissionMode::Yolo), ..Default::default() };
+        let (mut a, rx) = agent_run(script, Configs::default(), run_cfg);
+        a.cwd = tmp_dir();
+        let (_, (asked, _)) =
+            futures_util::future::join(a.turn(Some("go".to_string().into())), answer_plans(rx, allow_once)).await;
+        assert_eq!(asked.len(), 1, "yolo mode still asks");
+    });
+}
+
+#[test]
+fn a_model_can_plan_twice_in_one_turn_and_continues_after_each_park() {
+    run(async {
+        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\nplan = \"a/c:high\"\n");
+        let script = vec![
+            Ok(assistant(vec![enter_call("e1")], StopReason::ToolUse)),
+            Ok(assistant(vec![propose_call("p1", "one")], StopReason::ToolUse)),
+            Ok(assistant(vec![enter_call("e2")], StopReason::ToolUse)),
+            Ok(assistant(vec![propose_call("p2", "two")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("both parked")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_with(script, cfg);
+        a.cwd = tmp_dir();
+        a.title.requested = true; // the title request would take a scripted reply
+        a.ensure_session().await;
+        write_plan(&a, "one");
+        write_plan(&a, "two");
+        let turn = a.turn(Some("write plans for one and two".to_string().into()));
+        let (_, (asked, parked)) = futures_util::future::join(turn, answer_plans(rx, allow_once)).await;
+        assert_eq!(asked.len(), 2, "each entry asks again");
+        assert_eq!(parked, ["one", "two"]);
+        assert!(a.plan.plan.is_none());
+        assert_eq!((a.model.model.id.as_str(), a.model.thinking), ("a/c", Thinking::High));
+        let store = plans::store_for(&a.cwd).await;
+        assert!(store.load("one").is_ok() && store.load("two").is_ok());
+        let park_results: Vec<String> =
+            results(&a).into_iter().filter(|(_, t)| t.contains("Plan parked as")).map(|(_, t)| t).collect();
+        assert_eq!(park_results.len(), 2);
+        assert!(park_results.iter().all(|t| t.contains("Continue with what the user asked")), "{park_results:?}");
+        assert!(a.ports.providers.scripted.borrow().is_empty());
+    });
+}
+
+#[test]
+fn a_park_after_the_users_own_plan_mode_still_ends_the_turn() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![propose_call("p1", "t")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("parked")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent(script);
+        a.cwd = tmp_dir();
+        a.enter_plan().await;
+        assert!(a.plan.plan.as_ref().is_some_and(|p| !p.by_model));
+        write_plan(&a, "t");
+        let turn = a.turn(Some("go".to_string().into()));
+        let (_, (_, parked)) = futures_util::future::join(turn, answer_plans(rx, allow_once)).await;
+        assert_eq!(parked, ["t"]);
+        let r = results(&a);
+        assert!(r[0].1.contains("End your turn now") && !r[0].1.contains("Continue with"), "{r:?}");
+    });
+}
+
+#[test]
+fn a_session_saved_in_a_model_entered_plan_mode_resumes_with_by_model_set() {
+    run(async {
+        let (mut a, _rx) = agent(vec![]);
+        a.enter_plan_as(true).await;
+        let path = a.session.as_ref().unwrap().path.clone();
+        a.end_session().await;
+        a.reset_conversation();
+        assert!(a.plan.plan.is_none());
+        assert!(a.load_session(&path).await);
+        assert!(a.plan.plan.as_ref().is_some_and(|p| p.by_model));
+
+        a.exit_plan();
+        a.enter_plan().await;
+        let path = a.session.as_ref().unwrap().path.clone();
+        a.end_session().await;
+        a.reset_conversation();
+        assert!(a.load_session(&path).await);
+        assert!(a.plan.plan.as_ref().is_some_and(|p| !p.by_model));
+    });
+}
+
+#[test]
+fn a_subagent_is_offered_neither_plan_tool() {
+    run(async {
+        let run_cfg = RunConfig { subagent: true, excluded: HEADLESS_EXCLUDED.to_vec(), ..Default::default() };
+        let (mut a, _rx) = agent_run(vec![], Configs::default(), run_cfg);
+        let names = tool_names(&a);
+        assert!(!names.contains(&"enter_plan".to_string()) && !names.contains(&"propose_plan".to_string()));
+        a.enter_plan().await;
+        let names = tool_names(&a);
+        assert!(!names.contains(&"enter_plan".to_string()) && !names.contains(&"propose_plan".to_string()));
     });
 }
 

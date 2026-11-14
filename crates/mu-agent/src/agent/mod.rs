@@ -86,6 +86,8 @@ pub struct Agent {
 pub struct PlanState {
     prev_model: Option<String>,
     prev_thinking: Thinking,
+    /// The model entered plan mode itself (`enter_plan`), so it may carry on after a park.
+    by_model: bool,
 }
 
 struct ExecPlan {
@@ -163,7 +165,7 @@ const SKIP_TRUNCATED: &str = "Tool call not executed: output was truncated (max_
 const SKIP_BUDGET: &str = "Skipped: the run is past its request budget, deliver the final result";
 
 /// Tools a headless front end never offers: nobody is there to answer `ask` or approve a plan.
-pub const HEADLESS_EXCLUDED: [&str; 2] = ["ask", "propose_plan"];
+pub const HEADLESS_EXCLUDED: [&str; 3] = ["ask", "propose_plan", "enter_plan"];
 
 /// How a loop pass ended.
 enum Flow {

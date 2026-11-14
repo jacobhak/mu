@@ -13,7 +13,7 @@ edit = { "*.lock" = "ask" }
 "mcp__github_*" = "allow"   # a string decides every call of the tool
 ```
 
-`--permissions ask|edits|yolo` overrides the mode for one run, and `/permissions` shows or sets it while mu runs (it works mid-turn). The status line shows the mode whenever it is not `yolo`. Plan mode is independent: it is still read-only whatever the permission mode.
+`--permissions ask|edits|yolo` overrides the mode for one run, and `/permissions` shows or sets it while mu runs (it works mid-turn). The status line shows the mode whenever it is not `yolo`. Plan mode is independent: it is still read-only whatever the permission mode. The model's `enter_plan` call, which asks to switch to plan mode, is the one call that always asks, in every mode including `yolo`, and offers no standing grant.
 
 ## Modes
 

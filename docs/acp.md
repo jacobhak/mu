@@ -32,6 +32,7 @@ Background jobs (`task`, `bash` with `async`, and a command that kept running af
 
 ## Asking the client
 
+- **Entering plan mode.** The model's `enter_plan` call asks with `session/request_permission` (options: run it once, No); the client then gets `current_mode_update` for `plan`.
 - **Plans.** In plan mode, `propose_plan` asks for approval with `session/request_permission` (kind `switch_mode`, the plan as content). Options, in this order: approve and implement now keeping the conversation, approve and implement in a fresh session, approve and compact first, save the plan for later (a rejection: it is parked, not run), and keep planning. A client that auto-approves picks the first, so Paseo's Auto Accept implements the plan in this conversation. A cancelled request closes the review.
 - **Tool permissions.** A tool call that needs approval (see [Tool permissions](permissions.md)) asks with `session/request_permission` (the call's id and title as `toolCall`, the reason and what it would do as content). Options: run it once, then the scopes the configuration offers for the exact call (this session, this project, everywhere), and No. The landmark widths and typed patterns are the terminal UI's own. Declining with no scope is a denial; `--permissions` sets the mode for every session the server opens.
 - **Questions.** The model's `ask` tool is offered only when the client advertises `elicitation.form`; each question becomes a form field (a choice, many choices, plus an optional typed answer). Without it the tool is hidden and the model asks in prose.

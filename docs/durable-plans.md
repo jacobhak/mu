@@ -4,6 +4,7 @@ A plan does not have to be approved in the session that wrote it. It can be park
 
 ## Parking and approving
 
+- The model can switch the session to plan mode itself with the `enter_plan` tool, when you ask for a plan or before a large or risky change. Every call shows an approval prompt, in every permission mode, with no "don't ask again"; deny it with a note and the note goes back to the model. After you park a plan the model entered plan mode for, it may carry on in the same turn (for "write plans for A and B"); each new entry asks again. `-p` and `mu plan` runs and subagents are never offered `enter_plan`.
 - In the plan review, **Park plan** saves the plan and ends the turn. Plan mode turns off, and the session keeps the model and thinking level it planned with; leaving plan mode with `/plan` and approving a plan still restore or switch the model.
 - `/plans` lists the repository's pending plans. Choosing one opens the same review dialog as a live plan, with **Drop plan** in place of **Park plan**. Execute, compact, keep and refine apply to the current session. Esc leaves the plan parked.
 - Execute, compact and keep on a live plan also save it, so every approved plan is in the store. A failed save never blocks approval.

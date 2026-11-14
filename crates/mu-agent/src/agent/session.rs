@@ -194,7 +194,8 @@ impl Agent {
             // The model and thinking level in force before plan mode, so leaving it restores them.
             let prev_model = data["prevModel"].as_str().map(String::from);
             let prev_thinking = data["prevThinking"].as_str().and_then(Thinking::parse).unwrap_or(self.model.thinking);
-            self.plan.plan = Some(PlanState { prev_model, prev_thinking });
+            let by_model = data["byModel"].as_bool().unwrap_or(false);
+            self.plan.plan = Some(PlanState { prev_model, prev_thinking, by_model });
         }
         self.resumed = true;
         self.sync_plugin_session();

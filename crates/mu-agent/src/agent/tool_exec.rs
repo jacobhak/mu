@@ -41,9 +41,7 @@ impl Agent {
         if jobs && let Some(d) = v.iter_mut().find(|d| d.name == "bash") {
             *d = Tools::bash_def(true);
         }
-        if self.plan.plan.is_some() {
-            v.push(Tools::plan_def());
-        }
+        v.push(if self.plan.plan.is_some() { Tools::plan_def() } else { Tools::enter_plan_def() });
         let roles: Vec<String> = self.delegated_roles().into_iter().map(|(n, _)| format!("@{n}")).collect();
         *self.tools.delegated.borrow_mut() = roles.clone();
         let role_names: Vec<&str> = roles.iter().map(String::as_str).collect();
@@ -379,6 +377,9 @@ impl Agent {
         }
         let details = out.details.clone();
         if let Some(d) = details.as_ref() {
+            if d["enterPlan"].as_bool() == Some(true) && !out.is_error && self.plan.plan.is_none() {
+                self.enter_plan_as(true).await;
+            }
             self.apply_plan_decision(d, &mut out).await;
         }
         if name == "todo" && !out.is_error {
@@ -454,13 +455,21 @@ impl Agent {
                 let (store, saved) = self.save_plan(d).await;
                 match saved {
                     Ok(m) => {
+                        let by_model = self.plan.plan.as_ref().is_some_and(|p| p.by_model);
                         self.exit_plan_keeping_model();
                         self.plan.stored_plan = None;
                         self.emit(AgentEvent::PlanParked { id: m.id.clone(), path: store.md_path(&m.id) });
-                        out.text.push_str(&format!(
-                            " Parked as `{0}`; approve it with /plans or `mu plan approve {0}`.",
-                            m.id
-                        ));
+                        if by_model {
+                            out.text = format!(
+                                "Plan parked as `{0}`; approve it with /plans or `mu plan approve {0}`. Continue with what the user asked, or end your turn.",
+                                m.id
+                            );
+                        } else {
+                            out.text.push_str(&format!(
+                                " Parked as `{0}`; approve it with /plans or `mu plan approve {0}`.",
+                                m.id
+                            ));
+                        }
                     }
                     Err(e) => *out = ToolOutput::err(format!("Could not park the plan: {e}")),
                 }

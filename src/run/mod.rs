@@ -187,9 +187,13 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         let note = "\nThis task has an output schema. Finish by calling the `yield` tool with `data` matching it; a plain final message is not a result.\n";
         run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + note);
     }
-    if mode != Mode::Tui && !run.excluded.contains(&"ask") {
-        // No one can answer in a headless run.
-        run.excluded.push("ask");
+    if mode != Mode::Tui {
+        // No one can answer or approve in a headless run.
+        for tool in ["ask", "enter_plan"] {
+            if !run.excluded.contains(&tool) {
+                run.excluded.push(tool);
+            }
+        }
     }
     if let Some(n) = plan.as_ref().and_then(|r| r.note) {
         run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + n);
