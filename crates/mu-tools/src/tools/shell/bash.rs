@@ -369,7 +369,10 @@ impl Tools {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err("Command cancelled before launch.".into());
         }
-        jobs.check_capacity(1)?;
+        // A foreground call has its own slot: only a background job is held to the cap.
+        if waiting.is_none() {
+            jobs.check_capacity(1)?;
+        }
         let snapshot = self.shell_snapshot(true).await;
         let inherited = snapshot.is_some();
         let (snap_cwd, vars) = snapshot.unwrap_or_else(|| (self.cwd.clone(), process_env()));
@@ -1709,7 +1712,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn capacity_accounts_for_the_foreground_job_and_job_cancel_releases_it() {
+    async fn a_foreground_call_has_its_own_slot_outside_the_background_cap() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (tools, jobs, (events, mut rx)) = with_jobs();
@@ -1717,17 +1720,27 @@ mod tests {
                 for i in 0..crate::tools::task::MAX_TASKS {
                     jobs.push_running(&format!("full{i}"));
                 }
-                let out = tools.call("bash", &json!({"command": "printf 'no\\n'"}), &ctx).await;
-                assert!(out.is_error && out.text.contains("too many background jobs running"), "{}", out.text);
-                assert_eq!(jobs.snapshot().len(), crate::tools::task::MAX_TASKS, "nothing was launched");
+                let out = tools.call("bash", &json!({"command": "printf 'yes\\n'"}), &ctx).await;
+                assert!(
+                    !out.is_error && out.text.contains("yes"),
+                    "a full house still runs a foreground call: {}",
+                    out.text
+                );
+                let out = tools.call("bash", &json!({"command": "echo no", "async": true}), &ctx).await;
+                assert!(out.is_error && out.text.contains("too many background jobs running (8/8)"), "{}", out.text);
                 jobs.clear();
 
+                for i in 0..crate::tools::task::MAX_TASKS - 1 {
+                    jobs.push_running(&format!("seven{i}"));
+                }
                 let args = json!({"command": "printf 'started\\n'; sleep 30; printf 'done\\n'"});
                 let mut call = Box::pin(tools.call("bash", &args, &ctx));
                 until_output(call.as_mut(), &mut rx, "started").await;
-                assert_eq!(jobs.running(), 1, "the foreground job is an ordinary job");
-                assert!(jobs.snapshot().is_empty(), "but not listed as a background job");
-                assert_eq!(jobs.kill(None), 1);
+                assert_eq!(jobs.running(), crate::tools::task::MAX_TASKS, "the foreground job is a running job");
+                assert!(jobs.check_capacity(1).is_ok(), "but it takes no background slot");
+                assert!(jobs.check_capacity(2).is_err());
+                assert_eq!(jobs.snapshot().len(), crate::tools::task::MAX_TASKS - 1, "and is not listed");
+                assert_eq!(jobs.kill(None), crate::tools::task::MAX_TASKS);
                 let out = call.await;
                 assert!(out.is_error && out.text.contains("[Command cancelled]"), "{}", out.text);
                 assert!(!jobs.has_undelivered(), "the cancelled result stays with the call");

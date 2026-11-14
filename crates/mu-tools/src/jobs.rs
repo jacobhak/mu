@@ -119,30 +119,55 @@ impl OutputSink {
 struct Spec {
     id: String,
     agent: String,
-    kind: JobKind,
     cwd: PathBuf,
     /// The task prompt or command, truncated; kept for the jobs panel.
     task: String,
-    /// The command of a bash job; taken on delivery, like `text`.
-    command: Option<String>,
+}
+
+/// What differs between the kinds of job.
+enum Work {
+    Subagent {
+        tools: u32,
+        /// The child's session file, once it has opened it.
+        session: Option<PathBuf>,
+        model: Option<String>,
+    },
+    Bash {
+        /// Taken on delivery, like `text`.
+        command: Option<String>,
+        meta: Option<BashMeta>,
+        /// How it ended ("exit 3", "timed out", …).
+        note: Option<String>,
+    },
+}
+
+impl Work {
+    fn subagent() -> Self {
+        Work::Subagent { tools: 0, session: None, model: None }
+    }
+
+    fn bash(command: String) -> Self {
+        Work::Bash { command: Some(command), meta: None, note: None }
+    }
+
+    fn kind(&self) -> JobKind {
+        match self {
+            Work::Subagent { .. } => JobKind::Subagent,
+            Work::Bash { .. } => JobKind::Bash,
+        }
+    }
 }
 
 struct Job {
     /// Distinguishes a job from a later one that reuses its id after `clear`.
     seq: u64,
     spec: Spec,
-    tools: u32,
+    work: Work,
     last: String,
     state: SubagentState,
     text: String,
-    meta: Option<BashMeta>,
     started: SystemTime,
     ended: Option<SystemTime>,
-    /// How a bash job ended ("exit 3", "timed out", …).
-    note: Option<String>,
-    /// A subagent's session file, once the child has opened it.
-    session: Option<PathBuf>,
-    model: Option<String>,
     delivered: bool,
     notice_owned: bool,
     /// Counted and shown as a background job. A foreground call's job is not, so the call keeps its
@@ -316,9 +341,15 @@ impl JobsHandle {
         self.inner.borrow().iter().filter(|j| j.state == SubagentState::Running).count()
     }
 
-    /// Errs when `n` more running jobs would go over the cap.
+    /// Running jobs that count against the cap: the listed ones. A foreground call's command is
+    /// not listed, so it never uses a slot nor is refused for want of one.
+    fn background_running(&self) -> usize {
+        self.inner.borrow().iter().filter(|j| j.listed && j.state == SubagentState::Running).count()
+    }
+
+    /// Errs when `n` more background jobs would go over the cap.
     pub fn check_capacity(&self, n: usize) -> Result<(), String> {
-        let running = self.running();
+        let running = self.background_running();
         if running + n > MAX_TASKS {
             return Err(format!("too many background jobs running ({running}/{MAX_TASKS}); wait for some to finish"));
         }
@@ -332,21 +363,27 @@ impl JobsHandle {
             .borrow()
             .iter()
             .filter(|j| j.listed)
-            .map(|j| SubagentStatus {
-                name: j.spec.id.clone(),
-                agent: j.spec.agent.clone(),
-                tools: j.tools,
-                last: j.last.clone(),
-                state: j.state.clone(),
-                kind: j.spec.kind,
-                cwd: j.spec.cwd.clone(),
-                task: j.spec.task.clone(),
-                started: j.started,
-                ended: j.ended,
-                delivered: j.delivered,
-                note: j.note.clone(),
-                session: j.session.clone(),
-                model: j.model.clone(),
+            .map(|j| {
+                let (tools, note, session, model) = match &j.work {
+                    Work::Subagent { tools, session, model } => (*tools, None, session.clone(), model.clone()),
+                    Work::Bash { note, .. } => (0, note.clone(), None, None),
+                };
+                SubagentStatus {
+                    name: j.spec.id.clone(),
+                    agent: j.spec.agent.clone(),
+                    tools,
+                    last: j.last.clone(),
+                    state: j.state.clone(),
+                    kind: j.work.kind(),
+                    cwd: j.spec.cwd.clone(),
+                    task: j.spec.task.clone(),
+                    started: j.started,
+                    ended: j.ended,
+                    delivered: j.delivered,
+                    note,
+                    session,
+                    model,
+                }
             })
             .collect()
     }
@@ -360,22 +397,26 @@ impl JobsHandle {
         RefMut::filter_map(self.inner.borrow_mut(), |jobs| jobs.iter_mut().find(|j| j.seq == seq)).ok()
     }
 
-    fn start(&self, spec: Spec, last: String, cancel: CancellationToken, notice_owned: bool, listed: bool) -> u64 {
+    fn start(
+        &self,
+        spec: Spec,
+        work: Work,
+        last: String,
+        cancel: CancellationToken,
+        notice_owned: bool,
+        listed: bool,
+    ) -> u64 {
         let seq = self.next_seq.get();
         self.next_seq.set(seq + 1);
         self.inner.borrow_mut().push(Job {
             seq,
             spec,
-            tools: 0,
+            work,
             last,
             state: SubagentState::Running,
             text: String::new(),
-            meta: None,
             started: SystemTime::now(),
             ended: None,
-            note: None,
-            session: None,
-            model: None,
             delivered: false,
             notice_owned,
             listed,
@@ -404,19 +445,30 @@ impl JobsHandle {
         found
     }
 
-    /// Records a finished job and wakes an idle agent.
-    fn complete(&self, seq: u64, ok: bool, text: String, note: Option<String>, meta: Option<BashMeta>) {
+    /// The one place a job ends: records its outcome. `handed_back`: the caller waiting on the job
+    /// gets the result itself, so it is marked delivered and no idle agent is woken for it.
+    fn complete(&self, seq: u64, done: Finished, handed_back: bool) {
         if let Some(mut j) = self.job_mut(seq) {
-            j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
+            j.state = if done.ok { SubagentState::Done } else { SubagentState::Failed };
             j.ended = Some(SystemTime::now());
-            if !j.delivered {
-                j.text = text;
-                j.meta = meta;
+            if handed_back {
+                j.delivered = true;
             }
-            j.note = note;
+            let keep = !j.delivered;
+            if keep {
+                j.text = done.text;
+            }
+            if let Work::Bash { meta, note, .. } = &mut j.work {
+                *note = done.note;
+                if keep {
+                    *meta = done.meta;
+                }
+            }
         }
         self.notify.notify_waiters();
-        let _ = self.wake.send(());
+        if !handed_back {
+            let _ = self.wake.send(());
+        }
         self.emit();
     }
 
@@ -425,6 +477,7 @@ impl JobsHandle {
     fn spawn_job<F>(
         self: &Rc<Self>,
         spec: Spec,
+        kind: Work,
         last: String,
         cancel: CancellationToken,
         listed: bool,
@@ -432,12 +485,12 @@ impl JobsHandle {
     ) where
         F: Future<Output = Finished> + 'static,
     {
-        let seq = self.start(spec, last, cancel, true, listed);
+        let seq = self.start(spec, kind, last, cancel, true, listed);
         let fut = work(seq);
         let me = self.clone();
         tokio::task::spawn_local(async move {
             let done = fut.await;
-            me.complete(seq, done.ok, done.text, done.note, done.meta);
+            me.complete(seq, done, false);
         });
     }
 
@@ -455,16 +508,9 @@ impl JobsHandle {
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
         let label = format!("{id} ({agent})");
-        let spec = Spec {
-            id,
-            agent,
-            kind: JobKind::Subagent,
-            cwd: cwd.clone(),
-            task: command_line(payload["task"].as_str().unwrap_or("")),
-            command: None,
-        };
+        let spec = Spec { id, agent, cwd: cwd.clone(), task: command_line(payload["task"].as_str().unwrap_or("")) };
         let me = self.clone();
-        self.spawn_job(spec, String::new(), cancel, true, move |seq| async move {
+        self.spawn_job(spec, Work::subagent(), String::new(), cancel, true, move |seq| async move {
             let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
@@ -494,19 +540,12 @@ impl JobsHandle {
         let spec = Spec {
             id,
             agent: agent.into(),
-            kind: JobKind::Subagent,
             cwd: cwd.to_path_buf(),
             task: command_line(payload["task"].as_str().unwrap_or("")),
-            command: None,
         };
-        let seq = self.start(spec, String::new(), own.clone(), false, true);
+        let seq = self.start(spec, Work::subagent(), String::new(), own.clone(), false, true);
         let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool, &perms, "review").await;
-        if let Some(mut j) = self.job_mut(seq) {
-            j.state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
-            j.ended = Some(SystemTime::now());
-            j.delivered = true;
-        }
-        self.emit();
+        self.complete(seq, Finished { ok: out.ok, text: String::new(), note: None, meta: None }, true);
         out
     }
 
@@ -531,21 +570,27 @@ impl JobsHandle {
             cancel,
             |name, summary| {
                 if let Some(mut j) = self.job_mut(seq) {
-                    j.tools += 1;
+                    if let Work::Subagent { tools, .. } = &mut j.work {
+                        *tools += 1;
+                    }
                     j.last = format!("{name} {summary}");
                 }
                 on_tool(name, summary);
                 self.emit();
             },
             |path| {
-                if let Some(mut j) = self.job_mut(seq) {
-                    j.session = Some(PathBuf::from(path));
+                if let Some(mut j) = self.job_mut(seq)
+                    && let Work::Subagent { session, .. } = &mut j.work
+                {
+                    *session = Some(PathBuf::from(path));
                 }
                 self.emit();
             },
             |model| {
-                if let Some(mut j) = self.job_mut(seq) {
-                    j.model = Some(model.to_string());
+                if let Some(mut j) = self.job_mut(seq)
+                    && let Work::Subagent { model: m, .. } = &mut j.work
+                {
+                    *m = Some(model.to_string());
                 }
                 self.emit();
             },
@@ -599,17 +644,10 @@ impl JobsHandle {
         let line = command_line(&command);
         let listed = call.is_none();
         let sink = OutputSink::new(id.clone(), cwd.clone(), self.events.clone(), call);
-        let spec = Spec {
-            id: id.clone(),
-            agent: "bash".into(),
-            kind: JobKind::Bash,
-            cwd,
-            task: line.clone(),
-            command: Some(command),
-        };
+        let spec = Spec { id: id.clone(), agent: "bash".into(), cwd, task: line.clone() };
         let run_cancel = cancel.clone();
         let kept = sink.clone();
-        self.spawn_job(spec, line, cancel, listed, move |_| {
+        self.spawn_job(spec, Work::bash(command), line, cancel, listed, move |_| {
             let fut = run(run_cancel, kept.clone());
             async move {
                 let r = fut.await;
@@ -639,15 +677,19 @@ impl JobsHandle {
             })
             .map(|j| {
                 j.delivered = true;
+                let (command, note, meta) = match &mut j.work {
+                    Work::Bash { command, note, meta } => (command.take(), note.clone(), meta.take()),
+                    Work::Subagent { .. } => (None, None, None),
+                };
                 Done {
                     id: j.spec.id.clone(),
                     agent: j.spec.agent.clone(),
                     ok: j.state == SubagentState::Done,
                     // Delivered output is not kept: only the snapshot fields stay resident.
                     text: std::mem::take(&mut j.text),
-                    command: j.spec.command.take(),
-                    note: j.note.clone(),
-                    meta: j.meta.take(),
+                    command,
+                    note,
+                    meta,
                 }
             })
             .collect();
@@ -668,8 +710,10 @@ impl JobsHandle {
             if let Some(j) = jobs.iter_mut().find(|j| j.notice_owned && j.spec.id == id && !j.delivered) {
                 j.delivered = true;
                 j.text.clear();
-                j.meta = None;
-                j.spec.command = None;
+                if let Work::Bash { command, meta, .. } = &mut j.work {
+                    *command = None;
+                    *meta = None;
+                }
                 true
             } else {
                 false
@@ -743,26 +787,17 @@ impl JobsHandle {
 
     #[cfg(test)]
     pub(crate) fn push_running(&self, id: &str) {
+        let seq = self.next_seq.get();
+        self.next_seq.set(seq + 1);
         self.inner.borrow_mut().push(Job {
-            seq: 0,
-            spec: Spec {
-                id: id.into(),
-                agent: "scout".into(),
-                kind: JobKind::Subagent,
-                cwd: PathBuf::new(),
-                task: String::new(),
-                command: None,
-            },
-            tools: 0,
+            seq,
+            spec: Spec { id: id.into(), agent: "scout".into(), cwd: PathBuf::new(), task: String::new() },
+            work: Work::subagent(),
             last: String::new(),
             state: SubagentState::Running,
             text: String::new(),
-            meta: None,
             started: SystemTime::now(),
             ended: None,
-            note: None,
-            session: None,
-            model: None,
             delivered: false,
             notice_owned: true,
             listed: true,
@@ -902,7 +937,7 @@ pub(crate) mod tests {
         };
         let (result, ()) = tokio::join!(wait, discard);
         assert_eq!(result, WaitReady::Nothing);
-        h.complete(0, true, "discarded".into(), None, None);
+        h.complete(0, Finished { ok: true, text: "discarded".into(), note: None, meta: None }, false);
         assert!(h.take_undelivered().is_empty());
         assert!(h.inner.borrow()[0].text.is_empty());
     }
@@ -916,24 +951,13 @@ pub(crate) mod tests {
         let h = handle();
         h.inner.borrow_mut().push(Job {
             seq: 0,
-            spec: Spec {
-                id: "A".into(),
-                agent: "scout".into(),
-                kind: JobKind::Bash,
-                cwd: PathBuf::from("/w"),
-                task: "echo".into(),
-                command: Some("echo".into()),
-            },
-            tools: 0,
+            spec: Spec { id: "A".into(), agent: "scout".into(), cwd: PathBuf::from("/w"), task: "echo".into() },
+            work: Work::Bash { command: Some("echo".into()), meta: None, note: Some("exit 0".into()) },
             last: String::new(),
             state: SubagentState::Done,
             text: "big output".into(),
-            meta: None,
             started: SystemTime::now(),
             ended: Some(SystemTime::now()),
-            note: Some("exit 0".into()),
-            session: None,
-            model: None,
             delivered: false,
             notice_owned: true,
             listed: true,
@@ -949,7 +973,7 @@ pub(crate) mod tests {
         assert_eq!(got[0].text, "big output");
         assert_eq!((got[0].command.as_deref(), got[0].note.as_deref()), (Some("echo"), Some("exit 0")));
         assert!(h.inner.borrow()[0].text.is_empty());
-        assert!(h.inner.borrow()[0].spec.command.is_none());
+        assert!(matches!(&h.inner.borrow()[0].work, Work::Bash { command: None, .. }));
         assert!(h.take_undelivered().is_empty());
         let snap = h.snapshot();
         assert!(snap[0].delivered, "the snapshot follows delivery");
