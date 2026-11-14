@@ -20,48 +20,80 @@ use mu_tools::{context, plugin};
 use serde_json::{Value, json};
 use setup::{Setup, spawn_notice_printer};
 use std::rc::Rc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-/// What this process does. Decided once, from the command line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
+/// What this process does, with the data only that mode has. Decided once, from the command line.
+enum Mode {
     /// The interactive TUI.
-    Tui,
-    /// `-p PROMPT`: one prompt, the final answer on stdout.
-    Print,
-    /// `mu plan new|refine|approve`: a headless run that starts from a plan command.
-    Plan,
+    Tui { pick_session: bool },
+    /// `-p PROMPT`, or `mu plan new|refine|approve`: a headless run that starts from one command.
+    Print(PrintRun),
     /// `--headless`: one subagent task read from stdin, NDJSON on stdout.
-    Subagent,
+    Subagent { task: Value },
+}
+
+struct PrintRun {
+    first: events::Command,
+    expect_park: bool,
+    max_cost: Option<f64>,
+}
+
+/// A mode whose signal handlers are installed.
+enum Armed {
+    Tui { pick_session: bool },
+    Print { run: PrintRun, stop: UnboundedReceiver<()> },
+    Subagent { task: Value },
 }
 
 impl Mode {
-    fn of(cli: &Cli, plan: bool) -> Self {
-        if cli.headless {
-            Self::Subagent
-        } else if cli.print.is_some() {
-            Self::Print
-        } else if plan {
-            Self::Plan
+    /// `task` is the subagent task, read exactly when `--headless` is set.
+    fn of(cli: &Cli, plan: Option<PlanRun>, task: Option<Value>) -> Self {
+        if let Some(task) = task {
+            Self::Subagent { task }
+        } else if let Some(prompt) = &cli.print {
+            Self::Print(PrintRun {
+                first: events::Command::Prompt(prompt.clone().into()),
+                expect_park: false,
+                max_cost: cli.max_cost,
+            })
+        } else if let Some(r) = plan {
+            Self::Print(PrintRun { first: r.first, expect_park: r.expect_park, max_cost: None })
         } else {
-            Self::Tui
+            Self::Tui { pick_session: matches!(cli.resume, Some(None)) && !cli.continue_latest }
         }
     }
 
+    /// Whether `of` gives the TUI, before the task is read.
+    fn interactive(cli: &Cli, plan: bool) -> bool {
+        !cli.headless && cli.print.is_none() && !plan
+    }
+
     /// The agent's own mode: only the TUI keeps background jobs and `mu notify` delivery.
-    fn agent_mode(self) -> mu_agent::handle::Mode {
+    fn agent_mode(&self) -> mu_agent::handle::Mode {
         match self {
-            Self::Tui => mu_agent::handle::Mode::Tui,
+            Self::Tui { .. } => mu_agent::handle::Mode::Tui,
             _ => mu_agent::handle::Mode::Headless,
         }
     }
 
     /// The kind the session's owner record names.
-    fn run_kind(self) -> owner::RunKind {
+    fn run_kind(&self) -> owner::RunKind {
         match self {
-            Self::Tui => owner::RunKind::Tui,
-            Self::Subagent => owner::RunKind::Subagent,
-            Self::Print | Self::Plan => owner::RunKind::Print,
+            Self::Tui { .. } => owner::RunKind::Tui,
+            Self::Subagent { .. } => owner::RunKind::Subagent,
+            Self::Print(_) => owner::RunKind::Print,
         }
+    }
+
+    /// Installs the handlers the mode promises in the session's owner record. Before the agent task
+    /// can create or lock a session: an owner record that says `print_run` promises SIGUSR1 stops
+    /// the run instead of killing it.
+    fn arm(self) -> std::io::Result<Armed> {
+        Ok(match self {
+            Self::Tui { pick_session } => Armed::Tui { pick_session },
+            Self::Print(run) => Armed::Print { run, stop: signals::print_run_stop()? },
+            Self::Subagent { task } => Armed::Subagent { task },
+        })
     }
 }
 
@@ -72,15 +104,15 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     if cli.acp {
         return acp::run(cli.model.clone(), cli_thinking, permissions);
     }
-    let mode = Mode::of(cli, plan.is_some());
-    if matches!(cli.resume, Some(None)) && mode != Mode::Tui {
+    let interactive = Mode::interactive(cli, plan.is_some());
+    if matches!(cli.resume, Some(None)) && !interactive {
         bail!(
             "--resume without a session opens the session picker, which needs the interactive mode; pass a session id or path"
         );
     }
     let cwd = std::env::current_dir()?;
     let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
-    if mode == Mode::Tui && cfgs.mu.update.check {
+    if interactive && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
         let tx = notice_tx.clone();
         std::thread::spawn(move || {
@@ -91,74 +123,38 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     }
     drop(notice_tx);
 
-    let mut agent_def: Option<context::AgentDef> = None;
-    if let Some(name) = &cli.agent {
-        match ctx.agents.iter().find(|a| &a.name == name) {
-            Some(d) => agent_def = Some(d.clone()),
-            None => {
-                bail!("unknown agent `{name}`; looked in .omp/agents and {}/agents", paths::omp_agent_dir().display())
-            }
-        }
-    }
-    let mut sel = cli.model.clone();
-    let mut task_payload: Option<Value> = None;
-    if mode == Mode::Subagent {
-        let (p, def) = read_task(&ctx)?;
+    let mut agent_def = named_agent(cli, &ctx)?;
+    let task = if cli.headless {
+        let (payload, def) = read_task(&ctx)?;
         if def.is_some() {
             agent_def = def;
         }
-        if cli.model.is_none() {
-            if let Some(m) = p["model"].as_str() {
-                let role = m.trim_start_matches('@');
-                sel = Some(
-                    models::role_selector(role, &cfgs)
-                        .ok_or_else(|| anyhow!(mu_base::roles::not_configured(role, &cfgs)))?,
-                );
-            } else {
-                let role = if p["agent"] == context::SCOUT { context::SCOUT } else { context::TASK };
-                sel = match &agent_def {
-                    Some(d) => agent_selector(d, &cfgs),
-                    None => models::role_selector(role, &cfgs),
-                };
-            }
-        }
-        task_payload = Some(p);
-    } else if cli.model.is_none() {
-        sel = agent_def.as_ref().and_then(|d| agent_selector(d, &cfgs));
-    }
+        Some(payload)
+    } else {
+        None
+    };
+    let sel = select_model(cli, &cfgs, agent_def.as_ref(), task.as_ref())?;
     let def_thinking = agent_def.as_ref().and_then(|d| d.thinking.as_deref()).and_then(models::Thinking::parse);
     let role_sel = sel.clone();
     let level = cli_thinking.or(def_thinking);
-    let (spec, thinking) = match mode {
-        Mode::Tui => pick_model_or_none(&cfgs, &providers, sel, level)?,
-        _ => pick_model(&cfgs, &providers, sel, level)?,
+    let (spec, thinking) = if interactive {
+        pick_model_or_none(&cfgs, &providers, sel, level)?
+    } else {
+        pick_model(&cfgs, &providers, sel, level)?
     };
     let model_label = model_label(role_sel.as_deref(), &spec.id);
 
-    let pick_session = matches!(cli.resume, Some(None)) && !cli.continue_latest;
-    let resume = match (&cli.resume, cli.continue_latest) {
-        (Some(Some(p)), _) => match list::find(&cwd, p) {
-            Ok(f) => Some(f),
-            Err(e) => bail!("{e}"),
-        },
-        (_, true) => match list::latest_for(&cwd) {
-            Some(p) => Some(p),
-            None => bail!("no sessions for {} in {}", cwd.display(), paths::session_dir(&cwd).display()),
-        },
-        _ => None,
-    };
-    if mode == Mode::Tui && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    let resume = find_resume(cli, &cwd)?;
+    if interactive && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("mu: interactive mode needs a terminal; use -p");
     }
-    if let (Mode::Tui, Some(p)) = (mode, &resume) {
+    if let (true, Some(p)) = (interactive, &resume) {
         // As `mu take`: a `-p` run that has the session is stopped after its current step, then it is ours.
         if let Some(code) = crate::workflow::take::release(p, "mu")? {
             return Ok(code);
         }
     }
 
-    let cfgs_ui = cfgs.clone();
-    let (providers_ui, ctx_ui, cwd_ui) = (providers.clone(), ctx.clone(), cwd.clone());
     let mut run = agent::RunConfig {
         exit_on_resume_failure: cli.print.is_some(),
         pin_model: cli.model.is_some() && resume.is_some(),
@@ -166,28 +162,17 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         permission_mode: permissions,
         ..Default::default()
     };
-    if let Some(p) = &task_payload {
-        run.subagent = true;
-        run.excluded = agent::HEADLESS_EXCLUDED.to_vec();
-        run.parent_session = p["parentSession"].as_str().map(std::path::PathBuf::from);
-        run.inherited_permissions = p.get("permissions").cloned();
-        // A budget the parent cannot raise: `[task] soft_request_budget`, capped per agent.
-        let agent_name = p["agent"].as_str().unwrap_or(context::TASK);
-        run.request_budget = mu_tools::tools::task::soft_request_budget(agent_name, cfgs.mu.task.soft_request_budget);
-        run.budget_notice = cfgs.mu.task.budget_notice;
+    if let Some(p) = &task {
+        apply_task(&mut run, p, &cfgs);
     }
     if let Some(d) = &agent_def {
         apply_agent(&mut run, d);
     }
-    let output_schema = task_payload.as_ref().and_then(|p| task_output_schema(p, agent_def.as_ref()));
+    let output_schema = task.as_ref().and_then(|p| task_output_schema(p, agent_def.as_ref()));
     if let Some(s) = &output_schema {
-        if let Err(e) = schema::check_schema(s) {
-            bail!("bad subagent input: {e}");
-        }
-        let note = "\nThis task has an output schema. Finish by calling the `yield` tool with `data` matching it; a plain final message is not a result.\n";
-        run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + note);
+        require_output_schema(&mut run, s)?;
     }
-    if mode != Mode::Tui {
+    if !interactive {
         // No one can answer or approve in a headless run.
         for tool in ["ask", "enter_plan"] {
             if !run.excluded.contains(&tool) {
@@ -198,24 +183,23 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     if let Some(n) = plan.as_ref().and_then(|r| r.note) {
         run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + n);
     }
-    let name = task_payload.as_ref().and_then(|p| p["agent"].as_str()).or(agent_def.as_ref().map(|d| d.name.as_str()));
-    owner::set_run_info(mode.run_kind(), name);
+    let name = task.as_ref().and_then(|p| p["agent"].as_str()).or(agent_def.as_ref().map(|d| d.name.as_str()));
+    let name = name.map(String::from);
+    let mode = Mode::of(cli, plan, task);
+    owner::set_run_info(mode.run_kind(), name.as_deref());
 
-    let (print, max_cost) = (cli.print.clone(), cli.max_cost);
+    let cfgs_ui = cfgs.clone();
+    let (providers_ui, ctx_ui, cwd_ui) = (providers.clone(), ctx.clone(), cwd.clone());
+    let agent_mode = mode.agent_mode();
     let rt = mu_base::runtime::current_thread_runtime()?;
     let local = tokio::task::LocalSet::new();
     let code = local.block_on(&rt, async move {
-        // Before the agent task can create or lock a session: an owner record that says
-        // `print_run` promises SIGUSR1 stops the run instead of killing it.
-        let stop_rx = match mode {
-            Mode::Print | Mode::Plan => match signals::print_run_stop() {
-                Ok(rx) => Some(rx),
-                Err(e) => {
-                    eprintln!("mu: cannot install the SIGUSR1 handler: {e}");
-                    return 1;
-                }
-            },
-            Mode::Tui | Mode::Subagent => None,
+        let armed = match mode.arm() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("mu: cannot install the SIGUSR1 handler: {e}");
+                return 1;
+            }
         };
         let mut handle = build_agent(
             AgentSetup {
@@ -229,7 +213,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
                 output_schema: output_schema.clone(),
             },
             cwd,
-            mode.agent_mode(),
+            agent_mode,
         );
         if let Some(p) = resume {
             let _ = handle.cmd.send(events::Command::Resume(p));
@@ -243,33 +227,23 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
                 }
             }
         }
-        if mode == Mode::Tui {
-            signals::cancel_turn_on_sigusr1(handle.cmd.clone());
-        }
         let agent_task = handle.task;
-        let (code, printer) = match mode {
-            Mode::Tui => (
-                tui(&host, cfgs_ui, providers_ui, ctx_ui, cwd_ui, pick_session, handle.cmd, handle.ev, notice_rx).await,
-                None,
-            ),
-            Mode::Subagent => {
+        let (code, printer) = match armed {
+            Armed::Tui { pick_session } => {
+                signals::cancel_turn_on_sigusr1(handle.cmd.clone());
+                let ui = Ui { cfgs: cfgs_ui, providers: providers_ui, ctx: ctx_ui, cwd: cwd_ui, pick_session };
+                (tui(&host, ui, handle.cmd, handle.ev, notice_rx).await, None)
+            }
+            Armed::Subagent { task } => {
                 let printer = spawn_notice_printer(notice_rx);
                 plugin::process::exit_on_signals();
-                let p = task_payload.expect("a subagent run has its task");
-                (subagent(&p, model_label, output_schema, handle.cmd, handle.ev).await, Some(printer))
+                (subagent(&task, model_label, output_schema, handle.cmd, handle.ev).await, Some(printer))
             }
-            Mode::Print | Mode::Plan => {
+            Armed::Print { run, stop } => {
                 let printer = spawn_notice_printer(notice_rx);
                 plugin::process::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
-                let (first, expect_park, max_cost) = match (print, plan) {
-                    (Some(prompt), _) => (events::Command::Prompt(prompt.into()), false, max_cost),
-                    (None, Some(r)) => (r.first, r.expect_park, None),
-                    (None, None) => unreachable!("a print or plan run has a prompt or a plan"),
-                };
-                let stop = stop_rx.expect("a print or plan run stops on SIGUSR1");
-                let code = headless::print_mode(first, expect_park, handle.cmd, handle.ev, max_cost, stop).await;
-                (code, Some(printer))
+                (print(run, stop, handle.cmd, handle.ev).await, Some(printer))
             }
         };
         let code = match agent_task.await {
@@ -290,35 +264,118 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     Ok(code)
 }
 
-/// The interactive TUI until the user quits.
-#[allow(clippy::too_many_arguments)]
-async fn tui(
-    host: &Rc<plugin::host::PluginHost>,
+/// The agent `--agent` names, from the project's or the user's agent files.
+fn named_agent(cli: &Cli, ctx: &context::Context) -> Result<Option<context::AgentDef>> {
+    let Some(name) = &cli.agent else { return Ok(None) };
+    match ctx.agents.iter().find(|a| &a.name == name) {
+        Some(d) => Ok(Some(d.clone())),
+        None => bail!("unknown agent `{name}`; looked in .omp/agents and {}/agents", paths::omp_agent_dir().display()),
+    }
+}
+
+/// The model selector: `--model`, else the subagent task's own `model` or its role, else the agent file's.
+fn select_model(
+    cli: &Cli,
+    cfgs: &mu_base::config::Configs,
+    agent_def: Option<&context::AgentDef>,
+    task: Option<&Value>,
+) -> Result<Option<String>> {
+    if cli.model.is_some() {
+        return Ok(cli.model.clone());
+    }
+    let Some(p) = task else { return Ok(agent_def.and_then(|d| agent_selector(d, cfgs))) };
+    if let Some(m) = p["model"].as_str() {
+        let role = m.trim_start_matches('@');
+        return Ok(Some(
+            models::role_selector(role, cfgs).ok_or_else(|| anyhow!(mu_base::roles::not_configured(role, cfgs)))?,
+        ));
+    }
+    let role = if p["agent"] == context::SCOUT { context::SCOUT } else { context::TASK };
+    Ok(match agent_def {
+        Some(d) => agent_selector(d, cfgs),
+        None => models::role_selector(role, cfgs),
+    })
+}
+
+/// The session `--resume` or `--continue` names.
+fn find_resume(cli: &Cli, cwd: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    Ok(match (&cli.resume, cli.continue_latest) {
+        (Some(Some(p)), _) => match list::find(cwd, p) {
+            Ok(f) => Some(f),
+            Err(e) => bail!("{e}"),
+        },
+        (_, true) => match list::latest_for(cwd) {
+            Some(p) => Some(p),
+            None => bail!("no sessions for {} in {}", cwd.display(), paths::session_dir(cwd).display()),
+        },
+        _ => None,
+    })
+}
+
+/// What a subagent run takes from its task: its tools, its parent and its request budget.
+fn apply_task(run: &mut agent::RunConfig, p: &Value, cfgs: &mu_base::config::Configs) {
+    run.subagent = true;
+    run.excluded = agent::HEADLESS_EXCLUDED.to_vec();
+    run.parent_session = p["parentSession"].as_str().map(std::path::PathBuf::from);
+    run.inherited_permissions = p.get("permissions").cloned();
+    // A budget the parent cannot raise: `[task] soft_request_budget`, capped per agent.
+    let agent_name = p["agent"].as_str().unwrap_or(context::TASK);
+    run.request_budget = mu_tools::tools::task::soft_request_budget(agent_name, cfgs.mu.task.soft_request_budget);
+    run.budget_notice = cfgs.mu.task.budget_notice;
+}
+
+fn require_output_schema(run: &mut agent::RunConfig, s: &Value) -> Result<()> {
+    if let Err(e) = schema::check_schema(s) {
+        bail!("bad subagent input: {e}");
+    }
+    let note = "\nThis task has an output schema. Finish by calling the `yield` tool with `data` matching it; a plain final message is not a result.\n";
+    run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + note);
+    Ok(())
+}
+
+/// What the TUI needs besides the agent's channels.
+struct Ui {
     cfgs: Rc<mu_base::config::Configs>,
     providers: Rc<mu_provider::provider::client::Providers>,
     ctx: Rc<context::Context>,
     cwd: std::path::PathBuf,
     pick_session: bool,
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<events::Command>,
-    ev_rx: tokio::sync::mpsc::UnboundedReceiver<events::AgentEvent>,
-    notice_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+/// The interactive TUI until the user quits.
+async fn tui(
+    host: &Rc<plugin::host::PluginHost>,
+    ui: Ui,
+    cmd_tx: UnboundedSender<events::Command>,
+    ev_rx: UnboundedReceiver<events::AgentEvent>,
+    notice_rx: UnboundedReceiver<String>,
 ) -> i32 {
     host.set_interactive();
     mu_tui::app::run(mu_tui::app::AppInit {
         cmd_tx,
         ev_rx,
-        providers,
-        ctx,
+        providers: ui.providers,
+        ctx: ui.ctx,
         plugins: host.clone(),
         notice_rx,
-        cwd,
-        pick_session,
-        status_cfg: cfgs.omp.status_line.clone(),
-        theme: cfgs.mu.theme.clone(),
-        notify: cfgs.omp.completion.notify,
-        bell: cfgs.mu.bell,
+        cwd: ui.cwd,
+        pick_session: ui.pick_session,
+        status_cfg: ui.cfgs.omp.status_line.clone(),
+        theme: ui.cfgs.mu.theme.clone(),
+        notify: ui.cfgs.omp.completion.notify,
+        bell: ui.cfgs.mu.bell,
     })
     .await
+}
+
+/// `-p` and `mu plan`: the first command runs to the end of its turn, the answer on stdout.
+async fn print(
+    run: PrintRun,
+    stop: UnboundedReceiver<()>,
+    cmd: UnboundedSender<events::Command>,
+    ev: UnboundedReceiver<events::AgentEvent>,
+) -> i32 {
+    headless::print_mode(run.first, run.expect_park, cmd, ev, run.max_cost, stop).await
 }
 
 /// `--headless`: the task's prompt runs as a subagent, its `model` line first.
@@ -326,8 +383,8 @@ async fn subagent(
     p: &Value,
     model_label: String,
     output_schema: Option<Value>,
-    cmd: tokio::sync::mpsc::UnboundedSender<events::Command>,
-    ev: tokio::sync::mpsc::UnboundedReceiver<events::AgentEvent>,
+    cmd: UnboundedSender<events::Command>,
+    ev: UnboundedReceiver<events::AgentEvent>,
 ) -> i32 {
     let extra = p["context"].as_str().filter(|c| !c.is_empty());
     let task = p["task"].as_str().unwrap_or("");
