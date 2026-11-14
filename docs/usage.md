@@ -24,6 +24,8 @@ Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal`
 
 While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
 
+When the model asks for several tools in one message, calls that only read and need no approval run at the same time (at most 8): `read`, `grep`, `glob`, `bash` lines made only of read-only commands (no `cd`, assignment, redirect, `pty` or `async`), and plugin tools whose manifest says `tier = "read"`. Anything else (a write, a call that asks for approval or is denied, `task`, `ask`, `web_search`, `todo`) waits for the calls before it, runs alone, and the calls after it wait for it. Start and end events and the results follow the order of the calls whatever order they finish in, `tool_call` hooks still run call by call in that order, and Esc aborts every call in flight. In a headless run (no background jobs) `bash` lines share one shell and still run one at a time.
+
 A prompt can also be sent later, without staying at the keyboard: `/schedule 10m <prompt>` (see [Scheduled prompts](schedule.md)).
 
 Ctrl+C only exits: the first press says so and changes nothing else, and the second exits mu whatever is on screen (a running turn, a panel, a wizard, an embedded terminal). Esc is what backs out of those, one screen at a time, and in an embedded terminal it kills the command instead of being typed into it.
