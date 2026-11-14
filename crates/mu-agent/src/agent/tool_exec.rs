@@ -358,6 +358,9 @@ impl Agent {
         }
         let hits = self.redact_output(&mut out, true);
         self.log_redaction(&format!("tool:{name}"), &hits);
+        if name == "web_search" && !out.is_error {
+            self.tools.permissions.note_search_result(&out.text);
+        }
         let sub = format!("tool_result:{name}");
         for (_, v) in self
             .ports

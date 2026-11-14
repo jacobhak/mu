@@ -31,6 +31,13 @@ pub fn load_project(key: &Path, warn: &mut Vec<String>) -> RuleSet {
             return RuleSet::default();
         }
     };
+    // `/` maps to `-` in the file name, so `a-b` and `a/b` share a file: only the project it names applies.
+    if let Some(stored) = table.get("root").and_then(toml::Value::as_str)
+        && Path::new(stored) != key
+    {
+        warn.push(format!("{}: grants for {stored}, not {}; ignored", path.display(), key.display()));
+        return RuleSet::default();
+    }
     match table.get("rules") {
         Some(toml::Value::Table(rules)) => RuleSet::parse(rules, "project permissions", warn),
         None => RuleSet::default(),
@@ -69,6 +76,11 @@ fn write_grant(path: &Path, section: &[&str], root: Option<&Path>, g: &Grant) ->
     };
     let mut doc: DocumentMut = text.parse().map_err(|e| format!("{}: {e}; fix it by hand", path.display()))?;
     if let Some(key) = root {
+        if let Some(stored) = doc.get("root").and_then(Item::as_str)
+            && Path::new(stored) != key
+        {
+            return Err(format!("{}: holds grants for {stored}, not {}; not saved", path.display(), key.display()));
+        }
         doc.as_table_mut().insert("root", Item::Value(Value::from(key.to_string_lossy().into_owned())));
     }
     let mut table = doc.as_table_mut();
@@ -223,6 +235,22 @@ mod tests {
         let text = std::fs::read_to_string(project_file(key)).unwrap();
         assert!(text.contains("root = "), "{text}");
         assert_eq!(text.matches("a/*.txt").count(), 2, "once per tool, not once per add: {text}");
+    }
+
+    #[test]
+    fn grants_apply_only_to_the_project_they_were_stored_for() {
+        mu_testutil::home();
+        let (a, b) = (Path::new("/tmp/mu-grants/a-b"), Path::new("/tmp/mu-grants/a/b"));
+        assert_eq!(project_file(a), project_file(b), "the directory names collide");
+        add_project(a, &grant("write", &["x/*"])).unwrap();
+        let mut warn = Vec::new();
+        assert_eq!(load_project(a, &mut warn).0.len(), 4);
+        assert!(warn.is_empty(), "{warn:?}");
+        assert!(load_project(b, &mut warn).0.is_empty(), "another project's grants do not apply");
+        assert!(warn.iter().any(|w| w.contains("/tmp/mu-grants/a-b")), "{warn:?}");
+        let err = add_project(b, &grant("write", &["y/*"])).unwrap_err();
+        assert!(err.contains("not saved"), "{err}");
+        assert!(!std::fs::read_to_string(project_file(a)).unwrap().contains("y/*"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod classify;
 mod glob;
 mod grant;
 mod guard;
+mod hosts;
 mod store;
 mod verdict;
 
@@ -61,6 +62,7 @@ pub struct Permissions {
     global: RefCell<RuleSet>,
     project: std::cell::OnceCell<Project>,
     session: RefCell<RuleSet>,
+    searched: RefCell<Vec<String>>,
 }
 
 impl Default for Permissions {
@@ -71,6 +73,7 @@ impl Default for Permissions {
             global: RefCell::new(RuleSet::default()),
             project: std::cell::OnceCell::new(),
             session: RefCell::new(RuleSet::default()),
+            searched: RefCell::default(),
         }
     }
 }
@@ -83,6 +86,17 @@ impl Permissions {
             global: RefCell::new(cfg.rules.clone()),
             project: std::cell::OnceCell::new(),
             session: RefCell::new(RuleSet::default()),
+            searched: RefCell::default(),
+        }
+    }
+
+    /// Remembers the hosts a `web_search` result lists: `fetch` of them needs no approval in `ask`.
+    pub fn note_search_result(&self, text: &str) {
+        let mut searched = self.searched.borrow_mut();
+        for h in hosts::result_hosts(text) {
+            if !searched.contains(&h) {
+                searched.push(h);
+            }
         }
     }
 
@@ -135,7 +149,11 @@ impl Permissions {
 
     /// The payload a subagent inherits.
     pub fn inherit_json(&self) -> Value {
-        json!({"mode": self.mode.get().as_str(), "session": self.session.borrow().to_json()})
+        json!({
+            "mode": self.mode.get().as_str(),
+            "session": self.session.borrow().to_json(),
+            "searched": *self.searched.borrow(),
+        })
     }
 
     pub fn apply_inherited(&self, v: &Value) {
@@ -143,6 +161,12 @@ impl Permissions {
             self.mode.set(m);
         }
         self.session.borrow_mut().extend(&RuleSet::from_json(&v["session"]));
+        let mut searched = self.searched.borrow_mut();
+        for h in v["searched"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            if !searched.iter().any(|s| s == h) {
+                searched.push(h.to_string());
+            }
+        }
     }
 
     /// Asks the parent's UI on behalf of a subagent and passes the answer on.
@@ -191,6 +215,7 @@ impl Permissions {
                 (project, "project permissions"),
                 (self.session.borrow().clone(), "this session"),
             ],
+            searched: self.searched.borrow().clone(),
         }
     }
 
@@ -234,6 +259,12 @@ impl Permissions {
             Some(h) => format!("rule \"{}\" = ask ({})", h.rule.pattern, h.source),
             None if open.iter().all(|&i| call.subjects[i].needs == Capability::ReadOutside) => {
                 format!("{mode} mode: reading outside the project needs approval")
+            }
+            None if open.iter().all(|&i| call.subjects[i].needs == Capability::Network) => {
+                format!(
+                    "{mode} mode: {} is not a host a web search returned",
+                    hosts::url_host(&call.subjects[open[0]].text).unwrap_or_else(|| "this URL".into())
+                )
             }
             None if open.iter().all(|&i| call.subjects[i].tool != name) => {
                 format!("{mode} mode: writing {} needs approval", call.subjects[open[0]].text)
@@ -874,6 +905,29 @@ mod tests {
         assert!(req.grant.is_none());
         let Verdict::Ask(req) = p.check(&web, "fetch", &json!({"url": "https://example.com/a"})) else { panic!() };
         assert_eq!(req.grant.unwrap().patterns, ["https://example.com/*"]);
+    }
+
+    #[test]
+    fn ask_mode_asks_per_host_for_fetch_except_hosts_a_search_returned() {
+        let (p, t) = setup(PermissionMode::Ask);
+        let web = plugin_tools(&["fetch"], Some(Access::Read), t.cwd.clone());
+        let call = |p: &Permissions, url: &str| p.check(&web, "fetch", &json!({"url": url}));
+        let Verdict::Ask(req) = call(&p, "https://a.example/x") else { panic!() };
+        assert!(req.reason.contains("a.example"), "{}", req.reason);
+        assert_eq!(req.grant.as_ref().unwrap().patterns, ["https://a.example/*"]);
+
+        p.note_search_result("[1] T\n    https://a.example/p\n    snippet");
+        assert!(matches!(call(&p, "https://A.example/other"), Verdict::Allow), "the host a search returned");
+        assert!(matches!(call(&p, "https://b.example/x"), Verdict::Ask(_)), "another host");
+        assert!(matches!(call(&p, "https://a.example@b.example/"), Verdict::Ask(_)), "userinfo is not the host");
+
+        let heir = Permissions::default();
+        heir.set_mode(PermissionMode::Ask);
+        heir.apply_inherited(&p.inherit_json());
+        assert!(matches!(call(&heir, "https://a.example/x"), Verdict::Allow), "a subagent inherits the hosts");
+
+        let (p, _) = setup(PermissionMode::Edits);
+        assert!(matches!(call(&p, "https://c.example/"), Verdict::Allow), "edits does not ask");
     }
 
     #[test]

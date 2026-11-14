@@ -52,6 +52,8 @@ pub struct Gate {
     pub(super) mu_home: PathBuf,
     /// Global, project and session rules, with the source each is named by.
     pub(super) rules: [(RuleSet, &'static str); 3],
+    /// Hosts a `web_search` of this session returned.
+    pub(super) searched: Vec<String>,
 }
 
 /// A rule matches a subject by its displayed text (relative inside the project) or by its absolute
@@ -100,6 +102,11 @@ impl Gate {
             return (Outcome::Allow, hits);
         }
         (Outcome::Ask { rule, open }, hits)
+    }
+
+    /// Whether a search of this session returned the URL's host.
+    pub(super) fn searched_url(&self, url: &str) -> bool {
+        super::hosts::url_host(url).is_some_and(|h| self.searched.contains(&h))
     }
 
     pub(super) fn inside(&self, p: &Path) -> bool {

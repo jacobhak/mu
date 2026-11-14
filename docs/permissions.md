@@ -19,11 +19,11 @@ edit = { "*.lock" = "ask" }
 
 | Mode | Runs without asking | Asks |
 |---|---|---|
-| `ask` | reads inside the project: `read`, `grep`, `glob`, read-only `bash`; and `todo`, `ask`, `web_search`, `fetch`, … | everything that writes or runs, and reads outside the project |
+| `ask` | reads inside the project: `read`, `grep`, `glob`, read-only `bash`; and `todo`, `ask`, `web_search`, `fetch` of a host a `web_search` returned, … | everything that writes or runs, reads outside the project, and `fetch` of any other host |
 | `edits` | the same, plus file edits inside the project | commands, writes outside the project or into `.git`, and reads outside the project |
 | `yolo` | everything | only what a rule says to ask |
 
-"Inside the project" means under its root, with symlinks resolved. `local://` files (plans, notes) count as reading, as do the `artifact://`, `skill://` and `mu://` pages the tools refuse to write, so those always stay quiet; `fetch` and `web_search` read the network, not the machine, and are not gated by their reach. Reading outside the project asks in both `ask` and `edits`, so neither mode can walk `~/.ssh` or another checkout without permission; only `yolo` reads anywhere. Anything under the project's `.git` or under `~/.mu` is never covered by `edits`. Subagents run with the same mode and the same session grants.
+"Inside the project" means under its root, with symlinks resolved. `local://` files (plans, notes) count as reading, as do the `artifact://`, `skill://` and `mu://` pages the tools refuse to write, so those always stay quiet; `fetch` and `web_search` read the network, not the machine, and are not gated by their reach. In `ask` mode `fetch` is asked per host, because a model that has read project files can send their content in a URL: the prompt offers `https://host/*` as a grant, and a host that a `web_search` of the same session returned (and one a subagent inherits from its parent) is not asked about. `edits` and `yolo` do not ask. A redirect from an allowed host is followed without a new prompt. Reading outside the project asks in both `ask` and `edits`, so neither mode can walk `~/.ssh` or another checkout without permission; only `yolo` reads anywhere. Anything under the project's `.git` or under `~/.mu` is never covered by `edits`. Subagents run with the same mode and the same session grants.
 
 `readonly_bash = false` makes every `bash` call ask unless a rule allows it. The read-only set covers programs such as `ls`, `cat`, `grep`, `git status`, `git log`, `git diff`, `find` without `-delete`/`-exec`, and pipelines and loops made only of those; anything the classifier is not sure about is not read-only.
 
@@ -62,7 +62,7 @@ When a call needs approval, mu first asks how much to allow. The widths are land
 Then, for any width, where to remember it:
 
 1. **This session** — until mu exits.
-2. **In this project** — saved under `~/.mu/permissions/`, per checkout (worktrees share it). Never in the repository.
+2. **In this project** — saved under `~/.mu/permissions/`, per checkout (worktrees share it). Never in the repository. The file is named after the checkout's path with `/` written as `-`, so `~/code/a-b` and `~/code/a/b` name the same file; each file records the checkout's absolute path (`root`) and applies only to that one. For any other project the file is ignored with a warning, and a new grant is not saved over it.
 3. **Everywhere** — added to `~/.mu/config.toml`.
 4. **No** — do not run it.
 

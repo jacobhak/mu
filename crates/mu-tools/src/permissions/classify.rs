@@ -27,7 +27,11 @@ pub(super) fn classify(tools: &Tools, gate: &Gate, name: &str, args: &Value) -> 
         return Ok(call);
     }
     let text = if name == "fetch" { args["url"].as_str().unwrap_or("") } else { "" };
-    let needs = if access == Access::Read { Capability::ReadProject } else { Capability::Exec };
+    let needs = match access {
+        Access::Read if name == "fetch" && !gate.searched_url(text) => Capability::Network,
+        Access::Read => Capability::ReadProject,
+        _ => Capability::Exec,
+    };
     let subject = Subject::new(name, text, needs);
     Ok(Call { subjects: vec![subject], bash: None, bash_dir: tools.cwd.clone() })
 }

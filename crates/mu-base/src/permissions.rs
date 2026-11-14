@@ -23,6 +23,8 @@ pub enum Capability {
     ReadProject,
     /// Change files inside the project.
     WriteProject,
+    /// Fetch a host `web_search` has not returned: the page can carry what the model read.
+    Network,
     /// Read anything outside the project.
     ReadOutside,
     /// Run commands, and write outside the project.
@@ -36,9 +38,14 @@ impl PermissionMode {
     /// decided it first.
     pub fn capabilities(self) -> &'static [Capability] {
         const ASK: &[Capability] = &[Capability::ReadProject];
-        const EDITS: &[Capability] = &[Capability::ReadProject, Capability::WriteProject];
-        const YOLO: &[Capability] =
-            &[Capability::ReadProject, Capability::WriteProject, Capability::ReadOutside, Capability::Exec];
+        const EDITS: &[Capability] = &[Capability::ReadProject, Capability::WriteProject, Capability::Network];
+        const YOLO: &[Capability] = &[
+            Capability::ReadProject,
+            Capability::WriteProject,
+            Capability::Network,
+            Capability::ReadOutside,
+            Capability::Exec,
+        ];
         match self {
             Self::Ask => ASK,
             Self::Edits => EDITS,
@@ -262,10 +269,11 @@ mod tests {
         let edits = PermissionMode::Edits.capabilities();
         let yolo = PermissionMode::Yolo.capabilities();
         assert_eq!(ask, [ReadProject]);
-        assert_eq!(edits, [ReadProject, WriteProject]);
-        assert_eq!(yolo, [ReadProject, WriteProject, ReadOutside, Exec]);
+        assert_eq!(edits, [ReadProject, WriteProject, Network]);
+        assert_eq!(yolo, [ReadProject, WriteProject, Network, ReadOutside, Exec]);
         assert!(ask.iter().all(|c| edits.contains(c)), "edits adds to ask");
         assert!(edits.iter().all(|c| yolo.contains(c)), "yolo adds to edits");
+        assert!(!PermissionMode::Ask.allows(Network), "ask asks per host");
         assert!(!PermissionMode::Ask.allows(ReadOutside));
         assert!(!PermissionMode::Edits.allows(ReadOutside), "edits reads outside the project only when asked");
         assert!(!PermissionMode::Edits.allows(Exec));
