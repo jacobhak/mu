@@ -19,7 +19,7 @@ fn tool_panic_becomes_an_error_result() {
         ];
         let (mut a, _rx) = agent(script);
         a.turn(Some("go".to_string().into())).await;
-        assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
         let err = a.messages.iter().find_map(|m| match m {
             Message::ToolResult { is_error: true, content, .. } => Some(format!("{content:?}")),
             _ => None,
@@ -102,9 +102,9 @@ fn truncated_reply_with_calls_stays_paired() {
         ];
         let (mut a, _rx) = agent(script);
         a.turn(Some("go".to_string().into())).await;
-        assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
         a.turn(Some("again".to_string().into())).await;
-        assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
         assert!(a.messages.iter().any(|m| matches!(m, Message::ToolResult { is_error: true, .. })));
     });
 }
@@ -200,7 +200,7 @@ fn calls_after_a_successful_yield_are_skipped() {
         *a.tools.output_schema.borrow_mut() =
             Some(json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}));
         a.turn(Some("go".to_string().into())).await;
-        assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
         let r = results(&a);
         assert_eq!(r.len(), 2, "{r:?}");
         assert!(!r[0].0 && r[0].1.contains("Result submitted"), "{:?}", r[0]);
@@ -230,7 +230,7 @@ fn stop_skips_the_rest_of_the_batch_and_ends_the_turn() {
         let (mut a, mut rx) = agent(script);
         a.ports.inbox.borrow_mut().stop = true;
         a.turn(Some("go".to_string().into())).await;
-        assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
         let r = results(&a);
         assert_eq!(r.len(), 2);
         assert!(r.iter().all(|x| x.0 && x.1.contains("the run was stopped")), "{r:?}");
@@ -266,7 +266,7 @@ fn stop_during_a_tool_lets_it_finish_and_skips_the_next() {
             inbox.borrow_mut().stop = true;
         });
         a.turn(Some("go".to_string().into())).await;
-        assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
         let r = results(&a);
         assert_eq!(r.len(), 2);
         assert!(!r[0].0, "the running tool finished: {:?}", r[0]);
@@ -309,7 +309,7 @@ fn stop_plus_cancel_is_an_abort_and_stays_paired() {
             inbox.borrow().cancel.cancel();
         });
         a.turn(Some("go".to_string().into())).await;
-        assert!(mu_base::message::check_tool_pairs(&a.messages).is_ok());
+        assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
         let mut ended = None;
         while let Ok(e) = rx.try_recv() {
             if let AgentEvent::TurnEnd { aborted } = e {
@@ -754,7 +754,7 @@ fn each_user_turn_gets_its_own_nudge() {
 fn the_nudge_is_not_echoed_on_resume() {
     run(async {
         let (mut a, mut rx) = agent(vec![]);
-        a.messages.push(Message::user(mu_base::ask_nudge::REMINDER));
+        a.messages.push(Message::user(mu_base::ask_nudge::REMINDER), None, true);
         a.replay_history();
         assert!(drain(&mut rx).iter().all(|e| !matches!(e, AgentEvent::UserPrompt(_))));
     });
@@ -783,10 +783,10 @@ fn a_dismissal_is_kept_in_history_but_not_streamed() {
 fn a_dismissal_is_not_rendered_on_resume() {
     run(async {
         let (mut a, mut rx) = agent(vec![]);
-        a.messages.push(Message::user("go"));
-        a.messages.push(assistant(vec![Block::text("Keep it or drop it?")], StopReason::Stop));
-        a.messages.push(Message::user(mu_base::ask_nudge::REMINDER));
-        a.messages.push(assistant(vec![Block::text(".")], StopReason::Stop));
+        a.messages.push(Message::user("go"), None, false);
+        a.messages.push(assistant(vec![Block::text("Keep it or drop it?")], StopReason::Stop), None, false);
+        a.messages.push(Message::user(mu_base::ask_nudge::REMINDER), None, true);
+        a.messages.push(assistant(vec![Block::text(".")], StopReason::Stop), None, false);
         a.replay_history();
         let events = drain(&mut rx);
         assert!(events.iter().all(|e| !matches!(e, AgentEvent::Text(t) if t == ".")));
@@ -1329,10 +1329,8 @@ fn rewind_offers_only_what_the_user_typed_and_the_agent_replied() {
         let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("ok")], StopReason::Stop))]);
         a.ensure_session().await;
         a.turn(Some("typed".to_string().into())).await;
-        a.messages.push(Message::synthetic_user("plan"));
-        a.entry_ids.push("p".into());
-        a.messages.push(Message::user("<system-reminder>\nnote\n</system-reminder>"));
-        a.entry_ids.push("r".into());
+        a.messages.push(Message::synthetic_user("plan"), Some("p".into()), false);
+        a.messages.push(Message::user("<system-reminder>\nnote\n</system-reminder>"), Some("r".into()), false);
         drain(&mut rx);
         a.list_rewind();
         let points = drain(&mut rx)
@@ -1430,7 +1428,8 @@ async fn long_history(
 fn assert_matches_session(a: &Agent) {
     let loaded = mu_session::session::format::load(&a.session.as_ref().unwrap().path).unwrap();
     assert_eq!(loaded.messages.len(), a.messages.len());
-    assert_eq!(loaded.entry_ids, a.entry_ids);
+    let ids: Vec<String> = a.messages.entries().iter().map(|e| e.id.clone().unwrap_or_default()).collect();
+    assert_eq!(loaded.entry_ids, ids);
     assert_eq!(loaded.compaction.map(|c| c.summary), a.compaction.state.as_ref().map(|c| c.summary.clone()));
 }
 

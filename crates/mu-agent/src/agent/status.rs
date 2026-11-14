@@ -202,10 +202,10 @@ impl Agent {
     }
 
     pub(crate) fn fresh_usage_tokens(&self) -> Option<u64> {
-        let msgs = self.messages.get(self.compaction.fresh_from..)?;
+        let msgs = self.messages.entries().get(self.compaction.fresh_from..)?;
         let target = &self.model.model;
-        let (i, anchor) = msgs.iter().enumerate().rev().find_map(|(i, m)| Some((i, usage_anchor(m, target)?)))?;
-        let trailing: u64 = msgs[i + 1..].iter().map(|m| m.estimate_tokens(target)).sum();
+        let (i, anchor) = msgs.iter().enumerate().rev().find_map(|(i, e)| Some((i, usage_anchor(&e.msg, target)?)))?;
+        let trailing: u64 = msgs[i + 1..].iter().map(|e| e.msg.estimate_tokens(target)).sum();
         Some(anchor + trailing)
     }
 

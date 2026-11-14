@@ -138,7 +138,7 @@ impl Agent {
         };
         let plan_uri = plan.as_ref().and(plan_uri);
         let since = self.plan.review_base.as_ref().map_or(0, |b| b.since);
-        let notes = review::facts::user_notes(&self.messages, since);
+        let notes = review::facts::user_notes(&self.messages.to_vec(), since);
         let request = facts.request(plan, &notes, focus.as_deref());
         let model = mu_base::models::role_selector("review", &self.ports.providers.cfg)
             .and_then(|s| self.ports.providers.resolve(&s).ok())

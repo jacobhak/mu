@@ -95,7 +95,6 @@ impl Agent {
     pub(super) fn reset_conversation(&mut self) {
         self.session = None;
         self.messages.clear();
-        self.entry_ids.clear();
         self.mail.seen.clear();
         self.mail.announced.clear();
         self.plugin_ctx.clear();
@@ -132,7 +131,7 @@ impl Agent {
     /// Loads `path`, applying its model/thinking unless pinned by the command line.
     /// Re-emits the loaded conversation as UI events so a resumed session shows its history.
     pub(super) fn replay_history(&self) {
-        for e in history_events(&self.messages) {
+        for e in history_events(&self.messages.to_vec()) {
             self.emit(e);
         }
     }
@@ -242,15 +241,13 @@ impl Agent {
     /// Messages, ids, plugin context, review base, todo and title of a loaded session. Returns the
     /// secrets redacted on the way in, to be logged once the session file is open.
     fn restore_history(&mut self, loaded: Loaded) -> Vec<secrets::Hit> {
-        self.messages = loaded.messages;
         // Sessions written before redaction, or with it off, may hold secrets.
-        let mut msgs = std::mem::take(&mut self.messages);
+        let mut msgs = loaded.messages;
         let mut resume_hits = Vec::new();
         for m in msgs.iter_mut() {
             secrets::merge(&mut resume_hits, self.redact_message(m));
         }
-        self.messages = msgs;
-        self.entry_ids = loaded.entry_ids;
+        self.messages = History::load(msgs, loaded.entry_ids);
         self.plugin_ctx = loaded.plugin_context;
         for v in self.plugin_ctx.values_mut() {
             let r = secrets::redact(v, &self.cwd);

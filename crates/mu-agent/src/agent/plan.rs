@@ -74,7 +74,7 @@ impl Agent {
             None => self.tools.resolve(uri).ok().and_then(|r| std::fs::read_to_string(r.path).ok()).unwrap_or_default(),
         };
         let (base, read) = match &store.root {
-            Some(root) => (plans::base_now(root).await, plans::reads_from(&self.messages, &self.cwd, root)),
+            Some(root) => (plans::base_now(root).await, plans::reads_from(&self.messages.to_vec(), &self.cwd, root)),
             None => (None, Vec::new()),
         };
         let session = self.session.as_ref().map(|s| s.path.clone());

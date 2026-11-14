@@ -34,15 +34,14 @@ impl Agent {
         let last = self.messages.len().saturating_sub(1);
         let points = self
             .messages
+            .entries()
             .iter()
-            .zip(&self.entry_ids)
             .enumerate()
-            .filter(|(_, (_, id))| !id.is_empty())
-            .filter_map(|(i, (m, id))| {
-                let id = id.clone();
-                match prompt_of(m) {
+            .filter_map(|(i, e)| {
+                let id = e.id.clone()?;
+                match prompt_of(&e.msg) {
                     Some(p) => Some(RewindPoint { id, text: p.text, reply: false }),
-                    None if i < last => closing_reply(m).map(|text| RewindPoint { id, text, reply: true }),
+                    None if i < last => closing_reply(&e.msg).map(|text| RewindPoint { id, text, reply: true }),
                     None => None,
                 }
             })
@@ -53,7 +52,7 @@ impl Agent {
     /// Rewinds to entry `id`: for a prompt, the session continues from just before it, the way a
     /// reload would find it, and the prompt returns to the composer; for a reply, from just after.
     pub(super) async fn rewind(&mut self, id: &str) {
-        let Some(m) = self.entry_ids.iter().position(|e| e == id).map(|i| &self.messages[i]) else {
+        let Some(m) = self.messages.position_of_id(id).map(|i| &self.messages[i]) else {
             return self.error("that point is not in the conversation any more");
         };
         let draft = prompt_of(m);

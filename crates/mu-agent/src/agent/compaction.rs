@@ -232,7 +232,8 @@ impl Agent {
         if self.compaction.since == 0 {
             return Outcome::Skipped("Already compacted");
         }
-        let cut = cut_point(&self.messages, &self.model.model, keep_tokens(self.thresholds().1));
+        let history = self.messages.to_vec();
+        let cut = cut_point(&history, &self.model.model, keep_tokens(self.thresholds().1));
         if cut == 0 {
             return Outcome::Skipped("Nothing to compact");
         }
@@ -247,7 +248,7 @@ impl Agent {
             .filter_map(|(_, v)| v["context"].as_str().filter(|c| !c.is_empty()).map(String::from))
             .collect();
         // Each chunk is folded into the summary so far, so the last call has seen everything.
-        let chunks = match chunks_within(&self.messages[..cut], summary_input_chars(self.model.model.context_window)) {
+        let chunks = match chunks_within(&history[..cut], summary_input_chars(self.model.model.context_window)) {
             c if c.is_empty() => vec![String::new()],
             c => c,
         };
@@ -267,19 +268,18 @@ impl Agent {
             };
             prev = Some(summary.clone());
         }
-        let first_kept = self.entry_ids.get(cut).cloned().unwrap_or_default();
-        if self.session.is_some() && first_kept.is_empty() {
+        let first_kept = self.messages.id(cut).map(String::from);
+        if self.session.is_some() && first_kept.is_none() {
             // The entry the summary would point at was never written; cutting there would corrupt the chain.
             return Outcome::Skipped("Cannot compact: the session file is missing entries");
         }
-        self.messages.drain(..cut);
-        self.entry_ids.drain(..cut);
+        self.messages.drain_front(cut);
         let after_est = self.system_tokens()
             + mu_base::tool::tool_tokens(&self.tool_defs())
             + estimate_tokens(&summary)
             + self.messages.iter().map(|m| m.estimate_tokens(&self.model.model)).sum::<u64>();
         if let Some(s) = self.session.as_mut() {
-            s.compaction(&summary, &first_kept, before, after_est);
+            s.compaction(&summary, first_kept.as_deref().unwrap_or_default(), before, after_est);
         }
         self.compaction.state = Some(CompactionState { summary });
         self.compaction.fresh_from = self.messages.len();

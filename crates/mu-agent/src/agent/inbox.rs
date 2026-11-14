@@ -57,7 +57,7 @@ impl Agent {
         }
         self.push(Message::user(&inbox::notice(&notes)));
         let names: Vec<String> = notes.into_iter().map(|n| n.name).collect();
-        if self.entry_ids.last().is_some_and(|e| !e.is_empty()) {
+        if self.messages.last_id().is_some() {
             if let Some(s) = &self.session {
                 s.sync();
             }

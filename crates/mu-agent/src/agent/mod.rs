@@ -1,5 +1,6 @@
 mod budget;
 mod compaction;
+mod history;
 mod state;
 pub use state::RunConfig;
 use state::{CompactionFlow, Costs, Mailbox, Memo, ModelState, PlanFlow, Ports, SharedInbox, TitleState, new_inbox};
@@ -21,6 +22,7 @@ mod title;
 mod tool_exec;
 mod turn;
 use self::compaction::{Outcome, estimate_tokens};
+use self::history::History;
 use crate::plans;
 use crate::policy::ToolPolicy;
 use crate::prompt::{self, PromptInput};
@@ -60,9 +62,7 @@ pub struct Agent {
     cwd: PathBuf,
     ctx: Rc<Context>,
     session: Option<SessionFile>,
-    pub(crate) messages: Vec<Message>,
-    /// Parallel to `messages`.
-    entry_ids: Vec<String>,
+    pub(crate) messages: History,
     ports: Ports,
     model: ModelState,
     title: TitleState,
@@ -271,8 +271,7 @@ impl Agent {
             cwd: i.cwd,
             ctx: i.ctx,
             session: None,
-            messages: Vec::new(),
-            entry_ids: Vec::new(),
+            messages: History::default(),
             ports: Ports {
                 providers: i.providers,
                 plugins: i.plugins,

@@ -1,7 +1,44 @@
 use super::*;
 
+/// Whether the loop compacts before its next request.
+#[derive(Clone, Copy, PartialEq)]
+enum CompactionCheck {
+    /// The first request of a pass, and the retry after an overflow compaction, are not checked.
+    Skip,
+    Due,
+}
+
+/// Whether an overflow was already answered with a compaction in this pass.
+#[derive(Clone, Copy, PartialEq)]
+enum Overflow {
+    Fresh,
+    Compacted,
+}
+
+struct LoopState {
+    compaction: CompactionCheck,
+    overflow: Overflow,
+    /// Stop reminders sent so far: at most two per pass.
+    todo_nags: u8,
+}
+
+impl Default for LoopState {
+    fn default() -> Self {
+        Self { compaction: CompactionCheck::Skip, overflow: Overflow::Fresh, todo_nags: 0 }
+    }
+}
+
 impl Agent {
-    pub fn push(&mut self, mut m: Message) {
+    pub fn push(&mut self, m: Message) {
+        self.push_as(m, false);
+    }
+
+    /// Stores the end-of-turn `ask` reminder, marked so that nothing has to recognise its text.
+    fn push_reminder(&mut self) {
+        self.push_as(Message::user(ask_nudge::REMINDER), true);
+    }
+
+    fn push_as(&mut self, mut m: Message, reminder: bool) {
         let hits = self.redact_message(&mut m);
         if !hits.is_empty() && matches!(m, Message::User { .. }) {
             let names: Vec<String> = hits.iter().map(secrets::Hit::placeholder).collect();
@@ -16,11 +53,10 @@ impl Agent {
         if let Ok(v) = plugin_view {
             self.turn_msgs.push(v);
         }
-        let id = self.session.as_mut().and_then(|s| s.message(&m)).unwrap_or_default();
-        self.entry_ids.push(id);
+        let id = self.session.as_mut().and_then(|s| s.message(&m));
         // A reply's status goes out from `record_reply`, once its quota is applied.
         let reply = matches!(m, Message::Assistant { .. });
-        self.messages.push(m);
+        self.messages.push(m, id, reminder);
         self.compaction.since += 1;
         if !reply {
             self.emit_status();
@@ -184,26 +220,26 @@ impl Agent {
         if !self.ports.providers.cfg.mu.ask.nudge || self.run.subagent || !self.policy().permits("ask") {
             return false;
         }
-        for m in self.messages.iter().rev() {
-            match m {
-                Message::User { content, .. } if ask_nudge::is_reminder(&text_of(content)) => return false,
-                Message::User { .. } => return true,
-                Message::Assistant { .. } if tool_calls(m).iter().any(|(_, name, _)| name == "ask") => return false,
+        for e in self.messages.entries().iter().rev() {
+            match &e.msg {
+                Message::User { .. } => return !e.reminder,
+                m @ Message::Assistant { .. } if tool_calls(m).iter().any(|(_, name, _)| name == "ask") => {
+                    return false;
+                }
                 _ => {}
             }
         }
         true
     }
 
+    /// Runs requests until the pass ends: one per tool round, plus the retry after an overflow.
     async fn run_loop(&mut self, cancel: &CancellationToken) -> Flow {
-        let mut first = true;
-        let mut todo_nags = 0u8;
-        let mut compacted_for_overflow = false;
+        let mut st = LoopState::default();
         loop {
-            if !first && self.compaction_due(0) {
+            if st.compaction == CompactionCheck::Due && self.compaction_due(0) {
                 self.compact_reporting(cancel).await;
             }
-            first = false;
+            st.compaction = CompactionCheck::Due;
             // MCP servers without a cached tool list are started and listed once, before the first request.
             // A subagent restricted to named tools that include no MCP tool never needs the listing.
             if self.run.allow.as_ref().is_none_or(|a| a.iter().any(|n| n.starts_with("mcp__"))) {
@@ -224,20 +260,20 @@ impl Agent {
                 return Flow::Done;
             }
             // Held until the reply ends: a reply that turns out to be a dismissal is never shown.
-            let answering_reminder = matches!(self.messages.last(), Some(Message::User { content, .. }) if ask_nudge::is_reminder(&text_of(content)));
+            let answering_reminder = self.messages.ends_with_reminder();
             let (reply, dismissed) = self.stream_reply(cancel, answering_reminder).await;
             let msg = match reply {
                 Ok(m) => m,
                 Err(ProviderError::Aborted) => return Flow::Aborted,
                 Err(ProviderError::Overflow(m)) => {
-                    if compacted_for_overflow {
+                    if st.overflow == Overflow::Compacted {
                         self.error("context overflow after compaction");
                         return Flow::Failed;
                     }
-                    compacted_for_overflow = true;
+                    st.overflow = Overflow::Compacted;
                     match self.compact(None, cancel).await {
                         Outcome::Done => {
-                            first = true;
+                            st.compaction = CompactionCheck::Skip;
                             continue;
                         }
                         Outcome::Skipped(_) => {
@@ -275,7 +311,7 @@ impl Agent {
                 }
             }
             if stop != StopReason::ToolUse || calls.is_empty() {
-                match self.settle_pass(stop, prose_question, &mut todo_nags) {
+                match self.settle_pass(stop, prose_question, &mut st.todo_nags) {
                     Some(flow) => return flow,
                     None => continue,
                 }
@@ -409,7 +445,7 @@ impl Agent {
         }
         // Ask reminder: the turn ends with a decision question in prose. Once per user turn.
         if prose_question && self.ask_nudge_due() {
-            self.push(Message::user(ask_nudge::REMINDER));
+            self.push_reminder();
             return None;
         }
         Some(Flow::Done)
