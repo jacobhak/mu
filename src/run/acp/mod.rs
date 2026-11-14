@@ -6,7 +6,7 @@ mod commands;
 mod updates;
 
 use crate::cli::select::pick_model;
-use crate::run::setup::{Setup, setup};
+use crate::run::setup::{self, Setup};
 use anyhow::{Result, anyhow};
 use client::Rpc;
 use commands::Parsed;
@@ -837,8 +837,8 @@ impl Server {
 
 /// Starts an agent for `cwd` and waits until its session file exists. Replayed history, if
 /// requested, is streamed before this returns. Runs as its own local task, so the request loop keeps
-/// turning while it waits; `setup` is synchronous and does block that thread. `elicit`: the client
-/// can ask the user a form, so the model may use `ask`.
+/// turning while it waits; the disk reads of `setup` run on a blocking thread, and only building
+/// its `Rc` state is done here. `elicit`: the client can ask the user a form, so the model may use `ask`.
 #[allow(clippy::too_many_arguments)]
 async fn open_session(
     model: Option<String>,
@@ -850,7 +850,13 @@ async fn open_session(
     replay: bool,
     elicit: bool,
 ) -> Result<Box<Opened>> {
-    let Setup { cfgs, ctx, host, providers, notice_rx, .. } = setup(&cwd);
+    let loaded = {
+        let cwd = cwd.clone();
+        tokio::task::spawn_blocking(move || setup::load(&cwd))
+            .await
+            .map_err(|e| anyhow!("loading the config failed: {e}"))?
+    };
+    let Setup { cfgs, ctx, host, providers, notice_rx, .. } = setup::build(&cwd, loaded);
     let (spec, level) = pick_model(&cfgs, &providers, model.clone(), thinking)?;
     let run = agent::RunConfig {
         pin_model: model.is_some() && resume.is_some(),

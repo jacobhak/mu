@@ -3,10 +3,12 @@
 use super::child::ChildThen;
 use super::keys::is_baseten;
 use super::*;
+use crate::chat::blocks;
 use crate::custom::panel::Fetch;
 use crate::widgets::overlay::LoginTarget;
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
+use mu_base::events::SubagentStatus;
 use mu_base::message::Image;
 use mu_provider::auth::chatgpt::Account;
 use mu_provider::auth::check::Check;
@@ -57,6 +59,8 @@ pub(super) enum UiMsg {
     },
     /// The subagents' session files were read: the reader, handed back.
     Spend(Box<TreeCost>),
+    /// A finished subagent's session was read: its row, and what the session cost (`None` if the read failed).
+    SubagentCost(Box<SubagentStatus>, Option<f64>),
     /// An API key was checked: the outcome, and the entry to save when it holds.
     KeyChecked {
         flow: u64,
@@ -107,6 +111,10 @@ impl App {
                 self.agent.spend = Some(*t);
                 // The jobs or the session may have moved on while the files were read.
                 self.poll_spend();
+            }
+            UiMsg::SubagentCost(row, cost) => {
+                let lines = blocks::subagent_rows(std::slice::from_ref(&row), ' ', |_| cost);
+                self.agent.tr.commit(lines);
             }
             UiMsg::Copied(r) => match r {
                 Ok(n) => self.notice(&n),

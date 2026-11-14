@@ -87,6 +87,8 @@ pub(super) enum Effect {
     PlanList(Vec<PlanMeta>),
     /// The prompts `/rewind` can go back to.
     RewindPoints(Vec<RewindPoint>),
+    /// A subagent finished: read what its session cost, then print its row.
+    SubagentCost(SubagentStatus),
     /// The job snapshot changed: an open jobs panel takes it.
     JobsChanged,
     /// A bash job's output changed: an open jobs panel takes it from `AgentView::job_out`.
@@ -317,15 +319,19 @@ impl AgentView {
                 }
                 for r in v.iter().filter(|r| r.state != SubagentState::Running) {
                     if self.jobs_committed.insert(r.name.clone()) {
-                        // Its file is final now, and the periodic read may not have seen the end of it.
-                        let cost = r.session.as_deref().map(session_cost);
+                        // Its file is final now, and the periodic read may not have seen the end of it:
+                        // the app reads it on a blocking thread and commits the row when it has the cost.
+                        if r.kind == JobKind::Subagent && r.session.is_some() {
+                            fx.push(Effect::SubagentCost(r.clone()));
+                            continue;
+                        }
                         let lines = match r.kind {
                             // A bash job's result is its output, run time and end, like a foreground run's.
                             JobKind::Bash => {
                                 let out = self.job_out.get(&r.name).map(String::as_str);
                                 blocks::bash_job_result(r, out, self.expanded, w)
                             }
-                            JobKind::Subagent => blocks::subagent_rows(std::slice::from_ref(r), ' ', |_| cost),
+                            JobKind::Subagent => blocks::subagent_rows(std::slice::from_ref(r), ' ', |_| None),
                         };
                         self.tr.commit(lines);
                     }
@@ -562,6 +568,17 @@ impl App {
             }
             Effect::PlanList(list) => self.show_plans(list),
             Effect::RewindPoints(list) => self.show_rewind(list),
+            Effect::SubagentCost(row) => {
+                let tx = self.ui_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let path = row.session.clone();
+                    let cost = match path {
+                        Some(p) => tokio::task::spawn_blocking(move || session_cost(&p)).await.ok(),
+                        None => None,
+                    };
+                    let _ = tx.send(UiMsg::SubagentCost(Box::new(row), cost));
+                });
+            }
             Effect::JobsChanged => {
                 if let Some(Overlay::Jobs { st }) = &mut self.overlay {
                     st.set_jobs(self.agent.jobs.clone());
@@ -838,6 +855,16 @@ mod tests {
         v.on_event(AgentEvent::Compacted { before: 100, after: 40 }, SIZE);
         assert!(!v.compacting);
         assert!(pending(&v).contains("compacted 100→40 tokens"));
+    }
+
+    #[test]
+    fn a_finished_subagent_with_a_session_waits_for_its_cost_before_it_is_printed() {
+        let mut v = view();
+        let mut done = job("j1", SubagentState::Done, JobKind::Subagent);
+        done.session = Some(PathBuf::from("/x/s.jsonl"));
+        let fx = v.on_event(AgentEvent::Jobs(vec![done]), SIZE);
+        assert!(matches!(fx.as_slice(), [Effect::SubagentCost(r), Effect::JobsChanged] if r.name == "j1"));
+        assert!(v.tr.pending.is_empty(), "no file is read here; the app commits the row with the cost");
     }
 
     #[test]

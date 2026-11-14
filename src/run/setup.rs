@@ -41,11 +41,33 @@ pub fn spawn_notice_printer(
     (done, handle)
 }
 
-pub fn setup(cwd: &std::path::Path) -> Setup {
+/// What `setup` reads from disk: plain data, so it can be loaded on a blocking thread (a deep
+/// tree makes the context scan take tens of milliseconds) and turned into a `Setup` on the caller's.
+pub struct Loaded {
+    cfgs: config::Configs,
+    ctx: context::Context,
+    manifests: Vec<plugin::manifest::Manifest>,
+    servers: Vec<mu_tools::mcp::config::McpServer>,
+    warnings: Vec<String>,
+}
+
+pub fn load(cwd: &std::path::Path) -> Loaded {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let cfgs = Rc::new(config::Configs::load());
-    let ctx =
-        Rc::new(context::Context::load_all(cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user));
+    let cfgs = config::Configs::load();
+    let ctx = context::Context::load_all(cwd, &home, &paths::omp_agent_dir(), cfgs.omp.skills.enable_claude_user);
+    let (manifests, mut warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
+    let (servers, mcp_warnings) = mu_tools::mcp::config::load(cwd, &paths::omp_agent_dir());
+    warnings.extend(mcp_warnings);
+    Loaded { cfgs, ctx, manifests, servers, warnings }
+}
+
+pub fn setup(cwd: &std::path::Path) -> Setup {
+    build(cwd, load(cwd))
+}
+
+pub fn build(cwd: &std::path::Path, loaded: Loaded) -> Setup {
+    let Loaded { cfgs, ctx, manifests, servers, mut warnings } = loaded;
+    let (cfgs, ctx) = (Rc::new(cfgs), Rc::new(ctx));
     let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     for r in [secrets::configure(cfgs.mu.secrets.env.clone()), tools::edit::set_mode(&cfgs.mu.edit.mode)] {
         if let Err(e) = r {
@@ -55,9 +77,6 @@ pub fn setup(cwd: &std::path::Path) -> Setup {
     for w in cfgs.warnings.iter().chain(&ctx.warnings) {
         let _ = notice_tx.send(format!("warning: {w}"));
     }
-    let (manifests, mut warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
-    let (servers, mcp_warnings) = mu_tools::mcp::config::load(cwd, &paths::omp_agent_dir());
-    warnings.extend(mcp_warnings);
     let mcp_lifetime = match plugin::manifest::Lifetime::parse(&cfgs.mu.mcp.lifetime) {
         Some(l) => l,
         None => {
