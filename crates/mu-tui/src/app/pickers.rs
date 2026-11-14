@@ -8,6 +8,7 @@ use crate::panels::plan_review::Tier;
 use crate::panels::reply::ReplyPicker;
 use crate::text::markdown;
 use crate::widgets::overlay::{ApproveState, LoginTarget, OverlayEvent};
+use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use crossterm::event::KeyEvent;
 use mu_base::events::{Answer, AskQuestion};
@@ -169,35 +170,37 @@ impl App {
     /// rebuilt by a refresh.
     pub(super) fn open_session_model_picker(&mut self, request: u64, gateway: &[GatewayModel]) {
         let kept = match &self.overlay {
-            Some(Overlay::Model { sel, ids, .. }) => sel.highlighted().and_then(|i| ids.get(i)).cloned(),
+            Some(Overlay::Model { pick, .. }) => pick.highlighted().cloned(),
             _ => None,
         };
-        let mut items = Vec::new();
-        let mut ids = Vec::new();
+        let mut rows = Vec::new();
         let mut details = Vec::new();
         for role in super::slash::role_views(&self.services.providers.cfg, &self.ctx) {
             if role.value.is_none() {
                 continue;
             }
-            items.push(Item { label: format!("@{}", role.name), detail: role.row() });
-            ids.push(format!("@{}", role.name));
+            let id = format!("@{}", role.name);
+            rows.push((Item { label: id.clone(), detail: role.row() }, id));
             details.push(Some(format!("{}\nEnter switches this session to it.", role.detail())));
         }
         let (concrete, concrete_ids, error) = self.concrete_model_rows(gateway);
-        items.extend(concrete);
-        ids.extend(concrete_ids);
-        details.resize(items.len(), None);
+        rows.extend(concrete.into_iter().zip(concrete_ids));
+        details.resize(rows.len(), None);
         let context = match error {
             Some(e) => e,
-            None if items.is_empty() => "No models available; use /login to configure a provider".into(),
+            None if rows.is_empty() => "No models available; use /login to configure a provider".into(),
             None => "Session-only model switch".into(),
         };
-        let mut sel =
-            Select::new("Switch model (this session)", items).context(&context).details(details).back_keys(true);
-        if let Some(i) = kept.and_then(|id| ids.iter().position(|m| *m == id)) {
-            sel = sel.preselect(i);
-        }
-        self.overlay = Some(Overlay::Model { sel, ids, request });
+        let preselect = kept.and_then(|id| rows.iter().position(|(_, m)| *m == id));
+        let pick = Picker::from_rows(rows, |items| {
+            let sel = Select::new("Switch model (this session)", items).context(&context).details(details);
+            let sel = sel.back_keys(true);
+            match preselect {
+                Some(i) => sel.preselect(i),
+                None => sel,
+            }
+        });
+        self.overlay = Some(Overlay::Model { pick, request });
     }
 
     pub(super) fn open_model_roles(&mut self, role: Option<String>) {
@@ -214,7 +217,8 @@ impl App {
     /// blocking thread and fills it in when it arrives.
     pub(super) fn open_session_picker(&mut self) {
         let items = vec![Item { label: "Loading…".into(), detail: String::new() }];
-        self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths: vec![] });
+        let pick = Picker::placeholder(items, |items| Select::new("Resume session", items));
+        self.overlay = Some(Overlay::Session { pick });
         let (cwd, tx) = (self.cwd.clone(), self.ui_tx.clone());
         tokio::task::spawn_local(async move {
             let list =
@@ -227,7 +231,7 @@ impl App {
 
     pub(super) fn show_sessions(&mut self, list: Vec<mu_session::session::list::SessionInfo>) {
         // Only fill in a picker that is still the loading one.
-        if !matches!(&self.overlay, Some(Overlay::Session { paths, .. }) if paths.is_empty()) {
+        if !matches!(&self.overlay, Some(Overlay::Session { pick }) if pick.is_empty()) {
             return;
         }
         if list.is_empty() {
@@ -235,15 +239,18 @@ impl App {
             self.notice("no sessions for this directory");
             return;
         }
-        let items = list
-            .iter()
-            .map(|s| Item {
-                label: s.title.clone().unwrap_or_else(|| trunc(&s.first_prompt, 80)),
-                detail: ago(s.modified),
+        let rows = list
+            .into_iter()
+            .map(|s| {
+                let item = Item {
+                    label: s.title.clone().unwrap_or_else(|| trunc(&s.first_prompt, 80)),
+                    detail: ago(s.modified),
+                };
+                (item, s.path)
             })
             .collect();
-        let paths = list.into_iter().map(|s| s.path).collect();
-        self.overlay = Some(Overlay::Session { sel: Select::new("Resume session", items), paths });
+        let pick = Picker::from_rows(rows, |items| Select::new("Resume session", items));
+        self.overlay = Some(Overlay::Session { pick });
     }
 
     /// The prompts that can be taken back and the replies that can be returned to, the newest
@@ -253,7 +260,7 @@ impl App {
             return self.notice("no prompt or reply to go back to");
         }
         let total = points.len();
-        let (items, ids): (Vec<_>, Vec<_>) = points
+        let rows = points
             .into_iter()
             .rev()
             .enumerate()
@@ -263,10 +270,10 @@ impl App {
                 let who = if p.reply { "agent" } else { "you" };
                 (Item { label: format!("{who}: {}", trunc(first, 74)), detail }, p.id)
             })
-            .unzip();
+            .collect();
         let title =
             format!("Rewind to before a prompt (you) or after a reply (agent) ({total}); files stay as they are");
-        self.overlay = Some(Overlay::Rewind { sel: Select::new(&title, items), ids });
+        self.overlay = Some(Overlay::Rewind { pick: Picker::from_rows(rows, |items| Select::new(&title, items)) });
     }
 
     pub(super) fn show_plans(&mut self, list: Vec<mu_base::events::PlanMeta>) {
@@ -275,16 +282,19 @@ impl App {
             self.notice("no parked plans for this repository");
             return;
         }
-        let items = list
-            .iter()
-            .map(|m| Item {
-                label: m.title.clone(),
-                detail: format!("{} · {}", m.id, m.updated.get(..10).unwrap_or(&m.updated)),
+        let rows = list
+            .into_iter()
+            .map(|m| {
+                let item = Item {
+                    label: m.title.clone(),
+                    detail: format!("{} · {}", m.id, m.updated.get(..10).unwrap_or(&m.updated)),
+                };
+                (item, m.id)
             })
             .collect();
-        let ids = list.into_iter().map(|m| m.id).collect();
         let title = if deliver { "Deliver plan" } else { "Parked plans" };
-        self.overlay = Some(Overlay::Plans { sel: Select::new(title, items), ids, deliver });
+        self.overlay =
+            Some(Overlay::Plans { pick: Picker::from_rows(rows, |items| Select::new(title, items)), deliver });
     }
 
     /// Opens the reply picker on the newest reply, or says there is none.
@@ -297,34 +307,33 @@ impl App {
 
     pub(super) fn open_copy_picker(&mut self) {
         let first = |s: &str| s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
-        let mut items = Vec::new();
-        let mut texts = Vec::new();
+        let mut rows = Vec::new();
         for r in self.agent.tr.replies.iter().rev().take(20) {
-            items.push(Item {
+            let item = Item {
                 label: format!("Reply: {}", trunc(&first(r), 60)),
                 detail: format!("{} lines", r.lines().count()),
-            });
-            texts.push(r.clone());
+            };
+            rows.push((item, r.clone()));
             for (lang, body) in markdown::code_blocks(r) {
                 let lang = if lang.is_empty() { "text" } else { &lang };
-                items.push(Item {
+                let item = Item {
                     label: format!("Code {lang}: {}", trunc(&first(&body), 50)),
                     detail: format!("{} lines", body.lines().count()),
-                });
-                texts.push(body);
+                };
+                rows.push((item, body));
             }
         }
         for c in self.agent.bash_cmds.iter().rev().take(10) {
-            items.push(Item {
+            let item = Item {
                 label: format!("Command: {}", trunc(&first(c), 60)),
                 detail: format!("{} lines", c.lines().count()),
-            });
-            texts.push(c.clone());
+            };
+            rows.push((item, c.clone()));
         }
-        if items.is_empty() {
+        if rows.is_empty() {
             return self.notice("nothing to copy yet");
         }
-        self.overlay = Some(Overlay::Copy { sel: Select::new("Copy", items), texts });
+        self.overlay = Some(Overlay::Copy { pick: Picker::from_rows(rows, |items| Select::new("Copy", items)) });
     }
 
     /// The panel as this session sees it: its jobs, their output, and itself left out of the sessions.

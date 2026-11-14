@@ -1,7 +1,8 @@
 //! The TUI's event loop and the state it runs on. The method groups live in the sibling files:
 //! `agent_view` (the agent-event reducer), `ui_msgs` (results of background work and the tick),
-//! `slash` (what the composer submits), `schedule` (prompts sent at a later time), `pickers`
-//! (overlays), `child` (programs that take the terminal), `keys` (input routing and API keys),
+//! `slash` (what the composer submits), `commands` (the table of built-in slash commands),
+//! `schedule` (prompts sent at a later time), `pickers` (overlays), `child` (programs that take the
+//! terminal), `keys` (input routing and API keys),
 //! `mcp` (`/mcp`), `memory` (`/memory`), `model_sets` (`/modelset`), `custom_providers` (the
 //! custom-endpoint panel), and `services` (the writes that leave the screen: config, stored keys,
 //! MCP definitions, session control).
@@ -9,6 +10,7 @@
 mod agent_view;
 mod chatgpt;
 mod child;
+mod commands;
 mod custom_providers;
 mod keys;
 mod mcp;
@@ -23,11 +25,12 @@ mod web;
 
 use self::agent_view::{AgentView, error_lines, notice_lines};
 use self::chatgpt::ChatgptFlow;
+use self::commands::command_entries;
+pub use self::commands::interactive_reference;
 use self::keys::KeyFlow;
 use self::schedule::Schedule;
 use self::services::Services;
-pub use self::slash::interactive_reference;
-use self::slash::{command_entries, custom_completion_ids};
+use self::slash::custom_completion_ids;
 use self::ui_msgs::UiMsg;
 use crate::chat::composer::Composer;
 use crate::mcp::mcp_wizard::Wizard;

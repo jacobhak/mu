@@ -5,6 +5,7 @@ use super::keys::is_baseten;
 use super::*;
 use crate::custom::panel::Fetch;
 use crate::widgets::overlay::LoginTarget;
+use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use mu_base::message::Image;
 use mu_provider::auth::chatgpt::Account;
@@ -153,22 +154,21 @@ impl App {
             UiMsg::ScheduleDue(id) => self.on_schedule_due(id),
             UiMsg::LoginProviders(r) => {
                 self.leave_custom_wizard();
-                let (mut items, mut targets) = self.api_key_rows();
+                let mut rows = self.api_key_rows();
                 match r {
                     Ok(list) => {
                         for (n, name) in list.into_iter().filter(|(_, name)| !is_baseten(name)) {
-                            items.push(Item { label: name, detail: String::new() });
-                            targets.push(LoginTarget::Provider(n));
+                            rows.push((Item { label: name, detail: String::new() }, LoginTarget::Provider(n)));
                         }
                     }
                     // The API-key rows and MCP servers stay usable without omp.
                     Err(e) => self.error(&format!("cannot list omp's login providers: {e}")),
                 }
                 for (name, url) in self.plugins.needs_login() {
-                    items.push(Item { label: format!("mcp:{name}"), detail: url });
-                    targets.push(LoginTarget::Mcp(name));
+                    rows.push((Item { label: format!("mcp:{name}"), detail: url }, LoginTarget::Mcp(name)));
                 }
-                self.overlay = Some(Overlay::Login { sel: Select::new("Log in", items), targets });
+                self.overlay =
+                    Some(Overlay::Login { pick: Picker::from_rows(rows, |items| Select::new("Log in", items)) });
             }
             UiMsg::ClipboardImage(r) => match r {
                 Ok(Some(_)) if self.typing() => self.notice("image paste ignored while typing"),

@@ -725,7 +725,9 @@ mod tests {
         in_local(async {
             app.request_models();
             // Before any network answer: the row is already listed.
-            assert!(matches!(&app.overlay, Some(Overlay::Model { ids, .. }) if ids.contains(&"modal/x/b".to_string())));
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Model { pick, .. }) if pick.values().contains(&"modal/x/b".to_string()))
+            );
             settle(&mut app, &mut ui, |a| transcript_text(a).contains("gateway models unavailable")).await;
             assert!(screen(&app).contains("modal/x/b"), "a failed refresh keeps the rows");
             assert!(matches!(&app.overlay, Some(Overlay::Model { .. })));
@@ -743,9 +745,9 @@ mod tests {
         assert!(shown.contains("providers.toml"), "{shown}");
         assert!(shown.contains("fix"), "{shown}");
         assert!(matches!(&app.overlay, Some(Overlay::Model { .. })), "the picker still opens");
-        let (items, targets) = app.api_key_rows();
-        assert!(targets.contains(&LoginTarget::CustomProvider(None)), "the add row needs no valid file");
-        assert!(items.len() >= 2);
+        let rows = app.api_key_rows();
+        assert!(rows.iter().any(|(_, t)| *t == LoginTarget::CustomProvider(None)), "the add row needs no valid file");
+        assert!(rows.len() >= 2);
         assert!(transcript_text(&app).contains("providers.toml"));
     }
 
@@ -756,12 +758,12 @@ mod tests {
         registry.add("modal", CustomProvider::new("http://127.0.0.1:9").validated("modal").unwrap()).unwrap();
         let lab = CustomProvider { auth: AuthMode::None, ..CustomProvider::new("http://127.0.0.1:8") };
         registry.add("lab", lab.validated("lab").unwrap()).unwrap();
-        let (items, targets) = app.api_key_rows();
-        let row = |t: &LoginTarget| items.iter().zip(&targets).find(|(_, x)| *x == t).map(|(i, _)| i.detail.clone());
+        let rows = app.api_key_rows();
+        let row = |t: &LoginTarget| rows.iter().find(|(_, x)| x == t).map(|(i, _)| i.detail.clone());
         assert_eq!(row(&LoginTarget::ApiKey("modal".into())).as_deref(), Some("key missing"));
         assert_eq!(row(&LoginTarget::ApiKey("lab".into())).as_deref(), Some("no auth"));
-        assert!(targets.last() == Some(&LoginTarget::CustomProvider(None)), "the add row comes last");
-        assert_eq!(items.last().map(|i| i.label.as_str()), Some("+ Add a custom endpoint…"));
+        assert!(rows.last().map(|r| &r.1) == Some(&LoginTarget::CustomProvider(None)), "the add row comes last");
+        assert_eq!(rows.last().map(|r| r.0.label.as_str()), Some("+ Add a custom endpoint…"));
 
         // A keyless endpoint takes no key: its row says so instead of opening a key flow.
         app.login("lab");
@@ -827,16 +829,10 @@ mod tests {
         let (mut app, _cmds, _ui) = app_with("");
         let registry = app.services.providers.custom_registry().clone();
         registry.add("modal", CustomProvider::new("http://127.0.0.1:9").validated("modal").unwrap()).unwrap();
-        let (items, targets) = app.api_key_rows();
-        assert!(
-            targets.contains(&LoginTarget::CustomProvider(Some("modal".into()))),
-            "each endpoint has a row that edits it"
-        );
-        let label = items
-            .iter()
-            .zip(&targets)
-            .find(|(_, t)| **t == LoginTarget::CustomProvider(Some("modal".into())))
-            .map(|(i, _)| i.label.clone());
+        let rows = app.api_key_rows();
+        let edit = LoginTarget::CustomProvider(Some("modal".into()));
+        assert!(rows.iter().any(|(_, t)| *t == edit), "each endpoint has a row that edits it");
+        let label = rows.iter().find(|(_, t)| *t == edit).map(|(i, _)| i.label.clone());
         assert_eq!(label.as_deref(), Some("Edit custom endpoint: modal"));
 
         app.login("custom modal");

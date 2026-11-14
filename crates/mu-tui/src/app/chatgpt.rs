@@ -5,6 +5,7 @@
 use super::*;
 use crate::widgets::editor::adds_newline;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
+use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use crossterm::event::{KeyCode, KeyEvent};
 use mu_provider::auth::chatgpt::{self, Account, LABEL, PROVIDER_ID, USAGE_URL, oauth, signin};
@@ -38,24 +39,29 @@ pub(super) fn login_item(account: Option<&Account>) -> (Item, LoginTarget) {
 
 /// The ChatGPT menu for a saved account: sign in (again), sign out when signed in, forget the
 /// registration to use another account, or cancel.
-pub(super) fn chatgpt_menu(signed_in: bool) -> (Vec<Item>, Vec<KeyOption>) {
-    let mut items = vec![Item {
-        label: if signed_in { "Sign in again" } else { "Sign in" }.into(),
-        detail: "reauthorize this mu's registration".into(),
-    }];
-    let mut options = vec![KeyOption::SignIn];
+pub(super) fn chatgpt_menu(signed_in: bool) -> Vec<(Item, KeyOption)> {
+    let mut rows = vec![(
+        Item {
+            label: if signed_in { "Sign in again" } else { "Sign in" }.into(),
+            detail: "reauthorize this mu's registration".into(),
+        },
+        KeyOption::SignIn,
+    )];
     if signed_in {
-        items.push(Item { label: "Sign out".into(), detail: "drop the tokens and revoke them".into() });
-        options.push(KeyOption::SignOut);
+        rows.push((
+            Item { label: "Sign out".into(), detail: "drop the tokens and revoke them".into() },
+            KeyOption::SignOut,
+        ));
     }
-    items.push(Item {
-        label: "Use a different ChatGPT account".into(),
-        detail: "forget this registration, then sign in".into(),
-    });
-    options.push(KeyOption::Forget);
-    items.push(Item { label: "Cancel".into(), detail: "nothing changes".into() });
-    options.push(KeyOption::Cancel);
-    (items, options)
+    rows.push((
+        Item {
+            label: "Use a different ChatGPT account".into(),
+            detail: "forget this registration, then sign in".into(),
+        },
+        KeyOption::Forget,
+    ));
+    rows.push((Item { label: "Cancel".into(), detail: "nothing changes".into() }, KeyOption::Cancel));
+    rows
 }
 
 /// The picker's marker for a model that runs natively: the ChatGPT plan, or the API key.
@@ -198,12 +204,8 @@ impl App {
         let Some(signed_in) = self.services.providers.store().chatgpt_account().map(|a| a.signed_in()) else {
             return self.start_chatgpt();
         };
-        let (items, options) = chatgpt_menu(signed_in);
-        self.overlay = Some(Overlay::KeyChoice {
-            sel: Select::new("ChatGPT sign-in", items),
-            provider: PROVIDER_ID.into(),
-            options,
-        });
+        let pick = Picker::from_rows(chatgpt_menu(signed_in), |items| Select::new("ChatGPT sign-in", items));
+        self.overlay = Some(Overlay::KeyChoice { pick, provider: PROVIDER_ID.into() });
     }
 
     /// What the ChatGPT menu chose.
@@ -309,12 +311,10 @@ mod tests {
 
     #[test]
     fn the_chatgpt_menu_offers_a_different_account_with_or_without_a_sign_in() {
-        let (items, options) = chatgpt_menu(true);
-        assert_eq!(items.len(), options.len());
+        let (items, options): (Vec<_>, Vec<_>) = chatgpt_menu(true).into_iter().unzip();
         assert_eq!(options, [KeyOption::SignIn, KeyOption::SignOut, KeyOption::Forget, KeyOption::Cancel]);
         assert_eq!(items[2].label, "Use a different ChatGPT account");
-        let (items, options) = chatgpt_menu(false);
-        assert_eq!(items.len(), options.len());
+        let (items, options): (Vec<_>, Vec<_>) = chatgpt_menu(false).into_iter().unzip();
         assert_eq!(options, [KeyOption::SignIn, KeyOption::Forget, KeyOption::Cancel]);
         assert_eq!(items[0].label, "Sign in");
         assert_eq!(items[1].label, "Use a different ChatGPT account");

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::widgets::overlay::Overlay;
+use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use mu_base::config::models_path;
 
@@ -49,25 +50,26 @@ impl App {
             return self.notice(&msg);
         }
         let active = cfg.active_set();
-        let items = {
+        let rows = {
             let models = cfg.models.borrow();
             names
-                .iter()
+                .into_iter()
                 .map(|n| {
                     let mut detail = models
                         .sets
-                        .get(n)
+                        .get(&n)
                         .and_then(|r| r.get("default"))
                         .cloned()
                         .unwrap_or_else(|| "(no @default)".into());
                     if active.as_deref() == Some(n.as_str()) {
                         detail.push_str(" · active");
                     }
-                    Item { label: n.clone(), detail }
+                    (Item { label: n.clone(), detail }, n)
                 })
                 .collect()
         };
-        self.overlay = Some(Overlay::ModelSet { sel: Select::new("Model sets", items), names });
+        self.overlay =
+            Some(Overlay::ModelSet { pick: Picker::from_rows(rows, |items| Select::new("Model sets", items)) });
     }
 
     /// Makes `name` the active set and moves this session to its model.

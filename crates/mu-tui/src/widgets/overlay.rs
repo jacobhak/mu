@@ -11,6 +11,7 @@ use crate::panels::jobs_panel::{JobsPanel, JobsResult};
 use crate::panels::model_roles::{RoleEditor, RoleEditorAction};
 use crate::panels::plan_review::{PlanReview, ReviewResult};
 use crate::panels::reply::{ReplyPicker, ReplyResult};
+use crate::widgets::picker::{HasSelect, Pick, Picker};
 use crate::widgets::select::{Item, Select, SelectResult};
 use mu_base::events::{Answer, AskQuestion, PlanDecision};
 use mu_base::model_config::RoleMeta;
@@ -102,9 +103,9 @@ pub enum MemoryPick {
 }
 
 pub enum Overlay {
+    /// The models to switch to; each row carries its id or `@role`.
     Model {
-        sel: Select,
-        ids: Vec<String>,
+        pick: Picker<String>,
         request: u64,
     },
     ModelRoles {
@@ -112,19 +113,16 @@ pub enum Overlay {
     },
     /// What can be logged into: `omp login` providers, then MCP servers that need auth.
     Login {
-        sel: Select,
-        targets: Vec<LoginTarget>,
+        pick: Picker<LoginTarget>,
     },
     /// The API-key picker for `provider`: the options it offers.
     KeyChoice {
-        sel: Select,
+        pick: Picker<KeyOption>,
         provider: String,
-        options: Vec<KeyOption>,
     },
-    /// `/logout`: the stored API keys that can be removed.
+    /// `/logout`: the stored API keys that can be removed, by provider.
     Logout {
-        sel: Select,
-        providers: Vec<String>,
+        pick: Picker<String>,
     },
     /// A `/mcp` picker: the server list, a server's actions, or a wizard step.
     Mcp {
@@ -141,8 +139,7 @@ pub enum Overlay {
     },
     /// `/modelset`: the model sets, to switch to one.
     ModelSet {
-        sel: Select,
-        names: Vec<String>,
+        pick: Picker<String>,
     },
     /// The startup offer to copy omp's model config into models.toml.
     ModelImport {
@@ -154,20 +151,17 @@ pub enum Overlay {
         files: Vec<(PathBuf, String, Vec<String>)>,
     },
     Session {
-        sel: Select,
-        paths: Vec<PathBuf>,
+        pick: Picker<PathBuf>,
     },
-    /// The repository's parked plans.
+    /// The repository's parked plans, by id.
     Plans {
-        sel: Select,
-        ids: Vec<String>,
+        pick: Picker<String>,
         /// Chosen plans are delivered, not opened.
         deliver: bool,
     },
-    /// `/rewind`: the prompts and replies to go back to; `ids` are their session entries.
+    /// `/rewind`: the prompts and replies to go back to, by session entry.
     Rewind {
-        sel: Select,
-        ids: Vec<String>,
+        pick: Picker<String>,
     },
     /// A question, or the review after the last one. Boxed: the largest variant.
     Ask(Box<AskState>),
@@ -180,8 +174,7 @@ pub enum Overlay {
         stored: bool,
     },
     Copy {
-        sel: Select,
-        texts: Vec<String>,
+        pick: Picker<String>,
     },
     /// Pick parts of the last reply to quote into the composer.
     Reply {
@@ -193,14 +186,60 @@ pub enum Overlay {
     },
     /// `/memory`: the memory files and notes, then the history. Empty while the list loads.
     Memory {
-        sel: Select,
-        picks: Vec<MemoryPick>,
+        pick: Picker<MemoryPick>,
     },
-    /// `/memory` history: the commits, newest first; `shas` are their ids.
+    /// `/memory` history: the commits, newest first, by sha.
     MemoryLog {
-        sel: Select,
-        shas: Vec<String>,
+        pick: Picker<String>,
     },
+}
+
+type Outcome = (Option<Overlay>, Option<OverlayEvent>);
+
+/// Runs a key on a picker whose choice is one value: the overlay stays while it is pending, and a
+/// choice closes it with the event made from the value.
+fn pick_one<T: Clone>(
+    mut pick: Picker<T>,
+    k: KeyEvent,
+    keep: impl FnOnce(Picker<T>) -> Overlay,
+    event: impl FnOnce(T) -> OverlayEvent,
+) -> Outcome {
+    match pick.on_key(k) {
+        Pick::Pending => (Some(keep(pick)), None),
+        Pick::Chosen(value) => (None, value.map(event)),
+        Pick::Dismissed => (None, None),
+    }
+}
+
+/// The `Select` of every overlay that is a picker, as a shared or a mutable reference (`$m` is `sel`
+/// or `sel_mut`). The overlays that are not a plain `Select` are answered by the caller first.
+macro_rules! picker_select {
+    ($ov:expr, $m:ident) => {
+        match $ov {
+            Overlay::Model { pick, .. } => Some(pick.$m()),
+            Overlay::Login { pick } => Some(pick.$m()),
+            Overlay::KeyChoice { pick, .. } => Some(pick.$m()),
+            Overlay::Logout { pick } => Some(pick.$m()),
+            Overlay::ModelSet { pick } => Some(pick.$m()),
+            Overlay::Session { pick } => Some(pick.$m()),
+            Overlay::Plans { pick, .. } => Some(pick.$m()),
+            Overlay::Rewind { pick } => Some(pick.$m()),
+            Overlay::Copy { pick } => Some(pick.$m()),
+            Overlay::Memory { pick } => Some(pick.$m()),
+            Overlay::MemoryLog { pick } => Some(pick.$m()),
+            Overlay::Mcp { sel, .. }
+            | Overlay::Custom { sel }
+            | Overlay::Web { sel }
+            | Overlay::ModelImport { sel }
+            | Overlay::McpTrust { sel, .. } => Some(sel.$m()),
+            Overlay::ModelRoles { .. }
+            | Overlay::Ask(_)
+            | Overlay::Approve(_)
+            | Overlay::Review { .. }
+            | Overlay::Reply { .. }
+            | Overlay::Jobs { .. } => None,
+        }
+    };
 }
 
 /// What the user chose; the app carries it out.
@@ -842,51 +881,19 @@ impl Overlay {
     /// The picker inside this overlay, for everything but the plan review.
     pub fn select(&self) -> Option<&Select> {
         match self {
-            Overlay::Model { sel, .. }
-            | Overlay::Login { sel, .. }
-            | Overlay::KeyChoice { sel, .. }
-            | Overlay::Logout { sel, .. }
-            | Overlay::Mcp { sel, .. }
-            | Overlay::Custom { sel }
-            | Overlay::Web { sel }
-            | Overlay::ModelSet { sel, .. }
-            | Overlay::ModelImport { sel }
-            | Overlay::McpTrust { sel, .. }
-            | Overlay::Session { sel, .. }
-            | Overlay::Rewind { sel, .. }
-            | Overlay::Plans { sel, .. }
-            | Overlay::Copy { sel, .. }
-            | Overlay::Memory { sel, .. }
-            | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::ModelRoles { st } => Some(st.select()),
             Overlay::Ask(a) => Some(&a.sel),
             Overlay::Approve(a) => Some(a.select()),
-            Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
+            other => picker_select!(other, sel),
         }
     }
 
     pub fn select_mut(&mut self) -> Option<&mut Select> {
         match self {
-            Overlay::Model { sel, .. }
-            | Overlay::Login { sel, .. }
-            | Overlay::KeyChoice { sel, .. }
-            | Overlay::Logout { sel, .. }
-            | Overlay::Mcp { sel, .. }
-            | Overlay::Custom { sel }
-            | Overlay::Web { sel }
-            | Overlay::ModelSet { sel, .. }
-            | Overlay::ModelImport { sel }
-            | Overlay::McpTrust { sel, .. }
-            | Overlay::Session { sel, .. }
-            | Overlay::Rewind { sel, .. }
-            | Overlay::Plans { sel, .. }
-            | Overlay::Copy { sel, .. }
-            | Overlay::Memory { sel, .. }
-            | Overlay::MemoryLog { sel, .. } => Some(sel),
             Overlay::ModelRoles { st } => Some(st.select_mut()),
             Overlay::Ask(a) => Some(&mut a.sel),
             Overlay::Approve(a) => Some(a.select_mut()),
-            Overlay::Review { .. } | Overlay::Reply { .. } | Overlay::Jobs { .. } => None,
+            other => picker_select!(other, sel_mut),
         }
     }
 
@@ -957,14 +964,9 @@ impl Overlay {
     /// Handles one key. Returns the overlay if it stays open, and what the user chose, if anything.
     pub fn on_key(self, k: KeyEvent) -> (Option<Overlay>, Option<OverlayEvent>) {
         match self {
-            Overlay::Model { mut sel, ids, request } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Model { sel, ids, request }), None),
-                SelectResult::Chosen(i) => {
-                    let event = i.first().and_then(|i| ids.get(*i)).cloned().map(OverlayEvent::SetModel);
-                    (None, event)
-                }
-                _ => (None, None),
-            },
+            Overlay::Model { pick, request } => {
+                pick_one(pick, k, |pick| Overlay::Model { pick, request }, OverlayEvent::SetModel)
+            }
             Overlay::ModelRoles { mut st } => match st.on_key(k) {
                 RoleEditorAction::Pending => (Some(Overlay::ModelRoles { st }), None),
                 RoleEditorAction::Close => (None, None),
@@ -978,28 +980,15 @@ impl Overlay {
                     (Some(Overlay::ModelRoles { st }), Some(OverlayEvent::DeleteRole { set, role }))
                 }
             },
-            Overlay::Login { mut sel, targets } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Login { sel, targets }), None),
-                SelectResult::Chosen(i) => {
-                    (None, i.first().and_then(|i| targets.get(*i)).cloned().map(OverlayEvent::Login))
+            Overlay::Login { pick } => pick_one(pick, k, |pick| Overlay::Login { pick }, OverlayEvent::Login),
+            Overlay::KeyChoice { mut pick, provider } => match pick.on_key(k) {
+                Pick::Pending => (Some(Overlay::KeyChoice { pick, provider }), None),
+                Pick::Chosen(choice) => {
+                    (None, Some(OverlayEvent::Key { provider, choice: choice.unwrap_or(KeyOption::Cancel) }))
                 }
-                _ => (None, None),
+                Pick::Dismissed => (None, Some(OverlayEvent::Key { provider, choice: KeyOption::Cancel })),
             },
-            Overlay::KeyChoice { mut sel, provider, options } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::KeyChoice { sel, provider, options }), None),
-                SelectResult::Chosen(i) => {
-                    let choice = i.first().and_then(|i| options.get(*i)).cloned().unwrap_or(KeyOption::Cancel);
-                    (None, Some(OverlayEvent::Key { provider, choice }))
-                }
-                _ => (None, Some(OverlayEvent::Key { provider, choice: KeyOption::Cancel })),
-            },
-            Overlay::Logout { mut sel, providers } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Logout { sel, providers }), None),
-                SelectResult::Chosen(i) => {
-                    (None, i.first().and_then(|i| providers.get(*i)).cloned().map(OverlayEvent::Logout))
-                }
-                _ => (None, None),
-            },
+            Overlay::Logout { pick } => pick_one(pick, k, |pick| Overlay::Logout { pick }, OverlayEvent::Logout),
             Overlay::Mcp { mut sel, pick } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::Mcp { sel, pick }), None),
                 SelectResult::Chosen(i) => (None, Some(OverlayEvent::Mcp(pick, i.first().copied()))),
@@ -1016,13 +1005,7 @@ impl Overlay {
                 SelectResult::Text(t) => (None, Some(OverlayEvent::Custom(PanelPick::Text(t)))),
                 _ => (None, Some(OverlayEvent::Custom(PanelPick::Row(None)))),
             },
-            Overlay::ModelSet { mut sel, names } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::ModelSet { sel, names }), None),
-                SelectResult::Chosen(i) => {
-                    (None, i.first().and_then(|i| names.get(*i)).cloned().map(OverlayEvent::ModelSet))
-                }
-                _ => (None, None),
-            },
+            Overlay::ModelSet { pick } => pick_one(pick, k, |pick| Overlay::ModelSet { pick }, OverlayEvent::ModelSet),
             Overlay::ModelImport { mut sel } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::ModelImport { sel }), None),
                 SelectResult::Chosen(i) => (None, Some(OverlayEvent::ModelImport(i.first() == Some(&0)))),
@@ -1033,12 +1016,10 @@ impl Overlay {
                 SelectResult::Chosen(i) => (None, Some(OverlayEvent::McpTrust(i.first() == Some(&0), files))),
                 _ => (None, Some(OverlayEvent::McpTrust(false, files))),
             },
-            Overlay::Copy { mut sel, texts } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Copy { sel, texts }), None),
-                SelectResult::Chosen(i) => {
-                    (None, Some(OverlayEvent::Copy(i.first().and_then(|i| texts.get(*i)).cloned())))
-                }
-                _ => (None, None),
+            Overlay::Copy { mut pick } => match pick.on_key(k) {
+                Pick::Pending => (Some(Overlay::Copy { pick }), None),
+                Pick::Chosen(text) => (None, Some(OverlayEvent::Copy(text))),
+                Pick::Dismissed => (None, None),
             },
             Overlay::Reply { mut st } => match st.on_key(k) {
                 ReplyResult::Pending => (Some(Overlay::Reply { st }), None),
@@ -1060,55 +1041,33 @@ impl Overlay {
                 }
                 JobsResult::Take { session } => (None, Some(OverlayEvent::TakeSession(session))),
             },
-            Overlay::Session { mut sel, paths } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Session { sel, paths }), None),
-                SelectResult::Chosen(i) => {
-                    (None, i.first().and_then(|i| paths.get(*i)).map(|p| OverlayEvent::Resume(p.clone())))
-                }
-                _ => (None, None),
-            },
-            Overlay::Rewind { mut sel, ids } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Rewind { sel, ids }), None),
-                SelectResult::Chosen(i) => {
-                    (None, i.first().and_then(|i| ids.get(*i)).map(|id| OverlayEvent::Rewind(id.clone())))
-                }
-                _ => (None, None),
-            },
-            Overlay::Plans { mut sel, ids, deliver } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Plans { sel, ids, deliver }), None),
-                SelectResult::Chosen(i) => {
-                    let id = i.first().and_then(|i| ids.get(*i)).cloned();
-                    (
-                        None,
-                        id.map(|id| if deliver { OverlayEvent::DeliverPlan(id) } else { OverlayEvent::OpenPlan(id) }),
-                    )
-                }
-                _ => (None, None),
-            },
-            Overlay::Memory { mut sel, picks } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::Memory { sel, picks }), None),
-                SelectResult::Chosen(i) => {
-                    let ev = i.first().and_then(|i| picks.get(*i)).map(|p| match p {
-                        MemoryPick::File(path) => OverlayEvent::MemoryOpen(path.clone()),
-                        MemoryPick::History => OverlayEvent::MemoryHistory,
-                    });
-                    (None, ev)
-                }
-                _ => (None, None),
-            },
-            Overlay::MemoryLog { mut sel, shas } => {
+            Overlay::Session { pick } => pick_one(pick, k, |pick| Overlay::Session { pick }, OverlayEvent::Resume),
+            Overlay::Rewind { pick } => pick_one(pick, k, |pick| Overlay::Rewind { pick }, OverlayEvent::Rewind),
+            Overlay::Plans { pick, deliver } => pick_one(
+                pick,
+                k,
+                |pick| Overlay::Plans { pick, deliver },
+                |id| if deliver { OverlayEvent::DeliverPlan(id) } else { OverlayEvent::OpenPlan(id) },
+            ),
+            Overlay::Memory { pick } => pick_one(
+                pick,
+                k,
+                |pick| Overlay::Memory { pick },
+                |p| match p {
+                    MemoryPick::File(path) => OverlayEvent::MemoryOpen(path),
+                    MemoryPick::History => OverlayEvent::MemoryHistory,
+                },
+            ),
+            Overlay::MemoryLog { mut pick } => {
                 // `r` is the revert key unless the filter holds text, which then takes it.
-                if k.code == KeyCode::Char('r') && k.modifiers.is_empty() && !sel.is_filtering() {
-                    let ev = sel.highlighted().and_then(|i| shas.get(i)).cloned().map(OverlayEvent::MemoryRevert);
-                    return (Some(Overlay::MemoryLog { sel, shas }), ev);
+                if k.code == KeyCode::Char('r') && k.modifiers.is_empty() && !pick.sel.is_filtering() {
+                    let ev = pick.highlighted().cloned().map(OverlayEvent::MemoryRevert);
+                    return (Some(Overlay::MemoryLog { pick }), ev);
                 }
-                match sel.on_key(k) {
-                    SelectResult::Pending => (Some(Overlay::MemoryLog { sel, shas }), None),
-                    SelectResult::Chosen(i) => {
-                        let ev = i.first().and_then(|i| shas.get(*i)).cloned().map(OverlayEvent::MemoryShow);
-                        (Some(Overlay::MemoryLog { sel, shas }), ev)
-                    }
-                    _ => (None, None),
+                match pick.on_key(k) {
+                    Pick::Pending => (Some(Overlay::MemoryLog { pick }), None),
+                    Pick::Chosen(sha) => (Some(Overlay::MemoryLog { pick }), sha.map(OverlayEvent::MemoryShow)),
+                    Pick::Dismissed => (None, None),
                 }
             }
             Overlay::Review { mut review, mut reply, stored } => match review.on_key(k) {
@@ -1146,13 +1105,14 @@ mod tests {
         labels.iter().map(|l| Item { label: l.to_string(), detail: String::new() }).collect()
     }
 
+    fn rows<T: Clone>(title: &str, rows: &[(&str, T)]) -> Picker<T> {
+        let rows = rows.iter().map(|(l, v)| (items(&[*l]).remove(0), v.clone())).collect();
+        Picker::from_rows(rows, |items| Select::new(title, items))
+    }
+
     #[test]
     fn model_picker_switches_only_and_model_roles_expose_the_editor_select() {
-        let ov = Overlay::Model {
-            sel: Select::new("m", items(&["a/x", "@smol"])),
-            ids: vec!["a/x".into(), "@smol".into()],
-            request: 9,
-        };
+        let ov = Overlay::Model { pick: rows("m", &[("a/x", "a/x".into()), ("@smol", "@smol".into())]), request: 9 };
         let (rest, event) = ov.on_key(key(KeyCode::Enter));
         assert!(rest.is_none());
         assert!(matches!(event, Some(OverlayEvent::SetModel(id)) if id == "a/x"));
@@ -1203,7 +1163,7 @@ mod tests {
 
     #[test]
     fn typing_keeps_the_overlay_open_and_select_helpers_find_the_picker() {
-        let ov = Overlay::Copy { sel: Select::new("c", items(&["one"])), texts: vec!["1".into()] };
+        let ov = Overlay::Copy { pick: rows("c", &[("one", "1".to_string())]) };
         let (rest, ev) = ov.on_key(key(KeyCode::Char('o')));
         assert!(ev.is_none());
         let mut rest = rest.expect("still open");
@@ -1214,12 +1174,12 @@ mod tests {
 
     #[test]
     fn memory_picker_opens_a_file_or_loads_the_history() {
-        let picks = vec![MemoryPick::File("/m/user.md".into()), MemoryPick::History];
-        let ov = Overlay::Memory { sel: Select::new("m", items(&["User", "History"])), picks: picks.clone() };
+        let memory = || rows("m", &[("User", MemoryPick::File("/m/user.md".into())), ("History", MemoryPick::History)]);
+        let ov = Overlay::Memory { pick: memory() };
         let (rest, ev) = ov.on_key(key(KeyCode::Enter));
         assert!(rest.is_none());
         assert!(matches!(ev, Some(OverlayEvent::MemoryOpen(p)) if p.to_str() == Some("/m/user.md")));
-        let ov = Overlay::Memory { sel: Select::new("m", items(&["User", "History"])), picks };
+        let ov = Overlay::Memory { pick: memory() };
         let (rest, ev) = ov.on_key(key(KeyCode::Down));
         assert!(ev.is_none());
         let (rest, ev) = rest.expect("still open").on_key(key(KeyCode::Enter));
@@ -1228,14 +1188,13 @@ mod tests {
 
     #[test]
     fn memory_picker_closes_while_it_loads_on_enter() {
-        let ov = Overlay::Memory { sel: Select::new("m", items(&["Loading…"])), picks: vec![] };
+        let ov = Overlay::Memory { pick: Picker::placeholder(items(&["Loading…"]), |items| Select::new("m", items)) };
         assert!(matches!(ov.on_key(key(KeyCode::Enter)), (None, None)));
     }
 
     #[test]
     fn memory_history_shows_a_commit_and_reverts_the_highlighted_one_on_r() {
-        let shas: Vec<String> = vec!["aaa".into(), "bbb".into()];
-        let ov = Overlay::MemoryLog { sel: Select::new("h", items(&["one", "two"])), shas };
+        let ov = Overlay::MemoryLog { pick: rows("h", &[("one", "aaa".to_string()), ("two", "bbb".to_string())]) };
         let (rest, ev) = ov.on_key(key(KeyCode::Enter));
         assert!(matches!(ev, Some(OverlayEvent::MemoryShow(s)) if s == "aaa"));
         let (rest, ev) = rest.expect("the history stays open after a diff").on_key(key(KeyCode::Down));

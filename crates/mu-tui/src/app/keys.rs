@@ -7,6 +7,7 @@ use super::*;
 use crate::chat::composer::Action;
 use crate::term::clipboard;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
+use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mu_provider::auth::chatgpt::PROVIDER_ID;
@@ -66,7 +67,7 @@ fn api_key_items(
     stored: impl Fn(&str) -> bool,
     env_set: impl Fn(&str) -> bool,
     routes_chat: impl Fn(&str) -> bool,
-) -> (Vec<Item>, Vec<LoginTarget>) {
+) -> Vec<(Item, LoginTarget)> {
     let providers = providers::api_key_defs().map(|d| {
         let mut detail = key_status(stored(d.id), env_set(d.env_hint), d.env_hint);
         if stored(d.id) {
@@ -78,15 +79,15 @@ fn api_key_items(
         let detail = key_status(stored(d.id), env_set(d.env_hint), d.env_hint);
         (Item { label: format!("API key: {} (web search)", d.label), detail }, LoginTarget::ApiKey(d.id.into()))
     });
-    providers.chain(search).unzip()
+    providers.chain(search).collect()
 }
 
 /// The two answers to "does chat use this key?"; `current` marks the stored choice.
-fn chat_items(target: &KeyTarget, current: Option<bool>) -> Vec<Item> {
+fn chat_rows(target: &KeyTarget, current: Option<bool>) -> Vec<(Item, KeyOption)> {
     let id = target.id();
-    let row = |label: String, detail: &str, on: bool| Item {
-        label,
-        detail: if current == Some(on) { "current".into() } else { detail.into() },
+    let row = |label: String, detail: &str, on: bool| {
+        let item = Item { label, detail: if current == Some(on) { "current".into() } else { detail.into() } };
+        (item, KeyOption::Chat(on))
     };
     vec![
         row(format!("Yes: {id}/* chat models use this key"), "billed per token instead of your omp login", true),
@@ -440,7 +441,7 @@ impl App {
     /// The API-key rows that open `/login`: the chat providers, ChatGPT and the search services, then
     /// each custom endpoint (its key state, or that it takes none), then the row that adds one. A
     /// `providers.toml` that does not read is reported, and its endpoints are left out.
-    pub(super) fn api_key_rows(&mut self) -> (Vec<Item>, Vec<LoginTarget>) {
+    pub(super) fn api_key_rows(&mut self) -> Vec<(Item, LoginTarget)> {
         let customs = match self.services.providers.custom_registry().snapshot() {
             Ok(c) => c,
             Err(e) => {
@@ -449,28 +450,24 @@ impl App {
             }
         };
         let store = self.services.providers.store();
-        let (mut items, mut targets) =
-            api_key_items(|p| store.has(p), env_is_set, |p| store.get(p).is_some_and(|e| e.routes_chat()));
-        let (item, target) = chatgpt::login_item(store.chatgpt_account().as_ref());
-        items.insert(0, item);
-        targets.insert(0, target);
+        let mut rows = api_key_items(|p| store.has(p), env_is_set, |p| store.get(p).is_some_and(|e| e.routes_chat()));
+        rows.insert(0, chatgpt::login_item(store.chatgpt_account().as_ref()));
         for c in customs.values() {
             let label = if c.auth == AuthMode::None {
                 format!("Custom endpoint: {}", c.label())
             } else {
                 format!("API key: {} (custom)", c.label())
             };
-            items.push(Item { label, detail: c.key_state(store).word().into() });
-            targets.push(LoginTarget::ApiKey(c.id.clone()));
-            items.push(Item {
+            rows.push((Item { label, detail: c.key_state(store).word().into() }, LoginTarget::ApiKey(c.id.clone())));
+            let edit = Item {
                 label: format!("Edit custom endpoint: {}", c.label()),
                 detail: "address, key, models, reasoning".into(),
-            });
-            targets.push(LoginTarget::CustomProvider(Some(c.id.clone())));
+            };
+            rows.push((edit, LoginTarget::CustomProvider(Some(c.id.clone()))));
         }
-        items.push(Item { label: "+ Add a custom endpoint…".into(), detail: "guided: address, key, models".into() });
-        targets.push(LoginTarget::CustomProvider(None));
-        (items, targets)
+        let add = Item { label: "+ Add a custom endpoint…".into(), detail: "guided: address, key, models".into() };
+        rows.push((add, LoginTarget::CustomProvider(None)));
+        rows
     }
 
     /// `/login <id>` or a `/login` row: a key already stored for anthropic or openai opens a menu
@@ -488,14 +485,12 @@ impl App {
         let Some(entry) = stored.filter(|_| target.asks_chat()) else {
             return self.start_key_flow(target, None, None);
         };
-        let mut items = chat_items(&target, Some(entry.routes_chat()));
-        items.push(Item { label: "Replace the key".into(), detail: "paste, use a variable or a command".into() });
-        items.push(Item { label: "Cancel".into(), detail: "nothing changes".into() });
-        self.overlay = Some(Overlay::KeyChoice {
-            sel: Select::new(&format!("{} API key", target.label()), items),
-            provider: target.id().into(),
-            options: vec![KeyOption::Chat(true), KeyOption::Chat(false), KeyOption::Replace, KeyOption::Cancel],
-        });
+        let mut rows = chat_rows(&target, Some(entry.routes_chat()));
+        let replace = Item { label: "Replace the key".into(), detail: "paste, use a variable or a command".into() };
+        rows.push((replace, KeyOption::Replace));
+        rows.push((Item { label: "Cancel".into(), detail: "nothing changes".into() }, KeyOption::Cancel));
+        let pick = Picker::from_rows(rows, |items| Select::new(&format!("{} API key", target.label()), items));
+        self.overlay = Some(Overlay::KeyChoice { pick, provider: target.id().into() });
     }
 
     /// Says where to get a key, then offers the ways to give one.
@@ -521,16 +516,15 @@ impl App {
         if !url.is_empty() {
             self.notice(&format!("{label} API keys: create one at {url}"));
         }
-        let mut items = vec![Item { label: "Paste a key".into(), detail: "shown as bullets".into() }];
-        let mut options = vec![KeyOption::Paste];
+        let mut rows =
+            vec![(Item { label: "Paste a key".into(), detail: "shown as bullets".into() }, KeyOption::Paste)];
         if env_is_set(&hint) {
-            items.push(Item { label: format!("Use ${hint}"), detail: "already set".into() });
-            options.push(KeyOption::Env(hint));
+            rows.push((Item { label: format!("Use ${hint}"), detail: "already set".into() }, KeyOption::Env(hint)));
         }
-        items.push(Item { label: "Use a command".into(), detail: "a command that prints the key".into() });
-        options.push(KeyOption::Command);
-        self.overlay =
-            Some(Overlay::KeyChoice { sel: Select::new(&format!("{label} API key"), items), provider: id, options });
+        let command = Item { label: "Use a command".into(), detail: "a command that prints the key".into() };
+        rows.push((command, KeyOption::Command));
+        let pick = Picker::from_rows(rows, |items| Select::new(&format!("{label} API key"), items));
+        self.overlay = Some(Overlay::KeyChoice { pick, provider: id });
     }
 
     /// What the picker chose for `provider`, or `Cancel` when it was dismissed.
@@ -630,15 +624,16 @@ impl App {
                 if let Some(f) = self.flows.key_flow.as_mut() {
                     f.pending = Some(entry);
                 }
-                let items = vec![
-                    Item { label: "Save anyway".into(), detail: "use the key without checking it".into() },
-                    Item { label: "Cancel".into(), detail: "nothing is saved".into() },
+                let rows = vec![
+                    (
+                        Item { label: "Save anyway".into(), detail: "use the key without checking it".into() },
+                        KeyOption::SaveAnyway,
+                    ),
+                    (Item { label: "Cancel".into(), detail: "nothing is saved".into() }, KeyOption::Cancel),
                 ];
-                self.overlay = Some(Overlay::KeyChoice {
-                    sel: Select::new(&format!("{} did not answer", target.label()), items),
-                    provider: target.id().into(),
-                    options: vec![KeyOption::SaveAnyway, KeyOption::Cancel],
-                });
+                let pick =
+                    Picker::from_rows(rows, |items| Select::new(&format!("{} did not answer", target.label()), items));
+                self.overlay = Some(Overlay::KeyChoice { pick, provider: target.id().into() });
             }
             Err(e) => {
                 self.end_key_flow(false);
@@ -661,11 +656,9 @@ impl App {
         if let Some(f) = self.flows.key_flow.as_mut() {
             f.pending = Some(entry);
         }
-        self.overlay = Some(Overlay::KeyChoice {
-            sel: Select::new(&format!("Use this {} key for chat models?", target.label()), chat_items(&target, None)),
-            provider: target.id().into(),
-            options: vec![KeyOption::Chat(true), KeyOption::Chat(false)],
-        });
+        let title = format!("Use this {} key for chat models?", target.label());
+        let pick = Picker::from_rows(chat_rows(&target, None), |items| Select::new(&title, items));
+        self.overlay = Some(Overlay::KeyChoice { pick, provider: target.id().into() });
     }
 
     fn save_key(&mut self, target: KeyTarget, mut entry: Entry) {
@@ -733,22 +726,24 @@ impl App {
         if providers.is_empty() {
             return self.notice("no API keys are stored; /login adds one");
         }
-        let items = providers
-            .iter()
+        let rows = providers
+            .into_iter()
             .map(|p| {
-                if chatgpt::is_chatgpt(p) {
-                    return Item { label: "ChatGPT sign-in".into(), detail: "sign out and revoke".into() };
+                if chatgpt::is_chatgpt(&p) {
+                    return (Item { label: "ChatGPT sign-in".into(), detail: "sign out and revoke".into() }, p);
                 }
-                Item {
-                    label: KeyTarget::builtin(p)
+                let item = Item {
+                    label: KeyTarget::builtin(&p)
                         .map(|t| t.label().to_string())
-                        .or_else(|| custom.get(p).map(|c| c.label().to_string()))
+                        .or_else(|| custom.get(&p).map(|c| c.label().to_string()))
                         .unwrap_or_else(|| p.clone()),
                     detail: "remove this key".into(),
-                }
+                };
+                (item, p)
             })
             .collect();
-        self.overlay = Some(Overlay::Logout { sel: Select::new("Remove a key or sign out", items), providers });
+        let pick = Picker::from_rows(rows, |items| Select::new("Remove a key or sign out", items));
+        self.overlay = Some(Overlay::Logout { pick });
     }
 
     pub(super) fn logout(&mut self, provider: &str) {
@@ -898,23 +893,23 @@ pub(super) mod tests {
 
     #[test]
     fn login_rows_show_each_status() {
-        let (items, targets) = api_key_items(|p| p == "anthropic" || p == "exa", |n| n == "OPENAI_API_KEY", |_| false);
+        let (items, targets): (Vec<_>, Vec<_>) =
+            api_key_items(|p| p == "anthropic" || p == "exa", |n| n == "OPENAI_API_KEY", |_| false).into_iter().unzip();
         let details: Vec<&str> = items.iter().map(|i| i.detail.as_str()).collect();
         assert_eq!(details, ["key saved · not for chat", "$OPENAI_API_KEY is set", "not set", "not set", "key saved"]);
         assert_eq!(targets[2], LoginTarget::ApiKey("baseten".into()));
         assert_eq!(targets[4], LoginTarget::ApiKey("exa".into()));
         assert_eq!(items[3].label, "API key: Parallel (web search)");
-        let (items, _) = api_key_items(|p| p == "openai", |_| false, |_| true);
-        assert_eq!(items[1].detail, "key saved · chat");
+        let rows = api_key_items(|p| p == "openai", |_| false, |_| true);
+        assert_eq!(rows[1].0.detail, "key saved · chat");
     }
 
     #[test]
     fn escape_in_the_key_picker_cancels() {
-        let items = vec![Item { label: "Paste a key".into(), detail: String::new() }];
+        let rows = vec![(Item { label: "Paste a key".into(), detail: String::new() }, KeyOption::Paste)];
         let ov = Overlay::KeyChoice {
-            sel: Select::new("t", items),
+            pick: Picker::from_rows(rows, |items| Select::new("t", items)),
             provider: "anthropic".into(),
-            options: vec![KeyOption::Paste],
         };
         let (rest, ev) = ov.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(rest.is_none());
@@ -1028,7 +1023,7 @@ pub(super) mod tests {
             assert_eq!(app.prompt.ghost_seq, 0, "no prediction is asked for");
 
             // A paste reaches the masked input even with an overlay open.
-            app.overlay = Some(Overlay::Logout { sel: Select::new("t", vec![]), providers: vec![] });
+            app.overlay = Some(Overlay::Logout { pick: Picker::placeholder(vec![], |items| Select::new("t", items)) });
             app.on_terminal(Event::Paste("PASTED".into()));
             assert!(app.overlay.is_some());
             assert_eq!(app.prompt.composer.text(), "sk-abPASTED");
@@ -1206,8 +1201,8 @@ pub(super) mod tests {
         let t = KeyTarget::builtin("openai").unwrap();
         app.start_key_flow(t.clone(), None, None);
         app.on_key_checked(1, t.clone(), Entry::literal("sk-test-0123456789"), Ok(Check::Valid));
-        let Some(Overlay::KeyChoice { options, .. }) = &app.overlay else { panic!("no chat question") };
-        assert_eq!(options, &[KeyOption::Chat(true), KeyOption::Chat(false)]);
+        let Some(Overlay::KeyChoice { pick, .. }) = &app.overlay else { panic!("no chat question") };
+        assert_eq!(pick.values(), &[KeyOption::Chat(true), KeyOption::Chat(false)]);
         assert!(app.services.providers.store().get("openai").is_none(), "nothing is saved before the answer");
         app.on_key_choice("openai", KeyOption::Chat(false));
         let store = app.services.providers.store().clone();
@@ -1216,8 +1211,8 @@ pub(super) mod tests {
         assert!(!app.services.providers.is_direct("openai"));
         // The existing-key menu changes the answer without a new key.
         app.begin_key(t);
-        let Some(Overlay::KeyChoice { options, .. }) = &app.overlay else { panic!("no menu") };
-        assert_eq!(options.len(), 4);
+        let Some(Overlay::KeyChoice { pick, .. }) = &app.overlay else { panic!("no menu") };
+        assert_eq!(pick.values().len(), 4);
         app.on_key_choice("openai", KeyOption::Chat(true));
         assert!(app.services.providers.is_direct("openai"));
         store.remove("openai").unwrap();
@@ -1287,7 +1282,7 @@ pub(super) mod tests {
         app.start_key_flow(KeyTarget::builtin("anthropic").unwrap(), None, None);
         app.sync_key_flow();
         assert!(app.flows.key_flow.is_some(), "the key choice is still open");
-        app.overlay = Some(Overlay::Logout { sel: Select::new("t", vec![]), providers: vec![] });
+        app.overlay = Some(Overlay::Logout { pick: Picker::placeholder(vec![], |items| Select::new("t", items)) });
         app.sync_key_flow();
         assert!(app.flows.key_flow.is_none());
     }
@@ -1316,14 +1311,14 @@ pub(super) mod tests {
         if stored.is_empty() {
             assert!(transcript_text(&app).contains("no API keys are stored"));
         } else {
-            assert!(matches!(&app.overlay, Some(Overlay::Logout { providers, .. }) if !providers.is_empty()));
+            assert!(matches!(&app.overlay, Some(Overlay::Logout { pick }) if !pick.is_empty()));
         }
     }
 
     #[test]
     fn refresh_is_discoverable_and_queues_when_busy() {
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
-        assert!(super::super::slash::interactive_reference().contains("`/refresh`"));
+        assert!(super::super::commands::interactive_reference().contains("`/refresh`"));
         app.submit(UserInput::from("/refresh"), false);
         assert!(matches!(commands.try_recv(), Ok(Command::RefreshStatus)));
         assert!(!app.agent.running);
@@ -1488,8 +1483,8 @@ pub(super) mod tests {
         assert_eq!(cfg.role("smol"), None);
 
         app.modelset_cmd("");
-        let Some(Overlay::ModelSet { names, .. }) = &app.overlay else { panic!("no set picker") };
-        assert_eq!(names, &["main", "openai"]);
+        let Some(Overlay::ModelSet { pick }) = &app.overlay else { panic!("no set picker") };
+        assert_eq!(pick.values(), &["main", "openai"]);
         app.overlay = None;
 
         app.modelset_cmd("delete main");

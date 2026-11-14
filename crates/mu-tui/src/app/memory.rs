@@ -5,6 +5,7 @@
 use super::child::ChildThen;
 use super::*;
 use crate::widgets::overlay::MemoryPick;
+use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use serde_json::Value;
 
@@ -20,19 +21,21 @@ impl App {
     /// `/memory`: opens the picker on a loading row, then fills it with the files and notes.
     pub(super) fn open_memory(&mut self) {
         let items = vec![Item { label: "Loading…".into(), detail: String::new() }];
-        self.overlay = Some(Overlay::Memory { sel: Select::new("Memory", items), picks: vec![] });
+        let pick = Picker::placeholder(items, |items| Select::new("Memory", items));
+        self.overlay = Some(Overlay::Memory { pick });
         self.memory_request("memory/files", json!({ "cwd": self.cwd }), UiMsg::MemoryFiles);
     }
 
     /// Fills the picker that `open_memory` opened. A reply that comes after the picker was closed
     /// is dropped, but its failure is still said.
     pub(super) fn show_memory(&mut self, r: Result<Value, String>) {
-        let loading = matches!(&self.overlay, Some(Overlay::Memory { picks, .. }) if picks.is_empty());
+        let loading = matches!(&self.overlay, Some(Overlay::Memory { pick }) if pick.is_empty());
         match r {
             Ok(v) if loading => {
-                let (items, picks, context) = memory_rows(&v);
-                let sel = Select::new("Memory", items).context(&context).hint(MEMORY_HINT);
-                self.overlay = Some(Overlay::Memory { sel, picks });
+                let (rows, context) = memory_rows(&v);
+                let pick =
+                    Picker::from_rows(rows, |items| Select::new("Memory", items).context(&context).hint(MEMORY_HINT));
+                self.overlay = Some(Overlay::Memory { pick });
             }
             Ok(_) => {}
             Err(e) => {
@@ -53,17 +56,17 @@ impl App {
         if !v["history"].as_bool().unwrap_or(false) {
             return self.notice("no memory history yet: nothing has been written, or git is missing");
         }
-        let (items, shas) = memory_commits(&v);
-        if items.is_empty() {
+        let rows = memory_commits(&v);
+        if rows.is_empty() {
             return self.notice("no memory history yet");
         }
         // A list only replaces the picker or nothing: another overlay the user opened stays.
         if !matches!(self.overlay, None | Some(Overlay::Memory { .. }) | Some(Overlay::MemoryLog { .. })) {
             return;
         }
-        let title = format!("Memory history ({} commits)", items.len());
-        let sel = Select::new(&title, items).hint(HISTORY_HINT);
-        self.overlay = Some(Overlay::MemoryLog { sel, shas });
+        let title = format!("Memory history ({} commits)", rows.len());
+        let pick = Picker::from_rows(rows, |items| Select::new(&title, items).hint(HISTORY_HINT));
+        self.overlay = Some(Overlay::MemoryLog { pick });
     }
 
     /// Opens a memory file in `$VISUAL` or `$EDITOR`. Without either the path is said instead.
@@ -131,29 +134,27 @@ fn short(sha: &str) -> &str {
 
 /// The picker's rows from `memory/files`: the two entry files, the notes, then the history; and
 /// the line above them.
-fn memory_rows(v: &Value) -> (Vec<Item>, Vec<MemoryPick>, String) {
-    let mut items = Vec::new();
-    let mut picks = Vec::new();
+fn memory_rows(v: &Value) -> (Vec<(Item, MemoryPick)>, String) {
+    let mut rows = Vec::new();
     for f in v["files"].as_array().into_iter().flatten() {
         let (size, cap) = (f["size"].as_u64().unwrap_or(0), f["cap"].as_u64().unwrap_or(0));
-        items.push(Item { label: text(f, "label"), detail: format!("{size}/{cap}") });
-        picks.push(MemoryPick::File(text(f, "path").into()));
+        let item = Item { label: text(f, "label"), detail: format!("{size}/{cap}") };
+        rows.push((item, MemoryPick::File(text(f, "path").into())));
     }
     for n in v["notes"].as_array().into_iter().flatten() {
-        items.push(Item { label: text(n, "slug"), detail: text(n, "description") });
-        picks.push(MemoryPick::File(text(n, "path").into()));
+        let item = Item { label: text(n, "slug"), detail: text(n, "description") };
+        rows.push((item, MemoryPick::File(text(n, "path").into())));
     }
     let history = v["history"].as_bool().unwrap_or(false);
     let detail = if history { format!("last {LOG_LIMIT} commits") } else { "no commits yet".into() };
-    items.push(Item { label: "History".into(), detail });
-    picks.push(MemoryPick::History);
+    rows.push((Item { label: "History".into(), detail }, MemoryPick::History));
     let review = if v["review"].as_bool() == Some(true) { "on" } else { "off" };
     let context = format!("review {review} · {} queued", v["queue"].as_u64().unwrap_or(0));
-    (items, picks, context)
+    (rows, context)
 }
 
 /// The history's rows from `memory/log`, newest first, with the commit ids they stand for.
-fn memory_commits(v: &Value) -> (Vec<Item>, Vec<String>) {
+fn memory_commits(v: &Value) -> Vec<(Item, String)> {
     v["commits"]
         .as_array()
         .into_iter()
@@ -169,7 +170,7 @@ fn memory_commits(v: &Value) -> (Vec<Item>, Vec<String>) {
             };
             (item, sha)
         })
-        .unzip()
+        .collect()
 }
 
 #[cfg(test)]
@@ -188,7 +189,8 @@ mod tests {
             ],
             "notes": [{"slug": "rust", "path": "/m/notes/rust.md", "description": "Build notes", "type": "note"}],
         });
-        let (items, picks, context) = memory_rows(&v);
+        let (rows, context) = memory_rows(&v);
+        let (items, picks): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, ["User", "This repository", "rust", "History"]);
         assert_eq!(items[0].detail, "120/4000");
@@ -207,8 +209,8 @@ mod tests {
 
     #[test]
     fn history_without_git_says_so_in_its_row() {
-        let (items, _, _) = memory_rows(&json!({"history": false, "files": [], "notes": []}));
-        assert_eq!(items[0].detail, "no commits yet");
+        let (rows, _) = memory_rows(&json!({"history": false, "files": [], "notes": []}));
+        assert_eq!(rows[0].0.detail, "no commits yet");
     }
 
     #[test]
@@ -216,9 +218,9 @@ mod tests {
         let v = json!({"history": true, "commits": [
             {"sha": "0123456789abcdef", "time": "2026-11-06 10:00", "message": "manual edit\n\nbody", "files": ["user.md", "notes/rust.md"]}
         ]});
-        let (items, shas) = memory_commits(&v);
-        assert_eq!(items[0].label, "0123456 manual edit");
-        assert_eq!(items[0].detail, "2026-11-06 10:00 · user.md, notes/rust.md");
-        assert_eq!(shas, ["0123456789abcdef"]);
+        let rows = memory_commits(&v);
+        assert_eq!(rows[0].0.label, "0123456 manual edit");
+        assert_eq!(rows[0].0.detail, "2026-11-06 10:00 · user.md, notes/rust.md");
+        assert_eq!(rows[0].1, "0123456789abcdef");
     }
 }
