@@ -58,6 +58,19 @@ pub struct LiveRow {
     pub modified: Option<SystemTime>,
     /// Its title, else its first prompt; `None` when the caller has it already or there is none.
     pub title: Option<String>,
+    /// The remote it runs on, for a row that is not on this host.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// Rows for the agents of a remote, listed beside this host's. Set once at start-up by a client that
+/// runs here and has a `default_remote`; the call blocks, so it runs off the UI thread.
+pub type RemoteRows = Box<dyn Fn() -> Vec<LiveRow> + Send + Sync>;
+
+static REMOTE_ROWS: std::sync::OnceLock<RemoteRows> = std::sync::OnceLock::new();
+
+pub fn set_remote_rows(f: RemoteRows) {
+    let _ = REMOTE_ROWS.set(f);
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -184,6 +197,7 @@ fn live_rows(source: &dyn SessionSource, me: u32, a: LiveArgs) -> Live {
             parent: l.parent.as_deref().map(canon),
             modified: std::fs::metadata(&l.path).and_then(|m| m.modified()).ok(),
             title: if a.titled.contains(&l.path) { None } else { source.title(&l.path) },
+            host: None,
             live: l,
         })
         .collect();
@@ -191,15 +205,28 @@ fn live_rows(source: &dyn SessionSource, me: u32, a: LiveArgs) -> Live {
 }
 
 fn live_sessions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
-    ready(args, |a: LiveArgs| {
+    let local = |a: LiveArgs| {
         let me = std::process::id();
         #[cfg(test)]
         if let Some(s) = TEST_SOURCE.with(|s| s.borrow().clone()) {
-            return Ok::<_, String>(live_rows(s.as_ref(), me, a));
+            return live_rows(s.as_ref(), me, a);
         }
         let mut live = live_rows(&RunDir::profile(), me, a);
         live.notice = changes::unapplied_notice(&l.cwd, changes::KEPT_AFTER);
-        Ok(live)
+        live
+    };
+    if REMOTE_ROWS.get().is_none() {
+        return ready(args, |a: LiveArgs| Ok::<_, String>(local(a)));
+    }
+    pending(args, |a: LiveArgs| {
+        let mut live = local(a);
+        async move {
+            let remote = tokio::task::spawn_blocking(|| REMOTE_ROWS.get().map(|f| f()).unwrap_or_default())
+                .await
+                .unwrap_or_default();
+            live.rows.extend(remote);
+            Ok::<_, String>(live)
+        }
     })
 }
 
@@ -309,6 +336,7 @@ mod tests {
                 parent: Some("/s/p.jsonl".into()),
                 modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5)),
                 title: Some("t".into()),
+                host: Some("cluster".into()),
             }],
             canon: vec![("/a".into(), "/b".into())],
             notice: Some("n".into()),

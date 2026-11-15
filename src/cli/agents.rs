@@ -8,12 +8,13 @@ use serde_json::{Value, json};
 fn agents() -> Vec<Value> {
     let mut found: Vec<(i64, Value)> = owner::live_sessions()
         .into_iter()
-        .filter(|s| s.kind.as_deref() == Some("agent"))
+        .filter(|s| matches!(s.kind.as_deref(), Some("agent" | "worker")))
         .map(|s| {
             let started = s.started.parse::<jiff::Timestamp>().map_or(0, |t| t.as_second());
             let title = list::info(&s.path).and_then(|i| i.title);
             let row = json!({
                 "id": list::id_of(&s.path),
+                "kind": s.kind,
                 "cwd": s.cwd.map(|c| c.to_string_lossy().into_owned()).unwrap_or_default(),
                 "started": started,
                 "title": title,

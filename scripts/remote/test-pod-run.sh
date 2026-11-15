@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Runs pod-run.sh against a fake kubectl and a throwaway git repository. The fake's `exec` runs the command locally
-# with HOME and the repository path redirected into a directory that stands in for the pod. A real cluster is
-# needed for what this cannot show: pod scheduling, `kubectl wait`, jsonpath against real annotations, exec stream
-# behaviour on disconnect, and the image itself.
+# Runs mu-remote-pod against a fake kubectl and a fake `mu`, with a throwaway git repository. The fake's `exec` runs
+# the command locally with HOME and the checkout path redirected into a directory that stands in for the pod. A
+# real cluster is needed for what this cannot show: pod scheduling, `kubectl wait`, jsonpath against real labels,
+# exec stream behaviour on disconnect, and the image itself.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd -P)
 
@@ -10,37 +10,50 @@ T=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/mu-pod-test.XXXXXX")" && pwd -P)
 trap 'rm -rf "$T"' EXIT
 FAKE=$T/fake
 ROOT=$T/repo
-mkdir -p "$FAKE/pod/home" "$FAKE/pod/root" "$ROOT/scripts/remote"
+DIR=/mu-test-checkout
+mkdir -p "$FAKE" "$ROOT" "$T/bin"
 
 fail() {
   echo "FAIL: $*" >&2
   exit 1
 }
-has() { grep -qF -- "$2" "$1" || fail "$1 lacks '$2'"; }
-lacks() { ! grep -qiF -- "$2" "$1" || fail "$1 has '$2'"; }
+has() { grep -qaF -- "$2" "$1" || fail "$1 lacks '$2'"; }
+lacks() { ! grep -qaiF -- "$2" "$1" || fail "$1 has '$2'"; }
 
 cat > "$T/kubectl" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >> "$FAKE/calls"
-if [ "$1" = -n ]; then shift 2; fi
+while [ "$1" = -n ] || [ "$1" = --context ]; do shift 2; done
 cmd=$1
 shift
 case $cmd in
-  create) cat > "$FAKE/pod.yaml" ;;
-  wait) ;;
+  create)
+    cat > "$FAKE/pod.yaml"
+    name=$(sed -n 's/^  name: "\(.*\)"$/\1/p' "$FAKE/pod.yaml")
+    kind=$(sed -n 's/^    mu-kind: "\(.*\)"$/\1/p' "$FAKE/pod.yaml")
+    launcher=$(sed -n 's/^    mu-launcher: "\(.*\)"$/\1/p' "$FAKE/pod.yaml")
+    echo "$name|$kind|$launcher|Running" >> "$FAKE/pods.tsv"
+    ;;
+  wait) [ ! -f "$FAKE/wait-fails" ] || { echo "timed out waiting" >&2; exit 1; } ;;
   get) [ ! -f "$FAKE/pods.tsv" ] || cat "$FAKE/pods.tsv" ;;
-  delete) echo "$2" >> "$FAKE/deletes" ;;
+  delete)
+    echo "$2" >> "$FAKE/deletes"
+    [ ! -f "$FAKE/pods.tsv" ] || { grep -v "^$2|" "$FAKE/pods.tsv" > "$FAKE/pods.new" || true; mv "$FAKE/pods.new" "$FAKE/pods.tsv"; }
+    ;;
   exec)
+    pod=
     args=()
-    for a in "$@"; do args+=("${a//$MU_TASK_ROOT/$FAKE/pod/root}"); done
-    while [ "${args[0]}" != -- ]; do args=("${args[@]:1}"); done
+    for a in "$@"; do args+=("${a//$DIR/$FAKE/pod/root}"); done
+    while [ "${args[0]}" != -- ]; do
+      case ${args[0]} in -*) ;; *) pod=${args[0]} ;; esac
+      args=("${args[@]:1}")
+    done
     args=("${args[@]:1}")
+    echo "$pod ${args[*]}" >> "$FAKE/execs"
+    mkdir -p "$FAKE/pod/home" "$FAKE/pod/root"
     cd "$FAKE/pod"
-    export HOME=$FAKE/pod/home
-    case " ${args[*]} " in
-      *' eval '*) touch "$FAKE/worker-started" ;;
-    esac
+    export HOME=$FAKE/pod/home FAKE_POD=$pod
     case "${args[*]}" in
       *'tar -xf'*) tee "$FAKE/config.tar" | "${args[@]}" ;;
       *) "${args[@]}" ;;
@@ -49,69 +62,82 @@ case $cmd in
   *) echo "fake kubectl: unexpected $cmd" >&2; exit 1 ;;
 esac
 EOF
-chmod +x "$T/kubectl"
+cat > "$T/bin/mu" << 'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE/mu-calls"
+case "$1 $2" in
+  "worker bundle")
+    [ ! -f "$FAKE/bundle-fails" ] || { echo "nothing to bundle" >&2; exit 1; }
+    printf 'BUNDLE-BYTES' ;;
+  "agent list") [ ! -f "$FAKE/list-$FAKE_POD" ] || cat "$FAKE/list-$FAKE_POD" ;;
+  "attach --stdio") cat; exit 7 ;;
+  "agent --detach") echo '{"id":"agent-9"}' ;;
+esac
+EOF
+chmod +x "$T/kubectl" "$T/bin/mu"
 
-cp "$here/stage-a-worker.sh" "$ROOT/scripts/remote/"
 git -C "$ROOT" init -q
 echo hello > "$ROOT/a.txt"
 git -C "$ROOT" add -A
 git -C "$ROOT" -c user.name=t -c user.email=t@t commit -q -m init
-mk_task_ref() {
+mk_bundle() {
   local c
   c=$(git -C "$ROOT" -c user.name=mu -c user.email=mu@localhost commit-tree "HEAD^{tree}" -p HEAD -m task)
   git -C "$ROOT" update-ref "refs/mu/task/$1" "$c"
+  git -C "$ROOT" bundle create "$T/$1.bundle" "refs/mu/task/$1" > /dev/null 2>&1
 }
 
-mkdir -p "$T/mu-home" "$T/profile" "$T/agent/skills/s" "$T/agent/agents"
+mkdir -p "$T/home" "$T/mu-home" "$T/agent/skills/s" "$T/agent/agents"
 echo 'x = 1' > "$T/mu-home/config.toml"
-echo '{"key":"secret"}' > "$T/mu-home/auth.json"
-echo 'm = 1' > "$T/profile/models.toml"
-echo '{"key":"secret"}' > "$T/profile/auth.json"
+echo '{"key":"TOPSECRET"}' > "$T/mu-home/auth.json"
+echo 'm = 1' > "$T/mu-home/models.toml"
+echo '{"key":"TOPSECRET"}' > "$T/mu-home/mu-token.json"
 echo agents > "$T/agent/AGENTS.md"
 echo skill > "$T/agent/skills/s/SKILL.md"
-echo secret > "$T/agent/skills/s/token.txt"
-echo '{}' > "$T/agent/auth.json"
+echo TOPSECRET > "$T/agent/skills/s/token.txt"
+echo '{"key":"TOPSECRET"}' > "$T/agent/auth.json"
 
-# Runs the launcher as mu would: task id $1, extra environment after it. Output in $T/out, $T/err.
-launch() {
-  local id=$1
-  shift
-  mk_task_ref "$id"
-  env FAKE="$FAKE" KUBECTL="$T/kubectl" MU_POD_LOG="$T/log.jsonl" MU_POD_SPEC="$here/pod.yaml" \
-    MU_TASK_DEPTH=1 MU_TASK_NAME="$id" MU_TASK_ROOT="$ROOT" MU_TASK_CWD="$ROOT" \
-    MU_TASK_REF="refs/mu/task/$id" MU_TASK_RESULT_REF="refs/mu/result/$id" MU_TASK_SESSION=sess \
-    MU_TASK_PARENT_PID=$$ MU_TASK_MU_HOME="$T/mu-home" MU_TASK_PROFILE_HOME="$T/profile" MU_TASK_AGENT_DIR="$T/agent" \
-    "$@"
+TRUSTED=0
+SETTINGS='{"namespace":"ns","agent_namespace":"agents","image":"img:1"}'
+# Runs the adapter as mu would. Output in $T/out and $T/err; returns its status.
+adapter() {
+  env -u OMP_PROFILE -u PI_PROFILE FAKE="$FAKE" KUBECTL="$T/kubectl" PATH="$T/bin:$PATH" MU_POD_SPEC="$here/mu-remote-pod.yaml" \
+    MU_REMOTE_NAME=pods MU_REMOTE_SETTINGS="$SETTINGS" MU_REMOTE_TRUSTED="$TRUSTED" DIR="$DIR" \
+    HOME="$T/home" MU_HOME="$T/mu-home" PI_CODING_AGENT_DIR="$T/agent" \
+    "$here/mu-remote-pod" "$@" > "$T/out" 2> "$T/err"
+}
+fresh() {
+  rm -rf "$FAKE"
+  mkdir -p "$FAKE"
 }
 
-fresh_pod() {
-  rm -rf "$FAKE/pod" "$FAKE/deletes" "$FAKE/worker-started" "$FAKE/pods.tsv" "$FAKE/config.tar"
-  mkdir -p "$FAKE/pod/home" "$FAKE/pod/root"
-}
+# version
+fresh
+adapter version || fail "version failed: $(cat "$T/err")"
+[ "$(cat "$T/out")" = '{"contract":1}' ] || fail "version printed: $(cat "$T/out")"
 
-# 1. Normal run.
-fresh_pod
-printf '{"prompt":"hi"}\n' | launch norm-1 MU_POD_CMD="$ROOT/scripts/remote/stage-a-worker.sh" MU_STAGE_A_CHECKS=true \
-  "$here/pod-run.sh" > "$T/out" 2> "$T/err" 3> "$T/changes" || fail "launcher failed: $(cat "$T/err")"
-[ "$(wc -l < "$T/out" | tr -d ' ')" = 2 ] || fail "stdout is not two lines: $(cat "$T/out")"
-sed -n 1p "$T/out" | grep -q '^{"type":"tool"' || fail "line 1 is not the tool line"
-sed -n 2p "$T/out" | grep -q '^{"type":"result"' || fail "line 2 is not the result line"
-grep -q '"type":"changes"' "$T/out" && fail "the changes line went to stdout: $(cat "$T/out")"
-[ "$(wc -l < "$T/changes" | tr -d ' ')" = 1 ] || fail "descriptor 3 is not one line: $(cat "$T/changes")"
-grep -q '^{"type":"changes","ref":"refs/mu/result/norm-1","base":"[0-9a-f]\{40\}","files":1}$' "$T/changes" ||
-  fail "descriptor 3 does not hold the changes line: $(cat "$T/changes")"
-git -C "$ROOT" show "refs/mu/result/norm-1:stage-a-output.txt" > /dev/null || fail "result ref lacks the changed file"
-has "$FAKE/deletes" norm-1
-has "$FAKE/pod.yaml" 'mu/host: "'"$(hostname)"'"'
-has "$FAKE/pod.yaml" "mu/pid: \"$$\""
-has "$FAKE/pod.yaml" 'mu/parent: "sess"'
-has "$FAKE/pod.yaml" 'name: "norm-1"'
+# start --kind worker on an untrusted remote: progress, no secret, the checkout and the worker.
+fresh
+mk_bundle w1
+adapter start --kind worker --launch w1 --bundle "$T/w1.bundle" --dir "$DIR" || fail "start failed: $(cat "$T/err")"
+[ "$(cat "$T/out")" = '{"id":"w1"}' ] || fail "start printed: $(cat "$T/out")"
+[ "$(grep -c '^{"progress"' "$T/err")" = 4 ] || fail "expected four progress lines: $(cat "$T/err")"
+[ "$(grep '^{"progress"' "$T/err" | paste -sd' ' -)" = '{"progress":"scheduling"} {"progress":"pulling image"} {"progress":"copying repository"} {"progress":"starting"}' ] ||
+  fail "progress order: $(cat "$T/err")"
+has "$FAKE/pod.yaml" 'name: "w1"'
+has "$FAKE/pod.yaml" 'namespace: "ns"'
+has "$FAKE/pod.yaml" 'mu-kind: "worker"'
+has "$FAKE/pod.yaml" 'image: "img:1"'
+has "$FAKE/pod.yaml" "mountPath: \"$DIR\""
 grep -q '@' "$FAKE/pod.yaml" && fail "unfilled placeholder in pod.yaml"
-grep -q 'delete pod norm-1 --wait=false' "$FAKE/calls" || fail "pod not deleted with --wait=false"
-[ "$(wc -l < "$T/log.jsonl" | tr -d ' ')" = 1 ] || fail "expected one timing line"
-has "$T/log.jsonl" '"exit":0'
-
-# Config tar: what is sent, and no credentials.
+lacks "$FAKE/pod.yaml" secretRef
+lacks "$FAKE/pod.yaml" mu-sccache
+has "$FAKE/pod.yaml" 'activeDeadlineSeconds: 21600'
+[ -s "$T/mu-home/remote-launcher" ] || fail "no launcher id"
+has "$FAKE/pod.yaml" "mu-launcher: \"$(cat "$T/mu-home/remote-launcher")\""
+[ -f "$FAKE/pod/root/a.txt" ] || fail "the repository was not checked out"
+has "$FAKE/mu-calls" "worker run --launch w1 --dir $FAKE/pod/root --detach"
+[ ! -f "$FAKE/deletes" ] || fail "start deleted a pod: $(cat "$FAKE/deletes")"
 tar -tf "$FAKE/config.tar" > "$T/tar.list"
 has "$T/tar.list" .mu/config.toml
 has "$T/tar.list" .mu/models.toml
@@ -120,46 +146,101 @@ has "$T/tar.list" .omp/agent/skills/s/SKILL.md
 lacks "$T/tar.list" './'
 lacks "$T/tar.list" auth.json
 lacks "$T/tar.list" token
+# Everything kubectl received: its arguments, the pod, the config tar, the uploaded bundle.
+for f in "$FAKE/calls" "$FAKE/pod.yaml" "$FAKE/config.tar" "$FAKE/pod/home/task.bundle"; do lacks "$f" TOPSECRET; done
+id1=$(cat "$T/mu-home/remote-launcher")
 
-# 2. TERM deletes the pod. The launcher gets its own process group, as mu's terminate_group assumes.
-fresh_pod
-set -m
-printf '{"prompt":"hi"}\n' | launch term-1 MU_POD_CMD='sleep 30' "$here/pod-run.sh" > "$T/out2" 2> "$T/err2" &
-pgid=$!
-set +m
-for _ in $(seq 1 100); do
-  [ -f "$FAKE/worker-started" ] && break
-  sleep 0.1
-done
-[ -f "$FAKE/worker-started" ] || fail "worker never started: $(cat "$T/err2")"
-kill -TERM -- "-$pgid"
-wait "$pgid" || true
-has "$FAKE/deletes" term-1
-has "$T/log.jsonl" '"exit":143'
-git -C "$ROOT" rev-parse -q --verify refs/mu/result/term-1 > /dev/null && fail "TERM run produced a result ref"
+# connect: through kubectl exec and `mu attach --stdio`; a dropped stream deletes nothing.
+rc=0
+echo '{"hello":1}' | adapter connect w1 || rc=$?
+[ "$rc" = 7 ] || fail "connect did not return the stream's status: $rc"
+has "$T/out" '{"hello":1}'
+has "$FAKE/calls" 'exec -i w1 -- mu attach --stdio w1'
+has "$FAKE/mu-calls" 'attach --stdio w1'
+[ ! -f "$FAKE/deletes" ] || fail "a dropped stream deleted a pod: $(cat "$FAKE/deletes")"
 
-# 3. Sweep: only this host's pods whose pid is dead.
-fresh_pod
-true &
-dead=$!
-wait "$dead"
-printf 'orphan-1|%s|%s\nlive-1|%s|%s\nother-1|elsewhere|%s\nnopid-1|%s|\n' \
-  "$(hostname)" "$dead" "$(hostname)" "$$" "$dead" "$(hostname)" > "$FAKE/pods.tsv"
-printf '{"prompt":"hi"}\n' | launch sweep-1 MU_POD_CMD='true' "$here/pod-run.sh" > "$T/out3" 2> "$T/err3" ||
-  fail "launcher failed: $(cat "$T/err3")"
-has "$FAKE/deletes" orphan-1
-has "$FAKE/deletes" sweep-1
-lacks "$FAKE/deletes" live-1
-lacks "$FAKE/deletes" other-1
-lacks "$FAKE/deletes" nopid-1
-grep -q 'delete pod orphan-1 --wait=false' "$FAKE/calls" || fail "orphan not deleted with --wait=false"
-grep -q 'type' "$T/out3" && fail "stdout not empty for a worker that prints nothing: $(cat "$T/out3")"
+# fetch: the bundle on stdout, the pod deleted afterwards; a failed fetch keeps the pod.
+touch "$FAKE/bundle-fails"
+adapter fetch w1 && fail "fetch succeeded without a bundle"
+[ ! -f "$FAKE/deletes" ] || fail "a failed fetch deleted the pod"
+rm "$FAKE/bundle-fails"
+adapter fetch w1 || fail "fetch failed: $(cat "$T/err")"
+[ "$(cat "$T/out")" = BUNDLE-BYTES ] || fail "fetch printed: $(cat "$T/out")"
+has "$FAKE/deletes" w1
+grep -q 'delete pod w1 --wait=false' "$FAKE/calls" || fail "pod not deleted with --wait=false"
+[ "$(grep -n 'worker bundle' "$FAKE/mu-calls" | tail -1 | cut -d: -f1)" -ge 1 ] || fail "no bundle call"
 
-# 4. Without descriptor 3 (run by hand) the report is dropped and the launcher still succeeds.
-fresh_pod
-printf '{"prompt":"hi"}\n' | launch norm-2 MU_POD_CMD="$ROOT/scripts/remote/stage-a-worker.sh" MU_STAGE_A_CHECKS=true \
-  "$here/pod-run.sh" > "$T/out4" 2> "$T/err4" 3>&- || fail "launcher failed with descriptor 3 closed: $(cat "$T/err4")"
-git -C "$ROOT" rev-parse -q --verify refs/mu/result/norm-2 > /dev/null || fail "no result ref with descriptor 3 closed"
-grep -q 'changes' "$T/out4" "$T/err4" && fail "a report was written somewhere: $(cat "$T/out4" "$T/err4")"
+# stop: the worker is told, the pod deleted.
+fresh
+mk_bundle w2
+adapter start --kind worker --launch w2 --bundle "$T/w2.bundle" --dir "$DIR" || fail "start failed: $(cat "$T/err")"
+adapter stop w2 || fail "stop failed: $(cat "$T/err")"
+has "$FAKE/mu-calls" 'worker stop w2'
+has "$FAKE/deletes" w2
+
+# A failed start deletes the pod it made.
+fresh
+mk_bundle w3
+touch "$FAKE/wait-fails"
+adapter start --kind worker --launch w3 --bundle "$T/w3.bundle" --dir "$DIR" && fail "start succeeded with a pod that never got ready"
+has "$T/err" 'timed out waiting'
+has "$FAKE/deletes" w3
+
+# An untrusted remote refuses an sccache secret and nothing is created; a trusted one mounts it.
+fresh
+SETTINGS='{"sccache_secret_name":"cache-keys"}' adapter start --kind worker --launch w4 --bundle "$T/w3.bundle" --dir "$DIR" &&
+  fail "an untrusted remote accepted a secret"
+has "$T/err" 'not trusted'
+[ "$(wc -l < "$T/err" | tr -d ' ')" = 1 ] || fail "the refusal is not one line: $(cat "$T/err")"
+[ ! -f "$FAKE/calls" ] || fail "kubectl was called: $(cat "$FAKE/calls")"
+TRUSTED=1
+SETTINGS='{"sccache_secret_name":"cache-keys"}' adapter start --kind worker --launch w5 --bundle "$T/w3.bundle" --dir "$DIR" ||
+  fail "trusted start failed: $(cat "$T/err")"
+has "$FAKE/pod.yaml" 'name: "cache-keys"'
+TRUSTED=1 adapter start --kind worker --launch w6 --bundle "$T/w3.bundle" --dir "$DIR" || fail "$(cat "$T/err")"
+has "$FAKE/pod.yaml" 'name: "mu-sccache"'
+TRUSTED=0
+
+# start --kind agent: the agent namespace, mu's own reply, arguments passed on.
+fresh
+adapter start --kind agent --dir "$DIR" --model p/m --resume abc || fail "agent start failed: $(cat "$T/err")"
+[ "$(cat "$T/out")" = '{"id":"agent-9"}' ] || fail "agent start printed: $(cat "$T/out")"
+has "$FAKE/pod.yaml" 'mu-kind: "agent"'
+has "$FAKE/pod.yaml" 'namespace: "agents"'
+lacks "$FAKE/pod.yaml" activeDeadlineSeconds
+has "$FAKE/mu-calls" 'agent --detach --model p/m --resume abc'
+grep -q '^-n agents create' "$FAKE/calls" || fail "agent pod not made in the agent namespace"
+adapter start --kind agent --dir "$DIR" -c || fail "$(cat "$T/err")"
+has "$FAKE/mu-calls" 'agent --detach -c'
+SETTINGS='{"agent_deadline":"7200"}' adapter start --kind agent --dir "$DIR" || fail "$(cat "$T/err")"
+has "$FAKE/pod.yaml" 'activeDeadlineSeconds: 7200'
+
+# list: each pod's agents with a kind (agent when mu did not say); connect finds an agent's pod by its id.
+fresh
+printf 'mu-agent-1|agent|x|Running\nw9|worker|x|Running\n' > "$FAKE/pods.tsv"
+echo '{"id":"a1","cwd":"/p"}' > "$FAKE/list-mu-agent-1"
+echo '{"id":"w9","kind":"worker"}' > "$FAKE/list-w9"
+adapter list || fail "list failed: $(cat "$T/err")"
+has "$T/out" '{"id":"a1","cwd":"/p","kind":"agent"}'
+has "$T/out" '{"id":"w9","kind":"worker"}'
+adapter connect a1 || true
+has "$FAKE/calls" 'exec -i mu-agent-1 -- mu attach --stdio a1'
+adapter connect nope && fail "connect to an unknown id succeeded"
+has "$T/err" 'no pod runs nope'
+
+# Sweep: only this launcher's ended pods.
+fresh
+printf 'mine-done|worker|%s|Succeeded\nmine-failed|worker|%s|Failed\nmine-live|worker|%s|Running\nother-done|worker|elsewhere|Succeeded\n' \
+  "$id1" "$id1" "$id1" > "$FAKE/pods.tsv"
+mk_bundle w7
+adapter start --kind worker --launch w7 --bundle "$T/w7.bundle" --dir "$DIR" || fail "$(cat "$T/err")"
+has "$FAKE/deletes" mine-done
+has "$FAKE/deletes" mine-failed
+lacks "$FAKE/deletes" mine-live
+lacks "$FAKE/deletes" other-done
+[ "$(cat "$T/mu-home/remote-launcher")" = "$id1" ] || fail "the launcher id changed"
+
+adapter bogus && fail "an unknown verb succeeded"
+has "$T/err" 'unknown verb'
 
 echo "test-pod-run: ok"

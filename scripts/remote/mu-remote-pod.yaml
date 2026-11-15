@@ -1,5 +1,5 @@
-# Pod template for scripts/remote/pod-run.sh. The script replaces every @NAME@ placeholder itself (no envsubst);
-# string values arrive already escaped for a double-quoted YAML scalar.
+# Pod template for scripts/remote/mu-remote-pod. The script replaces every @NAME@ placeholder itself (no envsubst);
+# string values arrive already escaped for a double-quoted YAML scalar. @ENVFROM@ is empty on an untrusted remote.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -7,14 +7,12 @@ metadata:
   namespace: "@NAMESPACE@"
   labels:
     app: mu-task
-    mu/parent: "@PARENT@"
-  annotations:
-    mu/host: "@HOST@"
-    mu/pid: "@PID@"
+    mu-kind: "@KIND@"
+    mu-launcher: "@LAUNCHER@"
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
-  activeDeadlineSeconds: @DEADLINE@
+@DEADLINE_LINE@
   containers:
     - name: worker
       image: "@IMAGE@"
@@ -34,10 +32,7 @@ spec:
         - {name: HOME, value: /home/worker}
         - {name: SSL_CERT_FILE, value: /home/worker/ca-bundle.crt}
 @ENV@
-      envFrom:
-        - secretRef:
-            name: "@SCCACHE_SECRET@"
-            optional: true
+@ENVFROM@
       resources:
         requests:
           cpu: "@CPU@"

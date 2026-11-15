@@ -157,7 +157,11 @@ enum SearchGate {
 pub struct RelayRun {
     server: RelayServer,
     out: UnboundedSender<String>,
-    live: Rc<RefCell<HashMap<u64, CancellationToken>>>,
+    /// Each running call's token, with the number of the run that started it: a worker that asks for
+    /// the same id again (its stream was lost and the answer with it) replaces the old run, whose
+    /// answers are then dropped.
+    live: Rc<RefCell<HashMap<u64, (u64, CancellationToken)>>>,
+    runs: Cell<u64>,
     meter: Rc<Meter>,
     places: Rc<Semaphore>,
     finished: Cell<bool>,
@@ -165,7 +169,7 @@ pub struct RelayRun {
 
 impl Drop for RelayRun {
     fn drop(&mut self) {
-        for t in self.live.borrow().values() {
+        for (_, t) in self.live.borrow().values() {
             t.cancel();
         }
     }
@@ -187,6 +191,7 @@ impl RelayServer {
             server: self.clone(),
             out,
             live: Rc::default(),
+            runs: Cell::new(0),
             meter: Rc::new(meter),
             places: Rc::new(Semaphore::new(MAX_CONCURRENT)),
             finished: Cell::new(false),
@@ -214,7 +219,7 @@ impl RelayRun {
     pub fn handle_with(&self, id: u64, call: Call, approve: Approve<'_>) {
         match call {
             Call::Cancel => {
-                if let Some(t) = self.live.borrow().get(&id) {
+                if let Some((_, t)) = self.live.borrow().get(&id) {
                     t.cancel();
                 }
             }
@@ -235,12 +240,19 @@ impl RelayRun {
                     _ => None,
                 };
                 let token = CancellationToken::new();
-                self.live.borrow_mut().insert(id, token.clone());
+                let run = self.runs.get() + 1;
+                self.runs.set(run);
+                if let Some((_, old)) = self.live.borrow_mut().insert(id, (run, token.clone())) {
+                    old.cancel();
+                }
                 let (server, out, live) = (self.server.clone(), self.out.clone(), self.live.clone());
                 let (meter, places) = (self.meter.clone(), self.places.clone());
                 tokio::task::spawn_local(async move {
+                    let current = || live.borrow().get(&id).is_some_and(|(r, _)| *r == run);
                     let emit = |e: Event| {
-                        let _ = out.send(Reply::Event(e).line(id).to_string());
+                        if current() {
+                            let _ = out.send(Reply::Event(e).line(id).to_string());
+                        }
                     };
                     let reply = async {
                         let _place = tokio::select! {
@@ -260,8 +272,10 @@ impl RelayRun {
                         Ok(d) => Reply::Done(Box::new(d)),
                         Err(e) => Reply::Error(e),
                     };
-                    live.borrow_mut().remove(&id);
-                    let _ = out.send(reply.line(id).to_string());
+                    if current() {
+                        live.borrow_mut().remove(&id);
+                        let _ = out.send(reply.line(id).to_string());
+                    }
                 });
             }
         }
@@ -281,7 +295,7 @@ impl RelayRun {
     /// The worker has sent its `result`: calls still running are cancelled, later ones refused.
     pub fn finish(&self) {
         self.finished.set(true);
-        for t in self.live.borrow().values() {
+        for (_, t) in self.live.borrow().values() {
             t.cancel();
         }
     }
@@ -969,6 +983,26 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
     }
 
     #[test]
+    fn a_call_asked_again_replaces_the_old_run_and_only_the_new_one_answers() {
+        local(async {
+            let mut rig = rig();
+            rig.providers.set_relay(Rc::new(Slow));
+            // The worker's stream was lost and the answer with it: it sends the same id again.
+            rig.run.handle(5, rig.stream_call("sys"));
+            tokio::task::yield_now().await;
+            rig.run.handle(5, rig.stream_call("sys"));
+            tokio::task::yield_now().await;
+            assert!(rig.rx.try_recv().is_err(), "the cancelled run says nothing");
+            rig.run.handle(5, Call::Cancel);
+            let (_, end) = rig.until_end(5).await;
+            assert_eq!(end_error(end).kind, ErrorKind::Aborted);
+            tokio::task::yield_now().await;
+            assert!(rig.rx.try_recv().is_err(), "one answer for the id, not two");
+            assert!(rig.run.live.borrow().is_empty());
+        });
+    }
+
+    #[test]
     fn ending_the_child_cancels_every_call() {
         local(async {
             let rig = rig();
@@ -978,7 +1012,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
                 rig.run.handle(id, call);
             }
             tokio::task::yield_now().await;
-            let tokens: Vec<_> = rig.run.live.borrow().values().cloned().collect();
+            let tokens: Vec<_> = rig.run.live.borrow().values().map(|(_, t)| t.clone()).collect();
             assert_eq!(tokens.len(), 2);
             let Rig { run, mut rx, .. } = rig;
             drop(run);

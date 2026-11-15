@@ -398,7 +398,7 @@ impl App {
                     extern "C" fn noop(_: libc::c_int) {}
                     // SAFETY: installs a no-op handler; restored to the default below.
                     unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
-                    let status = std::process::Command::new(&exe).arg("--attach").arg(command).status();
+                    let status = std::process::Command::new(&exe).arg("--nested-client").arg(command).status();
                     // SAFETY: back to the default disposition.
                     unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
                     status

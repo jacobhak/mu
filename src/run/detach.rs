@@ -1,4 +1,5 @@
-//! `mu agent --detach`: starts the agent in the background and returns once it listens.
+//! `mu agent --detach` and `mu worker run --detach`: start the process in the background and return
+//! once it listens.
 //!
 //! The agent is a second `mu agent --detached` process in a session of its own (`setsid`), so closing
 //! the terminal or the ssh connection that ran this command does not reach it. Its output goes to
@@ -14,10 +15,11 @@ use std::time::Duration;
 
 const START_WAIT: Duration = Duration::from_secs(60);
 
-pub fn run() -> Result<i32> {
+/// `kind` is `agent` or `worker`: the command that is started again with `--detached`, and the log's name.
+pub fn run(kind: &str) -> Result<i32> {
     let logs = paths::profile_home().join("logs");
     mu_common::fs::create_private_dir(&logs).with_context(|| logs.display().to_string())?;
-    let starting = logs.join(format!("agent-starting-{}.log", std::process::id()));
+    let starting = logs.join(format!("{kind}-starting-{}.log", std::process::id()));
     let log = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -49,8 +51,9 @@ pub fn run() -> Result<i32> {
         let _ = tx.send(line);
     });
     let line = rx.recv_timeout(START_WAIT).unwrap_or_default();
-    let id =
-        serde_json::from_str::<serde_json::Value>(&line).ok().and_then(|v| v["session"].as_str().map(String::from));
+    let id = serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .and_then(|v| v["session"].as_str().or(v["id"].as_str()).map(String::from));
     let Some(id) = id else {
         let _ = child.kill();
         let _ = child.wait();
@@ -71,7 +74,7 @@ pub fn run() -> Result<i32> {
         );
     };
     // The open descriptor follows the rename.
-    let _ = std::fs::rename(&starting, logs.join(format!("agent-{id}.log")));
+    let _ = std::fs::rename(&starting, logs.join(format!("{kind}-{id}.log")));
     println!("{}", serde_json::json!({ "id": id }));
     Ok(0)
 }

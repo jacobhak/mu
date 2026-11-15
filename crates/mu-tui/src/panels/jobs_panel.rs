@@ -584,6 +584,10 @@ impl JobsPanel {
     /// Opens the selected session's transcript, read-only.
     fn open_session_view(&mut self) {
         let Some(r) = self.rows.get(self.s_at) else { return };
+        if r.host.is_some() {
+            self.status = Some("a session on a remote opens with mu -r".into());
+            return;
+        }
         let label = format!("{} · pid {}", r.label(), r.live.pid);
         self.view = Some(Self::new_view(r.id(), Some(label), Some(Followed::new(r.live.path.clone(), VIEW_KEEP))));
         self.refresh();
@@ -782,7 +786,7 @@ impl JobsPanel {
             KeyCode::PageUp => self.s_at = self.s_at.saturating_sub(self.s_page),
             KeyCode::Enter => self.open_session_view(),
             KeyCode::Char('n') => {
-                if let Some(r) = self.rows.get(self.s_at) {
+                if let Some(r) = self.rows.get(self.s_at).filter(|r| r.host.is_none()) {
                     self.input = Some(Compose { session: r.live.path.clone(), label: r.label(), text: String::new() });
                 }
             }
@@ -889,13 +893,17 @@ impl JobsPanel {
 
     fn sessions_frame(&self, width: usize, now: SystemTime) -> Screen {
         let label_w = self.rows.iter().map(|r| r.depth * 2 + r.label().chars().count()).max().unwrap_or(0).min(26);
+        let host_w = match self.rows.iter().any(|r| r.host.is_some()) {
+            true => self.rows.iter().map(|r| r.host.as_deref().unwrap_or("here").chars().count()).max().unwrap_or(0),
+            false => 0,
+        };
         let rows = self
             .rows
             .iter()
             .enumerate()
             .map(|(i, r)| {
                 let cost = self.cost_of(Some(&r.live.path));
-                sessions_tab::list_row(r, i == self.s_at, label_w, &cost, width, now, self.home.as_deref())
+                sessions_tab::list_row(r, i == self.s_at, label_w, host_w, &cost, width, now, self.home.as_deref())
             })
             .collect();
         let (detail_title, detail_rows) = match self.rows.get(self.s_at) {
@@ -1248,8 +1256,13 @@ mod tests {
     }
 
     fn live_of(lives: Vec<LiveSession>) -> Live {
-        let rows =
-            lives.into_iter().map(|live| LiveRow { parent: live.parent.clone(), modified: None, title: None, live });
+        let rows = lives.into_iter().map(|live| LiveRow {
+            parent: live.parent.clone(),
+            modified: None,
+            title: None,
+            host: None,
+            live,
+        });
         Live { rows: rows.collect(), canon: Vec::new(), notice: None }
     }
 

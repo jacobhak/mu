@@ -1,3 +1,4 @@
+use super::link::WorkerLaunch;
 use super::relay::{RelayAllow, RelayServer};
 use super::subagent::{
     ArtifactAlloc, ChildCmd, MU_VERSION, Mirror, Outcome, prepare_launch, preview_result, run_child_observed,
@@ -171,8 +172,6 @@ impl Tools {
             Err(e) => return ToolOutput::err(e),
         };
         let parent = self.session.path.borrow().clone();
-        let session = self.session_env().into_iter().find(|(k, _)| *k == "PI_SESSION_ID").map(|(_, v)| v);
-        let session = session.unwrap_or_default();
         #[cfg(any(test, feature = "test-support"))]
         let self_exe = self.child_exe.clone().map_or_else(mu_common::paths::self_exe, Ok);
         #[cfg(not(any(test, feature = "test-support")))]
@@ -181,20 +180,24 @@ impl Tools {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),
         };
+        // The kinds `[task] launch` names run on the remote.
+        let remote = |agent: &str| self.launch.as_ref().filter(|l| l.runs(agent));
         // A launched child's session file is on another machine, and a mirrored worker's children's
         // lines must reach its own parent: both ask their child to send its lines.
-        let mirror = if self.mirror {
-            Mirror::Forward(ctx.events.clone())
-        } else if self.launcher.is_empty() {
-            Mirror::Off
-        } else {
-            Mirror::Write
+        let mirror_of = |agent: &str| {
+            if self.mirror {
+                Mirror::Forward(ctx.events.clone())
+            } else if remote(agent).is_some() {
+                Mirror::Write
+            } else {
+                Mirror::Off
+            }
         };
         // A launched child has no credentials, and a relayed process has none to lend: the child's
         // model calls go to this process.
-        let relayed = !self.launcher.is_empty()
-            || std::env::var("MU_TASK_RELAY").is_ok_and(|v| v == "1")
+        let relayed_here = std::env::var("MU_TASK_RELAY").is_ok_and(|v| v == "1")
             || self.plugins.providers().is_some_and(|p| p.is_relayed());
+        let relayed = relayed_here || specs.iter().any(|(_, agent, ..)| remote(agent).is_some());
         let max_cost = self.plugins.providers().map_or(0.0, |p| p.cfg.mu.task.max_cost);
         let relay = relayed.then(|| RelayServer {
             plugins: self.plugins.clone(),
@@ -204,10 +207,11 @@ impl Tools {
         });
         let relay_tools = if relayed { self.plugins.relay_tools_payload() } else { Vec::new() };
         let payload = |agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
+            let launched = remote(agent).is_some();
             let mut p = json!({
                 "task": task, "context": a.context, "agent": agent, "parentSession": parent, "muVersion": MU_VERSION
             });
-            if relayed {
+            if relayed_here || launched {
                 p["relay"] = json!(true);
                 p["relayModels"] = json!(self.relay_allow(agent, model));
                 if !relay_tools.is_empty() {
@@ -215,8 +219,11 @@ impl Tools {
                 }
             }
             p["permissions"] = self.permissions.inherit_json();
-            if self.mirror || !self.launcher.is_empty() {
+            if self.mirror || launched {
                 p["mirrorSession"] = json!(true);
+            }
+            if launched {
+                p["depth"] = json!(depth() + 1);
             }
             if let Some(s) = schema {
                 p["outputSchema"] = s.clone();
@@ -235,18 +242,17 @@ impl Tools {
             // task refs.
             let mut ids: Vec<String> = Vec::new();
             let mut children = Vec::new();
-            for (name, _, _, cwd, _) in &specs {
+            for (name, agent, _, cwd, _) in &specs {
                 let id = (1..)
                     .map(|n| if n == 1 { name.clone() } else { format!("{name}-{n}") })
                     .find(|c| jobs.unique_id(c) == *c && !ids.contains(c))
                     .unwrap_or_default();
-                children.push(if self.launcher.is_empty() {
-                    ChildCmd::Local(exe.clone())
-                } else {
-                    match prepare_launch(&self.launcher, cwd, &id, &session).await {
+                children.push(match remote(agent) {
+                    None => ChildCmd::Local(exe.clone()),
+                    Some(on) => match prepare_launch(on, cwd, &id).await {
                         Ok(l) => ChildCmd::Launched(l),
                         Err(e) => return ToolOutput::err(e),
-                    }
+                    },
                 });
                 ids.push(id);
             }
@@ -261,7 +267,7 @@ impl Tools {
                     payload(agent, task, schemas[i], model.as_deref()),
                     self.permissions.clone(),
                     self.artifact_dir(),
-                    mirror.clone(),
+                    mirror_of(agent),
                     relay.clone(),
                 );
                 started.push(format!("{id} ({agent})"));
@@ -274,7 +280,7 @@ impl Tools {
             ));
         }
         let alloc = || self.next_artifact();
-        let how = Starter { exe: &exe, launcher: &self.launcher, session: &session, mirror };
+        let how = Starter { exe: &exe, launch: self.launch.as_ref(), mirror: &mirror_of };
         run_foreground(
             &specs,
             &schemas,
@@ -291,14 +297,12 @@ impl Tools {
     }
 }
 
-/// What starts a foreground task's child: this executable, or the launcher, which needs a launch
-/// prepared per task.
+/// What starts a foreground task's child: this executable, or a worker on the remote for the agent
+/// kinds `[task] launch` names, which needs a launch prepared per task.
 struct Starter<'a> {
     exe: &'a Path,
-    launcher: &'a [String],
-    /// The parent's session id.
-    session: &'a str,
-    mirror: Mirror,
+    launch: Option<&'a WorkerLaunch>,
+    mirror: &'a dyn Fn(&str) -> Mirror,
 }
 
 /// Builds one child's task payload.
@@ -346,16 +350,15 @@ async fn run_foreground(
         let payload = payload(agent, task, schemas[i], model.as_deref());
         let label = format!("{name} ({agent})");
         async move {
-            let child = if how.launcher.is_empty() {
-                ChildCmd::Local(how.exe.to_path_buf())
-            } else {
-                match prepare_launch(how.launcher, cwd, name, how.session).await {
+            let child = match how.launch.filter(|l| l.runs(agent)) {
+                None => ChildCmd::Local(how.exe.to_path_buf()),
+                Some(on) => match prepare_launch(on, cwd, name).await {
                     Ok(l) => ChildCmd::Launched(l),
                     Err(e) => {
                         rows.borrow_mut()[i].state = SubagentState::Failed;
                         return Outcome::failed(e);
                     }
-                }
+                },
             };
             let out = run_child_observed(
                 child,
@@ -370,7 +373,7 @@ async fn run_foreground(
                 |_| {},
                 |model| rows.borrow_mut()[i].model = Some(model.to_string()),
                 Some(&|r| perms.forward(events, &label, r)),
-                how.mirror.clone(),
+                (how.mirror)(agent),
                 relay,
             )
             .await;
@@ -663,9 +666,47 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn only_the_kinds_launch_names_run_on_the_remote() {
+        use crate::tools::link::test_support::Fake;
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-route-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, ECHO_CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = mu_testutil::repo();
+        let worker = "IFS= read -r a; IFS= read -r b\necho '{\"type\":\"result\",\"text\":\"remote says hi\",\"seq\":1}'\necho '{\"type\":\"exit\",\"code\":0,\"stderr\":\"\",\"seq\":2}'";
+        let fake = std::sync::Arc::new(Fake::new(&[worker]));
+        let mut t = Tools::for_test();
+        t.child_exe = Some(exe);
+        t.launch = Some(WorkerLaunch {
+            remote: fake.clone(),
+            kinds: vec!["task".into()],
+            reconnect: std::time::Duration::from_secs(1),
+        });
+        let cwd = root.to_str().unwrap();
+        let a: Args = serde_json::from_value(json!({"tasks":[
+            {"name":"Local","task":"x","agent":"scout","solutionSpace":"one fix: given","cwd":cwd},
+            {"name":"Far","task":"y","agent":"task","solutionSpace":"one fix: given","cwd":cwd}
+        ]}))
+        .unwrap();
+        let out = tokio::task::LocalSet::new().run_until(t.task(a, &ctx())).await;
+        let (local, far) = out.text.split_once("## Far").expect("both rows");
+        assert!(local.contains(r#""agent":"scout""#) && !local.contains("mirrorSession"), "{local}");
+        assert!(!local.contains(r#""relay""#), "a local child is not relayed: {local}");
+        assert!(far.contains("remote says hi"), "{far}");
+        assert_eq!(fake.started.lock().unwrap().len(), 1, "one worker started: the task, not the scout");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_failed_launch_prepare_is_that_rows_failure() {
         let mut t = Tools::for_test();
-        t.launcher = vec!["/nonexistent/launcher".into()];
+        t.launch = Some(WorkerLaunch {
+            remote: std::sync::Arc::new(crate::tools::link::test_support::Unused),
+            kinds: vec!["task".into()],
+            reconnect: std::time::Duration::from_secs(1),
+        });
         let dir = mu_testutil::tmp();
         let a: Args = serde_json::from_value(
             json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","cwd":dir.to_str().unwrap()}]}),

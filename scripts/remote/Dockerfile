@@ -1,8 +1,8 @@
-# Worker image for scripts/remote/pod-run.sh: pinned toolchain, git, shellcheck, sccache, a release `mu` and the
+# Worker image for scripts/remote/mu-remote-pod: pinned toolchain, git, shellcheck, sccache, a release `mu` and the
 # crates already fetched. The build context is the repository at one commit, streamed as a tar:
 #   git archive --format=tar HEAD | docker build -t <registry>/mu-worker:<tag> -f scripts/remote/Dockerfile -
-# No secrets are baked in. sccache's bucket comes from SCCACHE_* variables at run time (pod-run.sh forwards the
-# launcher's own and reads a Kubernetes secret for the key).
+# No secrets are baked in. sccache's bucket comes from SCCACHE_* variables at run time (mu-remote-pod forwards the
+# client's own and, on a trusted remote, reads a Kubernetes secret for the key).
 FROM debian:bookworm-slim
 
 ARG SCCACHE_VERSION=0.19.0

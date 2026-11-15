@@ -1,6 +1,7 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
 use super::changes;
+use super::link::{self, WorkerLaunch, WorkerRemote};
 use super::relay::{RelayAllow, RelayServer};
 use super::task::depth;
 use mu_base::events::{AgentEvent, EventTx, JobChanges};
@@ -10,9 +11,12 @@ use mu_provider::provider::relay::Call;
 use mu_session::session::file::MirrorFile;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
@@ -76,9 +80,6 @@ pub fn preview_result(text: &str, cwd: &Path, alloc: impl FnOnce() -> (u32, std:
 /// The version a parent puts in a task payload; a worker of another version refuses the task.
 pub const MU_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The file descriptor a launcher reports `changes` on. The worker's stdout cannot reach it.
-const CHANGES_FD: i32 = 3;
-
 /// How long a dead parent's task ref is kept.
 const REF_MAX_AGE: Duration = changes::KEPT_AFTER;
 
@@ -100,15 +101,18 @@ pub fn launch_id(name: &str) -> String {
     format!("{slug}-{}", &random[..8])
 }
 
-/// A subagent started through `[task] launcher`. Dropping it deletes the task ref, so the ref goes
-/// on every way out of the run, including a launcher that never started.
+/// A subagent started on a remote. Dropping it deletes the task ref and the bundle, so they go on
+/// every way out of the run, including a worker that never started.
 pub struct Launch {
-    argv: Vec<String>,
+    remote: Arc<dyn WorkerRemote>,
+    reconnect: Duration,
     id: String,
     root: PathBuf,
-    session: String,
     task_ref: String,
-    result_ref: String,
+    /// The snapshot commit the result is a change from.
+    base: String,
+    /// Holds the task bundle and, later, the result bundle.
+    dir: PathBuf,
 }
 
 impl Drop for Launch {
@@ -120,22 +124,28 @@ impl Drop for Launch {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// How a subagent is started: `mu --headless` here, or the launcher.
+/// How a subagent is started: `mu --headless` here, or as a worker on a remote.
 pub enum ChildCmd {
     Local(PathBuf),
     Launched(Launch),
 }
 
-/// Commits the parent's working tree (untracked files included) as `refs/mu/task/<id>` for the
-/// launcher to ship. `session` is the parent's session id, empty when it has no file yet.
-pub async fn prepare_launch(launcher: &[String], cwd: &Path, name: &str, session: &str) -> Result<Launch, String> {
-    if launcher.is_empty() {
-        return Err("task: the launcher is empty".into());
-    }
+/// Where a worker's checkout goes on the remote. The adapter may map it.
+fn remote_dir(id: &str) -> String {
+    format!("/work/{id}")
+}
+
+/// Commits the parent's working tree (untracked files included) as `refs/mu/task/<id>` and writes
+/// it, with its full history, as a bundle for the remote to start from. A remote that does not
+/// accept the repository refuses before anything is made.
+pub async fn prepare_launch(on: &WorkerLaunch, cwd: &Path, name: &str) -> Result<Launch, String> {
     let root = repo_root(cwd).await.map_err(|_| "task: a launched subagent needs a git repository".to_string())?;
+    let (remote, at) = (on.remote.clone(), root.clone());
+    tokio::task::spawn_blocking(move || remote.admit(&at)).await.map_err(|e| format!("task: {e}"))??;
     let _ = changes::prune(&root, REF_MAX_AGE).await;
     let _ = prune_refs(&root, "refs/mu/task/", REF_MAX_AGE).await;
     let id = launch_id(name);
@@ -146,17 +156,35 @@ pub async fn prepare_launch(launcher: &[String], cwd: &Path, name: &str, session
         args.extend(["-p", "HEAD"]);
     }
     args.extend(["-m", &message]);
-    let commit = git(&root, &args, None).await?;
+    let commit = git(&root, &args, None).await?.trim().to_string();
     let task_ref = format!("refs/mu/task/{id}");
-    git(&root, &["update-ref", &task_ref, commit.trim()], None).await?;
-    Ok(Launch {
-        argv: launcher.to_vec(),
-        result_ref: format!("refs/mu/result/{id}"),
+    git(&root, &["update-ref", &task_ref, &commit], None).await?;
+    let launch = Launch {
+        remote: on.remote.clone(),
+        reconnect: on.reconnect,
+        dir: std::env::temp_dir().join(format!("mu-launch-{id}")),
         id,
         root,
-        session: session.to_string(),
         task_ref,
-    })
+        base: commit,
+    };
+    mu_common::fs::create_private_dir(&launch.dir).map_err(|e| format!("task: cannot make the bundle: {e}"))?;
+    let bundle = launch.dir.join("task.bundle");
+    // No timeout: a long history takes as long as it takes.
+    let out = tokio::process::Command::new("git")
+        .args(["bundle", "create"])
+        .arg(&bundle)
+        .arg(&launch.task_ref)
+        .current_dir(&launch.root)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("task: git bundle: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("task: git bundle: {}", err.lines().next().unwrap_or("failed").trim()));
+    }
+    Ok(launch)
 }
 
 /// One line of a child's stdout: a progress event, or the final result.
@@ -192,69 +220,19 @@ enum ChildEvent {
     /// A model or search call of a relayed child; the line is read again as a `Call`.
     Relay(serde::de::IgnoredAny),
     Result(ChildResult),
-    /// Only the launcher may report changes, on `CHANGES_FD`; on the worker's stdout it is ignored.
+    /// A worker never reports its changes: mu reads the result bundle itself. A `changes` line is ignored.
     Changes(serde::de::IgnoredAny),
-}
-
-/// A launcher's report of the worker's changes, after the `result` line.
-#[derive(Deserialize)]
-struct ChangesLine {
-    #[serde(rename = "type")]
-    ty: String,
-    r#ref: String,
-    base: String,
-    #[serde(default)]
-    files: u64,
-}
-
-/// The `changes` reports in what the launcher wrote on `CHANGES_FD`: the last one that names this
-/// launch's own result ref and a commit hash as its base.
-fn read_changes(pipe: &mut std::fs::File, result_ref: &str) -> Option<(String, String, u64)> {
-    use std::io::Read;
-    let mut data = Vec::new();
-    let mut buf = [0u8; 4096];
-    // The pipe is non-blocking and the launcher has written before it exited; a leftover process
-    // that holds the write end open must not hold this read.
-    while data.len() < 64 * 1024 {
-        match pipe.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => data.extend_from_slice(&buf[..n]),
-        }
-    }
-    let valid_base = |b: &str| matches!(b.len(), 40 | 64) && b.bytes().all(|c| c.is_ascii_hexdigit());
-    String::from_utf8_lossy(&data)
-        .lines()
-        .filter_map(|l| serde_json::from_str::<ChangesLine>(l).ok())
-        .rfind(|c| c.ty == "changes" && c.r#ref == result_ref && valid_base(&c.base))
-        .map(|c| (c.r#ref, c.base, c.files))
-}
-
-/// Gives `cmd` a pipe as file descriptor `CHANGES_FD` and returns its read end.
-fn changes_pipe(cmd: &mut tokio::process::Command) -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
-    use std::os::fd::AsRawFd;
-    let (tx, rx) = tokio::net::unix::pipe::pipe()?;
-    let (write, read) = (tx.into_blocking_fd()?, rx.into_nonblocking_fd()?);
-    let w = write.as_raw_fd();
-    // SAFETY: dup2 and fcntl are async-signal-safe.
-    unsafe {
-        cmd.pre_exec(move || {
-            if w == CHANGES_FD {
-                if libc::fcntl(w, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            } else if libc::dup2(w, CHANGES_FD) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    Ok((std::fs::File::from(read), write))
+    /// A remote worker's last line: how its process ended and the tail of its stderr.
+    Exit {
+        #[serde(default)]
+        stderr: String,
+    },
 }
 
 /// Reads one line into `buf`, newline included, keeping at most `cap` bytes of it. `None` at the
 /// end of input; `Some(true)` when the line was longer than `cap`, which is read to its end and
 /// dropped (`buf` is then empty).
-async fn read_line_capped<R: AsyncBufRead + Unpin>(
+pub(super) async fn read_line_capped<R: AsyncBufRead + Unpin>(
     r: &mut R,
     buf: &mut Vec<u8>,
     cap: usize,
@@ -478,105 +456,102 @@ pub async fn run_child_observed(
     mirror: Mirror,
     relay: Option<&RelayServer>,
 ) -> Outcome {
-    let launched = matches!(child, ChildCmd::Launched(_));
-    let (job, result_ref) = match &child {
-        ChildCmd::Launched(l) => (l.id.clone(), Some(l.result_ref.clone())),
-        ChildCmd::Local(_) => (String::new(), None),
-    };
-    let snapshot = match &child {
-        ChildCmd::Launched(l) => Some((l.root.clone(), l.task_ref.clone())),
-        ChildCmd::Local(_) => None,
-    };
-    let mut cmd = match &child {
-        ChildCmd::Local(exe) => {
-            let mut cmd = tokio::process::Command::new(exe);
-            cmd.arg("--headless");
-            cmd
-        }
-        ChildCmd::Launched(l) => {
-            let Some((program, args)) = l.argv.split_first() else {
-                return Outcome::failed("cannot start subagent: the launcher is empty");
-            };
-            let mut cmd = tokio::process::Command::new(program);
-            cmd.args(args)
-                .env("MU_TASK_NAME", &l.id)
-                .env("MU_TASK_ROOT", &l.root)
-                .env("MU_TASK_CWD", cwd)
-                .env("MU_TASK_REF", &l.task_ref)
-                .env("MU_TASK_RESULT_REF", &l.result_ref)
-                .env("MU_TASK_SESSION", &l.session)
-                .env("MU_TASK_PARENT_PID", std::process::id().to_string())
-                .env("MU_TASK_MU_HOME", mu_common::paths::mu_home())
-                .env("MU_TASK_PROFILE_HOME", mu_common::paths::profile_home())
-                .env("MU_TASK_AGENT_DIR", mu_common::paths::omp_agent_dir());
-            cmd
-        }
-    };
-    cmd.current_dir(cwd)
-        .env("MU_TASK_DEPTH", (depth() + 1).to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Only a launcher reports changes, on a pipe the worker's stdout has no way into.
-    let mut changes_in = None;
-    if launched {
-        match changes_pipe(&mut cmd) {
-            Ok((read, write)) => changes_in = Some((read, write)),
-            Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
-        }
-    }
-    let mut child = match mu_base::process::spawn_grouped(&mut cmd, true) {
-        Ok(c) => c,
-        Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
-    };
-    // The write end is the child's alone from here.
-    let mut changes_in = changes_in.map(|(read, _write)| read);
-    let pid = child.id().unwrap_or(0) as i32;
-    let job = if job.is_empty() { format!("pid-{pid}") } else { job };
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    // The task payload, then one line per approval answer, for as long as the child reads them.
-    let (wtx, mut wrx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<String>();
     // What the parent put in the payload is what the child may call; a payload without it, none.
     let allow: RelayAllow =
         payload.get("relayModels").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
-    let relay = relay.map(|r| r.start(wtx.clone(), &job, allow));
     let task = payload.to_string();
-    tokio::task::spawn_local(async move {
-        let _ = stdin.write_all(task.as_bytes()).await;
-        let _ = stdin.write_all(b"\n").await;
-        while let Some(line) = wrx.recv().await {
-            if stdin.write_all(line.as_bytes()).await.is_err() || stdin.write_all(b"\n").await.is_err() {
-                break;
-            }
+    let link_cancel = CancellationToken::new();
+    let mut local: Option<(tokio::process::Child, tokio::task::JoinHandle<String>)> = None;
+    let mut launch: Option<(Launch, String)> = None;
+    let (job, mut source, pid) = match child {
+        ChildCmd::Local(exe) => {
+            let mut cmd = tokio::process::Command::new(exe);
+            cmd.arg("--headless")
+                .current_dir(cwd)
+                .env("MU_TASK_DEPTH", (depth() + 1).to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = match mu_base::process::spawn_grouped(&mut cmd, true) {
+                Ok(c) => c,
+                Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
+            };
+            let pid = child.id().unwrap_or(0) as i32;
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            // The task payload, then one line per approval answer, for as long as the child reads them.
+            let mut wrx = wrx;
+            tokio::task::spawn_local(async move {
+                let _ = stdin.write_all(task.as_bytes()).await;
+                let _ = stdin.write_all(b"\n").await;
+                while let Some(line) = wrx.recv().await {
+                    if stdin.write_all(line.as_bytes()).await.is_err() || stdin.write_all(b"\n").await.is_err() {
+                        break;
+                    }
+                }
+                let _ = stdin.shutdown().await;
+            });
+            let stderr = child.stderr.take().expect("stderr is piped");
+            let err_task = tokio::task::spawn_local(async move {
+                let mut tail: std::collections::VecDeque<String> = Default::default();
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    if tail.len() == 20 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(l);
+                }
+                tail.into_iter().collect::<Vec<_>>().join("\n")
+            });
+            let source = Source::Pipe(BufReader::new(child.stdout.take().expect("stdout is piped")));
+            local = Some((child, err_task));
+            (format!("pid-{pid}"), source, pid)
         }
-        let _ = stdin.shutdown().await;
-    });
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let err_task = tokio::task::spawn_local(async move {
-        let mut tail: std::collections::VecDeque<String> = Default::default();
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
-            if tail.len() == 20 {
-                tail.pop_front();
-            }
-            tail.push_back(l);
+        ChildCmd::Launched(l) => {
+            let (remote, id, bundle, dir) =
+                (l.remote.clone(), l.id.clone(), l.dir.join("task.bundle"), remote_dir(&l.id));
+            let started = tokio::task::spawn_blocking({
+                let remote = remote.clone();
+                move || remote.start(&id, &bundle, &dir, &mut |_| {})
+            })
+            .await;
+            let worker = match started {
+                Ok(Ok(w)) => w,
+                Ok(Err(e)) => return Outcome::failed(format!("cannot start a worker on {}: {e}", remote.name())),
+                Err(e) => return Outcome::failed(format!("cannot start a worker on {}: {e}", remote.name())),
+            };
+            let source = Source::Link(link::open(
+                remote,
+                worker.clone(),
+                payload.clone(),
+                wrx,
+                link_cancel.clone(),
+                l.reconnect,
+            ));
+            let job = l.id.clone();
+            launch = Some((l, worker));
+            (job, source, 0)
         }
-        tail.into_iter().collect::<Vec<_>>().join("\n")
-    });
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    };
+    let relay = relay.map(|r| r.start(wtx.clone(), &job, allow));
+    let launched = launch.is_some();
     let mut result: Option<ChildResult> = None;
     let mut cancelled = false;
     let mut bad_line: Option<String> = None;
     let mut mirrors = Mirrors::default();
     let mut notices: Vec<String> = Vec::new();
     let mut bad_entry = false;
+    let mut end = (false, None::<String>);
+    let mut worker_stderr: Option<String> = None;
+    // Answers already given, so a worker that asks again after a lost stream is not asked twice.
+    let answers: Rc<RefCell<HashMap<u64, Option<String>>>> = Rc::default();
     let parent_session = payload["parentSession"].as_str();
     let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
         tokio::select! {
-            n = read_line_capped(&mut stdout, &mut line, mu_common::rpc::MAX_LINE) => match n {
+            n = source.next(&mut line, &mut end) => match n {
                 Ok(None) => break,
                 Ok(Some(true)) => {
                     bad_line.get_or_insert_with(|| {
@@ -609,7 +584,7 @@ pub async fn run_child_observed(
                                         let _ = tx.send(AgentEvent::ChildEntry { file, line });
                                     }
                                     Mirror::Write => {
-                                        let launch = if launched { job.as_str() } else { "" };
+                                        let launch = launch.as_ref().map_or("", |(l, _)| l.id.as_str());
                                         let (created, notice) = mirrors.write(cwd, &file, &line, parent_session, launch);
                                         if let Some(path) = created {
                                             on_session(&path);
@@ -621,19 +596,31 @@ pub async fn run_child_observed(
                         }
                         Ok(ChildEvent::Entry { .. }) => {}
                         Ok(ChildEvent::Approve { id, request }) => {
-                            let rx = match approve {
-                                Some(f) => f(request),
-                                None => {
-                                    let (tx, rx) = oneshot::channel();
-                                    let _ = tx.send(ApprovalDecision::Unavailable);
-                                    rx
+                            let known = answers.borrow().get(&id).cloned();
+                            match known {
+                                Some(Some(answer)) => {
+                                    let _ = wtx.send(answer);
                                 }
-                            };
-                            let out = wtx.clone();
-                            tokio::task::spawn_local(async move {
-                                let d = rx.await.unwrap_or(ApprovalDecision::Deny { note: None });
-                                let _ = out.send(json!({"type": "approval", "id": id, "decision": d}).to_string());
-                            });
+                                Some(None) => {}
+                                None => {
+                                    answers.borrow_mut().insert(id, None);
+                                    let rx = match approve {
+                                        Some(f) => f(request),
+                                        None => {
+                                            let (tx, rx) = oneshot::channel();
+                                            let _ = tx.send(ApprovalDecision::Unavailable);
+                                            rx
+                                        }
+                                    };
+                                    let (out, answers) = (wtx.clone(), answers.clone());
+                                    tokio::task::spawn_local(async move {
+                                        let d = rx.await.unwrap_or(ApprovalDecision::Deny { note: None });
+                                        let answer = json!({"type": "approval", "id": id, "decision": d}).to_string();
+                                        answers.borrow_mut().insert(id, Some(answer.clone()));
+                                        let _ = out.send(answer);
+                                    });
+                                }
+                            }
                         }
                         Ok(ChildEvent::Relay(_)) => {
                             let call = serde_json::from_slice::<Value>(&line).ok().and_then(|v| Call::parse(&v));
@@ -647,6 +634,7 @@ pub async fn run_child_observed(
                                 run.finish();
                             }
                         }
+                        Ok(ChildEvent::Exit { stderr }) => worker_stderr = Some(stderr),
                         Ok(ChildEvent::Changes(_)) => {}
                         Err(_) => {
                             let text = String::from_utf8_lossy(&line);
@@ -670,28 +658,35 @@ pub async fn run_child_observed(
                 if pid > 0 {
                     tokio::task::spawn_local(mu_base::process::terminate_group(pid));
                 }
+                link_cancel.cancel();
             }
         }
     }
     let capped = relay.as_ref().and_then(|r| r.capped());
     drop(relay);
     drop(wtx);
-    // A child that ignores everything must not hang the parent: bound the wait, then kill.
-    if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await.is_err() {
-        mu_base::process::kill_group(pid, libc::SIGKILL);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
-    }
-    // A descendant that inherited stderr can hold it open after the child is gone.
-    let err_abort = err_task.abort_handle();
-    let stderr_tail = match tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await {
-        Ok(tail) => tail.unwrap_or_default(),
-        Err(_) => {
-            err_abort.abort();
-            String::new()
+    let mut stderr_tail = worker_stderr.unwrap_or_default();
+    if let Some((mut child, err_task)) = local {
+        // A child that ignores everything must not hang the parent: bound the wait, then kill.
+        if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await.is_err() {
+            mu_base::process::kill_group(pid, libc::SIGKILL);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
         }
-    };
+        // A descendant that inherited stderr can hold it open after the child is gone.
+        let err_abort = err_task.abort_handle();
+        stderr_tail = match tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await {
+            Ok(tail) => tail.unwrap_or_default(),
+            Err(_) => {
+                err_abort.abort();
+                String::new()
+            }
+        };
+    }
     drop(mirrors);
-    let changes = changes_in.as_mut().zip(result_ref).and_then(|(pipe, r)| read_changes(pipe, &r));
+    let (gave_up, lost) = end;
+    if stderr_tail.is_empty() {
+        stderr_tail = lost.clone().unwrap_or_default();
+    }
     let mut out = outcome(result, payload, cancelled, stderr_tail, bad_line);
     for n in notices {
         out.text.push('\n');
@@ -700,19 +695,80 @@ pub async fn run_child_observed(
     if let Some(cap) = capped {
         out.text.push_str(&format!("\n[task spend cap of ${cap:.2} reached; later model calls were refused]"));
     }
-    if let (Some((r#ref, base, _)), Some((root, task_ref))) = (changes, snapshot) {
-        // A task that failed or was cancelled leaves its changes for the user to look at.
-        let auto = if out.ok {
-            changes::auto_apply(&root, &task_ref, &base, &r#ref).await
-        } else {
-            changes::Auto::Failed("the task did not finish".into())
-        };
-        out.text.push('\n');
-        out.text.push_str(&changes::summary(&auto, &r#ref, &base));
-        let applied = matches!(auto, changes::Auto::Applied(_));
-        out.changes = Some(JobChanges { r#ref, base, applied });
+    if let Some((l, worker)) = &launch {
+        match collect(l, worker, cancelled).await {
+            Ok(Some(result_ref)) => {
+                // A task that failed or was cancelled leaves its changes for the user to look at.
+                let auto = if out.ok {
+                    changes::auto_apply(&l.root, &l.task_ref, &l.base, &result_ref).await
+                } else {
+                    changes::Auto::Failed("the task did not finish".into())
+                };
+                out.text.push('\n');
+                out.text.push_str(&changes::summary(&auto, &result_ref, &l.base));
+                let applied = matches!(auto, changes::Auto::Applied(_));
+                out.changes = Some(JobChanges { r#ref: result_ref, base: l.base.clone(), applied });
+            }
+            Ok(None) => {}
+            Err(e) => out.text.push_str(&format!("\n[worker {worker} on {}: {e}]", l.remote.name())),
+        }
+        if gave_up
+            && out.ok
+            && let Some(n) = lost
+        {
+            out.text.push_str(&format!("\n[{n}]"));
+        }
     }
     out
+}
+
+/// Where a worker's stream: the lines of a local pipe, or of the reconnecting link to a remote.
+enum Source {
+    Pipe(BufReader<tokio::process::ChildStdout>),
+    Link(tokio::sync::mpsc::UnboundedReceiver<link::Item>),
+}
+
+impl Source {
+    /// `read_line_capped`; a link's end is `end`: whether the parent gave up on it, and why.
+    async fn next(&mut self, buf: &mut Vec<u8>, end: &mut (bool, Option<String>)) -> std::io::Result<Option<bool>> {
+        match self {
+            Self::Pipe(r) => read_line_capped(r, buf, mu_common::rpc::MAX_LINE).await,
+            Self::Link(rx) => match rx.recv().await {
+                Some(link::Item::Line(b)) => {
+                    buf.extend_from_slice(&b);
+                    Ok(Some(false))
+                }
+                Some(link::Item::TooLong) => Ok(Some(true)),
+                Some(link::Item::End { gave_up, note }) => {
+                    *end = (gave_up, note);
+                    Ok(None)
+                }
+                None => Ok(None),
+            },
+        }
+    }
+}
+
+/// Fetches what the worker committed and imports it as the launch's result ref, then stops the
+/// worker. A worker whose result could not be fetched is left running unless the run was cancelled.
+async fn collect(l: &Launch, worker: &str, cancelled: bool) -> Result<Option<String>, String> {
+    let file = l.dir.join("result.bundle");
+    let fetched = tokio::task::spawn_blocking({
+        let (remote, worker, file) = (l.remote.clone(), worker.to_string(), file.clone());
+        move || {
+            let mut out = std::fs::File::create(&file).map_err(|e| format!("cannot write the result bundle: {e}"))?;
+            remote.fetch(&worker, &mut out)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    if fetched.is_ok() || cancelled {
+        let (remote, worker) = (l.remote.clone(), worker.to_string());
+        let _ = tokio::task::spawn_blocking(move || remote.stop(&worker)).await;
+    }
+    fetched.map_err(|e| format!("result not fetched: {e}"))?;
+    changes::import_bundle(&l.root, &file, &l.id, &l.base).await.map_err(|e| format!("result not kept: {e}"))
 }
 
 const BAD_LINE_CHARS: usize = 300;
@@ -806,16 +862,10 @@ mod child_line_tests {
 #[cfg(test)]
 mod launch_tests {
     use super::*;
-    use mu_testutil::{pid_in, repo, sh, tmp, wait_gone};
-    use std::os::unix::fs::PermissionsExt;
+    use crate::tools::link::test_support::{Fake, result_bundle};
+    use mu_testutil::{repo, sh, tmp};
+    use std::sync::atomic::Ordering;
     use tokio_util::sync::CancellationToken;
-
-    fn script(dir: &Path, body: &str) -> String {
-        let path = dir.join("launcher");
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path.display().to_string()
-    }
 
     fn task_refs(root: &Path) -> String {
         sh(root, &["for-each-ref", "refs/mu/task/"])
@@ -837,50 +887,33 @@ mod launch_tests {
         assert_eq!(launch_id(&long).len(), 40 + 1 + 8);
     }
 
-    const FAKE: &str = r#"#!/bin/sh
-IFS= read -r line
-echo '{"type":"session","path":"/s/worker.jsonl"}'
-echo '{"type":"tool","name":"read","summary":"x"}'
-snap=$(git -C "$MU_TASK_ROOT" show "$MU_TASK_REF:new.txt")
-printf '{"type":"result","text":"args=%s name=%s root=%s cwd=%s ref=%s result=%s session=%s ppid=%s depth=%s snap=%s home=%s"}\n' \
-  "$#" "$MU_TASK_NAME" "$MU_TASK_ROOT" "$MU_TASK_CWD" "$MU_TASK_REF" "$MU_TASK_RESULT_REF" "$MU_TASK_SESSION" \
-  "$MU_TASK_PARENT_PID" "$MU_TASK_DEPTH" "$snap" "$(test -n "$MU_TASK_MU_HOME$MU_TASK_PROFILE_HOME$MU_TASK_AGENT_DIR" && echo set)"
-echo '{"type":"changes","ref":"refs/mu/result/forged","base":"1111111111111111111111111111111111111111","files":99}'
-"#;
-
-    /// What a launcher does after the result: commit `text` as `file` on top of the snapshot into the
-    /// result ref and report it on fd 3. `meanwhile` runs first, as the user working in the tree would.
-    fn work(file: &str, text: &str, meanwhile: &str) -> String {
-        format!(
-            r#"{meanwhile}
-R="$MU_TASK_ROOT"
-export GIT_INDEX_FILE="$(mktemp -u)"
-git -C "$R" read-tree "$MU_TASK_REF"
-blob=$(printf '%s\n' '{text}' | git -C "$R" hash-object -w --stdin)
-git -C "$R" update-index --add --cacheinfo "100644,$blob,{file}"
-c=$(git -C "$R" -c user.name=w -c user.email=w@w commit-tree "$(git -C "$R" write-tree)" -p "$MU_TASK_REF" -m work)
-git -C "$R" update-ref "$MU_TASK_RESULT_REF" "$c"
-unset GIT_INDEX_FILE
-printf '{{"type":"changes","ref":"%s","base":"%s","files":1}}\n' "$MU_TASK_RESULT_REF" "$(git -C "$R" rev-parse "$MU_TASK_REF")" >&3
-"#
-        )
+    /// What a worker says over a connection: it reads the parent's `resume` and `task` lines first.
+    fn worker(lines: &str) -> String {
+        format!("IFS= read -r a; IFS= read -r b\n{lines}\n")
     }
 
-    fn worker(file: &str, text: &str, meanwhile: &str) -> String {
-        format!(
-            "#!/bin/sh\nIFS= read -r line\necho '{{\"type\":\"result\",\"text\":\"done\"}}'\n{}",
-            work(file, text, meanwhile)
-        )
+    const DONE: &str = r#"echo '{"type":"tool","name":"read","summary":"x","seq":1}'
+echo '{"type":"result","text":"done","seq":2}'
+echo '{"type":"exit","code":0,"stderr":"","seq":3}'"#;
+
+    fn on(fake: &Arc<Fake>, ms: u64) -> WorkerLaunch {
+        WorkerLaunch { remote: fake.clone(), kinds: vec!["task".into()], reconnect: Duration::from_millis(ms) }
     }
 
-    async fn run_in(root: &Path, launcher: &[String], name: &str) -> Outcome {
-        let launch = prepare_launch(launcher, root, name, "").await.unwrap();
+    async fn go(
+        root: &Path,
+        on: &WorkerLaunch,
+        name: &str,
+        cancel: &CancellationToken,
+        tools: &RefCell<Vec<String>>,
+    ) -> Outcome {
+        let launch = prepare_launch(on, root, name).await.unwrap();
         run_child_observed(
             ChildCmd::Launched(launch),
             root,
-            &json!({}),
-            &CancellationToken::new(),
-            |_, _| {},
+            &json!({"task": "go"}),
+            cancel,
+            |n, s| tools.borrow_mut().push(format!("{n} {s}")),
             |_| {},
             |_| {},
             None,
@@ -890,22 +923,29 @@ printf '{{"type":"changes","ref":"%s","base":"%s","files":1}}\n' "$MU_TASK_RESUL
         .await
     }
 
+    async fn run_on(root: &Path, fake: &Arc<Fake>, name: &str) -> Outcome {
+        let tools = RefCell::new(Vec::new());
+        tokio::task::LocalSet::new().run_until(go(root, &on(fake, 5000), name, &CancellationToken::new(), &tools)).await
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_result_over_an_unchanged_tree_is_applied() {
         let root = repo();
-        let launcher = vec![script(&tmp(), &worker("a.txt", "worked", ""))];
-        let out = tokio::task::LocalSet::new().run_until(run_in(&root, &launcher, "t")).await;
+        let fake = Arc::new(Fake::new(&[&worker(DONE)]).writing("a.txt", "worked"));
+        let out = run_on(&root, &fake, "t").await;
         assert!(out.ok && out.text.contains("[changes: applied: 1 files; ref refs/mu/result/t-"), "{}", out.text);
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "worked\n");
         assert!(out.changes.is_some_and(|c| c.applied));
+        assert_eq!(fake.stopped.lock().unwrap().len(), 1, "the worker is stopped once its result is in");
+        assert_eq!(task_refs(&root), "", "the task ref is gone after the run");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_result_is_kept_when_a_file_it_touches_changed_meanwhile() {
         let root = repo();
-        let meanwhile = format!("echo mine > {}/a.txt", root.display());
-        let launcher = vec![script(&tmp(), &worker("a.txt", "worked", &meanwhile))];
-        let out = tokio::task::LocalSet::new().run_until(run_in(&root, &launcher, "t")).await;
+        let script = worker(&format!("echo mine > {}/a.txt\n{DONE}", root.display()));
+        let fake = Arc::new(Fake::new(&[&script]).writing("a.txt", "worked"));
+        let out = run_on(&root, &fake, "t").await;
         assert!(out.ok, "{}", out.text);
         let line = out.text.lines().last().unwrap();
         assert!(
@@ -921,14 +961,10 @@ printf '{{"type":"changes","ref":"%s","base":"%s","files":1}}\n' "$MU_TASK_RESUL
     #[tokio::test(flavor = "current_thread")]
     async fn two_results_finishing_together_are_both_applied() {
         let root = repo();
-        let bin = tmp();
-        let (one, two) = (bin.join("one"), bin.join("two"));
-        std::fs::create_dir_all(&one).unwrap();
-        std::fs::create_dir_all(&two).unwrap();
-        let (l1, l2) =
-            (vec![script(&one, &worker("a.txt", "first", ""))], vec![script(&two, &worker("b.txt", "second", ""))]);
+        let one = Arc::new(Fake::new(&[&worker(DONE)]).writing("a.txt", "first"));
+        let two = Arc::new(Fake::new(&[&worker(DONE)]).writing("b.txt", "second"));
         let (o1, o2) = tokio::task::LocalSet::new()
-            .run_until(async { tokio::join!(run_in(&root, &l1, "one"), run_in(&root, &l2, "two")) })
+            .run_until(async { tokio::join!(run_on_local(&root, &one, "one"), run_on_local(&root, &two, "two")) })
             .await;
         assert!(
             o1.text.contains("applied: 1 files") && o2.text.contains("applied: 1 files"),
@@ -940,175 +976,117 @@ printf '{{"type":"changes","ref":"%s","base":"%s","files":1}}\n' "$MU_TASK_RESUL
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "second\n");
     }
 
+    async fn run_on_local(root: &Path, fake: &Arc<Fake>, name: &str) -> Outcome {
+        go(root, &on(fake, 5000), name, &CancellationToken::new(), &RefCell::new(Vec::new())).await
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_task_leaves_its_result_unapplied() {
         let root = repo();
-        let body = format!(
-            "#!/bin/sh\nIFS= read -r line\necho '{{\"type\":\"result\",\"isError\":true,\"text\":\"broke\"}}'\n{}",
-            work("a.txt", "worked", "")
+        let script = worker(
+            r#"echo '{"type":"result","isError":true,"text":"broke","seq":1}'
+echo '{"type":"exit","code":0,"stderr":"","seq":2}'"#,
         );
-        let launcher = vec![script(&tmp(), &body)];
-        let out = tokio::task::LocalSet::new().run_until(run_in(&root, &launcher, "t")).await;
+        let fake = Arc::new(Fake::new(&[&script]).writing("a.txt", "worked"));
+        let out = run_on(&root, &fake, "t").await;
         assert!(!out.ok && out.text.contains("not applied: the task did not finish"), "{}", out.text);
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_launcher_gets_the_environment_and_a_snapshot_commit_and_reports_changes() {
+    async fn a_worker_that_changed_nothing_leaves_no_changes_line() {
         let root = repo();
-        std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
-        let bin = tmp();
-        let launcher = vec![script(&bin, &format!("{FAKE}{}", work("a.txt", "worked", "")))];
-        let sessions = std::cell::RefCell::new(Vec::new());
-        let tools = std::cell::Cell::new(0);
-        let out = tokio::task::LocalSet::new()
-            .run_until(async {
-                let launch = prepare_launch(&launcher, &root, "Review Auth!", "sess-1").await.unwrap();
-                assert!(task_refs(&root).contains(&launch.task_ref), "{}", task_refs(&root));
-                run_child_observed(
-                    ChildCmd::Launched(launch),
-                    &root,
-                    &json!({"task": "go"}),
-                    &CancellationToken::new(),
-                    |_, _| tools.set(tools.get() + 1),
-                    |p| sessions.borrow_mut().push(p.to_string()),
-                    |_| {},
-                    None,
-                    Mirror::Off,
-                    None,
-                )
-                .await
-            })
-            .await;
-        assert!(out.ok, "{}", out.text);
-        let first = out.text.lines().next().unwrap();
-        let id = first.split(" name=").nth(1).unwrap().split(' ').next().unwrap();
-        assert!(id.starts_with("review-auth-"), "{first}");
-        for want in [
-            "args=0 ".to_string(),
-            format!("root={} ", root.display()),
-            format!("cwd={} ", root.display()),
-            format!("ref=refs/mu/task/{id} "),
-            format!("result=refs/mu/result/{id} "),
-            "session=sess-1 ".to_string(),
-            format!("ppid={} ", std::process::id()),
-            "depth=".to_string(),
-            "snap=untracked ".to_string(),
-            "home=set".to_string(),
-        ] {
-            assert!(first.contains(&want), "{want} not in {first}");
-        }
-        assert_eq!(
-            out.text.lines().last().unwrap(),
-            format!("[changes: applied: 1 files; ref refs/mu/result/{id}]"),
-            "the report came on fd 3; the forged one on stdout was ignored"
-        );
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "worked\n");
-        assert!(!out.text.contains("forged") && !out.text.contains("99 files"), "{}", out.text);
-        assert!(sessions.borrow().is_empty(), "a launched child's session is on the worker");
-        assert_eq!(tools.get(), 1);
-        assert_eq!(task_refs(&root), "", "the task ref is gone after the run");
+        let out = run_on(&root, &Arc::new(Fake::new(&[&worker(DONE)])), "t").await;
+        assert!(out.ok && out.text == "done" && out.changes.is_none(), "{}", out.text);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn the_task_ref_is_gone_when_the_launcher_cannot_start() {
+    async fn the_remote_gets_the_launch_id_a_dir_and_a_bundle_of_the_snapshot() {
         let root = repo();
-        let launcher = vec!["/nonexistent/mu-launcher".to_string()];
+        std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+        let fake = Arc::new(Fake::new(&[&worker(DONE)]));
+        let tools = RefCell::new(Vec::new());
         let out = tokio::task::LocalSet::new()
-            .run_until(async {
-                let launch = prepare_launch(&launcher, &root, "t", "").await.unwrap();
-                assert_ne!(task_refs(&root), "");
-                run_child_observed(
-                    ChildCmd::Launched(launch),
-                    &root,
-                    &json!({}),
-                    &CancellationToken::new(),
-                    |_, _| {},
-                    |_| {},
-                    |_| {},
-                    None,
-                    Mirror::Off,
-                    None,
-                )
-                .await
-            })
+            .run_until(go(&root, &on(&fake, 5000), "Review Auth!", &CancellationToken::new(), &tools))
             .await;
-        assert!(!out.ok && out.text.contains("cannot start subagent"), "{}", out.text);
+        assert!(out.ok, "{}", out.text);
+        let started = fake.started.lock().unwrap();
+        let (id, dir, heads) = &started[0];
+        assert!(id.starts_with("review-auth-"), "{id}");
+        assert_eq!(dir, &format!("/work/{id}"));
+        assert!(heads.ends_with(&format!("refs/mu/task/{id}")) && heads.lines().count() == 1, "{heads}");
+        assert_eq!(*tools.borrow(), ["read x"]);
+        assert!(!fake.bundle.lock().unwrap().as_ref().unwrap().exists(), "the bundle is gone with the run");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_task_bundle_carries_the_working_tree_and_the_full_history() {
+        let root = repo();
+        std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+        let before = sh(&root, &["rev-list", "--count", "HEAD"]);
+        let fake = Arc::new(Fake::new(&[&worker(DONE)]).writing("new.txt", "worked"));
+        let out = run_on(&root, &fake, "t").await;
+        // The fake worker built its result on the bundle's snapshot: the untracked file was in it.
+        assert!(out.ok && out.text.contains("applied: 1 files"), "{}", out.text);
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "worked\n");
+        assert_eq!(sh(&root, &["rev-list", "--count", "HEAD"]), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forged_changes_line_on_the_stream_is_ignored() {
+        let root = repo();
+        let script = worker(
+            r#"echo '{"type":"result","text":"done","seq":1}'
+echo '{"type":"changes","ref":"refs/mu/result/forged","base":"1111111111111111111111111111111111111111","files":99,"seq":2}'
+echo '{"type":"exit","code":0,"stderr":"","seq":3}'"#,
+        );
+        let out = run_on(&root, &Arc::new(Fake::new(&[&script])), "t").await;
+        assert!(out.ok && out.text == "done" && out.changes.is_none(), "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_bundle_of_the_wrong_shape_is_not_imported() {
+        let root = repo();
+        for (orphan, name, why) in [
+            (false, Some("refs/mu/result/other"), "does not hold exactly"),
+            (false, Some("refs/heads/main"), "does not hold exactly"),
+            (true, None, "does not descend from the task snapshot"),
+        ] {
+            let mut fake = Fake::new(&[&worker(DONE)]);
+            fake.result = Some(Box::new(move |b, id| result_bundle(b, id, "a.txt", "x", orphan, name)));
+            let out = run_on(&root, &Arc::new(fake), "t").await;
+            assert!(out.ok && out.changes.is_none() && out.text.contains(why), "{why}: {}", out.text);
+            assert_eq!(sh(&root, &["for-each-ref", "refs/mu/result/"]), "", "nothing was kept");
+        }
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_task_ref_is_gone_when_the_remote_cannot_start() {
+        let root = repo();
+        let mut fake = Fake::new(&[&worker(DONE)]);
+        fake.start_error = Some("no capacity".into());
+        let out = run_on(&root, &Arc::new(fake), "t").await;
+        assert!(!out.ok && out.text == "cannot start a worker on fake: no capacity", "{}", out.text);
         assert_eq!(task_refs(&root), "");
     }
 
-    /// Runs a launcher script as one launched task.
-    async fn launched(body: &str) -> Outcome {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_remote_that_refuses_the_repository_launches_nothing() {
         let root = repo();
-        let bin = tmp();
-        let launcher = vec![script(&bin, body)];
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let launch = prepare_launch(&launcher, &root, "t", "").await.unwrap();
-                run_child_observed(
-                    ChildCmd::Launched(launch),
-                    &root,
-                    &json!({}),
-                    &CancellationToken::new(),
-                    |_, _| {},
-                    |_| {},
-                    |_| {},
-                    None,
-                    Mirror::Off,
-                    None,
-                )
-                .await
-            })
-            .await
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_changes_line_on_stdout_alone_is_ignored() {
-        let out = launched(
-            "#!/bin/sh\nIFS= read -r line\necho '{\"type\":\"result\",\"text\":\"done\"}'\n\
-             printf '{\"type\":\"changes\",\"ref\":\"%s\",\"base\":\"0123456789abcdef0123456789abcdef01234567\",\"files\":1}\\n' \"$MU_TASK_RESULT_REF\"\n",
-        )
-        .await;
-        assert!(out.ok && out.text == "done", "{}", out.text);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_changes_report_must_name_the_launchs_ref_and_a_commit_hash() {
-        let report = |r: &str, base: &str| {
-            format!(
-                "#!/bin/sh\nIFS= read -r line\necho '{{\"type\":\"result\",\"text\":\"done\"}}'\n\
-                 printf '{{\"type\":\"changes\",\"ref\":\"%s\",\"base\":\"{base}\",\"files\":1}}\\n' \"{r}\" >&3\n"
-            )
-        };
-        let sha = "0123456789abcdef0123456789abcdef01234567";
-        for (r, base) in
-            [("refs/mu/result/other", sha), ("$MU_TASK_RESULT_REF", "not-a-sha"), ("$MU_TASK_RESULT_REF", "abc")]
-        {
-            let out = launched(&report(r, base)).await;
-            assert!(out.ok && out.text == "done", "{r} {base}: {}", out.text);
-        }
-        let out = launched(&report("$MU_TASK_RESULT_REF", sha)).await;
-        assert!(
-            out.text.contains("[changes: not applied: ") && out.text.contains("ref refs/mu/result/t-"),
-            "{}",
-            out.text
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_descendant_holding_the_changes_pipe_does_not_hold_the_result() {
-        let started = std::time::Instant::now();
-        let out = launched(
-            "#!/bin/sh\nIFS= read -r line\nsleep 20 >/dev/null 2>&1 &\necho '{\"type\":\"result\",\"text\":\"done\"}'\n",
-        )
-        .await;
-        assert!(out.ok && out.text == "done", "{}", out.text);
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        let mut fake = Fake::new(&[&worker(DONE)]);
+        fake.refuse = Some("remote fake is not trusted for /r".into());
+        let fake = Arc::new(fake);
+        let err = prepare_launch(&on(&fake, 100), &root, "t").await.err().unwrap();
+        assert_eq!(err, "remote fake is not trusted for /r");
+        assert_eq!(task_refs(&root), "");
+        assert!(fake.started.lock().unwrap().is_empty() && fake.connects.load(Ordering::SeqCst) == 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_launch_needs_a_git_repository() {
-        let err = prepare_launch(&["x".to_string()], &tmp(), "t", "").await.err().unwrap();
+        let fake = Arc::new(Fake::new(&[&worker(DONE)]));
+        let err = prepare_launch(&on(&fake, 100), &tmp(), "t").await.err().unwrap();
         assert!(err.contains("needs a git repository"), "{err}");
     }
 
@@ -1117,53 +1095,202 @@ printf '{{"type":"changes","ref":"%s","base":"%s","files":1}}\n' "$MU_TASK_RESUL
         let root = tmp();
         sh(&root, &["init", "-q"]);
         std::fs::write(root.join("f"), "x\n").unwrap();
-        let launch = prepare_launch(&["x".to_string()], &root, "t", "").await.unwrap();
+        let fake = Arc::new(Fake::new(&[&worker(DONE)]));
+        let launch = prepare_launch(&on(&fake, 100), &root, "t").await.unwrap();
         let parents = sh(&root, &["rev-list", "--parents", "-n1", &launch.task_ref]);
         assert_eq!(parents.split_whitespace().count(), 1, "{parents}");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cancel_ends_the_launchers_process_group() {
+    async fn the_exit_line_carries_the_workers_stderr_when_it_left_no_result() {
         let root = repo();
-        let bin = tmp();
-        let (p1, p2) = (bin.join("launcher.pid"), bin.join("sleep.pid"));
-        let body = format!(
-            "#!/bin/sh\nIFS= read -r line\necho $$ > {}\nsleep 60 &\necho $! > {}\nwait\n",
-            p1.display(),
-            p2.display()
+        let script = worker(r#"echo '{"type":"exit","code":1,"stderr":"boom, it broke","seq":1}'"#);
+        let out = run_on(&root, &Arc::new(Fake::new(&[&script])), "t").await;
+        assert!(!out.ok && out.text == "boom, it broke", "{}", out.text);
+    }
+
+    /// The parent's side of a stream that drops: the second connection resumes after the last line it
+    /// saw, gets the lines it missed once, and does not get the task again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_stream_resumes_with_no_line_lost_or_repeated() {
+        let root = repo();
+        let log = tmp();
+        let first = format!(
+            r#"IFS= read -r a; IFS= read -r b; printf '%s\n%s\n' "$a" "$b" > {l}/in1
+echo '{{"type":"tool","name":"t","summary":"a","seq":1}}'
+echo '{{"type":"tool","name":"t","summary":"b","seq":2}}'
+echo '{{"type":"tool","name":"t","summary":"c","seq":3}}'
+sleep 0.2"#,
+            l = log.display()
         );
-        let launcher = vec![script(&bin, &body)];
-        let cancel = CancellationToken::new();
+        // A worker that kept b and c unacknowledged replays them: the parent has them already.
+        let second = format!(
+            r#"IFS= read -r a; printf '%s\n' "$a" > {l}/in2; cat >> {l}/in2 &
+echo '{{"type":"tool","name":"t","summary":"b","seq":2}}'
+echo '{{"type":"tool","name":"t","summary":"c","seq":3}}'
+echo '{{"type":"tool","name":"t","summary":"d","seq":4}}'
+echo '{{"type":"result","text":"done","seq":5}}'
+echo '{{"type":"exit","code":0,"stderr":"","seq":6}}'
+sleep 0.3"#,
+            l = log.display()
+        );
+        let fake = Arc::new(Fake::new(&[&first, &second]).writing("a.txt", "worked"));
+        let out = run_on(&root, &fake, "t").await;
+        assert!(out.ok && out.text.contains("applied: 1 files"), "{}", out.text);
+        assert_eq!(fake.connects.load(Ordering::SeqCst), 2);
+        let seen = std::fs::read_to_string(log.join("in1")).unwrap();
+        let mut lines = seen.lines();
+        assert_eq!(lines.next(), Some(crate::tools::link::wire::resume(0).as_str()));
+        assert!(lines.next().is_some_and(|l| l.contains(r#""type":"task""#)), "the task follows the resume");
+        let again = std::fs::read_to_string(log.join("in2")).unwrap();
+        assert_eq!(again.lines().collect::<Vec<_>>(), [crate::tools::link::wire::resume(3)], "resume after 3, no task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_tools_of_a_resumed_stream_are_each_reported_once() {
+        let root = repo();
+        let first = worker(
+            r#"echo '{"type":"tool","name":"t","summary":"a","seq":1}'
+echo '{"type":"tool","name":"t","summary":"b","seq":2}'"#,
+        );
+        let second = worker_resumed(
+            r#"echo '{"type":"tool","name":"t","summary":"b","seq":2}'
+echo '{"type":"tool","name":"t","summary":"c","seq":3}'
+echo '{"type":"result","text":"done","seq":4}'
+echo '{"type":"exit","code":0,"stderr":"","seq":5}'"#,
+        );
+        let fake = Arc::new(Fake::new(&[&first, &second]));
+        let tools = RefCell::new(Vec::new());
+        let out = tokio::task::LocalSet::new()
+            .run_until(go(&root, &on(&fake, 5000), "t", &CancellationToken::new(), &tools))
+            .await;
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(*tools.borrow(), ["t a", "t b", "t c"]);
+    }
+
+    /// A reconnect sends only `resume`: the worker has the task.
+    fn worker_resumed(lines: &str) -> String {
+        format!("IFS= read -r a\n{lines}\n")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gap_in_the_numbers_drops_the_connection_and_asks_again() {
+        let root = repo();
+        let first = worker(
+            r#"echo '{"type":"tool","name":"t","summary":"a","seq":1}'
+echo '{"type":"tool","name":"t","summary":"c","seq":3}'
+sleep 0.2"#,
+        );
+        let second = worker_resumed(
+            r#"echo '{"type":"tool","name":"t","summary":"b","seq":2}'
+echo '{"type":"tool","name":"t","summary":"c","seq":3}'
+echo '{"type":"result","text":"done","seq":4}'
+echo '{"type":"exit","code":0,"stderr":"","seq":5}'"#,
+        );
+        let tools = RefCell::new(Vec::new());
+        let fake = Arc::new(Fake::new(&[&first, &second]));
+        let out = tokio::task::LocalSet::new()
+            .run_until(go(&root, &on(&fake, 5000), "t", &CancellationToken::new(), &tools))
+            .await;
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(*tools.borrow(), ["t a", "t b", "t c"]);
+    }
+
+    /// An approval the parent answered while the stream was down: the worker asks again after the
+    /// reconnect and gets the answer it already has, without the user being asked twice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_approval_asked_again_after_a_drop_is_answered_without_asking_twice() {
+        use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
+        let root = repo();
+        let ask = r#"echo '{"type":"approve","id":1,"request":{"tool":"bash","call_id":"c","title":"bash: touch x","reason":"r","body":"touch x","from":null,"grant":null},"seq":SEQ}'"#;
+        let first = worker(&ask.replace("SEQ", "1"));
+        let second = worker_resumed(&format!(
+            "{}\nIFS= read -r answer\nescaped=$(printf '%s' \"$answer\" | sed 's/\"/\\\\\"/g')\nprintf '{{\"type\":\"result\",\"text\":\"%s\",\"seq\":3}}\\n' \"$escaped\"\necho '{{\"type\":\"exit\",\"code\":0,\"stderr\":\"\",\"seq\":4}}'",
+            ask.replace("SEQ", "2")
+        ));
+        let fake = Arc::new(Fake::new(&[&first, &second]));
+        let asked = RefCell::new(0);
+        let answer = |_: ApprovalRequest| {
+            *asked.borrow_mut() += 1;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None });
+            rx
+        };
         let out = tokio::task::LocalSet::new()
             .run_until(async {
-                let launch = prepare_launch(&launcher, &root, "t", "").await.unwrap();
-                let run = tokio::task::spawn_local({
-                    let cancel = cancel.clone();
-                    async move {
-                        run_child_observed(
-                            ChildCmd::Launched(launch),
-                            &root,
-                            &json!({}),
-                            &cancel,
-                            |_, _| {},
-                            |_| {},
-                            |_| {},
-                            None,
-                            Mirror::Off,
-                            None,
-                        )
-                        .await
-                    }
-                });
-                let (a, b) = (pid_in(&p1).await, pid_in(&p2).await);
-                cancel.cancel();
-                let out = run.await.unwrap();
-                wait_gone(a).await;
-                wait_gone(b).await;
-                out
+                let launch = prepare_launch(&on(&fake, 5000), &root, "t").await.unwrap();
+                run_child_observed(
+                    ChildCmd::Launched(launch),
+                    &root,
+                    &json!({"task": "go"}),
+                    &CancellationToken::new(),
+                    |_, _| {},
+                    |_| {},
+                    |_| {},
+                    Some(&answer),
+                    Mirror::Off,
+                    None,
+                )
+                .await
             })
             .await;
-        assert!(!out.ok && out.text == "cancelled", "{}", out.text);
+        assert!(out.ok && out.text.contains("\"decision\":\"allow\""), "{}", out.text);
+        assert_eq!(*asked.borrow(), 1, "the user was asked once");
+        assert_eq!(fake.connects.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stream_down_past_the_timeout_ends_the_run_and_fetches_what_the_worker_has() {
+        let root = repo();
+        let line = "echo '{\"type\":\"tool\",\"name\":\"t\",\"summary\":\"a\",\"seq\":1}'";
+        let fake = Arc::new(Fake::new(&[&worker(line), &worker_resumed(line)]).writing("a.txt", "partial"));
+        let tools = RefCell::new(Vec::new());
+        let started = std::time::Instant::now();
+        let out = tokio::task::LocalSet::new()
+            .run_until(go(&root, &on(&fake, 700), "t", &CancellationToken::new(), &tools))
+            .await;
+        assert!(!out.ok && out.text.contains("lost the stream to worker t-"), "{}", out.text);
+        assert!(fake.connects.load(Ordering::SeqCst) >= 2, "it tried again");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert_eq!(fake.fetched.load(Ordering::SeqCst), 1);
+        assert!(out.text.contains("not applied: the task did not finish"), "what it committed is kept: {}", out.text);
+        assert_eq!(*tools.borrow(), ["t a"], "each connection replays line 1, and it counts once");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_fetches_what_the_worker_has_and_stops_it() {
+        let root = repo();
+        let script = worker("echo '{\"type\":\"tool\",\"name\":\"t\",\"summary\":\"a\",\"seq\":1}'\nexec sleep 30");
+        let fake = Arc::new(Fake::new(&[&script]).writing("a.txt", "partial"));
+        let cancel = CancellationToken::new();
+        let tools = RefCell::new(Vec::new());
+        let out = tokio::task::LocalSet::new()
+            .run_until(async {
+                let launch_on = on(&fake, 5000);
+                let run = go(&root, &launch_on, "t", &cancel, &tools);
+                let stopper = async {
+                    while tools.borrow().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    cancel.cancel();
+                };
+                tokio::join!(run, stopper).0
+            })
+            .await;
+        assert!(!out.ok && out.text.starts_with("cancelled"), "{}", out.text);
+        assert!(out.changes.is_some_and(|c| !c.applied), "the partial result is kept, not applied");
+        assert_eq!(fake.stopped.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worker_whose_result_cannot_be_fetched_is_left_running() {
+        let root = repo();
+        let mut fake = Fake::new(&[&worker(DONE)]);
+        fake.fetch_error = Some("pod unreachable".into());
+        let fake = Arc::new(fake);
+        let out = run_on(&root, &fake, "t").await;
+        assert!(out.ok && out.text.contains("result not fetched: pod unreachable"), "{}", out.text);
+        assert!(fake.stopped.lock().unwrap().is_empty(), "stopping it would lose the result");
     }
 }
 

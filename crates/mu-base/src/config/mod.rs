@@ -498,10 +498,6 @@ impl Configs {
         if let Some(t) = std::env::var("MU_THEME").ok().filter(|t| !t.is_empty()) {
             mu.theme.source = t;
         }
-        // `MU_TASK_LAUNCHER` replaces `[task] launcher` with one program path.
-        if let Some(l) = std::env::var("MU_TASK_LAUNCHER").ok().filter(|l| !l.is_empty()) {
-            mu.task.launcher = vec![l];
-        }
         let omp = load_omp(&mut warnings);
         let path = models_path();
         let mut models = ModelConfig::default();
@@ -654,11 +650,17 @@ mod tests {
     fn task_budget_defaults_and_overrides() {
         let d = toml::from_str::<MuConfig>("").unwrap().task;
         assert_eq!((d.soft_request_budget, d.budget_notice), (200, true));
-        assert!(d.launcher.is_empty());
+        assert!(d.launch.is_empty() && d.remote.is_none());
+        assert_eq!(d.reconnect_timeout, 600);
         assert_eq!(d.max_cost, 5.0);
         assert_eq!(toml::from_str::<MuConfig>("[task]\nmax_cost = 0").unwrap().task.max_cost, 0.0);
-        let t = toml::from_str::<MuConfig>("[task]\nlauncher = [\"/bin/run\", \"-x\"]").unwrap().task;
-        assert_eq!(t.launcher, ["/bin/run", "-x"]);
+        let t = toml::from_str::<MuConfig>("[task]\nlaunch = [\"task\"]\nremote = \"c\"\nreconnect_timeout = 30")
+            .unwrap()
+            .task;
+        assert_eq!(
+            (t.launch.as_slice(), t.remote.as_deref(), t.reconnect_timeout),
+            (&["task".to_string()][..], Some("c"), 30)
+        );
         let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;
         assert_eq!((t.soft_request_budget, t.budget_notice), (50, false));
     }

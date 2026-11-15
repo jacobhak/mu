@@ -8,6 +8,7 @@ mod glob;
 pub(crate) mod grep;
 mod job_cancel;
 mod job_wait;
+pub mod link;
 mod pathnote;
 mod plan;
 pub(crate) mod read;
@@ -76,8 +77,8 @@ pub struct Tools {
     pub(crate) repeats: std::cell::RefCell<std::collections::HashMap<String, (u64, u32)>>,
     /// The session's tool permissions: the gate reads it, `task` hands it to subagents.
     pub permissions: Rc<crate::permissions::Permissions>,
-    /// `[task] launcher`: when set, `task` subagents start through it instead of `mu --headless`.
-    pub launcher: Vec<String>,
+    /// `[task] launch`: the agent kinds that run as workers on a remote instead of `mu --headless` here.
+    pub launch: Option<link::WorkerLaunch>,
     /// This process's session file is mirrored by its parent, so its children's lines go there too.
     pub mirror: bool,
     shell: shell::worker::ShellWorker,
@@ -116,7 +117,7 @@ impl Tools {
             edit_store: pi_edit::EditStore::new(),
             repeats: Default::default(),
             permissions: Rc::default(),
-            launcher: Vec::new(),
+            launch: None,
             mirror: false,
             shell: Default::default(),
             shell_cwd: Default::default(),

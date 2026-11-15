@@ -60,11 +60,9 @@ pub struct Cli {
     /// Abort `-p` once the session has cost more than this many USD.
     #[arg(long, requires = "print")]
     pub max_cost: Option<f64>,
-    /// Run the terminal UI as a client of the `mu agent` that this shell command reaches: its stdin and
-    /// stdout carry the protocol (`'ssh host mu attach --stdio ID'`, `'kubectl exec -i pod -- mu attach --stdio ID'`). The
-    /// command is run again, with growing pauses, when the connection drops.
-    #[arg(long, value_name = "COMMAND", conflicts_with_all = ["resume", "continue_latest", "print", "headless", "acp"])]
-    pub attach: Option<String>,
+    /// The nested client of a take-over: runs the UI over this shell command's stdin and stdout. Internal.
+    #[arg(long, hide = true, value_name = "COMMAND", conflicts_with_all = ["resume", "continue_latest", "print", "headless", "acp"])]
+    pub nested_client: Option<String>,
     /// Run on this `[remote.NAME]` from config.toml for this run.
     #[arg(short = 'r', long = "remote", value_name = "NAME", conflicts_with = "local")]
     pub remote: Option<String>,
@@ -175,6 +173,13 @@ pub enum Sub {
         #[arg(long, conflicts_with = "session")]
         socket: Option<PathBuf>,
     },
+    /// The remote end of a launched task, run by an adapter: `run` serves the worker (see docs/remote.md),
+    /// `bundle` prints its result, `stop` ends it.
+    #[command(hide = true)]
+    Worker {
+        #[command(subcommand)]
+        cmd: WorkerCmd,
+    },
     /// Remotes from config.toml: `mu remote list|check NAME`.
     Remote {
         #[command(subcommand)]
@@ -212,6 +217,27 @@ pub enum Sub {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(clap::Subcommand)]
+pub enum WorkerCmd {
+    /// Serve worker `--launch ID` in `--dir`, a git checkout, until it is stopped.
+    Run {
+        #[arg(long)]
+        launch: String,
+        #[arg(long)]
+        dir: PathBuf,
+        /// Start the worker in the background and print `{"id":ID}` once it listens.
+        #[arg(long, conflicts_with = "detached")]
+        detach: bool,
+        /// What `--detach` starts.
+        #[arg(long, hide = true)]
+        detached: bool,
+    },
+    /// Commit what the worker changed and print the result as a git bundle (nothing when it changed nothing).
+    Bundle { id: String },
+    /// End the worker, committing what it changed first.
+    Stop { id: String },
 }
 
 #[derive(clap::Subcommand)]

@@ -182,6 +182,33 @@ pub async fn auto_apply(root: &Path, task_ref: &str, base: &str, result_ref: &st
     Auto::Failed(last)
 }
 
+/// Imports the result bundle of launch `launch` as `refs/mu/result/<launch>`. The bundle must hold
+/// that ref and nothing else, and its commit must descend from the task snapshot `base`; otherwise
+/// nothing is kept. `None` when the bundle is empty: the worker changed nothing.
+pub async fn import_bundle(root: &Path, bundle: &Path, launch: &str, base: &str) -> Result<Option<String>, String> {
+    if std::fs::metadata(bundle).map_err(|e| format!("cannot read the result bundle: {e}"))?.len() == 0 {
+        return Ok(None);
+    }
+    let result_ref = format!("{RESULT_PREFIX}{launch}");
+    check(&result_ref, base)?;
+    let file = bundle.to_string_lossy().into_owned();
+    let heads = run(root, &["bundle", "list-heads", &file], None).await?;
+    let heads = String::from_utf8_lossy(&heads);
+    let mut tips = heads.lines().filter_map(|l| l.split_once(' '));
+    match (tips.next(), tips.next()) {
+        (Some((sha, name)), None) if name == result_ref && valid_base(sha) => {}
+        _ => return Err(format!("the result bundle does not hold exactly {result_ref}")),
+    }
+    run(root, &["bundle", "verify", &file], None).await?;
+    run(root, &["fetch", "--no-tags", &file, &format!("{result_ref}:{result_ref}")], None).await?;
+    let descends = run(root, &["merge-base", "--is-ancestor", base, &result_ref], None).await.is_ok();
+    if !descends {
+        let _ = run(root, &["update-ref", "-d", &result_ref], None).await;
+        return Err("the result bundle's commit does not descend from the task snapshot".into());
+    }
+    Ok(Some(result_ref))
+}
+
 /// `git diff base result`, for reading.
 pub async fn diff(root: &Path, base: &str, result_ref: &str) -> Result<String, String> {
     check(result_ref, base)?;

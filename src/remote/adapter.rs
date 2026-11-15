@@ -28,7 +28,7 @@ pub struct Adapter {
     trusted: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StartAgent {
     pub resume: Option<String>,
     pub continue_latest: bool,
@@ -78,6 +78,14 @@ pub struct AgentInfo {
     pub title: Option<String>,
     pub client: Option<ClientInfo>,
     pub waiting: bool,
+    /// `agent` or `worker`; absent means agent.
+    pub kind: String,
+}
+
+impl AgentInfo {
+    pub fn is_agent(&self) -> bool {
+        self.kind.is_empty() || self.kind == "agent"
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -134,10 +142,28 @@ fn kill_group(pid: u32) {
 }
 
 impl Adapter {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn trusted(&self) -> bool {
+        self.trusted
+    }
+
+    /// The refusal for a main agent on a remote not marked `trusted = true`.
+    pub fn untrusted_agent(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "remote {} is not trusted to run a main agent (set trusted = true on a remote you control)",
+            self.name
+        )
+    }
+
     pub fn from_config(name: &str, r: &MuRemote) -> Result<Self> {
         r.validate(name).map_err(anyhow::Error::msg)?;
         let kind = if r.adapter.trim() == "ssh" {
             Kind::Ssh { host: r.host.clone().unwrap_or_default().trim().to_string(), program: ssh::program() }
+        } else if r.adapter.trim() == "pod" {
+            Kind::Program(mu_common::paths::mu_home().join("bin/mu-remote-pod").to_string_lossy().into_owned())
         } else {
             Kind::Program(r.adapter.trim().to_string())
         };
@@ -166,6 +192,9 @@ impl Adapter {
                 c
             }
         };
+        if !self.trusted {
+            super::worker::scrub_env(&mut cmd);
+        }
         cmd.env("MU_REMOTE_NAME", &self.name)
             .env("MU_REMOTE_SETTINGS", &self.settings)
             .env("MU_REMOTE_TRUSTED", if self.trusted { "1" } else { "0" });
@@ -292,6 +321,9 @@ impl Adapter {
 
     /// Starts a detached agent or worker and returns its id once it listens.
     pub fn start(&self, what: &Start, progress: &mut dyn FnMut(&str)) -> Result<String> {
+        if matches!(what, Start::Agent(_)) && !self.trusted {
+            return Err(self.untrusted_agent());
+        }
         let cmd = self.command("start", &what.args(), || ssh::start(what))?;
         parse_started(&self.capture("start", cmd, None, progress)?)
     }
@@ -301,9 +333,14 @@ impl Adapter {
         parse_list(&self.capture("list", cmd, timeout, &mut |_| {})?)
     }
 
-    /// Spawns `connect ID` with piped stdio: the caller owns the stream.
+    /// `connect ID`, not yet spawned: the caller sets the stdio and owns the stream.
+    pub fn connect_command(&self, id: &str) -> Result<Command> {
+        self.command("connect", &[id.to_string()], || Ok(ssh::connect(id)))
+    }
+
+    /// Spawns `connect ID` with piped stdio.
     pub fn connect(&self, id: &str) -> Result<Child> {
-        let mut cmd = self.command("connect", &[id.to_string()], || Ok(ssh::connect(id)))?;
+        let mut cmd = self.connect_command(id)?;
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         spawn(&mut cmd).with_context(|| format!("cannot run adapter `{}`", self.program()))
     }
@@ -394,6 +431,7 @@ esac
                 title: None,
                 client: Some(ClientInfo { host: "h".into(), since: 150 }),
                 waiting: true,
+                kind: String::new(),
             }
         );
         assert_eq!(agents[1].id, "def456");
@@ -431,6 +469,17 @@ esac
         let a = Adapter::from_config("far", &remote(&fake(&dir, 1), false)).unwrap();
         a.list(None).unwrap();
         assert_eq!(log(&dir), [r#"far|{"namespace":"ns"}|0|list"#]);
+    }
+
+    #[test]
+    fn a_main_agent_is_not_started_on_an_untrusted_remote() {
+        let dir = mu_testutil::tmp();
+        let a = Adapter::from_config("far", &remote(&fake(&dir, 1), false)).unwrap();
+        let e = a.start(&Start::Agent(StartAgent::default()), &mut |_| {}).unwrap_err().to_string();
+        assert_eq!(e, "remote far is not trusted to run a main agent (set trusted = true on a remote you control)");
+        assert!(!dir.join("log").exists(), "the adapter was never called");
+        let w = Start::Worker { launch: "L".into(), bundle: "/b".into(), dir: "/d".into() };
+        a.start(&w, &mut |_| {}).unwrap();
     }
 
     #[test]
@@ -503,7 +552,8 @@ esac
             &dir,
             r#"case "$5" in *list*) echo '{"id":"z"}' ;; *) echo '{"session":"s9","socket":"/x"}' ;; esac"#,
         );
-        let a = Adapter::from_config("devbox", &devbox()).unwrap().with_ssh_program(&ssh);
+        let trusted = MuRemote { trusted: true, ..devbox() };
+        let a = Adapter::from_config("devbox", &trusted).unwrap().with_ssh_program(&ssh);
         assert_eq!(a.version(None).unwrap(), 1);
         let argv = |dir: &std::path::Path| {
             std::fs::read_to_string(dir.join("argv")).unwrap().lines().map(str::to_string).collect::<Vec<_>>()

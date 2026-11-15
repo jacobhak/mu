@@ -356,12 +356,142 @@ fn child_requests(seen: &[String]) -> Vec<&String> {
         .collect()
 }
 
+fn on_path(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join(program))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("{program} on PATH"))
+}
+
+/// How a fake remote behaves.
+#[derive(Default)]
+struct Behaviour {
+    trusted: bool,
+    /// `repos` of an untrusted remote.
+    repos: Vec<PathBuf>,
+    /// The first connection is cut after this many lines from the worker (0: never).
+    cut_first: usize,
+    /// The task payload says another mu version on its way to the worker.
+    old_version: bool,
+}
+
+/// A remote that runs its workers on this machine, with a bare home (no key, no gateway), through an
+/// adapter script of the contract. Everything the adapter receives is logged in `log`.
+struct Remote {
+    bare: PathBuf,
+    log: PathBuf,
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        // A worker the test left behind.
+        for e in std::fs::read_dir(self.bare.join("workers")).into_iter().flatten().flatten() {
+            let state = std::fs::read_to_string(e.path().join("state.json")).unwrap_or_default();
+            if let Some(pid) = serde_json::from_str::<serde_json::Value>(&state).ok().and_then(|v| v["pid"].as_i64()) {
+                // SAFETY: a plain signal to a process this test started.
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
+        }
+    }
+}
+
+impl Remote {
+    /// The adapter's received environment, stdin of every connection, stdout of every connection and
+    /// task bundles, as one text.
+    fn received(&self) -> String {
+        let mut all = Vec::new();
+        for e in std::fs::read_dir(&self.log).unwrap().flatten() {
+            all.extend(std::fs::read(e.path()).unwrap());
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    }
+
+    fn log(&self, name: &str) -> String {
+        std::fs::read_to_string(self.log.join(name)).unwrap_or_default()
+    }
+}
+
+/// Makes `[remote.fake]` and `[task] launch = ["task"]` in the parent's `home` over a fake adapter.
+fn remote_for(home: &Path, b: Behaviour) -> Remote {
+    use std::os::unix::fs::PermissionsExt;
+    let bare = mu_testutil::tmp();
+    std::fs::create_dir_all(bare.join("empty-bin")).unwrap();
+    std::fs::copy(home.join("models.toml"), bare.join("models.toml")).unwrap();
+    let log = mu_testutil::tmp();
+    // The parent's PATH is empty, but launching a task commits the tree with git.
+    let _ = std::os::unix::fs::symlink(on_path("git"), home.join("empty-bin/git"));
+    let mangle = if b.old_version {
+        format!(
+            "{{ IFS= read -r r; printf '%s\\n' \"$r\"; IFS= read -r t; printf '%s\\n' \"$t\" | '{}' 's/\"muVersion\":\"[^\"]*\"/\"muVersion\":\"0.0.0\"/'; cat; }}",
+            on_path("sed").display()
+        )
+    } else {
+        "cat".to_string()
+    };
+    let script = format!(
+        r#"#!/bin/sh
+PATH='{path}'; export PATH
+unset MU_GATEWAY_URL ANTHROPIC_API_KEY
+env > '{log}'/env.$1.$$
+W='{bare}'
+as_worker() {{ MU_HOME="$W" HOME="$W" MU_TEST_HOME="$W" '{mu}' "$@"; }}
+case "$1" in
+  version) echo '{{"contract":1}}' ;;
+  start)
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in --launch) launch=$2 ;; --bundle) bundle=$2 ;; esac
+      shift
+    done
+    cat "$bundle" >> '{log}'/bundle.bin
+    d="$W/work/$launch"
+    git init -q "$d" && git -C "$d" fetch -q "$bundle" "refs/mu/task/$launch:refs/mu/task/$launch" \
+      && git -C "$d" checkout -q --detach "refs/mu/task/$launch" || exit 1
+    cd "$d" && as_worker worker run --launch "$launch" --dir "$d" --detach < /dev/null
+    ;;
+  connect)
+    n=$(cat '{log}'/connects.n 2>/dev/null || echo 0)
+    echo $((n + 1)) > '{log}'/connects.n
+    if [ "$n" -eq 0 ] && [ {cut} -gt 0 ]; then
+      {{ tee -a '{log}'/to-worker | {mangle} | as_worker attach --stdio "$2"; }} \
+        | {{ head -n {cut} | tee -a '{log}'/from-worker; kill $$; }}
+    else
+      tee -a '{log}'/to-worker | {mangle} | as_worker attach --stdio "$2" | tee -a '{log}'/from-worker
+    fi
+    ;;
+  fetch) as_worker worker bundle "$2" ;;
+  stop) as_worker worker stop "$2" ;;
+  *) echo "unknown verb $1" >&2; exit 3 ;;
+esac
+"#,
+        path = std::env::var("PATH").unwrap(),
+        log = log.display(),
+        bare = bare.display(),
+        mu = env!("CARGO_BIN_EXE_mu"),
+        cut = b.cut_first,
+    );
+    let adapter = home.join("adapter.sh");
+    std::fs::write(&adapter, script).unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repos = b.repos.iter().map(|r| format!("{:?}", r.display().to_string())).collect::<Vec<_>>().join(", ");
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "[task]\nlaunch = [\"task\"]\nremote = \"fake\"\nreconnect_timeout = 60\n\n[remote.fake]\nadapter = {:?}\ntrusted = {}\nrepos = [{repos}]\n",
+            adapter.display().to_string(),
+            b.trusted
+        ),
+    )
+    .unwrap();
+    Remote { bare, log }
+}
+
 /// A launched child has no credentials and no gateway: its model calls reach the server only
 /// through the parent.
 #[test]
 fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
     let (home, cwd, seen) = relay_fixture("relayed child result");
-    let bare = launcher_for(&home, &format!("exec '{}' --headless --model {MODEL}", env!("CARGO_BIN_EXE_mu")));
+    let remote = remote_for(&home, Behaviour { trusted: true, ..Default::default() });
     let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let requests = seen.lock().unwrap();
@@ -371,47 +501,110 @@ fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
         "the child's result reaches the parent's next request"
     );
     assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
-    assert!(!bare.join("auth.json").exists(), "the child never held a key store");
+    assert!(!remote.bare.join("auth.json").exists(), "the child never held a key store");
 }
 
-fn on_path(program: &str) -> PathBuf {
-    std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|d| d.join(program))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("{program} on PATH"))
-}
-
-/// Sets `[task] launcher` of `home` to a script that runs `command` with no credentials: a bare
-/// home, no key and no gateway. Returns that bare home.
-fn launcher_for(home: &Path, command: &str) -> PathBuf {
-    let bare = mu_testutil::tmp();
-    std::fs::create_dir_all(bare.join("empty-bin")).unwrap();
-    std::fs::copy(home.join("models.toml"), bare.join("models.toml")).unwrap();
-    // The parent's PATH is empty, but launching a task commits the tree with git.
-    std::os::unix::fs::symlink(on_path("git"), home.join("empty-bin/git")).unwrap();
-    let launcher = home.join("launcher.sh");
-    let script = format!(
-        "#!/bin/sh\nunset MU_GATEWAY_URL ANTHROPIC_API_KEY\nexport MU_HOME='{b}' HOME='{b}' MU_TEST_HOME='{b}' PATH='{b}/empty-bin'\n{command}\n",
-        b = bare.display(),
+/// The stream to the worker is cut after its first line, a relay call the parent has seen and
+/// answered into the dead connection. The parent reconnects, the worker asks again, and the task
+/// finishes with its model called once.
+#[test]
+fn a_worker_stream_cut_with_a_relay_call_in_flight_is_resumed_and_the_task_completes() {
+    let (home, cwd, seen) = relay_fixture("relayed child result");
+    let remote = remote_for(&home, Behaviour { trusted: true, cut_first: 1, ..Default::default() });
+    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(remote.log("connects.n").trim().parse::<u32>().unwrap() >= 2, "it reconnected");
+    let requests = seen.lock().unwrap();
+    assert_eq!(child_requests(&requests).len(), 1, "the worker's model call ran once: {requests:?}");
+    assert!(
+        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("relayed child result")),
+        "the result is complete: {requests:?}"
     );
-    std::fs::write(&launcher, script).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(home.join("config.toml"), format!("[task]\nlauncher = [\"{}\"]\n", launcher.display())).unwrap();
-    bare
+    assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
+    // No line the parent got twice: the worker's numbers on the second connection continue.
+    let numbers: Vec<u64> = remote
+        .log("from-worker")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()?["seq"].as_u64())
+        .collect();
+    assert_eq!(numbers.first(), Some(&1), "{numbers:?}");
+    assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1 || w[1] == 1), "{numbers:?}");
+}
+
+/// A worker for an untrusted remote gets nothing secret from the parent: not in the adapter's
+/// environment, the repository bundle, the task payload or any line of the stream either way.
+#[test]
+fn a_worker_on_an_untrusted_remote_is_sent_no_secret() {
+    const SECRET: &str = "sk-test-key";
+    let (home, cwd, seen) = relay_fixture("relayed child result");
+    let remote = remote_for(&home, Behaviour { repos: vec![cwd.clone()], ..Default::default() });
+    let o = mu(&home, &cwd)
+        .env("SEEDED_API_KEY", SECRET)
+        .env("SEEDED_SERVICE_TOKEN", SECRET)
+        .args(["-p", "delegate it", "--model", MODEL])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(std::fs::read_to_string(home.join("auth.json")).unwrap().contains(SECRET), "the parent holds it");
+    assert!(
+        seen.lock().unwrap().iter().any(|r| r.contains("\"tool_result\"") && r.contains("relayed child result")),
+        "the task ran"
+    );
+    let envs: Vec<String> = std::fs::read_dir(&remote.log)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("env."))
+        .collect();
+    assert!(envs.len() >= 4, "every verb ran: {envs:?}");
+    assert!(remote.log("to-worker").contains("\"type\":\"task\""), "the payload went through the stream");
+    assert!(
+        !remote.log("from-worker").is_empty() && std::fs::metadata(remote.log.join("bundle.bin")).unwrap().len() > 0
+    );
+    let all = remote.received();
+    assert!(!all.contains(SECRET), "a secret reached the adapter");
+    assert!(!all.contains("SEEDED_"), "even the names of the variables were scrubbed");
+}
+
+/// An untrusted remote runs only the repositories it lists, and only while what would be sent holds
+/// no credential-looking file.
+#[test]
+fn an_untrusted_remote_refuses_an_unlisted_repository_and_a_config_with_credentials() {
+    let (home, cwd, seen) = relay_fixture("relayed child result");
+    let remote = remote_for(&home, Behaviour::default());
+    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    {
+        let requests = seen.lock().unwrap();
+        assert!(child_requests(&requests).is_empty(), "no worker ran: {requests:?}");
+        assert!(
+            requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("remote fake is not trusted for")),
+            "{requests:?}"
+        );
+    }
+    assert!(remote.received().is_empty(), "the adapter was never run");
+
+    let (home, cwd, seen) = relay_fixture("relayed child result");
+    let remote = remote_for(&home, Behaviour { repos: vec![cwd.clone()], ..Default::default() });
+    let agents = home.join(".omp/agent/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join(".env"), "TOKEN=1\n").unwrap();
+    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let requests = seen.lock().unwrap();
+    assert!(child_requests(&requests).is_empty(), "{requests:?}");
+    assert!(
+        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("credential-looking files")),
+        "{requests:?}"
+    );
+    assert!(remote.received().is_empty(), "the adapter was never run");
 }
 
 /// A worker of another version refuses the task, and the parent shows that as the task's error.
 #[test]
 fn a_worker_of_another_version_refuses_the_task_with_one_clear_line() {
     let (home, cwd, seen) = relay_fixture("never said");
-    // The launcher changes the version in the payload on its way to the worker.
-    let command = format!(
-        "{{ IFS= read -r first; printf '%s\\n' \"$first\" | '{sed}' 's/\"muVersion\":\"[^\"]*\"/\"muVersion\":\"0.0.0\"/'; }} | '{mu}' --headless --model {MODEL}",
-        sed = on_path("sed").display(),
-        mu = env!("CARGO_BIN_EXE_mu"),
-    );
-    launcher_for(&home, &command);
+    remote_for(&home, Behaviour { trusted: true, old_version: true, ..Default::default() });
     let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let requests = seen.lock().unwrap();

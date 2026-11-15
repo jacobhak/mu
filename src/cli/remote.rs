@@ -1,12 +1,16 @@
-//! `mu remote list|check`: the configured remotes and whether their adapters answer.
+//! `mu remote list|check|install-adapter`: the configured remotes, whether their adapters answer, and the
+//! adapters mu ships.
 
 use crate::remote::adapter::Adapter;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use mu_base::config::{Configs, MuRemote};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+const POD_ADAPTER: &str = include_str!("../../scripts/remote/mu-remote-pod");
+const POD_TEMPLATE: &str = include_str!("../../scripts/remote/mu-remote-pod.yaml");
 
 #[derive(clap::Subcommand)]
 pub enum Cmd {
@@ -17,9 +21,40 @@ pub enum Cmd {
         /// A `[remote.NAME]` from config.toml.
         name: String,
     },
+    /// Write a shipped adapter into `~/.mu/bin/`; `pod` is the Kubernetes one.
+    InstallAdapter {
+        /// The adapter to install: `pod`.
+        name: String,
+    },
+}
+
+/// Writes `body` to `path` through a temporary file, so a running copy is never half-written.
+fn write_file(path: &Path, body: &str, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, body).with_context(|| tmp.display().to_string())?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(&tmp, path).with_context(|| path.display().to_string())
+}
+
+/// Installs the adapter `name` into `dir` and returns the program's path. Running it again replaces the files.
+pub fn install_adapter(name: &str, dir: &Path) -> Result<PathBuf> {
+    if name != "pod" {
+        bail!("unknown adapter `{name}`; mu ships `pod` (`ssh` is built in and needs no install)");
+    }
+    mu_common::fs::create_private_dir(dir).with_context(|| dir.display().to_string())?;
+    let program = dir.join("mu-remote-pod");
+    write_file(&dir.join("mu-remote-pod.yaml"), POD_TEMPLATE, 0o644)?;
+    write_file(&program, POD_ADAPTER, 0o755)?;
+    Ok(program)
 }
 
 pub fn run(cmd: Cmd) -> Result<i32> {
+    if let Cmd::InstallAdapter { name } = &cmd {
+        let program = install_adapter(name, &mu_common::paths::mu_home().join("bin"))?;
+        println!("installed {}; use `adapter = \"{name}\"` in a [remote.NAME] section", program.display());
+        return Ok(0);
+    }
     let cfgs = Configs::load();
     for w in cfgs.warnings.iter().filter(|w| w.contains("remote")) {
         eprintln!("{w}");
@@ -38,6 +73,7 @@ pub fn run(cmd: Cmd) -> Result<i32> {
             print!("{text}");
             Ok(if ok { 0 } else { 1 })
         }
+        Cmd::InstallAdapter { .. } => unreachable!("handled above"),
     }
 }
 
@@ -128,6 +164,21 @@ mod tests {
 
     fn program(path: &std::path::Path, trusted: bool) -> MuRemote {
         MuRemote { adapter: path.to_string_lossy().into_owned(), trusted, ..Default::default() }
+    }
+
+    #[test]
+    fn install_adapter_writes_an_executable_script_and_its_template() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = mu_testutil::tmp().join("bin");
+        let program = install_adapter("pod", &dir).unwrap();
+        assert_eq!(program, dir.join("mu-remote-pod"));
+        assert_eq!(std::fs::metadata(&program).unwrap().permissions().mode() & 0o111, 0o111);
+        assert_eq!(std::fs::read_to_string(&program).unwrap(), POD_ADAPTER);
+        assert_eq!(std::fs::read_to_string(dir.join("mu-remote-pod.yaml")).unwrap(), POD_TEMPLATE);
+        std::fs::write(&program, "stale").unwrap();
+        install_adapter("pod", &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&program).unwrap(), POD_ADAPTER);
+        assert!(install_adapter("nope", &dir).unwrap_err().to_string().contains("unknown adapter"));
     }
 
     #[test]

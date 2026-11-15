@@ -242,8 +242,10 @@ impl Default for MuAsk {
 
 /// `[task]`: a subagent's soft request budget. Crossing it steers a wrap-up notice (`budget_notice`);
 /// at 1.5x the run is stopped and asked for its partial result; 0 turns the guard off. A `scout` is
-/// capped at 100 however high the budget is, as in omp. `launcher` is a command (program and
-/// arguments) run in place of `mu --headless` for every `task` subagent; empty spawns locally.
+/// capped at 100 however high the budget is, as in omp. `launch` lists the agent kinds (`task`,
+/// `scout`, a custom agent's name) that run on `remote` (else `default_remote`) as reconnectable
+/// workers; any other kind, and every kind when it is empty, runs here. `reconnect_timeout` is the
+/// seconds a lost worker stream is retried before the parent fetches what the worker committed.
 /// `max_cost` is the most (USD) the model calls a relayed worker makes through its parent may cost,
 /// per worker; 0 turns the cap off.
 #[derive(Debug, Deserialize)]
@@ -251,13 +253,22 @@ impl Default for MuAsk {
 pub struct MuTask {
     pub soft_request_budget: u32,
     pub budget_notice: bool,
-    pub launcher: Vec<String>,
+    pub launch: Vec<String>,
+    pub remote: Option<String>,
+    pub reconnect_timeout: u64,
     pub max_cost: f64,
 }
 
 impl Default for MuTask {
     fn default() -> Self {
-        Self { soft_request_budget: 200, budget_notice: true, launcher: Vec::new(), max_cost: 5.0 }
+        Self {
+            soft_request_budget: 200,
+            budget_notice: true,
+            launch: Vec::new(),
+            remote: None,
+            reconnect_timeout: 600,
+            max_cost: 5.0,
+        }
     }
 }
 

@@ -1,7 +1,9 @@
 //! Named remotes (`[remote.NAME]`): where agents run besides here. `adapter` speaks the adapter contract.
 
 pub mod adapter;
+pub mod client;
 pub mod ssh;
+pub mod worker;
 
 use anyhow::{Result, bail};
 use mu_base::config::MuRemote;

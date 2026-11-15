@@ -49,8 +49,8 @@ pub struct RunConfig {
     pub request_budget: u32,
     /// Whether the wrap-up notice is injected when the budget is crossed.
     pub budget_notice: bool,
-    /// `[task] launcher`: the command `task` subagents start through. Empty in a subagent.
-    pub task_launcher: Vec<String>,
+    /// `[task] launch`: the remote `task` subagents of some kinds run on. `None` in a subagent.
+    pub task_launch: Option<mu_tools::tools::link::WorkerLaunch>,
     /// The parent asked for this run's session file over the stream: its own children's lines pass
     /// on to the parent too.
     pub mirror_session: bool,

@@ -124,12 +124,15 @@ pub enum RunKind {
     Acp,
     /// `mu agent`: the agent of a session, with a client attached or not.
     Agent,
+    /// `mu worker run`: a launched task that outlives its connection.
+    Worker,
 }
 
 impl RunKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Agent => "agent",
+            Self::Worker => "worker",
             Self::Tui => "tui",
             Self::Print => "print",
             Self::Subagent => "subagent",
@@ -447,6 +450,39 @@ impl OwnerRecord {
             c.push(path.clone());
         }
         Some(Self { path, file })
+    }
+}
+
+/// A worker's owner record, `run/<launch id>.json`, for `mu agent list`. A worker has no session
+/// of its own to name, so the record names an empty stub file beside it, removed with the record.
+pub struct WorkerRecord {
+    _record: OwnerRecord,
+    stub: PathBuf,
+}
+
+impl Drop for WorkerRecord {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.stub);
+    }
+}
+
+/// Claims the record of worker `launch` running in `cwd`. `None` when the id is not a valid session
+/// id or the record cannot be written.
+pub fn claim_worker(launch: &str, cwd: &Path) -> Option<WorkerRecord> {
+    if !valid_id(launch) {
+        return None;
+    }
+    let dir = paths::profile_home().join("run");
+    mu_common::fs::create_private_dir(&dir).ok()?;
+    let stub = dir.join(format!("{launch}.jsonl"));
+    std::fs::write(&stub, "").ok()?;
+    let extra = Extra { kind: Some(RunKind::Worker), cwd: Some(cwd.to_path_buf()), ..Extra::default() };
+    match OwnerRecord::claim_with(&stub, false, false, &extra) {
+        Some(record) => Some(WorkerRecord { _record: record, stub }),
+        None => {
+            let _ = std::fs::remove_file(&stub);
+            None
+        }
     }
 }
 

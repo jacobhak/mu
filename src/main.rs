@@ -47,7 +47,8 @@ fn dispatch() -> Result<i32> {
             Err(other) => Ok(plans_cli::run_cli(other, &std::env::current_dir()?)),
         },
         Some(Sub::Agent { cmd: Some(cli::AgentCmd::List { json }), .. }) => cli::agents::list(json),
-        Some(Sub::Agent { detach: true, .. }) => run::detach::run(),
+        Some(Sub::Agent { detach: true, .. }) => run::detach::run("agent"),
+        Some(Sub::Worker { cmd: cli::WorkerCmd::Run { detach: true, .. } }) => run::detach::run("worker"),
         Some(Sub::Agent { model, thinking, resume, continue_latest, detached, .. }) => {
             if detached {
                 run::mark_detached();
@@ -79,6 +80,11 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Predict { cmd } => cli::predict::run(cmd),
         Sub::MigrateProfile { name, dry_run } => workflow::migrate::run(&name, dry_run),
         Sub::Attach { session, socket, .. } => cli::attach::run(session.as_deref(), socket),
+        Sub::Worker { cmd } => match cmd {
+            cli::WorkerCmd::Run { launch, dir, detached, .. } => run::worker::run(&launch, &dir, detached),
+            cli::WorkerCmd::Bundle { id } => run::worker::bundle(&id),
+            cli::WorkerCmd::Stop { id } => run::worker::stop(&id),
+        },
         Sub::Plan { .. } => unreachable!("`mu plan` is routed in dispatch"),
         Sub::Agent { .. } => unreachable!("`mu agent` is routed in dispatch"),
     }

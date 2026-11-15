@@ -2,13 +2,14 @@
 //! it to that mode's function.
 
 mod acp;
-mod attach;
+pub mod attach;
 pub mod detach;
 mod headless;
 mod relay;
 mod serve;
 pub mod setup;
 mod signals;
+pub mod worker;
 
 use crate::cli::Cli;
 use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none, pick_model_with};
@@ -129,8 +130,21 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     if cli.acp {
         return acp::run(cli.model.clone(), cli_thinking, permissions);
     }
-    if let Some(command) = &cli.attach {
-        return attach::run(command);
+    if let Some(command) = &cli.nested_client {
+        return attach::run(attach::Link::Command(command.clone()), false);
+    }
+    if Mode::interactive(cli, plan.is_some()) && !agent {
+        let cfgs = mu_base::config::Configs::load();
+        match crate::remote::client::in_effect(cli.remote.as_deref(), cli.local, &cfgs)? {
+            Some(adapter) => {
+                return crate::remote::client::run(adapter, cli.resume.clone(), cli.continue_latest, cli.model.clone());
+            }
+            None => {
+                if let Some(rows) = crate::remote::client::tab_rows(&cfgs) {
+                    mu_tui::host::sessions::set_remote_rows(rows);
+                }
+            }
+        }
     }
     // `terminal`: the TUI. `interactive`: someone can answer a question or an approval, here or
     // through a client (the TUI and `mu agent`).
@@ -227,7 +241,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     if let Some(p) = &task {
         apply_task(&mut run, p, &cfgs);
     }
-    run.task_launcher = task_launcher(task.as_ref(), &cfgs.mu.task.launcher);
+    run.task_launch = task_launch(task.as_ref(), &cfgs, cli.local);
     if let Some(d) = &agent_def {
         apply_agent(&mut run, d);
     }
@@ -417,10 +431,20 @@ fn mirrors_session(p: &Value) -> bool {
     p["mirrorSession"] == true
 }
 
-/// The launcher `task` subagents start through. A worker (it has a task payload) gets none: it
+/// The remote `task` subagents of some kinds run on. A worker (it has a task payload) gets none: it
 /// holds a copy of its parent's config and spawns its own children locally.
-fn task_launcher(task: Option<&Value>, configured: &[String]) -> Vec<String> {
-    if task.is_some() { Vec::new() } else { configured.to_vec() }
+fn task_launch(
+    task: Option<&Value>,
+    cfgs: &mu_base::config::Configs,
+    local: bool,
+) -> Option<mu_tools::tools::link::WorkerLaunch> {
+    if task.is_some() {
+        return None;
+    }
+    crate::remote::worker::launch(&cfgs.mu, local).unwrap_or_else(|e| {
+        eprintln!("warning: {e}");
+        None
+    })
 }
 
 fn require_output_schema(run: &mut agent::RunConfig, s: &Value) -> Result<()> {
@@ -556,9 +580,14 @@ mod tests {
 
     #[test]
     fn a_process_started_with_a_task_payload_spawns_locally() {
-        let configured = vec!["/bin/launch".to_string()];
-        assert!(task_launcher(Some(&json!({"task": "t"})), &configured).is_empty());
-        assert_eq!(task_launcher(None, &configured), configured);
+        let mut cfgs = mu_base::config::Configs::default();
+        cfgs.mu.task.launch = vec!["task".into()];
+        cfgs.mu.task.remote = Some("far".into());
+        cfgs.mu
+            .remote
+            .insert("far".into(), mu_base::config::MuRemote { adapter: "/bin/adapter".into(), ..Default::default() });
+        assert!(task_launch(Some(&json!({"task": "t"})), &cfgs, false).is_none());
+        assert!(task_launch(None, &cfgs, false).is_some_and(|l| l.runs("task") && !l.runs("scout")));
     }
 
     #[test]

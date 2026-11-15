@@ -1,13 +1,15 @@
-//! `mu --attach '<command>'`: the terminal UI as a client of a `mu agent` that `command` reaches.
+//! The terminal UI as a client of a `mu agent` that a `Link` reaches: a remote adapter's `connect ID`
+//! (plain `mu` with a remote in effect), or the shell command of a take-over's nested client.
 //!
-//! `command` runs under `sh -c` with stdin and stdout piped: they carry the wire lines (see
-//! `mu_base::wire`), stderr lines are shown as notices. After the hello exchange the UI runs as it does
-//! in one process, over a `RemoteHost` and the client adapter. When the connection drops the UI stays up
-//! and says so; the command is run again after 1 s, doubling to 30 s, and the agent's catch-up repaints
-//! the conversation. The agent ending, a take-over by another client and `/detach` end the client for good.
-//! An agent that already has another client answers `Busy`: a reconnect then stops retrying and asks
-//! whether to take the session over.
+//! The link's process has stdin and stdout piped: they carry the wire lines (see `mu_base::wire`), stderr
+//! lines are shown as notices. After the hello exchange the UI runs as it does in one process, over a
+//! `RemoteHost` and the client adapter. When the connection drops the UI stays up and says so; the link
+//! is run again after 1 s, doubling to 30 s, and the agent's catch-up repaints the conversation. The
+//! agent ending, a take-over by another client and `/detach` end the client for good. An agent that
+//! already has another client answers `Busy`: a reconnect then stops retrying and asks whether to take
+//! the session over.
 
+use crate::remote::adapter::Adapter;
 use anyhow::{Result, bail};
 use mu_base::config::Configs;
 use mu_base::events::{AgentEvent, Answer, AskQuestion, Command};
@@ -15,8 +17,9 @@ use mu_base::wire::{AgentLine, ClientAdapter, ClientLine, Incoming, WIRE, WireCo
 use mu_common::rpc::{Framed, Line};
 use mu_tui::host::remote::RemoteHost;
 use mu_tui::host::{Host, HostInfo};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command as Process};
@@ -74,6 +77,51 @@ fn since_text(since: i64) -> String {
     if at.date() == today { at.strftime("%H:%M").to_string() } else { at.strftime("%Y-%m-%d %H:%M").to_string() }
 }
 
+/// What the client's connection runs each time it connects.
+#[derive(Clone)]
+pub enum Link {
+    /// A shell command that is a raw pipe to an agent (a take-over's nested client).
+    Command(String),
+    /// A remote adapter's `connect ID`.
+    Remote { adapter: Arc<Adapter>, id: String },
+}
+
+impl Link {
+    fn describe(&self) -> String {
+        match self {
+            Link::Command(c) => format!("`{c}`"),
+            Link::Remote { adapter, id } => format!("`{} connect {id}`", adapter.name()),
+        }
+    }
+
+    fn process(&self) -> Result<Process, String> {
+        let mut p = match self {
+            Link::Command(c) => {
+                let mut p = Process::new("sh");
+                p.arg("-c").arg(c);
+                p
+            }
+            Link::Remote { adapter, id } => Process::from(adapter.connect_command(id).map_err(|e| format!("{e:#}"))?),
+        };
+        p.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        Ok(p)
+    }
+}
+
+/// The link's stderr lines: kept for the error while the hello is awaited, shown as notices after.
+type Stderr = Rc<RefCell<(Vec<String>, bool)>>;
+
+/// The refusal for a link that ended before an agent answered: its stderr, which is the adapter's error.
+async fn ended(child: &mut Child, task: tokio::task::JoinHandle<()>, seen: &Stderr, fallback: String) -> Refused {
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    let lines = seen.borrow().0.join("\n");
+    Refused::Failed(if lines.is_empty() { fallback } else { lines })
+}
+
 struct Conn {
     child: Child,
     lines: UnboundedReceiver<AgentLine>,
@@ -82,31 +130,30 @@ struct Conn {
     detached: Rc<Cell<bool>>,
 }
 
-/// Runs `command`, says hello and waits for the agent's. Returns the connection and what the host told.
+/// Runs the link, says hello and waits for the agent's. Returns the connection and what the host told.
 async fn connect(
-    command: &str,
+    link: &Link,
     notices: &UnboundedSender<String>,
     who: &Who,
     join: Join,
 ) -> Result<(Conn, HostInfo), Refused> {
-    let mut child = Process::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("cannot run `{command}`: {e}"))?;
+    let command = link.describe();
+    let mut child = link.process()?.spawn().map_err(|e| format!("cannot run {command}: {e}"))?;
     let (Some(mut stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         return Err("cannot reach the command's streams".to_string().into());
     };
-    let to_notices = notices.clone();
-    tokio::task::spawn_local(async move {
+    let seen: Stderr = Rc::default();
+    let (to_notices, kept) = (notices.clone(), seen.clone());
+    let stderr_task = tokio::task::spawn_local(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(l)) = lines.next_line().await {
-            let _ = to_notices.send(l);
+            let mut k = kept.borrow_mut();
+            if k.1 {
+                let _ = to_notices.send(l);
+            } else {
+                k.0.push(l);
+            }
         }
     });
 
@@ -118,14 +165,19 @@ async fn connect(
         client: who.client.clone(),
         take: join.take,
     };
-    stdin.write_all(format!("{}\n", to_line(&hello)).as_bytes()).await.map_err(|e| format!("`{command}`: {e}"))?;
+    if let Err(e) = stdin.write_all(format!("{}\n", to_line(&hello)).as_bytes()).await {
+        return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
+    }
     let mut framed = Framed::new(BufReader::new(stdout));
     let first = tokio::time::timeout(HELLO_WAIT, framed.next_line())
         .await
-        .map_err(|_| format!("`{command}` did not answer within {}s", HELLO_WAIT.as_secs()))?;
+        .map_err(|_| format!("{command} did not answer within {}s", HELLO_WAIT.as_secs()))?;
     let value = match first {
         Some(Line::Value(v)) => v,
-        _ => return Err(format!("`{command}` ended without an answer from an agent").into()),
+        _ => {
+            let none = format!("{command} ended without an answer from an agent");
+            return Err(ended(&mut child, stderr_task, &seen, none).await);
+        }
     };
     let info = match serde_json::from_value::<AgentLine>(value) {
         Ok(AgentLine::Hello { wire, host, .. }) if wire == WIRE => serde_json::from_value::<HostInfo>(host)
@@ -137,8 +189,15 @@ async fn connect(
         }
         Ok(AgentLine::Busy { host, since }) => return Err(Refused::Busy { host, since }),
         Ok(AgentLine::Error(e)) => return Err(e.into()),
-        _ => return Err(format!("`{command}` is not an agent's stream").into()),
+        _ => return Err(format!("{command} is not an agent's stream").into()),
     };
+    {
+        let mut k = seen.borrow_mut();
+        for l in k.0.drain(..) {
+            let _ = notices.send(l);
+        }
+        k.1 = true;
+    }
 
     let (lines_tx, lines) = unbounded_channel();
     tokio::task::spawn_local(async move {
@@ -288,7 +347,7 @@ async fn ask_take_over(w: &mut Wires, host: &str, since: i64) -> bool {
 
 /// Keeps the UI connected: the first connection is made already, later ones after a pause. A `Busy`
 /// answer ends the retrying until the user decides.
-async fn drive(command: String, who: Who, first: Conn, mut w: Wires, notices: UnboundedSender<String>) {
+async fn drive(link: Link, who: Who, first: Conn, mut w: Wires, notices: UnboundedSender<String>) {
     let mut next = Some(first);
     let mut pause = FIRST_PAUSE;
     let mut take = false;
@@ -318,7 +377,7 @@ async fn drive(command: String, who: Who, first: Conn, mut w: Wires, notices: Un
                         },
                     }
                 }
-                match connect(&command, &notices, &who, Join { reconnect: true, take }).await {
+                match connect(&link, &notices, &who, Join { reconnect: true, take }).await {
                     Ok((c, _)) => {
                         pause = FIRST_PAUSE;
                         take = false;
@@ -389,20 +448,20 @@ fn read_key() -> Result<u8> {
     }
 }
 
-pub fn run(command: &str) -> Result<i32> {
+/// Runs the UI over `link`; `pick_session` opens the session picker (of the agent's sessions) first.
+pub fn run(link: Link, pick_session: bool) -> Result<i32> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        bail!("mu: --attach needs a terminal");
+        bail!("mu: interactive mode needs a terminal; use -p");
     }
     let cfgs = Configs::load();
     let rt = mu_base::runtime::current_thread_runtime()?;
     let local = tokio::task::LocalSet::new();
-    let command = command.to_string();
     let who = Who { host: hostname(), client: uuid::Uuid::new_v4().to_string() };
     local.block_on(&rt, async move {
         let (notice_tx, notice_rx) = unbounded_channel::<String>();
         let mut join = Join { reconnect: false, take: false };
         let (first, info) = loop {
-            match connect(&command, &notice_tx, &who, join).await {
+            match connect(&link, &notice_tx, &who, join).await {
                 Ok(c) => break c,
                 Err(Refused::Failed(e)) => bail!("{e}"),
                 Err(Refused::Busy { host, since }) => {
@@ -420,7 +479,7 @@ pub fn run(command: &str) -> Result<i32> {
         let (events, ev_rx) = unbounded_channel();
         let (replies_tx, replies) = unbounded_channel();
         let wires = Wires { host: host.clone(), adapter: ClientAdapter::new(replies_tx), replies, commands, events };
-        tokio::task::spawn_local(drive(command, who, first, wires, notice_tx));
+        tokio::task::spawn_local(drive(link, who, first, wires, notice_tx));
         let host: Rc<dyn Host> = host;
         Ok(mu_tui::app::run(mu_tui::app::AppInit {
             host,
@@ -428,7 +487,7 @@ pub fn run(command: &str) -> Result<i32> {
             ev_rx,
             notice_rx,
             cwd: info.cwd,
-            pick_session: false,
+            pick_session,
             status_cfg: cfgs.omp.status_line.clone(),
             theme: cfgs.mu.theme.clone(),
             notify: cfgs.omp.completion.notify,

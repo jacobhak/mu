@@ -814,3 +814,296 @@ fn a_client_that_attaches_is_told_which_requests_are_pending_and_a_waiting_flag_
     assert_eq!(pending["event"]["Pending"]["ids"], json!([]), "a dialog shown for id 1 is closed");
     assert!(cwd.join("made-by-the-test").exists());
 }
+
+/// A terminal for the real client: a pty with a reader thread that keeps everything the program drew.
+struct Term {
+    child: Child,
+    writer: std::fs::File,
+    out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Term {
+    fn spawn(mut command: Command) -> Term {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let (mut m, mut s) = (-1, -1);
+        let ws = libc::winsize { ws_row: 50, ws_col: 220, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: valid out-pointers; the descriptors are fresh and owned below.
+        let (master, slave) = unsafe {
+            let r = libc::openpty(
+                &mut m,
+                &mut s,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of!(ws).cast_mut(),
+            );
+            assert_eq!(r, 0);
+            (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+        };
+        command
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        // SAFETY: setsid and ioctl are async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            })
+        };
+        let child = command.spawn().unwrap();
+        drop(command);
+        let writer = std::fs::File::from(master.try_clone().unwrap());
+        let mut reader = std::fs::File::from(master);
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = out.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = reader.read(&mut buf) {
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        Term { child, writer, out }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.out.lock().unwrap()).into_owned()
+    }
+
+    fn wait_for(&self, needle: &str) {
+        for _ in 0..300 {
+            if self.text().contains(needle) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {needle:?}; the terminal got: {:?}", self.text());
+    }
+
+    /// Types into the composer once the UI is drawn, then presses Enter.
+    fn command(&mut self, line: &str) {
+        self.wait_for("type here");
+        self.send(line);
+        std::thread::sleep(Duration::from_millis(300));
+        self.send("\r");
+    }
+
+    fn send(&mut self, bytes: &str) {
+        self.writer.write_all(bytes.as_bytes()).unwrap();
+    }
+
+    fn wait_exit(&mut self) -> std::process::ExitStatus {
+        for _ in 0..200 {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the client did not end; it drew: {}", self.text());
+    }
+}
+
+impl Drop for Term {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A client machine (its own home, with a `[remote.far]` config) beside a "remote" one that the fake
+/// adapter reaches by running this binary with the remote's home. Every call is logged.
+struct Far {
+    client: PathBuf,
+    remote: PathBuf,
+    cwd: PathBuf,
+    dir: PathBuf,
+}
+
+impl Far {
+    fn new(trusted: bool, extra_config: &str) -> Far {
+        let (remote, cwd) = fixture();
+        let client = mu_testutil::tmp();
+        let dir = mu_testutil::tmp();
+        let script = format!(
+            r#"#!/bin/sh
+PATH=/usr/bin:/bin
+echo "$MU_REMOTE_NAME|$MU_REMOTE_TRUSTED|$*" >> '{dir}/log'
+inner() {{ MU_HOME='{remote}' MU_TEST_HOME='{remote}' HOME='{remote}' PATH='{remote}/empty-bin' '{bin}' "$@"; }}
+case "$1" in
+  version) echo '{{"contract":1}}' ;;
+  list) [ -e '{dir}/down' ] && {{ echo 'cannot reach the cluster: no route' >&2; exit 1; }}; inner agent list --json ;;
+  start) shift 3; cd '{cwd}' && inner agent --detach --model '{MODEL}' --permissions yolo "$@" ;;
+  connect)
+    echo $$ > '{dir}/connect.pid'
+    while [ -e '{dir}/hold' ]; do sleep 0.1; done
+    exec env MU_HOME='{remote}' MU_TEST_HOME='{remote}' HOME='{remote}' PATH='{remote}/empty-bin' '{bin}' attach --stdio "$2" ;;
+  *) echo "unknown verb $1" >&2; exit 3 ;;
+esac
+"#,
+            dir = dir.display(),
+            remote = remote.display(),
+            cwd = cwd.display(),
+            bin = env!("CARGO_BIN_EXE_mu"),
+        );
+        let adapter = dir.join("adapter");
+        std::fs::write(&adapter, script).unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = format!("[remote.far]\nadapter = '{}'\ntrusted = {trusted}\n{extra_config}", adapter.display());
+        std::fs::write(client.join("config.toml"), config).unwrap();
+        Far { client, remote, cwd, dir }
+    }
+
+    fn mu(&self) -> Command {
+        let mut c = mu(&self.client, &self.cwd);
+        c.arg("-r").arg("far");
+        c
+    }
+
+    fn log(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("log")).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+
+    fn calls(&self, verb: &str) -> usize {
+        self.log().iter().filter(|l| l.split('|').nth(2).is_some_and(|a| a.split(' ').next() == Some(verb))).count()
+    }
+
+    fn agents(&self) -> Vec<Value> {
+        agent_list(&self.remote, &self.cwd)
+    }
+
+    fn client_host(&self) -> Option<String> {
+        self.agents().first().and_then(|a| a["client"]["host"].as_str()).map(str::to_string)
+    }
+}
+
+#[test]
+fn a_client_starts_an_agent_on_the_remote_connects_and_later_rejoins_it() {
+    let far = Far::new(true, "");
+    let mut term = Term::spawn(far.mu());
+    wait_until("the agent to have a client", || far.client_host().is_some());
+    let agents = far.agents();
+    assert_eq!(agents.len(), 1, "{agents:?}");
+    let id = agents[0]["id"].as_str().unwrap().to_string();
+    let _agent = pid_of(&far.remote, &id);
+    assert_eq!(far.calls("start"), 1);
+    assert!(far.log().iter().any(|l| l == "far|1|start --kind agent"), "{:?}", far.log());
+    assert!(far.log().iter().any(|l| l == &format!("far|1|connect {id}")), "{:?}", far.log());
+
+    term.command("/detach");
+    assert!(term.wait_exit().success(), "{}", term.text());
+    wait_until("the client to leave", || far.client_host().is_none());
+
+    let mut again = Term::spawn({
+        let mut c = far.mu();
+        c.arg("-c");
+        c
+    });
+    wait_until("the second client", || far.client_host().is_some());
+    assert_eq!(far.calls("start"), 1, "-c joined the running agent: {:?}", far.log());
+    assert_eq!(far.calls("connect"), 2);
+    assert_eq!(far.agents().len(), 1);
+    again.command("/detach");
+    assert!(again.wait_exit().success());
+}
+
+#[test]
+fn resuming_a_session_that_no_agent_has_runs_start_with_it() {
+    let far = Far::new(true, "");
+    let mut term = Term::spawn({
+        let mut c = far.mu();
+        c.args(["--resume", "no-such-session"]);
+        c
+    });
+    wait_until("the start call", || far.calls("start") == 1);
+    assert!(far.log().iter().any(|l| l == "far|1|start --kind agent --resume no-such-session"), "{:?}", far.log());
+    let _ = term.wait_exit();
+}
+
+#[test]
+fn a_reconnect_does_not_take_the_session_from_the_client_that_has_it() {
+    let far = Far::new(true, "");
+    let term = Term::spawn(far.mu());
+    wait_until("the agent to have a client", || far.client_host().is_some());
+    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
+    let _agent = pid_of(&far.remote, &id);
+    let mine = far.client_host().unwrap();
+    term.wait_for("type here");
+
+    // The connection drops, and another client attaches before the reconnect gets through.
+    std::fs::write(far.dir.join("hold"), "").unwrap();
+    let pid: i32 = std::fs::read_to_string(far.dir.join("connect.pid")).unwrap().trim().parse().unwrap();
+    // SAFETY: plain signal to the adapter's connect process.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    wait_until("the agent to see the loss", || far.client_host().is_none());
+    let mut other = Client::connect(&far.remote.join("run").join(format!("{id}.sock")));
+    other.send(&hello_line(WIRE, "alpha", false));
+    assert!(other.next().unwrap().get("hello").is_some());
+    other.until(caught_up);
+    std::fs::remove_file(far.dir.join("hold")).unwrap();
+
+    term.wait_for("alpha has this session");
+    assert_eq!(far.client_host().as_deref(), Some("alpha"), "the reconnect left alpha alone (was {mine})");
+    other.command(AgentCommand::Prompt("still mine".into()));
+    other.until(|v| event_is(v, "TurnEnd"));
+}
+
+#[test]
+fn attaching_by_hand_to_a_busy_agent_asks_and_takes_over_only_on_t() {
+    let far = Far::new(true, "");
+    let agent = Agent::start(&far.remote, &far.cwd, &[]);
+    let mut alpha = Client::connect(&agent.socket);
+    alpha.send(&hello_line(WIRE, "alpha", false));
+    alpha.next().unwrap();
+    alpha.until(caught_up);
+
+    let resume = |far: &Far| {
+        let mut c = far.mu();
+        c.args(["--resume", &agent.session]);
+        Term::spawn(c)
+    };
+    let mut quits = resume(&far);
+    quits.wait_for("alpha has this session since");
+    quits.send("q");
+    assert!(quits.wait_exit().success());
+    assert_eq!(far.client_host().as_deref(), Some("alpha"));
+    assert_eq!(far.calls("start"), 0, "the agent was joined, not started");
+
+    let mut takes = resume(&far);
+    takes.wait_for("[t]ake it over");
+    takes.send("t");
+    wait_until("the take-over", || far.client_host().is_some_and(|h| h != "alpha"));
+    alpha.until(|v| v["event"].get("Detached").is_some());
+}
+
+#[test]
+fn a_main_agent_is_refused_on_an_untrusted_remote_and_the_adapter_never_starts_one() {
+    for args in [&[][..], &["-c"][..], &["--resume", "abc"][..]] {
+        let far = Far::new(false, "");
+        let o = far.mu().args(args).stdin(Stdio::null()).output().unwrap();
+        assert!(!o.status.success());
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("remote far is not trusted to run a main agent (set trusted = true on a remote you control)"),
+            "{err}"
+        );
+        assert_eq!(far.calls("start"), 0, "{:?}", far.log());
+        assert_eq!(far.calls("connect"), 0, "{:?}", far.log());
+        assert!(far.agents().is_empty());
+    }
+}
+
+#[test]
+fn an_unreachable_default_remote_is_refused_with_the_adapters_error() {
+    let far = Far::new(true, "");
+    let config = std::fs::read_to_string(far.client.join("config.toml")).unwrap();
+    std::fs::write(far.client.join("config.toml"), format!("default_remote = 'far'\n{config}")).unwrap();
+    std::fs::write(far.dir.join("down"), "").unwrap();
+    let o = mu(&far.client, &far.cwd).stdin(Stdio::null()).output().unwrap();
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("cannot reach the cluster: no route"), "{err}");
+    assert_eq!(far.calls("start"), 0);
+    assert!(!far.client.join("sessions").exists(), "nothing ran here instead");
+}

@@ -22,6 +22,8 @@ pub struct Row {
     pub job: Option<String>,
     /// When the session file was last written.
     pub modified: Option<SystemTime>,
+    /// The remote it runs on; `None` for a session on this host.
+    pub host: Option<String>,
 }
 
 impl Row {
@@ -39,6 +41,9 @@ impl Row {
     /// `s` can stop it: a `-p` run stops after its step, a subagent is terminated, an interactive mu
     /// that takes abort requests cancels its current turn.
     pub fn can_stop(&self) -> bool {
+        if self.host.is_some() {
+            return false;
+        }
         match self.live.kind.as_deref() {
             Some("print" | "subagent") => true,
             Some("tui" | "agent") => self.live.abort,
@@ -49,12 +54,12 @@ impl Row {
     /// `S` can terminate it: an interactive mu or an agent (it ends its session the proper way), after a
     /// confirmation. An agent is joined by a client, not taken over, so `t` is not offered for it.
     pub fn can_terminate(&self) -> bool {
-        matches!(self.live.kind.as_deref(), Some("tui" | "agent"))
+        self.host.is_none() && matches!(self.live.kind.as_deref(), Some("tui" | "agent"))
     }
 
     /// `t` can take it over: only a `-p` run hands its session over.
     pub fn can_take(&self) -> bool {
-        self.live.kind.as_deref() == Some("print") && self.live.print_run
+        self.host.is_none() && self.live.kind.as_deref() == Some("print") && self.live.print_run
     }
 
     /// The session id that `mu notify` and `mu take` accept.
@@ -101,6 +106,7 @@ pub fn build(
             depth,
             job,
             modified: l.modified,
+            host: l.host.clone(),
         });
     }
     out
@@ -139,12 +145,14 @@ pub fn short_path(p: &Path, home: Option<&str>, max: usize) -> String {
     format!("…{tail}")
 }
 
-/// One list row: a live mark, kind and agent, pid, cost, age, directory and title. `home` is the
-/// host's home directory.
+/// One list row: a live mark, kind and agent, host (when `host_w` is not 0), pid, cost, age, directory
+/// and title. `home` is the host's home directory.
+#[allow(clippy::too_many_arguments)]
 pub fn list_row(
     r: &Row,
     selected: bool,
     label_w: usize,
+    host_w: usize,
     cost: &str,
     width: usize,
     now: SystemTime,
@@ -159,7 +167,10 @@ pub fn list_row(
     if selected {
         name.attributes.set(crossterm::style::Attribute::Bold);
     }
-    let rest = format!(" {:>6} {cost:>6} {started:>4}  {cwd}  {}", r.live.pid, r.title);
+    let pid = if r.host.is_some() { String::new() } else { r.live.pid.to_string() };
+    let host =
+        if host_w == 0 { String::new() } else { format!(" {}", pad(r.host.as_deref().unwrap_or("here"), host_w)) };
+    let rest = format!("{host} {pid:>6} {cost:>6} {started:>4}  {cwd}  {}", r.title);
     let mut l = vec![
         if selected { span("❯ ", accent()) } else { span("  ", dim()) },
         span("● ", t.fg(Role::Ok)),
@@ -178,7 +189,10 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
     let t = theme::get();
     let muted = t.fg(Role::Muted);
     let faint = t.fg(Role::Faint);
-    let mut facts = format!("pid {}", r.live.pid);
+    let mut facts = match &r.host {
+        Some(h) => format!("on {h}"),
+        None => format!("pid {}", r.live.pid),
+    };
     if let Some(a) = age(&r.live.started, now) {
         facts.push_str(&format!(" · up {}", age_text(a)));
     }
@@ -193,6 +207,9 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
         rows.push(vec![span(format!("   {}", c.display()), muted)]);
     }
     rows.push(vec![span(format!("   session {}", r.id()), faint)]);
+    if let Some(c) = &r.live.client {
+        rows.push(vec![span(format!("   client {}", c.host), muted)]);
+    }
     if let Some(j) = &r.job {
         rows.push(vec![span(format!("   job {j} of this session"), muted)]);
     }
@@ -200,6 +217,10 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
     for (i, l) in wrap(&r.title, body_w).into_iter().enumerate() {
         let lead = if i == 0 { "   prompt " } else { "          " };
         rows.push(vec![span(lead, faint), span(l, t.fg(Role::Strong))]);
+    }
+    if r.host.is_some() {
+        rows.push(vec![span("   attach with mu -r to join it", faint)]);
+        return rows;
     }
     let mut keys = vec!["Enter peek", "n message"];
     if r.can_stop() {
@@ -244,12 +265,30 @@ mod tests {
     fn rows_of(lives: Vec<LiveSession>) -> Vec<LiveRow> {
         lives
             .into_iter()
-            .map(|live| LiveRow { parent: live.parent.clone(), modified: None, title: None, live })
+            .map(|live| LiveRow { parent: live.parent.clone(), modified: None, title: None, host: None, live })
             .collect()
     }
 
     fn names(rows: &[Row]) -> Vec<(String, usize)> {
         rows.iter().map(|r| (r.live.path.display().to_string(), r.depth)).collect()
+    }
+
+    #[test]
+    fn a_remote_agent_shows_its_host_who_has_it_and_offers_no_actions() {
+        let mut l = live("/remote/far/abc.jsonl", "agent", "2026-01-01T00:00:00Z");
+        l.waiting = true;
+        l.abort = true;
+        l.client = Some(mu_session::session::owner::ClientInfo { host: "laptop".into(), since: 5 });
+        let mut lives = rows_of(vec![l]);
+        lives[0].host = Some("far".into());
+        let rows = build(lives, &HashMap::new(), &[], None, &HashMap::new());
+        let r = &rows[0];
+        assert!(!r.can_stop() && !r.can_terminate() && !r.can_take());
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600 + 60);
+        let text = line_text(&list_row(r, false, 14, 4, "", 100, now, None));
+        assert!(text.contains("agent waiting") && text.contains(" far "), "{text}");
+        let d: Vec<String> = detail(r, "", 60, now).iter().map(line_text).collect();
+        assert!(d[0].contains("on far") && d.iter().any(|x| x.contains("client laptop")), "{d:?}");
     }
 
     #[test]
@@ -333,6 +372,7 @@ mod tests {
             depth: 0,
             job: None,
             modified: None,
+            host: None,
         };
         assert!(row("print").can_stop() && row("print").can_take());
         assert!(row("subagent").can_stop() && !row("subagent").can_take());
@@ -378,9 +418,10 @@ mod tests {
             depth: 1,
             job: Some("scout-1".into()),
             modified: None,
+            host: None,
         };
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600 + 3700);
-        let row = list_row(&r, true, 24, "$0.12", 80, now, None);
+        let row = list_row(&r, true, 24, 0, "$0.12", 80, now, None);
         let text = line_text(&row);
         assert!(text.contains("subagent review-lead") && text.contains("$0.12") && text.contains("1h"), "{text}");
         assert!(line_width(&row) <= 80);
