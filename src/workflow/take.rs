@@ -4,6 +4,7 @@
 use mu_common::paths;
 use mu_session::session::control::{Recheck, Want, recheck, signal};
 use mu_session::session::list::{find, header_cwd};
+use mu_session::session::mirror::checkout;
 use mu_session::session::owner::{Owner, is_free, owner};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -42,7 +43,7 @@ pub fn release(path: &Path, who: &str, ask: bool) -> anyhow::Result<Option<i32>>
         }
         Owner::Unknown => {
             eprintln!(
-                "{who}: the session is locked by a process that left no owner record (an older mu, or another MU_HOME); stop it yourself"
+                "{who}: the session is locked by a process that left no owner record (an older mu, another MU_HOME, or a mirror of a remote subagent's session that is still running); stop it yourself or wait for it"
             );
             Ok(Some(1))
         }
@@ -55,6 +56,26 @@ pub fn release(path: &Path, who: &str, ask: bool) -> anyhow::Result<Option<i32>>
             }
             stop_and_wait(path, pid, &started)
         }
+    }
+}
+
+/// `release` for a caller with no terminal and no stderr anyone reads (the agent serving an attached client):
+/// the reason a session cannot be had comes back as the error. Never asks.
+pub fn release_quiet(path: &Path) -> Result<(), String> {
+    match owner(path) {
+        Owner::Free => Ok(()),
+        Owner::Live { pid, print_run: false, .. } => {
+            Err(format!("pid {pid} has the session open in an interactive mu (or a subagent/ACP); close it there"))
+        }
+        Owner::Unknown => Err("the session is locked by a process that left no owner record (an older mu, another \
+                               MU_HOME, or a mirror of a remote subagent's session that is still running); stop it \
+                               yourself or wait for it"
+            .into()),
+        Owner::Live { pid, print_run: true, started, .. } => match stop_and_wait(path, pid, &started) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(format!("could not stop the `mu -p` run (pid {pid}); see the agent's log")),
+            Err(e) => Err(e.to_string()),
+        },
     }
 }
 
@@ -140,11 +161,20 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
 
 fn resume(path: &Path) -> anyhow::Result<i32> {
     use std::os::unix::process::CommandExt;
-    if let Some(dir) = header_cwd(path) {
-        if dir.is_dir() {
-            std::env::set_current_dir(&dir)?;
-        } else {
-            eprintln!("mu take: {} no longer exists; staying in the current directory", dir.display());
+    match checkout(path) {
+        Ok(Some(dir)) => std::env::set_current_dir(&dir)?,
+        Ok(None) => {
+            if let Some(dir) = header_cwd(path) {
+                if dir.is_dir() {
+                    std::env::set_current_dir(&dir)?;
+                } else {
+                    eprintln!("mu take: {} no longer exists; staying in the current directory", dir.display());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("mu take: {e}");
+            return Ok(1);
         }
     }
     let exe = paths::self_exe()?;

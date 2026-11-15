@@ -3,23 +3,20 @@
 //! `mu_provider::auth::chatgpt`; this file drives them and shows the results.
 
 use super::*;
+use crate::host::chatgpt::{self as host, Done, Flow, Gone, Notice, Paste, Revoke, Saved, Url};
+use crate::host::keys::ChatgptLabel;
 use crate::widgets::editor::adds_newline;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use crossterm::event::{KeyCode, KeyEvent};
-use mu_provider::auth::chatgpt::{self, Account, LABEL, PROVIDER_ID, USAGE_URL, oauth, signin};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_util::sync::CancellationToken;
+use mu_provider::auth::chatgpt::{self, AUTH_BASE, LABEL, PROVIDER_ID, USAGE_URL};
 
 /// A sign-in waiting for the browser's callback or for the redirect URL typed into the composer.
-/// The composer is locked to that input until the flow ends.
+/// The composer is locked to that input until the flow ends. The sign-in itself runs on the host.
 pub(super) struct ChatgptFlow {
     /// Tells a late result from the current flow's.
     pub(super) id: u64,
-    pub(super) cancel: CancellationToken,
-    /// The typed redirect URL goes to the login task here.
-    pub(super) paste: UnboundedSender<String>,
 }
 
 /// `openai-chatgpt`, or its `chatgpt` alias.
@@ -28,10 +25,10 @@ pub(super) fn is_chatgpt(id: &str) -> bool {
 }
 
 /// The `/login` row for the ChatGPT sign-in and its status.
-pub(super) fn login_item(account: Option<&Account>) -> (Item, LoginTarget) {
+pub(super) fn login_item(account: Option<&ChatgptLabel>) -> (Item, LoginTarget) {
     let detail = match account {
-        Some(a) if a.plan_usage() => format!("signed in as {} · chat on your plan", a.label()),
-        Some(a) if a.signed_in() => "signed in · plan usage not enabled".into(),
+        Some(a) if a.plan_usage => format!("signed in as {} · chat on your plan", a.label),
+        Some(a) if a.signed_in => "signed in · plan usage not enabled".into(),
         _ => "not signed in".into(),
     };
     (Item { label: "Continue with ChatGPT".into(), detail }, LoginTarget::ChatGpt)
@@ -64,6 +61,17 @@ pub(super) fn chatgpt_menu(signed_in: bool) -> Vec<(Item, KeyOption)> {
     rows
 }
 
+/// Whether the client may open `url`: `https` on the sign-in's own host, with no userinfo or port.
+/// The URL comes from the host, which may be a remote agent.
+fn auth_url_openable(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    if url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    AUTH_BASE.strip_prefix("https://").is_some_and(|h| h.eq_ignore_ascii_case(authority))
+}
+
 /// The picker's marker for a model that runs natively: the ChatGPT plan, or the API key.
 pub(super) fn native_label(provider: &str) -> &'static str {
     if provider == PROVIDER_ID { LABEL } else { "key" }
@@ -81,36 +89,53 @@ impl App {
         if self.chatgpt_typing() {
             return self.notice("a ChatGPT sign-in is already waiting: paste its redirect URL, or press Esc");
         }
-        let store = self.services.providers.store().clone();
-        let host = match store.chatgpt_host_id() {
-            Ok(h) => h,
-            Err(e) => return self.error(&format!("could not start the ChatGPT sign-in: {e}")),
-        };
-        let endpoints = store.chatgpt_endpoints();
-        let known = store.chatgpt_known();
         self.flows.chatgpt_seq += 1;
         let id = self.flows.chatgpt_seq;
-        let cancel = CancellationToken::new();
-        let (paste, mut paste_rx) = unbounded_channel();
-        self.flows.begin(Active::Chatgpt(ChatgptFlow { id, cancel: cancel.clone(), paste }));
+        // The flow is live before the host answers: its URL can arrive ahead of the reply.
+        self.flows.begin(Active::Chatgpt(ChatgptFlow { id }));
         self.prompt.composer.set_private(true);
         self.prompt.composer.set_closed(true);
-        self.notice("signing in with ChatGPT…");
-        let tx = self.ui_tx.clone();
-        tokio::task::spawn_local(async move {
-            let url_tx = tx.clone();
-            let req = oauth::LoginRequest { endpoints: &endpoints, host_id: &host, known, cancel };
-            let notice_tx = tx.clone();
-            let mut on_url = |url: &str| {
-                let _ = url_tx.send(UiMsg::ChatgptUrl { flow: id, url: url.to_string() });
-                let _ = chatgpt::browser::open_browser(url);
-            };
-            let mut notice = |text: &str| {
-                let _ = notice_tx.send(UiMsg::ChatgptNotice { flow: id, text: text.to_string() });
-            };
-            let r = oauth::login(req, &mut on_url, &mut notice, &mut paste_rx).await.map_err(|e| e.to_string());
-            let _ = tx.send(UiMsg::ChatgptDone { flow: id, r });
+        self.host_call(host::CHATGPT_START, &Flow { flow: id }, move |app, r: Result<(), String>| match r {
+            Ok(()) => app.notice("signing in with ChatGPT…"),
+            Err(e) => {
+                if app.flows.chatgpt().is_some_and(|f| f.id == id) {
+                    app.flows.end_chatgpt();
+                    app.unlock_composer();
+                }
+                app.error(&format!("could not start the ChatGPT sign-in: {e}"));
+            }
         });
+    }
+
+    /// A value the host pushed for the sign-in: its URL, a line it reports, or its end.
+    pub(super) fn on_chatgpt_pushed(&mut self, p: crate::host::Pushed) {
+        match p.name.as_str() {
+            host::URL => {
+                if let Ok(u) = serde_json::from_value::<Url>(p.data) {
+                    if self.flows.chatgpt().is_some_and(|f| f.id == u.flow) && !cfg!(test) {
+                        if auth_url_openable(&u.url) {
+                            let _ = chatgpt::browser::open_browser(&u.url);
+                        } else {
+                            self.notice(
+                                "the sign-in link is not on the ChatGPT sign-in host, so no browser was opened",
+                            );
+                        }
+                    }
+                    self.on_chatgpt_url(u.flow, &u.url);
+                }
+            }
+            host::NOTICE => {
+                if let Ok(n) = serde_json::from_value::<Notice>(p.data) {
+                    self.on_chatgpt_notice(n.flow, &n.text);
+                }
+            }
+            host::DONE => {
+                if let Ok(d) = serde_json::from_value::<Done>(p.data) {
+                    self.on_chatgpt_done(d.flow, d.error.map_or(Ok(()), Err));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A line the sign-in reports while it waits: a callback or pasted URL that did not match it.
@@ -151,8 +176,12 @@ impl App {
             return;
         }
         self.prompt.composer.take_secret();
-        if let Some(f) = self.flows.chatgpt() {
-            let _ = f.paste.send(text);
+        if let Some(flow) = self.flows.chatgpt().map(|f| f.id) {
+            self.host_call(host::CHATGPT_PASTE, &Paste { flow, text }, |app, r: Result<(), String>| {
+                if let Err(e) = r {
+                    app.error(&e);
+                }
+            });
         }
         self.notice("checking the redirect URL…");
     }
@@ -160,19 +189,19 @@ impl App {
     /// Esc while a sign-in waits: the flow ends, and its late result is ignored.
     fn cancel_chatgpt(&mut self) {
         let Some(f) = self.flows.end_chatgpt() else { return };
-        f.cancel.cancel();
+        self.host_call(host::CHATGPT_CANCEL, &Flow { flow: f.id }, |_, _: Result<(), String>| {});
         self.unlock_composer();
         self.notice("sign-in cancelled; nothing changed");
     }
 
-    pub(super) fn on_chatgpt_done(&mut self, flow: u64, r: Result<Account, String>) {
+    pub(super) fn on_chatgpt_done(&mut self, flow: u64, r: Result<(), String>) {
         if !self.flows.chatgpt().is_some_and(|f| f.id == flow) {
             return;
         }
         self.flows.end_chatgpt();
         self.unlock_composer();
         match r {
-            Ok(account) => self.save_chatgpt(account),
+            Ok(()) => self.save_chatgpt(flow),
             Err(e) => {
                 self.error(&format!("ChatGPT sign-in did not finish: {e}. Nothing was saved; /login to try again"))
             }
@@ -180,32 +209,36 @@ impl App {
     }
 
     /// Saves a finished sign-in by the same rules as `mu auth login`, then says what it means.
-    fn save_chatgpt(&mut self, account: Account) {
-        let store = self.services.providers.store().clone();
-        let saved = match signin::save(&store, account) {
-            Ok(s) => s,
-            Err(m) => return self.error(&m),
-        };
-        self.send(Command::RefreshModel);
-        if !saved.plan_usage {
-            return self.error(&format!(
-                "signed in as {}, but plan usage is not enabled for this sign-in, so {PROVIDER_ID}/* models cannot run yet. /login again and approve the plan permission",
-                saved.label
-            ));
-        }
-        self.notice(&format!("signed in as {}; {PROVIDER_ID}/* models now run on your ChatGPT plan", saved.label));
-        if saved.welcome {
-            self.notice(&format!("You're using your ChatGPT plan. Manage usage: {USAGE_URL}"));
-        }
+    fn save_chatgpt(&mut self, flow: u64) {
+        self.host_call(host::CHATGPT_SAVE, &Flow { flow }, |app, r: Result<Saved, String>| {
+            let saved = match r {
+                Ok(s) => s,
+                Err(m) => return app.error(&m),
+            };
+            app.send(Command::RefreshModel);
+            if !saved.plan_usage {
+                return app.error(&format!(
+                    "signed in as {}, but plan usage is not enabled for this sign-in, so {PROVIDER_ID}/* models cannot run yet. /login again and approve the plan permission",
+                    saved.label
+                ));
+            }
+            app.notice(&format!("signed in as {}; {PROVIDER_ID}/* models now run on your ChatGPT plan", saved.label));
+            if saved.welcome {
+                app.notice(&format!("You're using your ChatGPT plan. Manage usage: {USAGE_URL}"));
+            }
+        });
     }
 
     /// The `/login` row: signs in when no account is saved, else opens the ChatGPT menu (signed in or not).
     pub(super) fn chatgpt_row(&mut self) {
-        let Some(signed_in) = self.services.providers.store().chatgpt_account().map(|a| a.signed_in()) else {
-            return self.start_chatgpt();
-        };
-        let pick = Picker::from_rows(chatgpt_menu(signed_in), |items| Select::new("ChatGPT sign-in", items));
-        self.open_overlay(Overlay::KeyChoice { pick, provider: PROVIDER_ID.into() });
+        self.host_call(host::CHATGPT_STATUS, &(), |app, r: Result<Option<bool>, String>| match r {
+            Ok(Some(signed_in)) => {
+                let pick = Picker::from_rows(chatgpt_menu(signed_in), |items| Select::new("ChatGPT sign-in", items));
+                app.open_overlay(Overlay::KeyChoice { pick, provider: PROVIDER_ID.into() });
+            }
+            Ok(None) => app.start_chatgpt(),
+            Err(e) => app.error(&e),
+        });
     }
 
     /// What the ChatGPT menu chose.
@@ -220,22 +253,27 @@ impl App {
 
     /// Drops the tokens now and revokes the refresh token in the background.
     pub(super) fn chatgpt_sign_out(&mut self) {
-        let store = self.services.providers.store().clone();
-        let account = match signin::sign_out(&store) {
-            Ok(Some(a)) => a,
-            Ok(None) => return self.notice("not signed in with ChatGPT"),
-            Err(e) => return self.error(&format!("could not sign out of ChatGPT: {e}")),
-        };
-        self.notice(&format!(
-            "signed out of ChatGPT ({}); {PROVIDER_ID}/* models stop running until you sign in again",
-            account.label()
-        ));
-        self.send(Command::RefreshModel);
-        let tx = self.ui_tx.clone();
-        tokio::task::spawn_local(async move {
-            let r = signin::revoke(&store, &account).await;
-            let _ = tx.send(UiMsg::ChatgptRevoked(r));
+        self.host_call(host::CHATGPT_SIGN_OUT, &(), |app, r: Result<Option<Gone>, String>| {
+            let account = match r {
+                Ok(Some(a)) => a,
+                Ok(None) => return app.notice("not signed in with ChatGPT"),
+                Err(e) => return app.error(&format!("could not sign out of ChatGPT: {e}")),
+            };
+            app.notice(&format!(
+                "signed out of ChatGPT ({}); {PROVIDER_ID}/* models stop running until you sign in again",
+                account.label
+            ));
+            app.send(Command::RefreshModel);
+            app.revoke_chatgpt(account.revoke);
         });
+    }
+
+    fn revoke_chatgpt(&mut self, revoke: Option<u64>) {
+        if let Some(revoke) = revoke {
+            self.host_call(host::CHATGPT_REVOKE, &Revoke { revoke }, |app, r: Result<(), String>| {
+                app.on_chatgpt_revoked(r)
+            });
+        }
     }
 
     /// Forgets the registration, so the sign-in that follows may be another ChatGPT account. The
@@ -244,26 +282,21 @@ impl App {
         if self.chatgpt_typing() {
             return self.start_chatgpt();
         }
-        let store = self.services.providers.store().clone();
-        let account = match signin::forget(&store) {
-            Ok(a) => a,
-            Err(e) => return self.error(&format!("could not forget the ChatGPT registration: {e}")),
-        };
-        if let Some(account) = account {
-            self.notice(&format!(
-                "forgot the ChatGPT registration ({}); the next sign-in may use another ChatGPT account. The old app stays listed under your ChatGPT settings, apps, until you disconnect it there",
-                account.label()
-            ));
-            self.send(Command::RefreshModel);
-            if account.signed_in() {
-                let tx = self.ui_tx.clone();
-                tokio::task::spawn_local(async move {
-                    let r = signin::revoke(&store, &account).await;
-                    let _ = tx.send(UiMsg::ChatgptRevoked(r));
-                });
+        self.host_call(host::CHATGPT_FORGET, &(), |app, r: Result<Option<Gone>, String>| {
+            let account = match r {
+                Ok(a) => a,
+                Err(e) => return app.error(&format!("could not forget the ChatGPT registration: {e}")),
+            };
+            if let Some(account) = account {
+                app.notice(&format!(
+                    "forgot the ChatGPT registration ({}); the next sign-in may use another ChatGPT account. The old app stays listed under your ChatGPT settings, apps, until you disconnect it there",
+                    account.label
+                ));
+                app.send(Command::RefreshModel);
+                app.revoke_chatgpt(account.revoke);
             }
-        }
-        self.start_chatgpt();
+            app.start_chatgpt();
+        });
     }
 
     pub(super) fn on_chatgpt_revoked(&mut self, r: Result<(), String>) {
@@ -278,7 +311,148 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mu_provider::auth::chatgpt::{DIRECT_SCOPE, Tokens};
+    use crate::app::keys::tests::{in_local, press, test_app_with_commands, transcript_text};
+    use crate::host::{Deferred, Pushed, local::LocalHost};
+    use mu_provider::auth::chatgpt::{Account, DIRECT_SCOPE, Tokens};
+    use std::time::Duration;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    struct Rig {
+        app: App,
+        ui: UnboundedReceiver<UiMsg>,
+        pushed: UnboundedReceiver<Pushed>,
+        _cmds: UnboundedReceiver<Command>,
+    }
+
+    /// An app whose host is the local one, or the local one wrapped in `Deferred`.
+    fn rig(deferred: bool) -> Rig {
+        let (mut app, _cmds) = test_app_with_commands(std::env::temp_dir().join("mu-chatgpt-ui-history"));
+        let (ui_tx, ui) = tokio::sync::mpsc::unbounded_channel();
+        app.ui_tx = ui_tx;
+        if deferred {
+            app.host = Rc::new(Deferred(LocalHost::new(
+                app.services.providers.clone(),
+                app.ctx.clone(),
+                app.plugins.clone(),
+                app.cwd.clone(),
+            )));
+        }
+        let pushed = app.host.pushed().unwrap();
+        Rig { app, ui, pushed, _cmds }
+    }
+
+    impl Rig {
+        async fn pump(&mut self, done: impl Fn(&App) -> bool) {
+            let Rig { app, ui, pushed, .. } = self;
+            let waited = tokio::time::timeout(Duration::from_secs(10), async {
+                while !done(app) {
+                    tokio::select! {
+                        Some(m) = ui.recv() => app.on_ui(m),
+                        Some(p) = pushed.recv() => app.on_pushed(p),
+                    }
+                }
+            })
+            .await;
+            assert!(waited.is_ok(), "timed out; the transcript says:\n{}", transcript_text(app));
+        }
+    }
+
+    /// Runs `check` once with the local host and once with a deferred one.
+    fn on_both_hosts<F: std::future::Future<Output = ()>>(check: impl Fn(Rig) -> F) {
+        for deferred in [false, true] {
+            in_local(check(rig(deferred)));
+        }
+    }
+
+    fn save_account(app: &App, a: Account) {
+        app.services.providers.store().chatgpt_save(a).unwrap();
+    }
+
+    #[test]
+    fn the_login_row_opens_the_menu_of_a_saved_account() {
+        on_both_hosts(|mut r| async move {
+            save_account(&r.app, account(false, false));
+            r.app.chatgpt_row();
+            r.pump(|app| app.overlay.is_some()).await;
+            assert!(matches!(r.app.overlay, Some(Overlay::KeyChoice { .. })));
+        });
+    }
+
+    #[test]
+    fn a_sign_out_without_an_account_says_so() {
+        on_both_hosts(|mut r| async move {
+            r.app.chatgpt_sign_out();
+            r.pump(|app| transcript_text(app).contains("not signed in with ChatGPT")).await;
+        });
+    }
+
+    #[test]
+    fn forgetting_a_registration_names_it_and_starts_a_sign_in() {
+        on_both_hosts(|mut r| async move {
+            save_account(&r.app, account(false, false));
+            r.app.chatgpt_forget();
+            r.pump(|app| app.flows.chatgpt().is_some()).await;
+            let t = transcript_text(&r.app);
+            assert!(t.contains("forgot the ChatGPT registration (me@example.com)"), "{t}");
+            assert!(r.app.services.providers.store().chatgpt_account().is_none());
+        });
+    }
+
+    #[test]
+    fn revoking_an_unknown_sign_in_is_reported() {
+        on_both_hosts(|mut r| async move {
+            r.app.revoke_chatgpt(Some(u64::MAX));
+            r.pump(|app| transcript_text(app).contains("could not confirm")).await;
+            assert!(transcript_text(&r.app).contains("no ChatGPT sign-in to revoke"));
+        });
+    }
+
+    #[test]
+    fn a_finished_sign_in_is_saved_by_the_host() {
+        on_both_hosts(|mut r| async move {
+            let mut a = account(true, true);
+            if let Some(t) = a.tokens.as_mut() {
+                t.access_token = "acc-test-0123456789".into();
+                t.refresh_token = "ref-test-0123456789".into();
+                t.id_token = "id-test-0123456789".into();
+            }
+            r.app.flows.active = Active::Chatgpt(ChatgptFlow { id: 4 });
+            crate::host::chatgpt::finish_for_test(4, a);
+            r.app.on_chatgpt_done(4, Ok(()));
+            r.pump(|app| transcript_text(app).contains("Manage usage")).await;
+            let t = transcript_text(&r.app);
+            assert!(t.contains(&format!("signed in as me@example.com; {PROVIDER_ID}/* models now run")), "{t}");
+            assert!(r.app.services.providers.store().chatgpt_account().is_some_and(|a| a.signed_in()));
+            // A second save has nothing to save.
+            r.app.flows.active = Active::Chatgpt(ChatgptFlow { id: 4 });
+            r.app.on_chatgpt_done(4, Ok(()));
+            r.pump(|app| transcript_text(app).contains("no finished ChatGPT sign-in")).await;
+        });
+    }
+
+    #[test]
+    fn a_sign_in_shows_its_url_takes_a_paste_and_is_cancelled_on_the_host() {
+        on_both_hosts(|mut r| async move {
+            // A saved registration lets the callback listener use any free port.
+            save_account(&r.app, account(false, false));
+            r.app.start_chatgpt();
+            r.pump(|app| transcript_text(app).contains("A browser should open")).await;
+            assert!(r.app.typing(), "the composer is locked to the redirect URL");
+            for c in "nope".chars() {
+                r.app.on_terminal(press(KeyCode::Char(c), crossterm::event::KeyModifiers::NONE));
+            }
+            r.app.on_terminal(press(KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
+            r.pump(|app| transcript_text(app).contains("Paste the full address from the browser")).await;
+            r.app.on_terminal(press(KeyCode::Esc, crossterm::event::KeyModifiers::NONE));
+            assert!(r.app.flows.chatgpt().is_none());
+            // The host ends the cancelled flow; its late result is ignored.
+            let p = tokio::time::timeout(Duration::from_secs(10), r.pushed.recv()).await.unwrap().unwrap();
+            assert_eq!(p.name, crate::host::chatgpt::DONE);
+            r.app.on_pushed(p);
+            let t = transcript_text(&r.app);
+            assert!(t.contains("sign-in cancelled; nothing changed") && !t.contains("did not finish"), "{t}");
+        });
+    }
 
     fn account(signed_in: bool, plan: bool) -> Account {
         let tokens = signed_in.then(|| Tokens {
@@ -297,13 +471,41 @@ mod tests {
         }
     }
 
+    fn label(signed_in: bool, plan: bool) -> ChatgptLabel {
+        ChatgptLabel {
+            signed_in,
+            plan_usage: signed_in && plan,
+            label: "me@example.com".into(),
+            added: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn only_https_urls_on_the_auth_host_open() {
+        assert!(auth_url_openable("https://auth.openai.com/api/accounts/authorize?client_id=x&state=y"));
+        for bad in [
+            "http://auth.openai.com/a",
+            "file:///etc/passwd",
+            "https://auth.openai.com.evil.example/a",
+            "https://auth.openai.com@evil.example/a",
+            "https://evil.example/https://auth.openai.com/",
+            "https://auth.openai.com:8443/a",
+            "https://auth.openai.com/a b",
+            "https://auth.openai.com/a\n--flag",
+            "-https://auth.openai.com/",
+            "",
+        ] {
+            assert!(!auth_url_openable(bad), "{bad}");
+        }
+    }
+
     #[test]
     fn the_login_row_shows_each_status() {
-        let detail = |a: Option<Account>| login_item(a.as_ref()).0.detail;
+        let detail = |a: Option<ChatgptLabel>| login_item(a.as_ref()).0.detail;
         assert_eq!(detail(None), "not signed in");
-        assert_eq!(detail(Some(account(false, false))), "not signed in");
-        assert_eq!(detail(Some(account(true, true))), "signed in as me@example.com · chat on your plan");
-        assert_eq!(detail(Some(account(true, false))), "signed in · plan usage not enabled");
+        assert_eq!(detail(Some(label(false, false))), "not signed in");
+        assert_eq!(detail(Some(label(true, true))), "signed in as me@example.com · chat on your plan");
+        assert_eq!(detail(Some(label(true, false))), "signed in · plan usage not enabled");
         let (item, target) = login_item(None);
         assert_eq!(item.label, "Continue with ChatGPT");
         assert_eq!(target, LoginTarget::ChatGpt);

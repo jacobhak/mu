@@ -19,10 +19,10 @@ toml.workspace = true
 toml_edit.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 mu-testutil.workspace = true
-uuid.workspace = true
 
 [lints]
 workspace = true

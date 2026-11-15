@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::host::sessions::LiveRow;
 use crate::text::line::{self, Line, dim, span};
 use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
@@ -21,36 +22,49 @@ pub struct Row {
     pub job: Option<String>,
     /// When the session file was last written.
     pub modified: Option<SystemTime>,
+    /// The machine it runs on; `None` for a session on this host.
+    pub host: Option<String>,
+    /// How to open a session on another host, from the source that listed it.
+    pub hint: Option<String>,
+    /// A shell command that opens it (`mu --attach`).
+    pub attach: Option<String>,
 }
 
 impl Row {
-    /// `print`, `subagent review-lead`, `tui`; `?` for a record that says nothing.
+    /// `print`, `subagent review-lead`, `tui`; `?` for a record that says nothing. An agent with a
+    /// request that waits for a client adds ` waiting`, and one whose state is still locked ` locked`.
     pub fn label(&self) -> String {
         let kind = self.live.kind.as_deref().unwrap_or("?");
-        match &self.live.agent {
+        let label = match &self.live.agent {
             Some(a) => format!("{kind} {a}"),
             None => kind.to_string(),
-        }
+        };
+        let label = if self.live.locked { format!("{label} locked") } else { label };
+        if self.live.waiting { format!("{label} waiting") } else { label }
     }
 
     /// `s` can stop it: a `-p` run stops after its step, a subagent is terminated, an interactive mu
     /// that takes abort requests cancels its current turn.
     pub fn can_stop(&self) -> bool {
+        if self.host.is_some() {
+            return false;
+        }
         match self.live.kind.as_deref() {
             Some("print" | "subagent") => true,
-            Some("tui") => self.live.abort,
+            Some("tui" | "agent") => self.live.abort,
             _ => false,
         }
     }
 
-    /// `S` can terminate it: an interactive mu, after a confirmation.
+    /// `S` can terminate it: an interactive mu or an agent (it ends its session the proper way), after a
+    /// confirmation. An agent is joined by a client, not taken over, so `t` is not offered for it.
     pub fn can_terminate(&self) -> bool {
-        self.live.kind.as_deref() == Some("tui")
+        self.host.is_none() && matches!(self.live.kind.as_deref(), Some("tui" | "agent"))
     }
 
     /// `t` can take it over: only a `-p` run hands its session over.
     pub fn can_take(&self) -> bool {
-        self.live.kind.as_deref() == Some("print") && self.live.print_run
+        self.host.is_none() && self.live.kind.as_deref() == Some("print") && self.live.print_run
     }
 
     /// The session id that `mu notify` and `mu take` accept.
@@ -59,45 +73,47 @@ impl Row {
     }
 }
 
-fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
-
-/// The rows, in tree order: roots oldest first, each followed by its children. Left out: this process
-/// and its own session (the Jobs tab is that), and nothing else. `titles` caches titles by path.
+/// The rows, in tree order: roots oldest first, each followed by its children. Left out: this
+/// session (the Jobs tab is that), and nothing else. `titles` caches titles by path; `canon` has the
+/// canonical form of the paths the host was asked about (a path not in it stands for itself).
 pub fn build(
-    lives: Vec<LiveSession>,
+    lives: Vec<LiveRow>,
     titles: &HashMap<PathBuf, String>,
     jobs: &[SubagentStatus],
     own: Option<&Path>,
+    canon: &HashMap<PathBuf, PathBuf>,
 ) -> Vec<Row> {
+    let canon = |p: &Path| canon.get(p).cloned().unwrap_or_else(|| p.to_path_buf());
     let own = own.map(canon);
     let job_of: Vec<(PathBuf, &str)> =
         jobs.iter().filter_map(|j| j.session.as_deref().map(|p| (canon(p), j.name.as_str()))).collect();
-    let me = std::process::id();
-    let lives: Vec<LiveSession> =
-        lives.into_iter().filter(|l| l.pid != me && own.as_deref() != Some(l.path.as_path())).collect();
-    let paths: Vec<PathBuf> = lives.iter().map(|l| l.path.clone()).collect();
-    let parent_of = |l: &LiveSession| l.parent.as_deref().map(canon).filter(|p| paths.contains(p));
+    let lives: Vec<LiveRow> = lives.into_iter().filter(|l| own.as_deref() != Some(l.live.path.as_path())).collect();
+    let paths: Vec<PathBuf> = lives.iter().map(|l| l.live.path.clone()).collect();
+    let parent_of = |l: &LiveRow| l.parent.clone().filter(|p| paths.contains(p));
     let mut order: Vec<usize> = (0..lives.len()).collect();
-    order.sort_by(|&a, &b| (&lives[a].started, &lives[a].path).cmp(&(&lives[b].started, &lives[b].path)));
+    order.sort_by(|&a, &b| {
+        (&lives[a].live.started, &lives[a].live.path).cmp(&(&lives[b].live.started, &lives[b].live.path))
+    });
     let mut out: Vec<Row> = Vec::with_capacity(lives.len());
     let mut stack: Vec<(usize, usize)> =
         order.iter().rev().filter(|&&i| parent_of(&lives[i]).is_none()).map(|&i| (i, 0)).collect();
     while let Some((i, depth)) = stack.pop() {
         let l = &lives[i];
         for &c in order.iter().rev() {
-            if parent_of(&lives[c]).as_deref() == Some(l.path.as_path()) {
+            if parent_of(&lives[c]).as_deref() == Some(l.live.path.as_path()) {
                 stack.push((c, depth + 1));
             }
         }
-        let job = job_of.iter().find(|(p, _)| *p == l.path).map(|(_, n)| n.to_string());
+        let job = job_of.iter().find(|(p, _)| *p == l.live.path).map(|(_, n)| n.to_string());
         out.push(Row {
-            live: l.clone(),
-            title: titles.get(&l.path).cloned().unwrap_or_default(),
+            live: l.live.clone(),
+            title: titles.get(&l.live.path).cloned().unwrap_or_default(),
             depth,
             job,
-            modified: std::fs::metadata(&l.path).and_then(|m| m.modified()).ok(),
+            modified: l.modified,
+            host: l.host.clone(),
+            hint: l.hint.clone(),
+            attach: l.attach.clone(),
         });
     }
     out
@@ -136,22 +152,32 @@ pub fn short_path(p: &Path, home: Option<&str>, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn home() -> Option<String> {
-    std::env::var("HOME").ok()
-}
-
-/// One list row: a live mark, kind and agent, pid, cost, age, directory and title.
-pub fn list_row(r: &Row, selected: bool, label_w: usize, cost: &str, width: usize, now: SystemTime) -> Line {
+/// One list row: a live mark, kind and agent, host (when `host_w` is not 0), pid, cost, age, directory
+/// and title. `home` is the host's home directory.
+#[allow(clippy::too_many_arguments)]
+pub fn list_row(
+    r: &Row,
+    selected: bool,
+    label_w: usize,
+    host_w: usize,
+    cost: &str,
+    width: usize,
+    now: SystemTime,
+    home: Option<&str>,
+) -> Line {
     let t = theme::get();
     let started = age(&r.live.started, now).map(age_text).unwrap_or_default();
-    let cwd = r.live.cwd.as_deref().map(|c| short_path(c, home().as_deref(), 24)).unwrap_or_default();
+    let cwd = r.live.cwd.as_deref().map(|c| short_path(c, home, 24)).unwrap_or_default();
     let indent = "  ".repeat(r.depth);
     let label = pad(&format!("{indent}{}", r.label()), label_w);
     let mut name = t.fg(Role::Strong);
     if selected {
         name.attributes.set(crossterm::style::Attribute::Bold);
     }
-    let rest = format!(" {:>6} {cost:>6} {started:>4}  {cwd}  {}", r.live.pid, r.title);
+    let pid = if r.host.is_some() { String::new() } else { r.live.pid.to_string() };
+    let host =
+        if host_w == 0 { String::new() } else { format!(" {}", pad(r.host.as_deref().unwrap_or("here"), host_w)) };
+    let rest = format!("{host} {pid:>6} {cost:>6} {started:>4}  {cwd}  {}", r.title);
     let mut l = vec![
         if selected { span("❯ ", accent()) } else { span("  ", dim()) },
         span("● ", t.fg(Role::Ok)),
@@ -170,7 +196,10 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
     let t = theme::get();
     let muted = t.fg(Role::Muted);
     let faint = t.fg(Role::Faint);
-    let mut facts = format!("pid {}", r.live.pid);
+    let mut facts = match &r.host {
+        Some(h) => format!("on {h}"),
+        None => format!("pid {}", r.live.pid),
+    };
     if let Some(a) = age(&r.live.started, now) {
         facts.push_str(&format!(" · up {}", age_text(a)));
     }
@@ -185,6 +214,9 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
         rows.push(vec![span(format!("   {}", c.display()), muted)]);
     }
     rows.push(vec![span(format!("   session {}", r.id()), faint)]);
+    if let Some(c) = &r.live.client {
+        rows.push(vec![span(format!("   client {}", c.host), muted)]);
+    }
     if let Some(j) = &r.job {
         rows.push(vec![span(format!("   job {j} of this session"), muted)]);
     }
@@ -193,11 +225,20 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
         let lead = if i == 0 { "   prompt " } else { "          " };
         rows.push(vec![span(lead, faint), span(l, t.fg(Role::Strong))]);
     }
+    if r.host.is_some() {
+        let how = match (&r.attach, &r.hint) {
+            (Some(_), _) => "Enter attaches to it".to_string(),
+            (None, Some(h)) => h.clone(),
+            (None, None) => "it runs on another machine".to_string(),
+        };
+        rows.push(vec![span(format!("   {how}"), faint)]);
+        return rows;
+    }
     let mut keys = vec!["Enter peek", "n message"];
     if r.can_stop() {
         keys.push(match r.live.kind.as_deref() {
             Some("print") => "s stop after its step",
-            Some("tui") => "s abort its turn",
+            Some("tui" | "agent") => "s abort its turn",
             _ => "s terminate",
         });
     }
@@ -228,11 +269,56 @@ mod tests {
             cwd: Some(PathBuf::from("/work/proj")),
             parent: None,
             abort: false,
+            waiting: false,
+            locked: false,
+            client: None,
         }
+    }
+
+    fn rows_of(lives: Vec<LiveSession>) -> Vec<LiveRow> {
+        lives
+            .into_iter()
+            .map(|live| LiveRow {
+                parent: live.parent.clone(),
+                modified: None,
+                title: None,
+                host: None,
+                hint: None,
+                attach: None,
+                live,
+            })
+            .collect()
     }
 
     fn names(rows: &[Row]) -> Vec<(String, usize)> {
         rows.iter().map(|r| (r.live.path.display().to_string(), r.depth)).collect()
+    }
+
+    #[test]
+    fn a_remote_agent_shows_its_host_who_has_it_and_offers_no_actions() {
+        let mut l = live("/remote/far/abc.jsonl", "agent", "2026-01-01T00:00:00Z");
+        l.waiting = true;
+        l.abort = true;
+        l.client = Some(mu_session::session::owner::ClientInfo { host: "laptop".into(), since: 5 });
+        let mut lives = rows_of(vec![l]);
+        lives[0].host = Some("far".into());
+        let rows = build(lives, &HashMap::new(), &[], None, &HashMap::new());
+        let r = &rows[0];
+        assert!(!r.can_stop() && !r.can_terminate() && !r.can_take());
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600 + 60);
+        let text = line_text(&list_row(r, false, 14, 4, "", 100, now, None));
+        assert!(text.contains("agent waiting") && text.contains(" far "), "{text}");
+        let d: Vec<String> = detail(r, "", 60, now).iter().map(line_text).collect();
+        assert!(d[0].contains("on far") && d.iter().any(|x| x.contains("client laptop")), "{d:?}");
+    }
+
+    #[test]
+    fn a_locked_agent_is_labelled_locked_before_waiting() {
+        let mut l = live("/s/agent.jsonl", "agent", "2026-01-01T00:00:00Z");
+        l.locked = true;
+        l.waiting = true;
+        let rows = build(rows_of(vec![l]), &HashMap::new(), &[], None, &HashMap::new());
+        assert_eq!(rows[0].label(), "agent locked waiting");
     }
 
     #[test]
@@ -246,17 +332,18 @@ mod tests {
         let mut orphan = live("/s/orphan.jsonl", "subagent", "2026-01-01T00:00:09Z");
         orphan.parent = Some(PathBuf::from("/s/gone.jsonl"));
         let rows = build(
-            vec![
+            rows_of(vec![
                 orphan,
                 grand,
                 live("/s/root-new.jsonl", "print", "2026-01-01T00:00:05Z"),
                 child_a,
                 live("/s/root-old.jsonl", "print", "2026-01-01T00:00:01Z"),
                 child_b,
-            ],
+            ]),
             &HashMap::new(),
             &[],
             None,
+            &HashMap::new(),
         );
         assert_eq!(
             names(&rows),
@@ -293,8 +380,16 @@ mod tests {
             note: None,
             session: Some(PathBuf::from("/s/sub.jsonl")),
             model: None,
+            changes: None,
+            progress: None,
         };
-        let rows = build(vec![mine, sub, other], &HashMap::new(), &[job], Some(Path::new("/s/mine.jsonl")));
+        let rows = build(
+            rows_of(vec![mine, sub, other]),
+            &HashMap::new(),
+            &[job],
+            Some(Path::new("/s/mine.jsonl")),
+            &HashMap::new(),
+        );
         assert_eq!(names(&rows), [("/s/sub.jsonl".to_string(), 0), ("/s/other.jsonl".to_string(), 0)]);
         assert_eq!(rows[0].job.as_deref(), Some("scout-1"));
         assert_eq!(rows[1].job, None);
@@ -308,6 +403,9 @@ mod tests {
             depth: 0,
             job: None,
             modified: None,
+            host: None,
+            hint: None,
+            attach: None,
         };
         assert!(row("print").can_stop() && row("print").can_take());
         assert!(row("subagent").can_stop() && !row("subagent").can_take());
@@ -317,6 +415,14 @@ mod tests {
         modern.live.abort = true;
         assert!(modern.can_stop() && !modern.can_take());
         assert!(!row("acp").can_stop() && !row("acp").can_terminate());
+        // An agent is joined by a client, not taken over; it can be told to abort or to end.
+        let mut agent = row("agent");
+        assert!(agent.can_terminate() && !agent.can_take() && !agent.can_stop());
+        agent.live.abort = true;
+        assert!(agent.can_stop());
+        assert_eq!(agent.label(), "agent");
+        agent.live.waiting = true;
+        assert_eq!(agent.label(), "agent waiting");
         let mut r = row("subagent");
         r.live.agent = Some("review-lead".into());
         assert_eq!(r.label(), "subagent review-lead");
@@ -345,9 +451,12 @@ mod tests {
             depth: 1,
             job: Some("scout-1".into()),
             modified: None,
+            host: None,
+            hint: None,
+            attach: None,
         };
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600 + 3700);
-        let row = list_row(&r, true, 24, "$0.12", 80, now);
+        let row = list_row(&r, true, 24, 0, "$0.12", 80, now, None);
         let text = line_text(&row);
         assert!(text.contains("subagent review-lead") && text.contains("$0.12") && text.contains("1h"), "{text}");
         assert!(line_width(&row) <= 80);

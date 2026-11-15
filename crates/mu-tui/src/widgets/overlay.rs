@@ -321,6 +321,18 @@ pub enum OverlayEvent {
     },
     /// Take over a `-p` run: the panel closes and `mu take` runs on the terminal.
     TakeSession(PathBuf),
+    /// Join a session on another host: the panel closes and `mu --attach COMMAND` runs on the terminal.
+    AttachSession(String),
+    /// Show a launched job's diff in the panel.
+    DiffResult {
+        job: String,
+        result: crate::host::results::ResultArgs,
+    },
+    /// Apply a launched job's result with a three-way merge.
+    ApplyResult {
+        job: String,
+        result: crate::host::results::ResultArgs,
+    },
     /// Open a memory file in `$EDITOR`.
     MemoryOpen(PathBuf),
     /// Load the memory history.
@@ -879,6 +891,16 @@ impl Overlay {
     pub fn new_ask(qs: Vec<AskQuestion>, reply: oneshot::Sender<Option<Vec<Answer>>>) -> Overlay {
         Overlay::Ask(Box::new(AskState::new(qs, reply)))
     }
+    /// A dialog whose request is gone: the agent answered it elsewhere or no longer has it.
+    pub fn request_gone(&self) -> bool {
+        match self {
+            Overlay::Approve(a) => a.reply_closed(),
+            Overlay::Ask(a) => a.reply.as_ref().is_some_and(|r| r.is_closed()),
+            Overlay::Review { reply, .. } => reply.as_ref().is_some_and(|r| r.is_closed()),
+            _ => false,
+        }
+    }
+
     /// The picker inside this overlay, for everything but the plan review.
     pub fn select(&self) -> Option<&Select> {
         match self {
@@ -1032,6 +1054,13 @@ impl Overlay {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::TerminateSession { session, pid, started }))
                 }
                 JobsResult::Take { session } => (None, Some(OverlayEvent::TakeSession(session))),
+                JobsResult::Attach { command } => (None, Some(OverlayEvent::AttachSession(command))),
+                JobsResult::Diff { job, result } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::DiffResult { job, result }))
+                }
+                JobsResult::Apply { job, result } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::ApplyResult { job, result }))
+                }
             },
             Overlay::Session { pick } => pick_one(pick, k, |pick| Overlay::Session { pick }, OverlayEvent::Resume),
             Overlay::Rewind { pick } => pick_one(pick, k, |pick| Overlay::Rewind { pick }, OverlayEvent::Rewind),

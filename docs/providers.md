@@ -149,6 +149,8 @@ Version 2 added `chat` and `web`. A version-1 entry has no `chat` and routed cha
 
 The file is re-read when it changes, so a key added in one session reaches the others and new subagents. Writers lock `auth.json.lock` and replace the file atomically. A corrupt file is never overwritten. A `baseUrl` is checked when saved and again before every use, and redirects are never followed, so a key only goes to the host you configured. There is no keychain integration.
 
+With [state encryption](remote.md#where-your-data-goes) on (an agent with a state key), `auth.json` is one sealed envelope instead of JSON, readable only while the agent is unlocked: until then every read of a stored key and every write fails with `locked: attach to unlock`, a chat to a provider mu speaks natively fails the same way instead of going to the gateway. A plaintext file from before is still read, and is sealed at the first unlock. The lock file stays plaintext. With state encryption off the file is as described above.
+
 Stored keys are redacted from everything mu stores or sends (see [Secrets](secrets.md)): a model that runs `cat ~/.mu/auth.json` sees `[REDACTED:ANTHROPIC_API_KEY]`. The ChatGPT sign-in tokens are redacted the same way, as `OPENAI_CHATGPT_TOKEN`, `OPENAI_CHATGPT_REFRESH_TOKEN` and `OPENAI_CHATGPT_ID_TOKEN`.
 
 ## Thinking per provider

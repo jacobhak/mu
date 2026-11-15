@@ -4,11 +4,10 @@
 use super::*;
 use crate::term::clipboard;
 use crate::text::markdown;
-use mu_base::config::Configs;
 use mu_base::image;
 use mu_base::models::Thinking;
 use mu_base::permissions::PermissionMode;
-use mu_base::roles::{self, RoleView};
+use mu_provider::provider::client::Providers;
 use mu_tools::tools::todo::Status;
 
 pub(super) const HOTKEYS: &str = "Enter  submit (steer while a turn runs)      Ctrl+Q  queue follow-up      Shift+↑  edit last queued
@@ -17,27 +16,23 @@ Shift+Tab  cycle thinking      Ctrl+T  toggle thinking      Ctrl+O  expand jobs 
 Ctrl+G  edit in $EDITOR      Ctrl+V  paste clipboard image      Tab  accept suggestion / complete /command      →  accept suggestion      ↑/↓  history      Ctrl+A/E/K/U/W  line editing
 !cmd  run shell command and send output      !!cmd  run without sending";
 
-pub(super) fn role_views(cfg: &Configs, ctx: &Context) -> Vec<RoleView> {
-    let agents: Vec<(&str, &[String])> = ctx.agents.iter().map(|a| (a.name.as_str(), a.model.as_slice())).collect();
-    roles::views(cfg, &agents)
-}
-
 /// The custom endpoint ids in `providers.toml`, for completion. A file that does not read is its error.
-pub(super) fn custom_completion_ids(providers: &Providers) -> Result<Vec<String>, String> {
+pub(crate) fn custom_completion_ids(providers: &Providers) -> Result<Vec<String>, String> {
     providers.custom_registry().snapshot().map(|c| c.into_keys().collect()).map_err(|e| format!("{e:#}"))
 }
 
 impl App {
     /// Rebuilds the completion list, which names the model sets and the custom endpoints.
     pub(super) fn refresh_commands(&mut self) {
-        let ids = match custom_completion_ids(&self.services.providers) {
-            Ok(ids) => ids,
-            Err(e) => {
-                self.error(&e);
-                Vec::new()
+        self.host_call(host::completion::COMPLETIONS, &(), |app, r: Result<Completions, String>| match r {
+            Ok(c) => {
+                if let Some(e) = c.error {
+                    app.error(&e);
+                }
+                app.prompt.commands = c.entries;
             }
-        };
-        self.prompt.commands = command_entries(&self.plugins, &self.ctx, &self.services.providers.cfg, &ids);
+            Err(e) => app.error(&format!("cannot read the completion list: {e}")),
+        });
     }
 
     pub(super) fn submit(&mut self, mut input: UserInput, follow_up: bool) {
@@ -107,15 +102,10 @@ impl App {
         }
     }
 
-    fn observe_prompt(&self, text: &str) {
-        if !self.services.providers.cfg.mu.predict.enabled {
-            return;
+    fn observe_prompt(&mut self, text: &str) {
+        if self.prompt.predict {
+            self.host_call(host::completion::OBSERVE, &text, |_, _: Result<(), String>| {});
         }
-        let params = json!({ "text": text, "cwd": self.cwd });
-        let plugins = self.plugins.clone();
-        tokio::task::spawn_local(async move {
-            let _ = plugins.request("predict", "predict/observe", params, Duration::from_secs(2)).await;
-        });
     }
 
     fn slash(&mut self, cmd: &str) {
@@ -129,18 +119,21 @@ impl App {
         if self.agent.running {
             return self.notice("busy — Esc to abort first");
         }
-        let typed = |text: String| UserInput { text, images: Vec::new(), command: Some(format!("/{cmd}")) };
-        if let Some(sk) = name.strip_prefix("skill:") {
-            match self.ctx.skill_prompt(sk, arg) {
-                Some(p) => self.send_prompt(typed(p), false),
-                None => self.error(&format!("unknown skill {sk}")),
-            }
-        } else if let Some(c) = self.ctx.commands.iter().find(|c| c.name == name) {
-            let p = c.expand(arg);
-            self.send_prompt(typed(p), false);
-        } else {
-            self.error(&format!("unknown command /{name}"));
-        }
+        let (shown, name, arg) = (cmd.to_string(), name.to_string(), arg.to_string());
+        self.host_call(
+            host::completion::EXPAND,
+            &(name.clone(), arg),
+            move |app, r: Result<Expanded, String>| match r {
+                Ok(Expanded::Prompt(text)) => {
+                    app.send_prompt(UserInput { text, images: Vec::new(), command: Some(format!("/{shown}")) }, false)
+                }
+                Ok(Expanded::UnknownSkill) => {
+                    app.error(&format!("unknown skill {}", name.trim_start_matches("skill:")))
+                }
+                Ok(Expanded::UnknownCommand) => app.error(&format!("unknown command /{name}")),
+                Err(e) => app.error(&e),
+            },
+        );
     }
 
     pub(super) fn cmd_new(&mut self, _: &str) {
@@ -225,27 +218,41 @@ impl App {
         }
     }
 
+    pub(super) fn cmd_detach(&mut self) {
+        self.host_call(host::startup::DETACH, &(), |app, r: Result<(), String>| {
+            if let Err(e) = r {
+                app.error(&e);
+            }
+        });
+    }
+
     pub(super) fn cmd_skills(&mut self, _: &str) {
-        let s: Vec<String> = self
-            .ctx
-            .skills
-            .iter()
-            .map(|s| format!("{}{}: {}", s.name, if s.hidden { " (hidden)" } else { "" }, s.description))
-            .collect();
-        self.notice(&if s.is_empty() { "no skills".into() } else { s.join("\n") });
+        self.host_call(host::completion::SKILLS, &(), |app, r: Result<Vec<SkillRow>, String>| match r {
+            Ok(rows) => {
+                let s: Vec<String> = rows
+                    .iter()
+                    .map(|s| format!("{}{}: {}", s.name, if s.hidden { " (hidden)" } else { "" }, s.description))
+                    .collect();
+                app.notice(&if s.is_empty() { "no skills".into() } else { s.join("\n") });
+            }
+            Err(e) => app.error(&e),
+        });
     }
 
     pub(super) fn cmd_plugins(&mut self, _: &str) {
-        let p: Vec<String> = self
-            .plugins
-            .status()
-            .into_iter()
-            .map(|(n, l, up, extra)| {
-                let extra = if extra.is_empty() { extra } else { format!(" · {extra}") };
-                format!("{n} · {l} · {}{extra}", if up { "running" } else { "stopped" })
-            })
-            .collect();
-        self.notice(&if p.is_empty() { "no plugins".into() } else { p.join("\n") });
+        self.host_call(host::completion::PLUGINS, &(), |app, r: Result<Vec<PluginRow>, String>| match r {
+            Ok(rows) => {
+                let p: Vec<String> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let extra = if r.extra.is_empty() { r.extra } else { format!(" · {}", r.extra) };
+                        format!("{} · {} · {}{extra}", r.name, r.label, if r.running { "running" } else { "stopped" })
+                    })
+                    .collect();
+                app.notice(&if p.is_empty() { "no plugins".into() } else { p.join("\n") });
+            }
+            Err(e) => app.error(&e),
+        });
     }
 
     pub(super) fn jobs_cmd(&mut self, arg: &str) {

@@ -101,9 +101,10 @@ pub async fn fake_server(replies: Vec<Reply>) -> (String, std::sync::Arc<std::sy
     (base, seen)
 }
 
-/// A fresh, empty, canonical temp dir.
+/// A fresh, empty, canonical temp dir. It is under `/tmp` with a short name: an agent's socket lives below it
+/// (`run/<id>.sock`) and macOS's `$TMPDIR` alone leaves too little of the 100-byte socket path limit.
 pub fn tmp() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("mu-test-{}", uuid::Uuid::new_v4()));
+    let d = PathBuf::from("/tmp").join(format!("mu-t-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]));
     std::fs::create_dir_all(&d).unwrap();
     d.canonicalize().unwrap()
 }

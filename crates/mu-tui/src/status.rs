@@ -64,12 +64,9 @@ impl<'a> StatusEnv<'a> {
     pub fn new(cwd: &'a Path, config: &'a OmpStatusLine) -> Self {
         Self {
             cwd,
-            home: std::env::var("HOME").ok().filter(|h| !h.is_empty()),
+            home: crate::host::host_home(),
             config,
-            profile: std::env::var("OMP_PROFILE")
-                .or_else(|_| std::env::var("PI_PROFILE"))
-                .ok()
-                .filter(|p| !p.is_empty()),
+            profile: crate::host::host_profile(),
             expanded: false,
             turn_elapsed: None,
             jobs: JobCounts::default(),
@@ -554,7 +551,7 @@ fn path_display(cwd: &Path, home: Option<&str>, strip: bool) -> String {
     if !strip {
         return full;
     }
-    let mut scratch_roots: Vec<PathBuf> = vec![std::env::temp_dir(), "/tmp".into(), "/var/tmp".into()];
+    let mut scratch_roots: Vec<PathBuf> = vec![crate::host::host_tmp(), "/tmp".into(), "/var/tmp".into()];
     if let Some(h) = home {
         scratch_roots.push(Path::new(h).join("tmp"));
     }
@@ -794,6 +791,8 @@ mod tests {
             note: None,
             session: None,
             model: None,
+            changes: None,
+            progress: None,
         };
         let jobs =
             [mk(SubagentState::Running), mk(SubagentState::Done), mk(SubagentState::Done), mk(SubagentState::Failed)];

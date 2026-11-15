@@ -1,5 +1,7 @@
 //! The `mu` command line: the flags and subcommands. Model selection lives in `select`.
 
+pub mod agents;
+pub mod attach;
 pub mod auth;
 mod chatgpt_login;
 pub mod docs;
@@ -57,6 +59,13 @@ pub struct Cli {
     /// Abort `-p` once the session has cost more than this many USD.
     #[arg(long, requires = "print")]
     pub max_cost: Option<f64>,
+    /// Run the UI as a client of the `mu agent` that this shell command's stdin and stdout reach, for example
+    /// `ssh host mu attach --stdio ID`. The command is run again when it drops. See docs/remote.md.
+    #[arg(long, value_name = "COMMAND", conflicts_with_all = ["resume", "continue_latest", "print", "headless", "acp"])]
+    pub attach: Option<String>,
+    /// With `--attach`: the SSH ed25519 private key that unlocks a sealed agent (default ~/.ssh/id_ed25519).
+    #[arg(long, value_name = "PATH", requires = "attach")]
+    pub state_key: Option<PathBuf>,
     /// Serve the Agent Client Protocol over stdio.
     #[arg(long, conflicts_with_all = ["resume", "continue_latest", "print", "headless"])]
     pub acp: bool,
@@ -124,6 +133,43 @@ pub enum Sub {
         #[arg(long)]
         markdown: bool,
     },
+    /// Run the agent of a session with no terminal. It prints `{"session":ID,"socket":PATH}` and serves one
+    /// client at a time on that Unix socket (see docs/remote.md); it keeps running when the client leaves.
+    /// `mu agent list` lists the agents running here.
+    Agent {
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(mu_base::models::Thinking::NAMES))]
+        thinking: Option<String>,
+        /// Resume this session (id or path) instead of starting a new one.
+        #[arg(long)]
+        resume: Option<PathBuf>,
+        /// Resume the latest session for this directory.
+        #[arg(short = 'c', long = "continue")]
+        continue_latest: bool,
+        /// Start the agent in the background: it leaves this terminal and session, logs to
+        /// `<profile home>/logs/agent-<id>.log`, and this command prints `{"id":ID}` once it listens.
+        #[arg(long, conflicts_with = "detached")]
+        detach: bool,
+        /// What `--detach` starts: an agent that ignores SIGHUP and has its output in a log.
+        #[arg(long, hide = true)]
+        detached: bool,
+        #[command(subcommand)]
+        cmd: Option<AgentCmd>,
+    },
+    /// Join a running `mu agent` from this process's stdin and stdout: copies lines to and from its socket.
+    /// With no session it finds the one agent running in this directory.
+    #[command(hide = true)]
+    Attach {
+        /// Required: the raw protocol stream, for `ssh host mu attach --stdio ID`.
+        #[arg(long, required = true)]
+        stdio: bool,
+        /// Session id (prefix).
+        session: Option<String>,
+        /// A socket path, instead of a session.
+        #[arg(long, conflicts_with = "session")]
+        socket: Option<PathBuf>,
+    },
     /// Take over a running `mu -p` session: stop it after its current step, then resume it here.
     Take {
         /// Session file or id (prefix).
@@ -158,6 +204,16 @@ pub enum Sub {
     },
 }
 
+#[derive(clap::Subcommand)]
+pub enum AgentCmd {
+    /// List the agents running here, one per line.
+    List {
+        /// One JSON object per line: id, cwd, started (unix seconds), title, client, waiting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +224,29 @@ mod tests {
         assert!(Cli::try_parse_from(["mu", "--acp", "--resume", "abc"]).is_err());
         assert!(Cli::try_parse_from(["mu", "--acp", "-p", "x"]).is_err());
         assert!(Cli::try_parse_from(["mu", "--acp", "--model", "a/b"]).is_ok());
+    }
+
+    #[test]
+    fn attach_takes_a_command_and_an_optional_state_key() {
+        let c = Cli::try_parse_from(["mu", "--attach", "ssh h mu attach --stdio x", "--state-key", "/k"]).unwrap();
+        assert_eq!(
+            (c.attach.as_deref(), c.state_key.as_deref()),
+            (Some("ssh h mu attach --stdio x"), Some("/k".as_ref()))
+        );
+        assert!(Cli::try_parse_from(["mu", "--state-key", "/k"]).is_err(), "a key needs --attach");
+        assert!(Cli::try_parse_from(["mu", "--attach", "x", "-c"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "--attach", "x", "-p", "hi"]).is_err());
+    }
+
+    #[test]
+    fn agent_and_attach_take_their_own_flags() {
+        assert!(Cli::try_parse_from(["mu", "agent", "--model", "a/b", "--resume", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "-c", "--permissions", "yolo"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach"]).is_err(), "the raw pipe needs --stdio");
+        assert!(Cli::try_parse_from(["mu", "attach", "--stdio"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach", "--stdio", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach", "--stdio", "abc", "--socket", "/x"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "agent", "--detach"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "list", "--json"]).is_ok());
     }
 }

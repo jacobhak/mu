@@ -17,10 +17,21 @@ pub struct MuConfig {
     pub secrets: MuSecrets,
     pub status: MuStatus,
     pub task: MuTask,
+    pub agent: MuAgent,
+    pub sessions: MuSessions,
     /// `[permissions]`, parsed by `load_permissions` rather than serde.
     #[serde(skip)]
     pub permissions: MuPermissions,
     pub bell: MuBell,
+}
+
+/// `[sessions]`: `sources` are commands that list agents on other machines for the Sessions tab.
+/// Each prints JSON lines in the shape of `mu agent list --json`, plus `host` and `hint` (and
+/// optionally `attach`, a command that opens the row); see docs/remote.md.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MuSessions {
+    pub sources: Vec<Vec<String>>,
 }
 
 /// `[permissions]`: which tool calls may run without asking, and the rules that override it.
@@ -147,18 +158,49 @@ impl Default for MuAsk {
 
 /// `[task]`: a subagent's soft request budget. Crossing it steers a wrap-up notice (`budget_notice`);
 /// at 1.5x the run is stopped and asked for its partial result; 0 turns the guard off. A `scout` is
-/// capped at 100 however high the budget is, as in omp.
+/// capped at 100 however high the budget is, as in omp. `launcher` is a command (argv) that runs
+/// the agent kinds listed in `launch` (`task`, `scout`, a custom agent's name) in place of
+/// `mu --headless`; any other kind, and every kind when either is empty, runs here. `max_cost` is
+/// the most (USD) the model calls a launched worker makes through its parent may cost, per worker; 0
+/// turns the cap off.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct MuTask {
     pub soft_request_budget: u32,
     pub budget_notice: bool,
+    pub launcher: Vec<String>,
+    pub launch: Vec<String>,
+    pub max_cost: f64,
 }
 
 impl Default for MuTask {
     fn default() -> Self {
-        Self { soft_request_budget: 200, budget_notice: true }
+        Self { soft_request_budget: 200, budget_notice: true, launcher: Vec::new(), launch: Vec::new(), max_cost: 5.0 }
     }
+}
+
+/// `[agent]`: what `mu agent` does when a question or approval waits and no client is attached.
+/// `notify_command` is run (under `sh -c`) with the session id and a one-line summary as `$1` and
+/// `$2`; `approval_timeout` is the seconds after which a waiting approval is answered `Unavailable`
+/// (a waiting question is cancelled); 0 (the default) waits for ever. `state_key = "ssh"` encrypts the
+/// agent's credentials at rest under a key a client unlocks with its SSH key; `state_key_file` and
+/// `state_key_command` give an unattended 32-byte key instead (the file wins), and imply encryption.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MuAgent {
+    pub notify_command: Option<String>,
+    pub approval_timeout: u64,
+    pub state_key: StateKey,
+    pub state_key_file: Option<String>,
+    pub state_key_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateKey {
+    #[default]
+    Off,
+    Ssh,
 }
 
 /// `[mcp]`: `lifetime` of MCP server processes (`session`, `idle:10m`, `call`); default `session`.

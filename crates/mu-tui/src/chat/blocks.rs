@@ -95,7 +95,7 @@ fn prompt_rows(text: &str, inner: usize) -> Vec<Line> {
     let Some(call) = skill_call(text) else {
         return markdown::render(&end_quotes(text), inner);
     };
-    let home = std::env::var("HOME").ok();
+    let home = crate::host::host_home();
     let head = vec![
         span(format!("/skill:{}", call.name), name_style()),
         span(format!(" · {}", tilde(call.path, home.as_deref())), tfg(Role::Faint)),
@@ -885,6 +885,8 @@ mod tests {
             note: None,
             session: None,
             model: None,
+            changes: None,
+            progress: None,
         };
         let out: String = (0..20).map(|i| format!("l{i}\n")).collect();
         let text: Vec<String> = job_details(&r, Some(&out), 80).iter().map(text_of).collect();
@@ -938,6 +940,8 @@ mod tests {
             note: None,
             session: None,
             model: Some("scout · anthropic/haiku".into()),
+            changes: None,
+            progress: None,
         };
         let text = |cost: Option<f64>, state| text_of(&subagent_rows(&[row(state)], '⠋', |_| cost)[0]);
         assert_eq!(
@@ -975,6 +979,8 @@ mod tests {
             note: Some("exit 0".into()),
             session: None,
             model: None,
+            changes: None,
+            progress: None,
         }
     }
 

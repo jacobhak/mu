@@ -59,11 +59,14 @@ fn github(a: &[String]) -> Value {
     http_entry("https://api.githubcopilot.com/mcp/", headers, None)
 }
 
-pub fn presets(cwd: &Path, env_set: fn(&str) -> bool) -> Vec<Preset> {
+/// The variables `presets` asks about: the host answers which are set.
+pub const ENV_NAMES: [&str; 2] = ["GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN"];
+
+pub fn presets(cwd: &Path, env_set: impl Fn(&str) -> bool) -> Vec<Preset> {
     let cwd = cwd.display().to_string();
-    let token_default = if env_set("GITHUB_PERSONAL_ACCESS_TOKEN") {
+    let token_default = if env_set(ENV_NAMES[0]) {
         Some("${GITHUB_PERSONAL_ACCESS_TOKEN}".to_string())
-    } else if env_set("GITHUB_TOKEN") {
+    } else if env_set(ENV_NAMES[1]) {
         Some("${GITHUB_TOKEN}".to_string())
     } else {
         None

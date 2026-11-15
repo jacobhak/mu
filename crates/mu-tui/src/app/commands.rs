@@ -9,6 +9,8 @@ use mu_base::models::Thinking;
 use mu_base::permissions::PermissionMode;
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
+use mu_tools::context::Context;
+use mu_tools::plugin::host::PluginHost;
 
 /// What the completion lists of the built-in commands are built from.
 pub(super) struct CompleteCtx<'a> {
@@ -58,7 +60,7 @@ fn names(items: impl IntoIterator<Item = String>) -> (Vec<String>, Vec<String>) 
 }
 
 fn complete_model(c: &CompleteCtx) -> (Vec<String>, Vec<String>) {
-    super::slash::role_views(c.cfg, c.ctx).into_iter().map(|r| (format!("@{}", r.name), r.row())).unzip()
+    crate::host::models::role_views(c.cfg, c.ctx).into_iter().map(|r| (format!("@{}", r.name), r.row())).unzip()
 }
 
 fn complete_modelset(c: &CompleteCtx) -> (Vec<String>, Vec<String>) {
@@ -97,9 +99,10 @@ fn strings(items: &[&str]) -> (Vec<String>, Vec<String>) {
     names(items.iter().map(|s| s.to_string()))
 }
 
-pub(super) static BUILTIN: [Builtin; 33] = [
+pub(super) static BUILTIN: [Builtin; 34] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
+    cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
     cmd("new", "Start a new session", App::cmd_new),
     cmd("resume", "Resume a session from this directory", |a, _| a.open_session_picker()),
     cmd("fork", "Continue in a copy of this session; the original stays as it is", |a, _| a.send(Command::Fork)),
@@ -189,7 +192,7 @@ pub fn interactive_reference() -> String {
 
 /// The completion list of the composer: the built-in commands with their arguments, then the
 /// commands and skills that come from the context.
-pub(super) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs, custom_ids: &[String]) -> Vec<Entry> {
+pub(crate) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs, custom_ids: &[String]) -> Vec<Entry> {
     let cc = CompleteCtx { plugins, ctx, cfg, custom_ids };
     let mut commands: Vec<Entry> = BUILTIN
         .iter()
@@ -243,6 +246,7 @@ mod tests {
         assert_eq!(
             busy,
             [
+                "detach",
                 "thinking",
                 "permissions",
                 "refresh",

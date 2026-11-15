@@ -186,6 +186,8 @@ impl PtyRun {
     }
 }
 
+/// How long a terminal request waits for a front end to size it before the call runs without one.
+const PTY_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const KILL_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 const GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_millis(800);
 
@@ -496,7 +498,12 @@ impl Tools {
         let (input, input_rx) = mpsc::unbounded_channel::<PtyInput>();
         let (reply, rx) = oneshot::channel();
         ctx.events.send(AgentEvent::PtyOpen { id: ctx.call_id.clone(), input, reply }).ok()?;
-        let (cols, rows) = rx.await.ok()?;
+        // With no client attached nobody answers: the call must not wait for ever, and Cancel breaks it.
+        let (cols, rows) = tokio::select! {
+            size = rx => size.ok()?,
+            () = ctx.cancel.cancelled() => return None,
+            () = tokio::time::sleep(PTY_OPEN_WAIT) => return None,
+        };
         let cwd = a.cwd.as_ref().map(|c| self.abs(c)).unwrap_or_else(|| self.cwd.clone());
         let limits = Limits::new(a.timeout);
         let secs = limits.secs;
@@ -945,6 +952,28 @@ mod tests {
         let out = tools.call("bash", &json!({"command":"echo hi","pty":true}), &ctx).await;
         assert!(out.text.contains("hi"), "{}", out.text);
         assert!(out.text.contains("[pty unavailable without the terminal UI; ran without a terminal]"));
+    }
+
+    /// A parked terminal request (no client attached) is not an answer: Cancel ends the wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_ends_the_wait_for_a_terminal_nobody_sizes() {
+        let tools = Tools::for_test();
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let ctx = ToolCtx { events, cancel: cancel.clone(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let stop = cancel.clone();
+        let call = async { tools.call("bash", &json!({"command":"echo hi","pty":true}), &ctx).await };
+        let parked = async {
+            // The request is out and unanswered; then the user cancels.
+            let ev = rx.recv().await;
+            assert!(matches!(ev, Some(AgentEvent::PtyOpen { .. })));
+            stop.cancel();
+            ev
+        };
+        let started = Instant::now();
+        let (out, _kept) = tokio::join!(call, parked);
+        assert!(started.elapsed() < Duration::from_secs(10), "no wait for the 60 s limit");
+        assert!(out.text.contains("pty unavailable"), "{}", out.text);
     }
 
     #[tokio::test(flavor = "current_thread")]

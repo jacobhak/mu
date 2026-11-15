@@ -8,7 +8,7 @@ fn token_from_env_or_file() -> Result<String> {
     match std::env::var("MU_GATEWAY_TOKEN") {
         Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
         _ => {
-            let p = paths::omp_config_root().join("auth-gateway.token");
+            let p = mu_common::omp_state::credential_root().join("auth-gateway.token");
             std::fs::read_to_string(&p)
                 .map(|s| s.trim().to_string())
                 .map_err(|_| anyhow!("gateway token not found at {}; run `omp auth-gateway token`", p.display()))

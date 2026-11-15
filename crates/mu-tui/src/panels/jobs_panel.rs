@@ -3,12 +3,14 @@
 //! full-height view: a subagent's or another session's transcript, followed while it is written, or a
 //! bash job's output. See `design/jobs-panel.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::host::results::ResultArgs;
+use crate::host::sessions::{Live, LiveArgs, TailArgs, TailDelta};
 use crate::panels::reply::rule;
 use crate::panels::session_view;
 use crate::panels::sessions_tab::{self, Row};
@@ -17,9 +19,7 @@ use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
 use crate::widgets::frame::Frame;
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
-use mu_session::session::owner::LiveSession;
-use mu_session::session::runs::{RunDir, SessionSource};
-use mu_session::session::tail::Tail;
+use mu_base::message::Message;
 
 /// Most list rows shown at once.
 const LIST_MAX: usize = 8;
@@ -38,6 +38,21 @@ const VIEW_KEEP: usize = 500;
 /// How often the open transcript, and the cost of every listed session, are read again.
 const VIEW_POLL: Duration = Duration::from_millis(250);
 const TOTALS_POLL: Duration = Duration::from_secs(2);
+
+/// What the panel needs read from the host; the app makes the call and hands the reply back.
+pub enum Want {
+    Sessions(LiveArgs),
+    Tail { target: TailFor, args: TailArgs },
+}
+
+/// Whose tail a reply belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TailFor {
+    /// The cost column of a listed job or session.
+    Total,
+    /// The open transcript.
+    View,
+}
 
 pub enum JobsResult {
     Pending,
@@ -63,9 +78,23 @@ pub enum JobsResult {
         pid: u32,
         started: String,
     },
+    /// Join a session on another host: run `mu --attach` with this shell command.
+    Attach {
+        command: String,
+    },
     /// Take over a `-p` run (`mu take`).
     Take {
         session: PathBuf,
+    },
+    /// Show the diff of a launched job's result (`d`).
+    Diff {
+        job: String,
+        result: ResultArgs,
+    },
+    /// Apply a launched job's result with a three-way merge (`a`).
+    Apply {
+        job: String,
+        result: ResultArgs,
     },
 }
 
@@ -91,6 +120,10 @@ pub struct JobsPanel {
     titles: HashMap<PathBuf, String>,
     /// This session, which the Sessions tab leaves out (the Jobs tab is its children).
     own: Option<PathBuf>,
+    /// Canonical form of the paths the host was asked about (this session, the jobs' sessions).
+    canon: HashMap<PathBuf, PathBuf>,
+    /// `$HOME` on the host, which the Sessions tab shortens directories with.
+    home: Option<String>,
     /// Running totals of each listed session, for the cost column.
     totals: HashMap<PathBuf, Totals>,
     polled_totals: Option<Instant>,
@@ -103,15 +136,109 @@ pub struct JobsPanel {
     confirm_kill_all: bool,
     /// What the last action did, shown in place of the key line until the next key.
     status: Option<String>,
+    /// Jobs whose result was applied from this panel.
+    applied: HashSet<String>,
+    /// The host's note under the Sessions list: worker results nobody applied.
+    notice: Option<String>,
     /// The newest output of each bash job, as the app last sent it.
     outputs: HashMap<String, String>,
-    /// Where the Sessions tab's list of live sessions comes from.
-    source: Box<dyn SessionSource>,
+    /// Reads the panel waits to have made, taken by the app after each key and tick.
+    wants: Vec<Want>,
+    /// The list of live sessions was asked for and has not come back.
+    live_asked: bool,
+}
+
+/// A session file as far as the host has been read: what `Tail` keeps, built from the host's deltas.
+struct Followed {
+    path: PathBuf,
+    keep: usize,
+    offset: u64,
+    messages: Vec<Message>,
+    dropped: usize,
+    cost: f64,
+    tokens: u64,
+    caught_up: bool,
+    /// A read was asked for and has not come back.
+    asked: bool,
+}
+
+impl Followed {
+    fn new(path: PathBuf, keep: usize) -> Self {
+        Self {
+            path,
+            keep,
+            offset: 0,
+            messages: Vec::new(),
+            dropped: 0,
+            cost: 0.0,
+            tokens: 0,
+            caught_up: false,
+            asked: false,
+        }
+    }
+
+    fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+
+    fn tokens(&self) -> u64 {
+        self.tokens
+    }
+
+    fn caught_up(&self) -> bool {
+        self.caught_up
+    }
+
+    /// The read to ask the host for, unless one is out already.
+    fn ask(&mut self) -> Option<TailArgs> {
+        if self.asked {
+            return None;
+        }
+        self.asked = true;
+        Some(TailArgs {
+            path: self.path.clone(),
+            offset: self.offset,
+            caught_up: self.caught_up,
+            messages: self.keep > 0,
+        })
+    }
+
+    /// Takes what the host read. A reply to a read from another offset is dropped.
+    fn take(&mut self, d: TailDelta) {
+        self.asked = false;
+        if d.from != self.offset {
+            return;
+        }
+        if d.reset {
+            *self = Self::new(std::mem::take(&mut self.path), self.keep);
+        }
+        for m in d.messages {
+            self.messages.push(m);
+            if self.messages.len() > self.keep {
+                // Drop in blocks so a long run does not shift the vector on every message.
+                let cut = (self.messages.len() - self.keep).max(self.keep / 4).min(self.messages.len());
+                self.messages.drain(..cut);
+                self.dropped += cut;
+            }
+        }
+        self.cost += d.cost;
+        self.tokens += d.tokens;
+        self.offset = d.offset;
+        self.caught_up = d.caught_up;
+    }
 }
 
 /// A listed session's totals, and whether it can still change.
 struct Totals {
-    tail: Tail,
+    tail: Followed,
     /// Read to the end after its job finished.
     settled: bool,
 }
@@ -139,7 +266,7 @@ struct View {
     /// Set for a session of the Sessions tab: what to call it in the title.
     label: Option<String>,
     /// The session being followed; `None` for a bash job.
-    tail: Option<Tail>,
+    tail: Option<Followed>,
     settled: bool,
     polled: Option<Instant>,
     lines: Vec<Line>,
@@ -211,6 +338,8 @@ impl JobsPanel {
             s_page: LIST_MAX,
             titles: HashMap::new(),
             own: None,
+            canon: HashMap::new(),
+            home: None,
             totals: HashMap::new(),
             polled_totals: None,
             view: None,
@@ -218,16 +347,23 @@ impl JobsPanel {
             confirm: None,
             confirm_kill_all: false,
             status: None,
+            applied: HashSet::new(),
+            notice: None,
             outputs: HashMap::new(),
-            source: Box::new(RunDir::profile()),
+            wants: Vec::new(),
+            live_asked: false,
         }
     }
 
-    /// Reads the live sessions from `source` instead of this profile's run directory.
-    #[cfg(test)]
-    pub fn with_source(mut self, source: Box<dyn SessionSource>) -> Self {
-        self.source = source;
+    /// `$HOME` on the host, so directories of other sessions show as `~/…`.
+    pub fn with_home(mut self, home: &std::path::Path) -> Self {
+        self.home = Some(home.to_string_lossy().into_owned());
         self
+    }
+
+    /// The reads the panel is waiting for, to be made by the app.
+    pub fn take_wants(&mut self) -> Vec<Want> {
+        std::mem::take(&mut self.wants)
     }
 
     /// Starts with the output the app already has for its bash jobs.
@@ -268,23 +404,39 @@ impl JobsPanel {
         self.prune_totals();
     }
 
-    /// The live sessions, read now from the owner records.
+    /// Asks for the live sessions, unless that is under way.
     fn refresh_sessions(&mut self) {
-        self.set_sessions(self.source.live_sessions());
+        if self.live_asked {
+            return;
+        }
+        self.live_asked = true;
+        let mut canon: Vec<PathBuf> = self.own.iter().cloned().collect();
+        canon.extend(self.jobs.iter().filter_map(|j| j.session.clone()));
+        self.wants.push(Want::Sessions(LiveArgs { titled: self.titles.keys().cloned().collect(), canon }));
+    }
+
+    /// The host's answer to the request for the live sessions.
+    pub fn on_live(&mut self, r: Result<Live, String>) {
+        self.live_asked = false;
+        if let Ok(live) = r {
+            self.set_sessions(live);
+            // The new rows' costs are asked for with the list.
+            self.refresh();
+        }
     }
 
     /// A fresh list of live sessions: the selection stays on the same one when it is still there.
-    pub fn set_sessions(&mut self, lives: Vec<LiveSession>) {
+    pub fn set_sessions(&mut self, live: Live) {
         self.polled_totals = Some(Instant::now());
-        for l in &lives {
-            if !self.titles.contains_key(&l.path)
-                && let Some(t) = self.source.title(&l.path)
-            {
-                self.titles.insert(l.path.clone(), t);
+        self.notice = live.notice;
+        self.canon = live.canon.into_iter().collect();
+        for r in &live.rows {
+            if let Some(t) = &r.title {
+                self.titles.entry(r.live.path.clone()).or_insert_with(|| t.clone());
             }
         }
         let keep = self.rows.get(self.s_at).map(|r| r.live.path.clone());
-        self.rows = sessions_tab::build(lives, &self.titles, &self.jobs, self.own.as_deref());
+        self.rows = sessions_tab::build(live.rows, &self.titles, &self.jobs, self.own.as_deref(), &self.canon);
         self.s_at = keep
             .and_then(|p| self.rows.iter().position(|r| r.live.path == p))
             .unwrap_or_else(|| self.s_at.min(self.rows.len().saturating_sub(1)));
@@ -298,9 +450,9 @@ impl JobsPanel {
         self.totals.retain(|p, _| live.contains(&p));
     }
 
-    /// Reads what the sessions gained since the last read: the open transcript and the cost of every
-    /// listed subagent and session. `poll` calls it on a timer; tests call it directly. (The list of
-    /// live sessions is read by `refresh_sessions`, from `poll`.)
+    /// Asks for what the sessions gained since the last read: the open transcript and the cost of
+    /// every listed subagent and session. `poll` calls it on a timer. (The list of live sessions is
+    /// asked for by `refresh_sessions`, from `poll`.)
     pub fn refresh(&mut self) {
         self.polled_totals = Some(Instant::now());
         for j in &self.jobs {
@@ -308,33 +460,65 @@ impl JobsPanel {
             let t = self
                 .totals
                 .entry(p.clone())
-                .or_insert_with(|| Totals { tail: Tail::new(p.clone(), 0), settled: false });
-            if !t.settled {
-                t.tail.poll();
-                t.settled = j.state != SubagentState::Running && t.tail.caught_up();
+                .or_insert_with(|| Totals { tail: Followed::new(p.clone(), 0), settled: false });
+            if !t.settled
+                && let Some(args) = t.tail.ask()
+            {
+                self.wants.push(Want::Tail { target: TailFor::Total, args });
             }
         }
         for r in &self.rows {
             let t = self
                 .totals
                 .entry(r.live.path.clone())
-                .or_insert_with(|| Totals { tail: Tail::new(r.live.path.clone(), 0), settled: false });
-            t.tail.poll();
+                .or_insert_with(|| Totals { tail: Followed::new(r.live.path.clone(), 0), settled: false });
+            if let Some(args) = t.tail.ask() {
+                self.wants.push(Want::Tail { target: TailFor::Total, args });
+            }
         }
-        // A job's transcript is done once the job is and the file is read; a session's never is.
-        let job_state = self
-            .view
-            .as_ref()
-            .filter(|v| v.label.is_none())
-            .and_then(|v| self.jobs.iter().find(|j| j.name == v.name))
-            .map(|j| j.state.clone());
         if let Some(v) = &mut self.view {
             v.polled = Some(Instant::now());
             if !v.settled
                 && let Some(t) = &mut v.tail
+                && let Some(args) = t.ask()
             {
-                t.poll();
-                v.settled = job_state.is_some_and(|s| s != SubagentState::Running) && t.caught_up();
+                self.wants.push(Want::Tail { target: TailFor::View, args });
+            }
+        }
+    }
+
+    /// The host's answer to a read of `path`.
+    pub fn on_tail(&mut self, target: TailFor, path: &std::path::Path, r: Result<TailDelta, String>) {
+        match target {
+            TailFor::Total => {
+                let Some(t) = self.totals.get_mut(path) else { return };
+                match r {
+                    Ok(d) => t.tail.take(d),
+                    Err(_) => t.tail.asked = false,
+                }
+                if !t.settled
+                    && let Some(j) = self.jobs.iter().find(|j| j.session.as_deref() == Some(path))
+                {
+                    t.settled = j.state != SubagentState::Running && t.tail.caught_up();
+                }
+            }
+            TailFor::View => {
+                // A job's transcript is done once the job is and the file is read; a session's never is.
+                let job_state = self
+                    .view
+                    .as_ref()
+                    .filter(|v| v.label.is_none())
+                    .and_then(|v| self.jobs.iter().find(|j| j.name == v.name))
+                    .map(|j| j.state.clone());
+                let Some(v) = &mut self.view else { return };
+                let Some(t) = v.tail.as_mut().filter(|t| t.path == path) else { return };
+                match r {
+                    Ok(d) => t.take(d),
+                    Err(_) => t.asked = false,
+                }
+                if !v.settled {
+                    v.settled = job_state.is_some_and(|s| s != SubagentState::Running) && t.caught_up();
+                }
             }
         }
     }
@@ -372,7 +556,7 @@ impl JobsPanel {
         self.jobs.iter().filter(|j| j.state == SubagentState::Running).count()
     }
 
-    fn new_view(name: String, label: Option<String>, tail: Option<Tail>) -> View {
+    fn new_view(name: String, label: Option<String>, tail: Option<Followed>) -> View {
         View {
             name,
             label,
@@ -393,7 +577,7 @@ impl JobsPanel {
     fn open_view(&mut self) {
         let Some(j) = self.jobs.get(self.at) else { return };
         let tail = match (&j.session, j.kind) {
-            (Some(path), _) => Some(Tail::new(path.clone(), VIEW_KEEP)),
+            (Some(path), _) => Some(Followed::new(path.clone(), VIEW_KEEP)),
             (None, JobKind::Bash) => None,
             (None, JobKind::Subagent) => return,
         };
@@ -401,12 +585,21 @@ impl JobsPanel {
         self.refresh();
     }
 
-    /// Opens the selected session's transcript, read-only.
-    fn open_session_view(&mut self) {
-        let Some(r) = self.rows.get(self.s_at) else { return };
+    /// Opens the selected session's transcript, read-only; a session on another host is attached to
+    /// when its source gave a command for it, else the source's hint is shown.
+    fn open_session_view(&mut self) -> Option<JobsResult> {
+        let r = self.rows.get(self.s_at)?;
+        if r.host.is_some() {
+            if let Some(command) = &r.attach {
+                return Some(JobsResult::Attach { command: command.clone() });
+            }
+            self.status = Some(r.hint.clone().unwrap_or_else(|| "this session runs on another machine".into()));
+            return None;
+        }
         let label = format!("{} · pid {}", r.label(), r.live.pid);
-        self.view = Some(Self::new_view(r.id(), Some(label), Some(Tail::new(r.live.path.clone(), VIEW_KEEP))));
+        self.view = Some(Self::new_view(r.id(), Some(label), Some(Followed::new(r.live.path.clone(), VIEW_KEEP))));
         self.refresh();
+        None
     }
 
     fn switch_tab(&mut self) {
@@ -498,6 +691,30 @@ impl JobsPanel {
         self.status = Some(s.into());
     }
 
+    /// Opens a launched job's diff in the full-height view.
+    pub fn show_diff(&mut self, job: &str, diff: &str) {
+        let key = format!("diff:{job}");
+        let text = if diff.trim().is_empty() { "  the result changes nothing" } else { diff };
+        self.outputs.insert(key.clone(), text.to_string());
+        self.view = Some(Self::new_view(key, Some(format!("{job} · diff")), None));
+        if let Some(v) = &mut self.view {
+            v.follow = false;
+        }
+    }
+
+    /// The job's result is in the working tree now.
+    pub fn mark_applied(&mut self, job: &str) {
+        self.applied.insert(job.to_string());
+    }
+
+    /// The selected job and its result, when it finished and left one.
+    fn result_of(&self) -> Option<(&SubagentStatus, ResultArgs, bool)> {
+        let j = self.jobs.get(self.at).filter(|j| j.state != SubagentState::Running)?;
+        let c = j.changes.as_ref()?;
+        let args = ResultArgs { cwd: j.cwd.clone(), r#ref: c.r#ref.clone(), base: c.base.clone() };
+        Some((j, args, c.applied || self.applied.contains(&j.name)))
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) -> JobsResult {
         if k.kind == KeyEventKind::Release {
             return JobsResult::Pending;
@@ -545,6 +762,19 @@ impl JobsPanel {
                 }
             }
             KeyCode::Char('X') if self.running() > 0 => self.confirm_kill_all = true,
+            KeyCode::Char('d') => {
+                if let Some((j, result, _)) = self.result_of() {
+                    return JobsResult::Diff { job: j.name.clone(), result };
+                }
+            }
+            KeyCode::Char('a') => {
+                let r = self.result_of().map(|(j, result, applied)| (j.name.clone(), result, applied));
+                match r {
+                    Some((_, _, true)) => self.status = Some("that result is already applied".into()),
+                    Some((job, result, false)) => return JobsResult::Apply { job, result },
+                    None => {}
+                }
+            }
             _ => {}
         }
         JobsResult::Pending
@@ -563,9 +793,13 @@ impl JobsPanel {
             KeyCode::End | KeyCode::Char('G') => self.s_at = last,
             KeyCode::PageDown => self.s_at = (self.s_at + self.s_page).min(last),
             KeyCode::PageUp => self.s_at = self.s_at.saturating_sub(self.s_page),
-            KeyCode::Enter => self.open_session_view(),
+            KeyCode::Enter => {
+                if let Some(result) = self.open_session_view() {
+                    return result;
+                }
+            }
             KeyCode::Char('n') => {
-                if let Some(r) = self.rows.get(self.s_at) {
+                if let Some(r) = self.rows.get(self.s_at).filter(|r| r.host.is_none()) {
                     self.input = Some(Compose { session: r.live.path.clone(), label: r.label(), text: String::new() });
                 }
             }
@@ -638,8 +872,20 @@ impl JobsPanel {
             .collect();
         let (run, done) = (self.running(), self.jobs.len() - self.running());
         let (detail_title, detail_rows) = match self.jobs.get(self.at) {
-            Some(j) => (Some(format!("{} · {}", j.name, j.agent)), detail(j, &self.cost_cell(j), width, now)),
+            Some(j) => {
+                let mut rows = detail(j, &self.cost_cell(j), width, now);
+                if let Some((_, _, applied)) = self.result_of() {
+                    let what = if applied { "applied" } else { "not applied · d diff · a apply" };
+                    rows.push(vec![span(format!("   result {what}"), theme::get().fg(Role::Faint))]);
+                }
+                (Some(format!("{} · {}", j.name, j.agent)), rows)
+            }
             None => (None, Vec::new()),
+        };
+        let keys = if self.result_of().is_some() {
+            "j/k move · Enter transcript · d diff · a apply · x kill · Tab sessions · q close"
+        } else {
+            "j/k move · Enter transcript · x kill · X kill all · Tab sessions · q close"
         };
         Screen {
             title: format!("jobs · {run} running · {done} finished"),
@@ -651,22 +897,26 @@ impl JobsPanel {
             footer: if self.confirm_kill_all {
                 vec![span(format!("cancel all {run} running jobs? · y to confirm, any other key cancels"), accent())]
             } else {
-                line::styled("j/k move · Enter transcript · x kill · X kill all · Tab sessions · q close", |_| {
-                    dim()
-                })
+                line::styled(keys, |_| dim())
             },
             footer_cursor: None,
+            note: None,
         }
     }
 
     fn sessions_frame(&self, width: usize, now: SystemTime) -> Screen {
         let label_w = self.rows.iter().map(|r| r.depth * 2 + r.label().chars().count()).max().unwrap_or(0).min(26);
+        let host_w = match self.rows.iter().any(|r| r.host.is_some()) {
+            true => self.rows.iter().map(|r| r.host.as_deref().unwrap_or("here").chars().count()).max().unwrap_or(0),
+            false => 0,
+        };
         let rows = self
             .rows
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                sessions_tab::list_row(r, i == self.s_at, label_w, &self.cost_of(Some(&r.live.path)), width, now)
+                let cost = self.cost_of(Some(&r.live.path));
+                sessions_tab::list_row(r, i == self.s_at, label_w, host_w, &cost, width, now, self.home.as_deref())
             })
             .collect();
         let (detail_title, detail_rows) = match self.rows.get(self.s_at) {
@@ -706,6 +956,7 @@ impl JobsPanel {
             detail: detail_rows,
             footer,
             footer_cursor,
+            note: self.notice.as_ref().map(|n| vec![span(format!("  {n}"), accent())]),
         }
     }
 
@@ -767,6 +1018,8 @@ struct Screen {
     footer: Line,
     /// A column in the footer where the cursor goes (a message being typed).
     footer_cursor: Option<usize>,
+    /// One row between the list and the details, when there is room.
+    note: Option<Line>,
 }
 
 /// Lays a screen out in `max_rows`: a titled rule, a window of the list, the details between rules and
@@ -783,9 +1036,10 @@ fn draw(f: Screen, top: &mut usize, page: &mut usize, width: usize, max_rows: us
     }
     // The detail block's two rules are part of the body.
     let body = frame.body_rows(max_rows, 1);
+    let note_h = usize::from(split && f.note.is_some() && body >= 2 + DETAIL_MIN + 2);
     let (list_h, detail_h) = if split {
-        let list_h = n.clamp(1, LIST_MAX).min(body - 2 - DETAIL_MIN);
-        (list_h, (body - 2 - list_h).min(DETAIL_MAX))
+        let list_h = n.clamp(1, LIST_MAX).min(body - 2 - note_h - DETAIL_MIN);
+        (list_h, (body - 2 - note_h - list_h).min(DETAIL_MAX))
     } else {
         (body, 0)
     };
@@ -807,6 +1061,9 @@ fn draw(f: Screen, top: &mut usize, page: &mut usize, width: usize, max_rows: us
     // Blank-pad the list so the details start on a fixed row.
     let shown = if n == 0 { 1 } else { end - *top };
     out.extend(std::iter::repeat_n(Vec::new(), list_h.saturating_sub(shown)));
+    if let (1, Some(note)) = (note_h, &f.note) {
+        out.push(line::truncate(note, width));
+    }
     if split {
         out.push(rule(f.detail_title.as_deref(), width));
         let mut d = f.detail;
@@ -888,7 +1145,8 @@ fn list_row(
         JobKind::Subagent => format!("{:>3} tools", j.tools),
         JobKind::Bash => " ".repeat(9),
     };
-    let rest = format!(" {} {tools}  {:>7}  {cost:>6}  {}", pad(&j.agent, agent_w), clock(elapsed(j, now)), j.last);
+    let last = j.progress.as_deref().filter(|_| j.state == SubagentState::Running).unwrap_or(&j.last);
+    let rest = format!(" {} {tools}  {:>7}  {cost:>6}  {last}", pad(&j.agent, agent_w), clock(elapsed(j, now)));
     let mut name = t.fg(Role::Strong);
     if selected {
         name.attributes.set(crossterm::style::Attribute::Bold);
@@ -945,7 +1203,9 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
         let lead = if i == 0 { format!("   {label} ") } else { format!("   {} ", " ".repeat(label.len())) };
         rows.push(vec![span(lead, t.fg(Role::Faint)), span(r, t.fg(Role::Strong))]);
     }
-    if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
+    if let Some(p) = j.progress.as_deref().filter(|_| j.state == SubagentState::Running) {
+        rows.push(vec![span(format!("   starting {p}"), muted)]);
+    } else if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
         rows.push(vec![span(format!("   last {}", j.last), muted)]);
     }
     let hint = match (j.kind, &j.session) {
@@ -960,7 +1220,9 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::sessions::LiveRow;
     use crate::text::line::line_text;
+    use mu_session::session::owner::LiveSession;
     use mu_testutil::key;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -982,6 +1244,8 @@ mod tests {
             note: None,
             session: None,
             model: None,
+            changes: None,
+            progress: None,
         }
     }
 
@@ -989,8 +1253,36 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1012)
     }
 
+    /// Does what the app does with the panel's wants, with the host's own readers.
+    fn serve(p: &mut JobsPanel) {
+        for w in p.take_wants() {
+            match w {
+                Want::Tail { target, args } => {
+                    let path = args.path.clone();
+                    p.on_tail(target, &path, Ok(crate::host::sessions::read_tail(args)));
+                }
+                // Tests set the list themselves.
+                Want::Sessions(_) => p.on_live(Err(String::new())),
+            }
+        }
+    }
+
     fn text(p: &mut JobsPanel, w: usize, h: usize) -> Vec<String> {
+        serve(p);
         p.render(w, h, now()).0.iter().map(line_text).collect()
+    }
+
+    fn live_of(lives: Vec<LiveSession>) -> Live {
+        let rows = lives.into_iter().map(|live| LiveRow {
+            parent: live.parent.clone(),
+            modified: None,
+            title: None,
+            host: None,
+            hint: None,
+            attach: None,
+            live,
+        });
+        Live { rows: rows.collect(), canon: Vec::new(), notice: None }
     }
 
     #[test]
@@ -998,6 +1290,15 @@ mod tests {
         assert_eq!(clock(0), "0:00");
         assert_eq!(clock(75), "1:15");
         assert_eq!(clock(3600 + 61), "1:01:01");
+    }
+
+    #[test]
+    fn a_workers_start_progress_replaces_its_last_activity_while_set() {
+        let started = SubagentStatus { progress: Some("pulling image".into()), ..job("w", SubagentState::Running) };
+        let rows = text(&mut JobsPanel::new(vec![started]), 80, 14);
+        assert!(rows[1].contains("pulling image") && !rows[1].contains("read src/x.rs"), "{rows:?}");
+        let rows = text(&mut JobsPanel::new(vec![job("w", SubagentState::Running)]), 80, 14);
+        assert!(rows[1].contains("read src/x.rs") && !rows.iter().any(|r| r.contains("pulling")), "{rows:?}");
     }
 
     #[test]
@@ -1093,6 +1394,73 @@ mod tests {
         assert!(text(&mut p, 80, 10).iter().any(|r| r.contains("cancel all 1 running")));
         assert!(matches!(p.on_key(key(KeyCode::Char('n'))), JobsResult::Pending));
         assert!(matches!(p.on_key(key(KeyCode::Char('y'))), JobsResult::Pending), "the question is gone");
+    }
+
+    fn left_result(name: &str, state: SubagentState, applied: bool) -> SubagentStatus {
+        let changes = mu_base::events::JobChanges { r#ref: "refs/mu/result/a-1".into(), base: "0".repeat(40), applied };
+        SubagentStatus { changes: Some(changes), ..job(name, state) }
+    }
+
+    #[test]
+    fn d_and_a_name_the_result_of_a_finished_launched_job() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Done, false)]);
+        let JobsResult::Diff { job, result } = p.on_key(key(KeyCode::Char('d'))) else { panic!("not a diff") };
+        assert_eq!((job.as_str(), result.r#ref.as_str()), ("a", "refs/mu/result/a-1"));
+        assert_eq!(result.cwd, PathBuf::from("/work/proj"));
+        assert_eq!(result.base, "0".repeat(40));
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Apply { job, .. } if job == "a"));
+        let rows = text(&mut p, 100, 20);
+        assert!(rows.iter().any(|r| r.contains("result not applied · d diff · a apply")), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Enter transcript · d diff · a apply")),
+            "the key line says so: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_result_applied_automatically_or_from_the_panel_is_not_applied_again() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Done, true)]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        assert!(text(&mut p, 100, 20).iter().any(|r| r.contains("already applied")));
+        assert!(matches!(p.on_key(key(KeyCode::Char('d'))), JobsResult::Diff { .. }), "the diff stays readable");
+
+        let mut p = JobsPanel::new(vec![left_result("b", SubagentState::Done, false)]);
+        p.mark_applied("b");
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        assert!(text(&mut p, 100, 20).iter().any(|r| r.contains("result applied")));
+    }
+
+    #[test]
+    fn d_and_a_do_nothing_without_a_finished_result() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Running, false)]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('d'))), JobsResult::Pending));
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        let mut p = JobsPanel::new(vec![job("b", SubagentState::Done)]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('d'))), JobsResult::Pending));
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        assert!(!text(&mut p, 100, 20).iter().any(|r| r.contains("d diff")));
+    }
+
+    #[test]
+    fn the_diff_opens_in_the_full_height_view_and_q_returns() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Done, false)]);
+        p.show_diff("a", "diff --git a/f b/f\n-one\n+two\n");
+        let rows = text(&mut p, 80, 12);
+        assert!(rows[0].contains("a · diff"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("+two")) && rows.iter().any(|r| r.contains("-one")), "{rows:?}");
+        p.on_key(key(KeyCode::Char('q')));
+        assert!(p.view.is_none());
+        p.show_diff("a", "");
+        assert!(text(&mut p, 80, 12).iter().any(|r| r.contains("changes nothing")));
+    }
+
+    #[test]
+    fn the_sessions_tab_shows_the_hosts_notice_when_there_is_room() {
+        let mut p = JobsPanel::new(vec![]).on_sessions();
+        p.set_sessions(Live { notice: Some("2 unapplied worker results kept".into()), ..live_of(vec![]) });
+        assert!(text(&mut p, 80, 14).iter().any(|r| r.contains("2 unapplied worker results kept")));
+        p.set_sessions(live_of(vec![]));
+        assert!(!text(&mut p, 80, 14).iter().any(|r| r.contains("unapplied")));
     }
 
     #[test]
@@ -1274,6 +1642,9 @@ mod tests {
             cwd: Some(PathBuf::from("/work/other")),
             parent: None,
             abort: false,
+            waiting: false,
+            locked: false,
+            client: None,
         }
     }
 
@@ -1317,31 +1688,22 @@ mod tests {
         }
     }
 
-    /// A source with no live sessions, so no test reads `$MU_HOME/run`.
-    struct NoRuns;
-
-    impl SessionSource for NoRuns {
-        fn live_sessions(&self) -> Vec<LiveSession> {
-            Vec::new()
-        }
-    }
-
-    /// A panel on the Sessions tab with these sessions, not reading `$MU_HOME`.
+    /// A panel on the Sessions tab with these sessions.
     fn sessions_panel(lives: Vec<LiveSession>) -> JobsPanel {
-        let mut p = JobsPanel::new(vec![]).with_source(Box::new(NoRuns));
+        let mut p = JobsPanel::new(vec![]);
         p.tab = Tab::Sessions;
-        p.set_sessions(lives);
+        p.set_sessions(live_of(lives));
         p
     }
 
     #[test]
     fn tab_switches_between_jobs_and_sessions() {
-        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]).with_source(Box::new(NoRuns));
+        let mut p = JobsPanel::new(vec![job("a", SubagentState::Running)]);
         p.polled_totals = Some(Instant::now());
         assert!(text(&mut p, 80, 14)[0].starts_with("── jobs ·"));
         p.on_key(key(KeyCode::Tab));
         assert_eq!(p.tab, Tab::Sessions);
-        p.set_sessions(vec![lived(&session_path(), "print", "2026-01-01T00:00:00Z")]);
+        p.set_sessions(live_of(vec![lived(&session_path(), "print", "2026-01-01T00:00:00Z")]));
         let rows = text(&mut p, 80, 14);
         assert!(rows[0].starts_with("── sessions · 1 live"), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("print") && r.contains("4242")), "{rows:?}");
@@ -1452,9 +1814,9 @@ mod tests {
         p.s_at = 1;
         let mut c = lived(&session_path(), "print", "2026-01-01T00:00:00Z");
         c.pid = 1;
-        p.set_sessions(vec![lived(&b, "print", tb), c, lived(&a, "print", ta)]);
+        p.set_sessions(live_of(vec![lived(&b, "print", tb), c, lived(&a, "print", ta)]));
         assert_eq!(p.rows[p.s_at].live.path, b);
-        p.set_sessions(vec![]);
+        p.set_sessions(live_of(vec![]));
         assert_eq!(p.s_at, 0);
     }
 

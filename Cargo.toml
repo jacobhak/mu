@@ -76,6 +76,13 @@ reqwest = { version = "0.13.5", default-features = false, features = ["stream", 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 unicode-segmentation = "1.13"
 sha2 = "0.11.1"
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "encryption"] }
+chacha20poly1305 = "0.10"
+curve25519-dalek = "4"
+hkdf = "0.12"
+sha2_10 = { package = "sha2", version = "0.10" }
+zeroize = "1"
+getrandom = "0.3"
 ring = "0.17"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary", "NSString"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSBitmapImageRep", "NSImageRep"] }
@@ -98,8 +105,13 @@ uuid.workspace = true
 jiff.workspace = true
 anyhow.workspace = true
 libc.workspace = true
+base64.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+ssh-key.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+toml.workspace = true
 mu-common = { workspace = true, features = ["test-support"] }
 mu-testutil.workspace = true
 mu-agent = { workspace = true, features = ["test-support"] }

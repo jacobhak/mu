@@ -41,6 +41,91 @@ pub fn set_abort_signal() {
     ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// The client an agent serves: its host name and when it attached (unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClientInfo {
+    pub host: String,
+    pub since: i64,
+}
+
+/// What an agent adds to every owner record this process holds: a request waits for the user, and
+/// who is attached.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attention {
+    pub waiting: bool,
+    pub client: Option<ClientInfo>,
+    /// State encryption is on and nothing has unlocked it yet.
+    pub locked: bool,
+}
+
+static ATTENTION: std::sync::Mutex<Attention> =
+    std::sync::Mutex::new(Attention { waiting: false, client: None, locked: false });
+
+/// The owner records this process holds, by path.
+static CLAIMED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Changes what the owner records of this process say about its client, now and in records
+/// claimed later.
+pub fn set_attention(change: impl FnOnce(&mut Attention)) {
+    let Ok(mut now) = ATTENTION.lock() else { return };
+    change(&mut now);
+    let attention = now.clone();
+    drop(now);
+    let paths = CLAIMED.lock().map(|c| c.clone()).unwrap_or_default();
+    for p in paths {
+        rewrite(&p, &attention);
+    }
+}
+
+/// Rewrites `waiting`, `locked` and `client` of our own record in place. The new text is padded to the old
+/// length and written in one call, so a reader never sees a torn or empty file.
+fn rewrite(path: &Path, a: &Attention) {
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+    let Ok(mut f) = OpenOptions::new().read(true).write(true).open(path) else { return };
+    let mut text = String::new();
+    if f.read_to_string(&mut text).is_err() {
+        return;
+    }
+    let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return };
+    if v["pid"].as_u64() != Some(u64::from(std::process::id())) {
+        return;
+    }
+    set_attention_fields(&mut v, a);
+    let mut out = v.to_string();
+    while out.len() < text.len() {
+        out.push(' ');
+    }
+    let _ = f.write_all_at(out.as_bytes(), 0);
+}
+
+fn set_attention_fields(rec: &mut Value, a: &Attention) {
+    match a.waiting {
+        true => rec["waiting"] = json!(true),
+        false => {
+            if let Some(o) = rec.as_object_mut() {
+                o.remove("waiting");
+            }
+        }
+    }
+    match a.locked {
+        true => rec["locked"] = json!(true),
+        false => {
+            if let Some(o) = rec.as_object_mut() {
+                o.remove("locked");
+            }
+        }
+    }
+    match &a.client {
+        Some(c) => rec["client"] = json!(c),
+        None => {
+            if let Some(o) = rec.as_object_mut() {
+                o.remove("client");
+            }
+        }
+    }
+}
+
 /// What a process is, as its owner records name it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunKind {
@@ -48,11 +133,14 @@ pub enum RunKind {
     Print,
     Subagent,
     Acp,
+    /// `mu agent`: the agent of a session, with a client attached or not.
+    Agent,
 }
 
 impl RunKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Agent => "agent",
             Self::Tui => "tui",
             Self::Print => "print",
             Self::Subagent => "subagent",
@@ -78,7 +166,7 @@ pub fn set_run_info(kind: RunKind, agent: Option<&str>) {
 }
 
 /// Who has a session open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Owner {
     Free,
     Live {
@@ -102,6 +190,9 @@ pub(super) struct LiveRecord {
     cwd: Option<PathBuf>,
     parent: Option<PathBuf>,
     abort: bool,
+    waiting: bool,
+    locked: bool,
+    client: Option<ClientInfo>,
 }
 
 fn record_path(session: &Path) -> Option<PathBuf> {
@@ -138,6 +229,9 @@ fn read_record(rec: &Path) -> Option<LiveRecord> {
         cwd: text("cwd").map(PathBuf::from),
         parent: text("parent").map(PathBuf::from),
         abort: v["abort"].as_bool().unwrap_or(false),
+        waiting: v["waiting"].as_bool().unwrap_or(false),
+        locked: v["locked"].as_bool().unwrap_or(false),
+        client: serde_json::from_value(v["client"].clone()).ok(),
     })
 }
 
@@ -148,7 +242,7 @@ pub(super) fn live_record(session: &Path) -> Option<LiveRecord> {
 }
 
 /// A live mu process with a session open, from its owner record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LiveSession {
     pub path: PathBuf,
     pub pid: u32,
@@ -163,6 +257,13 @@ pub struct LiveSession {
     pub parent: Option<PathBuf>,
     /// SIGUSR1 cancels the current turn (an interactive mu that said so).
     pub abort: bool,
+    /// An agent has a question or approval that waits for a client.
+    pub waiting: bool,
+    /// The agent's state encryption is on and still locked.
+    #[serde(default)]
+    pub locked: bool,
+    /// The client an agent serves, when one is attached.
+    pub client: Option<ClientInfo>,
 }
 
 /// Every live owner record of this profile (`<profile home>/run`). A record whose writer is gone (its
@@ -199,6 +300,9 @@ pub fn live_sessions_in(run_dir: &Path) -> Vec<LiveSession> {
                 cwd: r.cwd,
                 parent,
                 abort: r.abort,
+                waiting: r.waiting,
+                locked: r.locked,
+                client: r.client,
             }
         })
         .collect()
@@ -285,6 +389,7 @@ struct Extra {
     cwd: Option<PathBuf>,
     parent: Option<PathBuf>,
     abort: bool,
+    attention: Attention,
 }
 
 impl OwnerRecord {
@@ -297,6 +402,7 @@ impl OwnerRecord {
             cwd: cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()),
             parent: parent.map(Path::to_path_buf),
             abort: ABORT.load(std::sync::atomic::Ordering::SeqCst),
+            attention: ATTENTION.lock().map(|a| a.clone()).unwrap_or_default(),
         };
         Self::claim_with(
             session,
@@ -314,7 +420,7 @@ impl OwnerRecord {
     fn claim_with(session: &Path, print_run: bool, inbox: bool, extra: &Extra) -> Option<Self> {
         let path = record_path(session)?;
         let dir = path.parent()?;
-        std::fs::create_dir_all(dir).ok()?;
+        mu_common::fs::create_private_dir(dir).ok()?;
         sweep_stale(dir);
         let pid = std::process::id();
         let tmp = dir.join(format!(".{}.{pid}.tmp", id_of(session)));
@@ -345,6 +451,7 @@ impl OwnerRecord {
             if extra.abort {
                 rec["abort"] = json!(true);
             }
+            set_attention_fields(&mut rec, &extra.attention);
             file.write_all(rec.to_string().as_bytes())?;
             // The lock follows the inode through the rename.
             std::fs::rename(&tmp, &path)
@@ -352,6 +459,9 @@ impl OwnerRecord {
         if done.is_err() {
             let _ = std::fs::remove_file(&tmp);
             return None;
+        }
+        if let Ok(mut c) = CLAIMED.lock() {
+            c.push(path.clone());
         }
         Some(Self { path, file })
     }
@@ -366,6 +476,9 @@ impl Drop for OwnerRecord {
             && a.ino() == b.ino()
         {
             let _ = std::fs::remove_file(&self.path);
+        }
+        if let Ok(mut c) = CLAIMED.lock() {
+            c.retain(|p| p != &self.path);
         }
     }
 }
@@ -490,11 +603,36 @@ mod tests {
     }
 
     #[test]
+    fn an_agents_client_and_waiting_flag_reach_its_record_and_the_listing() {
+        home();
+        let s = SessionFile::create(Path::new("/opt/attention"), None).unwrap();
+        set_attention(|a| {
+            a.waiting = true;
+            a.locked = true;
+            a.client = Some(ClientInfo { host: "laptop".into(), since: 100 });
+        });
+        let l = listed(&s.path).unwrap();
+        assert!(l.waiting && l.locked);
+        assert_eq!(l.client, Some(ClientInfo { host: "laptop".into(), since: 100 }));
+        // A record claimed later starts with what is set now.
+        let late = SessionFile::create(Path::new("/opt/attention-late"), None).unwrap();
+        assert!(listed(&late.path).unwrap().waiting);
+        set_attention(|a| *a = Attention::default());
+        let l = listed(&s.path).unwrap();
+        assert!(!l.waiting && !l.locked && l.client.is_none());
+        assert!(listed(&late.path).is_some(), "the record is still whole after rewrites");
+    }
+
+    #[test]
     fn the_run_kind_is_recorded_by_name() {
         home();
-        for (kind, name) in
-            [(RunKind::Tui, "tui"), (RunKind::Print, "print"), (RunKind::Subagent, "subagent"), (RunKind::Acp, "acp")]
-        {
+        for (kind, name) in [
+            (RunKind::Tui, "tui"),
+            (RunKind::Print, "print"),
+            (RunKind::Subagent, "subagent"),
+            (RunKind::Acp, "acp"),
+            (RunKind::Agent, "agent"),
+        ] {
             let d = tmp("run-kind");
             let path = d.join(format!("x_run-kind-{}.jsonl", uuid::Uuid::new_v4()));
             std::fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"k\"}\n").unwrap();

@@ -26,17 +26,26 @@ pub struct CostLedger {
 
 impl CostLedger {
     /// Records one assistant response, pricing it now if the table knows the model. `usage.cost`
-    /// is filled in when priced.
+    /// is filled in when priced; a cost already set (a relayed reply the parent priced) is kept.
     pub fn record(&mut self, provider: &str, model: &str, usage: &mut Usage) {
-        let id = priced_id(provider, model);
-        match pricing::cost(&id, usage) {
-            Some(c) => usage.cost = c,
-            None if has_tokens(usage) => self.unpriced.push((id, usage.clone())),
-            None => {}
+        if usage.cost.total == 0.0 {
+            let id = priced_id(provider, model);
+            match pricing::cost(&id, usage) {
+                Some(c) => usage.cost = c,
+                None if has_tokens(usage) => self.unpriced.push((id, usage.clone())),
+                None => {}
+            }
         }
         self.total += usage.cost.total;
         self.tokens_in += usage.input + usage.cache_read + usage.cache_write;
         self.tokens_out += usage.output;
+    }
+
+    /// Fills `usage.cost` from the price table, for a relayed reply the child cannot price itself.
+    pub fn price(provider: &str, model: &str, usage: &mut Usage) {
+        if let Some(c) = pricing::cost(&priced_id(provider, model), usage) {
+            usage.cost = c;
+        }
     }
 
     /// Takes in a stored response when a session is resumed: its recorded cost, except turns that
@@ -99,6 +108,21 @@ mod tests {
         assert_eq!(l.pending(), 1, "an unknown model waits for a price");
         l.reset();
         assert_eq!((l.tokens_in, l.pending()), (0, 0));
+    }
+
+    #[test]
+    fn a_preset_cost_is_kept_and_never_queued() {
+        let mut l = CostLedger::default();
+        let mut u = Usage {
+            input: 10,
+            cost: mu_base::message::Cost { total: 0.5, ..Default::default() },
+            ..Default::default()
+        };
+        l.record("nobody", "no-such-model", &mut u);
+        assert_eq!((l.total, u.cost.total, l.pending()), (0.5, 0.5, 0));
+        let mut u = Usage { input: 10, ..Default::default() };
+        l.record("nobody", "no-such-model", &mut u);
+        assert_eq!((l.total, l.pending()), (0.5, 1), "an unpriced model still queues");
     }
 
     #[test]

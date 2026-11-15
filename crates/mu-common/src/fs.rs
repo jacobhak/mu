@@ -39,6 +39,18 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Runs `f` with the process umask set to `mask`, then restores it. The umask is process-wide, so
+/// keep `f` to the one syscall that needs it (a `bind`): a file another thread creates in that
+/// window gets the stricter mask too.
+pub fn with_umask<T>(mask: u32, f: impl FnOnce() -> T) -> T {
+    // SAFETY: umask only swaps the process's file-creation mask.
+    let old = unsafe { libc::umask(mask as libc::mode_t) };
+    let out = f();
+    // SAFETY: as above; puts the previous mask back.
+    unsafe { libc::umask(old) };
+    out
+}
+
 /// Drops group and other permissions from an open file (best effort), for files that held user
 /// text and were created before they were made private.
 pub fn tighten(file: &std::fs::File) {
@@ -252,6 +264,22 @@ mod private_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_private_dir_is_0700_under_a_umask_of_zero_and_the_mask_comes_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("mu-fs-umask-{}", std::process::id()));
+        let leaf = d.join("a").join("run");
+        // SAFETY: reads the mask by setting and restoring it; no other test here changes it.
+        let before = unsafe { libc::umask(0o022) };
+        with_umask(0, || create_private_dir(&leaf)).unwrap();
+        let after = unsafe { libc::umask(before) };
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&leaf), 0o700);
+        assert_eq!(mode(&d.join("a")), 0o700);
+        assert_eq!(after as u32, 0o022, "the mask is restored");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn replaces_and_leaves_no_temp_file() {

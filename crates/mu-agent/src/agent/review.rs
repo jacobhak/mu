@@ -41,7 +41,7 @@ impl Agent {
         }
         let cancel = CancellationToken::new();
         self.ports.inbox.borrow_mut().cancel = cancel.clone();
-        self.emit(AgentEvent::TurnStart);
+        self.emit_turn_start();
         let sent = self.review_run(focus, &cancel).await;
         self.emit(AgentEvent::TurnEnd { aborted: cancel.is_cancelled() });
         // Input typed while the reviewer ran goes back to the composer, not into the fix turn.
@@ -213,6 +213,7 @@ impl Agent {
                     cancel,
                     progress,
                     self.tools.permissions.clone(),
+                    mu_tools::tools::subagent::Mirror::Off,
                 )
                 .await
             }

@@ -355,6 +355,9 @@ impl Providers {
     /// models, at most daily unless `force`. Failures keep the old cache. Returns how many
     /// models were fetched.
     pub async fn refresh_direct_models(&self, force: bool) -> usize {
+        if self.is_relayed() {
+            return 0;
+        }
         let mut n = 0;
         for def in PROVIDERS.iter().filter(|d| discovery::discovers(d) && self.is_direct(d.id)) {
             if !force && !discovery::stale(def.id) {

@@ -7,6 +7,7 @@ mod mu;
 mod retry;
 
 pub use mu::{Cards, MuBell, MuConfig, MuPermissions, MuStatus, MuTheme};
+pub use mu::{MuAgent, StateKey};
 use mu::{MuPredict, check_predict, check_status, load_permissions};
 use retry::check_retry;
 #[cfg(test)]
@@ -279,8 +280,10 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         secrets: parse(section("secrets"), "secrets", warn),
         status,
         task: parse(section("task"), "task", warn),
+        agent: parse(section("agent"), "agent", warn),
         permissions: load_permissions(&section("permissions"), warn),
         bell: parse(section("bell"), "bell", warn),
+        sessions: parse(section("sessions"), "sessions", warn),
     }
 }
 
@@ -645,8 +648,31 @@ mod tests {
     fn task_budget_defaults_and_overrides() {
         let d = toml::from_str::<MuConfig>("").unwrap().task;
         assert_eq!((d.soft_request_budget, d.budget_notice), (200, true));
+        assert!(d.launch.is_empty() && d.launcher.is_empty());
+        assert_eq!(d.max_cost, 5.0);
+        assert_eq!(toml::from_str::<MuConfig>("[task]\nmax_cost = 0").unwrap().task.max_cost, 0.0);
+        let t =
+            toml::from_str::<MuConfig>("[task]\nlaunch = [\"task\"]\nlauncher = [\"mu-remote\", \"launch\", \"c\"]")
+                .unwrap()
+                .task;
+        assert_eq!(
+            (t.launch.as_slice(), t.launcher.as_slice()),
+            (&["task".to_string()][..], &["mu-remote".to_string(), "launch".to_string(), "c".to_string()][..])
+        );
         let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;
         assert_eq!((t.soft_request_budget, t.budget_notice), (50, false));
+    }
+
+    #[test]
+    fn the_agents_state_key_source_and_session_sources_parse() {
+        let a = toml::from_str::<MuConfig>("[agent]\nstate_key = \"ssh\"\nstate_key_file = \"/k\"").unwrap().agent;
+        assert_eq!((a.state_key, a.state_key_file.as_deref(), a.state_key_command), (StateKey::Ssh, Some("/k"), None));
+        let d = MuAgent::default();
+        assert!(d.state_key == StateKey::Off && d.state_key_file.is_none() && d.state_key_command.is_none());
+        assert!(MuConfig::default().sessions.sources.is_empty());
+        let s =
+            toml::from_str::<MuConfig>("[sessions]\nsources = [[\"mu-remote\", \"rows\"], [\"x\"]]").unwrap().sessions;
+        assert_eq!(s.sources, [vec!["mu-remote".to_string(), "rows".to_string()], vec!["x".to_string()]]);
     }
 
     #[test]

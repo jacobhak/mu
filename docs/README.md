@@ -10,6 +10,7 @@
 - [Ghost text](ghost-text.md): prompt prediction and the opt-in SmolLM engine
 - [MCP servers](mcp.md)
 - [Agent Client Protocol](acp.md): `mu --acp`
+- [Remote use](remote.md): `mu agent`, `mu --attach`: the agent on one machine, the terminal UI on another; the launcher, attach and session-source contracts for programs that reach other machines
 - [Providers](providers.md): API keys for Anthropic, OpenAI and Baseten, custom vLLM/OpenAI-compatible endpoints (`mu providers`), Sign in with ChatGPT, `mu auth`, `/login`, routing and thinking per provider, what still needs omp
 - [Model roles](model-roles.md): what each role is for, and where to see and set them
 - [Custom agents](custom-agents.md)

@@ -11,6 +11,7 @@ pub fn profile_flag() -> String {
     std::env::var("OMP_PROFILE").ok().filter(|p| !p.is_empty()).map(|p| format!("--profile {p} ")).unwrap_or_default()
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub path: PathBuf,
     pub title: Option<String>,
@@ -33,6 +34,16 @@ pub fn latest_for(cwd: &Path) -> Option<PathBuf> {
     files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     files.into_iter().find(|p| {
         std::fs::metadata(p).is_ok_and(|m| m.len() > 0) && read_info(p.clone()).is_some_and(|s| s.cwd.is_some())
+    })
+}
+
+/// A session file name is one path component ending in `.jsonl`, with characters from
+/// `[A-Za-z0-9._-]` and no leading dot.
+pub fn valid_file_name(name: &str) -> bool {
+    name.strip_suffix(".jsonl").is_some_and(|stem| {
+        !stem.is_empty()
+            && !stem.starts_with('.')
+            && stem.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     })
 }
 
@@ -191,6 +202,14 @@ mod tests {
     use super::*;
     use crate::session::file::SessionFile;
     use mu_testutil::home;
+
+    #[test]
+    fn a_session_file_name_is_one_plain_jsonl_component() {
+        assert!(valid_file_name("2026-11-14T10-00-00-000Z_0192abcd-ef.jsonl"));
+        for bad in ["", ".jsonl", ".hidden.jsonl", "a.txt", "a/b.jsonl", "../a.jsonl", "a b.jsonl", "a\\b.jsonl"] {
+            assert!(!valid_file_name(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn id_validation_and_lookup() {

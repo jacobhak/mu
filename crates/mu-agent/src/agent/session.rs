@@ -144,6 +144,18 @@ impl Agent {
     /// Switches to the session file at `path`, whatever brought it about. The conversation is
     /// replayed to the front end only when it is not already on screen.
     pub(super) async fn reopen(&mut self, path: &Path, how: Reopen) -> bool {
+        // The worktree a mirror resumes in is the process's directory, which a running agent keeps.
+        if matches!(how, Reopen::Resume)
+            && mu_session::session::mirror::header(path).is_some_and(|h| h.mirrored)
+            && !mu_session::session::mirror::is_in_worktree(path, &self.cwd)
+        {
+            let id = mu_session::session::list::id_of(path);
+            self.error(format!(
+                "{} is a mirror of a remote task: open it with `mu --resume {id}` (or `mu take {id}`), which checks out its result in a worktree",
+                path.display()
+            ));
+            return false;
+        }
         let loaded = match format::load(path) {
             Ok(l) => l,
             Err(e) => {

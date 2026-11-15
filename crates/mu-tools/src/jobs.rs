@@ -14,9 +14,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::permissions::Permissions;
-use crate::tools::subagent::{BackgroundResult, Outcome, preview_result, run_child_observed};
+use crate::tools::relay::RelayServer;
+use crate::tools::subagent::{BackgroundResult, ChildCmd, Mirror, Outcome, preview_result, run_child_observed};
 use crate::tools::task::MAX_TASKS;
-use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
+use mu_base::events::{AgentEvent, EventTx, JobChanges, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
 use mu_base::tool::BashMeta;
 
@@ -131,6 +132,10 @@ enum Work {
         /// The child's session file, once it has opened it.
         session: Option<PathBuf>,
         model: Option<String>,
+        /// What a launched worker left, once it has finished.
+        changes: Option<JobChanges>,
+        /// The remote's latest start step, until the worker is connected.
+        progress: Option<String>,
     },
     Bash {
         /// Taken on delivery, like `text`.
@@ -143,7 +148,7 @@ enum Work {
 
 impl Work {
     fn subagent() -> Self {
-        Work::Subagent { tools: 0, session: None, model: None }
+        Work::Subagent { tools: 0, session: None, model: None, changes: None, progress: None }
     }
 
     fn bash(command: String) -> Self {
@@ -364,9 +369,11 @@ impl JobsHandle {
             .iter()
             .filter(|j| j.listed)
             .map(|j| {
-                let (tools, note, session, model) = match &j.work {
-                    Work::Subagent { tools, session, model } => (*tools, None, session.clone(), model.clone()),
-                    Work::Bash { note, .. } => (0, note.clone(), None, None),
+                let (tools, note, session, model, changes, progress) = match &j.work {
+                    Work::Subagent { tools, session, model, changes, progress } => {
+                        (*tools, None, session.clone(), model.clone(), changes.clone(), progress.clone())
+                    }
+                    Work::Bash { note, .. } => (0, note.clone(), None, None, None, None),
                 };
                 SubagentStatus {
                     name: j.spec.id.clone(),
@@ -383,6 +390,8 @@ impl JobsHandle {
                     note,
                     session,
                     model,
+                    changes,
+                    progress,
                 }
             })
             .collect()
@@ -499,11 +508,13 @@ impl JobsHandle {
         self: &Rc<Self>,
         id: String,
         agent: String,
-        exe: PathBuf,
+        child: ChildCmd,
         cwd: PathBuf,
         payload: Value,
         perms: Rc<Permissions>,
         artifacts: PathBuf,
+        mirror: Mirror,
+        relay: Option<RelayServer>,
     ) {
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
@@ -511,10 +522,41 @@ impl JobsHandle {
         let spec = Spec { id, agent, cwd: cwd.clone(), task: command_line(payload["task"].as_str().unwrap_or("")) };
         let me = self.clone();
         self.spawn_job(spec, Work::subagent(), String::new(), cancel, true, move |seq| async move {
-            let out = me.run_subagent(seq, &exe, &cwd, &payload, &child_cancel, |_, _| {}, &perms, &label).await;
+            let mut child = child;
+            if let ChildCmd::Launched(l) = &mut child {
+                let me = me.clone();
+                l.on_progress(move |p| {
+                    if let Some(mut j) = me.job_mut(seq)
+                        && let Work::Subagent { progress, .. } = &mut j.work
+                    {
+                        *progress = p.map(str::to_string);
+                    }
+                    me.emit();
+                });
+            }
+            let out = me
+                .run_subagent(
+                    seq,
+                    child,
+                    &cwd,
+                    &payload,
+                    &child_cancel,
+                    |_, _| {},
+                    &perms,
+                    &label,
+                    mirror,
+                    relay.as_ref(),
+                )
+                .await;
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
             let text = preview_result(&out.text, &cwd, || crate::tools::Tools::next_artifact_in(&artifacts));
+            if let Some(c) = out.changes
+                && let Some(mut j) = me.job_mut(seq)
+                && let Work::Subagent { changes, .. } = &mut j.work
+            {
+                *changes = Some(c);
+            }
             Finished { ok: out.ok, text, note: None, meta: None }
         });
     }
@@ -534,6 +576,7 @@ impl JobsHandle {
         cancel: &CancellationToken,
         on_tool: impl FnMut(&str, &str),
         perms: Rc<Permissions>,
+        mirror: Mirror,
     ) -> Outcome {
         let id = self.unique_id(id);
         let own = cancel.child_token();
@@ -544,7 +587,20 @@ impl JobsHandle {
             task: command_line(payload["task"].as_str().unwrap_or("")),
         };
         let seq = self.start(spec, Work::subagent(), String::new(), own.clone(), false, true);
-        let out = self.run_subagent(seq, exe, cwd, payload, &own, on_tool, &perms, "review").await;
+        let out = self
+            .run_subagent(
+                seq,
+                ChildCmd::Local(exe.to_path_buf()),
+                cwd,
+                payload,
+                &own,
+                on_tool,
+                &perms,
+                "review",
+                mirror,
+                None,
+            )
+            .await;
         self.complete(seq, Finished { ok: out.ok, text: String::new(), note: None, meta: None }, true);
         out
     }
@@ -555,16 +611,18 @@ impl JobsHandle {
     async fn run_subagent(
         &self,
         seq: u64,
-        exe: &Path,
+        child: ChildCmd,
         cwd: &Path,
         payload: &Value,
         cancel: &CancellationToken,
         mut on_tool: impl FnMut(&str, &str),
         perms: &Rc<Permissions>,
         from: &str,
+        mirror: Mirror,
+        relay: Option<&RelayServer>,
     ) -> Outcome {
         run_child_observed(
-            exe,
+            child,
             cwd,
             payload,
             cancel,
@@ -595,6 +653,8 @@ impl JobsHandle {
                 self.emit();
             },
             Some(&|r| perms.forward(&self.events, from, r)),
+            mirror,
+            relay,
         )
         .await
     }
@@ -1019,11 +1079,13 @@ pub(crate) mod tests {
                 h.spawn(
                     "A".into(),
                     "scout".into(),
-                    exe,
+                    ChildCmd::Local(exe),
                     base.clone(),
                     serde_json::json!({"task": "find  x\nnow"}),
                     Rc::default(),
                     base.join("artifacts"),
+                    Mirror::Off,
+                    None,
                 );
                 assert_eq!(h.finished().await.len(), 1);
             })
@@ -1064,6 +1126,7 @@ pub(crate) mod tests {
                 &CancellationToken::new(),
                 |n, s| seen.push(format!("{n} {s}")),
                 Rc::default(),
+                Mirror::Off,
             ))
             .await;
         assert_eq!((out.ok, out.text.as_str()), (true, "report"));
@@ -1091,7 +1154,17 @@ pub(crate) mod tests {
                     assert_eq!(h.kill(Some("review")), 1);
                 };
                 let (out, ()) = tokio::join!(
-                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}, Rc::default()),
+                    h.run_owned(
+                        "review",
+                        "review-lead",
+                        &exe,
+                        &base,
+                        &payload,
+                        &owner,
+                        |_, _| {},
+                        Rc::default(),
+                        Mirror::Off
+                    ),
                     killer
                 );
                 assert!(!out.ok && out.text == "cancelled", "{}", out.text);
@@ -1105,7 +1178,17 @@ pub(crate) mod tests {
                     owner.cancel();
                 };
                 let (out, ()) = tokio::join!(
-                    h.run_owned("review", "review-lead", &exe, &base, &payload, &owner, |_, _| {}, Rc::default()),
+                    h.run_owned(
+                        "review",
+                        "review-lead",
+                        &exe,
+                        &base,
+                        &payload,
+                        &owner,
+                        |_, _| {},
+                        Rc::default(),
+                        Mirror::Off
+                    ),
                     canceller
                 );
                 assert!(!out.ok);

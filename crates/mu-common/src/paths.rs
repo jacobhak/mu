@@ -196,7 +196,9 @@ pub fn encode_cwd(cwd: &Path) -> String {
 pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut child = Command::new(omp_bin())
+    let mut cmd = Command::new(omp_bin());
+    crate::omp_state::apply(&mut cmd).expect("omp state is locked");
+    let mut child = cmd
         .args(args)
         .envs(env.iter().copied())
         .stdin(Stdio::null())

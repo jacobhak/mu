@@ -4,19 +4,25 @@
 
 use super::keys::KeyThen;
 use super::*;
+use crate::host::keys::KeyInfo;
+use crate::host::web::WebState;
 use crate::web::wizard::{Answer, Step, Wizard};
 use crate::widgets::select::{Item, Select};
 use mu_provider::auth::web::{SearchBackend, WebSearch, label};
-use mu_provider::provider::providers::KeyTarget;
 
 impl App {
     /// `reply` is the waiting `web_search` call, told whether web search is now ready.
     pub(super) fn start_web_wizard(&mut self, reply: Option<tokio::sync::oneshot::Sender<bool>>) {
         self.leave_custom_wizard();
-        let store = self.services.providers.store().clone();
-        let wizard = Wizard::new(store.web(), move |id| store.has(id));
-        self.flows.begin(Active::Web(Box::new((wizard, reply))));
-        self.web_wizard_show();
+        self.host_call(host::web::WEB_STATE, &(), move |app, r: Result<WebState, String>| {
+            let state = r.unwrap_or_else(|e| {
+                app.error(&format!("could not read the web search choice: {e}"));
+                WebState::default()
+            });
+            let wizard = Wizard::new(state.current, move |id| state.keys.iter().any(|k| k == id));
+            app.flows.begin(Active::Web(Box::new((wizard, reply))));
+            app.web_wizard_show();
+        });
     }
 
     fn web_wizard_show(&mut self) {
@@ -27,11 +33,13 @@ impl App {
                 let rows = items.into_iter().map(|i| Item { label: i.label, detail: i.detail }).collect();
                 self.open_overlay(Overlay::Web { sel: Select::new(&title, rows).context(&context).details(about) });
             }
-            Step::NeedKey(id) => match KeyTarget::builtin(id) {
-                // A key added here serves web search only; chat use is a separate, explicit choice.
-                Some(t) => self.start_key_flow(t, Some(false), Some(KeyThen::WebWizard)),
-                None => self.web_wizard_answer(Answer::KeyCancelled),
-            },
+            Step::NeedKey(id) => {
+                self.host_call(host::keys::KEY_TARGET, &id, |app, r: Result<Option<KeyInfo>, String>| match r {
+                    // A key added here serves web search only; chat use is a separate, explicit choice.
+                    Ok(Some(t)) => app.start_key_flow(t, Some(false), Some(KeyThen::WebWizard)),
+                    _ => app.web_wizard_answer(Answer::KeyCancelled),
+                })
+            }
             Step::Done(w) => self.web_wizard_finish(Some(w)),
             Step::Cancelled => self.web_wizard_finish(None),
         }
@@ -55,28 +63,31 @@ impl App {
 
     fn web_wizard_finish(&mut self, chosen: Option<WebSearch>) {
         let Some((_, reply)) = self.flows.end_web() else { return };
-        let ready = match chosen {
-            Some(w) => match self.services.set_web(w.clone()) {
+        let Some(w) = chosen else {
+            self.notice("web search was not set up");
+            if let Some(tx) = reply {
+                let _ = tx.send(false);
+            }
+            return;
+        };
+        self.host_call(host::web::SET_WEB, &w, move |app, r: Result<(), String>| {
+            let ready = match r {
                 Ok(()) => {
                     if w.backend == SearchBackend::Off {
-                        self.notice("web search is off");
+                        app.notice("web search is off");
                     } else {
-                        self.notice(&format!("web search: {}", label(w.backend, w.keyless)));
+                        app.notice(&format!("web search: {}", label(w.backend, w.keyless)));
                     }
                     w.backend != SearchBackend::Off
                 }
                 Err(e) => {
-                    self.error(&format!("could not save the web search choice: {e}"));
+                    app.error(&format!("could not save the web search choice: {e}"));
                     false
                 }
-            },
-            None => {
-                self.notice("web search was not set up");
-                false
+            };
+            if let Some(tx) = reply {
+                let _ = tx.send(ready);
             }
-        };
-        if let Some(tx) = reply {
-            let _ = tx.send(ready);
-        }
+        });
     }
 }

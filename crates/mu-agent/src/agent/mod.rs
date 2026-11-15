@@ -263,6 +263,8 @@ impl Agent {
             permissions.set_mode(m);
         }
         tools.permissions = permissions;
+        tools.launch = i.run.task_launch.clone();
+        tools.mirror = i.run.mirror_session;
         let budget = (i.run.subagent && i.run.request_budget > 0)
             .then(|| budget::Budget::new(i.run.request_budget, i.run.budget_notice));
         let (title_tx, title_rx) = unbounded_channel();
@@ -350,6 +352,12 @@ impl Agent {
         let _ = self.ports.events.send(e);
     }
 
+    /// Starts a turn for the front end: where the session stands, then `TurnStart`.
+    pub(super) fn emit_turn_start(&self) {
+        self.emit(AgentEvent::TurnMark { leaf: self.session.as_ref().and_then(|s| s.leaf().map(String::from)) });
+        self.emit(AgentEvent::TurnStart);
+    }
+
     pub fn notice(&self, s: impl Into<String>) {
         self.emit(AgentEvent::Notice(s.into()));
     }
@@ -396,7 +404,7 @@ impl Agent {
     }
 
     pub async fn run(mut self, rx: UnboundedReceiver<Command>) {
-        self.costs.quota.enabled = true;
+        self.costs.quota.enabled = !self.ports.providers.is_relayed();
         self.sync_model_state();
         let providers = self.ports.providers.clone();
         tokio::task::spawn_local(async move {

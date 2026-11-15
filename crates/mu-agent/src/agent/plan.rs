@@ -269,7 +269,7 @@ impl Agent {
             title: meta.title.clone(),
             uri,
             decision,
-            base: crate::review::facts::snapshot_tree(&self.cwd).await.ok(),
+            base: mu_base::git::snapshot_tree(&self.cwd).await.ok(),
             approved_at: now_ms(),
             stored: Some(id.to_string()),
         }))

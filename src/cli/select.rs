@@ -16,12 +16,12 @@ fn chosen(cfgs: &config::Configs, sel: Option<String>) -> (Option<String>, Optio
 }
 
 fn resolve_chosen(
-    providers: &Providers,
+    resolve: impl FnOnce(&str) -> Result<(models::ModelSpec, Option<models::Thinking>)>,
     sel: &str,
     level: Option<models::Thinking>,
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
-    let (spec, role_level) = providers.resolve(sel)?;
+    let (spec, role_level) = resolve(sel)?;
     Ok((spec, cli_thinking.or(role_level).or(level).unwrap_or(models::Thinking::Medium)))
 }
 
@@ -32,13 +32,23 @@ pub(crate) fn pick_model(
     sel: Option<String>,
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
+    pick_model_with(cfgs, sel, cli_thinking, |s| providers.resolve(s))
+}
+
+/// `pick_model` with the selector resolved by `resolve`: a relayed worker asks its parent.
+pub(crate) fn pick_model_with(
+    cfgs: &config::Configs,
+    sel: Option<String>,
+    cli_thinking: Option<models::Thinking>,
+    resolve: impl FnOnce(&str) -> Result<(models::ModelSpec, Option<models::Thinking>)>,
+) -> Result<(models::ModelSpec, models::Thinking)> {
     let (sel, level) = chosen(cfgs, sel);
     let sel = sel.ok_or_else(|| {
         let hint =
             if cfgs.import_offer.borrow().is_some() { "; copy omp's model config with `mu models import`" } else { "" };
         anyhow!("{NO_MODEL}{hint}")
     })?;
-    resolve_chosen(providers, &sel, level, cli_thinking)
+    resolve_chosen(resolve, &sel, level, cli_thinking)
 }
 
 /// `pick_model` for the TUI: with no model named it starts unselected, so the user can `/login`
@@ -50,7 +60,7 @@ pub(crate) fn pick_model_or_none(
     cli_thinking: Option<models::Thinking>,
 ) -> Result<(models::ModelSpec, models::Thinking)> {
     match chosen(cfgs, sel) {
-        (Some(sel), level) => resolve_chosen(providers, &sel, level, cli_thinking),
+        (Some(sel), level) => resolve_chosen(|s| providers.resolve(s), &sel, level, cli_thinking),
         (None, level) => {
             Ok((models::ModelSpec::unselected(), cli_thinking.or(level).unwrap_or(models::Thinking::Medium)))
         }

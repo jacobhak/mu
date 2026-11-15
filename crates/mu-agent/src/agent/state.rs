@@ -49,6 +49,11 @@ pub struct RunConfig {
     pub request_budget: u32,
     /// Whether the wrap-up notice is injected when the budget is crossed.
     pub budget_notice: bool,
+    /// `[task] launcher`: the command `task` subagents of some kinds go through. `None` in a subagent.
+    pub task_launch: Option<mu_tools::tools::subagent::WorkerLaunch>,
+    /// The parent asked for this run's session file over the stream: its own children's lines pass
+    /// on to the parent too.
+    pub mirror_session: bool,
 }
 
 /// Messages queued while a turn runs, plus the turn's cancellation token. Only the agent loop touches it;

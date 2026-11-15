@@ -5,11 +5,17 @@
 //!
 //! Reads are cached per file stamp (inode, ctime, mtime and size), so a key added by one session reaches the
 //! others without a restart. Writes hold a lock file, re-read, and replace the file atomically.
+//!
+//! With state encryption on (`mu_common::sealed::is_initialised` for the file's directory) the file is
+//! a sealed envelope bound to the name `auth.json`; a plaintext file left from before is still read
+//! (until `sealing::seal_existing` rewrites it) and every write is sealed. While the state key is
+//! locked a sealed file is not read, fails with [`SealedError::Locked`] and is never cached.
 
 use super::chatgpt::ChatgptData;
 use super::chatgpt::store::{overlay_unsaved, register_tokens, unsaved_error};
 use super::web::WebSearch;
 use anyhow::{Context, Result, anyhow, bail};
+use mu_common::sealed::{self, SealedError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -21,6 +27,8 @@ use std::time::{Duration, Instant};
 /// rather than rewriting it without them. A file with no sign-in is still written as 2.
 const VERSION: u32 = 3;
 const VERSION_WITHOUT_CHATGPT: u32 = 2;
+/// The name the envelope is bound to, whatever the store's path.
+pub(super) const SEALED_NAME: &str = "auth.json";
 /// A `!command` reference gets this long to print the key.
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -158,6 +166,13 @@ struct FileData {
     /// Why the file could not be read, set only on a snapshot of a bad file.
     #[serde(skip)]
     error: Option<String>,
+    /// The file is sealed and the state key is locked.
+    #[serde(skip)]
+    locked: bool,
+}
+
+fn is_locked_error(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<SealedError>(), Some(SealedError::Locked))
 }
 
 fn chatgpt_unset(c: &ChatgptData) -> bool {
@@ -213,13 +228,38 @@ impl Store {
         self.path.with_file_name(n)
     }
 
+    /// The directory holding `keys/state.key` when state encryption is on for this file.
+    fn sealed_home(&self) -> Option<&Path> {
+        self.path.parent().filter(|h| sealed::is_initialised(h))
+    }
+
+    fn sealed_error(&self, e: SealedError) -> anyhow::Error {
+        match e {
+            SealedError::Locked => e.into(),
+            e => anyhow!("{}: {e}", self.path.display()),
+        }
+    }
+
+    /// The file is sealed and the state key is locked. Reads the file, never the cache.
+    pub fn is_locked(&self) -> bool {
+        self.sealed_home().is_some()
+            && !sealed::is_unlocked()
+            && std::fs::read(&self.path).is_ok_and(|b| sealed::is_sealed(&b))
+    }
+
     /// Reads the file now. A missing file is an empty store; an unreadable or corrupt one is an error.
     fn read_fresh(&self) -> Result<FileData> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(t) => t,
+        let bytes = match std::fs::read(&self.path) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileData::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
         };
+        let bytes = if self.sealed_home().is_some() && sealed::is_sealed(&bytes) {
+            sealed::open(SEALED_NAME, &bytes).map_err(|e| self.sealed_error(e))?
+        } else {
+            bytes
+        };
+        let text = String::from_utf8(bytes).with_context(|| format!("reading {}", self.path.display()))?;
         if text.trim().is_empty() {
             return Ok(FileData::default());
         }
@@ -237,28 +277,44 @@ impl Store {
         let stamp = self.stamp();
         let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some((s, d)) = cache.get(&self.path)
+        // Locking does not change the stamp, so a locked key store is read afresh and never cached.
+        let uncached = self.sealed_home().is_some() && !sealed::is_unlocked();
+        if !uncached
+            && let Some((s, d)) = cache.get(&self.path)
             && *s == stamp
         {
             return d.clone();
         }
-        let data = Arc::new(
-            self.read_fresh().unwrap_or_else(|e| FileData { error: Some(format!("{e:#}")), ..FileData::default() }),
-        );
+        let read = self.read_fresh();
+        let locked = read.as_ref().err().is_some_and(is_locked_error);
+        let data = Arc::new(read.unwrap_or_else(|e| FileData {
+            error: Some(format!("{e:#}")),
+            locked,
+            ..FileData::default()
+        }));
         for (provider, e) in &data.providers {
             if let Some(k) = &e.key {
                 mu_base::secrets::register_stored(&label(provider), k);
             }
         }
         register_tokens(&data.chatgpt);
-        cache.insert(self.path.clone(), (stamp, data.clone()));
+        if uncached {
+            cache.remove(&self.path);
+        } else {
+            cache.insert(self.path.clone(), (stamp, data.clone()));
+        }
         data
     }
 
     /// `Ok` when the store is absent or well-formed. A corrupt file is an error, and so is an entry
     /// mu ignores (no usable key or reference, or a base URL it refuses), named by provider.
     pub fn check(&self) -> Result<()> {
-        let data = self.read_fresh()?;
+        let data = match self.read_fresh() {
+            Ok(d) => d,
+            // Locked is the normal state of an agent waiting for its owner; it is not a broken file.
+            Err(e) if is_locked_error(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
         if let Some(e) = unsaved_error(&self.path) {
             bail!("{e}");
         }
@@ -338,8 +394,12 @@ impl Store {
                 }
             }
             let json = serde_json::to_string_pretty(&data)? + "\n";
-            mu_common::fs::write_private(&self.path, json.as_bytes())
-                .with_context(|| format!("writing {}", self.path.display()))?;
+            if self.sealed_home().is_some() {
+                sealed::write_sealed(&self.path, SEALED_NAME, json.as_bytes()).map_err(|e| self.sealed_error(e))?;
+            } else {
+                mu_common::fs::write_private(&self.path, json.as_bytes())
+                    .with_context(|| format!("writing {}", self.path.display()))?;
+            }
         }
         Ok(changed)
     }
@@ -418,9 +478,12 @@ impl Store {
     pub async fn resolve(&self, provider: &str) -> Result<Resolved> {
         let entry = match self.get(provider) {
             Some(e) => e,
-            None => match self.snapshot().error.clone() {
-                Some(e) => bail!("cannot read the stored key for {provider}: {e}"),
-                None => bail!("no API key stored for {provider}"),
+            None => match self.snapshot() {
+                s if s.locked => return Err(SealedError::Locked.into()),
+                s => match s.error.clone() {
+                    Some(e) => bail!("cannot read the stored key for {provider}: {e}"),
+                    None => bail!("no API key stored for {provider}"),
+                },
             },
         };
         resolve_entry_in(&self.path, provider, &entry).await

@@ -242,15 +242,13 @@ fn serve() -> Result<i32, String> {
     let mut kids = Kids(Vec::new(), Vec::new());
     let (broker, broker_url) = spawn_omp(&["auth-broker", "serve", "--bind=127.0.0.1:0"], &[], &mut kids.1)?;
     kids.0.push(broker);
+    let mut token_cmd = Command::new(mu_common::paths::omp_bin());
+    mu_common::omp_state::apply(&mut token_cmd).map_err(|e| e.to_string())?;
     run_with_timeout(
-        Command::new(mu_common::paths::omp_bin())
-            .args(["auth-gateway", "token"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
+        token_cmd.args(["auth-gateway", "token"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()),
         TOKEN_TIMEOUT,
     );
-    let token_path = paths::omp_config_root().join("auth-broker.token");
+    let token_path = mu_common::omp_state::credential_root().join("auth-broker.token");
     let token = fs::read_to_string(&token_path).map(|t| t.trim().to_string()).unwrap_or_default();
     if token.is_empty() {
         return Err(format!("broker token not found at {}", token_path.display()));
@@ -347,6 +345,7 @@ impl Drop for Kids {
 /// every platform a guard process that kills the child's group when the daemon's pipe to it closes.
 fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Result<(Child, String), String> {
     let mut cmd = Command::new(mu_common::paths::omp_bin());
+    mu_common::omp_state::apply(&mut cmd).map_err(|e| e.to_string())?;
     cmd.args(args).envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.process_group(0);
     #[cfg(target_os = "linux")]

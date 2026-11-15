@@ -136,7 +136,7 @@ pub struct Image {
 }
 
 /// A user prompt: text plus attached images.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UserInput {
     pub text: String,
     pub images: Vec<Image>,

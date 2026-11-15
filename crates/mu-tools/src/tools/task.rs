@@ -1,4 +1,8 @@
-use super::subagent::{ArtifactAlloc, preview_result, run_child_observed};
+use super::relay::{RelayAllow, RelayServer};
+use super::subagent::WorkerLaunch;
+use super::subagent::{
+    ArtifactAlloc, ChildCmd, MU_VERSION, Mirror, Outcome, prepare_launch, preview_result, run_child_observed,
+};
 use super::{ToolCtx, Tools};
 use crate::permissions::Permissions;
 use futures_util::future::join_all;
@@ -110,6 +114,18 @@ fn resolve_cwd(raw: Option<&str>, default: &Path) -> Result<PathBuf, String> {
 }
 
 impl Tools {
+    /// The models a relayed `agent` may call: what this process was itself allowed to pass on, else
+    /// the role chain of the task's model (its `model` role, else the agent's own) and `smol`.
+    fn relay_allow(&self, agent: &str, model: Option<&str>) -> RelayAllow {
+        if let Some(a) = self.plugins.relay_allow() {
+            return a;
+        }
+        let Some(p) = self.plugins.providers() else { return RelayAllow::default() };
+        let role = model.map_or(if agent == "scout" { "scout" } else { "task" }, |m| m.trim_start_matches('@'));
+        let extra = self.agent_models.borrow().get(agent).cloned().unwrap_or_default();
+        RelayAllow::for_task(&p, role, &extra)
+    }
+
     pub async fn task(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
         if a.tasks.is_empty() || a.tasks.len() > MAX_TASKS {
             return ToolOutput::err("task: provide 1-8 tasks");
@@ -164,9 +180,51 @@ impl Tools {
             Ok(e) => e,
             Err(e) => return ToolOutput::err(format!("cannot locate mu executable: {e}")),
         };
+        // The kinds `[task] launch` names run on the remote.
+        let remote = |agent: &str| self.launch.as_ref().filter(|l| l.runs(agent));
+        // A launched child's session file is on another machine, and a mirrored worker's children's
+        // lines must reach its own parent: both ask their child to send its lines.
+        let mirror_of = |agent: &str| {
+            if self.mirror {
+                Mirror::Forward(ctx.events.clone())
+            } else if remote(agent).is_some() {
+                Mirror::Write
+            } else {
+                Mirror::Off
+            }
+        };
+        // A launched child has no credentials, and a relayed process has none to lend: the child's
+        // model calls go to this process.
+        let relayed_here = std::env::var("MU_TASK_RELAY").is_ok_and(|v| v == "1")
+            || self.plugins.providers().is_some_and(|p| p.is_relayed());
+        let relayed = relayed_here || specs.iter().any(|(_, agent, ..)| remote(agent).is_some());
+        let max_cost = self.plugins.providers().map_or(0.0, |p| p.cfg.mu.task.max_cost);
+        let relay = relayed.then(|| RelayServer {
+            plugins: self.plugins.clone(),
+            permissions: self.permissions.clone(),
+            max_cost,
+            cwd: self.cwd.clone(),
+        });
+        let relay_tools = if relayed { self.plugins.relay_tools_payload() } else { Vec::new() };
         let payload = |agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
-            let mut p = json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
+            let launched = remote(agent).is_some();
+            let mut p = json!({
+                "task": task, "context": a.context, "agent": agent, "parentSession": parent, "muVersion": MU_VERSION
+            });
+            if relayed_here || launched {
+                p["relay"] = json!(true);
+                p["relayModels"] = json!(self.relay_allow(agent, model));
+                if !relay_tools.is_empty() {
+                    p["relayTools"] = json!(relay_tools);
+                }
+            }
             p["permissions"] = self.permissions.inherit_json();
+            if self.mirror || launched {
+                p["mirrorSession"] = json!(true);
+            }
+            if launched {
+                p["depth"] = json!(depth() + 1);
+            }
             if let Some(s) = schema {
                 p["outputSchema"] = s.clone();
             }
@@ -180,17 +238,37 @@ impl Tools {
             if let Err(e) = jobs.check_capacity(specs.len()) {
                 return ToolOutput::err(e);
             }
+            // Ids and launches first: a launch that fails then starts nothing, and drops the others'
+            // task refs.
+            let mut ids: Vec<String> = Vec::new();
+            let mut children = Vec::new();
+            for (name, agent, _, cwd, _) in &specs {
+                let id = (1..)
+                    .map(|n| if n == 1 { name.clone() } else { format!("{name}-{n}") })
+                    .find(|c| jobs.unique_id(c) == *c && !ids.contains(c))
+                    .unwrap_or_default();
+                children.push(match remote(agent) {
+                    None => ChildCmd::Local(exe.clone()),
+                    Some(on) => match prepare_launch(on, cwd, &id).await {
+                        Ok(l) => ChildCmd::Launched(l),
+                        Err(e) => return ToolOutput::err(e),
+                    },
+                });
+                ids.push(id);
+            }
             let mut started = Vec::new();
-            for (i, (name, agent, task, cwd, model)) in specs.iter().enumerate() {
-                let id = jobs.unique_id(name);
+            for (i, ((_, agent, task, cwd, model), child)) in specs.iter().zip(children).enumerate() {
+                let id = ids[i].clone();
                 jobs.spawn(
                     id.clone(),
                     agent.clone(),
-                    exe.clone(),
+                    child,
                     cwd.clone(),
                     payload(agent, task, schemas[i], model.as_deref()),
                     self.permissions.clone(),
                     self.artifact_dir(),
+                    mirror_of(agent),
+                    relay.clone(),
                 );
                 started.push(format!("{id} ({agent})"));
             }
@@ -202,9 +280,29 @@ impl Tools {
             ));
         }
         let alloc = || self.next_artifact();
-        run_foreground(&specs, &schemas, &exe, &payload, &ctx.cancel, &ctx.events, &self.permissions, &self.cwd, &alloc)
-            .await
+        let how = Starter { exe: &exe, launch: self.launch.as_ref(), mirror: &mirror_of };
+        run_foreground(
+            &specs,
+            &schemas,
+            &how,
+            &payload,
+            &ctx.cancel,
+            &ctx.events,
+            &self.permissions,
+            relay.as_ref(),
+            &self.cwd,
+            &alloc,
+        )
+        .await
     }
+}
+
+/// What starts a foreground task's child: this executable, or a worker on the remote for the agent
+/// kinds `[task] launch` names, which needs a launch prepared per task.
+struct Starter<'a> {
+    exe: &'a Path,
+    launch: Option<&'a WorkerLaunch>,
+    mirror: &'a dyn Fn(&str) -> Mirror,
 }
 
 /// Builds one child's task payload.
@@ -216,11 +314,12 @@ type Payload<'a> = dyn Fn(&str, &str, Option<&Value>, Option<&str>) -> Value + '
 async fn run_foreground(
     specs: &[(String, String, String, PathBuf, Option<String>)],
     schemas: &[Option<&Value>],
-    exe: &Path,
+    how: &Starter<'_>,
     payload: &Payload<'_>,
     cancel: &tokio_util::sync::CancellationToken,
     events: &EventTx,
     perms: &Rc<Permissions>,
+    relay: Option<&RelayServer>,
     cwd: &Path,
     alloc: ArtifactAlloc<'_>,
 ) -> ToolOutput {
@@ -242,6 +341,8 @@ async fn run_foreground(
                 note: None,
                 session: None,
                 model: None,
+                changes: None,
+                progress: None,
             })
             .collect::<Vec<_>>(),
     );
@@ -250,8 +351,18 @@ async fn run_foreground(
         let payload = payload(agent, task, schemas[i], model.as_deref());
         let label = format!("{name} ({agent})");
         async move {
+            let child = match how.launch.filter(|l| l.runs(agent)) {
+                None => ChildCmd::Local(how.exe.to_path_buf()),
+                Some(on) => match prepare_launch(on, cwd, name).await {
+                    Ok(l) => ChildCmd::Launched(l),
+                    Err(e) => {
+                        rows.borrow_mut()[i].state = SubagentState::Failed;
+                        return Outcome::failed(e);
+                    }
+                },
+            };
             let out = run_child_observed(
-                exe,
+                child,
                 cwd,
                 &payload,
                 cancel,
@@ -263,6 +374,8 @@ async fn run_foreground(
                 |_| {},
                 |model| rows.borrow_mut()[i].model = Some(model.to_string()),
                 Some(&|r| perms.forward(events, &label, r)),
+                (how.mirror)(agent),
+                relay,
             )
             .await;
             rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
@@ -367,13 +480,15 @@ mod cwd_tests {
         let seen = RefCell::new(Vec::new());
         let out = tokio::task::LocalSet::new()
             .run_until(run_child_observed(
-                &exe,
+                ChildCmd::Local(exe),
                 &base,
                 &json!({}),
                 &CancellationToken::new(),
                 |n, _| seen.borrow_mut().push(format!("tool {n}")),
                 |p| seen.borrow_mut().push(format!("session {p}")),
                 |m| seen.borrow_mut().push(format!("model {m}")),
+                None,
+                Mirror::Off,
                 None,
             ))
             .await;
@@ -504,6 +619,108 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn the_payload_carries_mus_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-version-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, ECHO_CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut t = Tools::for_test();
+        t.child_exe = Some(exe);
+        let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","solutionSpace":"one fix: given"}]})).unwrap();
+        let out = tokio::task::LocalSet::new().run_until(t.task(a, &ctx())).await;
+        assert!(out.text.contains(&format!(r#""muVersion":"{MU_VERSION}""#)), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_relayed_parent_passes_its_own_models_on_unchanged() {
+        let t = Tools::for_test();
+        assert_eq!(t.relay_allow("task", None), RelayAllow::default(), "no providers, nothing to allow");
+        t.plugins.set_relay_allow(Some(&json!({"ids": ["a/b"], "roles": ["task"]})));
+        let given = RelayAllow { ids: vec!["a/b".into()], roles: vec!["task".into()] };
+        for (agent, model) in [("task", None), ("scout", None), ("task", Some("@other"))] {
+            assert_eq!(t.relay_allow(agent, model), given, "{agent} {model:?}: a grandchild cannot widen it");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_mirrored_parent_asks_its_local_child_for_the_session_lines() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-mirror-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, ECHO_CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut t = Tools::for_test();
+        t.child_exe = Some(exe);
+        let args = || -> Args {
+            serde_json::from_value(json!({"tasks":[{"task":"x","solutionSpace":"one fix: given"}]})).unwrap()
+        };
+        let out = tokio::task::LocalSet::new().run_until(t.task(args(), &ctx())).await;
+        assert!(!out.text.contains("mirrorSession"), "{}", out.text);
+        t.mirror = true;
+        let out = tokio::task::LocalSet::new().run_until(t.task(args(), &ctx())).await;
+        assert!(out.text.contains(r#""mirrorSession":true"#), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_the_kinds_launch_names_go_through_the_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-route-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, ECHO_CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = mu_testutil::repo();
+        let launcher = base.join("launcher.sh");
+        let log = base.join("launched");
+        std::fs::write(
+            &launcher,
+            format!(
+                "IFS= read -r a\necho \"$MU_TASK_NAME\" >> {}\necho '{{\"type\":\"result\",\"text\":\"remote says hi\"}}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut t = Tools::for_test();
+        t.child_exe = Some(exe);
+        t.launch = Some(WorkerLaunch {
+            launcher: vec!["sh".into(), launcher.to_string_lossy().into_owned()],
+            kinds: vec!["task".into()],
+        });
+        let cwd = root.to_str().unwrap();
+        let a: Args = serde_json::from_value(json!({"tasks":[
+            {"name":"Local","task":"x","agent":"scout","solutionSpace":"one fix: given","cwd":cwd},
+            {"name":"Far","task":"y","agent":"task","solutionSpace":"one fix: given","cwd":cwd}
+        ]}))
+        .unwrap();
+        let out = tokio::task::LocalSet::new().run_until(t.task(a, &ctx())).await;
+        let (local, far) = out.text.split_once("## Far").expect("both rows");
+        assert!(local.contains(r#""agent":"scout""#) && !local.contains("mirrorSession"), "{local}");
+        assert!(!local.contains(r#""relay""#), "a local child is not relayed: {local}");
+        assert!(far.contains("remote says hi"), "{far}");
+        let launched = std::fs::read_to_string(&log).unwrap();
+        assert!(launched.lines().count() == 1 && launched.starts_with("far-"), "the task, not the scout: {launched}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_launch_prepare_is_that_rows_failure() {
+        let mut t = Tools::for_test();
+        t.launch = Some(WorkerLaunch { launcher: vec!["true".into()], kinds: vec!["task".into()] });
+        let dir = mu_testutil::tmp();
+        let a: Args = serde_json::from_value(
+            json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","cwd":dir.to_str().unwrap()}]}),
+        )
+        .unwrap();
+        let out = t.task(a, &ctx()).await;
+        assert!(out.is_error && out.text.contains("needs a git repository"), "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn bad_output_schema_is_rejected_before_spawning() {
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -548,7 +765,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         answer: Option<&dyn Fn(ApprovalRequest) -> tokio::sync::oneshot::Receiver<ApprovalDecision>>,
     ) -> String {
         run_child_observed(
-            &fake(base),
+            ChildCmd::Local(fake(base)),
             base,
             &json!({"task": "go"}),
             &CancellationToken::new(),
@@ -556,6 +773,8 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
             |_| {},
             |_| {},
             answer,
+            Mirror::Off,
+            None,
         )
         .await
         .text

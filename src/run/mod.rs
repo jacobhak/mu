@@ -2,12 +2,18 @@
 //! it to that mode's function.
 
 mod acp;
+pub mod attach;
+pub mod detach;
 mod headless;
+mod relay;
+mod serve;
 pub mod setup;
 mod signals;
+mod state;
+mod unlock;
 
 use crate::cli::Cli;
-use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none};
+use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none, pick_model_with};
 use crate::workflow::{deliver, plans_cli::PlanRun};
 use anyhow::{Result, anyhow, bail};
 use mu_agent::agent;
@@ -30,6 +36,8 @@ enum Mode {
     Print(PrintRun),
     /// `--headless`: one subagent task read from stdin, NDJSON on stdout.
     Subagent { task: Value },
+    /// `mu agent`: the agent with no terminal, serving a client over a Unix socket.
+    Agent { resumed: bool },
 }
 
 struct PrintRun {
@@ -43,12 +51,15 @@ enum Armed {
     Tui { pick_session: bool },
     Print { run: PrintRun, stop: UnboundedReceiver<()> },
     Subagent { task: Value },
+    Agent { resumed: bool },
 }
 
 impl Mode {
-    /// `task` is the subagent task, read exactly when `--headless` is set.
-    fn of(cli: &Cli, plan: Option<PlanRun>, task: Option<Value>) -> Self {
-        if let Some(task) = task {
+    /// `task` is the subagent task, read exactly when `--headless` is set; `agent` is `mu agent`.
+    fn of(cli: &Cli, plan: Option<PlanRun>, task: Option<Value>, agent: bool, resumed: bool) -> Self {
+        if agent {
+            Self::Agent { resumed }
+        } else if let Some(task) = task {
             Self::Subagent { task }
         } else if let Some(prompt) = &cli.print {
             Self::Print(PrintRun {
@@ -68,10 +79,10 @@ impl Mode {
         !cli.headless && cli.print.is_none() && !plan
     }
 
-    /// The agent's own mode: only the TUI keeps background jobs and `mu notify` delivery.
+    /// The agent's own mode: only the TUI and `mu agent` keep background jobs and `mu notify` delivery.
     fn agent_mode(&self) -> mu_agent::handle::Mode {
         match self {
-            Self::Tui { .. } => mu_agent::handle::Mode::Tui,
+            Self::Tui { .. } | Self::Agent { .. } => mu_agent::handle::Mode::Tui,
             _ => mu_agent::handle::Mode::Headless,
         }
     }
@@ -80,6 +91,7 @@ impl Mode {
     fn run_kind(&self) -> owner::RunKind {
         match self {
             Self::Tui { .. } => owner::RunKind::Tui,
+            Self::Agent { .. } => owner::RunKind::Agent,
             Self::Subagent { .. } => owner::RunKind::Subagent,
             Self::Print(_) => owner::RunKind::Print,
         }
@@ -93,26 +105,68 @@ impl Mode {
             Self::Tui { pick_session } => Armed::Tui { pick_session },
             Self::Print(run) => Armed::Print { run, stop: signals::print_run_stop()? },
             Self::Subagent { task } => Armed::Subagent { task },
+            Self::Agent { resumed } => Armed::Agent { resumed },
         })
     }
 }
 
 /// Runs the front end `cli` asks for. `plan` is the first step of a `mu plan` command, if that is what ran.
 pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
+    run_as(cli, plan, false)
+}
+
+/// The agent was started by `mu agent --detach`: it ignores SIGHUP and moves its stdout to its log.
+pub fn mark_detached() {
+    serve::DETACHED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `mu agent`: the agent of a session, with no terminal.
+pub fn run_agent(cli: &Cli) -> Result<i32> {
+    run_as(cli, None, true)
+}
+
+fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     let cli_thinking = cli.thinking.as_deref().and_then(models::Thinking::parse);
     let permissions = cli.permissions.as_deref().and_then(PermissionMode::parse);
     if cli.acp {
         return acp::run(cli.model.clone(), cli_thinking, permissions);
     }
-    let interactive = Mode::interactive(cli, plan.is_some());
-    if matches!(cli.resume, Some(None)) && !interactive {
+    if let Some(command) = &cli.attach {
+        return attach::run(attach::Link::new(command.clone(), cli.state_key.clone()), false);
+    }
+    if Mode::interactive(cli, plan.is_some()) && !agent {
+        let sources = mu_base::config::Configs::load().mu.sessions.sources;
+        if !sources.is_empty() {
+            mu_tui::host::sessions::set_session_sources(sources);
+        }
+    }
+    // `terminal`: the TUI. `interactive`: someone can answer a question or an approval, here or
+    // through a client (the TUI and `mu agent`).
+    let terminal = Mode::interactive(cli, plan.is_some()) && !agent;
+    let interactive = terminal || agent;
+    if matches!(cli.resume, Some(None)) && !terminal {
         bail!(
             "--resume without a session opens the session picker, which needs the interactive mode; pass a session id or path"
         );
     }
-    let cwd = std::env::current_dir()?;
+    let mut cwd = std::env::current_dir()?;
+    let mut resume = find_resume(cli, &cwd)?;
+    // A mirror of a launched worker's session opens in a worktree at what the worker produced.
+    if let Some(p) = &mut resume
+        && let Some(dir) = mu_session::session::mirror::checkout(p).map_err(|e| anyhow!("{e}"))?
+    {
+        if let Ok(abs) = std::fs::canonicalize(p.as_path()) {
+            *p = abs;
+        }
+        std::env::set_current_dir(&dir)?;
+        cwd = std::env::current_dir()?;
+    }
     let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
-    if interactive && cfgs.mu.update.check {
+    // Before anything reads a credential: a sealed store opens only with the key.
+    if agent {
+        state::start(&cfgs.mu.agent, &paths::profile_home()).map_err(|e| anyhow!("mu agent: {e}"))?;
+    }
+    if terminal && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
         let tx = notice_tx.clone();
         std::thread::spawn(move || {
@@ -137,20 +191,49 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     let def_thinking = agent_def.as_ref().and_then(|d| d.thinking.as_deref()).and_then(models::Thinking::parse);
     let role_sel = sel.clone();
     let level = cli_thinking.or(def_thinking);
-    let (spec, thinking) = if interactive {
-        pick_model_or_none(&cfgs, &providers, sel, level)?
+    // A relayed worker has no credentials: its parent resolves the selector, before any runtime exists.
+    let stdio = task.as_ref().filter(|p| relays(p)).map(|_| Rc::new(relay::StdioRelay::new()));
+    let mut deferred_model = None;
+    let (spec, thinking) = if let Some(r) = &stdio {
+        let picked = pick_model_with(&cfgs, sel, level, |s| {
+            let resolved = relay::resolve_first(s)?;
+            providers.remember_relayed(s, &resolved.spec, resolved.thinking);
+            Ok((resolved.spec, resolved.thinking))
+        })?;
+        providers.set_relay(r.clone());
+        picked
+    } else if interactive {
+        match pick_model_or_none(&cfgs, &providers, sel.clone(), level) {
+            // A locked agent cannot read the key store yet: it starts with no model and takes this one
+            // once a client has unlocked it.
+            Err(e) if agent && is_locked(&e) => {
+                deferred_model = sel.or_else(|| cfgs.role("default"));
+                (models::ModelSpec::unselected(), cli_thinking.or(level).unwrap_or(models::Thinking::Medium))
+            }
+            picked => picked?,
+        }
     } else {
         pick_model(&cfgs, &providers, sel, level)?
     };
+    if stdio.is_some() {
+        host.set_relay_tools(task.as_ref().and_then(|p| p.get("relayTools")));
+        host.set_relay_allow(task.as_ref().and_then(|p| p.get("relayModels")));
+    }
+    // The one reader of stdin, from here on: relay answers go to the relay, the rest to the subagent run.
+    let lines = if task.is_some() {
+        relay::spawn_reader(stdio.as_ref().map(|r| r.routes()))
+    } else {
+        tokio::sync::mpsc::unbounded_channel().1
+    };
     let model_label = model_label(role_sel.as_deref(), &spec.id);
 
-    let resume = find_resume(cli, &cwd)?;
-    if interactive && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if terminal && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("mu: interactive mode needs a terminal; use -p");
     }
     if let (true, Some(p)) = (interactive, &resume) {
-        // As `mu take`, but asked first: a `-p` run that has the session is stopped after its current step.
-        if let Some(code) = crate::workflow::take::release(p, "mu", true)? {
+        // As `mu take`, asked first when there is a terminal to ask on: a `-p` run that has the session
+        // is stopped after its current step.
+        if let Some(code) = crate::workflow::take::release(p, "mu", terminal)? {
             return Ok(code);
         }
     }
@@ -165,6 +248,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     if let Some(p) = &task {
         apply_task(&mut run, p, &cfgs);
     }
+    run.task_launch = task_launch(task.as_ref(), &cfgs);
     if let Some(d) = &agent_def {
         apply_agent(&mut run, d);
     }
@@ -185,7 +269,7 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     }
     let name = task.as_ref().and_then(|p| p["agent"].as_str()).or(agent_def.as_ref().map(|d| d.name.as_str()));
     let name = name.map(String::from);
-    let mode = Mode::of(cli, plan, task);
+    let mode = Mode::of(cli, plan, task, agent, resume.is_some());
     owner::set_run_info(mode.run_kind(), name.as_deref());
 
     let cfgs_ui = cfgs.clone();
@@ -228,22 +312,43 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
             }
         }
         let agent_task = handle.task;
+        let serving = matches!(armed, Armed::Agent { .. });
         let (code, printer) = match armed {
             Armed::Tui { pick_session } => {
                 signals::cancel_turn_on_sigusr1(handle.cmd.clone());
                 let ui = Ui { cfgs: cfgs_ui, providers: providers_ui, ctx: ctx_ui, cwd: cwd_ui, pick_session };
-                (tui(&host, ui, handle.cmd, handle.ev, notice_rx).await, None)
+                let (cmd, ev) = if mu_base::wire::loopback_on() {
+                    mu_base::wire::loopback(handle.cmd, handle.ev)
+                } else {
+                    (handle.cmd, handle.ev)
+                };
+                (tui(&host, ui, cmd, ev, notice_rx).await, None)
+            }
+            Armed::Agent { resumed } => {
+                signals::cancel_turn_on_sigusr1(handle.cmd.clone());
+                host.set_interactive();
+                let local = mu_tui::host::local::LocalHost::new(providers_ui, ctx_ui, host.clone(), cwd_ui);
+                let init = serve::Init {
+                    host: Rc::new(local),
+                    cmd: handle.cmd,
+                    ev: handle.ev,
+                    notices: notice_rx,
+                    resumed,
+                    config: cfgs_ui.mu.agent.clone(),
+                    deferred_model,
+                };
+                (serve::run(init).await, None)
             }
             Armed::Subagent { task } => {
                 let printer = spawn_notice_printer(notice_rx);
                 plugin::process::exit_on_signals();
-                (subagent(&task, model_label, output_schema, handle.cmd, handle.ev).await, Some(printer))
+                (subagent(&task, model_label, output_schema, handle.cmd, handle.ev, lines).await, Some(printer))
             }
             Armed::Print { run, stop } => {
                 let printer = spawn_notice_printer(notice_rx);
                 plugin::process::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
-                (print(run, stop, handle.cmd, handle.ev).await, Some(printer))
+                (print(run, stop, handle.cmd, handle.ev, host.relay_spend()).await, Some(printer))
             }
         };
         let code = match agent_task.await {
@@ -254,6 +359,9 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
             Ok(()) => code,
         };
         host.shutdown_all().await;
+        if serving {
+            state::shutdown();
+        }
         // Notices raised during shutdown are printed before the process exits.
         if let Some((done, handle)) = printer {
             let _ = done.send(());
@@ -262,6 +370,10 @@ pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
         code
     });
     Ok(code)
+}
+
+fn is_locked(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<mu_common::sealed::SealedError>(), Some(mu_common::sealed::SealedError::Locked))
 }
 
 /// The agent `--agent` names, from the project's or the user's agent files.
@@ -322,6 +434,30 @@ fn apply_task(run: &mut agent::RunConfig, p: &Value, cfgs: &mu_base::config::Con
     let agent_name = p["agent"].as_str().unwrap_or(context::TASK);
     run.request_budget = mu_tools::tools::task::soft_request_budget(agent_name, cfgs.mu.task.soft_request_budget);
     run.budget_notice = cfgs.mu.task.budget_notice;
+    run.mirror_session = mirrors_session(p);
+}
+
+/// Whether the parent asked this run to send its model calls to it.
+fn relays(p: &Value) -> bool {
+    p["relay"] == true
+}
+
+/// Whether the parent asked for this run's session file over the stream.
+fn mirrors_session(p: &Value) -> bool {
+    p["mirrorSession"] == true
+}
+
+/// The launcher `task` subagents of some kinds go through. A subagent (it has a task payload) gets
+/// none: its own subagents spawn locally.
+pub(crate) fn task_launch(
+    task: Option<&Value>,
+    cfgs: &mu_base::config::Configs,
+) -> Option<mu_tools::tools::subagent::WorkerLaunch> {
+    let t = &cfgs.mu.task;
+    if task.is_some() || t.launcher.is_empty() || t.launch.is_empty() {
+        return None;
+    }
+    Some(mu_tools::tools::subagent::WorkerLaunch { launcher: t.launcher.clone(), kinds: t.launch.clone() })
 }
 
 fn require_output_schema(run: &mut agent::RunConfig, s: &Value) -> Result<()> {
@@ -351,12 +487,14 @@ async fn tui(
     notice_rx: UnboundedReceiver<String>,
 ) -> i32 {
     host.set_interactive();
+    let local = mu_tui::host::local::LocalHost::new(ui.providers.clone(), ui.ctx.clone(), host.clone(), ui.cwd.clone());
+    // Loopback: every host call answers later, as a remote host's do.
+    let host_for_ui: Rc<dyn mu_tui::host::Host> =
+        if mu_base::wire::loopback_on() { Rc::new(mu_tui::host::Deferred(local)) } else { Rc::new(local) };
     mu_tui::app::run(mu_tui::app::AppInit {
+        host: host_for_ui,
         cmd_tx,
         ev_rx,
-        providers: ui.providers,
-        ctx: ui.ctx,
-        plugins: host.clone(),
         notice_rx,
         cwd: ui.cwd,
         pick_session: ui.pick_session,
@@ -364,6 +502,9 @@ async fn tui(
         theme: ui.cfgs.mu.theme.clone(),
         notify: ui.cfgs.omp.completion.notify,
         bell: ui.cfgs.mu.bell,
+        hide_thinking: ui.cfgs.omp.hide_thinking_block,
+        smooth_streaming: ui.cfgs.omp.display.smooth_streaming,
+        status_levels: ui.cfgs.mu.status,
     })
     .await
 }
@@ -374,8 +515,9 @@ async fn print(
     stop: UnboundedReceiver<()>,
     cmd: UnboundedSender<events::Command>,
     ev: UnboundedReceiver<events::AgentEvent>,
+    spend: Rc<mu_tools::tools::relay::RelaySpend>,
 ) -> i32 {
-    headless::print_mode(run.first, run.expect_park, cmd, ev, run.max_cost, stop).await
+    headless::print_mode_with(run.first, run.expect_park, cmd, ev, run.max_cost, stop, Some(spend)).await
 }
 
 /// `--headless`: the task's prompt runs as a subagent, its `model` line first.
@@ -385,12 +527,13 @@ async fn subagent(
     output_schema: Option<Value>,
     cmd: UnboundedSender<events::Command>,
     ev: UnboundedReceiver<events::AgentEvent>,
+    lines: UnboundedReceiver<String>,
 ) -> i32 {
     let extra = p["context"].as_str().filter(|c| !c.is_empty());
     let task = p["task"].as_str().unwrap_or("");
     let prompt = extra.map_or(task.to_string(), |c| format!("{c}\n\n{task}"));
     println!("{}", json!({"type": "model", "label": model_label}));
-    headless::subagent_mode(prompt, output_schema, cmd, ev).await
+    headless::subagent_mode(prompt, output_schema, mirrors_session(p), cmd, ev, lines).await
 }
 
 /// The subagent task on stdin, and the agent it names: a project agent, else one of mu's built-in
@@ -402,9 +545,22 @@ fn read_task(ctx: &context::Context) -> Result<(Value, Option<context::AgentDef>
     task_line(ctx, &input)
 }
 
+/// A worker runs only the version of mu that sent it the task: the wire between them is not
+/// versioned otherwise. A payload that carries no version (a hand-written one) is accepted.
+fn check_version(p: &Value) -> Result<()> {
+    match p["muVersion"].as_str() {
+        Some(v) if v != mu_tools::tools::subagent::MU_VERSION => bail!(
+            "this worker is mu {} but the parent that sent the task is mu {v}; use the same version on both",
+            mu_tools::tools::subagent::MU_VERSION
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// The first line as a payload and the agent it names; a payload without `agent` runs the worker.
 fn task_line(ctx: &context::Context, input: &str) -> Result<(Value, Option<context::AgentDef>)> {
     let p: Value = serde_json::from_str(input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
+    check_version(&p)?;
     let mut def = None;
     if let Some(name) = p["agent"].as_str() {
         match ctx.agents.iter().find(|a| a.name == name).cloned().or_else(|| context::builtin_agent(name)) {
@@ -434,6 +590,17 @@ fn task_output_schema(payload: &Value, def: Option<&context::AgentDef>) -> Optio
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_process_started_with_a_task_payload_spawns_locally() {
+        let mut cfgs = mu_base::config::Configs::default();
+        assert!(task_launch(None, &cfgs).is_none(), "nothing configured");
+        cfgs.mu.task.launch = vec!["task".into()];
+        assert!(task_launch(None, &cfgs).is_none(), "kinds without a launcher");
+        cfgs.mu.task.launcher = vec!["/bin/launcher".into()];
+        assert!(task_launch(Some(&json!({"task": "t"})), &cfgs).is_none());
+        assert!(task_launch(None, &cfgs).is_some_and(|l| l.runs("task") && !l.runs("scout")));
+    }
 
     #[test]
     fn task_output_schema_prefers_caller_then_agent() {

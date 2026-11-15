@@ -26,6 +26,8 @@ pub fn retry_notice(attempt: u32, max_attempts: u32, delay: Duration, reason: &s
     format!("retrying in {} ({reason}) [attempt {attempt}/{max_attempts}]", wait_text(delay))
 }
 
+/// What a front end asks of the agent. Serialisable as is: `wire::WireCommand` wraps it.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Command {
     Prompt(UserInput),
     /// Creates the session file now, so its id is known before the first prompt.
@@ -94,7 +96,7 @@ pub enum Command {
 }
 
 /// A prompt `Command::Rewind` can go back before, or an agent reply it can go back to just after.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RewindPoint {
     /// The session entry holding the prompt or reply.
     pub id: String,
@@ -104,13 +106,13 @@ pub struct RewindPoint {
 }
 
 /// Messages queued for the agent: steered into the running turn, or held until it ends.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct QueueState {
     pub steer: Vec<UserInput>,
     pub follow_up: Vec<UserInput>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatusSnapshot {
     /// `provider/model`.
     pub model_id: String,
@@ -151,7 +153,7 @@ pub struct StatusSnapshot {
 }
 
 /// The provider prompt cache as of the last reply: what it read, and what changed since the request.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CacheStatus {
     pub input: u64,
     pub cache_read: u64,
@@ -162,7 +164,7 @@ pub struct CacheStatus {
     pub changed: Option<CacheBreak>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CacheBreak {
     Model,
     Thinking,
@@ -234,7 +236,7 @@ impl PlanMeta {
 }
 
 /// Branch and working-tree counts of a repository (`gitinfo`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GitInfo {
     pub branch: Option<String>,
     /// Entries with a staged (index) change.
@@ -246,7 +248,7 @@ pub struct GitInfo {
     pub behind: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QuotaWindow {
     /// `5h`, `1d` or `7d`.
     pub label: String,
@@ -255,14 +257,14 @@ pub struct QuotaWindow {
 }
 
 /// Subscription usage windows of one provider (`quota`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderUsage {
     pub provider: String,
     pub windows: Vec<QuotaWindow>,
 }
 
 /// What an ask preview shows; a frontend styles its box by it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PreviewKind {
     Code,
@@ -271,7 +273,7 @@ pub enum PreviewKind {
     Text,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AskOption {
     pub label: String,
     pub description: Option<String>,
@@ -282,7 +284,7 @@ pub struct AskOption {
     pub kind: Option<PreviewKind>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AskQuestion {
     pub question: String,
     /// Why the question comes up and what hangs on it, so the dialog reads on its own. Shown above
@@ -298,7 +300,7 @@ pub struct AskQuestion {
     pub skippable: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Answer {
     Options(Vec<String>),
     /// Picked options (one, or several when multi) with a free-text note attached.
@@ -312,6 +314,7 @@ pub enum Answer {
     Cancelled,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum PlanDecision {
     Execute {
         model: Option<String>,
@@ -350,7 +353,7 @@ impl PlanDecision {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SubagentState {
     Running,
     Done,
@@ -358,13 +361,22 @@ pub enum SubagentState {
 }
 
 /// What a background job runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum JobKind {
     Subagent,
     Bash,
 }
 
-#[derive(Clone, Debug)]
+/// What a launched worker left: its result ref, the commit it is a diff from, and whether the
+/// diff is in the working tree.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobChanges {
+    pub r#ref: String,
+    pub base: String,
+    pub applied: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SubagentStatus {
     pub name: String,
     pub agent: String,
@@ -387,16 +399,36 @@ pub struct SubagentStatus {
     /// The model a subagent runs on, as `role · provider/model` (no role when named directly); known
     /// once its process has resolved it.
     pub model: Option<String>,
+    /// The result a launched subagent left to apply.
+    #[serde(default)]
+    pub changes: Option<JobChanges>,
+    /// The latest step of a worker still being started on a remote ("pulling image", …); gone once connected.
+    #[serde(default)]
+    pub progress: Option<String>,
 }
 
 /// Input from the TUI to a command running on a pseudo-terminal.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum PtyInput {
     Bytes(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     Kill,
 }
 
+/// What the agent tells a front end. The five variants that carry an in-process reply handle are
+/// `serde(skip)`: they cross a wire as `wire::WireEvent` requests with an id.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
+    /// Only a client that joins a running agent over a wire sees this, never the agent itself:
+    /// `Replay(true)` before what it missed (the view starts afresh and stays quiet: no bell), and
+    /// `Replay(false)` when it is caught up.
+    Replay(bool),
+    /// Sent immediately before every `TurnStart`: the session entry the turn begins after (`None`
+    /// with no session file yet). A client that attaches mid-turn shows history up to here and
+    /// replays the turn's events after it.
+    TurnMark {
+        leaf: Option<String>,
+    },
     TurnStart,
     /// Sent right after `TurnStart` when the turn began without user input (a background job
     /// finished or a `mu notify` message arrived).
@@ -431,6 +463,7 @@ pub enum AgentEvent {
         chunk: String,
     },
     /// A bash call wants a terminal. `reply` carries `(cols, rows)`; dropping it makes the tool fall back.
+    #[serde(skip)]
     PtyOpen {
         id: String,
         input: mpsc::UnboundedSender<PtyInput>,
@@ -455,6 +488,11 @@ pub enum AgentEvent {
         reason: String,
     },
     Notice(String),
+    /// A line of a nested child's session file, passing through a mirrored worker to its parent.
+    ChildEntry {
+        file: String,
+        line: String,
+    },
     Error(String),
     Compacting,
     Compacted {
@@ -470,20 +508,24 @@ pub enum AgentEvent {
         id: String,
         tail: String,
     },
+    #[serde(skip)]
     Ask {
         questions: Vec<AskQuestion>,
         reply: oneshot::Sender<Option<Vec<Answer>>>,
     },
     /// A tool call needs the user's approval. Dropping `reply` denies it and ends the turn.
+    #[serde(skip)]
     Approve {
         request: ApprovalRequest,
         reply: oneshot::Sender<ApprovalDecision>,
     },
     /// `web_search` was called and no backend is set up: the front end runs the setup wizard and
     /// replies whether web search is now ready. A dropped `reply` means no.
+    #[serde(skip)]
     WebSetup {
         reply: oneshot::Sender<bool>,
     },
+    #[serde(skip)]
     PlanReview {
         title: String,
         uri: String,
