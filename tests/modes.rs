@@ -270,6 +270,14 @@ fn text_reply(text: &str) -> String {
 /// is not fixed: a title, the parent's first call (answers with a `task` call), the parent's call
 /// after the task result, and otherwise the child's.
 fn relay_model(child_says: &str) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    relay_model_spending(child_says, 10)
+}
+
+/// `relay_model` whose child's replies report `child_input_tokens` of input.
+fn relay_model_spending(
+    child_says: &str,
+    child_input_tokens: u64,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::Read;
     let child_says = child_says.to_string();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -313,6 +321,7 @@ fn relay_model(child_says: &str) -> (String, std::sync::Arc<std::sync::Mutex<Vec
                     tool_use_body("t1", "task", &call)
                 } else {
                     text_reply(&child_says)
+                        .replace("\"input_tokens\":10", &format!("\"input_tokens\":{child_input_tokens}"))
                 };
                 seen.lock().unwrap().push(req);
                 let out = format!(
@@ -328,7 +337,12 @@ fn relay_model(child_says: &str) -> (String, std::sync::Arc<std::sync::Mutex<Vec
 
 /// A parent home pointed at `relay_model`, a git cwd and the requests the server saw.
 fn relay_fixture(child_says: &str) -> (PathBuf, PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    let (base, seen) = relay_model(child_says);
+    relay_fixture_from(relay_model(child_says))
+}
+
+fn relay_fixture_from(
+    (base, seen): (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>),
+) -> (PathBuf, PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let home = home_with_key(&base);
     std::fs::write(home.join("models.toml"), format!("[sets.main]\ndefault = \"{MODEL}\"\n")).unwrap();
     (home, mu_testutil::repo(), seen)
@@ -347,25 +361,7 @@ fn child_requests(seen: &[String]) -> Vec<&String> {
 #[test]
 fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
     let (home, cwd, seen) = relay_fixture("relayed child result");
-    let bare = mu_testutil::tmp();
-    std::fs::create_dir_all(bare.join("empty-bin")).unwrap();
-    std::fs::copy(home.join("models.toml"), bare.join("models.toml")).unwrap();
-    // The parent's PATH is empty, but launching a task commits the tree with git.
-    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|d| d.join("git"))
-        .find(|g| g.is_file())
-        .expect("git on PATH");
-    std::os::unix::fs::symlink(git, home.join("empty-bin/git")).unwrap();
-    let launcher = home.join("launcher.sh");
-    let script = format!(
-        "#!/bin/sh\nunset MU_GATEWAY_URL ANTHROPIC_API_KEY\nexport MU_HOME='{b}' HOME='{b}' MU_TEST_HOME='{b}' PATH='{b}/empty-bin'\nexec '{mu}' --headless --model {MODEL}\n",
-        b = bare.display(),
-        mu = env!("CARGO_BIN_EXE_mu"),
-    );
-    std::fs::write(&launcher, script).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(home.join("config.toml"), format!("[task]\nlauncher = [\"{}\"]\n", launcher.display())).unwrap();
+    let bare = launcher_for(&home, &format!("exec '{}' --headless --model {MODEL}", env!("CARGO_BIN_EXE_mu")));
     let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let requests = seen.lock().unwrap();
@@ -376,6 +372,86 @@ fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
     );
     assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
     assert!(!bare.join("auth.json").exists(), "the child never held a key store");
+}
+
+fn on_path(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join(program))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("{program} on PATH"))
+}
+
+/// Sets `[task] launcher` of `home` to a script that runs `command` with no credentials: a bare
+/// home, no key and no gateway. Returns that bare home.
+fn launcher_for(home: &Path, command: &str) -> PathBuf {
+    let bare = mu_testutil::tmp();
+    std::fs::create_dir_all(bare.join("empty-bin")).unwrap();
+    std::fs::copy(home.join("models.toml"), bare.join("models.toml")).unwrap();
+    // The parent's PATH is empty, but launching a task commits the tree with git.
+    std::os::unix::fs::symlink(on_path("git"), home.join("empty-bin/git")).unwrap();
+    let launcher = home.join("launcher.sh");
+    let script = format!(
+        "#!/bin/sh\nunset MU_GATEWAY_URL ANTHROPIC_API_KEY\nexport MU_HOME='{b}' HOME='{b}' MU_TEST_HOME='{b}' PATH='{b}/empty-bin'\n{command}\n",
+        b = bare.display(),
+    );
+    std::fs::write(&launcher, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(home.join("config.toml"), format!("[task]\nlauncher = [\"{}\"]\n", launcher.display())).unwrap();
+    bare
+}
+
+/// A worker of another version refuses the task, and the parent shows that as the task's error.
+#[test]
+fn a_worker_of_another_version_refuses_the_task_with_one_clear_line() {
+    let (home, cwd, seen) = relay_fixture("never said");
+    // The launcher changes the version in the payload on its way to the worker.
+    let command = format!(
+        "{{ IFS= read -r first; printf '%s\\n' \"$first\" | '{sed}' 's/\"muVersion\":\"[^\"]*\"/\"muVersion\":\"0.0.0\"/'; }} | '{mu}' --headless --model {MODEL}",
+        sed = on_path("sed").display(),
+        mu = env!("CARGO_BIN_EXE_mu"),
+    );
+    launcher_for(&home, &command);
+    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let requests = seen.lock().unwrap();
+    assert!(child_requests(&requests).is_empty(), "the worker never called the model: {requests:?}");
+    assert!(
+        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("use the same version on both")),
+        "the version error is the task's error: {requests:?}"
+    );
+}
+
+/// The worker itself refuses a payload of another version, whoever sent it.
+#[test]
+fn headless_refuses_a_task_of_another_version() {
+    let home = home_with_key(&serve(vec![]));
+    let cwd = mu_testutil::tmp();
+    let payload = json!({"agent": "task", "task": "x", "muVersion": "0.0.0"}).to_string();
+    let mut c = mu(&home, &cwd);
+    let o = run_with_stdin(c.args(["--headless", "--model", MODEL]), &payload);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("use the same version on both"), "stderr: {}", stderr(&o));
+    assert!(stdout(&o).is_empty(), "no result line: {}", stdout(&o));
+}
+
+/// What a relayed worker spends counts against `--max-cost`: the child's one reply costs more than
+/// the cap, and the run fails; the same run without relaying (the child pays itself) does not.
+#[test]
+fn max_cost_counts_what_a_relayed_worker_spent() {
+    let run = |relayed: bool| {
+        let (home, cwd, _) = relay_fixture_from(relay_model_spending("expensive child", 1_000_000));
+        let mut c = mu(&home, &cwd);
+        if relayed {
+            c.env("MU_TASK_RELAY", "1");
+        }
+        c.args(["-p", "delegate it", "--model", MODEL, "--max-cost", "1.0"]).output().unwrap()
+    };
+    let o = run(true);
+    assert!(!o.status.success(), "stdout: {} stderr: {}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("cost cap $1.00 exceeded"), "stderr: {}", stderr(&o));
+    let o = run(false);
+    assert!(o.status.success(), "stdout: {} stderr: {}", stdout(&o), stderr(&o));
 }
 
 /// `MU_TASK_RELAY=1` relays for a local child too.

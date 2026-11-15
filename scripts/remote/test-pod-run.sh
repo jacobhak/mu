@@ -92,12 +92,14 @@ fresh_pod() {
 # 1. Normal run.
 fresh_pod
 printf '{"prompt":"hi"}\n' | launch norm-1 MU_POD_CMD="$ROOT/scripts/remote/stage-a-worker.sh" MU_STAGE_A_CHECKS=true \
-  "$here/pod-run.sh" > "$T/out" 2> "$T/err" || fail "launcher failed: $(cat "$T/err")"
-[ "$(wc -l < "$T/out" | tr -d ' ')" = 3 ] || fail "stdout is not three lines: $(cat "$T/out")"
+  "$here/pod-run.sh" > "$T/out" 2> "$T/err" 3> "$T/changes" || fail "launcher failed: $(cat "$T/err")"
+[ "$(wc -l < "$T/out" | tr -d ' ')" = 2 ] || fail "stdout is not two lines: $(cat "$T/out")"
 sed -n 1p "$T/out" | grep -q '^{"type":"tool"' || fail "line 1 is not the tool line"
 sed -n 2p "$T/out" | grep -q '^{"type":"result"' || fail "line 2 is not the result line"
-sed -n 3p "$T/out" | grep -q '^{"type":"changes","ref":"refs/mu/result/norm-1","base":"[0-9a-f]\{40\}","files":1}$' ||
-  fail "line 3 is not the changes line: $(sed -n 3p "$T/out")"
+grep -q '"type":"changes"' "$T/out" && fail "the changes line went to stdout: $(cat "$T/out")"
+[ "$(wc -l < "$T/changes" | tr -d ' ')" = 1 ] || fail "descriptor 3 is not one line: $(cat "$T/changes")"
+grep -q '^{"type":"changes","ref":"refs/mu/result/norm-1","base":"[0-9a-f]\{40\}","files":1}$' "$T/changes" ||
+  fail "descriptor 3 does not hold the changes line: $(cat "$T/changes")"
 git -C "$ROOT" show "refs/mu/result/norm-1:stage-a-output.txt" > /dev/null || fail "result ref lacks the changed file"
 has "$FAKE/deletes" norm-1
 has "$FAKE/pod.yaml" 'mu/host: "'"$(hostname)"'"'
@@ -152,5 +154,12 @@ lacks "$FAKE/deletes" other-1
 lacks "$FAKE/deletes" nopid-1
 grep -q 'delete pod orphan-1 --wait=false' "$FAKE/calls" || fail "orphan not deleted with --wait=false"
 grep -q 'type' "$T/out3" && fail "stdout not empty for a worker that prints nothing: $(cat "$T/out3")"
+
+# 4. Without descriptor 3 (run by hand) the report is dropped and the launcher still succeeds.
+fresh_pod
+printf '{"prompt":"hi"}\n' | launch norm-2 MU_POD_CMD="$ROOT/scripts/remote/stage-a-worker.sh" MU_STAGE_A_CHECKS=true \
+  "$here/pod-run.sh" > "$T/out4" 2> "$T/err4" 3>&- || fail "launcher failed with descriptor 3 closed: $(cat "$T/err4")"
+git -C "$ROOT" rev-parse -q --verify refs/mu/result/norm-2 > /dev/null || fail "no result ref with descriptor 3 closed"
+grep -q 'changes' "$T/out4" "$T/err4" && fail "a report was written somewhere: $(cat "$T/out4" "$T/err4")"
 
 echo "test-pod-run: ok"

@@ -119,10 +119,12 @@ impl Server {
             return Ok(());
         }
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        mu_common::fs::create_private_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         // A stale file from a process that died: nobody holds the session's lock, so it is ours.
         let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // The socket is born 0600 so it is never reachable between bind and chmod.
+        let listener = mu_common::fs::with_umask(0o077, || UnixListener::bind(&path))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))

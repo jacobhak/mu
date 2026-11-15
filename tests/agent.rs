@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -73,15 +74,22 @@ impl Agent {
     }
 
     fn start_env(home: &Path, cwd: &Path, extra: &[&str], env: &[(&str, &Path)]) -> Agent {
-        let mut child = mu(home, cwd)
+        let mut command = mu(home, cwd);
+        command
             .envs(env.iter().copied())
             .args(["agent", "--model", MODEL, "--permissions", "yolo"])
             .args(extra)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::inherit());
+        // SAFETY: umask is async-signal-safe. A umask of 0 shows the agent sets its own modes.
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0);
+                Ok(())
+            })
+        };
+        let mut child = command.spawn().unwrap();
         let mut first = String::new();
         BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
         let v: Value = serde_json::from_str(&first).unwrap_or_else(|e| panic!("first line {first:?}: {e}"));
@@ -179,6 +187,8 @@ fn an_agent_prints_its_socket_and_serves_a_prompt_then_exits_on_exit() {
     let mut agent = Agent::start(&home, &cwd, &[]);
     let mode = std::fs::metadata(&agent.socket).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the socket is private");
+    let run = std::fs::metadata(home.join("run")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(run, 0o700, "so is run/, under a umask of 0");
     assert_eq!(agent.socket.parent().unwrap(), home.join("run"), "beside the owner record");
     assert!(agent.socket.file_name().unwrap().to_string_lossy().starts_with(&agent.session));
 

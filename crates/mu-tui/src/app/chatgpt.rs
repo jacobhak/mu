@@ -4,12 +4,13 @@
 
 use super::*;
 use crate::host::chatgpt::{self as host, Done, Flow, Gone, Notice, Paste, Revoke, Saved, Url};
+use crate::host::keys::ChatgptLabel;
 use crate::widgets::editor::adds_newline;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 use crossterm::event::{KeyCode, KeyEvent};
-use mu_provider::auth::chatgpt::{self, Account, LABEL, PROVIDER_ID, USAGE_URL};
+use mu_provider::auth::chatgpt::{self, AUTH_BASE, LABEL, PROVIDER_ID, USAGE_URL};
 
 /// A sign-in waiting for the browser's callback or for the redirect URL typed into the composer.
 /// The composer is locked to that input until the flow ends. The sign-in itself runs on the host.
@@ -24,10 +25,10 @@ pub(super) fn is_chatgpt(id: &str) -> bool {
 }
 
 /// The `/login` row for the ChatGPT sign-in and its status.
-pub(super) fn login_item(account: Option<&Account>) -> (Item, LoginTarget) {
+pub(super) fn login_item(account: Option<&ChatgptLabel>) -> (Item, LoginTarget) {
     let detail = match account {
-        Some(a) if a.plan_usage() => format!("signed in as {} · chat on your plan", a.label()),
-        Some(a) if a.signed_in() => "signed in · plan usage not enabled".into(),
+        Some(a) if a.plan_usage => format!("signed in as {} · chat on your plan", a.label),
+        Some(a) if a.signed_in => "signed in · plan usage not enabled".into(),
         _ => "not signed in".into(),
     };
     (Item { label: "Continue with ChatGPT".into(), detail }, LoginTarget::ChatGpt)
@@ -58,6 +59,17 @@ pub(super) fn chatgpt_menu(signed_in: bool) -> Vec<(Item, KeyOption)> {
     ));
     rows.push((Item { label: "Cancel".into(), detail: "nothing changes".into() }, KeyOption::Cancel));
     rows
+}
+
+/// Whether the client may open `url`: `https` on the sign-in's own host, with no userinfo or port.
+/// The URL comes from the host, which may be a remote agent.
+fn auth_url_openable(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    if url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    AUTH_BASE.strip_prefix("https://").is_some_and(|h| h.eq_ignore_ascii_case(authority))
 }
 
 /// The picker's marker for a model that runs natively: the ChatGPT plan, or the API key.
@@ -101,7 +113,13 @@ impl App {
             host::URL => {
                 if let Ok(u) = serde_json::from_value::<Url>(p.data) {
                     if self.flows.chatgpt().is_some_and(|f| f.id == u.flow) && !cfg!(test) {
-                        let _ = chatgpt::browser::open_browser(&u.url);
+                        if auth_url_openable(&u.url) {
+                            let _ = chatgpt::browser::open_browser(&u.url);
+                        } else {
+                            self.notice(
+                                "the sign-in link is not on the ChatGPT sign-in host, so no browser was opened",
+                            );
+                        }
                     }
                     self.on_chatgpt_url(u.flow, &u.url);
                 }
@@ -295,7 +313,7 @@ mod tests {
     use super::*;
     use crate::app::keys::tests::{in_local, press, test_app_with_commands, transcript_text};
     use crate::host::{Deferred, Pushed, local::LocalHost};
-    use mu_provider::auth::chatgpt::{DIRECT_SCOPE, Tokens};
+    use mu_provider::auth::chatgpt::{Account, DIRECT_SCOPE, Tokens};
     use std::time::Duration;
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -453,13 +471,41 @@ mod tests {
         }
     }
 
+    fn label(signed_in: bool, plan: bool) -> ChatgptLabel {
+        ChatgptLabel {
+            signed_in,
+            plan_usage: signed_in && plan,
+            label: "me@example.com".into(),
+            added: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn only_https_urls_on_the_auth_host_open() {
+        assert!(auth_url_openable("https://auth.openai.com/api/accounts/authorize?client_id=x&state=y"));
+        for bad in [
+            "http://auth.openai.com/a",
+            "file:///etc/passwd",
+            "https://auth.openai.com.evil.example/a",
+            "https://auth.openai.com@evil.example/a",
+            "https://evil.example/https://auth.openai.com/",
+            "https://auth.openai.com:8443/a",
+            "https://auth.openai.com/a b",
+            "https://auth.openai.com/a\n--flag",
+            "-https://auth.openai.com/",
+            "",
+        ] {
+            assert!(!auth_url_openable(bad), "{bad}");
+        }
+    }
+
     #[test]
     fn the_login_row_shows_each_status() {
-        let detail = |a: Option<Account>| login_item(a.as_ref()).0.detail;
+        let detail = |a: Option<ChatgptLabel>| login_item(a.as_ref()).0.detail;
         assert_eq!(detail(None), "not signed in");
-        assert_eq!(detail(Some(account(false, false))), "not signed in");
-        assert_eq!(detail(Some(account(true, true))), "signed in as me@example.com · chat on your plan");
-        assert_eq!(detail(Some(account(true, false))), "signed in · plan usage not enabled");
+        assert_eq!(detail(Some(label(false, false))), "not signed in");
+        assert_eq!(detail(Some(label(true, true))), "signed in as me@example.com · chat on your plan");
+        assert_eq!(detail(Some(label(true, false))), "signed in · plan usage not enabled");
         let (item, target) = login_item(None);
         assert_eq!(item.label, "Continue with ChatGPT");
         assert_eq!(target, LoginTarget::ChatGpt);

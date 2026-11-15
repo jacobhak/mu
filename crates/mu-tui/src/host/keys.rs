@@ -5,7 +5,7 @@ use super::local::{Local, Registry};
 use super::{Answer, pending, ready};
 use mu_provider::auth::chatgpt::{Account, PROVIDER_ID};
 use mu_provider::auth::check;
-use mu_provider::auth::store::Entry;
+use mu_provider::auth::store::{Entry, Store};
 use mu_provider::provider::custom::{AuthMode, KeyState};
 use mu_provider::provider::providers::{self, KeyTarget, SEARCH_KEYS};
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,23 @@ pub struct CustomRow {
     pub state: KeyState,
 }
 
+/// The ChatGPT sign-in as a row shows it. The account's tokens never leave the host.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatgptLabel {
+    pub signed_in: bool,
+    /// The grant includes plan usage.
+    pub plan_usage: bool,
+    /// The email, or the account's subject when there is none.
+    pub label: String,
+    pub added: String,
+}
+
+impl ChatgptLabel {
+    fn of(a: &Account) -> Self {
+        Self { signed_in: a.signed_in(), plan_usage: a.plan_usage(), label: a.label(), added: a.added.clone() }
+    }
+}
+
 /// What the `/login` key rows show.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct KeyFacts {
@@ -99,7 +116,7 @@ pub struct KeyFacts {
     pub stored: Vec<(String, bool)>,
     /// The key variables (`ANTHROPIC_API_KEY`, …) that are set on the host.
     pub env_set: Vec<String>,
-    pub chatgpt: Option<Account>,
+    pub chatgpt: Option<ChatgptLabel>,
     pub customs: Vec<CustomRow>,
     /// `providers.toml` did not read: the custom endpoints are missing from the list.
     pub error: Option<String>,
@@ -162,7 +179,7 @@ fn key_rows(l: &Rc<Local>, args: serde_json::Value) -> Answer {
         Ok(KeyFacts {
             stored: store.list().into_iter().map(|(p, e)| (p, e.routes_chat())).collect(),
             env_set,
-            chatgpt: store.chatgpt_account(),
+            chatgpt: store.chatgpt_account().as_ref().map(ChatgptLabel::of),
             customs: customs
                 .values()
                 .map(|c| CustomRow {
@@ -196,8 +213,18 @@ fn check_key(l: &Rc<Local>, args: serde_json::Value) -> Answer {
         let target = KeyTarget::find(&id, l.providers.custom_registry())
             .map_err(|e| format!("{e:#}"))
             .and_then(|t| t.ok_or_else(|| format!("no API key support for `{id}`")));
+        let entry = pinned_base_url(l.providers.store(), &id, entry);
         async move { check::check_target(&target?, &entry).await }
     })
+}
+
+/// A stored key is sent only to its stored `base_url`: the client's `base_url` counts only for a
+/// provider with no stored key.
+pub(super) fn pinned_base_url(store: &Store, id: &str, mut entry: Entry) -> Entry {
+    if let Some(stored) = store.get(id) {
+        entry.base_url = stored.base_url;
+    }
+    entry
 }
 
 fn save_key(l: &Rc<Local>, args: serde_json::Value) -> Answer {

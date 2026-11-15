@@ -41,18 +41,46 @@ impl Accum {
     }
 }
 
+/// `print_mode_with` that counts no relayed workers' spend.
+#[cfg(test)]
+pub async fn print_mode(
+    first: Command,
+    expect_park: bool,
+    cmd: UnboundedSender<Command>,
+    ev: UnboundedReceiver<AgentEvent>,
+    max_cost: Option<f64>,
+    stop: UnboundedReceiver<()>,
+) -> i32 {
+    print_mode_with(first, expect_park, cmd, ev, max_cost, stop, None).await
+}
+
+/// Stops the run once `cost` passes `max`: it cancels the turn and fails the run, once.
+fn stop_over_cap(cmd: &UnboundedSender<Command>, max: Option<f64>, cost: f64, capped: &mut bool, code: &mut i32) {
+    if let Some(max) = max.filter(|m| cost > *m)
+        && !*capped
+    {
+        *capped = true;
+        let _ = cmd.send(Command::Cancel);
+        eprintln!("mu: cost cap ${max:.2} exceeded");
+        *code = 1;
+    }
+}
+
 /// `-p`: runs one prompt to completion. Final assistant text goes to stdout, progress to stderr.
 /// Each message on `stop` is a request to hand the session over: the first ends the turn at the
 /// next boundary (after the running tool, if any), the second cancels the current step. A stopped run
-/// exits 3 and prints how to resume. Returns the process exit code.
-pub async fn print_mode(
+/// exits 3 and prints how to resume. `max_cost` is checked against the run's own cost plus what the
+/// workers it relays model calls for have spent (`spend`). Returns the process exit code.
+pub async fn print_mode_with(
     first: Command,
     expect_park: bool,
     cmd: UnboundedSender<Command>,
     mut ev: UnboundedReceiver<AgentEvent>,
     max_cost: Option<f64>,
     stop: UnboundedReceiver<()>,
+    spend: Option<std::rc::Rc<mu_tools::tools::relay::RelaySpend>>,
 ) -> i32 {
+    let relayed = || spend.as_ref().map_or(0.0, |s| s.total());
     let mut stop = Some(stop);
     // A stored plan opens its session once it starts, so a refusal leaves none behind.
     if !matches!(first, Command::StartPlan { .. } | Command::RefinePlan { .. }) {
@@ -70,6 +98,15 @@ pub async fn print_mode(
                 Some(e) => e,
                 None => break,
             },
+            () = async {
+                match &spend {
+                    Some(s) => s.changed.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                stop_over_cap(&cmd, max_cost, acc.cost + relayed(), &mut capped, &mut code);
+                continue;
+            }
             s = async {
                 match &mut stop {
                     Some(r) => r.recv().await,
@@ -97,14 +134,7 @@ pub async fn print_mode(
                 if let Some(p) = session_line(&mut session, s.session_path) {
                     eprintln!("{p}");
                 }
-                if let Some(max) = max_cost.filter(|m| acc.cost > *m)
-                    && !capped
-                {
-                    capped = true;
-                    let _ = cmd.send(Command::Cancel);
-                    eprintln!("mu: cost cap ${max:.2} exceeded");
-                    code = 1;
-                }
+                stop_over_cap(&cmd, max_cost, acc.cost + relayed(), &mut capped, &mut code);
             }
             AgentEvent::ToolSkipped { id } => skipped = Some((id, String::new())),
             AgentEvent::ToolStart { id, name, args } => match &mut skipped {
@@ -144,7 +174,7 @@ pub async fn print_mode(
             _ => {}
         }
     }
-    let (cost, exited) = (acc.cost, acc.exited);
+    let (cost, exited) = (acc.cost + relayed(), acc.exited);
     let last = acc.text();
     if !exited {
         eprintln!("mu: agent stopped unexpectedly");
@@ -491,6 +521,27 @@ mod tests {
     }
 
     #[test]
+    fn spend_relayed_to_workers_counts_against_the_cost_cap() {
+        use mu_tools::tools::relay::RelaySpend;
+        let run = |spent: f64, own: f64| {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let (ctx, mut crx) = unbounded_channel();
+            let (etx, erx) = unbounded_channel();
+            let (_stx, srx) = unbounded_channel();
+            let spend = std::rc::Rc::new(RelaySpend::default());
+            spend.add("job", spent);
+            etx.send(status(own, None)).unwrap();
+            etx.send(AgentEvent::Exit).unwrap();
+            let code =
+                rt.block_on(print_mode_with(Command::Prompt("x".into()), false, ctx, erx, Some(1.0), srx, Some(spend)));
+            (code, std::iter::from_fn(|| crx.try_recv().ok()).any(|c| matches!(c, Command::Cancel)))
+        };
+        assert_eq!(run(0.0, 0.5), (0, false));
+        assert_eq!(run(1.5, 0.0), (1, true), "the workers' spend alone is over the cap");
+        assert_eq!(run(0.75, 0.5), (1, true), "and so is theirs with the run's own");
+    }
+
+    #[test]
     fn a_second_stop_cancels() {
         let ev = vec![status(0.0, None), AgentEvent::TurnEnd { aborted: true }, AgentEvent::Exit];
         assert_eq!(drive(ev, 2, None).0, 3);
@@ -723,7 +774,7 @@ mod tests {
             run_child_observed(
                 ChildCmd::Local(exe),
                 &top_cwd,
-                &json!({}),
+                &json!({"parentSession": root.path.to_string_lossy()}),
                 &tokio_util::sync::CancellationToken::new(),
                 |_, _| {},
                 |p| started.borrow_mut().push(p.to_string()),

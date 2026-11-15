@@ -4,6 +4,7 @@ use super::manifest::{self, Lifetime, Manifest};
 use super::process::Proc;
 use crate::mcp;
 use crate::permissions::Access;
+use crate::tools::relay::{RelayAllow, RelaySpend};
 use mu_base::tool::{ToolDef, ToolOutput};
 use mu_provider::provider::client::Providers;
 use serde_json::{Value, json};
@@ -147,6 +148,10 @@ pub struct PluginHost {
     pub(super) reserved: fn(&str) -> bool,
     /// Tools a relayed process offers whose plugin is on its parent: calls go over the relay.
     relay_tools: RefCell<Vec<(ToolDef, Access)>>,
+    /// The models a relayed process was allowed to use; it passes them on to its own children.
+    relay_allow: RefCell<Option<RelayAllow>>,
+    /// What the relayed workers of this process have spent, for `--max-cost`.
+    relay_spend: Rc<RelaySpend>,
 }
 
 impl PluginHost {
@@ -222,7 +227,22 @@ impl PluginHost {
             mcp_lifetime,
             reserved,
             relay_tools: RefCell::new(Vec::new()),
+            relay_allow: RefCell::new(None),
+            relay_spend: Rc::default(),
         })
+    }
+
+    /// Takes the `relayModels` of a task payload; absent or unparsable means none.
+    pub fn set_relay_allow(&self, v: Option<&Value>) {
+        *self.relay_allow.borrow_mut() = v.and_then(|v| serde_json::from_value(v.clone()).ok());
+    }
+
+    pub fn relay_allow(&self) -> Option<RelayAllow> {
+        self.relay_allow.borrow().clone()
+    }
+
+    pub fn relay_spend(&self) -> Rc<RelaySpend> {
+        self.relay_spend.clone()
     }
 
     pub fn set_providers(&self, p: &Rc<Providers>) {

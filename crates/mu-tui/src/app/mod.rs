@@ -18,6 +18,7 @@ mod mcp;
 mod memory;
 mod model_sets;
 mod pickers;
+mod program_output;
 mod schedule;
 #[cfg(test)]
 mod services;

@@ -263,6 +263,23 @@ impl Permissions {
         {
             return Verdict::Deny(guard::REFUSAL.into());
         }
+        self.verdict(&gate, &call, name, args)
+    }
+
+    /// What a worker's `web_search` needs from this session, as a network call: `ask` mode prompts
+    /// for it, and the rules for `web_search` apply.
+    pub fn check_relayed_search(&self, cwd: &Path, args: &Value) -> Verdict {
+        let gate = self.gate(cwd);
+        let query = args["query"].as_str().unwrap_or("");
+        let call = classify::Call {
+            subjects: vec![verdict::Subject::new("web_search", query, Capability::Network)],
+            bash: None,
+            bash_dir: cwd.to_path_buf(),
+        };
+        self.verdict(&gate, &call, "web_search", args)
+    }
+
+    fn verdict(&self, gate: &Gate, call: &classify::Call, name: &str, args: &Value) -> Verdict {
         let (outcome, hits) = gate.decide(&call.subjects);
         let mode = gate.mode.as_str();
         let (rule, open) = match outcome {
@@ -280,7 +297,7 @@ impl Permissions {
             None if open.iter().all(|&i| call.subjects[i].needs == Capability::ReadOutside) => {
                 format!("{mode} mode: reading outside the project needs approval")
             }
-            None if open.iter().all(|&i| call.subjects[i].needs == Capability::Network) => {
+            None if name == "fetch" && open.iter().all(|&i| call.subjects[i].needs == Capability::Network) => {
                 format!(
                     "{mode} mode: {} is not a host a web search returned",
                     hosts::url_host(&call.subjects[open[0]].text).unwrap_or_else(|| "this URL".into())
@@ -291,7 +308,7 @@ impl Permissions {
             }
             None => format!("{mode} mode: {name} needs approval"),
         };
-        let grant = grant::grant(&gate, &call, name, args, &hits);
+        let grant = grant::grant(gate, call, name, args, &hits);
         Verdict::Ask(ApprovalRequest {
             tool: name.to_string(),
             call_id: String::new(),

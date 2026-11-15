@@ -16,6 +16,10 @@ pub const CUSTOM_ENV: &str = "custom_env";
 pub const CUSTOM_FETCH: &str = "custom_fetch";
 pub const CUSTOM_SAVE: &str = "custom_save";
 
+/// Stands in for a stored literal key in `custom_get`'s reply: the key never leaves the host. A
+/// probe carrying it is checked with the stored key, and a save carrying it keeps the stored key.
+pub const KEY_MARKER: &str = "mu:stored-key";
+
 /// What a new endpoint's panel needs: which ids are taken, and the files a save writes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Open {
@@ -72,7 +76,13 @@ fn open(l: &Rc<Local>, args: serde_json::Value) -> Answer {
 fn get(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |id: String| {
         let def = l.providers.custom_registry().get(&id).map_err(|e| format!("{e:#}"))?;
-        Ok(Edit { entry: def.as_ref().and_then(|_| l.providers.store().get(&id)), def, dests: dests(l) })
+        let entry = def.as_ref().and_then(|_| l.providers.store().get(&id)).map(|mut e| {
+            if e.key.is_some() {
+                e.key = Some(KEY_MARKER.into());
+            }
+            e
+        });
+        Ok(Edit { entry, def, dests: dests(l) })
     })
 }
 
@@ -82,13 +92,47 @@ fn env(_: &Rc<Local>, args: serde_json::Value) -> Answer {
 }
 
 /// The endpoint's `/models` with the draft's credential. Nothing is written.
-fn fetch(_: &Rc<Local>, args: serde_json::Value) -> Answer {
-    pending(args, |probe: Probe| async move {
-        if let Some(key) = probe.credential.as_ref().and_then(|e| e.key.as_deref()) {
-            mu_base::secrets::register_stored(&custom::env_hint(&probe.id), key);
+fn fetch(l: &Rc<Local>, args: serde_json::Value) -> Answer {
+    pending(args, |probe: Probe| {
+        let probe = pin_probe(l, probe);
+        async move {
+            let probe = match probe {
+                Ok(p) => p,
+                Err(f) => return Ok(f),
+            };
+            if let Some(key) = probe.credential.as_ref().and_then(|e| e.key.as_deref()) {
+                mu_base::secrets::register_stored(&custom::env_hint(&probe.id), key);
+            }
+            Ok(read_listing(&probe).await)
         }
-        Ok(read_listing(&probe).await)
     })
+}
+
+/// Swaps the marker for the stored key, and keeps a stored key to its stored `base_url`: the
+/// client's `base_url` counts only for an endpoint that has no stored key.
+pub(super) fn pin_probe(l: &Local, mut probe: Probe) -> Result<Probe, Fetch> {
+    let stored = l.providers.store().get(&probe.id);
+    if probe.credential.as_ref().is_some_and(|e| e.key.as_deref() == Some(KEY_MARKER)) {
+        match &stored {
+            Some(s) => probe.credential = Some(s.clone()),
+            None => return Err(Fetch::Credential(format!("no key is stored for {}", probe.id))),
+        }
+    }
+    if stored.is_some() {
+        let saved = l.providers.custom_registry().get(&probe.id).ok().flatten();
+        let trim = |u: &str| u.trim_end_matches('/').to_string();
+        match saved {
+            Some(def) if trim(&def.base_url) == trim(&probe.base_url) => {}
+            Some(def) => {
+                return Err(Fetch::Failed(format!(
+                    "the stored key for {} goes only to {}; save the endpoint with the new URL first",
+                    probe.id, def.base_url
+                )));
+            }
+            None => return Err(Fetch::Failed(format!("the stored key for {} has no saved endpoint", probe.id))),
+        }
+    }
+    Ok(probe)
 }
 
 async fn read_listing(probe: &Probe) -> Fetch {
@@ -114,6 +158,9 @@ async fn read_listing(probe: &Probe) -> Fetch {
 fn save(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |saved: Saved| {
         let Saved { id, provider, entry, editing, key_changed, listed } = saved;
+        if entry.as_ref().is_some_and(|e| e.key.as_deref() == Some(KEY_MARKER)) && !(editing && !key_changed) {
+            return Err("the key shown as stored was not entered; enter the key again".into());
+        }
         let (registry, store) = (l.providers.custom_registry(), l.providers.store());
         let written = if editing {
             // An edit only writes the key it was given; otherwise the stored one stays.

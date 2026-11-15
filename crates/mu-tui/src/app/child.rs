@@ -1,6 +1,7 @@
 //! Programs that take the terminal while they run: `omp login`, `omp /mcp reauth`, `$EDITOR` and
 //! `mu take`. The terminal is handed over, and the screen is redrawn when the program exits.
 
+use super::program_output::OutputFilter;
 use super::ui_msgs::UiMsg;
 use super::*;
 use crate::host::plans::{READ_FILE, ReadFile, WRITE_FILE, WriteFile};
@@ -10,6 +11,22 @@ use crate::host::program::{
 };
 use crate::render::Renderer;
 use crate::term::term;
+
+thread_local! {
+    /// The host program this client started and is showing: its id and the filter its output passes.
+    static HOST_PROGRAM: std::cell::RefCell<Option<(u64, OutputFilter)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What `program_output` for `id` may write to the terminal; nothing unless that program is the
+/// one running.
+fn program_bytes(id: u64, data: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    HOST_PROGRAM.with(|p| match p.borrow_mut().as_mut() {
+        Some((running, filter)) if *running == id => Some(filter.push(&bytes)),
+        _ => None,
+    })
+}
 
 /// What to do when a child that owned the terminal exits.
 pub(super) enum ChildThen {
@@ -251,6 +268,7 @@ impl App {
         self.screen.child_busy = true;
         static PROGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = PROGRAMS.fetch_add(1, Ordering::SeqCst);
+        HOST_PROGRAM.with(|p| *p.borrow_mut() = Some((id, OutputFilter::default())));
         let (cols, rows) = if cfg!(test) { (80, 24) } else { crossterm::terminal::size().unwrap_or((80, 24)) };
 
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -282,6 +300,7 @@ impl App {
         let args = ProgramRun { id, program, cols, rows };
         self.host_call(PROGRAM_RUN, &args, move |app, r: Result<ProgramDone, String>| {
             stop.store(true, Ordering::SeqCst);
+            HOST_PROGRAM.with(|p| *p.borrow_mut() = None);
             let status = r.map(|d| match d.code {
                 Some(c) => std::process::ExitStatus::from_raw(c << 8),
                 None => std::process::ExitStatus::from_raw(libc::SIGHUP),
@@ -292,10 +311,9 @@ impl App {
 
     /// Output of the host program on this terminal.
     pub(super) fn on_program_output(&mut self, p: crate::host::Pushed) {
-        use base64::Engine;
         use std::io::Write;
         let Ok(o) = serde_json::from_value::<ProgramOutput>(p.data) else { return };
-        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(o.data) {
+        if let Some(bytes) = program_bytes(o.id, &o.data) {
             let mut out = std::io::stdout();
             let _ = out.write_all(&bytes).and_then(|()| out.flush());
         }
@@ -357,12 +375,17 @@ impl App {
                     Ok(t) => t,
                     Err(e) => return app.error(&format!("cannot reach the agent: {e}")),
                 };
-                let sock = private_socket_path();
-                let listener = match tokio::net::UnixListener::bind(&sock) {
-                    Ok(l) => l,
+                let bound = private_socket_dir().and_then(|dir| {
+                    let sock = dir.join("take.sock");
+                    tokio::net::UnixListener::bind(&sock).map(|l| (l, sock)).inspect_err(|_| {
+                        let _ = std::fs::remove_dir_all(&dir);
+                    })
+                });
+                let (listener, sock) = match bound {
+                    Ok(b) => b,
                     Err(e) => {
                         tunnel.close();
-                        return app.error(&format!("cannot listen on {}: {e}", sock.display()));
+                        return app.error(&format!("cannot listen for the nested client: {e}"));
                     }
                 };
                 tokio::task::spawn_local(bridge(listener, tunnel, sock.clone()));
@@ -412,15 +435,20 @@ async fn bridge(listener: tokio::net::UnixListener, mut tunnel: crate::host::Tun
     }
     tunnel.close();
     let _ = std::fs::remove_file(&sock);
+    if let Some(dir) = sock.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
-/// A socket path only this user can reach, for the nested client of a take-over.
-fn private_socket_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+/// A fresh directory only this user can enter (0700), for the socket of a take-over's nested client.
+fn private_socket_dir() -> std::io::Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|d| d.is_dir())
         .unwrap_or_else(std::env::temp_dir);
-    dir.join(format!("mu-take-{}.sock", &uuid::Uuid::new_v4().simple().to_string()[..8]))
+    let dir = base.join(format!("mu-take-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    mu_common::fs::create_private_dir(&dir)?;
+    Ok(dir)
 }
 
 /// Reads the keystrokes of the terminal for a program on the host, until `stop` is set.
@@ -605,12 +633,38 @@ mod remote_program_tests {
     }
 
     #[test]
-    fn output_pushed_by_the_host_reaches_the_terminal_and_a_garbled_chunk_is_ignored() {
+    fn output_pushed_by_the_host_is_ignored_unless_its_program_is_running_here() {
+        use base64::Engine;
         let (mut app, _ui_rx, _calls, _gate) = remote_app();
-        app.on_pushed(Pushed {
-            name: crate::host::program::PROGRAM_OUTPUT.into(),
-            data: serde_json::json!({"id": 1, "data": "aGk="}),
+        let b64 = |s: &[u8]| base64::engine::general_purpose::STANDARD.encode(s);
+        assert_eq!(program_bytes(1, &b64(b"hi")), None, "no program is running");
+        in_local(async {
+            app.run_host_program(Program::Login { args: vec![], pick: None }, ChildThen::Login);
+            let id = HOST_PROGRAM.with(|p| p.borrow().as_ref().map(|(id, _)| *id)).expect("a program is running");
+            assert_eq!(program_bytes(id, &b64(b"hi\x1b]52;c;aGk=\x07")), Some(b"hi".to_vec()));
+            assert_eq!(program_bytes(id + 1, &b64(b"hi")), None, "another id is not this program");
+            assert_eq!(program_bytes(id, "not base64!"), None);
         });
+    }
+
+    #[test]
+    fn a_finished_program_takes_no_more_output() {
+        use base64::Engine;
+        let (mut app, mut ui_rx, _calls, gate) = remote_app();
+        in_local(async {
+            app.run_host_program(Program::Login { args: vec![], pick: None }, ChildThen::Login);
+            let id = HOST_PROGRAM.with(|p| p.borrow().as_ref().map(|(id, _)| *id)).unwrap();
+            gate.send(serde_json::json!({"code": 0})).unwrap();
+            let m = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv()).await.unwrap().unwrap();
+            app.on_ui(m);
+            let data = base64::engine::general_purpose::STANDARD.encode(b"late");
+            assert_eq!(program_bytes(id, &data), None);
+        });
+    }
+
+    #[test]
+    fn a_garbled_chunk_is_ignored() {
+        let (mut app, _ui_rx, _calls, _gate) = remote_app();
         app.on_pushed(Pushed {
             name: crate::host::program::PROGRAM_OUTPUT.into(),
             data: serde_json::json!("nonsense"),
@@ -754,5 +808,29 @@ mod temp_tests {
         assert_ne!(a, b);
         assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = (std::fs::remove_file(a), std::fs::remove_file(b));
+    }
+}
+
+#[cfg(test)]
+mod take_socket_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_take_over_socket_lives_in_a_private_dir_that_the_bridge_removes() {
+        let dir = mu_common::fs::with_umask(0, private_socket_dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let sock = dir.join("take.sock");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let (out, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let tunnel = crate::host::Tunnel { id: 1, out, rx };
+            let client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            drop(client);
+            bridge(listener, tunnel, sock.clone()).await;
+        });
+        assert!(!dir.exists(), "the socket and its directory are gone");
     }
 }

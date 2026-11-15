@@ -67,6 +67,8 @@ pub struct Tools {
     pub output_schema: std::cell::RefCell<Option<Value>>,
     /// The `@role`s the last advertised `task` def offered, which a task's `model` may name.
     pub delegated: std::cell::RefCell<Vec<String>>,
+    /// The model selectors of each custom agent, which a relayed task of that agent may use.
+    pub agent_models: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>>,
     pub edit_store: pi_edit::EditStore,
     /// Each read this session (path with its selector) and the fingerprint and count of what it
     /// returned, for the repeated-read hint.
@@ -109,6 +111,7 @@ impl Tools {
             session: Default::default(),
             output_schema: Default::default(),
             delegated: Default::default(),
+            agent_models: Default::default(),
             edit_store: pi_edit::EditStore::new(),
             repeats: Default::default(),
             permissions: Rc::default(),

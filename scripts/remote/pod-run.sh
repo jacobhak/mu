@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Kubernetes launcher for mu task subagents: runs in place of `mu --headless` with the same stdin and stdout.
 # Everything travels through `kubectl exec`: config as a tar, the repository as a git bundle, the protocol, and the
-# result bundle back. Nothing but the protocol is written to stdout; diagnostics go to stderr.
+# result bundle back. Nothing but the protocol is written to stdout; diagnostics go to stderr. The `changes` report
+# goes to file descriptor 3, which mu opens for a launcher; it is not written anywhere when descriptor 3 is closed.
 #
 # Input: the MU_TASK_* variables mu sets for a launcher (see the remote-execution design, Plan 1 step 3).
 # Settings (environment):
@@ -184,7 +185,8 @@ if [ -n "$summary" ]; then
   git -C "$MU_TASK_ROOT" fetch -q "$TMP/in.bundle" "$MU_TASK_RESULT_REF:$MU_TASK_RESULT_REF" >&2
   base=${summary%% *}
   files=${summary##* }
-  printf '{"type":"changes","ref":"%s","base":"%s","files":%s}\n' "$MU_TASK_RESULT_REF" "$base" "$files"
+  # Only mu's own descriptor 3 is trusted for this line: the worker's stdout could print the same text.
+  printf '{"type":"changes","ref":"%s","base":"%s","files":%s}\n' "$MU_TASK_RESULT_REF" "$base" "$files" 2> /dev/null >&3 || true
 fi
 
 exit "$WORKER_RC"

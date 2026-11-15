@@ -317,7 +317,7 @@ impl OwnerRecord {
     fn claim_with(session: &Path, print_run: bool, inbox: bool, extra: &Extra) -> Option<Self> {
         let path = record_path(session)?;
         let dir = path.parent()?;
-        std::fs::create_dir_all(dir).ok()?;
+        mu_common::fs::create_private_dir(dir).ok()?;
         sweep_stale(dir);
         let pid = std::process::id();
         let tmp = dir.join(format!(".{}.{pid}.tmp", id_of(session)));

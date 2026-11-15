@@ -47,6 +47,8 @@ impl Agent {
         v.push(if self.plan.plan.is_some() { Tools::plan_def() } else { Tools::enter_plan_def() });
         let roles: Vec<String> = self.delegated_roles().into_iter().map(|(n, _)| format!("@{n}")).collect();
         *self.tools.delegated.borrow_mut() = roles.clone();
+        *self.tools.agent_models.borrow_mut() =
+            self.ctx.agents.iter().map(|a| (a.name.clone(), a.model.clone())).collect();
         let role_names: Vec<&str> = roles.iter().map(String::as_str).collect();
         v.push(Tools::task_def(jobs, &self.ctx.agents, &role_names));
         if jobs {

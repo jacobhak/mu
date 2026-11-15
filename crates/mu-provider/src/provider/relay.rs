@@ -74,6 +74,8 @@ pub enum ErrorKind {
     Fatal,
     Aborted,
     NoModel,
+    /// The parent refuses the call: a model outside the task's set, a spent cap, a finished task.
+    Denied,
 }
 
 /// A failed call as it crosses: a `ProviderError`, or `NoModel` from `complete`.
@@ -132,7 +134,7 @@ impl From<RelayError> for ProviderError {
             }
             ErrorKind::Overflow => ProviderError::Overflow(e.msg),
             ErrorKind::Aborted => ProviderError::Aborted,
-            ErrorKind::Fatal | ErrorKind::NoModel => ProviderError::Fatal(e.msg),
+            ErrorKind::Fatal | ErrorKind::NoModel | ErrorKind::Denied => ProviderError::Fatal(e.msg),
         }
     }
 }

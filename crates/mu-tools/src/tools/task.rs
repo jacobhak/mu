@@ -1,5 +1,7 @@
-use super::relay::RelayServer;
-use super::subagent::{ArtifactAlloc, ChildCmd, Mirror, Outcome, prepare_launch, preview_result, run_child_observed};
+use super::relay::{RelayAllow, RelayServer};
+use super::subagent::{
+    ArtifactAlloc, ChildCmd, MU_VERSION, Mirror, Outcome, prepare_launch, preview_result, run_child_observed,
+};
 use super::{ToolCtx, Tools};
 use crate::permissions::Permissions;
 use futures_util::future::join_all;
@@ -111,6 +113,18 @@ fn resolve_cwd(raw: Option<&str>, default: &Path) -> Result<PathBuf, String> {
 }
 
 impl Tools {
+    /// The models a relayed `agent` may call: what this process was itself allowed to pass on, else
+    /// the role chain of the task's model (its `model` role, else the agent's own) and `smol`.
+    fn relay_allow(&self, agent: &str, model: Option<&str>) -> RelayAllow {
+        if let Some(a) = self.plugins.relay_allow() {
+            return a;
+        }
+        let Some(p) = self.plugins.providers() else { return RelayAllow::default() };
+        let role = model.map_or(if agent == "scout" { "scout" } else { "task" }, |m| m.trim_start_matches('@'));
+        let extra = self.agent_models.borrow().get(agent).cloned().unwrap_or_default();
+        RelayAllow::for_task(&p, role, &extra)
+    }
+
     pub async fn task(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
         if a.tasks.is_empty() || a.tasks.len() > MAX_TASKS {
             return ToolOutput::err("task: provide 1-8 tasks");
@@ -181,13 +195,21 @@ impl Tools {
         let relayed = !self.launcher.is_empty()
             || std::env::var("MU_TASK_RELAY").is_ok_and(|v| v == "1")
             || self.plugins.providers().is_some_and(|p| p.is_relayed());
-        let relay =
-            relayed.then(|| RelayServer { plugins: self.plugins.clone(), permissions: self.permissions.clone() });
+        let max_cost = self.plugins.providers().map_or(0.0, |p| p.cfg.mu.task.max_cost);
+        let relay = relayed.then(|| RelayServer {
+            plugins: self.plugins.clone(),
+            permissions: self.permissions.clone(),
+            max_cost,
+            cwd: self.cwd.clone(),
+        });
         let relay_tools = if relayed { self.plugins.relay_tools_payload() } else { Vec::new() };
         let payload = |agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
-            let mut p = json!({"task": task, "context": a.context, "agent": agent, "parentSession": parent});
+            let mut p = json!({
+                "task": task, "context": a.context, "agent": agent, "parentSession": parent, "muVersion": MU_VERSION
+            });
             if relayed {
                 p["relay"] = json!(true);
+                p["relayModels"] = json!(self.relay_allow(agent, model));
                 if !relay_tools.is_empty() {
                     p["relayTools"] = json!(relay_tools);
                 }
@@ -589,6 +611,33 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         assert!(!out.is_error, "{}", out.text);
         assert!(out.text.contains(r#""model":"@w""#), "{}", out.text);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_payload_carries_mus_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mu-task-version-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, ECHO_CHILD).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut t = Tools::for_test();
+        t.child_exe = Some(exe);
+        let a: Args = serde_json::from_value(json!({"tasks":[{"task":"x","solutionSpace":"one fix: given"}]})).unwrap();
+        let out = tokio::task::LocalSet::new().run_until(t.task(a, &ctx())).await;
+        assert!(out.text.contains(&format!(r#""muVersion":"{MU_VERSION}""#)), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_relayed_parent_passes_its_own_models_on_unchanged() {
+        let t = Tools::for_test();
+        assert_eq!(t.relay_allow("task", None), RelayAllow::default(), "no providers, nothing to allow");
+        t.plugins.set_relay_allow(Some(&json!({"ids": ["a/b"], "roles": ["task"]})));
+        let given = RelayAllow { ids: vec!["a/b".into()], roles: vec!["task".into()] };
+        for (agent, model) in [("task", None), ("scout", None), ("task", Some("@other"))] {
+            assert_eq!(t.relay_allow(agent, model), given, "{agent} {model:?}: a grandchild cannot widen it");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

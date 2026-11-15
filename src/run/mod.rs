@@ -179,6 +179,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     };
     if stdio.is_some() {
         host.set_relay_tools(task.as_ref().and_then(|p| p.get("relayTools")));
+        host.set_relay_allow(task.as_ref().and_then(|p| p.get("relayModels")));
     }
     // The one reader of stdin, from here on: relay answers go to the relay, the rest to the subagent run.
     let lines = if task.is_some() {
@@ -302,7 +303,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
                 let printer = spawn_notice_printer(notice_rx);
                 plugin::process::exit_on_signals();
                 host.warnings.iter().for_each(|w| eprintln!("warning: {w}"));
-                (print(run, stop, handle.cmd, handle.ev).await, Some(printer))
+                (print(run, stop, handle.cmd, handle.ev, host.relay_spend()).await, Some(printer))
             }
         };
         let code = match agent_task.await {
@@ -455,8 +456,9 @@ async fn print(
     stop: UnboundedReceiver<()>,
     cmd: UnboundedSender<events::Command>,
     ev: UnboundedReceiver<events::AgentEvent>,
+    spend: Rc<mu_tools::tools::relay::RelaySpend>,
 ) -> i32 {
-    headless::print_mode(run.first, run.expect_park, cmd, ev, run.max_cost, stop).await
+    headless::print_mode_with(run.first, run.expect_park, cmd, ev, run.max_cost, stop, Some(spend)).await
 }
 
 /// `--headless`: the task's prompt runs as a subagent, its `model` line first.
@@ -484,9 +486,22 @@ fn read_task(ctx: &context::Context) -> Result<(Value, Option<context::AgentDef>
     task_line(ctx, &input)
 }
 
+/// A worker runs only the version of mu that sent it the task: the wire between them is not
+/// versioned otherwise. A payload that carries no version (a hand-written one) is accepted.
+fn check_version(p: &Value) -> Result<()> {
+    match p["muVersion"].as_str() {
+        Some(v) if v != mu_tools::tools::subagent::MU_VERSION => bail!(
+            "this worker is mu {} but the parent that sent the task is mu {v}; use the same version on both",
+            mu_tools::tools::subagent::MU_VERSION
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// The first line as a payload and the agent it names; a payload without `agent` runs the worker.
 fn task_line(ctx: &context::Context, input: &str) -> Result<(Value, Option<context::AgentDef>)> {
     let p: Value = serde_json::from_str(input).map_err(|e| anyhow::anyhow!("bad subagent input: {e}"))?;
+    check_version(&p)?;
     let mut def = None;
     if let Some(name) = p["agent"].as_str() {
         match ctx.agents.iter().find(|a| a.name == name).cloned().or_else(|| context::builtin_agent(name)) {

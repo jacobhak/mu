@@ -650,6 +650,8 @@ mod tests {
         let d = toml::from_str::<MuConfig>("").unwrap().task;
         assert_eq!((d.soft_request_budget, d.budget_notice), (200, true));
         assert!(d.launcher.is_empty());
+        assert_eq!(d.max_cost, 5.0);
+        assert_eq!(toml::from_str::<MuConfig>("[task]\nmax_cost = 0").unwrap().task.max_cost, 0.0);
         let t = toml::from_str::<MuConfig>("[task]\nlauncher = [\"/bin/run\", \"-x\"]").unwrap().task;
         assert_eq!(t.launcher, ["/bin/run", "-x"]);
         let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;

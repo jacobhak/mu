@@ -1,6 +1,6 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
-use super::relay::RelayServer;
+use super::relay::{RelayAllow, RelayServer};
 use super::task::depth;
 use mu_base::events::{AgentEvent, EventTx};
 use mu_base::git::{git, prune_refs, repo_root, short_sha, snapshot_tree};
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -69,6 +69,12 @@ pub fn preview_result(text: &str, cwd: &Path, alloc: impl FnOnce() -> (u32, std:
     };
     format!("{head}\n\n{note}")
 }
+
+/// The version a parent puts in a task payload; a worker of another version refuses the task.
+pub const MU_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The file descriptor a launcher reports `changes` on. The worker's stdout cannot reach it.
+const CHANGES_FD: i32 = 3;
 
 /// How long a launched task's result ref and a dead parent's task ref are kept.
 const REF_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 3600);
@@ -184,14 +190,135 @@ enum ChildEvent {
     /// A model or search call of a relayed child; the line is read again as a `Call`.
     Relay(serde::de::IgnoredAny),
     Result(ChildResult),
-    /// A launcher's report of the worker's changes, after the `result` line.
-    Changes {
-        r#ref: String,
-        base: String,
-        #[serde(default)]
-        files: u64,
-    },
+    /// Only the launcher may report changes, on `CHANGES_FD`; on the worker's stdout it is ignored.
+    Changes(serde::de::IgnoredAny),
 }
+
+/// A launcher's report of the worker's changes, after the `result` line.
+#[derive(Deserialize)]
+struct ChangesLine {
+    #[serde(rename = "type")]
+    ty: String,
+    r#ref: String,
+    base: String,
+    #[serde(default)]
+    files: u64,
+}
+
+/// The `changes` reports in what the launcher wrote on `CHANGES_FD`: the last one that names this
+/// launch's own result ref and a commit hash as its base.
+fn read_changes(pipe: &mut std::fs::File, result_ref: &str) -> Option<(String, String, u64)> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    // The pipe is non-blocking and the launcher has written before it exited; a leftover process
+    // that holds the write end open must not hold this read.
+    while data.len() < 64 * 1024 {
+        match pipe.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+        }
+    }
+    let valid_base = |b: &str| matches!(b.len(), 40 | 64) && b.bytes().all(|c| c.is_ascii_hexdigit());
+    String::from_utf8_lossy(&data)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<ChangesLine>(l).ok())
+        .rfind(|c| c.ty == "changes" && c.r#ref == result_ref && valid_base(&c.base))
+        .map(|c| (c.r#ref, c.base, c.files))
+}
+
+/// Gives `cmd` a pipe as file descriptor `CHANGES_FD` and returns its read end.
+fn changes_pipe(cmd: &mut tokio::process::Command) -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
+    use std::os::fd::AsRawFd;
+    let (tx, rx) = tokio::net::unix::pipe::pipe()?;
+    let (write, read) = (tx.into_blocking_fd()?, rx.into_nonblocking_fd()?);
+    let w = write.as_raw_fd();
+    // SAFETY: dup2 and fcntl are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            if w == CHANGES_FD {
+                if libc::fcntl(w, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(w, CHANGES_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok((std::fs::File::from(read), write))
+}
+
+/// Reads one line into `buf`, newline included, keeping at most `cap` bytes of it. `None` at the
+/// end of input; `Some(true)` when the line was longer than `cap`, which is read to its end and
+/// dropped (`buf` is then empty).
+async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<Option<bool>> {
+    let mut dropped = false;
+    let mut seen = false;
+    loop {
+        let chunk = r.fill_buf().await?;
+        if chunk.is_empty() {
+            break;
+        }
+        seen = true;
+        let (end, used) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (true, i + 1),
+            None => (false, chunk.len()),
+        };
+        if !dropped {
+            if buf.len() + used > cap {
+                dropped = true;
+                buf.clear();
+                buf.shrink_to_fit();
+            } else {
+                buf.extend_from_slice(&chunk[..used]);
+            }
+        }
+        r.consume(used);
+        if end {
+            break;
+        }
+    }
+    Ok(seen.then_some(dropped))
+}
+
+/// What a worker's `entry` line is, by its `type`.
+enum EntryLine {
+    /// A line of the session file the parent keeps.
+    Session,
+    /// A cost line: the parent's own ledger is the source of a launched worker's cost.
+    Cost,
+    /// Not a session entry.
+    Bad,
+}
+
+fn entry_line(line: &str) -> EntryLine {
+    const KINDS: [&str; 9] = [
+        "title",
+        "session",
+        "message",
+        "compaction",
+        "model_change",
+        "thinking_level_change",
+        "title_change",
+        "mode_change",
+        "custom",
+    ];
+    let Ok(Value::Object(o)) = serde_json::from_str::<Value>(line) else { return EntryLine::Bad };
+    match o.get("type").and_then(Value::as_str) {
+        Some("cost") => EntryLine::Cost,
+        Some(t) if KINDS.contains(&t) && (t != "message" || o.get("message").is_some_and(Value::is_object)) => {
+            EntryLine::Session
+        }
+        _ => EntryLine::Bad,
+    }
+}
+
+/// How long a launched task's result ref and a dead parent's task ref are kept.
 
 #[derive(Deserialize)]
 struct ChildResult {
@@ -222,16 +349,39 @@ struct Mirrors {
     /// `None` once mirroring that file ended.
     files: HashMap<String, Option<MirrorFile>>,
     first: bool,
+    /// The child's own file: the first one it names.
+    own: Option<String>,
+    /// Lines of the own file before its header, kept until the header is checked.
+    held: Vec<String>,
 }
 
 impl Mirrors {
     /// Appends `line` to the mirror of `file`. Returns the path of the child's own mirror when this
-    /// call created it, and a notice when mirroring `file` ends.
-    fn write(&mut self, cwd: &Path, file: &str, line: &str) -> (Option<String>, Option<String>) {
+    /// call created it, and a notice when mirroring `file` ends. The child's own file must open
+    /// with a header whose `parentSession` is `parent`, the session that started the task.
+    fn write(&mut self, cwd: &Path, file: &str, line: &str, parent: Option<&str>) -> (Option<String>, Option<String>) {
         let mut created = None;
         if !self.files.contains_key(file) {
+            if *self.own.get_or_insert_with(|| file.to_string()) == file {
+                let header = serde_json::from_str::<Value>(line).ok();
+                match header.as_ref().and_then(|v| v["type"].as_str()) {
+                    Some("title") => {
+                        self.held.push(line.to_string());
+                        return (None, None);
+                    }
+                    Some("session") if header.as_ref().and_then(|v| v["parentSession"].as_str()) == parent => {}
+                    Some("session") => return self.refuse(file, "its header does not name this task's session"),
+                    _ => return self.refuse(file, "it does not begin with a header"),
+                }
+            }
             match MirrorFile::create(cwd, file) {
-                Ok(m) => {
+                Ok(mut m) => {
+                    for held in self.held.drain(..) {
+                        if let Err(e) = m.append_line(&held) {
+                            self.files.insert(file.to_string(), None);
+                            return (None, Some(format!("[session mirror of {file} stopped: {e}]")));
+                        }
+                    }
                     if !self.first {
                         created = Some(m.path.to_string_lossy().into_owned());
                         self.first = true;
@@ -252,6 +402,12 @@ impl Mirrors {
                 (created, Some(format!("[session mirror of {file} stopped: {e}]")))
             }
         }
+    }
+
+    fn refuse(&mut self, file: &str, why: &str) -> (Option<String>, Option<String>) {
+        self.files.insert(file.to_string(), None);
+        self.held.clear();
+        (None, Some(format!("[session mirror of {file} refused: {why}]")))
     }
 }
 
@@ -298,6 +454,10 @@ pub async fn run_child_observed(
     relay: Option<&RelayServer>,
 ) -> Outcome {
     let launched = matches!(child, ChildCmd::Launched(_));
+    let (job, result_ref) = match &child {
+        ChildCmd::Launched(l) => (l.id.clone(), Some(l.result_ref.clone())),
+        ChildCmd::Local(_) => (String::new(), None),
+    };
     let mut cmd = match &child {
         ChildCmd::Local(exe) => {
             let mut cmd = tokio::process::Command::new(exe);
@@ -329,15 +489,29 @@ pub async fn run_child_observed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Only a launcher reports changes, on a pipe the worker's stdout has no way into.
+    let mut changes_in = None;
+    if launched {
+        match changes_pipe(&mut cmd) {
+            Ok((read, write)) => changes_in = Some((read, write)),
+            Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
+        }
+    }
     let mut child = match mu_base::process::spawn_grouped(&mut cmd, true) {
         Ok(c) => c,
         Err(e) => return Outcome::failed(format!("cannot start subagent: {e}")),
     };
+    // The write end is the child's alone from here.
+    let mut changes_in = changes_in.map(|(read, _write)| read);
     let pid = child.id().unwrap_or(0) as i32;
+    let job = if job.is_empty() { format!("pid-{pid}") } else { job };
     let mut stdin = child.stdin.take().expect("stdin is piped");
     // The task payload, then one line per approval answer, for as long as the child reads them.
     let (wtx, mut wrx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let relay = relay.map(|r| r.start(wtx.clone()));
+    // What the parent put in the payload is what the child may call; a payload without it, none.
+    let allow: RelayAllow =
+        payload.get("relayModels").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let relay = relay.map(|r| r.start(wtx.clone(), &job, allow));
     let task = payload.to_string();
     tokio::task::spawn_local(async move {
         let _ = stdin.write_all(task.as_bytes()).await;
@@ -365,16 +539,22 @@ pub async fn run_child_observed(
     let mut result: Option<ChildResult> = None;
     let mut cancelled = false;
     let mut bad_line: Option<String> = None;
-    let mut changes: Option<(String, String, u64)> = None;
     let mut mirrors = Mirrors::default();
     let mut notices: Vec<String> = Vec::new();
+    let mut bad_entry = false;
+    let parent_session = payload["parentSession"].as_str();
     let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
         tokio::select! {
-            n = stdout.read_until(b'\n', &mut line) => match n {
-                Ok(0) => break,
-                Ok(_) => {
+            n = read_line_capped(&mut stdout, &mut line, mu_common::rpc::MAX_LINE) => match n {
+                Ok(None) => break,
+                Ok(Some(true)) => {
+                    bad_line.get_or_insert_with(|| {
+                        format!("a line longer than {} MiB was dropped", mu_common::rpc::MAX_LINE >> 20)
+                    });
+                }
+                Ok(Some(false)) => {
                     // Bytes, not `lines()`: a stray invalid UTF-8 byte must not end the read.
                     match serde_json::from_slice::<ChildEvent>(&line) {
                         Ok(ChildEvent::Tool { name, summary }) => on_tool(&name, &summary),
@@ -385,19 +565,31 @@ pub async fn run_child_observed(
                             }
                         }
                         Ok(ChildEvent::Model { label }) => on_model(&label),
-                        Ok(ChildEvent::Entry { file, line }) => match &mirror {
-                            Mirror::Off => {}
-                            Mirror::Forward(tx) => {
-                                let _ = tx.send(AgentEvent::ChildEntry { file, line });
-                            }
-                            Mirror::Write => {
-                                let (created, notice) = mirrors.write(cwd, &file, &line);
-                                if let Some(path) = created {
-                                    on_session(&path);
+                        Ok(ChildEvent::Entry { file, line }) if !matches!(mirror, Mirror::Off) => {
+                            match entry_line(&line) {
+                                EntryLine::Cost => {}
+                                EntryLine::Bad => {
+                                    if !bad_entry {
+                                        bad_entry = true;
+                                        notices.push("[a line that is not a session entry was dropped from the session mirror]".into());
+                                    }
                                 }
-                                notices.extend(notice);
+                                EntryLine::Session => match &mirror {
+                                    Mirror::Off => {}
+                                    Mirror::Forward(tx) => {
+                                        let _ = tx.send(AgentEvent::ChildEntry { file, line });
+                                    }
+                                    Mirror::Write => {
+                                        let (created, notice) = mirrors.write(cwd, &file, &line, parent_session);
+                                        if let Some(path) = created {
+                                            on_session(&path);
+                                        }
+                                        notices.extend(notice);
+                                    }
+                                },
                             }
-                        },
+                        }
+                        Ok(ChildEvent::Entry { .. }) => {}
                         Ok(ChildEvent::Approve { id, request }) => {
                             let rx = match approve {
                                 Some(f) => f(request),
@@ -416,11 +608,16 @@ pub async fn run_child_observed(
                         Ok(ChildEvent::Relay(_)) => {
                             let call = serde_json::from_slice::<Value>(&line).ok().and_then(|v| Call::parse(&v));
                             if let (Some(run), Some((id, call))) = (&relay, call) {
-                                run.handle(id, call);
+                                run.handle_with(id, call, approve);
                             }
                         }
-                        Ok(ChildEvent::Result(r)) => result = Some(r),
-                        Ok(ChildEvent::Changes { r#ref, base, files }) => changes = Some((r#ref, base, files)),
+                        Ok(ChildEvent::Result(r)) => {
+                            result = Some(r);
+                            if let Some(run) = &relay {
+                                run.finish();
+                            }
+                        }
+                        Ok(ChildEvent::Changes(_)) => {}
                         Err(_) => {
                             let text = String::from_utf8_lossy(&line);
                             let text = text.trim();
@@ -446,6 +643,7 @@ pub async fn run_child_observed(
             }
         }
     }
+    let capped = relay.as_ref().and_then(|r| r.capped());
     drop(relay);
     drop(wtx);
     // A child that ignores everything must not hang the parent: bound the wait, then kill.
@@ -463,10 +661,14 @@ pub async fn run_child_observed(
         }
     };
     drop(mirrors);
+    let changes = changes_in.as_mut().zip(result_ref).and_then(|(pipe, r)| read_changes(pipe, &r));
     let mut out = outcome(result, payload, cancelled, stderr_tail, bad_line);
     for n in notices {
         out.text.push('\n');
         out.text.push_str(&n);
+    }
+    if let Some(cap) = capped {
+        out.text.push_str(&format!("\n[task spend cap of ${cap:.2} reached; later model calls were refused]"));
     }
     if let Some((r#ref, base, files)) = changes {
         out.text.push_str(&format!(
@@ -609,7 +811,8 @@ snap=$(git -C "$MU_TASK_ROOT" show "$MU_TASK_REF:new.txt")
 printf '{"type":"result","text":"args=%s name=%s root=%s cwd=%s ref=%s result=%s session=%s ppid=%s depth=%s snap=%s home=%s"}\n' \
   "$#" "$MU_TASK_NAME" "$MU_TASK_ROOT" "$MU_TASK_CWD" "$MU_TASK_REF" "$MU_TASK_RESULT_REF" "$MU_TASK_SESSION" \
   "$MU_TASK_PARENT_PID" "$MU_TASK_DEPTH" "$snap" "$(test -n "$MU_TASK_MU_HOME$MU_TASK_PROFILE_HOME$MU_TASK_AGENT_DIR" && echo set)"
-echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","files":2}'
+echo '{"type":"changes","ref":"refs/mu/result/forged","base":"1111111111111111111111111111111111111111","files":99}'
+printf '{"type":"changes","ref":"%s","base":"0123456789abcdef0123456789abcdef01234567","files":2}\n' "$MU_TASK_RESULT_REF" >&3
 "#;
 
     #[tokio::test(flavor = "current_thread")]
@@ -659,8 +862,12 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
         }
         assert_eq!(
             out.text.lines().last().unwrap(),
-            "[changes: 2 files at refs/mu/result/x, base 0123456; see git diff 0123456789abcdef refs/mu/result/x]"
+            format!(
+                "[changes: 2 files at refs/mu/result/{id}, base 0123456; see git diff 0123456789abcdef0123456789abcdef01234567 refs/mu/result/{id}]"
+            ),
+            "the report came on fd 3; the forged one on stdout was ignored"
         );
+        assert!(!out.text.contains("forged") && !out.text.contains("99 files"), "{}", out.text);
         assert!(sessions.borrow().is_empty(), "a launched child's session is on the worker");
         assert_eq!(tools.get(), 1);
         assert_eq!(task_refs(&root), "", "the task ref is gone after the run");
@@ -691,6 +898,71 @@ echo '{"type":"changes","ref":"refs/mu/result/x","base":"0123456789abcdef","file
             .await;
         assert!(!out.ok && out.text.contains("cannot start subagent"), "{}", out.text);
         assert_eq!(task_refs(&root), "");
+    }
+
+    /// Runs a launcher script as one launched task.
+    async fn launched(body: &str) -> Outcome {
+        let root = repo();
+        let bin = tmp();
+        let launcher = vec![script(&bin, body)];
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let launch = prepare_launch(&launcher, &root, "t", "").await.unwrap();
+                run_child_observed(
+                    ChildCmd::Launched(launch),
+                    &root,
+                    &json!({}),
+                    &CancellationToken::new(),
+                    |_, _| {},
+                    |_| {},
+                    |_| {},
+                    None,
+                    Mirror::Off,
+                    None,
+                )
+                .await
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changes_line_on_stdout_alone_is_ignored() {
+        let out = launched(
+            "#!/bin/sh\nIFS= read -r line\necho '{\"type\":\"result\",\"text\":\"done\"}'\n\
+             printf '{\"type\":\"changes\",\"ref\":\"%s\",\"base\":\"0123456789abcdef0123456789abcdef01234567\",\"files\":1}\\n' \"$MU_TASK_RESULT_REF\"\n",
+        )
+        .await;
+        assert!(out.ok && out.text == "done", "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changes_report_must_name_the_launchs_ref_and_a_commit_hash() {
+        let report = |r: &str, base: &str| {
+            format!(
+                "#!/bin/sh\nIFS= read -r line\necho '{{\"type\":\"result\",\"text\":\"done\"}}'\n\
+                 printf '{{\"type\":\"changes\",\"ref\":\"%s\",\"base\":\"{base}\",\"files\":1}}\\n' \"{r}\" >&3\n"
+            )
+        };
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for (r, base) in
+            [("refs/mu/result/other", sha), ("$MU_TASK_RESULT_REF", "not-a-sha"), ("$MU_TASK_RESULT_REF", "abc")]
+        {
+            let out = launched(&report(r, base)).await;
+            assert!(out.ok && out.text == "done", "{r} {base}: {}", out.text);
+        }
+        let out = launched(&report("$MU_TASK_RESULT_REF", sha)).await;
+        assert!(out.text.contains("[changes: 1 files at refs/mu/result/t-"), "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_descendant_holding_the_changes_pipe_does_not_hold_the_result() {
+        let started = std::time::Instant::now();
+        let out = launched(
+            "#!/bin/sh\nIFS= read -r line\nsleep 20 >/dev/null 2>&1 &\necho '{\"type\":\"result\",\"text\":\"done\"}'\n",
+        )
+        .await;
+        assert!(out.ok && out.text == "done", "{}", out.text);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -843,11 +1115,15 @@ mod mirror_tests {
     }
 
     async fn run(exe: PathBuf, cwd: &Path, on_session: impl FnMut(&str)) -> Outcome {
+        run_with(exe, cwd, json!({}), on_session).await
+    }
+
+    async fn run_with(exe: PathBuf, cwd: &Path, payload: Value, on_session: impl FnMut(&str)) -> Outcome {
         tokio::task::LocalSet::new()
             .run_until(run_child_observed(
                 ChildCmd::Local(exe),
                 cwd,
-                &json!({}),
+                &payload,
                 &CancellationToken::new(),
                 |_, _| {},
                 on_session,
@@ -937,6 +1213,93 @@ mod mirror_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_mirror_whose_header_names_another_session_is_refused() {
+        mu_testutil::home();
+        let (src, cwd, dir) = (mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp());
+        let theirs = source(&src, None, 0.0);
+        let foreign = source(&src, Some(&theirs), 0.5);
+        let lines = lines_of(&foreign);
+        let mirror = mu_common::paths::session_dir(&cwd).join(name(&foreign));
+        let seen = std::cell::Cell::new(0);
+        let payload = json!({"parentSession": "/sessions/this-one.jsonl"});
+        let out =
+            run_with(child(&dir, &entries(&name(&foreign), &lines)), &cwd, payload, |_| seen.set(seen.get() + 1)).await;
+        assert!(out.ok && out.text.contains("refused: its header does not name this task's session"), "{}", out.text);
+        assert!(!mirror.exists(), "nothing was written");
+        assert_eq!(seen.get(), 0);
+        // The same header is accepted when it names this session.
+        let payload = json!({"parentSession": theirs.to_string_lossy()});
+        let out = run_with(child(&dir, &entries(&name(&foreign), &lines)), &cwd, payload, |_| {}).await;
+        assert!(out.ok && out.text == "ok", "{}", out.text);
+        assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&foreign).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_mirror_that_does_not_begin_with_a_header_is_refused() {
+        mu_testutil::home();
+        let (src, cwd, dir) = (mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp());
+        let remote = source(&src, None, 0.0);
+        let lines = lines_of(&remote);
+        // The header is missing: title slot, then a message.
+        let stream = entries(&name(&remote), &[lines[0].clone(), lines[2].clone()]);
+        let out = run(child(&dir, &stream), &cwd, |_| {}).await;
+        assert!(out.text.contains("refused: it does not begin with a header"), "{}", out.text);
+        assert!(!mu_common::paths::session_dir(&cwd).join(name(&remote)).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cost_lines_and_lines_that_are_not_entries_never_reach_the_mirror() {
+        mu_testutil::home();
+        let (src, cwd, dir) = (mu_testutil::tmp(), mu_testutil::tmp(), mu_testutil::tmp());
+        let remote = source(&src, None, 0.25);
+        let mut lines = lines_of(&remote);
+        let forged = [
+            json!({"type": "cost", "total": 100.0}).to_string(),
+            "not json".to_string(),
+            json!({"type": "unheard-of"}).to_string(),
+            json!({"type": "message", "message": "a string"}).to_string(),
+            json!(["type", "message"]).to_string(),
+        ];
+        lines.splice(2..2, forged.iter().cloned());
+        let out = run(child(&dir, &entries(&name(&remote), &lines)), &cwd, |_| {}).await;
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(out.text.matches("not a session entry").count(), 1, "one notice: {}", out.text);
+        let mirror = mu_common::paths::session_dir(&cwd).join(name(&remote));
+        assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&remote).unwrap());
+        assert!((session_cost(&mirror) - 0.25).abs() < 1e-9);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_line_over_the_cap_is_dropped_and_the_result_after_it_still_counts() {
+        let dir = mu_testutil::tmp();
+        let exe = dir.join("fake-mu");
+        let over = mu_common::rpc::MAX_LINE + 1024;
+        let body = format!(
+            "#!/bin/sh\nhead -c {over} /dev/zero | tr '\\0' a\necho\necho '{{\"type\":\"result\",\"text\":\"fine\"}}'\n"
+        );
+        std::fs::write(&exe, body).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = run(exe, &dir, |_| {}).await;
+        assert!(out.ok && out.text == "fine", "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_line_capped_keeps_lines_up_to_the_cap_and_skips_longer_ones() {
+        let mut r = tokio::io::BufReader::with_capacity(4, &b"abc\nabcdefghij\nxy\nlast"[..]);
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        loop {
+            buf.clear();
+            match read_line_capped(&mut r, &mut buf, 5).await.unwrap() {
+                None => break,
+                Some(dropped) => got.push((dropped, String::from_utf8_lossy(&buf).into_owned())),
+            }
+        }
+        let want = [(false, "abc\n"), (true, ""), (false, "xy\n"), (false, "last")];
+        assert_eq!(got, want.map(|(d, s)| (d, s.to_string())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_nested_mirror_is_counted_with_its_parent_whatever_its_own_cwd() {
         mu_testutil::home();
         let (root_cwd, kid_cwd, grand_cwd, cwd, dir) =
@@ -948,7 +1311,8 @@ mod mirror_tests {
         stream.extend(entries(&name(&grand), &lines_of(&grand)));
         let exe = child(&dir, &stream);
         let seen = std::cell::RefCell::new(Vec::new());
-        assert!(run(exe, &cwd, |p| seen.borrow_mut().push(p.to_string())).await.ok);
+        let payload = json!({"parentSession": root.to_string_lossy()});
+        assert!(run_with(exe, &cwd, payload, |p| seen.borrow_mut().push(p.to_string())).await.ok);
         let beside = mu_common::paths::session_dir(&cwd);
         let (kid_mirror, grand_mirror) = (beside.join(name(&kid)), beside.join(name(&grand)));
         assert_eq!(*seen.borrow(), [kid_mirror.to_string_lossy()], "only the child's own file is its session");
