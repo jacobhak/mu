@@ -3,8 +3,6 @@
 `~/.mu/config.toml` is optional, and so is every key in it. The values below are the defaults. Model roles, per-model limits and compaction thresholds live in [`models.toml`](model-roles.md#models-toml), not here; a `[compaction]` table left in `config.toml` is no longer read and warns at startup.
 
 ```toml
-# default_remote = "devbox"  # plain `mu` runs on this remote; `mu --local` runs here (see remote.md#remotes)
-
 [theme]
 source = "tokyo-night"  # default; or "terminal" (follow your terminal's palette), "omarchy", a bundled or ~/.mu/themes name, or a colors.toml path
 # accent = "blue"     # palette key or "#rrggbb"
@@ -56,9 +54,8 @@ lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 soft_request_budget = 200  # a scout is capped at 100 however high this is
 budget_notice = true       # the wrap-up notice at the budget
 max_cost = 5.0             # most a launched worker may spend (USD) on the model calls it makes through this session; 0 turns the cap off
-# launch = ["task"]          # agent kinds that run as workers on a remote; any other kind runs here (see below)
-# remote = "cluster"         # the [remote.NAME] they run on; default: default_remote
-# reconnect_timeout = 600    # seconds a lost worker stream is retried before the result is fetched as it stands
+# launcher = ["mu-remote", "launch", "cluster"]  # a command that runs the kinds in `launch` in place of `mu --headless` (see below)
+# launch = ["task"]          # agent kinds that go through the launcher; any other kind runs here
 
 # [agent]                # `mu agent` with no client attached (see remote.md#when-nobody-is-attached)
 # notify_command = "notify-send \"mu $1\" \"$2\""  # run under sh -c when a question or approval starts waiting; $1 is the session id, $2 a one-line summary
@@ -67,13 +64,8 @@ max_cost = 5.0             # most a launched worker may spend (USD) on the model
 # state_key_file = "/run/secrets/state-key"  # unattended instead: a 32-byte key (raw or 64 hex characters) read at start; implies encryption, wins over the command
 # state_key_command = "cat /run/secrets/state-key"  # the same, printed by a command run under sh -c
 
-# [remote.devbox]        # where agents can run besides here; `mu -r devbox`, `mu remote list|check` (see remote.md#remotes)
-# adapter = "ssh"        # "ssh" is built in (needs host); anything else is a program on PATH or a path
-# host = "devbox"
-# trusted = false        # true for a remote you control; only a trusted one may run the main agent
-# repos = []             # on an untrusted remote: the repositories (paths or origin URLs) whose workers may run there
-# state_key = "~/.ssh/id_ed25519"  # the SSH private key that unlocks an agent's encrypted state (default shown; read on this machine)
-# [remote.devbox.settings]  # passed to the adapter as JSON; no secrets (keys like token, password, secret, key are refused)
+# [sessions]             # the Sessions tab, beside this machine's (see remote.md#for-extension-authors)
+# sources = [["mu-remote", "rows"]]  # commands that print other machines' agents as JSON lines: id, cwd, started, title, client, waiting, host, hint, attach
 
 [update]
 check = true          # daily release check at startup
@@ -87,6 +79,6 @@ user_cap = 1500       # characters in user.md
 project_cap = 4000    # characters in a repository's memory.md
 ```
 
-With `[task] launch` set, a `task` subagent of a listed kind (`task`, `scout`, a custom agent's name) runs as a worker on `[task] remote`, or on `default_remote` when that is unset (`--local` leaves `default_remote` out). Scouts, kinds not listed and `/review` run here, and so do a worker's own subagents. Before each launch mu commits the working tree, untracked files included, as `refs/mu/task/<id>` (deleted when the run ends) and hands the remote that commit with its full history as a git bundle. The worker outlives its connection: mu reconnects for up to `reconnect_timeout` seconds, and past that fetches what the worker had committed. What the worker changed comes back as a bundle that mu imports as `refs/mu/result/<id>`; the task's result then ends with a line saying whether it was applied (see [remote.md](remote.md#tasks-on-a-remote)). `refs/mu/result/*` older than 14 days are deleted before each launch. A remote that is not trusted takes only the repositories in its `repos`. The old `[task] launcher` and `MU_TASK_LAUNCHER` are gone.
+With `[task] launcher` and `[task] launch` set, a `task` subagent of a listed kind (`task`, `scout`, a custom agent's name) runs through the launcher, a command that stands in for `mu --headless` (usually it runs the subagent on another machine). Kinds not listed and `/review` run here, and so do a launched subagent's own subagents. Before each launch mu commits the working tree, untracked files included, as `refs/mu/task/<id>` (deleted when the run ends) and hands the launcher that commit with its full history as a git bundle. What the launcher's worker changed comes back as a bundle that mu imports as `refs/mu/result/<id>`; the task's result then ends with a line saying whether it was applied. The launcher's environment and the files involved are the launcher contract, in [remote.md](remote.md#for-extension-authors). `refs/mu/result/*` older than 14 days are deleted before each launch.
 
 A launched worker has no credentials: its model calls and web searches go through this session. It may call only its task's model, that model's fallback roles and `@smol` (for titles); any other model is refused, and a worker's own subagents get no more than that. Calls the worker makes after it has sent its `result` are refused and any still running are cancelled, and at most eight run at once. The cost of its calls counts in this session's `--max-cost` and, past `[task] max_cost`, further calls fail with `task spend cap reached` and the task's result says so; one-off calls such as a title are not priced, so they do not count. A worker's web search goes through the same permission check as yours, as a network call: in `ask` mode it asks first, and the hosts it returns are noted for the worker only, so a `fetch` of one of them from this session still asks. The task carries mu's version: a worker of another version refuses the task with one line, which the task shows as its error. A line from the worker longer than 64 MiB and an image over 20 MB are dropped; a worker's session lines must be session entries, the first of them a header naming this session as its parent, and `cost` lines are dropped.

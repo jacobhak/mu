@@ -363,55 +363,32 @@ fn on_path(program: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{program} on PATH"))
 }
 
-/// How a fake remote behaves.
-#[derive(Default)]
-struct Behaviour {
-    trusted: bool,
-    /// `repos` of an untrusted remote.
-    repos: Vec<PathBuf>,
-    /// The first connection is cut after this many lines from the worker (0: never). The first of them
-    /// is the handshake, the rest are encrypted.
-    cut_first: usize,
+/// What a test launcher leaves as its result.
+#[derive(Clone, Copy)]
+enum Leaves {
+    /// Nothing changed: an empty result bundle.
+    Nothing,
+    /// `a.txt` changed, in the bundle contract A names.
+    Changed,
+    /// A bundle holding a ref the launch does not own.
+    Forged,
 }
 
-/// A remote that runs its workers on this machine, with a bare home (no key, no gateway), through an
-/// adapter script of the contract. Everything the adapter receives is logged in `log`.
-struct Remote {
+/// A launcher (launcher contract 2) that runs the subagent on this machine with a bare home (no key,
+/// no gateway), the way a remote's would. Its environment is logged in `log`.
+struct Launcher {
     bare: PathBuf,
     log: PathBuf,
 }
 
-impl Drop for Remote {
-    fn drop(&mut self) {
-        // A worker the test left behind.
-        for e in std::fs::read_dir(self.bare.join("workers")).into_iter().flatten().flatten() {
-            let state = std::fs::read_to_string(e.path().join("state.json")).unwrap_or_default();
-            if let Some(pid) = serde_json::from_str::<serde_json::Value>(&state).ok().and_then(|v| v["pid"].as_i64()) {
-                // SAFETY: a plain signal to a process this test started.
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            }
-        }
-    }
-}
-
-impl Remote {
-    /// The adapter's received environment, stdin of every connection, stdout of every connection and
-    /// task bundles, as one text.
-    fn received(&self) -> String {
-        let mut all = Vec::new();
-        for e in std::fs::read_dir(&self.log).unwrap().flatten() {
-            all.extend(std::fs::read(e.path()).unwrap());
-        }
-        String::from_utf8_lossy(&all).into_owned()
-    }
-
+impl Launcher {
     fn log(&self, name: &str) -> String {
         std::fs::read_to_string(self.log.join(name)).unwrap_or_default()
     }
 }
 
-/// Makes `[remote.fake]` and `[task] launch = ["task"]` in the parent's `home` over a fake adapter.
-fn remote_for(home: &Path, b: Behaviour) -> Remote {
+/// Sets `[task] launcher` and `launch = ["task"]` in the parent's `home` over a scripted launcher.
+fn launcher_for(home: &Path, result: Leaves) -> Launcher {
     use std::os::unix::fs::PermissionsExt;
     let bare = mu_testutil::tmp();
     std::fs::create_dir_all(bare.join("empty-bin")).unwrap();
@@ -419,62 +396,46 @@ fn remote_for(home: &Path, b: Behaviour) -> Remote {
     let log = mu_testutil::tmp();
     // The parent's PATH is empty, but launching a task commits the tree with git.
     let _ = std::os::unix::fs::symlink(on_path("git"), home.join("empty-bin/git"));
+    let (ref_name, with_base) = match result {
+        Leaves::Forged => ("refs/heads/forged", ""),
+        _ => ("refs/mu/result/$MU_TASK_NAME", " \"^$MU_TASK_REF\""),
+    };
+    let after = match result {
+        Leaves::Nothing => String::new(),
+        Leaves::Changed | Leaves::Forged => format!(
+            r#"echo worked > a.txt
+git add -A && git -c user.name=t -c user.email=t@t commit -q -m work
+git update-ref "{ref_name}" HEAD
+git bundle create -q "$MU_TASK_RESULT_BUNDLE" "{ref_name}"{with_base}"#
+        ),
+    };
     let script = format!(
         r#"#!/bin/sh
 PATH='{path}'; export PATH
 unset MU_GATEWAY_URL ANTHROPIC_API_KEY
-env > '{log}'/env.$1.$$
+env > '{log}'/env
 W='{bare}'
-as_worker() {{ MU_HOME="$W" HOME="$W" MU_TEST_HOME="$W" '{mu}' "$@"; }}
-case "$1" in
-  version) echo '{{"contract":1}}' ;;
-  start)
-    shift
-    while [ $# -gt 0 ]; do
-      case "$1" in --launch) launch=$2 ;; --bundle) bundle=$2 ;; esac
-      shift
-    done
-    cat "$bundle" >> '{log}'/bundle.bin
-    d="$W/work/$launch"
-    git init -q "$d" && git -C "$d" fetch -q "$bundle" "refs/mu/task/$launch:refs/mu/task/$launch" \
-      && git -C "$d" checkout -q --detach "refs/mu/task/$launch" || exit 1
-    cd "$d" && as_worker worker run --launch "$launch" --dir "$d" --detach < /dev/null
-    ;;
-  connect)
-    n=$(cat '{log}'/connects.n 2>/dev/null || echo 0)
-    echo $((n + 1)) > '{log}'/connects.n
-    if [ "$n" -eq 0 ] && [ {cut} -gt 0 ]; then
-      {{ tee -a '{log}'/to-worker | as_worker attach --stdio "$2"; }} \
-        | {{ k=0; while [ $k -lt {cut} ] && IFS= read -r l; do printf '%s\n' "$l" | tee -a '{log}'/from-worker; k=$((k + 1)); done; kill $$; }}
-    else
-      tee -a '{log}'/to-worker | as_worker attach --stdio "$2" | tee -a '{log}'/from-worker
-    fi
-    ;;
-  fetch) as_worker worker bundle "$2" ;;
-  stop) as_worker worker stop "$2" ;;
-  *) echo "unknown verb $1" >&2; exit 3 ;;
-esac
+d="$W/work/$MU_TASK_NAME"
+git init -q "$d" && git -C "$d" fetch -q "$MU_TASK_BUNDLE" "$MU_TASK_REF:$MU_TASK_REF" \
+  && git -C "$d" checkout -q --detach "$MU_TASK_REF" || exit 1
+cd "$d"
+MU_HOME="$W" HOME="$W" MU_TEST_HOME="$W" '{mu}' --headless | tee -a '{log}'/from-worker
+{after}
 "#,
         path = std::env::var("PATH").unwrap(),
         log = log.display(),
         bare = bare.display(),
         mu = env!("CARGO_BIN_EXE_mu"),
-        cut = b.cut_first,
     );
-    let adapter = home.join("adapter.sh");
-    std::fs::write(&adapter, script).unwrap();
-    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let repos = b.repos.iter().map(|r| format!("{:?}", r.display().to_string())).collect::<Vec<_>>().join(", ");
+    let launcher = home.join("launcher.sh");
+    std::fs::write(&launcher, script).unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(
         home.join("config.toml"),
-        format!(
-            "[task]\nlaunch = [\"task\"]\nremote = \"fake\"\nreconnect_timeout = 60\n\n[remote.fake]\nadapter = {:?}\ntrusted = {}\nrepos = [{repos}]\n",
-            adapter.display().to_string(),
-            b.trusted
-        ),
+        format!("[task]\nlauncher = [{:?}]\nlaunch = [\"task\"]\n", launcher.display().to_string()),
     )
     .unwrap();
-    Remote { bare, log }
+    Launcher { bare, log }
 }
 
 /// A launched child has no credentials and no gateway: its model calls reach the server only
@@ -482,7 +443,7 @@ esac
 #[test]
 fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
     let (home, cwd, seen) = relay_fixture("relayed child result");
-    let remote = remote_for(&home, Behaviour { trusted: true, ..Default::default() });
+    let launcher = launcher_for(&home, Leaves::Nothing);
     let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let requests = seen.lock().unwrap();
@@ -492,99 +453,66 @@ fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
         "the child's result reaches the parent's next request"
     );
     assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
-    assert!(!remote.bare.join("auth.json").exists(), "the child never held a key store");
+    assert!(!launcher.bare.join("auth.json").exists(), "the child never held a key store");
+    let env = launcher.log("env");
+    assert!(
+        env.contains("MU_TASK_CONTRACT=2") && env.contains("MU_TASK_BUNDLE=") && env.contains("MU_TASK_RESULT_BUNDLE=")
+    );
+    assert!(!env.contains("sk-test-key"), "the launcher is given no credential: {env}");
+    assert!(!launcher.log("from-worker").is_empty(), "the stream went through the launcher");
 }
 
-/// The stream to the worker is cut after its first line, a relay call the parent has seen and
-/// answered into the dead connection. The parent reconnects, the worker asks again, and the task
-/// finishes with its model called once.
+/// The result bundle the launcher leaves is imported and applied to the parent's tree.
 #[test]
-fn a_worker_stream_cut_with_a_relay_call_in_flight_is_resumed_and_the_task_completes() {
+fn a_launched_childs_result_bundle_is_imported_and_applied() {
     let (home, cwd, seen) = relay_fixture("relayed child result");
-    let remote = remote_for(&home, Behaviour { trusted: true, cut_first: 2, ..Default::default() });
+    let _launcher = launcher_for(&home, Leaves::Changed);
     let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
     assert!(o.status.success(), "stderr: {}", stderr(&o));
-    assert!(remote.log("connects.n").trim().parse::<u32>().unwrap() >= 2, "it reconnected");
+    assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "worked\n");
     let requests = seen.lock().unwrap();
-    assert_eq!(child_requests(&requests).len(), 1, "the worker's model call ran once: {requests:?}");
     assert!(
-        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("relayed child result")),
-        "the result is complete: {requests:?}"
+        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("[changes: applied: 1 files")),
+        "the parent is told: {requests:?}"
     );
-    assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
-    // Both connections were encrypted: the stream carries no line the parent could read.
-    let from = remote.log("from-worker");
-    assert!(from.lines().count() > 2 && !from.contains("\"seq\"") && !from.contains("\"type\""), "{from}");
+    assert_eq!(mu_testutil::sh(&cwd, &["for-each-ref", "refs/mu/task/"]), "", "the task ref is gone");
 }
 
-/// A worker for an untrusted remote gets nothing secret from the parent: not in the adapter's
-/// environment, the repository bundle, the task payload or any line of the stream either way.
+/// A bundle that holds a ref the launch does not own is refused, and nothing reaches the tree.
 #[test]
-fn a_worker_on_an_untrusted_remote_is_sent_no_secret() {
-    const SECRET: &str = "sk-test-key";
+fn a_forged_result_bundle_is_refused() {
     let (home, cwd, seen) = relay_fixture("relayed child result");
-    let remote = remote_for(&home, Behaviour { repos: vec![cwd.clone()], ..Default::default() });
-    let o = mu(&home, &cwd)
-        .env("SEEDED_API_KEY", SECRET)
-        .env("SEEDED_SERVICE_TOKEN", SECRET)
-        .args(["-p", "delegate it", "--model", MODEL])
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "stderr: {}", stderr(&o));
-    assert!(std::fs::read_to_string(home.join("auth.json")).unwrap().contains(SECRET), "the parent holds it");
-    assert!(
-        seen.lock().unwrap().iter().any(|r| r.contains("\"tool_result\"") && r.contains("relayed child result")),
-        "the task ran"
-    );
-    let envs: Vec<String> = std::fs::read_dir(&remote.log)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("env."))
-        .collect();
-    assert!(envs.len() >= 4, "every verb ran: {envs:?}");
-    let to = remote.log("to-worker");
-    assert!(!to.is_empty() && !to.contains("\"type\"") && !to.contains("delegate"), "the payload is encrypted: {to}");
-    assert!(
-        !remote.log("from-worker").is_empty() && std::fs::metadata(remote.log.join("bundle.bin")).unwrap().len() > 0
-    );
-    let all = remote.received();
-    assert!(!all.contains(SECRET), "a secret reached the adapter");
-    assert!(!all.contains("SEEDED_"), "even the names of the variables were scrubbed");
-}
-
-/// An untrusted remote runs only the repositories it lists, and only while what would be sent holds
-/// no credential-looking file.
-#[test]
-fn an_untrusted_remote_refuses_an_unlisted_repository_and_a_config_with_credentials() {
-    let (home, cwd, seen) = relay_fixture("relayed child result");
-    let remote = remote_for(&home, Behaviour::default());
+    let _launcher = launcher_for(&home, Leaves::Forged);
     let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
     assert!(o.status.success(), "stderr: {}", stderr(&o));
-    {
-        let requests = seen.lock().unwrap();
-        assert!(child_requests(&requests).is_empty(), "no worker ran: {requests:?}");
-        assert!(
-            requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("remote fake is not trusted for")),
-            "{requests:?}"
-        );
-    }
-    assert!(remote.received().is_empty(), "the adapter was never run");
-
-    let (home, cwd, seen) = relay_fixture("relayed child result");
-    let remote = remote_for(&home, Behaviour { repos: vec![cwd.clone()], ..Default::default() });
-    let agents = home.join(".omp/agent/agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(agents.join(".env"), "TOKEN=1\n").unwrap();
-    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
-    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "one\n");
     let requests = seen.lock().unwrap();
-    assert!(child_requests(&requests).is_empty(), "{requests:?}");
     assert!(
-        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("credential-looking files")),
+        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("does not hold exactly")),
         "{requests:?}"
     );
-    assert!(remote.received().is_empty(), "the adapter was never run");
+    assert_eq!(mu_testutil::sh(&cwd, &["for-each-ref", "refs/mu/result/", "refs/heads/forged"]), "");
+}
+
+/// The launched child's session is mirrored into the parent's session directory.
+#[test]
+fn a_launched_childs_session_is_mirrored_in_the_parent() {
+    fn find(dir: &Path) -> bool {
+        std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                find(&p)
+            } else {
+                p.extension().is_some_and(|x| x == "jsonl")
+                    && std::fs::read_to_string(&p).is_ok_and(|t| t.contains("\"mirrored\":true"))
+            }
+        })
+    }
+    let (home, cwd, _) = relay_fixture("relayed child result");
+    let _launcher = launcher_for(&home, Leaves::Nothing);
+    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(find(&home), "a mirrored session file is in the parent's home");
 }
 
 /// The worker itself refuses a payload of another version, whoever sent it.

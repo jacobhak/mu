@@ -8,7 +8,6 @@ pub mod docs;
 pub mod models;
 pub mod predict;
 pub mod providers;
-pub mod remote;
 mod secret;
 pub mod select;
 pub mod web;
@@ -60,15 +59,13 @@ pub struct Cli {
     /// Abort `-p` once the session has cost more than this many USD.
     #[arg(long, requires = "print")]
     pub max_cost: Option<f64>,
-    /// The nested client of a take-over: runs the UI over this shell command's stdin and stdout. Internal.
-    #[arg(long, hide = true, value_name = "COMMAND", conflicts_with_all = ["resume", "continue_latest", "print", "headless", "acp"])]
-    pub nested_client: Option<String>,
-    /// Run on this `[remote.NAME]` from config.toml for this run.
-    #[arg(short = 'r', long = "remote", value_name = "NAME", conflicts_with = "local")]
-    pub remote: Option<String>,
-    /// Run here even when `default_remote` is set.
-    #[arg(long)]
-    pub local: bool,
+    /// Run the UI as a client of the `mu agent` that this shell command's stdin and stdout reach, for example
+    /// `ssh host mu attach --stdio ID`. The command is run again when it drops. See docs/remote.md.
+    #[arg(long, value_name = "COMMAND", conflicts_with_all = ["resume", "continue_latest", "print", "headless", "acp"])]
+    pub attach: Option<String>,
+    /// With `--attach`: the SSH ed25519 private key that unlocks a sealed agent (default ~/.ssh/id_ed25519).
+    #[arg(long, value_name = "PATH", requires = "attach")]
+    pub state_key: Option<PathBuf>,
     /// Serve the Agent Client Protocol over stdio.
     #[arg(long, conflicts_with_all = ["resume", "continue_latest", "print", "headless"])]
     pub acp: bool,
@@ -138,7 +135,7 @@ pub enum Sub {
     },
     /// Run the agent of a session with no terminal. It prints `{"session":ID,"socket":PATH}` and serves one
     /// client at a time on that Unix socket (see docs/remote.md); it keeps running when the client leaves.
-    /// `mu agent list` lists the agents running here; `mu agent key` prints their key's fingerprint.
+    /// `mu agent list` lists the agents running here.
     Agent {
         #[arg(long)]
         model: Option<String>,
@@ -172,18 +169,6 @@ pub enum Sub {
         /// A socket path, instead of a session.
         #[arg(long, conflicts_with = "session")]
         socket: Option<PathBuf>,
-    },
-    /// The remote end of a launched task, run by an adapter: `run` serves the worker (see docs/remote.md),
-    /// `bundle` prints its result, `stop` ends it.
-    #[command(hide = true)]
-    Worker {
-        #[command(subcommand)]
-        cmd: WorkerCmd,
-    },
-    /// Remotes from config.toml: `mu remote list|check NAME`.
-    Remote {
-        #[command(subcommand)]
-        cmd: remote::Cmd,
     },
     /// Take over a running `mu -p` session: stop it after its current step, then resume it here.
     Take {
@@ -220,27 +205,6 @@ pub enum Sub {
 }
 
 #[derive(clap::Subcommand)]
-pub enum WorkerCmd {
-    /// Serve worker `--launch ID` in `--dir`, a git checkout, until it is stopped.
-    Run {
-        #[arg(long)]
-        launch: String,
-        #[arg(long)]
-        dir: PathBuf,
-        /// Start the worker in the background and print `{"id":ID}` once it listens.
-        #[arg(long, conflicts_with = "detached")]
-        detach: bool,
-        /// What `--detach` starts.
-        #[arg(long, hide = true)]
-        detached: bool,
-    },
-    /// Commit what the worker changed and print the result as a git bundle (nothing when it changed nothing).
-    Bundle { id: String },
-    /// End the worker, committing what it changed first.
-    Stop { id: String },
-}
-
-#[derive(clap::Subcommand)]
 pub enum AgentCmd {
     /// List the agents running here, one per line.
     List {
@@ -248,9 +212,6 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print the fingerprint of this profile's agent key (made on first use), to compare with the one a
-    /// client shows when it first connects.
-    Key,
 }
 
 #[cfg(test)]
@@ -266,17 +227,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_flags_and_subcommand_parse() {
-        let c = Cli::try_parse_from(["mu", "-r", "devbox"]).unwrap();
-        assert_eq!((c.remote.as_deref(), c.local), (Some("devbox"), false));
-        assert!(Cli::try_parse_from(["mu", "--local"]).unwrap().local);
-        assert!(Cli::try_parse_from(["mu", "-r", "a", "--local"]).is_err());
-        assert!(matches!(
-            Cli::try_parse_from(["mu", "remote", "check", "a"]).unwrap().command,
-            Some(Sub::Remote { cmd: remote::Cmd::Check { .. } })
-        ));
-        assert!(Cli::try_parse_from(["mu", "remote", "list"]).is_ok());
-        assert!(Cli::try_parse_from(["mu", "remote", "check"]).is_err());
+    fn attach_takes_a_command_and_an_optional_state_key() {
+        let c = Cli::try_parse_from(["mu", "--attach", "ssh h mu attach --stdio x", "--state-key", "/k"]).unwrap();
+        assert_eq!(
+            (c.attach.as_deref(), c.state_key.as_deref()),
+            (Some("ssh h mu attach --stdio x"), Some("/k".as_ref()))
+        );
+        assert!(Cli::try_parse_from(["mu", "--state-key", "/k"]).is_err(), "a key needs --attach");
+        assert!(Cli::try_parse_from(["mu", "--attach", "x", "-c"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "--attach", "x", "-p", "hi"]).is_err());
     }
 
     #[test]

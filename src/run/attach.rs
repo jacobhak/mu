@@ -1,31 +1,27 @@
-//! The terminal UI as a client of a `mu agent` that a `Link` reaches: a remote adapter's `connect ID`
-//! (plain `mu` with a remote in effect), or the shell command of a take-over's nested client.
+//! The terminal UI as a client of a `mu agent` that a `Link` reaches: the shell command of
+//! `mu --attach COMMAND`, or of a take-over's nested client.
 //!
-//! The link's process has stdin and stdout piped: they carry the wire lines (see `mu_base::wire`), stderr
-//! lines are shown as notices. After the hello, the handshake (the agent's key is pinned per remote and
-//! agent id, see `mu_common::secure`; a take-over's nested client does not pin) and the encrypted hello
-//! exchange the UI runs as it does in one process, over a
-//! `RemoteHost` and the client adapter. When the connection drops the UI stays up and says so; the link
-//! is run again after 1 s, doubling to 30 s, and the agent's catch-up repaints the conversation. The
-//! agent ending, a take-over by another client and `/detach` end the client for good. An agent that
-//! already has another client answers `Busy`: a reconnect then stops retrying and asks whether to take
-//! the session over.
+//! The command's process has stdin and stdout piped: they carry the wire lines (see `mu_base::wire`),
+//! plain JSON behind the hello, so the stream is as private as whatever the command runs over. stderr
+//! lines are shown as notices. The UI runs as it does in one process, over a `RemoteHost` and the
+//! client adapter. When the connection drops the UI stays up and says so; the command is run again
+//! after 1 s, doubling to 30 s, and the agent's catch-up repaints the conversation. The agent ending, a
+//! take-over by another client and `/detach` end the client for good. An agent that already has
+//! another client answers `Busy`: a reconnect then stops retrying and asks whether to take the session
+//! over.
 
 use super::unlock::{self, Calls, Terminal};
-use crate::remote::adapter::Adapter;
 use anyhow::{Result, bail};
 use mu_base::config::Configs;
 use mu_base::events::{AgentEvent, Answer, AskQuestion, Command};
-use mu_base::wire::{AgentLine, ClientAdapter, ClientLine, Incoming, WIRE, WireCommand, from_line, to_line};
+use mu_base::wire::{AgentLine, ClientAdapter, ClientLine, Incoming, WIRE, WireCommand, to_line};
 use mu_common::rpc::{Framed, Line};
-use mu_common::secure::{self, Handshake};
 use mu_tui::host::remote::RemoteHost;
 use mu_tui::host::{Host, HostInfo};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command as Process};
@@ -83,46 +79,33 @@ fn since_text(since: i64) -> String {
     if at.date() == today { at.strftime("%H:%M").to_string() } else { at.strftime("%Y-%m-%d %H:%M").to_string() }
 }
 
-/// What the client's connection runs each time it connects.
+/// What the client's connection runs each time it connects: a shell command that is a raw pipe to an
+/// agent (`mu attach --stdio ID` somewhere), and the SSH key that unlocks the agent's sealed state.
 #[derive(Clone)]
-pub enum Link {
-    /// A shell command that is a raw pipe to an agent (a take-over's nested client).
-    Command(String),
-    /// A remote adapter's `connect ID`.
-    Remote { adapter: Arc<Adapter>, id: String },
+pub struct Link {
+    pub command: String,
+    pub state_key: PathBuf,
 }
 
 impl Link {
+    pub fn new(command: String, state_key: Option<PathBuf>) -> Self {
+        let state_key = state_key.unwrap_or_else(|| mu_common::paths::home().join(".ssh/id_ed25519"));
+        Self { command, state_key }
+    }
+
     fn describe(&self) -> String {
-        match self {
-            Link::Command(c) => format!("`{c}`"),
-            Link::Remote { adapter, id } => format!("`{} connect {id}`", adapter.name()),
-        }
+        format!("`{}`", self.command)
     }
 
-    /// The remote and agent whose key is pinned. A take-over's nested client reaches an agent through
-    /// the channel of the session it runs in, which authenticated that host already.
-    fn pin(&self) -> Option<(String, String)> {
-        match self {
-            Link::Command(_) => None,
-            Link::Remote { adapter, id } => Some((adapter.name().to_string(), id.clone())),
-        }
-    }
-
-    fn process(&self) -> Result<Process, String> {
-        let mut p = match self {
-            Link::Command(c) => {
-                let mut p = Process::new("sh");
-                p.arg("-c").arg(c);
-                p
-            }
-            Link::Remote { adapter, id } => Process::from(adapter.connect_command(id).map_err(|e| format!("{e:#}"))?),
-        };
-        p.stdin(std::process::Stdio::piped())
+    fn process(&self) -> Process {
+        let mut p = Process::new("/bin/sh");
+        p.arg("-c")
+            .arg(&self.command)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        Ok(p)
+        p
     }
 }
 
@@ -155,7 +138,7 @@ async fn connect(
     join: Join,
 ) -> Result<(Conn, HostInfo), Refused> {
     let command = link.describe();
-    let mut child = link.process()?.spawn().map_err(|e| format!("cannot run {command}: {e}"))?;
+    let mut child = link.process().spawn().map_err(|e| format!("cannot run {command}: {e}"))?;
     let (Some(mut stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         return Err("cannot reach the command's streams".to_string().into());
@@ -174,66 +157,7 @@ async fn connect(
         }
     });
 
-    // Outside the encryption, so that a version mismatch is answered in the clear: only the wire.
     let hello = ClientLine::Hello {
-        wire: WIRE,
-        version: env!("MU_VERSION").into(),
-        reconnect: false,
-        host: String::new(),
-        client: String::new(),
-        take: false,
-    };
-    let key = secure::client_key()?;
-    let mut hs = Handshake::initiator(&key)?;
-    let opening = format!("{}\n{}\n", to_line(&hello), hs.write()?);
-    if let Err(e) = stdin.write_all(opening.as_bytes()).await {
-        return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
-    }
-    let mut framed = Framed::new(BufReader::new(stdout));
-    let first = tokio::time::timeout(HELLO_WAIT, framed.next_line())
-        .await
-        .map_err(|_| format!("{command} did not answer within {}s", HELLO_WAIT.as_secs()))?;
-    let value = match first {
-        Some(Line::Value(v)) => v,
-        _ => {
-            let none = format!("{command} ended without an answer from an agent");
-            return Err(ended(&mut child, stderr_task, &seen, none).await);
-        }
-    };
-    if !value.is_string() {
-        return Err(match serde_json::from_value::<AgentLine>(value) {
-            Ok(AgentLine::Hello { wire, .. }) if wire != WIRE => {
-                format!("the agent speaks wire {wire}, this mu wire {WIRE}: use the same mu on both sides").into()
-            }
-            Ok(AgentLine::Error(e)) => e.into(),
-            _ => format!("{command} is not an agent's stream").into(),
-        });
-    }
-    hs.read(&value)?;
-    if let (Some((remote, agent)), Some(agent_key)) = (link.pin(), hs.remote_key()) {
-        match secure::check_pin(&secure::pins_path(), &remote, &agent, &agent_key)? {
-            secure::Pinned::Known => {}
-            secure::Pinned::First => {
-                let text = format!(
-                    "first contact with agent {agent} on {remote}: its key is {}, now pinned. Compare it with \
-                     `mu agent key` run there; a later change is refused.",
-                    secure::fingerprint(&agent_key)
-                );
-                // Before the UI is up the terminal is still plain: this stays in its scrollback.
-                if join.reconnect {
-                    let _ = notices.send(text);
-                } else {
-                    eprintln!("{text}");
-                }
-            }
-        }
-    }
-    let msg3 = hs.write()?;
-    if let Err(e) = stdin.write_all(format!("{msg3}\n").as_bytes()).await {
-        return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
-    }
-    let (mut sealer, mut opener, _) = hs.finish()?;
-    let who = ClientLine::Hello {
         wire: WIRE,
         version: env!("MU_VERSION").into(),
         reconnect: join.reconnect,
@@ -241,23 +165,28 @@ async fn connect(
         client: who.client.clone(),
         take: join.take,
     };
-    if let Err(e) = secure::write_line(&mut stdin, &mut sealer, &to_line(&who)).await {
+    if let Err(e) = stdin.write_all(format!("{}\n", to_line(&hello)).as_bytes()).await {
         return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
     }
-    let answer = tokio::time::timeout(HELLO_WAIT, secure::next_line(&mut framed, &mut opener))
+    let mut framed = Framed::new(BufReader::new(stdout));
+    let answer = tokio::time::timeout(HELLO_WAIT, framed.next_line())
         .await
         .map_err(|_| format!("{command} did not answer within {}s", HELLO_WAIT.as_secs()))?;
-    let line = match answer {
-        Ok(Some(l)) => l,
-        Ok(None) => {
+    let value = match answer {
+        Some(Line::Value(v)) => v,
+        _ => {
             let none = format!("{command} ended without an answer from an agent");
             return Err(ended(&mut child, stderr_task, &seen, none).await);
         }
-        Err(e) => return Err(e.into()),
     };
-    let info = match from_line::<AgentLine>(&line) {
+    let info = match serde_json::from_value::<AgentLine>(value) {
         Ok(AgentLine::Hello { wire, host, .. }) if wire == WIRE => serde_json::from_value::<HostInfo>(host)
             .map_err(|e| format!("the agent's host facts are unreadable: {e}"))?,
+        Ok(AgentLine::Hello { wire, .. }) => {
+            return Err(
+                format!("the agent speaks wire {wire}, this mu wire {WIRE}: use the same mu on both sides").into()
+            );
+        }
         Ok(AgentLine::Busy { host, since }) => return Err(Refused::Busy { host, since }),
         Ok(AgentLine::Error(e)) => return Err(e.into()),
         _ => return Err(format!("{command} is not an agent's stream").into()),
@@ -274,19 +203,18 @@ async fn connect(
     let broken = notices.clone();
     tokio::task::spawn_local(async move {
         loop {
-            match secure::next_line(&mut framed, &mut opener).await {
-                Ok(Some(text)) => {
-                    if let Ok(line) = from_line::<AgentLine>(&text)
+            match framed.next_line().await {
+                Some(Line::Value(v)) => {
+                    if let Ok(line) = serde_json::from_value::<AgentLine>(v)
                         && lines_tx.send(line).is_err()
                     {
                         return;
                     }
                 }
-                Ok(None) => return,
-                Err(e) => {
-                    let _ = broken.send(format!("the stream from the agent broke: {e}"));
-                    return;
+                Some(Line::Bad(e)) => {
+                    let _ = broken.send(format!("a line of the stream from the agent is unreadable: {e}"));
                 }
+                None => return,
             }
         }
     });
@@ -298,7 +226,7 @@ async fn connect(
             if matches!(line, ClientLine::Detach) {
                 marked.set(true);
             }
-            if secure::write_line(&mut stdin, &mut sealer, &to_line(&line)).await.is_err() {
+            if stdin.write_all(to_line(&line).as_bytes()).await.is_err() || stdin.write_all(b"\n").await.is_err() {
                 return;
             }
         }
@@ -497,21 +425,10 @@ fn read_line(echo: bool) -> Option<zeroize::Zeroizing<String>> {
     Some(zeroize::Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-impl Link {
-    /// The SSH key that unlocks the agent's state: a take-over's nested client has none.
-    fn state_key(&self) -> Option<PathBuf> {
-        match self {
-            Link::Command(_) => None,
-            Link::Remote { adapter, .. } => Some(adapter.state_key_path()),
-        }
-    }
-}
-
 /// Unlocks the agent's state, or sets it up, as far as `term` can ask. The agent stays as it is when that
 /// cannot be done: the user was told why, and a turn that needs a credential then fails as locked.
 async fn settle_state(conn: &mut Conn, link: &Link, term: &mut impl Terminal) {
-    let key = link.state_key();
-    let _ = unlock::settle(&mut HostCalls { conn, next: 0 }, key.as_deref(), term).await;
+    let _ = unlock::settle(&mut HostCalls { conn, next: 0 }, Some(&link.state_key), term).await;
 }
 
 const TAKE_IT: &str = "Take it over";

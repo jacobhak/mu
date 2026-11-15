@@ -70,14 +70,14 @@ pub(super) async fn settle(calls: &mut impl Calls, key: Option<&Path>, term: &mu
 async fn unlock(calls: &mut impl Calls, key: Option<&Path>, term: &mut impl Terminal) -> Outcome {
     const LOCKED: &str = "the agent's state is locked";
     let Some(path) = key else {
-        term.say(&format!("{LOCKED} and no SSH key is set for it: attach with a [remote] state_key to unlock"));
+        term.say(&format!("{LOCKED} and no SSH key is set for it: attach with --state-key to unlock"));
         return Outcome::Pending;
     };
     let private = match std::fs::read_to_string(path) {
         Ok(t) => Zeroizing::new(t),
         Err(e) => {
             term.say(&format!(
-                "{LOCKED}, and {} cannot be read ({e}): set [remote] state_key to the key that unlocks it",
+                "{LOCKED}, and {} cannot be read ({e}): pass --state-key with the key that unlocks it",
                 path.display()
             ));
             return Outcome::Pending;
@@ -169,7 +169,7 @@ async fn init(calls: &mut impl Calls, key: Option<&Path>, term: &mut impl Termin
         return Outcome::Pending;
     }
     let Some(private) = key else {
-        term.say(&format!("{NONE}: no SSH key is set for it ([remote] state_key)"));
+        term.say(&format!("{NONE}: no SSH key is set for it (--state-key)"));
         return Outcome::Pending;
     };
     let public = public_key_path(private);

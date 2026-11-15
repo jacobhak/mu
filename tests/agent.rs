@@ -2,7 +2,6 @@
 //! scripted client speaking the wire lines over the agent's Unix socket.
 use mu_base::events::Command as AgentCommand;
 use mu_base::wire::{ClientLine, WIRE, WireCommand, to_line};
-use mu_common::secure::{Handshake, Keypair, Opener, Sealer};
 use mu_testutil::{Reply, block_on, fake_server};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -121,14 +120,10 @@ impl Drop for Agent {
     }
 }
 
-/// A client of the wire over any pipe: its first hello opens the channel (the version in the clear, the
-/// handshake, then the real hello inside); every line after goes through it. A hello of another wire
-/// number gets the agent's plain answer, which `next` returns.
+/// A client of the wire over any pipe: plain JSON lines, the hello first.
 struct Client {
     reader: Box<dyn BufRead>,
     writer: Box<dyn Write>,
-    chan: Option<(Sealer, Opener)>,
-    plain: std::collections::VecDeque<Value>,
 }
 
 impl Client {
@@ -139,7 +134,7 @@ impl Client {
     }
 
     fn over(reader: Box<dyn BufRead>, writer: Box<dyn Write>) -> Client {
-        Client { reader, writer, chan: None, plain: Default::default() }
+        Client { reader, writer }
     }
 
     /// An agent that refuses the version closes at once: a write after that may fail.
@@ -158,34 +153,7 @@ impl Client {
     }
 
     fn send(&mut self, line: &ClientLine) {
-        if self.chan.is_none()
-            && let ClientLine::Hello { wire, .. } = line
-        {
-            let bare = ClientLine::Hello {
-                wire: *wire,
-                version: "test".into(),
-                reconnect: false,
-                host: String::new(),
-                client: String::new(),
-                take: false,
-            };
-            let mut hs = Handshake::initiator(&Keypair::generate().unwrap()).unwrap();
-            self.write_text(&to_line(&bare));
-            self.write_text(&hs.write().unwrap());
-            let Some(answer) = self.read_raw() else { return };
-            if !answer.is_string() {
-                self.plain.push_back(answer);
-                return;
-            }
-            hs.read(&answer).unwrap();
-            self.write_text(&hs.write().unwrap());
-            let (sealer, opener, _) = hs.finish().unwrap();
-            self.chan = Some((sealer, opener));
-        }
-        let (sealer, _) = self.chan.as_mut().expect("a hello opens the channel");
-        for wire in sealer.seal(&to_line(line)).unwrap() {
-            self.write_text(&wire);
-        }
+        self.write_text(&to_line(line));
     }
 
     /// A hello that takes the session from whoever has it.
@@ -196,16 +164,7 @@ impl Client {
 
     /// The next line, `None` at the end of the stream.
     fn next(&mut self) -> Option<Value> {
-        if let Some(v) = self.plain.pop_front() {
-            return Some(v);
-        }
-        loop {
-            let raw = self.read_raw()?;
-            let Some((_, opener)) = self.chan.as_mut() else { return Some(raw) };
-            if let Some(text) = opener.open(&raw).unwrap() {
-                return Some(serde_json::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}")));
-            }
-        }
+        self.read_raw()
     }
 
     /// Reads until `done` accepts a line; returns all lines read, that one last.
@@ -631,7 +590,7 @@ fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
     assert_eq!(session, first.session, "the resumed agent has the same session");
 
     c.send(&ClientLine::TunnelOpen { id: 7, session });
-    // The nested client opens its own channel to the second agent, through the first one's tunnel.
+    // The nested client speaks to the second agent through the first one's tunnel.
     let tunnel = |c: &mut Client, line: &str| c.send(&ClientLine::TunnelLine { id: 7, line: line.to_string() });
     let next_tunnelled = |c: &mut Client| -> Value {
         loop {
@@ -641,29 +600,11 @@ fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
             }
         }
     };
-    let bare = ClientLine::Hello {
-        wire: WIRE,
-        version: "test".into(),
-        reconnect: false,
-        host: String::new(),
-        client: String::new(),
-        take: false,
-    };
-    let mut hs = Handshake::initiator(&Keypair::generate().unwrap()).unwrap();
-    tunnel(&mut c, &to_line(&bare));
-    tunnel(&mut c, &hs.write().unwrap());
-    hs.read(&next_tunnelled(&mut c)).unwrap();
-    tunnel(&mut c, &hs.write().unwrap());
-    let (mut sealer, mut opener, _) = hs.finish().unwrap();
-    for w in sealer.seal(&to_line(&hello_line(WIRE, "nested", false))).unwrap() {
-        tunnel(&mut c, &w);
-    }
+    tunnel(&mut c, &to_line(&hello_line(WIRE, "nested", false)));
     let tunnelled: Vec<Value> = {
         let mut got = Vec::new();
         loop {
-            let wire = next_tunnelled(&mut c);
-            let Some(text) = opener.open(&wire).unwrap() else { continue };
-            let inner: Value = serde_json::from_str(&text).unwrap();
+            let inner = next_tunnelled(&mut c);
             let done = inner["event"] == "CaughtUp";
             got.push(inner);
             if done {
@@ -679,10 +620,7 @@ fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
     );
 
     // End the nested agent through the tunnel, then close it.
-    let exit = to_line(&ClientLine::Command(WireCommand::Command(AgentCommand::Exit)));
-    for w in sealer.seal(&exit).unwrap() {
-        tunnel(&mut c, &w);
-    }
+    tunnel(&mut c, &to_line(&ClientLine::Command(WireCommand::Command(AgentCommand::Exit))));
     let closed = c.until(|v| v.get("tunnelClose").is_some()).pop().unwrap();
     assert_eq!(closed["tunnelClose"]["id"], 7);
 }
@@ -1017,68 +955,52 @@ impl Drop for Term {
     }
 }
 
-/// A client machine (its own home, with a `[remote.far]` config) beside a "remote" one that the fake
-/// adapter reaches by running this binary with the remote's home. Every call is logged.
+/// A client machine (its own home) beside a "remote" one that a link script reaches by running this
+/// binary with the remote's home: a plain command, as `ssh host mu attach --stdio ID` would be.
 struct Far {
     client: PathBuf,
     remote: PathBuf,
     cwd: PathBuf,
     dir: PathBuf,
+    link: PathBuf,
+    state_key: std::cell::RefCell<Option<PathBuf>>,
 }
 
 impl Far {
-    fn new(trusted: bool, extra_config: &str) -> Far {
+    fn new() -> Far {
         let (remote, cwd) = fixture();
         let client = mu_testutil::tmp();
         let dir = mu_testutil::tmp();
         let script = format!(
             r#"#!/bin/sh
 PATH=/usr/bin:/bin
-echo "$MU_REMOTE_NAME|$MU_REMOTE_TRUSTED|$*" >> '{dir}/log'
-inner() {{ MU_HOME='{remote}' MU_TEST_HOME='{remote}' HOME='{remote}' PATH='{remote}/empty-bin' '{bin}' "$@"; }}
-case "$1" in
-  version) echo '{{"contract":1}}' ;;
-  list) [ -e '{dir}/down' ] && {{ echo 'cannot reach the cluster: no route' >&2; exit 1; }}; inner agent list --json ;;
-  start) shift 3; cd '{cwd}' && inner agent --detach --model '{MODEL}' --permissions yolo "$@" ;;
-  connect)
-    echo $$ > '{dir}/connect.pid'
-    while [ -e '{dir}/hold' ]; do sleep 0.1; done
-    if [ -e '{dir}/capture' ]; then
-      mkfifo '{dir}'/in.$$
-      exec 3<&0
-      tee -a '{dir}/to-agent' <&3 > '{dir}'/in.$$ &
-      inner attach --stdio "$2" < '{dir}'/in.$$ | tee -a '{dir}/from-agent'
-      exit
-    fi
-    exec env MU_HOME='{remote}' MU_TEST_HOME='{remote}' HOME='{remote}' PATH='{remote}/empty-bin' '{bin}' attach --stdio "$2" ;;
-  *) echo "unknown verb $1" >&2; exit 3 ;;
-esac
+echo $$ > '{dir}/connect.pid'
+while [ -e '{dir}/hold' ]; do sleep 0.1; done
+exec env MU_HOME='{remote}' MU_TEST_HOME='{remote}' HOME='{remote}' PATH='{remote}/empty-bin' '{bin}' attach --stdio "$1"
 "#,
             dir = dir.display(),
             remote = remote.display(),
-            cwd = cwd.display(),
             bin = env!("CARGO_BIN_EXE_mu"),
         );
-        let adapter = dir.join("adapter");
-        std::fs::write(&adapter, script).unwrap();
-        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config = format!("[remote.far]\nadapter = '{}'\ntrusted = {trusted}\n{extra_config}", adapter.display());
-        std::fs::write(client.join("config.toml"), config).unwrap();
-        Far { client, remote, cwd, dir }
+        let link = dir.join("link");
+        std::fs::write(&link, script).unwrap();
+        std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Far { client, remote, cwd, dir, link, state_key: Default::default() }
     }
 
-    fn mu(&self) -> Command {
+    /// An agent running on the remote.
+    fn start(&self, extra: &[&str]) -> Agent {
+        Agent::start(&self.remote, &self.cwd, extra)
+    }
+
+    /// The UI on the client machine, attached to agent `id` through the link.
+    fn mu(&self, id: &str) -> Command {
         let mut c = mu(&self.client, &self.cwd);
-        c.arg("-r").arg("far");
+        c.arg("--attach").arg(format!("{} {id}", self.link.display()));
+        if let Some(k) = self.state_key.borrow().as_ref() {
+            c.arg("--state-key").arg(k);
+        }
         c
-    }
-
-    fn log(&self) -> Vec<String> {
-        std::fs::read_to_string(self.dir.join("log")).unwrap_or_default().lines().map(str::to_string).collect()
-    }
-
-    fn calls(&self, verb: &str) -> usize {
-        self.log().iter().filter(|l| l.split('|').nth(2).is_some_and(|a| a.split(' ').next() == Some(verb))).count()
     }
 
     fn agents(&self) -> Vec<Value> {
@@ -1091,128 +1013,54 @@ esac
 }
 
 #[test]
-fn a_client_starts_an_agent_on_the_remote_connects_and_later_rejoins_it() {
-    let far = Far::new(true, "");
-    let mut term = Term::spawn(far.mu());
+fn the_ui_attaches_over_a_command_link_detaches_and_rejoins() {
+    let far = Far::new();
+    let agent = far.start(&[]);
+    let mut term = Term::spawn(far.mu(&agent.session));
     wait_until("the agent to have a client", || far.client_host().is_some());
-    let agents = far.agents();
-    assert_eq!(agents.len(), 1, "{agents:?}");
-    let id = agents[0]["id"].as_str().unwrap().to_string();
-    let _agent = pid_of(&far.remote, &id);
-    assert_eq!(far.calls("start"), 1);
-    assert!(far.log().iter().any(|l| l == "far|1|start --kind agent"), "{:?}", far.log());
-    assert!(far.log().iter().any(|l| l == &format!("far|1|connect {id}")), "{:?}", far.log());
+    term.command("a question");
+    term.wait_for("hello from the fake");
 
     term.command("/detach");
     assert!(term.wait_exit().success(), "{}", term.text());
     wait_until("the client to leave", || far.client_host().is_none());
 
-    let mut again = Term::spawn({
-        let mut c = far.mu();
-        c.arg("-c");
-        c
-    });
+    let mut again = Term::spawn(far.mu(&agent.session));
     wait_until("the second client", || far.client_host().is_some());
-    assert_eq!(far.calls("start"), 1, "-c joined the running agent: {:?}", far.log());
-    assert_eq!(far.calls("connect"), 2);
+    again.wait_for("hello from the fake");
     assert_eq!(far.agents().len(), 1);
     again.command("/detach");
     assert!(again.wait_exit().success());
 }
 
 #[test]
-fn the_stream_the_adapter_carries_holds_no_plaintext_event() {
-    let far = Far::new(true, "");
-    std::fs::write(far.dir.join("capture"), "").unwrap();
-    let mut term = Term::spawn(far.mu());
-    wait_until("the agent to have a client", || far.client_host().is_some());
-    let _agent = pid_of(&far.remote, far.agents()[0]["id"].as_str().unwrap());
-    term.command("a-recognisable-prompt");
-    term.wait_for("hello from the fake");
-    let to = std::fs::read_to_string(far.dir.join("to-agent")).unwrap();
-    let from = std::fs::read_to_string(far.dir.join("from-agent")).unwrap();
-    assert!(to.lines().count() >= 4 && from.lines().count() >= 4, "the capture holds the exchange");
-    for (way, text) in [("to the agent", &to), ("from the agent", &from)] {
-        for plain in ["a-recognisable-prompt", "hello from the fake", "UserPrompt", "TurnEnd", "CaughtUp", "\"event\""]
-        {
-            assert!(!text.contains(plain), "{plain} crossed the pipe in the clear {way}");
-        }
-    }
-    // Only the version is in the clear: the first line the client sends.
-    let first: Value = serde_json::from_str(to.lines().next().unwrap()).unwrap();
-    assert_eq!(first["hello"]["wire"], WIRE);
-    assert!(first["hello"]["host"] == "" && first["hello"]["client"] == "", "{first}");
-    std::thread::sleep(Duration::from_secs(1));
-    term.command("/detach");
-    assert!(term.wait_exit().success(), "{}", term.text());
-}
-
-#[test]
-fn the_agents_key_is_pinned_on_first_contact_shows_what_agent_key_prints_and_a_change_is_refused() {
-    let far = Far::new(true, "");
-    let mut term = Term::spawn(far.mu());
-    wait_until("the agent to have a client", || far.client_host().is_some());
-    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
-    let _agent = pid_of(&far.remote, &id);
-    term.wait_for("first contact with agent");
-    term.command("/detach");
-    assert!(term.wait_exit().success(), "{}", term.text());
-
-    let pins = far.client.join("keys").join("pins.json");
-    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&pins).unwrap()).unwrap();
-    let pinned = stored["far"][&id].as_str().unwrap_or_else(|| panic!("no pin for {id}: {stored}")).to_string();
-    use base64::Engine;
-    let key = base64::engine::general_purpose::STANDARD.decode(&pinned).unwrap();
-    let there = mu(&far.remote, &far.cwd).args(["agent", "key"]).output().unwrap();
-    assert!(there.status.success());
-    let printed = String::from_utf8_lossy(&there.stdout).trim().to_string();
-    assert_eq!(printed, mu_common::secure::fingerprint(&key), "`mu agent key` prints what the client pinned");
-    let again = mu(&far.remote, &far.cwd).args(["agent", "key"]).output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&again.stdout).trim(), printed, "stable");
-    let mode = std::fs::metadata(far.remote.join("keys").join("agent.key")).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600);
-
-    // The agent now shows another key than the pinned one.
-    let other = base64::engine::general_purpose::STANDARD.encode(Keypair::generate().unwrap().public());
-    std::fs::write(&pins, json!({"far": {id.clone(): other}}).to_string()).unwrap();
-    let mut refused = Term::spawn({
-        let mut c = far.mu();
-        c.arg("-c");
-        c
-    });
-    assert!(!refused.wait_exit().success());
-    let drawn = refused.text();
-    assert!(drawn.contains("Refusing to connect") && drawn.contains(&mu_common::secure::fingerprint(&key)), "{drawn}");
-    assert!(far.client_host().is_none(), "the agent never got a client");
-}
-
-#[test]
-fn resuming_a_session_that_no_agent_has_runs_start_with_it() {
-    let far = Far::new(true, "");
-    let mut term = Term::spawn({
-        let mut c = far.mu();
-        c.args(["--resume", "no-such-session"]);
-        c
-    });
-    wait_until("the start call", || far.calls("start") == 1);
-    assert!(far.log().iter().any(|l| l == "far|1|start --kind agent --resume no-such-session"), "{:?}", far.log());
-    let _ = term.wait_exit();
+fn a_command_that_is_not_an_agents_stream_is_an_error() {
+    let far = Far::new();
+    let mut c = mu(&far.client, &far.cwd);
+    c.args(["--attach", "echo 'no agent here' >&2; exit 3"]);
+    let mut term = Term::spawn(c);
+    assert!(!term.wait_exit().success());
+    assert!(term.text().contains("no agent here"), "{}", term.text());
+    let mut c = mu(&far.client, &far.cwd);
+    c.args(["--attach", "echo not-json"]);
+    let mut term = Term::spawn(c);
+    assert!(!term.wait_exit().success());
 }
 
 #[test]
 fn a_reconnect_does_not_take_the_session_from_the_client_that_has_it() {
-    let far = Far::new(true, "");
-    let term = Term::spawn(far.mu());
+    let far = Far::new();
+    let agent = far.start(&[]);
+    let id = agent.session.clone();
+    let term = Term::spawn(far.mu(&id));
     wait_until("the agent to have a client", || far.client_host().is_some());
-    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
-    let _agent = pid_of(&far.remote, &id);
     let mine = far.client_host().unwrap();
     term.wait_for("type here");
 
     // The connection drops, and another client attaches before the reconnect gets through.
     std::fs::write(far.dir.join("hold"), "").unwrap();
     let pid: i32 = std::fs::read_to_string(far.dir.join("connect.pid")).unwrap().trim().parse().unwrap();
-    // SAFETY: plain signal to the adapter's connect process.
+    // SAFETY: plain signal to the link's process.
     unsafe { libc::kill(pid, libc::SIGKILL) };
     wait_until("the agent to see the loss", || far.client_host().is_none());
     let mut other = Client::connect(&far.remote.join("run").join(format!("{id}.sock")));
@@ -1229,61 +1077,25 @@ fn a_reconnect_does_not_take_the_session_from_the_client_that_has_it() {
 
 #[test]
 fn attaching_by_hand_to_a_busy_agent_asks_and_takes_over_only_on_t() {
-    let far = Far::new(true, "");
-    let agent = Agent::start(&far.remote, &far.cwd, &[]);
+    let far = Far::new();
+    let agent = far.start(&[]);
     let mut alpha = Client::connect(&agent.socket);
     alpha.send(&hello_line(WIRE, "alpha", false));
     alpha.next().unwrap();
     alpha.until(caught_up);
 
-    let resume = |far: &Far| {
-        let mut c = far.mu();
-        c.args(["--resume", &agent.session]);
-        Term::spawn(c)
-    };
-    let mut quits = resume(&far);
+    let attach = |far: &Far| Term::spawn(far.mu(&agent.session));
+    let mut quits = attach(&far);
     quits.wait_for("alpha has this session since");
     quits.send("q");
     assert!(quits.wait_exit().success());
     assert_eq!(far.client_host().as_deref(), Some("alpha"));
-    assert_eq!(far.calls("start"), 0, "the agent was joined, not started");
 
-    let mut takes = resume(&far);
+    let mut takes = attach(&far);
     takes.wait_for("[t]ake it over");
     takes.send("t");
     wait_until("the take-over", || far.client_host().is_some_and(|h| h != "alpha"));
     alpha.until(|v| v["event"].get("Detached").is_some());
-}
-
-#[test]
-fn a_main_agent_is_refused_on_an_untrusted_remote_and_the_adapter_never_starts_one() {
-    for args in [&[][..], &["-c"][..], &["--resume", "abc"][..]] {
-        let far = Far::new(false, "");
-        let o = far.mu().args(args).stdin(Stdio::null()).output().unwrap();
-        assert!(!o.status.success());
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(
-            err.contains("remote far is not trusted to run a main agent (set trusted = true on a remote you control)"),
-            "{err}"
-        );
-        assert_eq!(far.calls("start"), 0, "{:?}", far.log());
-        assert_eq!(far.calls("connect"), 0, "{:?}", far.log());
-        assert!(far.agents().is_empty());
-    }
-}
-
-#[test]
-fn an_unreachable_default_remote_is_refused_with_the_adapters_error() {
-    let far = Far::new(true, "");
-    let config = std::fs::read_to_string(far.client.join("config.toml")).unwrap();
-    std::fs::write(far.client.join("config.toml"), format!("default_remote = 'far'\n{config}")).unwrap();
-    std::fs::write(far.dir.join("down"), "").unwrap();
-    let o = mu(&far.client, &far.cwd).stdin(Stdio::null()).output().unwrap();
-    assert!(!o.status.success());
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert!(err.contains("cannot reach the cluster: no route"), "{err}");
-    assert_eq!(far.calls("start"), 0);
-    assert!(!far.client.join("sessions").exists(), "nothing ran here instead");
 }
 
 /// An SSH ed25519 identity on disk the way `ssh-keygen` leaves it: the private key and `<private>.pub`.
@@ -1306,17 +1118,14 @@ fn identity(seed: u8, passphrase: Option<&str>) -> Identity {
     Identity { private, public }
 }
 
-/// The client's `[remote.far] state_key`: the key it unlocks with.
+/// The key the client unlocks with: what `--state-key` gets.
 fn set_client_key(far: &Far, key: &Path) {
-    let config = std::fs::read_to_string(far.client.join("config.toml")).unwrap();
-    let kept: Vec<&str> = config.lines().filter(|l| !l.starts_with("state_key")).collect();
-    std::fs::write(far.client.join("config.toml"), format!("{}\nstate_key = '{}'\n", kept.join("\n"), key.display()))
-        .unwrap();
+    *far.state_key.borrow_mut() = Some(key.to_path_buf());
 }
 
 /// A remote whose agents encrypt their state under an SSH key; `notified` collects what `notify_command` got.
 fn ssh_far(key: &Identity) -> Far {
-    let far = Far::new(true, "");
+    let far = Far::new();
     set_client_key(&far, &key.private);
     let config =
         format!("[agent]\nstate_key = 'ssh'\nnotify_command = 'echo \"$2\" >> {}/notified'\n", far.dir.display());
@@ -1324,15 +1133,14 @@ fn ssh_far(key: &Identity) -> Far {
     far
 }
 
-fn attach_continuing(far: &Far) -> Term {
-    let mut c = far.mu();
-    c.arg("-c");
-    Term::spawn(c)
+fn attach_to(far: &Far, agent: &Agent) -> Term {
+    Term::spawn(far.mu(&agent.session))
 }
 
 /// The first attach, which sets the state key up; the agent is left running with no client.
-fn first_attach(far: &Far, key: &Identity) -> Pid {
-    let mut term = Term::spawn(far.mu());
+fn first_attach(far: &Far, key: &Identity) -> Agent {
+    let agent = far.start(&[]);
+    let mut term = attach_to(far, &agent);
     term.wait_for("[y/N]");
     assert!(term.text().contains(&key.public), "the key that would unlock it is shown: {}", term.text());
     assert!(!far.remote.join("keys/state.key").exists(), "nothing is set up before the user agrees");
@@ -1340,19 +1148,17 @@ fn first_attach(far: &Far, key: &Identity) -> Pid {
     term.wait_for("type here");
     assert!(far.remote.join("keys/state.key").exists());
     assert_eq!(far.agents()[0]["locked"], json!(false));
-    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
-    let pid = pid_of(&far.remote, &id);
     term.command("/detach");
     assert!(term.wait_exit().success(), "{}", term.text());
-    pid
+    agent
 }
 
 /// The agent dies with no goodbye and a new one takes the session: it starts locked.
-fn restart_locked(far: &Far, old: &Pid) -> Agent {
-    // SAFETY: plain signal to the agent the test started.
-    unsafe { libc::kill(old.0, libc::SIGKILL) };
+fn restart_locked(far: &Far, mut old: Agent) -> Agent {
+    old.child.kill().unwrap();
+    let _ = old.child.wait();
     wait_until("the agent to be gone", || far.agents().is_empty());
-    Agent::start(&far.remote, &far.cwd, &["-c"])
+    far.start(&["-c"])
 }
 
 fn locked_rows(far: &Far) -> (Value, Value) {
@@ -1418,7 +1224,7 @@ fn the_first_attach_sets_up_an_ssh_state_key_and_a_restarted_agent_is_locked_unt
     let state = std::fs::read_to_string(far.remote.join("keys/state.key")).unwrap();
     assert!(!state.contains("PRIVATE KEY") && state.contains("recipients"), "{state}");
 
-    let _agent = restart_locked(&far, &old);
+    let agent = restart_locked(&far, old);
     assert_eq!(locked_rows(&far), (json!(true), json!(true)), "locked, and waiting for someone to unlock it");
     wait_until("the notify command", || {
         std::fs::read_to_string(far.dir.join("notified")).is_ok_and(|t| t.contains("locked: attach to unlock"))
@@ -1427,7 +1233,7 @@ fn the_first_attach_sets_up_an_ssh_state_key_and_a_restarted_agent_is_locked_unt
     // A key that is not a recipient is refused, naming what the agent accepts; the client still attaches.
     let other = identity(2, None);
     set_client_key(&far, &other.private);
-    let mut refused = attach_continuing(&far);
+    let mut refused = attach_to(&far, &agent);
     let fingerprint =
         serde_json::from_str::<Value>(&state).unwrap()["recipients"][0]["fingerprint"].as_str().unwrap().to_string();
     refused.wait_for("not one of the keys");
@@ -1439,7 +1245,7 @@ fn the_first_attach_sets_up_an_ssh_state_key_and_a_restarted_agent_is_locked_unt
 
     // A key that is not there leaves it locked as well.
     set_client_key(&far, Path::new("/nonexistent/id_ed25519"));
-    let mut missing = attach_continuing(&far);
+    let mut missing = attach_to(&far, &agent);
     missing.wait_for("cannot be read");
     missing.wait_for("type here");
     assert_eq!(locked_rows(&far).0, json!(true));
@@ -1447,7 +1253,7 @@ fn the_first_attach_sets_up_an_ssh_state_key_and_a_restarted_agent_is_locked_unt
     assert!(missing.wait_exit().success());
 
     set_client_key(&far, &key.private);
-    let mut unlocks = attach_continuing(&far);
+    let mut unlocks = attach_to(&far, &agent);
     unlocks.wait_for("is unlocked");
     unlocks.wait_for("type here");
     wait_until("the agent to be open", || locked_rows(&far) == (json!(false), json!(false)));
@@ -1460,9 +1266,9 @@ fn an_encrypted_key_asks_for_its_passphrase_and_wrong_ones_leave_the_agent_locke
     let key = identity(3, Some("hunter2"));
     let far = ssh_far(&key);
     let old = first_attach(&far, &key);
-    let _agent = restart_locked(&far, &old);
+    let agent = restart_locked(&far, old);
 
-    let mut wrong = attach_continuing(&far);
+    let mut wrong = attach_to(&far, &agent);
     let asked = |t: &Term| t.text().matches("passphrase for").count();
     for (i, guess) in ["one", "two", "three"].iter().enumerate() {
         wait_until("the passphrase prompt", || asked(&wrong) > i);
@@ -1475,7 +1281,7 @@ fn an_encrypted_key_asks_for_its_passphrase_and_wrong_ones_leave_the_agent_locke
     wrong.command("/detach");
     assert!(wrong.wait_exit().success());
 
-    let mut right = attach_continuing(&far);
+    let mut right = attach_to(&far, &agent);
     right.wait_for("passphrase for");
     right.send("hunter2\r");
     right.wait_for("is unlocked");
@@ -1490,15 +1296,14 @@ fn an_encrypted_key_asks_for_its_passphrase_and_wrong_ones_leave_the_agent_locke
 fn a_reconnect_to_an_agent_that_restarted_locked_unlocks_it_when_the_key_needs_no_passphrase() {
     let key = identity(4, None);
     let far = ssh_far(&key);
-    let mut term = Term::spawn(far.mu());
+    let old = far.start(&[]);
+    let mut term = attach_to(&far, &old);
     term.wait_for("[y/N]");
     term.send("y\r");
     term.wait_for("type here");
     wait_until("the agent to have a client", || far.client_host().is_some());
-    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
-    let old = pid_of(&far.remote, &id);
 
-    let agent = restart_locked(&far, &old);
+    let agent = restart_locked(&far, old);
     wait_until("the client to unlock the restarted agent", || {
         far.agents().first().is_some_and(|a| a["locked"] == json!(false) && a["client"]["host"].is_string())
     });
@@ -1508,4 +1313,49 @@ fn a_reconnect_to_an_agent_that_restarted_locked_unlocks_it_when_the_key_needs_n
     peek.hello();
     let seen = peek.until(caught_up);
     assert!(seen.iter().any(|v| v.to_string().contains("claude-sonnet-5-5")), "{seen:?}");
+}
+
+/// A session source: its rows are listed in the Sessions tab with their host, a row with an `attach`
+/// command opens as a nested `mu --attach`, and one with only a `hint` shows the hint.
+#[test]
+fn a_session_source_lists_rows_that_open_by_their_attach_command_or_show_their_hint() {
+    let far = Far::new();
+    let agent = far.start(&[]);
+    let row = |id: &str, started: u64, extra: Value| {
+        let mut v = json!({"id": id, "cwd": "/srv/work", "started": started, "title": format!("title of {id}"), "host": "farhost"});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        v.to_string()
+    };
+    let attach = format!("{} {}", far.link.display(), agent.session);
+    let rows = [
+        row(&agent.session, 1_700_000_000, json!({"attach": attach, "hint": "unused"})),
+        row("hintonly", 1_700_000_100, json!({"hint": "open it with the-launcher-script"})),
+    ];
+    let source = far.dir.join("source.sh");
+    std::fs::write(&source, format!("#!/bin/sh\nPATH=/usr/bin:/bin\ncat <<'EOF'\n{}\nEOF\n", rows.join("\n"))).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        far.client.join("config.toml"),
+        format!("[sessions]\nsources = [[{:?}]]\n", source.display().to_string()),
+    )
+    .unwrap();
+
+    let mut term = Term::spawn(mu(&far.client, &far.cwd));
+    term.command("/jobs");
+    term.wait_for("farhost");
+    term.wait_for("Enter attaches to it");
+    // The second row only has a hint.
+    term.send("j");
+    term.wait_for("open it with the-launcher-script");
+    term.send("k");
+    term.send("\r");
+    wait_until("the nested client to attach", || far.client_host().is_some());
+    // The nested UI draws its own composer after the outer one's.
+    wait_until("the nested UI", || term.text().matches("type here").count() >= 2);
+    term.send("/detach");
+    std::thread::sleep(Duration::from_millis(300));
+    term.send("\r");
+    term.wait_for("back from the attached session");
+    wait_until("the nested client to leave", || far.client_host().is_none());
+    term.send("q");
 }

@@ -1,6 +1,7 @@
 //! Encrypted credential state (`mu_common::sealed`): what a client asks of an agent to unlock it, set
-//! its state key up, or change its recipients. The data key crosses only as base64 inside these calls,
-//! which travel the encrypted channel; no reply carries it or a private key.
+//! its state key up, or change its recipients. The data key crosses only as base64 inside these calls;
+//! no reply carries it or a private key. The attach stream is plain JSON lines, so the data key is as
+//! private as the pipe that carries it (an ssh connection, a kubectl exec): see docs/remote.md.
 
 use super::local::{Local, Registry};
 use super::{Answer, ready};

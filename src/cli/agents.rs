@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 fn agents() -> Vec<Value> {
     let mut found: Vec<(i64, Value)> = owner::live_sessions()
         .into_iter()
-        .filter(|s| matches!(s.kind.as_deref(), Some("agent" | "worker")))
+        .filter(|s| s.kind.as_deref() == Some("agent"))
         .map(|s| {
             let started = s.started.parse::<jiff::Timestamp>().map_or(0, |t| t.as_second());
             let title = list::info(&s.path).and_then(|i| i.title);
@@ -27,13 +27,6 @@ fn agents() -> Vec<Value> {
         .collect();
     found.sort_by_key(|(started, _)| *started);
     found.into_iter().map(|(_, row)| row).collect()
-}
-
-/// `mu agent key`: the fingerprint of the key that every agent of this profile shows its clients.
-pub fn key() -> Result<i32> {
-    let key = mu_common::secure::agent_key().map_err(anyhow::Error::msg)?;
-    println!("{}", key.fingerprint());
-    Ok(0)
 }
 
 pub fn list(json: bool) -> Result<i32> {

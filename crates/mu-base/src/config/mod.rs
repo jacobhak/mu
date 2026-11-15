@@ -6,10 +6,9 @@ use std::cell::RefCell;
 mod mu;
 mod retry;
 
-pub use mu::MuRemote;
 pub use mu::{Cards, MuBell, MuConfig, MuPermissions, MuStatus, MuTheme};
 pub use mu::{MuAgent, StateKey};
-use mu::{MuPredict, check_predict, check_status, load_permissions, load_remotes};
+use mu::{MuPredict, check_predict, check_status, load_permissions};
 use retry::check_retry;
 #[cfg(test)]
 use retry::{DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_WAIT, RetryPolicy};
@@ -284,8 +283,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         agent: parse(section("agent"), "agent", warn),
         permissions: load_permissions(&section("permissions"), warn),
         bell: parse(section("bell"), "bell", warn),
-        default_remote: table.get("default_remote").and_then(|v| v.as_str()).map(str::to_string),
-        remote: load_remotes(section("remote"), warn),
+        sessions: parse(section("sessions"), "sessions", warn),
     }
 }
 
@@ -650,78 +648,31 @@ mod tests {
     fn task_budget_defaults_and_overrides() {
         let d = toml::from_str::<MuConfig>("").unwrap().task;
         assert_eq!((d.soft_request_budget, d.budget_notice), (200, true));
-        assert!(d.launch.is_empty() && d.remote.is_none());
-        assert_eq!(d.reconnect_timeout, 600);
+        assert!(d.launch.is_empty() && d.launcher.is_empty());
         assert_eq!(d.max_cost, 5.0);
         assert_eq!(toml::from_str::<MuConfig>("[task]\nmax_cost = 0").unwrap().task.max_cost, 0.0);
-        let t = toml::from_str::<MuConfig>("[task]\nlaunch = [\"task\"]\nremote = \"c\"\nreconnect_timeout = 30")
-            .unwrap()
-            .task;
+        let t =
+            toml::from_str::<MuConfig>("[task]\nlaunch = [\"task\"]\nlauncher = [\"mu-remote\", \"launch\", \"c\"]")
+                .unwrap()
+                .task;
         assert_eq!(
-            (t.launch.as_slice(), t.remote.as_deref(), t.reconnect_timeout),
-            (&["task".to_string()][..], Some("c"), 30)
+            (t.launch.as_slice(), t.launcher.as_slice()),
+            (&["task".to_string()][..], &["mu-remote".to_string(), "launch".to_string(), "c".to_string()][..])
         );
         let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;
         assert_eq!((t.soft_request_budget, t.budget_notice), (50, false));
     }
 
     #[test]
-    fn the_agents_state_key_source_and_a_remotes_key_path_parse() {
+    fn the_agents_state_key_source_and_session_sources_parse() {
         let a = toml::from_str::<MuConfig>("[agent]\nstate_key = \"ssh\"\nstate_key_file = \"/k\"").unwrap().agent;
         assert_eq!((a.state_key, a.state_key_file.as_deref(), a.state_key_command), (StateKey::Ssh, Some("/k"), None));
         let d = MuAgent::default();
         assert!(d.state_key == StateKey::Off && d.state_key_file.is_none() && d.state_key_command.is_none());
-        let (c, w) = remotes("[remote.d]\nadapter = \"ssh\"\nhost = \"h\"\nstate_key = \"~/.ssh/other\"\n");
-        assert!(w.is_empty(), "{w:?}");
-        assert_eq!(c.remote["d"].state_key.as_deref(), Some("~/.ssh/other"));
-    }
-
-    fn remotes(text: &str) -> (MuConfig, Vec<String>) {
-        let mut c = toml::from_str::<MuConfig>(text).unwrap();
-        let mut w = Vec::new();
-        let table: toml::Table = text.parse().unwrap();
-        c.remote = load_remotes(table.get("remote").cloned().unwrap_or(toml::Value::Table(Default::default())), &mut w);
-        (c, w)
-    }
-
-    #[test]
-    fn remotes_parse_with_defaults() {
-        let (c, w) = remotes(
-            "default_remote = \"cluster\"\n\
-             [remote.cluster]\nadapter = \"pod\"\ntrusted = true\n\
-             [remote.cluster.settings]\nnamespace = \"ns\"\nsccache_secret_name = \"s\"\n\
-             [remote.devbox]\nadapter = \"ssh\"\nhost = \"devbox\"\nrepos = [\"/src/a\"]\n",
-        );
-        assert!(w.is_empty(), "{w:?}");
-        assert_eq!(c.default_remote.as_deref(), Some("cluster"));
-        let cluster = &c.remote["cluster"];
-        assert!(cluster.trusted);
-        assert_eq!(cluster.settings_json(), r#"{"namespace":"ns","sccache_secret_name":"s"}"#);
-        let devbox = &c.remote["devbox"];
-        assert!(!devbox.trusted);
-        assert_eq!(
-            (devbox.host.as_deref(), devbox.repos.as_slice()),
-            (Some("devbox"), ["/src/a".to_string()].as_slice())
-        );
-        assert_eq!(devbox.settings_json(), "{}");
-        assert!(MuConfig::default().remote.is_empty() && MuConfig::default().default_remote.is_none());
-    }
-
-    #[test]
-    fn invalid_remotes_are_dropped_with_a_reason() {
-        let (c, w) = remotes(
-            "[remote.a]\n[remote.b]\nadapter = \"ssh\"\n[remote.c]\nadapter = \"ssh\"\nhost = \"-oProxyCommand=x\"\n\
-             [remote.d]\nadapter = \"pod\"\n[remote.d.settings.auth]\nApi_Key = \"x\"\n\
-             [remote.e]\nadapter = \"pod\"\n[remote.e.settings]\ntoken = \"x\"\n\
-             [remote.f]\nadapter = \"pod\"\n[remote.f.settings]\nkubeconfig_path = \"/x\"\n",
-        );
-        assert_eq!(c.remote.keys().collect::<Vec<_>>(), ["f"]);
-        assert_eq!(w.len(), 5, "{w:?}");
-        assert!(w[0].contains("needs an adapter"), "{w:?}");
-        assert!(w[1].contains("needs a host"), "{w:?}");
-        assert!(w[2].contains("must not start with -"), "{w:?}");
-        assert!(w[3].contains("remote.d.settings.auth.Api_Key") && w[3].contains("secret"), "{w:?}");
-        assert!(w[4].contains("remote.e.settings.token"), "{w:?}");
+        assert!(MuConfig::default().sessions.sources.is_empty());
+        let s =
+            toml::from_str::<MuConfig>("[sessions]\nsources = [[\"mu-remote\", \"rows\"], [\"x\"]]").unwrap().sessions;
+        assert_eq!(s.sources, [vec!["mu-remote".to_string(), "rows".to_string()], vec!["x".to_string()]]);
     }
 
     #[test]

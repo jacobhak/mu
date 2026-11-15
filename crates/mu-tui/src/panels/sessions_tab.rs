@@ -22,8 +22,12 @@ pub struct Row {
     pub job: Option<String>,
     /// When the session file was last written.
     pub modified: Option<SystemTime>,
-    /// The remote it runs on; `None` for a session on this host.
+    /// The machine it runs on; `None` for a session on this host.
     pub host: Option<String>,
+    /// How to open a session on another host, from the source that listed it.
+    pub hint: Option<String>,
+    /// A shell command that opens it (`mu --attach`).
+    pub attach: Option<String>,
 }
 
 impl Row {
@@ -108,6 +112,8 @@ pub fn build(
             job,
             modified: l.modified,
             host: l.host.clone(),
+            hint: l.hint.clone(),
+            attach: l.attach.clone(),
         });
     }
     out
@@ -220,7 +226,12 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
         rows.push(vec![span(lead, faint), span(l, t.fg(Role::Strong))]);
     }
     if r.host.is_some() {
-        rows.push(vec![span("   attach with mu -r to join it", faint)]);
+        let how = match (&r.attach, &r.hint) {
+            (Some(_), _) => "Enter attaches to it".to_string(),
+            (None, Some(h)) => h.clone(),
+            (None, None) => "it runs on another machine".to_string(),
+        };
+        rows.push(vec![span(format!("   {how}"), faint)]);
         return rows;
     }
     let mut keys = vec!["Enter peek", "n message"];
@@ -267,7 +278,15 @@ mod tests {
     fn rows_of(lives: Vec<LiveSession>) -> Vec<LiveRow> {
         lives
             .into_iter()
-            .map(|live| LiveRow { parent: live.parent.clone(), modified: None, title: None, host: None, live })
+            .map(|live| LiveRow {
+                parent: live.parent.clone(),
+                modified: None,
+                title: None,
+                host: None,
+                hint: None,
+                attach: None,
+                live,
+            })
             .collect()
     }
 
@@ -385,6 +404,8 @@ mod tests {
             job: None,
             modified: None,
             host: None,
+            hint: None,
+            attach: None,
         };
         assert!(row("print").can_stop() && row("print").can_take());
         assert!(row("subagent").can_stop() && !row("subagent").can_take());
@@ -431,6 +452,8 @@ mod tests {
             job: Some("scout-1".into()),
             modified: None,
             host: None,
+            hint: None,
+            attach: None,
         };
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600 + 3700);
         let row = list_row(&r, true, 24, 0, "$0.12", 80, now, None);

@@ -11,7 +11,6 @@ pub mod setup;
 mod signals;
 mod state;
 mod unlock;
-pub mod worker;
 
 use crate::cli::Cli;
 use crate::cli::select::{agent_selector, model_label, pick_model, pick_model_or_none, pick_model_with};
@@ -132,20 +131,13 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     if cli.acp {
         return acp::run(cli.model.clone(), cli_thinking, permissions);
     }
-    if let Some(command) = &cli.nested_client {
-        return attach::run(attach::Link::Command(command.clone()), false);
+    if let Some(command) = &cli.attach {
+        return attach::run(attach::Link::new(command.clone(), cli.state_key.clone()), false);
     }
     if Mode::interactive(cli, plan.is_some()) && !agent {
-        let cfgs = mu_base::config::Configs::load();
-        match crate::remote::client::in_effect(cli.remote.as_deref(), cli.local, &cfgs)? {
-            Some(adapter) => {
-                return crate::remote::client::run(adapter, cli.resume.clone(), cli.continue_latest, cli.model.clone());
-            }
-            None => {
-                if let Some(rows) = crate::remote::client::tab_rows(&cfgs) {
-                    mu_tui::host::sessions::set_remote_rows(rows);
-                }
-            }
+        let sources = mu_base::config::Configs::load().mu.sessions.sources;
+        if !sources.is_empty() {
+            mu_tui::host::sessions::set_session_sources(sources);
         }
     }
     // `terminal`: the TUI. `interactive`: someone can answer a question or an approval, here or
@@ -256,7 +248,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     if let Some(p) = &task {
         apply_task(&mut run, p, &cfgs);
     }
-    run.task_launch = task_launch(task.as_ref(), &cfgs, cli.local);
+    run.task_launch = task_launch(task.as_ref(), &cfgs);
     if let Some(d) = &agent_def {
         apply_agent(&mut run, d);
     }
@@ -455,20 +447,17 @@ fn mirrors_session(p: &Value) -> bool {
     p["mirrorSession"] == true
 }
 
-/// The remote `task` subagents of some kinds run on. A worker (it has a task payload) gets none: it
-/// holds a copy of its parent's config and spawns its own children locally.
-fn task_launch(
+/// The launcher `task` subagents of some kinds go through. A subagent (it has a task payload) gets
+/// none: its own subagents spawn locally.
+pub(crate) fn task_launch(
     task: Option<&Value>,
     cfgs: &mu_base::config::Configs,
-    local: bool,
-) -> Option<mu_tools::tools::link::WorkerLaunch> {
-    if task.is_some() {
+) -> Option<mu_tools::tools::subagent::WorkerLaunch> {
+    let t = &cfgs.mu.task;
+    if task.is_some() || t.launcher.is_empty() || t.launch.is_empty() {
         return None;
     }
-    crate::remote::worker::launch(&cfgs.mu, local).unwrap_or_else(|e| {
-        eprintln!("warning: {e}");
-        None
-    })
+    Some(mu_tools::tools::subagent::WorkerLaunch { launcher: t.launcher.clone(), kinds: t.launch.clone() })
 }
 
 fn require_output_schema(run: &mut agent::RunConfig, s: &Value) -> Result<()> {
@@ -605,13 +594,12 @@ mod tests {
     #[test]
     fn a_process_started_with_a_task_payload_spawns_locally() {
         let mut cfgs = mu_base::config::Configs::default();
+        assert!(task_launch(None, &cfgs).is_none(), "nothing configured");
         cfgs.mu.task.launch = vec!["task".into()];
-        cfgs.mu.task.remote = Some("far".into());
-        cfgs.mu
-            .remote
-            .insert("far".into(), mu_base::config::MuRemote { adapter: "/bin/adapter".into(), ..Default::default() });
-        assert!(task_launch(Some(&json!({"task": "t"})), &cfgs, false).is_none());
-        assert!(task_launch(None, &cfgs, false).is_some_and(|l| l.runs("task") && !l.runs("scout")));
+        assert!(task_launch(None, &cfgs).is_none(), "kinds without a launcher");
+        cfgs.mu.task.launcher = vec!["/bin/launcher".into()];
+        assert!(task_launch(Some(&json!({"task": "t"})), &cfgs).is_none());
+        assert!(task_launch(None, &cfgs).is_some_and(|l| l.runs("task") && !l.runs("scout")));
     }
 
     #[test]

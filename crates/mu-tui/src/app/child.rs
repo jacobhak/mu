@@ -41,6 +41,8 @@ pub(super) enum ChildThen {
     MemoryEdit(HostEdit),
     /// `mu take` ran on the terminal for a session picked in the jobs panel.
     Take,
+    /// `mu --attach` ran on the terminal for a session another host listed.
+    Attach,
 }
 
 /// A host file being edited on this machine: the copy the editor works on, and the text it had.
@@ -126,6 +128,14 @@ impl App {
                     Ok(s) if s.success() => self.notice("back from mu take"),
                     Ok(s) => self.error(&format!("mu take exited with {s}")),
                     Err(e) => self.error(&format!("cannot run mu take: {e}")),
+                }
+                self.open_sessions();
+            }
+            ChildThen::Attach => {
+                match status {
+                    Ok(s) if s.success() => self.notice("back from the attached session"),
+                    Ok(s) => self.error(&format!("mu --attach exited with {s}")),
+                    Err(e) => self.error(&format!("cannot run mu --attach: {e}")),
                 }
                 self.open_sessions();
             }
@@ -361,6 +371,15 @@ impl App {
         });
     }
 
+    /// Hands the terminal to `mu --attach COMMAND`, then comes back to the Sessions tab.
+    pub(super) fn attach_session(&mut self, command: String) {
+        let exe = match mu_common::paths::self_exe() {
+            Ok(e) => e,
+            Err(e) => return self.error(&format!("cannot locate mu: {e}")),
+        };
+        self.start_child(ChildThen::Attach, move || run_attach(&exe, &command));
+    }
+
     /// Takes over a `-p` run beside a remote host. The agent stops the run and starts an agent on its session;
     /// this side opens a tunnel to that agent, serves it on a private socket and runs a nested client on
     /// that socket with the terminal, as `mu take` runs a nested mu locally. The first session is back when
@@ -398,18 +417,21 @@ impl App {
                     crate::host::program::quote(&exe.to_string_lossy()),
                     crate::host::program::quote(&sock.to_string_lossy())
                 );
-                app.start_child(ChildThen::Take, move || {
-                    extern "C" fn noop(_: libc::c_int) {}
-                    // SAFETY: installs a no-op handler; restored to the default below.
-                    unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
-                    let status = std::process::Command::new(&exe).arg("--nested-client").arg(command).status();
-                    // SAFETY: back to the default disposition.
-                    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
-                    status
-                });
+                app.start_child(ChildThen::Take, move || run_attach(&exe, &command));
             },
         );
     }
+}
+
+/// `mu --attach COMMAND` on the terminal, with Ctrl-C going to it and not to this mu.
+fn run_attach(exe: &std::path::Path, command: &str) -> std::io::Result<std::process::ExitStatus> {
+    extern "C" fn noop(_: libc::c_int) {}
+    // SAFETY: installs a no-op handler; restored to the default below.
+    unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    let status = std::process::Command::new(exe).arg("--attach").arg(command).status();
+    // SAFETY: back to the default disposition.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+    status
 }
 
 /// Copies lines between the nested client's connection to `listener` and the tunnel, until either ends.

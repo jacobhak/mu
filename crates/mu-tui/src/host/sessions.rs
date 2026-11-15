@@ -58,19 +58,108 @@ pub struct LiveRow {
     pub modified: Option<SystemTime>,
     /// Its title, else its first prompt; `None` when the caller has it already or there is none.
     pub title: Option<String>,
-    /// The remote it runs on, for a row that is not on this host.
+    /// The machine it runs on, for a row that is not on this host.
     #[serde(default)]
     pub host: Option<String>,
+    /// How to open a row that is not on this host, shown in the Sessions tab's status line.
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// A shell command that opens it: `mu --attach` runs it, as a take-over's nested client does.
+    #[serde(default)]
+    pub attach: Option<String>,
 }
 
-/// Rows for the agents of a remote, listed beside this host's. Set once at start-up by a client that
-/// runs here and has a `default_remote`; the call blocks, so it runs off the UI thread.
-pub type RemoteRows = Box<dyn Fn() -> Vec<LiveRow> + Send + Sync>;
+/// How long one session source may take.
+const SOURCE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
-static REMOTE_ROWS: std::sync::OnceLock<RemoteRows> = std::sync::OnceLock::new();
+/// What a session source prints, a line per agent: the shape of `mu agent list --json`, plus where it
+/// runs and how to open it.
+#[derive(Deserialize)]
+struct SourceRow {
+    id: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    started: i64,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    client: Option<owner::ClientInfo>,
+    #[serde(default)]
+    waiting: bool,
+    #[serde(default)]
+    locked: bool,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    hint: Option<String>,
+    #[serde(default)]
+    attach: Option<String>,
+}
 
-pub fn set_remote_rows(f: RemoteRows) {
-    let _ = REMOTE_ROWS.set(f);
+impl SourceRow {
+    fn row(self, source: &str) -> LiveRow {
+        let host = self.host.filter(|h| !h.trim().is_empty()).unwrap_or_else(|| source.to_string());
+        let started = jiff::Timestamp::from_second(self.started).map(|t| t.to_string()).unwrap_or_default();
+        LiveRow {
+            live: LiveSession {
+                path: Path::new("remote").join(&host).join(format!("{}.jsonl", self.id)),
+                pid: 0,
+                print_run: false,
+                inbox: false,
+                started,
+                kind: Some("agent".into()),
+                agent: None,
+                cwd: Some(self.cwd.into()),
+                parent: None,
+                abort: false,
+                waiting: self.waiting,
+                locked: self.locked,
+                client: self.client,
+            },
+            parent: None,
+            modified: None,
+            title: self.title,
+            host: Some(host),
+            hint: self.hint,
+            attach: self.attach.filter(|a| !a.trim().is_empty()),
+        }
+    }
+}
+
+/// The rows a session source's output holds; a line that is not one is skipped.
+fn source_rows(source: &str, out: &str) -> Vec<LiveRow> {
+    out.lines().filter_map(|l| serde_json::from_str::<SourceRow>(l).ok()).map(|r| r.row(source)).collect()
+}
+
+/// Commands that list agents on other machines (`[sessions] sources`), listed beside this host's.
+/// Set once at start-up; they block, so they run off the UI thread.
+static SOURCES: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
+
+pub fn set_session_sources(sources: Vec<Vec<String>>) {
+    let _ = SOURCES.set(sources.into_iter().filter(|s| !s.is_empty()).collect());
+}
+
+fn has_sources() -> bool {
+    SOURCES.get().is_some_and(|s| !s.is_empty())
+}
+
+/// Runs every source at once and returns what they print as rows. A source that fails or is slow adds none.
+async fn remote_rows() -> Vec<LiveRow> {
+    let mut runs = tokio::task::JoinSet::new();
+    for argv in SOURCES.get().into_iter().flatten().cloned() {
+        runs.spawn(async move {
+            let mut cmd = tokio::process::Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
+            let out = mu_base::process::run_capture(cmd, SOURCE_WAIT).await.unwrap_or_default();
+            source_rows(&argv[0], &out)
+        });
+    }
+    let mut rows = Vec::new();
+    while let Some(done) = runs.join_next().await {
+        rows.extend(done.unwrap_or_default());
+    }
+    rows
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -198,6 +287,8 @@ fn live_rows(source: &dyn SessionSource, me: u32, a: LiveArgs) -> Live {
             modified: std::fs::metadata(&l.path).and_then(|m| m.modified()).ok(),
             title: if a.titled.contains(&l.path) { None } else { source.title(&l.path) },
             host: None,
+            hint: None,
+            attach: None,
             live: l,
         })
         .collect();
@@ -215,16 +306,13 @@ fn live_sessions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
         live.notice = changes::unapplied_notice(&l.cwd, changes::KEPT_AFTER);
         live
     };
-    if REMOTE_ROWS.get().is_none() {
+    if !has_sources() {
         return ready(args, |a: LiveArgs| Ok::<_, String>(local(a)));
     }
     pending(args, |a: LiveArgs| {
         let mut live = local(a);
         async move {
-            let remote = tokio::task::spawn_blocking(|| REMOTE_ROWS.get().map(|f| f()).unwrap_or_default())
-                .await
-                .unwrap_or_default();
-            live.rows.extend(remote);
+            live.rows.extend(remote_rows().await);
             Ok::<_, String>(live)
         }
     })
@@ -338,6 +426,8 @@ mod tests {
                 modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5)),
                 title: Some("t".into()),
                 host: Some("cluster".into()),
+                hint: Some("mu-remote cluster".into()),
+                attach: Some("mu-remote connect cluster a".into()),
             }],
             canon: vec![("/a".into(), "/b".into())],
             notice: Some("n".into()),
@@ -371,6 +461,25 @@ mod tests {
         std::fs::write(&p, user("x")).unwrap();
         let shrunk = read_tail(args(next.offset, true, true));
         assert!(shrunk.reset && shrunk.messages.len() == 1, "{shrunk:?}");
+    }
+
+    #[test]
+    fn a_session_source_line_becomes_a_remote_row_and_a_stray_line_is_skipped() {
+        let out = concat!(
+            "{\"id\":\"abc\",\"cwd\":\"/w\",\"started\":1700000000,\"title\":\"t\",\"waiting\":true,",
+            "\"client\":{\"host\":\"laptop\",\"since\":5},\"host\":\"far\",\"hint\":\"open with X\",\"attach\":\"x abc\"}\n",
+            "not json\n",
+            "{\"id\":\"def\"}\n",
+        );
+        let rows = source_rows("prog", out);
+        assert_eq!(rows.len(), 2);
+        let first = &rows[0];
+        assert_eq!(first.host.as_deref(), Some("far"));
+        assert_eq!((first.hint.as_deref(), first.attach.as_deref()), (Some("open with X"), Some("x abc")));
+        assert!(first.live.waiting && first.live.client.as_ref().is_some_and(|c| c.host == "laptop"));
+        assert_eq!(first.title.as_deref(), Some("t"));
+        assert_eq!(rows[1].host.as_deref(), Some("prog"), "a row with no host names the source");
+        assert!(rows[1].attach.is_none());
     }
 
     #[test]

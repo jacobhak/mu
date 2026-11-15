@@ -1,5 +1,5 @@
-use super::link::WorkerLaunch;
 use super::relay::{RelayAllow, RelayServer};
+use super::subagent::WorkerLaunch;
 use super::subagent::{
     ArtifactAlloc, ChildCmd, MU_VERSION, Mirror, Outcome, prepare_launch, preview_result, run_child_observed,
 };
@@ -667,8 +667,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn only_the_kinds_launch_names_run_on_the_remote() {
-        use crate::tools::link::test_support::Fake;
+    async fn only_the_kinds_launch_names_go_through_the_launcher() {
         use std::os::unix::fs::PermissionsExt;
         let base = std::env::temp_dir().join(format!("mu-task-route-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
@@ -676,14 +675,21 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         std::fs::write(&exe, ECHO_CHILD).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let root = mu_testutil::repo();
-        let worker = "IFS= read -r a; IFS= read -r b\necho '{\"type\":\"result\",\"text\":\"remote says hi\",\"seq\":1}'\necho '{\"type\":\"exit\",\"code\":0,\"stderr\":\"\",\"seq\":2}'";
-        let fake = std::sync::Arc::new(Fake::new(&[worker]));
+        let launcher = base.join("launcher.sh");
+        let log = base.join("launched");
+        std::fs::write(
+            &launcher,
+            format!(
+                "IFS= read -r a\necho \"$MU_TASK_NAME\" >> {}\necho '{{\"type\":\"result\",\"text\":\"remote says hi\"}}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
         let mut t = Tools::for_test();
         t.child_exe = Some(exe);
         t.launch = Some(WorkerLaunch {
-            remote: fake.clone(),
+            launcher: vec!["sh".into(), launcher.to_string_lossy().into_owned()],
             kinds: vec!["task".into()],
-            reconnect: std::time::Duration::from_secs(1),
         });
         let cwd = root.to_str().unwrap();
         let a: Args = serde_json::from_value(json!({"tasks":[
@@ -696,18 +702,15 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         assert!(local.contains(r#""agent":"scout""#) && !local.contains("mirrorSession"), "{local}");
         assert!(!local.contains(r#""relay""#), "a local child is not relayed: {local}");
         assert!(far.contains("remote says hi"), "{far}");
-        assert_eq!(fake.started.lock().unwrap().len(), 1, "one worker started: the task, not the scout");
+        let launched = std::fs::read_to_string(&log).unwrap();
+        assert!(launched.lines().count() == 1 && launched.starts_with("far-"), "the task, not the scout: {launched}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_launch_prepare_is_that_rows_failure() {
         let mut t = Tools::for_test();
-        t.launch = Some(WorkerLaunch {
-            remote: std::sync::Arc::new(crate::tools::link::test_support::Unused),
-            kinds: vec!["task".into()],
-            reconnect: std::time::Duration::from_secs(1),
-        });
+        t.launch = Some(WorkerLaunch { launcher: vec!["true".into()], kinds: vec!["task".into()] });
         let dir = mu_testutil::tmp();
         let a: Args = serde_json::from_value(
             json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","cwd":dir.to_str().unwrap()}]}),

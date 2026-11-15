@@ -321,6 +321,8 @@ pub enum OverlayEvent {
     },
     /// Take over a `-p` run: the panel closes and `mu take` runs on the terminal.
     TakeSession(PathBuf),
+    /// Join a session on another host: the panel closes and `mu --attach COMMAND` runs on the terminal.
+    AttachSession(String),
     /// Show a launched job's diff in the panel.
     DiffResult {
         job: String,
@@ -1052,6 +1054,7 @@ impl Overlay {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::TerminateSession { session, pid, started }))
                 }
                 JobsResult::Take { session } => (None, Some(OverlayEvent::TakeSession(session))),
+                JobsResult::Attach { command } => (None, Some(OverlayEvent::AttachSession(command))),
                 JobsResult::Diff { job, result } => {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::DiffResult { job, result }))
                 }

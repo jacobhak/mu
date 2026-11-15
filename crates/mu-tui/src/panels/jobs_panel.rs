@@ -78,6 +78,10 @@ pub enum JobsResult {
         pid: u32,
         started: String,
     },
+    /// Join a session on another host: run `mu --attach` with this shell command.
+    Attach {
+        command: String,
+    },
     /// Take over a `-p` run (`mu take`).
     Take {
         session: PathBuf,
@@ -581,16 +585,21 @@ impl JobsPanel {
         self.refresh();
     }
 
-    /// Opens the selected session's transcript, read-only.
-    fn open_session_view(&mut self) {
-        let Some(r) = self.rows.get(self.s_at) else { return };
+    /// Opens the selected session's transcript, read-only; a session on another host is attached to
+    /// when its source gave a command for it, else the source's hint is shown.
+    fn open_session_view(&mut self) -> Option<JobsResult> {
+        let r = self.rows.get(self.s_at)?;
         if r.host.is_some() {
-            self.status = Some("a session on a remote opens with mu -r".into());
-            return;
+            if let Some(command) = &r.attach {
+                return Some(JobsResult::Attach { command: command.clone() });
+            }
+            self.status = Some(r.hint.clone().unwrap_or_else(|| "this session runs on another machine".into()));
+            return None;
         }
         let label = format!("{} · pid {}", r.label(), r.live.pid);
         self.view = Some(Self::new_view(r.id(), Some(label), Some(Followed::new(r.live.path.clone(), VIEW_KEEP))));
         self.refresh();
+        None
     }
 
     fn switch_tab(&mut self) {
@@ -784,7 +793,11 @@ impl JobsPanel {
             KeyCode::End | KeyCode::Char('G') => self.s_at = last,
             KeyCode::PageDown => self.s_at = (self.s_at + self.s_page).min(last),
             KeyCode::PageUp => self.s_at = self.s_at.saturating_sub(self.s_page),
-            KeyCode::Enter => self.open_session_view(),
+            KeyCode::Enter => {
+                if let Some(result) = self.open_session_view() {
+                    return result;
+                }
+            }
             KeyCode::Char('n') => {
                 if let Some(r) = self.rows.get(self.s_at).filter(|r| r.host.is_none()) {
                     self.input = Some(Compose { session: r.live.path.clone(), label: r.label(), text: String::new() });
@@ -1265,6 +1278,8 @@ mod tests {
             modified: None,
             title: None,
             host: None,
+            hint: None,
+            attach: None,
             live,
         });
         Live { rows: rows.collect(), canon: Vec::new(), notice: None }
