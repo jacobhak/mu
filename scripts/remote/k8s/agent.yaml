@@ -1,6 +1,7 @@
-# The main agent: one pod running `mu agent --detach`. The image is the one built from scripts/remote/Dockerfile plus
-# `kubectl` and `jq` (the agent's pod adapter needs them) and the adapter in /usr/local/lib/mu (see
-# docs/remote-kubernetes.md). Labels app=mu-task and mu-kind=agent are how `mu -r` finds it.
+# The main agent: one pod running `mu agent --detach`. <agent-image> is the `agent` target of
+# scripts/remote/Dockerfile (it carries omp, kubectl, jq, tini and the adapter in /usr/local/lib/mu); <image> in the
+# agent's config is the `worker` target (see docs/remote-kubernetes.md). Labels app=mu-task and mu-kind=agent are
+# how `mu -r` finds it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -57,7 +58,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       initContainers:
         - name: config
-          image: "<image>"
+          image: "<agent-image>"
           command: ["sh", "-c", "[ -f \"$MU_HOME/config.toml\" ] || cp /init/config.toml \"$MU_HOME/config.toml\""]
           env:
             - {name: MU_HOME, value: /home/mu/.mu}
@@ -70,12 +71,16 @@ spec:
             - {name: auth, mountPath: /home/mu/.mu}
       containers:
         - name: agent
-          image: "<image>"
+          image: "<agent-image>"
           imagePullPolicy: IfNotPresent
-          command: ["sh", "/init/init.sh"]
+          command: ["tini", "--", "sh", "/init/init.sh"]
           env:
             - {name: HOME, value: /home/mu}
             - {name: MU_HOME, value: /home/mu/.mu}
+            # omp keeps its own credentials (`/login`) in its agent directory: on the `auth` volume with mu's.
+            - {name: PI_CODING_AGENT_DIR, value: /home/mu/.mu/omp}
+            # The image's cargo home is read-only here; the registry cache goes to the home volume.
+            - {name: CARGO_HOME, value: /home/mu/.cargo}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

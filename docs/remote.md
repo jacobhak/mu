@@ -111,7 +111,7 @@ mu runs `<adapter> <verb> …` with these in the environment: `MU_REMOTE_NAME`, 
 
 ### The pod adapter
 
-`mu remote install-adapter pod` writes `mu-remote-pod` and its pod template `mu-remote-pod.yaml` from the mu binary into `~/.mu/bin/` (running it again replaces them), and `adapter = "pod"` then runs that program. It drives `kubectl` (your kubeconfig is the credential) and needs `jq`, to read the settings, on the client. One pod per agent or worker, from the image built with `scripts/remote/Dockerfile` (the Dockerfile stays in the repository: an image is built from a checkout).
+`mu remote install-adapter pod` writes `mu-remote-pod` and its pod template `mu-remote-pod.yaml` from the mu binary into `~/.mu/bin/` (running it again replaces them), and `adapter = "pod"` then runs that program. It drives `kubectl` (your kubeconfig is the credential) and needs `jq`, to read the settings, on the client. One pod per agent or worker, from the `worker` (or, for the main agent, `agent`) image built with `scripts/remote/Dockerfile` (the Dockerfile stays in the repository: an image is built from a checkout).
 
 ```toml
 [remote.cluster]
