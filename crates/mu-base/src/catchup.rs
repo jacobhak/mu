@@ -43,6 +43,14 @@ fn is_boundary(e: &AgentEvent) -> bool {
     matches!(e, AgentEvent::BlockEnd | AgentEvent::ToolEnd { .. })
 }
 
+/// A question or an approval that waits for an answer, as a one-line summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    pub id: u64,
+    pub approval: bool,
+    pub summary: String,
+}
+
 #[derive(Default)]
 pub struct Catchup {
     adapter: AgentAdapter,
@@ -55,6 +63,7 @@ pub struct Catchup {
     last: BTreeMap<State, String>,
     /// Requests waiting for an answer, by id, as the lines to send again.
     requests: BTreeMap<u64, String>,
+    waiting: BTreeMap<u64, Waiting>,
 }
 
 impl Catchup {
@@ -68,6 +77,13 @@ impl Catchup {
         let state = state_of(&ev);
         let mark = if let AgentEvent::TurnMark { leaf } = &ev { Some(leaf.clone()) } else { None };
         let ends = matches!(ev, AgentEvent::TurnEnd { .. } | AgentEvent::TurnFailed);
+        let waits = match &ev {
+            AgentEvent::Approve { request, .. } => Some((true, request.title.clone())),
+            AgentEvent::Ask { questions, .. } => {
+                Some((false, questions.first().map(|q| q.question.clone()).unwrap_or_default()))
+            }
+            _ => None,
+        };
         let wire = self.adapter.event(ev);
         let request = match &wire {
             WireEvent::Ask { id, .. }
@@ -81,6 +97,9 @@ impl Catchup {
         match request {
             Some(id) => {
                 self.requests.insert(id, line.clone());
+                if let Some((approval, summary)) = waits {
+                    self.waiting.insert(id, Waiting { id, approval, summary });
+                }
             }
             None => {
                 if let Some(leaf) = mark {
@@ -103,8 +122,7 @@ impl Catchup {
             }
         }
         // A terminal call's request goes when its tool ends.
-        let adapter = &self.adapter;
-        self.requests.retain(|id, _| adapter.is_parked(*id));
+        self.forget_answered();
         line
     }
 
@@ -122,9 +140,19 @@ impl Catchup {
     /// A command from the client: completes the handle a reply names, or returns the command for the agent.
     pub fn command(&mut self, c: WireCommand) -> Option<Command> {
         let out = self.adapter.command(c);
+        self.forget_answered();
+        out
+    }
+
+    fn forget_answered(&mut self) {
         let adapter = &self.adapter;
         self.requests.retain(|id, _| adapter.is_parked(*id));
-        out
+        self.waiting.retain(|id, _| adapter.is_parked(*id));
+    }
+
+    /// The questions and approvals that wait for an answer, oldest first.
+    pub fn waiting(&self) -> Vec<Waiting> {
+        self.waiting.values().cloned().collect()
     }
 
     /// The session entry the running turn began after, `None` when no turn runs. `Some(None)` is a turn
@@ -142,6 +170,7 @@ impl Catchup {
         }
         out.extend(self.turn.iter().map(|(_, l)| l.clone()));
         out.extend(self.last.values().cloned());
+        out.push(event_line(WireEvent::Pending { ids: self.requests.keys().copied().collect() }));
         out.extend(self.requests.values().cloned());
         out.push(event_line(WireEvent::CaughtUp));
         out
@@ -194,9 +223,11 @@ mod tests {
                         _ => "event:?".into(),
                     },
                     Incoming::CaughtUp => "caught-up".into(),
+                    Incoming::Skip => "skip".into(),
                     Incoming::Detached(r) => format!("detached:{r}"),
                 }
             })
+            .filter(|l| l != "skip")
             .collect()
     }
 
@@ -293,6 +324,53 @@ mod tests {
         assert_eq!(got.last().map(String::as_str), Some("caught-up"));
         // The newest text is still there.
         assert!(got.iter().any(|l| l == &format!("text:a{}", blocks - 1)));
+    }
+
+    #[tokio::test]
+    async fn a_reconnecting_client_shows_a_request_once_and_closes_one_the_agent_dropped() {
+        let mut c = Catchup::new();
+        let (reply, _rx) = oneshot::channel();
+        c.event(AgentEvent::Approve {
+            request: ApprovalRequest {
+                tool: "bash".into(),
+                call_id: "c".into(),
+                title: "t".into(),
+                reason: "r".into(),
+                body: "b".into(),
+                from: None,
+                grant: None,
+            },
+            reply,
+        });
+        let (tx, _out) = mpsc::unbounded_channel();
+        let client = ClientAdapter::new(tx);
+        let feed = |lines: Vec<String>| -> Vec<Incoming> {
+            lines
+                .iter()
+                .map(|l| match from_line::<AgentLine>(l).unwrap() {
+                    AgentLine::Event(w) => client.incoming(w),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        let mut shown_reply = None;
+        for i in feed(c.catch_up(vec![])) {
+            if let Incoming::Event(AgentEvent::Approve { reply, .. }) = i {
+                shown_reply = Some(reply);
+            }
+        }
+        let shown_reply = shown_reply.expect("the first catch-up opens the dialog");
+        assert!(
+            !feed(c.catch_up(vec![])).iter().any(|i| matches!(i, Incoming::Event(AgentEvent::Approve { .. }))),
+            "no second dialog for the same request"
+        );
+        assert!(!shown_reply.is_closed());
+        // Answered elsewhere: the next catch-up no longer lists it.
+        let allow = ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None };
+        c.command(WireCommand::Approval { id: 1, decision: allow });
+        feed(c.catch_up(vec![]));
+        tokio::task::yield_now().await;
+        assert!(shown_reply.is_closed(), "the dialog for a request the agent no longer has is closed");
     }
 
     #[tokio::test]

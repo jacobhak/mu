@@ -1,4 +1,7 @@
 mod cli;
+// Consumed by attach and the session picker.
+#[cfg_attr(not(test), allow(dead_code))]
+mod remote;
 mod run;
 mod update;
 mod workflow;
@@ -32,13 +35,23 @@ fn dispatch() -> Result<i32> {
     if let Some(t) = &cli.theme {
         unsafe { std::env::set_var("MU_THEME", t) };
     }
+    if matches!(cli.command, None | Some(Sub::Plan { .. }) | Some(Sub::Agent { .. })) {
+        std::thread::spawn(|| {
+            mu_base::image::prune_blobs_now();
+        });
+    }
     match cli.command.take() {
         None => run::run(&cli, None),
         Some(Sub::Plan { cmd }) => match plans_cli::plan_run(cmd) {
             Ok(r) => run::run(&cli, Some(r)),
             Err(other) => Ok(plans_cli::run_cli(other, &std::env::current_dir()?)),
         },
-        Some(Sub::Agent { model, thinking, resume, continue_latest }) => {
+        Some(Sub::Agent { cmd: Some(cli::AgentCmd::List { json }), .. }) => cli::agents::list(json),
+        Some(Sub::Agent { detach: true, .. }) => run::detach::run(),
+        Some(Sub::Agent { model, thinking, resume, continue_latest, detached, .. }) => {
+            if detached {
+                run::mark_detached();
+            }
             cli.model = model.or(cli.model.take());
             cli.thinking = thinking.or(cli.thinking.take());
             cli.resume = resume.map(Some).or(cli.resume.take());
@@ -62,9 +75,10 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Providers { cmd } => cli::providers::run(cmd),
         Sub::Web { cmd } => cli::web::run(cmd),
         Sub::Models { cmd } => cli::models::run(cmd),
+        Sub::Remote { cmd } => cli::remote::run(cmd),
         Sub::Predict { cmd } => cli::predict::run(cmd),
         Sub::MigrateProfile { name, dry_run } => workflow::migrate::run(&name, dry_run),
-        Sub::Attach { session, socket } => cli::attach::run(session.as_deref(), socket),
+        Sub::Attach { session, socket, .. } => cli::attach::run(session.as_deref(), socket),
         Sub::Plan { .. } => unreachable!("`mu plan` is routed in dispatch"),
         Sub::Agent { .. } => unreachable!("`mu agent` is routed in dispatch"),
     }

@@ -1,18 +1,22 @@
 //! `mu agent`: the agent with no terminal, serving one client at a time over a Unix socket.
 //!
 //! The socket sits beside the session's owner record (`<profile home>/run/<session id>.sock`, mode
-//! 0600) and there is no network listener: reaching a remote agent is `ssh host mu attach` or
-//! `kubectl exec -i pod -- mu attach`. A connection starts with one hello line each way; then the client's
+//! 0600) and there is no network listener: reaching a remote agent is `ssh host mu attach --stdio ID` or
+//! `kubectl exec -i pod -- mu attach --stdio ID`. A connection starts with one hello line each way (or
+//! `Busy`, when another client has the session); then the client's
 //! commands and host requests come in, and the agent's events, host replies and pushed values go out.
 //! The agent keeps running when the client goes away (`mu_base::catchup::Catchup` keeps what a client
 //! that attaches later needs) and ends only on `Command::Exit` or a signal.
 
-use mu_base::catchup::Catchup;
+use mu_base::catchup::{Catchup, Waiting};
+use mu_base::config::MuAgent;
 use mu_base::events::{AgentEvent, Command};
-use mu_base::wire::{AgentLine, ClientLine, WIRE, WireEvent, event_line, to_line};
+use mu_base::permissions::ApprovalDecision;
+use mu_base::wire::{AgentLine, ClientLine, WIRE, WireCommand, WireEvent, event_line, to_line};
 use mu_common::paths;
 use mu_common::rpc::{Framed, Line};
 use mu_session::session::format;
+use mu_session::session::owner::{self, ClientInfo};
 use mu_tui::host::Host;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -20,6 +24,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
+
+/// Set for an agent started by `mu agent --detach`.
+pub static DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `sun_path` holds 104 bytes on macOS (108 on Linux), the terminating NUL included.
 const MAX_SOCKET_PATH: usize = 100;
@@ -32,6 +39,14 @@ pub struct Init {
     pub notices: UnboundedReceiver<String>,
     /// The session is resumed, so it exists already.
     pub resumed: bool,
+    pub config: MuAgent,
+}
+
+/// Who said hello (see `ClientLine::Hello`).
+struct Hello {
+    client: String,
+    host: String,
+    take: bool,
 }
 
 /// What a connection's tasks tell the loop.
@@ -39,6 +54,7 @@ enum Inbox {
     /// A client said hello: its writer, ready for lines, and the signal that the writer has finished.
     Joined {
         id: u64,
+        hello: Hello,
         writer: UnboundedSender<String>,
         written: oneshot::Receiver<()>,
     },
@@ -48,6 +64,9 @@ enum Inbox {
 
 struct Client {
     id: u64,
+    /// The client's own id, the same across its connections.
+    who: String,
+    info: ClientInfo,
     writer: UnboundedSender<String>,
     written: oneshot::Receiver<()>,
 }
@@ -62,6 +81,10 @@ struct Server {
     client: Option<Client>,
     /// Open tunnels, by id: where the client's lines for each go.
     tunnels: std::collections::HashMap<u64, UnboundedSender<String>>,
+    config: MuAgent,
+    /// The requests that wait with no client attached, and since when.
+    unattended: std::collections::HashMap<u64, std::time::Instant>,
+    flagged: bool,
 }
 
 /// `{path}`: takes the session over for a client that has no terminal here: a `mu -p` run holding it is
@@ -147,6 +170,88 @@ impl Server {
         self.client = None;
         self.tunnels.clear();
         mu_tui::host::program::kill_all();
+        owner::set_attention(|a| a.client = None);
+    }
+
+    /// Keeps what waits with no client in view: the owner record's `waiting`, the notify command (once
+    /// per request) and the clock the approval timeout runs on.
+    fn attend(&mut self) {
+        let waiting = self.catchup.waiting();
+        self.unattended.retain(|id, _| waiting.iter().any(|w| w.id == *id));
+        if self.client.is_some() {
+            self.unattended.clear();
+        } else {
+            for w in &waiting {
+                let known = self.unattended.len();
+                self.unattended.entry(w.id).or_insert_with(std::time::Instant::now);
+                if self.unattended.len() > known {
+                    self.notify(w);
+                }
+            }
+        }
+        let flag = !self.unattended.is_empty();
+        if flag != self.flagged {
+            self.flagged = flag;
+            owner::set_attention(|a| a.waiting = flag);
+        }
+    }
+
+    fn notify(&self, w: &Waiting) {
+        let (Some(command), Some(session)) = (&self.config.notify_command, &self.session) else { return };
+        let what = if w.approval { "approval" } else { "question" };
+        let summary = format!("{what}: {}", w.summary).replace('\n', " ");
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .arg("mu-notify")
+            .arg(mu_session::session::list::id_of(session))
+            .arg(summary)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut c) => {
+                tokio::task::spawn_local(async move {
+                    let _ = c.wait().await;
+                });
+            }
+            Err(e) => eprintln!("mu agent: cannot run notify_command: {e}"),
+        }
+    }
+
+    fn timeout(&self) -> Option<std::time::Duration> {
+        (self.config.approval_timeout > 0).then(|| std::time::Duration::from_secs(self.config.approval_timeout))
+    }
+
+    /// When the first unattended request runs out of time.
+    fn next_expiry(&self) -> Option<tokio::time::Instant> {
+        let t = self.timeout()?;
+        self.unattended.values().min().map(|s| (*s + t).into())
+    }
+
+    /// Answers the requests nobody took up in time: an approval as unavailable, a question as cancelled.
+    fn expire(&mut self) {
+        let Some(limit) = self.timeout() else { return };
+        for w in self.catchup.waiting() {
+            if !self.unattended.get(&w.id).is_some_and(|s| s.elapsed() >= limit) {
+                continue;
+            }
+            let answer = if w.approval {
+                WireCommand::Approval { id: w.id, decision: ApprovalDecision::Unavailable }
+            } else {
+                WireCommand::Answer { id: w.id, answers: None }
+            };
+            self.catchup.command(answer);
+            let note = format!(
+                "no client answered the {} within {}s: {}",
+                if w.approval { "approval" } else { "question" },
+                limit.as_secs(),
+                w.summary
+            );
+            eprintln!("mu agent: {note}");
+            self.catchup.event(AgentEvent::Notice(note));
+        }
     }
 
     /// A tunnel to the agent of `session`, which runs on this host: its lines go both ways untouched.
@@ -233,24 +338,32 @@ impl Server {
             .collect()
     }
 
-    fn join(&mut self, id: u64, writer: UnboundedSender<String>, written: oneshot::Receiver<()>) {
+    fn join(&mut self, id: u64, hello: Hello, writer: UnboundedSender<String>, written: oneshot::Receiver<()>) {
         if let Some(old) = self.client.take() {
+            let same = !old.who.is_empty() && old.who == hello.client;
+            if !same && !hello.take {
+                let _ = writer.send(to_line(&AgentLine::Busy { host: old.info.host.clone(), since: old.info.since }));
+                self.client = Some(old);
+                return;
+            }
             self.tunnels.clear();
             mu_tui::host::program::kill_all();
             let _ = old.writer.send(to_line(&AgentLine::Event(WireEvent::Detached {
                 reason: "another client took this session".into(),
             })));
         }
-        let hello = AgentLine::Hello {
+        let info = ClientInfo { host: hello.host, since: jiff::Timestamp::now().as_second() };
+        owner::set_attention(|a| a.client = Some(info.clone()));
+        let greeting = AgentLine::Hello {
             wire: WIRE,
             version: env!("MU_VERSION").into(),
             host: serde_json::to_value(self.host.info()).unwrap_or_default(),
         };
-        let _ = writer.send(to_line(&hello));
+        let _ = writer.send(to_line(&greeting));
         for line in self.catchup.catch_up(self.history()) {
             let _ = writer.send(line);
         }
-        self.client = Some(Client { id, writer, written });
+        self.client = Some(Client { id, who: hello.client, info, writer, written });
     }
 
     fn on_line(&mut self, id: u64, line: ClientLine) {
@@ -307,18 +420,18 @@ async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>) 
     let mut lines = Framed::new(BufReader::new(read));
     let hello = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line()).await;
     let Ok(Some(Line::Value(v))) = hello else { return };
-    match serde_json::from_value::<ClientLine>(v) {
-        Ok(ClientLine::Hello { wire, .. }) if wire == WIRE => {}
+    let hello = match serde_json::from_value::<ClientLine>(v) {
+        Ok(ClientLine::Hello { wire, host, client, take, .. }) if wire == WIRE => Hello { client, host, take },
         Ok(ClientLine::Hello { wire, .. }) => {
             let refusal = AgentLine::Error(format!("this agent speaks wire {WIRE}, the client wire {wire}"));
             let _ = write.write_all(format!("{}\n", to_line(&refusal)).as_bytes()).await;
             return;
         }
         _ => return,
-    }
+    };
     let (writer, mut out) = unbounded_channel::<String>();
     let (done, written) = oneshot::channel();
-    if inbox.send(Inbox::Joined { id, writer, written }).is_err() {
+    if inbox.send(Inbox::Joined { id, hello, writer, written }).is_err() {
         return;
     }
     tokio::task::spawn_local(async move {
@@ -345,7 +458,7 @@ async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>) 
 }
 
 pub async fn run(init: Init) -> i32 {
-    let Init { host, cmd, mut ev, mut notices, resumed } = init;
+    let Init { host, cmd, mut ev, mut notices, resumed, config } = init;
     let mut server = Server {
         host,
         cmd,
@@ -355,6 +468,9 @@ pub async fn run(init: Init) -> i32 {
         listener: None,
         client: None,
         tunnels: Default::default(),
+        config,
+        unattended: Default::default(),
+        flagged: false,
     };
     // Before the socket exists: whoever reads the first line may signal at once.
     let (mut term, mut hup, mut int) = {
@@ -389,12 +505,20 @@ pub async fn run(init: Init) -> i32 {
     }
     let (Some(session), Some(socket)) = (server.session.clone(), server.socket.clone()) else { return 1 };
     println!("{}", serde_json::json!({"session": mu_session::session::list::id_of(&session), "socket": socket}));
+    let detached = DETACHED.load(std::sync::atomic::Ordering::SeqCst);
+    if detached {
+        // The starter has what it needs and closes its end: later output goes to the log with stderr.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // SAFETY: both descriptors are open.
+        unsafe { libc::dup2(2, 1) };
+    }
 
     let mut pushed = server.host.pushed();
     let (inbox_tx, mut inbox) = unbounded_channel::<Inbox>();
     let mut next_id = 0u64;
     let mut asked_to_stop = false;
     loop {
+        let expiry = server.next_expiry();
         tokio::select! {
             e = ev.recv() => match e {
                 Some(AgentEvent::Exit) | None => break,
@@ -418,7 +542,7 @@ pub async fn run(init: Init) -> i32 {
                 }
             }
             Some(m) = inbox.recv() => match m {
-                Inbox::Joined { id, writer, written } => server.join(id, writer, written),
+                Inbox::Joined { id, hello, writer, written } => server.join(id, hello, writer, written),
                 Inbox::Line(id, line) => server.on_line(id, line),
                 Inbox::Closed(id) => {
                     if server.client.as_ref().map(|c| c.id) == Some(id) {
@@ -430,10 +554,21 @@ pub async fn run(init: Init) -> i32 {
                 server.send(&AgentLine::Pushed { name: p.name, data: p.data });
             }
             Some(n) = notices.recv() => eprintln!("mu agent: {n}"),
+            () = async {
+                match expiry {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending().await,
+                }
+            } => server.expire(),
             _ = term.recv() => stop(&mut asked_to_stop, &server.cmd, 143),
-            _ = hup.recv() => stop(&mut asked_to_stop, &server.cmd, 129),
+            _ = hup.recv() => {
+                if !detached {
+                    stop(&mut asked_to_stop, &server.cmd, 129);
+                }
+            }
             _ = int.recv() => stop(&mut asked_to_stop, &server.cmd, 130),
         }
+        server.attend();
     }
     if let Some(socket) = &server.socket {
         let _ = std::fs::remove_file(socket);

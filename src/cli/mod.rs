@@ -1,5 +1,6 @@
 //! The `mu` command line: the flags and subcommands. Model selection lives in `select`.
 
+pub mod agents;
 pub mod attach;
 pub mod auth;
 mod chatgpt_login;
@@ -7,6 +8,7 @@ pub mod docs;
 pub mod models;
 pub mod predict;
 pub mod providers;
+pub mod remote;
 mod secret;
 pub mod select;
 pub mod web;
@@ -59,10 +61,16 @@ pub struct Cli {
     #[arg(long, requires = "print")]
     pub max_cost: Option<f64>,
     /// Run the terminal UI as a client of the `mu agent` that this shell command reaches: its stdin and
-    /// stdout carry the protocol (`'ssh host mu attach'`, `'kubectl exec -i pod -- mu attach'`). The
+    /// stdout carry the protocol (`'ssh host mu attach --stdio ID'`, `'kubectl exec -i pod -- mu attach --stdio ID'`). The
     /// command is run again, with growing pauses, when the connection drops.
     #[arg(long, value_name = "COMMAND", conflicts_with_all = ["resume", "continue_latest", "print", "headless", "acp"])]
     pub attach: Option<String>,
+    /// Run on this `[remote.NAME]` from config.toml for this run.
+    #[arg(short = 'r', long = "remote", value_name = "NAME", conflicts_with = "local")]
+    pub remote: Option<String>,
+    /// Run here even when `default_remote` is set.
+    #[arg(long)]
+    pub local: bool,
     /// Serve the Agent Client Protocol over stdio.
     #[arg(long, conflicts_with_all = ["resume", "continue_latest", "print", "headless"])]
     pub acp: bool,
@@ -131,7 +139,8 @@ pub enum Sub {
         markdown: bool,
     },
     /// Run the agent of a session with no terminal. It prints `{"session":ID,"socket":PATH}` and serves one
-    /// client at a time on that Unix socket (see `mu attach`); it keeps running when the client leaves.
+    /// client at a time on that Unix socket (see docs/remote.md); it keeps running when the client leaves.
+    /// `mu agent list` lists the agents running here.
     Agent {
         #[arg(long)]
         model: Option<String>,
@@ -143,15 +152,33 @@ pub enum Sub {
         /// Resume the latest session for this directory.
         #[arg(short = 'c', long = "continue")]
         continue_latest: bool,
+        /// Start the agent in the background: it leaves this terminal and session, logs to
+        /// `<profile home>/logs/agent-<id>.log`, and this command prints `{"id":ID}` once it listens.
+        #[arg(long, conflicts_with = "detached")]
+        detach: bool,
+        /// What `--detach` starts: an agent that ignores SIGHUP and has its output in a log.
+        #[arg(long, hide = true)]
+        detached: bool,
+        #[command(subcommand)]
+        cmd: Option<AgentCmd>,
     },
-    /// Join a running `mu agent` from this terminal's stdin and stdout: copies lines to and from its socket.
+    /// Join a running `mu agent` from this process's stdin and stdout: copies lines to and from its socket.
     /// With no session it finds the one agent running in this directory.
+    #[command(hide = true)]
     Attach {
+        /// Required: the raw protocol stream, for `ssh host mu attach --stdio ID`.
+        #[arg(long, required = true)]
+        stdio: bool,
         /// Session id (prefix).
         session: Option<String>,
         /// A socket path, instead of a session.
         #[arg(long, conflicts_with = "session")]
         socket: Option<PathBuf>,
+    },
+    /// Remotes from config.toml: `mu remote list|check NAME`.
+    Remote {
+        #[command(subcommand)]
+        cmd: remote::Cmd,
     },
     /// Take over a running `mu -p` session: stop it after its current step, then resume it here.
     Take {
@@ -187,6 +214,16 @@ pub enum Sub {
     },
 }
 
+#[derive(clap::Subcommand)]
+pub enum AgentCmd {
+    /// List the agents running here, one per line.
+    List {
+        /// One JSON object per line: id, cwd, started (unix seconds), title, client, waiting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,11 +237,28 @@ mod tests {
     }
 
     #[test]
+    fn remote_flags_and_subcommand_parse() {
+        let c = Cli::try_parse_from(["mu", "-r", "devbox"]).unwrap();
+        assert_eq!((c.remote.as_deref(), c.local), (Some("devbox"), false));
+        assert!(Cli::try_parse_from(["mu", "--local"]).unwrap().local);
+        assert!(Cli::try_parse_from(["mu", "-r", "a", "--local"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["mu", "remote", "check", "a"]).unwrap().command,
+            Some(Sub::Remote { cmd: remote::Cmd::Check { .. } })
+        ));
+        assert!(Cli::try_parse_from(["mu", "remote", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "remote", "check"]).is_err());
+    }
+
+    #[test]
     fn agent_and_attach_take_their_own_flags() {
         assert!(Cli::try_parse_from(["mu", "agent", "--model", "a/b", "--resume", "abc"]).is_ok());
         assert!(Cli::try_parse_from(["mu", "agent", "-c", "--permissions", "yolo"]).is_ok());
-        assert!(Cli::try_parse_from(["mu", "attach"]).is_ok());
-        assert!(Cli::try_parse_from(["mu", "attach", "abc"]).is_ok());
-        assert!(Cli::try_parse_from(["mu", "attach", "abc", "--socket", "/x"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "attach"]).is_err(), "the raw pipe needs --stdio");
+        assert!(Cli::try_parse_from(["mu", "attach", "--stdio"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach", "--stdio", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "attach", "--stdio", "abc", "--socket", "/x"]).is_err());
+        assert!(Cli::try_parse_from(["mu", "agent", "--detach"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "list", "--json"]).is_ok());
     }
 }

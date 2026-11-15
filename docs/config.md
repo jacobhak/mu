@@ -3,6 +3,8 @@
 `~/.mu/config.toml` is optional, and so is every key in it. The values below are the defaults. Model roles, per-model limits and compaction thresholds live in [`models.toml`](model-roles.md#models-toml), not here; a `[compaction]` table left in `config.toml` is no longer read and warns at startup.
 
 ```toml
+# default_remote = "devbox"  # plain `mu` runs on this remote; `mu --local` runs here (see remote.md#remotes)
+
 [theme]
 source = "tokyo-night"  # default; or "terminal" (follow your terminal's palette), "omarchy", a bundled or ~/.mu/themes name, or a colors.toml path
 # accent = "blue"     # palette key or "#rrggbb"
@@ -55,6 +57,17 @@ soft_request_budget = 200  # a scout is capped at 100 however high this is
 budget_notice = true       # the wrap-up notice at the budget
 max_cost = 5.0             # most a launched worker may spend (USD) on the model calls it makes through this session; 0 turns the cap off
 # launcher = ["/path/to/pod-run.sh"]  # run every `task` subagent through this command instead of `mu --headless`; MU_TASK_LAUNCHER overrides it with one program path; see below
+
+# [agent]                # `mu agent` with no client attached (see remote.md#when-nobody-is-attached)
+# notify_command = "notify-send \"mu $1\" \"$2\""  # run under sh -c when a question or approval starts waiting; $1 is the session id, $2 a one-line summary
+# approval_timeout = 0   # seconds after which a waiting approval is answered "unavailable" (a question is cancelled); 0 waits for ever
+
+# [remote.devbox]        # where agents can run besides here; `mu -r devbox`, `mu remote list|check` (see remote.md#remotes)
+# adapter = "ssh"        # "ssh" is built in (needs host); anything else is a program on PATH or a path
+# host = "devbox"
+# trusted = false        # true for a remote you control; only a trusted one may run the main agent
+# repos = []             # on an untrusted remote: the repositories (paths or origin URLs) whose workers may run there
+# [remote.devbox.settings]  # passed to the adapter as JSON; no secrets (keys like token, password, secret, key are refused)
 
 [update]
 check = true          # daily release check at startup

@@ -295,6 +295,8 @@ mod tests {
             cwd: Some(PathBuf::from("/work")),
             parent: Some(PathBuf::from("/s/p.jsonl")),
             abort: false,
+            waiting: false,
+            client: None,
         }
     }
 

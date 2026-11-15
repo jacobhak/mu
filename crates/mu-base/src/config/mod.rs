@@ -6,8 +6,10 @@ use std::cell::RefCell;
 mod mu;
 mod retry;
 
+pub use mu::MuAgent;
+pub use mu::MuRemote;
 pub use mu::{Cards, MuBell, MuConfig, MuPermissions, MuStatus, MuTheme};
-use mu::{MuPredict, check_predict, check_status, load_permissions};
+use mu::{MuPredict, check_predict, check_status, load_permissions, load_remotes};
 use retry::check_retry;
 #[cfg(test)]
 use retry::{DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_WAIT, RetryPolicy};
@@ -279,8 +281,11 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         secrets: parse(section("secrets"), "secrets", warn),
         status,
         task: parse(section("task"), "task", warn),
+        agent: parse(section("agent"), "agent", warn),
         permissions: load_permissions(&section("permissions"), warn),
         bell: parse(section("bell"), "bell", warn),
+        default_remote: table.get("default_remote").and_then(|v| v.as_str()).map(str::to_string),
+        remote: load_remotes(section("remote"), warn),
     }
 }
 
@@ -656,6 +661,54 @@ mod tests {
         assert_eq!(t.launcher, ["/bin/run", "-x"]);
         let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;
         assert_eq!((t.soft_request_budget, t.budget_notice), (50, false));
+    }
+
+    fn remotes(text: &str) -> (MuConfig, Vec<String>) {
+        let mut c = toml::from_str::<MuConfig>(text).unwrap();
+        let mut w = Vec::new();
+        let table: toml::Table = text.parse().unwrap();
+        c.remote = load_remotes(table.get("remote").cloned().unwrap_or(toml::Value::Table(Default::default())), &mut w);
+        (c, w)
+    }
+
+    #[test]
+    fn remotes_parse_with_defaults() {
+        let (c, w) = remotes(
+            "default_remote = \"cluster\"\n\
+             [remote.cluster]\nadapter = \"pod\"\ntrusted = true\n\
+             [remote.cluster.settings]\nnamespace = \"ns\"\nsccache_secret_name = \"s\"\n\
+             [remote.devbox]\nadapter = \"ssh\"\nhost = \"devbox\"\nrepos = [\"/src/a\"]\n",
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.default_remote.as_deref(), Some("cluster"));
+        let cluster = &c.remote["cluster"];
+        assert!(cluster.trusted);
+        assert_eq!(cluster.settings_json(), r#"{"namespace":"ns","sccache_secret_name":"s"}"#);
+        let devbox = &c.remote["devbox"];
+        assert!(!devbox.trusted);
+        assert_eq!(
+            (devbox.host.as_deref(), devbox.repos.as_slice()),
+            (Some("devbox"), ["/src/a".to_string()].as_slice())
+        );
+        assert_eq!(devbox.settings_json(), "{}");
+        assert!(MuConfig::default().remote.is_empty() && MuConfig::default().default_remote.is_none());
+    }
+
+    #[test]
+    fn invalid_remotes_are_dropped_with_a_reason() {
+        let (c, w) = remotes(
+            "[remote.a]\n[remote.b]\nadapter = \"ssh\"\n[remote.c]\nadapter = \"ssh\"\nhost = \"-oProxyCommand=x\"\n\
+             [remote.d]\nadapter = \"pod\"\n[remote.d.settings.auth]\nApi_Key = \"x\"\n\
+             [remote.e]\nadapter = \"pod\"\n[remote.e.settings]\ntoken = \"x\"\n\
+             [remote.f]\nadapter = \"pod\"\n[remote.f.settings]\nkubeconfig_path = \"/x\"\n",
+        );
+        assert_eq!(c.remote.keys().collect::<Vec<_>>(), ["f"]);
+        assert_eq!(w.len(), 5, "{w:?}");
+        assert!(w[0].contains("needs an adapter"), "{w:?}");
+        assert!(w[1].contains("needs a host"), "{w:?}");
+        assert!(w[2].contains("must not start with -"), "{w:?}");
+        assert!(w[3].contains("remote.d.settings.auth.Api_Key") && w[3].contains("secret"), "{w:?}");
+        assert!(w[4].contains("remote.e.settings.token"), "{w:?}");
     }
 
     #[test]

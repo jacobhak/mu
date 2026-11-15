@@ -14,10 +14,11 @@ use crate::permissions::{ApprovalDecision, ApprovalRequest};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 /// Raised with every change to `WireCommand`, `WireEvent` or a host request.
-pub const WIRE: u32 = 1;
+pub const WIRE: u32 = 2;
 
 /// Front end to agent.
 #[derive(Serialize, Deserialize)]
@@ -89,6 +90,11 @@ pub enum WireEvent {
     /// Everything the client missed has been sent: from here on events are live. Until it arrives the
     /// client does not ring the bell or notify for what it is shown.
     CaughtUp,
+    /// The request ids the agent still waits on, sent in a catch-up before those requests: a dialog
+    /// the client shows for any other id was answered elsewhere and is closed.
+    Pending {
+        ids: Vec<u64>,
+    },
     /// Another client took the session, or the agent ended the connection: the client prints the
     /// reason and exits.
     Detached {
@@ -103,6 +109,18 @@ pub enum ClientLine {
     Hello {
         wire: u32,
         version: String,
+        /// The connection follows a lost one: it must not take the session from another client.
+        #[serde(default)]
+        reconnect: bool,
+        /// The client's host name, shown to whoever else wants the session.
+        #[serde(default)]
+        host: String,
+        /// Stands for one client across its connections: a lost connection's successor is not "another".
+        #[serde(default)]
+        client: String,
+        /// Take the session from the client that has it, instead of being answered `Busy`.
+        #[serde(default)]
+        take: bool,
     },
     Command(WireCommand),
     /// A request for host state; answered by an `AgentLine::HostReply` with the same id.
@@ -141,6 +159,12 @@ pub enum AgentLine {
         host: serde_json::Value,
     },
     Event(WireEvent),
+    /// Another client has the session, since `since` (unix seconds): the agent closes the connection
+    /// after this line. A hello with `take` takes the session.
+    Busy {
+        host: String,
+        since: i64,
+    },
     HostReply {
         id: u64,
         result: Result<serde_json::Value, String>,
@@ -334,6 +358,8 @@ pub enum Incoming {
     Event(AgentEvent),
     CaughtUp,
     Detached(String),
+    /// Nothing to show: a request the client already shows, or the list of pending ones.
+    Skip,
 }
 
 /// The front end's side: turns wire events back into events with fresh local reply handles, whose
@@ -342,11 +368,13 @@ pub enum Incoming {
 /// Needs a Tokio runtime: each reply handle gets a task that waits for it.
 pub struct ClientAdapter {
     out: mpsc::UnboundedSender<WireCommand>,
+    /// The requests shown and not yet answered, by id: the task that waits for each reply handle.
+    live: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>,
 }
 
 impl ClientAdapter {
     pub fn new(out: mpsc::UnboundedSender<WireCommand>) -> Self {
-        Self { out }
+        Self { out, live: Arc::default() }
     }
 
     pub fn command(&self, mut c: Command) -> WireCommand {
@@ -357,12 +385,38 @@ impl ClientAdapter {
     /// Waits for the local reply handle; a handle dropped unanswered is reported so the agent drops its own.
     fn relay<T: Send + 'static>(&self, id: u64, rx: oneshot::Receiver<T>, reply: fn(u64, T) -> WireCommand) {
         let out = self.out.clone();
-        tokio::spawn(async move {
-            let _ = out.send(match rx.await {
+        let live = self.live.clone();
+        let task = tokio::spawn(async move {
+            let command = match rx.await {
                 Ok(v) => reply(id, v),
                 Err(_) => WireCommand::Dropped { id },
-            });
+            };
+            if let Ok(mut l) = live.lock() {
+                l.remove(&id);
+            }
+            let _ = out.send(command);
         });
+        if let Ok(mut l) = self.live.lock() {
+            l.insert(id, task.abort_handle());
+        }
+    }
+
+    /// The agent's pending ids: a request shown for any other id is forgotten, which closes its
+    /// reply handle without telling the agent (it no longer has the request).
+    fn settle(&self, pending: &[u64]) {
+        if let Ok(mut l) = self.live.lock() {
+            l.retain(|id, task| {
+                let keep = pending.contains(id);
+                if !keep {
+                    task.abort();
+                }
+                keep
+            });
+        }
+    }
+
+    fn shown(&self, id: u64) -> bool {
+        self.live.lock().is_ok_and(|l| l.contains_key(&id))
     }
 
     /// What a wire event is to the front end: an event, or one of the two that end or settle a connection.
@@ -370,6 +424,19 @@ impl ClientAdapter {
         match w {
             WireEvent::CaughtUp => Incoming::CaughtUp,
             WireEvent::Detached { reason } => Incoming::Detached(reason),
+            WireEvent::Pending { ids } => {
+                self.settle(&ids);
+                Incoming::Skip
+            }
+            WireEvent::Ask { id, .. }
+            | WireEvent::Approve { id, .. }
+            | WireEvent::WebSetup { id }
+            | WireEvent::PlanReview { id, .. }
+            | WireEvent::PtyOpen { id, .. }
+                if self.shown(id) =>
+            {
+                Incoming::Skip
+            }
             w => Incoming::Event(self.event(w)),
         }
     }
@@ -378,7 +445,9 @@ impl ClientAdapter {
     /// they come out as an empty notice.
     pub fn event(&self, w: WireEvent) -> AgentEvent {
         match w {
-            WireEvent::CaughtUp | WireEvent::Detached { .. } => AgentEvent::Notice(String::new()),
+            WireEvent::CaughtUp | WireEvent::Detached { .. } | WireEvent::Pending { .. } => {
+                AgentEvent::Notice(String::new())
+            }
             WireEvent::Event(mut ev) => {
                 event_inputs(&mut ev, keep);
                 ev

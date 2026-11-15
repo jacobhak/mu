@@ -1601,6 +1601,8 @@ mod tests {
             cwd: Some(PathBuf::from("/work/other")),
             parent: None,
             abort: false,
+            waiting: false,
+            client: None,
         }
     }
 

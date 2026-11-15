@@ -889,6 +889,16 @@ impl Overlay {
     pub fn new_ask(qs: Vec<AskQuestion>, reply: oneshot::Sender<Option<Vec<Answer>>>) -> Overlay {
         Overlay::Ask(Box::new(AskState::new(qs, reply)))
     }
+    /// A dialog whose request is gone: the agent answered it elsewhere or no longer has it.
+    pub fn request_gone(&self) -> bool {
+        match self {
+            Overlay::Approve(a) => a.reply_closed(),
+            Overlay::Ask(a) => a.reply.as_ref().is_some_and(|r| r.is_closed()),
+            Overlay::Review { reply, .. } => reply.as_ref().is_some_and(|r| r.is_closed()),
+            _ => false,
+        }
+    }
+
     /// The picker inside this overlay, for everything but the plan review.
     pub fn select(&self) -> Option<&Select> {
         match self {

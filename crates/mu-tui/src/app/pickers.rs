@@ -88,6 +88,15 @@ impl App {
         self.open_next_dialog();
     }
 
+    /// Closes the dialogs whose request is gone (answered on another client, or not asked again after a
+    /// reconnect).
+    pub(super) fn close_stale_dialogs(&mut self) {
+        if self.overlay.as_ref().is_some_and(Overlay::request_gone) {
+            self.overlay = None;
+        }
+        self.parked.retain(|o| !o.request_gone());
+    }
+
     /// Shows the next queued dialog once none is up: a queued picker, ask or review first, then
     /// the oldest approval (those whose turn is over are dropped).
     pub(super) fn open_next_dialog(&mut self) {
@@ -719,6 +728,8 @@ mod session_tests {
             cwd: Some(PathBuf::from("/work/other")),
             parent: None,
             abort: false,
+            waiting: false,
+            client: None,
         }
     }
 

@@ -1,6 +1,6 @@
-//! `mu attach`: joins this process's stdin and stdout to a running `mu agent`'s socket. It knows nothing
-//! of the lines it copies, so `ssh host mu attach` and `kubectl exec -i pod -- mu attach` carry the
-//! protocol to a client on another machine.
+//! `mu attach --stdio`: joins this process's stdin and stdout to a running `mu agent`'s socket. It knows
+//! nothing of the lines it copies, so `ssh host mu attach --stdio ID` and
+//! `kubectl exec -i pod -- mu attach --stdio ID` carry the protocol to a client on another machine.
 
 use anyhow::{Result, bail};
 use mu_common::paths;

@@ -81,6 +81,74 @@ pub fn resolve(data: &str) -> Option<String> {
     Some(STANDARD.encode(bytes))
 }
 
+const BLOB_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
+const BLOB_GC_EVERY: u64 = 86_400;
+/// Where blob references live: session files and their run, inbox and delivery records.
+const BLOB_REF_DIRS: &[&str] = &["sessions", "run", "inbox", "deliveries"];
+
+/// Adds every blob hash mentioned in the files under `dir` to `out`. `false` if anything could not be read.
+fn collect_refs(dir: &Path, out: &mut std::collections::HashSet<String>) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let mut ok = true;
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        let path = entry.path();
+        let Ok(ty) = entry.file_type() else { return false };
+        if ty.is_dir() {
+            ok &= collect_refs(&path, out);
+        } else if ty.is_file() {
+            let Ok(text) = std::fs::read(&path) else { return false };
+            let text = String::from_utf8_lossy(&text);
+            for (i, _) in text.match_indices(BLOB_PREFIX) {
+                let hash = text[i + BLOB_PREFIX.len()..].chars().take(64).collect::<String>();
+                if is_ref(&format!("{BLOB_PREFIX}{hash}")) {
+                    out.insert(hash);
+                }
+            }
+        }
+    }
+    ok
+}
+
+/// Removes blobs in `<profile>/blobs` that no file in the profile references and that are older than 30
+/// days, at most once a day (stamp `<profile>/blobs.gc`). Any unreadable file under the profile skips the
+/// run, so a blob is never removed on partial knowledge. Returns how many were removed.
+pub fn prune_blobs(profile: &Path, now: std::time::SystemTime) -> usize {
+    let secs = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let stamp = profile.join("blobs.gc");
+    let last = std::fs::read_to_string(&stamp).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    if last.is_some_and(|l| secs(now).saturating_sub(l) < BLOB_GC_EVERY) {
+        return 0;
+    }
+    let Ok(blobs) = std::fs::read_dir(profile.join("blobs")) else { return 0 };
+    let mut refs = std::collections::HashSet::new();
+    if !BLOB_REF_DIRS.iter().all(|d| collect_refs(&profile.join(d), &mut refs)) {
+        return 0;
+    }
+    let mut removed = 0;
+    for entry in blobs.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|n| is_ref(&format!("{BLOB_PREFIX}{n}"))) else { continue };
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| now.duration_since(m).is_ok_and(|age| age > BLOB_MAX_AGE));
+        if old && !refs.contains(name) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    let _ = mu_common::fs::write_atomic(&stamp, secs(now).to_string().as_bytes());
+    removed
+}
+
+/// `prune_blobs` for the current profile.
+pub fn prune_blobs_now() -> usize {
+    prune_blobs(&mu_common::paths::profile_home(), std::time::SystemTime::now())
+}
+
 /// Moves an image's inline base64 into the blob store, so what stays in memory (and in the session
 /// file) is a short reference. An image that cannot be stored stays inline: attaching never fails for it.
 pub fn externalize(img: Image) -> Image {
@@ -240,5 +308,55 @@ mod tests {
         // Inline data can be moved into the store.
         let moved = externalize(Image { data: STANDARD.encode(&png), mime_type: "image/png".into() });
         assert_eq!(moved.data, img.data);
+    }
+
+    fn set_age(p: &Path, days: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+    }
+
+    fn profile_with_blobs() -> (PathBuf, [PathBuf; 3]) {
+        let p = std::env::temp_dir().join(format!("mu-gc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(p.join("blobs")).unwrap();
+        std::fs::create_dir_all(p.join("sessions/x")).unwrap();
+        let [kept, orphan, fresh] = ["a", "b", "c"].map(|c| p.join("blobs").join(c.repeat(64)));
+        for (f, d) in [(&kept, 40), (&orphan, 40), (&fresh, 1)] {
+            std::fs::write(f, b"x").unwrap();
+            set_age(f, d);
+        }
+        std::fs::write(p.join("sessions/x/s.jsonl"), format!("{{\"data\":\"{BLOB_PREFIX}{}\"}}\n", "a".repeat(64)))
+            .unwrap();
+        (p, [kept, orphan, fresh])
+    }
+
+    #[test]
+    fn prune_removes_only_old_unreferenced_blobs_once_a_day() {
+        let (p, [kept, orphan, fresh]) = profile_with_blobs();
+        let now = std::time::SystemTime::now();
+        assert_eq!(prune_blobs(&p, now), 1);
+        assert!(kept.exists() && fresh.exists() && !orphan.exists());
+        // A second run within a day does nothing, even for a newly orphaned blob.
+        std::fs::remove_file(p.join("sessions/x/s.jsonl")).unwrap();
+        assert_eq!(prune_blobs(&p, now + std::time::Duration::from_secs(3600)), 0);
+        assert!(kept.exists());
+        assert_eq!(prune_blobs(&p, now + std::time::Duration::from_secs(2 * 86_400)), 1);
+        assert!(!kept.exists() && fresh.exists());
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_skips_when_a_session_file_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (p, [_, orphan, _]) = profile_with_blobs();
+        let bad = p.join("sessions/x/bad.jsonl");
+        std::fs::write(&bad, "{}").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&bad).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        assert_eq!(prune_blobs(&p, std::time::SystemTime::now()), 0);
+        assert!(orphan.exists());
+        let _ = std::fs::remove_dir_all(&p);
     }
 }

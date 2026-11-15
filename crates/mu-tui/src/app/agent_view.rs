@@ -558,6 +558,7 @@ impl App {
         for effect in fx {
             self.apply(effect);
         }
+        self.close_stale_dialogs();
         self.open_next_dialog();
         if spend {
             self.poll_spend();

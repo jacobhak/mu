@@ -25,13 +25,15 @@ pub struct Row {
 }
 
 impl Row {
-    /// `print`, `subagent review-lead`, `tui`; `?` for a record that says nothing.
+    /// `print`, `subagent review-lead`, `tui`; `?` for a record that says nothing. An agent with a
+    /// request that waits for a client adds ` waiting`.
     pub fn label(&self) -> String {
         let kind = self.live.kind.as_deref().unwrap_or("?");
-        match &self.live.agent {
+        let label = match &self.live.agent {
             Some(a) => format!("{kind} {a}"),
             None => kind.to_string(),
-        }
+        };
+        if self.live.waiting { format!("{label} waiting") } else { label }
     }
 
     /// `s` can stop it: a `-p` run stops after its step, a subagent is terminated, an interactive mu
@@ -45,7 +47,7 @@ impl Row {
     }
 
     /// `S` can terminate it: an interactive mu or an agent (it ends its session the proper way), after a
-    /// confirmation. An agent is joined with `mu attach`, not taken over, so `t` is not offered for it.
+    /// confirmation. An agent is joined by a client, not taken over, so `t` is not offered for it.
     pub fn can_terminate(&self) -> bool {
         matches!(self.live.kind.as_deref(), Some("tui" | "agent"))
     }
@@ -234,6 +236,8 @@ mod tests {
             cwd: Some(PathBuf::from("/work/proj")),
             parent: None,
             abort: false,
+            waiting: false,
+            client: None,
         }
     }
 
@@ -338,12 +342,14 @@ mod tests {
         modern.live.abort = true;
         assert!(modern.can_stop() && !modern.can_take());
         assert!(!row("acp").can_stop() && !row("acp").can_terminate());
-        // An agent is joined with `mu attach`, not taken over; it can be told to abort or to end.
+        // An agent is joined by a client, not taken over; it can be told to abort or to end.
         let mut agent = row("agent");
         assert!(agent.can_terminate() && !agent.can_take() && !agent.can_stop());
         agent.live.abort = true;
         assert!(agent.can_stop());
         assert_eq!(agent.label(), "agent");
+        agent.live.waiting = true;
+        assert_eq!(agent.label(), "agent waiting");
         let mut r = row("subagent");
         r.live.agent = Some("review-lead".into());
         assert_eq!(r.label(), "subagent review-lead");

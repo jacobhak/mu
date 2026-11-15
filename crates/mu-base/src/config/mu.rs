@@ -3,10 +3,14 @@
 use super::retry::MuRetry;
 use crate::permissions::{PermissionMode, RuleSet};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct MuConfig {
+    /// The remote plain `mu` runs on; `mu --local` runs here.
+    pub default_remote: Option<String>,
+    pub remote: BTreeMap<String, MuRemote>,
     pub predict: MuPredict,
     pub ask: MuAsk,
     pub theme: MuTheme,
@@ -17,10 +21,101 @@ pub struct MuConfig {
     pub secrets: MuSecrets,
     pub status: MuStatus,
     pub task: MuTask,
+    pub agent: MuAgent,
     /// `[permissions]`, parsed by `load_permissions` rather than serde.
     #[serde(skip)]
     pub permissions: MuPermissions,
     pub bell: MuBell,
+}
+
+/// `[remote.NAME]`: where agents can run besides here. `adapter` is `ssh` (built in, needs `host`) or
+/// a program on PATH or a path. `settings` goes to the adapter as JSON and mu does not read it.
+/// `trusted` and `repos` are mu's own: whether the main agent may run there, and the repositories
+/// (paths or origin URLs) whose workers may run on an untrusted remote.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MuRemote {
+    pub adapter: String,
+    pub host: Option<String>,
+    pub settings: toml::Table,
+    pub trusted: bool,
+    pub repos: Vec<String>,
+}
+
+const SECRET_WORDS: [&str; 8] = ["token", "password", "passwd", "secret", "key", "apikey", "credential", "credentials"];
+/// A trailing word that makes the key a reference to a secret rather than the secret itself.
+const REFERENCE_WORDS: [&str; 6] = ["name", "ref", "file", "path", "env", "var"];
+
+fn secret_looking(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|p| !p.is_empty()).collect();
+    parts.iter().any(|p| SECRET_WORDS.contains(p)) && !parts.last().is_some_and(|p| REFERENCE_WORDS.contains(p))
+}
+
+fn find_secret_key(t: &toml::Table, path: &str) -> Option<String> {
+    t.iter().find_map(|(k, v)| {
+        let here = format!("{path}.{k}");
+        if secret_looking(k) {
+            return Some(here);
+        }
+        match v {
+            toml::Value::Table(inner) => find_secret_key(inner, &here),
+            _ => None,
+        }
+    })
+}
+
+impl MuRemote {
+    /// Why `[remote.NAME]` cannot be used, if it cannot.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("a remote needs a name".to_string());
+        }
+        let adapter = self.adapter.trim();
+        if adapter.is_empty() {
+            return Err(format!("[remote.{name}] needs an adapter (`ssh`, or a program)"));
+        }
+        if adapter == "ssh" {
+            match self.host.as_deref().map(str::trim) {
+                None | Some("") => return Err(format!("[remote.{name}] uses the ssh adapter and needs a host")),
+                Some(h) if h.starts_with('-') => {
+                    return Err(format!("[remote.{name}] host {h:?} must not start with -"));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(k) = find_secret_key(&self.settings, &format!("remote.{name}.settings")) {
+            return Err(format!(
+                "[{k}] looks like a secret; mu config never holds credentials: the adapter reads them from where \
+                 its tool keeps them (ssh-agent, kubeconfig). A reference ending in _name, _ref, _file, _path, \
+                 _env or _var is fine"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `settings` as the JSON the adapter gets in `MU_REMOTE_SETTINGS`.
+    pub fn settings_json(&self) -> String {
+        serde_json::to_string(&self.settings).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Parses `[remote.*]`; a remote that cannot be used is dropped with a warning.
+pub(super) fn load_remotes(v: toml::Value, warn: &mut Vec<String>) -> BTreeMap<String, MuRemote> {
+    let remotes: BTreeMap<String, MuRemote> = v.try_into().unwrap_or_else(|e| {
+        warn.push(format!("config.toml: ignoring [remote]: {e}"));
+        BTreeMap::new()
+    });
+    remotes
+        .into_iter()
+        .filter(|(name, r)| match r.validate(name) {
+            Ok(()) => true,
+            Err(e) => {
+                warn.push(format!("config.toml: ignoring remote: {e}"));
+                false
+            }
+        })
+        .collect()
 }
 
 /// `[permissions]`: which tool calls may run without asking, and the rules that override it.
@@ -164,6 +259,17 @@ impl Default for MuTask {
     fn default() -> Self {
         Self { soft_request_budget: 200, budget_notice: true, launcher: Vec::new(), max_cost: 5.0 }
     }
+}
+
+/// `[agent]`: what `mu agent` does when a question or approval waits and no client is attached.
+/// `notify_command` is run (under `sh -c`) with the session id and a one-line summary as `$1` and
+/// `$2`; `approval_timeout` is the seconds after which a waiting approval is answered `Unavailable`
+/// (a waiting question is cancelled); 0 (the default) waits for ever.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MuAgent {
+    pub notify_command: Option<String>,
+    pub approval_timeout: u64,
 }
 
 /// `[mcp]`: `lifetime` of MCP server processes (`session`, `idle:10m`, `call`); default `session`.

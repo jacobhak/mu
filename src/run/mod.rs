@@ -3,6 +3,7 @@
 
 mod acp;
 mod attach;
+pub mod detach;
 mod headless;
 mod relay;
 mod serve;
@@ -110,6 +111,11 @@ impl Mode {
 /// Runs the front end `cli` asks for. `plan` is the first step of a `mu plan` command, if that is what ran.
 pub fn run(cli: &Cli, plan: Option<PlanRun>) -> Result<i32> {
     run_as(cli, plan, false)
+}
+
+/// The agent was started by `mu agent --detach`: it ignores SIGHUP and moves its stdout to its log.
+pub fn mark_detached() {
+    serve::DETACHED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// `mu agent`: the agent of a session, with no terminal.
@@ -300,8 +306,14 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
                 signals::cancel_turn_on_sigusr1(handle.cmd.clone());
                 host.set_interactive();
                 let local = mu_tui::host::local::LocalHost::new(providers_ui, ctx_ui, host.clone(), cwd_ui);
-                let init =
-                    serve::Init { host: Rc::new(local), cmd: handle.cmd, ev: handle.ev, notices: notice_rx, resumed };
+                let init = serve::Init {
+                    host: Rc::new(local),
+                    cmd: handle.cmd,
+                    ev: handle.ev,
+                    notices: notice_rx,
+                    resumed,
+                    config: cfgs_ui.mu.agent.clone(),
+                };
                 (serve::run(init).await, None)
             }
             Armed::Subagent { task } => {

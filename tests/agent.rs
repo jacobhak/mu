@@ -75,9 +75,11 @@ impl Agent {
 
     fn start_env(home: &Path, cwd: &Path, extra: &[&str], env: &[(&str, &Path)]) -> Agent {
         let mut command = mu(home, cwd);
+        let mode: &[&str] = if extra.contains(&"--permissions") { &[] } else { &["--permissions", "yolo"] };
         command
             .envs(env.iter().copied())
-            .args(["agent", "--model", MODEL, "--permissions", "yolo"])
+            .args(["agent", "--model", MODEL])
+            .args(mode)
             .args(extra)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -134,8 +136,9 @@ impl Client {
         writeln!(self.writer, "{}", to_line(line)).unwrap();
     }
 
+    /// A hello that takes the session from whoever has it.
     fn hello(&mut self) -> Value {
-        self.send(&ClientLine::Hello { wire: WIRE, version: "test".into() });
+        self.send(&hello_line(WIRE, "test", true));
         self.next().expect("the agent's hello")
     }
 
@@ -164,6 +167,17 @@ impl Client {
 
     fn command(&mut self, c: AgentCommand) {
         self.send(&ClientLine::Command(WireCommand::Command(c)));
+    }
+}
+
+fn hello_line(wire: u32, host: &str, take: bool) -> ClientLine {
+    ClientLine::Hello {
+        wire,
+        version: "test".into(),
+        reconnect: false,
+        host: host.into(),
+        client: format!("client-of-{host}"),
+        take,
     }
 }
 
@@ -215,7 +229,7 @@ fn a_different_wire_number_is_refused() {
     let (home, cwd) = fixture();
     let agent = Agent::start(&home, &cwd, &[]);
     let mut c = Client::connect(&agent.socket);
-    c.send(&ClientLine::Hello { wire: WIRE + 1, version: "test".into() });
+    c.send(&hello_line(WIRE + 1, "test", false));
     let reply = c.next().unwrap();
     assert!(reply["error"].as_str().unwrap().contains("wire"), "{reply}");
     assert!(c.next().is_none(), "and the connection closes");
@@ -291,14 +305,14 @@ fn attach_copies_lines_between_stdio_and_the_socket() {
     let (home, cwd) = fixture();
     let agent = Agent::start(&home, &cwd, &[]);
     let mut attach = mu(&home, &cwd)
-        .args(["attach", &agent.session[..8]])
+        .args(["attach", "--stdio", &agent.session[..8]])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut stdin = attach.stdin.take().unwrap();
-    writeln!(stdin, "{}", to_line(&ClientLine::Hello { wire: WIRE, version: "test".into() })).unwrap();
+    writeln!(stdin, "{}", to_line(&hello_line(WIRE, "test", false))).unwrap();
     writeln!(stdin, "{}", to_line(&ClientLine::Detach)).unwrap();
     drop(stdin);
     let out = attach.wait_with_output().unwrap();
@@ -311,7 +325,7 @@ fn attach_copies_lines_between_stdio_and_the_socket() {
 #[test]
 fn attach_with_nothing_running_says_so() {
     let (home, cwd) = fixture();
-    let o = mu(&home, &cwd).args(["attach"]).output().unwrap();
+    let o = mu(&home, &cwd).args(["attach", "--stdio"]).output().unwrap();
     assert!(!o.status.success());
     assert!(
         String::from_utf8_lossy(&o.stderr).contains("no agent is running"),
@@ -340,10 +354,14 @@ fn tool_use_body(id: &str, name: &str, input: &Value) -> String {
 /// A fake model that answers by request body (mu also sends title requests whose timing is not fixed):
 /// the first real request calls `bash` on a terminal, the one after its result says it is done.
 fn pty_model() -> String {
+    tool_model(json!({"command": "echo from-the-pty", "pty": true}))
+}
+
+/// `pty_model` for any `bash` call.
+fn tool_model(call: Value) -> String {
     use std::io::Read;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let call = json!({"command": "echo from-the-pty", "pty": true});
     std::thread::spawn(move || {
         for sock in listener.incoming() {
             let Ok(mut sock) = sock else { return };
@@ -534,7 +552,7 @@ fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
     assert_eq!(session, first.session, "the resumed agent has the same session");
 
     c.send(&ClientLine::TunnelOpen { id: 7, session });
-    let hello = to_line(&ClientLine::Hello { wire: WIRE, version: "nested".into() });
+    let hello = to_line(&hello_line(WIRE, "nested", false));
     c.send(&ClientLine::TunnelLine { id: 7, line: hello });
     let tunnelled: Vec<Value> = {
         let mut got = Vec::new();
@@ -602,4 +620,197 @@ fn a_terminal_nobody_attends_waits_in_the_agent_and_a_late_client_is_asked_again
         seen.iter()
             .any(|v| v["event"]["Event"]["ToolOutput"]["chunk"].as_str().is_some_and(|c| c.contains("from-the-pty")))
     );
+}
+
+/// Kills the process at the end of a test (a detached agent has no handle).
+struct Pid(i32);
+
+impl Drop for Pid {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
+fn pid_of(home: &Path, id: &str) -> Pid {
+    let text = std::fs::read_to_string(home.join("run").join(format!("{id}.json"))).unwrap();
+    let rec: Value = serde_json::from_str(&text).unwrap();
+    Pid(rec["pid"].as_u64().unwrap() as i32)
+}
+
+fn agent_list(home: &Path, cwd: &Path) -> Vec<Value> {
+    let o = mu(home, cwd).args(["agent", "list", "--json"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..300 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn a_detached_agent_prints_its_id_and_survives_sighup() {
+    let (home, cwd) = fixture();
+    let o = mu(&home, &cwd)
+        .args(["agent", "--detach", "--model", MODEL, "--permissions", "yolo"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    let printed: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let id = printed["id"].as_str().unwrap().to_string();
+    assert_eq!(o.stdout.iter().filter(|b| **b == b'\n').count(), 1, "one line: {printed}");
+    let pid = pid_of(&home, &id);
+    assert!(home.join("run").join(format!("{id}.sock")).exists(), "it listens before the command returns");
+    assert!(home.join("logs").join(format!("agent-{id}.log")).is_file());
+
+    unsafe { libc::kill(pid.0, libc::SIGHUP) };
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(unsafe { libc::kill(pid.0, 0) }, 0, "SIGHUP did not end it");
+    let mut c = Client::connect(&home.join("run").join(format!("{id}.sock")));
+    c.hello();
+    c.until(caught_up);
+    c.command(AgentCommand::Prompt("hi".into()));
+    c.until(|v| event_is(v, "TurnEnd"));
+    c.command(AgentCommand::Exit);
+    c.until(|v| event_is(v, "Exit"));
+}
+
+#[test]
+fn the_listing_says_who_is_attached_and_whether_a_request_waits() {
+    let (home, cwd) = fixture();
+    let agent = Agent::start(&home, &cwd, &[]);
+    let rows = agent_list(&home, &cwd);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["id"], agent.session.as_str());
+    assert!(row["cwd"].is_string() && row["started"].as_i64().unwrap() > 1_000_000_000);
+    assert!(row["title"].is_null() && row["client"].is_null() && row["waiting"] == false, "{row}");
+
+    let mut c = Client::connect(&agent.socket);
+    c.send(&hello_line(WIRE, "laptop", false));
+    c.next().unwrap();
+    c.until(caught_up);
+    wait_until("the client in the listing", || agent_list(&home, &cwd)[0]["client"]["host"] == "laptop");
+    let client = &agent_list(&home, &cwd)[0]["client"];
+    assert!(client["since"].as_i64().unwrap() > 1_000_000_000, "{client}");
+
+    c.send(&ClientLine::Detach);
+    wait_until("the client to leave the listing", || agent_list(&home, &cwd)[0]["client"].is_null());
+    let human = mu(&home, &cwd).args(["agent", "list"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&human.stdout).contains(&agent.session));
+}
+
+#[test]
+fn a_second_client_is_told_who_has_the_session_and_takes_it_only_when_it_says_so() {
+    let (home, cwd) = fixture();
+    let agent = Agent::start(&home, &cwd, &[]);
+    let mut alpha = Client::connect(&agent.socket);
+    alpha.send(&hello_line(WIRE, "alpha", false));
+    alpha.next().unwrap();
+    alpha.until(caught_up);
+
+    let mut beta = Client::connect(&agent.socket);
+    beta.send(&hello_line(WIRE, "beta", false));
+    let busy = beta.next().unwrap();
+    assert_eq!(busy["busy"]["host"], "alpha", "{busy}");
+    assert!(busy["busy"]["since"].as_i64().unwrap() > 1_000_000_000);
+    assert!(beta.next().is_none(), "and the connection closes");
+    // Alpha was not disturbed.
+    alpha.command(AgentCommand::Prompt("still mine".into()));
+    alpha.until(|v| event_is(v, "TurnEnd"));
+
+    // A lost connection's successor is the same client: no question.
+    let mut again = Client::connect(&agent.socket);
+    again.send(&hello_line(WIRE, "alpha", false));
+    assert!(again.next().unwrap().get("hello").is_some());
+    again.until(caught_up);
+    alpha.until(|v| v["event"].get("Detached").is_some());
+
+    // The explicit take-over.
+    let mut beta = Client::connect(&agent.socket);
+    beta.send(&hello_line(WIRE, "beta", true));
+    assert!(beta.next().unwrap().get("hello").is_some());
+    beta.until(caught_up);
+    again.until(|v| v["event"].get("Detached").is_some());
+    wait_until("beta in the listing", || agent_list(&home, &cwd)[0]["client"]["host"] == "beta");
+}
+
+fn ask_mode_agent(home: &Path, cwd: &Path, config: &str) -> Agent {
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    Agent::start(home, cwd, &["--permissions", "ask"])
+}
+
+fn allow() -> WireCommand {
+    use mu_base::permissions::{ApprovalDecision, ApprovalScope};
+    WireCommand::Approval {
+        id: 1,
+        decision: ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None },
+    }
+}
+
+#[test]
+fn an_approval_nobody_attends_is_flagged_announced_and_given_up_after_the_timeout() {
+    let home = home_with_key(&tool_model(json!({"command": "echo x > made-by-the-test"})));
+    let cwd = mu_testutil::tmp();
+    let notified = home.join("notified");
+    let config = format!("[agent]\nnotify_command = 'echo \"$1|$2\" > {}'\napproval_timeout = 3\n", notified.display());
+    let agent = ask_mode_agent(&home, &cwd, &config);
+    let mut c = Client::connect(&agent.socket);
+    c.hello();
+    c.until(caught_up);
+    c.command(AgentCommand::Prompt("go".into()));
+    c.until(|v| v["event"].get("Approve").is_some());
+    assert!(agent_list(&home, &cwd)[0]["waiting"] == false, "a client is attached and sees it");
+    c.send(&ClientLine::Detach);
+
+    wait_until("the waiting flag", || agent_list(&home, &cwd)[0]["waiting"] == true);
+    wait_until("the notify command", || notified.exists() && !std::fs::read_to_string(&notified).unwrap().is_empty());
+    let said = std::fs::read_to_string(&notified).unwrap();
+    assert!(said.starts_with(&format!("{}|approval: ", agent.session)), "{said}");
+
+    wait_until("the timeout", || agent_list(&home, &cwd)[0]["waiting"] == false);
+    assert!(!cwd.join("made-by-the-test").exists(), "an approval that timed out does not run the call");
+    let mut late = Client::connect(&agent.socket);
+    late.hello();
+    let lines = late.until(caught_up);
+    let all = serde_json::to_string(&lines).unwrap();
+    assert!(all.contains("needs approval"), "the model was told it was unavailable: {all}");
+}
+
+#[test]
+fn a_client_that_attaches_is_told_which_requests_are_pending_and_a_waiting_flag_clears() {
+    let home = home_with_key(&tool_model(json!({"command": "echo x > made-by-the-test"})));
+    let cwd = mu_testutil::tmp();
+    let agent = ask_mode_agent(&home, &cwd, "");
+    let mut first = Client::connect(&agent.socket);
+    first.hello();
+    first.until(caught_up);
+    first.command(AgentCommand::Prompt("go".into()));
+    first.until(|v| v["event"].get("Approve").is_some());
+    first.send(&ClientLine::Detach);
+    wait_until("the waiting flag", || agent_list(&home, &cwd)[0]["waiting"] == true);
+
+    let mut second = Client::connect(&agent.socket);
+    second.hello();
+    let lines = second.until(caught_up);
+    let pending = lines.iter().find(|v| v["event"].get("Pending").is_some()).expect("the pending ids come first");
+    assert_eq!(pending["event"]["Pending"]["ids"], json!([1]));
+    assert!(lines.iter().any(|v| v["event"].get("Approve").is_some()));
+    wait_until("the flag to clear", || agent_list(&home, &cwd)[0]["waiting"] == false);
+
+    // Answered on this client; the next one learns that nothing is pending any more.
+    second.send(&ClientLine::Command(allow()));
+    second.until(|v| event_is(v, "TurnEnd"));
+    let mut third = Client::connect(&agent.socket);
+    third.hello();
+    let lines = third.until(caught_up);
+    let pending = lines.iter().find(|v| v["event"].get("Pending").is_some()).unwrap();
+    assert_eq!(pending["event"]["Pending"]["ids"], json!([]), "a dialog shown for id 1 is closed");
+    assert!(cwd.join("made-by-the-test").exists());
 }
