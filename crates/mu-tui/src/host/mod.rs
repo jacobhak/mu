@@ -30,6 +30,7 @@ pub mod remote;
 pub mod results;
 pub mod sessions;
 pub mod startup;
+pub mod state;
 pub mod web;
 
 use serde::Serialize;

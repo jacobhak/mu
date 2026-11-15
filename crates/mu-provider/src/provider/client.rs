@@ -193,7 +193,13 @@ impl Providers {
         }
         let custom = self.registry.snapshot()?;
         let failure = RefCell::new(None);
+        let locked = std::cell::Cell::new(false);
         let direct = |p: &str, m: &str| {
+            // A locked key store cannot say whether this provider has a key, so it must not fall through to the gateway.
+            if native_def(p).is_some() && self.store.is_locked() {
+                locked.set(true);
+                return None;
+            }
             if let Some(c) = custom.get(p) {
                 let listed = crate::model::discovery::custom_find(c, m)
                     .map_or((None, None), |r| (r.context_length, r.max_completion_tokens));
@@ -207,7 +213,11 @@ impl Providers {
             }
             self.is_direct(p).then(|| direct_spec(p, m)).flatten()
         };
-        let (spec, level) = models::resolve(sel, &self.cfg, self.gw_models.borrow().as_deref(), &direct)?;
+        let resolved = models::resolve(sel, &self.cfg, self.gw_models.borrow().as_deref(), &direct);
+        if locked.get() {
+            return Err(mu_common::sealed::SealedError::Locked.into());
+        }
+        let (spec, level) = resolved?;
         if let Some(e) = failure.into_inner() {
             return Err(e);
         }

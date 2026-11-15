@@ -28,13 +28,14 @@ pub struct Row {
 
 impl Row {
     /// `print`, `subagent review-lead`, `tui`; `?` for a record that says nothing. An agent with a
-    /// request that waits for a client adds ` waiting`.
+    /// request that waits for a client adds ` waiting`, and one whose state is still locked ` locked`.
     pub fn label(&self) -> String {
         let kind = self.live.kind.as_deref().unwrap_or("?");
         let label = match &self.live.agent {
             Some(a) => format!("{kind} {a}"),
             None => kind.to_string(),
         };
+        let label = if self.live.locked { format!("{label} locked") } else { label };
         if self.live.waiting { format!("{label} waiting") } else { label }
     }
 
@@ -258,6 +259,7 @@ mod tests {
             parent: None,
             abort: false,
             waiting: false,
+            locked: false,
             client: None,
         }
     }
@@ -289,6 +291,15 @@ mod tests {
         assert!(text.contains("agent waiting") && text.contains(" far "), "{text}");
         let d: Vec<String> = detail(r, "", 60, now).iter().map(line_text).collect();
         assert!(d[0].contains("on far") && d.iter().any(|x| x.contains("client laptop")), "{d:?}");
+    }
+
+    #[test]
+    fn a_locked_agent_is_labelled_locked_before_waiting() {
+        let mut l = live("/s/agent.jsonl", "agent", "2026-01-01T00:00:00Z");
+        l.locked = true;
+        l.waiting = true;
+        let rows = build(rows_of(vec![l]), &HashMap::new(), &[], None, &HashMap::new());
+        assert_eq!(rows[0].label(), "agent locked waiting");
     }
 
     #[test]

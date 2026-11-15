@@ -1628,6 +1628,7 @@ mod tests {
             parent: None,
             abort: false,
             waiting: false,
+            locked: false,
             client: None,
         }
     }

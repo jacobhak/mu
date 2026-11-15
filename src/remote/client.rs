@@ -88,6 +88,9 @@ fn agent_line(n: usize, a: &AgentInfo) -> String {
     if let Some(c) = &a.client {
         line.push_str(&format!("  [attached from {}]", c.host));
     }
+    if a.locked {
+        line.push_str("  [locked: attach to unlock]");
+    }
     if a.waiting {
         line.push_str("  [waiting for you]");
     }
@@ -268,6 +271,7 @@ fn row(remote: &str, a: AgentInfo) -> LiveRow {
             parent: None,
             abort: false,
             waiting: a.waiting,
+            locked: a.locked,
             client: a.client.map(|c| ClientInfo { host: c.host, since: c.since }),
         },
         parent: None,
@@ -400,6 +404,13 @@ mod tests {
             ..agent("abc1", 1)
         };
         assert_eq!(agent_line(1, &a), "1) abc1  /w  fix it  [attached from laptop]  [waiting for you]");
+    }
+
+    #[test]
+    fn a_locked_agent_is_listed_as_locked_in_the_picker_and_the_sessions_tab() {
+        let a = AgentInfo { locked: true, waiting: true, ..agent("abc1", 1) };
+        assert_eq!(agent_line(1, &a), "1) abc1  /w  [locked: attach to unlock]  [waiting for you]");
+        assert!(row("cluster", a).live.locked);
     }
 
     #[test]

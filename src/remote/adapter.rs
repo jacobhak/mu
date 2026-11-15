@@ -26,6 +26,7 @@ pub struct Adapter {
     kind: Kind,
     settings: String,
     trusted: bool,
+    state_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -83,6 +84,7 @@ pub struct AgentInfo {
     pub title: Option<String>,
     pub client: Option<ClientInfo>,
     pub waiting: bool,
+    pub locked: bool,
     /// `agent` or `worker`; absent means agent.
     pub kind: String,
 }
@@ -161,6 +163,16 @@ impl Adapter {
         matches!(self.kind, Kind::Program(_))
     }
 
+    /// The SSH private key that unlocks the agent's encrypted state (`~` expanded).
+    pub fn state_key_path(&self) -> PathBuf {
+        let path = self.state_key.as_deref().filter(|p| !p.trim().is_empty()).unwrap_or("~/.ssh/id_ed25519");
+        match path.strip_prefix("~/") {
+            Some(rest) => mu_common::paths::home().join(rest),
+            None if path == "~" => mu_common::paths::home(),
+            None => PathBuf::from(path),
+        }
+    }
+
     /// A string in the remote's `settings`.
     pub fn setting(&self, key: &str) -> Option<String> {
         let v: serde_json::Value = serde_json::from_str(&self.settings).ok()?;
@@ -184,7 +196,13 @@ impl Adapter {
         } else {
             Kind::Program(r.adapter.trim().to_string())
         };
-        Ok(Self { name: name.to_string(), kind, settings: r.settings_json(), trusted: r.trusted })
+        Ok(Self {
+            name: name.to_string(),
+            kind,
+            settings: r.settings_json(),
+            trusted: r.trusted,
+            state_key: r.state_key.clone(),
+        })
     }
 
     #[cfg(test)]
@@ -451,6 +469,7 @@ esac
                 title: None,
                 client: Some(ClientInfo { host: "h".into(), since: 150 }),
                 waiting: true,
+                locked: false,
                 kind: String::new(),
             }
         );

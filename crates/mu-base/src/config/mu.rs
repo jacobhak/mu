@@ -31,12 +31,14 @@ pub struct MuConfig {
 /// `[remote.NAME]`: where agents can run besides here. `adapter` is `ssh` (built in, needs `host`) or
 /// a program on PATH or a path. `settings` goes to the adapter as JSON and mu does not read it.
 /// `trusted` and `repos` are mu's own: whether the main agent may run there, and the repositories
-/// (paths or origin URLs) whose workers may run on an untrusted remote.
+/// (paths or origin URLs) whose workers may run on an untrusted remote. `state_key` is the path of the
+/// SSH ed25519 private key that unlocks the agent's encrypted state (default `~/.ssh/id_ed25519`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct MuRemote {
     pub adapter: String,
     pub host: Option<String>,
+    pub state_key: Option<String>,
     pub settings: toml::Table,
     pub trusted: bool,
     pub repos: Vec<String>,
@@ -275,12 +277,25 @@ impl Default for MuTask {
 /// `[agent]`: what `mu agent` does when a question or approval waits and no client is attached.
 /// `notify_command` is run (under `sh -c`) with the session id and a one-line summary as `$1` and
 /// `$2`; `approval_timeout` is the seconds after which a waiting approval is answered `Unavailable`
-/// (a waiting question is cancelled); 0 (the default) waits for ever.
+/// (a waiting question is cancelled); 0 (the default) waits for ever. `state_key = "ssh"` encrypts the
+/// agent's credentials at rest under a key a client unlocks with its SSH key; `state_key_file` and
+/// `state_key_command` give an unattended 32-byte key instead (the file wins), and imply encryption.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct MuAgent {
     pub notify_command: Option<String>,
     pub approval_timeout: u64,
+    pub state_key: StateKey,
+    pub state_key_file: Option<String>,
+    pub state_key_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateKey {
+    #[default]
+    Off,
+    Ssh,
 }
 
 /// `[mcp]`: `lifetime` of MCP server processes (`session`, `idle:10m`, `call`); default `session`.

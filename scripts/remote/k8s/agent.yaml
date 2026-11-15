@@ -20,6 +20,11 @@ data:
   config.toml: |
     # Copied to $MU_HOME/config.toml by the `config` init container when none exists; edit the real file afterwards.
     default_remote = "workers"
+    # Seal credentials (auth.json, omp's login database) with your SSH ed25519 key, so a volume snapshot or backup
+    # holds none in the clear. The first attach asks for the key; after a pod restart the agent is locked until a
+    # client attaches. Remove the comment to turn it on (see docs/remote-kubernetes.md).
+    # [agent]
+    # state_key = "ssh"
     [task]
     launch = ["task"]
     remote = "workers"

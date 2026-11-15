@@ -54,9 +54,12 @@ pub struct ClientInfo {
 pub struct Attention {
     pub waiting: bool,
     pub client: Option<ClientInfo>,
+    /// State encryption is on and nothing has unlocked it yet.
+    pub locked: bool,
 }
 
-static ATTENTION: std::sync::Mutex<Attention> = std::sync::Mutex::new(Attention { waiting: false, client: None });
+static ATTENTION: std::sync::Mutex<Attention> =
+    std::sync::Mutex::new(Attention { waiting: false, client: None, locked: false });
 
 /// The owner records this process holds, by path.
 static CLAIMED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -74,7 +77,7 @@ pub fn set_attention(change: impl FnOnce(&mut Attention)) {
     }
 }
 
-/// Rewrites `waiting` and `client` of our own record in place. The new text is padded to the old
+/// Rewrites `waiting`, `locked` and `client` of our own record in place. The new text is padded to the old
 /// length and written in one call, so a reader never sees a torn or empty file.
 fn rewrite(path: &Path, a: &Attention) {
     use std::io::Read;
@@ -102,6 +105,14 @@ fn set_attention_fields(rec: &mut Value, a: &Attention) {
         false => {
             if let Some(o) = rec.as_object_mut() {
                 o.remove("waiting");
+            }
+        }
+    }
+    match a.locked {
+        true => rec["locked"] = json!(true),
+        false => {
+            if let Some(o) = rec.as_object_mut() {
+                o.remove("locked");
             }
         }
     }
@@ -183,6 +194,7 @@ pub(super) struct LiveRecord {
     parent: Option<PathBuf>,
     abort: bool,
     waiting: bool,
+    locked: bool,
     client: Option<ClientInfo>,
 }
 
@@ -221,6 +233,7 @@ fn read_record(rec: &Path) -> Option<LiveRecord> {
         parent: text("parent").map(PathBuf::from),
         abort: v["abort"].as_bool().unwrap_or(false),
         waiting: v["waiting"].as_bool().unwrap_or(false),
+        locked: v["locked"].as_bool().unwrap_or(false),
         client: serde_json::from_value(v["client"].clone()).ok(),
     })
 }
@@ -249,6 +262,9 @@ pub struct LiveSession {
     pub abort: bool,
     /// An agent has a question or approval that waits for a client.
     pub waiting: bool,
+    /// The agent's state encryption is on and still locked.
+    #[serde(default)]
+    pub locked: bool,
     /// The client an agent serves, when one is attached.
     pub client: Option<ClientInfo>,
 }
@@ -288,6 +304,7 @@ pub fn live_sessions_in(run_dir: &Path) -> Vec<LiveSession> {
                 parent,
                 abort: r.abort,
                 waiting: r.waiting,
+                locked: r.locked,
                 client: r.client,
             }
         })
@@ -627,17 +644,18 @@ mod tests {
         let s = SessionFile::create(Path::new("/opt/attention"), None).unwrap();
         set_attention(|a| {
             a.waiting = true;
+            a.locked = true;
             a.client = Some(ClientInfo { host: "laptop".into(), since: 100 });
         });
         let l = listed(&s.path).unwrap();
-        assert!(l.waiting);
+        assert!(l.waiting && l.locked);
         assert_eq!(l.client, Some(ClientInfo { host: "laptop".into(), since: 100 }));
         // A record claimed later starts with what is set now.
         let late = SessionFile::create(Path::new("/opt/attention-late"), None).unwrap();
         assert!(listed(&late.path).unwrap().waiting);
         set_attention(|a| *a = Attention::default());
         let l = listed(&s.path).unwrap();
-        assert!(!l.waiting && l.client.is_none());
+        assert!(!l.waiting && !l.locked && l.client.is_none());
         assert!(listed(&late.path).is_some(), "the record is still whole after rewrites");
     }
 

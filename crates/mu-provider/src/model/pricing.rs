@@ -330,13 +330,19 @@ async fn fetch() {
 }
 
 async fn try_fetch() -> bool {
-    let out = tokio::process::Command::new(mu_common::paths::omp_bin())
+    let mut cmd = tokio::process::Command::new(mu_common::paths::omp_bin());
+    if mu_common::omp_state::apply(cmd.as_std_mut()).is_err() {
+        return false;
+    }
+    let out = cmd
         .args(["models", "ls", "--json"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .output();
-    let Ok(Ok(out)) = tokio::time::timeout(REFRESH_TIMEOUT, out).await else { return false };
+    let out = tokio::time::timeout(REFRESH_TIMEOUT, out).await;
+    mu_common::omp_state::after_omp_exit();
+    let Ok(Ok(out)) = out else { return false };
     if !out.status.success() {
         return false;
     }

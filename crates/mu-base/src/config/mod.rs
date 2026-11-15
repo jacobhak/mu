@@ -6,9 +6,9 @@ use std::cell::RefCell;
 mod mu;
 mod retry;
 
-pub use mu::MuAgent;
 pub use mu::MuRemote;
 pub use mu::{Cards, MuBell, MuConfig, MuPermissions, MuStatus, MuTheme};
+pub use mu::{MuAgent, StateKey};
 use mu::{MuPredict, check_predict, check_status, load_permissions, load_remotes};
 use retry::check_retry;
 #[cfg(test)]
@@ -663,6 +663,17 @@ mod tests {
         );
         let t = toml::from_str::<MuConfig>("[task]\nsoft_request_budget = 50\nbudget_notice = false").unwrap().task;
         assert_eq!((t.soft_request_budget, t.budget_notice), (50, false));
+    }
+
+    #[test]
+    fn the_agents_state_key_source_and_a_remotes_key_path_parse() {
+        let a = toml::from_str::<MuConfig>("[agent]\nstate_key = \"ssh\"\nstate_key_file = \"/k\"").unwrap().agent;
+        assert_eq!((a.state_key, a.state_key_file.as_deref(), a.state_key_command), (StateKey::Ssh, Some("/k"), None));
+        let d = MuAgent::default();
+        assert!(d.state_key == StateKey::Off && d.state_key_file.is_none() && d.state_key_command.is_none());
+        let (c, w) = remotes("[remote.d]\nadapter = \"ssh\"\nhost = \"h\"\nstate_key = \"~/.ssh/other\"\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.remote["d"].state_key.as_deref(), Some("~/.ssh/other"));
     }
 
     fn remotes(text: &str) -> (MuConfig, Vec<String>) {

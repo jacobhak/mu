@@ -323,6 +323,7 @@ mod tests {
             parent: Some(PathBuf::from("/s/p.jsonl")),
             abort: false,
             waiting: false,
+            locked: false,
             client: None,
         }
     }

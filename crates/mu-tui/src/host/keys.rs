@@ -285,13 +285,16 @@ fn login_providers(l: &Rc<Local>, args: serde_json::Value) -> Answer {
 
 /// Provider menu of `omp login`, scraped from its numbered prompt (omp has no machine-readable list).
 async fn list_login_providers() -> Result<Vec<(usize, String)>, String> {
-    let out = tokio::process::Command::new(mu_common::paths::omp_bin())
+    let mut cmd = tokio::process::Command::new(mu_common::paths::omp_bin());
+    mu_common::omp_state::apply(cmd.as_std_mut()).map_err(|e| e.to_string())?;
+    let out = cmd
         .arg("login")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .await
         .map_err(|e| e.to_string())?;
+    mu_common::omp_state::after_omp_exit();
     Ok(parse_login_menu(&String::from_utf8_lossy(&out.stdout)))
 }
 

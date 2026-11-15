@@ -471,6 +471,8 @@ impl PluginHost {
             Kind::Native { manifest } => {
                 let mut c = Command::new(resolve_command(manifest));
                 c.args(&manifest.command[1..]).current_dir(&manifest.dir);
+                // The plugins that run omp (the gateway) inherit its memory copy; a locked state fails there.
+                c.envs(mu_common::omp_state::envs().unwrap_or_default());
                 c
             }
         };

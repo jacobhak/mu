@@ -65,6 +65,9 @@ async fn fetch_token_with(
 ) -> Option<String> {
     for id in ids {
         let mut c = Command::new(omp);
+        if mu_common::omp_state::apply(c.as_std_mut()).is_err() {
+            return None;
+        }
         c.arg("token");
         if force {
             c.arg("--force-refresh");
@@ -73,7 +76,9 @@ async fn fetch_token_with(
         if let Some((url, token)) = broker {
             c.env("OMP_AUTH_BROKER_URL", url).env("OMP_AUTH_BROKER_TOKEN", token);
         }
-        if let Some(t) = run_capture(c, Duration::from_secs(20)).await {
+        let out = run_capture(c, Duration::from_secs(20)).await;
+        mu_common::omp_state::after_omp_exit();
+        if let Some(t) = out {
             let t = t.trim().to_string();
             if !t.is_empty() {
                 return Some(t);

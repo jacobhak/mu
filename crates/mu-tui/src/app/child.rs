@@ -204,6 +204,7 @@ impl App {
         }
         self.start_child(ChildThen::Login, move || {
             let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
+            mu_common::omp_state::apply(&mut cmd)?;
             cmd.arg("login").args(&args);
             if pick.is_some() {
                 cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -219,6 +220,7 @@ impl App {
             };
             // SAFETY: back to the default disposition.
             unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+            mu_common::omp_state::after_omp_exit();
             status
         });
     }
@@ -237,6 +239,7 @@ impl App {
             let cwd = app.cwd.clone();
             app.start_child(ChildThen::McpLogin(name.clone()), move || {
                 let mut cmd = std::process::Command::new(mu_common::paths::omp_bin());
+                mu_common::omp_state::apply(&mut cmd)?;
                 cmd.args(["-p", "--no-session"]).arg(format!("/mcp reauth {name}")).current_dir(&cwd);
                 extern "C" fn noop(_: libc::c_int) {}
                 // As in `run_login`: Ctrl-C reaches omp, not mu.
@@ -245,6 +248,7 @@ impl App {
                 let status = cmd.status();
                 // SAFETY: back to the default disposition.
                 unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+                mu_common::omp_state::after_omp_exit();
                 status
             });
         });

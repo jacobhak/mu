@@ -129,7 +129,12 @@ fn run(l: &Rc<Local>, args: serde_json::Value) -> Answer {
 async fn run_program(push: UnboundedSender<Pushed>, cwd: PathBuf, r: Run) -> Result<Done, String> {
     use mu_base::pty;
     let (line, pick) = command_line(&r.program);
-    let pty = pty::spawn(&line, &cwd, r.cols, r.rows, &[]).map_err(|e| format!("cannot run the program: {e}"))?;
+    let env: Vec<(&str, String)> = mu_common::omp_state::envs()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(k, v)| (k, v.to_string_lossy().into_owned()))
+        .collect();
+    let pty = pty::spawn(&line, &cwd, r.cols, r.rows, &env).map_err(|e| format!("cannot run the program: {e}"))?;
     let (io, mut child) = (pty.io.clone(), pty.child);
     let (ctl_tx, mut ctl) = unbounded_channel();
     RUNNING.with(|m| m.borrow_mut().insert(r.id, ctl_tx));
@@ -176,6 +181,7 @@ async fn run_program(push: UnboundedSender<Pushed>, cwd: PathBuf, r: Run) -> Res
     }
     RUNNING.with(|m| m.borrow_mut().remove(&r.id));
     mu_base::process::terminate_group(io.pid()).await;
+    mu_common::omp_state::after_omp_exit();
     Ok(Done { code: status.flatten().and_then(|s| s.code()) })
 }
 

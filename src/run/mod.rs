@@ -9,6 +9,8 @@ mod relay;
 mod serve;
 pub mod setup;
 mod signals;
+mod state;
+mod unlock;
 pub mod worker;
 
 use crate::cli::Cli;
@@ -168,6 +170,10 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
         cwd = std::env::current_dir()?;
     }
     let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
+    // Before anything reads a credential: a sealed store opens only with the key.
+    if agent {
+        state::start(&cfgs.mu.agent, &paths::profile_home()).map_err(|e| anyhow!("mu agent: {e}"))?;
+    }
     if terminal && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
         let tx = notice_tx.clone();
@@ -195,6 +201,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     let level = cli_thinking.or(def_thinking);
     // A relayed worker has no credentials: its parent resolves the selector, before any runtime exists.
     let stdio = task.as_ref().filter(|p| relays(p)).map(|_| Rc::new(relay::StdioRelay::new()));
+    let mut deferred_model = None;
     let (spec, thinking) = if let Some(r) = &stdio {
         let picked = pick_model_with(&cfgs, sel, level, |s| {
             let resolved = relay::resolve_first(s)?;
@@ -204,7 +211,15 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
         providers.set_relay(r.clone());
         picked
     } else if interactive {
-        pick_model_or_none(&cfgs, &providers, sel, level)?
+        match pick_model_or_none(&cfgs, &providers, sel.clone(), level) {
+            // A locked agent cannot read the key store yet: it starts with no model and takes this one
+            // once a client has unlocked it.
+            Err(e) if agent && is_locked(&e) => {
+                deferred_model = sel.or_else(|| cfgs.role("default"));
+                (models::ModelSpec::unselected(), cli_thinking.or(level).unwrap_or(models::Thinking::Medium))
+            }
+            picked => picked?,
+        }
     } else {
         pick_model(&cfgs, &providers, sel, level)?
     };
@@ -305,6 +320,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
             }
         }
         let agent_task = handle.task;
+        let serving = matches!(armed, Armed::Agent { .. });
         let (code, printer) = match armed {
             Armed::Tui { pick_session } => {
                 signals::cancel_turn_on_sigusr1(handle.cmd.clone());
@@ -327,6 +343,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
                     notices: notice_rx,
                     resumed,
                     config: cfgs_ui.mu.agent.clone(),
+                    deferred_model,
                 };
                 (serve::run(init).await, None)
             }
@@ -350,6 +367,9 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
             Ok(()) => code,
         };
         host.shutdown_all().await;
+        if serving {
+            state::shutdown();
+        }
         // Notices raised during shutdown are printed before the process exits.
         if let Some((done, handle)) = printer {
             let _ = done.send(());
@@ -358,6 +378,10 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
         code
     });
     Ok(code)
+}
+
+fn is_locked(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<mu_common::sealed::SealedError>(), Some(mu_common::sealed::SealedError::Locked))
 }
 
 /// The agent `--agent` names, from the project's or the user's agent files.

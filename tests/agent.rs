@@ -1285,3 +1285,227 @@ fn an_unreachable_default_remote_is_refused_with_the_adapters_error() {
     assert_eq!(far.calls("start"), 0);
     assert!(!far.client.join("sessions").exists(), "nothing ran here instead");
 }
+
+/// An SSH ed25519 identity on disk the way `ssh-keygen` leaves it: the private key and `<private>.pub`.
+struct Identity {
+    private: PathBuf,
+    public: String,
+}
+
+fn identity(seed: u8, passphrase: Option<&str>) -> Identity {
+    use ssh_key::private::Ed25519Keypair;
+    let key = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
+    let public = key.public_key().to_openssh().unwrap();
+    let stored = match passphrase {
+        Some(p) => key.encrypt(&mut rand_core::OsRng, p).unwrap(),
+        None => key,
+    };
+    let private = mu_testutil::tmp().join("id_ed25519");
+    std::fs::write(&private, stored.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes()).unwrap();
+    std::fs::write(format!("{}.pub", private.display()), format!("{public} test@laptop\n")).unwrap();
+    Identity { private, public }
+}
+
+/// The client's `[remote.far] state_key`: the key it unlocks with.
+fn set_client_key(far: &Far, key: &Path) {
+    let config = std::fs::read_to_string(far.client.join("config.toml")).unwrap();
+    let kept: Vec<&str> = config.lines().filter(|l| !l.starts_with("state_key")).collect();
+    std::fs::write(far.client.join("config.toml"), format!("{}\nstate_key = '{}'\n", kept.join("\n"), key.display()))
+        .unwrap();
+}
+
+/// A remote whose agents encrypt their state under an SSH key; `notified` collects what `notify_command` got.
+fn ssh_far(key: &Identity) -> Far {
+    let far = Far::new(true, "");
+    set_client_key(&far, &key.private);
+    let config =
+        format!("[agent]\nstate_key = 'ssh'\nnotify_command = 'echo \"$2\" >> {}/notified'\n", far.dir.display());
+    std::fs::write(far.remote.join("config.toml"), config).unwrap();
+    far
+}
+
+fn attach_continuing(far: &Far) -> Term {
+    let mut c = far.mu();
+    c.arg("-c");
+    Term::spawn(c)
+}
+
+/// The first attach, which sets the state key up; the agent is left running with no client.
+fn first_attach(far: &Far, key: &Identity) -> Pid {
+    let mut term = Term::spawn(far.mu());
+    term.wait_for("[y/N]");
+    assert!(term.text().contains(&key.public), "the key that would unlock it is shown: {}", term.text());
+    assert!(!far.remote.join("keys/state.key").exists(), "nothing is set up before the user agrees");
+    term.send("y\r");
+    term.wait_for("type here");
+    assert!(far.remote.join("keys/state.key").exists());
+    assert_eq!(far.agents()[0]["locked"], json!(false));
+    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
+    let pid = pid_of(&far.remote, &id);
+    term.command("/detach");
+    assert!(term.wait_exit().success(), "{}", term.text());
+    pid
+}
+
+/// The agent dies with no goodbye and a new one takes the session: it starts locked.
+fn restart_locked(far: &Far, old: &Pid) -> Agent {
+    // SAFETY: plain signal to the agent the test started.
+    unsafe { libc::kill(old.0, libc::SIGKILL) };
+    wait_until("the agent to be gone", || far.agents().is_empty());
+    Agent::start(&far.remote, &far.cwd, &["-c"])
+}
+
+fn locked_rows(far: &Far) -> (Value, Value) {
+    let rows = far.agents();
+    (rows[0]["locked"].clone(), rows[0]["waiting"].clone())
+}
+
+#[test]
+fn an_agent_with_a_state_key_file_starts_unlocked_and_a_wrong_key_stops_it() {
+    let (home, cwd) = fixture();
+    let secret = home.join("state-secret");
+    std::fs::write(&secret, "ab".repeat(32)).unwrap();
+    let config = |path: &Path| format!("[agent]\nstate_key_file = '{}'\n", path.display());
+    std::fs::write(home.join("config.toml"), config(&secret)).unwrap();
+
+    let mut agent = Agent::start(&home, &cwd, &[]);
+    assert!(home.join("keys/state.key").exists(), "state encryption is on");
+    let state = std::fs::read_to_string(home.join("keys/state.key")).unwrap();
+    assert!(!state.contains(&"ab".repeat(32)), "the key itself is never stored");
+    assert_eq!(locked_rows_at(&home, &cwd), (json!(false), json!(false)));
+    // Asked over the wire, the agent says encryption is on and open.
+    let mut client = Client::connect(&agent.socket);
+    client.hello();
+    client.until(caught_up);
+    client.send(&ClientLine::Host { id: 7, call: "state_status".into(), args: Value::Null });
+    let reply = client.until(|v| v.get("hostReply").is_some()).pop().unwrap();
+    assert_eq!(
+        reply["hostReply"]["result"]["Ok"],
+        json!({"enabled": true, "initialised": true, "locked": false, "kind": "raw"})
+    );
+    drop(client);
+    agent.child.kill().unwrap();
+    let _ = agent.child.wait();
+
+    // The same key opens the state again after a restart; another key does not.
+    drop(agent);
+    let agent = Agent::start(&home, &cwd, &["-c"]);
+    assert_eq!(locked_rows_at(&home, &cwd).0, json!(false));
+    drop(agent);
+    let other = home.join("other-secret");
+    std::fs::write(&other, [9u8; 32]).unwrap();
+    std::fs::write(home.join("config.toml"), config(&other)).unwrap();
+    let o = mu(&home, &cwd)
+        .args(["agent", "--model", MODEL, "--permissions", "yolo", "-c"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("does not open this profile's state key"), "{err}");
+}
+
+fn locked_rows_at(home: &Path, cwd: &Path) -> (Value, Value) {
+    let rows = agent_list(home, cwd);
+    (rows[0]["locked"].clone(), rows[0]["waiting"].clone())
+}
+
+#[test]
+fn the_first_attach_sets_up_an_ssh_state_key_and_a_restarted_agent_is_locked_until_a_recipient_unlocks_it() {
+    let key = identity(1, None);
+    let far = ssh_far(&key);
+    let old = first_attach(&far, &key);
+    let state = std::fs::read_to_string(far.remote.join("keys/state.key")).unwrap();
+    assert!(!state.contains("PRIVATE KEY") && state.contains("recipients"), "{state}");
+
+    let _agent = restart_locked(&far, &old);
+    assert_eq!(locked_rows(&far), (json!(true), json!(true)), "locked, and waiting for someone to unlock it");
+    wait_until("the notify command", || {
+        std::fs::read_to_string(far.dir.join("notified")).is_ok_and(|t| t.contains("locked: attach to unlock"))
+    });
+
+    // A key that is not a recipient is refused, naming what the agent accepts; the client still attaches.
+    let other = identity(2, None);
+    set_client_key(&far, &other.private);
+    let mut refused = attach_continuing(&far);
+    let fingerprint =
+        serde_json::from_str::<Value>(&state).unwrap()["recipients"][0]["fingerprint"].as_str().unwrap().to_string();
+    refused.wait_for("not one of the keys");
+    assert!(refused.text().contains(&fingerprint), "{}", refused.text());
+    refused.wait_for("type here");
+    assert_eq!(locked_rows(&far).0, json!(true));
+    refused.command("/detach");
+    assert!(refused.wait_exit().success());
+
+    // A key that is not there leaves it locked as well.
+    set_client_key(&far, Path::new("/nonexistent/id_ed25519"));
+    let mut missing = attach_continuing(&far);
+    missing.wait_for("cannot be read");
+    missing.wait_for("type here");
+    assert_eq!(locked_rows(&far).0, json!(true));
+    missing.command("/detach");
+    assert!(missing.wait_exit().success());
+
+    set_client_key(&far, &key.private);
+    let mut unlocks = attach_continuing(&far);
+    unlocks.wait_for("is unlocked");
+    unlocks.wait_for("type here");
+    wait_until("the agent to be open", || locked_rows(&far) == (json!(false), json!(false)));
+    unlocks.command("/detach");
+    assert!(unlocks.wait_exit().success());
+}
+
+#[test]
+fn an_encrypted_key_asks_for_its_passphrase_and_wrong_ones_leave_the_agent_locked() {
+    let key = identity(3, Some("hunter2"));
+    let far = ssh_far(&key);
+    let old = first_attach(&far, &key);
+    let _agent = restart_locked(&far, &old);
+
+    let mut wrong = attach_continuing(&far);
+    let asked = |t: &Term| t.text().matches("passphrase for").count();
+    for (i, guess) in ["one", "two", "three"].iter().enumerate() {
+        wait_until("the passphrase prompt", || asked(&wrong) > i);
+        assert!(!wrong.text().contains(guess), "the passphrase is not echoed");
+        wrong.send(&format!("{guess}\r"));
+    }
+    wrong.wait_for("too many wrong passphrases");
+    wrong.wait_for("type here");
+    assert_eq!(locked_rows(&far).0, json!(true));
+    wrong.command("/detach");
+    assert!(wrong.wait_exit().success());
+
+    let mut right = attach_continuing(&far);
+    right.wait_for("passphrase for");
+    right.send("hunter2\r");
+    right.wait_for("is unlocked");
+    right.wait_for("type here");
+    assert!(!right.text().contains("hunter2"));
+    wait_until("the agent to be open", || locked_rows(&far).0 == json!(false));
+    right.command("/detach");
+    assert!(right.wait_exit().success());
+}
+
+#[test]
+fn a_reconnect_to_an_agent_that_restarted_locked_unlocks_it_when_the_key_needs_no_passphrase() {
+    let key = identity(4, None);
+    let far = ssh_far(&key);
+    let mut term = Term::spawn(far.mu());
+    term.wait_for("[y/N]");
+    term.send("y\r");
+    term.wait_for("type here");
+    wait_until("the agent to have a client", || far.client_host().is_some());
+    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
+    let old = pid_of(&far.remote, &id);
+
+    let agent = restart_locked(&far, &old);
+    wait_until("the client to unlock the restarted agent", || {
+        far.agents().first().is_some_and(|a| a["locked"] == json!(false) && a["client"]["host"].is_string())
+    });
+    assert!(!term.text().contains("passphrase for"), "a reconnect never asks");
+    // The model the agent could not resolve while locked is set once it is open.
+    let mut peek = Client::connect(&agent.socket);
+    peek.hello();
+    let seen = peek.until(caught_up);
+    assert!(seen.iter().any(|v| v.to_string().contains("claude-sonnet-5-5")), "{seen:?}");
+}

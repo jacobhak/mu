@@ -12,6 +12,8 @@ What counts as a secret:
 - Provider API keys you added to mu's key store (`mu auth`, `/login`), whatever their format (Baseten keys have none): the literal keys in `auth.json`, and the values of `$NAME` and `!command` references once resolved. They show as `[REDACTED:ANTHROPIC_API_KEY]`, `[REDACTED:OPENAI_API_KEY]` or `[REDACTED:BASETEN_API_KEY]`, so `cat ~/.mu/auth.json` run by the model comes back redacted. Provider error bodies pass through the same filter before they are shown or stored.
 - ChatGPT sign-in tokens (the `chatgpt` section of `auth.json`): the access, refresh and ID tokens, as `[REDACTED:OPENAI_CHATGPT_TOKEN]`, `[REDACTED:OPENAI_CHATGPT_REFRESH_TOKEN]` and `[REDACTED:OPENAI_CHATGPT_ID_TOKEN]`.
 
+Redaction covers what the model sees. At rest, `auth.json` can additionally be sealed with the agent's state key (see [providers.md](providers.md#the-store)): the key store then holds no plaintext key or token, and a copy of it taken while the agent is locked reveals none. On copy-on-write or snapshotting storage, snapshots taken before the file was sealed keep the plaintext.
+
 Known values are matched exactly; there is no guessing from randomness, so hashes and ids are left alone.
 
 When a tool result had secrets replaced, the model is told which placeholders it saw, that the values are hidden, and to use environment variables by name (`"$GEMINI_API_KEY"`). A `bash`, `edit` or `write` call that contains a placeholder mu handed out is refused with an explanation, since it would write the placeholder where the secret was. When your own message had a secret replaced, mu shows a notice.

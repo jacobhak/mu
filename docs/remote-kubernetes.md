@@ -72,6 +72,12 @@ Nothing secret goes in a manifest, a Secret or `config.toml`. Run `/login` (or `
 
 `mu agent key` in the pod prints the agent's key fingerprint; compare it with what the client shows when it pins the key for the first time (`kubectl exec -n mu-agent mu-agent-0 -- mu agent key`).
 
+## Sealing credentials with your SSH key
+
+The encrypted StorageClass is the storage layer's, and its key is the cluster's. To keep credentials unreadable from a volume snapshot, a backup or a shared volume even when that layer is not trusted, turn on mu's own sealing: uncomment `[agent] state_key = "ssh"` in the agent's `config.toml` (the `mu-agent-init` ConfigMap has it commented out; edit the real file in the `auth` volume if the agent already started once). The first `mu -r <remote>` attach shows the public key it would use (`~/.ssh/id_ed25519.pub`; an ed25519 key, no RSA) and asks before it enables the sealing. From then on `auth.json` and omp's login database sit on the volume only in sealed form, and omp reads them from a memory-backed directory in the pod (`/dev/shm`, which the container runtime provides even with a read-only root file system; the database is a few MB). After a pod restart the agent starts locked and waits, setting `waiting` in `mu agent list --json`, until a client with the key attaches and unlocks it.
+
+For an agent that must restart unattended, `state_key_file` or `state_key_command` reads a 32-byte key at start instead; the key's source (a Secret, a KMS) then decides how well it is protected. Details and limits (what a runtime attacker on the node can still read, which files stay in the clear) are in [remote.md](remote.md#where-your-data-goes).
+
 ## Cluster hygiene
 
 - **Separate namespaces.** The agent, which holds credentials, and the workers, which run model-written code, never share one; pod security `restricted` is enforced on `mu-agent` and `baseline` on `mu-workers`.

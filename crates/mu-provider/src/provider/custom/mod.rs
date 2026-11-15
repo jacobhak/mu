@@ -559,6 +559,9 @@ impl CustomProvider {
             return Ok(None);
         }
         let id = &self.id;
+        if store.is_locked() {
+            return Err(mu_common::sealed::SealedError::Locked.into());
+        }
         let entry = store.get(id).ok_or_else(|| {
             anyhow!("no API key for custom provider `{id}`: add one with /login {id} or `mu auth add {id}`")
         })?;

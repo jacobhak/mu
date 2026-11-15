@@ -44,6 +44,8 @@ pub struct Init {
     /// The session is resumed, so it exists already.
     pub resumed: bool,
     pub config: MuAgent,
+    /// The model selector that could not be resolved while the state was locked: set once it is open.
+    pub deferred_model: Option<String>,
 }
 
 /// Who said hello (see `ClientLine::Hello`).
@@ -89,6 +91,13 @@ struct Server {
     /// The requests that wait with no client attached, and since when.
     unattended: std::collections::HashMap<u64, std::time::Instant>,
     flagged: bool,
+    /// The profile has a state key, so the agent is locked until something unlocks it.
+    sealed: bool,
+    locked: bool,
+    deferred_model: Option<String>,
+    /// Replies of calls that finished later, by the id of the connection that asked. They go through the loop so
+    /// that everything the call pushed before it ended is sent first.
+    replies: UnboundedSender<(u64, String)>,
 }
 
 /// `{path}`: takes the session over for a client that has no terminal here: a `mu -p` run holding it is
@@ -178,8 +187,19 @@ impl Server {
     }
 
     /// Keeps what waits with no client in view: the owner record's `waiting`, the notify command (once
-    /// per request) and the clock the approval timeout runs on.
+    /// per request) and the clock the approval timeout runs on. A locked agent is `locked` and `waiting`
+    /// too, and runs the notify command once when it becomes so.
     fn attend(&mut self) {
+        let locked = self.sealed && !mu_common::sealed::is_unlocked();
+        if locked != self.locked {
+            self.locked = locked;
+            owner::set_attention(|a| a.locked = locked);
+            if locked {
+                self.notify_summary("locked: attach to unlock");
+            } else if let Some(model) = self.deferred_model.take() {
+                let _ = self.cmd.send(Command::SetModel(model));
+            }
+        }
         let waiting = self.catchup.waiting();
         self.unattended.retain(|id, _| waiting.iter().any(|w| w.id == *id));
         if self.client.is_some() {
@@ -193,7 +213,7 @@ impl Server {
                 }
             }
         }
-        let flag = !self.unattended.is_empty();
+        let flag = !self.unattended.is_empty() || self.locked;
         if flag != self.flagged {
             self.flagged = flag;
             owner::set_attention(|a| a.waiting = flag);
@@ -201,9 +221,13 @@ impl Server {
     }
 
     fn notify(&self, w: &Waiting) {
-        let (Some(command), Some(session)) = (&self.config.notify_command, &self.session) else { return };
         let what = if w.approval { "approval" } else { "question" };
-        let summary = format!("{what}: {}", w.summary).replace('\n', " ");
+        self.notify_summary(&format!("{what}: {}", w.summary));
+    }
+
+    fn notify_summary(&self, summary: &str) {
+        let (Some(command), Some(session)) = (&self.config.notify_command, &self.session) else { return };
+        let summary = summary.replace('\n', " ");
         let child = tokio::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(command)
@@ -407,9 +431,9 @@ impl Server {
                         let _ = client.writer.send(reply(r));
                     }
                     mu_tui::host::Answer::Pending(fut) => {
-                        let writer = client.writer.clone();
+                        let (replies, client_id) = (self.replies.clone(), client.id);
                         tokio::task::spawn_local(async move {
-                            let _ = writer.send(reply(fut.await));
+                            let _ = replies.send((client_id, reply(fut.await)));
                         });
                     }
                 }
@@ -432,6 +456,12 @@ async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>, 
         Ok(ClientLine::Hello { wire, .. }) => {
             let refusal = AgentLine::Error(format!("this agent speaks wire {WIRE}, the client wire {wire}"));
             let _ = write.write_all(format!("{}\n", to_line(&refusal)).as_bytes()).await;
+            // Closing with the client's next bytes unread would reset the connection and could drop the answer.
+            let _ = write.shutdown().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while lines.next_line().await.is_some() {}
+            })
+            .await;
             return;
         }
         _ => return,
@@ -483,7 +513,8 @@ async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>, 
 }
 
 pub async fn run(init: Init) -> i32 {
-    let Init { host, cmd, mut ev, mut notices, resumed, config } = init;
+    let Init { host, cmd, mut ev, mut notices, resumed, config, deferred_model } = init;
+    let (replies_tx, mut replies) = unbounded_channel::<(u64, String)>();
     let mut server = Server {
         host,
         cmd,
@@ -496,7 +527,12 @@ pub async fn run(init: Init) -> i32 {
         config,
         unattended: Default::default(),
         flagged: false,
+        sealed: false,
+        locked: false,
+        deferred_model,
+        replies: replies_tx,
     };
+    server.sealed = mu_common::sealed::is_initialised(&paths::profile_home());
     let key = match secure::agent_key() {
         Ok(k) => Rc::new(k),
         Err(e) => {
@@ -537,6 +573,7 @@ pub async fn run(init: Init) -> i32 {
         }
     }
     let (Some(session), Some(socket)) = (server.session.clone(), server.socket.clone()) else { return 1 };
+    server.attend();
     println!("{}", serde_json::json!({"session": mu_session::session::list::id_of(&session), "socket": socket}));
     let detached = DETACHED.load(std::sync::atomic::Ordering::SeqCst);
     if detached {
@@ -586,6 +623,14 @@ pub async fn run(init: Init) -> i32 {
             Some(p) = async { match pushed.as_mut() { Some(r) => r.recv().await, None => std::future::pending().await } } => {
                 server.send(&AgentLine::Pushed { name: p.name, data: p.data });
             }
+            Some((client_id, line)) = replies.recv() => {
+                while let Some(p) = pushed.as_mut().and_then(|r| r.try_recv().ok()) {
+                    server.send(&AgentLine::Pushed { name: p.name, data: p.data });
+                }
+                if let Some(c) = server.client.as_ref().filter(|c| c.id == client_id) {
+                    let _ = c.writer.send(line);
+                }
+            }
             Some(n) = notices.recv() => eprintln!("mu agent: {n}"),
             () = async {
                 match expiry {
@@ -618,6 +663,7 @@ pub async fn run(init: Init) -> i32 {
 /// The first signal ends the agent the proper way (jobs, hooks, plugins); a second means it is stuck.
 fn stop(asked: &mut bool, cmd: &UnboundedSender<Command>, code: i32) {
     if *asked {
+        super::state::shutdown();
         std::process::exit(code);
     }
     *asked = true;

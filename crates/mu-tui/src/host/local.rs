@@ -19,6 +19,7 @@ pub struct Local {
     pub ctx: Rc<Context>,
     pub plugins: Rc<PluginHost>,
     pub cwd: PathBuf,
+    pub profile_home: PathBuf,
     /// Where a handler's background task sends values the UI did not ask for.
     pub push: UnboundedSender<Pushed>,
 }
@@ -70,8 +71,9 @@ impl LocalHost {
         super::memory::register(&mut registry);
         super::program::register(&mut registry);
         super::results::register(&mut registry);
+        super::state::register(&mut registry);
         Self {
-            local: Rc::new(Local { providers, ctx, plugins, cwd, push }),
+            local: Rc::new(Local { providers, ctx, plugins, cwd, profile_home: info.profile_home.clone(), push }),
             info,
             handlers: registry.0,
             pushed: RefCell::new(Some(pushed)),
@@ -120,7 +122,35 @@ mod tests {
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
         let auth = mu_testutil::tmp().join("auth.json");
         let providers = Rc::new(Providers::for_tests_with_auth(Rc::new(Configs::default()), gateway, auth));
-        LocalHost::new(providers, Rc::new(Context::default()), plugins, "/".into())
+        let mut h = LocalHost::new(providers, Rc::new(Context::default()), plugins, "/".into());
+        let l = &h.local;
+        // Its own profile, so the state calls never touch the test process's shared one.
+        h.local = Rc::new(Local {
+            providers: l.providers.clone(),
+            ctx: l.ctx.clone(),
+            plugins: l.plugins.clone(),
+            cwd: l.cwd.clone(),
+            profile_home: mu_testutil::tmp(),
+            push: l.push.clone(),
+        });
+        h
+    }
+
+    /// An SSH ed25519 identity from a seed: its private key text and its public key line.
+    fn identity(seed: u8) -> (String, String) {
+        use ssh_key::private::Ed25519Keypair;
+        let key = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
+        (key.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string(), key.public_key().to_openssh().unwrap())
+    }
+
+    /// State calls share the process's unlocked state and the wanted flag: one test at a time.
+    fn state_serial() -> std::sync::MutexGuard<'static, ()> {
+        static S: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = S.lock().unwrap_or_else(|e| e.into_inner());
+        mu_common::sealed::lock();
+        crate::host::state::set_wanted(false);
+        crate::host::state::reset_failures();
+        g
     }
 
     fn ready(h: &LocalHost, name: &str, args: Value) -> Result<Value, String> {
@@ -162,8 +192,13 @@ mod tests {
 
     #[test]
     fn no_host_reply_carries_a_stored_secret() {
+        use base64::Engine;
+        let _g = state_serial();
         let h = host();
         seed(&h);
+        crate::host::state::set_wanted(true);
+        let (private, public) = identity(7);
+        let dk_like = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
         // Calls that need arguments to say anything about a credential; every other call is made with `null`.
         let with_args = [
             ("key_target", json!("anthropic")),
@@ -173,6 +208,10 @@ mod tests {
             ("remove_key", json!("nothing-stored")),
             ("result_diff", json!({"cwd": "/", "ref": "refs/mu/result/none", "base": "0".repeat(40)})),
             ("result_apply", json!({"cwd": "/", "ref": "refs/mu/result/none", "base": "0".repeat(40)})),
+            ("state_init", json!({"recipients": [public]})),
+            ("state_unlock", json!({"dk": dk_like})),
+            ("state_add_recipient", json!({"recipient": public})),
+            ("state_remove_recipient", json!({"fingerprint": "SHA256:none"})),
         ];
         let mut names: Vec<&str> = h.handlers.keys().copied().collect();
         names.sort_unstable();
@@ -189,7 +228,7 @@ mod tests {
                 // A call that waits (the network, a child program) is not run; its future is dropped.
                 if let Answer::Ready(reply) = h.call(name, args) {
                     let text = format!("{reply:?}");
-                    for secret in SECRETS {
+                    for secret in SECRETS.iter().chain(&[dk_like.as_str(), private.as_str()]) {
                         assert!(!text.contains(secret), "{name} replied with a stored secret: {text}");
                     }
                     walked += 1;
@@ -197,6 +236,95 @@ mod tests {
             }
         }
         assert!(walked > 20, "only {walked} replies were read");
+        mu_common::sealed::lock();
+        crate::host::state::set_wanted(false);
+    }
+
+    fn status(h: &LocalHost) -> crate::host::state::StateStatus {
+        serde_json::from_value(ready(h, "state_status", Value::Null).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_state_key_is_set_up_locked_and_unlocked_through_the_host_without_a_reply_carrying_a_key() {
+        use base64::Engine;
+        use mu_common::sealed::{self, Kind, Wrapped};
+        let _g = state_serial();
+        let h = host();
+        let home = h.local.profile_home.clone();
+        let (private, public) = identity(1);
+        let s = status(&h);
+        assert!(!s.enabled && !s.initialised && !s.locked && s.kind.is_none());
+        assert!(ready(&h, "state_init", json!({"recipients": [public]})).is_err(), "not turned on");
+
+        crate::host::state::set_wanted(true);
+        assert!(status(&h).needs_init());
+        assert!(ready(&h, "state_wrapped", Value::Null).is_err(), "nothing to unwrap yet");
+        let mut replies = vec![ready(&h, "state_init", json!({"recipients": [public]})).unwrap()];
+        assert_eq!(
+            status(&h),
+            crate::host::state::StateStatus {
+                enabled: true,
+                initialised: true,
+                locked: false,
+                kind: Some(Kind::Recipients),
+            }
+        );
+        assert!(ready(&h, "state_init", json!({"recipients": [public]})).is_err(), "only once");
+        assert!(sealed::is_initialised(&home));
+
+        sealed::lock();
+        let s = status(&h);
+        assert!(s.locked && !s.needs_init());
+        let wrapped = ready(&h, "state_wrapped", Value::Null).unwrap();
+        replies.push(wrapped.clone());
+        let w: Wrapped = serde_json::from_value(wrapped).unwrap();
+        let dk = sealed::unwrap_with_identity(&w, &private, None).unwrap();
+        let dk_text = base64::engine::general_purpose::STANDARD.encode(dk.as_bytes());
+        replies.push(ready(&h, "state_unlock", json!({"dk": dk_text})).unwrap());
+        assert!(!status(&h).locked && sealed::is_unlocked());
+        assert!(ready(&h, "state_wrapped", Value::Null).is_err(), "only while locked");
+
+        let (_, other) = identity(2);
+        replies.push(ready(&h, "state_add_recipient", json!({"recipient": other})).unwrap());
+        assert_eq!(replies.last().unwrap().as_array().unwrap().len(), 2);
+        let fp = replies.last().unwrap()[1]["fingerprint"].as_str().unwrap().to_string();
+        replies.push(ready(&h, "state_remove_recipient", json!({"fingerprint": fp})).unwrap());
+        assert_eq!(replies.last().unwrap().as_array().unwrap().len(), 1);
+        replies.push(status_value(&h));
+        let text = format!("{replies:?}");
+        assert!(!text.contains(&dk_text) && !text.contains(&private), "a reply carried a key: {text}");
+
+        sealed::lock();
+        assert!(
+            ready(&h, "state_add_recipient", json!({"recipient": other})).is_err(),
+            "a locked agent changes nothing"
+        );
+        crate::host::state::set_wanted(false);
+    }
+
+    fn status_value(h: &LocalHost) -> Value {
+        ready(h, "state_status", Value::Null).unwrap()
+    }
+
+    #[test]
+    fn a_wrong_key_is_refused_and_only_a_few_are_tried_a_minute() {
+        use base64::Engine;
+        let _g = state_serial();
+        let h = host();
+        let (_, public) = identity(3);
+        crate::host::state::set_wanted(true);
+        ready(&h, "state_init", json!({"recipients": [public]})).unwrap();
+        mu_common::sealed::lock();
+        let wrong = json!({"dk": base64::engine::general_purpose::STANDARD.encode([5u8; 32])});
+        for _ in 0..5 {
+            let e = ready(&h, "state_unlock", wrong.clone()).unwrap_err();
+            assert!(e.contains("wrong key"), "{e}");
+        }
+        let e = ready(&h, "state_unlock", wrong).unwrap_err();
+        assert!(e.contains("too many"), "{e}");
+        assert!(ready(&h, "state_unlock", json!({"dk": "not base64!"})).is_err());
+        assert!(status(&h).locked);
+        crate::host::state::set_wanted(false);
     }
 
     #[test]

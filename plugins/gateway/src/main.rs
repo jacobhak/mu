@@ -4,7 +4,7 @@
 mod daemon;
 mod shared;
 
-use mu_common::{paths, rpc};
+use mu_common::rpc;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -38,7 +38,7 @@ async fn handle(req: rpc::Request) -> Result<Value, rpc::RpcError> {
             Ok(json!({"baseUrl": base_url, "token": token}))
         }
         "broker/endpoint" => {
-            let (dir, root) = (shared::gw_dir(), paths::omp_config_root());
+            let (dir, root) = (shared::gw_dir(), mu_common::omp_state::credential_root());
             tokio::task::spawn_blocking(move || broker_endpoint_rpc(&dir, &root))
                 .await
                 .map_err(|e| err(-32000, e.to_string()))?
@@ -61,7 +61,7 @@ fn endpoint(pid: u32) -> Result<(String, String), String> {
         Some(st) if shared::alive(st.pid) && shared::healthy(&st.url) => st.url,
         _ => daemon::start(&dir)?,
     };
-    let token_path = paths::omp_config_root().join("auth-gateway.token");
+    let token_path = mu_common::omp_state::credential_root().join("auth-gateway.token");
     let token =
         fs::read_to_string(&token_path).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty()).ok_or_else(
             || format!("gateway token not found at {}; run `omp auth-gateway token`", token_path.display()),

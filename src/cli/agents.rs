@@ -20,6 +20,7 @@ fn agents() -> Vec<Value> {
                 "title": title,
                 "client": s.client,
                 "waiting": s.waiting,
+                "locked": s.locked,
             });
             (started, row)
         })
@@ -51,7 +52,11 @@ pub fn list(json: bool) -> Result<i32> {
             Some(h) => format!("client {h}"),
             None => "no client".into(),
         };
-        let waiting = if r["waiting"] == true { "  waiting for you" } else { "" };
+        let waiting = match (r["locked"] == true, r["waiting"] == true) {
+            (true, _) => "  locked: attach to unlock",
+            (false, true) => "  waiting for you",
+            _ => "",
+        };
         let title = r["title"].as_str().map(|t| format!("  {t}")).unwrap_or_default();
         println!("{}  {}  {client}{waiting}{title}", r["id"].as_str().unwrap_or(""), r["cwd"].as_str().unwrap_or(""));
     }
