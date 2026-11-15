@@ -101,6 +101,8 @@ pub fn launch_id(name: &str) -> String {
     format!("{slug}-{}", &random[..8])
 }
 
+type ProgressFn = Box<dyn Fn(Option<&str>)>;
+
 /// A subagent started on a remote. Dropping it deletes the task ref and the bundle, so they go on
 /// every way out of the run, including a worker that never started.
 pub struct Launch {
@@ -113,6 +115,14 @@ pub struct Launch {
     base: String,
     /// Holds the task bundle and, later, the result bundle.
     dir: PathBuf,
+    /// Told each step the remote reports while starting the worker, then `None` once it has started.
+    progress: Option<ProgressFn>,
+}
+
+impl Launch {
+    pub fn on_progress(&mut self, f: impl Fn(Option<&str>) + 'static) {
+        self.progress = Some(Box::new(f));
+    }
 }
 
 impl Drop for Launch {
@@ -167,6 +177,7 @@ pub async fn prepare_launch(on: &WorkerLaunch, cwd: &Path, name: &str) -> Result
         root,
         task_ref,
         base: commit,
+        progress: None,
     };
     mu_common::fs::create_private_dir(&launch.dir).map_err(|e| format!("task: cannot make the bundle: {e}"))?;
     let bundle = launch.dir.join("task.bundle");
@@ -511,11 +522,24 @@ pub async fn run_child_observed(
         ChildCmd::Launched(l) => {
             let (remote, id, bundle, dir) =
                 (l.remote.clone(), l.id.clone(), l.dir.join("task.bundle"), remote_dir(&l.id));
-            let started = tokio::task::spawn_blocking({
+            let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let mut start = tokio::task::spawn_blocking({
                 let remote = remote.clone();
-                move || remote.start(&id, &bundle, &dir, &mut |_| {})
-            })
-            .await;
+                move || remote.start(&id, &bundle, &dir, &mut |p| drop(ptx.send(p.to_string())))
+            });
+            let started = loop {
+                tokio::select! {
+                    Some(p) = prx.recv() => {
+                        if let Some(f) = &l.progress {
+                            f(Some(&p));
+                        }
+                    }
+                    r = &mut start => break r,
+                }
+            };
+            if let Some(f) = &l.progress {
+                f(None);
+            }
             let worker = match started {
                 Ok(Ok(w)) => w,
                 Ok(Err(e)) => return Outcome::failed(format!("cannot start a worker on {}: {e}", remote.name())),
@@ -1059,6 +1083,42 @@ echo '{"type":"exit","code":0,"stderr":"","seq":3}'"#,
             assert_eq!(sh(&root, &["for-each-ref", "refs/mu/result/"]), "", "nothing was kept");
         }
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_progress_is_on_the_job_until_the_worker_is_connected() {
+        let root = repo();
+        let (release, gate) = std::sync::mpsc::channel();
+        let mut fake = Fake::new(&[&worker(DONE)]).writing("a.txt", "worked");
+        fake.progress = vec!["scheduling", "pulling image"];
+        *fake.gate.lock().unwrap() = Some(gate);
+        let fake = Arc::new(fake);
+        let h = crate::jobs::tests::handle();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let launch = prepare_launch(&on(&fake, 5000), &root, "t").await.unwrap();
+                h.spawn(
+                    "t".into(),
+                    "task".into(),
+                    ChildCmd::Launched(launch),
+                    root.clone(),
+                    json!({"task": "go"}),
+                    Rc::default(),
+                    root.join("artifacts"),
+                    Mirror::Off,
+                    None,
+                );
+                let shown = async {
+                    while h.snapshot()[0].progress.as_deref() != Some("pulling image") {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(10), shown).await.expect("progress is shown");
+                release.send(()).unwrap();
+                h.finished().await;
+            })
+            .await;
+        assert_eq!(h.snapshot()[0].progress, None);
     }
 
     #[tokio::test(flavor = "current_thread")]

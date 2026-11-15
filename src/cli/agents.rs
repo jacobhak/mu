@@ -28,6 +28,13 @@ fn agents() -> Vec<Value> {
     found.into_iter().map(|(_, row)| row).collect()
 }
 
+/// `mu agent key`: the fingerprint of the key that every agent of this profile shows its clients.
+pub fn key() -> Result<i32> {
+    let key = mu_common::secure::agent_key().map_err(anyhow::Error::msg)?;
+    println!("{}", key.fingerprint());
+    Ok(0)
+}
+
 pub fn list(json: bool) -> Result<i32> {
     let rows = agents();
     if json {

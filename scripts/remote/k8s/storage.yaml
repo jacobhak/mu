@@ -1,0 +1,38 @@
+# <storage-class> MUST be encrypted at rest: these volumes hold the repositories, the transcripts and auth.json.
+# `auth` is the agent's profile home (auth.json, sessions, memory, the agent's key): mu replaces auth.json by
+# renaming a new file over it, so the directory is the unit that can be mounted. Only the agent container mounts it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auth
+  namespace: mu-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: <storage-class>
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: home
+  namespace: mu-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: <storage-class>
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: work
+  namespace: mu-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: <storage-class>
+  resources:
+    requests:
+      storage: 20Gi

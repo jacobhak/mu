@@ -13,6 +13,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use mu_base::git::{git, snapshot_tree};
 use mu_common::paths;
+use mu_common::rpc::Framed;
+use mu_common::secure;
 use mu_provider::provider::relay::{Call, Reply};
 use mu_session::session::{list, owner};
 use mu_tools::tools::link::wire;
@@ -145,6 +147,8 @@ struct Hub {
     calls: HashMap<u64, (u64, String)>,
     asks: HashMap<u64, (u64, String)>,
     conn: Option<Conn>,
+    /// The parent's static key, as the first connection showed it.
+    parent_key: Option<Vec<u8>>,
     gens: u64,
     child_in: Option<UnboundedSender<String>>,
     child_pid: i32,
@@ -161,6 +165,7 @@ impl Hub {
             calls: HashMap::new(),
             asks: HashMap::new(),
             conn: None,
+            parent_key: None,
             gens: 0,
             child_in: None,
             child_pid: 0,
@@ -362,6 +367,8 @@ async fn serve(place: Place, detached: bool) -> Result<i32> {
     }
     let backlog = Backlog::new(MEMORY_CAP, state_dir(&place.launch).join("backlog"));
     let hub: Shared = Rc::new(RefCell::new(Hub::new(backlog)));
+    // In memory only: a worker's key lives as long as the worker.
+    let key = Rc::new(secure::Keypair::generate().map_err(|e| anyhow!(e))?);
     let place = Rc::new(place);
     let (mut term, mut int, mut hup) =
         (signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?, signal(SignalKind::hangup())?);
@@ -371,7 +378,7 @@ async fn serve(place: Place, detached: bool) -> Result<i32> {
         tokio::select! {
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
-                    tokio::task::spawn_local(connection(stream, hub.clone(), place.clone()));
+                    tokio::task::spawn_local(connection(stream, hub.clone(), place.clone(), key.clone()));
                 }
             }
             _ = term.recv() => break,
@@ -395,28 +402,45 @@ async fn serve(place: Place, detached: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// One connection: its first line is `resume`; then the parent's acknowledgements, the task, and
-/// lines for the child. A newer connection replaces this one.
-async fn connection(stream: UnixStream, hub: Shared, place: Rc<Place>) {
+/// One connection: the handshake (the parent's key is the one the first connection showed), then, inside
+/// the channel, its first line `resume`; then the parent's acknowledgements, the task, and lines for the
+/// child. A newer connection replaces this one.
+async fn connection(stream: UnixStream, hub: Shared, place: Rc<Place>, key: Rc<secure::Keypair>) {
     let (rd, mut wr) = stream.into_split();
+    let mut rd = Framed::new(BufReader::new(rd));
+    let limit = Duration::from_secs(10);
+    let (mut sealer, mut opener, parent) =
+        match tokio::time::timeout(limit, secure::accept(&key, &mut rd, &mut wr)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return eprintln!("mu worker: a connection's handshake failed: {e}"),
+            Err(_) => return,
+        };
+    {
+        let mut h = hub.borrow_mut();
+        match &h.parent_key {
+            None => h.parent_key = Some(parent),
+            Some(k) if *k == parent => {}
+            Some(_) => return eprintln!("mu worker: refused a connection whose key is not the parent's"),
+        }
+    }
     let (tx, mut rx) = unbounded_channel::<String>();
     tokio::task::spawn_local(async move {
         while let Some(l) = rx.recv().await {
-            if wr.write_all(l.as_bytes()).await.is_err() || wr.write_all(b"\n").await.is_err() {
+            if secure::write_line(&mut wr, &mut sealer, &l).await.is_err() {
                 break;
             }
         }
     });
-    let mut rd = BufReader::new(rd).lines();
-    let after = match rd.next_line().await {
-        Ok(Some(l)) => match serde_json::from_str::<Value>(&l) {
+    let first = tokio::time::timeout(limit, secure::next_line(&mut rd, &mut opener)).await;
+    let after = match first {
+        Ok(Ok(Some(l))) => match serde_json::from_str::<Value>(&l) {
             Ok(v) if v["type"] == "resume" => v["after"].as_u64().unwrap_or(0),
             _ => return,
         },
         _ => return,
     };
     let serial = hub.borrow_mut().attach(tx, after);
-    while let Ok(Some(line)) = rd.next_line().await {
+    while let Ok(Some(line)) = secure::next_line(&mut rd, &mut opener).await {
         if !hub.borrow().current(serial) {
             break;
         }
@@ -670,6 +694,70 @@ mod tests {
         let (tx3, mut rx3) = unbounded_channel();
         h.attach(tx3, 6);
         assert!(sent(&mut rx3).is_empty());
+    }
+
+    type Dialed = (
+        Framed<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        secure::Sealer,
+        secure::Opener,
+        tokio::net::unix::OwnedWriteHalf,
+    );
+
+    /// A parent with static key `me` connecting to a worker whose key is `key`: handshake, then `resume`.
+    async fn dial(hub: &Shared, key: &Rc<secure::Keypair>, me: &secure::Keypair) -> Dialed {
+        let (a, b) = UnixStream::pair().unwrap();
+        let place =
+            Rc::new(Place { launch: "t".into(), dir: mu_testutil::tmp(), base: String::new(), exe: PathBuf::new() });
+        tokio::task::spawn_local(connection(b, hub.clone(), place, key.clone()));
+        let (rd, mut wr) = a.into_split();
+        let mut rd = Framed::new(BufReader::new(rd));
+        let mut hs = secure::Handshake::initiator(me).unwrap();
+        wr.write_all(format!("{}\n", hs.write().unwrap()).as_bytes()).await.unwrap();
+        let Some(mu_common::rpc::Line::Value(v)) = rd.next_line().await else { panic!("no handshake answer") };
+        hs.read(&v).unwrap();
+        wr.write_all(format!("{}\n", hs.write().unwrap()).as_bytes()).await.unwrap();
+        let (mut sealer, opener, seen) = hs.finish().unwrap();
+        assert_eq!(seen, key.public(), "the parent sees the worker's key");
+        let _ = secure::write_line(&mut wr, &mut sealer, &wire::resume(0)).await;
+        (rd, sealer, opener, wr)
+    }
+
+    async fn connections(hub: &Shared, n: u64) {
+        for _ in 0..200 {
+            if hub.borrow().gens >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the worker did not take connection {n}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_stream_is_encrypted_and_only_the_parent_that_came_first_may_reconnect() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let hub: Shared = Rc::new(RefCell::new(hub()));
+                let key = Rc::new(secure::Keypair::generate().unwrap());
+                let parent = secure::Keypair::generate().unwrap();
+                let (mut rd, _s, mut op, _w) = dial(&hub, &key, &parent).await;
+                connections(&hub, 1).await;
+                hub.borrow_mut().emit(r#"{"type":"tool","name":"x"}"#);
+                let line = secure::next_line(&mut rd, &mut op).await.unwrap().unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["seq"], 1);
+
+                // The same parent reconnects and has the same key; the worker replays what it was not told of.
+                let (mut rd2, _s2, mut op2, _w2) = dial(&hub, &key, &parent).await;
+                connections(&hub, 2).await;
+                let again = secure::next_line(&mut rd2, &mut op2).await.unwrap().unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&again).unwrap()["seq"], 1);
+
+                // Another key is refused: its stream just ends.
+                let stranger = secure::Keypair::generate().unwrap();
+                let (mut rd3, ..) = dial(&hub, &key, &stranger).await;
+                assert!(rd3.next_line().await.is_none(), "a connection with another key gets nothing");
+                assert_eq!(hub.borrow().gens, 2, "and does not replace the parent's");
+            })
+            .await;
     }
 
     #[test]

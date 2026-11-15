@@ -369,10 +369,9 @@ struct Behaviour {
     trusted: bool,
     /// `repos` of an untrusted remote.
     repos: Vec<PathBuf>,
-    /// The first connection is cut after this many lines from the worker (0: never).
+    /// The first connection is cut after this many lines from the worker (0: never). The first of them
+    /// is the handshake, the rest are encrypted.
     cut_first: usize,
-    /// The task payload says another mu version on its way to the worker.
-    old_version: bool,
 }
 
 /// A remote that runs its workers on this machine, with a bare home (no key, no gateway), through an
@@ -420,14 +419,6 @@ fn remote_for(home: &Path, b: Behaviour) -> Remote {
     let log = mu_testutil::tmp();
     // The parent's PATH is empty, but launching a task commits the tree with git.
     let _ = std::os::unix::fs::symlink(on_path("git"), home.join("empty-bin/git"));
-    let mangle = if b.old_version {
-        format!(
-            "{{ IFS= read -r r; printf '%s\\n' \"$r\"; IFS= read -r t; printf '%s\\n' \"$t\" | '{}' 's/\"muVersion\":\"[^\"]*\"/\"muVersion\":\"0.0.0\"/'; cat; }}",
-            on_path("sed").display()
-        )
-    } else {
-        "cat".to_string()
-    };
     let script = format!(
         r#"#!/bin/sh
 PATH='{path}'; export PATH
@@ -453,10 +444,10 @@ case "$1" in
     n=$(cat '{log}'/connects.n 2>/dev/null || echo 0)
     echo $((n + 1)) > '{log}'/connects.n
     if [ "$n" -eq 0 ] && [ {cut} -gt 0 ]; then
-      {{ tee -a '{log}'/to-worker | {mangle} | as_worker attach --stdio "$2"; }} \
-        | {{ head -n {cut} | tee -a '{log}'/from-worker; kill $$; }}
+      {{ tee -a '{log}'/to-worker | as_worker attach --stdio "$2"; }} \
+        | {{ k=0; while [ $k -lt {cut} ] && IFS= read -r l; do printf '%s\n' "$l" | tee -a '{log}'/from-worker; k=$((k + 1)); done; kill $$; }}
     else
-      tee -a '{log}'/to-worker | {mangle} | as_worker attach --stdio "$2" | tee -a '{log}'/from-worker
+      tee -a '{log}'/to-worker | as_worker attach --stdio "$2" | tee -a '{log}'/from-worker
     fi
     ;;
   fetch) as_worker worker bundle "$2" ;;
@@ -510,7 +501,7 @@ fn a_launched_child_with_no_credentials_reaches_the_model_through_the_parent() {
 #[test]
 fn a_worker_stream_cut_with_a_relay_call_in_flight_is_resumed_and_the_task_completes() {
     let (home, cwd, seen) = relay_fixture("relayed child result");
-    let remote = remote_for(&home, Behaviour { trusted: true, cut_first: 1, ..Default::default() });
+    let remote = remote_for(&home, Behaviour { trusted: true, cut_first: 2, ..Default::default() });
     let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     assert!(remote.log("connects.n").trim().parse::<u32>().unwrap() >= 2, "it reconnected");
@@ -521,14 +512,9 @@ fn a_worker_stream_cut_with_a_relay_call_in_flight_is_resumed_and_the_task_compl
         "the result is complete: {requests:?}"
     );
     assert!(stdout(&o).contains("parent finished"), "stdout: {}", stdout(&o));
-    // No line the parent got twice: the worker's numbers on the second connection continue.
-    let numbers: Vec<u64> = remote
-        .log("from-worker")
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()?["seq"].as_u64())
-        .collect();
-    assert_eq!(numbers.first(), Some(&1), "{numbers:?}");
-    assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1 || w[1] == 1), "{numbers:?}");
+    // Both connections were encrypted: the stream carries no line the parent could read.
+    let from = remote.log("from-worker");
+    assert!(from.lines().count() > 2 && !from.contains("\"seq\"") && !from.contains("\"type\""), "{from}");
 }
 
 /// A worker for an untrusted remote gets nothing secret from the parent: not in the adapter's
@@ -557,7 +543,8 @@ fn a_worker_on_an_untrusted_remote_is_sent_no_secret() {
         .filter(|n| n.starts_with("env."))
         .collect();
     assert!(envs.len() >= 4, "every verb ran: {envs:?}");
-    assert!(remote.log("to-worker").contains("\"type\":\"task\""), "the payload went through the stream");
+    let to = remote.log("to-worker");
+    assert!(!to.is_empty() && !to.contains("\"type\"") && !to.contains("delegate"), "the payload is encrypted: {to}");
     assert!(
         !remote.log("from-worker").is_empty() && std::fs::metadata(remote.log.join("bundle.bin")).unwrap().len() > 0
     );
@@ -598,21 +585,6 @@ fn an_untrusted_remote_refuses_an_unlisted_repository_and_a_config_with_credenti
         "{requests:?}"
     );
     assert!(remote.received().is_empty(), "the adapter was never run");
-}
-
-/// A worker of another version refuses the task, and the parent shows that as the task's error.
-#[test]
-fn a_worker_of_another_version_refuses_the_task_with_one_clear_line() {
-    let (home, cwd, seen) = relay_fixture("never said");
-    remote_for(&home, Behaviour { trusted: true, old_version: true, ..Default::default() });
-    let o = mu(&home, &cwd).args(["-p", "delegate it", "--model", MODEL]).output().unwrap();
-    assert!(o.status.success(), "stderr: {}", stderr(&o));
-    let requests = seen.lock().unwrap();
-    assert!(child_requests(&requests).is_empty(), "the worker never called the model: {requests:?}");
-    assert!(
-        requests.iter().any(|r| r.contains("\"tool_result\"") && r.contains("use the same version on both")),
-        "the version error is the task's error: {requests:?}"
-    );
 }
 
 /// The worker itself refuses a payload of another version, whoever sent it.

@@ -2,6 +2,7 @@
 //! scripted client speaking the wire lines over the agent's Unix socket.
 use mu_base::events::Command as AgentCommand;
 use mu_base::wire::{ClientLine, WIRE, WireCommand, to_line};
+use mu_common::secure::{Handshake, Keypair, Opener, Sealer};
 use mu_testutil::{Reply, block_on, fake_server};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -120,20 +121,71 @@ impl Drop for Agent {
     }
 }
 
+/// A client of the wire over any pipe: its first hello opens the channel (the version in the clear, the
+/// handshake, then the real hello inside); every line after goes through it. A hello of another wire
+/// number gets the agent's plain answer, which `next` returns.
 struct Client {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: Box<dyn BufRead>,
+    writer: Box<dyn Write>,
+    chan: Option<(Sealer, Opener)>,
+    plain: std::collections::VecDeque<Value>,
 }
 
 impl Client {
     fn connect(socket: &Path) -> Client {
         let stream = UnixStream::connect(socket).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-        Client { reader: BufReader::new(stream.try_clone().unwrap()), writer: stream }
+        Client::over(Box::new(BufReader::new(stream.try_clone().unwrap())), Box::new(stream))
+    }
+
+    fn over(reader: Box<dyn BufRead>, writer: Box<dyn Write>) -> Client {
+        Client { reader, writer, chan: None, plain: Default::default() }
+    }
+
+    /// An agent that refuses the version closes at once: a write after that may fail.
+    fn write_text(&mut self, text: &str) {
+        let _ = writeln!(self.writer, "{text}");
+        let _ = self.writer.flush();
+    }
+
+    fn read_raw(&mut self) -> Option<Value> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => None,
+            Ok(_) => Some(serde_json::from_str(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))),
+            Err(e) => panic!("reading the agent: {e}"),
+        }
     }
 
     fn send(&mut self, line: &ClientLine) {
-        writeln!(self.writer, "{}", to_line(line)).unwrap();
+        if self.chan.is_none()
+            && let ClientLine::Hello { wire, .. } = line
+        {
+            let bare = ClientLine::Hello {
+                wire: *wire,
+                version: "test".into(),
+                reconnect: false,
+                host: String::new(),
+                client: String::new(),
+                take: false,
+            };
+            let mut hs = Handshake::initiator(&Keypair::generate().unwrap()).unwrap();
+            self.write_text(&to_line(&bare));
+            self.write_text(&hs.write().unwrap());
+            let Some(answer) = self.read_raw() else { return };
+            if !answer.is_string() {
+                self.plain.push_back(answer);
+                return;
+            }
+            hs.read(&answer).unwrap();
+            self.write_text(&hs.write().unwrap());
+            let (sealer, opener, _) = hs.finish().unwrap();
+            self.chan = Some((sealer, opener));
+        }
+        let (sealer, _) = self.chan.as_mut().expect("a hello opens the channel");
+        for wire in sealer.seal(&to_line(line)).unwrap() {
+            self.write_text(&wire);
+        }
     }
 
     /// A hello that takes the session from whoever has it.
@@ -144,11 +196,15 @@ impl Client {
 
     /// The next line, `None` at the end of the stream.
     fn next(&mut self) -> Option<Value> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => Some(serde_json::from_str(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))),
-            Err(e) => panic!("reading the agent: {e}"),
+        if let Some(v) = self.plain.pop_front() {
+            return Some(v);
+        }
+        loop {
+            let raw = self.read_raw()?;
+            let Some((_, opener)) = self.chan.as_mut() else { return Some(raw) };
+            if let Some(text) = opener.open(&raw).unwrap() {
+                return Some(serde_json::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}")));
+            }
         }
     }
 
@@ -311,15 +367,16 @@ fn attach_copies_lines_between_stdio_and_the_socket() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut stdin = attach.stdin.take().unwrap();
-    writeln!(stdin, "{}", to_line(&hello_line(WIRE, "test", false))).unwrap();
-    writeln!(stdin, "{}", to_line(&ClientLine::Detach)).unwrap();
-    drop(stdin);
+    let stdin = attach.stdin.take().unwrap();
+    let stdout = attach.stdout.take().unwrap();
+    let mut c = Client::over(Box::new(BufReader::new(stdout)), Box::new(stdin));
+    let hello = c.hello();
+    assert!(hello.get("hello").is_some(), "{hello}");
+    c.until(caught_up);
+    c.send(&ClientLine::Detach);
+    drop(c);
     let out = attach.wait_with_output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.lines().next().unwrap().contains("\"hello\""), "{text}");
-    assert!(text.contains("CaughtUp"), "{text}");
 }
 
 #[test]
@@ -471,6 +528,28 @@ fn a_host_program_runs_on_a_terminal_with_its_output_pushed_and_its_input_taken(
 }
 
 #[test]
+fn a_login_started_by_a_client_writes_the_agents_credentials_not_the_clients() {
+    let (home, cwd) = fixture();
+    let omp = home.join("login-omp");
+    std::fs::create_dir_all(home.join(".omp/agent")).unwrap();
+    std::fs::write(&omp, "#!/bin/sh\nprintf '%s' \"$1\" > \"$HOME/.omp/agent/auth.json\"\n").unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let agent = Agent::start_env(&home, &cwd, &[], &[("MU_OMP", omp.as_path())]);
+    let mut c = Client::connect(&agent.socket);
+    c.hello();
+    c.until(caught_up);
+    let run = json!({"id": 6, "program": {"Login": {"args": ["x"], "pick": null}}, "cols": 80, "rows": 24});
+    c.send(&ClientLine::Host { id: 1, call: "program_run".into(), args: run });
+    let done = c.until(|v| v["hostReply"]["id"] == 1);
+    assert_eq!(done.last().unwrap()["hostReply"]["result"]["Ok"]["code"], 0);
+    let written = home.join(".omp/agent/auth.json");
+    assert_eq!(std::fs::read_to_string(written).unwrap(), "login", "the agent's home got the credentials");
+    let clients = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    assert_ne!(clients, home);
+    assert_ne!(std::fs::read_to_string(clients.join(".omp/agent/auth.json")).ok().as_deref(), Some("login"));
+}
+
+#[test]
 fn a_program_ends_with_the_client_that_started_it() {
     let (home, cwd) = fixture();
     let marker = home.join("hung-up");
@@ -552,19 +631,43 @@ fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
     assert_eq!(session, first.session, "the resumed agent has the same session");
 
     c.send(&ClientLine::TunnelOpen { id: 7, session });
-    let hello = to_line(&hello_line(WIRE, "nested", false));
-    c.send(&ClientLine::TunnelLine { id: 7, line: hello });
-    let tunnelled: Vec<Value> = {
-        let mut got = Vec::new();
+    // The nested client opens its own channel to the second agent, through the first one's tunnel.
+    let tunnel = |c: &mut Client, line: &str| c.send(&ClientLine::TunnelLine { id: 7, line: line.to_string() });
+    let next_tunnelled = |c: &mut Client| -> Value {
         loop {
             let v = c.next().expect("the tunnel carries lines");
             if let Some(line) = v["tunnelLine"]["line"].as_str() {
-                let inner: Value = serde_json::from_str(line).unwrap();
-                let done = inner["event"] == "CaughtUp";
-                got.push(inner);
-                if done {
-                    break;
-                }
+                return serde_json::from_str(line).unwrap();
+            }
+        }
+    };
+    let bare = ClientLine::Hello {
+        wire: WIRE,
+        version: "test".into(),
+        reconnect: false,
+        host: String::new(),
+        client: String::new(),
+        take: false,
+    };
+    let mut hs = Handshake::initiator(&Keypair::generate().unwrap()).unwrap();
+    tunnel(&mut c, &to_line(&bare));
+    tunnel(&mut c, &hs.write().unwrap());
+    hs.read(&next_tunnelled(&mut c)).unwrap();
+    tunnel(&mut c, &hs.write().unwrap());
+    let (mut sealer, mut opener, _) = hs.finish().unwrap();
+    for w in sealer.seal(&to_line(&hello_line(WIRE, "nested", false))).unwrap() {
+        tunnel(&mut c, &w);
+    }
+    let tunnelled: Vec<Value> = {
+        let mut got = Vec::new();
+        loop {
+            let wire = next_tunnelled(&mut c);
+            let Some(text) = opener.open(&wire).unwrap() else { continue };
+            let inner: Value = serde_json::from_str(&text).unwrap();
+            let done = inner["event"] == "CaughtUp";
+            got.push(inner);
+            if done {
+                break;
             }
         }
         got
@@ -577,7 +680,9 @@ fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
 
     // End the nested agent through the tunnel, then close it.
     let exit = to_line(&ClientLine::Command(WireCommand::Command(AgentCommand::Exit)));
-    c.send(&ClientLine::TunnelLine { id: 7, line: exit });
+    for w in sealer.seal(&exit).unwrap() {
+        tunnel(&mut c, &w);
+    }
     let closed = c.until(|v| v.get("tunnelClose").is_some()).pop().unwrap();
     assert_eq!(closed["tunnelClose"]["id"], 7);
 }
@@ -938,6 +1043,13 @@ case "$1" in
   connect)
     echo $$ > '{dir}/connect.pid'
     while [ -e '{dir}/hold' ]; do sleep 0.1; done
+    if [ -e '{dir}/capture' ]; then
+      mkfifo '{dir}'/in.$$
+      exec 3<&0
+      tee -a '{dir}/to-agent' <&3 > '{dir}'/in.$$ &
+      inner attach --stdio "$2" < '{dir}'/in.$$ | tee -a '{dir}/from-agent'
+      exit
+    fi
     exec env MU_HOME='{remote}' MU_TEST_HOME='{remote}' HOME='{remote}' PATH='{remote}/empty-bin' '{bin}' attach --stdio "$2" ;;
   *) echo "unknown verb $1" >&2; exit 3 ;;
 esac
@@ -1006,6 +1118,72 @@ fn a_client_starts_an_agent_on_the_remote_connects_and_later_rejoins_it() {
     assert_eq!(far.agents().len(), 1);
     again.command("/detach");
     assert!(again.wait_exit().success());
+}
+
+#[test]
+fn the_stream_the_adapter_carries_holds_no_plaintext_event() {
+    let far = Far::new(true, "");
+    std::fs::write(far.dir.join("capture"), "").unwrap();
+    let mut term = Term::spawn(far.mu());
+    wait_until("the agent to have a client", || far.client_host().is_some());
+    let _agent = pid_of(&far.remote, far.agents()[0]["id"].as_str().unwrap());
+    term.command("a-recognisable-prompt");
+    term.wait_for("hello from the fake");
+    let to = std::fs::read_to_string(far.dir.join("to-agent")).unwrap();
+    let from = std::fs::read_to_string(far.dir.join("from-agent")).unwrap();
+    assert!(to.lines().count() >= 4 && from.lines().count() >= 4, "the capture holds the exchange");
+    for (way, text) in [("to the agent", &to), ("from the agent", &from)] {
+        for plain in ["a-recognisable-prompt", "hello from the fake", "UserPrompt", "TurnEnd", "CaughtUp", "\"event\""]
+        {
+            assert!(!text.contains(plain), "{plain} crossed the pipe in the clear {way}");
+        }
+    }
+    // Only the version is in the clear: the first line the client sends.
+    let first: Value = serde_json::from_str(to.lines().next().unwrap()).unwrap();
+    assert_eq!(first["hello"]["wire"], WIRE);
+    assert!(first["hello"]["host"] == "" && first["hello"]["client"] == "", "{first}");
+    std::thread::sleep(Duration::from_secs(1));
+    term.command("/detach");
+    assert!(term.wait_exit().success(), "{}", term.text());
+}
+
+#[test]
+fn the_agents_key_is_pinned_on_first_contact_shows_what_agent_key_prints_and_a_change_is_refused() {
+    let far = Far::new(true, "");
+    let mut term = Term::spawn(far.mu());
+    wait_until("the agent to have a client", || far.client_host().is_some());
+    let id = far.agents()[0]["id"].as_str().unwrap().to_string();
+    let _agent = pid_of(&far.remote, &id);
+    term.wait_for("first contact with agent");
+    term.command("/detach");
+    assert!(term.wait_exit().success(), "{}", term.text());
+
+    let pins = far.client.join("keys").join("pins.json");
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&pins).unwrap()).unwrap();
+    let pinned = stored["far"][&id].as_str().unwrap_or_else(|| panic!("no pin for {id}: {stored}")).to_string();
+    use base64::Engine;
+    let key = base64::engine::general_purpose::STANDARD.decode(&pinned).unwrap();
+    let there = mu(&far.remote, &far.cwd).args(["agent", "key"]).output().unwrap();
+    assert!(there.status.success());
+    let printed = String::from_utf8_lossy(&there.stdout).trim().to_string();
+    assert_eq!(printed, mu_common::secure::fingerprint(&key), "`mu agent key` prints what the client pinned");
+    let again = mu(&far.remote, &far.cwd).args(["agent", "key"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&again.stdout).trim(), printed, "stable");
+    let mode = std::fs::metadata(far.remote.join("keys").join("agent.key")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    // The agent now shows another key than the pinned one.
+    let other = base64::engine::general_purpose::STANDARD.encode(Keypair::generate().unwrap().public());
+    std::fs::write(&pins, json!({"far": {id.clone(): other}}).to_string()).unwrap();
+    let mut refused = Term::spawn({
+        let mut c = far.mu();
+        c.arg("-c");
+        c
+    });
+    assert!(!refused.wait_exit().success());
+    let drawn = refused.text();
+    assert!(drawn.contains("Refusing to connect") && drawn.contains(&mu_common::secure::fingerprint(&key)), "{drawn}");
+    assert!(far.client_host().is_none(), "the agent never got a client");
 }
 
 #[test]

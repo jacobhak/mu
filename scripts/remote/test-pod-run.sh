@@ -215,6 +215,27 @@ has "$FAKE/mu-calls" 'agent --detach -c'
 SETTINGS='{"agent_deadline":"7200"}' adapter start --kind agent --dir "$DIR" || fail "$(cat "$T/err")"
 has "$FAKE/pod.yaml" 'activeDeadlineSeconds: 7200'
 
+# start --kind agent --bundle: the repository is cloned into the directory (history and branch), nothing secret is sent.
+fresh
+git -C "$ROOT" branch -q -M main
+echo second > "$ROOT/b.txt"
+git -C "$ROOT" add -A
+git -C "$ROOT" -c user.name=t -c user.email=t@t commit -q -m second
+git -C "$ROOT" bundle create "$T/agent.bundle" HEAD refs/heads/main > /dev/null 2>&1
+adapter start --kind agent --bundle "$T/agent.bundle" --dir "$DIR" || fail "agent start with a bundle failed: $(cat "$T/err")"
+[ "$(cat "$T/out")" = '{"id":"agent-9"}' ] || fail "agent start printed: $(cat "$T/out")"
+[ -f "$FAKE/pod/root/a.txt" ] && [ -f "$FAKE/pod/root/b.txt" ] || fail "the repository was not cloned"
+[ "$(git -C "$FAKE/pod/root" rev-list --count HEAD)" = 2 ] || fail "the clone lacks the history"
+[ "$(git -C "$FAKE/pod/root" branch --show-current)" = main ] || fail "the clone is not on the branch"
+has "$FAKE/mu-calls" 'agent --detach'
+for f in "$FAKE/calls" "$FAKE/pod.yaml" "$FAKE/config.tar" "$FAKE/pod/home/task.bundle"; do lacks "$f" TOPSECRET; done
+adapter start --kind agent --bundle "$T/missing.bundle" --dir "$DIR" && fail "a missing bundle was accepted"
+has "$T/err" 'does not exist'
+fresh
+adapter start --kind agent --dir "$DIR" || fail "$(cat "$T/err")"
+[ ! -e "$FAKE/pod/root/a.txt" ] || fail "a start without a bundle cloned something"
+[ ! -e "$FAKE/pod/home/task.bundle" ] || fail "a start without a bundle uploaded one"
+
 # list: each pod's agents with a kind (agent when mu did not say); connect finds an agent's pod by its id.
 fresh
 printf 'mu-agent-1|agent|x|Running\nw9|worker|x|Running\n' > "$FAKE/pods.tsv"

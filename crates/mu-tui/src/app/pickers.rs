@@ -837,6 +837,7 @@ mod session_tests {
                 session: Some(path),
                 model: None,
                 changes: None,
+                progress: None,
             };
             let (mut app, mut rx, _cmds) = app_with(deferred, dir);
             app.agent.jobs = vec![job];

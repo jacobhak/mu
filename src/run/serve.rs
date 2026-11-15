@@ -2,8 +2,11 @@
 //!
 //! The socket sits beside the session's owner record (`<profile home>/run/<session id>.sock`, mode
 //! 0600) and there is no network listener: reaching a remote agent is `ssh host mu attach --stdio ID` or
-//! `kubectl exec -i pod -- mu attach --stdio ID`. A connection starts with one hello line each way (or
-//! `Busy`, when another client has the session); then the client's
+//! `kubectl exec -i pod -- mu attach --stdio ID`. A connection starts with the client's plaintext hello
+//! (the wire number, so a mismatch gets a readable answer) and a Noise handshake (`mu_common::secure`,
+//! with the key `mu agent key` prints); every later line is encrypted, whether the client is local or on
+//! the far end of an ssh. Inside, one hello line each way come first (or `Busy`, when another client has
+//! the session); then the client's
 //! commands and host requests come in, and the agent's events, host replies and pushed values go out.
 //! The agent keeps running when the client goes away (`mu_base::catchup::Catchup` keeps what a client
 //! that attaches later needs) and ends only on `Command::Exit` or a signal.
@@ -12,9 +15,10 @@ use mu_base::catchup::{Catchup, Waiting};
 use mu_base::config::MuAgent;
 use mu_base::events::{AgentEvent, Command};
 use mu_base::permissions::ApprovalDecision;
-use mu_base::wire::{AgentLine, ClientLine, WIRE, WireCommand, WireEvent, event_line, to_line};
+use mu_base::wire::{AgentLine, ClientLine, WIRE, WireCommand, WireEvent, event_line, from_line, to_line};
 use mu_common::paths;
 use mu_common::rpc::{Framed, Line};
+use mu_common::secure;
 use mu_session::session::format;
 use mu_session::session::owner::{self, ClientInfo};
 use mu_tui::host::Host;
@@ -414,19 +418,34 @@ impl Server {
     }
 }
 
-/// One accepted connection: the hello exchange, then lines to the loop; writes come from a channel.
-async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>) {
+/// One accepted connection. The plaintext hello (`wire` and `version` only matter) gets a readable answer
+/// when the versions differ; then the handshake, and everything after is encrypted: the hello that says
+/// who the client is comes first. Lines go to the loop; writes come from a channel.
+async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>, key: Rc<secure::Keypair>) {
     let (read, mut write) = stream.into_split();
     let mut lines = Framed::new(BufReader::new(read));
-    let hello = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line()).await;
+    let limit = std::time::Duration::from_secs(10);
+    let hello = tokio::time::timeout(limit, lines.next_line()).await;
     let Ok(Some(Line::Value(v))) = hello else { return };
-    let hello = match serde_json::from_value::<ClientLine>(v) {
-        Ok(ClientLine::Hello { wire, host, client, take, .. }) if wire == WIRE => Hello { client, host, take },
+    match serde_json::from_value::<ClientLine>(v) {
+        Ok(ClientLine::Hello { wire, .. }) if wire == WIRE => {}
         Ok(ClientLine::Hello { wire, .. }) => {
             let refusal = AgentLine::Error(format!("this agent speaks wire {WIRE}, the client wire {wire}"));
             let _ = write.write_all(format!("{}\n", to_line(&refusal)).as_bytes()).await;
             return;
         }
+        _ => return,
+    }
+    let (mut sealer, mut opener) = match tokio::time::timeout(limit, secure::accept(&key, &mut lines, &mut write)).await
+    {
+        Ok(Ok((s, o, _))) => (s, o),
+        Ok(Err(e)) => return eprintln!("mu agent: a client's handshake failed: {e}"),
+        Err(_) => return,
+    };
+    let who = tokio::time::timeout(limit, secure::next_line(&mut lines, &mut opener)).await;
+    let Ok(Ok(Some(first))) = who else { return };
+    let hello = match from_line::<ClientLine>(&first) {
+        Ok(ClientLine::Hello { host, client, take, .. }) => Hello { client, host, take },
         _ => return,
     };
     let (writer, mut out) = unbounded_channel::<String>();
@@ -436,22 +455,28 @@ async fn connection(id: u64, stream: UnixStream, inbox: UnboundedSender<Inbox>) 
     }
     tokio::task::spawn_local(async move {
         while let Some(line) = out.recv().await {
-            if write.write_all(line.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() {
+            if secure::write_line(&mut write, &mut sealer, &line).await.is_err() {
                 break;
             }
         }
         let _ = write.shutdown().await;
         let _ = done.send(());
     });
-    while let Some(l) = lines.next_line().await {
-        let Line::Value(v) = l else { continue };
-        match serde_json::from_value::<ClientLine>(v) {
-            Ok(line) => {
-                if inbox.send(Inbox::Line(id, line)).is_err() {
-                    return;
+    loop {
+        match secure::next_line(&mut lines, &mut opener).await {
+            Ok(Some(text)) => match from_line::<ClientLine>(&text) {
+                Ok(line) => {
+                    if inbox.send(Inbox::Line(id, line)).is_err() {
+                        return;
+                    }
                 }
+                Err(e) => eprintln!("mu agent: unreadable line from the client: {e}"),
+            },
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("mu agent: the stream from the client broke: {e}");
+                break;
             }
-            Err(e) => eprintln!("mu agent: unreadable line from the client: {e}"),
         }
     }
     let _ = inbox.send(Inbox::Closed(id));
@@ -471,6 +496,14 @@ pub async fn run(init: Init) -> i32 {
         config,
         unattended: Default::default(),
         flagged: false,
+    };
+    let key = match secure::agent_key() {
+        Ok(k) => Rc::new(k),
+        Err(e) => {
+            eprintln!("mu agent: no key for the clients' channel: {e}");
+            let _ = server.cmd.send(Command::Exit);
+            return 1;
+        }
     };
     // Before the socket exists: whoever reads the first line may signal at once.
     let (mut term, mut hup, mut int) = {
@@ -538,7 +571,7 @@ pub async fn run(init: Init) -> i32 {
             } => {
                 if let Ok((stream, _)) = accepted {
                     next_id += 1;
-                    tokio::task::spawn_local(connection(next_id, stream, inbox_tx.clone()));
+                    tokio::task::spawn_local(connection(next_id, stream, inbox_tx.clone(), key.clone()));
                 }
             }
             Some(m) = inbox.recv() => match m {

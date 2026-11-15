@@ -17,8 +17,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-/// Raised with every change to `WireCommand`, `WireEvent` or a host request.
-pub const WIRE: u32 = 2;
+/// Raised with every change to `WireCommand`, `WireEvent` or a host request, or to how a connection
+/// starts (3: a handshake follows the hello and every later line is encrypted, `mu_common::secure`).
+pub const WIRE: u32 = 3;
 
 /// Front end to agent.
 #[derive(Serialize, Deserialize)]
@@ -709,6 +710,7 @@ mod tests {
                 base: "0".repeat(40),
                 applied: false,
             }),
+            progress: None,
         }
     }
 

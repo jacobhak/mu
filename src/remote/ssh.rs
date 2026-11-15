@@ -18,7 +18,10 @@ pub fn argv(host: &str, remote: &str) -> Vec<String> {
     ["-T", "-o", "BatchMode=yes", host, remote].map(String::from).to_vec()
 }
 
-fn start_agent(a: &StartAgent) -> String {
+fn start_agent(a: &StartAgent) -> Result<String> {
+    if a.bundle.is_some() {
+        bail!("the ssh adapter cannot take a repository bundle");
+    }
     let mut cmd = String::new();
     if let Some(dir) = &a.dir {
         cmd.push_str(&format!("cd {} && ", quote(dir)));
@@ -32,12 +35,12 @@ fn start_agent(a: &StartAgent) -> String {
     } else if a.continue_latest {
         cmd.push_str(" -c");
     }
-    cmd
+    Ok(cmd)
 }
 
 pub fn start(s: &Start) -> Result<String> {
     match s {
-        Start::Agent(a) => Ok(start_agent(a)),
+        Start::Agent(a) => start_agent(a),
         Start::Worker { .. } => bail!("the ssh adapter cannot run workers; use another adapter for `[task] remote`"),
     }
 }

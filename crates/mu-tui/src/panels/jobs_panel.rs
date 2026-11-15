@@ -1132,7 +1132,8 @@ fn list_row(
         JobKind::Subagent => format!("{:>3} tools", j.tools),
         JobKind::Bash => " ".repeat(9),
     };
-    let rest = format!(" {} {tools}  {:>7}  {cost:>6}  {}", pad(&j.agent, agent_w), clock(elapsed(j, now)), j.last);
+    let last = j.progress.as_deref().filter(|_| j.state == SubagentState::Running).unwrap_or(&j.last);
+    let rest = format!(" {} {tools}  {:>7}  {cost:>6}  {last}", pad(&j.agent, agent_w), clock(elapsed(j, now)));
     let mut name = t.fg(Role::Strong);
     if selected {
         name.attributes.set(crossterm::style::Attribute::Bold);
@@ -1189,7 +1190,9 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
         let lead = if i == 0 { format!("   {label} ") } else { format!("   {} ", " ".repeat(label.len())) };
         rows.push(vec![span(lead, t.fg(Role::Faint)), span(r, t.fg(Role::Strong))]);
     }
-    if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
+    if let Some(p) = j.progress.as_deref().filter(|_| j.state == SubagentState::Running) {
+        rows.push(vec![span(format!("   starting {p}"), muted)]);
+    } else if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
         rows.push(vec![span(format!("   last {}", j.last), muted)]);
     }
     let hint = match (j.kind, &j.session) {
@@ -1229,6 +1232,7 @@ mod tests {
             session: None,
             model: None,
             changes: None,
+            progress: None,
         }
     }
 
@@ -1271,6 +1275,15 @@ mod tests {
         assert_eq!(clock(0), "0:00");
         assert_eq!(clock(75), "1:15");
         assert_eq!(clock(3600 + 61), "1:01:01");
+    }
+
+    #[test]
+    fn a_workers_start_progress_replaces_its_last_activity_while_set() {
+        let started = SubagentStatus { progress: Some("pulling image".into()), ..job("w", SubagentState::Running) };
+        let rows = text(&mut JobsPanel::new(vec![started]), 80, 14);
+        assert!(rows[1].contains("pulling image") && !rows[1].contains("read src/x.rs"), "{rows:?}");
+        let rows = text(&mut JobsPanel::new(vec![job("w", SubagentState::Running)]), 80, 14);
+        assert!(rows[1].contains("read src/x.rs") && !rows.iter().any(|r| r.contains("pulling")), "{rows:?}");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use super::adapter::{Adapter, AgentInfo, Start, StartAgent};
 use super::{Selection, resolve};
 use crate::run::attach::{self, Link};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use mu_base::config::Configs;
 use mu_session::session::list::id_of;
 use mu_session::session::owner::{ClientInfo, LiveSession};
@@ -161,9 +161,96 @@ pub fn run(
     };
     let id = match plan(&want, &found, model.as_deref())? {
         Plan::Connect(id) => id,
-        Plan::Start(s) => adapter.start(&Start::Agent(s), &mut |p| eprintln!("mu: {p}…"))?,
+        Plan::Start(mut s) => {
+            let staged = if adapter.takes_bundle() && s.resume.is_none() && !s.continue_latest {
+                let base = adapter.setting("work_dir").unwrap_or_else(|| DEFAULT_WORK_DIR.to_string());
+                let cwd = std::env::current_dir()?;
+                stage_bundle(&cwd, &base, &std::env::temp_dir()).context("mu: could not bundle the repository")?
+            } else {
+                None
+            };
+            if let Some(b) = &staged {
+                eprintln!("mu: sending {} to {}…", b.repo, adapter.name());
+                s.bundle = Some(b.file());
+                s.dir = Some(b.dir.clone());
+            }
+            adapter.start(&Start::Agent(s), &mut |p| eprintln!("mu: {p}…"))?
+        }
     };
     attach::run(Link::Remote { adapter, id }, pick)
+}
+
+pub const DEFAULT_WORK_DIR: &str = "/work";
+
+/// The repository's bundle in a private temp directory, removed when this is dropped.
+#[derive(Debug)]
+pub struct StagedBundle {
+    tmp: PathBuf,
+    pub repo: String,
+    /// Where the remote clones it.
+    pub dir: String,
+}
+
+impl StagedBundle {
+    pub fn file(&self) -> PathBuf {
+        self.tmp.join("repo.bundle")
+    }
+}
+
+impl Drop for StagedBundle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.tmp);
+    }
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A bundle of the repository `cwd` is in (full history: HEAD and its branch), for `start --dir
+/// <base>/<repo>`. `None` outside a git repository or in one without a commit. The bundle holds no
+/// working-tree changes and no config of the repository.
+pub fn stage_bundle(cwd: &Path, base: &str, temp: &Path) -> Result<Option<StagedBundle>> {
+    let Some(top) = git(cwd, &["rev-parse", "--show-toplevel"]) else { return Ok(None) };
+    if git(cwd, &["rev-parse", "--verify", "-q", "HEAD"]).is_none() {
+        return Ok(None);
+    }
+    let name: String = Path::new(&top)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .collect();
+    let name = name.trim_matches(['.', '-']);
+    let repo = if name.is_empty() { "repo" } else { name }.to_string();
+    let tmp = temp.join(format!("mu-agent-bundle-{}", uuid::Uuid::new_v4().simple()));
+    mu_common::fs::create_private_dir(&tmp)?;
+    let staged = StagedBundle { tmp, dir: format!("{}/{repo}", base.trim_end_matches('/')), repo };
+    let mut args = vec!["bundle", "create", "-q"];
+    let file = staged.file();
+    let file = file.to_string_lossy();
+    args.push(&file);
+    args.push("HEAD");
+    let branch = git(cwd, &["symbolic-ref", "-q", "HEAD"]);
+    if let Some(b) = &branch {
+        args.push(b);
+    }
+    // No timeout: a long history takes as long as it takes.
+    let out =
+        std::process::Command::new("git").args(&args).current_dir(cwd).stdin(std::process::Stdio::null()).output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("git bundle: {}", err.lines().next().unwrap_or("failed").trim());
+    }
+    Ok(Some(staged))
 }
 
 fn row(remote: &str, a: AgentInfo) -> LiveRow {
@@ -205,6 +292,65 @@ pub fn tab_rows(cfgs: &Configs) -> Option<RemoteRows> {
 mod tests {
     use super::*;
     use crate::remote::adapter::ClientInfo as Attached;
+
+    fn sh(cwd: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn tempfile_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-client-test-{name}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_bundle_holds_head_and_branch_with_history_and_is_cleaned_up() {
+        let t = tempfile_dir("bundle");
+        let repo = t.join("my repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a"), "1").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-q", "-m", "one"]);
+        std::fs::write(repo.join("a"), "2").unwrap();
+        sh(&repo, &["commit", "-q", "-am", "two"]);
+        std::fs::write(repo.join("untracked"), "x").unwrap();
+        let staged = stage_bundle(&repo, "/work/", &t).unwrap().unwrap();
+        assert_eq!((staged.repo.as_str(), staged.dir.as_str()), ("my-repo", "/work/my-repo"));
+        let heads = std::process::Command::new("git")
+            .args(["bundle", "list-heads"])
+            .arg(staged.file())
+            .current_dir(&t)
+            .output()
+            .unwrap();
+        let heads = String::from_utf8_lossy(&heads.stdout).into_owned();
+        assert!(heads.contains("HEAD") && heads.contains("refs/heads/main"), "{heads}");
+        let clone = t.join("clone");
+        sh(&t, &["clone", "-q", &staged.file().to_string_lossy(), &clone.to_string_lossy()]);
+        assert_eq!(std::fs::read_to_string(clone.join("a")).unwrap(), "2");
+        assert!(!clone.join("untracked").exists());
+        let tmp = staged.tmp.clone();
+        drop(staged);
+        assert!(!tmp.exists());
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn no_bundle_outside_a_repository_or_without_a_commit() {
+        let t = tempfile_dir("nobundle");
+        assert!(stage_bundle(&t, "/work", &t).unwrap().is_none());
+        sh(&t, &["init", "-q"]);
+        assert!(stage_bundle(&t, "/work", &t).unwrap().is_none());
+        std::fs::remove_dir_all(&t).unwrap();
+    }
 
     fn agent(id: &str, started: i64) -> AgentInfo {
         AgentInfo { id: id.into(), cwd: "/w".into(), started, ..Default::default() }

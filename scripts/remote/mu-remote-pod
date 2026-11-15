@@ -212,6 +212,7 @@ verb_start() {
     agent)
       NS=$AGENT_NS
       dir=${dir:-/work}
+      [ -z "$bundle" ] || [ -f "$bundle" ] || die "bundle $bundle does not exist"
       POD=mu-agent-$(rand 4)
       deadline=$(setting agent_deadline)
       ;;
@@ -279,8 +280,10 @@ verb_start() {
   # Without the "." entry: the worker owns the files but not the mount point, so extracting "." fails on its mode.
   # shellcheck disable=SC2046
   tar -cf - -C "$TMP/config" -- $(ls -A "$TMP/config") | kc exec -i "$POD" -- sh -c 'tar -xf - -C "$HOME"' > /dev/null
-  if [ "$kind" = worker ]; then
+  if [ -n "$bundle" ]; then
     kc exec -i "$POD" -- sh -c 'cat > "$HOME/task.bundle"' < "$bundle" > /dev/null
+  fi
+  if [ "$kind" = worker ]; then
     # The bundle's first ref is the snapshot; the checkout is detached at it.
     kc exec "$POD" -- sh -c '
       set -e
@@ -290,6 +293,13 @@ verb_start() {
       [ -n "$ref" ] || ref=HEAD
       git fetch -q "$HOME/task.bundle" "$ref"
       git checkout -q --detach FETCH_HEAD
+    ' sh "$dir" < /dev/null > /dev/null
+  elif [ -n "$bundle" ]; then
+    # The client's HEAD and branch, with their full history; the bundle is no remote worth keeping.
+    kc exec "$POD" -- sh -c '
+      set -e
+      git clone -q "$HOME/task.bundle" "$1"
+      git -C "$1" remote remove origin
     ' sh "$dir" < /dev/null > /dev/null
   fi
 

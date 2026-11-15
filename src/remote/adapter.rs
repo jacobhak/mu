@@ -34,6 +34,8 @@ pub struct StartAgent {
     pub continue_latest: bool,
     pub dir: Option<String>,
     pub model: Option<String>,
+    /// A git bundle the adapter clones into `dir` before starting the agent there.
+    pub bundle: Option<PathBuf>,
 }
 
 pub enum Start {
@@ -51,6 +53,9 @@ impl Start {
                     a.extend(["--resume".into(), id.clone()]);
                 } else if s.continue_latest {
                     a.push("-c".into());
+                }
+                if let Some(b) = &s.bundle {
+                    a.extend(["--bundle".into(), b.to_string_lossy().into_owned()]);
                 }
                 if let Some(d) = &s.dir {
                     a.extend(["--dir".into(), d.clone()]);
@@ -148,6 +153,18 @@ impl Adapter {
 
     pub fn trusted(&self) -> bool {
         self.trusted
+    }
+
+    /// Whether `start --kind agent` can take a bundle: the ssh adapter starts in a home directory that has
+    /// the repository already.
+    pub fn takes_bundle(&self) -> bool {
+        matches!(self.kind, Kind::Program(_))
+    }
+
+    /// A string in the remote's `settings`.
+    pub fn setting(&self, key: &str) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(&self.settings).ok()?;
+        v.get(key)?.as_str().map(str::to_string)
     }
 
     /// The refusal for a main agent on a remote not marked `trusted = true`.
@@ -418,6 +435,9 @@ esac
         };
         assert_eq!(a.start(&Start::Agent(start), &mut |p| seen.push(p.to_string())).unwrap(), "abc123");
         assert_eq!(seen, ["scheduling", "starting"]);
+        let with_repo =
+            StartAgent { dir: Some("/work/r".into()), bundle: Some("/r.bundle".into()), ..Default::default() };
+        a.start(&Start::Agent(with_repo), &mut |_| {}).unwrap();
         let w = Start::Worker { launch: "L".into(), bundle: "/b.bundle".into(), dir: "/d".into() };
         a.start(&w, &mut |_| {}).unwrap();
         let agents = a.list(None).unwrap();
@@ -450,6 +470,7 @@ esac
         let want = [
             "version",
             "start --kind agent --resume old --dir /w --model p/m",
+            "start --kind agent --bundle /r.bundle --dir /work/r",
             "start --kind worker --launch L --bundle /b.bundle --dir /d",
             "list",
             "fetch abc123",

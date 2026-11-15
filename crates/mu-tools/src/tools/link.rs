@@ -7,8 +7,13 @@
 //! it ignores a second one). `{"type":"ack","seq":N}` lets the worker drop what it kept. Lines the
 //! parent sends (relay answers, approvals) are not kept: the worker asks again for what it never
 //! got answered. The last line of a worker is `{"type":"exit",...}`.
+//!
+//! All of that rides inside an encrypted channel (`mu_common::secure`, Noise `XX`): the parent makes a
+//! key for the task, the worker one of its own, and each connection starts with the handshake. The first
+//! connection pins the worker's key for the rest of the task; a different one later ends the task.
 
 use super::subagent::read_line_capped;
+use mu_common::secure::{Handshake, Keypair, Opener, Sealer};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -32,6 +37,10 @@ pub trait WorkerRemote: Send + Sync {
     fn start(&self, launch: &str, bundle: &Path, dir: &str, progress: &mut dyn FnMut(&str)) -> Result<String, String>;
     /// A process whose stdin and stdout are the worker's stream.
     fn connect(&self, id: &str) -> Result<Child, String>;
+    /// Whether the stream is encrypted. Only a test double that plays a worker's plaintext side says no.
+    fn encrypted(&self) -> bool {
+        true
+    }
     /// Writes the worker's result bundle to `out`; nothing when it changed nothing.
     fn fetch(&self, id: &str, out: &mut (dyn Write + Send)) -> Result<(), String>;
     fn stop(&self, id: &str) -> Result<(), String>;
@@ -121,11 +130,21 @@ enum Ended {
     Exit,
     Cancelled,
     Lost,
+    /// The worker is not the one it was: no retry.
+    Refused(String),
 }
 
 struct State {
     seen: u64,
     started: bool,
+    /// The worker's static key, as the first connection showed it.
+    worker_key: Option<Vec<u8>>,
+}
+
+/// The parent's end of the channel of one connection.
+struct Channel {
+    sealer: Sealer,
+    opener: Opener,
 }
 
 /// Starts the stream to worker `id`: reconnects until it says `exit`, `cancel` fires, or the stream
@@ -155,7 +174,12 @@ async fn run(
     cancel: &CancellationToken,
     give_up: Duration,
 ) -> Item {
-    let mut st = State { seen: 0, started: false };
+    let mut st = State { seen: 0, started: false, worker_key: None };
+    // In memory only, and new for every task.
+    let key = match Keypair::generate() {
+        Ok(k) => k,
+        Err(e) => return Item::End { gave_up: true, note: Some(e) },
+    };
     let mut backoff = BACKOFF_START;
     let mut down_since: Option<Instant> = None;
     let mut last_error = String::new();
@@ -169,9 +193,11 @@ async fn run(
         let started = Instant::now();
         match tokio::task::spawn_blocking(move || r.connect(&want)).await {
             Ok(Ok(child)) => {
-                let (ended, tail) = connection(child, &mut st, task, &mut lines, tx, cancel).await;
+                let secure = remote.encrypted().then_some(&key);
+                let (ended, tail) = connection(child, &mut st, secure, task, &mut lines, tx, cancel).await;
                 match ended {
                     Ended::Exit | Ended::Cancelled => return Item::End { gave_up: false, note: None },
+                    Ended::Refused(note) => return Item::End { gave_up: true, note: Some(note) },
                     Ended::Lost => {}
                 }
                 if !tail.is_empty() {
@@ -233,6 +259,49 @@ async fn write(stdin: &mut ChildStdin, line: &str) -> bool {
     matches!(tokio::time::timeout(WRITE_TIMEOUT, w).await, Ok(Ok(())))
 }
 
+/// Sends `line`: through the channel when there is one.
+async fn send(stdin: &mut ChildStdin, chan: &mut Option<Channel>, line: &str) -> bool {
+    let Some(c) = chan else { return write(stdin, line).await };
+    let Ok(wire) = c.sealer.seal(line) else { return false };
+    for w in &wire {
+        if !write(stdin, w).await {
+            return false;
+        }
+    }
+    true
+}
+
+const HANDSHAKE_WAIT: Duration = Duration::from_secs(30);
+
+/// The handshake as the initiator: the worker's key comes back with the channel.
+async fn handshake(
+    key: &Keypair,
+    stdin: &mut ChildStdin,
+    rrx: &mut UnboundedReceiver<Read>,
+) -> Result<(Channel, Vec<u8>), String> {
+    let work = async {
+        let mut hs = Handshake::initiator(key)?;
+        if !write(stdin, &hs.write()?).await {
+            return Err("the stream closed during the handshake".to_string());
+        }
+        let line = match rrx.recv().await {
+            Some(Read::Line(b)) => {
+                serde_json::from_slice::<Value>(&b).map_err(|_| "the worker did not answer the handshake")?
+            }
+            _ => return Err("the stream closed during the handshake".to_string()),
+        };
+        hs.read(&line)?;
+        if !write(stdin, &hs.write()?).await {
+            return Err("the stream closed during the handshake".to_string());
+        }
+        let (sealer, opener, remote) = hs.finish()?;
+        Ok((Channel { sealer, opener }, remote))
+    };
+    tokio::time::timeout(HANDSHAKE_WAIT, work)
+        .await
+        .unwrap_or_else(|_| Err("the worker did not answer the handshake".into()))
+}
+
 fn reap(mut child: Child) {
     let _ = child.kill();
     drop(tokio::task::spawn_blocking(move || child.wait()));
@@ -242,6 +311,7 @@ fn reap(mut child: Child) {
 async fn connection(
     mut child: Child,
     st: &mut State,
+    key: Option<&Keypair>,
     task: &Value,
     lines: &mut UnboundedReceiver<String>,
     tx: &UnboundedSender<Item>,
@@ -277,10 +347,36 @@ async fn connection(
             }
         }
     });
+    let mut chan = None;
+    if let Some(key) = key {
+        match handshake(key, &mut stdin, &mut rrx).await {
+            Ok((c, remote)) => {
+                match &st.worker_key {
+                    None => st.worker_key = Some(remote),
+                    Some(k) if *k == remote => {}
+                    Some(_) => {
+                        reader.abort();
+                        drop(stdin);
+                        reap(child);
+                        let note = "the worker's key is not the one it showed first: the stream was taken over, so the task is dropped";
+                        return (Ended::Refused(note.into()), String::new());
+                    }
+                }
+                chan = Some(c);
+            }
+            Err(e) => {
+                reader.abort();
+                drop(stdin);
+                reap(child);
+                return (Ended::Lost, e);
+            }
+        }
+    }
+    let mut note = String::new();
     let mut ended = Ended::Lost;
-    let mut ok = write(&mut stdin, &wire::resume(st.seen)).await;
+    let mut ok = send(&mut stdin, &mut chan, &wire::resume(st.seen)).await;
     if ok && !st.started {
-        ok = write(&mut stdin, &wire::task(task)).await;
+        ok = send(&mut stdin, &mut chan, &wire::task(task)).await;
     }
     let mut since_ack = 0u32;
     while ok {
@@ -290,7 +386,20 @@ async fn connection(
                 Some(Read::TooLong) => {
                     let _ = tx.send(Item::TooLong);
                 }
-                Some(Read::Line(b)) => {
+                Some(Read::Line(mut b)) => {
+                    if let Some(c) = chan.as_mut() {
+                        let opened = serde_json::from_slice::<Value>(&b)
+                            .map_err(|_| "a line of the stream is not encrypted".to_string())
+                            .and_then(|w| c.opener.open(&w));
+                        match opened {
+                            Ok(Some(line)) => b = line.into_bytes(),
+                            Ok(None) => continue,
+                            Err(e) => {
+                                note = e;
+                                break;
+                            }
+                        }
+                    }
                     let v = serde_json::from_slice::<Value>(&b).ok();
                     if let Some(seq) = v.as_ref().and_then(wire::seq_of) {
                         if seq <= st.seen {
@@ -311,12 +420,12 @@ async fn connection(
                     since_ack += 1;
                     if since_ack >= ACK_EVERY {
                         since_ack = 0;
-                        ok = write(&mut stdin, &wire::ack(st.seen)).await;
+                        ok = send(&mut stdin, &mut chan, &wire::ack(st.seen)).await;
                     }
                 }
             },
             l = lines.recv() => match l {
-                Some(l) => ok = write(&mut stdin, &l).await,
+                Some(l) => ok = send(&mut stdin, &mut chan, &l).await,
                 None => {
                     ended = Ended::Cancelled;
                     break;
@@ -334,6 +443,13 @@ async fn connection(
     let tail = match tokio::time::timeout(Duration::from_secs(1), tail).await {
         Ok(Ok(t)) => t,
         _ => String::new(),
+    };
+    let tail = if note.is_empty() {
+        tail
+    } else if tail.is_empty() {
+        note
+    } else {
+        format!("{note}\n{tail}")
     };
     (ended, tail)
 }
@@ -404,6 +520,9 @@ pub(crate) mod test_support {
         pub fetch_error: Option<String>,
         pub start_error: Option<String>,
         pub refuse: Option<String>,
+        /// Reported by `start`, which then waits for `gate` to be sent to (or dropped) when it is set.
+        pub progress: Vec<&'static str>,
+        pub gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         pub bundle: Mutex<Option<PathBuf>>,
         /// (launch id, dir, heads of the bundle) of each start.
         pub started: Mutex<Vec<(String, String, String)>>,
@@ -420,6 +539,8 @@ pub(crate) mod test_support {
                 fetch_error: None,
                 start_error: None,
                 refuse: None,
+                progress: Vec::new(),
+                gate: Mutex::new(None),
                 bundle: Mutex::new(None),
                 started: Mutex::new(Vec::new()),
                 fetched: AtomicUsize::new(0),
@@ -438,10 +559,26 @@ pub(crate) mod test_support {
         fn name(&self) -> &str {
             "fake"
         }
+        fn encrypted(&self) -> bool {
+            false
+        }
         fn admit(&self, _: &Path) -> Result<(), String> {
             self.refuse.clone().map_or(Ok(()), Err)
         }
-        fn start(&self, launch: &str, bundle: &Path, dir: &str, _: &mut dyn FnMut(&str)) -> Result<String, String> {
+        fn start(
+            &self,
+            launch: &str,
+            bundle: &Path,
+            dir: &str,
+            progress: &mut dyn FnMut(&str),
+        ) -> Result<String, String> {
+            for p in &self.progress {
+                progress(p);
+            }
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(g) = gate {
+                let _ = g.recv();
+            }
             if let Some(e) = &self.start_error {
                 return Err(e.clone());
             }

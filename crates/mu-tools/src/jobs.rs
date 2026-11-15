@@ -134,6 +134,8 @@ enum Work {
         model: Option<String>,
         /// What a launched worker left, once it has finished.
         changes: Option<JobChanges>,
+        /// The remote's latest start step, until the worker is connected.
+        progress: Option<String>,
     },
     Bash {
         /// Taken on delivery, like `text`.
@@ -146,7 +148,7 @@ enum Work {
 
 impl Work {
     fn subagent() -> Self {
-        Work::Subagent { tools: 0, session: None, model: None, changes: None }
+        Work::Subagent { tools: 0, session: None, model: None, changes: None, progress: None }
     }
 
     fn bash(command: String) -> Self {
@@ -367,11 +369,11 @@ impl JobsHandle {
             .iter()
             .filter(|j| j.listed)
             .map(|j| {
-                let (tools, note, session, model, changes) = match &j.work {
-                    Work::Subagent { tools, session, model, changes } => {
-                        (*tools, None, session.clone(), model.clone(), changes.clone())
+                let (tools, note, session, model, changes, progress) = match &j.work {
+                    Work::Subagent { tools, session, model, changes, progress } => {
+                        (*tools, None, session.clone(), model.clone(), changes.clone(), progress.clone())
                     }
-                    Work::Bash { note, .. } => (0, note.clone(), None, None, None),
+                    Work::Bash { note, .. } => (0, note.clone(), None, None, None, None),
                 };
                 SubagentStatus {
                     name: j.spec.id.clone(),
@@ -389,6 +391,7 @@ impl JobsHandle {
                     session,
                     model,
                     changes,
+                    progress,
                 }
             })
             .collect()
@@ -519,6 +522,18 @@ impl JobsHandle {
         let spec = Spec { id, agent, cwd: cwd.clone(), task: command_line(payload["task"].as_str().unwrap_or("")) };
         let me = self.clone();
         self.spawn_job(spec, Work::subagent(), String::new(), cancel, true, move |seq| async move {
+            let mut child = child;
+            if let ChildCmd::Launched(l) = &mut child {
+                let me = me.clone();
+                l.on_progress(move |p| {
+                    if let Some(mut j) = me.job_mut(seq)
+                        && let Work::Subagent { progress, .. } = &mut j.work
+                    {
+                        *progress = p.map(str::to_string);
+                    }
+                    me.emit();
+                });
+            }
             let out = me
                 .run_subagent(
                     seq,

@@ -724,6 +724,7 @@ mod tests {
             session: None,
             model: None,
             changes: None,
+            progress: None,
         }
     }
 

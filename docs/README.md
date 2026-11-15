@@ -11,6 +11,7 @@
 - [MCP servers](mcp.md)
 - [Agent Client Protocol](acp.md): `mu --acp`
 - [Remote use](remote.md): `mu agent`, `mu -r`: the agent on one machine, the terminal UI on another
+- [Remote use on Kubernetes](remote-kubernetes.md): a generic example of the main agent in a trusted cluster
 - [Providers](providers.md): API keys for Anthropic, OpenAI and Baseten, custom vLLM/OpenAI-compatible endpoints (`mu providers`), Sign in with ChatGPT, `mu auth`, `/login`, routing and thinking per provider, what still needs omp
 - [Model roles](model-roles.md): what each role is for, and where to see and set them
 - [Custom agents](custom-agents.md)

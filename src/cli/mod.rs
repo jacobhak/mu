@@ -138,7 +138,7 @@ pub enum Sub {
     },
     /// Run the agent of a session with no terminal. It prints `{"session":ID,"socket":PATH}` and serves one
     /// client at a time on that Unix socket (see docs/remote.md); it keeps running when the client leaves.
-    /// `mu agent list` lists the agents running here.
+    /// `mu agent list` lists the agents running here; `mu agent key` prints their key's fingerprint.
     Agent {
         #[arg(long)]
         model: Option<String>,
@@ -248,6 +248,9 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print the fingerprint of this profile's agent key (made on first use), to compare with the one a
+    /// client shows when it first connects.
+    Key,
 }
 
 #[cfg(test)]

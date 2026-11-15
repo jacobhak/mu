@@ -402,6 +402,9 @@ pub struct SubagentStatus {
     /// The result a launched subagent left to apply.
     #[serde(default)]
     pub changes: Option<JobChanges>,
+    /// The latest step of a worker still being started on a remote ("pulling image", …); gone once connected.
+    #[serde(default)]
+    pub progress: Option<String>,
 }
 
 /// Input from the TUI to a command running on a pseudo-terminal.

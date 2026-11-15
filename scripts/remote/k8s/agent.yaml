@@ -1,0 +1,109 @@
+# The main agent: one pod running `mu agent --detach`. The image is the one built from scripts/remote/Dockerfile plus
+# `kubectl` and `jq` (the agent's pod adapter needs them) and the adapter in /usr/local/lib/mu (see
+# docs/remote-kubernetes.md). Labels app=mu-task and mu-kind=agent are how `mu -r` finds it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mu-agent-init
+  namespace: mu-agent
+data:
+  init.sh: |
+    #!/bin/sh
+    # Starts the agent, then follows its log so `kubectl logs` shows it and the container lives while the agent does.
+    # The liveness probe restarts the container (and with it the agent) when the agent is gone.
+    set -eu
+    mkdir -p "$MU_HOME/logs" /work
+    cd /work
+    mu agent --detach > /dev/null
+    exec tail -F "$MU_HOME"/logs/agent-*.log
+  config.toml: |
+    # Copied to $MU_HOME/config.toml by the `config` init container when none exists; edit the real file afterwards.
+    default_remote = "workers"
+    [task]
+    launch = ["task"]
+    remote = "workers"
+    [remote.workers]
+    adapter = "/usr/local/lib/mu/mu-remote-pod"
+    trusted = true
+    [remote.workers.settings]
+    namespace = "mu-workers"
+    image = "<image>"
+    sccache_secret_name = "mu-sccache"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mu-agent
+  namespace: mu-agent
+spec:
+  serviceName: mu-agent
+  replicas: 1
+  selector:
+    matchLabels: {app: mu-task, mu-kind: agent}
+  template:
+    metadata:
+      labels:
+        app: mu-task
+        mu-kind: agent
+    spec:
+      serviceAccountName: mu-agent
+      # The agent's own adapter talks to the API server with this account (Role in mu-workers only).
+      automountServiceAccountToken: true
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        - name: config
+          image: "<image>"
+          command: ["sh", "-c", "[ -f \"$MU_HOME/config.toml\" ] || cp /init/config.toml \"$MU_HOME/config.toml\""]
+          env:
+            - {name: MU_HOME, value: /home/mu/.mu}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: init, mountPath: /init, readOnly: true}
+            - {name: auth, mountPath: /home/mu/.mu}
+      containers:
+        - name: agent
+          image: "<image>"
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "/init/init.sh"]
+          env:
+            - {name: HOME, value: /home/mu}
+            - {name: MU_HOME, value: /home/mu/.mu}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "mu agent list --json | grep -q '\"id\"'"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - {name: init, mountPath: /init, readOnly: true}
+            - {name: home, mountPath: /home/mu}
+            - {name: auth, mountPath: /home/mu/.mu}
+            - {name: work, mountPath: /work}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: init
+          configMap: {name: mu-agent-init}
+        - name: home
+          persistentVolumeClaim: {claimName: home}
+        - name: auth
+          persistentVolumeClaim: {claimName: auth}
+        - name: work
+          persistentVolumeClaim: {claimName: work}
+        - name: tmp
+          emptyDir: {}

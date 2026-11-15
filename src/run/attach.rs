@@ -2,7 +2,9 @@
 //! (plain `mu` with a remote in effect), or the shell command of a take-over's nested client.
 //!
 //! The link's process has stdin and stdout piped: they carry the wire lines (see `mu_base::wire`), stderr
-//! lines are shown as notices. After the hello exchange the UI runs as it does in one process, over a
+//! lines are shown as notices. After the hello, the handshake (the agent's key is pinned per remote and
+//! agent id, see `mu_common::secure`; a take-over's nested client does not pin) and the encrypted hello
+//! exchange the UI runs as it does in one process, over a
 //! `RemoteHost` and the client adapter. When the connection drops the UI stays up and says so; the link
 //! is run again after 1 s, doubling to 30 s, and the agent's catch-up repaints the conversation. The
 //! agent ending, a take-over by another client and `/detach` end the client for good. An agent that
@@ -13,8 +15,9 @@ use crate::remote::adapter::Adapter;
 use anyhow::{Result, bail};
 use mu_base::config::Configs;
 use mu_base::events::{AgentEvent, Answer, AskQuestion, Command};
-use mu_base::wire::{AgentLine, ClientAdapter, ClientLine, Incoming, WIRE, WireCommand, to_line};
+use mu_base::wire::{AgentLine, ClientAdapter, ClientLine, Incoming, WIRE, WireCommand, from_line, to_line};
 use mu_common::rpc::{Framed, Line};
+use mu_common::secure::{self, Handshake};
 use mu_tui::host::remote::RemoteHost;
 use mu_tui::host::{Host, HostInfo};
 use std::cell::{Cell, RefCell};
@@ -94,6 +97,15 @@ impl Link {
         }
     }
 
+    /// The remote and agent whose key is pinned. A take-over's nested client reaches an agent through
+    /// the channel of the session it runs in, which authenticated that host already.
+    fn pin(&self) -> Option<(String, String)> {
+        match self {
+            Link::Command(_) => None,
+            Link::Remote { adapter, id } => Some((adapter.name().to_string(), id.clone())),
+        }
+    }
+
     fn process(&self) -> Result<Process, String> {
         let mut p = match self {
             Link::Command(c) => {
@@ -157,15 +169,19 @@ async fn connect(
         }
     });
 
+    // Outside the encryption, so that a version mismatch is answered in the clear: only the wire.
     let hello = ClientLine::Hello {
         wire: WIRE,
         version: env!("MU_VERSION").into(),
-        reconnect: join.reconnect,
-        host: who.host.clone(),
-        client: who.client.clone(),
-        take: join.take,
+        reconnect: false,
+        host: String::new(),
+        client: String::new(),
+        take: false,
     };
-    if let Err(e) = stdin.write_all(format!("{}\n", to_line(&hello)).as_bytes()).await {
+    let key = secure::client_key()?;
+    let mut hs = Handshake::initiator(&key)?;
+    let opening = format!("{}\n{}\n", to_line(&hello), hs.write()?);
+    if let Err(e) = stdin.write_all(opening.as_bytes()).await {
         return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
     }
     let mut framed = Framed::new(BufReader::new(stdout));
@@ -179,14 +195,64 @@ async fn connect(
             return Err(ended(&mut child, stderr_task, &seen, none).await);
         }
     };
-    let info = match serde_json::from_value::<AgentLine>(value) {
+    if !value.is_string() {
+        return Err(match serde_json::from_value::<AgentLine>(value) {
+            Ok(AgentLine::Hello { wire, .. }) if wire != WIRE => {
+                format!("the agent speaks wire {wire}, this mu wire {WIRE}: use the same mu on both sides").into()
+            }
+            Ok(AgentLine::Error(e)) => e.into(),
+            _ => format!("{command} is not an agent's stream").into(),
+        });
+    }
+    hs.read(&value)?;
+    if let (Some((remote, agent)), Some(agent_key)) = (link.pin(), hs.remote_key()) {
+        match secure::check_pin(&secure::pins_path(), &remote, &agent, &agent_key)? {
+            secure::Pinned::Known => {}
+            secure::Pinned::First => {
+                let text = format!(
+                    "first contact with agent {agent} on {remote}: its key is {}, now pinned. Compare it with \
+                     `mu agent key` run there; a later change is refused.",
+                    secure::fingerprint(&agent_key)
+                );
+                // Before the UI is up the terminal is still plain: this stays in its scrollback.
+                if join.reconnect {
+                    let _ = notices.send(text);
+                } else {
+                    eprintln!("{text}");
+                }
+            }
+        }
+    }
+    let msg3 = hs.write()?;
+    if let Err(e) = stdin.write_all(format!("{msg3}\n").as_bytes()).await {
+        return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
+    }
+    let (mut sealer, mut opener, _) = hs.finish()?;
+    let who = ClientLine::Hello {
+        wire: WIRE,
+        version: env!("MU_VERSION").into(),
+        reconnect: join.reconnect,
+        host: who.host.clone(),
+        client: who.client.clone(),
+        take: join.take,
+    };
+    if let Err(e) = secure::write_line(&mut stdin, &mut sealer, &to_line(&who)).await {
+        return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
+    }
+    let answer = tokio::time::timeout(HELLO_WAIT, secure::next_line(&mut framed, &mut opener))
+        .await
+        .map_err(|_| format!("{command} did not answer within {}s", HELLO_WAIT.as_secs()))?;
+    let line = match answer {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            let none = format!("{command} ended without an answer from an agent");
+            return Err(ended(&mut child, stderr_task, &seen, none).await);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let info = match from_line::<AgentLine>(&line) {
         Ok(AgentLine::Hello { wire, host, .. }) if wire == WIRE => serde_json::from_value::<HostInfo>(host)
             .map_err(|e| format!("the agent's host facts are unreadable: {e}"))?,
-        Ok(AgentLine::Hello { wire, .. }) => {
-            return Err(
-                format!("the agent speaks wire {wire}, this mu wire {WIRE}: use the same mu on both sides").into()
-            );
-        }
         Ok(AgentLine::Busy { host, since }) => return Err(Refused::Busy { host, since }),
         Ok(AgentLine::Error(e)) => return Err(e.into()),
         _ => return Err(format!("{command} is not an agent's stream").into()),
@@ -200,13 +266,22 @@ async fn connect(
     }
 
     let (lines_tx, lines) = unbounded_channel();
+    let broken = notices.clone();
     tokio::task::spawn_local(async move {
-        while let Some(l) = framed.next_line().await {
-            let Line::Value(v) = l else { continue };
-            if let Ok(line) = serde_json::from_value::<AgentLine>(v)
-                && lines_tx.send(line).is_err()
-            {
-                return;
+        loop {
+            match secure::next_line(&mut framed, &mut opener).await {
+                Ok(Some(text)) => {
+                    if let Ok(line) = from_line::<AgentLine>(&text)
+                        && lines_tx.send(line).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = broken.send(format!("the stream from the agent broke: {e}"));
+                    return;
+                }
             }
         }
     });
@@ -218,7 +293,7 @@ async fn connect(
             if matches!(line, ClientLine::Detach) {
                 marked.set(true);
             }
-            if stdin.write_all(format!("{}\n", to_line(&line)).as_bytes()).await.is_err() {
+            if secure::write_line(&mut stdin, &mut sealer, &to_line(&line)).await.is_err() {
                 return;
             }
         }
