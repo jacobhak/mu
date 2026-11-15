@@ -337,6 +337,7 @@ async fn run_foreground(
                 note: None,
                 session: None,
                 model: None,
+                changes: None,
             })
             .collect::<Vec<_>>(),
     );

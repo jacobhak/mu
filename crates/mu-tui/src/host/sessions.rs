@@ -12,6 +12,7 @@ use mu_session::session::owner::{self, LiveSession, Owner};
 use mu_session::session::runs::{RunDir, SessionSource};
 use mu_session::session::tail::Tail;
 use mu_session::session::tree_cost::{self, Child, TreeCost};
+use mu_tools::tools::changes;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -64,6 +65,9 @@ pub struct Live {
     pub rows: Vec<LiveRow>,
     /// Each of `LiveArgs::canon` with its canonical form.
     pub canon: Vec<(PathBuf, PathBuf)>,
+    /// A line the tab shows under the list: worker results kept because nobody applied them.
+    #[serde(default)]
+    pub notice: Option<String>,
 }
 
 /// `tail_read` arguments: the session file, how far the caller has read it, and whether it was caught up.
@@ -183,17 +187,19 @@ fn live_rows(source: &dyn SessionSource, me: u32, a: LiveArgs) -> Live {
             live: l,
         })
         .collect();
-    Live { rows, canon: a.canon.into_iter().map(|p| (p.clone(), canon(&p))).collect() }
+    Live { rows, canon: a.canon.into_iter().map(|p| (p.clone(), canon(&p))).collect(), notice: None }
 }
 
-fn live_sessions(_: &Rc<Local>, args: serde_json::Value) -> Answer {
+fn live_sessions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |a: LiveArgs| {
         let me = std::process::id();
         #[cfg(test)]
         if let Some(s) = TEST_SOURCE.with(|s| s.borrow().clone()) {
             return Ok::<_, String>(live_rows(s.as_ref(), me, a));
         }
-        Ok(live_rows(&RunDir::profile(), me, a))
+        let mut live = live_rows(&RunDir::profile(), me, a);
+        live.notice = changes::unapplied_notice(&l.cwd, changes::KEPT_AFTER);
+        Ok(live)
     })
 }
 
@@ -303,6 +309,7 @@ mod tests {
                 title: Some("t".into()),
             }],
             canon: vec![("/a".into(), "/b".into())],
+            notice: Some("n".into()),
         });
         round(TailDelta { from: 3, reset: true, messages: vec![], offset: 9, cost: 0.5, tokens: 12, caught_up: true });
         round(Spend { total: 0.75, costs: vec![("/s/k.jsonl".into(), 0.75)] });

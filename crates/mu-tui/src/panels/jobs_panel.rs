@@ -3,12 +3,13 @@
 //! full-height view: a subagent's or another session's transcript, followed while it is written, or a
 //! bash job's output. See `design/jobs-panel.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::host::results::ResultArgs;
 use crate::host::sessions::{Live, LiveArgs, TailArgs, TailDelta};
 use crate::panels::reply::rule;
 use crate::panels::session_view;
@@ -81,6 +82,16 @@ pub enum JobsResult {
     Take {
         session: PathBuf,
     },
+    /// Show the diff of a launched job's result (`d`).
+    Diff {
+        job: String,
+        result: ResultArgs,
+    },
+    /// Apply a launched job's result with a three-way merge (`a`).
+    Apply {
+        job: String,
+        result: ResultArgs,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,6 +132,10 @@ pub struct JobsPanel {
     confirm_kill_all: bool,
     /// What the last action did, shown in place of the key line until the next key.
     status: Option<String>,
+    /// Jobs whose result was applied from this panel.
+    applied: HashSet<String>,
+    /// The host's note under the Sessions list: worker results nobody applied.
+    notice: Option<String>,
     /// The newest output of each bash job, as the app last sent it.
     outputs: HashMap<String, String>,
     /// Reads the panel waits to have made, taken by the app after each key and tick.
@@ -328,6 +343,8 @@ impl JobsPanel {
             confirm: None,
             confirm_kill_all: false,
             status: None,
+            applied: HashSet::new(),
+            notice: None,
             outputs: HashMap::new(),
             wants: Vec::new(),
             live_asked: false,
@@ -407,6 +424,7 @@ impl JobsPanel {
     /// A fresh list of live sessions: the selection stays on the same one when it is still there.
     pub fn set_sessions(&mut self, live: Live) {
         self.polled_totals = Some(Instant::now());
+        self.notice = live.notice;
         self.canon = live.canon.into_iter().collect();
         for r in &live.rows {
             if let Some(t) = &r.title {
@@ -660,6 +678,30 @@ impl JobsPanel {
         self.status = Some(s.into());
     }
 
+    /// Opens a launched job's diff in the full-height view.
+    pub fn show_diff(&mut self, job: &str, diff: &str) {
+        let key = format!("diff:{job}");
+        let text = if diff.trim().is_empty() { "  the result changes nothing" } else { diff };
+        self.outputs.insert(key.clone(), text.to_string());
+        self.view = Some(Self::new_view(key, Some(format!("{job} · diff")), None));
+        if let Some(v) = &mut self.view {
+            v.follow = false;
+        }
+    }
+
+    /// The job's result is in the working tree now.
+    pub fn mark_applied(&mut self, job: &str) {
+        self.applied.insert(job.to_string());
+    }
+
+    /// The selected job and its result, when it finished and left one.
+    fn result_of(&self) -> Option<(&SubagentStatus, ResultArgs, bool)> {
+        let j = self.jobs.get(self.at).filter(|j| j.state != SubagentState::Running)?;
+        let c = j.changes.as_ref()?;
+        let args = ResultArgs { cwd: j.cwd.clone(), r#ref: c.r#ref.clone(), base: c.base.clone() };
+        Some((j, args, c.applied || self.applied.contains(&j.name)))
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) -> JobsResult {
         if k.kind == KeyEventKind::Release {
             return JobsResult::Pending;
@@ -707,6 +749,19 @@ impl JobsPanel {
                 }
             }
             KeyCode::Char('X') if self.running() > 0 => self.confirm_kill_all = true,
+            KeyCode::Char('d') => {
+                if let Some((j, result, _)) = self.result_of() {
+                    return JobsResult::Diff { job: j.name.clone(), result };
+                }
+            }
+            KeyCode::Char('a') => {
+                let r = self.result_of().map(|(j, result, applied)| (j.name.clone(), result, applied));
+                match r {
+                    Some((_, _, true)) => self.status = Some("that result is already applied".into()),
+                    Some((job, result, false)) => return JobsResult::Apply { job, result },
+                    None => {}
+                }
+            }
             _ => {}
         }
         JobsResult::Pending
@@ -800,8 +855,20 @@ impl JobsPanel {
             .collect();
         let (run, done) = (self.running(), self.jobs.len() - self.running());
         let (detail_title, detail_rows) = match self.jobs.get(self.at) {
-            Some(j) => (Some(format!("{} · {}", j.name, j.agent)), detail(j, &self.cost_cell(j), width, now)),
+            Some(j) => {
+                let mut rows = detail(j, &self.cost_cell(j), width, now);
+                if let Some((_, _, applied)) = self.result_of() {
+                    let what = if applied { "applied" } else { "not applied · d diff · a apply" };
+                    rows.push(vec![span(format!("   result {what}"), theme::get().fg(Role::Faint))]);
+                }
+                (Some(format!("{} · {}", j.name, j.agent)), rows)
+            }
             None => (None, Vec::new()),
+        };
+        let keys = if self.result_of().is_some() {
+            "j/k move · Enter transcript · d diff · a apply · x kill · Tab sessions · q close"
+        } else {
+            "j/k move · Enter transcript · x kill · X kill all · Tab sessions · q close"
         };
         Screen {
             title: format!("jobs · {run} running · {done} finished"),
@@ -813,11 +880,10 @@ impl JobsPanel {
             footer: if self.confirm_kill_all {
                 vec![span(format!("cancel all {run} running jobs? · y to confirm, any other key cancels"), accent())]
             } else {
-                line::styled("j/k move · Enter transcript · x kill · X kill all · Tab sessions · q close", |_| {
-                    dim()
-                })
+                line::styled(keys, |_| dim())
             },
             footer_cursor: None,
+            note: None,
         }
     }
 
@@ -869,6 +935,7 @@ impl JobsPanel {
             detail: detail_rows,
             footer,
             footer_cursor,
+            note: self.notice.as_ref().map(|n| vec![span(format!("  {n}"), accent())]),
         }
     }
 
@@ -930,6 +997,8 @@ struct Screen {
     footer: Line,
     /// A column in the footer where the cursor goes (a message being typed).
     footer_cursor: Option<usize>,
+    /// One row between the list and the details, when there is room.
+    note: Option<Line>,
 }
 
 /// Lays a screen out in `max_rows`: a titled rule, a window of the list, the details between rules and
@@ -946,9 +1015,10 @@ fn draw(f: Screen, top: &mut usize, page: &mut usize, width: usize, max_rows: us
     }
     // The detail block's two rules are part of the body.
     let body = frame.body_rows(max_rows, 1);
+    let note_h = usize::from(split && f.note.is_some() && body >= 2 + DETAIL_MIN + 2);
     let (list_h, detail_h) = if split {
-        let list_h = n.clamp(1, LIST_MAX).min(body - 2 - DETAIL_MIN);
-        (list_h, (body - 2 - list_h).min(DETAIL_MAX))
+        let list_h = n.clamp(1, LIST_MAX).min(body - 2 - note_h - DETAIL_MIN);
+        (list_h, (body - 2 - note_h - list_h).min(DETAIL_MAX))
     } else {
         (body, 0)
     };
@@ -970,6 +1040,9 @@ fn draw(f: Screen, top: &mut usize, page: &mut usize, width: usize, max_rows: us
     // Blank-pad the list so the details start on a fixed row.
     let shown = if n == 0 { 1 } else { end - *top };
     out.extend(std::iter::repeat_n(Vec::new(), list_h.saturating_sub(shown)));
+    if let (1, Some(note)) = (note_h, &f.note) {
+        out.push(line::truncate(note, width));
+    }
     if split {
         out.push(rule(f.detail_title.as_deref(), width));
         let mut d = f.detail;
@@ -1147,6 +1220,7 @@ mod tests {
             note: None,
             session: None,
             model: None,
+            changes: None,
         }
     }
 
@@ -1176,7 +1250,7 @@ mod tests {
     fn live_of(lives: Vec<LiveSession>) -> Live {
         let rows =
             lives.into_iter().map(|live| LiveRow { parent: live.parent.clone(), modified: None, title: None, live });
-        Live { rows: rows.collect(), canon: Vec::new() }
+        Live { rows: rows.collect(), canon: Vec::new(), notice: None }
     }
 
     #[test]
@@ -1279,6 +1353,73 @@ mod tests {
         assert!(text(&mut p, 80, 10).iter().any(|r| r.contains("cancel all 1 running")));
         assert!(matches!(p.on_key(key(KeyCode::Char('n'))), JobsResult::Pending));
         assert!(matches!(p.on_key(key(KeyCode::Char('y'))), JobsResult::Pending), "the question is gone");
+    }
+
+    fn left_result(name: &str, state: SubagentState, applied: bool) -> SubagentStatus {
+        let changes = mu_base::events::JobChanges { r#ref: "refs/mu/result/a-1".into(), base: "0".repeat(40), applied };
+        SubagentStatus { changes: Some(changes), ..job(name, state) }
+    }
+
+    #[test]
+    fn d_and_a_name_the_result_of_a_finished_launched_job() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Done, false)]);
+        let JobsResult::Diff { job, result } = p.on_key(key(KeyCode::Char('d'))) else { panic!("not a diff") };
+        assert_eq!((job.as_str(), result.r#ref.as_str()), ("a", "refs/mu/result/a-1"));
+        assert_eq!(result.cwd, PathBuf::from("/work/proj"));
+        assert_eq!(result.base, "0".repeat(40));
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Apply { job, .. } if job == "a"));
+        let rows = text(&mut p, 100, 20);
+        assert!(rows.iter().any(|r| r.contains("result not applied · d diff · a apply")), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Enter transcript · d diff · a apply")),
+            "the key line says so: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_result_applied_automatically_or_from_the_panel_is_not_applied_again() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Done, true)]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        assert!(text(&mut p, 100, 20).iter().any(|r| r.contains("already applied")));
+        assert!(matches!(p.on_key(key(KeyCode::Char('d'))), JobsResult::Diff { .. }), "the diff stays readable");
+
+        let mut p = JobsPanel::new(vec![left_result("b", SubagentState::Done, false)]);
+        p.mark_applied("b");
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        assert!(text(&mut p, 100, 20).iter().any(|r| r.contains("result applied")));
+    }
+
+    #[test]
+    fn d_and_a_do_nothing_without_a_finished_result() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Running, false)]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('d'))), JobsResult::Pending));
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        let mut p = JobsPanel::new(vec![job("b", SubagentState::Done)]);
+        assert!(matches!(p.on_key(key(KeyCode::Char('d'))), JobsResult::Pending));
+        assert!(matches!(p.on_key(key(KeyCode::Char('a'))), JobsResult::Pending));
+        assert!(!text(&mut p, 100, 20).iter().any(|r| r.contains("d diff")));
+    }
+
+    #[test]
+    fn the_diff_opens_in_the_full_height_view_and_q_returns() {
+        let mut p = JobsPanel::new(vec![left_result("a", SubagentState::Done, false)]);
+        p.show_diff("a", "diff --git a/f b/f\n-one\n+two\n");
+        let rows = text(&mut p, 80, 12);
+        assert!(rows[0].contains("a · diff"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("+two")) && rows.iter().any(|r| r.contains("-one")), "{rows:?}");
+        p.on_key(key(KeyCode::Char('q')));
+        assert!(p.view.is_none());
+        p.show_diff("a", "");
+        assert!(text(&mut p, 80, 12).iter().any(|r| r.contains("changes nothing")));
+    }
+
+    #[test]
+    fn the_sessions_tab_shows_the_hosts_notice_when_there_is_room() {
+        let mut p = JobsPanel::new(vec![]).on_sessions();
+        p.set_sessions(Live { notice: Some("2 unapplied worker results kept".into()), ..live_of(vec![]) });
+        assert!(text(&mut p, 80, 14).iter().any(|r| r.contains("2 unapplied worker results kept")));
+        p.set_sessions(live_of(vec![]));
+        assert!(!text(&mut p, 80, 14).iter().any(|r| r.contains("unapplied")));
     }
 
     #[test]

@@ -69,6 +69,7 @@ impl LocalHost {
         super::plans::register(&mut registry);
         super::memory::register(&mut registry);
         super::program::register(&mut registry);
+        super::results::register(&mut registry);
         Self {
             local: Rc::new(Local { providers, ctx, plugins, cwd, push }),
             info,
@@ -170,6 +171,8 @@ mod tests {
             ("custom_get", json!("missing")),
             ("custom_env", json!("ANTHROPIC_API_KEY")),
             ("remove_key", json!("nothing-stored")),
+            ("result_diff", json!({"cwd": "/", "ref": "refs/mu/result/none", "base": "0".repeat(40)})),
+            ("result_apply", json!({"cwd": "/", "ref": "refs/mu/result/none", "base": "0".repeat(40)})),
         ];
         let mut names: Vec<&str> = h.handlers.keys().copied().collect();
         names.sort_unstable();
@@ -194,6 +197,31 @@ mod tests {
             }
         }
         assert!(walked > 20, "only {walked} replies were read");
+    }
+
+    #[test]
+    fn a_result_is_diffed_and_applied_through_the_host_and_only_by_its_ref() {
+        use crate::host::results::{Applied, RESULT_APPLY, RESULT_DIFF, ResultArgs};
+        use mu_testutil::{repo, sh};
+        let root = repo();
+        let base = sh(&root, &["rev-parse", "HEAD"]).trim().to_string();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        sh(&root, &["commit", "-qam", "work"]);
+        sh(&root, &["update-ref", "refs/mu/result/h-1", "HEAD"]);
+        sh(&root, &["reset", "-q", "--hard", &base]);
+        let h = host();
+        let args = |r: &str| json!(ResultArgs { cwd: root.clone(), r#ref: r.into(), base: base.clone() });
+        let wait = |a: Answer| match a {
+            Answer::Pending(f) => mu_testutil::block_on(f),
+            Answer::Ready(r) => r,
+        };
+        let diff = wait(h.call(RESULT_DIFF, args("refs/mu/result/h-1"))).unwrap();
+        assert!(diff.as_str().is_some_and(|d| d.contains("+two")), "{diff}");
+        assert!(wait(h.call(RESULT_DIFF, args("refs/heads/master"))).is_err(), "only a result ref is served");
+        let done = wait(h.call(RESULT_APPLY, args("refs/mu/result/h-1"))).unwrap();
+        let done: Applied = serde_json::from_value(done).unwrap();
+        assert_eq!(done, Applied { files: 1, conflicts: Vec::new() });
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "two\n");
     }
 
     #[test]

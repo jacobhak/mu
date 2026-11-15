@@ -885,6 +885,7 @@ mod tests {
             note: None,
             session: None,
             model: None,
+            changes: None,
         };
         let out: String = (0..20).map(|i| format!("l{i}\n")).collect();
         let text: Vec<String> = job_details(&r, Some(&out), 80).iter().map(text_of).collect();
@@ -938,6 +939,7 @@ mod tests {
             note: None,
             session: None,
             model: Some("scout · anthropic/haiku".into()),
+            changes: None,
         };
         let text = |cost: Option<f64>, state| text_of(&subagent_rows(&[row(state)], '⠋', |_| cost)[0]);
         assert_eq!(
@@ -975,6 +977,7 @@ mod tests {
             note: Some("exit 0".into()),
             session: None,
             model: None,
+            changes: None,
         }
     }
 

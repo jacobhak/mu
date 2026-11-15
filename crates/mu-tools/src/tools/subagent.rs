@@ -1,9 +1,10 @@
 //! The subagent child protocol: running a `mu --headless` child and reading its result, and the
 //! result of a background command. Jobs and `task` both use it.
+use super::changes;
 use super::relay::{RelayAllow, RelayServer};
 use super::task::depth;
-use mu_base::events::{AgentEvent, EventTx};
-use mu_base::git::{git, prune_refs, repo_root, short_sha, snapshot_tree};
+use mu_base::events::{AgentEvent, EventTx, JobChanges};
+use mu_base::git::{git, prune_refs, repo_root, snapshot_tree};
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_provider::provider::relay::Call;
 use mu_session::session::file::MirrorFile;
@@ -23,11 +24,13 @@ pub struct Outcome {
     pub text: String,
     /// Validated result of a task given an `outputSchema`.
     pub data: Option<Value>,
+    /// The result a launched worker left, applied or kept.
+    pub changes: Option<JobChanges>,
 }
 
 impl Outcome {
     pub(super) fn failed(text: impl Into<String>) -> Self {
-        Self { ok: false, text: text.into(), data: None }
+        Self { ok: false, text: text.into(), data: None, changes: None }
     }
 }
 
@@ -76,8 +79,8 @@ pub const MU_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The file descriptor a launcher reports `changes` on. The worker's stdout cannot reach it.
 const CHANGES_FD: i32 = 3;
 
-/// How long a launched task's result ref and a dead parent's task ref are kept.
-const REF_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 3600);
+/// How long a dead parent's task ref is kept.
+const REF_MAX_AGE: Duration = changes::KEPT_AFTER;
 
 /// A pod name, a label value and a ref component all accept the result: a slug of `name` (at most
 /// 40 characters) and 8 random hex digits.
@@ -133,9 +136,8 @@ pub async fn prepare_launch(launcher: &[String], cwd: &Path, name: &str, session
         return Err("task: the launcher is empty".into());
     }
     let root = repo_root(cwd).await.map_err(|_| "task: a launched subagent needs a git repository".to_string())?;
-    for prefix in ["refs/mu/result/", "refs/mu/task/"] {
-        let _ = prune_refs(&root, prefix, REF_MAX_AGE).await;
-    }
+    let _ = changes::prune(&root, REF_MAX_AGE).await;
+    let _ = prune_refs(&root, "refs/mu/task/", REF_MAX_AGE).await;
     let id = launch_id(name);
     let tree = snapshot_tree(&root).await?;
     let message = format!("mu task {id}");
@@ -359,8 +361,16 @@ impl Mirrors {
     /// Appends `line` to the mirror of `file`. Returns the path of the child's own mirror when this
     /// call created it, and a notice when mirroring `file` ends. The child's own file must open
     /// with a header whose `parentSession` is `parent`, the session that started the task.
-    fn write(&mut self, cwd: &Path, file: &str, line: &str, parent: Option<&str>) -> (Option<String>, Option<String>) {
+    fn write(
+        &mut self,
+        cwd: &Path,
+        file: &str,
+        line: &str,
+        parent: Option<&str>,
+        launch: &str,
+    ) -> (Option<String>, Option<String>) {
         let mut created = None;
+        let mut marked = None;
         if !self.files.contains_key(file) {
             if *self.own.get_or_insert_with(|| file.to_string()) == file {
                 let header = serde_json::from_str::<Value>(line).ok();
@@ -369,7 +379,12 @@ impl Mirrors {
                         self.held.push(line.to_string());
                         return (None, None);
                     }
-                    Some("session") if header.as_ref().and_then(|v| v["parentSession"].as_str()) == parent => {}
+                    Some("session") if header.as_ref().and_then(|v| v["parentSession"].as_str()) == parent => {
+                        marked = header
+                            .as_ref()
+                            .filter(|_| !launch.is_empty())
+                            .map(|h| mirrored_header(h.clone(), cwd, launch));
+                    }
                     Some("session") => return self.refuse(file, "its header does not name this task's session"),
                     _ => return self.refuse(file, "it does not begin with a header"),
                 }
@@ -394,6 +409,7 @@ impl Mirrors {
                 }
             }
         }
+        let line = marked.as_deref().unwrap_or(line);
         let Some(Some(m)) = self.files.get_mut(file) else { return (created, None) };
         match m.append_line(line) {
             Ok(()) => (created, None),
@@ -409,6 +425,15 @@ impl Mirrors {
         self.held.clear();
         (None, Some(format!("[session mirror of {file} refused: {why}]")))
     }
+}
+
+/// The header of a launched worker's own session as the parent keeps it: marked as a mirror of
+/// launch `launch`, and located in the parent's directory (the worker's own is on another machine).
+fn mirrored_header(mut header: Value, cwd: &Path, launch: &str) -> String {
+    header["mirrored"] = json!(true);
+    header["launchId"] = json!(launch);
+    header["cwd"] = json!(cwd.to_string_lossy());
+    header.to_string()
 }
 
 /// Runs one `mu --headless` subagent in `cwd`, reporting each tool call to `on_tool(name, summary)`.
@@ -457,6 +482,10 @@ pub async fn run_child_observed(
     let (job, result_ref) = match &child {
         ChildCmd::Launched(l) => (l.id.clone(), Some(l.result_ref.clone())),
         ChildCmd::Local(_) => (String::new(), None),
+    };
+    let snapshot = match &child {
+        ChildCmd::Launched(l) => Some((l.root.clone(), l.task_ref.clone())),
+        ChildCmd::Local(_) => None,
     };
     let mut cmd = match &child {
         ChildCmd::Local(exe) => {
@@ -580,7 +609,8 @@ pub async fn run_child_observed(
                                         let _ = tx.send(AgentEvent::ChildEntry { file, line });
                                     }
                                     Mirror::Write => {
-                                        let (created, notice) = mirrors.write(cwd, &file, &line, parent_session);
+                                        let launch = if launched { job.as_str() } else { "" };
+                                        let (created, notice) = mirrors.write(cwd, &file, &line, parent_session, launch);
                                         if let Some(path) = created {
                                             on_session(&path);
                                         }
@@ -670,13 +700,17 @@ pub async fn run_child_observed(
     if let Some(cap) = capped {
         out.text.push_str(&format!("\n[task spend cap of ${cap:.2} reached; later model calls were refused]"));
     }
-    if let Some((r#ref, base, files)) = changes {
-        out.text.push_str(&format!(
-            "\n[changes: {files} files at {}, base {}; see git diff {base} {}]",
-            r#ref,
-            short_sha(&base),
-            r#ref
-        ));
+    if let (Some((r#ref, base, _)), Some((root, task_ref))) = (changes, snapshot) {
+        // A task that failed or was cancelled leaves its changes for the user to look at.
+        let auto = if out.ok {
+            changes::auto_apply(&root, &task_ref, &base, &r#ref).await
+        } else {
+            changes::Auto::Failed("the task did not finish".into())
+        };
+        out.text.push('\n');
+        out.text.push_str(&changes::summary(&auto, &r#ref, &base));
+        let applied = matches!(auto, changes::Auto::Applied(_));
+        out.changes = Some(JobChanges { r#ref, base, applied });
     }
     out
 }
@@ -698,13 +732,13 @@ fn outcome(
             match r.data {
                 Some(d) if ok && r.schema_ok != Some(false) => {
                     let pretty = serde_json::to_string_pretty(&d).unwrap_or_else(|_| d.to_string());
-                    Outcome { ok: true, text: format!("```json\n{pretty}\n```"), data: Some(d) }
+                    Outcome { ok: true, text: format!("```json\n{pretty}\n```"), data: Some(d), changes: None }
                 }
                 // Asked for typed data and none came back: never pass the free text off as the result.
                 None if ok && payload.get("outputSchema").is_some_and(|s| !s.is_null()) => {
                     Outcome::failed(format!("subagent returned no schema-validated data\n{text}"))
                 }
-                _ => Outcome { ok, text, data: None },
+                _ => Outcome { ok, text, data: None, changes: None },
             }
         }
         None => Outcome::failed(if cancelled {
@@ -812,15 +846,119 @@ printf '{"type":"result","text":"args=%s name=%s root=%s cwd=%s ref=%s result=%s
   "$#" "$MU_TASK_NAME" "$MU_TASK_ROOT" "$MU_TASK_CWD" "$MU_TASK_REF" "$MU_TASK_RESULT_REF" "$MU_TASK_SESSION" \
   "$MU_TASK_PARENT_PID" "$MU_TASK_DEPTH" "$snap" "$(test -n "$MU_TASK_MU_HOME$MU_TASK_PROFILE_HOME$MU_TASK_AGENT_DIR" && echo set)"
 echo '{"type":"changes","ref":"refs/mu/result/forged","base":"1111111111111111111111111111111111111111","files":99}'
-printf '{"type":"changes","ref":"%s","base":"0123456789abcdef0123456789abcdef01234567","files":2}\n' "$MU_TASK_RESULT_REF" >&3
 "#;
+
+    /// What a launcher does after the result: commit `text` as `file` on top of the snapshot into the
+    /// result ref and report it on fd 3. `meanwhile` runs first, as the user working in the tree would.
+    fn work(file: &str, text: &str, meanwhile: &str) -> String {
+        format!(
+            r#"{meanwhile}
+R="$MU_TASK_ROOT"
+export GIT_INDEX_FILE="$(mktemp -u)"
+git -C "$R" read-tree "$MU_TASK_REF"
+blob=$(printf '%s\n' '{text}' | git -C "$R" hash-object -w --stdin)
+git -C "$R" update-index --add --cacheinfo "100644,$blob,{file}"
+c=$(git -C "$R" -c user.name=w -c user.email=w@w commit-tree "$(git -C "$R" write-tree)" -p "$MU_TASK_REF" -m work)
+git -C "$R" update-ref "$MU_TASK_RESULT_REF" "$c"
+unset GIT_INDEX_FILE
+printf '{{"type":"changes","ref":"%s","base":"%s","files":1}}\n' "$MU_TASK_RESULT_REF" "$(git -C "$R" rev-parse "$MU_TASK_REF")" >&3
+"#
+        )
+    }
+
+    fn worker(file: &str, text: &str, meanwhile: &str) -> String {
+        format!(
+            "#!/bin/sh\nIFS= read -r line\necho '{{\"type\":\"result\",\"text\":\"done\"}}'\n{}",
+            work(file, text, meanwhile)
+        )
+    }
+
+    async fn run_in(root: &Path, launcher: &[String], name: &str) -> Outcome {
+        let launch = prepare_launch(launcher, root, name, "").await.unwrap();
+        run_child_observed(
+            ChildCmd::Launched(launch),
+            root,
+            &json!({}),
+            &CancellationToken::new(),
+            |_, _| {},
+            |_| {},
+            |_| {},
+            None,
+            Mirror::Off,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_over_an_unchanged_tree_is_applied() {
+        let root = repo();
+        let launcher = vec![script(&tmp(), &worker("a.txt", "worked", ""))];
+        let out = tokio::task::LocalSet::new().run_until(run_in(&root, &launcher, "t")).await;
+        assert!(out.ok && out.text.contains("[changes: applied: 1 files; ref refs/mu/result/t-"), "{}", out.text);
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "worked\n");
+        assert!(out.changes.is_some_and(|c| c.applied));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_is_kept_when_a_file_it_touches_changed_meanwhile() {
+        let root = repo();
+        let meanwhile = format!("echo mine > {}/a.txt", root.display());
+        let launcher = vec![script(&tmp(), &worker("a.txt", "worked", &meanwhile))];
+        let out = tokio::task::LocalSet::new().run_until(run_in(&root, &launcher, "t")).await;
+        assert!(out.ok, "{}", out.text);
+        let line = out.text.lines().last().unwrap();
+        assert!(
+            line.starts_with("[changes: not applied: a.txt changed since the task started; ref refs/mu/result/t-"),
+            "{line}"
+        );
+        assert!(line.contains("| git apply --3way]"), "{line}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "mine\n");
+        let changes = out.changes.unwrap();
+        assert!(!changes.applied && !sh(&root, &["for-each-ref", &changes.r#ref]).is_empty(), "the ref stays");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_results_finishing_together_are_both_applied() {
+        let root = repo();
+        let bin = tmp();
+        let (one, two) = (bin.join("one"), bin.join("two"));
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let (l1, l2) =
+            (vec![script(&one, &worker("a.txt", "first", ""))], vec![script(&two, &worker("b.txt", "second", ""))]);
+        let (o1, o2) = tokio::task::LocalSet::new()
+            .run_until(async { tokio::join!(run_in(&root, &l1, "one"), run_in(&root, &l2, "two")) })
+            .await;
+        assert!(
+            o1.text.contains("applied: 1 files") && o2.text.contains("applied: 1 files"),
+            "{} / {}",
+            o1.text,
+            o2.text
+        );
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "first\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "second\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_task_leaves_its_result_unapplied() {
+        let root = repo();
+        let body = format!(
+            "#!/bin/sh\nIFS= read -r line\necho '{{\"type\":\"result\",\"isError\":true,\"text\":\"broke\"}}'\n{}",
+            work("a.txt", "worked", "")
+        );
+        let launcher = vec![script(&tmp(), &body)];
+        let out = tokio::task::LocalSet::new().run_until(run_in(&root, &launcher, "t")).await;
+        assert!(!out.ok && out.text.contains("not applied: the task did not finish"), "{}", out.text);
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_launcher_gets_the_environment_and_a_snapshot_commit_and_reports_changes() {
         let root = repo();
         std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
         let bin = tmp();
-        let launcher = vec![script(&bin, FAKE)];
+        let launcher = vec![script(&bin, &format!("{FAKE}{}", work("a.txt", "worked", "")))];
         let sessions = std::cell::RefCell::new(Vec::new());
         let tools = std::cell::Cell::new(0);
         let out = tokio::task::LocalSet::new()
@@ -862,11 +1000,10 @@ printf '{"type":"changes","ref":"%s","base":"0123456789abcdef0123456789abcdef012
         }
         assert_eq!(
             out.text.lines().last().unwrap(),
-            format!(
-                "[changes: 2 files at refs/mu/result/{id}, base 0123456; see git diff 0123456789abcdef0123456789abcdef01234567 refs/mu/result/{id}]"
-            ),
+            format!("[changes: applied: 1 files; ref refs/mu/result/{id}]"),
             "the report came on fd 3; the forged one on stdout was ignored"
         );
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "worked\n");
         assert!(!out.text.contains("forged") && !out.text.contains("99 files"), "{}", out.text);
         assert!(sessions.borrow().is_empty(), "a launched child's session is on the worker");
         assert_eq!(tools.get(), 1);
@@ -951,7 +1088,11 @@ printf '{"type":"changes","ref":"%s","base":"0123456789abcdef0123456789abcdef012
             assert!(out.ok && out.text == "done", "{r} {base}: {}", out.text);
         }
         let out = launched(&report("$MU_TASK_RESULT_REF", sha)).await;
-        assert!(out.text.contains("[changes: 1 files at refs/mu/result/t-"), "{}", out.text);
+        assert!(
+            out.text.contains("[changes: not applied: ") && out.text.contains("ref refs/mu/result/t-"),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1101,6 +1242,30 @@ mod mirror_tests {
 
     fn lines_of(p: &Path) -> Vec<String> {
         std::fs::read_to_string(p).unwrap().lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn a_launched_workers_own_header_is_kept_as_a_mirror_in_the_parents_directory() {
+        mu_testutil::home();
+        let cwd = Path::new("/opt/mirror-header");
+        let header =
+            json!({"type":"session","version":3,"id":"w","timestamp":"t","cwd":"/work","parentSession":"/p.jsonl"});
+        let kid =
+            json!({"type":"session","version":3,"id":"k","timestamp":"t","cwd":"/work","parentSession":"/w.jsonl"});
+        let mut m = Mirrors::default();
+        let name = |n: &str| format!("2026-01-01T00-00-00-000Z_{n}.jsonl");
+        let (created, notice) = m.write(cwd, &name("w"), &header.to_string(), Some("/p.jsonl"), "t-9");
+        assert!(notice.is_none(), "{notice:?}");
+        m.write(cwd, &name("k"), &kid.to_string(), Some("/p.jsonl"), "t-9");
+        let own = lines_of(Path::new(&created.unwrap()));
+        let v: Value = serde_json::from_str(&own[0]).unwrap();
+        assert_eq!(
+            (v["mirrored"].clone(), v["launchId"].clone(), v["cwd"].clone()),
+            (json!(true), json!("t-9"), json!("/opt/mirror-header"))
+        );
+        assert_eq!(v["parentSession"], "/p.jsonl");
+        let kid_path = mu_common::paths::session_dir(cwd).join(name("k"));
+        assert_eq!(lines_of(&kid_path), [kid.to_string()], "a nested child's header is copied as it came");
     }
 
     /// A child that prints `stream`, then a result.

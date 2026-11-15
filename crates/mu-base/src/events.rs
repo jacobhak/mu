@@ -367,6 +367,15 @@ pub enum JobKind {
     Bash,
 }
 
+/// What a launched worker left: its result ref, the commit it is a diff from, and whether the
+/// diff is in the working tree.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobChanges {
+    pub r#ref: String,
+    pub base: String,
+    pub applied: bool,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SubagentStatus {
     pub name: String,
@@ -390,6 +399,9 @@ pub struct SubagentStatus {
     /// The model a subagent runs on, as `role · provider/model` (no role when named directly); known
     /// once its process has resolved it.
     pub model: Option<String>,
+    /// The result a launched subagent left to apply.
+    #[serde(default)]
+    pub changes: Option<JobChanges>,
 }
 
 /// Input from the TUI to a command running on a pseudo-terminal.

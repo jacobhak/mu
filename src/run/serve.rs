@@ -77,7 +77,11 @@ async fn take(args: serde_json::Value) -> Result<serde_json::Value, String> {
     let exe = paths::self_exe().map_err(|e| format!("cannot locate mu: {e}"))?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("agent").arg("--resume").arg(&path).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
-    if let Some(dir) = mu_session::session::list::header_cwd(&path).filter(|d| d.is_dir()) {
+    let probe = path.clone();
+    let worktree = tokio::task::spawn_blocking(move || mu_session::session::mirror::checkout(&probe))
+        .await
+        .map_err(|e| e.to_string())??;
+    if let Some(dir) = worktree.or_else(|| mu_session::session::list::header_cwd(&path).filter(|d| d.is_dir())) {
         cmd.current_dir(dir);
     }
     cmd.process_group(0);

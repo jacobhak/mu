@@ -307,6 +307,7 @@ mod tests {
             note: None,
             session: Some(PathBuf::from("/s/sub.jsonl")),
             model: None,
+            changes: None,
         };
         let rows = build(
             rows_of(vec![mine, sub, other]),

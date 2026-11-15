@@ -4,6 +4,7 @@
 use mu_common::paths;
 use mu_session::session::control::{Recheck, Want, recheck, signal};
 use mu_session::session::list::{find, header_cwd};
+use mu_session::session::mirror::checkout;
 use mu_session::session::owner::{Owner, is_free, owner};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -160,11 +161,20 @@ fn stop_and_wait(path: &Path, pid: u32, started: &str) -> anyhow::Result<Option<
 
 fn resume(path: &Path) -> anyhow::Result<i32> {
     use std::os::unix::process::CommandExt;
-    if let Some(dir) = header_cwd(path) {
-        if dir.is_dir() {
-            std::env::set_current_dir(&dir)?;
-        } else {
-            eprintln!("mu take: {} no longer exists; staying in the current directory", dir.display());
+    match checkout(path) {
+        Ok(Some(dir)) => std::env::set_current_dir(&dir)?,
+        Ok(None) => {
+            if let Some(dir) = header_cwd(path) {
+                if dir.is_dir() {
+                    std::env::set_current_dir(&dir)?;
+                } else {
+                    eprintln!("mu take: {} no longer exists; staying in the current directory", dir.display());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("mu take: {e}");
+            return Ok(1);
         }
     }
     let exe = paths::self_exe()?;

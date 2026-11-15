@@ -4,6 +4,7 @@ use super::child::ChildThen;
 use super::*;
 use crate::host::keys::KeyInfo;
 use crate::host::models::{self as models_host, ModelKind, ModelRow, ModelRows, RoleTable};
+use crate::host::results::{Applied, RESULT_APPLY, RESULT_DIFF};
 use crate::host::sessions::{self, Live, TailDelta};
 use crate::panels::jobs_panel::{JobsPanel, Want};
 use crate::panels::model_roles::RoleEditor;
@@ -596,6 +597,36 @@ impl App {
             OverlayEvent::MemoryShow(sha) => self.show_memory_commit(sha),
             OverlayEvent::MemoryRevert(sha) => self.revert_memory_commit(sha),
             OverlayEvent::TakeSession(path) => self.take_session(path),
+            OverlayEvent::DiffResult { job, result } => {
+                self.host_call(RESULT_DIFF, &result, move |app, r: Result<String, String>| match r {
+                    Ok(diff) => {
+                        if let Some(Overlay::Jobs { st }) = &mut app.overlay {
+                            st.show_diff(&job, &diff);
+                        }
+                    }
+                    Err(e) => app.panel_status(format!("no diff: {e}")),
+                });
+            }
+            OverlayEvent::ApplyResult { job, result } => {
+                self.host_call(RESULT_APPLY, &result, move |app, r: Result<Applied, String>| {
+                    let msg = match r {
+                        Ok(a) if a.conflicts.is_empty() => {
+                            if let Some(Overlay::Jobs { st }) = &mut app.overlay {
+                                st.mark_applied(&job);
+                            }
+                            format!("applied {} files of {job}", a.files)
+                        }
+                        Ok(a) => {
+                            if let Some(Overlay::Jobs { st }) = &mut app.overlay {
+                                st.mark_applied(&job);
+                            }
+                            format!("applied {job} with conflicts in {}", a.conflicts.join(", "))
+                        }
+                        Err(e) => format!("not applied: {e}"),
+                    };
+                    app.panel_status(msg);
+                });
+            }
         }
     }
 }
@@ -794,6 +825,7 @@ mod session_tests {
                 note: None,
                 session: Some(path),
                 model: None,
+                changes: None,
             };
             let (mut app, mut rx, _cmds) = app_with(deferred, dir);
             app.agent.jobs = vec![job];

@@ -321,6 +321,16 @@ pub enum OverlayEvent {
     },
     /// Take over a `-p` run: the panel closes and `mu take` runs on the terminal.
     TakeSession(PathBuf),
+    /// Show a launched job's diff in the panel.
+    DiffResult {
+        job: String,
+        result: crate::host::results::ResultArgs,
+    },
+    /// Apply a launched job's result with a three-way merge.
+    ApplyResult {
+        job: String,
+        result: crate::host::results::ResultArgs,
+    },
     /// Open a memory file in `$EDITOR`.
     MemoryOpen(PathBuf),
     /// Load the memory history.
@@ -1032,6 +1042,12 @@ impl Overlay {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::TerminateSession { session, pid, started }))
                 }
                 JobsResult::Take { session } => (None, Some(OverlayEvent::TakeSession(session))),
+                JobsResult::Diff { job, result } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::DiffResult { job, result }))
+                }
+                JobsResult::Apply { job, result } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::ApplyResult { job, result }))
+                }
             },
             Overlay::Session { pick } => pick_one(pick, k, |pick| Overlay::Session { pick }, OverlayEvent::Resume),
             Overlay::Rewind { pick } => pick_one(pick, k, |pick| Overlay::Rewind { pick }, OverlayEvent::Rewind),

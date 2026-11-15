@@ -1,4 +1,5 @@
 mod ask;
+pub mod changes;
 mod diff;
 pub mod docs;
 pub mod edit;

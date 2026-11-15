@@ -135,7 +135,18 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
             "--resume without a session opens the session picker, which needs the interactive mode; pass a session id or path"
         );
     }
-    let cwd = std::env::current_dir()?;
+    let mut cwd = std::env::current_dir()?;
+    let mut resume = find_resume(cli, &cwd)?;
+    // A mirror of a launched worker's session opens in a worktree at what the worker produced.
+    if let Some(p) = &mut resume
+        && let Some(dir) = mu_session::session::mirror::checkout(p).map_err(|e| anyhow!("{e}"))?
+    {
+        if let Ok(abs) = std::fs::canonicalize(p.as_path()) {
+            *p = abs;
+        }
+        std::env::set_current_dir(&dir)?;
+        cwd = std::env::current_dir()?;
+    }
     let Setup { cfgs, ctx, host, providers, notice_tx, notice_rx } = setup::setup(&cwd);
     if terminal && cfgs.mu.update.check {
         // Background release check at most once a day; silent when offline or on a dev build.
@@ -189,7 +200,6 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     };
     let model_label = model_label(role_sel.as_deref(), &spec.id);
 
-    let resume = find_resume(cli, &cwd)?;
     if terminal && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         bail!("mu: interactive mode needs a terminal; use -p");
     }

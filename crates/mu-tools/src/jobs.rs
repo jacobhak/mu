@@ -17,7 +17,7 @@ use crate::permissions::Permissions;
 use crate::tools::relay::RelayServer;
 use crate::tools::subagent::{BackgroundResult, ChildCmd, Mirror, Outcome, preview_result, run_child_observed};
 use crate::tools::task::MAX_TASKS;
-use mu_base::events::{AgentEvent, EventTx, JobKind, SubagentState, SubagentStatus};
+use mu_base::events::{AgentEvent, EventTx, JobChanges, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
 use mu_base::tool::BashMeta;
 
@@ -132,6 +132,8 @@ enum Work {
         /// The child's session file, once it has opened it.
         session: Option<PathBuf>,
         model: Option<String>,
+        /// What a launched worker left, once it has finished.
+        changes: Option<JobChanges>,
     },
     Bash {
         /// Taken on delivery, like `text`.
@@ -144,7 +146,7 @@ enum Work {
 
 impl Work {
     fn subagent() -> Self {
-        Work::Subagent { tools: 0, session: None, model: None }
+        Work::Subagent { tools: 0, session: None, model: None, changes: None }
     }
 
     fn bash(command: String) -> Self {
@@ -365,9 +367,11 @@ impl JobsHandle {
             .iter()
             .filter(|j| j.listed)
             .map(|j| {
-                let (tools, note, session, model) = match &j.work {
-                    Work::Subagent { tools, session, model } => (*tools, None, session.clone(), model.clone()),
-                    Work::Bash { note, .. } => (0, note.clone(), None, None),
+                let (tools, note, session, model, changes) = match &j.work {
+                    Work::Subagent { tools, session, model, changes } => {
+                        (*tools, None, session.clone(), model.clone(), changes.clone())
+                    }
+                    Work::Bash { note, .. } => (0, note.clone(), None, None, None),
                 };
                 SubagentStatus {
                     name: j.spec.id.clone(),
@@ -384,6 +388,7 @@ impl JobsHandle {
                     note,
                     session,
                     model,
+                    changes,
                 }
             })
             .collect()
@@ -531,6 +536,12 @@ impl JobsHandle {
             // `run_child` already says "cancelled" when a cancelled child produced no result; a child
             // that finished before the kill landed keeps its real result.
             let text = preview_result(&out.text, &cwd, || crate::tools::Tools::next_artifact_in(&artifacts));
+            if let Some(c) = out.changes
+                && let Some(mut j) = me.job_mut(seq)
+                && let Work::Subagent { changes, .. } = &mut j.work
+            {
+                *changes = Some(c);
+            }
             Finished { ok: out.ok, text, note: None, meta: None }
         });
     }

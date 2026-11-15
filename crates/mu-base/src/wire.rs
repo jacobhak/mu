@@ -635,6 +635,11 @@ mod tests {
             note: Some("n".into()),
             session: Some("/s".into()),
             model: None,
+            changes: Some(crate::events::JobChanges {
+                r#ref: "refs/mu/result/x".into(),
+                base: "0".repeat(40),
+                applied: false,
+            }),
         }
     }
 

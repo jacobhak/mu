@@ -361,6 +361,7 @@ mod tests {
             note: None,
             session: None,
             model: None,
+            changes: None,
         }
     }
 

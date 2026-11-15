@@ -32,9 +32,11 @@ mod tests {
         assert!(mu_base::schema::check_schema(&report_schema()).is_ok());
         assert!(mu_base::schema::validate(&report_schema(), &data).is_ok());
         assert!(mu_base::schema::validate(&report_schema(), &serde_json::json!({"verdict":"maybe"})).is_err());
-        let with_data = Outcome { ok: true, text: "```json\n{\"verdict\":\"pass\"}\n```".into(), data: Some(data) };
+        let with_data =
+            Outcome { ok: true, text: "```json\n{\"verdict\":\"pass\"}\n```".into(), data: Some(data), changes: None };
         assert_eq!(report_of(&with_data).unwrap().verdict, "fail");
-        let scraped = Outcome { ok: true, text: "x\n```json\n{\"verdict\":\"pass\"}\n```".into(), data: None };
+        let scraped =
+            Outcome { ok: true, text: "x\n```json\n{\"verdict\":\"pass\"}\n```".into(), data: None, changes: None };
         assert!(report_of(&scraped).is_none());
     }
 
@@ -44,7 +46,7 @@ mod tests {
         use serde_json::json;
         let base = json!({"verdict":"fail","summary":"s","dropped":3,"findings":[{"title":"t","body":"b","file":"a.rs","line":12,"end_line":14,"priority":1,"confidence":0.9}]});
         assert!(mu_base::schema::validate(&report_schema(), &base).is_ok());
-        let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(base.clone()) }).unwrap();
+        let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(base.clone()), changes: None }).unwrap();
         assert_eq!(r.findings[0].line, Some(12));
         assert_eq!(r.dropped, 3);
         let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
@@ -96,10 +98,10 @@ mod tests {
     fn report_of_clamps() {
         use mu_tools::tools::subagent::Outcome;
         let d = serde_json::json!({"verdict":"fail","findings":[{"title":"a","priority":7,"confidence":3.0},{}]});
-        let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(d) }).unwrap();
+        let r = report_of(&Outcome { ok: true, text: String::new(), data: Some(d), changes: None }).unwrap();
         assert_eq!((r.findings[0].priority, r.findings[0].confidence), (3, 1.0));
         assert_eq!((r.findings[1].priority, r.findings[1].confidence), (2, 1.0));
-        assert!(report_of(&Outcome { ok: true, text: "```json\n{}\n```".into(), data: None }).is_none());
+        assert!(report_of(&Outcome { ok: true, text: "```json\n{}\n```".into(), data: None, changes: None }).is_none());
     }
 
     #[test]

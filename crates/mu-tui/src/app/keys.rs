@@ -1066,6 +1066,7 @@ pub(super) mod tests {
             note: None,
             session: Some(kid),
             model: None,
+            changes: None,
         };
         let (ui_tx, mut ui_rx) = unbounded_channel();
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
@@ -1141,6 +1142,7 @@ pub(super) mod tests {
             note: None,
             session: None,
             model: None,
+            changes: None,
         };
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
         in_local(async {
