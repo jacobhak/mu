@@ -86,12 +86,13 @@ pub fn shutdown() {
     sealed::lock();
 }
 
+/// Held by every test in this binary that touches the process-wide state key (here and in `unlock`).
+#[cfg(test)]
+pub(super) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     fn home() -> std::path::PathBuf {
         mu_testutil::tmp()

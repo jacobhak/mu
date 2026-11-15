@@ -211,12 +211,10 @@ mod tests {
     use mu_tui::host::state::UnlockArgs;
     use ssh_key::LineEnding;
     use ssh_key::private::Ed25519Keypair;
-    use std::sync::{Mutex, MutexGuard};
-
-    static SERIAL: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     fn serial() -> MutexGuard<'static, ()> {
-        let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::run::state::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         lock();
         mu_tui::host::state::set_wanted(false);
         g
