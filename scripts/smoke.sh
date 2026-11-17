@@ -13,7 +13,13 @@ work="$(mktemp -d)"
 tm="mu-smoke-$$"
 fail=0
 pass() { echo "ok   $1"; }
-bad() { echo "FAIL $1"; fail=1; }
+# The first TUI failure also prints the pane: the log is all a later reader has of the run.
+bad() {
+  echo "FAIL $1"; fail=1
+  if [ -z "${dumped:-}" ] && tmux has-session -t "$tm" 2>/dev/null; then
+    dumped=1; tmux capture-pane -pt "$tm" -S -200 | sed 's/^/     | /'
+  fi
+}
 # Kill only gateway daemons that were started with this run's MU_HOME.
 kill_daemons() {
   local p
@@ -28,6 +34,14 @@ screen() { tmux capture-pane -pt "$tm" -S -200; }
 wait_for() { # pattern timeout_s
   local end=$((SECONDS + ${2:-30}))
   while ((SECONDS < end)); do screen | grep -qF -- "$1" && return 0; sleep 0.5; done
+  return 1
+}
+# No turn runs: the status line (the last one drawn) shows μ where a running turn shows its spinner.
+# Seen twice a second apart, so a turn about to start (a finished job's wake-up) is not missed.
+idle() { screen | grep -v '^[[:space:]]*$' | tail -1 | grep -q '^ *μ'; }
+wait_idle() { # timeout_s
+  local end=$((SECONDS + ${1:-30}))
+  while ((SECONDS < end)); do idle && sleep 1 && idle && return 0; sleep 0.5; done
   return 1
 }
 session_file() { ls -t "$state"/sessions/*/*.jsonl | head -1; }
@@ -69,12 +83,15 @@ tmux send-keys -t "$tm" 'also run date' Enter
 check "steer shows in queue bar" wait_for "↳ steer: also run date" 5
 wait_for "\$ sleep 8" 30
 check "steer reaches the model" wait_for "\$ date" 60
-wait_for "FIN" 60
+# The steer sent `sleep 8` to the background; its result wakes a turn of its own. Both must be over
+# before the next prompt, or it would join a running turn instead of starting one.
+wait_for "job results delivered: bg_1" 60
+check "turns end" wait_idle 60
 
-# Queue while the reply streams: input sent during a foreground bash call would release its wait
-# and reach the model at once, leaving nothing queued for the abort to return.
-tmux send-keys -t "$tm" 'Without tools, write a 3000-word story. Its first line is only the word KEEPER spelled backwards, in capitals.' Enter
-wait_for "REPEEK" 30
+# Queue right behind a fresh prompt whose reply makes no tool call: input sent during a foreground
+# bash call would release its wait and reach the model at once, leaving nothing queued for the abort
+# to return. Neither the model's wording nor its speed matters here; only a long reply does.
+tmux send-keys -t "$tm" 'Without tools, write a 3000-word story.' Enter
 tmux send-keys -t "$tm" 'queued text' Enter
 check "queued text waits in queue bar" wait_for "↳ steer: queued text" 5
 tmux send-keys -t "$tm" Escape
