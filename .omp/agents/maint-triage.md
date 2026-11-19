@@ -17,7 +17,7 @@ Decide whether the upgrade leaves something mu owns wrong. `behaviour_change` is
 - stored data written by one version can no longer be read by the other (token store changes, say)
 
 Everything else a user could notice is `false` for `behaviour_change`. List it in `fyi`, one line each, instead of in `summary`:
-- behaviour mu passes through unchanged from the linked crates (pi-edit, pi-shell, pi-diff, pi-walker): edit rules and their error text, the edit tool description pi-edit supplies, shell semantics and builtins, walk and ignore rules. mu hands these to the model or the user as they are, so an upstream fix there needs nothing from mu unless mu's own code or text contradicts it.
+- behaviour mu passes through unchanged from the linked crates (omp-edit, omp-shell, omp-diff, omp-xfs): edit rules and their error text, the edit tool description omp-edit supplies, shell semantics and builtins, walk and ignore rules. mu hands these to the model or the user as they are, so an upstream fix there needs nothing from mu unless mu's own code or text contradicts it.
 - changes that take effect entirely inside code omp runs on its own: the gateway and provider quirks, `omp login` flows, rows added to or removed from the login menu, omp's TUI, tools mu does not call.
 
 These are NOT user-visible at all, even though they show up in mu; leave them out of both lists:
@@ -28,7 +28,7 @@ Decide from evidence, and do the work: never answer "not confirmed". For every c
 
 Required work before you answer (a skim of the stat files or a grep for keywords is NOT enough):
 1. Read every hunk of `cli.diff` to the end, using `read` with offsets until the file or section ends. Then decide, per changed file, whether mu reaches that code path and whether mu parses, matches, documents or works around what changed.
-2. Read every hunk of `crates.diff` for pi-edit, pi-shell, pi-diff and pi-walker. For each public item mu uses (grep mu's `crates/` and `src/` for the crate names), state whether its behaviour changed and whether mu's own code or text depends on the old behaviour.
+2. Read every hunk of `crates.diff` for omp-edit, omp-shell, omp-diff and omp-xfs. For each public item mu uses (grep mu's `crates/` and `src/` for the crate names), state whether its behaviour changed and whether mu's own code or text depends on the old behaviour.
 3. Read the changelog entries.
 Then write the summary from what you read. The summary MUST NOT contain phrases like "not checked", "not confirmed" or "did not read": if you did not read something, go and read it.
 

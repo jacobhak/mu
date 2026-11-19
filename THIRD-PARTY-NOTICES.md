@@ -11,7 +11,7 @@ behaviour in Rust and copies or adapts this material from it:
 - parts of the tool descriptions in `crates/mu-tools/src/tools/`
 - `design/theme/omp-dark-tokyo-night.json`: an omp theme, kept as a design reference
 
-mu also depends on omp's Rust crates (`pi-edit`, `pi-shell`, `pi-diff`, `pi-walker`)
+mu also depends on omp's Rust crates (`omp-edit`, `omp-shell`, `omp-diff`, `omp-xfs`)
 and the `omp` CLI. Those are fetched, not vendored, and carry their own licenses.
 
 ```

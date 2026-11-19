@@ -70,7 +70,7 @@ pub struct Tools {
     pub delegated: std::cell::RefCell<Vec<String>>,
     /// The model selectors of each custom agent, which a relayed task of that agent may use.
     pub agent_models: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>>,
-    pub edit_store: pi_edit::EditStore,
+    pub edit_store: omp_edit::EditStore,
     /// Each read this session (path with its selector) and the fingerprint and count of what it
     /// returned, for the repeated-read hint.
     pub(crate) repeats: std::cell::RefCell<std::collections::HashMap<String, (u64, u32)>>,
@@ -113,7 +113,7 @@ impl Tools {
             output_schema: Default::default(),
             delegated: Default::default(),
             agent_models: Default::default(),
-            edit_store: pi_edit::EditStore::new(),
+            edit_store: omp_edit::EditStore::new(),
             repeats: Default::default(),
             permissions: Rc::default(),
             launch: None,
@@ -362,7 +362,7 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| {
             tool_def(
                 "edit",
-                pi_edit::description(edit::mode()),
+                omp_edit::description(edit::mode()),
                 json!({"type":"object","properties":{
                     "input":{"type":"string","description":"The edit payload, in the format described above"}},"required":["input"]}),
             )

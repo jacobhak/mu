@@ -3,7 +3,7 @@ use crate::walk::{block_on_walk, walk_options};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
 use mu_base::tool::ToolOutput;
-use pi_walker::{Detail, FileType, Fs, walk};
+use omp_xfs::{Detail, FileType, Fs, walk};
 use serde::Deserialize;
 use std::path::PathBuf;
 

@@ -17,16 +17,16 @@ fi
 d() { git -C "$OMPSRC" diff "v$old" "v$new" -- "${@}" > "$out/$DEST" || true; }
 DEST=changelog.diff; d 'packages/*/CHANGELOG.md'
 DEST=cli.diff; d packages/coding-agent/src/cli
-DEST=crates.diff; d crates/pi-edit crates/pi-shell crates/pi-diff crates/pi-walker crates/vendor
+DEST=crates.diff; d crates/edit crates/shell crates/diff crates/xfs crates/vendor
 # stat files: a short index of every changed file
 stat() { git -C "$OMPSRC" diff --stat=200 "v$old" "v$new" -- "${@:2}" > "$out/$1" || true; }
 stat cli.stat packages/coding-agent/src/cli
-stat crates.stat crates/pi-edit crates/pi-shell crates/pi-diff crates/pi-walker crates/vendor
+stat crates.stat crates/edit crates/shell crates/diff crates/xfs crates/vendor
 
 cat > "$out/touchpoints.md" <<'TP'
 # omp touchpoints in mu
 
-- Rust crates pinned in Cargo.toml by tag: `pi-edit`, `pi-shell`, `pi-diff`, `pi-walker`, plus the patched `tree-sitter-go`, `grep-searcher`, `jaq-core`, `jaq-json`, `jaq-std` (`[patch.crates-io]`).
+- Rust crates pinned in Cargo.toml by tag: `omp-edit`, `omp-shell`, `omp-diff`, `omp-xfs`, plus the patched `tree-sitter-go`, `grep-searcher`, `jaq-core`, `jaq-json`, `jaq-std` (`[patch.crates-io]`).
 - The `omp` CLI, run as a subprocess (the pinned copy at ~/.mu/bin/omp): `auth-broker`, `auth-gateway`, `models ls --json`, `login`, `search`, `read`, `--version`.
 - Provider APIs reached through the omp gateway.
 - omp config read by mu: `config.yml` status line, theme, skills; `.omp/agents`, `.omp/commands`, `AGENTS.md`.

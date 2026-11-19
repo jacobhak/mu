@@ -23,10 +23,10 @@ mu-provider = { path = "crates/mu-provider" }
 mu-session = { path = "crates/mu-session" }
 mu-tools = { path = "crates/mu-tools" }
 mu-tui = { path = "crates/mu-tui" }
-pi-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-pi-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-pi-diff = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-pi-walker = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
+omp-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
+omp-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
+omp-diff = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
+omp-xfs = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
 encoding_rs = "0.8"
 httpdate = "1"
 tokio = "1"

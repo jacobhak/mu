@@ -4,10 +4,10 @@ use super::uri::physical;
 use crate::permissions::Gate;
 use async_trait::async_trait;
 use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
-use pi_edit::modes::hashline::input::{Patch, SplitOptions};
-use pi_edit::modes::hashline::types::FileOp as HashlineOp;
-use pi_edit::modes::sloppy::parse::split_sloppy_sections;
-use pi_edit::{
+use omp_edit::modes::hashline::input::{Patch, SplitOptions};
+use omp_edit::modes::hashline::types::FileOp as HashlineOp;
+use omp_edit::modes::sloppy::parse::split_sloppy_sections;
+use omp_edit::{
     ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, UrlResolution, WriteRequest,
     WriteResponse, engine::FileOp, session::SessionConfig,
 };
@@ -21,10 +21,10 @@ pub struct Args {
     input: String,
 }
 
-/// One file an edit payload writes, as pi-edit addresses it.
+/// One file an edit payload writes, as omp-edit addresses it.
 pub(crate) struct Target {
     pub authored: String,
-    /// Where pi-edit writes it; `None` when it refuses the target.
+    /// Where omp-edit writes it; `None` when it refuses the target.
     pub abs: Option<PathBuf>,
     /// An internal URL (`local://`), which stays inside mu's own pages.
     pub internal: bool,
@@ -204,7 +204,7 @@ pub fn is_hashline() -> bool {
 }
 
 /// Writes the files an edit changes and keeps each file's text before and after. A file the
-/// payload did not name (pi-edit rebinds a section whose path is missing onto another file with the
+/// payload did not name (omp-edit rebinds a section whose path is missing onto another file with the
 /// same tag) is written only where the gate would let a write of it run.
 struct FsWriter {
     changes: std::sync::Mutex<Vec<FileChange>>,

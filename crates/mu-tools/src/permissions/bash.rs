@@ -1,9 +1,9 @@
 //! The read-only `bash` classifier: which simple commands of a command line cannot change
 //! anything. Anything it is not sure about is not read-only.
 
-use pi_shell::bash::syntax::Features;
-use pi_shell::bash::syntax::tree::{Case, Comsub, For, ProcSub};
-use pi_shell::bash::syntax::{
+use omp_shell::bash::syntax::Features;
+use omp_shell::bash::syntax::tree::{Case, Comsub, For, ProcSub};
+use omp_shell::bash::syntax::{
     AndOr, ArithText, AssignValue, Command, CommandKind, Cond, CondExpr, HereDoc, List, ParamOp, Part, Pipeline,
     Program, Redir, RedirOp, RedirTarget, Sep, Seq, Simple, Subscript, Word, WordPart, parse_all,
 };
