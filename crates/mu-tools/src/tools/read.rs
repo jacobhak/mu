@@ -1,7 +1,7 @@
 use super::Tools;
 use encoding_rs::{CoderResult, Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252};
 use mu_base::tool::{FileMeta, ToolMeta, ToolOutput};
-use pi_edit::{path_policy::canonical_key, store::MAX_SNAPSHOT_FILE_BYTES, text};
+use omp_edit::{path_policy::canonical_key, store::MAX_SNAPSHOT_FILE_BYTES, text};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::fmt::Write;

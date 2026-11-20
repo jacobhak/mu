@@ -1,4 +1,4 @@
-//! Syntax highlighting for fenced code via tree-sitter, for the grammars omp's `pi-ast` links in
+//! Syntax highlighting for fenced code via tree-sitter, for the grammars omp's `omp-ast` links in
 //! anyway. Captures map to 17 categories (omp's syntax set plus diff, heading, code, link and
 //! emphasis kinds), coloured with the active theme. Configs are built on first use per language.
 

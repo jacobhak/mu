@@ -45,7 +45,7 @@ pub fn load(cwd: &Path, home: &Path, agent_dir: &Path) -> Vec<ContextFile> {
 
 /// cwd-relative paths of AGENTS.md files 1–4 directories below cwd.
 fn nested_agents_md(cwd: &Path) -> Vec<String> {
-    use pi_walker::{FileType, Fs, walk};
+    use omp_xfs::{FileType, Fs, walk};
     use std::time::Duration;
     let opts = walk::Options { max_depth: Some(4), skip_node_modules: true, ..crate::walk::walk_options() };
     let dirs = crate::walk::block_on_walk(async {

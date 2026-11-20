@@ -8,7 +8,7 @@
 //!
 //! The runtime is created by the first call and kept: background jobs (`cmd &`) are tasks on it.
 
-use pi_shell::{
+use omp_shell::{
     cancel::CancelToken,
     shell::{Shell, ShellRunOptions, ShellRunResult},
 };

@@ -1,6 +1,6 @@
 //! Diff rows for edit and write cards: a `│` line-number gutter, coloured added/removed rows with
 //! the changed part of a modified line reversed, and syntax-highlighted context. Reads both
-//! pi-edit's numbered rows (`-8|code`, `+8|code`, ` 9|code`, an empty row for a gap) and plain unified diffs.
+//! omp-edit's numbered rows (`-8|code`, `+8|code`, ` 9|code`, an empty row for a gap) and plain unified diffs.
 use crate::text::highlight;
 use crate::text::line::{Line, span};
 use crate::theme::{self, Role};
@@ -24,13 +24,13 @@ enum Row<'a> {
         num: Option<usize>,
         code: &'a str,
     },
-    /// A hunk boundary: `@@ … @@` or pi-edit's empty gap row.
+    /// A hunk boundary: `@@ … @@` or omp-edit's empty gap row.
     Gap,
     /// File headers, `\ No newline at end of file` and anything else that is not code.
     Note(&'a str),
 }
 
-/// Splits pi-edit's `12|code` into the number and the code.
+/// Splits omp-edit's `12|code` into the number and the code.
 fn numbered(rest: &str) -> Option<(usize, &str)> {
     let bar = rest.find('|')?;
     let n = rest[..bar].parse().ok()?;

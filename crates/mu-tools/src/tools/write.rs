@@ -1,7 +1,7 @@
 use super::uri::{Scheme, physical};
 use super::{Tools, diff};
 use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
-use pi_edit::{path_policy::canonical_key, text};
+use omp_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::io::Read;

@@ -4,7 +4,7 @@ use crate::tools::subagent::BackgroundResult;
 use crate::tools::{ToolCtx, Tools};
 use mu_base::events::AgentEvent;
 use mu_base::tool::{BashMeta, ToolMeta, ToolOutput};
-use pi_shell::{
+use omp_shell::{
     cancel::{AbortReason, CancelToken},
     shell::ShellRunOptions,
 };
@@ -708,7 +708,7 @@ fn job_shell() -> PathBuf {
 /// unfinished line, so a run with two streams has two.
 #[derive(Default)]
 struct Stream {
-    decoder: pi_shell::output_decode::OutputDecoder,
+    decoder: omp_shell::output_decode::OutputDecoder,
     cleaner: mu_base::pty::Cleaner,
 }
 
@@ -1232,7 +1232,7 @@ mod tests {
         let out = tools.call("bash", &json!({"command": cmd}), &ctx()).await;
         assert!(out.text.contains("started"), "{}", out.text);
         // A subshell's background external outlives the call, as it does in bash (oh-my-pi v18.18
-        // stopped ending it), and so does a `nohup` job, which pi-shell detaches from the session.
+        // stopped ending it), and so does a `nohup` job, which omp-shell detaches from the session.
         let (quiet_pid, kept_pid) = (mu_testutil::pid_in(&quiet_file).await, mu_testutil::pid_in(&kept_file).await);
         assert!(mu_testutil::pid_running(quiet_pid), "the subshell's job did not outlive the call");
         assert!(mu_testutil::pid_running(kept_pid), "the nohup job did not outlive the call");

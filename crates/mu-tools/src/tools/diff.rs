@@ -1,8 +1,8 @@
 /// Unified diff with 3 lines of context; empty when the texts are equal.
 pub fn unified(old: &str, new: &str) -> String {
     const CTX: usize = 3;
-    let (ot, nt) = (pi_diff::line_tokens_str(old), pi_diff::line_tokens_str(new));
-    let runs = pi_diff::line_runs_str(old, new);
+    let (ot, nt) = (omp_diff::line_tokens_str(old), omp_diff::line_tokens_str(new));
+    let runs = omp_diff::line_runs_str(old, new);
     // (marker, line, old line no, new line no)
     let mut rows: Vec<(char, &str, usize, usize)> = Vec::new();
     let (mut o, mut n) = (0usize, 0usize);

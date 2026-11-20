@@ -1,12 +1,12 @@
 //! The directory walk options and the runner for them, shared by the search tools and context discovery.
-use pi_walker::walk;
+use omp_xfs::walk;
 use std::future::Future;
 
 pub fn walk_options() -> walk::Options {
     walk::Options { hidden: false, gitignore: true, skip_git: true, ..Default::default() }
 }
 
-/// pi-walker spawns its workers on the ambient runtime, and mu's is single-threaded. Each walk gets a
+/// omp-xfs spawns its walk workers on the ambient runtime, and mu's is single-threaded. Each walk gets a
 /// multi-threaded runtime of its own, entered from a scoped thread so this works inside or outside a runtime,
 /// and gone when the walk ends: an idle mu keeps no worker threads (one per CPU).
 pub fn block_on_walk<F: Future + Send>(f: F) -> F::Output

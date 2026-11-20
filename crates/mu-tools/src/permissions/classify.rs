@@ -129,7 +129,7 @@ fn by_args(tools: &Tools, gate: &Gate, name: &str, args: &Value) -> Result<Optio
         for t in targets {
             call.subjects.push(match t.abs {
                 Some(abs) if !t.internal => gate.write_subject(name, &physical(&abs)),
-                // Internal pages stay inside mu's own; pi-edit refuses a target it cannot resolve.
+                // Internal pages stay inside mu's own; omp-edit refuses a target it cannot resolve.
                 _ => Subject::new(name, t.authored, Capability::ReadProject),
             });
         }
