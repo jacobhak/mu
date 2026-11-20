@@ -36,7 +36,7 @@ impl Agent {
                 true
             }
             Err(e) => {
-                self.error(format!("cannot create the session file: {e}"));
+                self.error(format!("{}: {e}", mu_base::events::SESSION_CREATE_FAILED));
                 false
             }
         }

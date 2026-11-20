@@ -533,6 +533,11 @@ pub async fn run(init: Init) -> i32 {
     loop {
         match ev.recv().await {
             Some(AgentEvent::Exit) | None => return 1,
+            Some(AgentEvent::Error(m)) if m.starts_with(mu_base::events::SESSION_CREATE_FAILED) => {
+                eprintln!("mu agent: {m}");
+                let _ = server.cmd.send(Command::Exit);
+                return 1;
+            }
             Some(e) => {
                 if let Some(path) = server.on_event(e) {
                     if let Err(e) = server.bind(&path) {

@@ -415,6 +415,10 @@ pub enum PtyInput {
     Kill,
 }
 
+/// The start of the `AgentEvent::Error` text for a session file that could not be created: `mu agent`
+/// waits for a session before it listens, and gives up on this error instead of waiting for ever.
+pub const SESSION_CREATE_FAILED: &str = "cannot create the session file";
+
 /// What the agent tells a front end. The five variants that carry an in-process reply handle are
 /// `serde(skip)`: they cross a wire as `wire::WireEvent` requests with an id.
 #[derive(serde::Serialize, serde::Deserialize)]

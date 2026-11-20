@@ -725,6 +725,23 @@ fn a_detached_agent_prints_its_id_and_survives_sighup() {
 }
 
 #[test]
+fn an_agent_that_cannot_make_its_session_file_says_why_and_exits() {
+    let (home, cwd) = fixture();
+    // The session directory cannot be made below a file.
+    std::fs::write(home.join("sessions"), "").unwrap();
+    let started = std::time::Instant::now();
+    let o = mu(&home, &cwd)
+        .args(["agent", "--detach", "--model", MODEL, "--permissions", "yolo"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "stdout: {}", String::from_utf8_lossy(&o.stdout));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("cannot create the session file"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(30), "it did not wait for the start timeout");
+}
+
+#[test]
 fn the_listing_says_who_is_attached_and_whether_a_request_waits() {
     let (home, cwd) = fixture();
     let agent = Agent::start(&home, &cwd, &[]);
