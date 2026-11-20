@@ -1080,7 +1080,9 @@ mod tests {
     async fn a_background_run_stops_reading_a_descendant_that_has_gone_quiet() {
         let t = Instant::now();
         let r = run_background(
-            "(trap '' TERM; echo once; sleep 30) & echo leader-done".into(),
+            // Ignore TERM before forking: the leader's exit sends TERM at once, and a subshell
+            // that has not yet run its own `trap` would die before it wrote anything.
+            "trap '' TERM; (echo once; sleep 30) & echo leader-done".into(),
             std::env::temp_dir(),
             std::env::vars().collect(),
             Some(60.0),
