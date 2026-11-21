@@ -1,0 +1,54 @@
+name: run
+# One command on the dispatched ref, on a CI runner: a build or test away from the machine that asks for it.
+#   gh workflow run run.yml --ref <branch> -f command='cargo check -p mu-tools' [-f runner=mu-ci] [-f cache=sccache]
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Command to run in the checkout (bash)
+        required: true
+        default: cargo check --workspace
+      runner:
+        type: choice
+        options: [arc-mu, mu-ci]
+        default: arc-mu
+      cache:
+        description: rust-cache (as ci.yml), sccache (the cluster's MinIO; arc-mu only) or none
+        type: choice
+        options: [rust-cache, sccache, none]
+        default: rust-cache
+permissions:
+  contents: read
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+run-name: "run: ${{ inputs.command }} (${{ inputs.runner }}, ${{ inputs.cache }})"
+jobs:
+  run:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.cache == 'rust-cache'
+        with:
+          # See ci.yml: cache-bin prunes the runner's own ~/.cargo/bin.
+          cache-bin: false
+      - name: sccache
+        if: inputs.cache == 'sccache'
+        run: |
+          [ -n "${SCCACHE_BUCKET:-}" ] || { echo "no SCCACHE_BUCKET: this runner has no sccache bucket" >&2; exit 1; }
+          v=v0.19.0 f=sccache-v0.19.0-x86_64-unknown-linux-musl
+          curl -fsSL -o /tmp/sc.tgz "https://github.com/mozilla/sccache/releases/download/$v/$f.tar.gz"
+          echo "aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd  /tmp/sc.tgz" | sha256sum -c -
+          tar -xzf /tmp/sc.tgz -C /tmp && install -m 0755 "/tmp/$f/sccache" "$HOME/.cargo/bin/sccache"
+          # MinIO's certificate is issued by the cluster CA, which the pod's service account mount carries.
+          cat /etc/ssl/certs/ca-certificates.crt /var/run/secrets/kubernetes.io/serviceaccount/ca.crt > "$HOME/ca-bundle.crt"
+          echo "SSL_CERT_FILE=$HOME/ca-bundle.crt" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: command
+        env:
+          COMMAND: ${{ inputs.command }}
+        run: bash -c "$COMMAND"
+      - run: sccache --show-stats
+        if: always() && inputs.cache == 'sccache'
