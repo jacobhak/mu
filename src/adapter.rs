@@ -13,8 +13,9 @@ use std::time::Duration;
 
 /// How long a `core/secrets` call may take; mu answers within milliseconds.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
-/// mu closes the plugin's stdin right after `shutdown`, so the final flush may never be answered: bound it.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
+/// mu keeps stdin open and answers `core/secrets` until it gets the `shutdown` reply (it waits up to 5 s for
+/// that): bound the final flush below it.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// `core/secrets` over the plugin's stdio, callable from a blocking thread.
 struct RpcMu {

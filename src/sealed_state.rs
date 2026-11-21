@@ -5,9 +5,15 @@
 //! root. When mu reports state encryption on and unlocked (`core/secrets` `info`), `materialize` restores them from
 //! mu's secret store into a private directory that mirrors omp's config root: everything else in it is a symlink to
 //! the real entry, so sessions, config and caches stay on the volume. Every omp this process starts gets
-//! `PI_CONFIG_DIR` pointing at the mirror (see `envs`); `flush` seals the memory copies back through mu, and
-//! `shutdown` removes them. A crash between flushes loses what omp changed since the last one (a rotated refresh
-//! token, a fresh login), so the sealed copy can hold a stale token. Otherwise (no encryption, or locked) nothing
+//! `PI_CONFIG_DIR` pointing at the mirror (see `envs`); `flush` seals the memory copies back through mu.
+//!
+//! There is one mirror per profile, shared by every adapter and by the daemon, whichever adapter started it.
+//! Adapters register as `users/<pid>` in it under a file lock; the first one restores the credentials, later ones
+//! join (sealing at once whatever the mirror holds that was never sealed, e.g. rotations made by a daemon while no
+//! adapter was alive). `shutdown` does a final flush and removes the mirror only when no other adapter is
+//! attached and no daemon runs; otherwise the daemon keeps writing into it and the next attacher seals the
+//! difference. A crash between flushes loses what omp changed since the last one (a rotated refresh token, a
+//! fresh login), so the sealed copy can hold a stale token. Otherwise (no encryption, or locked) nothing
 //! happens and omp uses its own files.
 //!
 //! `materialize`, `flush` and `envs` block on mu's replies: call them from a blocking thread, never from the
@@ -16,7 +22,6 @@
 use crate::state;
 use crate::vendor::fs as vfs;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -97,8 +102,33 @@ struct Mirror {
     root: PathBuf,
     /// `PI_CONFIG_DIR`: `mem/omp` relative to `$HOME`.
     config_dir: OsString,
-    last: HashMap<&'static str, [u8; 32]>,
-    _stop: mpsc::Sender<()>,
+    /// The daemon's state directory: `state.json` says whether a daemon uses the mirror.
+    key: PathBuf,
+    lock: PathBuf,
+    pid: u32,
+    _stop: Option<mpsc::Sender<()>>,
+}
+
+impl Mirror {
+    fn lock(&self) -> io::Result<vfs::FileLock> {
+        vfs::FileLock::exclusive(&self.lock)
+    }
+
+    fn scratch(&self) -> PathBuf {
+        self.mem.join(format!("snapshot.{}.tmp", self.pid))
+    }
+
+    fn recorded(&self, name: &str) -> Option<String> {
+        std::fs::read_to_string(self.mem.join("last-sealed").join(name)).ok()
+    }
+
+    fn record(&self, name: &str, hash: &[u8; 32]) -> io::Result<()> {
+        vfs::write_private(&self.mem.join("last-sealed").join(name), hex(hash).as_bytes())
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 static MIRROR: Mutex<Option<Mirror>> = Mutex::new(None);
@@ -138,29 +168,47 @@ fn is_ram_fs(dir: &Path) -> bool {
     t == TMPFS || t == RAMFS
 }
 
-fn dir_prefix(key: &Path) -> String {
+fn uid() -> u32 {
     // SAFETY: getuid cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let digest = Sha256::digest(key.as_os_str().as_encoded_bytes());
-    let id: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    format!("apg-{uid}-{id}-")
+    unsafe { libc::getuid() }
 }
 
-/// Removes directories a crashed adapter of this profile left behind.
-fn prune_stale(memory: &Path, prefix: &str) {
-    let Ok(entries) = std::fs::read_dir(memory) else { return };
+fn profile_id(key: &Path) -> String {
+    hex(&Sha256::digest(key.as_os_str().as_encoded_bytes())[..6])
+}
+
+/// The one mirror of the profile `key` names: no pid in it, so every adapter and the daemon share it.
+fn mirror_dir(memory: &Path, key: &Path) -> PathBuf {
+    memory.join(format!("ai-provider-gateway-{}-{}", uid(), profile_id(key)))
+}
+
+/// Lock for attach, flush and detach. Kept in a private directory of its own because `memory` is shared
+/// (`/tmp`), and survives the mirror's removal.
+fn lock_path(memory: &Path, key: &Path) -> PathBuf {
+    memory.join(format!("ai-provider-gateway-{}-locks", uid())).join(format!("{}.lock", profile_id(key)))
+}
+
+fn users_dir(mem: &Path) -> PathBuf {
+    mem.join("users")
+}
+
+/// Drops registry entries of adapters that are gone; true when none is left.
+fn prune_users(mem: &Path) -> bool {
+    let mut any = false;
+    let Ok(entries) = std::fs::read_dir(users_dir(mem)) else { return true };
     for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(prefix)).and_then(|p| p.parse::<i32>().ok()) else {
-            continue;
-        };
-        // SAFETY: signal 0 only checks that the process exists.
-        let gone =
-            unsafe { libc::kill(pid, 0) } == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
-            let _ = std::fs::remove_dir_all(e.path());
+        match e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) {
+            Some(pid) if state::alive(pid) => any = true,
+            _ => {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
+    !any
+}
+
+fn daemon_alive(key: &Path) -> bool {
+    state::read_state(key).is_some_and(|s| state::alive(s.pid))
 }
 
 /// Symlinks each entry of `real` into `mem` that is not skipped and not there yet.
@@ -245,10 +293,9 @@ fn adopt(mem: &Path, real: &Path, skip: &dyn Fn(&str) -> bool) {
     }
 }
 
-fn adopt_all(s: &Mirror) {
-    let l = &s.layout;
-    adopt(&s.root.join("agent"), &l.agent, &|n| is_credential_name(n));
-    adopt(&s.root, &l.root, &|n| n == "agent" || is_credential_name(n));
+fn adopt_all(l: &Layout, root: &Path) {
+    adopt(&root.join("agent"), &l.agent, &|n| is_credential_name(n));
+    adopt(root, &l.root, &|n| n == "agent" || is_credential_name(n));
 }
 
 /// A consistent copy of a SQLite database (WAL included), by SQLite's online backup.
@@ -280,22 +327,24 @@ fn read_current(s: &Mirror, c: &Cred) -> io::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     match c.kind {
-        Kind::Db => snapshot(&path, &s.mem.join("snapshot.tmp")).map(Some),
+        Kind::Db => snapshot(&path, &s.scratch()).map(Some),
         Kind::File => std::fs::read(&path).map(Some),
     }
 }
 
-/// Seals each credential that changed since the last seal. True when anything was written.
-fn flush_locked(s: &mut Mirror) -> io::Result<bool> {
+/// Seals each credential that differs from what was last sealed (recorded in the mirror, so every adapter
+/// agrees). The mirror is the single source: this only ever re-seals its own content. True when anything was
+/// written. Call with the mirror's lock held.
+fn flush_locked(s: &Mirror) -> io::Result<bool> {
     let mut wrote = false;
     for c in &CREDS {
         let Some(bytes) = read_current(s, c)? else { continue };
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
-        if s.last.get(c.name) == Some(&hash) {
+        if s.recorded(c.name).as_deref() == Some(hex(&hash).as_str()) {
             continue;
         }
         s.mu.put(c.name, &bytes)?;
-        s.last.insert(c.name, hash);
+        s.record(c.name, &hash)?;
         wrote = true;
     }
     Ok(wrote)
@@ -303,11 +352,11 @@ fn flush_locked(s: &mut Mirror) -> io::Result<bool> {
 
 /// Brings a credential into memory: from its sealed copy, else by importing the plaintext one omp left on the
 /// volume (sealed first, and only then removed).
-fn restore(s: &mut Mirror, c: &Cred) -> io::Result<()> {
+fn restore(s: &Mirror, c: &Cred) -> io::Result<()> {
     let dest = s.root.join(c.rel);
     if let Some(bytes) = s.mu.get(c.name)? {
-        s.last.insert(c.name, Sha256::digest(&bytes).into());
-        return vfs::write_private(&dest, &bytes);
+        vfs::write_private(&dest, &bytes)?;
+        return s.record(c.name, &Sha256::digest(&bytes).into());
     }
     let (real, siblings): (PathBuf, &[&str]) = match c.kind {
         Kind::Db => (s.layout.agent.join("agent.db"), &["-wal", "-shm", "-journal"]),
@@ -317,7 +366,7 @@ fn restore(s: &mut Mirror, c: &Cred) -> io::Result<()> {
         return Ok(());
     }
     let bytes = match c.kind {
-        Kind::Db => snapshot(&real, &s.mem.join("snapshot.tmp"))?,
+        Kind::Db => snapshot(&real, &s.scratch())?,
         Kind::File => std::fs::read(&real)?,
     };
     vfs::write_private(&dest, &bytes)?;
@@ -357,6 +406,52 @@ fn relative_to_home(home: &Path, target: &Path) -> io::Result<OsString> {
     Ok(rel.into_os_string())
 }
 
+/// Joins the profile's mirror as adapter `pid`, creating and restoring it when this is the first. Under the
+/// mirror's lock, so adapters starting together do not race.
+fn attach(mu: Arc<dyn Secrets>, key: &Path, layout: Layout, pid: u32) -> io::Result<Mirror> {
+    let mem = mirror_dir(&layout.memory, key);
+    let lock = lock_path(&layout.memory, key);
+    let top = mem.join("omp");
+    let root = match &layout.profile {
+        Some(p) => top.join("profiles").join(p),
+        None => top.clone(),
+    };
+    let config_dir = relative_to_home(&layout.home, &top)?;
+    let s = Mirror { layout, mu, mem, root, config_dir, key: key.to_path_buf(), lock, pid, _stop: None };
+    let _guard = s.lock()?;
+    let mut joined = s.mem.join("ready").exists();
+    if joined && prune_users(&s.mem) && !daemon_alive(key) {
+        // Nobody uses it: seal what it holds, then rebuild from the sealed copy. Unsealable, it is kept.
+        link_all(&s.layout, &s.mem)?;
+        if flush_locked(&s).is_ok() {
+            adopt_all(&s.layout, &s.root);
+            let _ = std::fs::remove_dir_all(&s.mem);
+            joined = false;
+        }
+    }
+    if joined {
+        link_all(&s.layout, &s.mem)?;
+        // What the mirror holds beyond the last seal (a daemon's rotations while no adapter was alive) wins.
+        let _ = flush_locked(&s);
+    } else {
+        let _ = std::fs::remove_dir_all(&s.mem);
+        let built = (|| {
+            vfs::create_private_dir(&s.mem)?;
+            link_all(&s.layout, &s.mem)?;
+            for c in &CREDS {
+                restore(&s, c)?;
+            }
+            vfs::write_private(&s.mem.join("ready"), b"")
+        })();
+        if let Err(e) = built {
+            let _ = std::fs::remove_dir_all(&s.mem);
+            return Err(e);
+        }
+    }
+    vfs::write_private(&users_dir(&s.mem).join(pid.to_string()), b"")?;
+    Ok(s)
+}
+
 fn materialize_in(mu: Arc<dyn Secrets>, key: &Path, layout: Layout) -> io::Result<bool> {
     let info = mu.info()?;
     if !(info.sealed && info.unlocked) {
@@ -367,36 +462,16 @@ fn materialize_in(mu: Arc<dyn Secrets>, key: &Path, layout: Layout) -> io::Resul
         link_all(&s.layout, &s.mem)?;
         return Ok(true);
     }
-    let prefix = dir_prefix(key);
-    prune_stale(&layout.memory, &prefix);
-    let mem = layout.memory.join(format!("{prefix}{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&mem);
-    vfs::create_private_dir(&mem)?;
-    let built = (|| {
-        let config_dir = relative_to_home(&layout.home, &mem.join("omp"))?;
-        let root = link_all(&layout, &mem)?;
-        let (stop, rx) = mpsc::channel();
-        let mut s = Mirror { layout, mu, mem: mem.clone(), root, config_dir, last: HashMap::new(), _stop: stop };
-        for c in &CREDS {
-            restore(&mut s, c)?;
+    let mut s = attach(mu, key, layout, std::process::id())?;
+    let (stop, rx) = mpsc::channel();
+    s._stop = Some(stop);
+    *g = Some(s);
+    let _ = std::thread::Builder::new().name("apg-flush".into()).spawn(move || {
+        while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(INTERVAL) {
+            flush();
         }
-        Ok((s, rx))
-    })();
-    match built {
-        Ok((s, rx)) => {
-            *g = Some(s);
-            let _ = std::thread::Builder::new().name("apg-flush".into()).spawn(move || {
-                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(INTERVAL) {
-                    flush();
-                }
-            });
-            Ok(true)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&mem);
-            Err(e)
-        }
-    }
+    });
+    Ok(true)
 }
 
 /// When mu has state encryption on and unlocked, unseals omp's credential state into memory and points omp at
@@ -407,8 +482,11 @@ pub fn materialize(mu: Arc<dyn Secrets>) -> io::Result<bool> {
 
 /// Like `flush`, with the error.
 pub fn flush_checked() -> io::Result<bool> {
-    match mirror_lock().as_mut() {
-        Some(s) => flush_locked(s),
+    match mirror_lock().as_ref() {
+        Some(s) => {
+            let _guard = s.lock()?;
+            flush_locked(s)
+        }
         None => Ok(false),
     }
 }
@@ -418,16 +496,29 @@ pub fn flush() {
     let _ = flush_checked();
 }
 
-fn finish(old: Option<Mirror>) {
-    if let Some(mut s) = old {
+/// Leaves the mirror: final flush, and removal when no other adapter is attached and no daemon runs. With a
+/// daemon still running it stays, and the next attacher seals what the daemon wrote.
+fn detach(s: Mirror) {
+    let Ok(_guard) = s.lock() else { return };
+    let _ = std::fs::remove_file(users_dir(&s.mem).join(s.pid.to_string()));
+    let last = prune_users(&s.mem) && !daemon_alive(&s.key);
+    if last {
         // Before the flush, which may wait on a mu that has stopped answering.
-        adopt_all(&s);
-        let _ = flush_locked(&mut s);
+        adopt_all(&s.layout, &s.root);
+    }
+    let _ = flush_locked(&s);
+    if last {
         let _ = std::fs::remove_dir_all(&s.mem);
     }
 }
 
-/// Final flush, then removes the memory copy.
+fn finish(old: Option<Mirror>) {
+    if let Some(s) = old {
+        detach(s);
+    }
+}
+
+/// Final flush, then leaves the mirror (removing it when nothing else uses it).
 pub fn shutdown() {
     let old = mirror_lock().take();
     finish(old);
@@ -466,6 +557,7 @@ pub fn credential_root() -> PathBuf {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -776,12 +868,9 @@ mod tests {
     }
 
     #[test]
-    fn materializing_again_keeps_the_directory_and_stale_ones_are_pruned() {
+    fn materializing_again_keeps_the_directory() {
         let f = Fixture::new("again");
-        let stale = f.dir.join("mem").join(format!("{}999999999", dir_prefix(&f.key())));
-        std::fs::create_dir_all(stale.join("omp")).unwrap();
         f.materialize(f.layout(None)).unwrap();
-        assert!(!stale.exists());
         plant_db(&f.mem_agent().join("agent.db"));
         let mem = f.mem();
         std::fs::create_dir(f.real_agent().join("late")).unwrap();
@@ -789,6 +878,133 @@ mod tests {
         assert_eq!(f.mem(), mem);
         assert_eq!(values(&f.mem_agent().join("agent.db")), [MARKER], "the live database is untouched");
         assert!(f.mem_agent().join("late").is_symlink(), "entries that appeared since are linked");
+    }
+
+    const TOKEN: &str = "auth-gateway.token";
+
+    fn peer_pid() -> u32 {
+        // SAFETY: getppid cannot fail.
+        unsafe { libc::getppid() as u32 }
+    }
+
+    fn token(m: &Mirror) -> String {
+        std::fs::read_to_string(m.root.join(TOKEN)).unwrap()
+    }
+
+    fn put_token(m: &Mirror, v: &str) {
+        std::fs::write(m.root.join(TOKEN), v).unwrap();
+    }
+
+    fn fake_daemon(f: &Fixture) {
+        std::fs::create_dir_all(f.key()).unwrap();
+        state::write_state(&f.key(), std::process::id(), "http://127.0.0.1:1", "http://127.0.0.1:2").unwrap();
+    }
+
+    fn attach_as(f: &Fixture, pid: u32) -> Mirror {
+        attach(f.mu.clone(), &f.key(), f.layout(None), pid).unwrap()
+    }
+
+    fn seal(f: &Fixture, v: &str) {
+        f.mu.store.lock().unwrap().insert(TOKEN.into(), v.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn two_adapters_share_one_mirror_and_the_second_does_not_restore_over_it() {
+        let f = Fixture::new("shared");
+        seal(&f, "old");
+        let a = attach_as(&f, std::process::id());
+        assert_eq!(token(&a), "old");
+        put_token(&a, "rotated");
+        let b = attach_as(&f, peer_pid());
+        assert_eq!(a.mem, b.mem);
+        assert_eq!(a.mem, mirror_dir(&f.dir.join("mem"), &f.key()));
+        assert_eq!(token(&b), "rotated", "joined, not restored");
+        assert_eq!(f.sealed(TOKEN).unwrap(), b"rotated", "the attacher sealed the unsealed difference");
+        for pid in [std::process::id(), peer_pid()] {
+            assert!(users_dir(&a.mem).join(pid.to_string()).exists());
+        }
+        let puts = f.mu.puts.load(Ordering::SeqCst);
+        detach(a);
+        assert!(b.mem.exists(), "another adapter is still attached");
+        assert!(!users_dir(&b.mem).join(std::process::id().to_string()).exists());
+        detach(b);
+        assert_eq!(f.mu.puts.load(Ordering::SeqCst), puts, "re-sealing unchanged content writes nothing");
+    }
+
+    #[test]
+    fn the_last_adapter_leaving_keeps_the_mirror_while_a_daemon_runs_and_removes_it_otherwise() {
+        let f = Fixture::new("leave");
+        fake_daemon(&f);
+        let a = attach_as(&f, std::process::id());
+        let mem = a.mem.clone();
+        detach(a);
+        assert!(mem.exists(), "the daemon still writes into it");
+
+        std::fs::remove_file(f.key().join("state.json")).unwrap();
+        let b = attach_as(&f, std::process::id());
+        detach(b);
+        assert!(!mem.exists());
+    }
+
+    #[test]
+    fn a_rotation_made_while_no_adapter_was_attached_is_sealed_by_the_next_attacher() {
+        let f = Fixture::new("rotation");
+        fake_daemon(&f);
+        seal(&f, "old");
+        let a = attach_as(&f, std::process::id());
+        let root = a.root.clone();
+        detach(a);
+        std::fs::write(root.join(TOKEN), "rotated-by-daemon").unwrap();
+        assert_eq!(f.sealed(TOKEN).unwrap(), b"old");
+        let b = attach_as(&f, std::process::id());
+        assert_eq!(f.sealed(TOKEN).unwrap(), b"rotated-by-daemon");
+        assert_eq!(token(&b), "rotated-by-daemon");
+    }
+
+    #[test]
+    fn an_unsealed_rotation_survives_a_rebuild_when_no_daemon_remains() {
+        let f = Fixture::new("rebuild");
+        fake_daemon(&f);
+        seal(&f, "old");
+        let a = attach_as(&f, std::process::id());
+        let root = a.root.clone();
+        detach(a);
+        std::fs::write(root.join(TOKEN), "rotated-by-daemon").unwrap();
+        std::fs::remove_file(f.key().join("state.json")).unwrap();
+        let b = attach_as(&f, std::process::id());
+        assert_eq!(f.sealed(TOKEN).unwrap(), b"rotated-by-daemon");
+        assert_eq!(token(&b), "rotated-by-daemon");
+    }
+
+    #[test]
+    fn a_dead_adapters_registry_entry_is_pruned_on_attach() {
+        let f = Fixture::new("prune");
+        let a = attach_as(&f, std::process::id());
+        let dead = users_dir(&a.mem).join("999999999");
+        std::fs::write(&dead, "").unwrap();
+        let b = attach_as(&f, peer_pid());
+        assert!(!dead.exists());
+        assert!(users_dir(&b.mem).join(peer_pid().to_string()).exists());
+    }
+
+    #[test]
+    fn a_newer_sealed_copy_is_not_overwritten_by_a_stale_clean_mirror() {
+        let f = Fixture::new("newer");
+        fake_daemon(&f);
+        seal(&f, "old");
+        let a = attach_as(&f, std::process::id());
+        detach(a);
+        seal(&f, "newer");
+        let puts = f.mu.puts.load(Ordering::SeqCst);
+        let b = attach_as(&f, std::process::id());
+        assert_eq!(f.sealed(TOKEN).unwrap(), b"newer");
+        assert_eq!(f.mu.puts.load(Ordering::SeqCst), puts);
+        detach(b);
+
+        std::fs::remove_file(f.key().join("state.json")).unwrap();
+        let c = attach_as(&f, std::process::id());
+        assert_eq!(f.sealed(TOKEN).unwrap(), b"newer");
+        assert_eq!(token(&c), "newer", "an unused clean mirror is rebuilt from the sealed copy");
     }
 
     #[test]

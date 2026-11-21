@@ -103,9 +103,8 @@ provider = "gateway"
 - `provider/endpoint {clientPid, start}` is `endpoint --client-pid clientPid`, with `--no-start` when `start` is
   false (default true). It answers `{baseUrl, token}` or `null`.
 - `provider/prices {}` is `prices`.
-- `shutdown` seals omp's credentials once more and removes the memory copy. mu closes the plugin's stdin right
-  after `shutdown`, so that last flush is bounded to 1.5 s and may not get through; the periodic flush is the
-  reliable one.
+- `shutdown` (a request; mu keeps the plugin's stdin open until it is answered) seals omp's credentials once
+  more, bounded to 4 s, leaves the shared memory copy (below) and only then replies.
 
 **Sealing through `core/secrets`.** When mu has state encryption on and unlocked (`core/secrets {"op":"info"}`
 answers `sealed` and `unlocked`), the adapter keeps omp's credentials (`agent/agent.db`, `auth-broker.token`,
@@ -115,11 +114,20 @@ answers `sealed` and `unlocked`), the adapter keeps omp's credentials (`agent/ag
   `auth-gateway.token`) into a private memory-backed directory (tmpfs under `$XDG_RUNTIME_DIR` or `/dev/shm` on
   Linux, a 0700 temp directory on macOS) that mirrors omp's config root: everything else is a symlink to the real
   entry, so sessions, config and caches stay where they are.
+- There is one such copy per profile, `<memory dir>/ai-provider-gateway-<uid>-<profile hash>`, shared by every
+  adapter and by the daemon, whichever adapter started it. Adapters register in it as `users/<pid>` (dead ones
+  are pruned) under a file lock, so adapters starting together do not race. The first one restores the
+  credentials; later ones join without restoring over it. The copy records what was last sealed: a joining
+  adapter seals at once anything the copy holds beyond that (rotations the daemon made while no adapter was
+  attached), and never overwrites a newer sealed copy with a clean, older one.
+- The last adapter to leave seals a final time and removes the copy only when no daemon runs for the profile
+  (`state.json`). With a daemon running, the copy stays and the daemon keeps writing into it; the next adapter
+  seals the difference, and removes and rebuilds a clean copy that nothing uses.
 - Every omp it starts (the daemon pair, `models ls`) gets `PI_CONFIG_DIR` pointing at that copy (and
   `PI_CODING_AGENT_DIR` when you had overridden it). The loopback tokens are read from the copy too.
-- It seals changes back every 30 s (the SQLite file by online backup, WAL included), after starting the daemon and
-  after `prices`, and at shutdown. A crash between flushes loses what omp changed since the last one; the sealed
-  copy can then hold a stale refresh token.
+- Every adapter seals changes back every 30 s (the SQLite file by online backup, WAL included), after starting
+  the daemon and after `prices`, and at shutdown, writing only what differs from the last sealed content. A crash
+  between flushes loses what omp changed since the last one; the sealed copy can then hold a stale refresh token.
 - A plaintext `agent.db` or token omp left on the volume (say, from `ai-provider-gateway login` run outside mu) is
   imported into mu's store the first time and removed from the volume; with a sealed copy already there, the
   sealed copy wins.
@@ -157,10 +165,6 @@ logs every `gh` and `git` write instead of making it; `scripts/maint/test.sh` ru
 
 The broker refreshes OAuth tokens in the same credential store that running omp sessions use. If a provider
 rotates refresh tokens, omp and the broker could invalidate each other's.
-
-A second one, specific to the mu adapter: the daemon may outlive the adapter (the adapter's idle lifetime is
-shorter than the daemon's), and the daemon's omp processes keep using the memory copy the adapter removed at
-shutdown. Whatever the broker refreshes after that is not sealed.
 
 ## License
 
