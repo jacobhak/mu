@@ -28,7 +28,14 @@ for p in "$GITHUB_WORKSPACE/target" "$cargo_home/registry" "$cargo_home/git"; do
 done
 [ "${#paths[@]}" -gt 0 ] || { echo "publish-offload-base: nothing to publish" >&2; exit 1; }
 
-tar -C / --owner="$(id -u)" --group="$(id -g)" --numeric-owner -czf "$work/layer.tar.gz" "${paths[@]}"
+# The checkout path and its parents below $HOME go in as directory entries of their own, owned by the CI user:
+# extracting the layer would create them as root, and a job could not write its checkout there.
+dirs=()
+d=$GITHUB_WORKSPACE
+case $d in "$HOME"/*) while [ "$d" != "$HOME" ]; do dirs=("${d#/}" ${dirs[@]+"${dirs[@]}"}); d=$(dirname "$d"); done ;; esac
+
+tar -C / --owner="$(id -u)" --group="$(id -g)" --numeric-owner -czf "$work/layer.tar.gz" \
+  --no-recursion ${dirs[@]+"${dirs[@]}"} --recursion "${paths[@]}"
 du -h "$work/layer.tar.gz"
 
 image=$REGISTRY/offload-base/mu
