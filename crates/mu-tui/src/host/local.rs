@@ -115,13 +115,28 @@ mod tests {
     const REFRESH_TOKEN: &str = "test-refresh-token-0123456789abcdef";
     const SECRETS: [&str; 5] = [ANTHROPIC_KEY, CUSTOM_KEY, ID_TOKEN, ACCESS_TOKEN, REFRESH_TOKEN];
 
-    fn host() -> LocalHost {
+    /// A host whose temp directories are removed when it drops.
+    struct TestHost {
+        host: LocalHost,
+        _dirs: [mu_testutil::TempDir; 2],
+    }
+
+    impl std::ops::Deref for TestHost {
+        type Target = LocalHost;
+        fn deref(&self) -> &LocalHost {
+            &self.host
+        }
+    }
+
+    fn host() -> TestHost {
         use mu_base::config::Configs;
         let (ntx, _nrx) = unbounded_channel();
         let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
         let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
-        let auth = mu_testutil::tmp().join("auth.json");
+        let auth_dir = mu_testutil::tmp();
+        let auth = auth_dir.join("auth.json");
         let providers = Rc::new(Providers::for_tests_with_auth(Rc::new(Configs::default()), gateway, auth));
+        let profile_dir = mu_testutil::tmp();
         let mut h = LocalHost::new(providers, Rc::new(Context::default()), plugins, "/".into());
         let l = &h.local;
         // Its own profile, so the state calls never touch the test process's shared one.
@@ -130,10 +145,10 @@ mod tests {
             ctx: l.ctx.clone(),
             plugins: l.plugins.clone(),
             cwd: l.cwd.clone(),
-            profile_home: mu_testutil::tmp(),
+            profile_home: profile_dir.to_path_buf(),
             push: l.push.clone(),
         });
-        h
+        TestHost { host: h, _dirs: [auth_dir, profile_dir] }
     }
 
     /// An SSH ed25519 identity from a seed: its private key text and its public key line.
@@ -338,7 +353,7 @@ mod tests {
         sh(&root, &["update-ref", "refs/mu/result/h-1", "HEAD"]);
         sh(&root, &["reset", "-q", "--hard", &base]);
         let h = host();
-        let args = |r: &str| json!(ResultArgs { cwd: root.clone(), r#ref: r.into(), base: base.clone() });
+        let args = |r: &str| json!(ResultArgs { cwd: root.to_path_buf(), r#ref: r.into(), base: base.clone() });
         let wait = |a: Answer| match a {
             Answer::Pending(f) => mu_testutil::block_on(f),
             Answer::Ready(r) => r,

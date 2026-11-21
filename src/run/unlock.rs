@@ -222,7 +222,7 @@ mod tests {
 
     /// An agent's side over the sealed state of `home`, as the host calls answer.
     struct Agent {
-        home: PathBuf,
+        home: mu_testutil::TempDir,
         calls: Vec<String>,
     }
 
@@ -277,7 +277,7 @@ mod tests {
     }
 
     struct Keys {
-        dir: PathBuf,
+        dir: mu_testutil::TempDir,
         private: PathBuf,
         public: String,
     }
@@ -376,9 +376,9 @@ mod tests {
     fn an_agent_with_no_state_key_is_set_up_for_the_clients_public_key_only_when_the_user_agrees() {
         let _g = serial();
         let k = keys(4, None);
-        let home = mu_testutil::tmp();
         mu_tui::host::state::set_wanted(true);
-        let mut a = Agent { home: home.clone(), calls: Vec::new() };
+        let mut a = Agent { home: mu_testutil::tmp(), calls: Vec::new() };
+        let home = a.home.to_path_buf();
 
         let mut no = Script { interactive: true, ..Default::default() };
         assert_eq!(run(&mut a, Some(&k.private), &mut no), Outcome::Pending);

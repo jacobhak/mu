@@ -377,14 +377,30 @@ mod tests {
         json!({"verdict":"pass","summary":"ok","findings":[]})
     }
 
-    fn setup(plan: bool) -> (Job, Record, PathBuf) {
+    /// The repo `setup` made, which derefs to its path, with the other directories it made; all are removed on drop.
+    struct Dirs {
+        repo: mu_testutil::TempDir,
+        _plan: mu_testutil::TempDir,
+        _rec: mu_testutil::TempDir,
+    }
+
+    impl std::ops::Deref for Dirs {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.repo
+        }
+    }
+
+    fn setup(plan: bool) -> (Job, Record, Dirs) {
         mu_testutil::home();
         let repo = repo();
-        let plan_file = tmp().join("plan.md");
+        let plan_dir = tmp();
+        let plan_file = plan_dir.join("plan.md");
         std::fs::write(&plan_file, "# plan\n").unwrap();
         let base = sh(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let rec_dir = tmp();
         let job = Job {
-            dir: tmp().join("rec"),
+            dir: rec_dir.join("rec"),
             plan: plan.then(|| "x".to_string()),
             new_worktree: None,
             max_fix: 2,
@@ -392,13 +408,13 @@ mod tests {
         };
         let rec = Record {
             id: "x".into(),
-            repo: repo.clone(),
-            worktree: repo.clone(),
+            repo: repo.to_path_buf(),
+            worktree: repo.to_path_buf(),
             base,
             plan_path: Some(plan_file),
             ..Default::default()
         };
-        (job, rec, repo)
+        (job, rec, Dirs { repo, _plan: plan_dir, _rec: rec_dir })
     }
 
     fn go(f: &mut Fake, job: &Job, rec: &mut Record) {
@@ -407,7 +423,7 @@ mod tests {
 
     #[test]
     fn blocking_findings_go_back_to_the_implementer() {
-        let (job, mut rec, _) = setup(true);
+        let (job, mut rec, _dirs) = setup(true);
         let mut f = Fake { reviews: [failing(), passing()].into(), ..Default::default() };
         go(&mut f, &job, &mut rec);
         assert_eq!(f.resumes.len(), 1);
@@ -425,7 +441,7 @@ mod tests {
 
     #[test]
     fn stops_after_max_fix_with_fail() {
-        let (job, mut rec, _) = setup(true);
+        let (job, mut rec, _dirs) = setup(true);
         let mut f = Fake { reviews: [failing(), failing(), failing()].into(), ..Default::default() };
         go(&mut f, &job, &mut rec);
         assert_eq!(f.review_outs.len(), 3);
@@ -437,7 +453,7 @@ mod tests {
 
     #[test]
     fn restart_runs_review_and_fix_only() {
-        let (job, mut rec, _) = setup(false);
+        let (job, mut rec, _dirs) = setup(false);
         rec.session = Some("/s/old.jsonl".into());
         rec.reviews = 1;
         rec.fixes = 1;
@@ -452,7 +468,7 @@ mod tests {
 
     #[test]
     fn failed_implement_keeps_the_session() {
-        let (job, mut rec, _) = setup(true);
+        let (job, mut rec, _dirs) = setup(true);
         let s = PathBuf::from("/s/impl.jsonl");
         let mut f = Fake { impl_result: Some((Some(s.clone()), Err("mu plan exited 3".into()))), ..Default::default() };
         go(&mut f, &job, &mut rec);
@@ -474,7 +490,7 @@ mod tests {
 
     #[test]
     fn notifies_the_starting_session() {
-        let (mut job, mut rec, _) = setup(true);
+        let (mut job, mut rec, _dirs) = setup(true);
         job.notify = Some("/s/boss.jsonl".into());
         let mut f = Fake { reviews: [passing()].into(), ..Default::default() };
         go(&mut f, &job, &mut rec);
@@ -486,7 +502,7 @@ mod tests {
 
     #[test]
     fn missing_report_is_error() {
-        let (job, mut rec, _) = setup(true);
+        let (job, mut rec, _dirs) = setup(true);
         let mut f = Fake::default();
         go(&mut f, &job, &mut rec);
         assert_eq!(rec.verdict.as_deref(), Some("error"));
@@ -497,7 +513,8 @@ mod tests {
     #[test]
     fn worktree_is_created_from_head_without_upstream() {
         let (mut job, mut rec, repo) = setup(true);
-        let wt = tmp().join("repo-x");
+        let wt_dir = tmp();
+        let wt = wt_dir.join("repo-x");
         job.new_worktree = Some("plan/x".into());
         rec.worktree = wt.clone();
         let mut f = Fake { reviews: [passing()].into(), ..Default::default() };
@@ -512,7 +529,8 @@ mod tests {
     fn mu_steps_argv() {
         mu_testutil::home();
         let repo = repo();
-        let script = tmp().join("fake.sh");
+        let script_dir = tmp();
+        let script = script_dir.join("fake.sh");
         std::fs::write(
             &script,
             "printf '%s|' \"$@\" >> \"$PWD/args.log\"; echo >> \"$PWD/args.log\"\n\

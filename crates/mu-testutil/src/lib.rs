@@ -8,14 +8,27 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A private `MU_HOME` for this test process, created once, with no omp profile, so per-profile state
 /// is `MU_HOME` itself whatever the developer's shell sets. Tests that touch mu's state (sessions,
-/// blobs) call it first so they never write to the real `~/.mu`.
+/// blobs) call it first so they never write to the real `~/.mu`. A home this call created is removed
+/// at process exit; one given by `MU_TEST_HOME` belongs to the test that spawned this process.
 pub fn home() -> &'static Path {
     static H: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static OWNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    extern "C" fn remove_owned() {
+        if let Some(d) = OWNED.get() {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
     H.get_or_init(|| {
         // A spawned test binary (tests/modes.rs) is given its home by the test that starts it.
         let d = match std::env::var_os("MU_TEST_HOME") {
             Some(d) => PathBuf::from(d),
-            None => std::env::temp_dir().join(format!("mu-test-home-{}", uuid::Uuid::new_v4())),
+            None => {
+                let d = std::env::temp_dir().join(format!("mu-test-home-{}", uuid::Uuid::new_v4()));
+                let _ = OWNED.set(d.clone());
+                // SAFETY: the handler only reads a `OnceLock` and removes a directory.
+                unsafe { libc::atexit(remove_owned) };
+                d
+            }
         };
         std::fs::create_dir_all(&d).unwrap();
         // SAFETY: set once, before any test in this process reads it through `home()`.
@@ -103,10 +116,40 @@ pub async fn fake_server(replies: Vec<Reply>) -> (String, std::sync::Arc<std::sy
 
 /// A fresh, empty, canonical temp dir. It is under `/tmp` with a short name: an agent's socket lives below it
 /// (`run/<id>.sock`) and macOS's `$TMPDIR` alone leaves too little of the 100-byte socket path limit.
-pub fn tmp() -> PathBuf {
+/// The directory is removed when the guard drops, so keep the guard for as long as the path is used.
+pub fn tmp() -> TempDir {
     let d = PathBuf::from("/tmp").join(format!("mu-t-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]));
     std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+    TempDir(d.canonicalize().unwrap())
+}
+
+/// Guard for a directory made by `tmp()`: removes it recursively on drop.
+#[derive(Debug)]
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
 }
 
 /// Runs `git` in `dir` with a fixed identity, panics on failure, returns stdout.
@@ -122,7 +165,7 @@ pub fn sh(dir: &Path, args: &[&str]) -> String {
 }
 
 /// A fresh git repo whose initial commit holds `a.txt` and `b.txt`, both `one\n`.
-pub fn repo() -> PathBuf {
+pub fn repo() -> TempDir {
     let d = tmp();
     sh(&d, &["init", "-q"]);
     std::fs::write(d.join("a.txt"), "one\n").unwrap();

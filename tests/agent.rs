@@ -39,7 +39,7 @@ fn sse(body: &str) -> Reply {
 }
 
 /// A `MU_HOME` (also `HOME`) whose key store holds an Anthropic key that points at `base`.
-fn home_with_key(base: &str) -> PathBuf {
+fn home_with_key(base: &str) -> mu_testutil::TempDir {
     let home = mu_testutil::tmp();
     let store = json!({"version": 1, "providers": {"anthropic": {"key": "sk-test-key", "baseUrl": base}}});
     std::fs::write(home.join("auth.json"), store.to_string()).unwrap();
@@ -205,7 +205,7 @@ fn caught_up(v: &Value) -> bool {
     v["event"] == "CaughtUp"
 }
 
-fn fixture() -> (PathBuf, PathBuf) {
+fn fixture() -> (mu_testutil::TempDir, mu_testutil::TempDir) {
     let home = home_with_key(&serve(vec![sse(ANSWER), sse(ANSWER), sse(ANSWER)]));
     (home, mu_testutil::tmp())
 }
@@ -504,7 +504,7 @@ fn a_login_started_by_a_client_writes_the_agents_credentials_not_the_clients() {
     let written = home.join(".omp/agent/auth.json");
     assert_eq!(std::fs::read_to_string(written).unwrap(), "login", "the agent's home got the credentials");
     let clients = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    assert_ne!(clients, home);
+    assert_ne!(clients, home.path());
     assert_ne!(std::fs::read_to_string(clients.join(".omp/agent/auth.json")).ok().as_deref(), Some("login"));
 }
 
@@ -579,7 +579,8 @@ fn a_session_is_taken_over_through_the_agent_and_reached_by_a_tunnel() {
     let file = session_file(&home, &first.session);
 
     // Another agent's client takes it over: the host starts an agent on it and a tunnel reaches it.
-    let other = Agent::start(&home, &mu_testutil::tmp(), &[]);
+    let other_cwd = mu_testutil::tmp();
+    let other = Agent::start(&home, &other_cwd, &[]);
     let mut c = Client::connect(&other.socket);
     c.hello();
     c.until(caught_up);
@@ -975,10 +976,10 @@ impl Drop for Term {
 /// A client machine (its own home) beside a "remote" one that a link script reaches by running this
 /// binary with the remote's home: a plain command, as `ssh host mu attach --stdio ID` would be.
 struct Far {
-    client: PathBuf,
-    remote: PathBuf,
-    cwd: PathBuf,
-    dir: PathBuf,
+    client: mu_testutil::TempDir,
+    remote: mu_testutil::TempDir,
+    cwd: mu_testutil::TempDir,
+    dir: mu_testutil::TempDir,
     link: PathBuf,
     state_key: std::cell::RefCell<Option<PathBuf>>,
 }
@@ -1119,6 +1120,7 @@ fn attaching_by_hand_to_a_busy_agent_asks_and_takes_over_only_on_t() {
 struct Identity {
     private: PathBuf,
     public: String,
+    _dir: mu_testutil::TempDir,
 }
 
 fn identity(seed: u8, passphrase: Option<&str>) -> Identity {
@@ -1129,10 +1131,11 @@ fn identity(seed: u8, passphrase: Option<&str>) -> Identity {
         Some(p) => key.encrypt(&mut rand_core::OsRng, p).unwrap(),
         None => key,
     };
-    let private = mu_testutil::tmp().join("id_ed25519");
+    let dir = mu_testutil::tmp();
+    let private = dir.join("id_ed25519");
     std::fs::write(&private, stored.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes()).unwrap();
     std::fs::write(format!("{}.pub", private.display()), format!("{public} test@laptop\n")).unwrap();
-    Identity { private, public }
+    Identity { private, public, _dir: dir }
 }
 
 /// The key the client unlocks with: what `--state-key` gets.

@@ -70,7 +70,7 @@ fn serve(replies: Vec<Reply>) -> (String, Seen) {
     rx.recv().unwrap()
 }
 
-fn home_with_key(base: &str) -> PathBuf {
+fn home_with_key(base: &str) -> mu_testutil::TempDir {
     let home = mu_testutil::tmp();
     let store = json!({"version": 1, "providers": {"anthropic": {"key": "sk-test-key", "baseUrl": base}}});
     std::fs::write(home.join("auth.json"), store.to_string()).unwrap();
@@ -85,6 +85,8 @@ struct Acp {
     /// Every message the agent sent, in order.
     log: Vec<Value>,
     next: u64,
+    /// Directories the child runs in, removed after it is killed.
+    held: Vec<mu_testutil::TempDir>,
 }
 
 impl Drop for Acp {
@@ -131,7 +133,12 @@ impl Acp {
                 }
             }
         });
-        Self { child, stdin, rx, log: Vec::new(), next: 1 }
+        Self { child, stdin, rx, log: Vec::new(), next: 1, held: Vec::new() }
+    }
+
+    fn holding(mut self, dir: mu_testutil::TempDir) -> Self {
+        self.held.push(dir);
+        self
     }
 
     fn send(&mut self, v: Value) {
@@ -206,11 +213,11 @@ impl Acp {
     }
 }
 
-fn setup(replies: Vec<Reply>) -> (Acp, PathBuf, Seen) {
+fn setup(replies: Vec<Reply>) -> (Acp, mu_testutil::TempDir, Seen) {
     let (base, seen) = serve(replies);
     let home = home_with_key(&base);
     let cwd = mu_testutil::tmp();
-    (Acp::start(&home, &cwd), cwd, seen)
+    (Acp::start(&home, &cwd).holding(home), cwd, seen)
 }
 
 fn kind_of(u: &Value) -> &str {
@@ -541,7 +548,7 @@ fn a_deleted_session_leaves_the_list() {
     acp.init(json!({}));
     let (sid, _) = acp.new_session(&cwd);
     let listed = |acp: &mut Acp| -> Vec<String> {
-        let r = acp.call("session/list", json!({"cwd": cwd}));
+        let r = acp.call("session/list", json!({"cwd": cwd.path()}));
         r["result"]["sessions"]
             .as_array()
             .unwrap()

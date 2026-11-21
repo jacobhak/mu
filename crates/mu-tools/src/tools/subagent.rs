@@ -891,10 +891,25 @@ mod launch_tests {
     }
 
     /// A launcher that reads the payload line, then runs `body`.
-    fn launcher(body: &str) -> WorkerLaunch {
-        let file = tmp().join("launcher.sh");
+    fn launcher(body: &str) -> Scripted {
+        let dir = tmp();
+        let file = dir.join("launcher.sh");
         std::fs::write(&file, format!("IFS= read -r payload\n{body}\n")).unwrap();
-        WorkerLaunch { launcher: vec!["sh".into(), file.to_string_lossy().into_owned()], kinds: vec!["task".into()] }
+        let launcher = vec!["sh".into(), file.to_string_lossy().into_owned()];
+        Scripted { launch: WorkerLaunch { launcher, kinds: vec!["task".into()] }, _dir: dir }
+    }
+
+    /// A launcher whose script is removed when this drops.
+    struct Scripted {
+        launch: WorkerLaunch,
+        _dir: mu_testutil::TempDir,
+    }
+
+    impl std::ops::Deref for Scripted {
+        type Target = WorkerLaunch;
+        fn deref(&self) -> &WorkerLaunch {
+            &self.launch
+        }
     }
 
     const DONE: &str = r#"echo '{"type":"tool","name":"read","summary":"x"}'
@@ -984,18 +999,20 @@ git bundle create -q "$MU_TASK_RESULT_BUNDLE" "{result_ref}"{base}"#
     #[tokio::test(flavor = "current_thread")]
     async fn two_results_finishing_together_are_both_applied() {
         let root = repo();
-        let one = launcher(&format!("{DONE}\n{}", writing("a.txt", "first")));
-        let two = launcher(&format!("{DONE}\n{}", writing("b.txt", "second")));
+        let (one, two) = (
+            launcher(&format!("{DONE}\n{}", writing("a.txt", "first"))),
+            launcher(&format!("{DONE}\n{}", writing("b.txt", "second"))),
+        );
         let (o1, o2) = tokio::task::LocalSet::new()
             .run_until(async {
                 let go = |on: WorkerLaunch, name: &'static str| {
-                    let root = root.clone();
+                    let root = root.to_path_buf();
                     async move {
                         go(&root, &on, name, &json!({"task": "go"}), &CancellationToken::new(), &RefCell::default())
                             .await
                     }
                 };
-                tokio::join!(go(one, "one"), go(two, "two"))
+                tokio::join!(go(one.launch.clone(), "one"), go(two.launch.clone(), "two"))
             })
             .await;
         assert!(
@@ -1122,7 +1139,8 @@ echo plain >&2
         let seen: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
         let out = tokio::task::LocalSet::new()
             .run_until(async {
-                let mut launch = prepare_launch(&launcher(&body), &root, "t").await.unwrap();
+                let scripted = launcher(&body);
+                let mut launch = prepare_launch(&scripted, &root, "t").await.unwrap();
                 let s = seen.clone();
                 launch.on_progress(move |p| s.borrow_mut().push(p.map(str::to_string)));
                 run_child_observed(
@@ -1209,7 +1227,8 @@ wait"#,
         let started = std::time::Instant::now();
         let out = tokio::task::LocalSet::new()
             .run_until(async {
-                let launch = prepare_launch(&launcher(&body), &root, "t").await.unwrap();
+                let scripted = launcher(&body);
+                let launch = prepare_launch(&scripted, &root, "t").await.unwrap();
                 // The first tool line proves the launcher is running and has set its trap.
                 run_child_observed(
                     ChildCmd::Launched(launch),

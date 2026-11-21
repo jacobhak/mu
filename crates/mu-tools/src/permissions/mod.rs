@@ -362,14 +362,33 @@ mod tests {
         ("bash".into(), Rule { pattern: pattern.into(), action: Action::Deny })
     }
 
-    fn setup(mode: PermissionMode) -> (Permissions, Tools) {
+    /// `Tools` working in a fresh repo that is removed when this drops.
+    struct Fixture {
+        tools: Tools,
+        _root: mu_testutil::TempDir,
+    }
+
+    impl std::ops::Deref for Fixture {
+        type Target = Tools;
+        fn deref(&self) -> &Tools {
+            &self.tools
+        }
+    }
+
+    impl std::ops::DerefMut for Fixture {
+        fn deref_mut(&mut self) -> &mut Tools {
+            &mut self.tools
+        }
+    }
+
+    fn setup(mode: PermissionMode) -> (Permissions, Fixture) {
         mu_testutil::home();
         let root = repo();
         let perms = Permissions::new(&MuPermissions { mode, readonly_bash: true, rules: RuleSet::default() });
         block_on(perms.ensure_project(&root, &mut Vec::new()));
-        let mut t = Tools::for_test();
-        t.cwd = root;
-        (perms, t)
+        let mut tools = Tools::for_test();
+        tools.cwd = root.to_path_buf();
+        (perms, Fixture { tools, _root: root })
     }
 
     /// A directory outside the checkout, held at its resolved path. macOS resolves `/etc` and

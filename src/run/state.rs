@@ -94,7 +94,7 @@ pub(super) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod tests {
     use super::*;
 
-    fn home() -> std::path::PathBuf {
+    fn home() -> mu_testutil::TempDir {
         mu_testutil::tmp()
     }
 

@@ -253,7 +253,8 @@ fn stop_skips_the_rest_of_the_batch_and_ends_the_turn() {
 #[test]
 fn stop_during_a_tool_lets_it_finish_and_skips_the_next() {
     run(async {
-        let started = mu_testutil::tmp().join("started");
+        let started_dir = mu_testutil::tmp();
+        let started = started_dir.join("started");
         let command = format!("touch {}; sleep 1", started.display());
         let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![
@@ -297,7 +298,8 @@ fn stop_with_a_plain_reply_ends_normally() {
 #[test]
 fn stop_plus_cancel_is_an_abort_and_stays_paired() {
     run(async {
-        let started = mu_testutil::tmp().join("started");
+        let started_dir = mu_testutil::tmp();
+        let started = started_dir.join("started");
         let command = format!("touch {}; sleep 5", started.display());
         let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse))];
@@ -846,7 +848,8 @@ fn a_wake_delivers_the_queued_message_and_empties_the_inbox() {
 #[test]
 fn a_message_during_a_turn_joins_that_turn() {
     run(async {
-        let started = mu_testutil::tmp().join("started");
+        let started_dir = mu_testutil::tmp();
+        let started = started_dir.join("started");
         let command = format!("touch {}; sleep 0.3", started.display());
         let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![
