@@ -189,7 +189,8 @@ P
   rc=0; run_agent maint-triage "$APG_MAINT_TRIAGE_USD" "$bwt" "$tprompt" "$tout" || rc=$?
   if [ "$rc" = 0 ]; then
     local lastline
-    lastline="$(grep -v '^[[:space:]]*$' "$tout" | tail -n 1)"
+    # The last JSON-object line: a model may wrap it in a code fence, which then is the last line.
+    lastline="$(grep -E '^[[:space:]]*\{.*\}[[:space:]]*$' "$tout" | tail -n 1)"
     if echo "$lastline" | jq -e '.behaviour_change | type == "boolean"' >/dev/null 2>&1; then
       change="$(echo "$lastline" | jq -r '.behaviour_change')"
       summary="$(echo "$lastline" | jq -r '.summary // ""')"

@@ -32,7 +32,7 @@ Then write the summary from what you read. The summary MUST NOT contain phrases 
 
 Do not modify anything. Be brief in the answer, not in the investigation.
 
-Output contract: the last line of your final message must be exactly one JSON object and nothing else on that line:
+Output contract: the last line of your final message must be exactly one JSON object and nothing else on that line (no code fence around it):
 {"behaviour_change": true|false, "summary": "<markdown, at most 15 lines, \n-separated; when true, each change with the file it leaves wrong; when false, one line saying why nothing here needs to change>", "fyi": "<markdown, at most 15 lines, \n-separated; user-visible changes that need nothing from this repo, or empty>", "risk": "low|medium|high"}
 
 `risk` is the risk to this tool of the upgrade, not the size of the release.
