@@ -1,5 +1,6 @@
 name: ci
-# Timing experiment, not for merging: the checks without rust-cache's restore, at 2 and 4 build jobs.
+# Timing experiment, not for merging: the checks without rust-cache's restore, at 2 and 4 build jobs, and with
+# sccache in the in-cluster MinIO (run twice: the first fills the bucket).
 on:
   pull_request:
 permissions:
@@ -13,15 +14,32 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        jobs: [2, 4]
-    name: check (no cache, ${{ matrix.jobs }} jobs)
+        include:
+          - {cache: none, jobs: 2}
+          - {cache: none, jobs: 4}
+          - {cache: sccache, jobs: 4}
+    name: check (${{ matrix.cache }}, ${{ matrix.jobs }} jobs)
     env:
       CARGO_BUILD_JOBS: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
       - run: nproc && cat /sys/fs/cgroup/cpu.max 2>/dev/null || true
+      - name: sccache
+        if: matrix.cache == 'sccache'
+        run: |
+          v=v0.19.0 f=sccache-v0.19.0-x86_64-unknown-linux-musl
+          curl -fsSL -o /tmp/sc.tgz "https://github.com/mozilla/sccache/releases/download/$v/$f.tar.gz"
+          echo "aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd  /tmp/sc.tgz" | sha256sum -c -
+          tar -xzf /tmp/sc.tgz -C /tmp && install -m 0755 "/tmp/$f/sccache" "$HOME/.cargo/bin/sccache"
+          # MinIO's certificate is issued by the cluster CA, which the pod's service account mount carries.
+          cat /etc/ssl/certs/ca-certificates.crt /var/run/secrets/kubernetes.io/serviceaccount/ca.crt > "$HOME/ca-bundle.crt"
+          echo "SSL_CERT_FILE=$HOME/ca-bundle.crt" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          [ -n "$SCCACHE_BUCKET" ] && echo "bucket: $SCCACHE_BUCKET"
       - run: scripts/ci-checks.sh
+      - run: sccache --show-stats
+        if: always() && matrix.cache == 'sccache'
       - run: df -h / && du -sh target
         if: always()
   macos:
