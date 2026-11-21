@@ -1,44 +1,33 @@
 name: ci
+# Timing experiment, not for merging: the checks without rust-cache's restore, at 2 and 4 build jobs.
 on:
-  push:
-    branches: [main]
   pull_request:
 permissions:
   contents: read
 env:
-  # The workspace builds once, in the dev profile, and clippy runs in that same build; no debug info keeps it
-  # within the runner's disk.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_INCREMENTAL: 0
 jobs:
   check:
     runs-on: arc-mu
+    strategy:
+      fail-fast: false
+      matrix:
+        jobs: [2, 4]
+    name: check (no cache, ${{ matrix.jobs }} jobs)
     env:
-      # This runner reserves 2 cores; cargo would otherwise use every core it can see.
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # On a self-hosted runner ~/.cargo/bin holds the real rustup, and
-          # cache-bin prunes that directory: the next job then finds no rustup.
-          cache-bin: false
+      - run: nproc && cat /sys/fs/cgroup/cpu.max 2>/dev/null || true
       - run: scripts/ci-checks.sh
       - run: df -h / && du -sh target
         if: always()
   macos:
-    # macOS platform coverage on the self-hosted Mac. Branch protection needs a
-    # paid plan on a private repo, so nothing here gates a merge.
-    # A JIT-provisioned runner carries only the labels it was created with, so
-    # there is no implicit self-hosted or macOS label to match on.
     runs-on: mu-ci
+    name: macos (no cache)
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # On a self-hosted runner ~/.cargo/bin holds the real rustup, and
-          # cache-bin prunes that directory: the next job then finds no rustup.
-          cache-bin: false
       - run: scripts/ci-checks.sh
