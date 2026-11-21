@@ -5,6 +5,7 @@
 # cannot drift from the one jobs use:
 #
 #   docker build -f .github/runner/Dockerfile -t <registry>/arc-mu-runner:latest .
+# arm64 (offload's arm64 base): build the same on an arm64 host and tag it arc-mu-runner-arm64:latest.
 #
 # The base is the same Ubuntu 24.04 as the hosted ubuntu-24.04 runner.
 FROM ghcr.io/actions/actions-runner:latest
