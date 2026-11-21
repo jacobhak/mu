@@ -94,7 +94,7 @@ Usage, configuration and the individual features are documented in [`docs/`](doc
 
 ### Maintenance bot
 
-A local systemd timer keeps mu current with oh-my-pi; everything is reported through GitHub issues and PRs. `scripts/maint/setup.sh [--profile NAME]` installs it (config in `~/.mu/maint/config.env`, budgets `MU_MAINT_*_USD`, `MU_MAINT_DRY_RUN=1` prints instead of mutating GitHub). Its LLM steps are the agents in `.omp/agents/` (`maint-triage`, `maint-fixer`, `maint-digest`), run by the installed `mu`.
+A local systemd timer keeps mu current with oh-my-pi; everything is reported through GitHub issues and PRs. `scripts/maint/setup.sh [--profile NAME]` installs it (config in `~/.mu/maint/config.env`, budgets `MU_MAINT_*_USD`, `MU_MAINT_DRY_RUN=1` prints instead of mutating GitHub). Its LLM steps are the agents in `.omp/agents/` (`maint-triage`, `maint-fixer`, `maint-digest`), run by the installed `mu`. When `offload` is installed and reachable, `check.sh` runs its `test` stage (`scripts/ci-checks.sh`) as `offload run -- scripts/ci-checks.sh`; the build, contract and smoke stages stay local (they need the local omp profile, a live model and the release binary). `MU_MAINT_OFFLOAD=0` forces everything local; a stage that runs past `MU_MAINT_STAGE_SECS` (default 2400) fails.
 
 | Level | Trigger | Action |
 |---|---|---|

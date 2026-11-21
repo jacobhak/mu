@@ -6,6 +6,7 @@ dest="${2:?usage: fetch-omp.sh <version> <dest>}"
 
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64) plat=linux-x64 ;;
+  Linux/aarch64) plat=linux-arm64 ;;
   Darwin/arm64) plat=darwin-arm64 ;;
   *) echo "unsupported platform" >&2; exit 1 ;;
 esac

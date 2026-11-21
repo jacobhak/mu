@@ -13,12 +13,14 @@ A failed `bump` stage means the version pin itself could not be completed: `bump
 
 If the prompt says `MODE: behaviour review`, checks already pass. Your job is to fix what the listed upstream changes made wrong in mu (code, prompts, tool descriptions, docs), or state per change why nothing is. Making no edits is the expected outcome when mu only passes the behaviour through. Do not add a test whose purpose is to pin omp's behaviour: omp tests its own crates. Add a test only alongside a mu code change you make.
 
+If the prompt lists triage findings alongside failing checks, do both: make the stages pass first, then review each listed change as in behaviour review mode. In the final message give the account of the fix first, then one line per listed change.
+
 Rules:
 - Make the failing stages pass with the smallest change that is correct. Fix the cause, never weaken or delete a test or contract test to get green.
 - NEVER edit `.github/` or `upstream.toml`, and never change the version an oh-my-pi `tag`/`rev` entry in `Cargo.toml` points at. The bot owns those. Adding or removing a whole oh-my-pi `[patch]` entry is allowed when the new release starts or stops vendoring that crate.
 - Do not commit, push, or create branches. Leave changes in the working tree.
 - The smoke stage spends real money; do not run `scripts/smoke.sh`. Reason from its log instead.
-- Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. Contract tests need `MU_OMP` pointing at the pinned omp, which the prompt gives when relevant.
+- Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. When `offload` is installed run them as `offload run -- <command>` (for example `offload run -- cargo test --workspace`) rather than locally. Contract tests need `MU_OMP` pointing at the pinned omp, which the prompt gives when relevant, and the local omp profile: run them locally, not offloaded.
 - If you cannot make it pass, say so plainly and explain what blocks you.
 
 Final message (plain markdown). The first line must be a one-line summary suitable as a commit subject (no prefix, under 70 chars).

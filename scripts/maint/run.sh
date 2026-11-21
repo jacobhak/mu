@@ -143,16 +143,23 @@ P
   log "maint: result=$result published=$published spend=\$$(run_spend)"
 }
 
-# ci_wait <branch>: waits for the PR's `check` job (the macos job gates nothing). Exit 0 when it passed,
-# 1 when it failed or was cancelled, 2 when it had not finished within MU_MAINT_CI_WAIT_SECS.
+# ci_wait <branch>: waits for the branch's `check` job (the macos job gates nothing). Exit 0 when it passed,
+# 1 when it ended any other way, 2 when it had not finished within MU_MAINT_CI_WAIT_SECS.
+# The check-runs REST API, not `gh pr checks --json`: gh 2.46 (Ubuntu 24.04) has no --json there, and the
+# error it printed was swallowed, so the wait always ran out and no bump ever auto-merged.
 ci_wait() {
-  local branch="$1" deadline bucket
+  local branch="$1" deadline sha state
   deadline=$((SECONDS + ${MU_MAINT_CI_WAIT_SECS:-3600}))
   while :; do
-    bucket="$(gh pr checks "$branch" -R "$REPO" --json name,bucket -q '[.[] | select(.name == "check")] | .[0].bucket // ""' 2> /dev/null || true)"
-    case "$bucket" in
-      pass) return 0 ;;
-      fail | cancel) return 1 ;;
+    sha="$(gh api "repos/$REPO/git/ref/heads/$branch" -q .object.sha 2> /dev/null || true)"
+    state=""
+    if [ -n "$sha" ]; then
+      state="$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" -q '[.check_runs[] | select(.name == "check")] | sort_by(.id) | last | if . == null then "" elif .status != "completed" then "pending" else .conclusion end' 2> /dev/null || true)"
+    fi
+    case "$state" in
+      success) return 0 ;;
+      "" | pending) ;;
+      *) return 1 ;;
     esac
     [ "$SECONDS" -lt "$deadline" ] || return 2
     sleep 30
@@ -231,6 +238,16 @@ P
       cat > "$fprompt" <<P
 Adapt mu to oh-my-pi v$latest (bumped from v$pinned). The failing check run is in $RUN/bump (check.txt and one log per stage). Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
 P
+      if [ "$change" = true ]; then
+        cat >> "$fprompt" <<P
+
+Triage also found that these changes in v$latest leave something in mu wrong, apart from the failing checks:
+
+$summary
+
+First make the checks pass. Then, for each listed change, decide whether mu's own code, prompts, tool descriptions or docs are wrong, stale or incomplete because of it, and fix those too (no test that only pins upstream behaviour). Report each in the final message as in the behaviour review format of your agent instructions, after the account of the build fix.
+P
+      fi
     fi
     rc=0; run_agent maint-fixer "$MU_MAINT_FIX_USD" "$bwt" "$fprompt" "$fout" || rc=$?
     fixrc=$rc

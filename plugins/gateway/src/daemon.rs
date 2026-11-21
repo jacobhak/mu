@@ -22,6 +22,10 @@ const START_TIMEOUT: Duration =
     Duration::from_secs(2 * SPAWN_WAIT.as_secs() + TOKEN_TIMEOUT.as_secs() + START_MARGIN.as_secs());
 const POLL: Duration = Duration::from_millis(200);
 const STOP_GRACE: Duration = Duration::from_secs(2);
+/// How long the omp pair gets to exit after SIGTERM before SIGKILL. omp's auth broker finishes a token refresh
+/// already in flight first (up to its 10 s cleanup deadline); killing it sooner leaves a spent refresh token in
+/// the store. A pair with nothing in flight exits at once, so this only bounds the worst case.
+const CHILD_GRACE: Duration = Duration::from_secs(12);
 const STOP_POLL: Duration = Duration::from_millis(200);
 
 /// Set by SIGTERM, SIGHUP or SIGINT: `serve` stops and its children go with it.
@@ -142,7 +146,7 @@ fn watch_group(pgid: i32, mut pipe: impl Read) {
         }
     }
     signal_group(pgid, libc::SIGTERM);
-    let deadline = Instant::now() + STOP_GRACE;
+    let deadline = Instant::now() + CHILD_GRACE;
     while group_alive(pgid) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
     }
@@ -301,14 +305,14 @@ impl Kids {
         self.0.iter_mut().any(|c| matches!(c.try_wait(), Ok(Some(_))))
     }
 
-    /// SIGTERM to each child's group, wait up to `STOP_GRACE` for the groups to empty, then SIGKILL.
+    /// SIGTERM to each child's group, wait up to `CHILD_GRACE` for the groups to empty, then SIGKILL.
     fn terminate(&mut self) {
         let mut kids = std::mem::take(&mut self.0);
         let pids: Vec<i32> = kids.iter().map(|c| c.id() as i32).collect();
         for &pid in &pids {
             signal_group(pid, libc::SIGTERM);
         }
-        let deadline = Instant::now() + STOP_GRACE;
+        let deadline = Instant::now() + CHILD_GRACE;
         loop {
             // Reap leaders first: a zombie leader keeps its group visible to `group_alive`.
             for c in &mut kids {

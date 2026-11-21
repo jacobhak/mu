@@ -14,3 +14,8 @@ feature-unification = "workspace"
 # elsewhere from the same sources. Build scripts' rerun-if-changed paths still go by modification time.
 [build]
 fingerprint = "content"
+
+# aarch64 Linux links with GNU ld, which needs 2.3 GB for one test binary (rust-lld, already the x86_64 default,
+# 1.5 GB, in half the time). cargo links five such binaries at once, so a 6 GiB build node ran out of memory.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-Zunstable-options", "-Clink-self-contained=+linker", "-Clinker-features=+lld"]
