@@ -49,9 +49,7 @@ fn status_reports_not_running() {
     let s = Scratch::new("status");
     let o = s.run(&["status"]);
     assert!(o.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["running"], false);
-    assert_eq!(v["leases"], 0);
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "{\"running\":false,\"pid\":null,\"url\":null,\"leases\":0}\n");
 }
 
 #[test]

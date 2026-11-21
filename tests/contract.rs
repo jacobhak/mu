@@ -125,7 +125,8 @@ fn contract_auth_broker_and_gateway_serve_and_answer_healthz() {
 #[ignore = "contract: runs the real omp"]
 fn contract_models_ls_json_parses_into_the_price_shape() {
     let s = Scratch::new("models");
-    let o = s.output(&["models", "ls", "--json"]);
+    // omp lists only the models it has a credential for; a fake key makes its anthropic catalogue visible.
+    let o = s.omp(&["models", "ls", "--json"]).env("ANTHROPIC_API_KEY", "sk-ant-fake").output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("models ls --json prints JSON");
     let models = v["models"].as_array().expect("a models array");

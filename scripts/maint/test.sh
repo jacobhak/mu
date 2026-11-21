@@ -19,10 +19,11 @@ cat > "$tmp/check-stub.sh" <<'EOF'
 mkdir -p "$2"
 printf 'build ok\ntest ok\ncontract ok\n' > "$2/check.txt"
 EOF
-chmod +x "$tmp/check-stub.sh"
+printf '#!/bin/sh\nexit 0\n' > "$tmp/mu"
+chmod +x "$tmp/check-stub.sh" "$tmp/mu"
 
 out="$tmp/out.txt"
-MU="$(command -v true)" APG_MAINT_CHECK="$tmp/check-stub.sh" APG_MAINT_DRY_RUN=1 APG_MAINT_FORCE_LATEST="$pinned" \
+MU="$tmp/mu" APG_MAINT_CHECK="$tmp/check-stub.sh" APG_MAINT_DRY_RUN=1 APG_MAINT_FORCE_LATEST="$pinned" \
   "$root/scripts/maint/run.sh" nightly > "$out" 2>&1 || { cat "$out" >&2; echo "maint test: nightly dry run failed" >&2; exit 1; }
 grep -q 'result=uptodate' "$out" || { cat "$out" >&2; echo "maint test: expected result=uptodate" >&2; exit 1; }
 echo "maint test: ok"
