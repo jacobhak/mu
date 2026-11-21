@@ -1498,6 +1498,19 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn compact_queues_when_busy() {
+        let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
+        app.submit(UserInput::from("/compact"), false);
+        assert!(matches!(commands.try_recv(), Ok(Command::Compact(None))));
+        assert!(!transcript_text(&app).contains("queued"));
+        app.agent.running = true;
+        app.submit(UserInput::from("/compact keep x"), false);
+        assert!(matches!(commands.try_recv(), Ok(Command::Compact(Some(f))) if f == "keep x"));
+        assert!(transcript_text(&app).contains("compaction queued until the current turn finishes"));
+        assert!(!transcript_text(&app).contains("busy"));
+    }
+
+    #[test]
     fn model_editor_is_independent_of_session_switching_and_discovery() {
         use mu_base::config::Configs;
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));

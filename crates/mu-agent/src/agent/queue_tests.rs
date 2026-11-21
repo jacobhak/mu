@@ -151,6 +151,37 @@ fn refresh_status_waits_in_the_backlog_during_a_turn() {
 }
 
 #[test]
+fn compact_waits_in_the_backlog_during_a_turn() {
+    run(async {
+        let (tx, rx) = unbounded_channel();
+        let (events, _erx) = unbounded_channel();
+        let inbox = new_inbox();
+        let mut q = queue(rx, &inbox, events);
+        tx.send(Command::Compact(Some("focus".into()))).unwrap();
+        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        assert!(matches!(q.backlog.pop_front(), Some(Command::Compact(Some(f))) if f == "focus"));
+    });
+}
+
+#[test]
+fn cancel_drops_a_queued_compact_but_keeps_other_backlog() {
+    run(async {
+        let (tx, rx) = unbounded_channel();
+        let (events, mut erx) = unbounded_channel();
+        let inbox = new_inbox();
+        let mut q = queue(rx, &inbox, events);
+        tx.send(Command::Compact(None)).unwrap();
+        tx.send(Command::RefreshStatus).unwrap();
+        tx.send(Command::Cancel).unwrap();
+        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        assert!(matches!(q.backlog.pop_front(), Some(Command::RefreshStatus)));
+        assert!(q.backlog.is_empty());
+        assert!(inbox.borrow().cancel.is_cancelled());
+        assert!(drain(&mut erx).iter().any(|e| matches!(e, AgentEvent::Notice(m) if m == "queued compaction dropped")));
+    });
+}
+
+#[test]
 fn idle_thinking_cycles_ignore_intervening_status_events() {
     run(async {
         let (mut a, mut events) = crate::testing::agent(vec![]);

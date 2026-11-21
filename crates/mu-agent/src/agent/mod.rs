@@ -218,6 +218,15 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
                     q.perms.set_mode(m);
                     announce_mode(&q.events, m);
                 }
+                Some(Command::Cancel) => {
+                    // Esc drops a compaction queued behind the turn along with the turn itself.
+                    let n = q.backlog.len();
+                    q.backlog.retain(|c| !matches!(c, Command::Compact(_)));
+                    if q.backlog.len() < n {
+                        let _ = q.events.send(AgentEvent::Notice("queued compaction dropped".into()));
+                    }
+                    q.inbox.borrow().cancel.cancel();
+                }
                 Some(c @ (Command::SetThinking(_) | Command::CycleThinking)) => {
                     let t = match c {
                         Command::SetThinking(t) => t,

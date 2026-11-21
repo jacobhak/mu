@@ -123,7 +123,7 @@ pub(super) static BUILTIN: [Builtin; 34] = [
     cmd("permissions", "Show or set tool permissions: ask, edits or yolo", App::cmd_permissions)
         .busy_ok()
         .complete(|_| names(PermissionMode::NAMES.iter().map(|s| s.to_string()))),
-    cmd("compact", "Compact the context [focus]", App::cmd_compact),
+    cmd("compact", "Compact the context [focus]; waits for a running turn", App::cmd_compact).busy_ok(),
     cmd("plan", "Toggle plan mode", |a, arg| a.send(Command::TogglePlan((!arg.is_empty()).then(|| arg.to_string())))),
     cmd("review", "Review changes against the approved plan [focus]", App::cmd_review),
     cmd("refresh", "Refresh Git and gateway quota status", App::cmd_refresh).busy_ok(),
@@ -249,6 +249,7 @@ mod tests {
                 "detach",
                 "thinking",
                 "permissions",
+                "compact",
                 "refresh",
                 "session",
                 "todo",

@@ -178,6 +178,9 @@ impl App {
     }
 
     pub(super) fn cmd_compact(&mut self, arg: &str) {
+        if self.agent.running {
+            self.notice("compaction queued until the current turn finishes");
+        }
         self.agent.running = true;
         self.send(Command::Compact((!arg.is_empty()).then(|| arg.to_string())));
     }
