@@ -345,7 +345,7 @@ pub enum OverlayEvent {
 
 /// The question as a picker: its options, a free-text row, multi-select, the recommended choice
 /// preselected. Single-select answers on the digit keys (`y`/`n` for a confirm), and a note can be
-/// typed on the highlighted option (Right, or Tab in single-select). Options show their
+/// typed on the highlighted option (Tab, or Right). Options show their
 /// descriptions in place.
 #[cfg(test)]
 pub fn ask_select(q: &AskQuestion) -> Select {
@@ -378,6 +378,7 @@ fn ask_at(q: &AskQuestion, pos: Option<(usize, usize)>, prior: Option<&Answer>) 
         .previews(previews)
         .preview_kinds(kinds)
         .notes()
+        .unfiltered()
         .described()
         .back_keys(back)
         .hint(&ask_hint(q, pos));
@@ -418,7 +419,7 @@ fn prefill(s: Select, q: &AskQuestion, prior: &Answer) -> Select {
 /// The footer: the keys of the question's kind, then how to go back (or cancel, on the first).
 fn ask_hint(q: &AskQuestion, pos: Option<(usize, usize)>) -> String {
     let mut hint = if q.multi {
-        "↑↓ move · Tab toggle · Enter submit · → note".to_string()
+        "↑↓ move · Space mark · Tab/→ note · Enter submit".to_string()
     } else if q.confirm {
         "y yes · n no · Enter choose · Tab/→ note".to_string()
     } else {
@@ -1270,10 +1271,10 @@ mod tests {
         };
         let (lines, _) = ask_select(&q).render(40, 20);
         let t: Vec<String> = lines.iter().map(crate::text::line::line_text).collect();
-        assert_eq!(t[2].trim_end(), "❯ Yes", "{t:?}");
-        assert_eq!(t[3], "    apply the change now and run the", "{t:?}");
-        assert_eq!(t[4], "    tests afterwards", "{t:?}");
-        assert_eq!(t[5], "  No", "{t:?}");
+        assert_eq!(t[1].trim_end(), "❯ Yes", "{t:?}");
+        assert_eq!(t[2], "    apply the change now and run the", "{t:?}");
+        assert_eq!(t[3], "    tests afterwards", "{t:?}");
+        assert_eq!(t[4], "  No", "{t:?}");
     }
 
     #[test]
@@ -1298,9 +1299,8 @@ mod tests {
             ["Deploy the canary?", "status: 3 services green", "errors: none in the last hour"],
             "{t:?}"
         );
-        assert_eq!(t[3].trim_end(), "›", "{t:?}");
-        assert_eq!(cur, (3, 2));
-        assert!(t[4].starts_with("❯ Yes"), "{t:?}");
+        assert!(t[3].starts_with("❯ Yes"), "no filter line: {t:?}");
+        assert_eq!(cur, (3, 0));
         assert!(lines.iter().all(|l| crate::text::line::line_width(l) <= 30), "{t:?}");
     }
 
@@ -1391,7 +1391,7 @@ mod tests {
         assert_eq!(answer(&mut rx), "[Skipped]");
 
         let (ov, mut rx) = ask_ov(AskQuestion { multi: true, ..q.clone() });
-        let ov = press(ov, &[KeyCode::Tab, KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        let ov = press(ov, &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         let (rest, _) = ov.on_key(key(KeyCode::Enter));
         assert!(rest.is_none());
         assert_eq!(answer(&mut rx), "[Skipped]", "Enter on the skip row wins over checked options");
@@ -1438,10 +1438,10 @@ mod tests {
     #[test]
     fn multi_note_goes_with_the_list_of_picks() {
         let (ov, mut rx) = ask_ov(ask_q(&["X", "Y", "Z"], true, false, None));
-        let ov = press(ov, &[KeyCode::Tab, KeyCode::Down, KeyCode::Right]);
+        let ov = press(ov, &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Char(' '), KeyCode::Tab]);
         let ov = press(ov, &typed("both"));
         assert!(ov.on_key(key(KeyCode::Enter)).0.is_none());
-        assert_eq!(answer(&mut rx), r#"[Noted { picks: ["X"], note: "both" }]"#);
+        assert_eq!(answer(&mut rx), r#"[Noted { picks: ["X", "Y"], note: "both" }]"#);
     }
 
     #[test]
@@ -1510,8 +1510,8 @@ mod tests {
         q.options[1].kind = Some(mu_base::events::PreviewKind::Diff);
         let (lines, _) = ask_select(&q).render(40, 30);
         let t: Vec<String> = lines.iter().map(crate::text::line::line_text).collect();
-        assert!(t[3].contains("┌─ code ─") && t[4].contains("fn a() {}"), "{t:?}");
-        assert!(t[7].contains("┌─ diff ─") && t[8].contains("plain words"), "{t:?}");
+        assert!(t[2].contains("┌─ code ─") && t[3].contains("fn a() {}"), "{t:?}");
+        assert!(t[6].contains("┌─ diff ─") && t[7].contains("plain words"), "{t:?}");
     }
 
     /// Two questions with two options each, for the back keys and the review.
@@ -1551,12 +1551,14 @@ mod tests {
     }
 
     #[test]
-    fn left_with_text_in_the_filter_moves_the_cursor_instead() {
+    fn typing_does_not_filter_an_ask_and_left_still_goes_back() {
         let (ov, _rx) = open(two_q());
         let ov = press(ov, &[KeyCode::Enter]);
         let ov = press(ov, &typed("x"));
         let mut ov = press(ov, &[KeyCode::Left]);
-        assert!(screen(&mut ov).iter().any(|l| l.contains("2/2")), "still on question two");
+        let t = screen(&mut ov);
+        assert!(t.iter().any(|l| l.contains("1/2")), "{t:?}");
+        assert!(t.iter().any(|l| l.contains("A")) && t.iter().any(|l| l.contains("B")), "nothing was filtered out");
     }
 
     #[test]
@@ -1673,7 +1675,7 @@ mod tests {
     fn going_back_restores_a_multi_select_set() {
         let qs = vec![ask_q(&["X", "Y", "Z"], true, false, None), ask_q(&["P", "Q"], false, false, None)];
         let (ov, mut rx) = open(qs);
-        let ov = press(ov, &[KeyCode::Tab, KeyCode::Down, KeyCode::Tab, KeyCode::Enter]);
+        let ov = press(ov, &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Char(' '), KeyCode::Enter]);
         let mut ov = press(ov, &[KeyCode::BackTab]);
         let t = screen(&mut ov);
         assert!(t.iter().any(|l| l == &panel_row("❯ [x] X")), "{t:?}");

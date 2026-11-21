@@ -61,6 +61,8 @@ pub struct Select {
     skip: Option<String>,
     /// The filter line. Single line: Enter and newlines are the caller's.
     filter: Editor,
+    /// Whether typing filters the list. Off, the filter line is not drawn and typed text is ignored.
+    filterable: bool,
     /// Highlighted row position in the filtered row list.
     sel: usize,
     /// Original indices toggled (multi) or preselected.
@@ -72,7 +74,7 @@ pub struct Select {
     haystacks: Vec<String>,
     /// The filtered rows for the filter they were computed with; reused until the filter changes.
     rows_cache: RefCell<Option<(String, Rc<Vec<Row>>)>>,
-    /// Note key enabled: Right (with the filter empty), or Tab in single-select, edits a note.
+    /// Note key enabled: Tab, or Right (with the filter empty), edits a note.
     notes: bool,
     note: Editor,
     /// The note before the edit, restored by Esc.
@@ -108,6 +110,7 @@ impl Select {
             free: None,
             skip: None,
             filter: Editor::default(),
+            filterable: true,
             sel: 0,
             checked: BTreeSet::new(),
             mode: Mode::List,
@@ -127,6 +130,12 @@ impl Select {
 
     pub fn multi(mut self) -> Self {
         self.multi = true;
+        self
+    }
+
+    /// No filter: the list is not narrowed by typing, so letters, and Space in multi-select, are the caller's keys.
+    pub fn unfiltered(mut self) -> Self {
+        self.filterable = false;
         self
     }
 
@@ -332,12 +341,10 @@ impl Select {
             }
             KeyCode::Enter => self.choose(&rows),
             KeyCode::Right if self.notes && self.filter.is_empty() => self.start_note(&rows),
-            KeyCode::Tab if self.notes && !self.multi => self.start_note(&rows),
-            // Space toggles only while the filter is empty; with text in it, Space is part of the
-            // filter. Tab always toggles.
-            KeyCode::Tab | KeyCode::Char(' ')
-                if self.multi && !ctrl && (key.code == KeyCode::Tab || self.filter.is_empty()) =>
-            {
+            KeyCode::Tab if self.notes => self.start_note(&rows),
+            // Space toggles only while the filter is empty (always, when unfiltered); with text in
+            // it, Space is part of the filter.
+            KeyCode::Char(' ') if self.multi && !ctrl && self.filter.is_empty() => {
                 if let Some(Row::Item(i)) = rows.get(self.sel)
                     && !self.checked.remove(i)
                 {
@@ -346,7 +353,7 @@ impl Select {
                 SelectResult::Pending
             }
             _ => {
-                if self.filter.key(key, false) == editor::Edit::Changed {
+                if self.filterable && self.filter.key(key, false) == editor::Edit::Changed {
                     self.sel = 0;
                 }
                 SelectResult::Pending
@@ -417,10 +424,11 @@ impl Select {
         match self.mode {
             Mode::Text => self.text.insert_str(&text),
             Mode::Note => self.note.insert_str(&text),
-            Mode::List => {
+            Mode::List if self.filterable => {
                 self.filter.insert_str(&text.replace('\n', " "));
                 self.sel = 0;
             }
+            Mode::List => {}
         }
     }
 
@@ -778,14 +786,32 @@ mod tests {
     }
 
     #[test]
-    fn space_types_in_the_filter_and_tab_toggles() {
+    fn space_toggles_only_while_the_filter_is_empty() {
         let mut s = Select::new("t", items(&["new york", "newark"])).multi();
         s.on_key(key(KeyCode::Char(' ')));
+        s.on_key(key(KeyCode::Down));
         assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "empty filter: space toggles");
         let mut s = Select::new("t", items(&["new york", "newark"])).multi();
         type_str(&mut s, "new y");
-        s.on_key(key(KeyCode::Tab));
-        assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "the filter kept its space");
+        s.on_key(key(KeyCode::Char(' ')));
+        s.on_key(key(KeyCode::Backspace));
+        assert_eq!(
+            chosen(s.on_key(key(KeyCode::Enter))),
+            Some(vec![0]),
+            "the space went into the filter, nothing toggled"
+        );
+    }
+
+    #[test]
+    fn unfiltered_has_no_filter_line_and_space_always_marks() {
+        let mut s = Select::new("t", items(&["new york", "newark"])).multi().unfiltered();
+        type_str(&mut s, "ne w");
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(texts(&s.render(40, 10).0), ["t", "  [x] new york", "❯ [x] newark"].map(String::from)[..]);
+        assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0, 1]), "typing filtered nothing");
+        s.on_paste("zzz");
+        assert_eq!(s.rows().len(), 2, "paste does not filter either");
     }
 
     #[test]
@@ -874,14 +900,21 @@ mod tests {
     }
 
     #[test]
-    fn tab_opens_a_note_only_in_single_select() {
+    fn tab_opens_a_note_and_in_multi_space_marks() {
         let mut s = Select::new("t", ask_items()).notes();
         s.on_key(key(KeyCode::Tab));
         type_str(&mut s, "z");
         assert!(matches!(s.on_key(key(KeyCode::Enter)), SelectResult::Noted(p, n) if p == vec![0] && n == "z"));
         let mut s = Select::new("t", ask_items()).notes().multi();
+        s.on_key(key(KeyCode::Char(' ')));
+        s.on_key(key(KeyCode::Down));
+        s.on_key(key(KeyCode::Char(' ')));
         s.on_key(key(KeyCode::Tab));
-        assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), Some(vec![0]), "in multi, Tab toggles");
+        type_str(&mut s, "z");
+        assert!(
+            matches!(s.on_key(key(KeyCode::Enter)), SelectResult::Noted(p, n) if p == vec![0, 1] && n == "z"),
+            "in multi, Tab adds a note to the marked picks"
+        );
     }
 
     #[test]

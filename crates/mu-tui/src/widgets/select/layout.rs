@@ -75,12 +75,16 @@ impl Select {
                 }
             }
             Mode::List => {
-                let (line, col) = self.filter.view_line("› ", width);
-                cursor = (out.len(), col);
-                out.push(line);
+                // Without a filter the cursor rests at the start of the list.
+                cursor = (out.len(), 0);
+                if self.filterable {
+                    let (line, col) = self.filter.view_line("› ", width);
+                    cursor = (out.len(), col);
+                    out.push(line);
+                }
                 // The list budget is the room after the filter line; the hint takes the last row only
                 // when one list row is left under it.
-                let list_room = room - 1;
+                let list_room = room - usize::from(self.filterable);
                 let hint = self.hint.as_ref().filter(|_| list_room >= 2);
                 has_hint = hint.is_some();
                 let avail = list_room - usize::from(hint.is_some());
