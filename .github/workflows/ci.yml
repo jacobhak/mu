@@ -20,6 +20,11 @@ jobs:
           # cache-bin prunes that directory: the next job then finds no rustup.
           cache-bin: false
       - run: scripts/ci-checks.sh
+      - name: publish offload base
+        if: github.event_name == 'push' && vars.OFFLOAD_REGISTRY != ''
+        env:
+          REGISTRY: ${{ vars.OFFLOAD_REGISTRY }}
+        run: scripts/publish-offload-base.sh
       - run: df -h / && du -sh target
         if: always()
   macos:
