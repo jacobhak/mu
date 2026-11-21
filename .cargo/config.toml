@@ -1,0 +1,10 @@
+# This machine's build settings (scripts/start.sh writes sccache there); git-ignored.
+include = [{ path = "local.toml", optional = true }]
+
+# Features resolved once for the whole workspace, so `cargo test -p <crate>` reuses the workspace build
+# instead of compiling that crate and its dependencies again under another feature set.
+[unstable]
+feature-unification = true
+
+[resolver]
+feature-unification = "workspace"
