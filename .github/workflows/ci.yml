@@ -1,6 +1,6 @@
 name: ci
-# Timing experiment, not for merging: the checks without rust-cache's restore, at 2 and 4 build jobs, and with
-# sccache in the in-cluster MinIO (run twice: the first fills the bucket).
+# Timing experiment, not for merging: the checks without rust-cache's restore and upload, with no cache and with
+# sccache in the in-cluster MinIO (run twice: the first fills the bucket). Build jobs stay at ci.yml's 2.
 on:
   pull_request:
 permissions:
@@ -14,13 +14,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {cache: none, jobs: 2}
-          - {cache: none, jobs: 4}
-          - {cache: sccache, jobs: 4}
-    name: check (${{ matrix.cache }}, ${{ matrix.jobs }} jobs)
+        cache: [none, sccache]
+    name: check (${{ matrix.cache }})
     env:
-      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
