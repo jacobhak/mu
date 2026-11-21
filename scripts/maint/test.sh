@@ -11,8 +11,11 @@ head="$(git -C "$root" rev-parse HEAD)"
 pinned="$(git -C "$root" show HEAD:upstream.toml | sed -n 's/^omp = "\(.*\)"/\1/p')"
 export MAINT="$tmp/maint" CLONE="$tmp/maint/repo"
 mkdir -p "$MAINT"
-git clone -q --no-hardlinks "$root" "$CLONE"
-git -C "$CLONE" update-ref refs/remotes/origin/main "$head"
+# A private origin whose main is HEAD, so the run sees the same commit whatever branch or worktree `root` is
+# (the bot's own check stage runs this from a bump worktree, whose `main` ref is the real one's).
+git init -q --bare -b main "$tmp/origin.git"
+git -C "$root" push -q "$tmp/origin.git" "$head:refs/heads/main"
+git clone -q "$tmp/origin.git" "$CLONE"
 
 cat > "$tmp/check-stub.sh" <<'EOF'
 #!/usr/bin/env bash
