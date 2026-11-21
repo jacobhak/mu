@@ -1,0 +1,88 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  # Dry run: builds and tests both platforms without publishing a release.
+  workflow_dispatch:
+# Builds only read the repository; the release job below adds what publishing needs.
+permissions:
+  contents: read
+jobs:
+  # The Linux build runs in ubuntu:22.04, so the binary's glibc floor is 2.35.
+  build-linux:
+    runs-on: arc-ai-provider-gateway
+    container: ubuntu:22.04
+    env:
+      # The container installs shellcheck below, so here a missing one is a failure.
+      REQUIRE_SHELLCHECK: 1
+    steps:
+      - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git pkg-config shellcheck
+      - run: curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      # The checkout is owned by another uid inside the container; without this every git command
+      # (the shellcheck stage's `git ls-files`) fails with "dubious ownership".
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # See ci.yml: cache-bin prunes the runner's own ~/.cargo/bin.
+          cache-bin: false
+      - run: scripts/ci-checks.sh
+      - run: cargo build --release --locked
+      - run: scripts/package.sh linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-provider-gateway-linux-x64
+          path: dist/ai-provider-gateway-linux-x64.tar.gz
+          # Only the release job reads it; the published copy is the release asset.
+          retention-days: 1
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ai-provider-gateway-mac, plat: darwin-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - run: scripts/ci-checks.sh
+      - run: cargo build --release --locked
+      - run: scripts/package.sh ${{ matrix.plat }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-provider-gateway-${{ matrix.plat }}
+          path: dist/ai-provider-gateway-${{ matrix.plat }}.tar.gz
+          retention-days: 1
+  release:
+    needs: [build, build-linux]
+    # A manual run exercises the matrix; only a tag publishes.
+    if: github.event_name == 'push'
+    runs-on: arc-ai-provider-gateway
+    permissions:
+      contents: write
+      # For the build provenance attestation below.
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      # Attestations need a public repo or GitHub Enterprise Cloud; on a private repo without either this
+      # step fails, and the release goes out with its checksum only. install.sh verifies one when it exists.
+      - uses: actions/attest-build-provenance@v2
+        continue-on-error: true
+        with:
+          subject-path: dist/*.tar.gz
+      - run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --title "$GITHUB_REF_NAME" \
+            --notes "omp $(sed -n 's/^omp = "\(.*\)"/\1/p' upstream.toml)"
