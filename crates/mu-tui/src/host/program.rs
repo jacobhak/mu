@@ -216,7 +216,7 @@ mod tests {
         mu_testutil::block_on_local(async {
             let (push, mut out) = unbounded_channel();
             let run = Run { id: 1, program: Program::McpLogin { name: "x".into() }, cols: 80, rows: 24 };
-            let task = tokio::task::spawn_local(run_program(push, dir.clone(), run));
+            let task = tokio::task::spawn_local(run_program(push, dir.to_path_buf(), run));
             out.recv().await.expect("the program printed");
             kill_all();
             let done = tokio::time::timeout(std::time::Duration::from_secs(10), task).await.expect("ended").unwrap();

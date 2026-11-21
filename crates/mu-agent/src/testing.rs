@@ -62,8 +62,9 @@ pub fn agent_in(
     script: Vec<Result<Message, ProviderError>>,
     cfg: Configs,
     run: RunConfig,
-    cwd: PathBuf,
+    cwd: impl AsRef<Path>,
 ) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    let cwd = cwd.as_ref().to_path_buf();
     mu_testutil::home(); // sessions go to a private MU_HOME, not the real ~/.mu
     let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
     let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());

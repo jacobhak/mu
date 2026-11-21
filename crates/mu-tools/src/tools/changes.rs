@@ -394,7 +394,8 @@ mod tests {
         let snap = sh(root, &["commit-tree", tree.trim(), "-p", "HEAD", "-m", "snapshot"]);
         let task_ref = format!("refs/mu/task/{id}");
         sh(root, &["update-ref", &task_ref, snap.trim()]);
-        let work = tmp().join("work");
+        let work_dir = tmp();
+        let work = work_dir.join("work");
         sh(root, &["worktree", "add", "-q", "--detach", work.to_str().unwrap(), snap.trim()]);
         for (f, text) in edits {
             std::fs::write(work.join(f), text).unwrap();
@@ -455,7 +456,8 @@ mod tests {
         let root = repo();
         std::fs::write(root.join("new.txt"), "one\n").unwrap();
         // The snapshot holds `new.txt` as `git add -A` would; the real index does not.
-        let ix = tmp().join("ix");
+        let ix_dir = tmp();
+        let ix = ix_dir.join("ix");
         let with = |args: &[&str]| {
             let o = std::process::Command::new("git")
                 .args(args)
@@ -472,7 +474,8 @@ mod tests {
         let snap = sh(&root, &["commit-tree", snap_tree.trim(), "-p", "HEAD", "-m", "snapshot"]);
         let snap = snap.trim();
         sh(&root, &["update-ref", "refs/mu/task/x-4", snap]);
-        let work = tmp().join("work");
+        let work_dir = tmp();
+        let work = work_dir.join("work");
         sh(&root, &["worktree", "add", "-q", "--detach", work.to_str().unwrap(), snap]);
         std::fs::write(work.join("new.txt"), "two\n").unwrap();
         sh(&work, &["commit", "-qam", "work"]);

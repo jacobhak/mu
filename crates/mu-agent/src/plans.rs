@@ -352,8 +352,8 @@ mod tests {
     use mu_testutil::{repo, rt, sh, tmp};
     use serde_json::json;
 
-    fn store_in(dir: PathBuf) -> Store {
-        Store { dir, root: None }
+    fn store_in(dir: &Path) -> Store {
+        Store { dir: dir.to_path_buf(), root: None }
     }
 
     fn save<'a>(
@@ -378,7 +378,8 @@ mod tests {
     #[test]
     fn round_trip_collision_and_update_in_place() {
         mu_testutil::home();
-        let s = store_in(tmp());
+        let dir = tmp();
+        let s = store_in(&dir);
         let (s1, s2) = (PathBuf::from("/s/1"), PathBuf::from("/s/2"));
         let a = save(&s, "x", Some(&s1), None, &["b"]);
         let (m, text) = s.load("x").unwrap();
@@ -399,7 +400,8 @@ mod tests {
     #[test]
     fn status_rules_and_list() {
         mu_testutil::home();
-        let s = store_in(tmp());
+        let dir = tmp();
+        let s = store_in(&dir);
         save(&s, "p", None, None, &[]);
         save(&s, "q", None, None, &[]);
         s.approve("p", "execute", None).unwrap();
@@ -416,7 +418,8 @@ mod tests {
     fn worktrees_share_a_store() {
         mu_testutil::home();
         let d = repo();
-        let wt = tmp().join("wt");
+        let wt_dir = tmp();
+        let wt = wt_dir.join("wt");
         sh(&d, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "other"]);
         let (a, b) = rt().block_on(async { (store_for(&d).await, store_for(&wt).await) });
         assert_eq!(a.dir, b.dir);

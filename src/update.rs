@@ -344,7 +344,8 @@ mod tests {
 
     #[test]
     fn marker_makes_a_clean_sha_a_dev_build() {
-        let marker = mu_testutil::tmp().join("dev-build");
+        let dir = mu_testutil::tmp();
+        let marker = dir.join("dev-build");
         assert!(!is_dev_build_at("799ca34873a1", &marker));
         std::fs::write(&marker, "799ca34873a1\n").unwrap();
         assert!(is_dev_build_at("799ca34873a1", &marker));

@@ -35,7 +35,7 @@ fn sse(body: &str) -> Reply {
 }
 
 /// A `MU_HOME` (also `HOME`) whose key store holds an Anthropic key that points at `base`.
-fn home_with_key(base: &str) -> PathBuf {
+fn home_with_key(base: &str) -> mu_testutil::TempDir {
     let home = mu_testutil::tmp();
     let store = json!({"version": 1, "providers": {"anthropic": {"key": "sk-test-key", "baseUrl": base}}});
     std::fs::write(home.join("auth.json"), store.to_string()).unwrap();
@@ -336,13 +336,15 @@ fn relay_model_spending(
 }
 
 /// A parent home pointed at `relay_model`, a git cwd and the requests the server saw.
-fn relay_fixture(child_says: &str) -> (PathBuf, PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+fn relay_fixture(
+    child_says: &str,
+) -> (mu_testutil::TempDir, mu_testutil::TempDir, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     relay_fixture_from(relay_model(child_says))
 }
 
 fn relay_fixture_from(
     (base, seen): (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>),
-) -> (PathBuf, PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+) -> (mu_testutil::TempDir, mu_testutil::TempDir, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let home = home_with_key(&base);
     std::fs::write(home.join("models.toml"), format!("[sets.main]\ndefault = \"{MODEL}\"\n")).unwrap();
     (home, mu_testutil::repo(), seen)
@@ -377,8 +379,8 @@ enum Leaves {
 /// A launcher (launcher contract 2) that runs the subagent on this machine with a bare home (no key,
 /// no gateway), the way a remote's would. Its environment is logged in `log`.
 struct Launcher {
-    bare: PathBuf,
-    log: PathBuf,
+    bare: mu_testutil::TempDir,
+    log: mu_testutil::TempDir,
 }
 
 impl Launcher {

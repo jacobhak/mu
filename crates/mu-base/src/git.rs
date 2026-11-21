@@ -203,15 +203,16 @@ mod tests {
     fn worktrees_of_one_clone_share_the_main_checkout_and_key() {
         use mu_testutil::{block_on, repo, sh, tmp};
         let main = repo();
-        let wt = tmp().join("wt");
+        let wt_dir = tmp();
+        let wt = wt_dir.join("wt");
         sh(&main, &["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()]);
         let outside = tmp();
         block_on(async {
-            assert_eq!(main_checkout(&main).await, main);
-            assert_eq!(main_checkout(&wt).await, main);
+            assert_eq!(main_checkout(&main).await, main.path());
+            assert_eq!(main_checkout(&wt).await, main.path());
             assert_eq!(repo_root(&wt).await.unwrap(), wt.canonicalize().unwrap());
             assert_eq!(repo_key(&wt).await, repo_key(&main).await);
-            assert_eq!(main_checkout(&outside).await, outside);
+            assert_eq!(main_checkout(&outside).await, outside.path());
             assert!(repo_root(&outside).await.is_err());
         });
     }

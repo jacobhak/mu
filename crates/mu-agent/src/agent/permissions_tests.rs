@@ -124,7 +124,8 @@ fn a_read_outside_the_project_prompts_and_is_granted_by_its_path() {
             Ok(assistant(vec![call], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
-        let (mut a, rx) = agent_in(script, Configs::default(), ask(), mu_testutil::repo());
+        let root = mu_testutil::repo();
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), &root);
         let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Deny { note: Some("not that".into()) }).await;
         assert_eq!(reqs.len(), 1, "reading outside the project prompts");
         assert_eq!(reqs[0].title, format!("read: {path}"));
@@ -151,7 +152,8 @@ fn a_wider_answer_covers_a_neighbouring_file() {
             Ok(assistant(vec![call(second.to_string_lossy().into_owned(), "t2")], StopReason::ToolUse)),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
-        let (mut a, rx) = agent_in(script, Configs::default(), ask(), mu_testutil::repo());
+        let root = mu_testutil::repo();
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), &root);
         let width = format!("{dir}/*");
         let answer = width.clone();
         let reqs = turn_answered(&mut a, rx, "go", move |_| ApprovalDecision::Allow {
@@ -192,7 +194,8 @@ fn a_granted_directory_covers_grep_too() {
             )),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
-        let (mut a, rx) = agent_in(script, Configs::default(), ask(), mu_testutil::repo());
+        let root = mu_testutil::repo();
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), &root);
         let reqs = turn_answered(&mut a, rx, "go", move |_| ApprovalDecision::Allow {
             scope: ApprovalScope::Session,
             note: None,
@@ -229,7 +232,7 @@ fn a_write_grant_covers_editing_the_same_file() {
             )),
             Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
         ];
-        let (mut a, rx) = agent_in(script, Configs::default(), ask(), root.clone());
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), &root);
         let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Allow {
             scope: ApprovalScope::Session,
             note: None,
