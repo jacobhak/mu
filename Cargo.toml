@@ -133,6 +133,11 @@ unwrap_used = "warn"
 
 [profile.dev]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+# Line numbers in backtraces for mu's own crates only: dependencies' line tables were a quarter of target/.
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 strip = true

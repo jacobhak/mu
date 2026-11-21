@@ -22,5 +22,13 @@ rmcp = { version = "3.8", default-features = false, features = ["client", "serve
 axum = "0.8"
 tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "time", "process", "net"] }
 
+# The workspace's dev profile (../../Cargo.toml) does not reach this separate project.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 strip = true

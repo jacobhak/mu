@@ -39,15 +39,15 @@ dir="$(dirname "$main_dir")/$(basename "$main_dir")-${slug//\//-}"
 
 # --no-track: the branch must not inherit origin/main as upstream, or a bare `git push` would target main.
 git worktree add --quiet --no-track -b "$branch" "$dir" "$base"
-# The worktree's own .cargo/config.toml, which .gitignore keeps out of commits: the only place a build
-# here picks up its compiler wrapper.
+# The worktree's own .cargo/local.toml, which .gitignore keeps out of commits and the tracked .cargo/config.toml
+# includes: the only place a build here picks up its compiler wrapper.
 sccache_ok=0
 if command -v sccache >/dev/null 2>&1; then
   sccache_ok=1
   mkdir -p "$dir/.cargo"
   # incremental = false, because sccache cannot cache incremental builds: with it on a fresh worktree
   # compiled from scratch (214 s against 89 s), and the price here is a few seconds per edit rebuild.
-  printf '[build]\nrustc-wrapper = "sccache"\nincremental = false\n' > "$dir/.cargo/config.toml"
+  printf '[build]\nrustc-wrapper = "sccache"\nincremental = false\n' > "$dir/.cargo/local.toml"
 fi
 say "created $dir on $branch at $(git rev-parse --short "$base") ($base)"
 if [ "$sccache_ok" = 1 ]; then
