@@ -133,6 +133,8 @@ unwrap_used = "warn"
 
 [profile.dev]
 debug = "line-tables-only"
+# sccache cannot cache incremental builds; set here rather than per machine so every build is the same.
+incremental = false
 split-debuginfo = "unpacked"
 
 # Line numbers in backtraces for mu's own crates only: dependencies' line tables were a quarter of target/.

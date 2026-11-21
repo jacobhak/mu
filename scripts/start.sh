@@ -45,9 +45,7 @@ sccache_ok=0
 if command -v sccache >/dev/null 2>&1; then
   sccache_ok=1
   mkdir -p "$dir/.cargo"
-  # incremental = false, because sccache cannot cache incremental builds: with it on a fresh worktree
-  # compiled from scratch (214 s against 89 s), and the price here is a few seconds per edit rebuild.
-  printf '[build]\nrustc-wrapper = "sccache"\nincremental = false\n' > "$dir/.cargo/local.toml"
+  printf '[build]\nrustc-wrapper = "sccache"\n' > "$dir/.cargo/local.toml"
 fi
 say "created $dir on $branch at $(git rev-parse --short "$base") ($base)"
 if [ "$sccache_ok" = 1 ]; then

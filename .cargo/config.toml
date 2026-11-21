@@ -5,6 +5,12 @@ include = [{ path = "local.toml", optional = true }]
 # instead of compiling that crate and its dependencies again under another feature set.
 [unstable]
 feature-unification = true
+checksum-freshness = true
 
 [resolver]
 feature-unification = "workspace"
+
+# Freshness by content, not modification time: a fresh checkout (a CI job, a bundle) reuses outputs built
+# elsewhere from the same sources. Build scripts' rerun-if-changed paths still go by modification time.
+[build]
+fingerprint = "content"
