@@ -1411,6 +1411,11 @@ mod mirror_tests {
         let mirror = mu_common::paths::session_dir(&cwd).join(name(&remote));
         assert_eq!(*seen.borrow(), [mirror.to_string_lossy()]);
         assert!(held.get(), "the file is locked while the run goes");
+        // A child another test forks meanwhile shares the descriptor, and with it the lock, until its exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while locked(&mirror) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!locked(&mirror), "and free after it");
         assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&remote).unwrap());
         assert!((session_cost(&mirror) - 0.25).abs() < 1e-9);
