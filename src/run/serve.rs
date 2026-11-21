@@ -176,11 +176,10 @@ impl Server {
         Ok(())
     }
 
-    /// The client left: what it started for itself goes with it (programs on a terminal, tunnels).
+    /// The client left: what it started for itself goes with it (tunnels).
     fn client_gone(&mut self) {
         self.client = None;
         self.tunnels.clear();
-        mu_tui::host::program::kill_all();
         owner::set_attention(|a| a.client = None);
     }
 
@@ -373,7 +372,6 @@ impl Server {
                 return;
             }
             self.tunnels.clear();
-            mu_tui::host::program::kill_all();
             let _ = old.writer.send(to_line(&AgentLine::Event(WireEvent::Detached {
                 reason: "another client took this session".into(),
             })));

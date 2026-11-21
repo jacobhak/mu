@@ -1,4 +1,0 @@
-name = "gateway"
-command = ["mu-gateway"]
-lifetime = "idle:10m"
-provider = "gateway"

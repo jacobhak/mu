@@ -24,9 +24,8 @@ fn main() {
         .and_then(|r| r.split('"').next())
         .unwrap_or("unknown");
     println!("cargo:rustc-env=MU_GIT_SHA={sha}");
-    println!("cargo:rustc-env=MU_OMP_VERSION={omp}");
     println!(
-        "cargo:rustc-env=MU_VERSION={} ({sha}) omp {omp}",
+        "cargo:rustc-env=MU_VERSION={} ({sha}) oh-my-pi crates {omp}",
         std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION")
     );
 }

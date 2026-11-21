@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-# Helpers only tests call (contract tests that run the real omp).
-test-support = []
-
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -23,7 +19,6 @@ hkdf.workspace = true
 sha2_10.workspace = true
 zeroize.workspace = true
 getrandom.workspace = true
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }

@@ -64,12 +64,12 @@ impl LocalHost {
         super::keys::register(&mut registry);
         super::web::register(&mut registry);
         super::chatgpt::register(&mut registry);
+        super::mcp_login::register(&mut registry);
         super::custom::register(&mut registry);
         super::mcp::register(&mut registry);
         super::sessions::register(&mut registry);
         super::plans::register(&mut registry);
         super::memory::register(&mut registry);
-        super::program::register(&mut registry);
         super::results::register(&mut registry);
         super::state::register(&mut registry);
         Self {
@@ -132,7 +132,8 @@ mod tests {
         use mu_base::config::Configs;
         let (ntx, _nrx) = unbounded_channel();
         let plugins = PluginHost::new(vec![], vec![], ntx, Default::default());
-        let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start());
+        let gateway = mu_provider::provider::endpoint::GatewaySource::new(plugins.gateway_start())
+            .with_plugin(plugins.gateway_peek(), plugins.gateway_prices());
         let auth_dir = mu_testutil::tmp();
         let auth = auth_dir.join("auth.json");
         let providers = Rc::new(Providers::for_tests_with_auth(Rc::new(Configs::default()), gateway, auth));

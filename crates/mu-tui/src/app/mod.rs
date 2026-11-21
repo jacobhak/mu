@@ -15,10 +15,10 @@ mod custom_providers;
 mod hostcall;
 mod keys;
 mod mcp;
+mod mcp_login;
 mod memory;
 mod model_sets;
 mod pickers;
-mod program_output;
 mod schedule;
 #[cfg(test)]
 mod services;
@@ -31,6 +31,7 @@ use self::chatgpt::ChatgptFlow;
 pub(crate) use self::commands::command_entries;
 pub use self::commands::interactive_reference;
 use self::keys::KeyFlow;
+use self::mcp_login::McpLoginFlow;
 use self::schedule::Schedule;
 #[cfg(test)]
 use self::services::Services;
@@ -139,7 +140,7 @@ struct Screen {
     last_draw: Instant,
     /// Something changed that needs a redraw.
     dirty: bool,
-    /// A child process (editor, `omp login`) owns the terminal: no drawing and no input reading
+    /// A child process (editor, `mu take`) owns the terminal: no drawing and no input reading
     /// until it exits, but agent and plugin tasks keep running.
     child_busy: bool,
     started: Instant,
@@ -176,6 +177,8 @@ enum Active {
     Key(Box<KeyFlow>),
     /// A ChatGPT sign-in in progress; while it waits the composer takes the redirect URL.
     Chatgpt(ChatgptFlow),
+    /// An MCP server's OAuth sign-in in progress; while it waits the composer takes the redirect URL.
+    McpLogin(McpLoginFlow),
     Web(Box<WebFlow>),
     /// The custom-endpoint wizard in progress.
     Custom(Box<custom_providers::CustomFlow>),
@@ -189,6 +192,8 @@ struct Flows {
     key_flow_seq: u64,
     /// Tells a late sign-in result from another's.
     chatgpt_seq: u64,
+    /// Tells a late MCP sign-in result from another's.
+    mcp_login_seq: u64,
     /// Tells a late custom-endpoint answer from another's.
     custom_wizard_seq: u64,
 }
@@ -225,6 +230,13 @@ impl Flows {
     fn chatgpt(&self) -> Option<&ChatgptFlow> {
         match &self.active {
             Active::Chatgpt(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    fn mcp_login(&self) -> Option<&McpLoginFlow> {
+        match &self.active {
+            Active::McpLogin(f) => Some(f),
             _ => None,
         }
     }
@@ -299,6 +311,16 @@ impl Flows {
     fn end_chatgpt(&mut self) -> Option<ChatgptFlow> {
         match std::mem::take(&mut self.active) {
             Active::Chatgpt(f) => Some(f),
+            other => {
+                self.active = other;
+                None
+            }
+        }
+    }
+
+    fn end_mcp_login(&mut self) -> Option<McpLoginFlow> {
+        match std::mem::take(&mut self.active) {
+            Active::McpLogin(f) => Some(f),
             other => {
                 self.active = other;
                 None
@@ -406,6 +428,7 @@ pub async fn run(init: AppInit) -> i32 {
             active: Active::None,
             key_flow_seq: 0,
             chatgpt_seq: 0,
+            mcp_login_seq: 0,
             custom_wizard_seq: 0,
         },
         quitting: false,

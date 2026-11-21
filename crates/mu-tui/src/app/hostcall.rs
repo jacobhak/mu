@@ -38,7 +38,9 @@ impl App {
             crate::host::chatgpt::URL | crate::host::chatgpt::NOTICE | crate::host::chatgpt::DONE => {
                 self.on_chatgpt_pushed(p)
             }
-            crate::host::program::PROGRAM_OUTPUT => self.on_program_output(p),
+            crate::host::mcp_login::URL | crate::host::mcp_login::NOTICE | crate::host::mcp_login::DONE => {
+                self.on_mcp_login_pushed(p)
+            }
             _ => {}
         }
     }

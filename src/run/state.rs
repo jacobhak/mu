@@ -80,9 +80,8 @@ pub fn start(config: &MuAgent, profile_home: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The agent is ending: omp's credentials are sealed back and the memory copy removed, then the key goes.
+/// The agent is ending: the key goes.
 pub fn shutdown() {
-    mu_common::omp_state::shutdown();
     sealed::lock();
 }
 

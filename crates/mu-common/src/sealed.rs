@@ -168,9 +168,7 @@ fn store(dk: Dk) {
     *global() = Some(dk);
 }
 
-/// Locks, after removing omp's memory copy: its final flush needs the key.
 pub fn lock() {
-    crate::omp_state::shutdown();
     *global() = None;
 }
 

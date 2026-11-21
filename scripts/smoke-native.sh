@@ -86,20 +86,20 @@ for _ in $(seq 40); do [ -s "$work/port" ] && break; sleep 0.25; done
 port="$(cat "$work/port" 2>/dev/null)"
 check "fake API listening" test -n "$port"
 
-# A fake omp: every call is recorded and fails.
+# A fake omp first on PATH: mu must never spawn one; any call is recorded and fails.
 mkdir -p "$work/bin"
 printf '#!/bin/sh\necho "$0 $*" >> "%s/omp-calls.log"\nexit 1\n' "$work" > "$work/bin/omp"
 chmod +x "$work/bin/omp"
 
 cd "$work" || exit 1
 key_marker="sk-smoke-native-key"
-printf '%s' "$key_marker" | env -u ANTHROPIC_API_KEY MU_OMP="$work/bin/omp" \
+printf '%s' "$key_marker" | env -u ANTHROPIC_API_KEY PATH="$work/bin:$PATH" \
   "$mu" auth add anthropic --base-url "http://127.0.0.1:$port" --no-validate >/dev/null 2>&1
 key_listed() { env -u ANTHROPIC_API_KEY "$mu" auth list | grep -q anthropic; }
 check "key stored for the fake API" key_listed
 
 tmux new -d -s "$tm" -x 150 -y 40 \
-  "cd $work && env -u ANTHROPIC_API_KEY MU_OMP=$work/bin/omp MU_HOME=$MU_HOME OMP_PROFILE=$OMP_PROFILE $mu --model anthropic/claude-haiku-5-5; echo EXIT=\$?; sleep 60"
+  "cd $work && env -u ANTHROPIC_API_KEY PATH=$work/bin:\$PATH MU_HOME=$MU_HOME OMP_PROFILE=$OMP_PROFILE $mu --model anthropic/claude-haiku-5-5; echo EXIT=\$?; sleep 60"
 wait_for "μ" 20 || bad "tui starts"
 tmux send-keys -t "$tm" 'Say hi.' Enter
 check "native reply renders" wait_for "NATIVE-OK" 30

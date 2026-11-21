@@ -520,7 +520,6 @@ impl App {
                 self.save_role(&set, &role, value.as_deref(), meta.as_ref())
             }
             OverlayEvent::DeleteRole { set, role } => self.delete_role(&set, &role),
-            OverlayEvent::Login(LoginTarget::Provider(n)) => self.run_login(&[], Some(n)),
             OverlayEvent::Login(LoginTarget::Mcp(name)) => self.run_mcp_login(&name),
             OverlayEvent::Login(LoginTarget::ChatGpt) => self.chatgpt_row(),
             OverlayEvent::Login(LoginTarget::CustomProvider(None)) => self.start_custom_wizard(),

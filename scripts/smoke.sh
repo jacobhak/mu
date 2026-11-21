@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Live end-to-end checks against the omp gateway (spends a few cents of haiku). Opt-in; not part of `cargo test`.
-# Usage: scripts/smoke.sh [path-to-mu]   Needs: tmux, jq, omp on PATH, plugins/gateway built next to mu.
+# Live end-to-end checks through a gateway plugin (spends a few cents of haiku). Opt-in; not part of `cargo test`.
+# Usage: scripts/smoke.sh [path-to-mu]   Needs: tmux, jq, and a gateway plugin directory (default
+# ~/.mu/plugins/gateway, as `ai-provider-gateway`'s install.sh writes it; MU_SMOKE_GATEWAY_PLUGIN overrides).
 set -uo pipefail
 mu="$(readlink -f "${1:-target/release/mu}")"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -8,7 +9,13 @@ MU_HOME="$(mktemp -d)"
 export MU_HOME
 profile="${OMP_PROFILE:-${PI_PROFILE:-}}"
 state="$MU_HOME${profile:+/profiles/$profile}" # mu's per-profile state (paths::profile_home)
-mkdir -p "$MU_HOME/plugins" && ln -s "$root/plugins/gateway" "$MU_HOME/plugins/gateway"
+gateway_plugin="${MU_SMOKE_GATEWAY_PLUGIN:-$HOME/.mu/plugins/gateway}"
+if [ ! -d "$gateway_plugin" ]; then
+  echo "smoke: no gateway plugin (set MU_SMOKE_GATEWAY_PLUGIN); skipping"
+  rm -rf "$MU_HOME"
+  exit 0
+fi
+mkdir -p "$MU_HOME/plugins" && ln -s "$gateway_plugin" "$MU_HOME/plugins/gateway"
 work="$(mktemp -d)"
 tm="mu-smoke-$$"
 fail=0
@@ -23,7 +30,7 @@ bad() {
 # Kill only gateway daemons that were started with this run's MU_HOME.
 kill_daemons() {
   local p
-  for p in $(pgrep -f "mu-gateway daemon" 2>/dev/null); do
+  for p in $(pgrep -f "ai-provider-gateway daemon" 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qxF "MU_HOME=$MU_HOME" && kill "$p" 2>/dev/null
   done
 }

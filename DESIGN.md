@@ -13,7 +13,7 @@ Status: early and experimental, changing quickly; no stable version (see README,
    reads, allocator retention — must go to zero.
 2. **Load on use.** Nothing starts, parses or allocates until the user or the model needs it.
 3. **omp-compatible files.** Context files, skills, rules, MCP config and sessions work unchanged.
-4. **Reuse before rewrite.** omp's MIT-licensed Rust crates for tools; omp's own gateway for OAuth and other providers; native clients only for API keys and the ChatGPT sign-in.
+4. **Reuse before rewrite.** omp's MIT-licensed Rust crates for tools; gateways for OAuth and other providers are plugins (`ai-provider-gateway` wraps omp's); native clients only for API keys and the ChatGPT sign-in.
 
 ## Why
 
@@ -38,7 +38,7 @@ flowchart LR
     loop --- tools[built-in tools]
     loop --- host[plugin host]
   end
-  host <-->|JSON-RPC over stdio, started on use| gw[gateway: omp auth-gateway]
+  host <-->|JSON-RPC over stdio, started on use| gw[gateway provider plugin]
   host <-->|JSON-RPC| web[web]
   host <-->|JSON-RPC| mem[memory]
   host <-->|MCP| mcp[any MCP server]
@@ -50,7 +50,7 @@ flowchart LR
 | Component | Responsibility | Reuse |
 |---|---|---|
 | Agent loop | Turns, tool execution, model roles, thinking levels, compaction, plan mode. Within one assistant message, consecutive read-only calls that need no approval (`Permissions::runs_concurrently` plus an `Allow` verdict) run concurrently on the loop's thread, at most 8 at a time; every other call is a barrier that runs alone. Hooks and start events run call by call in message order, results are appended in call order | — |
-| Provider client | Streaming requests, retries, thinking mapping and usage, over three wire formats (Anthropic Messages, OpenAI Responses, Chat Completions) to a provider's own API with the user's key or ChatGPT sign-in, or Anthropic Messages to the omp gateway | — |
+| Provider client | Streaming requests, retries, thinking mapping and usage, over three wire formats (Anthropic Messages, OpenAI Responses, Chat Completions) to a provider's own API with the user's key or ChatGPT sign-in, or Anthropic Messages to a gateway provider plugin's endpoint | — |
 | Sessions | omp v3 JSONL tree (`id`/`parentId`), resume; a running `-p` run can be stopped at a tool boundary and taken over (`mu take`); owners are recorded in `<profile home>/run/` (pid, kind, agent, cwd, parent; the jobs panel's Sessions tab lists the live ones); a per-session inbox in `<profile home>/inbox/<id>/` that `mu notify` fills and an interactive owner drains (`SIGUSR2` wakes it); the file format is unchanged. Branching (`/fork`) and checkpoint/rewind (`/rewind`) are implemented | — |
 | Context | AGENTS.md / CLAUDE.md discovery, skills, `RULES.md`, prompt templates, slash commands | — |
 | Stream rules | Regex rules checked against the model stream; on match: abort, inject the rule, retry | — |
@@ -70,7 +70,7 @@ The core is a workspace of crates. Each depends only on the ones above it in thi
 |---|---|---|
 | `mu-common` | paths, fs, rpc, time | — |
 | `mu-base` | protocol and foundation: messages, the agent event protocol, the tool contract (`tool`), text helpers, process and pty handling, `jsoncache`, schema validation, secrets redaction, config, model types and roles, git, `mem` | mu-common |
-| `mu-provider` | provider client and wire formats, model catalog, discovery and pricing, the API-key store, the ChatGPT sign-in (`auth/chatgpt`), the gateway source and quota | mu-base |
+| `mu-provider` | provider client and wire formats, model catalog, discovery and pricing, the API-key store, the ChatGPT sign-in (`auth/chatgpt`), the gateway source, quota and prices | mu-base |
 | `mu-session` | session files, tail reader, the notify inbox and sender, run control (stop, terminate, live-run check) | mu-base |
 | `mu-tools` | built-in tools (`tools/`, with the shell), background jobs, the plugin host, the MCP data layer, context discovery | mu-base, mu-provider, mu-session |
 | `mu-agent` | the agent loop, compaction, the system prompt, plans, review core, `AgentHandle` and `build_agent` | mu-base, mu-provider, mu-session, mu-tools |
@@ -145,7 +145,8 @@ Hooks other than `tool_call` run concurrently under one deadline (30 s; 10 s for
 | plugin → core | `core/complete` | One-off model call through the configured providers (memory summaries, advisor, commit messages). An error with no model for the role carries `kind: "no_model"` |
 | plugin → core | `core/tool` | Invoke a built-in tool. *Not yet implemented; add it when a plugin needs it.* |
 | plugin → core | `ui/notify`, `ui/confirm`, `ui/select`, `ui/input` | User interaction (the subset pi's RPC extension UI proves workable). Only `ui/notify` is implemented; `ui/confirm`, `ui/select` and `ui/input` are *not yet implemented* — add them when a plugin needs them. |
-| plugin → core | `core/mcpToken` | Only from an MCP http bridge: an OAuth access token for its server, fetched with `omp token` (through the auth broker when the gateway is running) |
+| plugin → core | `core/secrets` | Native plugins: a sealed key-value store. Params `{op: "get"\|"put"\|"delete"\|"info", name?, value?}` with base64 values; `get` returns `{value}` (null when absent), `put` `{}`, `delete` `{deleted}`, `info` `{sealed, unlocked}`. The namespace is always the calling plugin's (`<profile home>/secrets/plugin-<name>/<name>`), never chosen by the plugin. With [state encryption](docs/remote.md#encrypted-state) on, values are sealed and a locked agent answers `locked: attach to unlock` |
+| plugin → core | `core/mcpSecret` | Only from an MCP http bridge: `{op: "get"\|"put"\|"delete", value?}` on the OAuth blob (a JSON string) for its server, kept in the secret store under the server's OAuth key (the http URL, or a stdio server's `auth.resource`). A `get` of nothing marks the server as needing `/login mcp:<name>` |
 | plugin → core | `core/webSearch` | Web plugin only (other plugins get an error): the chosen search backend and the one key it needs, for a `web_search` call |
 | core → plugin | `tool/call`, `command/run`, `hook/<name>` | Dispatch |
 
@@ -157,8 +158,8 @@ All omp features outside the core become first-party plugins that load on use.
 
 | Plugin | Day one | Implementation |
 |---|---|---|
-| gateway | yes | Starts `omp auth-broker serve` + `omp auth-gateway serve`; serves every omp provider without a native API key in mu, OAuth logins, account pools, quota. See Providers. |
-| mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It is a separate Cargo project outside the workspace so that the core does not build `rmcp`; it installs its own rustls crypto provider. It answers any `core/*` request a server sends with -32601. |
+| gateway | optional | Not part of mu: any plugin whose manifest says `provider = "gateway"` and serves `provider/endpoint` and `provider/prices`. It serves every provider without a native API key in mu, subscription logins, account pools and quota. The implementation that wraps omp's auth broker and gateway is the separate tool `ai-provider-gateway`. See Providers. |
+| mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It also does MCP OAuth (`login` and `token` modes, tokens kept through `core/mcpSecret`). It is a separate Cargo project outside the workspace so that the core does not build `rmcp`; it installs its own rustls crypto provider. It answers any other `core/*` request a server sends with -32601. |
 | web | yes | Rust; fetch. Search goes only through the backend the user chose (`/web`, see `docs/web.md`): Parallel or Exa, keyless or with a key, or Anthropic's or OpenAI's own search tool with that provider's key. Until a backend is chosen, no search contacts anything. |
 | memory | yes | Rust; curated markdown memory per repository plus a user file, versioned in git, reviewed in the background by the `memory` role, with FTS5 search over past sessions. See docs/memory.md. |
 | prediction | yes | Rust; word n-gram by default, optional SmolLM2-135M. See Prediction below. |
@@ -185,22 +186,16 @@ All omp features outside the core become first-party plugins that load on use.
   (`provider::wire`): Anthropic Messages, OpenAI Responses and Chat Completions (Baseten is a preset of the
   generic client). Model limits, prices, reasoning ladders and Chat Completions quirks come from a snapshot of
   omp's catalog regenerated on every bump (`crates/mu-provider/src/model/catalog.json`), plus live discovery for Baseten. A
-  session that uses only native providers starts no omp process.
+  session that uses only native providers starts no gateway.
 - **ChatGPT plan:** `openai-chatgpt/*` models are called directly with the user's ChatGPT sign-in: OAuth against `auth.openai.com` with a dynamically registered client, then the Responses API with a Bearer access token. The sign-in never goes through the gateway. Its state is the `chatgpt` section of `auth.json` (store version 3). Plan models have the same ids as `openai/*`; the model picker chooses between key and plan, with no precedence rule.
-- **Gateway:** every other model, and every provider without a key or sign-in in mu, is served through `omp auth-gateway
-  serve`, backed by `omp auth-broker serve`. The
-  core speaks one wire protocol, Anthropic Messages, to it and holds no credentials for those providers.
-  (`auth-gateway stdio` was rejected: it returns a streamed reply as one string after the stream ends.) The
-  gateway also accepts OpenAI Chat/Responses and pi-native stream requests, dispatches through omp's
-  provider layer with the broker's credentials, and lists usable models at `GET /v1/models`.
-- **Lifecycle:** the plugin starts both processes when a model is first used, on loopback
-  ports, passing `OMP_AUTH_BROKER_URL` only to the gateway process it spawns — the user's omp config is not
-  changed. It authenticates with the bearer tokens omp keeps in its config dir. Lifetime `idle:<duration>`
-  stops both. One pair serves all mu sessions of the same omp profile (state in `$MU_HOME/gateway/`, or `gateway/profiles/<name>/` under a profile): the pair holds that profile's credentials and `models.yml`, so profiles never share one. Idle, the pair measured about 306 MB total and 216 MB private (broker 93 / 58 MB, gateway 214 / 158 MB; `BENCHMARKS.md`).
-- **What `serve` does not do** (unlike `stdio`): role selectors such as `@smol` and omp's fallback chains.
-  The core resolves roles itself from omp's config and sends provider-qualified ids.
-- **Open risk:** the broker refreshes OAuth tokens in the same credential store that running omp
-  sessions use. If a provider rotates refresh tokens, omp and the broker could invalidate each other's.
+- **Gateway:** every other model, and every provider without a key or sign-in in mu, is served through a
+  gateway provider plugin (`provider = "gateway"`). The contract is `provider/endpoint {clientPid, start}`
+  (returns `{baseUrl, token}`, or `null` when `start` is false and nothing runs), `provider/prices {}` (the
+  price list), and a base URL that serves Anthropic Messages at `/v1/messages`, `/v1/models` and `/v1/usage`
+  (see `docs/providers.md`). The core speaks one wire protocol, Anthropic Messages, to it and holds no
+  credentials for those providers. It never runs omp. The omp-wrapping implementation, its lifecycle, state
+  layout, idle memory (about 306 MB total, 216 MB private; `BENCHMARKS.md`) and the open risk of sharing
+  omp's credential store with running omp sessions belong to the separate `ai-provider-gateway` tool and its README.
 
 ## Compatibility
 
@@ -213,7 +208,7 @@ Reads omp's files in place. Agent dir: `~/.omp/agent`, or `~/.omp/profiles/<name
 | Sticky rules | `<agent>/RULES.md`, `.omp/RULES.md` | Read; carried on every request |
 | Stream rules | omp rule files | Read |
 | Skills | `<root>/skills/<name>/SKILL.md`, one level deep | Read |
-| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. Project files (in the working directory) need trust: their servers start only after `/mcp trust` (or **Trust** in the startup dialog), and again when the file's servers change. Unlike omp, which does not gate them. Agent-dir files are always trusted. `/mcp` is the one writer: add, remove and `disabledServers` / `enabledServers` edits to these files (nothing else in a file changes; an unparseable file is left alone) and a live sync of the running servers. OAuth tokens come from `omp token`, and `/login mcp:<name>` runs omp's own flow; mu never reads omp's credential store |
+| MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. Project files (in the working directory) need trust: their servers start only after `/mcp trust` (or **Trust** in the startup dialog), and again when the file's servers change. Unlike omp, which does not gate them. Agent-dir files are always trusted. `/mcp` is the one writer: add, remove and `disabledServers` / `enabledServers` edits to these files (nothing else in a file changes; an unparseable file is left alone) and a live sync of the running servers. OAuth is mu's own (the `mu-mcp-http` bridge, `/login mcp:<name>`); logins made in omp are not reused |
 | Sessions | `<agent>/sessions/<encoded-cwd>/<ts>_<id>.jsonl`, v3 tree; blobs `<agent>/blobs/<sha256>` | Written in omp's v3 format to mu's own directory; omp opens them with `--resume <path>` or `--session-dir` |
 
 Non-goal: running pi or omp TypeScript extensions.

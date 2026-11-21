@@ -169,7 +169,7 @@ impl Agent {
     /// one catalogue refresh per process.
     pub(super) fn settle_prices(&mut self) {
         if self.costs.cost.settle() && self.costs.quota.enabled && !self.gateway_idle() {
-            tokio::task::spawn_local(pricing::refresh_missing());
+            tokio::task::spawn_local(pricing::refresh_missing(self.ports.providers.gateway_prices()));
         }
     }
 
@@ -187,13 +187,13 @@ impl Agent {
         }
     }
 
-    /// Native models pause quota polling. omp's catalogue is read only once a gateway model is in use,
-    /// so a native-only session never starts omp.
+    /// Native models pause quota polling. The gateway plugin's price list is read only once a gateway model
+    /// is in use, so a native-only session never starts the gateway.
     pub(super) fn sync_model_state(&mut self) {
         self.costs.quota.set_paused(self.gateway_idle());
         if !self.gateway_idle() && !self.model.pricing_checked && !self.ports.providers.is_relayed() {
             self.model.pricing_checked = true;
-            tokio::task::spawn_local(pricing::refresh());
+            tokio::task::spawn_local(pricing::refresh(self.ports.providers.gateway_prices()));
         }
     }
 

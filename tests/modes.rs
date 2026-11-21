@@ -43,7 +43,7 @@ fn home_with_key(base: &str) -> mu_testutil::TempDir {
     home
 }
 
-/// The binary with a private home and cwd, and an empty `PATH` so no omp is found.
+/// The binary with a private home and cwd, and an empty `PATH` so no host program is found.
 fn mu(home: &Path, cwd: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_mu"));
     c.current_dir(cwd)
@@ -51,7 +51,6 @@ fn mu(home: &Path, cwd: &Path) -> Command {
         .env("MU_HOME", home)
         .env("HOME", home)
         .env("PATH", home.join("empty-bin"))
-        .env("MU_OMP", home.join("no-omp"))
         .env_remove("OMP_PROFILE")
         .env_remove("MU_GATEWAY_URL")
         .env_remove("MU_THEME")

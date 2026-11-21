@@ -34,14 +34,14 @@ pub enum Cmd {
         /// Save without asking the provider whether the key works.
         #[arg(long)]
         no_validate: bool,
-        /// anthropic and openai: its chat models use this key, billed per token instead of your omp login.
+        /// anthropic and openai: its chat models use this key, billed per token instead of your gateway login.
         #[arg(long, conflicts_with = "no_chat")]
         chat: bool,
-        /// anthropic and openai: keep chat on omp; the key is used only where you choose it, such as `mu web use`.
+        /// anthropic and openai: keep chat on the gateway; the key is used only where you choose it, such as `mu web use`.
         #[arg(long)]
         no_chat: bool,
     },
-    /// Remove a key; a provider's chat models go back through omp. `openai-chatgpt` signs out instead.
+    /// Remove a key; a provider's chat models go back through the gateway. `openai-chatgpt` signs out instead.
     Rm { provider: String },
     /// Sign in with ChatGPT: `openai-chatgpt/*` models then run on your ChatGPT plan. Opens a browser;
     /// over SSH, paste the final redirect URL back into the terminal.
@@ -172,7 +172,7 @@ fn exec(store: &Store, registry: &Registry, cmd: Cmd, out: &mut impl Write) -> R
                     )?,
                     _ if was_chat => writeln!(
                         out,
-                        "removed the {} key; {}/* models go through omp again",
+                        "removed the {} key; {}/* models go through the gateway again",
                         target.label(),
                         target.id()
                     )?,
@@ -227,9 +227,17 @@ fn exec(store: &Store, registry: &Registry, cmd: Cmd, out: &mut impl Write) -> R
             let Some(chat) = chat_flag(&target, chat, no_chat)? else { unreachable!("asks_chat requires a flag") };
             if store.set_chat(target.id(), chat)? {
                 if chat {
-                    writeln!(out, "{}/* models now use your API key (billed per token) instead of omp.", target.id())?;
+                    writeln!(
+                        out,
+                        "{}/* models now use your API key (billed per token) instead of the gateway.",
+                        target.id()
+                    )?;
                 } else {
-                    writeln!(out, "{}/* chat models go through omp again; the key stays for web search", target.id())?;
+                    writeln!(
+                        out,
+                        "{}/* chat models go through the gateway again; the key stays for web search",
+                        target.id()
+                    )?;
                 }
                 Ok(0)
             } else {
@@ -254,7 +262,7 @@ fn chat_flag(t: &KeyTarget, chat: bool, no_chat: bool) -> Result<Option<bool>> {
         }
         _ if chat || no_chat => Ok(Some(chat)),
         _ => bail!(
-            "say whether {id}/* chat models should use this key, billed per token, instead of your omp login: add --chat or --no-chat",
+            "say whether {id}/* chat models should use this key, billed per token, instead of your gateway login: add --chat or --no-chat",
             id = t.id()
         ),
     }

@@ -119,15 +119,6 @@ pub fn omp_agent_dir() -> PathBuf {
     }
 }
 
-/// The omp binary mu runs: `$MU_OMP`, else `<mu_home>/bin/omp` when installed, else `omp` on PATH.
-pub fn omp_bin() -> PathBuf {
-    if let Some(p) = std::env::var_os("MU_OMP").filter(|p| !p.is_empty()) {
-        return PathBuf::from(p);
-    }
-    let own = mu_home().join("bin").join("omp");
-    if own.is_file() { own } else { PathBuf::from("omp") }
-}
-
 /// Errors when neither `MU_HOME` nor `HOME` names a directory, so state is never written relative to the cwd.
 pub fn check_home() -> Result<(), String> {
     let set = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
@@ -189,42 +180,6 @@ fn dashed(rel: &Path) -> String {
 
 pub fn encode_cwd(cwd: &Path) -> String {
     Home::from_env().encode_cwd(cwd)
-}
-
-/// Runs the real `omp_bin()` with `args` (stdin null, 60 s limit) and returns its stdout. For contract tests.
-#[cfg(any(test, feature = "test-support"))]
-pub fn run_omp_blocking(args: &[&str], env: &[(&str, &str)]) -> String {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new(omp_bin());
-    crate::omp_state::apply(&mut cmd).expect("omp state is locked");
-    let mut child = cmd
-        .args(args)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("cannot run omp");
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait().expect("wait") {
-            Some(_) => break,
-            None if start.elapsed() > std::time::Duration::from_secs(60) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("omp {args:?} timed out after 60s");
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    }
-    String::from_utf8_lossy(&reader.join().expect("reader thread does not panic")).into_owned()
 }
 
 #[cfg(test)]

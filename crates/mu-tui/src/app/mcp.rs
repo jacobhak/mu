@@ -108,7 +108,7 @@ impl App {
             add("Enable", "turn it on and connect", McpAction::Enable);
         } else {
             if entry.needs_login || entry.wants_oauth {
-                add("Log in", "OAuth through omp", McpAction::Login);
+                add("Log in", "OAuth sign-in", McpAction::Login);
             }
             add("Test", "reconnect and list its tools", McpAction::Test);
             add("Reconnect", "restart the server and refresh its tools", McpAction::Reconnect);
@@ -359,12 +359,13 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::child::ChildThen;
-    use super::super::keys::tests::{in_local, test_app_with_commands, transcript_text};
+    use super::super::keys::tests::{in_local, press, test_app_with_commands, transcript_text};
     use super::*;
     use crate::app::ui_msgs::UiMsg;
     use crate::host::local::LocalHost;
-    use crate::host::{Answer as HostAnswer, Deferred, HostInfo, Pushed};
+    use crate::host::mcp_login as hlogin;
+    use crate::host::{Answer as HostAnswer, Deferred, HostInfo, Pushed, encode};
+    use crossterm::event::KeyModifiers;
     use mu_tools::mcp::discover::Found;
     use serde_json::{Value, json};
     use std::cell::RefCell;
@@ -590,18 +591,74 @@ mod tests {
                 r.app.run_mcp_login("nope");
                 settle(&mut r, says("no MCP server `nope` is configured")).await;
 
-                let mut r = rig(deferred, vec![(hmcp::MCP_AFTER_LOGIN, ok((4, true)))]);
-                let status = std::process::Command::new("true").status().unwrap();
-                r.app.on_child_done(ChildThen::McpLogin("srv".into()), Ok(status));
+                let mut r = rig(deferred, login_calls(ok((4, true))));
+                let flow = start_login(&mut r).await;
+                assert_eq!(
+                    r.seen.borrow()[1],
+                    (hlogin::MCP_LOGIN_START.to_string(), json!({"flow": flow, "name": "srv"}))
+                );
+                assert!(r.app.typing(), "the composer is locked to the redirect URL");
+                r.app
+                    .on_pushed(Pushed { name: hlogin::DONE.into(), data: encode(&hlogin::Done { flow, error: None }) });
                 settle(&mut r, says("mcp:srv: logged in, 4 tools")).await;
+                assert_eq!(r.seen.borrow().last().unwrap(), &(hmcp::MCP_AFTER_LOGIN.to_string(), json!("srv")));
                 assert!(matches!(r.cmds.try_recv(), Ok(Command::RefreshTools)));
+                assert!(!r.app.typing());
 
-                let mut r = rig(deferred, vec![(hmcp::MCP_AFTER_LOGIN, Err("no tools".into()))]);
-                let status = std::process::Command::new("true").status().unwrap();
-                r.app.on_child_done(ChildThen::McpLogin("srv".into()), Ok(status));
+                let mut r = rig(deferred, login_calls(Err("no tools".into())));
+                let flow = start_login(&mut r).await;
+                r.app
+                    .on_pushed(Pushed { name: hlogin::DONE.into(), data: encode(&hlogin::Done { flow, error: None }) });
                 settle(&mut r, says("logged in, but its tools could not be listed: no tools")).await;
+
+                let mut r = rig(deferred, login_calls(ok((0, false))));
+                let flow = start_login(&mut r).await;
+                let failed = hlogin::Done { flow, error: Some("timed out".into()) };
+                r.app.on_pushed(Pushed { name: hlogin::DONE.into(), data: encode(&failed) });
+                assert!(says("mcp:srv: login did not finish: timed out")(&r.app));
+                assert!(r.seen.borrow().iter().all(|(n, _)| n != hmcp::MCP_AFTER_LOGIN));
             });
         }
+    }
+
+    #[test]
+    fn escape_cancels_a_waiting_login_and_unlocks_the_composer() {
+        for deferred in [false, true] {
+            in_local(async move {
+                let mut r = rig(deferred, login_calls(ok((0, false))));
+                let flow = start_login(&mut r).await;
+                let url = hlogin::Url { flow, url: "https://auth.example/authorize?x=1".into() };
+                r.app.on_pushed(Pushed { name: hlogin::URL.into(), data: encode(&url) });
+                assert!(says("open this link:\nhttps://auth.example/authorize?x=1")(&r.app));
+                r.app.on_terminal(press(KeyCode::Char('x'), KeyModifiers::NONE));
+                assert_eq!(r.app.prompt.composer.text(), "x");
+                r.app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(r.app.flows.mcp_login().is_none() && !r.app.typing());
+                assert_eq!(r.app.prompt.composer.text(), "");
+                assert_eq!(
+                    r.seen.borrow().last().unwrap(),
+                    &(hlogin::MCP_LOGIN_CANCEL.to_string(), json!({"flow": flow}))
+                );
+                assert!(says("sign-in cancelled")(&r.app));
+            });
+        }
+    }
+
+    /// A configured server `srv` whose login starts, and whose after-login call answers `after`.
+    fn login_calls(after: Result<Value, String>) -> Vec<(&'static str, Result<Value, String>)> {
+        vec![
+            (hmcp::MCP_NAMES, ok(vec!["srv"])),
+            (hlogin::MCP_LOGIN_START, ok(())),
+            (hlogin::MCP_LOGIN_CANCEL, ok(())),
+            (hmcp::MCP_AFTER_LOGIN, after),
+        ]
+    }
+
+    /// Starts the login of `srv` and returns its flow id.
+    async fn start_login(r: &mut Rig) -> u64 {
+        r.app.run_mcp_login("srv");
+        settle(r, |app| app.flows.mcp_login().is_some() && says("signing in to mcp:srv")(app)).await;
+        r.app.flows.mcp_login().expect("the login is waiting").id
     }
 
     #[test]

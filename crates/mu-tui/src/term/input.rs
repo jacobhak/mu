@@ -49,7 +49,7 @@ enum Source {
 }
 
 /// Blocks in select(2) until `fd` is readable, tells the reader, and waits for it to drain before selecting
-/// again. It never reads, so keystrokes meant for a child process (editor, `omp login`) are not stolen.
+/// again. It never reads, so keystrokes meant for a child process (editor, `mu take`) are not stolen.
 fn select_thread(fd: RawFd, ready: tokio::sync::mpsc::UnboundedSender<()>, ack: std::sync::mpsc::Receiver<()>) {
     loop {
         // SAFETY: `set` is zeroed and initialised by FD_ZERO/FD_SET; `fd` is below FD_SETSIZE for a freshly opened tty.
@@ -74,7 +74,7 @@ fn select_thread(fd: RawFd, ready: tokio::sync::mpsc::UnboundedSender<()>, ack: 
 impl Reader {
     /// Reads from `/dev/tty` rather than fd 0: `O_NONBLOCK` is a property of the open file description,
     /// which stdout and stderr usually share with stdin, and non-blocking stdout would fail writes with
-    /// `EAGAIN`. Children (editor, `omp login`) also keep a blocking stdin.
+    /// `EAGAIN`. Children (editor, `mu take`) also keep a blocking stdin.
     pub fn new() -> io::Result<Self> {
         let shared = term::tty().ok_or_else(|| io::Error::other("no controlling terminal"))?;
         // A duplicate of the shared handle: same open file description (so the same non-blocking

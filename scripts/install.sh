@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs mu (binaries, plugins, pinned omp) under $MU_HOME (default ~/.mu).
+# Installs mu (binaries, plugins) under $MU_HOME (default ~/.mu).
 # Usage: install.sh [--tag <tag>] [--from-source <dir>] [--skip-if-dev]
 set -euo pipefail
 REPO=jacobhak/mu
@@ -122,14 +122,12 @@ fi
 
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
-for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do
+for b in mu mu-web mu-mcp-http mu-predict mu-memory; do
   [ -e "$stage/bin/$b" ] || continue
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"
 done
-omp_ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' "$stage/upstream.toml")"
-"$stage/scripts/fetch-omp.sh" "$omp_ver" "$home/bin/omp"
-for p in gateway web predict memory; do
+for p in web predict memory; do
   [ -d "$stage/plugins/$p" ] || continue
   # Swap in whole: a half-copied plugin directory is never visible, and the old one is kept on failure.
   dest="${home:?}/plugins/$p"
@@ -139,6 +137,10 @@ for p in gateway web predict memory; do
   mv "$dest.new" "$dest"
   rm -rf "$dest.old"
 done
+# The gateway plugin left mu: an installed one (and its binary and omp) stays as it is.
+if grep -qs 'mu-gateway' "$home/plugins/gateway/plugin.toml"; then
+  echo "install: the gateway plugin is no longer part of mu; install ai-provider-gateway to replace it (the old one is left as is)"
+fi
 # The memory plugin used to be a Bun daemon; its socket and lock are all it left in $MU_HOME/memory.
 rm -f "$home/bin/mu-memory-daemon" "$home/memory/sock" "$home/memory/lock"
 rmdir "$home/memory" 2>/dev/null || true

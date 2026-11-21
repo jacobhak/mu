@@ -87,8 +87,12 @@ fn chat_rows(target: &KeyInfo, current: Option<bool>) -> Vec<(Item, KeyOption)> 
         (item, KeyOption::Chat(on))
     };
     vec![
-        row(format!("Yes: {id}/* chat models use this key"), "billed per token instead of your omp login", true),
-        row("No: web search and other chosen uses only".into(), &format!("{id}/* chat keeps going through omp"), false),
+        row(format!("Yes: {id}/* chat models use this key"), "billed per token instead of your gateway login", true),
+        row(
+            "No: web search and other chosen uses only".into(),
+            &format!("{id}/* chat keeps going through the gateway"),
+            false,
+        ),
     ]
 }
 
@@ -199,7 +203,11 @@ impl App {
         if self.custom_wizard_active() && self.custom_key(k) {
             return;
         }
-        if self.chatgpt_typing() {
+        if self.mcp_login_typing() {
+            if self.mcp_login_key(k) {
+                return;
+            }
+        } else if self.chatgpt_typing() {
             if self.chatgpt_key(k) {
                 return;
             }
@@ -284,8 +292,8 @@ impl App {
         }
     }
 
-    /// `/login`: with a provider id run `omp login <id>`, with `mcp:<name>` log in to that MCP
-    /// server; otherwise list omp's providers and the MCP servers that need auth in a picker.
+    /// `/login`: with a provider id add its key, with `mcp:<name>` log in to that MCP server;
+    /// otherwise list the key rows and the MCP servers that need auth in a picker.
     pub(super) fn login(&mut self, provider: &str) {
         if chatgpt::is_chatgpt(provider) {
             return self.start_chatgpt();
@@ -305,27 +313,24 @@ impl App {
         let name = provider.to_string();
         self.host_call(host::keys::KEY_TARGET, &provider, move |app, r: Result<Option<KeyInfo>, String>| match r {
             Ok(Some(target)) => app.begin_key(target),
-            Ok(None) if !name.is_empty() => app.run_login(&[name.as_str()], None),
+            Ok(None) if !name.is_empty() => {
+                app.error(&format!("unknown login target `{name}`: /login lists what mu can log in to"))
+            }
             Ok(None) => {
-                app.notice("listing login providers…");
                 app.host_call(host::keys::LOGIN_PROVIDERS, &(), |app, r: Result<LoginList, String>| app.show_login(r));
             }
             Err(e) => app.error(&e),
         });
     }
 
-    /// The `/login` picker: the key rows, then omp's providers and the MCP servers that need auth.
+    /// The `/login` picker: the key rows, then the MCP servers that need auth.
     fn show_login(&mut self, r: Result<LoginList, String>) {
         self.leave_custom_wizard();
-        let list = r.unwrap_or_else(|e| LoginList { error: Some(e), ..Default::default() });
+        let list = r.unwrap_or_else(|e| {
+            self.error(&e);
+            LoginList::default()
+        });
         self.with_api_key_rows(move |app, mut rows| {
-            for (n, name) in list.providers.into_iter().filter(|(_, name)| !is_baseten(name)) {
-                rows.push((Item { label: name, detail: String::new() }, LoginTarget::Provider(n)));
-            }
-            // The API-key rows and MCP servers stay usable without omp.
-            if let Some(e) = list.error {
-                app.error(&format!("cannot list omp's login providers: {e}"));
-            }
             for (name, url) in list.mcp {
                 rows.push((Item { label: format!("mcp:{name}"), detail: url }, LoginTarget::Mcp(name)));
             }
@@ -404,13 +409,17 @@ impl App {
     /// Whether a key or command is being typed (or a custom endpoint's text or check is waiting):
     /// the composer is locked to it.
     pub(super) fn typing(&self) -> bool {
-        self.flows.key().is_some_and(|f| f.typing.is_some()) || self.chatgpt_typing() || self.custom_typing()
+        self.flows.key().is_some_and(|f| f.typing.is_some())
+            || self.chatgpt_typing()
+            || self.mcp_login_typing()
+            || self.custom_typing()
     }
 
     /// A key is being typed or a choice waits for the user: no prediction is asked for.
     pub(super) fn key_flow_pending(&self) -> bool {
         self.flows.key().is_some_and(|f| f.typing.is_some() || f.pending.is_some())
             || self.chatgpt_typing()
+            || self.mcp_login_typing()
             || self.custom_typing()
     }
 
@@ -575,12 +584,12 @@ impl App {
                         Ok(true) => {
                             let msg = if on {
                                 format!(
-                                    "{id}/* models now use your API key (billed per token) instead of omp.",
+                                    "{id}/* models now use your API key (billed per token) instead of the gateway.",
                                     id = target.id
                                 )
                             } else {
                                 format!(
-                                    "{id}/* chat models go through omp again; the key stays for web search",
+                                    "{id}/* chat models go through the gateway again; the key stays for web search",
                                     id = target.id
                                 )
                             };
@@ -775,32 +784,16 @@ impl App {
                 app.send(Command::RefreshModel);
             }
             Ok(true) if was_chat => {
-                app.notice(&format!("removed the {} key; {}/* models go through omp again", target.label, target.id));
+                app.notice(&format!(
+                    "removed the {} key; {}/* models go through the gateway again",
+                    target.label, target.id
+                ));
                 app.send(Command::RefreshModel);
             }
             Ok(true) => app.notice(&format!("removed the {} key", target.label)),
             Ok(false) => app.notice(&format!("no {} key is stored", target.label)),
             Err(e) => app.error(&format!("could not remove the {} key: {e}", target.label)),
         });
-    }
-}
-
-/// omp's login menu names Baseten too; mu owns that provider's key, so the omp row is dropped.
-pub(super) fn is_baseten(name: &str) -> bool {
-    name.split(|c: char| !c.is_alphanumeric())
-        .find(|w| !w.is_empty())
-        .is_some_and(|w| w.eq_ignore_ascii_case("baseten"))
-}
-
-#[cfg(test)]
-mod login_tests {
-    #[test]
-    fn baseten_is_the_only_omp_row_mu_drops() {
-        use super::is_baseten;
-        assert!(is_baseten("Baseten"));
-        assert!(is_baseten(" Baseten (API key)"));
-        assert!(!is_baseten("Basetenx"));
-        assert!(!is_baseten("Z.AI (GLM · Sign in)"));
     }
 }
 
@@ -941,6 +934,7 @@ pub(super) mod tests {
                 active: Active::None,
                 key_flow_seq: 0,
                 chatgpt_seq: 0,
+                mcp_login_seq: 0,
                 custom_wizard_seq: 0,
             },
             quitting: false,
@@ -1402,7 +1396,9 @@ pub(super) mod tests {
             pump(&mut app, &mut rx).await; // the target
             pump(&mut app, &mut rx).await; // remove_key
             assert!(store.get("openai").is_none());
-            assert!(transcript_text(&app).contains("removed the OpenAI key; openai/* models go through omp again"));
+            assert!(
+                transcript_text(&app).contains("removed the OpenAI key; openai/* models go through the gateway again")
+            );
             app.logout("openai");
             pump(&mut app, &mut rx).await;
             pump(&mut app, &mut rx).await;
@@ -1411,25 +1407,20 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_deferred_login_list_has_the_key_rows_omp_providers_and_mcp_servers() {
+    fn a_deferred_login_list_has_the_key_rows_and_mcp_servers() {
         use crate::host::keys::LoginList;
         let (mut app, mut rx) = deferred_app();
         in_local(async {
-            let list = LoginList {
-                providers: vec![(1, "Z.AI".into()), (2, "Baseten".into())],
-                error: Some("no omp".into()),
-                mcp: vec![("docs".into(), "https://docs.example".into())],
-            };
+            let list = LoginList { mcp: vec![("docs".into(), "https://docs.example".into())] };
             app.show_login(Ok(list));
             assert!(app.overlay.is_none());
             pump(&mut app, &mut rx).await;
             let Some(Overlay::Login { pick }) = &app.overlay else { panic!("no login list") };
             let labels: Vec<&LoginTarget> = pick.values().iter().collect();
-            assert!(labels.contains(&&LoginTarget::Provider(1)) && !labels.contains(&&LoginTarget::Provider(2)));
             assert!(labels.contains(&&LoginTarget::Mcp("docs".into())));
             assert!(labels.contains(&&LoginTarget::ChatGpt));
             assert!(labels.contains(&&LoginTarget::CustomProvider(None)));
-            assert!(transcript_text(&app).contains("cannot list omp's login providers: no omp"));
+            assert!(labels.contains(&&LoginTarget::ApiKey("baseten".into())));
         });
     }
 

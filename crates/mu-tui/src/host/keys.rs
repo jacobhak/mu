@@ -1,5 +1,5 @@
 //! `/login` and `/logout` (table rows "/login, /logout, keys"): the stored API keys, which key a
-//! provider id stands for, checking a key against its provider, and the providers `omp login` lists.
+//! provider id stands for, checking a key against its provider, and the MCP servers that need a login.
 
 use super::local::{Local, Registry};
 use super::{Answer, pending, ready};
@@ -136,13 +136,9 @@ pub struct LogoutList {
     pub error: Option<String>,
 }
 
-/// The providers of `omp login` and the MCP servers that need a login.
+/// The MCP servers that need a login.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LoginList {
-    /// Menu number and name.
-    pub providers: Vec<(usize, String)>,
-    /// Why `omp login` could not be listed.
-    pub error: Option<String>,
     /// MCP server name and its URL.
     pub mcp: Vec<(String, String)>,
 }
@@ -268,79 +264,14 @@ fn logout_list(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     })
 }
 
-/// Runs `omp login` without a terminal for its provider menu; the MCP servers that need a login
-/// are read once it answers.
 fn login_providers(l: &Rc<Local>, args: serde_json::Value) -> Answer {
-    pending(args, |(): ()| {
-        let plugins = l.plugins.clone();
-        async move {
-            let (providers, error) = match list_login_providers().await {
-                Ok(p) => (p, None),
-                Err(e) => (Vec::new(), Some(e)),
-            };
-            Ok(LoginList { providers, error, mcp: plugins.needs_login() })
-        }
-    })
-}
-
-/// Provider menu of `omp login`, scraped from its numbered prompt (omp has no machine-readable list).
-async fn list_login_providers() -> Result<Vec<(usize, String)>, String> {
-    let mut cmd = tokio::process::Command::new(mu_common::paths::omp_bin());
-    mu_common::omp_state::apply(cmd.as_std_mut()).map_err(|e| e.to_string())?;
-    let out = cmd
-        .arg("login")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    mu_common::omp_state::after_omp_exit();
-    Ok(parse_login_menu(&String::from_utf8_lossy(&out.stdout)))
-}
-
-fn parse_login_menu(text: &str) -> Vec<(usize, String)> {
-    let mut plain = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for n in chars.by_ref() {
-                if n.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            plain.push(c);
-        }
-    }
-    plain
-        .lines()
-        .filter_map(|l| {
-            let (n, name) = l.trim().split_once(". ")?;
-            Some((n.parse().ok()?, name.trim().to_string())).filter(|(_, name): &(usize, String)| !name.is_empty())
-        })
-        .collect()
+    ready(args, |(): ()| Ok(LoginList { mcp: l.plugins.needs_login() }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mu_provider::auth::check::Check;
-
-    #[test]
-    fn menu_numbers_and_names_survive_ansi_and_noise() {
-        let t = "Select a provider:\n\n  1. ChatGPT Plus/Pro (Codex)\n\x1b[2m  12. Z.AI (GLM · Sign in)\x1b[0m\nEnter number: ";
-        assert_eq!(
-            parse_login_menu(t),
-            vec![(1, "ChatGPT Plus/Pro (Codex)".into()), (12, "Z.AI (GLM · Sign in)".into())]
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn contract_omp_login_menu() {
-        let out = mu_common::paths::run_omp_blocking(&["login"], &[]);
-        assert!(!parse_login_menu(&out).is_empty(), "no providers parsed from: {out}");
-    }
 
     #[test]
     fn the_replies_survive_the_wire() {
@@ -368,11 +299,7 @@ mod tests {
         let back: LogoutList = serde_json::from_value(serde_json::to_value(&logout).unwrap()).unwrap();
         assert_eq!(back, logout);
 
-        let login = LoginList {
-            providers: vec![(1, "ChatGPT".into())],
-            error: None,
-            mcp: vec![("docs".into(), "https://x".into())],
-        };
+        let login = LoginList { mcp: vec![("docs".into(), "https://x".into())] };
         let back: LoginList = serde_json::from_value(serde_json::to_value(&login).unwrap()).unwrap();
         assert_eq!(back, login);
 

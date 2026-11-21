@@ -28,7 +28,7 @@ pub(super) struct Shared {
     pub(super) providers: RefCell<Weak<Providers>>,
     pub(super) notices: mpsc::UnboundedSender<String>,
     pub(super) init: RefCell<InitParams>,
-    /// The plugin that serves `provider/endpoint`, asked for the auth broker's address.
+    /// The gateway provider plugin's slot.
     pub(super) gateway: RefCell<Option<Weak<Slot>>>,
     pub(super) cache_dir: std::path::PathBuf,
     /// A terminal UI is attached, so `/login mcp:<name>` can be offered.
@@ -577,27 +577,77 @@ impl PluginHost {
         Ok(args)
     }
 
-    pub(crate) async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
+    fn provider_slot(&self, kind: &str) -> Result<Rc<Slot>, String> {
         let slot =
             self.slots.borrow().iter().find(|s| s.native().and_then(|m| m.provider.as_deref()) == Some(kind)).cloned();
-        let Some(slot) = slot else {
+        slot.ok_or_else(|| {
             let dir = mu_common::paths::mu_home().join("plugins");
             let found: Vec<String> =
                 self.slots.borrow().iter().filter(|s| s.native().is_some()).map(|s| s.name()).collect();
             let found = if found.is_empty() { "no plugins".to_string() } else { found.join(", ") };
-            return Err(format!(
-                "no gateway: no plugin in {} provides `{kind}` (loaded: {found}); install the gateway plugin there or set MU_GATEWAY_URL",
+            format!(
+                "no gateway: no plugin in {} provides `{kind}` (loaded: {found}); install a gateway plugin there or set MU_GATEWAY_URL and MU_GATEWAY_TOKEN",
                 dir.display()
-            ));
-        };
+            )
+        })
+    }
+
+    pub(crate) async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
+        let slot = self.provider_slot(kind)?;
         let proc = self.ensure(&slot).await?;
         let v = proc
-            .request("provider/endpoint", json!({"clientPid": std::process::id()}), Some(Duration::from_secs(45)))
+            .request(
+                "provider/endpoint",
+                json!({"clientPid": std::process::id(), "start": true}),
+                Some(Duration::from_secs(45)),
+            )
             .await?;
         match (v["baseUrl"].as_str(), v["token"].as_str()) {
             (Some(b), Some(t)) => Ok((b.trim_end_matches('/').into(), t.into())),
             _ => Err("gateway plugin returned no endpoint".into()),
         }
+    }
+
+    /// The endpoint of a gateway that is already running: `MU_GATEWAY_URL`, else the gateway plugin when its
+    /// process is up and reports one. Never starts anything.
+    pub fn gateway_peek(self: &Rc<Self>) -> mu_provider::provider::endpoint::PeekFn {
+        let host = self.clone();
+        Rc::new(move || -> mu_provider::provider::endpoint::BoxPeek {
+            let host = host.clone();
+            Box::pin(async move {
+                if let Some(r) = mu_provider::gateway::env_endpoint() {
+                    return r.ok();
+                }
+                let slot = host.shared.gateway.borrow().as_ref()?.upgrade()?;
+                let proc = slot.proc.borrow().clone()?;
+                let v = proc
+                    .request(
+                        "provider/endpoint",
+                        json!({"clientPid": std::process::id(), "start": false}),
+                        Some(Duration::from_secs(5)),
+                    )
+                    .await
+                    .ok()?;
+                Some((v["baseUrl"].as_str()?.trim_end_matches('/').into(), v["token"].as_str()?.into()))
+            })
+        })
+    }
+
+    /// The gateway plugin's price list (`provider/prices`), as JSON text.
+    pub fn gateway_prices(self: &Rc<Self>) -> mu_provider::provider::endpoint::PricesFn {
+        let host = self.clone();
+        Rc::new(move || -> mu_provider::provider::endpoint::BoxPrices {
+            let host = host.clone();
+            Box::pin(async move {
+                if std::env::var_os("MU_GATEWAY_URL").is_some_and(|u| !u.is_empty()) {
+                    return Err("MU_GATEWAY_URL serves no price list".into());
+                }
+                let slot = host.provider_slot("gateway")?;
+                let proc = host.ensure(&slot).await?;
+                let v = proc.request("provider/prices", json!({}), Some(Duration::from_secs(60))).await?;
+                Ok(v.to_string())
+            })
+        })
     }
 
     /// The gateway endpoint `GatewaySource` resolves: `MU_GATEWAY_URL` if set, else the gateway plugin.

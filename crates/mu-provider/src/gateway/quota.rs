@@ -1,9 +1,10 @@
 //! Subscription usage windows (`5h`, `7d`) from the gateway's `GET /v1/usage`.
 //!
-//! Only an already-running gateway is queried: the lookup reads `state.json` and checks its pid, so
-//! refreshing never starts one. State lives in `$MU_HOME/gateway/` (`profiles/<name>/` under an omp profile).
+//! Only an already-running gateway is queried: the lookup asks the gateway plugin to peek
+//! (`provider/endpoint` with `start: false`), so refreshing never starts one.
 //! The gateway caches each account's usage for 5 minutes and fetches it upstream on a miss, so a call can
 //! take seconds; callers run it off the agent loop.
+use crate::provider::endpoint::PeekFn;
 use mu_base::events::{ProviderUsage, QuotaWindow};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -49,14 +50,15 @@ pub fn parse_usage(body: &str, provider: &str, now_ms: i64) -> Option<ProviderUs
 
 pub enum Fetch {
     Got(ProviderUsage),
-    /// No gateway is running; checking again is a local file read.
+    /// No gateway is running; checking again is a plugin call.
     NoGateway,
     /// The request failed, timed out, or the report has no windows for the provider.
     Failed,
 }
 
-pub async fn fetch(provider: &str) -> Fetch {
-    let Some((url, token)) = crate::gateway::running_endpoint() else { return Fetch::NoGateway };
+pub async fn fetch(peek: Option<PeekFn>, provider: &str) -> Fetch {
+    let Some(peek) = peek else { return Fetch::NoGateway };
+    let Some((url, token)) = peek().await else { return Fetch::NoGateway };
     let body = async {
         crate::net::install_crypto();
         let client = reqwest::Client::builder().timeout(TIMEOUT).build().ok()?;
@@ -88,7 +90,7 @@ fn interval(failures: u32) -> Duration {
     }
 }
 
-/// While no gateway runs, check again this often (a local file read), so quota shows soon after the
+/// While no gateway runs, check again this often (a plugin call), so quota shows soon after the
 /// first request starts one.
 const NO_GATEWAY_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -110,6 +112,8 @@ pub struct QuotaTracker {
     paused: bool,
     /// Quota is fetched only for the top-level interactive agent.
     pub enabled: bool,
+    /// Looks up a running gateway; without one there is nothing to fetch.
+    peek: Option<PeekFn>,
     /// The background fetch writes its result here and pings `wake`.
     slot: Slot,
     wake: UnboundedSender<()>,
@@ -128,6 +132,7 @@ impl Default for QuotaTracker {
             refresh_pending: false,
             paused: false,
             enabled: false,
+            peek: None,
             slot: Rc::new(RefCell::new(None)),
             wake,
             wake_rx: Some(wake_rx),
@@ -136,6 +141,10 @@ impl Default for QuotaTracker {
 }
 
 impl QuotaTracker {
+    pub fn set_peek(&mut self, p: PeekFn) {
+        self.peek = Some(p);
+    }
+
     /// The receiver that is pinged when a fetch finishes; taken once by the run loop.
     pub fn take_wake(&mut self) -> Option<UnboundedReceiver<()>> {
         self.wake_rx.take()
@@ -224,9 +233,10 @@ impl QuotaTracker {
             return;
         }
         self.inflight = true;
-        let (provider, slot, wake) = (provider.to_string(), self.slot.clone(), self.wake.clone());
+        let (provider, slot, wake, peek) =
+            (provider.to_string(), self.slot.clone(), self.wake.clone(), self.peek.clone());
         tokio::task::spawn_local(async move {
-            let got = fetch(&provider).await;
+            let got = fetch(peek, &provider).await;
             *slot.borrow_mut() = Some((provider, got));
             let _ = wake.send(());
         });
@@ -335,6 +345,22 @@ mod tests {
         q.inflight = true;
         q.force_refresh("anthropic");
         assert!(!q.refresh_pending);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_running_gateway_is_reported_as_none() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut q = QuotaTracker { enabled: true, ..Default::default() };
+                q.set_peek(Rc::new(|| Box::pin(async { None })));
+                let mut wake = q.take_wake().unwrap();
+                q.tick("anthropic");
+                assert!(q.inflight);
+                wake.recv().await.unwrap();
+                q.tick("anthropic");
+                assert!(q.no_gateway && q.failures == 0, "no gateway is not a failed fetch");
+            })
+            .await;
     }
 
     #[test]

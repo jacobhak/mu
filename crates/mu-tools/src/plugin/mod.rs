@@ -5,6 +5,7 @@
 pub mod host;
 pub mod manifest;
 mod mcp_runtime;
+pub use mcp_runtime::McpLoginEvent;
 pub mod process;
 #[cfg(test)]
 mod tests;

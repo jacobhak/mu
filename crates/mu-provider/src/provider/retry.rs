@@ -99,7 +99,7 @@ pub fn context_fill(req: &super::types::Request<'_>) -> f64 {
     tokens as f64 * 100.0 / window as f64
 }
 
-const LOGIN_HINT: &str = "\nIf you haven't logged in yet, run /login (or `omp login`) first.";
+const LOGIN_HINT: &str = "\nIf the gateway needs a login, log in to it first.";
 
 /// What a ChatGPT plan error code tells the user, as `(retryable, text)`; `None` for codes the plan
 /// does not use. `param` is the field the API refused (`error.param`).
@@ -285,8 +285,8 @@ mod tests {
         assert!(matches!(gw(400, "bad field"), ProviderError::Fatal(_)));
         assert!(matches!(gw(401, "no"), ProviderError::Fatal(_)));
         let e = gw(404, r#"{"message":"Unknown model: x/y"}"#).to_string();
-        assert!(e.contains("/login"), "{e}");
-        assert!(!gw(400, "bad field").to_string().contains("/login"));
+        assert!(e.contains("log in to it first"), "{e}");
+        assert!(!gw(400, "bad field").to_string().contains("log in to it first"));
     }
 
     #[test]
@@ -317,17 +317,17 @@ mod tests {
         assert!(e.contains("/login") && !e.contains("API key"), "{e}");
         assert!(matches!(chatgpt_error(400, None, r#"{"error":{"message":"bad"}}"#, None), ProviderError::Fatal(_)));
         let v = classify_http(401, None, "x", Some(chatgpt::LABEL)).to_string();
-        assert!(v.contains("sign-in was not accepted") && !v.contains("omp login"), "{v}");
+        assert!(v.contains("sign-in was not accepted") && !v.contains("gateway"), "{v}");
     }
 
     #[test]
     fn the_login_hint_depends_on_the_route() {
         let e = classify_http(401, None, "invalid x-api-key", Some("Anthropic")).to_string();
         assert!(e.contains("Anthropic rejected the API key; run /login to replace it"), "{e}");
-        assert!(!e.contains("omp login"), "{e}");
+        assert!(!e.contains("gateway"), "{e}");
         let e = classify_http(403, None, "", Some("Baseten")).to_string();
         assert!(e.contains("Baseten rejected the API key"), "{e}");
-        assert!(gw(401, "no").to_string().contains("omp login"));
+        assert!(gw(401, "no").to_string().contains("If the gateway needs a login"));
         // a native 404 is a missing model, not a login problem
         assert!(
             !classify_http(404, None, r#"{"message":"Unknown model"}"#, Some("OpenAI")).to_string().contains("/login")

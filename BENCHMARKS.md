@@ -6,7 +6,7 @@ Versions: mu 0.1.0, claude 2.1.289, opencode 1.3.3, omp 18.12.6, pi 0.73.1.
 
 ## Read this first: mu's gateway is not in the mu rows
 
-mu normally reaches models through a shared pair of processes, `omp auth-broker` and `omp auth-gateway`, one pair for all mu sessions. The mu rows below bypass it (`MU_GATEWAY_URL`) and are therefore **not** the cost of running mu as installed. A session with an API key added in mu needs no gateway (next section).
+mu normally reaches models through a gateway provider plugin. The one measured here is `ai-provider-gateway`'s shared pair of processes, `omp auth-broker` and `omp auth-gateway`, one pair for all mu sessions. The mu rows below bypass it (`MU_GATEWAY_URL`) and are therefore **not** the cost of running mu as installed. A session with an API key added in mu needs no gateway (next section).
 
 | | total | private |
 |---|---|---|
@@ -26,7 +26,7 @@ What this means, using the idle figure:
 
 ## With an API key in mu, there is no gateway
 
-Since native providers, a session that talks to Anthropic, OpenAI or Baseten with a key added in mu starts no omp process, so the pair above is not part of its cost. Re-measured 2026-11-06 with `scripts/measure-sessions.sh` (the 2026-11-04 table is replaced: its setup was not recorded and it did not reproduce, with 5 MB private where a clean `HOME` gives 2 to 3 MB). Release binary, interactive TUI in tmux, `--model anthropic/claude-sonnet-5-5`, a scratch `HOME` and `MU_HOME`, one `say pong` prompt against a local fake Anthropic server that holds the stream open for 15 s. `Pss` and `Pss_Anon` from `/proc/<pid>/smaps_rollup` of the `mu` process only, 9 s after start, then 6 s into the request. Medians of 5 rounds, the three rows interleaved; the spread was under 1 MB total and 0.1 MB private in every column. "Before" is the parent of the native-providers commit (`50e2396`, binary 61.8 MB), built separately; "after" is `8f81324` (69.2 MB).
+Since native providers, a session that talks to Anthropic, OpenAI or Baseten with a key added in mu starts no gateway process, so the pair above is not part of its cost. Re-measured 2026-11-06 with `scripts/measure-sessions.sh` (the 2026-11-04 table is replaced: its setup was not recorded and it did not reproduce, with 5 MB private where a clean `HOME` gives 2 to 3 MB). Release binary, interactive TUI in tmux, `--model anthropic/claude-sonnet-5-5`, a scratch `HOME` and `MU_HOME`, one `say pong` prompt against a local fake Anthropic server that holds the stream open for 15 s. `Pss` and `Pss_Anon` from `/proc/<pid>/smaps_rollup` of the `mu` process only, 9 s after start, then 6 s into the request. Medians of 5 rounds, the three rows interleaved; the spread was under 1 MB total and 0.1 MB private in every column. "Before" is the parent of the native-providers commit (`50e2396`, binary 61.8 MB), built separately; "after" is `8f81324` (69.2 MB).
 
 | | idle total | idle private | request in flight, total | in flight, private |
 |---|---|---|---|---|
@@ -130,7 +130,7 @@ Reading the columns:
 - pi was installed into `~/.cache/mu-bench-tools` with `npm install --prefix`, not into the system.
 - Reproduce: `cargo build --release -p mu-bench && ./target/release/mu-bench compare crates/mu-bench/scenarios/compare-agentic.toml --runs 7 --sessions 2,4,8`. Details, the scenario format and how to probe another harness are in [`crates/mu-bench/README.md`](crates/mu-bench/README.md). Run it on a machine that is otherwise quiet: with 8 sessions of opencode it needs about 3.5 GB.
 - Native-provider and interactive tables (Linux; need `tmux` and `python3`): `scripts/measure-sessions.sh -m native target/release/mu 1 2 4 8` runs N interactive sessions against `scripts/fake-anthropic.py`, and `-m bypass` does the same through `MU_GATEWAY_URL`. A table row is the median of 5 runs with the rows interleaved (one run of each row per round). For the "before native providers" row, build the parent of that commit in a separate worktree (`git worktree add --detach <dir> <commit>^`, `CARGO_TARGET_DIR=<elsewhere> cargo build --release -p mu`) and pass its binary. The script aborts if another process runs the binary, since that would share its pages.
-- Gateway pair: `scripts/measure-gateway.sh 1` and `scripts/measure-gateway.sh 8` (an empty `HOME`, `omp` on `PATH`, the network). The requests are rejected at once by the real API and no real credential is sent. A held-open model stream through the gateway cannot be measured offline (see `crates/mu-bench/README.md`).
+- Gateway pair: `scripts/measure-gateway.sh 1` and `scripts/measure-gateway.sh 8`, which now live in the `ai-provider-gateway` repo (an empty `HOME`, `omp` on `PATH`, the network). The requests are rejected at once by the real API and no real credential is sent. A held-open model stream through the gateway cannot be measured offline (see `crates/mu-bench/README.md`).
 
 ## History
 

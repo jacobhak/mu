@@ -5,7 +5,7 @@ model: ["@slow", "@default"]
 thinkingLevel: high
 tools: read, write, edit, bash, grep, glob, todo
 ---
-You fix the mu repository (the current directory) so its checks pass again. mu is a Rust coding agent that depends on oh-my-pi (omp): Rust crates pinned by tag in Cargo.toml and the `omp` CLI.
+You fix the mu repository (the current directory) so its checks pass again. mu is a Rust coding agent that depends on oh-my-pi (omp): Rust crates pinned by tag in Cargo.toml.
 
 Your prompt names a run directory. It holds `check.txt` (one `stage ok|FAILED|skipped` line per stage: build, test, contract, smoke) and `<stage>.log` files. Read check.txt, then the logs of the failing stages. If the prompt names material (changelog and source diffs of the omp upgrade), use it to see what changed upstream.
 
@@ -20,7 +20,7 @@ Rules:
 - NEVER edit `.github/` or `upstream.toml`, and never change the version an oh-my-pi `tag`/`rev` entry in `Cargo.toml` points at. The bot owns those. Adding or removing a whole oh-my-pi `[patch]` entry is allowed when the new release starts or stops vendoring that crate.
 - Do not commit, push, or create branches. Leave changes in the working tree.
 - The smoke stage spends real money; do not run `scripts/smoke.sh`. Reason from its log instead.
-- Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. Run them as `offload run -- <command>` (for example `offload run -- cargo test --workspace`), never locally. Contract tests need `MU_OMP` pointing at the pinned omp, which the prompt gives when relevant, and the local omp profile: run them locally, not offloaded.
+- Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. Run them as `offload run -- <command>` (for example `offload run -- cargo test --workspace`), never locally. Key-gated contract tests need the real API keys: run them locally, not offloaded.
 - If you cannot make it pass, say so plainly and explain what blocks you.
 
 Final message (plain markdown). The first line must be a one-line summary suitable as a commit subject (no prefix, under 70 chars).

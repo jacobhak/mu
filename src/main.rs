@@ -79,13 +79,3 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Agent { .. } => unreachable!("`mu agent` is routed in dispatch"),
     }
 }
-
-#[cfg(test)]
-mod contract_tests {
-    #[test]
-    #[ignore]
-    fn contract_omp_version() {
-        let out = mu_common::paths::run_omp_blocking(&["--version"], &[]);
-        assert_eq!(out.trim(), format!("omp/{}", env!("MU_OMP_VERSION")));
-    }
-}

@@ -107,6 +107,32 @@ fn a_call_during_idle_shutdown_gets_a_fresh_process() {
     });
 }
 
+#[test]
+fn core_secrets_are_namespaced_by_plugin() {
+    run(async {
+        let on_call = r#"printf '{"jsonrpc":"2.0","id":50,"method":"core/secrets","params":{"op":"put","name":"x","value":"aGk="}}\n'
+read -r r1
+printf '{"jsonrpc":"2.0","id":51,"method":"core/secrets","params":{"op":"get","name":"x"}}\n'
+read -r r2
+printf '{"jsonrpc":"2.0","id":52,"method":"core/secrets","params":{"op":"put","name":"../x","value":"aGk="}}\n'
+read -r r3
+printf '%s\n%s\n%s\n' "$r1" "$r2" "$r3" > replies.log
+printf '{"jsonrpc":"2.0","id":%s,"result":{"content":"ok"}}\n' "$id""#;
+        let (h, dir) = host(on_call, "session");
+        let r = h.call_tool("slow", &json!({}), &CancellationToken::new()).await;
+        assert_eq!(r.text, "ok", "{}", r.text);
+        let replies = std::fs::read_to_string(dir.join("replies.log")).unwrap();
+        let mut lines = replies.lines();
+        assert!(lines.next().unwrap().contains(r#""result":{}"#));
+        assert!(lines.next().unwrap().contains(r#""value":"aGk=""#));
+        assert!(lines.next().unwrap().contains(r#""code":-32603"#));
+        let stored = mu_common::paths::profile_home().join("secrets/plugin-t/x");
+        assert_eq!(std::fs::read(stored).unwrap(), b"hi");
+        h.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
 /// A shell-script MCP server: two-page `tools/list`, and calls that return text, an error and an
 /// image, ping the client, or hang. Every line it receives is appended to `$LOG`.
 const MCP_SERVER: &str = r#"while IFS= read -r line; do
@@ -124,7 +150,7 @@ const MCP_SERVER: &str = r#"while IFS= read -r line; do
       read -r r1; read -r r2; printf '%s\n%s\n' "$r1" "$r2" >> "$LOG"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id" ;;
     *'"method":"tools/call"'*'"name":"tokener"'*)
-      printf '{"jsonrpc":"2.0","id":97,"method":"core/mcpToken","params":{"force":false}}\n'
+      printf '{"jsonrpc":"2.0","id":97,"method":"core/mcpSecret","params":{"op":"get"}}\n'
       read -r r1; printf '%s\n' "$r1" >> "$LOG"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}]}}\n' "$id" ;;
     *'"method":"tools/call"'*'"name":"hang"'*) sleep 100 & ;;
@@ -493,6 +519,48 @@ while :; do sleep 100 & wait; done
         assert!(marker.exists(), "the group got SIGTERM before SIGKILL");
         mu_testutil::wait_until("the process group to end", || !group_running(pid)).await;
         assert!(!group_running(pid), "the process group is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn a_plugin_can_use_core_while_it_shuts_down() {
+    run(async {
+        let dir = std::env::temp_dir().join(format!("mu-plug-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"shutdown"'*)
+      printf '{"jsonrpc":"2.0","id":50,"method":"core/secrets","params":{"op":"put","name":"bye","value":"aGk="}}\n'
+      read -r reply
+      printf '%s\n' "$reply" > reply.log
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      exit 0 ;;
+  esac
+done
+"#;
+        std::fs::write(dir.join("p.sh"), script).unwrap();
+        let m = Manifest {
+            name: "sealer".into(),
+            command: vec!["sh".into(), "p.sh".into()],
+            lifetime: manifest::Lifetime::parse("session").unwrap(),
+            hooks: vec![],
+            required_hooks: vec![],
+            provider: None,
+            tools: vec![manifest::ToolSpec::with_schema("slow", json!({}))],
+            timeout: std::time::Duration::from_secs(300),
+            dir: dir.clone(),
+        };
+        let (ntx, _nrx) = mpsc::unbounded_channel();
+        let h = PluginHost::new(vec![m], vec![], ntx, Default::default());
+        h.ensure(&h.slot(0)).await.unwrap();
+        h.shutdown_all().await;
+        let reply = std::fs::read_to_string(dir.join("reply.log")).unwrap();
+        assert!(reply.contains(r#""result":{}"#), "core answered during shutdown: {reply}");
+        let stored = mu_common::paths::profile_home().join("secrets/plugin-sealer/bye");
+        assert_eq!(std::fs::read(stored).unwrap(), b"hi");
         let _ = std::fs::remove_dir_all(dir);
     });
 }

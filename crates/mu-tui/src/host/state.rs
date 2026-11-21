@@ -90,14 +90,14 @@ pub fn status(profile_home: &Path) -> StateStatus {
     }
 }
 
-/// Seals what was plaintext and unseals omp's directory, once the state key is open. A failure is logged:
+/// Seals what was plaintext and migrates the legacy sealed plugin credentials, once the state key is open. A failure is logged:
 /// the agent keeps running with what it has.
 pub fn after_unlock(profile_home: &Path) {
     if let Err(e) = mu_provider::auth::sealing::seal_existing(profile_home) {
         eprintln!("mu agent: could not seal the stored credentials: {e:#}");
     }
-    if let Err(e) = mu_common::omp_state::materialize(profile_home) {
-        eprintln!("mu agent: could not prepare omp's credentials: {e}");
+    if let Err(e) = mu_common::plugin_secrets::migrate_legacy(profile_home) {
+        eprintln!("mu agent: could not migrate sealed plugin credentials: {e}");
     }
 }
 

@@ -1,8 +1,9 @@
-//! Per-model token prices, from omp's catalogue.
+//! Per-model token prices, from the gateway plugin's catalogue.
 //!
-//! Source: `omp models ls --json` (per-million rates, `pricingStatus`). It lists only models the active
-//! profile can use, so its output is cached per profile (`paths::profile_home()/pricing.json`) and
+//! Source: the gateway plugin's `provider/prices` (per-million rates, `pricingStatus`). It lists only models
+//! the active profile can use, so it is cached per profile (`paths::profile_home()/pricing.json`) and
 //! refreshed at most once a day, off the draw path. A model missing from the cache forces one refresh.
+use crate::provider::endpoint::BoxPrices;
 use mu_base::message::{Cost, Usage};
 use mu_common::paths;
 use serde::Deserialize;
@@ -308,45 +309,29 @@ fn heuristic_name(model_id: &str) -> String {
 }
 
 /// Refreshes the cached catalogue when it is missing or older than a day, and an hour after a failure.
-/// Failures keep the old cache. Runs `omp models ls --json`; never called from the draw path.
-pub async fn refresh() {
+/// Failures keep the old cache. Asks the gateway plugin; never called from the draw path.
+pub async fn refresh(prices: BoxPrices) {
     if cache().due() {
-        fetch().await;
+        fetch(prices).await;
     }
 }
 
 /// Refreshes regardless of the cache's age, once per process: for a model the cache does not list
 /// (new model, or a cache written while its provider was not logged in).
-pub async fn refresh_missing() {
+pub async fn refresh_missing(prices: BoxPrices) {
     if !FORCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        fetch().await;
+        fetch(prices).await;
     }
 }
 
-async fn fetch() {
-    if !try_fetch().await {
+async fn fetch(prices: BoxPrices) {
+    if !try_fetch(prices).await {
         cache().mark_failed();
     }
 }
 
-async fn try_fetch() -> bool {
-    let mut cmd = tokio::process::Command::new(mu_common::paths::omp_bin());
-    if mu_common::omp_state::apply(cmd.as_std_mut()).is_err() {
-        return false;
-    }
-    let out = cmd
-        .args(["models", "ls", "--json"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(REFRESH_TIMEOUT, out).await;
-    mu_common::omp_state::after_omp_exit();
-    let Ok(Ok(out)) = out else { return false };
-    if !out.status.success() {
-        return false;
-    }
-    let Ok(text) = String::from_utf8(out.stdout) else { return false };
+async fn try_fetch(prices: BoxPrices) -> bool {
+    let Ok(Ok(text)) = tokio::time::timeout(REFRESH_TIMEOUT, prices).await else { return false };
     let Some(parsed) = Table::from_json(&text) else { return false };
     if parsed.entries.is_empty() || !cache().save(&text) {
         return false;
@@ -448,17 +433,24 @@ mod tests {
         assert_eq!(heuristic_name("modal/zai-org/glm-5.3-flash"), "GLM 5.3 Flash");
     }
 
+    const PLUGIN_PRICES: &str = r#"{"models":[
+      {"provider":"fake","id":"priced-model","pricingStatus":"fixed",
+       "cost":{"input":2,"output":4,"cacheRead":0,"cacheWrite":0}}]}"#;
+
     #[test]
-    #[ignore]
-    fn contract_omp_models_ls() {
-        let out = mu_common::paths::run_omp_blocking(&["models", "ls", "--json"], &[]);
-        let t = Table::from_json(&out).expect("models ls --json did not parse");
-        assert!(!t.entries.is_empty());
-        assert!(
-            t.entries
-                .iter()
-                .any(|(k, e)| k.starts_with("anthropic/") && e.rates.as_ref().is_some_and(|r| r.input > 0.0)),
-            "no anthropic model with a non-zero input price"
-        );
+    fn a_plugin_price_list_replaces_the_table_and_a_failure_keeps_it() {
+        mu_testutil::home();
+        let ok: BoxPrices = Box::pin(async { Ok(PLUGIN_PRICES.to_string()) });
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(rt.block_on(try_fetch(ok)));
+        let u = usage(1_000_000, 1_000_000, 0, 0);
+        assert_eq!(cost("fake/priced-model", &u).unwrap().total, 6.0);
+        let _ = std::fs::remove_file(paths::profile_home().join("pricing.json"));
+        if let Ok(mut g) = TABLE.write() {
+            *g = None;
+        }
+        let err: BoxPrices = Box::pin(async { Err("no gateway".to_string()) });
+        assert!(!rt.block_on(try_fetch(err)));
+        assert!(cost("fake/priced-model", &u).is_none());
     }
 }

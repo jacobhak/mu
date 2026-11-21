@@ -15,7 +15,7 @@ pub enum Kind {
 pub struct McpServer {
     pub name: String,
     pub kind: Kind,
-    /// omp's `auth` block (`{type, credentialId}`), when present.
+    /// omp's `auth` block (`{type, resource, …}`), when present.
     pub auth: Option<Value>,
     /// Milliseconds; `Some(0)` means no timeout, `None` means the default (30 s).
     pub timeout_ms: Option<u64>,
@@ -48,8 +48,41 @@ impl McpServer {
         self.auth.as_ref()?.get("type")?.as_str()
     }
 
-    pub fn credential_id(&self) -> Option<&str> {
-        self.auth.as_ref()?.get("credentialId")?.as_str().filter(|s| !s.is_empty())
+    /// The protected resource whose OAuth token this server uses: an http server's url, or a stdio
+    /// server's `auth.resource`. It keys the stored credential.
+    pub fn oauth_key(&self) -> Option<String> {
+        match &self.kind {
+            Kind::Http { url, .. } => Some(url.clone()),
+            Kind::Stdio { .. } => {
+                if self.auth_type() != Some("oauth") {
+                    return None;
+                }
+                let r = self.entry["auth"]["resource"].as_str()?;
+                (r.starts_with("http://") || r.starts_with("https://")).then(|| r.to_string())
+            }
+        }
+    }
+
+    /// The OAuth settings the bridge reads from `MU_MCP_OAUTH`, as a JSON object; absent keys are omitted.
+    pub fn oauth_env(&self) -> String {
+        let (auth, oauth) = (&self.entry["auth"], &self.entry["oauth"]);
+        let pick = |key: &str, from: &[&Value]| from.iter().find_map(|v| v.get(key).filter(|x| !x.is_null())).cloned();
+        let mut out = serde_json::Map::new();
+        let fields: [(&str, Option<Value>); 7] = [
+            ("clientId", pick("clientId", &[oauth, auth])),
+            ("clientSecret", pick("clientSecret", &[oauth, auth])),
+            ("scope", pick("scope", &[oauth])),
+            ("callbackPort", pick("callbackPort", &[oauth])),
+            ("callbackPath", pick("callbackPath", &[oauth])),
+            ("redirectUri", pick("redirectUri", &[oauth])),
+            ("tokenUrl", pick("tokenUrl", &[auth])),
+        ];
+        for (k, v) in fields {
+            if let Some(v) = v {
+                out.insert(k.into(), v);
+            }
+        }
+        Value::Object(out).to_string()
     }
 
     /// Whether this server is known to need a stored OAuth credential.
@@ -253,6 +286,11 @@ pub fn load_all_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<
                 )),
                 Ok(Some(mut s)) => {
                     s.raw_url = raw.get("url").and_then(Value::as_str).map(String::from);
+                    if trusted && matches!(s.kind, Kind::Stdio { .. }) && s.wants_oauth() && s.oauth_key().is_none() {
+                        warnings.push(format!(
+                            "mcp server `{name}`: OAuth on a stdio server needs `auth.resource`, the URL of its protected resource; starting it without a token"
+                        ));
+                    }
                     let key = connection_key(&s);
                     if keys.contains(&key) {
                         continue;
@@ -455,14 +493,16 @@ mod tests {
         let (cwd, agent) = (d.join("p"), d.join("a"));
         write(
             &agent.join("mcp.json"),
-            r#"{"mcpServers":{"h":{"url":"http://h","timeout":"0","requestIdFormat":"string","instructions":"false","auth":{"type":"oauth","credentialId":"mcp_oauth_1"}},"s":{"command":"c","env":{"A":"b","N":1},"cwd":"/w"}}}"#,
+            r#"{"mcpServers":{"h":{"url":"http://h","timeout":"0","requestIdFormat":"string","instructions":"false","auth":{"type":"oauth","clientId":"cid"},"oauth":{"scope":"a b","callbackPort":8123}},"s":{"command":"c","env":{"A":"b","N":1},"cwd":"/w"}}}"#,
         );
         let (s, w) = load_with(&cwd, &agent, &env);
         assert!(w.is_empty(), "{w:?}");
         let h = &s[0];
         assert_eq!(h.timeout_ms, Some(0));
         assert!(h.string_ids && !h.instructions && h.wants_oauth());
-        assert_eq!(h.credential_id(), Some("mcp_oauth_1"));
+        assert_eq!(h.oauth_key().as_deref(), Some("http://h"));
+        let env: Value = serde_json::from_str(&h.oauth_env()).unwrap();
+        assert_eq!(env, json!({"clientId": "cid", "scope": "a b", "callbackPort": 8123}));
         match &s[1].kind {
             Kind::Stdio { env, cwd, .. } => {
                 assert_eq!(env, &vec![("A".to_string(), "b".to_string()), ("N".to_string(), "1".to_string())]);
@@ -470,6 +510,23 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_stdio_server_is_keyed_by_its_oauth_resource() {
+        let d = tmp();
+        let (cwd, agent) = (d.join("p"), d.join("a"));
+        write(
+            &agent.join("mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"c","auth":{"type":"oauth","resource":"https://r/mcp"}},"b":{"command":"c","auth":{"type":"oauth","resource":"nope"}},"c":{"command":"c","auth":{"resource":"https://r"}}}}"#,
+        );
+        let (s, w) = load_with(&cwd, &agent, &env);
+        assert_eq!(s[0].oauth_key().as_deref(), Some("https://r/mcp"));
+        assert_eq!(s[1].oauth_key(), None);
+        assert_eq!(s[2].oauth_key(), None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("`b`") && w[0].contains("auth.resource"), "{w:?}");
         let _ = std::fs::remove_dir_all(d);
     }
 

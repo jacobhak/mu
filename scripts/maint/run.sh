@@ -76,7 +76,7 @@ nightly() {
     worktree fix origin/main "$branch"
     local fixwt="$MAINT/wt/fix" prompt="$RUN/s0-prompt.md" fout="$RUN/s0-fixer.md"
     cat > "$prompt" <<P
-Fix main. The check run is in $RUN/main (check.txt and one log per stage). The pinned omp for contract tests is at $MAINT/omp/$(pinned_ver)/omp (set MU_OMP to it). Work in the current directory.
+Fix main. The check run is in $RUN/main (check.txt and one log per stage). Work in the current directory.
 P
     rc=0; run_agent maint-fixer "$MU_MAINT_FIX_USD" "$fixwt" "$prompt" "$fout" || rc=$?
     local green=0
@@ -205,7 +205,8 @@ P
   rc=0; run_agent maint-triage "$MU_MAINT_TRIAGE_USD" "$bwt" "$tprompt" "$tout" || rc=$?
   if [ "$rc" = 0 ]; then
     local lastline
-    lastline="$(grep -v '^[[:space:]]*$' "$tout" | tail -n 1)"
+    # The last JSON-object line: a model may wrap it in a code fence, which then is the last line.
+    lastline="$(grep -E '^[[:space:]]*\{.*\}[[:space:]]*$' "$tout" | tail -n 1)"
     if echo "$lastline" | jq -e '.behaviour_change | type == "boolean"' >/dev/null 2>&1; then
       change="$(echo "$lastline" | jq -r '.behaviour_change')"
       summary="$(echo "$lastline" | jq -r '.summary // ""')"
@@ -228,7 +229,7 @@ MODE: behaviour review (checks are GREEN; do not go looking for failures). Triag
 
 $summary
 
-Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
+Upstream change material is in $RUN/material. Work in the current directory.
 
 For each listed change, decide whether mu's own code, prompts, tool descriptions or docs are now wrong, stale or incomplete because of it, and fix those. If nothing in mu is, make no change: do not add a test that only pins upstream behaviour. Follow the final-message format for behaviour review in your agent instructions.
 P
@@ -236,7 +237,7 @@ P
       result=s1; sev="S1 — bump fails checks"; labels=(maint:bump maint:needs-review)
       [ "$pinfail" = 0 ] || sev="S1 — cargo cannot resolve the v$latest pin"
       cat > "$fprompt" <<P
-Adapt mu to oh-my-pi v$latest (bumped from v$pinned). The failing check run is in $RUN/bump (check.txt and one log per stage). Upstream change material is in $RUN/material. The pinned omp for contract tests is at $MAINT/omp/$latest/omp (set MU_OMP to it). Work in the current directory.
+Adapt mu to oh-my-pi v$latest (bumped from v$pinned). The failing check run is in $RUN/bump (check.txt and one log per stage). Upstream change material is in $RUN/material. Work in the current directory.
 P
       if [ "$change" = true ]; then
         cat >> "$fprompt" <<P

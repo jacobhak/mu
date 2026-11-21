@@ -2,11 +2,11 @@
 
 mu reaches a model one of three ways:
 
-- **Natively**, for Anthropic, OpenAI and Baseten, with an API key you add in mu. Requests go straight to the provider's API. No omp process runs.
-- **Natively, on your ChatGPT plan**, for `openai-chatgpt/*` models after [Sign in with ChatGPT](#sign-in-with-chatgpt). Requests go straight to `api.openai.com`. No omp process runs.
-- **Through the omp gateway** for everything else: subscription logins (Claude Pro/Max, Codex), every other omp provider, and any of the three providers you have not given a key to. The gateway holds those credentials; log in with omp (`/login` lists omp's providers too).
+- **Natively**, for Anthropic, OpenAI and Baseten, with an API key you add in mu. Requests go straight to the provider's API. No gateway runs.
+- **Natively, on your ChatGPT plan**, for `openai-chatgpt/*` models after [Sign in with ChatGPT](#sign-in-with-chatgpt). Requests go straight to `api.openai.com`. No gateway runs.
+- **Through a gateway provider plugin** for everything else: subscription logins (Claude Pro/Max, Codex), every other provider omp supports, and any of the three providers you have not given a key to. The gateway holds those credentials. It is installed separately, for example [`ai-provider-gateway`](#gateway-plugins), which wraps omp's auth broker and gateway; log in with `ai-provider-gateway login`. mu does not run omp itself, and without a gateway plugin these models are unavailable.
 
-The gateway is one `omp auth-broker` and `omp auth-gateway` pair shared by every mu process. It starts with the first request that needs it. Each mu process that asks for it holds a lease, refreshed on every ask. The pair stops itself, checked every 30 seconds (`MU_GATEWAY_TICK_SECS`), once no live mu process has asked for 30 minutes (`MU_GATEWAY_IDLE_SECS`, in seconds); the lease of a process that has exited is dropped at once, so it does not hold the pair. The `omp` broker and gateway processes you see in `ps` are this pair; the next request starts a new one.
+How a gateway starts, is shared between mu processes and stops when idle is up to the plugin; see its README. mu starts it with the first request that needs it.
 
 Model ids are omp's (`anthropic/claude-sonnet-5-5`, `openai/gpt-5.5`, `baseten/moonshotai/Kimi-K3`), so the roles you copy from omp (`mu models import`) work in both tools. Plan models are `openai-chatgpt/<model>` (`openai-chatgpt/gpt-6.1-sol`): the same models as `openai/<model>`, billed to your ChatGPT plan instead of a key.
 
@@ -14,15 +14,15 @@ Model ids are omp's (`anthropic/claude-sonnet-5-5`, `openai/gpt-5.5`, `baseten/m
 
 A provider is native **only when mu's key store has an entry for it and the entry says its chat models use the key**. A `ANTHROPIC_API_KEY` in your environment does not switch anything: that would silently move `anthropic/*` from a Claude subscription to per-token billing. To use the variable, add it explicitly (`mu auth add anthropic --chat --env ANTHROPIC_API_KEY`, or pick it in `/login`).
 
-For Anthropic and OpenAI the key can serve chat models, or only web search ([web.md](web.md)), and you say which: `/login` asks "Use this key for chat models?", `mu auth add` needs `--chat` or `--no-chat`, and `mu auth use <provider> --chat|--no-chat` changes it later. A key saved with `--no-chat` leaves `anthropic/*` on omp (your subscription). Baseten's key is only for chat. Keys for Parallel and Exa are only for web search.
+For Anthropic and OpenAI the key can serve chat models, or only web search ([web.md](web.md)), and you say which: `/login` asks "Use this key for chat models?", `mu auth add` needs `--chat` or `--no-chat`, and `mu auth use <provider> --chat|--no-chat` changes it later. A key saved with `--no-chat` leaves `anthropic/*` on the gateway (your subscription). Baseten's key is only for chat. Keys for Parallel and Exa are only for web search.
 
-Add a key for chat and the provider's models go native at once, in running sessions too; remove it (`/logout`, `mu auth rm`) and they go back through omp. The status line shows `· key` after a natively routed model, and cost is shown instead of subscription usage, since a key is metered.
+Add a key for chat and the provider's models go native at once, in running sessions too; remove it (`/logout`, `mu auth rm`) and they go back through the gateway. The status line shows `· key` after a natively routed model, and cost is shown instead of subscription usage, since a key is metered.
 
 A ChatGPT sign-in routes `openai-chatgpt/*` natively on the same terms, once the account's grant includes plan usage. Nothing picks between `openai/*` and `openai-chatgpt/*` for you: the model you choose decides the credential, and a plan model never falls back to your key or the reverse. The status line shows `· ChatGPT plan` for a plan model and tracks session cost at model token rates, as for gateway subscriptions.
 
 ## Sign in with ChatGPT
 
-OpenAI lets open-source tools run requests on a ChatGPT Plus or Pro plan. mu signs you in through the browser and sends requests to `api.openai.com` with the resulting access token. This is not the Codex CLI's login, and omp is not involved. OpenAI offers plan usage to open-source and local personal tools such as mu; a sign-in whose grant lacks plan usage (`chatgpt.tokens.use.direct`) is kept, but cannot run models until you approve that permission by signing in again.
+OpenAI lets open-source tools run requests on a ChatGPT Plus or Pro plan. mu signs you in through the browser and sends requests to `api.openai.com` with the resulting access token. This is not the Codex CLI's login, and no gateway is involved. OpenAI offers plan usage to open-source and local personal tools such as mu; a sign-in whose grant lacks plan usage (`chatgpt.tokens.use.direct`) is kept, but cannot run models until you approve that permission by signing in again.
 
 Sign in from `/login` (the first row, "Continue with ChatGPT") or with `mu auth login openai-chatgpt`. mu opens the sign-in page in your browser; the browser returns to `127.0.0.1:1455`. Over SSH, or wherever the browser cannot reach that address, the browser ends on a page that does not load. Copy its address and paste it into mu (or the terminal running `mu auth login`), then press Enter. Esc cancels, and nothing is saved.
 
@@ -40,7 +40,7 @@ The route is HTTP streaming only (no WebSocket). It leaves out request fields th
 
 ## Adding a key
 
-In the TUI, `/login` lists the providers and the search services under "API keys" (`key saved · chat`, `key saved · not for chat`, `$ANTHROPIC_API_KEY is set`, `not set`), then omp's OAuth providers. `/login anthropic` goes straight to the key flow: paste a key (masked, nothing is echoed), use the environment variable, or give a command. mu asks the provider whether the key works before saving (`401`/`403` rejects it; if the provider cannot be reached you can save anyway; Parallel and Exa have no free way to test a key, so theirs are saved unchecked). With a key already stored for Anthropic or OpenAI, `/login anthropic` offers to change its chat use or replace it. `/logout` removes a stored key.
+In the TUI, `/login` lists the providers and the search services under "API keys" (`key saved · chat`, `key saved · not for chat`, `$ANTHROPIC_API_KEY is set`, `not set`), then ChatGPT, custom endpoints and MCP servers that need a login. `/login anthropic` goes straight to the key flow: paste a key (masked, nothing is echoed), use the environment variable, or give a command. mu asks the provider whether the key works before saving (`401`/`403` rejects it; if the provider cannot be reached you can save anyway; Parallel and Exa have no free way to test a key, so theirs are saved unchecked). With a key already stored for Anthropic or OpenAI, `/login anthropic` offers to change its chat use or replace it. `/logout` removes a stored key.
 
 From a shell, for scripts and headless setups:
 
@@ -64,7 +64,7 @@ mu auth test openai-chatgpt                  # does the plan answer?
 
 ## Custom endpoints (vLLM, Modal, any OpenAI-compatible server)
 
-Any server that speaks Chat Completions (`POST <base>/chat/completions`, `GET <base>/models`) can be a named provider, with no omp involved. Set one up from `/login` ("+ Add a custom endpoint…", or `/login custom`), or from a shell:
+Any server that speaks Chat Completions (`POST <base>/chat/completions`, `GET <base>/models`) can be a named provider, with no gateway involved. Set one up from `/login` ("+ Add a custom endpoint…", or `/login custom`), or from a shell:
 
 ```sh
 mu providers add modal --base-url https://example--serve.modal.run/v1 --label Modal --env MODAL_API_KEY
@@ -170,7 +170,7 @@ Anthropic requests also carry 5-minute prompt-cache breakpoints on the last tool
 
 ## Models and prices
 
-Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`crates/mu-provider/src/model/catalog.json`), regenerated on every omp bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/switch` and `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.toml` limits win over both. A [custom endpoint](#custom-endpoints-vllm-modal-any-openai-compatible-server)'s model is in neither catalogue, so its `cost` rates in `providers.toml` are its price, and only that.
+Context windows, output limits, prices, efforts and Chat Completions quirks come from a snapshot of omp's catalog (`crates/mu-provider/src/model/catalog.json`), still generated from oh-my-pi's sources at every crates bump by `scripts/maint/gen-catalog.sh`. Baseten also lists its models live (`GET /models`, at most daily, an hour after a failed attempt, cached in `native-models.json`) so new ids appear in `/switch` and `/model` with the provider's own limits and prices; listed prices win over the snapshot's. A discovered id without a snapshot row runs with reasoning off, because a new family's reasoning shape is not guessed. `models.toml` limits win over both. A [custom endpoint](#custom-endpoints-vllm-modal-any-openai-compatible-server)'s model is in neither catalogue, so its `cost` rates in `providers.toml` are its price, and only that.
 
 `/switch` and the model list of the `/model` editor mark native models `key` and plan models `ChatGPT plan`. mu never picks a model for you: with no `--model` and no `default` role (set with `/model`, or in `models.toml`; `mu models import` copies omp's), `-p`, `--headless` and ACP runs stop with an error that says so, and the TUI starts with no model (the status line shows `no model · /switch`), refuses prompts, and waits for you to `/login` and choose one with `/switch` (`/model` only edits the saved roles, so saving `@default` does not choose a model for the running session). A chosen model stays on its credential until you pick another; nothing falls back from one to another. A gateway model whose provider is native is routed natively and is marked `key` too.
 
@@ -178,11 +178,22 @@ Context windows, output limits, prices, efforts and Chat Completions quirks come
 
 Messages store the same `api` strings as omp (`anthropic-messages`, `openai-responses`, `openai-completions`), and reasoning is stored the way omp stores it (a Responses reasoning item in `thinkingSignature`; the field name `reasoning_content` for Chat Completions), so a session can continue in either tool. Reasoning is only replayed natively to where it came from: Anthropic thinking to the same API and provider; OpenAI and Baseten reasoning to the same model. Anthropic and OpenAI drop other models' thinking; Baseten models get it as text in a `<think>` block, as omp does.
 
-## What still needs omp
+## What still needs a gateway
 
-- Subscription logins through omp (Claude Pro/Max, Codex) and every provider other than Anthropic, OpenAI, Baseten and ChatGPT (the gateway). Sign in with ChatGPT itself needs no omp.
-- OAuth for MCP servers. Web search and fetch no longer use omp ([web.md](web.md)).
+- Subscription logins (Claude Pro/Max, Codex) and every provider other than Anthropic, OpenAI, Baseten and ChatGPT: they go through a [gateway plugin](#gateway-plugins). Sign in with ChatGPT itself needs no gateway.
+- Nothing else. MCP OAuth is done by mu ([mcp.md](mcp.md)), and web search and fetch never needed omp ([web.md](web.md)).
 - Model roles and limits are mu's own `models.toml`; omp's `models.yml` only matters to the gateway.
+
+## Gateway plugins
+
+A gateway is a native plugin whose manifest says `provider = "gateway"`. mu asks it for two things over the plugin's stdio JSON-RPC:
+
+- `provider/endpoint {clientPid, start}` returns `{baseUrl, token}`, or `null` when `start` is false and nothing is running. mu calls it with `start: true` to use the gateway and with `start: false` to peek at quota without starting anything.
+- `provider/prices {}` returns `{"models":[{provider,id,name?,reasoning?,pricingStatus?,cost:{input,output,cacheRead,cacheWrite,longContext?}}]}`, the price list mu caches per profile in `pricing.json`.
+
+The base URL must serve `/v1/messages`, `/v1/models` and `/v1/usage`.
+
+`ai-provider-gateway` is such a plugin: a separate tool that wraps omp's auth broker and gateway and also works without mu. Its `install.sh` writes the manifest as the `gateway` plugin under `~/.mu/plugins` unless you pass `--no-mu`. Without a plugin, `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` point mu at a running gateway directly; that has no price list, so gateway models outside the snapshot show no cost.
 
 ## Not in v1
 

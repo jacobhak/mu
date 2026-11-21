@@ -211,10 +211,10 @@ impl KeyTarget {
 /// What the user is told after saving a provider's key: the routing and billing consequence.
 pub fn saved_notice(def: &ProviderDef, chat: bool) -> String {
     if chat {
-        format!("{}/* models now use your API key (billed per token) instead of omp.", def.id)
+        format!("{}/* models now use your API key (billed per token) instead of the gateway.", def.id)
     } else {
         format!(
-            "saved the {} key; {}/* chat models still go through omp (your subscription). The key is used only where you choose it, such as /web.",
+            "saved the {} key; {}/* chat models still go through the gateway. The key is used only where you choose it, such as /web.",
             def.label, def.id
         )
     }
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(ids.iter().filter(|t| t.asks_chat()).count(), 2);
         assert!(find("nope").is_none());
         assert_eq!(find("exa").unwrap().env_hint(), "EXA_API_KEY");
-        assert!(saved_notice(native_def("openai").unwrap(), false).contains("still go through omp"));
+        assert!(saved_notice(native_def("openai").unwrap(), false).contains("still go through the gateway"));
     }
 
     fn cfg() -> Configs {

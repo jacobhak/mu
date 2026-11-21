@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: check.sh <worktree> <outdir>   Runs the check stages with the omp pinned by the worktree.
+# Usage: check.sh <worktree> <outdir>   Runs the check stages on the worktree.
 # Writes <outdir>/<stage>.log and <outdir>/check.txt. Exit 0 only when every stage is ok.
 set -uo pipefail
 wt="$(cd "${1:?usage: check.sh <worktree> <outdir>}" && pwd)"
@@ -10,19 +10,10 @@ export CARGO_TARGET_DIR
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 
-ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' "$wt/upstream.toml")"
-omp="$MAINT/omp/$ver/omp"
-if ! "$wt/scripts/fetch-omp.sh" "$ver" "$omp" > "$out/fetch-omp.log" 2>&1; then
-  echo "fetch-omp FAILED" > "$out/check.txt"
-  cat "$out/fetch-omp.log" >&2
-  exit 1
-fi
-export MU_OMP="$omp"
-
 # The fmt/clippy/test stage is the heavy one: with offload installed and its build nodes reachable it runs
 # there (`offload run -- <command>`, as AGENTS.md says) instead of on the bot's box. Build, contract and
-# smoke stay local: they need the local omp profile (the contract tests list models through it), a live
-# model, tmux and the release binary. MU_MAINT_OFFLOAD=0 forces everything local. A stage that outlives
+# smoke stay local: they need a live model, API keys, tmux and the release binary. MU_MAINT_OFFLOAD=0 forces
+# everything local. A stage that outlives
 # MU_MAINT_STAGE_SECS fails: a hung test (issue #21) once held the nightly run until systemd killed it after 3 h.
 stage_secs="${MU_MAINT_STAGE_SECS:-2400}"
 use_offload() {

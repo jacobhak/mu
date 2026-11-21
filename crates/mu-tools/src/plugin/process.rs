@@ -277,8 +277,9 @@ impl Proc {
 
     pub(super) async fn shutdown(&self) {
         if self.mcp().is_none() {
-            let line = serde_json::to_string(&Request::new(None, "shutdown", json!({}))).expect("request serializes");
-            let _ = tokio::time::timeout(Duration::from_secs(2), self.write_line(&line)).await;
+            // A request, answered when the plugin is done: stdin stays open meanwhile, so core can still reply
+            // to what the plugin asks on its way out (sealing its state through `core/secrets`).
+            let _ = self.request("shutdown", json!({}), Some(Duration::from_secs(5))).await;
         }
         let Ok(mut stdin) = tokio::time::timeout(Duration::from_secs(2), self.stdin.lock()).await else {
             // A writer is stuck on a full pipe: the plugin is not reading, so stop its group.
@@ -412,6 +413,7 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
                 mu_provider::auth::web::plugin_config(&mu_provider::auth::store::Store::new()).await
             }
             "core/webSearch" => Err("core/webSearch is only for the web plugin".into()),
+            "core/secrets" => core_secrets(&proc.name, p),
             "ui/notify" => {
                 let level = p["level"].as_str().unwrap_or("info");
                 let _ =
@@ -426,14 +428,42 @@ async fn handle_plugin_request(proc: Rc<Proc>, slot: Rc<Slot>, shared: Rc<Shared
             Ok(v) => Response::ok(id, v),
             // A token that could not be fetched is a failed request, not a missing method.
             Err(e)
-                if matches!(req.method.as_str(), "core/mcpToken" | "core/webSearch" | "core/complete")
-                    && !not_found =>
+                if matches!(
+                    req.method.as_str(),
+                    "core/mcpSecret" | "core/webSearch" | "core/complete" | "core/secrets"
+                ) && !not_found =>
             {
                 Response::err_kind(id, -32603, e, err_kind)
             }
             Err(e) => Response::err(id, -32601, e),
         };
         let _ = proc.write_line(&serde_json::to_string(&resp).expect("response serializes")).await;
+    }
+}
+
+/// `core/secrets`: a plugin's own namespace in the sealed secret store. The namespace is never the plugin's choice.
+fn core_secrets(plugin: &str, p: &Value) -> Result<Value, String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use mu_common::{plugin_secrets as store, sealed};
+    let home = mu_common::paths::profile_home();
+    let ns = format!("plugin-{plugin}");
+    let name = || p["name"].as_str().ok_or_else(|| "missing name".to_string());
+    let e = |e: sealed::SealedError| e.to_string();
+    match p["op"].as_str().unwrap_or("") {
+        "get" => {
+            let v = store::get(&home, &ns, name()?).map_err(e)?;
+            Ok(json!({"value": v.map(|b| STANDARD.encode(b))}))
+        }
+        "put" => {
+            let v = p["value"].as_str().ok_or("missing value")?;
+            let bytes = STANDARD.decode(v).map_err(|_| "value is not base64".to_string())?;
+            store::put(&home, &ns, name()?, &bytes).map_err(e)?;
+            Ok(json!({}))
+        }
+        "delete" => Ok(json!({"deleted": store::delete(&home, &ns, name()?).map_err(e)?})),
+        "info" => Ok(json!({"sealed": store::sealed(&home), "unlocked": sealed::is_unlocked()})),
+        op => Err(format!("unknown core/secrets op `{op}`")),
     }
 }
 
@@ -471,8 +501,6 @@ impl PluginHost {
             Kind::Native { manifest } => {
                 let mut c = Command::new(resolve_command(manifest));
                 c.args(&manifest.command[1..]).current_dir(&manifest.dir);
-                // The plugins that run omp (the gateway) inherit its memory copy; a locked state fails there.
-                c.envs(mu_common::omp_state::envs().unwrap_or_default());
                 c
             }
         };

@@ -54,7 +54,6 @@ fn mu(home: &Path, cwd: &Path) -> Command {
         .env("MU_HOME", home)
         .env("HOME", home)
         .env("PATH", home.join("empty-bin"))
-        .env("MU_OMP", home.join("no-omp"))
         .env_remove("OMP_PROFILE")
         .env_remove("MU_GATEWAY_URL")
         .env_remove("MU_THEME")
@@ -440,112 +439,6 @@ fn a_terminal_call_is_sized_and_fed_by_the_client() {
     let out: String = seen.iter().filter_map(|v| v["event"]["Event"]["ToolOutput"]["chunk"].as_str()).collect();
     assert!(out.contains("from-the-pty"), "the terminal's output reaches the client: {seen:?}");
     assert!(seen.iter().any(|v| v["event"]["Event"].get("ToolEnd").is_some()));
-}
-
-/// A stand-in for omp that prints a prompt, reads one line and exits with 3.
-fn fake_omp(dir: &Path) -> PathBuf {
-    let path = dir.join("fake-omp");
-    std::fs::write(&path, "#!/bin/sh\nprintf 'READY\\n'\nread x\nprintf 'got:%s\\n' \"$x\"\nexit 3\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
-#[test]
-fn a_host_program_runs_on_a_terminal_with_its_output_pushed_and_its_input_taken() {
-    use base64::Engine;
-    let b64 = &base64::engine::general_purpose::STANDARD;
-    let (home, cwd) = fixture();
-    let omp = fake_omp(&home);
-    let agent = Agent::start_env(&home, &cwd, &[], &[("MU_OMP", omp.as_path())]);
-    let mut c = Client::connect(&agent.socket);
-    c.hello();
-    c.until(caught_up);
-    let run = json!({"id": 5, "program": {"McpLogin": {"name": "x"}}, "cols": 80, "rows": 24});
-    c.send(&ClientLine::Host { id: 1, call: "program_run".into(), args: run });
-    let mut seen = String::new();
-    let pushed = |v: &Value| v["pushed"]["name"] == "program_output";
-    let text = |v: &Value| {
-        String::from_utf8_lossy(&b64.decode(v["pushed"]["data"]["data"].as_str().unwrap()).unwrap()).into_owned()
-    };
-    while !seen.contains("READY") {
-        let lines = c.until(pushed);
-        seen.push_str(&text(lines.last().unwrap()));
-    }
-    let keys = json!({"id": 5, "data": b64.encode(b"hello\n")});
-    c.send(&ClientLine::Host { id: 2, call: "program_input".into(), args: keys });
-    let mut done = None;
-    while done.is_none() {
-        let v = c.next().expect("the stream goes on");
-        if pushed(&v) {
-            seen.push_str(&text(&v));
-        } else if v["hostReply"]["id"] == 1 {
-            done = Some(v);
-        }
-    }
-    assert!(seen.contains("got:hello"), "the keystrokes reached the program: {seen:?}");
-    assert_eq!(done.unwrap()["hostReply"]["result"]["Ok"]["code"], 3);
-}
-
-#[test]
-fn a_login_started_by_a_client_writes_the_agents_credentials_not_the_clients() {
-    let (home, cwd) = fixture();
-    let omp = home.join("login-omp");
-    std::fs::create_dir_all(home.join(".omp/agent")).unwrap();
-    std::fs::write(&omp, "#!/bin/sh\nprintf '%s' \"$1\" > \"$HOME/.omp/agent/auth.json\"\n").unwrap();
-    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let agent = Agent::start_env(&home, &cwd, &[], &[("MU_OMP", omp.as_path())]);
-    let mut c = Client::connect(&agent.socket);
-    c.hello();
-    c.until(caught_up);
-    let run = json!({"id": 6, "program": {"Login": {"args": ["x"], "pick": null}}, "cols": 80, "rows": 24});
-    c.send(&ClientLine::Host { id: 1, call: "program_run".into(), args: run });
-    let done = c.until(|v| v["hostReply"]["id"] == 1);
-    assert_eq!(done.last().unwrap()["hostReply"]["result"]["Ok"]["code"], 0);
-    let written = home.join(".omp/agent/auth.json");
-    assert_eq!(std::fs::read_to_string(written).unwrap(), "login", "the agent's home got the credentials");
-    let clients = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    assert_ne!(clients, home.path());
-    assert_ne!(std::fs::read_to_string(clients.join(".omp/agent/auth.json")).ok().as_deref(), Some("login"));
-}
-
-#[test]
-fn a_program_ends_with_the_client_that_started_it() {
-    let (home, cwd) = fixture();
-    let marker = home.join("hung-up");
-    let omp = home.join("waiting-omp");
-    std::fs::write(
-        &omp,
-        // Builtins only: the agent's PATH is empty in these tests.
-        format!("#!/bin/sh\ntrap ': > \"{}\"; exit 1' HUP\nprintf 'READY\\n'\nread x\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let agent = Agent::start_env(&home, &cwd, &[], &[("MU_OMP", omp.as_path())]);
-    let mut c = Client::connect(&agent.socket);
-    c.hello();
-    c.until(caught_up);
-    c.send(&ClientLine::Host {
-        id: 1,
-        call: "program_run".into(),
-        args: json!({"id": 9, "program": {"McpLogin": {"name": "x"}}, "cols": 80, "rows": 24}),
-    });
-    let mut seen = String::new();
-    while !seen.contains("READY") {
-        let line = c.until(|v| v["pushed"]["name"] == "program_output").pop().unwrap();
-        let data = line["pushed"]["data"]["data"].as_str().unwrap();
-        seen.push_str(&String::from_utf8_lossy(
-            &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).unwrap(),
-        ));
-    }
-    // The program waits for a line nobody will send; its client leaves.
-    c.send(&ClientLine::Detach);
-    for _ in 0..100 {
-        if marker.exists() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!("the program was not hung up when its client left");
 }
 
 /// The session file of `id` under a test home.

@@ -4330,7 +4330,6 @@ dependencies = [
  "jiff",
  "libc",
  "rand_core 0.6.4",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4338,16 +4337,6 @@ dependencies = [
  "ssh-key",
  "tokio",
  "zeroize",
-]
-
-[[package]]
-name = "mu-gateway"
-version = "0.1.0"
-dependencies = [
- "libc",
- "mu-common",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -4440,6 +4429,7 @@ name = "mu-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "encoding_rs",
  "flume",
  "futures-util",

@@ -490,8 +490,6 @@ pub async fn run_child_observed(
     let mut cmd = match child {
         ChildCmd::Local(exe) => {
             let mut cmd = tokio::process::Command::new(exe);
-            // A locked state leaves the child to fail where it needs omp's credentials.
-            cmd.envs(mu_common::omp_state::envs().unwrap_or_default());
             cmd.arg("--headless");
             cmd
         }

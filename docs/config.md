@@ -60,7 +60,7 @@ max_cost = 5.0             # most a launched worker may spend (USD) on the model
 # [agent]                # `mu agent` with no client attached (see remote.md#when-nobody-is-attached)
 # notify_command = "notify-send \"mu $1\" \"$2\""  # run under sh -c when a question or approval starts waiting; $1 is the session id, $2 a one-line summary
 # approval_timeout = 0   # seconds after which a waiting approval is answered "unavailable" (a question is cancelled); 0 waits for ever
-# state_key = "off"      # "ssh": seal auth.json and omp's logins under a key a client unlocks with its SSH ed25519 key (see remote.md#encrypted-state)
+# state_key = "off"      # "ssh": seal auth.json and plugin secrets under a key a client unlocks with its SSH ed25519 key (see remote.md#encrypted-state)
 # state_key_file = "/run/secrets/state-key"  # unattended instead: a 32-byte key (raw or 64 hex characters) read at start; implies encryption, wins over the command
 # state_key_command = "cat /run/secrets/state-key"  # the same, printed by a command run under sh -c
 

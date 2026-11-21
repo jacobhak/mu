@@ -98,7 +98,8 @@ pub fn build(cwd: &std::path::Path, loaded: Loaded) -> Setup {
     );
     let providers = Rc::new(Providers::new(
         cfgs.clone(),
-        mu_provider::provider::endpoint::GatewaySource::new(host.gateway_start()),
+        mu_provider::provider::endpoint::GatewaySource::new(host.gateway_start())
+            .with_plugin(host.gateway_peek(), host.gateway_prices()),
     ));
     // A malformed providers.toml is reported here; model resolution fails on it until it is fixed.
     if let Err(e) = providers.custom_registry().snapshot() {

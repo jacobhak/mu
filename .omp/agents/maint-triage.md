@@ -11,14 +11,14 @@ Your prompt names a material directory containing: `changelog.diff` (omp package
 Decide whether the upgrade leaves something mu owns wrong. `behaviour_change` is `true` only when BOTH hold: (a) a person using mu would notice the change after upgrading, and (b) because of it, something in mu's own code, prompts, tool descriptions, docs, README or tests is now wrong, stale or incomplete. It is NOT about whether mu needs code changes to build or pass its checks; the bump has already been built and tested, and that work is handled separately.
 
 (b) holds if, for example:
-- mu parses or matches output whose shape or wording changed (`crates/mu-provider/src/model/pricing.rs` for `omp models ls --json`, the login menu parser, error classification in the provider code)
+- mu parses or matches output whose shape or wording changed (error classification in the provider code)
 - mu's code works around or depends on the behaviour that changed (a retry, a timeout, a fallback that is now wrong or redundant)
 - text mu itself ships or documents describes the old behaviour: a prompt or tool description written in mu, the docs, the README (grep them: a documented gateway default that changed counts)
 - stored data written by one version can no longer be read by the other (token store changes, say)
 
 Everything else a user could notice is `false` for `behaviour_change`. List it in `fyi`, one line each, instead of in `summary`:
 - behaviour mu passes through unchanged from the linked crates (omp-edit, omp-shell, omp-diff, omp-xfs): edit rules and their error text, the edit tool description omp-edit supplies, shell semantics and builtins, walk and ignore rules. mu hands these to the model or the user as they are, so an upstream fix there needs nothing from mu unless mu's own code or text contradicts it.
-- changes that take effect entirely inside code omp runs on its own: the gateway and provider quirks, `omp login` flows, rows added to or removed from the login menu, omp's TUI, tools mu does not call.
+- changes that take effect entirely inside code mu does not run: omp's own gateway, provider quirks and TUI, tools mu does not call.
 
 These are NOT user-visible at all, even though they show up in mu; leave them out of both lists:
 - catalog data: models added, removed or re-priced, changed default or role models, new capability axes (a change only if the JSON shape mu parses in `crates/mu-provider/src/model/pricing.rs` changes)

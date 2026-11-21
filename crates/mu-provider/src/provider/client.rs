@@ -110,6 +110,16 @@ pub struct Providers {
 }
 
 impl Providers {
+    /// Looks up a running gateway without starting one; for the quota tracker.
+    pub fn gateway_peek_fn(&self) -> endpoint::PeekFn {
+        self.gateway.peek_fn()
+    }
+
+    /// The gateway's price list as JSON text, for `model::pricing`.
+    pub fn gateway_prices(&self) -> endpoint::BoxPrices {
+        self.gateway.prices()
+    }
+
     pub fn new(cfg: Rc<Configs>, gateway: endpoint::GatewaySource) -> Self {
         Self::with_store(cfg, gateway, crate::auth::store::Store::new())
     }
@@ -831,7 +841,7 @@ mod native_route_tests {
             assert!(matches!(e, ProviderError::Fatal(_)), "{e:?}");
             let msg = e.to_string();
             assert!(msg.contains("Anthropic rejected the API key; run /login to replace it"), "{msg}");
-            assert!(!msg.contains("NATIVE0123456789") && !msg.contains("omp login"), "{msg}");
+            assert!(!msg.contains("NATIVE0123456789") && !msg.contains("gateway"), "{msg}");
             assert_eq!(seen.lock().unwrap().len(), 1, "a stored key is not retried");
             let _ = std::fs::remove_dir_all(d);
         });

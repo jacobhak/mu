@@ -16,6 +16,10 @@ PR checks run on the PR merged with `main`; if CI fails on files you didn't touc
 
 `ci.yml` has a `macos` job on the self-hosted Mac as well as the Linux one, and release builds run `scripts/ci-checks.sh` on both platforms. Nothing gates a merge on either job (branch protection needs a paid plan on a private repo), so a red job is a signal to act on, not a block. Be careful about platform specifics: `/proc`, `/sys`, `readlink -f`, GNU `sed`/`date`/`stat` flags, `/tmp` vs `$TMPDIR`, case-insensitive filesystems and Linux-only syscalls. mu supports Linux and macOS equally: use portable APIs, and where the platforms differ, implement both rather than skipping one.
 
-Run builds, tests and checks as `offload run -- <command>` (for example `offload run -- scripts/ci-checks.sh`), never locally.
+CI uses no GitHub Actions cache (no `rust-cache`): caches counted against the account's shared Actions storage, filled it, and a release artifact upload failed. Linux jobs get compiled crates from sccache; the macOS job builds cold (about as fast as a cache restore was). Do not add one back.
+
+Start work in a worktree with `scripts/start.sh <branch>`, never in the main checkout.
+
+Run builds, tests and checks as `offload run -- <command>` (for example `offload run -- scripts/ci-checks.sh`), never locally. A subagent that builds must run where `offload` is available: with a `[task] launcher`, list only agent kinds that need no build in `launch` (workers behind a launcher have no toolchain or `offload`).
 
 Enable the pre-commit fmt check once per clone: `git config core.hooksPath .githooks`.

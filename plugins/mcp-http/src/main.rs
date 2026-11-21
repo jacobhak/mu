@@ -3,21 +3,29 @@
 //! through unchanged; the bridge only handles auth and session recovery.
 //!
 //! Configuration comes from the environment only:
-//! - `MU_MCP_URL` (required): the server endpoint.
+//! - `MU_MCP_URL` (required): the server endpoint, which is also the key of its OAuth credential.
 //! - `MU_MCP_HEADERS` (optional): a JSON object of header name to string value, sent on every request.
-//! - `MU_MCP_AUTH` (optional): a JSON object such as `{"type":"oauth"}`. When set, a token is fetched
-//!   before the first request instead of after the first 401.
+//! - `MU_MCP_OAUTH` (optional): a JSON object of OAuth settings (`clientId`, `clientSecret`, `scope`,
+//!   `callbackPort`, `callbackPath`, `redirectUri`, `tokenUrl`). When set, the stored credential is
+//!   looked up before the first request; after a 401 it is always asked for.
 //!
-//! Bridge to core: on a 401 the bridge writes `{"method":"core/mcpToken","params":{"force":bool}}` on
-//! stdout and expects `{"result":{"token":"..."}}` or an error on stdin. The token lives in memory only.
-//! Headers and tokens are never printed.
+//! The credential is kept by the core: the bridge sends `core/mcpSecret` (`get`, `put`, `delete`) on
+//! stdout and reads the reply on stdin. Tokens live in memory only. Headers and tokens are never printed.
+//!
+//! Modes: no argument relays; `login` runs the sign-in (notifications `login/url` and `login/notice`,
+//! `login/paste` in, `login/done` out); `token` prints one access token as `token/result`.
+
+mod core_rpc;
+mod oauth;
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use core_rpc::{CoreRpc, Pump};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use oauth::{Fail, OAuthCfg};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError};
@@ -25,8 +33,6 @@ use rmcp::transport::{StreamableHttpClientTransport, Transport};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// The bridge's own request ids start here, so they do not collide with the core's small ids.
-const TOKEN_ID_BASE: u64 = 1 << 40;
 /// A message may be sent again once after a session re-initialise; a second expiry is fatal.
 const MAX_SESSION_ATTEMPTS: u8 = 1;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -34,32 +40,35 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 type Http = StreamableHttpClientTransport<reqwest::Client>;
 type SendErr = StreamableHttpError<reqwest::Error>;
 type Sends = FuturesUnordered<Pin<Box<dyn Future<Output = Sent> + Send>>>;
+type Tokens = FuturesUnordered<Pin<Box<dyn Future<Output = Result<Option<String>, Fail>>>>>;
 
 struct Config {
     url: String,
     headers: HashMap<HeaderName, HeaderValue>,
-    auth_up_front: bool,
+    oauth: OAuthCfg,
+}
+
+fn oauth_from_env() -> Result<OAuthCfg, String> {
+    let url = std::env::var("MU_MCP_URL").ok().filter(|u| !u.is_empty()).ok_or("MU_MCP_URL is not set")?;
+    OAuthCfg::parse(url, std::env::var("MU_MCP_OAUTH").ok())
 }
 
 impl Config {
     fn from_env() -> Result<Self, String> {
-        let url = std::env::var("MU_MCP_URL").ok().filter(|u| !u.is_empty()).ok_or("MU_MCP_URL is not set")?;
+        let oauth = oauth_from_env()?;
         let headers = match std::env::var("MU_MCP_HEADERS") {
             Ok(s) if !s.trim().is_empty() => parse_headers(&s)?,
             _ => HashMap::new(),
         };
-        let auth_up_front = match std::env::var("MU_MCP_AUTH") {
-            Ok(s) if !s.trim().is_empty() => {
-                let v: Value = serde_json::from_str(&s).map_err(|_| "MU_MCP_AUTH is not valid JSON")?;
-                if !v.is_object() {
-                    return Err("MU_MCP_AUTH must be a JSON object".into());
-                }
-                true
-            }
-            _ => false,
-        };
-        Ok(Config { url, headers, auth_up_front })
+        Ok(Config { url: oauth.url.clone(), headers, oauth })
     }
+}
+
+/// What a token fetch is for: the look before the first request, or a token after a 401.
+#[derive(Clone, Copy)]
+enum Want {
+    UpFront,
+    Token { force: bool },
 }
 
 /// Parses `MU_MCP_HEADERS`. Error messages name the header but never print its value.
@@ -107,9 +116,10 @@ struct Bridge {
     swallow: Vec<Value>,
     /// Messages waiting for a fresh token.
     waiting: Vec<Retry>,
-    /// The outstanding core/mcpToken request: (id, forced).
-    token_wait: Option<(u64, bool)>,
-    next_id: u64,
+    /// Token fetches under way; at most one.
+    tokens: Tokens,
+    rpc: CoreRpc,
+    pump: Pump,
     /// 401s from the current transport since the server last answered. 1 asks for a token, 2 forces
     /// one, and 3 gives up.
     episode_401s: u32,
@@ -122,6 +132,7 @@ fn method_of(v: &Value) -> Option<&str> {
 
 impl Bridge {
     fn new(cfg: Config) -> Self {
+        let (rpc, pump) = core_rpc::channel();
         Bridge {
             cfg,
             client: reqwest::Client::new(),
@@ -134,8 +145,9 @@ impl Bridge {
             stored_initialized: None,
             swallow: Vec::new(),
             waiting: Vec::new(),
-            token_wait: None,
-            next_id: 0,
+            tokens: FuturesUnordered::new(),
+            rpc,
+            pump,
             episode_401s: 0,
             stdout: tokio::io::stdout(),
         }
@@ -143,7 +155,7 @@ impl Bridge {
 
     /// True when the worker is gone and nothing is left that could replace it.
     fn dead(&self) -> bool {
-        self.closed && self.sends.is_empty() && self.waiting.is_empty() && self.token_wait.is_none()
+        self.closed && self.sends.is_empty() && self.waiting.is_empty() && self.tokens.is_empty()
     }
 
     fn build(&self) -> Http {
@@ -200,49 +212,48 @@ impl Bridge {
     /// Sends a message from the core, connecting first, or queues it while a token is missing.
     async fn submit(&mut self, r: Retry) -> Result<(), String> {
         if self.transport.is_none() {
-            if self.cfg.auth_up_front && self.token.is_none() {
+            if self.cfg.oauth.enabled {
                 self.waiting.push(r);
-                return self.want_token(false).await;
+                self.want_token(Want::UpFront);
+                return Ok(());
             }
             self.connect();
         }
         self.dispatch(r).await
     }
 
-    /// Asks the core for a token, unless a request is already outstanding.
-    async fn want_token(&mut self, force: bool) -> Result<(), String> {
-        if self.token_wait.is_some() {
-            return Ok(());
+    /// Starts fetching a token, unless a fetch is already under way.
+    fn want_token(&mut self, want: Want) {
+        if !self.tokens.is_empty() {
+            return;
         }
-        let id = TOKEN_ID_BASE + self.next_id;
-        self.next_id += 1;
-        self.token_wait = Some((id, force));
-        self.emit(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "core/mcpToken",
-            "params": { "force": force },
-        }))
-        .await
+        let (cfg, rpc) = (self.cfg.oauth.clone(), self.rpc.clone());
+        self.tokens.push(Box::pin(async move {
+            match want {
+                Want::UpFront => oauth::up_front_token(&cfg, &rpc).await,
+                Want::Token { force } => oauth::access_token(&cfg, &rpc, force).await.map(Some),
+            }
+        }));
     }
 
-    /// Handles the core's answer to `core/mcpToken`.
-    async fn on_token_reply(&mut self, v: &Value, forced: bool) -> Result<(), String> {
-        if let Some(token) = v.pointer("/result/token").and_then(Value::as_str) {
-            self.token = Some(token.to_owned());
-            let waiting = std::mem::take(&mut self.waiting);
-            return self.rebuild(waiting).await;
+    /// A token fetch finished: connect with it, or fail the bridge.
+    async fn on_token(&mut self, r: Result<Option<String>, Fail>) -> Result<(), String> {
+        match r {
+            Ok(token) => {
+                if token.is_some() {
+                    self.token = token;
+                }
+                let waiting = std::mem::take(&mut self.waiting);
+                self.rebuild(waiting).await
+            }
+            Err(Fail::NeedsLogin) => Err("not logged in: run /login mcp:<name> in mu".into()),
+            Err(Fail::Other(e)) => Err(e),
         }
-        if !forced {
-            return self.want_token(true).await;
-        }
-        let why = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("no token");
-        Err(format!("the core gave no token for this server: {why}"))
     }
 
     /// A send was refused with 401. Ask for a token (the second time forced) and retry, or give up.
     async fn on_auth(&mut self, generation: u64, r: Retry) -> Result<(), String> {
-        if self.token_wait.is_some() {
+        if !self.tokens.is_empty() {
             self.waiting.push(r);
             return Ok(());
         }
@@ -256,7 +267,8 @@ impl Bridge {
         }
         let force = self.episode_401s == 2;
         self.waiting.push(r);
-        self.want_token(force).await
+        self.want_token(Want::Token { force });
+        Ok(())
     }
 
     /// Starts a new transport and sends `msgs` on it. The stored initialize handshake is replayed
@@ -317,12 +329,8 @@ impl Bridge {
                 return Ok(());
             }
         };
-        if let Some((id, forced)) = self.token_wait
-            && method_of(&v).is_none()
-            && v.get("id") == Some(&json!(id))
-        {
-            self.token_wait = None;
-            return self.on_token_reply(&v, forced).await;
+        if self.pump.on_reply(&v) {
+            return Ok(());
         }
         match method_of(&v) {
             Some("initialize") => self.stored_init = Some(v.clone()),
@@ -337,7 +345,7 @@ impl Bridge {
         self.episode_401s = 0;
         let v = serde_json::to_value(&msg).map_err(|e| format!("cannot encode a server message: {e}"))?;
         // `core/*` is the private channel between this bridge and the core. A server must never reach
-        // it (it could make the core fetch tokens and hand them back): answer "method not found".
+        // it (it could make the core read the stored credential): answer "method not found".
         if let Some(m) = method_of(&v)
             && m.starts_with("core/")
         {
@@ -379,6 +387,8 @@ async fn run(cfg: Config) -> Result<(), String> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {
+            Some(call) = b.pump.next_line() => b.emit(&call).await?,
+            Some(r) = b.tokens.next(), if !b.tokens.is_empty() => b.on_token(r).await?,
             line = lines.next_line() => {
                 let line: Option<String> = line.map_err(|e| format!("stdin: {e}"))?;
                 match line {
@@ -403,9 +413,97 @@ async fn run(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
+async fn write_json(v: &Value) -> Result<(), String> {
+    let mut out = tokio::io::stdout();
+    let mut line = serde_json::to_vec(v).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    out.write_all(&line).await.map_err(|e| format!("stdout: {e}"))?;
+    out.flush().await.map_err(|e| format!("stdout: {e}"))
+}
+
+/// Runs `work` while serving the core's side of stdio: its calls go out, replies and `login/paste`
+/// lines come in. Stdin closing ends `paste`, which `login` takes as a cancel.
+async fn drive<T>(
+    work: impl Future<Output = T>,
+    mut pump: Pump,
+    mut paste: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> Result<T, String> {
+    tokio::pin!(work);
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut open = true;
+    let out = loop {
+        tokio::select! {
+            r = &mut work => break r,
+            Some(call) = pump.next_line() => write_json(&call).await?,
+            line = lines.next_line(), if open => match line {
+                Ok(Some(l)) => {
+                    let Ok(v) = serde_json::from_str::<Value>(l.trim()) else { continue };
+                    if method_of(&v) == Some("login/paste") {
+                        if let (Some(tx), Some(t)) = (&paste, v.pointer("/params/text").and_then(Value::as_str)) {
+                            let _ = tx.send(t.to_string());
+                        }
+                    } else {
+                        pump.on_reply(&v);
+                    }
+                }
+                _ => {
+                    open = false;
+                    paste = None;
+                }
+            },
+        }
+    };
+    for call in pump.drain() {
+        write_json(&call).await?;
+    }
+    Ok(out)
+}
+
+async fn finish(method: &str, params: Value) -> Result<(), String> {
+    write_json(&json!({"jsonrpc": "2.0", "method": method, "params": params})).await
+}
+
+/// `login`: the sign-in. Ends with `login/done`, `{}` or `{"error": …}`.
+async fn run_login(cfg: OAuthCfg) -> Result<(), String> {
+    let (rpc, pump) = core_rpc::channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let r = drive(oauth::login(&cfg, &rpc, &mut rx), pump, Some(tx)).await?;
+    finish("login/done", r.as_ref().map_or_else(|e| json!({"error": e}), |_| json!({}))).await?;
+    r
+}
+
+/// `token`: one access token as `token/result`: `{"token"}`, `{"needsLogin": true}` or `{"error"}`.
+async fn run_token(cfg: OAuthCfg) -> Result<(), String> {
+    let (rpc, pump) = core_rpc::channel();
+    let r = drive(oauth::access_token(&cfg, &rpc, false), pump, None).await?;
+    match r {
+        Ok(token) => finish("token/result", json!({"token": token})).await,
+        Err(Fail::NeedsLogin) => finish("token/result", json!({"needsLogin": true})).await,
+        Err(Fail::Other(e)) => {
+            finish("token/result", json!({"error": e})).await?;
+            Err(e)
+        }
+    }
+}
+
+enum Mode {
+    Relay(Config),
+    Login(OAuthCfg),
+    Token(OAuthCfg),
+}
+
+fn mode_from_args() -> Result<Mode, String> {
+    match std::env::args().nth(1).as_deref() {
+        None => Config::from_env().map(Mode::Relay),
+        Some("login") => oauth_from_env().map(Mode::Login),
+        Some("token") => oauth_from_env().map(Mode::Token),
+        Some(other) => Err(format!("unknown mode `{other}` (expected `login` or `token`)")),
+    }
+}
+
 fn main() {
-    let cfg = match Config::from_env() {
-        Ok(c) => c,
+    let mode = match mode_from_args() {
+        Ok(m) => m,
         Err(e) => {
             eprintln!("mu-mcp-http: {e}");
             std::process::exit(2);
@@ -414,7 +512,13 @@ fn main() {
     // Already-installed is fine: the provider is process-wide.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
-    let result = rt.block_on(run(cfg));
+    let result = rt.block_on(async {
+        match mode {
+            Mode::Relay(cfg) => run(cfg).await,
+            Mode::Login(cfg) => run_login(cfg).await,
+            Mode::Token(cfg) => run_token(cfg).await,
+        }
+    });
     // A blocked stdin read would keep a normal runtime drop waiting, so do not wait for it.
     rt.shutdown_background();
     match result {

@@ -4,13 +4,24 @@
 use super::host::{Kind, McpInfo, McpSync, PluginHost, Shared, Slot, stop_slot};
 use super::process::{Proc, sibling_or_path};
 use crate::mcp;
-use mu_common::rpc::Request;
+use mu_common::rpc::{Frame, Framed, Request, Response};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
+use std::process::Stdio;
 use std::rc::Rc;
 use std::time::Duration;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
+
+const MCP_OAUTH_NS: &str = "mcp-oauth";
+
+/// What a running `mu-mcp-http login` tells the user.
+pub enum McpLoginEvent {
+    Url(String),
+    Notice(String),
+}
 
 /// `file://` URI for an absolute path, percent-encoding everything outside the unreserved set and `/`.
 fn file_uri(path: &str) -> String {
@@ -31,7 +42,7 @@ pub(super) enum McpError {
 }
 
 /// What an MCP server may ask of the client: `ping`, `roots/list` and notifications; the http
-/// bridge also asks for OAuth tokens (`core/mcpToken`).
+/// bridge also reads and writes its OAuth credential (`core/mcpSecret`).
 pub(super) async fn mcp_request(
     proc: &Proc,
     m: &mcp::McpSlot,
@@ -44,21 +55,8 @@ pub(super) async fn mcp_request(
             let cwd = shared.init.borrow().cwd.clone();
             Ok(json!({"roots": [{"uri": file_uri(&cwd), "name": "project"}]}))
         }
-        "core/mcpToken" if matches!(m.server.borrow().kind, mcp::config::Kind::Http { .. }) => {
-            let server = m.server.borrow().clone();
-            let force = req.params["force"].as_bool().unwrap_or(false);
-            let ids = mcp::auth::credential_ids(&server, mu_common::paths::profile().as_deref());
-            let broker = broker_endpoint(shared).await;
-            match mcp::auth::fetch_token(&ids, force, broker.as_ref()).await {
-                Some(token) => {
-                    m.needs_login.set(false);
-                    Ok(json!({"token": token}))
-                }
-                None => {
-                    m.needs_login.set(true);
-                    Err(McpError::Failed(format!("no credential for mcp:{}", server.name)))
-                }
-            }
+        "core/mcpSecret" if matches!(m.server.borrow().kind, mcp::config::Kind::Http { .. }) => {
+            mcp_secret(m, &req.params)
         }
         n if n.starts_with("notifications/") => {
             use std::io::Write;
@@ -73,13 +71,57 @@ pub(super) async fn mcp_request(
     }
 }
 
-/// The auth broker's address and token, only when the gateway plugin is already running (this
-/// never starts it) and its daemon is alive.
-async fn broker_endpoint(shared: &Shared) -> Option<(String, String)> {
-    let slot = shared.gateway.borrow().as_ref()?.upgrade()?;
-    let proc = slot.proc.borrow().clone()?;
-    let v = proc.request("broker/endpoint", json!({}), Some(Duration::from_secs(5))).await.ok()?;
-    Some((v["url"].as_str()?.to_string(), v["token"].as_str()?.to_string()))
+/// The server's OAuth credential blob in the sealed secret store, keyed by the hash of its resource.
+/// The blob is the bridge's, opaque to core.
+fn mcp_secret(m: &mcp::McpSlot, params: &Value) -> Result<Value, McpError> {
+    use mu_common::{plugin_secrets as store, sealed::SealedError};
+    use sha2::{Digest, Sha256};
+    let fail = |e: SealedError| McpError::Failed(e.to_string());
+    let server = m.server.borrow().clone();
+    let key =
+        server.oauth_key().ok_or_else(|| McpError::Failed(format!("mcp:{} has no OAuth resource", server.name)))?;
+    let name: String = Sha256::digest(key.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let home = mu_common::paths::profile_home();
+    match params["op"].as_str().unwrap_or("") {
+        "get" => {
+            let found = store::get(&home, MCP_OAUTH_NS, &name).map_err(fail)?;
+            let text = found
+                .map(String::from_utf8)
+                .transpose()
+                .map_err(|_| McpError::Failed("the stored credential is not UTF-8".into()))?;
+            // A probe is the bridge looking before it knows the server needs OAuth at all.
+            if !params["probe"].as_bool().unwrap_or(false) {
+                m.needs_login.set(text.is_none());
+            }
+            if let Some(t) = &text {
+                register_tokens(t);
+            }
+            Ok(json!({"value": text}))
+        }
+        "put" => {
+            let v = params["value"].as_str().ok_or_else(|| McpError::Failed("missing value".into()))?;
+            store::put(&home, MCP_OAUTH_NS, &name, v.as_bytes()).map_err(fail)?;
+            m.needs_login.set(false);
+            register_tokens(v);
+            Ok(json!({}))
+        }
+        "delete" => {
+            store::delete(&home, MCP_OAUTH_NS, &name).map_err(fail)?;
+            m.needs_login.set(true);
+            Ok(json!({}))
+        }
+        op => Err(McpError::Failed(format!("unknown core/mcpSecret op `{op}`"))),
+    }
+}
+
+/// Redacts the blob's access and refresh tokens from now on; best effort.
+fn register_tokens(blob: &str) {
+    let Ok(v) = serde_json::from_str::<Value>(blob) else { return };
+    for k in ["access_token", "refresh_token"] {
+        if let Some(t) = v.pointer(&format!("/credentials/token_response/{k}")).and_then(Value::as_str) {
+            mu_base::secrets::register_stored("MCP_OAUTH_TOKEN", t);
+        }
+    }
 }
 
 /// `tools/list` with `nextCursor` paging.
@@ -442,6 +484,147 @@ impl PluginHost {
         Ok((after.len(), before != after))
     }
 
+    /// Runs `mu-mcp-http <mode>` (`login` or `token`) for this server and returns its final message
+    /// (`login/done` or `token/result`). Its `core/mcpSecret` requests are served here; `login/paste`
+    /// lines carry what the user pastes. `cancel`, `limit` or the helper ending without a result kill it.
+    async fn run_oauth_helper(
+        &self,
+        m: &mcp::McpSlot,
+        mode: &str,
+        events: Option<UnboundedSender<McpLoginEvent>>,
+        mut paste: Option<UnboundedReceiver<String>>,
+        cancel: CancellationToken,
+        limit: Duration,
+    ) -> Result<Value, String> {
+        use mcp::config::Kind;
+        let server = m.server.borrow().clone();
+        let key = server.oauth_key().ok_or_else(|| format!("mcp:{} has no OAuth resource", server.name))?;
+        let project = std::path::PathBuf::from(&self.shared.init.borrow().cwd);
+        let project = if project.as_os_str().is_empty() { ".".into() } else { project };
+        let mut cmd = Command::new(sibling_or_path("mu-mcp-http"));
+        cmd.arg(mode).current_dir(&project).env("MU_MCP_URL", key).env("MU_MCP_OAUTH", server.oauth_env());
+        if let Kind::Http { headers, .. } = &server.kind {
+            let headers = mcp::auth::resolve_pairs(headers, &project).await;
+            let headers: serde_json::Map<String, Value> =
+                headers.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+            cmd.env("MU_MCP_HEADERS", Value::Object(headers).to_string());
+        }
+        let log_dir = mu_common::paths::mu_home().join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join(format!("plugin-{}.log", server.name)))
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log);
+        let mut child =
+            mu_base::process::spawn_grouped(&mut cmd, true).map_err(|e| format!("cannot start mu-mcp-http: {e}"))?;
+        let pgid = child.id().unwrap_or(0) as i32;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let (tx, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let reader = tokio::task::spawn_local(async move {
+            let mut r = Framed::new(BufReader::new(stdout));
+            while let Some(f) = r.next_frame().await {
+                if tx.send(f).is_err() {
+                    break;
+                }
+            }
+        });
+        let run = async {
+            loop {
+                let line = tokio::select! {
+                    f = frames.recv() => match f {
+                        None => return Err("the sign-in helper ended without a result".to_string()),
+                        Some(Frame::Response(_)) => continue,
+                        Some(Frame::Request(r)) => {
+                            let param = |k: &str| r.params[k].as_str().unwrap_or_default().to_string();
+                            match r.method.as_str() {
+                                "login/url" => {
+                                    if let Some(e) = &events {
+                                        let _ = e.send(McpLoginEvent::Url(param("url")));
+                                    }
+                                    continue;
+                                }
+                                "login/notice" => {
+                                    if let Some(e) = &events {
+                                        let _ = e.send(McpLoginEvent::Notice(param("text")));
+                                    }
+                                    continue;
+                                }
+                                "login/done" | "token/result" => return Ok(r.params),
+                                "core/mcpSecret" => {
+                                    let Some(id) = r.id.clone() else { continue };
+                                    let resp = match mcp_secret(m, &r.params) {
+                                        Ok(v) => Response::ok(id, v),
+                                        Err(McpError::NotFound(s)) => Response::err(id, -32601, s),
+                                        Err(McpError::Failed(s)) => Response::err(id, -32603, s),
+                                    };
+                                    serde_json::to_string(&resp).expect("response serializes")
+                                }
+                                _ => continue,
+                            }
+                        }
+                    },
+                    text = async {
+                        match paste.as_mut() {
+                            Some(p) => p.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match text {
+                        Some(text) => serde_json::to_string(&Request::new(None, "login/paste", json!({"text": text})))
+                            .expect("request serializes"),
+                        None => {
+                            paste = None;
+                            continue;
+                        }
+                    },
+                };
+                if stdin.write_all(format!("{line}\n").as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                    return Err("the sign-in helper ended without a result".to_string());
+                }
+            }
+        };
+        let out = tokio::select! {
+            r = run => r,
+            _ = cancel.cancelled() => Err("cancelled".to_string()),
+            _ = tokio::time::sleep(limit) => Err(format!("no result within {}s", limit.as_secs())),
+        };
+        reader.abort();
+        mu_base::process::kill_group(pgid, libc::SIGKILL);
+        let _ = child.wait().await;
+        out
+    }
+
+    /// Signs in to an OAuth MCP server through the bridge's `login` mode. Progress goes to `events`,
+    /// pasted redirect URLs come in on `paste`.
+    pub async fn mcp_login(
+        &self,
+        name: &str,
+        events: UnboundedSender<McpLoginEvent>,
+        paste: UnboundedReceiver<String>,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        let slot = self
+            .slots
+            .borrow()
+            .iter()
+            .find(|s| s.as_mcp().is_some_and(|m| m.name() == name))
+            .cloned()
+            .ok_or_else(|| format!("no MCP server `{name}` is configured"))?;
+        let m = slot.as_mcp().expect("an mcp slot");
+        if m.server.borrow().oauth_key().is_none() {
+            return Err(format!("mcp:{name} has no OAuth: a stdio server needs `auth.resource`"));
+        }
+        let done =
+            self.run_oauth_helper(m, "login", Some(events), Some(paste), cancel, Duration::from_secs(11 * 60)).await?;
+        match done["error"].as_str() {
+            Some(e) => Err(e.to_string()),
+            None => Ok(()),
+        }
+    }
+
     pub(super) async fn mcp_command(&self, m: &mcp::McpSlot) -> Result<Command, String> {
         use mcp::config::Kind;
         let server = m.server.borrow().clone();
@@ -452,17 +635,23 @@ impl PluginHost {
                 let dir = cwd.as_ref().map(|c| project.join(c)).unwrap_or_else(|| project.clone());
                 let mut cmd = Command::new(command);
                 cmd.args(args).current_dir(dir).envs(mcp::auth::resolve_pairs(env, &project).await);
-                let ids = mcp::auth::credential_ids(&server, mu_common::paths::profile().as_deref());
-                if server.wants_oauth() && !ids.is_empty() {
-                    let broker = broker_endpoint(&self.shared).await;
-                    match mcp::auth::fetch_token(&ids, false, broker.as_ref()).await {
-                        Some(t) => {
-                            cmd.env("OAUTH_ACCESS_TOKEN", t);
+                if server.wants_oauth() && server.oauth_key().is_some() {
+                    let r = self
+                        .run_oauth_helper(m, "token", None, None, CancellationToken::new(), Duration::from_secs(20))
+                        .await;
+                    match r {
+                        Ok(v) if v["token"].is_string() => {
+                            cmd.env("OAUTH_ACCESS_TOKEN", v["token"].as_str().unwrap_or_default());
                         }
-                        None => {
+                        Ok(v) if v["needsLogin"].as_bool() == Some(true) => {
                             m.needs_login.set(true);
                             return Err(self.login_msg(&server.name));
                         }
+                        Ok(v) => {
+                            let e = v["error"].as_str().unwrap_or("no token").to_string();
+                            return Err(format!("mcp:{}: could not get its OAuth token: {e}", server.name));
+                        }
+                        Err(e) => return Err(format!("mcp:{}: could not get its OAuth token: {e}", server.name)),
                     }
                 }
                 Ok(cmd)
@@ -475,9 +664,7 @@ impl PluginHost {
                 cmd.current_dir(&project)
                     .env("MU_MCP_URL", url)
                     .env("MU_MCP_HEADERS", Value::Object(headers).to_string());
-                if server.wants_oauth() {
-                    cmd.env("MU_MCP_AUTH", server.auth.clone().unwrap_or_default().to_string());
-                }
+                cmd.env("MU_MCP_OAUTH", server.oauth_env());
                 Ok(cmd)
             }
         }
@@ -496,5 +683,42 @@ impl PluginHost {
         *w.instructions.borrow_mut() = r["instructions"].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
         let n = Request::new(None, "notifications/initialized", json!({}));
         proc.write_line(&serde_json::to_string(&n).expect("notification serializes")).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(url: &str) -> mcp::McpSlot {
+        let server = mcp::config::McpServer {
+            name: "s".into(),
+            kind: mcp::config::Kind::Http { url: url.into(), headers: vec![] },
+            auth: None,
+            timeout_ms: None,
+            instructions: true,
+            string_ids: false,
+            entry: json!({"url": url}),
+            raw_url: None,
+        };
+        mcp::McpSlot::new(server, "/")
+    }
+
+    #[test]
+    fn the_credential_blob_round_trips_and_tracks_needing_login() {
+        mu_testutil::home();
+        let m = slot(&format!("http://{}/mcp", uuid::Uuid::new_v4()));
+        let get = || mcp_secret(&m, &json!({"op": "get"})).ok().unwrap();
+        assert_eq!(mcp_secret(&m, &json!({"op": "get", "probe": true})).ok().unwrap()["value"], Value::Null);
+        assert!(!m.needs_login.get(), "a probe does not mark the server as needing login");
+        assert_eq!(get()["value"], Value::Null);
+        assert!(m.needs_login.get());
+        mcp_secret(&m, &json!({"op": "put", "value": "{\"a\":1}"})).ok().unwrap();
+        assert!(!m.needs_login.get());
+        assert_eq!(get()["value"], "{\"a\":1}");
+        mcp_secret(&m, &json!({"op": "delete"})).ok().unwrap();
+        assert!(m.needs_login.get());
+        assert_eq!(get()["value"], Value::Null);
+        assert!(matches!(mcp_secret(&m, &json!({"op": "zap"})), Err(McpError::Failed(_))));
     }
 }

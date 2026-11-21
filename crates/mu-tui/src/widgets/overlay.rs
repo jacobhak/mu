@@ -21,8 +21,6 @@ use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 /// One entry of the `/login` picker.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LoginTarget {
-    /// An `omp login` provider, by its menu number.
-    Provider(usize),
     /// An MCP server, by its name in `mcp.json`.
     Mcp(String),
     /// A key target (a chat provider or a search service), by id (`KeyTarget::find`).
@@ -112,7 +110,7 @@ pub enum Overlay {
     ModelRoles {
         st: Box<RoleEditor>,
     },
-    /// What can be logged into: `omp login` providers, then MCP servers that need auth.
+    /// What can be logged into: the key rows, ChatGPT, custom endpoints, then MCP servers that need auth.
     Login {
         pick: Picker<LoginTarget>,
     },
