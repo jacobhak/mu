@@ -1,0 +1,9 @@
+[Unit]
+Description=ai-provider-gateway maintenance bot, nightly
+[Timer]
+Unit=apg-maint@nightly.service
+OnCalendar=*-*-* 04:30
+Persistent=true
+RandomizedDelaySec=10m
+[Install]
+WantedBy=timers.target
