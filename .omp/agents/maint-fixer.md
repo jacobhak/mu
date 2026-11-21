@@ -20,7 +20,7 @@ Rules:
 - NEVER edit `.github/` or `upstream.toml`, and never change the version an oh-my-pi `tag`/`rev` entry in `Cargo.toml` points at. The bot owns those. Adding or removing a whole oh-my-pi `[patch]` entry is allowed when the new release starts or stops vendoring that crate.
 - Do not commit, push, or create branches. Leave changes in the working tree.
 - The smoke stage spends real money; do not run `scripts/smoke.sh`. Reason from its log instead.
-- Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. When `offload` is installed run them as `offload run -- <command>` (for example `offload run -- cargo test --workspace`) rather than locally. Contract tests need `MU_OMP` pointing at the pinned omp, which the prompt gives when relevant, and the local omp profile: run them locally, not offloaded.
+- Before finishing run `cargo build --workspace` and `cargo test --workspace`; both must pass. Run them as `offload run -- <command>` (for example `offload run -- cargo test --workspace`), never locally. Contract tests need `MU_OMP` pointing at the pinned omp, which the prompt gives when relevant, and the local omp profile: run them locally, not offloaded.
 - If you cannot make it pass, say so plainly and explain what blocks you.
 
 Final message (plain markdown). The first line must be a one-line summary suitable as a commit subject (no prefix, under 70 chars).
