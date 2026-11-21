@@ -16,6 +16,6 @@ PR checks run on the PR merged with `main`; if CI fails on files you didn't touc
 
 `ci.yml` has a `macos` job on the self-hosted Mac as well as the Linux one, and release builds run `scripts/ci-checks.sh` on both platforms. Nothing gates a merge on either job (branch protection needs a paid plan on a private repo), so a red job is a signal to act on, not a block. Be careful about platform specifics: `/proc`, `/sys`, `readlink -f`, GNU `sed`/`date`/`stat` flags, `/tmp` vs `$TMPDIR`, case-insensitive filesystems and Linux-only syscalls. mu supports Linux and macOS equally: use portable APIs, and where the platforms differ, implement both rather than skipping one.
 
-If `offload` is installed, run builds, tests and checks as `offload run -- <command>` (for example `offload run -- scripts/ci-checks.sh`) rather than locally.
+Run builds, tests and checks as `offload run -- <command>` (for example `offload run -- scripts/ci-checks.sh`), never locally.
 
 Enable the pre-commit fmt check once per clone: `git config core.hooksPath .githooks`.

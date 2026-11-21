@@ -25,7 +25,12 @@ branch="$(git symbolic-ref --quiet --short HEAD)" || die "detached HEAD; check o
 
 ci_checks() {
   [ "$checks" = 1 ] || return 0
-  scripts/ci-checks.sh || die "checks failed"
+  if command -v offload > /dev/null; then
+    offload run -- scripts/ci-checks.sh || die "checks failed"
+  else
+    say "offload not installed: running the checks locally"
+    scripts/ci-checks.sh || die "checks failed"
+  fi
 }
 
 # Another agent may push while the checks run: refetch and redo, a few times.

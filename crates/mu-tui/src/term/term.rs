@@ -147,6 +147,9 @@ fn on() -> io::Result<()> {
     execute!(out, EnableBracketedPaste)?;
     if KBD.load(SeqCst) {
         execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+    } else {
+        // xterm modifyOtherKeys: how tmux (`extended-keys on`) and xterm tell Ctrl+Enter from Enter.
+        out.write_all(b"\x1b[>4;2m")?;
     }
     write_terminal_seq("\x1b[?5522h");
     Ok(())
@@ -162,6 +165,8 @@ fn off() {
     let _ = out.write_all(b"\x1b[?2026l");
     if KBD.load(SeqCst) {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
+    } else {
+        let _ = out.write_all(b"\x1b[>4;0m");
     }
     let _ = execute!(out, DisableBracketedPaste, ResetColor, cursor::Show);
     let _ = terminal::disable_raw_mode();

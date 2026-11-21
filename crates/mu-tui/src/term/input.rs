@@ -219,6 +219,24 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
 }
 
+/// xterm's modifyOtherKeys form `ESC [ 27 ; mods ; code ~` (what tmux sends for Ctrl+Enter with
+/// `extended-keys on`) rewritten as the kitty form `ESC [ code ; mods u`, which terminput parses.
+fn modify_other_keys_as_csi_u(seq: &[u8]) -> Option<Vec<u8>> {
+    let body = seq.strip_prefix(b"\x1b[27;")?.strip_suffix(b"~")?;
+    let (mods, code) = body.split_at(body.iter().position(|&b| b == b';')?);
+    let code = &code[1..];
+    let digits = |s: &[u8]| !s.is_empty() && s.iter().all(u8::is_ascii_digit);
+    if !digits(mods) || !digits(code) {
+        return None;
+    }
+    let mut out = b"\x1b[".to_vec();
+    out.extend_from_slice(code);
+    out.push(b';');
+    out.extend_from_slice(mods);
+    out.push(b'u');
+    Some(out)
+}
+
 /// Index just past the OSC terminator (BEL or ST) at or after `from` (at least byte 2), and the payload end.
 fn osc_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     let mut i = from.max(2);
@@ -330,7 +348,9 @@ impl Parser {
             }
             let start = if self.buf[0] == 0x1b && self.buf.len() > 1 { 2 } else { 1 };
             for n in start..=self.buf.len() {
-                match terminput::Event::parse_from(&self.buf[..n]) {
+                let seq = &self.buf[..n];
+                let csi_u = modify_other_keys_as_csi_u(seq);
+                match terminput::Event::parse_from(csi_u.as_deref().unwrap_or(seq)) {
                     Ok(Some(ev)) => {
                         self.buf.drain(..n);
                         out.extend(terminput_crossterm::to_crossterm(ev).ok().map(Input::Term));
@@ -568,6 +588,16 @@ mod tests {
             &got,
             &[key(KeyCode::Char('a')), Input::Term(Event::Paste("x\ny".into())), key(KeyCode::Char('b'))]
         ));
+    }
+
+    #[test]
+    fn modify_other_keys_ctrl_enter_is_a_key() {
+        let mut p = Parser::default();
+        let ctrl_enter = || Input::Term(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)));
+        assert!(same(&p.feed(b"\x1b[27;5;13~"), &[ctrl_enter()]));
+        assert!(same(&p.feed(b"\x1b[13;5u"), &[ctrl_enter()]));
+        assert!(p.feed(b"\x1b[27;5;1").is_empty());
+        assert!(same(&p.feed(b"3~"), &[ctrl_enter()]));
     }
 
     #[test]
