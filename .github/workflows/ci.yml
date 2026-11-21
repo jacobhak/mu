@@ -11,11 +11,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # On a self-hosted runner ~/.cargo/bin holds the real rustup, and
-          # cache-bin prunes that directory: the next job then finds no rustup.
-          cache-bin: false
       - run: scripts/ci-checks.sh
   macos:
     # macOS platform coverage on the self-hosted Mac. Branch protection needs a
@@ -26,7 +21,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
       - run: scripts/ci-checks.sh

@@ -24,10 +24,6 @@ jobs:
       # (the shellcheck stage's `git ls-files`) fails with "dubious ownership".
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # See ci.yml: cache-bin prunes the runner's own ~/.cargo/bin.
-          cache-bin: false
       - run: scripts/ci-checks.sh
       - run: cargo build --release --locked
       - run: scripts/package.sh linux-x64
@@ -47,9 +43,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
       - run: scripts/ci-checks.sh
       - run: cargo build --release --locked
       - run: scripts/package.sh ${{ matrix.plat }}
