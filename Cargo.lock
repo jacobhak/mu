@@ -2949,7 +2949,7 @@ dependencies = [
 [[package]]
 name = "grep-searcher"
 version = "0.1.17"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "bstr",
  "encoding_rs",
@@ -3709,7 +3709,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jaq-core"
 version = "3.1.1"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "dyn-clone",
  "once_cell",
@@ -3719,7 +3719,7 @@ dependencies = [
 [[package]]
 name = "jaq-json"
 version = "2.0.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "bstr",
  "bytes",
@@ -3736,7 +3736,7 @@ dependencies = [
 [[package]]
 name = "jaq-std"
 version = "3.0.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "bstr",
  "jaq-core",
@@ -4888,8 +4888,8 @@ dependencies = [
 
 [[package]]
 name = "omp-ast"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4924,8 +4924,8 @@ dependencies = [
 
 [[package]]
 name = "omp-builtins"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "ansi-width",
  "argmax",
@@ -5020,16 +5020,16 @@ dependencies = [
 
 [[package]]
 name = "omp-diff"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "xutf",
 ]
 
 [[package]]
 name = "omp-edit"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "async-trait",
  "omp-ast",
@@ -5045,8 +5045,8 @@ dependencies = [
 
 [[package]]
 name = "omp-iso"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "async-trait",
  "libc",
@@ -5059,8 +5059,8 @@ dependencies = [
 
 [[package]]
 name = "omp-shell"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5098,8 +5098,8 @@ dependencies = [
 
 [[package]]
 name = "omp-vcs"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "futures",
  "gix",
@@ -5116,8 +5116,8 @@ dependencies = [
 
 [[package]]
 name = "omp-vfs"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "async-trait",
  "libc",
@@ -5130,8 +5130,8 @@ dependencies = [
 
 [[package]]
 name = "omp-xfs"
-version = "19.0.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+version = "19.1.0"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "flume",
  "futures",
@@ -7042,7 +7042,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.0.0#57771ae562b9345e0579bceb2d68d585e3e6927e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
 dependencies = [
  "cc",
  "tree-sitter-language",
