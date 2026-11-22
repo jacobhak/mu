@@ -20,8 +20,9 @@
 //! async runtime that serves the replies.
 
 use crate::state;
-use crate::vendor::fs as vfs;
-use sha2::{Digest, Sha256};
+use mu_common::fs as vfs;
+use mu_common::paths;
+use sha2_10::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -30,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Names the memory directory in the environment of every process that inherits omp's overrides.
-const ENV_STATE: &str = "AI_PROVIDER_GATEWAY_STATE";
+const ENV_STATE: &str = "MU_GATEWAY_STATE";
 const INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Info {
@@ -80,12 +81,12 @@ struct Layout {
 
 impl Layout {
     fn from_env() -> Self {
-        let home = state::user_home();
-        let profile = state::safe_profile();
+        let home = paths::home();
+        let profile = paths::safe_profile();
         Self {
             base: home.join(".omp"),
-            root: state::omp_config_root(),
-            agent: state::omp_agent_dir(),
+            root: paths::omp_config_root(),
+            agent: paths::omp_agent_dir(),
             memory: memory_base(),
             agent_override: profile.is_none() && std::env::var_os("PI_CODING_AGENT_DIR").is_some_and(|d| !d.is_empty()),
             profile,
@@ -179,13 +180,13 @@ fn profile_id(key: &Path) -> String {
 
 /// The one mirror of the profile `key` names: no pid in it, so every adapter and the daemon share it.
 fn mirror_dir(memory: &Path, key: &Path) -> PathBuf {
-    memory.join(format!("ai-provider-gateway-{}-{}", uid(), profile_id(key)))
+    memory.join(format!("mu-gateway-{}-{}", uid(), profile_id(key)))
 }
 
 /// Lock for attach, flush and detach. Kept in a private directory of its own because `memory` is shared
 /// (`/tmp`), and survives the mirror's removal.
 fn lock_path(memory: &Path, key: &Path) -> PathBuf {
-    memory.join(format!("ai-provider-gateway-{}-locks", uid())).join(format!("{}.lock", profile_id(key)))
+    memory.join(format!("mu-gateway-{}-locks", uid())).join(format!("{}.lock", profile_id(key)))
 }
 
 fn users_dir(mem: &Path) -> PathBuf {
@@ -544,12 +545,12 @@ pub fn credential_root() -> PathBuf {
     match std::env::var_os(ENV_STATE).filter(|d| !d.is_empty()) {
         Some(mem) => {
             let top = PathBuf::from(mem).join("omp");
-            match state::safe_profile() {
+            match paths::safe_profile() {
                 Some(p) => top.join("profiles").join(p),
                 None => top,
             }
         }
-        None => state::omp_config_root(),
+        None => paths::omp_config_root(),
     }
 }
 

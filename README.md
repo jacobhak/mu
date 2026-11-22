@@ -10,9 +10,9 @@ mu keeps most of what omp does and changes where the memory goes. A session hold
 
 - **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3.6 MB of private memory (about 20 MB counting the binary's shared pages).
 - **Features start on use.** Web, memory and prediction are separate processes, and so is the optional model gateway (a [gateway provider plugin](docs/providers.md#gateway-plugins)), which only providers without an API key or ChatGPT sign-in in mu need. Each starts on first use and exits after a few idle minutes. A session that talks only to Anthropic, OpenAI or Baseten with your own key, or to OpenAI on your ChatGPT plan, starts no gateway at all. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
-- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 306 MB total, 216 MB private, while they run, idle; measured with `ai-provider-gateway`). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
+- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 306 MB total, 216 MB private, while they run, idle; measured with `scripts/measure-gateway.sh`). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
-- **Works with your omp setup.** mu uses omp's config, models, MCP setup, context files and skills, and, through the gateway, its logins for OAuth providers. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup, and the installer does not bundle omp: Anthropic, OpenAI and Baseten work with just an API key (OpenAI models also run on a ChatGPT plan).
+- **Works with your omp setup.** mu uses omp's config, models, MCP setup, context files and skills, and, through the gateway, its logins for OAuth providers. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup, and the installer fetches omp only when you ask (`--with-omp`, for the gateway): Anthropic, OpenAI and Baseten work with just an API key (OpenAI models also run on a ChatGPT plan).
 
 The cost: features that live inside omp's runtime, such as TypeScript extensions, aren't available. The reasoning and measurements behind the design are in [`DESIGN.md`](DESIGN.md).
 
@@ -29,7 +29,7 @@ mu also adds a few things omp doesn't have:
 Early and experimental: started in October 2026 and changing quickly.
 
 - No stable version. Releases are nightly builds of `main` (`mu-YYYYMMDD-<sha7>`); config, flags and plugin interfaces can change without notice.
-- Model roles, per-model limits and compaction thresholds live in mu's own `models.toml` (copy omp's with `mu models import`). Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth`), with no gateway involved; OpenAI models also run on your ChatGPT plan through Sign in with ChatGPT (`/login`). Every other provider, and subscription logins, go through an optional gateway provider plugin such as `ai-provider-gateway` (see [Providers](docs/providers.md)).
+- Model roles, per-model limits and compaction thresholds live in mu's own `models.toml` (copy omp's with `mu models import`). Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth`), with no gateway involved; OpenAI models also run on your ChatGPT plan through Sign in with ChatGPT (`/login`). Every other provider, and subscription logins, go through the gateway plugin that ships with mu, `mu-gateway` (see [Providers](docs/providers.md)).
 - Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
 - No support promised. Issues and PRs are welcome but may go unanswered.
 
@@ -49,7 +49,7 @@ The installer checks the tarball against the `SHA256SUMS` of the same release, w
 
 This installs `mu` and its plugins under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Installing `--from-source` needs only a Rust toolchain; no Bun. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `--from-source` asks git whether the tree has uncommitted changes and records the answer in `~/.mu/dev-build` (removed by any other install), because the version's `-dirty` suffix misses an unstaged edit. `mu --version` prints `mu 0.1.0 (<sha>) oh-my-pi crates <version>`.
 
-Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu auth add <provider>`; those models then run without a gateway. Or sign in with ChatGPT (`/login`, or `mu auth login openai-chatgpt` from a shell) to run OpenAI models on your plan. A gateway plugin is only needed for subscription (OAuth) logins and the other providers: install `ai-provider-gateway` (its `install.sh` registers it with mu), then log in with `ai-provider-gateway login`. Web search and fetch need no gateway, and MCP OAuth is done by mu itself (`/login mcp:<name>`).
+Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu auth add <provider>`; those models then run without a gateway. Or sign in with ChatGPT (`/login`, or `mu auth login openai-chatgpt` from a shell) to run OpenAI models on your plan. A gateway plugin is only needed for subscription (OAuth) logins and the other providers: install with `--with-omp` (`curl … | bash -s -- --with-omp`, or `scripts/install.sh --with-omp`; it adds the 300 MB omp CLI the plugin runs), then log in with `mu-gateway login <provider>`. Web search and fetch need no gateway, and MCP OAuth is done by mu itself (`/login mcp:<name>`).
 
 ### Updating
 
@@ -62,13 +62,13 @@ Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu
 ### Manual build
 
 ```sh
-cargo build --release --workspace        # target/release/{mu,mu-web,mu-predict,mu-memory}
+cargo build --release --workspace        # target/release/{mu,mu-gateway,mu-web,mu-predict,mu-memory}
 scripts/build-mcp-http.sh                # target/release/mu-mcp-http (see docs/mcp.md)
 mkdir -p ~/.mu/plugins
-for p in web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
+for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
 ```
 
-Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-web`, `mu-predict` and `mu-mcp-http` are resolved next to the `mu` binary. A gateway plugin comes from `ai-provider-gateway`'s `install.sh --from-source` (see its README). `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` bypass the gateway plugin and point at a running gateway directly.
+Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web`, `mu-predict` and `mu-mcp-http` are resolved next to the `mu` binary (the gateway's source and README are in [`plugins/gateway`](plugins/gateway/README.md)). `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` bypass the gateway plugin and point at a running gateway directly.
 
 ### Syntax highlighting
 

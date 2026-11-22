@@ -4,7 +4,7 @@ mu reaches a model one of three ways:
 
 - **Natively**, for Anthropic, OpenAI and Baseten, with an API key you add in mu. Requests go straight to the provider's API. No gateway runs.
 - **Natively, on your ChatGPT plan**, for `openai-chatgpt/*` models after [Sign in with ChatGPT](#sign-in-with-chatgpt). Requests go straight to `api.openai.com`. No gateway runs.
-- **Through a gateway provider plugin** for everything else: subscription logins (Claude Pro/Max, Codex), every other provider omp supports, and any of the three providers you have not given a key to. The gateway holds those credentials. It is installed separately, for example [`ai-provider-gateway`](#gateway-plugins), which wraps omp's auth broker and gateway; log in with `ai-provider-gateway login`. mu does not run omp itself, and without a gateway plugin these models are unavailable.
+- **Through a gateway provider plugin** for everything else: subscription logins (Claude Pro/Max, Codex), every other provider omp supports, and any of the three providers you have not given a key to. The gateway holds those credentials. The [`mu-gateway`](#gateway-plugins) plugin that ships with mu wraps omp's auth broker and gateway; it needs the omp CLI, which `install.sh --with-omp` adds (300 MB, so opt-in), and you log in with `mu-gateway login <provider>`. mu itself does not run omp, and without omp or another gateway plugin these models are unavailable.
 
 How a gateway starts, is shared between mu processes and stops when idle is up to the plugin; see its README. mu starts it with the first request that needs it.
 
@@ -193,7 +193,7 @@ A gateway is a native plugin whose manifest says `provider = "gateway"`. mu asks
 
 The base URL must serve `/v1/messages`, `/v1/models` and `/v1/usage`.
 
-`ai-provider-gateway` is such a plugin: a separate tool that wraps omp's auth broker and gateway and also works without mu. Its `install.sh` writes the manifest as the `gateway` plugin under `~/.mu/plugins` unless you pass `--no-mu`. Without a plugin, `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` point mu at a running gateway directly; that has no price list, so gateway models outside the snapshot show no cost.
+`mu-gateway` ([`plugins/gateway`](../plugins/gateway/README.md)) is such a plugin: it wraps omp's auth broker and gateway, and its CLI (`endpoint`, `status`, `stop`, `login`) also works without mu. `install.sh` installs it as the `gateway` plugin under `~/.mu/plugins`. Without a plugin, `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` point mu at a running gateway directly; that has no price list, so gateway models outside the snapshot show no cost.
 
 ## Not in v1
 

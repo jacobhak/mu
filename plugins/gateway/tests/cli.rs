@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)] // integration-test helpers outside any #[test] fn
+
 use std::process::{Command, Output};
 
 struct Scratch(std::path::PathBuf);
@@ -11,10 +13,10 @@ impl Scratch {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_ai-provider-gateway"))
+        Command::new(env!("CARGO_BIN_EXE_mu-gateway"))
             .args(args)
             .env("HOME", &self.0)
-            .env("AI_PROVIDER_GATEWAY_HOME", self.0.join("gw"))
+            .env("MU_GATEWAY_HOME", self.0.join("gw"))
             .env_remove("OMP_PROFILE")
             .env_remove("PI_PROFILE")
             .output()
@@ -62,11 +64,11 @@ fn stop_with_no_daemon_says_so() {
 #[test]
 fn a_missing_omp_is_an_error_on_stderr_with_exit_1() {
     let s = Scratch::new("noomp");
-    let o = Command::new(env!("CARGO_BIN_EXE_ai-provider-gateway"))
+    let o = Command::new(env!("CARGO_BIN_EXE_mu-gateway"))
         .args(["prices"])
         .env("HOME", &s.0)
-        .env("AI_PROVIDER_GATEWAY_HOME", s.0.join("gw"))
-        .env("AI_PROVIDER_GATEWAY_OMP", s.0.join("no-such-omp"))
+        .env("MU_GATEWAY_HOME", s.0.join("gw"))
+        .env("MU_GATEWAY_OMP", s.0.join("no-such-omp"))
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(1));

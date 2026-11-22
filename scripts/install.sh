@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Installs mu (binaries, plugins) under $MU_HOME (default ~/.mu).
-# Usage: install.sh [--tag <tag>] [--from-source <dir>] [--skip-if-dev]
+# Usage: install.sh [--tag <tag>] [--from-source <dir>] [--skip-if-dev] [--with-omp]
+#   --with-omp  also install the pinned omp CLI (about 300 MB) as $MU_HOME/bin/omp, which the gateway plugin runs for
+#               providers that have no API key in mu. An omp already installed there is kept up to date without it.
 set -euo pipefail
 REPO=jacobhak/mu
-tag="" src="" skip_dev=0
+tag="" src="" skip_dev=0 with_omp=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) tag="${2:?--tag needs a value}"; shift 2 ;;
     --from-source) src="$(cd "${2:?--from-source needs a dir}" && pwd)"; shift 2 ;;
     --skip-if-dev) skip_dev=1; shift ;;
+    --with-omp) with_omp=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -122,12 +125,12 @@ fi
 
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
-for b in mu mu-web mu-mcp-http mu-predict mu-memory; do
+for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do
   [ -e "$stage/bin/$b" ] || continue
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"
 done
-for p in web predict memory; do
+for p in gateway web predict memory; do
   [ -d "$stage/plugins/$p" ] || continue
   # Swap in whole: a half-copied plugin directory is never visible, and the old one is kept on failure.
   dest="${home:?}/plugins/$p"
@@ -137,9 +140,12 @@ for p in web predict memory; do
   mv "$dest.new" "$dest"
   rm -rf "$dest.old"
 done
-# The gateway plugin left mu: an installed one (and its binary and omp) stays as it is.
-if grep -qs 'mu-gateway' "$home/plugins/gateway/plugin.toml"; then
-  echo "install: the gateway plugin is no longer part of mu; install ai-provider-gateway to replace it (the old one is left as is)"
+# The gateway plugin's omp: opt-in, kept current once present.
+if [ "$with_omp" = 1 ] || [ -e "$home/bin/omp" ]; then
+  omp_ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' "$stage/upstream.toml")"
+  "$stage/scripts/fetch-omp.sh" "$omp_ver" "$home/bin/omp"
+else
+  echo "install: the gateway plugin (subscription logins and providers without an API key) needs omp; run install.sh --with-omp to add it"
 fi
 # The memory plugin used to be a Bun daemon; its socket and lock are all it left in $MU_HOME/memory.
 rm -f "$home/bin/mu-memory-daemon" "$home/memory/sock" "$home/memory/lock"

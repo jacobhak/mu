@@ -1,18 +1,17 @@
-//! `ai-provider-gateway`: one shared `omp auth-broker` + `omp auth-gateway` pair per omp profile, leased by client
-//! pid and stopped when idle. Any client can use it; `mu-plugin` is the adapter for mu.
+//! `mu-gateway`: one shared `omp auth-broker` + `omp auth-gateway` pair per omp profile, leased by client pid and
+//! stopped when idle. Any client can use it; `mu-plugin` is the adapter for mu.
 
 mod adapter;
 mod commands;
 mod daemon;
 mod sealed_state;
 mod state;
-mod vendor;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(name = "ai-provider-gateway", version = env!("APG_VERSION"), about)]
+#[command(name = "mu-gateway", version = env!("MU_GATEWAY_VERSION"), about)]
 struct Cli {
     /// The omp profile to serve (default: $OMP_PROFILE).
     #[arg(long, global = true)]
@@ -74,7 +73,7 @@ fn main() {
     match out {
         Ok(v) => println!("{v}"),
         Err(e) => {
-            eprintln!("ai-provider-gateway: {e}");
+            eprintln!("mu-gateway: {e}");
             std::process::exit(1);
         }
     }

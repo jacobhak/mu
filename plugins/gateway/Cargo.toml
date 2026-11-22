@@ -1,19 +1,19 @@
 [package]
-name = "ai-provider-gateway"
+name = "mu-gateway"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
-description = "A shared, lease-managed gateway to the AI providers an omp login can reach"
+description = "mu's gateway provider plugin: a shared, lease-managed gateway to the AI providers an omp login can reach"
 
 [dependencies]
-base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
-libc = "0.2"
+mu-common = { path = "../../crates/mu-common" }
+base64.workspace = true
+clap.workspace = true
+libc.workspace = true
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
-tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "sync", "time", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2_10.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "io-std", "io-util", "sync", "time", "process"] }
 
-[lints.clippy]
-unwrap_used = "warn"
+[lints]
+workspace = true

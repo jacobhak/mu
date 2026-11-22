@@ -23,10 +23,7 @@ impl Endpoint {
 fn read_token(root: &std::path::Path) -> Result<String, String> {
     let path = root.join("auth-gateway.token");
     fs::read_to_string(&path).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty()).ok_or_else(|| {
-        format!(
-            "gateway token not found at {}; run `omp auth-gateway token` (or `ai-provider-gateway login`)",
-            path.display()
-        )
+        format!("gateway token not found at {}; run `omp auth-gateway token` (or `mu-gateway login`)", path.display())
     })
 }
 

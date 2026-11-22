@@ -1,11 +1,12 @@
 //! Where state lives, and what the daemon and its clients share through it.
 //!
-//! `$AI_PROVIDER_GATEWAY_HOME` (else `$XDG_STATE_HOME/ai-provider-gateway`, else
-//! `~/.local/state/ai-provider-gateway`) holds, per omp profile, `profiles/<name>/{state.json, leases/,
-//! daemon.log}` (the profile-less one sits in the home itself) and, at the top level, the pinned omp under
-//! `omp/<version>/omp`. The daemon serves one profile's credentials and `models.yml`, so each profile gets its own.
+//! `$MU_GATEWAY_HOME` (else `<mu home>/gateway`) holds, per omp profile, `profiles/<name>/{state.json, leases/,
+//! daemon.log}` (the profile-less one sits in the home itself). The daemon serves one profile's credentials and
+//! `models.yml`, so each profile gets its own.
 
-use crate::vendor::fs::FileLock;
+use mu_common::fs::FileLock;
+pub use mu_common::paths::self_exe;
+use mu_common::paths::{mu_home, profile, profile_subdir};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -15,86 +16,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The omp version this build is pinned to (`upstream.toml`).
-pub const OMP_VERSION: &str = env!("OMP_VERSION");
-
-pub fn user_home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-}
-
 fn env_dir(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 pub fn home_dir() -> PathBuf {
-    if let Some(d) = env_dir("AI_PROVIDER_GATEWAY_HOME") {
-        return d;
-    }
-    if let Some(d) = env_dir("XDG_STATE_HOME") {
-        return d.join("ai-provider-gateway");
-    }
-    user_home().join(".local/state/ai-provider-gateway")
+    env_dir("MU_GATEWAY_HOME").unwrap_or_else(|| mu_home().join("gateway"))
 }
 
-/// The active omp profile name (`OMP_PROFILE`, else `PI_PROFILE`), if any. `--profile` sets `OMP_PROFILE`.
-pub fn profile() -> Option<String> {
-    std::env::var("OMP_PROFILE").ok().or_else(|| std::env::var("PI_PROFILE").ok()).filter(|s| !s.is_empty())
-}
-
-/// `name` is safe to use as one path component: no separators, not `.` or `..`.
-pub fn valid_profile_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".."
-}
-
-/// The active profile name, only if it is safe as a path component (anything else reads as no profile).
-pub fn safe_profile() -> Option<String> {
-    profile().filter(|p| valid_profile_name(p))
-}
-
-/// `base` itself, or `base/profiles/<name>` under a profile: the one rule for per-profile state dirs.
-pub fn profile_subdir(base: PathBuf, profile: Option<&str>) -> PathBuf {
-    match profile.filter(|p| valid_profile_name(p)) {
-        Some(p) => base.join("profiles").join(p),
-        None => base,
-    }
-}
-
-pub fn omp_config_root() -> PathBuf {
-    match safe_profile() {
-        Some(p) => user_home().join(".omp/profiles").join(p),
-        None => user_home().join(".omp"),
-    }
-}
-
-pub fn omp_agent_dir() -> PathBuf {
-    if profile().is_some() {
-        return omp_config_root().join("agent");
-    }
-    match std::env::var_os("PI_CODING_AGENT_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => user_home().join(".omp/agent"),
-    }
-}
-
-/// The omp binary: `$AI_PROVIDER_GATEWAY_OMP`, else the pinned copy `<home>/omp/<version>/omp` when it is a
-/// file, else `omp` on `PATH`.
+/// The omp binary: `$MU_GATEWAY_OMP`, else the `omp` next to this executable (where mu's installer puts the
+/// pinned copy) when it is a file, else `omp` on `PATH`.
 pub fn omp_bin() -> PathBuf {
-    if let Some(p) = env_dir("AI_PROVIDER_GATEWAY_OMP") {
+    if let Some(p) = env_dir("MU_GATEWAY_OMP") {
         return p;
     }
-    let pinned = home_dir().join("omp").join(OMP_VERSION).join("omp");
-    if pinned.is_file() { pinned } else { PathBuf::from("omp") }
-}
-
-/// The running executable, for re-spawning ourselves. After the binary is replaced on disk `current_exe()`
-/// names a path that no longer exists (`… (deleted)`); `/proc/self/exe` still executes the running image.
-pub fn self_exe() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    if exe.exists() {
-        return Ok(exe);
-    }
-    let proc_exe = PathBuf::from("/proc/self/exe");
-    if proc_exe.exists() { Ok(proc_exe) } else { Ok(exe) }
+    let pinned = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("omp")));
+    pinned.filter(|p| p.is_file()).unwrap_or_else(|| PathBuf::from("omp"))
 }
 
 pub fn gw_dir() -> PathBuf {

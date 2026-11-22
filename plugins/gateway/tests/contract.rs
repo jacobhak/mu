@@ -1,5 +1,6 @@
 //! Contract tests against the real pinned omp, under a scratch HOME. Run by `scripts/ci-checks.sh` and the
-//! maintenance bot with `-- --ignored contract_`; the binary comes from `AI_PROVIDER_GATEWAY_OMP`.
+//! maintenance bot with `-- --ignored contract_`; the binary comes from `MU_GATEWAY_OMP`.
+#![allow(clippy::unwrap_used)] // integration-test helpers outside any #[test] fn
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -19,7 +20,7 @@ impl Scratch {
     }
 
     fn omp(&self, args: &[&str]) -> Command {
-        let bin = std::env::var_os("AI_PROVIDER_GATEWAY_OMP").expect("AI_PROVIDER_GATEWAY_OMP names the omp binary");
+        let bin = std::env::var_os("MU_GATEWAY_OMP").expect("MU_GATEWAY_OMP names the omp binary");
         let mut cmd = Command::new(bin);
         cmd.args(args)
             .env("HOME", &self.0)

@@ -43,7 +43,14 @@ cmd_test() {
   # binaries links in 1.5 GB), and 2 costs little. aarch64 needs .cargo/config.toml's lld flags as well.
   if [ "$offloaded" = 1 ]; then offload_run env CARGO_BUILD_JOBS="${MU_MAINT_OFFLOAD_JOBS:-2}" scripts/ci-checks.sh; else timeout "$stage_secs" scripts/ci-checks.sh; fi
 }
-cmd_contract() { timeout "$stage_secs" cargo test --workspace --locked -- --ignored contract_; }
+# The gateway plugin's contract tests run the real omp, pinned by the worktree's upstream.toml.
+cmd_contract() {
+  local ver omp
+  ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' upstream.toml)"
+  omp="$MAINT/omp/$ver/omp"
+  timeout "$stage_secs" scripts/fetch-omp.sh "$ver" "$omp" \
+    && MU_GATEWAY_OMP="$omp" timeout "$stage_secs" cargo test --workspace --locked -- --ignored contract_
+}
 # The smoke stage drives a live model and flakes: it gets one retry, and a pass on the retry is recorded as such.
 cmd_smoke() {
   scripts/smoke.sh "$CARGO_TARGET_DIR/release/mu" && return 0

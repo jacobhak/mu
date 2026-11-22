@@ -35,7 +35,7 @@ extern "C" fn request_stop(_sig: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-/// Spawns (detached, setsid) `ai-provider-gateway daemon` unless one is already healthy, and returns its URL.
+/// Spawns (detached, setsid) `mu-gateway daemon` unless one is already healthy, and returns its URL.
 /// Called with the profile directory's lock held.
 pub fn start(dir: &Path) -> Result<String, String> {
     stop_orphaned_pair(dir);
@@ -128,7 +128,7 @@ fn parse_omp_children(ps: &str, parent: i32) -> Vec<i32> {
         .collect()
 }
 
-/// `ai-provider-gateway guard <pgid>`: blocks on stdin, whose write end the daemon holds. When the daemon
+/// `mu-gateway guard <pgid>`: blocks on stdin, whose write end the daemon holds. When the daemon
 /// dies by any means, stdin reaches EOF and the guard stops the omp group. Works on Linux and macOS.
 pub fn guard(pgid: i32) -> i32 {
     watch_group(pgid, std::io::stdin());
@@ -216,12 +216,12 @@ fn sleep_unless_stopped(tick: Duration) -> bool {
     }
 }
 
-/// Daemon entry point (`ai-provider-gateway daemon`). Returns the process exit code.
+/// Daemon entry point (`mu-gateway daemon`). Returns the process exit code.
 pub fn run() -> i32 {
     match serve() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("ai-provider-gateway daemon: {e}");
+            eprintln!("mu-gateway daemon: {e}");
             1
         }
     }
@@ -252,8 +252,8 @@ fn env_secs(key: &str, default: f64) -> Duration {
 fn serve() -> Result<i32, String> {
     let dir = state::gw_dir();
     fs::create_dir_all(dir.join("leases")).map_err(|e| e.to_string())?;
-    let idle = env_secs("AI_PROVIDER_GATEWAY_IDLE_SECS", 1800.0);
-    let tick = env_secs("AI_PROVIDER_GATEWAY_TICK_SECS", 30.0);
+    let idle = env_secs("MU_GATEWAY_IDLE_SECS", 1800.0);
+    let tick = env_secs("MU_GATEWAY_TICK_SECS", 30.0);
     let me = std::process::id();
     for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
         // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
@@ -284,19 +284,19 @@ fn serve() -> Result<i32, String> {
     kids.0.push(gw);
     let kid_pids: Vec<i32> = kids.0.iter().map(|c| c.id() as i32).collect();
     state::write_state_with_kids(&dir, me, &gw_url, &broker_url, &kid_pids).map_err(|e| e.to_string())?;
-    eprintln!("ai-provider-gateway daemon {me}: gateway at {gw_url}");
+    eprintln!("mu-gateway daemon {me}: gateway at {gw_url}");
 
     loop {
         if sleep_unless_stopped(tick) {
             state::remove_state_if_owned(&dir, me);
-            eprintln!("ai-provider-gateway daemon {me}: stopping on a signal");
+            eprintln!("mu-gateway daemon {me}: stopping on a signal");
             return Ok(0);
         }
         if kids.exited() {
             let lock = state::lock(&dir).map_err(|e| e.to_string())?;
             state::remove_state_if_owned(&dir, me);
             drop(lock);
-            eprintln!("ai-provider-gateway daemon {me}: broker or gateway exited; stopping");
+            eprintln!("mu-gateway daemon {me}: broker or gateway exited; stopping");
             return Ok(1);
         }
         state::prune_leases(&dir);
@@ -309,7 +309,7 @@ fn serve() -> Result<i32, String> {
         {
             state::remove_state_if_owned(&dir, me);
             drop(lock);
-            eprintln!("ai-provider-gateway daemon {me}: no client lease within {}s; stopping", idle.as_secs_f64());
+            eprintln!("mu-gateway daemon {me}: no client lease within {}s; stopping", idle.as_secs_f64());
             return Ok(0);
         }
     }
@@ -381,7 +381,7 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Re
     let mut child = cmd.spawn().map_err(|e| format!("cannot run `omp` ({e})"))?;
     match spawn_guard(child.id()) {
         Some(g) => guards.push(g),
-        None => eprintln!("ai-provider-gateway daemon: no guard for `omp {}`", args.join(" ")),
+        None => eprintln!("mu-gateway daemon: no guard for `omp {}`", args.join(" ")),
     }
     let tag = args.join(" ");
     let (tx, rx) = mpsc::channel::<String>();
@@ -453,8 +453,8 @@ mod timeout_tests {
 
     #[test]
     fn omp_children_are_picked_by_parent_and_command() {
-        let ps = "  10     1 ai-provider-gateway daemon\n  11    10 omp auth-broker serve --bind=127.0.0.1:0\n  \
-                  12    10 ai-provider-gateway guard 11\n  13    99 omp auth-gateway serve\n  14    10 omp auth-gateway serve\n";
+        let ps = "  10     1 mu-gateway daemon\n  11    10 omp auth-broker serve --bind=127.0.0.1:0\n  \
+                  12    10 mu-gateway guard 11\n  13    99 omp auth-gateway serve\n  14    10 omp auth-gateway serve\n";
         assert_eq!(parse_omp_children(ps, 10), vec![11, 14]);
         assert!(parse_omp_children("garbage\n\n", 10).is_empty());
     }

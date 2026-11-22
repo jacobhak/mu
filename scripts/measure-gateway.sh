@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Memory of the omp broker + gateway pair that ai-provider-gateway's daemon starts, idle and with requests in flight. Linux only (/proc).
+# Memory of the omp broker + gateway pair that mu-gateway's daemon starts, idle and with requests in flight. Linux only (/proc).
 # Usage: scripts/measure-gateway.sh [REQUESTS]      (default: 1)
 # Runs in an empty HOME. The broker gets only a fake Anthropic key, so the requests go to the real api.anthropic.com
 # and are rejected at once (401): this needs the network and sends no real credential, and it does not hold a model stream
 # open. The gateway cannot be pointed at a fake provider (it ignores ANTHROPIC_BASE_URL and the proxy variables, and lists
 # no models for a keyless llama.cpp), so a held-open stream cannot be measured this way.
 # Samples Pss / Pss_Anon of each process (and its children) 8 s after start, then 6 s after sending the requests.
-# Needs: omp (or AI_PROVIDER_GATEWAY_OMP), curl.
+# Needs: omp (or MU_GATEWAY_OMP), curl.
 set -uo pipefail
-omp="${AI_PROVIDER_GATEWAY_OMP:-omp}"
+omp="${MU_GATEWAY_OMP:-omp}"
 reqs="${1:-1}"
 H="$(mktemp -d)"
 export HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" XDG_CACHE_HOME="$H/.cache"

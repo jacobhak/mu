@@ -1,4 +1,5 @@
 //! Drives `mu-plugin` over stdio like mu does, answering its `core/secrets` calls.
+#![allow(clippy::unwrap_used)] // integration-test helpers outside any #[test] fn
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -23,10 +24,10 @@ impl Mu {
         let dir = std::env::temp_dir().join(format!("apg-adapter-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ai-provider-gateway"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mu-gateway"))
             .arg("mu-plugin")
             .env("HOME", &dir)
-            .env("AI_PROVIDER_GATEWAY_HOME", dir.join("gw"))
+            .env("MU_GATEWAY_HOME", dir.join("gw"))
             .env("XDG_RUNTIME_DIR", &dir)
             .env_remove("OMP_PROFILE")
             .env_remove("PI_PROFILE")

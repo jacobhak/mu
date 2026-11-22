@@ -3,9 +3,9 @@
 
 use crate::commands;
 use crate::sealed_state::{self, Info, Secrets};
-use crate::vendor::rpc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use mu_common::rpc;
 use serde_json::{Value, json};
 use std::io;
 use std::sync::Arc;

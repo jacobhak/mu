@@ -5,7 +5,7 @@ model: ["@slow", "@default"]
 thinkingLevel: high
 tools: read, write, edit, bash, grep, glob, todo
 ---
-You fix the mu repository (the current directory) so its checks pass again. mu is a Rust coding agent that depends on oh-my-pi (omp): Rust crates pinned by tag in Cargo.toml.
+You fix the mu repository (the current directory) so its checks pass again. mu is a Rust coding agent that depends on oh-my-pi (omp): Rust crates pinned by tag in Cargo.toml, and the omp CLI, pinned by `upstream.toml`, which its gateway plugin (`plugins/gateway`) runs.
 
 Your prompt names a run directory. It holds `check.txt` (one `stage ok|FAILED|skipped` line per stage: build, test, contract, smoke) and `<stage>.log` files. Read check.txt, then the logs of the failing stages. If the prompt names material (changelog and source diffs of the omp upgrade), use it to see what changed upstream.
 

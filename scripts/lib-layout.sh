@@ -4,10 +4,10 @@ stage_layout() {
   local root="$1" rel="$2" dest="$3" p
   rm -rf "$dest/mu"
   mkdir -p "$dest/mu/bin" "$dest/mu/plugins" "$dest/mu/scripts"
-  for p in mu mu-web mu-mcp-http mu-predict mu-memory; do
+  for p in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do
     cp "$rel/$p" "$dest/mu/bin/$p"
   done
-  for p in predict memory; do
+  for p in gateway predict memory; do
     mkdir -p "$dest/mu/plugins/$p"
     cp "$root/plugins/$p/plugin.toml" "$dest/mu/plugins/$p/"
   done
@@ -16,5 +16,5 @@ stage_layout() {
   cp -R "$root/plugins/web/schemas" "$dest/mu/plugins/web/schemas"
   cp -R "$root/plugins/memory/schemas" "$dest/mu/plugins/memory/schemas"
   cp "$root/upstream.toml" "$root/LICENSE" "$root/THIRD-PARTY-NOTICES.md" "$dest/mu/"
-  cp "$root/scripts/install.sh" "$dest/mu/scripts/"
+  cp "$root/scripts/install.sh" "$root/scripts/fetch-omp.sh" "$dest/mu/scripts/"
 }

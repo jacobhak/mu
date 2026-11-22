@@ -1,3 +1,0 @@
-# The oh-my-pi release whose omp CLI this tool is built and tested against.
-# Fetched by scripts/fetch-omp.sh; bumped by scripts/maint/bump.sh.
-omp = "19.0.0"

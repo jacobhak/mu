@@ -1,0 +1,4 @@
+name = "gateway"
+command = ["mu-gateway", "mu-plugin"]
+lifetime = "idle:10m"
+provider = "gateway"
