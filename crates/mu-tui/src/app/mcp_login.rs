@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::host::mcp_login::{self as host, Done, Flow, Notice, Paste, Start, Url};
-use crate::widgets::editor::adds_newline;
-use crossterm::event::{KeyCode, KeyEvent};
+use crate::keymap;
+use crossterm::event::KeyEvent;
 
 /// A sign-in waiting for the browser's callback or for the redirect URL typed into the composer.
 /// The composer is locked to that input until the flow ends.
@@ -42,7 +42,8 @@ impl App {
         if let Some(f) = self.flows.mcp_login() {
             let waiting = f.name.clone();
             return self.notice(&format!(
-                "a sign-in to mcp:{waiting} is already waiting: paste its redirect URL, or press Esc"
+                "a sign-in to mcp:{waiting} is already waiting: paste its redirect URL, or press {}",
+                keymap::WIZARD_CANCEL.label()
             ));
         }
         self.flows.mcp_login_seq += 1;
@@ -103,17 +104,19 @@ impl App {
         }
         self.notice(&format!(
             "A browser should open to log in to mcp:{name}. If it does not, open this link:\n{url}\n\
-             If the browser can't reach this machine, paste the final redirect URL here and press Enter (Esc cancels)."
+             If the browser can't reach this machine, paste the final redirect URL here and press {} ({} cancels).",
+            keymap::SUBMIT.label(),
+            keymap::WIZARD_CANCEL.label()
         ));
     }
 
     /// Keys the redirect-URL input takes before the composer. True when handled.
     pub(super) fn mcp_login_key(&mut self, k: KeyEvent) -> bool {
-        if k.code == KeyCode::Esc {
+        if keymap::WIZARD_CANCEL.hit(&k) {
             self.cancel_mcp_login();
             return true;
         }
-        if k.code == KeyCode::Enter && !adds_newline(k.modifiers) {
+        if keymap::SUBMIT.hit(&k) {
             self.send_mcp_redirect();
             return true;
         }

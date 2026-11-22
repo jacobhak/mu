@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
+use crate::keymap;
 use crate::text::line::{self, Line, plain, span};
 use crate::theme::{self, Role};
 use crate::widgets::complete::{self, Entry};
-use crate::widgets::editor::{Edit, Editor, adds_newline, normalize_paste};
+use crate::widgets::editor::{Edit, Editor, normalize_paste};
 use crossterm::style::ContentStyle;
 use mu_base::image;
 use mu_base::message::{Image, UserInput};
@@ -319,8 +320,6 @@ impl Composer {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
-        let plain_mods = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
-        let ctrl_only = key.modifiers == KeyModifiers::CONTROL;
         let mut ghost = self.ghost.take();
         if std::mem::take(&mut self.magic_space) && self.takes_magic_space_back(&key) {
             self.buf.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), true);
@@ -328,10 +327,10 @@ impl Composer {
         }
         let action = 'act: {
             if self.menu.is_some() {
-                if let Some(a) = self.menu_key(&key, plain_mods, ctrl_only) {
+                if let Some(a) = self.menu_key(&key) {
                     break 'act a;
                 }
-            } else if key.code == KeyCode::Tab {
+            } else if keymap::COMPLETE.hit(&key) {
                 break 'act match ghost {
                     Some(g) => {
                         let a = self.accept_ghost(&g);
@@ -343,8 +342,8 @@ impl Composer {
                     }
                     None => Action::None,
                 };
-            } else if let (KeyCode::Right, Some(g)) = (key.code, ghost.as_deref())
-                && plain_mods
+            } else if let Some(g) = ghost.as_deref()
+                && keymap::ACCEPT_GHOST.hit(&key)
                 && self.at_end()
             {
                 break 'act self.accept_ghost(g);
@@ -368,8 +367,9 @@ impl Composer {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let takes = match key.code {
-            KeyCode::Char(c) => (!ctrl && !alt && is_punctuation(c)) || (ctrl && c == 'q'),
-            KeyCode::Enter => self.menu.is_none(),
+            KeyCode::Char(c) if !ctrl && !alt && is_punctuation(c) => true,
+            _ if keymap::QUEUE.hit(key) => true,
+            _ if keymap::SUBMIT.hit(key) => self.menu.is_none(),
             _ => false,
         };
         takes && self.at_end() && self.buf.lines[self.buf.row].ends_with(' ')
@@ -410,20 +410,18 @@ impl Composer {
     }
 
     /// Menu keys; `None` falls through to normal handling.
-    fn menu_key(&mut self, key: &KeyEvent, plain_mods: bool, ctrl_only: bool) -> Option<Action> {
+    fn menu_key(&mut self, key: &KeyEvent) -> Option<Action> {
         let m = self.menu.as_mut()?;
         let n = m.items.len();
-        match key.code {
-            KeyCode::Up if plain_mods => m.sel = (m.sel + n - 1) % n,
-            KeyCode::Down if plain_mods => m.sel = (m.sel + 1) % n,
-            KeyCode::Char('p') if ctrl_only => m.sel = (m.sel + n - 1) % n,
-            KeyCode::Char('n') if ctrl_only => m.sel = (m.sel + 1) % n,
-            KeyCode::Tab => {
+        match key {
+            k if keymap::MENU_PREV.hit(k) => m.sel = (m.sel + n - 1) % n,
+            k if keymap::MENU_NEXT.hit(k) => m.sel = (m.sel + 1) % n,
+            k if keymap::COMPLETE.hit(k) => {
                 let text = self.menu_text(true);
                 self.set_text(&text);
                 self.magic_space = true;
             }
-            KeyCode::Enter if plain_mods => {
+            k if keymap::SUBMIT.hit(k) => {
                 let (exact, arg, needs) = (m.exact, m.arg.is_some(), m.needs_arg[m.sel]);
                 if exact {
                     return None;
@@ -441,7 +439,7 @@ impl Composer {
                 }
                 return Some(self.submit(false));
             }
-            KeyCode::Esc => {
+            k if keymap::MENU_CLOSE.hit(k) => {
                 self.menu_closed_for = Some(self.text());
                 self.menu = None;
             }
@@ -524,57 +522,69 @@ impl Composer {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        match key.code {
-            KeyCode::Char('d') if ctrl && self.is_empty() => Action::None,
-            KeyCode::Enter if adds_newline(key.modifiers) && !self.buf.masked => self.edit(|b| b.newline()),
-            KeyCode::Enter => self.submit(false),
-            KeyCode::Char('q') if ctrl => self.submit(running),
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && !alt && !ctrl => Action::PopQueue,
-            KeyCode::Esc if self.buf.masked => {
+        let k = &key;
+        if keymap::DELETE.hit(k) && self.is_empty() {
+            Action::None
+        } else if keymap::NEWLINE.hit(k) && !self.buf.masked {
+            self.edit(|b| b.newline())
+        } else if keymap::SUBMIT.hit(k) {
+            self.submit(false)
+        } else if keymap::QUEUE.hit(k) {
+            self.submit(running)
+        } else if keymap::POP_QUEUE.hit(k) {
+            Action::PopQueue
+        } else if keymap::ABORT.hit(k) {
+            if self.buf.masked {
                 self.clear();
                 Action::Redraw
+            } else if running {
+                Action::Abort
+            } else {
+                Action::None
             }
-            KeyCode::Esc => {
-                if running {
-                    Action::Abort
-                } else {
-                    Action::None
-                }
+        } else if keymap::CYCLE_THINKING.hit(k) {
+            Action::CycleThinking
+        } else if keymap::TOGGLE_THINKING.hit(k) {
+            Action::ToggleThinking
+        } else if keymap::TOGGLE_EXPANDED.hit(k) {
+            Action::ToggleExpanded
+        } else if keymap::MODEL_PICKER.hit(k) {
+            Action::ModelPicker
+        } else if keymap::EDIT_EXTERNAL.hit(k) && !self.locked() {
+            Action::EditExternal
+        } else if keymap::REPLY.hit(k) && self.menu.is_none() && !self.locked() {
+            Action::Reply
+        } else if keymap::JOBS.hit(k) {
+            Action::Jobs
+        } else if keymap::JOB_CANCEL.hit(k) {
+            Action::JobCancel
+        } else if keymap::JOB_NEXT.hit(k) {
+            Action::JobFocus(1)
+        } else if keymap::JOB_PREV.hit(k) {
+            Action::JobFocus(-1)
+        } else if keymap::HISTORY_PREV.hit(k) {
+            if self.buf.row == 0 {
+                self.history_prev();
+            } else {
+                self.buf.key(key, true);
             }
-            KeyCode::BackTab => Action::CycleThinking,
-            KeyCode::Char('t') if ctrl => Action::ToggleThinking,
-            KeyCode::Char('o') if ctrl => Action::ToggleExpanded,
-            KeyCode::Char('m') if alt => Action::ModelPicker,
-            KeyCode::Char('g') if ctrl && !self.locked() => Action::EditExternal,
-            KeyCode::Char('r') if ctrl && self.menu.is_none() && !self.locked() => Action::Reply,
-            KeyCode::Char('j') if alt && !ctrl => Action::Jobs,
-            KeyCode::Char('k') if alt && !ctrl && !key.modifiers.contains(KeyModifiers::SHIFT) => Action::JobCancel,
-            KeyCode::Down if alt && !ctrl => Action::JobFocus(1),
-            KeyCode::Up if alt && !ctrl => Action::JobFocus(-1),
-            KeyCode::Up | KeyCode::Char('p') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
-                if self.buf.row == 0 {
-                    self.history_prev();
-                } else {
-                    self.buf.key(key, true);
-                }
-                Action::Redraw
+            Action::Redraw
+        } else if keymap::HISTORY_NEXT.hit(k) {
+            if self.buf.row + 1 == self.buf.lines.len() {
+                self.history_next();
+            } else {
+                self.buf.key(key, true);
             }
-            KeyCode::Down | KeyCode::Char('n') if !matches!(key.code, KeyCode::Char(_)) || ctrl => {
-                if self.buf.row + 1 == self.buf.lines.len() {
-                    self.history_next();
-                } else {
-                    self.buf.key(key, true);
-                }
-                Action::Redraw
-            }
-            KeyCode::Char('v') if ctrl && !self.locked() => Action::PasteImage,
-            _ => match self.buf.key(key, true) {
+            Action::Redraw
+        } else if keymap::PASTE_IMAGE.hit(k) && !self.locked() {
+            Action::PasteImage
+        } else {
+            let multiline = !self.buf.masked;
+            match self.buf.key(key, multiline) {
                 Edit::Changed => self.edit(|_| {}),
                 Edit::Moved => Action::Redraw,
                 Edit::Unhandled => Action::None,
-            },
+            }
         }
     }
 

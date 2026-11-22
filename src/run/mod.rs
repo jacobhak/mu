@@ -498,6 +498,7 @@ async fn tui(
         pick_session: ui.pick_session,
         status_cfg: ui.cfgs.omp.status_line.clone(),
         theme: ui.cfgs.mu.theme.clone(),
+        keys: ui.cfgs.mu.keys.clone(),
         notify: ui.cfgs.omp.completion.notify,
         bell: ui.cfgs.mu.bell,
         hide_thinking: ui.cfgs.omp.hide_thinking_block,

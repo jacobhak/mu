@@ -8,7 +8,7 @@ use crate::mcp::mcp_cmd::{self, Draft, McpCmd};
 use crate::mcp::mcp_wizard::{Answer, Step, Wizard};
 use crate::widgets::overlay::{McpAction, McpPick, McpRow, Overlay};
 use crate::widgets::select::{Item, Select};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use mu_base::events::Command;
 
 impl App {
@@ -306,7 +306,9 @@ impl App {
                 let items = items.into_iter().map(|i| Item { label: i.label, detail: i.detail }).collect();
                 self.open_overlay(Overlay::Mcp { sel: Select::new(&title, items), pick: McpPick::Wizard });
             }
-            Step::Text { prompt, .. } => self.notice(&format!("{prompt}   (Esc cancels)")),
+            Step::Text { prompt, .. } => {
+                self.notice(&format!("{prompt}   ({} cancels)", crate::keymap::WIZARD_CANCEL.label()))
+            }
             Step::Done(draft) => {
                 self.end_mcp_wizard();
                 self.mcp_add(draft);
@@ -331,15 +333,12 @@ impl App {
 
     /// Keys the wizard takes before the composer sees them. True when the key was handled.
     pub(super) fn mcp_wizard_key(&mut self, k: KeyEvent) -> bool {
-        if k.code == KeyCode::Esc {
+        if crate::keymap::WIZARD_CANCEL.hit(&k) {
             self.mcp_wizard_cancel();
             return true;
         }
         // An empty Enter picks the step's default, which the composer would swallow.
-        if k.code == KeyCode::Enter
-            && self.prompt.composer.is_empty()
-            && !crate::widgets::editor::adds_newline(k.modifiers)
-        {
+        if crate::keymap::SUBMIT.hit(&k) && self.prompt.composer.is_empty() {
             self.mcp_wizard_line("");
             return true;
         }
@@ -365,7 +364,7 @@ mod tests {
     use crate::host::local::LocalHost;
     use crate::host::mcp_login as hlogin;
     use crate::host::{Answer as HostAnswer, Deferred, HostInfo, Pushed, encode};
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use mu_tools::mcp::discover::Found;
     use serde_json::{Value, json};
     use std::cell::RefCell;
@@ -642,6 +641,20 @@ mod tests {
                 assert!(says("sign-in cancelled")(&r.app));
             });
         }
+    }
+
+    #[test]
+    fn a_rebound_cancel_key_cancels_a_waiting_login() {
+        in_local(async move {
+            let mut r = rig(false, login_calls(ok((0, false))));
+            start_login(&mut r).await;
+            crate::keymap::with_keys(&[("wizard", "cancel", &["f5"])], || {
+                r.app.on_terminal(press(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(r.app.flows.mcp_login().is_some(), "the old default no longer cancels");
+                r.app.on_terminal(press(KeyCode::F(5), KeyModifiers::NONE));
+                assert!(r.app.flows.mcp_login().is_none());
+            });
+        });
     }
 
     /// A configured server `srv` whose login starts, and whose after-login call answers `after`.

@@ -5,11 +5,11 @@
 use super::*;
 use crate::host::chatgpt::{self as host, Done, Flow, Gone, Notice, Paste, Revoke, Saved, Url};
 use crate::host::keys::ChatgptLabel;
-use crate::widgets::editor::adds_newline;
+use crate::keymap;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use mu_provider::auth::chatgpt::{self, AUTH_BASE, LABEL, PROVIDER_ID, USAGE_URL};
 
 /// A sign-in waiting for the browser's callback or for the redirect URL typed into the composer.
@@ -87,7 +87,10 @@ impl App {
     pub(super) fn start_chatgpt(&mut self) {
         self.leave_custom_wizard();
         if self.chatgpt_typing() {
-            return self.notice("a ChatGPT sign-in is already waiting: paste its redirect URL, or press Esc");
+            return self.notice(&format!(
+                "a ChatGPT sign-in is already waiting: paste its redirect URL, or press {}",
+                keymap::WIZARD_CANCEL.label()
+            ));
         }
         self.flows.chatgpt_seq += 1;
         let id = self.flows.chatgpt_seq;
@@ -150,18 +153,20 @@ impl App {
         if self.flows.chatgpt().is_some_and(|f| f.id == flow) {
             self.notice(&format!(
                 "A browser should open to sign in with ChatGPT. If it does not, open this link:\n{url}\n\
-                 If the browser can't reach this machine, paste the final redirect URL here and press Enter (Esc cancels)."
+                 If the browser can't reach this machine, paste the final redirect URL here and press {} ({} cancels).",
+                keymap::SUBMIT.label(),
+                keymap::WIZARD_CANCEL.label()
             ));
         }
     }
 
     /// Keys the redirect-URL input takes before the composer. True when handled.
     pub(super) fn chatgpt_key(&mut self, k: KeyEvent) -> bool {
-        if k.code == KeyCode::Esc {
+        if keymap::WIZARD_CANCEL.hit(&k) {
             self.cancel_chatgpt();
             return true;
         }
-        if k.code == KeyCode::Enter && !adds_newline(k.modifiers) {
+        if keymap::SUBMIT.hit(&k) {
             self.send_redirect();
             return true;
         }
@@ -313,6 +318,7 @@ mod tests {
     use super::*;
     use crate::app::keys::tests::{in_local, press, test_app_with_commands, transcript_text};
     use crate::host::{Deferred, Pushed, local::LocalHost};
+    use crossterm::event::KeyCode;
     use mu_provider::auth::chatgpt::{Account, DIRECT_SCOPE, Tokens};
     use std::time::Duration;
     use tokio::sync::mpsc::UnboundedReceiver;

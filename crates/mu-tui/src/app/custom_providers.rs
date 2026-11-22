@@ -10,7 +10,7 @@ use super::*;
 use crate::custom::panel::{self, Action, Answer, Fetch, Probe, Saved, Step};
 use crate::host::custom::{CUSTOM_ENV, CUSTOM_FETCH, CUSTOM_GET, CUSTOM_OPEN, CUSTOM_SAVE, Edit, Open, Outcome};
 use crate::widgets::overlay::PanelPick;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use mu_provider::provider::custom;
 
 /// The panel in progress, and the composer text it displaced (put back when it ends).
@@ -101,7 +101,11 @@ impl App {
             }
             Step::Key => {
                 self.prompt.composer.set_masked(true);
-                self.notice("paste the key and press Enter (shown as bullets; Esc goes back)");
+                self.notice(&format!(
+                    "paste the key and press {} (shown as bullets; {} goes back)",
+                    crate::keymap::SUBMIT.label(),
+                    crate::keymap::WIZARD_CANCEL.label()
+                ));
             }
         }
     }
@@ -136,18 +140,17 @@ impl App {
         let Some(f) = self.flows.custom() else { return false };
         // A check is running: Esc gives up on it, and its late answer is ignored.
         if f.checking {
-            if k.code == KeyCode::Esc {
+            if crate::keymap::WIZARD_CANCEL.hit(&k) {
                 self.custom_cancel();
             }
             return true;
         }
         if f.panel.awaits_key() {
-            if k.code == KeyCode::Esc {
+            if crate::keymap::WIZARD_CANCEL.hit(&k) {
                 self.custom_key_cancelled();
                 return true;
             }
-            let enter = k.code == KeyCode::Enter && !crate::widgets::editor::adds_newline(k.modifiers);
-            if enter {
+            if crate::keymap::SUBMIT.hit(&k) {
                 let text = self.prompt.composer.secret_text();
                 self.custom_key_typed(&text);
                 return true;
@@ -155,7 +158,7 @@ impl App {
             return false;
         }
         // Esc in a field's editor leaves the field, rather than a list of one empty row.
-        if k.code == KeyCode::Esc
+        if crate::keymap::WIZARD_CANCEL.hit(&k)
             && let Some(Overlay::Custom { sel }) = &self.overlay
             && sel.is_editing()
         {
@@ -317,7 +320,7 @@ mod tests {
     use super::*;
     use crate::text::line::line_text;
     use crate::widgets::overlay::{LoginTarget, OverlayEvent};
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use mu_base::config::Configs;
     use mu_base::events::Command;
     use mu_provider::provider::custom::{AuthMode, CustomModel, CustomProvider};

@@ -8,6 +8,8 @@ Up/Down move between sentences, list items, headings, table rows and code lines;
 
 Vim and Emacs keys work too: `j k h l`, `w b e` (word), `0 ^ $` (start and end of the unit), `{ }` (previous and next block), `gg G`, Ctrl+D/Ctrl+U (half page), counts such as `5j`, `q` to close; Ctrl+N/P (unit), Ctrl+F/B and Alt+F/B (word), Ctrl+A/E (start and end of the unit), Ctrl+V/Alt+V (page), `Alt+<`/`Alt+>` (top and bottom), Ctrl+G (cancel).
 
+These are the defaults; every key can be rebound under `[keys.reply]` in `config.toml` (see [keys.md](keys.md)). Counts are typed digits and are not rebindable.
+
 ## Marking and quoting
 
 Space marks the current unit. Shift with an arrow (or H/J/K/L) selects: Shift+Left/Right by word, Shift+Up/Down to the edge of the unit and then by unit; Space turns the selection into a mark, Esc drops it, a plain move drops it too. `c` clears the marks.

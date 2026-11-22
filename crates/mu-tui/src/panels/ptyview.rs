@@ -62,7 +62,7 @@ impl PtyView {
         }
         // Esc leaves the tool: the command is killed and the view closes when its call ends. Ctrl+C
         // never reaches the command; the app uses it to exit mu.
-        if k.code == KeyCode::Esc {
+        if crate::keymap::TERMINAL_KILL.hit(&k) {
             let _ = self.input.send(PtyInput::Kill);
             return;
         }
@@ -167,6 +167,18 @@ mod tests {
         v.key(k(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(rx.try_recv(), Ok(PtyInput::Kill)));
         assert!(encode_key(k(KeyCode::Esc, KeyModifiers::NONE), false).is_none(), "Esc is not a keystroke");
+    }
+
+    #[test]
+    fn the_kill_key_can_be_rebound() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let v = PtyView::new("x".into(), tx, (80, 24));
+        crate::keymap::with_keys(&[("terminal", "kill", &["f5"])], || {
+            v.key(k(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(rx.try_recv().is_err(), "Esc no longer kills, and is no keystroke");
+            v.key(k(KeyCode::F(5), KeyModifiers::NONE));
+            assert!(matches!(rx.try_recv(), Ok(PtyInput::Kill)));
+        });
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use crate::keymap;
 use crate::widgets::editor::{self, Editor};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mu_base::events::PreviewKind;
@@ -286,20 +287,14 @@ impl Select {
         if key.kind == KeyEventKind::Release {
             return SelectResult::Pending;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
         if !self.context.is_empty() {
-            match key.code {
-                KeyCode::PageUp => {
-                    self.context_scroll.set(self.context_scroll.get().saturating_sub(1));
-                    return SelectResult::Pending;
-                }
-                KeyCode::PageDown => {
-                    self.context_scroll
-                        .set(self.context_scroll.get().saturating_add(1).min(self.context_scroll_max.get()));
-                    return SelectResult::Pending;
-                }
-                _ => {}
+            if keymap::SELECT_CONTEXT_UP.hit(&key) {
+                self.context_scroll.set(self.context_scroll.get().saturating_sub(1));
+                return SelectResult::Pending;
+            }
+            if keymap::SELECT_CONTEXT_DOWN.hit(&key) {
+                self.context_scroll.set(self.context_scroll.get().saturating_add(1).min(self.context_scroll_max.get()));
+                return SelectResult::Pending;
             }
         }
         match self.mode {
@@ -311,97 +306,81 @@ impl Select {
         let n = rows.len();
         self.sel = self.sel.min(n.saturating_sub(1));
         if let KeyCode::Char(c) = key.code
-            && !ctrl
-            && !alt
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             && self.filter.is_empty()
             && !self.multi
             && let Some(i) = self.quick_item(c)
         {
             return self.finish(vec![i]);
         }
-        match key.code {
-            KeyCode::Esc => SelectResult::Cancelled,
-            KeyCode::BackTab if self.back => SelectResult::Back,
-            KeyCode::Left if self.back && self.filter.is_empty() => SelectResult::Back,
-            KeyCode::Up => {
-                self.step(-1, n);
-                SelectResult::Pending
-            }
-            KeyCode::Down => {
-                self.step(1, n);
-                SelectResult::Pending
-            }
-            KeyCode::Char('p') if ctrl => {
-                self.step(-1, n);
-                SelectResult::Pending
-            }
-            KeyCode::Char('n') if ctrl => {
-                self.step(1, n);
-                SelectResult::Pending
-            }
-            KeyCode::Enter => self.choose(&rows),
-            KeyCode::Right if self.notes && self.filter.is_empty() => self.start_note(&rows),
-            KeyCode::Tab if self.notes => self.start_note(&rows),
+        if keymap::SELECT_CANCEL.hit(&key) {
+            SelectResult::Cancelled
+        } else if self.back && keymap::SELECT_BACK.hit(&key)
+            || self.back && self.filter.is_empty() && keymap::SELECT_BACK_EMPTY.hit(&key)
+        {
+            SelectResult::Back
+        } else if keymap::SELECT_UP.hit(&key) {
+            self.step(-1, n);
+            SelectResult::Pending
+        } else if keymap::SELECT_DOWN.hit(&key) {
+            self.step(1, n);
+            SelectResult::Pending
+        } else if keymap::SELECT_CHOOSE.hit(&key) {
+            self.choose(&rows)
+        } else if self.notes && self.filter.is_empty() && keymap::SELECT_NOTE_EMPTY.hit(&key)
+            || self.notes && keymap::SELECT_NOTE.hit(&key)
+        {
+            self.start_note(&rows)
+        } else if self.multi && self.filter.is_empty() && keymap::SELECT_TOGGLE.hit(&key) {
             // Space toggles only while the filter is empty (always, when unfiltered); with text in
             // it, Space is part of the filter.
-            KeyCode::Char(' ') if self.multi && !ctrl && self.filter.is_empty() => {
-                if let Some(Row::Item(i)) = rows.get(self.sel)
-                    && !self.checked.remove(i)
-                {
-                    self.checked.insert(*i);
-                }
-                SelectResult::Pending
+            if let Some(Row::Item(i)) = rows.get(self.sel)
+                && !self.checked.remove(i)
+            {
+                self.checked.insert(*i);
             }
-            _ => {
-                if self.filterable && self.filter.key(key, false) == editor::Edit::Changed {
-                    self.sel = 0;
-                }
-                SelectResult::Pending
+            SelectResult::Pending
+        } else {
+            if self.filterable && self.filter.key(key, false) == editor::Edit::Changed {
+                self.sel = 0;
             }
+            SelectResult::Pending
         }
     }
 
     /// Typing the free-text answer: Enter submits it, Esc goes back to the list.
     fn text_key(&mut self, key: KeyEvent) -> SelectResult {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::List;
+        if keymap::SELECT_CANCEL.hit(&key) {
+            self.mode = Mode::List;
+            SelectResult::Pending
+        } else if keymap::SUBMIT.hit(&key) {
+            if self.text.is_blank() {
                 SelectResult::Pending
+            } else if self.multi && !self.checked.is_empty() {
+                SelectResult::Noted(self.checked.iter().copied().collect(), self.text.text())
+            } else {
+                SelectResult::Text(self.text.text())
             }
-            KeyCode::Enter if !editor::adds_newline(key.modifiers) => {
-                if self.text.is_blank() {
-                    SelectResult::Pending
-                } else if self.multi && !self.checked.is_empty() {
-                    SelectResult::Noted(self.checked.iter().copied().collect(), self.text.text())
-                } else {
-                    SelectResult::Text(self.text.text())
-                }
-            }
-            _ => {
-                self.text.key(key, true);
-                SelectResult::Pending
-            }
+        } else {
+            self.text.key(key, true);
+            SelectResult::Pending
         }
     }
 
     /// Typing the note on the highlighted row: Enter submits it with the picks, Esc restores the
     /// note as it was and goes back to the list.
     fn note_key(&mut self, key: KeyEvent) -> SelectResult {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::List;
-                self.note = Editor::from_text(&self.note_before);
-                SelectResult::Pending
-            }
-            KeyCode::Enter if !editor::adds_newline(key.modifiers) => {
-                self.mode = Mode::List;
-                let rows = self.rows();
-                self.choose(&rows)
-            }
-            _ => {
-                self.note.key(key, true);
-                SelectResult::Pending
-            }
+        if keymap::SELECT_CANCEL.hit(&key) {
+            self.mode = Mode::List;
+            self.note = Editor::from_text(&self.note_before);
+            SelectResult::Pending
+        } else if keymap::SUBMIT.hit(&key) {
+            self.mode = Mode::List;
+            let rows = self.rows();
+            self.choose(&rows)
+        } else {
+            self.note.key(key, true);
+            SelectResult::Pending
         }
     }
 
@@ -619,6 +598,25 @@ mod tests {
             SelectResult::Chosen(v) => Some(v),
             _ => None,
         }
+    }
+
+    #[test]
+    fn rebinding_select_keys_replaces_the_defaults() {
+        let f5 = key(KeyCode::F(5));
+        let f6 = key(KeyCode::F(6));
+        let f7 = key(KeyCode::F(7));
+        crate::keymap::with_keys(
+            &[("select", "move_down", &["f5"]), ("select", "choose", &["f6"]), ("select", "cancel", &["f7"])],
+            || {
+                let mut s = Select::new("t", items(&["a", "b", "c"]));
+                s.on_key(key(KeyCode::Down));
+                assert_eq!(chosen(s.on_key(key(KeyCode::Enter))), None, "Enter no longer chooses");
+                s.on_key(f5);
+                assert_eq!(chosen(s.on_key(f6)), Some(vec![1]));
+                assert!(matches!(s.on_key(key(KeyCode::Esc)), SelectResult::Pending));
+                assert!(matches!(s.on_key(f7), SelectResult::Cancelled));
+            },
+        );
     }
 
     #[test]

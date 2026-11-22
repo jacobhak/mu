@@ -19,6 +19,7 @@ pub struct MuConfig {
     pub task: MuTask,
     pub agent: MuAgent,
     pub sessions: MuSessions,
+    pub keys: MuKeys,
     /// `[permissions]`, parsed by `load_permissions` rather than serde.
     #[serde(skip)]
     pub permissions: MuPermissions,
@@ -32,6 +33,29 @@ pub struct MuConfig {
 #[serde(default)]
 pub struct MuSessions {
     pub sources: Vec<Vec<String>>,
+}
+
+/// `[keys.<context>]`: `action = "chord"` or `action = ["chord", ...]`. The UI owns the context and
+/// action names and the chord syntax (docs/keys.md); this only carries the table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct MuKeys(pub std::collections::BTreeMap<String, std::collections::BTreeMap<String, KeySpec>>);
+
+/// One binding: a chord, or a list of them (empty: the action is unbound).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum KeySpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl KeySpec {
+    pub fn chords(&self) -> Vec<&str> {
+        match self {
+            Self::One(s) => vec![s.as_str()],
+            Self::Many(v) => v.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 /// `[permissions]`: which tool calls may run without asking, and the rules that override it.

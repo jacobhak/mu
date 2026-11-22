@@ -82,6 +82,7 @@ pub struct AppInit {
     pub pick_session: bool,
     pub status_cfg: mu_base::config::OmpStatusLine,
     pub theme: mu_base::config::MuTheme,
+    pub keys: mu_base::config::MuKeys,
     /// Ring the terminal when your turn ends with nothing running in the background, or when a
     /// running turn needs you: a question, an approval or a plan review, whoever started it (omp's
     /// `completion.notify`).
@@ -367,6 +368,7 @@ pub async fn run(init: AppInit) -> i32 {
         pick_session,
         status_cfg,
         theme,
+        keys,
         notify,
         bell,
         hide_thinking,
@@ -374,7 +376,8 @@ pub async fn run(init: AppInit) -> i32 {
         status_levels,
     } = init;
     crate::host::set_facts(host.info().clone());
-    let theme_warnings = theme::init(&theme);
+    let mut theme_warnings = theme::init(&theme);
+    theme_warnings.extend(crate::keymap::init(&keys));
     let (ui_tx, mut ui_rx) = unbounded_channel();
     let completions: Completions = crate::host::call(&*host, completion::COMPLETIONS, &()).await.unwrap_or_else(|e| {
         Completions { entries: Vec::new(), error: Some(format!("cannot read the completion list: {e}")) }

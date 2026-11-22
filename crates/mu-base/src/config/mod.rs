@@ -6,7 +6,7 @@ use std::cell::RefCell;
 mod mu;
 mod retry;
 
-pub use mu::{Cards, MuBell, MuConfig, MuPermissions, MuStatus, MuTheme};
+pub use mu::{Cards, KeySpec, MuBell, MuConfig, MuKeys, MuPermissions, MuStatus, MuTheme};
 pub use mu::{MuAgent, StateKey};
 use mu::{MuPredict, check_predict, check_status, load_permissions};
 use retry::check_retry;
@@ -306,6 +306,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         permissions: load_permissions(&section("permissions"), warn),
         bell: parse(section("bell"), "bell", warn),
         sessions: parse(section("sessions"), "sessions", warn),
+        keys: parse(section("keys"), "keys", warn),
     }
 }
 
@@ -662,6 +663,19 @@ mod tests {
         std::fs::write(&path, "theme = 3\n").unwrap();
         assert!(set_theme_source(&path, "white").unwrap_err().contains("not a table"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keys_section_takes_a_chord_or_a_list() {
+        let c = toml::from_str::<MuConfig>(
+            "[keys.chat]\ntoggle_thinking = \"f5\"\nmodel_picker = [\"alt+m\", \"f2\"]\nreply = []\n",
+        )
+        .unwrap();
+        let chat = &c.keys.0["chat"];
+        assert_eq!(chat["toggle_thinking"].chords(), ["f5"]);
+        assert_eq!(chat["model_picker"].chords(), ["alt+m", "f2"]);
+        assert!(chat["reply"].chords().is_empty());
+        assert!(toml::from_str::<MuConfig>("").unwrap().keys.0.is_empty());
     }
 
     #[test]

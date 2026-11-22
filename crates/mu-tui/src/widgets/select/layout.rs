@@ -20,7 +20,14 @@ const CONTEXT_MAX_LINES: usize = 8;
 /// Rows a highlighted item's detail text may take under the list.
 const DETAIL_MAX_LINES: usize = 6;
 
-const TEXT_HINT: &str = "Enter submit · Shift/Alt/Ctrl-Enter newline · Esc to options";
+/// The newline chords read badly as a list, so that part stays literal.
+fn text_hint() -> String {
+    format!(
+        "{} submit · Shift/Alt/Ctrl-Enter newline · {} to options",
+        crate::keymap::SUBMIT.label(),
+        crate::keymap::SELECT_CANCEL.label()
+    )
+}
 
 impl Select {
     /// Lines (title, input, rows) fitted to `max_rows`, and the cursor (row, col).
@@ -56,7 +63,7 @@ impl Select {
                 cursor = (out.len() + cur.0, cur.1);
                 out.extend(lines);
                 if hint {
-                    out.push(line::styled(TEXT_HINT, |_| dim()));
+                    out.push(line::styled(text_hint(), |_| dim()));
                 }
             }
             Mode::Note => {
@@ -71,7 +78,7 @@ impl Select {
                 cursor = (out.len() + cur.0, cur.1);
                 out.extend(lines);
                 if hint {
-                    out.push(line::styled(TEXT_HINT, |_| dim()));
+                    out.push(line::styled(text_hint(), |_| dim()));
                 }
             }
             Mode::List => {

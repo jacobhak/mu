@@ -1,3 +1,4 @@
+use crate::keymap;
 use crate::status::format_number;
 use crate::text::accent;
 use crate::text::line::{self, Line, dim, span, styled};
@@ -156,91 +157,93 @@ impl DocReview {
         if k.kind == KeyEventKind::Release {
             return ReviewResult::Pending;
         }
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let plain = !ctrl && !k.modifiers.contains(KeyModifiers::ALT);
+        let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if self.editing {
-            match k.code {
-                KeyCode::Esc => {
-                    self.editing = false;
-                    self.text.clear();
-                }
-                KeyCode::Enter if self.selected_input() == Some(ActionInput::Optional) => {
-                    let text = self.text.trim();
-                    let text = (!text.is_empty()).then(|| self.text.clone());
-                    return self.choice(text);
-                }
-                KeyCode::Enter if !self.text.trim().is_empty() => {
-                    return self.choice(Some(self.text.clone()));
-                }
-                KeyCode::Backspace => {
-                    self.text.pop();
-                }
-                KeyCode::Char('c') if ctrl => return ReviewResult::Cancelled,
-                KeyCode::Char('u') if ctrl => self.text.clear(),
-                KeyCode::Char(c) if plain => self.text.push(c),
-                _ => {}
+            if keymap::REVIEW_FEEDBACK_BACK.hit(&k) {
+                self.editing = false;
+                self.text.clear();
+            } else if keymap::SUBMIT.hit(&k) && self.selected_input() == Some(ActionInput::Optional) {
+                let text = self.text.trim();
+                let text = (!text.is_empty()).then(|| self.text.clone());
+                return self.choice(text);
+            } else if keymap::SUBMIT.hit(&k) && !self.text.trim().is_empty() {
+                return self.choice(Some(self.text.clone()));
+            } else if keymap::BACKSPACE.hit(&k) {
+                self.text.pop();
+            } else if keymap::REVIEW_CANCEL.hit(&k) {
+                return ReviewResult::Cancelled;
+            } else if keymap::KILL_BOL.hit(&k) {
+                self.text.clear();
+            } else if let KeyCode::Char(c) = k.code
+                && plain
+            {
+                self.text.push(c);
             }
             return ReviewResult::Pending;
         }
         let page = self.body_h.saturating_sub(1).max(1) as isize;
-        match k.code {
-            KeyCode::Esc => return ReviewResult::Cancelled,
-            KeyCode::Char('c') if ctrl => return ReviewResult::Cancelled,
-            KeyCode::Char('g') if ctrl && self.file.is_some() => return ReviewResult::Edit,
-            KeyCode::Char('c') if k.modifiers.is_empty() => return ReviewResult::Copy,
-            KeyCode::Char('n')
-                if k.modifiers.is_empty()
-                    && self.focus == Focus::Actions
-                    && self.selected_input() == Some(ActionInput::Optional) =>
-            {
-                self.editing = true;
-            }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.focus = if self.focus == Focus::Body { Focus::Actions } else { Focus::Body };
-            }
-            KeyCode::PageUp => self.scroll_by(-page),
-            KeyCode::PageDown => self.scroll_by(page),
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = self.max_scroll(),
-            _ if self.focus == Focus::Body => match k.code {
-                KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.scroll >= self.max_scroll() {
-                        self.focus = Focus::Actions;
-                    } else {
-                        self.scroll_by(1);
-                    }
+        if keymap::REVIEW_CANCEL.hit(&k) {
+            return ReviewResult::Cancelled;
+        } else if keymap::REVIEW_EDIT.hit(&k) && self.file.is_some() {
+            return ReviewResult::Edit;
+        } else if keymap::REVIEW_COPY.hit(&k) {
+            return ReviewResult::Copy;
+        } else if keymap::REVIEW_NOTE.hit(&k)
+            && self.focus == Focus::Actions
+            && self.selected_input() == Some(ActionInput::Optional)
+        {
+            self.editing = true;
+        } else if keymap::REVIEW_TOGGLE_FOCUS.hit(&k) {
+            self.focus = if self.focus == Focus::Body { Focus::Actions } else { Focus::Body };
+        } else if keymap::REVIEW_PAGE_UP.hit(&k) {
+            self.scroll_by(-page);
+        } else if keymap::REVIEW_PAGE_DOWN.hit(&k) {
+            self.scroll_by(page);
+        } else if keymap::REVIEW_TOP.hit(&k) {
+            self.scroll = 0;
+        } else if keymap::REVIEW_BOTTOM.hit(&k) {
+            self.scroll = self.max_scroll();
+        } else if self.focus == Focus::Body {
+            if keymap::REVIEW_SCROLL_UP.hit(&k) {
+                self.scroll_by(-1);
+            } else if keymap::REVIEW_SCROLL_DOWN.hit(&k) {
+                if self.scroll >= self.max_scroll() {
+                    self.focus = Focus::Actions;
+                } else {
+                    self.scroll_by(1);
                 }
-                KeyCode::Char('g') => self.scroll = 0,
-                KeyCode::Char('G') => self.scroll = self.max_scroll(),
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Actions,
-                _ => {}
-            },
-            KeyCode::Up | KeyCode::Char('k') => match (0..self.sel).rev().find(|&i| self.enabled(i)) {
+            } else if keymap::REVIEW_DOC_TOP.hit(&k) {
+                self.scroll = 0;
+            } else if keymap::REVIEW_DOC_BOTTOM.hit(&k) {
+                self.scroll = self.max_scroll();
+            } else if keymap::REVIEW_TO_ACTIONS.hit(&k) {
+                self.focus = Focus::Actions;
+            }
+        } else if keymap::REVIEW_SELECT_PREV.hit(&k) {
+            match (0..self.sel).rev().find(|&i| self.enabled(i)) {
                 Some(i) => self.sel = i,
                 None => self.focus = Focus::Body,
-            },
-            KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(i) = (self.sel + 1..self.actions.len()).find(|&i| self.enabled(i)) {
-                    self.sel = i;
-                }
             }
-            KeyCode::Left => self.tier = self.tier.saturating_sub(1),
-            KeyCode::Right => self.tier = (self.tier + 1).min(self.tiers.len().saturating_sub(1)),
-            KeyCode::Char('h') if self.slider() => self.tier = self.tier.saturating_sub(1),
-            KeyCode::Char('l') if self.slider() => self.tier = (self.tier + 1).min(self.tiers.len() - 1),
-            KeyCode::Enter => {
-                let Some(row) = self.actions.get(self.sel) else { return ReviewResult::Pending };
-                if row.off {
-                    return ReviewResult::Pending;
-                }
-                if row.input == ActionInput::Required {
-                    self.editing = true;
-                    return ReviewResult::Pending;
-                }
-                return self.choice(None);
+        } else if keymap::REVIEW_SELECT_NEXT.hit(&k) {
+            if let Some(i) = (self.sel + 1..self.actions.len()).find(|&i| self.enabled(i)) {
+                self.sel = i;
             }
-            _ => {}
+        } else if keymap::REVIEW_TIER_PREV.hit(&k) || (keymap::REVIEW_SLIDER_PREV.hit(&k) && self.slider()) {
+            self.tier = self.tier.saturating_sub(1);
+        } else if keymap::REVIEW_TIER_NEXT.hit(&k) {
+            self.tier = (self.tier + 1).min(self.tiers.len().saturating_sub(1));
+        } else if keymap::REVIEW_SLIDER_NEXT.hit(&k) && self.slider() {
+            self.tier = (self.tier + 1).min(self.tiers.len() - 1);
+        } else if keymap::REVIEW_CONFIRM.hit(&k) {
+            let Some(row) = self.actions.get(self.sel) else { return ReviewResult::Pending };
+            if row.off {
+                return ReviewResult::Pending;
+            }
+            if row.input == ActionInput::Required {
+                self.editing = true;
+                return ReviewResult::Pending;
+            }
+            return self.choice(None);
         }
         ReviewResult::Pending
     }
@@ -327,29 +330,33 @@ impl DocReview {
             }
             out.push(l);
         }
-        let help: Vec<&str> = if self.editing {
-            vec!["Enter send", "Esc back"]
+        let cancel = format!("{} cancel", keymap::REVIEW_CANCEL.label());
+        let copy = format!("{} copy", keymap::REVIEW_COPY.label());
+        let edit = format!("{} edit", keymap::REVIEW_EDIT.label());
+        let toggle = keymap::REVIEW_TOGGLE_FOCUS.label();
+        let help: Vec<String> = if self.editing {
+            vec![format!("{} send", keymap::SUBMIT.label()), format!("{} back", keymap::REVIEW_FEEDBACK_BACK.label())]
         } else if self.focus == Focus::Body {
-            let mut h = vec!["↑↓ scroll", "PgUp/PgDn page", "g/G ends", "c copy"];
+            let mut h = vec!["↑↓ scroll".to_string(), "PgUp/PgDn page".into(), "g/G ends".into(), copy];
             if self.file.is_some() {
-                h.push("Ctrl+G edit");
+                h.push(edit);
             }
-            h.extend(["Tab actions", "Esc cancel"]);
+            h.extend([format!("{toggle} actions"), cancel]);
             h
         } else {
-            let mut h = vec!["↑↓ select", "Enter confirm"];
+            let mut h = vec!["↑↓ select".to_string(), format!("{} confirm", keymap::REVIEW_CONFIRM.label())];
             if self.slider() {
-                h.push("←→ model");
+                h.push("←→ model".into());
             }
-            h.push("c copy");
+            h.push(copy);
             if self.file.is_some() {
-                h.push("Ctrl+G edit");
+                h.push(edit);
             }
-            h.push("Tab document");
+            h.push(format!("{toggle} document"));
             if self.selected_input() == Some(ActionInput::Optional) {
-                h.push("n note");
+                h.push(format!("{} note", keymap::REVIEW_NOTE.label()));
             }
-            h.push("Esc cancel");
+            h.push(cancel);
             h
         };
         out.push(styled(help.join(" · "), |_| dim()));
@@ -550,6 +557,24 @@ mod tests {
             r.on_key(key(KeyCode::Down));
         }
         assert_eq!(decided(r.on_key(key(KeyCode::Enter))).id, "drop");
+    }
+
+    #[test]
+    fn rebinding_moves_the_keys_and_the_hints() {
+        let esc = key(KeyCode::Esc);
+        let f5 = key(KeyCode::F(5));
+        assert!(matches!(review("x", None, vec![]).on_key(esc), ReviewResult::Cancelled));
+        crate::keymap::with_keys(&[("review", "cancel", &["f5"]), ("review", "select_next", &["ctrl+n"])], || {
+            let mut r = review("x", None, vec![]);
+            assert!(matches!(r.on_key(esc), ReviewResult::Pending));
+            assert!(matches!(r.on_key(f5), ReviewResult::Cancelled));
+            r.on_key(key(KeyCode::Down));
+            assert_eq!(r.sel, 0);
+            r.on_key(mu_testutil::key_mods(KeyCode::Char('n'), KeyModifiers::CONTROL));
+            assert_eq!(r.sel, 1);
+            let (rows, _) = r.render(80, 30);
+            assert!(line::line_text(rows.last().unwrap()).ends_with("F5 cancel"));
+        });
     }
 
     #[test]

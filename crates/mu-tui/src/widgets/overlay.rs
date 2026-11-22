@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::oneshot;
 
+use crate::keymap;
 use crate::panels::doc_review::{DocReview, ReviewResult};
 use crate::panels::jobs_panel::{JobsPanel, JobsResult};
 use crate::panels::model_roles::{RoleEditor, RoleEditorAction};
@@ -433,7 +434,7 @@ fn ask_hint(q: &AskQuestion, pos: Option<(usize, usize)>) -> String {
     if pos.is_some_and(|(k, _)| k > 1) {
         hint.push_str(" · ← / ⇧Tab back");
     }
-    hint.push_str(" · Esc cancel");
+    hint.push_str(&format!(" · {} cancel", keymap::SELECT_CANCEL.label()));
     if q.context.as_ref().is_some_and(|c| !c.trim().is_empty()) {
         hint = format!("PgUp/PgDn context · {hint}");
     }
@@ -459,7 +460,7 @@ fn review_select(qs: &[AskQuestion], answers: &[Option<Answer>]) -> Select {
     Select::new("Review your answers", items)
         .preselect(submit)
         .back_keys(true)
-        .hint("↑↓ move · Enter reopen or submit · ← / ⇧Tab back · Esc cancel")
+        .hint(&format!("↑↓ move · Enter reopen or submit · ← / ⇧Tab back · {} cancel", keymap::SELECT_CANCEL.label()))
 }
 
 /// An answer on one line, as the review lists it.
@@ -652,12 +653,17 @@ impl ApproveState {
             items.push(Item { label: format!("For {label}"), detail: patterns.join(", ") });
         }
         items.push(Item { label: "No".into(), detail: String::new() });
+        let esc = keymap::SELECT_CANCEL.label();
         let hint = if widths.is_empty() && req.models.is_empty() {
-            "y yes · n no · Enter choose · Tab/→ note · Esc cancel".to_string()
+            format!("y yes · n no · Enter choose · Tab/→ note · {esc} cancel")
         } else if widths.is_empty() {
-            format!("y yes · n no · 1–{} pick · Enter choose · Tab/→ note · Esc cancel", items.len())
+            format!("y yes · n no · 1–{} pick · Enter choose · Tab/→ note · {esc} cancel", items.len())
         } else {
-            format!("y yes · n no · 1–{} pick · e type a pattern · Enter choose · Tab/→ note · Esc cancel", items.len())
+            format!(
+                "y yes · n no · 1–{} pick · {} type a pattern · Enter choose · Tab/→ note · {esc} cancel",
+                items.len(),
+                keymap::OVERLAY_PATTERN.label()
+            )
         };
         Select::new(&req.title, items).context(&Self::context(req)).notes().described().hint(&hint)
     }
@@ -669,7 +675,7 @@ impl ApproveState {
         Select::new("Pattern to remember", Vec::new())
             .free_text("pattern")
             .edit_text(&prefill)
-            .hint("Enter saves what you type · Esc goes back")
+            .hint(&format!("Enter saves what you type · {} goes back", keymap::SELECT_CANCEL.label()))
     }
 
     /// Second step: where to remember the patterns.
@@ -679,10 +685,10 @@ impl ApproveState {
             .map(|label| Item { label: label.into(), detail: String::new() })
             .collect();
         Select::new(&format!("Remember {} for", patterns.join(", ")), items)
-            .context("Esc goes back to the widths.")
+            .context(&format!("{} goes back to the widths.", keymap::SELECT_CANCEL.label()))
             .notes()
             .note_text(self.note.as_deref().unwrap_or(""))
-            .hint("1–3 pick · Enter choose · Tab/→ note · Esc back")
+            .hint(&format!("1–3 pick · Enter choose · Tab/→ note · {} back", keymap::SELECT_CANCEL.label()))
     }
 
     fn keep(self) -> (Option<Overlay>, Option<OverlayEvent>) {
@@ -723,15 +729,15 @@ impl ApproveState {
     fn width_key(mut self, k: KeyEvent, mut sel: Select) -> (Option<Overlay>, Option<OverlayEvent>) {
         let widths = Self::widths(&self.req);
         // Shortcuts move the highlight rather than answer, so a note can still be typed.
+        if !sel.is_typing() && !widths.is_empty() && keymap::OVERLAY_PATTERN.hit(&k) {
+            let sel = self.pattern_picker();
+            self.step = Some(Step::Pattern(sel));
+            return self.keep();
+        }
         if k.modifiers.is_empty()
             && let KeyCode::Char(c) = k.code
             && !sel.is_typing()
         {
-            if c == 'e' && !widths.is_empty() {
-                let sel = self.pattern_picker();
-                self.step = Some(Step::Pattern(sel));
-                return self.keep();
-            }
             let rows = self.req.models.len() + widths.len() + 2;
             let row = match c {
                 'y' => Some(0),
@@ -1103,7 +1109,7 @@ impl Overlay {
             ),
             Overlay::MemoryLog { mut pick } => {
                 // `r` is the revert key unless the filter holds text, which then takes it.
-                if k.code == KeyCode::Char('r') && k.modifiers.is_empty() && !pick.sel.is_filtering() {
+                if keymap::OVERLAY_REVERT.hit(&k) && !pick.sel.is_filtering() {
                     let ev = pick.highlighted().cloned().map(OverlayEvent::MemoryRevert);
                     return (Some(Overlay::MemoryLog { pick }), ev);
                 }
@@ -1253,6 +1259,19 @@ mod tests {
         let (rest, ev) = rest.expect("still open").on_key(key(KeyCode::Char('r')));
         assert!(ev.is_none(), "with the filter holding text, r is typed into it");
         assert!(matches!(rest.expect("still open").on_key(key(KeyCode::Esc)), (None, None)));
+    }
+
+    #[test]
+    fn memory_revert_key_can_be_rebound() {
+        crate::keymap::with_keys(&[("overlay", "memory_revert", &["f5"])], || {
+            let ov = Overlay::MemoryLog { pick: rows("h", &[("one", "aaa".to_string())]) };
+            let (rest, ev) = ov.on_key(key(KeyCode::Char('r')));
+            assert!(ev.is_none(), "r is typed into the filter now");
+            let ov = Overlay::MemoryLog { pick: rows("h", &[("one", "aaa".to_string())]) };
+            let _ = rest;
+            let (_, ev) = ov.on_key(key(KeyCode::F(5)));
+            assert!(matches!(ev, Some(OverlayEvent::MemoryRevert(s)) if s == "aaa"));
+        });
     }
 
     #[test]

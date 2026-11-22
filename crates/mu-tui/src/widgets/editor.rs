@@ -8,12 +8,6 @@ use unicode_width::UnicodeWidthStr;
 use crate::text::line::{self, Line, plain};
 use mu_base::text::grapheme_width;
 
-/// Whether an Enter with these modifiers is a newline rather than a submit. Ctrl+Enter only
-/// arrives distinct from Enter on terminals with the kitty keyboard protocol.
-pub fn adds_newline(m: KeyModifiers) -> bool {
-    m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
-}
-
 /// What a key did to the text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edit {
@@ -331,43 +325,46 @@ impl Editor {
         Edit::Changed
     }
 
-    /// Applies an editing key. Enter (Alt/Shift) and Ctrl-J make a newline only when `multiline`;
-    /// plain Enter is never handled here, the caller submits on it.
+    /// Applies an editing key (the `editor` binds). A newline is made only when `multiline`; the
+    /// submit key is never handled here, the caller submits on it. A plain character is typed.
     pub fn key(&mut self, key: KeyEvent, multiline: bool) -> Edit {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        match key.code {
-            KeyCode::Enter if multiline && adds_newline(key.modifiers) => self.ed(Self::newline),
-            KeyCode::Char('j') if ctrl && multiline => self.ed(Self::newline),
-            KeyCode::Char(c) if !ctrl && !alt => {
-                self.insert_str(&c.to_string());
-                Edit::Changed
-            }
-            KeyCode::Left => self.mv(Self::left),
-            KeyCode::Char('b') if ctrl => self.mv(Self::left),
-            KeyCode::Right => self.mv(Self::right),
-            KeyCode::Char('f') if ctrl => self.mv(Self::right),
-            KeyCode::Char('b') if alt => self.mv(Self::word_left),
-            KeyCode::Char('f') if alt => self.mv(Self::word_right),
-            KeyCode::Home => self.mv(Self::home),
-            KeyCode::Char('a') if ctrl => self.mv(Self::home),
-            KeyCode::End => self.mv(Self::end),
-            KeyCode::Char('e') if ctrl => self.mv(Self::end),
-            KeyCode::Up if self.row > 0 => self.mv(Self::up),
-            KeyCode::Char('p') if ctrl && self.row > 0 => self.mv(Self::up),
-            KeyCode::Down if self.row + 1 < self.lines.len() => self.mv(Self::down),
-            KeyCode::Char('n') if ctrl && self.row + 1 < self.lines.len() => self.mv(Self::down),
-            KeyCode::Backspace if alt => self.ed(Self::delete_word_back),
-            KeyCode::Backspace => self.ed(Self::backspace),
-            KeyCode::Char('h') if ctrl => self.ed(Self::backspace),
-            KeyCode::Delete => self.ed(Self::delete),
-            KeyCode::Char('d') if ctrl => self.ed(Self::delete),
-            KeyCode::Char('d') if alt => self.ed(Self::delete_word_fwd),
-            KeyCode::Char('w') if ctrl => self.ed(Self::delete_word_back),
-            KeyCode::Char('k') if ctrl => self.ed(Self::kill_eol),
-            KeyCode::Char('u') if ctrl => self.ed(Self::kill_bol),
-            KeyCode::Char('y') if ctrl => self.ed(Self::yank),
-            _ => Edit::Unhandled,
+        use crate::keymap as k;
+        if multiline && k::NEWLINE.hit(&key) {
+            return self.ed(Self::newline);
+        }
+        if let KeyCode::Char(c) = key.code
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.insert_str(&c.to_string());
+            return Edit::Changed;
+        }
+        type Step = fn(&mut Editor);
+        let last = self.row + 1 >= self.lines.len();
+        let moves: [(&k::Bind, bool, Step); 8] = [
+            (&k::LEFT, true, Self::left),
+            (&k::RIGHT, true, Self::right),
+            (&k::WORD_LEFT, true, Self::word_left),
+            (&k::WORD_RIGHT, true, Self::word_right),
+            (&k::HOME, true, Self::home),
+            (&k::END, true, Self::end),
+            (&k::UP, self.row > 0, Self::up),
+            (&k::DOWN, !last, Self::down),
+        ];
+        if let Some((_, _, f)) = moves.iter().find(|(b, ok, _)| *ok && b.hit(&key)) {
+            return self.mv(*f);
+        }
+        let edits: [(&k::Bind, Step); 7] = [
+            (&k::BACKSPACE, Self::backspace),
+            (&k::DELETE, Self::delete),
+            (&k::DELETE_WORD_BACK, Self::delete_word_back),
+            (&k::DELETE_WORD_FWD, Self::delete_word_fwd),
+            (&k::KILL_EOL, Self::kill_eol),
+            (&k::KILL_BOL, Self::kill_bol),
+            (&k::YANK, Self::yank),
+        ];
+        match edits.iter().find(|(b, _)| b.hit(&key)) {
+            Some((_, f)) => self.ed(*f),
+            None => Edit::Unhandled,
         }
     }
 

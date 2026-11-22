@@ -8,6 +8,9 @@ source = "tokyo-night"  # default; or "terminal" (follow your terminal's palette
 # accent = "blue"     # palette key or "#rrggbb"
 cards = "filled"      # or "outline"
 
+# [keys.chat]         # rebind any shortcut: action = "ctrl+t" or ["ctrl+t", "f5"]; see keys.md
+# toggle_thinking = "f5"
+
 [predict]
 enabled = true
 threshold = 0.3       # minimum confidence for ghost text; 0.15 saves a few more keystrokes but shows about 55% more wrong ghosts

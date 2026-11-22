@@ -4,6 +4,7 @@ pub mod app;
 pub(crate) mod chat;
 pub(crate) mod custom;
 pub mod host;
+pub(crate) mod keymap;
 pub mod labels;
 pub(crate) mod mcp;
 pub(crate) mod panels;

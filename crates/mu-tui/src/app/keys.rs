@@ -6,6 +6,7 @@
 use super::*;
 use crate::chat::composer::Action;
 use crate::host::keys::{KeyFacts, KeyInfo, LoginList, LogoutList, TargetKind};
+use crate::keymap;
 use crate::term::clipboard;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
 use crate::widgets::picker::Picker;
@@ -184,7 +185,7 @@ impl App {
         if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return false;
         }
-        if !(k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL)) {
+        if !keymap::QUIT.hit(k) {
             self.ctrl_c_armed = false;
             return false;
         }
@@ -271,24 +272,21 @@ impl App {
     fn marked_job_key(&mut self, k: &KeyEvent) -> bool {
         if self.agent.job_focus.is_none()
             || !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            || k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             || matches!(k.code, KeyCode::Modifier(_))
         {
             return false;
         }
-        match k.code {
-            KeyCode::Char('k' | 'x') if k.modifiers.is_empty() => {
-                self.cancel_job();
-                true
-            }
-            KeyCode::Esc => {
-                self.agent.job_focus = None;
-                true
-            }
-            _ => {
-                self.agent.job_focus = None;
-                false
-            }
+        if keymap::JOB_MARK_CANCEL.hit(k) {
+            self.cancel_job();
+            true
+        } else if keymap::JOB_UNMARK.hit(k) {
+            self.agent.job_focus = None;
+            true
+        } else if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            false
+        } else {
+            self.agent.job_focus = None;
+            false
         }
     }
 
@@ -340,11 +338,11 @@ impl App {
 
     /// Keys the masked or command input takes before the composer. True when the key was handled.
     fn key_flow_key(&mut self, k: KeyEvent) -> bool {
-        if k.code == KeyCode::Esc {
+        if keymap::WIZARD_CANCEL.hit(&k) {
             self.cancel_key_flow();
             return true;
         }
-        if k.code == KeyCode::Enter && !crate::widgets::editor::adds_newline(k.modifiers) {
+        if keymap::SUBMIT.hit(&k) {
             self.finish_typing();
             return true;
         }
@@ -560,13 +558,22 @@ impl App {
             KeyOption::Paste => {
                 self.set_typing(Some(Typing::Key));
                 self.prompt.composer.set_masked(true);
-                self.notice(&format!("paste the {} key and press Enter (Esc cancels)", target.label));
+                self.notice(&format!(
+                    "paste the {} key and press {} ({} cancels)",
+                    target.label,
+                    keymap::SUBMIT.label(),
+                    keymap::WIZARD_CANCEL.label()
+                ));
             }
             KeyOption::Command => {
                 self.set_typing(Some(Typing::Command));
                 self.prompt.composer.set_private(true);
                 self.prompt.composer.set_closed(true);
-                self.notice("type the command that prints the key and press Enter (Esc cancels)");
+                self.notice(&format!(
+                    "type the command that prints the key and press {} ({} cancels)",
+                    keymap::SUBMIT.label(),
+                    keymap::WIZARD_CANCEL.label()
+                ));
             }
             KeyOption::Env(name) => match Entry::reference(&format!("${name}")) {
                 Ok(entry) => self.check_key(target, entry),

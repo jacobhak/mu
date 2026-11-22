@@ -10,6 +10,7 @@ use crossterm::style::{Attribute, ContentStyle};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::keymap;
 use crate::text::accent;
 use crate::text::line::{self, Line, dim, span};
 use crate::theme::{self, Role};
@@ -528,6 +529,35 @@ enum Mv {
     Block(isize),
 }
 
+/// The cursor move a key stands for.
+fn motion(k: &KeyEvent) -> Option<Mv> {
+    let table: [(&keymap::Bind, Mv); 22] = [
+        (&keymap::REPLY_UP, Mv::Up(false)),
+        (&keymap::REPLY_DOWN, Mv::Down(false)),
+        (&keymap::REPLY_LEFT, Mv::Left(false)),
+        (&keymap::REPLY_RIGHT, Mv::Right(false)),
+        (&keymap::REPLY_EXTEND_UP, Mv::Up(true)),
+        (&keymap::REPLY_EXTEND_DOWN, Mv::Down(true)),
+        (&keymap::REPLY_EXTEND_LEFT, Mv::Left(true)),
+        (&keymap::REPLY_EXTEND_RIGHT, Mv::Right(true)),
+        (&keymap::REPLY_PAGE_UP, Mv::Page(-1, false)),
+        (&keymap::REPLY_PAGE_DOWN, Mv::Page(1, false)),
+        (&keymap::REPLY_EXTEND_PAGE_UP, Mv::Page(-1, true)),
+        (&keymap::REPLY_EXTEND_PAGE_DOWN, Mv::Page(1, true)),
+        (&keymap::REPLY_HALF_UP, Mv::Half(-1)),
+        (&keymap::REPLY_HALF_DOWN, Mv::Half(1)),
+        (&keymap::REPLY_TOP, Mv::Top(false)),
+        (&keymap::REPLY_BOTTOM, Mv::Bottom(false)),
+        (&keymap::REPLY_EXTEND_TOP, Mv::Top(true)),
+        (&keymap::REPLY_EXTEND_BOTTOM, Mv::Bottom(true)),
+        (&keymap::REPLY_UNIT_START, Mv::UnitStart),
+        (&keymap::REPLY_UNIT_END, Mv::UnitEnd),
+        (&keymap::REPLY_BLOCK_PREV, Mv::Block(-1)),
+        (&keymap::REPLY_BLOCK_NEXT, Mv::Block(1)),
+    ];
+    table.into_iter().find(|(b, _)| b.hit(k)).map(|(_, mv)| mv)
+}
+
 /// What a key did to the picker.
 #[derive(Debug, PartialEq)]
 pub enum ReplyResult {
@@ -568,12 +598,8 @@ impl View {
     }
 
     fn key(&mut self, k: KeyEvent) -> ReplyResult {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = k.modifiers.contains(KeyModifiers::ALT);
-        let plain = !ctrl && !alt;
-        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         let pending_g = std::mem::take(&mut self.pending_g);
-        if plain
+        if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             && let KeyCode::Char(d @ '0'..='9') = k.code
             && (d != '0' || self.count > 0)
         {
@@ -582,88 +608,38 @@ impl View {
         }
         let had_count = self.count > 0;
         let n = std::mem::take(&mut self.count).max(1);
-        let mv = match k.code {
-            KeyCode::Esc => {
-                // Esc first drops a pending count or selection, then closes.
-                return if self.anchor.take().is_none() && !had_count {
-                    ReplyResult::Close
-                } else {
-                    ReplyResult::Pending
-                };
+        if keymap::REPLY_CANCEL.hit(&k) {
+            // Cancel first drops a pending count or selection, then closes.
+            return if self.anchor.take().is_none() && !had_count { ReplyResult::Close } else { ReplyResult::Pending };
+        }
+        if keymap::REPLY_QUOTE.hit(&k) {
+            self.take_selection();
+            return ReplyResult::Quote(self.quotes());
+        }
+        if keymap::REPLY_GOTO_PREFIX.hit(&k) && !pending_g {
+            self.pending_g = true;
+            return ReplyResult::Pending;
+        }
+        if keymap::REPLY_MARK.hit(&k) {
+            if !self.take_selection() {
+                self.toggle_unit();
             }
-            KeyCode::Char('g') if ctrl && !alt => {
-                return if self.anchor.take().is_none() && !had_count {
-                    ReplyResult::Close
-                } else {
-                    ReplyResult::Pending
-                };
-            }
-            KeyCode::Up => Mv::Up(shift),
-            KeyCode::Down => Mv::Down(shift),
-            KeyCode::Left => Mv::Left(shift),
-            KeyCode::Right => Mv::Right(shift),
-            KeyCode::PageUp => Mv::Page(-1, shift),
-            KeyCode::PageDown => Mv::Page(1, shift),
-            KeyCode::Home if plain => Mv::Top(shift),
-            KeyCode::End if plain => Mv::Bottom(shift),
-            KeyCode::Enter => {
-                self.take_selection();
-                return ReplyResult::Quote(self.quotes());
-            }
-            KeyCode::Char(c) if plain => match c {
-                'k' => Mv::Up(false),
-                'K' => Mv::Up(true),
-                'j' => Mv::Down(false),
-                'J' => Mv::Down(true),
-                'h' | 'b' => Mv::Left(false),
-                'H' | 'B' => Mv::Left(true),
-                'l' | 'w' | 'e' => Mv::Right(false),
-                'L' | 'W' | 'E' => Mv::Right(true),
-                '0' | '^' => Mv::UnitStart,
-                '$' => Mv::UnitEnd,
-                '{' => Mv::Block(-1),
-                '}' => Mv::Block(1),
-                'G' => Mv::Bottom(false),
-                'g' if pending_g => Mv::Top(false),
-                'g' => {
-                    self.pending_g = true;
-                    return ReplyResult::Pending;
-                }
-                ' ' => {
-                    if !self.take_selection() {
-                        self.toggle_unit();
-                    }
-                    return ReplyResult::Pending;
-                }
-                'c' => {
-                    self.marks.clear();
-                    self.anchor = None;
-                    return ReplyResult::Pending;
-                }
-                'q' => return ReplyResult::Close,
-                _ => return ReplyResult::Pending,
-            },
-            KeyCode::Char(c) if ctrl && !alt => match c.to_ascii_lowercase() {
-                'n' => Mv::Down(false),
-                'p' => Mv::Up(false),
-                'f' => Mv::Right(false),
-                'b' => Mv::Left(false),
-                'a' => Mv::UnitStart,
-                'e' => Mv::UnitEnd,
-                'v' => Mv::Page(1, false),
-                'd' => Mv::Half(1),
-                'u' => Mv::Half(-1),
-                _ => return ReplyResult::Pending,
-            },
-            KeyCode::Char(c) if alt && !ctrl => match c {
-                'f' => Mv::Right(false),
-                'b' => Mv::Left(false),
-                'v' => Mv::Page(-1, false),
-                '<' => Mv::Top(false),
-                '>' => Mv::Bottom(false),
-                _ => return ReplyResult::Pending,
-            },
-            _ => return ReplyResult::Pending,
+            return ReplyResult::Pending;
+        }
+        if keymap::REPLY_CLEAR.hit(&k) {
+            self.marks.clear();
+            self.anchor = None;
+            return ReplyResult::Pending;
+        }
+        if keymap::REPLY_CLOSE.hit(&k) {
+            return ReplyResult::Close;
+        }
+        let mv = if keymap::REPLY_GOTO_PREFIX.hit(&k) {
+            Mv::Top(false)
+        } else if let Some(mv) = motion(&k) {
+            mv
+        } else {
+            return ReplyResult::Pending;
         };
         // A counted word move moves at once instead of first revealing the cursor word.
         if n > 1 && matches!(mv, Mv::Left(false) | Mv::Right(false)) {
@@ -954,16 +930,25 @@ impl View {
             frame.footer.push(rule(None, width));
         }
         if max_rows >= 9 {
+            let mark = keymap::REPLY_MARK.label();
+            let quote = keymap::REPLY_QUOTE.label();
+            let cancel = keymap::REPLY_CANCEL.label();
             let (a, b) = if self.anchor.is_some() {
-                ("Shift+←→ word · Shift+↑↓ unit · Space mark", "Enter quote · Esc drop selection · Ctrl+G close")
+                (
+                    format!("Shift+←→ word · Shift+↑↓ unit · {mark} mark"),
+                    format!("{quote} quote · {cancel} drop selection · Ctrl+G close"),
+                )
             } else {
                 (
-                    "↑↓ jk unit · ←→ hl word · Shift+move select · gg G { } ^D ^U ^N ^P ^F ^B",
-                    "Space mark · c clear · Enter quote · [ ] Tab reply (3[ jumps) · Esc close",
+                    "↑↓ jk unit · ←→ hl word · Shift+move select · gg G { } ^D ^U ^N ^P ^F ^B".to_string(),
+                    format!(
+                        "{mark} mark · {} clear · {quote} quote · [ ] Tab reply (3[ jumps) · {cancel} close",
+                        keymap::REPLY_CLEAR.label()
+                    ),
                 )
             };
-            frame.footer.push(line::styled(a, |_| dim()));
-            frame.footer.push(line::styled(b, |_| dim()));
+            frame.footer.push(line::styled(&a, |_| dim()));
+            frame.footer.push(line::styled(&b, |_| dim()));
         }
         let h = frame.body_rows(max_rows, 1);
         let w = width.saturating_sub(GUTTER).max(1);
@@ -1099,21 +1084,12 @@ impl ReplyPicker {
         if k.kind == KeyEventKind::Release {
             return ReplyResult::Pending;
         }
-        let (ctrl, alt) = (k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT));
-        // Ctrl+Alt is how some terminals report AltGr, which is how `[` and `]` are typed on many layouts.
-        let bracket = (!ctrl && !alt) || (ctrl && alt);
-        let dir: isize = match k.code {
-            KeyCode::Char('[') if bracket => -1,
-            KeyCode::Char(']') if bracket => 1,
-            KeyCode::BackTab if !ctrl && !alt => -1,
-            KeyCode::Tab if !ctrl && !alt => {
-                if k.modifiers.contains(KeyModifiers::SHIFT) {
-                    -1
-                } else {
-                    1
-                }
-            }
-            _ => return self.views[self.at].key(k),
+        let dir: isize = if keymap::REPLY_PREV_REPLY.hit(&k) {
+            -1
+        } else if keymap::REPLY_NEXT_REPLY.hit(&k) {
+            1
+        } else {
+            return self.views[self.at].key(k);
         };
         let view = &mut self.views[self.at];
         // A count (`3[`) jumps that many replies.
@@ -1459,6 +1435,31 @@ mod tests {
         let (lines, _) = p.render(60, 10);
         assert!(line_text(&lines[0]).starts_with("── reply 2/2 · 1 marked"), "{:?}", line_text(&lines[0]));
         assert!(lines.iter().any(|l| line_text(l).contains("Enter quote")));
+    }
+
+    #[test]
+    fn rebinding_moves_keys_and_frees_the_old_ones() {
+        crate::keymap::with_keys(
+            &[("reply", "down", &["f5"]), ("reply", "next_reply", &["f6"]), ("reply", "quote", &["f7"])],
+            || {
+                let mut p = picker(ALPHA);
+                press(&mut p, KeyCode::F(5));
+                assert_eq!(at_unit(&p), 1);
+                press(&mut p, KeyCode::Char('j'));
+                press(&mut p, KeyCode::Down);
+                assert_eq!(at_unit(&p), 1, "the old chords are free");
+                assert_eq!(press(&mut p, KeyCode::Enter), ReplyResult::Pending);
+                assert!(matches!(press(&mut p, KeyCode::F(7)), ReplyResult::Quote(_)));
+                let mut p = five();
+                press(&mut p, KeyCode::Char('['));
+                press(&mut p, KeyCode::Tab);
+                assert_eq!(p.at, 3, "Tab no longer switches");
+                press(&mut p, KeyCode::F(6));
+                assert_eq!(p.at, 4);
+                let (lines, _) = p.render(80, 10);
+                assert!(lines.iter().any(|l| line_text(l).contains("F7 quote")));
+            },
+        );
     }
 
     fn five() -> ReplyPicker {

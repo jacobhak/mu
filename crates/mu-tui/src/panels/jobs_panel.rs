@@ -11,6 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::host::results::ResultArgs;
 use crate::host::sessions::{Live, LiveArgs, TailArgs, TailDelta};
+use crate::keymap;
 use crate::panels::reply::rule;
 use crate::panels::session_view;
 use crate::panels::sessions_tab::{self, Row};
@@ -614,39 +615,37 @@ impl JobsPanel {
     }
 
     fn view_key(&mut self, k: KeyEvent) -> JobsResult {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let Some(v) = self.view.as_mut() else { return JobsResult::Pending };
         let page = v.body_h.max(1) as isize;
-        match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = None,
-            KeyCode::Down | KeyCode::Char('j') => v.scroll(1),
-            KeyCode::Char('n') if ctrl => v.scroll(1),
-            KeyCode::Up | KeyCode::Char('k') => v.scroll(-1),
-            KeyCode::Char('p') if ctrl => v.scroll(-1),
-            KeyCode::PageDown => v.scroll(page),
-            KeyCode::Char('f') if ctrl => v.scroll(page),
-            KeyCode::PageUp => v.scroll(-page),
-            KeyCode::Char('b') if ctrl => v.scroll(-page),
-            KeyCode::Char('d') if ctrl => v.scroll(page / 2),
-            KeyCode::Char('u') if ctrl => v.scroll(-(page / 2)),
-            KeyCode::Home | KeyCode::Char('g') => {
-                v.top = 0;
-                v.follow = v.max_top == 0;
+        if keymap::JOBS_VIEW_CLOSE.hit(&k) {
+            self.view = None;
+        } else if keymap::JOBS_VIEW_DOWN.hit(&k) {
+            v.scroll(1);
+        } else if keymap::JOBS_VIEW_UP.hit(&k) {
+            v.scroll(-1);
+        } else if keymap::JOBS_VIEW_PAGE_DOWN.hit(&k) {
+            v.scroll(page);
+        } else if keymap::JOBS_VIEW_PAGE_UP.hit(&k) {
+            v.scroll(-page);
+        } else if keymap::JOBS_VIEW_HALF_DOWN.hit(&k) {
+            v.scroll(page / 2);
+        } else if keymap::JOBS_VIEW_HALF_UP.hit(&k) {
+            v.scroll(-(page / 2));
+        } else if keymap::JOBS_VIEW_TOP.hit(&k) {
+            v.top = 0;
+            v.follow = v.max_top == 0;
+        } else if keymap::JOBS_VIEW_BOTTOM.hit(&k) {
+            v.follow = true;
+        } else if keymap::JOBS_VIEW_FOLLOW.hit(&k) {
+            if v.follow {
+                v.top = v.max_top;
             }
-            KeyCode::End | KeyCode::Char('G') => v.follow = true,
-            KeyCode::Char('f') => {
-                if v.follow {
-                    v.top = v.max_top;
-                }
-                v.follow = !v.follow;
+            v.follow = !v.follow;
+        } else if keymap::JOBS_VIEW_KILL.hit(&k) && v.label.is_none() {
+            let name = v.name.clone();
+            if self.jobs.iter().any(|j| j.name == name && j.state == SubagentState::Running) {
+                return JobsResult::Kill(Some(name));
             }
-            KeyCode::Char('x') if v.label.is_none() => {
-                let name = v.name.clone();
-                if self.jobs.iter().any(|j| j.name == name && j.state == SubagentState::Running) {
-                    return JobsResult::Kill(Some(name));
-                }
-            }
-            _ => {}
         }
         JobsResult::Pending
     }
@@ -655,26 +654,27 @@ impl JobsPanel {
     fn input_key(&mut self, k: KeyEvent) -> JobsResult {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let Some(c) = self.input.as_mut() else { return JobsResult::Pending };
-        match k.code {
-            KeyCode::Esc => self.input = None,
-            KeyCode::Enter => {
-                if let Some(c) = self.input.take() {
-                    let text = c.text.trim().to_string();
-                    if !text.is_empty() {
-                        return JobsResult::Notify { session: c.session, text };
-                    }
+        if keymap::JOBS_INPUT_CANCEL.hit(&k) {
+            self.input = None;
+        } else if keymap::SUBMIT.hit(&k) {
+            if let Some(c) = self.input.take() {
+                let text = c.text.trim().to_string();
+                if !text.is_empty() {
+                    return JobsResult::Notify { session: c.session, text };
                 }
             }
-            KeyCode::Backspace => {
-                c.text.pop();
-            }
-            KeyCode::Char('u') if ctrl => c.text.clear(),
-            KeyCode::Char('w') if ctrl => {
-                let kept = c.text.trim_end().rfind(' ').map_or(0, |i| i + 1);
-                c.text.truncate(kept);
-            }
-            KeyCode::Char(ch) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => c.text.push(ch),
-            _ => {}
+        } else if keymap::JOBS_INPUT_BACKSPACE.hit(&k) {
+            c.text.pop();
+        } else if keymap::JOBS_INPUT_CLEAR.hit(&k) {
+            c.text.clear();
+        } else if keymap::JOBS_INPUT_DELETE_WORD.hit(&k) {
+            let kept = c.text.trim_end().rfind(' ').map_or(0, |i| i + 1);
+            c.text.truncate(kept);
+        } else if let KeyCode::Char(ch) = k.code
+            && !ctrl
+            && !k.modifiers.contains(KeyModifiers::ALT)
+        {
+            c.text.push(ch);
         }
         JobsResult::Pending
     }
@@ -721,7 +721,7 @@ impl JobsPanel {
         }
         self.status = None;
         if std::mem::take(&mut self.confirm_kill_all) {
-            return if k.code == KeyCode::Char('y') { JobsResult::Kill(None) } else { JobsResult::Pending };
+            return if keymap::JOBS_CONFIRM.hit(&k) { JobsResult::Kill(None) } else { JobsResult::Pending };
         }
         if self.confirm.is_some() {
             return self.confirm_key(k);
@@ -732,7 +732,7 @@ impl JobsPanel {
         if self.view.is_some() {
             return self.view_key(k);
         }
-        if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+        if keymap::JOBS_SWITCH_TAB.hit(&k) {
             self.switch_tab();
             return JobsResult::Pending;
         }
@@ -743,92 +743,90 @@ impl JobsPanel {
     }
 
     fn jobs_key(&mut self, k: KeyEvent) -> JobsResult {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let last = self.jobs.len().saturating_sub(1);
-        match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => return JobsResult::Close,
-            KeyCode::Down | KeyCode::Char('j') => self.at = (self.at + 1).min(last),
-            KeyCode::Char('n') if ctrl => self.at = (self.at + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => self.at = self.at.saturating_sub(1),
-            KeyCode::Char('p') if ctrl => self.at = self.at.saturating_sub(1),
-            KeyCode::Home | KeyCode::Char('g') => self.at = 0,
-            KeyCode::End | KeyCode::Char('G') => self.at = last,
-            KeyCode::PageDown => self.at = (self.at + self.page).min(last),
-            KeyCode::PageUp => self.at = self.at.saturating_sub(self.page),
-            KeyCode::Enter => self.open_view(),
-            KeyCode::Char('x') => {
-                if let Some(j) = self.jobs.get(self.at).filter(|j| j.state == SubagentState::Running) {
-                    return JobsResult::Kill(Some(j.name.clone()));
-                }
+        if keymap::JOBS_CLOSE.hit(&k) {
+            return JobsResult::Close;
+        } else if keymap::JOBS_DOWN.hit(&k) {
+            self.at = (self.at + 1).min(last);
+        } else if keymap::JOBS_UP.hit(&k) {
+            self.at = self.at.saturating_sub(1);
+        } else if keymap::JOBS_TOP.hit(&k) {
+            self.at = 0;
+        } else if keymap::JOBS_BOTTOM.hit(&k) {
+            self.at = last;
+        } else if keymap::JOBS_PAGE_DOWN.hit(&k) {
+            self.at = (self.at + self.page).min(last);
+        } else if keymap::JOBS_PAGE_UP.hit(&k) {
+            self.at = self.at.saturating_sub(self.page);
+        } else if keymap::JOBS_OPEN.hit(&k) {
+            self.open_view();
+        } else if keymap::JOBS_KILL.hit(&k) {
+            if let Some(j) = self.jobs.get(self.at).filter(|j| j.state == SubagentState::Running) {
+                return JobsResult::Kill(Some(j.name.clone()));
             }
-            KeyCode::Char('X') if self.running() > 0 => self.confirm_kill_all = true,
-            KeyCode::Char('d') => {
-                if let Some((j, result, _)) = self.result_of() {
-                    return JobsResult::Diff { job: j.name.clone(), result };
-                }
+        } else if keymap::JOBS_KILL_ALL.hit(&k) && self.running() > 0 {
+            self.confirm_kill_all = true;
+        } else if keymap::JOBS_DIFF.hit(&k) {
+            if let Some((j, result, _)) = self.result_of() {
+                return JobsResult::Diff { job: j.name.clone(), result };
             }
-            KeyCode::Char('a') => {
-                let r = self.result_of().map(|(j, result, applied)| (j.name.clone(), result, applied));
-                match r {
-                    Some((_, _, true)) => self.status = Some("that result is already applied".into()),
-                    Some((job, result, false)) => return JobsResult::Apply { job, result },
-                    None => {}
-                }
+        } else if keymap::JOBS_APPLY.hit(&k) {
+            let r = self.result_of().map(|(j, result, applied)| (j.name.clone(), result, applied));
+            match r {
+                Some((_, _, true)) => self.status = Some("that result is already applied".into()),
+                Some((job, result, false)) => return JobsResult::Apply { job, result },
+                None => {}
             }
-            _ => {}
         }
         JobsResult::Pending
     }
 
     fn sessions_key(&mut self, k: KeyEvent) -> JobsResult {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let last = self.rows.len().saturating_sub(1);
-        match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => return JobsResult::Close,
-            KeyCode::Down | KeyCode::Char('j') => self.s_at = (self.s_at + 1).min(last),
-            KeyCode::Char('n') if ctrl => self.s_at = (self.s_at + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => self.s_at = self.s_at.saturating_sub(1),
-            KeyCode::Char('p') if ctrl => self.s_at = self.s_at.saturating_sub(1),
-            KeyCode::Home | KeyCode::Char('g') => self.s_at = 0,
-            KeyCode::End | KeyCode::Char('G') => self.s_at = last,
-            KeyCode::PageDown => self.s_at = (self.s_at + self.s_page).min(last),
-            KeyCode::PageUp => self.s_at = self.s_at.saturating_sub(self.s_page),
-            KeyCode::Enter => {
-                if let Some(result) = self.open_session_view() {
-                    return result;
-                }
+        if keymap::JOBS_CLOSE.hit(&k) {
+            return JobsResult::Close;
+        } else if keymap::JOBS_DOWN.hit(&k) {
+            self.s_at = (self.s_at + 1).min(last);
+        } else if keymap::JOBS_UP.hit(&k) {
+            self.s_at = self.s_at.saturating_sub(1);
+        } else if keymap::JOBS_TOP.hit(&k) {
+            self.s_at = 0;
+        } else if keymap::JOBS_BOTTOM.hit(&k) {
+            self.s_at = last;
+        } else if keymap::JOBS_PAGE_DOWN.hit(&k) {
+            self.s_at = (self.s_at + self.s_page).min(last);
+        } else if keymap::JOBS_PAGE_UP.hit(&k) {
+            self.s_at = self.s_at.saturating_sub(self.s_page);
+        } else if keymap::JOBS_OPEN.hit(&k) {
+            if let Some(result) = self.open_session_view() {
+                return result;
             }
-            KeyCode::Char('n') => {
-                if let Some(r) = self.rows.get(self.s_at).filter(|r| r.host.is_none()) {
-                    self.input = Some(Compose { session: r.live.path.clone(), label: r.label(), text: String::new() });
-                }
+        } else if keymap::JOBS_MESSAGE.hit(&k) {
+            if let Some(r) = self.rows.get(self.s_at).filter(|r| r.host.is_none()) {
+                self.input = Some(Compose { session: r.live.path.clone(), label: r.label(), text: String::new() });
             }
-            KeyCode::Char('s') => {
-                if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_stop()) {
-                    return JobsResult::Stop {
-                        session: r.live.path.clone(),
-                        pid: r.live.pid,
-                        started: r.live.started.clone(),
-                        kind: r.live.kind.clone().unwrap_or_default(),
-                    };
-                }
+        } else if keymap::JOBS_STOP.hit(&k) {
+            if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_stop()) {
+                return JobsResult::Stop {
+                    session: r.live.path.clone(),
+                    pid: r.live.pid,
+                    started: r.live.started.clone(),
+                    kind: r.live.kind.clone().unwrap_or_default(),
+                };
             }
-            KeyCode::Char('t') => {
-                if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_take()) {
-                    return JobsResult::Take { session: r.live.path.clone() };
-                }
+        } else if keymap::JOBS_TAKE.hit(&k) {
+            if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_take()) {
+                return JobsResult::Take { session: r.live.path.clone() };
             }
-            KeyCode::Char('S') => {
-                if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_terminate()) {
-                    self.confirm = Some(Confirm {
-                        session: r.live.path.clone(),
-                        pid: r.live.pid,
-                        started: r.live.started.clone(),
-                        label: r.label(),
-                    });
-                }
-            }
-            _ => {}
+        } else if keymap::JOBS_TERMINATE.hit(&k)
+            && let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_terminate())
+        {
+            self.confirm = Some(Confirm {
+                session: r.live.path.clone(),
+                pid: r.live.pid,
+                started: r.live.started.clone(),
+                label: r.label(),
+            });
         }
         JobsResult::Pending
     }
@@ -836,7 +834,7 @@ impl JobsPanel {
     /// `y` terminates; any other key keeps the session.
     fn confirm_key(&mut self, k: KeyEvent) -> JobsResult {
         let Some(c) = self.confirm.take() else { return JobsResult::Pending };
-        if k.code == KeyCode::Char('y') {
+        if keymap::JOBS_CONFIRM.hit(&k) {
             return JobsResult::Terminate { session: c.session, pid: c.pid, started: c.started };
         }
         JobsResult::Pending
@@ -935,7 +933,12 @@ impl JobsPanel {
                 None,
             ),
             (None, Some(c)) => {
-                let lead = format!("message to {} (Enter send, Esc cancel): ", c.label);
+                let lead = format!(
+                    "message to {} ({} send, {} cancel): ",
+                    c.label,
+                    keymap::SUBMIT.label(),
+                    keymap::JOBS_INPUT_CANCEL.label()
+                );
                 let col = lead.chars().count() + c.text.chars().count();
                 (vec![span(lead, dim()), span(c.text.clone(), Default::default())], Some(col))
             }
@@ -1221,7 +1224,9 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
 mod tests {
     use super::*;
     use crate::host::sessions::LiveRow;
+    use crate::keymap::with_keys;
     use crate::text::line::line_text;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use mu_session::session::owner::LiveSession;
     use mu_testutil::key;
     use std::path::PathBuf;
@@ -1830,6 +1835,45 @@ mod tests {
         assert!(text(&mut p, 80, 12).iter().any(|r| r.contains("waiting for the session file")), "the view stays");
         p.set_jobs(vec![with_session("a", SubagentState::Failed, &path)]);
         assert!(matches!(p.on_key(key(KeyCode::Char('x'))), JobsResult::Pending), "a finished job is not killed");
+    }
+
+    #[test]
+    fn rebinding_moves_the_list_view_and_prompt_keys() {
+        let two = || vec![job("a", SubagentState::Done), job("b", SubagentState::Done)];
+        let f5 = || key(KeyCode::F(5));
+        with_keys(&[("jobs", "up", &["f5"]), ("jobs", "close", &["f6"])], || {
+            let mut p = JobsPanel::new(two());
+            assert_eq!(p.at, 1);
+            p.on_key(key(KeyCode::Char('k')));
+            assert_eq!(p.at, 1, "the old default no longer moves");
+            p.on_key(f5());
+            assert_eq!(p.at, 0);
+            assert!(matches!(p.on_key(key(KeyCode::Char('q'))), JobsResult::Pending));
+            assert!(matches!(p.on_key(key(KeyCode::F(6))), JobsResult::Close));
+        });
+
+        let path = session_path();
+        let j = with_session("a", SubagentState::Running, &path);
+        with_keys(&[("jobs_view", "close", &["f5"]), ("jobs_view", "kill", &["f6"])], || {
+            let mut p = JobsPanel::new(vec![j.clone()]);
+            p.on_key(key(KeyCode::Enter));
+            assert!(p.view.is_some());
+            assert!(matches!(p.on_key(key(KeyCode::Char('x'))), JobsResult::Pending), "x no longer kills");
+            assert!(matches!(p.on_key(key(KeyCode::F(6))), JobsResult::Kill(Some(_))));
+            p.on_key(key(KeyCode::Esc));
+            assert!(p.view.is_some(), "Esc no longer closes");
+            p.on_key(f5());
+            assert!(p.view.is_none());
+        });
+
+        with_keys(&[("jobs_input", "cancel", &["f5"])], || {
+            let mut p = sessions_panel(vec![lived(&session_path(), "tui", "2026-01-01T00:00:00Z")]);
+            p.on_key(key(KeyCode::Char('n')));
+            p.on_key(key(KeyCode::Esc));
+            assert!(p.input.is_some(), "Esc no longer cancels");
+            p.on_key(f5());
+            assert!(p.input.is_none());
+        });
     }
 
     #[test]
