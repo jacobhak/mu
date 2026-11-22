@@ -11,6 +11,7 @@ use crate::panels::doc_review::{DocReview, ReviewResult};
 use crate::panels::jobs_panel::{JobsPanel, JobsResult};
 use crate::panels::model_roles::{RoleEditor, RoleEditorAction};
 use crate::panels::reply::{ReplyPicker, ReplyResult};
+use crate::panels::theme_picker::{ThemeAction, ThemePicker};
 use crate::widgets::frame::free_rows;
 use crate::widgets::picker::{HasSelect, Pick, Picker};
 use crate::widgets::select::{Item, Select, SelectResult};
@@ -189,6 +190,10 @@ pub enum Overlay {
     MemoryLog {
         pick: Picker<String>,
     },
+    /// `/theme`: the themes, previewed on the screen as the highlight moves.
+    Theme {
+        st: ThemePicker,
+    },
 }
 
 type Outcome = (Option<Overlay>, Option<OverlayEvent>);
@@ -224,6 +229,7 @@ macro_rules! picker_select {
             Overlay::Copy { pick } => Some(pick.$m()),
             Overlay::Memory { pick } => Some(pick.$m()),
             Overlay::MemoryLog { pick } => Some(pick.$m()),
+            Overlay::Theme { st } => Some(st.$m()),
             Overlay::Mcp { sel, .. }
             | Overlay::Custom { sel }
             | Overlay::Web { sel }
@@ -338,6 +344,8 @@ pub enum OverlayEvent {
     MemoryShow(String),
     /// Revert a commit.
     MemoryRevert(String),
+    /// Keep this theme (a `[theme] source`) and save it to config.toml.
+    SetTheme(String),
 }
 
 /// The question as a picker: its options, a free-text row, multi-select, the recommended choice
@@ -1070,6 +1078,11 @@ impl Overlay {
                 JobsResult::Apply { job, result } => {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::ApplyResult { job, result }))
                 }
+            },
+            Overlay::Theme { mut st } => match st.on_key(k) {
+                ThemeAction::Pending => (Some(Overlay::Theme { st }), None),
+                ThemeAction::Chosen(source) => (None, Some(OverlayEvent::SetTheme(source))),
+                ThemeAction::Close => (None, None),
             },
             Overlay::Session { pick } => pick_one(pick, k, |pick| Overlay::Session { pick }, OverlayEvent::Resume),
             Overlay::Rewind { pick } => pick_one(pick, k, |pick| Overlay::Rewind { pick }, OverlayEvent::Rewind),

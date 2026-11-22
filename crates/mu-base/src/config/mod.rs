@@ -229,6 +229,28 @@ fn load_omp(warn: &mut Vec<String>) -> OmpConfig {
     }
 }
 
+/// Sets `[theme] source` in `config.toml`, keeping comments, other keys and other sections.
+pub fn save_theme_source(source: &str) -> Result<(), String> {
+    set_theme_source(&paths::mu_home().join("config.toml"), source)
+}
+
+fn set_theme_source(path: &std::path::Path, source: &str) -> Result<(), String> {
+    use toml_edit::{DocumentMut, Item, Table, value};
+    let lock_path = path.with_file_name("config.toml.lock");
+    let _lock = mu_common::fs::FileLock::exclusive(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut doc: DocumentMut = text.parse().map_err(|e| format!("{}: {e}; fix it by hand", path.display()))?;
+    let theme = doc.as_table_mut().entry("theme").or_insert_with(|| Item::Table(Table::new()));
+    let theme =
+        theme.as_table_mut().ok_or_else(|| format!("{}: [theme] is not a table; set it by hand", path.display()))?;
+    theme.insert("source", value(source));
+    mu_common::fs::write_atomic(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn load_mu(warn: &mut Vec<String>) -> MuConfig {
     let p = paths::mu_home().join("config.toml");
     let Ok(text) = std::fs::read_to_string(&p) else { return MuConfig::default() };
@@ -614,6 +636,32 @@ mod tests {
         assert_eq!((c.theme.source.as_str(), c.theme.cards), ("gruvbox", Cards::Outline));
         let d = toml::from_str::<MuConfig>("").unwrap();
         assert_eq!((d.theme.source.as_str(), d.theme.accent, d.theme.cards), ("tokyo-night", None, Cards::Filled));
+    }
+
+    #[test]
+    fn saving_the_theme_keeps_the_rest_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("mu-theme-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# mine\n[theme]\nsource = \"nord\" # old\ncards = \"outline\"\n\n[bell]\nturn_end = false\n",
+        )
+        .unwrap();
+        set_theme_source(&path, "gruvbox").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# mine") && text.contains("cards = \"outline\"") && text.contains("[bell]"), "{text}");
+        let c: MuConfig = toml::from_str(&text).unwrap();
+        assert_eq!((c.theme.source.as_str(), c.theme.cards, c.bell.turn_end), ("gruvbox", Cards::Outline, false));
+
+        std::fs::write(&path, "").unwrap();
+        set_theme_source(&path, "white").unwrap();
+        let c: MuConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(c.theme.source, "white");
+
+        std::fs::write(&path, "theme = 3\n").unwrap();
+        assert!(set_theme_source(&path, "white").unwrap_err().contains("not a table"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

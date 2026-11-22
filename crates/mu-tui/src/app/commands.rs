@@ -99,7 +99,28 @@ fn strings(items: &[&str]) -> (Vec<String>, Vec<String>) {
     names(items.iter().map(|s| s.to_string()))
 }
 
-pub(super) static BUILTIN: [Builtin; 33] = [
+fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
+    use crate::theme::Origin;
+    crate::theme::available()
+        .into_iter()
+        .map(|e| {
+            let tone = match e.dark {
+                Some(true) => "dark",
+                Some(false) => "light",
+                None => "",
+            };
+            let from = match e.origin {
+                Origin::Bundled => "",
+                Origin::Custom => "~/.mu/themes",
+                Origin::Terminal => "your terminal's colours",
+                Origin::Omarchy => "omarchy's current theme",
+            };
+            (e.name, [tone, from].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · "))
+        })
+        .unzip()
+}
+
+pub(super) static BUILTIN: [Builtin; 34] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
@@ -131,6 +152,9 @@ pub(super) static BUILTIN: [Builtin; 33] = [
     cmd("todo", "Show the todo list", |a, _| a.show_todo()).busy_ok(),
     cmd("skills", "List skills", App::cmd_skills).busy_ok(),
     cmd("plugins", "List plugins", App::cmd_plugins).busy_ok(),
+    cmd("theme", "Pick a colour theme, previewed live, and save it [name]", App::cmd_theme)
+        .busy_ok()
+        .complete(complete_theme),
     cmd("mcp", "Manage MCP servers (picker; or add, import, remove, enable, test…)", App::mcp_cmd)
         .complete(|_| MCP_SUBCOMMANDS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip()),
     cmd("hotkeys", "Show key bindings", |a, _| a.notice(HOTKEYS)),
@@ -242,7 +266,7 @@ mod tests {
 
     #[test]
     fn commands_that_work_bare_do_not_wait_for_an_argument() {
-        for name in ["permissions", "mcp", "model", "jobs", "copy"] {
+        for name in ["permissions", "mcp", "model", "jobs", "copy", "theme"] {
             assert!(!find(name).unwrap().needs_arg, "/{name} runs without an argument");
         }
         for name in ["rename", "image", "schedule"] {
@@ -265,6 +289,7 @@ mod tests {
                 "todo",
                 "skills",
                 "plugins",
+                "theme",
                 "copy",
                 "reply",
                 "image",

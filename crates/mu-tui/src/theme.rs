@@ -3,7 +3,8 @@ use crate::term::probe::{self, Answers, Rgb};
 use crossterm::style::{Attribute, Color, ContentStyle};
 use mu_base::config::{Cards, MuTheme};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 const PALETTES: &[(&str, &str)] = &[
@@ -230,6 +231,14 @@ fn contrast(a: Rgb, b: Rgb) -> f64 {
     (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
+fn omarchy_file() -> PathBuf {
+    mu_common::paths::home().join(".local/state/omarchy/current/theme/colors.toml")
+}
+
+fn user_theme(name: &str) -> PathBuf {
+    mu_common::paths::mu_home().join("themes").join(format!("{name}.toml"))
+}
+
 fn load_palette(source: &str) -> Result<Palette, String> {
     let err = |e: String| format!("theme: {source}: {e}");
     let file = |p: &std::path::Path| -> Result<Palette, String> {
@@ -240,13 +249,13 @@ fn load_palette(source: &str) -> Result<Palette, String> {
         return Ok(Palette::from_answers(&probe::query(Duration::from_millis(1000))));
     }
     if source == "omarchy" {
-        return file(&mu_common::paths::home().join(".local/state/omarchy/current/theme/colors.toml"));
+        return file(&omarchy_file());
     }
     if source.contains('/') || source.ends_with(".toml") {
         let p = mu_common::paths::expand_tilde(source, &mu_common::paths::home()).unwrap_or_else(|| source.into());
         return file(&p);
     }
-    let user = mu_common::paths::mu_home().join("themes").join(format!("{source}.toml"));
+    let user = user_theme(source);
     if user.exists() {
         return file(&user);
     }
@@ -254,6 +263,64 @@ fn load_palette(source: &str) -> Result<Palette, String> {
         Some((_, text)) => Palette::from_toml(text).map_err(err),
         None => Err(err("unknown palette".into())),
     }
+}
+
+/// Where a theme in the picker comes from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Origin {
+    Bundled,
+    /// A file in `~/.mu/themes`.
+    Custom,
+    /// The terminal's own colours.
+    Terminal,
+    /// omarchy's current theme.
+    Omarchy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// What `[theme] source` and `--theme` take.
+    pub name: String,
+    pub origin: Origin,
+    /// Whether the background is darker than the text; `None` when it is not known without a probe.
+    pub dark: Option<bool>,
+}
+
+fn is_dark(p: &Palette) -> Option<bool> {
+    Some(luminance(*p.rgb.get("background")?) < luminance(*p.rgb.get("foreground")?))
+}
+
+/// The themes a user can pick: bundled and `~/.mu/themes/*.toml` by name (a file shadows a bundled
+/// palette of the same name), then `terminal`, then `omarchy` when its colours file exists.
+pub fn available() -> Vec<Entry> {
+    let mut named: std::collections::BTreeMap<String, Entry> = PALETTES
+        .iter()
+        .map(|(name, text)| {
+            let dark = Palette::from_toml(text).ok().as_ref().and_then(is_dark);
+            (name.to_string(), Entry { name: name.to_string(), origin: Origin::Bundled, dark })
+        })
+        .collect();
+    if let Ok(dir) = std::fs::read_dir(mu_common::paths::mu_home().join("themes")) {
+        for f in dir.flatten() {
+            let p = f.path();
+            let (Some(name), true) =
+                (p.file_stem().and_then(|s| s.to_str()), p.extension().is_some_and(|e| e == "toml"))
+            else {
+                continue;
+            };
+            let dark =
+                std::fs::read_to_string(&p).ok().and_then(|t| Palette::from_toml(&t).ok()).as_ref().and_then(is_dark);
+            named.insert(name.to_string(), Entry { name: name.to_string(), origin: Origin::Custom, dark });
+        }
+    }
+    let mut out: Vec<Entry> = named.into_values().collect();
+    out.push(Entry { name: "terminal".into(), origin: Origin::Terminal, dark: None });
+    if let Some(dark) =
+        std::fs::read_to_string(omarchy_file()).ok().and_then(|t| Palette::from_toml(&t).ok()).map(|p| is_dark(&p))
+    {
+        out.push(Entry { name: "omarchy".into(), origin: Origin::Omarchy, dark });
+    }
+    out
 }
 
 pub fn truecolor_terminal() -> bool {
@@ -271,9 +338,32 @@ pub struct Theme {
     cards: Cards,
 }
 
-static THEME: OnceLock<Theme> = OnceLock::new();
+/// The active theme and the source it came from. A theme is leaked when built (a few hundred
+/// bytes) so that `get` can hand out `&'static Theme`; a switch replaces the reference, and the
+/// ones that can be reused are kept in `CACHED`.
+static CURRENT: RwLock<Option<Active>> = RwLock::new(None);
+static CACHED: Mutex<Vec<Active>> = Mutex::new(Vec::new());
+/// The `[theme]` accent and card style, which a switch keeps.
+static OPTIONS: Mutex<Option<(Option<String>, Cards)>> = Mutex::new(None);
 /// `init` ran. Reading the theme earlier would pin the bundled default for the whole run.
 static INIT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A theme with the source it was built from.
+#[derive(Clone)]
+pub struct Active {
+    source: String,
+    theme: &'static Theme,
+}
+
+impl Active {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn bundled_default() -> Palette {
     Palette::from_toml(PALETTES.iter().find(|(k, _)| *k == "tokyo-night").map_or("", |p| p.1))
@@ -286,28 +376,84 @@ pub fn get() -> &'static Theme {
         cfg!(test) || INIT_DONE.load(std::sync::atomic::Ordering::Relaxed),
         "theme::get() called before theme::init()"
     );
-    THEME.get_or_init(|| Theme::build(&bundled_default(), None, true, Cards::Outline).0)
+    if let Some(a) = &*CURRENT.read().unwrap_or_else(PoisonError::into_inner) {
+        return a.theme;
+    }
+    let mut cur = CURRENT.write().unwrap_or_else(PoisonError::into_inner);
+    let a = cur.get_or_insert_with(|| Active {
+        source: "tokyo-night".into(),
+        theme: Box::leak(Box::new(Theme::build(&bundled_default(), None, true, Cards::Outline).0)),
+    });
+    a.theme
+}
+
+/// The theme in use, to put back with `restore`.
+pub fn active() -> Active {
+    get();
+    CURRENT.read().unwrap_or_else(PoisonError::into_inner).clone().expect("get installed a theme")
+}
+
+pub fn restore(a: &Active) {
+    *CURRENT.write().unwrap_or_else(PoisonError::into_inner) = Some(a.clone());
+}
+
+/// What a source costs to build again: the bundled palettes and the terminal's answer do not change
+/// during a run, a file may.
+fn cacheable(source: &str) -> bool {
+    source == "terminal" || (PALETTES.iter().any(|(k, _)| *k == source) && !user_theme(source).exists())
+}
+
+fn install(source: &str, theme: Theme) -> Active {
+    let a = Active { source: source.to_string(), theme: Box::leak(Box::new(theme)) };
+    if cacheable(source) {
+        lock(&CACHED).push(a.clone());
+    }
+    restore(&a);
+    a
 }
 
 /// Loads the configured palette (probing the terminal if asked) and installs the theme. Returns warnings.
 pub fn init(cfg: &MuTheme) -> Vec<String> {
     let mut warnings = vec![];
-    let pal = match load_palette(&cfg.source) {
-        Ok(p) => p,
+    let (pal, source) = match load_palette(&cfg.source) {
+        Ok(p) => (p, cfg.source.as_str()),
         Err(e) => {
             // A bad name or file falls back to the bundled default at once. Only `theme = "terminal"`
             // asks the terminal (and waits for its answer).
             warnings.push(format!("{e}; using the bundled tokyo-night palette"));
-            bundled_default()
+            (bundled_default(), "tokyo-night")
         }
     };
+    *lock(&OPTIONS) = Some((cfg.accent.clone(), cfg.cards));
     let (t, w) = Theme::build(&pal, cfg.accent.as_deref(), truecolor_terminal(), cfg.cards);
     warnings.extend(w);
     INIT_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-    if THEME.set(t).is_err() {
-        warnings.push("theme: it was read before it was configured, so the configured theme is ignored".into());
+    let read_early = CURRENT.read().unwrap_or_else(PoisonError::into_inner).is_some();
+    install(source, t);
+    if read_early {
+        warnings
+            .push("theme: it was read before it was configured, so the early reads used the bundled default".into());
     }
     warnings
+}
+
+/// Switches the running theme to `source`, with the accent and card style from the config. The
+/// terminal's colours are read once at start-up: `terminal` can only be switched back to when it was
+/// the theme then.
+pub fn switch(source: &str) -> Result<(), String> {
+    let cached = lock(&CACHED).iter().find(|a| a.source == source).cloned();
+    if let Some(a) = cached {
+        restore(&a);
+        return Ok(());
+    }
+    if source == "terminal" {
+        return Err("the terminal's colours are read at start-up".into());
+    }
+    let pal = load_palette(source)?;
+    let (accent, cards) = lock(&OPTIONS).clone().unwrap_or((None, Cards::Filled));
+    let (t, _) = Theme::build(&pal, accent.as_deref(), truecolor_terminal(), cards);
+    install(source, t);
+    Ok(())
 }
 
 fn mix(a: Rgb, b: Rgb, p: u8) -> Rgb {

@@ -169,6 +169,34 @@ impl App {
         }
     }
 
+    /// `/theme` opens the picker; `/theme <name>` switches to that theme at once. Either way the
+    /// choice is saved as `[theme] source`.
+    pub(super) fn cmd_theme(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.open_overlay(Overlay::Theme { st: crate::panels::theme_picker::ThemePicker::new() });
+        } else {
+            self.apply_theme(arg);
+        }
+    }
+
+    pub(super) fn apply_theme(&mut self, source: &str) {
+        let live = match crate::theme::switch(source) {
+            Ok(()) => true,
+            // The terminal's colours cannot be read while running; the next start reads them.
+            Err(_) if source == "terminal" => false,
+            Err(e) => return self.error(&e),
+        };
+        self.screen.dirty = true;
+        match mu_base::config::save_theme_source(source) {
+            Ok(()) if live => {
+                self.notice(&format!("theme {source}, saved to config.toml; earlier output keeps its colours"))
+            }
+            Ok(()) => self
+                .notice("theme terminal saved to config.toml; it follows the terminal's colours from the next start"),
+            Err(e) => self.error(&format!("theme {source} is on for this session, but not saved: {e}")),
+        }
+    }
+
     pub(super) fn cmd_deliver(&mut self, arg: &str) {
         if arg.is_empty() {
             self.flows.pick_deliver = true;

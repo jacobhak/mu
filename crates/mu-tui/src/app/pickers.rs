@@ -602,6 +602,7 @@ impl App {
                     },
                 );
             }
+            OverlayEvent::SetTheme(source) => self.apply_theme(&source),
             OverlayEvent::MemoryOpen(path) => self.open_memory_file(path),
             OverlayEvent::MemoryHistory => self.open_memory_history(),
             OverlayEvent::MemoryShow(sha) => self.show_memory_commit(sha),
