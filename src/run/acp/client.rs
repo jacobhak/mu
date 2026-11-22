@@ -124,7 +124,7 @@ pub(super) fn approval_decision(result: &Value) -> ApprovalDecision {
         Some("global") => ApprovalScope::Global,
         _ => return ApprovalDecision::Deny { note: None },
     };
-    ApprovalDecision::Allow { scope, note: None, patterns: None }
+    ApprovalDecision::Allow { scope, note: None, patterns: None, model: None }
 }
 
 pub(super) async fn approve_tool(
@@ -347,6 +347,7 @@ mod tests {
                 patterns: vec!["touch *".into()],
                 wider: Vec::new(),
             }),
+            models: Vec::new(),
         };
         let ids = |v: &Value| -> Vec<String> {
             v["options"].as_array().unwrap().iter().map(|o| o["optionId"].as_str().unwrap().to_string()).collect()

@@ -1,5 +1,6 @@
 use super::*;
 use crate::review;
+use mu_base::permissions::ModelChoice;
 
 impl Agent {
     /// Whether a model selector from a mode file can be used now: a role needs a model set for it,
@@ -18,6 +19,7 @@ impl Agent {
             self.error(format!("unknown mode {name}"));
             return;
         };
+        let chosen = self.plan.entry_model.take();
         if self.plan.mode.is_some() {
             self.leave_mode(true);
         }
@@ -28,11 +30,15 @@ impl Agent {
             prev_thinking: self.model.thinking,
             by_model,
         };
-        if let Some(sel) = def.model.iter().find(|s| self.selector_usable(s)) {
+        if let Some(sel) = &chosen {
             self.set_model(sel);
-        }
-        if let Some(t) = def.thinking.as_deref().and_then(Thinking::parse) {
-            self.set_thinking(t);
+        } else {
+            if let Some(sel) = def.model.iter().find(|s| self.selector_usable(s)) {
+                self.set_model(sel);
+            }
+            if let Some(t) = def.thinking.as_deref().and_then(Thinking::parse) {
+                self.set_thinking(t);
+            }
         }
         if let Some(s) = self.session.as_mut() {
             s.mode_change(
@@ -43,6 +49,30 @@ impl Agent {
         self.plan.mode = Some(prev);
         self.notice(format!("{name} mode on"));
         self.emit_status();
+    }
+
+    /// The other models the user may enter mode `name` on, offered with the approval: the session's
+    /// own model when the mode would replace it, then each `cycle_order` role that has a model.
+    pub(super) fn entry_models(&self, name: &str) -> Vec<ModelChoice> {
+        let Some(def) = self.ctx.mode(name) else { return Vec::new() };
+        let current = &self.model.model.id;
+        let mut out = Vec::new();
+        if def.model.iter().any(|s| self.selector_usable(s)) {
+            out.push(ModelChoice {
+                label: "Yes, on the current model".into(),
+                detail: current.clone(),
+                selector: current.clone(),
+            });
+        }
+        let cfg = &self.ports.providers.cfg;
+        for role in cfg.role_cycle() {
+            let selector = format!("@{role}");
+            let Ok((spec, _)) = self.ports.providers.resolve(&selector) else { continue };
+            if &spec.id != current {
+                out.push(ModelChoice { label: format!("Yes, on {selector}"), detail: spec.id, selector });
+            }
+        }
+        out
     }
 
     pub(super) fn exit_mode(&mut self) {

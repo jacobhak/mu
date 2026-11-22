@@ -704,7 +704,7 @@ fn allow() -> WireCommand {
     use mu_base::permissions::{ApprovalDecision, ApprovalScope};
     WireCommand::Approval {
         id: 1,
-        decision: ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None },
+        decision: ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None, model: None },
     }
 }
 

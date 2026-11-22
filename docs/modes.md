@@ -70,7 +70,7 @@ Also in `exit.approved`: `{{context}}` (a note that the history is usable, empty
 ## Entering
 
 - `/<name> [prompt]` for every mode with `command: true`. With a prompt it enters the mode and runs the prompt; without, it toggles the mode. Switching from another mode leaves it first. Built-in command names win over a mode of the same name.
-- The model's `enter_mode` tool, offered while no mode is on and at least one mode has `model_entry` other than `never`. `ask` always asks you, in every permission mode, with no grant; `allow` enters without asking. `-p` and `mu plan` runs and subagents are never offered it.
+- The model's `enter_mode` tool, offered while no mode is on and at least one mode has `model_entry` other than `never`. `ask` always asks you, in every permission mode, with no grant, and the prompt can enter the mode on another model: "Yes, on the current model" (when the mode would replace it) and one row per role in `cycle_order` (see [model roles](model-roles.md)) that has a model, each used in place of the mode's own model and thinking level; `allow` enters without asking. `-p` and `mu plan` runs and subagents are never offered it.
 - [ACP](acp.md) clients list `default` plus every `command` mode.
 - `mu plan new --mode <name>` plans in another mode, headless.
 

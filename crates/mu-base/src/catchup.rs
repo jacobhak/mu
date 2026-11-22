@@ -252,6 +252,7 @@ mod tests {
                 body: "b".into(),
                 from: None,
                 grant: None,
+                models: Vec::new(),
             },
             reply,
         });
@@ -279,7 +280,7 @@ mod tests {
 
         // The request is answered once, whoever answers it.
         assert_eq!(c.parked(), 1);
-        let allow = ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None };
+        let allow = ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None, model: None };
         assert!(c.command(WireCommand::Approval { id: 1, decision: allow }).is_none());
         assert!(matches!(rx.await.unwrap(), ApprovalDecision::Allow { .. }));
         assert_eq!(c.parked(), 0);
@@ -339,6 +340,7 @@ mod tests {
                 body: "b".into(),
                 from: None,
                 grant: None,
+                models: Vec::new(),
             },
             reply,
         });
@@ -366,7 +368,7 @@ mod tests {
         );
         assert!(!shown_reply.is_closed());
         // Answered elsewhere: the next catch-up no longer lists it.
-        let allow = ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None };
+        let allow = ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None, model: None };
         c.command(WireCommand::Approval { id: 1, decision: allow });
         feed(c.catch_up(vec![]));
         tokio::task::yield_now().await;

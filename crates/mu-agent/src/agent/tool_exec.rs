@@ -338,6 +338,7 @@ impl Agent {
         &mut self,
         id: &str,
         name: &str,
+        args: &Value,
         verdict: Verdict,
         cancel: &CancellationToken,
     ) -> (Option<ToolOutput>, Option<String>) {
@@ -346,12 +347,19 @@ impl Agent {
         match verdict {
             Verdict::Allow => {}
             Verdict::Deny(msg) => stop = Some(ToolOutput::err(msg)),
-            Verdict::Ask(mut req) => {
+            Verdict::Ask(req) => {
+                let mut req = *req;
                 req.call_id = id.into();
+                if name == "enter_mode" {
+                    req.models = self.entry_models(args["mode"].as_str().unwrap_or_default());
+                }
                 let grant = req.grant.clone();
                 let reason = req.reason.clone();
                 match self.approve(req, cancel).await {
-                    ApprovalDecision::Allow { scope, note, patterns } => {
+                    ApprovalDecision::Allow { scope, note, patterns, model } => {
+                        if name == "enter_mode" {
+                            self.plan.entry_model = model;
+                        }
                         if scope != ApprovalScope::Once
                             && let Some(g) = grant
                         {
@@ -431,7 +439,7 @@ impl Agent {
                     Some(v) => v,
                     None => self.verdict_for(name, &args).await,
                 };
-                let (stop, note) = self.settle_verdict(id, name, verdict, cancel).await;
+                let (stop, note) = self.settle_verdict(id, name, &args, verdict, cancel).await;
                 user_note = note;
                 match stop {
                     Some(o) => o,
@@ -484,6 +492,9 @@ impl Agent {
                 self.enter_mode(name, true).await;
             }
             self.apply_mode_action(d, &mut out).await;
+        }
+        if name == "enter_mode" {
+            self.plan.entry_model = None;
         }
         if name == "todo" && !out.is_error {
             self.emit(AgentEvent::Todo(self.tools.todo_json()));

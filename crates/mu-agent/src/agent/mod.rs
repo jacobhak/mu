@@ -303,7 +303,7 @@ impl Agent {
                 tx: title_tx,
                 rx: Some(title_rx),
             },
-            plan: PlanFlow { mode: None, exec_plan: None, stored_plan: None, review_base: None },
+            plan: PlanFlow { mode: None, exec_plan: None, stored_plan: None, review_base: None, entry_model: None },
             mail: Mailbox {
                 wake_rx: None,
                 wake_tx: None,

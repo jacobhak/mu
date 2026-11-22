@@ -979,7 +979,7 @@ fn propose_call(id: &str, slug: &str) -> Block {
 }
 
 fn allow_once() -> ApprovalDecision {
-    ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None }
+    ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None, model: None }
 }
 
 /// Answers every approval with `answer()` and parks every plan review; returns the approval
@@ -1040,6 +1040,34 @@ fn an_approved_enter_mode_turns_the_mode_on_for_the_rest_of_the_turn() {
         let names = tool_names(&a);
         assert!(names.contains(&"propose_plan".to_string()) && !names.contains(&"enter_mode".to_string()));
         assert!(a.ports.providers.scripted.borrow().is_empty(), "the turn went on to a second request");
+    });
+}
+
+#[test]
+fn enter_mode_offers_the_cycle_roles_and_the_one_picked_replaces_the_modes_model() {
+    run(async {
+        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\nplan = \"a/c:high\"\nslow = \"a/d\"\n");
+        let script = vec![
+            Ok(assistant(vec![enter_call("e1")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("planning")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_with(script, cfg);
+        a.cwd = tmp_dir();
+        a.title.requested = true;
+        let current = a.model.model.id.clone();
+        let pick_slow = || ApprovalDecision::Allow {
+            scope: ApprovalScope::Once,
+            note: None,
+            patterns: None,
+            model: Some("@slow".into()),
+        };
+        let turn = a.turn(Some("go".to_string().into()));
+        let ((), (asked, _)) = futures_util::future::join(turn, answer_plans(rx, pick_slow)).await;
+        let offered: Vec<&str> = asked[0].models.iter().map(|m| m.selector.as_str()).collect();
+        assert!(offered.contains(&"@slow") && offered.contains(&current.as_str()), "{offered:?}");
+        assert!(a.plan.mode.as_ref().is_some_and(|p| p.name == "plan"));
+        assert_eq!(a.model.model.id, "a/d", "the picked role, not @plan");
+        assert!(a.plan.entry_model.is_none(), "the pick is used once");
     });
 }
 

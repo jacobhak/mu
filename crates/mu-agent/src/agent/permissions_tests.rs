@@ -92,6 +92,7 @@ fn a_session_grant_covers_later_calls() {
             scope: ApprovalScope::Session,
             note: None,
             patterns: None,
+            model: None,
         })
         .await;
         assert_eq!(reqs.len(), 1, "the second call is covered by the session grant");
@@ -160,6 +161,7 @@ fn a_wider_answer_covers_a_neighbouring_file() {
             scope: ApprovalScope::Session,
             note: None,
             patterns: Some(vec![answer.clone()]),
+            model: None,
         })
         .await;
         assert_eq!(reqs.len(), 1, "the second file is covered by the directory grant");
@@ -200,6 +202,7 @@ fn a_granted_directory_covers_grep_too() {
             scope: ApprovalScope::Session,
             note: None,
             patterns: Some(vec![format!("{dir}/*")]),
+            model: None,
         })
         .await;
         assert_eq!(reqs.len(), 1, "the grant covers grep of the same directory");
@@ -237,6 +240,7 @@ fn a_write_grant_covers_editing_the_same_file() {
             scope: ApprovalScope::Session,
             note: None,
             patterns: None,
+            model: None,
         })
         .await;
         assert_eq!(reqs.len(), 1, "the write's grant covers editing that file");

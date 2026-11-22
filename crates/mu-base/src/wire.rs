@@ -780,7 +780,12 @@ mod tests {
             assert_eq!(json_of(&through(&a)), json_of(&a));
         }
         for d in [
-            ApprovalDecision::Allow { scope: ApprovalScope::Project, note: None, patterns: Some(vec!["x".into()]) },
+            ApprovalDecision::Allow {
+                scope: ApprovalScope::Project,
+                note: None,
+                patterns: Some(vec!["x".into()]),
+                model: Some("@slow".into()),
+            },
             ApprovalDecision::Deny { note: Some("no".into()) },
             ApprovalDecision::Unavailable,
         ] {
@@ -797,6 +802,7 @@ mod tests {
             body: "b".into(),
             from: None,
             grant: None,
+            models: Vec::new(),
         }
     }
 
@@ -927,7 +933,9 @@ mod tests {
         assert!(matches!(ui_ev.recv().await, Some(AgentEvent::UserPrompt(t)) if t == "hello"));
         let Some(AgentEvent::Approve { request, reply }) = ui_ev.recv().await else { panic!("no approval") };
         assert_eq!(request.tool, "bash");
-        reply.send(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None }).unwrap();
+        reply
+            .send(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None, model: None })
+            .unwrap();
         assert!(matches!(ui_ev.recv().await, Some(AgentEvent::TurnEnd { aborted: false })));
         ui_cmd.send(Command::Exit).unwrap();
         assert!(matches!(ui_ev.recv().await, Some(AgentEvent::Exit)));

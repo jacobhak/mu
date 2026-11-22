@@ -112,6 +112,9 @@ pub(super) struct PlanFlow {
     /// The stored plan being revised in its mode; the exit tool updates it in place.
     pub(super) stored_plan: Option<String>,
     pub(super) review_base: Option<crate::review::ReviewBase>,
+    /// The model the user picked when approving `enter_mode`; the next `enter_mode` uses it in
+    /// place of the mode's own.
+    pub(super) entry_model: Option<String>,
 }
 
 /// Wake-ups and `mu notify` delivery.

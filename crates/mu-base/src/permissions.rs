@@ -210,6 +210,20 @@ pub struct ApprovalRequest {
     pub from: Option<String>,
     /// What "don't ask again" would remember; `None` when that cannot be offered.
     pub grant: Option<Grant>,
+    /// Models the call may run on instead of its default; empty when it has no such choice.
+    #[serde(default)]
+    pub models: Vec<ModelChoice>,
+}
+
+/// A model an approval may switch the call to, shown as one more way to say yes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// The row: "Yes, on @slow".
+    pub label: String,
+    /// What it resolves to.
+    pub detail: String,
+    /// What the session switches to: a model id or `@role`.
+    pub selector: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +255,9 @@ pub enum ApprovalDecision {
         /// The patterns the answer picked from the wider levels; `None` for the request's own.
         #[serde(default)]
         patterns: Option<Vec<String>>,
+        /// The `ModelChoice::selector` the answer picked; `None` for the call's own model.
+        #[serde(default)]
+        model: Option<String>,
     },
     Deny {
         note: Option<String>,

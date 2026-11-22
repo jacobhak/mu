@@ -637,13 +637,17 @@ impl ApproveState {
     /// stays short however deep the path is.
     fn width_picker(req: &ApprovalRequest) -> Select {
         let widths = Self::widths(req);
-        let mut items = vec![Item { label: "Yes, just this once".into(), detail: String::new() }];
+        let yes = if req.models.is_empty() { "Yes, just this once" } else { "Yes" };
+        let mut items = vec![Item { label: yes.into(), detail: String::new() }];
+        items.extend(req.models.iter().map(|m| Item { label: m.label.clone(), detail: m.detail.clone() }));
         for (label, patterns) in &widths {
             items.push(Item { label: format!("For {label}"), detail: patterns.join(", ") });
         }
         items.push(Item { label: "No".into(), detail: String::new() });
-        let hint = if widths.is_empty() {
+        let hint = if widths.is_empty() && req.models.is_empty() {
             "y yes · n no · Enter choose · Tab/→ note · Esc cancel".to_string()
+        } else if widths.is_empty() {
+            format!("y yes · n no · 1–{} pick · Enter choose · Tab/→ note · Esc cancel", items.len())
         } else {
             format!("y yes · n no · 1–{} pick · e type a pattern · Enter choose · Tab/→ note · Esc cancel", items.len())
         };
@@ -720,7 +724,7 @@ impl ApproveState {
                 self.step = Some(Step::Pattern(sel));
                 return self.keep();
             }
-            let rows = widths.len() + 2;
+            let rows = self.req.models.len() + widths.len() + 2;
             let row = match c {
                 'y' => Some(0),
                 'n' => Some(rows - 1),
@@ -755,11 +759,18 @@ impl ApproveState {
         row: Option<usize>,
         note: Option<String>,
     ) -> (Option<Overlay>, Option<OverlayEvent>) {
+        let models = self.req.models.len();
         match row {
-            Some(0) => self.answer(ApprovalDecision::Allow { scope: ApprovalScope::Once, note, patterns: None }),
-            Some(i) if i == widths.len() + 1 => self.answer(ApprovalDecision::Deny { note }),
+            Some(0) => {
+                self.answer(ApprovalDecision::Allow { scope: ApprovalScope::Once, note, patterns: None, model: None })
+            }
+            Some(i) if i <= models => {
+                let model = Some(self.req.models[i - 1].selector.clone());
+                self.answer(ApprovalDecision::Allow { scope: ApprovalScope::Once, note, patterns: None, model })
+            }
+            Some(i) if i == models + widths.len() + 1 => self.answer(ApprovalDecision::Deny { note }),
             Some(i) => {
-                let patterns = widths[i - 1].1.clone();
+                let patterns = widths[i - 1 - models].1.clone();
                 self.note = note;
                 let sel = self.scope_picker(&patterns);
                 self.step = Some(Step::Scope { patterns, sel });
@@ -848,7 +859,7 @@ impl ApproveState {
             Some(2) => ApprovalScope::Global,
             _ => return self.answer(ApprovalDecision::Deny { note }),
         };
-        self.answer(ApprovalDecision::Allow { scope, note, patterns: Some(patterns) })
+        self.answer(ApprovalDecision::Allow { scope, note, patterns: Some(patterns), model: None })
     }
 
     /// The turn it belonged to ended before it was answered.
@@ -1175,6 +1186,7 @@ mod tests {
                 patterns: patterns.iter().map(|p| p.to_string()).collect(),
                 wider: Vec::new(),
             }),
+            models: Vec::new(),
         };
         let widths = ApproveState::widths(&req(&["*"]));
         assert_eq!(widths, [("every call of mcp__x__y".to_string(), vec!["*".to_string()])]);

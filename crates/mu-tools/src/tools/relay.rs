@@ -286,7 +286,7 @@ impl RelayRun {
             Verdict::Allow => SearchGate::Run,
             Verdict::Deny(why) => SearchGate::Refused(why),
             Verdict::Ask(req) => match approve {
-                Some(f) => SearchGate::Ask(f(req)),
+                Some(f) => SearchGate::Ask(f(*req)),
                 None => SearchGate::Refused("this web search needs approval and no one can give it".into()),
             },
         }
@@ -1094,7 +1094,8 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
                     rx
                 }
             };
-            let yes = answer(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None });
+            let yes =
+                answer(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None, model: None });
             rig.run.handle_with(1, search_call(), Some(&yes));
             let (_, end) = rig.until_end(1).await;
             let Reply::Done(d) = end else { panic!("{end:?}") };

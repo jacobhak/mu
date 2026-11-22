@@ -1157,6 +1157,7 @@ mod tests {
                     mu_base::permissions::GrantWidth { label: "everything".into(), patterns: vec!["touch /*".into()] },
                 ],
             }),
+            models: Vec::new(),
         }
     }
 
@@ -1179,6 +1180,38 @@ mod tests {
         press(&mut app, crossterm::event::KeyCode::Enter);
         assert!(app.overlay.is_none());
         assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, .. })));
+    }
+
+    #[test]
+    fn a_model_row_answers_yes_on_that_model_and_no_stays_last() {
+        let mut app = test_app(std::env::temp_dir().join("mu-approve-history.jsonl"));
+        let mut req = approval("enter_mode", "plan");
+        req.grant = None;
+        req.models = ["@smol", "@slow"]
+            .map(|s| mu_base::permissions::ModelChoice {
+                label: format!("Yes, on {s}"),
+                detail: "a/b".into(),
+                selector: s.into(),
+            })
+            .to_vec();
+        let mut rx = open_approval(&mut app, req.clone());
+        press(&mut app, crossterm::event::KeyCode::Char('3'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        match rx.try_recv() {
+            Ok(ApprovalDecision::Allow { scope: ApprovalScope::Once, model: Some(m), .. }) => assert_eq!(m, "@slow"),
+            other => panic!("expected yes on @slow, got {other:?}"),
+        }
+        let mut rx = open_approval(&mut app, req.clone());
+        press(&mut app, crossterm::event::KeyCode::Char('y'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(ApprovalDecision::Allow { model: None, .. })),
+            "plain yes keeps the default"
+        );
+        let mut rx = open_approval(&mut app, req);
+        press(&mut app, crossterm::event::KeyCode::Char('n'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
     }
 
     #[test]

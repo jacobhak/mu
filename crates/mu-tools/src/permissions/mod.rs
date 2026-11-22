@@ -65,7 +65,7 @@ impl Access {
 pub enum Verdict {
     Allow,
     Deny(String),
-    Ask(ApprovalRequest),
+    Ask(Box<ApprovalRequest>),
 }
 
 /// One project's resolved state: its root, the key grants are stored under, and its rules.
@@ -249,7 +249,7 @@ impl Permissions {
                 Some((_, crate::context::ModelEntry::Allow, ..)) => Verdict::Allow,
                 Some((n, crate::context::ModelEntry::Ask, description, read_only)) => {
                     let ro = if read_only { " The working tree is read-only until the mode ends." } else { "" };
-                    Verdict::Ask(ApprovalRequest {
+                    Verdict::Ask(Box::new(ApprovalRequest {
                         tool: name.to_string(),
                         call_id: String::new(),
                         title: format!("enter_mode: switch to {n} mode"),
@@ -260,7 +260,8 @@ impl Permissions {
                         body: args["reason"].as_str().unwrap_or("").to_string(),
                         from: None,
                         grant: None,
-                    })
+                        models: Vec::new(),
+                    }))
                 }
                 _ => Verdict::Deny(format!("Mode `{mode}` cannot be entered by the model.")),
             };
@@ -321,7 +322,7 @@ impl Permissions {
             None => format!("{mode} mode: {name} needs approval"),
         };
         let grant = grant::grant(gate, call, name, args, &hits);
-        Verdict::Ask(ApprovalRequest {
+        Verdict::Ask(Box::new(ApprovalRequest {
             tool: name.to_string(),
             call_id: String::new(),
             title: format!("{name}: {}", summary(name, args)),
@@ -329,7 +330,8 @@ impl Permissions {
             body: truncate_body(&body(name, args)),
             from: None,
             grant,
-        })
+            models: Vec::new(),
+        }))
     }
 }
 
