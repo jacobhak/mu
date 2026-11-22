@@ -42,24 +42,53 @@ impl Args {
     }
 }
 
+/// A header's words after `***`, lowercased, with whitespace runs collapsed to one space.
+fn header_words(rest: &str) -> String {
+    rest.split_whitespace().map(str::to_ascii_lowercase).collect::<Vec<_>>().join(" ")
+}
+
+/// `*** <action> Block: <selector>`, or a malformed block header, which the parser reports itself.
+fn is_block_header(words: &str) -> bool {
+    const ACTIONS: [&str; 9] = [
+        "",
+        "replace ",
+        "delete ",
+        "cut ",
+        "insert ",
+        "insert before ",
+        "insert after ",
+        "paste before ",
+        "paste after ",
+    ];
+    words
+        .split_once("block")
+        .is_some_and(|(head, tail)| ACTIONS.contains(&head) && (tail.is_empty() || tail.starts_with([':', ' '])))
+}
+
 /// The first line that looks like a sloppy-format header but is not one. The parser reads such a line as
-/// body text, so `*** Find all` would be written into the file. Only unindented lines count: an indented
+/// body text, so `*** Replace now` would be written into the file. Only unindented lines count: an indented
 /// one is how a literal `*** …` line is written.
 fn near_miss_header(input: &str) -> Option<(usize, &str)> {
     input.lines().enumerate().find_map(|(i, line)| {
         let rest = line.strip_prefix("***")?;
         let spaced = rest.starts_with([' ', '\t']);
-        let body = rest.trim();
-        let lower = body.to_ascii_lowercase();
-        let word = |w: &str| lower.strip_prefix(w).filter(|t| t.is_empty() || t.starts_with(char::is_whitespace));
-        let op = ["find", "replace", "insert before", "insert after"].iter().find_map(|w| word(w));
+        let words = header_words(rest);
+        if spaced && is_block_header(&words) {
+            return None;
+        }
+        let word = |w: &str| words.strip_prefix(w).filter(|t| t.is_empty() || t.starts_with(' '));
+        let op = ["find", "replace", "insert before", "insert after", "cut", "paste before", "paste after"]
+            .iter()
+            .find_map(|w| word(w));
         let bad = match op {
-            // An operator header takes no argument.
-            Some(tail) => !spaced || !tail.trim().is_empty(),
+            // An operator header takes no argument, except `all` after `Find`.
+            Some(tail) => !spaced || !(tail.is_empty() || words == "find all"),
             None => {
-                !spaced && ["edit file", "find", "replace", "insert"].iter().any(|w| lower.starts_with(w))
-                    || spaced && word("all").is_some()
-                    || spaced && word("insert").is_some()
+                !spaced
+                    && ["edit file", "find", "replace", "insert", "cut", "paste", "delete"]
+                        .iter()
+                        .any(|w| words.starts_with(w))
+                    || spaced && ["all", "insert", "paste"].iter().any(|w| word(w).is_some())
             }
         };
         bad.then_some((i + 1, line.trim_end()))
@@ -71,7 +100,11 @@ enum Header {
     Edit,
     Find,
     Replace,
-    Insert { before: bool },
+    Insert {
+        before: bool,
+    },
+    /// Cut, Paste and the Block actions: no anchor, no insert body.
+    Other,
 }
 
 fn header_of(line: &str) -> Option<Header> {
@@ -79,13 +112,17 @@ fn header_of(line: &str) -> Option<Header> {
     if !rest.starts_with([' ', '\t']) {
         return None;
     }
-    let words: Vec<String> = rest.split_whitespace().map(str::to_ascii_lowercase).collect();
-    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let words = header_words(rest);
+    if is_block_header(&words) {
+        return Some(Header::Other);
+    }
+    let w: Vec<&str> = words.split(' ').collect();
     match w.as_slice() {
-        ["find"] => Some(Header::Find),
+        ["find"] | ["find", "all"] => Some(Header::Find),
         ["replace"] => Some(Header::Replace),
         ["insert", "before"] => Some(Header::Insert { before: true }),
         ["insert", "after"] => Some(Header::Insert { before: false }),
+        ["cut"] | ["paste", "before" | "after"] => Some(Header::Other),
         ["edit", "file", ..] | ["edit", "file:", ..] => Some(Header::Edit),
         _ => None,
     }
@@ -138,7 +175,7 @@ fn repeated_anchor(input: &str) -> Option<(usize, &'static str)> {
                 find_at = i + 1;
             }
             Header::Insert { .. } => body.clear(),
-            Header::Replace => {}
+            Header::Replace | Header::Other => {}
         }
         part = Some(h);
     }
@@ -158,8 +195,11 @@ fn refuse_malformed(mode: EditMode, input: &str) -> Option<ToolOutput> {
         return Some(ToolOutput::err(format!(
             "Line {n}, `{line}`, looks like an edit header but is not one, so it would be written into the file as \
              text. Headers are `*** Edit File: <path>` (with ` all` after the path to change every match), \
-             `*** Find`, `*** Replace`, `*** Insert Before` and `*** Insert After`, each alone on its line. If the \
-             line is meant as text, indent it. Nothing was changed."
+             `*** Find` or `*** Find all`, then one of `*** Replace`, `*** Insert Before`, `*** Insert After`, \
+             `*** Cut`, `*** Paste Before` and `*** Paste After`, each alone on its line; a block action names its \
+             opening line: `*** Replace Block: <prefix>`, `*** Delete Block: …`, `*** Cut Block: …`, \
+             `*** Paste Before Block: …`, `*** Paste After Block: …`. If the line is meant as text, indent it. \
+             Nothing was changed."
         )));
     }
     let (n, header) = repeated_anchor(input)?;
@@ -519,11 +559,22 @@ mod tests {
     #[test]
     fn near_miss_headers_are_found_and_real_ones_are_not() {
         let ok = "*** Edit File: a.rs\n*** Find\nx\n*** Replace\ny\n*** Edit File: b.rs all\n*** Insert Before\nz\n\
-                  *** Insert After\n***bold*** text\n*** Finding things\n*** End Patch\n    *** Find all\n";
+                  *** Insert After\n***bold*** text\n*** Finding things\n*** End Patch\n    *** Insert here\n";
+        let new =
+            ["Find all", "Cut", "Paste  Before", "Paste After", "Replace Block: if (x) {", "Delete Block: fn old("];
+        let blocks = ["Cut Block: fn a(", "Paste After Block: fn b(", "Edit File: blocks/a.rs"];
+        for h in new.iter().chain(&blocks) {
+            assert_eq!(near_miss_header(&format!("{ok}*** {h}\n")), None, "{h}");
+        }
         assert_eq!(near_miss_header(ok), None);
         for (bad, line) in [
-            ("*** Find\nx\n*** Find all\n", 3),
+            ("*** Find\nx\n*** Paste Before here\n", 3),
+            ("*** Find everything\n", 1),
             ("*** all\n", 1),
+            ("*** Paste\n", 1),
+            ("*** Cut here\n", 1),
+            ("*** Replace blocking\n", 1),
+            ("***Cut Block: fn a(\n", 1),
             ("***Find\n", 1),
             ("*** Replace now\n", 1),
             ("*** Insert\n", 1),
@@ -536,7 +587,7 @@ mod tests {
 
     #[test]
     fn a_near_miss_is_refused_in_sloppy_mode_only() {
-        let input = "*** Edit File: x.txt\n*** Find\na\n*** Replace\nb\n*** Find all\n";
+        let input = "*** Edit File: x.txt\n*** Find\na\n*** Replace\nb\n*** Paste Before here\n";
         let r = refuse_malformed(EditMode::Sloppy, input).unwrap();
         assert!(r.is_error && r.text.contains("Line 6") && r.text.contains("indent it"), "{}", r.text);
         assert!(refuse_malformed(EditMode::Hashline, input).is_none());
@@ -550,6 +601,8 @@ mod tests {
         assert_eq!(repeated_anchor(after), Some((2, "*** Insert After")));
         let r = refuse_malformed(EditMode::Sloppy, after).unwrap();
         assert!(r.is_error && r.text.contains("line 2") && r.text.contains("only the anchor"), "{}", r.text);
+        let all = after.replace("*** Find\n", "*** Find all\n");
+        assert_eq!(repeated_anchor(&all), Some((2, "*** Insert After")));
     }
 
     #[test]
@@ -558,6 +611,13 @@ mod tests {
                   *** Find\nimpl Args {\n*** Insert Before\n#[cfg(test)]\n\
                   *** Find\n}\n*** Insert Before\nfn f() {\n}\n\
                   *** Find\nlet x = 1;\n*** Replace\nlet x = 1;\nlet y = 2;\n";
+        // A block body is not part of the insert before it, even when it ends with that insert's anchor.
+        let block = format!(
+            "{ok}{}",
+            "*** Find all\nlet total = compute();\n*** Insert Before\nuse(total);\n\
+             *** Replace Block: fn run(\nfn run() {\nlet total = compute();\n"
+        );
+        assert_eq!(repeated_anchor(&block), None);
         assert_eq!(repeated_anchor(ok), None);
         assert!(refuse_malformed(EditMode::Sloppy, ok).is_none());
     }

@@ -23,10 +23,10 @@ mu-provider = { path = "crates/mu-provider" }
 mu-session = { path = "crates/mu-session" }
 mu-tools = { path = "crates/mu-tools" }
 mu-tui = { path = "crates/mu-tui" }
-omp-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-omp-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-omp-diff = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-omp-xfs = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
+omp-edit = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
+omp-shell = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
+omp-diff = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
+omp-xfs = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
 encoding_rs = "0.8"
 httpdate = "1"
 tokio = "1"
@@ -118,11 +118,11 @@ mu-provider = { workspace = true, features = ["test-support"] }
 mu-tools = { workspace = true, features = ["test-support"] }
 
 [patch.crates-io]
-tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-grep-searcher = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-jaq-core = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-jaq-json = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
-jaq-std = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.0.0" }
+tree-sitter-go = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
+grep-searcher = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
+jaq-core = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
+jaq-json = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
+jaq-std = { git = "https://github.com/can1357/oh-my-pi", tag = "v19.1.0" }
 
 [lints]
 workspace = true
