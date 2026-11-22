@@ -1,0 +1,2 @@
+image = "offload-base/mu:main"
+arch = ["amd64"]

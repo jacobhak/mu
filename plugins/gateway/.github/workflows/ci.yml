@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: arc-ai-provider-gateway
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup component add rustfmt clippy
+      - run: scripts/ci-checks.sh
+  macos:
+    # macOS platform coverage on the self-hosted Mac. Branch protection needs a
+    # paid plan on a private repo, so nothing here gates a merge.
+    # A JIT-provisioned runner carries only the labels it was created with, so
+    # there is no implicit self-hosted or macOS label to match on.
+    runs-on: ai-provider-gateway-mac
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup component add rustfmt clippy
+      - run: scripts/ci-checks.sh
