@@ -14,6 +14,7 @@
 - [Providers](providers.md): API keys for Anthropic, OpenAI and Baseten, custom vLLM/OpenAI-compatible endpoints (`mu providers`), Sign in with ChatGPT, `mu auth`, `/login`, routing and thinking per provider, what needs a gateway plugin
 - [Model roles](model-roles.md): what each role is for, and where to see and set them
 - [Custom agents](custom-agents.md)
+- [Modes](modes.md): plan mode and your own modes as markdown files: prompt, model, tool policy, exit actions
 - [Memory](memory.md)
 - [Secrets](secrets.md): what mu redacts before storing or sending text, and what it does not protect against
 - [Tool permissions](permissions.md): modes (`ask`, `edits`, `yolo`), rules, and the approval prompt

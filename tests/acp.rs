@@ -431,7 +431,8 @@ fn a_plan_is_approved_through_a_permission_request() {
 
 #[test]
 fn a_model_entered_plan_mode_is_approved_by_the_client_and_reported_as_a_mode() {
-    let (mut acp, cwd, seen) = setup(vec![tool_use("e1", "enter_plan", json!({"reason": "big change"})), text("ok")]);
+    let enter_call = tool_use("e1", "enter_mode", json!({"mode": "plan", "reason": "big change"}));
+    let (mut acp, cwd, seen) = setup(vec![enter_call, text("ok")]);
     acp.init(json!({}));
     let (sid, _) = acp.new_session(&cwd);
     let mut asked: Vec<Value> = Vec::new();
@@ -442,7 +443,7 @@ fn a_model_entered_plan_mode_is_approved_by_the_client_and_reported_as_a_mode() 
     });
     assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
     assert_eq!(asked.len(), 1);
-    assert_eq!(asked[0]["toolCall"]["title"], "enter_plan: switch to plan mode");
+    assert_eq!(asked[0]["toolCall"]["title"], "enter_mode: switch to plan mode");
     let ids: Vec<&str> =
         asked[0]["options"].as_array().unwrap().iter().map(|o| o["optionId"].as_str().unwrap()).collect();
     assert_eq!(ids, ["once", "deny"], "no standing grant");
@@ -453,8 +454,8 @@ fn a_model_entered_plan_mode_is_approved_by_the_client_and_reported_as_a_mode() 
     let first = seen.lock().unwrap()[0].clone();
     // The request that carries the tool's result is the turn's second; a title request may sit between.
     let second = seen.lock().unwrap().iter().find(|b| b.contains("Plan mode is on. Follow")).cloned().unwrap();
-    // Tool definitions, by their descriptions: the second request's history names `enter_plan` too.
-    let (enter, propose) = ("Ask the user to switch this session", "Submit the finished plan");
+    // Tool definitions, by their descriptions: the second request's history names `enter_mode` too.
+    let (enter, propose) = ("Ask to switch this session to a mode", "Submit the finished plan");
     assert!(first.contains(enter) && !first.contains(propose));
     assert!(second.contains(propose) && !second.contains(enter));
 }

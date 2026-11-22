@@ -6,9 +6,9 @@ use crate::host::keys::KeyInfo;
 use crate::host::models::{self as models_host, ModelKind, ModelRow, ModelRows, RoleTable};
 use crate::host::results::{Applied, RESULT_APPLY, RESULT_DIFF};
 use crate::host::sessions::{self, Live, TailDelta};
+use crate::panels::doc_review::Tier;
 use crate::panels::jobs_panel::{JobsPanel, Want};
 use crate::panels::model_roles::RoleEditor;
-use crate::panels::plan_review::Tier;
 use crate::panels::reply::ReplyPicker;
 use crate::text::markdown;
 use crate::widgets::overlay::{ApproveState, LoginTarget, OverlayEvent};
@@ -321,9 +321,10 @@ impl App {
         let rows = list
             .into_iter()
             .map(|m| {
+                let mode = if m.mode == "plan" { String::new() } else { format!(" · {}", m.mode) };
                 let item = Item {
                     label: m.title.clone(),
-                    detail: format!("{} · {}", m.id, m.updated.get(..10).unwrap_or(&m.updated)),
+                    detail: format!("{} · {}{mode}", m.id, m.updated.get(..10).unwrap_or(&m.updated)),
                 };
                 (item, m.id)
             })
@@ -550,12 +551,13 @@ impl App {
                 });
             }
             OverlayEvent::Rewind(id) => self.send(Command::Rewind(id)),
-            OverlayEvent::CopyPlan(text) => self.copy_async(text, "plan copied".into()),
-            OverlayEvent::EditPlan(file) => self.edit_host_file(file, false, "plan", ChildThen::PlanEdit),
-            OverlayEvent::PlanCancelled { stored: true } => self.notice("plan left parked"),
-            OverlayEvent::PlanCancelled { stored: false } => {
-                self.send(Command::Cancel);
-                self.notice("plan review cancelled; plan mode stays on");
+            OverlayEvent::CopyDoc(text) => self.copy_async(text, "plan copied".into()),
+            OverlayEvent::EditDoc(file) => self.edit_host_file(file, false, "plan", ChildThen::DocEdit),
+            OverlayEvent::ReviewCancelled { cancel_turn, notice } => {
+                if cancel_turn {
+                    self.send(Command::Cancel);
+                }
+                self.notice(&notice);
             }
             OverlayEvent::OpenPlan(id) => self.send(Command::OpenPlan(id)),
             OverlayEvent::DeliverPlan(id) => self.send(Command::Deliver(id)),

@@ -1,4 +1,4 @@
-use mu_base::events::{AgentEvent, Command, PlanDecision, retry_notice};
+use mu_base::events::{ActionChoice, AgentEvent, Command, retry_notice};
 use mu_base::permissions::ApprovalDecision;
 use mu_tools::tools::summary;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -159,8 +159,10 @@ pub async fn print_mode_with(
             AgentEvent::TurnEnd { aborted: true } => code = 1,
             AgentEvent::Exit => break,
             // Nobody is there to approve: a plan that reaches review is parked for later.
-            AgentEvent::PlanReview { reply, .. } => {
-                let _ = reply.send(PlanDecision::Park);
+            AgentEvent::Review { request, reply } => {
+                if request.actions.iter().any(|a| a.id == "park") {
+                    let _ = reply.send(ActionChoice { id: "park".into(), text: None, model: None });
+                }
             }
             // A `-p` run has no one to answer a tool approval.
             AgentEvent::Approve { request, reply } => {
@@ -557,20 +559,38 @@ mod tests {
             for e in events {
                 etx.send(e).unwrap();
             }
-            rt.block_on(print_mode(Command::TogglePlan(None), expect_park, ctx, erx, None, srx))
+            let first = Command::Mode { name: "plan".into(), prompt: None };
+            rt.block_on(print_mode(first, expect_park, ctx, erx, None, srx))
         };
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let review = AgentEvent::PlanReview {
-            title: "T".into(),
-            uri: "local://t-plan.md".into(),
-            file: std::path::PathBuf::new(),
-            content: String::new(),
-            stored: false,
-            note: None,
-            reply: tx,
+        let action = |id: &str| mu_base::events::ActionSpec {
+            id: id.into(),
+            label: id.into(),
+            disabled: false,
+            input: mu_base::events::ActionInput::None,
+            keeps_context: false,
+            approves: false,
         };
+        let request = mu_base::events::ReviewRequest {
+            header: "Plan review".into(),
+            title: "T".into(),
+            uri: Some("local://t-plan.md".into()),
+            file: None,
+            content: String::new(),
+            note: None,
+            actions: vec![action("execute"), action("park")],
+            default: 0,
+            models: false,
+            cancel_turn: true,
+            cancel_notice: String::new(),
+        };
+        let review = AgentEvent::Review { request: request.clone(), reply: tx };
         assert_eq!(run(vec![review, AgentEvent::Exit], true), 1, "nothing was parked");
-        assert!(matches!(rx.try_recv(), Ok(PlanDecision::Park)));
+        assert_eq!(rx.try_recv().unwrap().id, "park");
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let no_park = mu_base::events::ReviewRequest { actions: vec![action("execute")], ..request };
+        run(vec![AgentEvent::Review { request: no_park, reply: tx }, AgentEvent::Exit], true);
+        assert!(rx.try_recv().is_err(), "without a park action the review is dropped");
         let parked = AgentEvent::PlanParked { id: "t".into(), path: "/p/t.md".into() };
         assert_eq!(run(vec![parked, AgentEvent::Exit], true), 0);
         assert_eq!(run(vec![AgentEvent::Exit], false), 0);
@@ -955,7 +975,7 @@ mod tests {
 
     #[test]
     fn a_refused_headless_plan_creates_no_session() {
-        let keep = || PlanDecision::Keep { model: None };
+        let keep = || mu_base::events::ModeAction::Keep { model: None };
         block(async {
             let stale = Command::StartPlan { id: "t".into(), decision: keep(), anyway: false };
             let r = headless_refusal(stale, |cwd, _| std::fs::write(cwd.join("a.txt"), "two\n").unwrap()).await;

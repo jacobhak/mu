@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use updates::{Jobs, Stream, translate};
+use updates::{Jobs, Stream, translate_with};
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -112,14 +112,15 @@ struct Pending {
     value: String,
 }
 
-/// The modes a session offers: plan mode is the only one that is not the default behaviour.
-const MODES: [(&str, &str, &str); 2] = [
-    ("default", "Default", "Read, edit and run commands"),
-    ("plan", "Plan", "Explore read-only, then propose a plan for your approval"),
-];
+/// The modes a session offers: id, name, description. `default` is no mode; the rest are the `command` modes.
+fn modes(ctx: &Context) -> Vec<(String, String, String)> {
+    let mut out = vec![("default".to_string(), "Default".to_string(), "Read, edit and run commands".to_string())];
+    out.extend(ctx.modes.iter().filter(|m| m.command).map(|m| (m.name.clone(), m.title(), m.description.clone())));
+    out
+}
 
-fn mode_id(plan: bool) -> &'static str {
-    if plan { "plan" } else { "default" }
+fn mode_id(mode: Option<&str>) -> &str {
+    mode.unwrap_or("default")
 }
 
 /// What the client was last told about the session.
@@ -127,7 +128,7 @@ fn mode_id(plan: bool) -> &'static str {
 struct Advertised {
     model: String,
     thinking: String,
-    plan: bool,
+    mode: Option<String>,
 }
 
 struct Session {
@@ -151,7 +152,9 @@ struct Session {
     /// Output of running tools and jobs, and the jobs the client has been told about.
     stream: Stream,
     jobs: Jobs,
-    /// The `propose_plan` call in flight, which the plan approval request refers to.
+    /// The modes' exit tools.
+    mode_tools: Vec<String>,
+    /// The exit tool call in flight, which the review request refers to.
     plan_call: Option<String>,
     /// Distinguishes reopened sessions that share an id, so a closed agent's late events are dropped.
     epoch: u64,
@@ -175,9 +178,10 @@ impl Session {
         models.extend(self.models.iter().map(|m| json!({"value": m, "name": pricing::display_name(m)})));
         let levels: Vec<Value> = Thinking::NAMES.iter().map(|n| json!({"value": n, "name": n})).collect();
         let modes: Vec<Value> =
-            MODES.iter().map(|(id, name, d)| json!({"value": id, "name": name, "description": d})).collect();
+            modes(&self.ctx).iter().map(|(id, name, d)| json!({"value": id, "name": name, "description": d})).collect();
+        let current = mode_id(self.advertised.mode.as_deref());
         json!([
-            {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": mode_id(self.advertised.plan), "options": modes},
+            {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": current, "options": modes},
             {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": self.advertised.model, "options": models},
             {"id": "thinking", "name": "Thinking", "category": "thought_level", "type": "select", "currentValue": self.advertised.thinking, "options": levels},
         ])
@@ -185,8 +189,8 @@ impl Session {
 
     fn modes(&self) -> Value {
         let available: Vec<Value> =
-            MODES.iter().map(|(id, name, d)| json!({"id": id, "name": name, "description": d})).collect();
-        json!({"currentModeId": mode_id(self.advertised.plan), "availableModes": available})
+            modes(&self.ctx).iter().map(|(id, name, d)| json!({"id": id, "name": name, "description": d})).collect();
+        json!({"currentModeId": mode_id(self.advertised.mode.as_deref()), "availableModes": available})
     }
 
     fn command_list(&self) -> Value {
@@ -482,12 +486,12 @@ impl Server {
                 s.prompt = Some(id);
                 let _ = s.cmd.send(Command::Review(focus));
             }
-            Parsed::Plan(Some(text)) => {
+            Parsed::Mode { name, prompt: Some(text) } => {
                 s.prompt = Some(id);
-                let _ = s.cmd.send(Command::TogglePlan(Some(text)));
+                let _ = s.cmd.send(Command::Mode { name, prompt: Some(text) });
             }
-            Parsed::Plan(None) => {
-                let _ = s.cmd.send(Command::TogglePlan(None));
+            Parsed::Mode { name, prompt: None } => {
+                let _ = s.cmd.send(Command::Mode { name, prompt: None });
                 end_turn(&id);
             }
             Parsed::Rename(title) => {
@@ -530,16 +534,16 @@ impl Server {
                 None => return fail(&id, INVALID_PARAMS, format!("unknown thinking level {value}")),
             },
             "mode" => {
-                let Some((mode, ..)) = MODES.iter().find(|m| m.0 == value) else {
+                if !modes(&s.ctx).iter().any(|m| m.0 == value) {
                     return fail(&id, INVALID_PARAMS, format!("unknown mode {value}"));
-                };
-                if *mode == mode_id(s.advertised.plan) {
+                }
+                if value == mode_id(s.advertised.mode.as_deref()) {
                     return respond(
                         &id,
                         if reply == "set_mode" { json!({}) } else { json!({"configOptions": s.config_options()}) },
                     );
                 }
-                Command::TogglePlan(None)
+                if value == "default" { Command::ExitMode } else { Command::Mode { name: value.into(), prompt: None } }
             }
             _ => return fail(&id, INVALID_PARAMS, format!("unknown config option {config}")),
         };
@@ -673,15 +677,16 @@ impl Server {
                 if !s.models.contains(&st.model_id) {
                     s.models.push(st.model_id.clone());
                 }
-                let cur = Advertised { model: st.model_id.clone(), thinking: st.thinking.clone(), plan: st.plan };
+                let cur =
+                    Advertised { model: st.model_id.clone(), thinking: st.thinking.clone(), mode: st.mode.clone() };
                 let changed = s.advertised != cur;
-                let mode_changed = s.advertised.plan != cur.plan;
+                let mode_changed = s.advertised.mode != cur.mode;
                 let satisfied = s.pending_cfg.as_ref().is_some_and(|p| match p.config.as_str() {
                     // A model request may resolve to a different id than the one asked for (an alias),
                     // so a model change also answers it; otherwise the request would never be answered.
                     "model" => cur.model == p.value || s.advertised.model != cur.model,
                     "thinking" => cur.thinking == p.value,
-                    _ => mode_id(cur.plan) == p.value,
+                    _ => mode_id(cur.mode.as_deref()) == p.value,
                 });
                 s.advertised = cur;
                 if satisfied {
@@ -696,7 +701,10 @@ impl Server {
                 if mode_changed {
                     update(
                         sid,
-                        json!({"sessionUpdate": "current_mode_update", "currentModeId": mode_id(s.advertised.plan)}),
+                        json!({
+                            "sessionUpdate": "current_mode_update",
+                            "currentModeId": mode_id(s.advertised.mode.as_deref()),
+                        }),
                     );
                 }
                 if let Some(used) = st.context_tokens.filter(|_| st.context_window > 0)
@@ -763,16 +771,16 @@ impl Server {
                 }
             }
             AgentEvent::ToolStart { id, name, args } => {
-                if name == "propose_plan" {
+                if s.mode_tools.contains(&name) {
                     s.plan_call = Some(id.clone());
                 }
-                for u in translate(&s.cwd, AgentEvent::ToolStart { id, name, args }, true) {
+                for u in translate_with(&s.cwd, AgentEvent::ToolStart { id, name, args }, true, &s.mode_tools) {
                     update(sid, u);
                 }
             }
             AgentEvent::ToolEnd { id, name, output } => {
                 s.stream.end(&id);
-                for u in translate(&s.cwd, AgentEvent::ToolEnd { id, name, output }, true) {
+                for u in translate_with(&s.cwd, AgentEvent::ToolEnd { id, name, output }, true, &s.mode_tools) {
                     update(sid, u);
                 }
             }
@@ -796,12 +804,12 @@ impl Server {
                     tokio::task::spawn_local(client::ask_user(rpc, sid.to_string(), questions, reply));
                 }
             }
-            AgentEvent::PlanReview { title, content, reply, .. } => {
+            AgentEvent::Review { request, reply } => {
                 let call = s.plan_call.take().unwrap_or_else(|| "plan-review".to_string());
-                tokio::task::spawn_local(client::review_plan(rpc, sid.to_string(), call, title, content, reply));
+                tokio::task::spawn_local(client::review(rpc, sid.to_string(), call, request, reply));
             }
             e => {
-                for u in translate(&s.cwd, e, true) {
+                for u in translate_with(&s.cwd, e, true, &s.mode_tools) {
                     update(sid, u);
                 }
             }
@@ -881,6 +889,7 @@ async fn open_session(
         cwd.clone(),
         Mode::Acp,
     );
+    let mode_tools: Vec<String> = ctx.modes.iter().map(|m| m.exit.tool.clone()).collect();
     let known = resume.as_deref().map(list::id_of);
     let _ = cmd_tx.send(match resume {
         Some(p) => Command::Resume(p),
@@ -894,7 +903,7 @@ async fn open_session(
             Some(AgentEvent::Exit) | None => break Err(anyhow!("agent exited during startup")),
             Some(e) => {
                 if let (true, Some(sid)) = (replay, &known) {
-                    for u in translate(&cwd, e, false) {
+                    for u in translate_with(&cwd, e, false, &mode_tools) {
                         update(sid, u);
                     }
                 }
@@ -928,12 +937,13 @@ async fn open_session(
         streamed: false,
         pending_cfg: None,
         models,
-        advertised: Advertised { model: st.model_id, thinking: st.thinking, plan: st.plan },
+        advertised: Advertised { model: st.model_id, thinking: st.thinking, mode: st.mode },
         providers: providers.clone(),
         used: st.context_tokens,
         title: st.title,
         stream: Stream::default(),
         jobs: Jobs::default(),
+        mode_tools,
         plan_call: None,
         epoch,
     };
@@ -1067,8 +1077,11 @@ mod tests {
     }
 
     #[test]
-    fn modes_are_default_and_plan() {
-        assert_eq!((mode_id(false), mode_id(true)), ("default", "plan"));
-        assert!(MODES.iter().all(|m| m.0 == "default" || m.0 == "plan"));
+    fn modes_are_default_and_the_command_modes() {
+        assert_eq!((mode_id(None), mode_id(Some("plan"))), ("default", "plan"));
+        let ctx = Context { modes: mu_tools::context::builtin_modes(), ..Default::default() };
+        let ids: Vec<String> = modes(&ctx).into_iter().map(|m| m.0).collect();
+        assert_eq!(ids, ["default", "plan"]);
+        assert_eq!(modes(&ctx)[1].1, "Plan");
     }
 }

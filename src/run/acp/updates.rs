@@ -15,14 +15,15 @@ const KEEP: usize = 16 * 1024;
 /// Least time between two updates of one running call.
 const EVERY: Duration = Duration::from_millis(250);
 
-pub(super) fn tool_kind(name: &str) -> &'static str {
+/// `mode_tools` are the modes' exit tools.
+pub(super) fn tool_kind(name: &str, mode_tools: &[String]) -> &'static str {
     match name {
         "read" => "read",
         "grep" | "glob" => "search",
         "edit" | "write" => "edit",
         "bash" => "execute",
         "fetch" | "web_search" => "fetch",
-        "propose_plan" => "switch_mode",
+        n if mode_tools.iter().any(|t| t == n) => "switch_mode",
         _ => "other",
     }
 }
@@ -90,8 +91,13 @@ pub(super) fn plan_entries(phases: &Value) -> Vec<Value> {
     out
 }
 
-/// ACP `session/update` payloads for one agent event. `live` is false while replaying history.
+#[cfg(test)]
 pub(super) fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
+    translate_with(cwd, e, live, &[])
+}
+
+/// ACP `session/update` payloads for one agent event. `live` is false while replaying history.
+pub(super) fn translate_with(cwd: &Path, e: AgentEvent, live: bool, mode_tools: &[String]) -> Vec<Value> {
     let text = |kind: &str, t: String| json!({"sessionUpdate": kind, "content": {"type": "text", "text": t}});
     match e {
         AgentEvent::UserPrompt(t) if !live => vec![text("user_message_chunk", t)],
@@ -112,7 +118,7 @@ pub(super) fn translate(cwd: &Path, e: AgentEvent, live: bool) -> Vec<Value> {
                 "toolCallId": id,
                 "name": name,
                 "title": title,
-                "kind": tool_kind(&name),
+                "kind": tool_kind(&name, mode_tools),
                 "status": "in_progress",
                 "rawInput": args,
             });

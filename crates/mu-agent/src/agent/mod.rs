@@ -27,7 +27,7 @@ use crate::plans;
 use crate::policy::ToolPolicy;
 use crate::prompt::{self, PromptInput};
 use mu_base::ask_nudge;
-use mu_base::events::{AgentEvent, Command, EventTx, PlanDecision, PlanMeta, QueueState, StatusSnapshot};
+use mu_base::events::{AgentEvent, Command, EventTx, ModeAction, PlanMeta, QueueState, StatusSnapshot};
 use mu_base::git;
 use mu_base::mem;
 use mu_base::message::UserInput;
@@ -83,19 +83,22 @@ pub struct Agent {
     review_child: Option<PathBuf>,
 }
 
-pub struct PlanState {
+pub struct ModeState {
+    name: String,
     prev_model: Option<String>,
     prev_thinking: Thinking,
-    /// The model entered plan mode itself (`enter_plan`), so it may carry on after a park.
+    /// The model entered the mode itself (`enter_mode`), so it may carry on after a park.
     by_model: bool,
 }
 
 struct ExecPlan {
     content: String,
     title: String,
-    /// `local://<slug>-plan.md`
+    /// `local://<slug>-<document>.md`
     uri: String,
-    decision: PlanDecision,
+    decision: ModeAction,
+    /// The mode that wrote the document.
+    mode: String,
     /// Tree snapshot at approval, the base for `/review`.
     base: Option<String>,
     approved_at: i64,
@@ -124,22 +127,19 @@ enum Step {
     Wake,
 }
 
-const PLAN_APPROVED: &str = include_str!("../prompts/plan-approved.md");
-const PLAN_REFINE: &str = include_str!("../prompts/plan-refine.md");
-
-/// The hidden prompt that starts executing an approved plan.
-fn plan_prompt(p: &ExecPlan) -> String {
-    let context = if !matches!(p.decision, PlanDecision::Execute { .. }) {
-        "- History usable; the plan below authoritative if it conflicts with earlier exploration.\n"
+/// The hidden prompt that starts executing an approved document.
+fn plan_prompt(p: &ExecPlan, m: &context::ModeDef) -> String {
+    let context = if !matches!(p.decision, ModeAction::Execute { .. }) {
+        format!("- History usable; the {} below authoritative if it conflicts with earlier exploration.\n", m.noun())
     } else {
-        ""
+        String::new()
     };
-    PLAN_APPROVED.replace("{{context}}", context).replace("{{path}}", &p.uri).replace("{{plan}}", p.content.trim_end())
+    // Rendered before the document goes in, so placeholders the document itself mentions stay as written.
+    m.render(&m.exit.approved)
+        .replace("{{context}}", &context)
+        .replace("{{path}}", &p.uri)
+        .replace("{{document}}", p.content.trim_end())
 }
-
-const PLAN_COMPACT_FOCUS: &str = "The user approved an implementation plan; it will be supplied in full right after this summary. Preserve what implementing it needs: decisions, constraints, file paths, symbols, and findings from exploration. Omit the plan text itself.";
-
-const PLAN_PROMPT: &str = include_str!("../prompts/plan-mode.md");
 
 /// Starts a detached `mu deliver` for a plan, in `cwd`, for `session`. `Ok` is what it printed; `Err` is what to show.
 pub type DeliverFn =
@@ -164,8 +164,8 @@ const SKIP_YIELDED: &str = "Skipped: the result was already submitted with `yiel
 const SKIP_TRUNCATED: &str = "Tool call not executed: output was truncated (max_tokens)";
 const SKIP_BUDGET: &str = "Skipped: the run is past its request budget, deliver the final result";
 
-/// Tools a headless front end never offers: nobody is there to answer `ask` or approve a plan.
-pub const HEADLESS_EXCLUDED: [&str; 3] = ["ask", "propose_plan", "enter_plan"];
+/// Tools a headless front end never offers: nobody is there to answer `ask` or let the model switch mode.
+pub const HEADLESS_EXCLUDED: [&str; 2] = ["ask", "enter_mode"];
 
 /// How a loop pass ended.
 enum Flow {
@@ -303,7 +303,7 @@ impl Agent {
                 tx: title_tx,
                 rx: Some(title_rx),
             },
-            plan: PlanFlow { plan: None, exec_plan: None, stored_plan: None, review_base: None },
+            plan: PlanFlow { mode: None, exec_plan: None, stored_plan: None, review_base: None },
             mail: Mailbox {
                 wake_rx: None,
                 wake_tx: None,
@@ -390,14 +390,27 @@ impl Agent {
             .map_err(|e| e.to_string())
     }
 
+    /// The mode that is on, if it is defined here.
+    pub(super) fn active_mode(&self) -> Option<&context::ModeDef> {
+        self.plan.mode.as_ref().and_then(|s| self.ctx.mode(&s.name))
+    }
+
     pub fn system(&self) -> String {
         let mcp = self.ports.plugins.mcp_instructions();
         let roles = self.delegated_roles();
+        let mode = self.active_mode().map(|m| {
+            let mut text = m.render(&m.prompt);
+            if self.run.headless_modes {
+                text.push_str("\n\n");
+                text.push_str(&m.render(&m.exit.headless));
+            }
+            text
+        });
         let prompt = prompt::system_prompt(&PromptInput {
             model: &self.model.model.id,
             cwd: &self.cwd,
             ctx: &self.ctx,
-            plan: self.plan.plan.as_ref().map(|_| PLAN_PROMPT),
+            mode: mode.as_deref(),
             subagent: self.run.subagent,
             ask: self.policy().permits("ask"),
             task: self.policy().permits("task"),
@@ -518,16 +531,22 @@ impl Agent {
             Command::Fork => self.fork().await,
             Command::ListRewind => self.list_rewind(),
             Command::Rewind(id) => self.rewind(&id).await,
-            Command::TogglePlan(prompt) => match (self.plan.plan.is_some(), prompt) {
-                (false, p) => {
-                    self.enter_plan().await;
-                    if let Some(p) = p {
-                        drive(self.turn(Some(p.into())), q).await;
+            Command::Mode { name, prompt } => {
+                let on = self.plan.mode.as_ref().is_some_and(|m| m.name == name);
+                match (on, prompt) {
+                    (false, p) => {
+                        self.enter_mode(&name, false).await;
+                        if let Some(p) = p
+                            && self.plan.mode.as_ref().is_some_and(|m| m.name == name)
+                        {
+                            drive(self.turn(Some(p.into())), q).await;
+                        }
                     }
+                    (true, Some(p)) => drive(self.turn(Some(p.into())), q).await,
+                    (true, None) => self.exit_mode(),
                 }
-                (true, Some(p)) => drive(self.turn(Some(p.into())), q).await,
-                (true, None) => self.exit_plan(),
-            },
+            }
+            Command::ExitMode => self.exit_mode(),
             Command::Compact(focus) => drive(self.manual_compact(focus), q).await,
             Command::Review(focus) => drive(self.review(focus), q).await,
             Command::Rename(t) => {

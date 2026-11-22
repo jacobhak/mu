@@ -219,7 +219,7 @@ fn cancel_closes_an_open_plan_dialog_without_a_decision() {
         let feeder = async {
             let mut reply = None;
             while let Some(e) = rx.recv().await {
-                if let AgentEvent::PlanReview { reply: r, .. } = e {
+                if let AgentEvent::Review { reply: r, .. } = e {
                     reply = Some(r);
                     tx.send(Command::Cancel).unwrap();
                     break;
@@ -232,7 +232,7 @@ fn cancel_closes_an_open_plan_dialog_without_a_decision() {
             feeder
         );
         assert!(ran.expect("the dialog closes on cancel"), "the run loop goes on");
-        assert!(a.plan.plan.is_none());
+        assert!(a.plan.mode.is_none());
         let (meta, _) = store.load("t").unwrap();
         assert_eq!(meta.status, mu_base::events::Status::Pending);
     });

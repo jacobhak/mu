@@ -127,6 +127,7 @@ impl App {
                 Ok(Expanded::Prompt(text)) => {
                     app.send_prompt(UserInput { text, images: Vec::new(), command: Some(format!("/{shown}")) }, false)
                 }
+                Ok(Expanded::Mode { name, prompt }) => app.send(Command::Mode { name, prompt }),
                 Ok(Expanded::UnknownSkill) => {
                     app.error(&format!("unknown skill {}", name.trim_start_matches("skill:")))
                 }

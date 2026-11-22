@@ -1818,7 +1818,7 @@ pub(super) mod tests {
         let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
         let record = |seen: &Rc<std::cell::RefCell<Vec<(String, String)>>>| {
             let seen = seen.clone();
-            move |_: &mut App, tiers: Vec<crate::panels::plan_review::Tier>| {
+            move |_: &mut App, tiers: Vec<crate::panels::doc_review::Tier>| {
                 *seen.borrow_mut() = tiers.into_iter().map(|t| (t.role, t.detail)).collect();
             }
         };

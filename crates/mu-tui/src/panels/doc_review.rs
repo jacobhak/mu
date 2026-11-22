@@ -7,7 +7,7 @@ use crate::widgets::frame::Frame;
 use crate::widgets::select::clean_paste;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::ContentStyle;
-use mu_base::events::PlanDecision;
+use mu_base::events::{ActionChoice, ActionInput, ReviewRequest};
 use std::path::PathBuf;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -22,7 +22,7 @@ pub enum ReviewResult {
     Cancelled,
     Copy,
     Edit,
-    Decided(PlanDecision),
+    Decided(ActionChoice),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -31,73 +31,75 @@ enum Focus {
     Actions,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Act {
-    Execute,
-    Compact,
-    Keep,
-    Park,
-    Drop,
-    Refine,
+struct Row {
+    id: String,
+    label: String,
+    off: bool,
+    input: ActionInput,
+    approves: bool,
 }
 
-pub struct PlanReview {
-    pub file: PathBuf,
+pub struct DocReview {
+    pub file: Option<PathBuf>,
+    pub cancel_turn: bool,
+    pub cancel_notice: String,
+    header: String,
     title: String,
-    uri: String,
+    uri: Option<String>,
     content: String,
     lines: Vec<Line>,
     cache_w: usize,
     scroll: usize,
     body_h: usize,
     focus: Focus,
-    actions: Vec<(String, bool, Act)>,
+    actions: Vec<Row>,
     note: Option<String>,
     sel: usize,
+    models: bool,
     tiers: Vec<Tier>,
     tier: usize,
     editing: bool,
     text: String,
 }
 
-impl PlanReview {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        title: String,
-        uri: String,
-        file: PathBuf,
-        content: String,
-        context: Option<(u64, u64)>,
-        tiers: Vec<Tier>,
-        stored: bool,
-        note: Option<String>,
-    ) -> Self {
-        let (keep, keep_off) = match context {
-            Some((t, w)) => {
-                (format!("Approve and keep context (~{} / {})", format_number(t), format_number(w)), t * 100 > 95 * w)
-            }
-            None => ("Approve and keep context".to_string(), false),
-        };
+impl DocReview {
+    pub fn new(req: ReviewRequest, context: Option<(u64, u64)>, tiers: Vec<Tier>) -> Self {
         let tier = tiers.iter().position(|t| t.role == "default").unwrap_or(0);
+        let actions: Vec<Row> = req
+            .actions
+            .into_iter()
+            .map(|a| {
+                let (label, off) = match context.filter(|_| a.keeps_context) {
+                    Some((t, w)) => {
+                        (format!("{} (~{} / {})", a.label, format_number(t), format_number(w)), t * 100 > 95 * w)
+                    }
+                    None => (a.label, false),
+                };
+                Row { id: a.id, label, off: off || a.disabled, input: a.input, approves: a.approves }
+            })
+            .collect();
+        let sel = if actions.get(req.default).is_some_and(|r| !r.off) {
+            req.default
+        } else {
+            actions.iter().position(|r| !r.off).unwrap_or(0)
+        };
         Self {
-            file,
-            title,
-            uri,
-            content,
+            file: req.file,
+            cancel_turn: req.cancel_turn,
+            cancel_notice: req.cancel_notice,
+            header: req.header,
+            title: req.title,
+            uri: req.uri,
+            content: req.content,
             lines: Vec::new(),
             cache_w: 0,
             scroll: 0,
             body_h: 10,
             focus: Focus::Actions,
-            actions: vec![
-                ("Approve and execute".into(), false, Act::Execute),
-                ("Approve and compact context".into(), false, Act::Compact),
-                (keep, keep_off, Act::Keep),
-                if stored { ("Drop plan".into(), false, Act::Drop) } else { ("Park plan".into(), false, Act::Park) },
-                (REFINE_LABEL.into(), false, Act::Refine),
-            ],
-            note,
-            sel: 0,
+            actions,
+            note: req.note,
+            sel,
+            models: req.models,
             tiers,
             tier,
             editing: false,
@@ -121,11 +123,21 @@ impl PlanReview {
     }
 
     fn slider(&self) -> bool {
-        self.tiers.len() > 1
+        self.models && self.tiers.len() > 1
     }
 
     fn model(&self) -> Option<String> {
         if self.slider() { self.tiers[self.tier].model.clone() } else { None }
+    }
+
+    fn choice(&self, text: Option<String>) -> ReviewResult {
+        let row = &self.actions[self.sel];
+        let model = if row.approves { self.model() } else { None };
+        ReviewResult::Decided(ActionChoice { id: row.id.clone(), text, model })
+    }
+
+    fn selected_input(&self) -> Option<ActionInput> {
+        self.actions.get(self.sel).map(|r| r.input)
     }
 
     fn max_scroll(&self) -> usize {
@@ -137,7 +149,7 @@ impl PlanReview {
     }
 
     fn enabled(&self, i: usize) -> bool {
-        !self.actions[i].1
+        !self.actions[i].off
     }
 
     pub fn on_key(&mut self, k: KeyEvent) -> ReviewResult {
@@ -152,8 +164,13 @@ impl PlanReview {
                     self.editing = false;
                     self.text.clear();
                 }
+                KeyCode::Enter if self.selected_input() == Some(ActionInput::Optional) => {
+                    let text = self.text.trim();
+                    let text = (!text.is_empty()).then(|| self.text.clone());
+                    return self.choice(text);
+                }
                 KeyCode::Enter if !self.text.trim().is_empty() => {
-                    return ReviewResult::Decided(PlanDecision::Refine(self.text.clone()));
+                    return self.choice(Some(self.text.clone()));
                 }
                 KeyCode::Backspace => {
                     self.text.pop();
@@ -169,8 +186,15 @@ impl PlanReview {
         match k.code {
             KeyCode::Esc => return ReviewResult::Cancelled,
             KeyCode::Char('c') if ctrl => return ReviewResult::Cancelled,
-            KeyCode::Char('g') if ctrl => return ReviewResult::Edit,
+            KeyCode::Char('g') if ctrl && self.file.is_some() => return ReviewResult::Edit,
             KeyCode::Char('c') if k.modifiers.is_empty() => return ReviewResult::Copy,
+            KeyCode::Char('n')
+                if k.modifiers.is_empty()
+                    && self.focus == Focus::Actions
+                    && self.selected_input() == Some(ActionInput::Optional) =>
+            {
+                self.editing = true;
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = if self.focus == Focus::Body { Focus::Actions } else { Focus::Body };
             }
@@ -206,20 +230,15 @@ impl PlanReview {
             KeyCode::Char('h') if self.slider() => self.tier = self.tier.saturating_sub(1),
             KeyCode::Char('l') if self.slider() => self.tier = (self.tier + 1).min(self.tiers.len() - 1),
             KeyCode::Enter => {
-                let model = self.model();
-                let Some((_, _, act)) = self.actions.get(self.sel) else { return ReviewResult::Pending };
-                return match act {
-                    Act::Execute => ReviewResult::Decided(PlanDecision::Execute { model }),
-                    Act::Compact => ReviewResult::Decided(PlanDecision::Compact { model }),
-                    Act::Keep if self.enabled(self.sel) => ReviewResult::Decided(PlanDecision::Keep { model }),
-                    Act::Keep => ReviewResult::Pending,
-                    Act::Park => ReviewResult::Decided(PlanDecision::Park),
-                    Act::Drop => ReviewResult::Decided(PlanDecision::Drop),
-                    Act::Refine => {
-                        self.editing = true;
-                        ReviewResult::Pending
-                    }
-                };
+                let Some(row) = self.actions.get(self.sel) else { return ReviewResult::Pending };
+                if row.off {
+                    return ReviewResult::Pending;
+                }
+                if row.input == ActionInput::Required {
+                    self.editing = true;
+                    return ReviewResult::Pending;
+                }
+                return self.choice(None);
             }
             _ => {}
         }
@@ -241,11 +260,12 @@ impl PlanReview {
         self.scroll = self.scroll.min(n.saturating_sub(self.body_h));
 
         let pos = if n == 0 {
-            " · (empty plan)".to_string()
+            " · (empty)".to_string()
         } else {
-            format!(" · {} · {}–{}/{}", self.uri, self.scroll + 1, (self.scroll + self.body_h).min(n), n)
+            let uri = self.uri.as_ref().map(|u| format!(" · {u}")).unwrap_or_default();
+            format!("{uri} · {}–{}/{}", self.scroll + 1, (self.scroll + self.body_h).min(n), n)
         };
-        frame.header[0] = vec![span(format!("Plan review: {}", self.title), accent()), span(pos, dim())];
+        frame.header[0] = vec![span(format!("{}: {}", self.header, self.title), accent()), span(pos, dim())];
         let body: Vec<Line> = self.lines.iter().skip(self.scroll).take(self.body_h).cloned().collect();
         let first_action = frame.header.len() + body.len() + first_action;
         let cur = match edit_cursor.filter(|_| self.editing) {
@@ -277,12 +297,12 @@ impl PlanReview {
         }
         let first_action = out.len();
         let mut edit_cursor: Option<(usize, usize)> = None;
-        for (i, (label, off, act)) in self.actions.iter().enumerate() {
+        for (i, Row { label, off, .. }) in self.actions.iter().enumerate() {
             let selected = i == self.sel;
             let focused = selected && self.focus == Focus::Actions;
             let marker_style = if focused { theme::get().fg(Role::Accent) } else { dim() };
             let mut l: Line = vec![span(if selected { "❯ " } else { "  " }, marker_style)];
-            if *act == Act::Refine && self.editing {
+            if selected && self.editing {
                 l.push(span(
                     format!("{label}: {}", self.text),
                     if focused { line::bold() } else { ContentStyle::default() },
@@ -310,13 +330,26 @@ impl PlanReview {
         let help: Vec<&str> = if self.editing {
             vec!["Enter send", "Esc back"]
         } else if self.focus == Focus::Body {
-            vec!["↑↓ scroll", "PgUp/PgDn page", "g/G ends", "c copy", "Ctrl+G edit", "Tab actions", "Esc cancel"]
+            let mut h = vec!["↑↓ scroll", "PgUp/PgDn page", "g/G ends", "c copy"];
+            if self.file.is_some() {
+                h.push("Ctrl+G edit");
+            }
+            h.extend(["Tab actions", "Esc cancel"]);
+            h
         } else {
             let mut h = vec!["↑↓ select", "Enter confirm"];
             if self.slider() {
                 h.push("←→ model");
             }
-            h.extend(["c copy", "Ctrl+G edit", "Tab plan", "Esc cancel"]);
+            h.push("c copy");
+            if self.file.is_some() {
+                h.push("Ctrl+G edit");
+            }
+            h.push("Tab document");
+            if self.selected_input() == Some(ActionInput::Optional) {
+                h.push("n note");
+            }
+            h.push("Esc cancel");
             h
         };
         out.push(styled(help.join(" · "), |_| dim()));
@@ -324,16 +357,54 @@ impl PlanReview {
     }
 }
 
-/// The label of the action that takes free-text feedback.
-const REFINE_LABEL: &str = "Refine plan";
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mu_base::events::ActionSpec;
     use mu_testutil::key;
 
-    fn review(content: &str, ctx: Option<(u64, u64)>, tiers: Vec<Tier>) -> PlanReview {
-        PlanReview::new("T".into(), "local://t-plan.md".into(), PathBuf::new(), content.into(), ctx, tiers, false, None)
+    const REFINE_LABEL: &str = "Refine plan";
+
+    fn spec(id: &str, label: &str, input: ActionInput, keeps: bool, approves: bool) -> ActionSpec {
+        ActionSpec { id: id.into(), label: label.into(), disabled: false, input, keeps_context: keeps, approves }
+    }
+
+    fn request(content: &str, stored: bool) -> ReviewRequest {
+        let n = ActionInput::None;
+        ReviewRequest {
+            header: "Plan review".into(),
+            title: "T".into(),
+            uri: Some("local://t-plan.md".into()),
+            file: Some(PathBuf::new()),
+            content: content.into(),
+            note: None,
+            actions: vec![
+                spec("execute", "Approve and execute", n, false, true),
+                spec("compact", "Approve and compact context", n, false, true),
+                spec("keep", "Approve and keep context", n, true, true),
+                if stored {
+                    spec("drop", "Drop plan", n, false, false)
+                } else {
+                    spec("park", "Park plan", n, false, false)
+                },
+                spec("refine", REFINE_LABEL, ActionInput::Required, false, false),
+            ],
+            default: 0,
+            models: true,
+            cancel_turn: !stored,
+            cancel_notice: String::new(),
+        }
+    }
+
+    fn review(content: &str, ctx: Option<(u64, u64)>, tiers: Vec<Tier>) -> DocReview {
+        DocReview::new(request(content, false), ctx, tiers)
+    }
+
+    fn decided(r: ReviewResult) -> ActionChoice {
+        match r {
+            ReviewResult::Decided(c) => c,
+            _ => panic!("not decided"),
+        }
     }
 
     fn tiers() -> Vec<Tier> {
@@ -360,10 +431,10 @@ mod tests {
     #[test]
     fn keep_label_and_disable() {
         let r = review("x", Some((42_000, 200_000)), vec![]);
-        assert_eq!(r.actions[2].0, "Approve and keep context (~42K / 200K)");
-        assert!(!r.actions[2].1);
+        assert_eq!(r.actions[2].label, "Approve and keep context (~42K / 200K)");
+        assert!(!r.actions[2].off);
         let mut r = review("x", Some((196_000, 200_000)), vec![]);
-        assert!(r.actions[2].1);
+        assert!(r.actions[2].off);
         r.sel = 1;
         r.on_key(key(KeyCode::Down));
         assert_eq!(r.sel, 3);
@@ -404,45 +475,88 @@ mod tests {
         let text = line::line_text(&rows[row]);
         assert!(text.starts_with(&format!("❯ {REFINE_LABEL}: x")), "{text:?}");
         assert_eq!(col, line::line_width(&vec![span(format!("❯ {REFINE_LABEL}: x"), ContentStyle::default())]));
-        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Refine(t)) if t == "x"));
+        let c = decided(r.on_key(key(KeyCode::Enter)));
+        assert_eq!((c.id.as_str(), c.text.as_deref()), ("refine", Some("x")));
+    }
+
+    #[test]
+    fn labels_come_from_the_request() {
+        let r = review("x", None, vec![]);
+        let labels: Vec<&str> = r.actions.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Approve and execute",
+                "Approve and compact context",
+                "Approve and keep context",
+                "Park plan",
+                REFINE_LABEL
+            ]
+        );
+    }
+
+    #[test]
+    fn enter_on_a_required_row_opens_the_text_line() {
+        let mut r = review("x", None, vec![]);
+        r.sel = 4;
+        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Pending));
+        assert!(r.editing);
+        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Pending));
+    }
+
+    #[test]
+    fn n_adds_a_note_on_an_optional_row() {
+        let mut req = request("x", false);
+        req.actions[0].input = ActionInput::Optional;
+        let mut r = DocReview::new(req, None, vec![]);
+        r.on_key(key(KeyCode::Char('n')));
+        assert!(r.editing);
+        r.on_key(key(KeyCode::Char('h')));
+        r.on_key(key(KeyCode::Char('i')));
+        let c = decided(r.on_key(key(KeyCode::Enter)));
+        assert_eq!((c.id.as_str(), c.text.as_deref()), ("execute", Some("hi")));
+        let mut req = request("x", false);
+        req.actions[0].input = ActionInput::Optional;
+        let mut r = DocReview::new(req, None, vec![]);
+        r.on_key(key(KeyCode::Char('n')));
+        assert_eq!(decided(r.on_key(key(KeyCode::Enter))).text, None);
     }
 
     #[test]
     fn tier_model() {
         let mut r = review("x", None, tiers());
-        assert!(
-            matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: Some(m) }) if m == "@default")
-        );
+        let c = decided(r.on_key(key(KeyCode::Enter)));
+        assert_eq!((c.id.as_str(), c.model.as_deref()), ("execute", Some("@default")));
         let mut r = review("x", None, tiers());
         r.on_key(key(KeyCode::Left));
-        assert!(
-            matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: Some(m) }) if m == "@smol")
-        );
+        assert_eq!(decided(r.on_key(key(KeyCode::Enter))).model.as_deref(), Some("@smol"));
         let mut r = review("x", None, tiers().into_iter().take(1).collect());
-        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Execute { model: None })));
+        assert_eq!(decided(r.on_key(key(KeyCode::Enter))).model, None);
     }
 
     #[test]
     fn park_and_drop_actions() {
         let live = review("x", None, vec![]);
-        assert_eq!(live.actions[3].0, "Park plan");
-        let mut r = review("x", None, vec![]);
+        assert_eq!(live.actions[3].label, "Park plan");
+        let mut r = review("x", None, tiers());
         for _ in 0..3 {
             r.on_key(key(KeyCode::Down));
         }
-        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Park)));
-        let mut r = PlanReview::new("T".into(), "u".into(), PathBuf::new(), "x".into(), None, vec![], true, None);
-        assert_eq!(r.actions[3].0, "Drop plan");
+        let c = decided(r.on_key(key(KeyCode::Enter)));
+        assert_eq!((c.id.as_str(), c.model), ("park", None));
+        let mut r = DocReview::new(request("x", true), None, vec![]);
+        assert_eq!(r.actions[3].label, "Drop plan");
         for _ in 0..3 {
             r.on_key(key(KeyCode::Down));
         }
-        assert!(matches!(r.on_key(key(KeyCode::Enter)), ReviewResult::Decided(PlanDecision::Drop)));
+        assert_eq!(decided(r.on_key(key(KeyCode::Enter))).id, "drop");
     }
 
     #[test]
     fn note_is_the_second_row() {
-        let mut r =
-            PlanReview::new("T".into(), "u".into(), PathBuf::new(), "x".into(), None, vec![], true, Some("N".into()));
+        let mut req = request("x", true);
+        req.note = Some("N".into());
+        let mut r = DocReview::new(req, None, vec![]);
         let (rows, _) = r.render(60, 30);
         assert_eq!(line::line_text(&rows[1]), "N");
     }

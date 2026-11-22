@@ -4,8 +4,9 @@ A plan does not have to be approved in the session that wrote it. It can be park
 
 ## Parking and approving
 
-- The model can switch the session to plan mode itself with the `enter_plan` tool, when you ask for a plan or before a large or risky change. Every call shows an approval prompt, in every permission mode, with no "don't ask again"; deny it with a note and the note goes back to the model. After you park a plan the model entered plan mode for, it may carry on in the same turn (for "write plans for A and B"); each new entry asks again. `-p` and `mu plan` runs and subagents are never offered `enter_plan`.
-- In the plan review, **Park plan** saves the plan and ends the turn. Plan mode turns off, and the session keeps the model and thinking level it planned with; leaving plan mode with `/plan` and approving a plan still restore or switch the model.
+- The model can switch the session to a [mode](modes.md) itself with the `enter_mode` tool, when you ask for a plan or before a large or risky change. Each mode's `model_entry` decides whether that asks: plan's is `ask`, so every call shows an approval prompt, in every permission mode, with no "don't ask again"; deny it with a note and the note goes back to the model. After you park a plan the model entered plan mode for, it may carry on in the same turn (for "write plans for A and B"); each new entry asks again. `-p` and `mu plan` runs and subagents are never offered `enter_mode`.
+- In the plan review, **Park plan** saves the plan and ends the turn. Plan mode turns off, and the session keeps the model and thinking level it planned with; leaving plan mode with `/plan` and approving a plan still restore or switch the model. Parking applies to any mode: its dialog offers `park` when the mode's `exit.actions` lists it.
+- The store records the mode a document was written in; `/plans` and `mu plan list` show it when it is not `plan`.
 - `/plans` lists the repository's pending plans. Choosing one opens the same review dialog as a live plan, with **Drop plan** in place of **Park plan**. Execute, compact, keep and refine apply to the current session. Esc leaves the plan parked.
 - Execute, compact and keep on a live plan also save it, so every approved plan is in the store. A failed save never blocks approval.
 - Approving in a session does not create a worktree: the plan runs in the directory mu runs in. There is no automatic review/fix loop; a run ends when the implementer's turn ends, and `/review` works against the approved plan as usual.
@@ -38,7 +39,7 @@ Opening a plan compares the current working tree with `base`. Only files in `rea
 
 - `list [--all] [--json]`: pending plans, or all. `--json` adds `path`.
 - `show <id> [--json]`: metadata, drift and text. `--json` adds `path`, `content` and `drift` (`state`: `unknown`, `clean` or `changed`).
-- `new "<brief>"`: plans in plan mode with no user and parks the result. The model is told the run is headless and that parking is the expected result. Prints `plan: <id> · <path>` to stderr. Exits 1 if nothing was parked.
+- `new [--mode <name>] "<brief>"`: plans in plan mode (or the named mode) with no user and parks the result. The model is told the run is headless and that parking is the expected result. Prints `plan: <id> · <path>` to stderr. Exits 1 if nothing was parked.
 - `refine <id> [text]`: revises a pending plan, then parks it again under the same id. Without text it brings the plan up to date with the current code. The model is told the run is headless and that parking is the expected result.
 - `approve <id> [--anyway]`: runs the plan like `-p`, in the current directory. `ask` is unavailable, no terminal is needed and `mu take` works. It exits 1 with `is stale` if files the plan read changed, unless `--anyway`. `--model` goes before `plan`.
 - `drop <id>`: drops a pending plan.

@@ -99,7 +99,7 @@ fn strings(items: &[&str]) -> (Vec<String>, Vec<String>) {
     names(items.iter().map(|s| s.to_string()))
 }
 
-pub(super) static BUILTIN: [Builtin; 34] = [
+pub(super) static BUILTIN: [Builtin; 33] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
@@ -124,7 +124,6 @@ pub(super) static BUILTIN: [Builtin; 34] = [
         .busy_ok()
         .complete(|_| names(PermissionMode::NAMES.iter().map(|s| s.to_string()))),
     cmd("compact", "Compact the context [focus]; waits for a running turn", App::cmd_compact).busy_ok(),
-    cmd("plan", "Toggle plan mode", |a, arg| a.send(Command::TogglePlan((!arg.is_empty()).then(|| arg.to_string())))),
     cmd("review", "Review changes against the approved plan [focus]", App::cmd_review),
     cmd("refresh", "Refresh Git and gateway quota status", App::cmd_refresh).busy_ok(),
     cmd("session", "Show the session file and title", App::cmd_session).busy_ok(),
@@ -171,6 +170,10 @@ pub(super) fn find(name: &str) -> Option<&'static Builtin> {
     BUILTIN.iter().find(|c| c.name == name)
 }
 
+pub(crate) fn is_builtin(name: &str) -> bool {
+    find(name).is_some()
+}
+
 /// `mu://reference/interactive.md`: the built-in slash commands and the key bindings.
 pub fn interactive_reference() -> String {
     let mut s = String::from(
@@ -204,6 +207,13 @@ pub(crate) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs
     commands.extend(ctx.commands.iter().map(|c| Entry {
         name: c.name.clone(),
         desc: c.description.clone(),
+        needs_arg: false,
+        args: vec![],
+        arg_descs: vec![],
+    }));
+    commands.extend(ctx.modes.iter().filter(|m| m.command && find(&m.name).is_none()).map(|m| Entry {
+        name: m.name.clone(),
+        desc: m.description.clone(),
         needs_arg: false,
         args: vec![],
         arg_descs: vec![],

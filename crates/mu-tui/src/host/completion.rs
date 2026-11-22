@@ -3,7 +3,7 @@
 
 use super::local::{Local, Registry};
 use super::{Answer, pending, ready};
-use crate::app::{command_entries, custom_completion_ids};
+use crate::app::{command_entries, custom_completion_ids, is_builtin};
 use crate::widgets::complete::Entry;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
@@ -27,6 +27,7 @@ pub struct Completions {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Expanded {
     Prompt(String),
+    Mode { name: String, prompt: Option<String> },
     UnknownSkill,
     UnknownCommand,
 }
@@ -95,6 +96,9 @@ fn expand(l: &Rc<Local>, args: serde_json::Value) -> Answer {
                 Some(p) => Expanded::Prompt(p),
                 None => Expanded::UnknownSkill,
             }
+        } else if l.ctx.modes.iter().any(|m| m.command && m.name == name && !is_builtin(&name)) {
+            let prompt = (!arg.is_empty()).then(|| arg.clone());
+            Expanded::Mode { name, prompt }
         } else if let Some(c) = l.ctx.commands.iter().find(|c| c.name == name) {
             Expanded::Prompt(c.expand(&arg))
         } else {

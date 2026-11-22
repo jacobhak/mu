@@ -7,19 +7,19 @@
 //!
 //! Not `mu-provider`'s `provider/wire`, which is about model APIs.
 
-use crate::events::{AgentEvent, Answer, AskQuestion, Command, PlanDecision, PtyInput, QueueState};
+use crate::events::{ActionChoice, AgentEvent, Answer, AskQuestion, Command, PtyInput, QueueState, ReviewRequest};
 use crate::image;
 use crate::message::UserInput;
 use crate::permissions::{ApprovalDecision, ApprovalRequest};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 /// Raised with every change to `WireCommand`, `WireEvent` or a host request, or to how a connection
-/// starts (4: plain JSON lines behind the hello; encrypting the pipe is up to whatever carries it).
-pub const WIRE: u32 = 4;
+/// starts (4: plain JSON lines behind the hello; encrypting the pipe is up to whatever carries it;
+/// 5: the plan dialog became a generic document review).
+pub const WIRE: u32 = 5;
 
 /// Front end to agent.
 #[derive(Serialize, Deserialize)]
@@ -37,9 +37,9 @@ pub enum WireCommand {
         id: u64,
         ready: bool,
     },
-    PlanDecided {
+    Decided {
         id: u64,
-        decision: PlanDecision,
+        choice: ActionChoice,
     },
     /// The size a pseudo-terminal call is waiting for.
     PtySize {
@@ -74,14 +74,9 @@ pub enum WireEvent {
     WebSetup {
         id: u64,
     },
-    PlanReview {
+    Review {
         id: u64,
-        title: String,
-        uri: String,
-        file: PathBuf,
-        content: String,
-        stored: bool,
-        note: Option<String>,
+        request: ReviewRequest,
     },
     /// A bash call wants a terminal; `tool` is its call id.
     PtyOpen {
@@ -242,7 +237,7 @@ enum Parked {
     Ask(oneshot::Sender<Option<Vec<Answer>>>),
     Approve(oneshot::Sender<ApprovalDecision>),
     WebSetup(oneshot::Sender<bool>),
-    Plan(oneshot::Sender<PlanDecision>),
+    Review(oneshot::Sender<ActionChoice>),
     Pty { tool: String, input: mpsc::UnboundedSender<PtyInput>, reply: Option<oneshot::Sender<(u16, u16)>> },
 }
 
@@ -281,8 +276,8 @@ impl AgentAdapter {
                 WireEvent::Approve { id: self.park(Parked::Approve(reply)), request }
             }
             AgentEvent::WebSetup { reply } => WireEvent::WebSetup { id: self.park(Parked::WebSetup(reply)) },
-            AgentEvent::PlanReview { title, uri, file, content, stored, note, reply } => {
-                WireEvent::PlanReview { id: self.park(Parked::Plan(reply)), title, uri, file, content, stored, note }
+            AgentEvent::Review { request, reply } => {
+                WireEvent::Review { id: self.park(Parked::Review(reply)), request }
             }
             AgentEvent::PtyOpen { id: tool, input, reply } => {
                 let id = self.park(Parked::Pty { tool: tool.clone(), input, reply: Some(reply) });
@@ -320,9 +315,9 @@ impl AgentAdapter {
                     let _ = tx.send(ready);
                 }
             }
-            WireCommand::PlanDecided { id, decision } => {
-                if let Some(Parked::Plan(tx)) = self.take(id, |p| matches!(p, Parked::Plan(_))) {
-                    let _ = tx.send(decision);
+            WireCommand::Decided { id, choice } => {
+                if let Some(Parked::Review(tx)) = self.take(id, |p| matches!(p, Parked::Review(_))) {
+                    let _ = tx.send(choice);
                 }
             }
             WireCommand::PtySize { id, cols, rows } => {
@@ -432,7 +427,7 @@ impl ClientAdapter {
             WireEvent::Ask { id, .. }
             | WireEvent::Approve { id, .. }
             | WireEvent::WebSetup { id }
-            | WireEvent::PlanReview { id, .. }
+            | WireEvent::Review { id, .. }
             | WireEvent::PtyOpen { id, .. }
                 if self.shown(id) =>
             {
@@ -468,10 +463,10 @@ impl ClientAdapter {
                 self.relay(id, rx, |id, ready| WireCommand::WebSetupDone { id, ready });
                 AgentEvent::WebSetup { reply }
             }
-            WireEvent::PlanReview { id, title, uri, file, content, stored, note } => {
+            WireEvent::Review { id, request } => {
                 let (reply, rx) = oneshot::channel();
-                self.relay(id, rx, |id, decision| WireCommand::PlanDecided { id, decision });
-                AgentEvent::PlanReview { title, uri, file, content, stored, note, reply }
+                self.relay(id, rx, |id, choice| WireCommand::Decided { id, choice });
+                AgentEvent::Review { request, reply }
             }
             WireEvent::PtyOpen { id, tool } => {
                 let (reply, rx) = oneshot::channel();
@@ -515,7 +510,7 @@ pub fn roundtrip_event(e: AgentEvent) -> AgentEvent {
         AgentEvent::Ask { .. }
             | AgentEvent::Approve { .. }
             | AgentEvent::WebSetup { .. }
-            | AgentEvent::PlanReview { .. }
+            | AgentEvent::Review { .. }
             | AgentEvent::PtyOpen { .. }
     ) {
         return e;
@@ -602,8 +597,8 @@ pub fn loopback(
 mod tests {
     use super::*;
     use crate::events::{
-        CacheBreak, CacheStatus, GitInfo, JobKind, ProviderUsage, QuotaWindow, RewindPoint, StatusSnapshot,
-        SubagentState, SubagentStatus,
+        ActionInput, ActionSpec, CacheBreak, CacheStatus, GitInfo, JobKind, ModeAction, ProviderUsage, QuotaWindow,
+        RewindPoint, StatusSnapshot, SubagentState, SubagentStatus,
     };
     use crate::message::Image;
     use crate::permissions::{ApprovalScope, PermissionMode};
@@ -633,7 +628,8 @@ mod tests {
             Command::NewSession,
             Command::Compact(Some("keep x".into())),
             Command::Review(None),
-            Command::TogglePlan(Some("a".into())),
+            Command::Mode { name: "plan".into(), prompt: Some("a".into()) },
+            Command::ExitMode,
             Command::Resume("/tmp/s.jsonl".into()),
             Command::Fork,
             Command::ListRewind,
@@ -646,11 +642,7 @@ mod tests {
             Command::ListPlans,
             Command::OpenPlan("p".into()),
             Command::Deliver("p".into()),
-            Command::StartPlan {
-                id: "p".into(),
-                decision: PlanDecision::Keep { model: Some("m".into()) },
-                anyway: true,
-            },
+            Command::StartPlan { id: "p".into(), decision: ModeAction::Keep { model: Some("m".into()) }, anyway: true },
             Command::RefinePlan { id: "p".into(), text: None },
             Command::Steer("s".into()),
             Command::FollowUp("f".into()),
@@ -870,25 +862,36 @@ mod tests {
         assert!(rx.await.unwrap());
 
         let (reply, rx) = oneshot::channel();
-        let AgentEvent::PlanReview { reply: local, title, stored, .. } = exchange(
-            &mut agent,
-            &client,
-            AgentEvent::PlanReview {
-                title: "T".into(),
-                uri: "u".into(),
-                file: "/f".into(),
-                content: "c".into(),
-                stored: true,
-                note: None,
-                reply,
-            },
-        ) else {
-            panic!("not a PlanReview")
+        let request = ReviewRequest {
+            header: "Plan review".into(),
+            title: "T".into(),
+            uri: Some("u".into()),
+            file: Some("/f".into()),
+            content: "c".into(),
+            note: None,
+            actions: vec![ActionSpec {
+                id: "refine".into(),
+                label: "Refine plan".into(),
+                disabled: false,
+                input: ActionInput::Required,
+                keeps_context: false,
+                approves: false,
+            }],
+            default: 0,
+            models: true,
+            cancel_turn: true,
+            cancel_notice: "n".into(),
         };
-        assert!(stored && title == "T");
-        local.send(PlanDecision::Refine("more".into())).unwrap();
+        let AgentEvent::Review { reply: local, request, .. } =
+            exchange(&mut agent, &client, AgentEvent::Review { request, reply })
+        else {
+            panic!("not a Review")
+        };
+        assert!(request.title == "T" && request.actions[0].input == ActionInput::Required);
+        local.send(ActionChoice { id: "refine".into(), text: Some("more".into()), model: None }).unwrap();
         deliver(&mut agent, &mut out).await;
-        assert!(matches!(rx.await.unwrap(), PlanDecision::Refine(t) if t == "more"));
+        let got = rx.await.unwrap();
+        assert!(got.id == "refine" && got.text.as_deref() == Some("more"));
         assert_eq!(agent.parked(), 0);
     }
 

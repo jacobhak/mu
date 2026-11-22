@@ -17,7 +17,7 @@ pub(super) enum ChildThen {
     /// The external editor was run on the composer text kept in this file.
     ComposerEdit(PathBuf),
     /// The editor was run on a private copy of the plan file shown in the review overlay.
-    PlanEdit(HostEdit),
+    DocEdit(HostEdit),
     /// The editor was run on a private copy of a memory file from `/memory`.
     MemoryEdit(HostEdit),
     /// `mu take` ran on the terminal for a session picked in the jobs panel.
@@ -94,7 +94,7 @@ impl App {
                 self.open_sessions();
             }
             ChildThen::MemoryEdit(edit) => self.finish_host_edit(edit, status, "memory file", |_, _| {}),
-            ChildThen::PlanEdit(edit) => self.finish_host_edit(edit, status, "plan", |app, text| {
+            ChildThen::DocEdit(edit) => self.finish_host_edit(edit, status, "plan", |app, text| {
                 if let Some(Overlay::Review { review, .. }) = &mut app.overlay {
                     review.set_content(text);
                 }
@@ -408,7 +408,7 @@ mod host_edit_tests {
     fn a_file_the_host_did_not_hand_out_is_refused_and_left_alone() {
         let (dir, file) = scratch("secret");
         let (now, later) = both_hosts(
-            |app| app.edit_host_file(file.clone(), false, "plan", ChildThen::PlanEdit),
+            |app| app.edit_host_file(file.clone(), false, "plan", ChildThen::DocEdit),
             |app| transcript_text(app).contains("cannot read plan"),
         );
         assert!(now.contains("cannot read plan: ") && now.contains("not a file the host offered"), "{now}");

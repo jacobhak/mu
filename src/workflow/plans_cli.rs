@@ -19,7 +19,12 @@ pub enum PlanCmd {
         json: bool,
     },
     /// Plan a brief in plan mode without a user and park the result
-    New { brief: String },
+    New {
+        brief: String,
+        /// The mode to plan in
+        #[arg(long, default_value = "plan")]
+        mode: String,
+    },
     /// Revise a parked plan headless and park it again
     Refine { id: String, text: Option<String> },
     /// Approve a parked plan and run it headless in this directory
@@ -36,28 +41,24 @@ pub enum PlanCmd {
 pub struct PlanRun {
     pub first: mu_base::events::Command,
     pub expect_park: bool,
-    /// Appended to the system prompt.
-    pub note: Option<&'static str>,
+    /// The mode's headless note is appended to the system prompt.
+    pub headless: bool,
 }
 
 /// `Err` gives back the store commands (`list`, `show`, `drop`) for `run_cli`.
 pub fn plan_run(cmd: PlanCmd) -> Result<PlanRun, PlanCmd> {
-    use mu_base::events::{Command, PlanDecision};
+    use mu_base::events::{Command, ModeAction};
     match cmd {
-        PlanCmd::New { brief } => Ok(PlanRun {
-            first: Command::TogglePlan(Some(brief)),
-            expect_park: true,
-            note: Some(mu_agent::prompt::HEADLESS_NOTE),
-        }),
-        PlanCmd::Refine { id, text } => Ok(PlanRun {
-            first: Command::RefinePlan { id, text },
-            expect_park: true,
-            note: Some(mu_agent::prompt::HEADLESS_NOTE),
-        }),
+        PlanCmd::New { brief, mode } => {
+            Ok(PlanRun { first: Command::Mode { name: mode, prompt: Some(brief) }, expect_park: true, headless: true })
+        }
+        PlanCmd::Refine { id, text } => {
+            Ok(PlanRun { first: Command::RefinePlan { id, text }, expect_park: true, headless: true })
+        }
         PlanCmd::Approve { id, anyway } => Ok(PlanRun {
-            first: Command::StartPlan { id, decision: PlanDecision::Keep { model: None }, anyway },
+            first: Command::StartPlan { id, decision: ModeAction::Keep { model: None }, anyway },
             expect_park: false,
-            note: None,
+            headless: false,
         }),
         other => Err(other),
     }
@@ -88,7 +89,9 @@ async fn cli(cmd: PlanCmd, cwd: &Path) -> i32 {
                 println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
             } else {
                 for m in &list {
-                    println!("{}  {}  {}  {}", m.id, m.status.name(), &m.updated[..m.updated.len().min(10)], m.title);
+                    let mode = if m.mode == "plan" { String::new() } else { format!(" [{}]", m.mode) };
+                    let date = &m.updated[..m.updated.len().min(10)];
+                    println!("{}  {}  {}  {}{mode}", m.id, m.status.name(), date, m.title);
                 }
             }
             0
@@ -141,13 +144,15 @@ mod tests {
 
     #[test]
     fn headless_planning_expects_a_park() {
-        for cmd in [PlanCmd::New { brief: "b".into() }, PlanCmd::Refine { id: "x".into(), text: None }] {
+        let new = PlanCmd::New { brief: "b".into(), mode: "plan".into() };
+        for cmd in [new, PlanCmd::Refine { id: "x".into(), text: None }] {
             let r = plan_run(cmd).ok().unwrap();
-            let n = r.note.unwrap();
-            assert!(r.expect_park && n.contains("parked for later approval") && n.contains("expected result"));
+            assert!(r.expect_park && r.headless);
         }
+        let r = plan_run(PlanCmd::New { brief: "b".into(), mode: "design".into() }).ok().unwrap();
+        assert!(matches!(r.first, mu_base::events::Command::Mode { ref name, .. } if name == "design"));
         let r = plan_run(PlanCmd::Approve { id: "x".into(), anyway: false }).ok().unwrap();
-        assert!(!r.expect_park && r.note.is_none());
+        assert!(!r.expect_park && !r.headless);
         assert!(plan_run(PlanCmd::Drop { id: "x".into() }).is_err());
     }
 }

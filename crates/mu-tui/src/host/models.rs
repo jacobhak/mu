@@ -3,7 +3,7 @@
 
 use super::local::{Local, Registry};
 use super::{Answer, pending, ready};
-use crate::panels::plan_review::Tier;
+use crate::panels::doc_review::Tier;
 use mu_base::config::{Configs, models_path};
 use mu_base::model_config::{MAIN_SET, RoleMeta};
 use mu_base::roles::{self, RoleView};
@@ -93,7 +93,8 @@ pub struct SetTable {
 /// What the new active set assigns, for the session's next model.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Switched {
-    pub plan: bool,
+    /// The active mode's first model selector the new set can serve.
+    pub mode_model: Option<String>,
     pub default: Option<String>,
 }
 
@@ -255,12 +256,23 @@ fn set_table(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     })
 }
 
-/// `name`: makes it the active set.
+/// `(name, mode)`: makes `name` the active set; `mode` is the session's active mode, if any.
 fn switch_set(l: &Rc<Local>, args: serde_json::Value) -> Answer {
-    ready(args, |name: String| {
+    ready(args, |(name, mode): (String, Option<String>)| {
         let cfg = &l.providers.cfg;
         cfg.switch_set(&name)?;
-        Ok(Switched { plan: cfg.role("plan").is_some(), default: cfg.role("default") })
+        let mode_model = mode.and_then(|m| {
+            l.ctx
+                .mode(&m)?
+                .model
+                .iter()
+                .find(|sel| match sel.strip_prefix('@') {
+                    Some(role) => cfg.role(role).is_some(),
+                    None => l.providers.resolve(sel).is_ok(),
+                })
+                .cloned()
+        });
+        Ok(Switched { mode_model, default: cfg.role("default") })
     })
 }
 
@@ -331,7 +343,7 @@ mod tests {
         let back = round(&set);
         assert_eq!((back.sets, back.import_offer), (set.sets, true));
 
-        let sw = Switched { plan: true, default: Some("a/b".into()) };
+        let sw = Switched { mode_model: Some("@plan".into()), default: Some("a/b".into()) };
         assert_eq!(round(&sw), sw);
         let imp = Imported { lines: vec!["l".into()], path: "/m".into(), has_default: true };
         assert_eq!(round(&imp), imp);

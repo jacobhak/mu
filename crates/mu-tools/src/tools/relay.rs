@@ -1204,7 +1204,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
                 cancel: CancellationToken::new(),
                 wait_interrupt: None,
                 call_id: "c".into(),
-                plan: false,
+                mode: None,
             };
             let out = tools.call("web_search", &serde_json::json!({"query": "x"}), &ctx).await;
             assert!(!out.is_error && out.text.contains("https://a.example/p"), "{}", out.text);

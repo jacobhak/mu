@@ -1,7 +1,7 @@
-//! What the agent asks of the client: approval of a plan (`session/request_permission`) and the
+//! What the agent asks of the client: review of a mode's document (`session/request_permission`) and the
 //! model's `ask` questions (`elicitation/create`).
 
-use mu_base::events::{Answer, AskQuestion, PlanDecision};
+use mu_base::events::{ActionChoice, ActionInput, ActionSpec, Answer, AskQuestion, ReviewRequest};
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
@@ -42,45 +42,45 @@ impl Rpc {
     }
 }
 
-/// The plan approval options: id, name, kind. Approvals come first, so a client that auto-approves
-/// picks to implement in this conversation.
-const PLAN_OPTIONS: [(&str, &str, &str); 5] = [
-    ("keep", "Approve and implement now, keeping this conversation", "allow_once"),
-    ("execute", "Approve and implement in a fresh session", "allow_once"),
-    ("compact", "Approve, compact the conversation, then implement", "allow_once"),
-    ("park", "Save the plan for later and do not implement it", "reject_once"),
-    ("refine", "Keep planning", "reject_once"),
-];
+/// The enabled actions as offered to the client: those that keep this conversation first, so a client
+/// that auto-approves continues here, then the rest in order.
+fn offered(req: &ReviewRequest) -> Vec<&ActionSpec> {
+    let enabled = || req.actions.iter().filter(|a| !a.disabled);
+    enabled().filter(|a| a.keeps_context).chain(enabled().filter(|a| !a.keeps_context)).collect()
+}
 
-pub(super) fn plan_request(sid: &str, call_id: &str, title: &str, content: &str) -> Value {
-    let options: Vec<Value> =
-        PLAN_OPTIONS.iter().map(|(id, name, kind)| json!({"optionId": id, "name": name, "kind": kind})).collect();
+pub(super) fn review_request(sid: &str, call_id: &str, req: &ReviewRequest) -> Value {
+    let options: Vec<Value> = offered(req)
+        .iter()
+        .map(|a| {
+            let kind = if a.approves { "allow_once" } else { "reject_once" };
+            json!({"optionId": a.id, "name": a.label, "kind": kind})
+        })
+        .collect();
     json!({
         "sessionId": sid,
         "toolCall": {
             "toolCallId": call_id,
-            "title": format!("Plan: {title}"),
+            "title": format!("{}: {}", req.header, req.title),
             "kind": "switch_mode",
             "status": "pending",
-            "content": [{"type": "content", "content": {"type": "text", "text": content}}],
+            "content": [{"type": "content", "content": {"type": "text", "text": req.content}}],
         },
         "options": options,
     })
 }
 
-/// What a `session/request_permission` result decides. Anything but a known approval is no approval.
-pub(super) fn plan_decision(result: &Value) -> PlanDecision {
+/// What a `session/request_permission` result chose. `None` unless it selected an offered option.
+pub(super) fn review_choice(result: &Value, req: &ReviewRequest) -> Option<ActionChoice> {
     let o = &result["outcome"];
     if o["outcome"] != "selected" {
-        return PlanDecision::Drop;
+        return None;
     }
-    match o["optionId"].as_str() {
-        Some("keep") => PlanDecision::Keep { model: None },
-        Some("execute") => PlanDecision::Execute { model: None },
-        Some("compact") => PlanDecision::Compact { model: None },
-        Some("park") => PlanDecision::Park,
-        _ => PlanDecision::Refine("The plan is not approved yet. Stop and wait for the user's instructions.".into()),
-    }
+    let id = o["optionId"].as_str()?;
+    let action = offered(req).into_iter().find(|a| a.id == id)?;
+    let text = (action.input == ActionInput::Required)
+        .then(|| "Not approved yet. Stop and wait for the user's instructions.".to_string());
+    Some(ActionChoice { id: action.id.clone(), text, model: None })
 }
 
 /// A tool call's approval options: answering once, then the scopes the prompt offers a grant for.
@@ -141,20 +141,20 @@ pub(super) async fn approve_tool(
     let _ = reply.send(decision);
 }
 
-pub(super) async fn review_plan(
+/// Asks the client; the reply is dropped (no decision) unless it selects an offered option.
+pub(super) async fn review(
     rpc: Rpc,
     sid: String,
     call_id: String,
-    title: String,
-    content: String,
-    reply: oneshot::Sender<PlanDecision>,
+    req: ReviewRequest,
+    reply: oneshot::Sender<ActionChoice>,
 ) {
-    let rx = rpc.request("session/request_permission", plan_request(&sid, &call_id, &title, &content));
-    let decision = match rx.await {
-        Ok(Ok(v)) => plan_decision(&v),
-        _ => PlanDecision::Drop,
-    };
-    let _ = reply.send(decision);
+    let rx = rpc.request("session/request_permission", review_request(&sid, &call_id, &req));
+    if let Ok(Ok(v)) = rx.await
+        && let Some(choice) = review_choice(&v, &req)
+    {
+        let _ = reply.send(choice);
+    }
 }
 
 fn choices(q: &AskQuestion) -> Vec<Value> {
@@ -282,23 +282,55 @@ mod tests {
     }
 
     #[test]
-    fn plan_options_put_approvals_first_and_unknown_outcomes_are_no_approval() {
-        let p = plan_request("s", "call", "Add x", "the plan");
-        let kinds: Vec<&str> = p["options"].as_array().unwrap().iter().map(|o| o["kind"].as_str().unwrap()).collect();
-        assert_eq!(kinds, ["allow_once", "allow_once", "allow_once", "reject_once", "reject_once"]);
+    fn review_options_put_kept_context_first_and_unknown_outcomes_are_no_decision() {
+        let action = |id: &str, approves: bool, keeps: bool, input: ActionInput, disabled: bool| ActionSpec {
+            id: id.into(),
+            label: format!("label {id}"),
+            disabled,
+            input,
+            keeps_context: keeps,
+            approves,
+        };
+        let none = ActionInput::None;
+        let req = ReviewRequest {
+            header: "Plan review".into(),
+            title: "Add x".into(),
+            uri: None,
+            file: None,
+            content: "the plan".into(),
+            note: None,
+            actions: vec![
+                action("execute", true, false, none, false),
+                action("compact", true, false, none, true),
+                action("keep", true, true, none, false),
+                action("park", false, false, none, false),
+                action("refine", false, false, ActionInput::Required, false),
+            ],
+            default: 0,
+            models: true,
+            cancel_turn: true,
+            cancel_notice: String::new(),
+        };
+        let p = review_request("s", "call", &req);
+        let opts = p["options"].as_array().unwrap();
+        let ids: Vec<&str> = opts.iter().map(|o| o["optionId"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["keep", "execute", "park", "refine"], "disabled dropped, keep first");
+        let kinds: Vec<&str> = opts.iter().map(|o| o["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["allow_once", "allow_once", "reject_once", "reject_once"]);
         assert_eq!(
             (p["toolCall"]["kind"].as_str(), p["toolCall"]["title"].as_str()),
-            (Some("switch_mode"), Some("Plan: Add x"))
+            (Some("switch_mode"), Some("Plan review: Add x"))
         );
-        let pick = |id: &str| plan_decision(&json!({"outcome": {"outcome": "selected", "optionId": id}}));
-        assert!(matches!(pick("keep"), PlanDecision::Keep { model: None }));
-        assert!(matches!(pick("execute"), PlanDecision::Execute { .. }));
-        assert!(matches!(pick("compact"), PlanDecision::Compact { .. }));
-        assert!(matches!(pick("park"), PlanDecision::Park));
-        assert!(matches!(pick("refine"), PlanDecision::Refine(_)));
-        assert!(matches!(pick("something else"), PlanDecision::Refine(_)));
-        assert!(matches!(plan_decision(&json!({"outcome": {"outcome": "cancelled"}})), PlanDecision::Drop));
-        assert!(matches!(plan_decision(&json!({})), PlanDecision::Drop));
+        let pick = |id: &str| review_choice(&json!({"outcome": {"outcome": "selected", "optionId": id}}), &req);
+        let keep = pick("keep").unwrap();
+        assert_eq!((keep.id.as_str(), keep.text), ("keep", None));
+        assert_eq!(pick("park").unwrap().id, "park");
+        let refine = pick("refine").unwrap();
+        assert!(refine.text.unwrap().contains("Stop and wait"));
+        assert!(pick("something else").is_none());
+        assert!(pick("compact").is_none(), "a disabled action was never offered");
+        assert!(review_choice(&json!({"outcome": {"outcome": "cancelled"}}), &req).is_none());
+        assert!(review_choice(&json!({}), &req).is_none());
     }
 
     #[test]

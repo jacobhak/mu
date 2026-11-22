@@ -23,6 +23,8 @@ pub struct Save<'a> {
     pub session: Option<&'a Path>,
     pub base: Option<Base>,
     pub adopt: Option<&'a str>,
+    /// The mode that wrote the document.
+    pub mode: &'a str,
 }
 
 fn hash_of(text: &str) -> String {
@@ -139,6 +141,7 @@ impl Store {
                     updated: now,
                     hash: hash_of(s.content),
                     approved: None,
+                    mode: s.mode.into(),
                     ..old
                 }
             }
@@ -164,6 +167,7 @@ impl Store {
                     updated: now,
                     hash: hash_of(s.content),
                     approved: None,
+                    mode: s.mode.into(),
                 }
             }
         };
@@ -371,6 +375,7 @@ mod tests {
             session,
             base: None,
             adopt,
+            mode: "plan",
         })
         .unwrap()
     }
@@ -439,6 +444,7 @@ mod tests {
             updated: String::new(),
             hash: String::new(),
             approved: None,
+            mode: "plan".into(),
         }
     }
 

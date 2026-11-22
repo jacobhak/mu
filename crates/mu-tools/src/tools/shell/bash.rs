@@ -947,8 +947,7 @@ mod tests {
         let tools = Tools::for_test();
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let out = tools.call("bash", &json!({"command":"echo hi","pty":true}), &ctx).await;
         assert!(out.text.contains("hi"), "{}", out.text);
         assert!(out.text.contains("[pty unavailable without the terminal UI; ran without a terminal]"));
@@ -960,7 +959,7 @@ mod tests {
         let tools = Tools::for_test();
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
-        let ctx = ToolCtx { events, cancel: cancel.clone(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: cancel.clone(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let stop = cancel.clone();
         let call = async { tools.call("bash", &json!({"command":"echo hi","pty":true}), &ctx).await };
         let parked = async {
@@ -1125,7 +1124,7 @@ mod tests {
                 "timeout": 30
             });
             let ctx =
-                ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+                ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
             let t = Instant::now();
             let out = tools.call("bash", &cmd, &ctx).await;
             assert!(t.elapsed() < Duration::from_secs(5), "held open for {:?}", t.elapsed());
@@ -1149,8 +1148,7 @@ mod tests {
     async fn session_env_reaches_commands() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let cmd = json!({"command": "echo \"[$PI_SESSION_ID|$PI_SESSION_FILE]\""});
         let out = tools.call("bash", &cmd, &ctx).await;
         assert!(out.text.contains("[|]"), "{}", out.text);
@@ -1165,8 +1163,7 @@ mod tests {
     async fn a_command_that_exports_a_variable_is_told_it_persists() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let run = |c: &str| {
             let tools = &tools;
             let ctx = &ctx;
@@ -1198,8 +1195,7 @@ mod tests {
     async fn a_file_tool_notes_a_relative_path_after_the_shell_moved() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let glob = json!({"pattern": "*.mu-no-such-ext", "path": "."});
         let out = tools.call("glob", &glob, &ctx).await;
         assert!(!out.text.contains("[mu:"), "no shell call yet: {}", out.text);
@@ -1252,8 +1248,7 @@ mod tests {
     async fn finished_background_job_is_reaped_and_keeps_its_status() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let out = tools.call("bash", &json!({"command": "/bin/sh -c 'sleep 0.3; exit 7' & echo $!"}), &ctx).await;
         let pid: i32 = out.text.trim().parse().unwrap_or_else(|_| panic!("no pid: {}", out.text));
         let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1307,7 +1302,7 @@ mod tests {
                 }
             });
             let ctx =
-                ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+                ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
             let t = std::time::Instant::now();
             let out =
                 tools.call("bash", &json!({"command":"sleep 0.3; echo done","pty":true,"timeout":20}), &ctx).await;
@@ -1322,8 +1317,7 @@ mod tests {
     async fn result_carries_structured_facts_and_the_same_text() {
         let tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let out = tools.call("bash", &json!({"command": "echo hi; exit 3"}), &ctx).await;
         let Some(ToolMeta::Bash(m)) = &out.meta else { panic!("no meta: {:?}", out.text) };
         assert_eq!(m.exit_code, Some(3));
@@ -1410,7 +1404,7 @@ mod tests {
 
     fn ctx() -> ToolCtx {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None }
+        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None }
     }
 
     async fn finished(jobs: &crate::jobs::JobsHandle) -> Vec<crate::jobs::Done> {
@@ -1641,7 +1635,7 @@ mod tests {
         cancel: CancellationToken,
     ) -> (ToolCtx, crate::jobs::ActiveWait) {
         let wait = jobs.begin_wait();
-        (ToolCtx { events, cancel, call_id: "c".into(), plan: false, wait_interrupt: Some(wait.token()) }, wait)
+        (ToolCtx { events, cancel, call_id: "c".into(), mode: None, wait_interrupt: Some(wait.token()) }, wait)
     }
 
     fn tmp(name: &str) -> PathBuf {

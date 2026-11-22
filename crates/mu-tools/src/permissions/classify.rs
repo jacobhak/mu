@@ -56,7 +56,7 @@ impl Permissions {
                     && a.cmds.iter().all(|c| c.readonly && !c.assigns && c.writes.is_empty())
             }
             "web_search" => false,
-            _ => !crate::tools::is_builtin(name) && tools.access(name) == Access::Read,
+            _ => !crate::tools::is_builtin(name) && !tools.is_mode_tool(name) && tools.access(name) == Access::Read,
         }
     }
 }

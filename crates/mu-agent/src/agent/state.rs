@@ -1,7 +1,7 @@
 //! The agent's state, grouped by concern. Fields are visible to the `agent` module tree only.
 
 use super::status::PrefixKey;
-use super::{DeliverFn, ExecPlan, PlanState};
+use super::{DeliverFn, ExecPlan, ModeState};
 use mu_base::events::{EventTx, GitInfo};
 use mu_base::message::UserInput;
 use mu_base::models::{ModelSpec, Thinking};
@@ -54,6 +54,8 @@ pub struct RunConfig {
     /// The parent asked for this run's session file over the stream: its own children's lines pass
     /// on to the parent too.
     pub mirror_session: bool,
+    /// A headless `mu plan` run: the active mode's headless note is added to its prompt.
+    pub headless_modes: bool,
 }
 
 /// Messages queued while a turn runs, plus the turn's cancellation token. Only the agent loop touches it;
@@ -105,9 +107,9 @@ pub(super) struct TitleState {
 }
 
 pub(super) struct PlanFlow {
-    pub(super) plan: Option<PlanState>,
+    pub(super) mode: Option<ModeState>,
     pub(super) exec_plan: Option<ExecPlan>,
-    /// The stored plan being revised in plan mode; `propose_plan` updates it in place.
+    /// The stored plan being revised in its mode; the exit tool updates it in place.
     pub(super) stored_plan: Option<String>,
     pub(super) review_base: Option<crate::review::ReviewBase>,
 }

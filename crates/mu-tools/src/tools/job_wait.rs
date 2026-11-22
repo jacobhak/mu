@@ -65,32 +65,22 @@ mod tests {
     fn ctx(jobs: &std::rc::Rc<JobsHandle>, cancel: CancellationToken) -> (ToolCtx, crate::jobs::ActiveWait) {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let wait = jobs.begin_wait();
-        (ToolCtx { events, cancel, call_id: "c".into(), plan: false, wait_interrupt: Some(wait.token()) }, wait)
+        (ToolCtx { events, cancel, call_id: "c".into(), mode: None, wait_interrupt: Some(wait.token()) }, wait)
     }
 
     #[tokio::test]
     async fn needs_jobs_and_an_active_wait() {
         let plain_tools = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let no_jobs = ToolCtx {
-            events,
-            cancel: CancellationToken::new(),
-            call_id: "c".into(),
-            plan: false,
-            wait_interrupt: None,
-        };
+        let no_jobs =
+            ToolCtx { events, cancel: CancellationToken::new(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let out = plain_tools.job_wait(Args { ids: vec![] }, &no_jobs).await;
         assert!(out.is_error && out.text.contains("unavailable without background jobs"), "{}", out.text);
 
         let (t, _jobs) = tools();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let plain = ToolCtx {
-            events,
-            cancel: CancellationToken::new(),
-            call_id: "c".into(),
-            plan: false,
-            wait_interrupt: None,
-        };
+        let plain =
+            ToolCtx { events, cancel: CancellationToken::new(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let out = t.job_wait(Args { ids: vec![] }, &plain).await;
         assert!(out.is_error && out.text.contains("no active interruptible wait"), "{}", out.text);
     }

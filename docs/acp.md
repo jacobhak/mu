@@ -18,11 +18,11 @@ A prompt that fails (a provider error, a rejected key) answers with a JSON-RPC e
 
 ## Options and modes
 
-Config options: `model` (the roles you have set, each with what it is for ([Model roles](model-roles.md)), then the advertised `provider/model` ids; a role selector such as `@slow:high` is also accepted, resolved as `--model` is; an unconfigured role fails with an invalid-params error that names what the role is for and its fallback), `thinking`, and `mode`. The modes are `default` and `plan`: plan mode is read-only exploration that ends with a proposed plan. `session/set_mode` and the `mode` option are the same switch, and `current_mode_update` reports changes the agent makes itself (a plan being approved or parked).
+Config options: `model` (the roles you have set, each with what it is for ([Model roles](model-roles.md)), then the advertised `provider/model` ids; a role selector such as `@slow:high` is also accepted, resolved as `--model` is; an unconfigured role fails with an invalid-params error that names what the role is for and its fallback), `thinking`, and `mode`. The modes are `default` plus every [mode](modes.md) with `command: true` (`plan` is read-only exploration that ends with a proposed plan). `session/set_mode` and the `mode` option are the same switch, and `current_mode_update` reports changes the agent makes itself (a plan being approved or parked).
 
 ## Slash commands
 
-The session advertises its commands with `available_commands_update`, and a prompt that starts with one runs it: `/compact [focus]`, `/review [focus]`, `/plan [prompt]` (toggles plan mode; with a prompt, runs it in plan mode) and `/rename <title>`, plus the prompt templates from `.omp/commands` and friends and `/skill:<name> [args]`. Anything else that starts with `/` goes to the model as typed. The commands that need the terminal UI (`/model`, `/login`, `/resume`, `/mcp`, ...) are not offered; use the options and the client's own pickers.
+The session advertises its commands with `available_commands_update`, and a prompt that starts with one runs it: `/compact [focus]`, `/review [focus]`, a `/<name> [prompt]` per mode, such as `/plan` (toggles the mode; with a prompt, runs it in the mode) and `/rename <title>`, plus the prompt templates from `.omp/commands` and friends and `/skill:<name> [args]`. Anything else that starts with `/` goes to the model as typed. The commands that need the terminal UI (`/model`, `/login`, `/resume`, `/mcp`, ...) are not offered; use the options and the client's own pickers.
 
 ## Tool calls
 
@@ -34,8 +34,9 @@ Background jobs (`task`, `bash` with `async`, and a command that kept running af
 
 ## Asking the client
 
-- **Entering plan mode.** The model's `enter_plan` call asks with `session/request_permission` (options: run it once, No); the client then gets `current_mode_update` for `plan`.
-- **Plans.** In plan mode, `propose_plan` asks for approval with `session/request_permission` (kind `switch_mode`, the plan as content). Options, in this order: approve and implement now keeping the conversation, approve and implement in a fresh session, approve and compact first, save the plan for later (a rejection: it is parked, not run), and keep planning. A client that auto-approves picks the first, so Paseo's Auto Accept implements the plan in this conversation. A cancelled request closes the review.
+- **Entering a mode.** The model's `enter_mode` call asks with `session/request_permission` (options: run it once, No) when the mode's `model_entry` is `ask`; the client then gets `current_mode_update` for the mode.
+- **Documents.** In a mode, its exit tool (`propose_plan` in plan mode) asks for approval with `session/request_permission` (kind `switch_mode`, the document as content). The options are the mode's `exit.actions`, with the `keep` action (approve and keep the conversation) first, then the others in their order (plan: approve in a fresh session, approve and compact first, save for later (a rejection: it is parked, not run), keep planning). A client that auto-approves picks the first, so Paseo's Auto Accept implements the plan in this conversation. A cancelled request closes the review.
+- **Review findings.** `/review` findings come as a `session/request_permission` with the review actions (send blocking findings, send all, choose, dismiss).
 - **Tool permissions.** A tool call that needs approval (see [Tool permissions](permissions.md)) asks with `session/request_permission` (the call's id and title as `toolCall`, the reason and what it would do as content). Options: run it once, then the scopes the configuration offers for the exact call (this session, this project, everywhere), and No. The landmark widths and typed patterns are the terminal UI's own. Declining with no scope is a denial; `--permissions` sets the mode for every session the server opens.
 - **Questions.** The model's `ask` tool is offered only when the client advertises `elicitation.form`; each question becomes a form field (a choice, many choices, plus an optional typed answer). Without it the tool is hidden and the model asks in prose.
 

@@ -134,7 +134,7 @@ fn a_scout_gets_its_own_prompt_and_no_shell() {
     assert!(!body.contains("\"name\":\"bash\""), "bash is not offered: {body}");
 }
 
-/// Nobody can approve `enter_plan` in a print run or a subagent, and a subagent cannot plan at all.
+/// Nobody can approve `enter_mode` in a print run or a subagent, and a subagent cannot plan at all.
 #[test]
 fn print_and_headless_runs_are_offered_neither_plan_tool() {
     let (tx, rx) = mpsc::channel();
@@ -157,7 +157,7 @@ fn print_and_headless_runs_are_offered_neither_plan_tool() {
     assert_eq!(requests.len(), 2);
     for body in requests.iter() {
         assert!(body.contains("\"name\":\"read\""), "tools are offered: {body}");
-        assert!(!body.contains("\"name\":\"enter_plan\"") && !body.contains("\"name\":\"propose_plan\""), "{body}");
+        assert!(!body.contains("\"name\":\"enter_mode\"") && !body.contains("\"name\":\"propose_plan\""), "{body}");
     }
 }
 

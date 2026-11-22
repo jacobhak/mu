@@ -1,4 +1,7 @@
 mod at_imports;
+pub mod modes;
+
+pub use modes::*;
 
 use std::path::{Path, PathBuf};
 
@@ -431,10 +434,11 @@ pub struct Context {
     pub skills: Vec<Skill>,
     pub commands: Vec<SlashCommand>,
     pub agents: Vec<AgentDef>,
+    pub modes: Vec<ModeDef>,
 }
 
 impl Context {
-    pub fn load_all(cwd: &Path, home: &Path, agent_dir: &Path, claude_user: bool) -> Self {
+    pub fn load_all(cwd: &Path, home: &Path, agent_dir: &Path, claude_user: bool, mode_dir: &Path) -> Self {
         let mut rules = Vec::new();
         let user = std::fs::read_to_string(agent_dir.join("RULES.md")).ok();
         let project = walk(cwd, home).into_iter().find_map(|d| std::fs::read_to_string(d.join(".omp/RULES.md")).ok());
@@ -449,8 +453,19 @@ impl Context {
         let skills = discover_skills(cwd, home, agent_dir, claude_user);
         let commands = discover_commands(cwd, home, agent_dir);
         let agents = discover_agents(cwd, home, agent_dir);
+        let modes = discover_modes(cwd, home, mode_dir);
+        for c in &commands {
+            if modes.iter().any(|m| m.command && m.name == c.name) {
+                let n = &c.name;
+                WARNINGS.with(|w| w.borrow_mut().push(format!("command /{n} is shadowed by mode {n}")));
+            }
+        }
         let warnings = WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
-        Self { warnings, files, nested, rules, skills, commands, agents }
+        Self { warnings, files, nested, rules, skills, commands, agents, modes }
+    }
+
+    pub fn mode(&self, name: &str) -> Option<&ModeDef> {
+        self.modes.iter().find(|m| m.name == name)
     }
 
     /// `/skill:<name> [args]` prompt text.
@@ -589,7 +604,7 @@ mod tests {
         let proj = home.join("p");
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("AGENTS.md"), "@./missing.md").unwrap();
-        let ctx = Context::load_all(&proj, &home, &root.join("agent"), false);
+        let ctx = Context::load_all(&proj, &home, &root.join("agent"), false, &root.join("modes"));
         assert_eq!(ctx.warnings.len(), 1, "{:?}", ctx.warnings);
         assert!(ctx.warnings[0].contains("cannot read @-import"));
     }

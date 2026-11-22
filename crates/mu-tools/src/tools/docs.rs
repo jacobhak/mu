@@ -26,6 +26,7 @@ const PAGES: &[(&str, &str)] = &[
     ("mcp.md", include_str!("../../../../docs/mcp.md")),
     ("memory.md", include_str!("../../../../docs/memory.md")),
     ("model-roles.md", include_str!("../../../../docs/model-roles.md")),
+    ("modes.md", include_str!("../../../../docs/modes.md")),
     ("permissions.md", include_str!("../../../../docs/permissions.md")),
     ("providers.md", include_str!("../../../../docs/providers.md")),
     ("remote.md", include_str!("../../../../docs/remote.md")),
@@ -109,8 +110,13 @@ fn tools_reference() -> String {
     defs.push(Tools::task_def(true, &[], &[]));
     defs.push(Tools::job_cancel_def());
     defs.push(Tools::wait_def());
-    defs.push(Tools::plan_def());
-    defs.push(Tools::enter_plan_def());
+    if let Some(plan) = crate::context::builtin_modes().first() {
+        defs.push(Tools::exit_def(plan));
+    }
+    defs.push(Tools::enter_mode_def(&[(
+        "plan".into(),
+        "Explore read-only, then propose a plan for your approval".into(),
+    )]));
     let mut s = String::from(
         "# Tools\n\nThe built-in tools the model is offered. Plugin and MCP tools are listed in `mu://state/plugins.md`.\n",
     );
@@ -348,7 +354,7 @@ mod tests {
         assert!(state.text.contains("mu://state/session.md:"), "{}", state.text);
         let missing = t.read(args(serde_json::json!({"path": "mu://nope.md"}))).await;
         assert!(missing.is_error, "{}", missing.text);
-        let w = t.write(args(serde_json::json!({"path": "mu://usage.md", "content": "x"})), false).await;
+        let w = t.write(args(serde_json::json!({"path": "mu://usage.md", "content": "x"})), None).await;
         assert!(w.is_error && w.text.contains("read-only"), "{}", w.text);
     }
 

@@ -258,15 +258,13 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     }
     if !interactive {
         // No one can answer or approve in a headless run.
-        for tool in ["ask", "enter_plan"] {
+        for tool in ["ask", "enter_mode"] {
             if !run.excluded.contains(&tool) {
                 run.excluded.push(tool);
             }
         }
     }
-    if let Some(n) = plan.as_ref().and_then(|r| r.note) {
-        run.agent_prompt = Some(run.agent_prompt.take().unwrap_or_default() + n);
-    }
+    run.headless_modes = plan.as_ref().is_some_and(|r| r.headless);
     let name = task.as_ref().and_then(|p| p["agent"].as_str()).or(agent_def.as_ref().map(|d| d.name.as_str()));
     let name = name.map(String::from);
     let mode = Mode::of(cli, plan, task, agent, resume.is_some());

@@ -44,7 +44,22 @@ impl Agent {
         if jobs && let Some(d) = v.iter_mut().find(|d| d.name == "bash") {
             *d = Tools::bash_def(true);
         }
-        v.push(if self.plan.plan.is_some() { Tools::plan_def() } else { Tools::enter_plan_def() });
+        self.sync_mode_tables();
+        match self.active_mode() {
+            Some(m) => v.push(Tools::exit_def(m)),
+            None => {
+                let enterable: Vec<(String, String)> = self
+                    .ctx
+                    .modes
+                    .iter()
+                    .filter(|m| m.model_entry != context::ModelEntry::Never)
+                    .map(|m| (m.name.clone(), m.description.clone()))
+                    .collect();
+                if !enterable.is_empty() {
+                    v.push(Tools::enter_mode_def(&enterable));
+                }
+            }
+        }
         let roles: Vec<String> = self.delegated_roles().into_iter().map(|(n, _)| format!("@{n}")).collect();
         *self.tools.delegated.borrow_mut() = roles.clone();
         *self.tools.agent_models.borrow_mut() =
@@ -63,13 +78,32 @@ impl Agent {
         v
     }
 
+    /// Tells the tools which modes exist: how the model may enter each and which tools exit them.
+    pub(super) fn sync_mode_tables(&self) {
+        *self.tools.mode_entry.borrow_mut() = self
+            .ctx
+            .modes
+            .iter()
+            .map(|m| (m.name.clone(), m.model_entry, m.description.clone(), m.read_only()))
+            .collect();
+        *self.tools.mode_tools.borrow_mut() =
+            self.ctx.modes.iter().map(|m| (m.exit.tool.clone(), m.name.clone())).collect();
+    }
+
     /// The tool limits for this run; enforced in `run_tool` and used to build the advertised list.
     pub fn policy(&self) -> ToolPolicy {
         ToolPolicy {
             allow: self.run.allow.clone(),
             excluded: self.run.excluded.clone(),
             depth: mu_tools::tools::task::depth(),
-            plan: self.plan.plan.is_some(),
+            mode: self.active_mode().map(|m| crate::policy::ModePolicy {
+                name: m.name.clone(),
+                title: m.title(),
+                exit_tool: m.exit.tool.clone(),
+                allow: m.allow.clone(),
+                deny: m.deny.clone(),
+            }),
+            mode_tools: self.ctx.modes.iter().map(|m| (m.exit.tool.clone(), m.name.clone())).collect(),
         }
     }
 
@@ -237,7 +271,7 @@ impl Agent {
             events: self.ports.events.clone(),
             cancel: cancel.clone(),
             call_id: id.clone(),
-            plan: self.plan.plan.is_some(),
+            mode: self.active_mode().cloned(),
             wait_interrupt: None,
         };
         let mut out = self.tools.call("bash", &args, &ctx).await;
@@ -361,7 +395,7 @@ impl Agent {
             events: self.ports.events.clone(),
             cancel: cancel.clone(),
             call_id: id.into(),
-            plan: self.plan.plan.is_some(),
+            mode: self.active_mode().cloned(),
             wait_interrupt: wait,
         };
         use futures_util::FutureExt;
@@ -443,10 +477,13 @@ impl Agent {
         }
         let details = out.details.clone();
         if let Some(d) = details.as_ref() {
-            if d["enterPlan"].as_bool() == Some(true) && !out.is_error && self.plan.plan.is_none() {
-                self.enter_plan_as(true).await;
+            if let Some(name) = d["enterMode"].as_str()
+                && !out.is_error
+                && self.plan.mode.is_none()
+            {
+                self.enter_mode(name, true).await;
             }
-            self.apply_plan_decision(d, &mut out).await;
+            self.apply_mode_action(d, &mut out).await;
         }
         if name == "todo" && !out.is_error {
             self.emit(AgentEvent::Todo(self.tools.todo_json()));
@@ -467,22 +504,24 @@ impl Agent {
         out
     }
 
-    /// Acts on a `propose_plan` result: the plan is started, kept as the review base, or parked.
-    async fn apply_plan_decision(&mut self, d: &Value, out: &mut ToolOutput) {
-        let decision = plan_decision(d);
+    /// Acts on an exit tool's result: the document is started, kept as the review base, parked, or the mode ends.
+    async fn apply_mode_action(&mut self, d: &Value, out: &mut ToolOutput) {
+        let decision = mode_action(d);
+        let mode = d["mode"].as_str().unwrap_or("plan").to_string();
+        let noun = context::capitalize(self.ctx.mode(&mode).map_or("plan", |m| m.noun()));
         let (base, now) = match decision {
-            Some(PlanDecision::Execute { .. } | PlanDecision::Compact { .. } | PlanDecision::Keep { .. }) => {
+            Some(ModeAction::Execute { .. } | ModeAction::Compact { .. } | ModeAction::Keep { .. }) => {
                 (mu_base::git::snapshot_tree(&self.cwd).await.ok(), now_ms())
             }
             _ => (None, 0),
         };
         match decision {
-            Some(k @ (PlanDecision::Execute { .. } | PlanDecision::Compact { .. })) => {
+            Some(k @ (ModeAction::Execute { .. } | ModeAction::Compact { .. })) => {
                 let (_, saved) = self.save_plan(d).await;
                 let stored = match saved {
                     Ok(m) => Some(m.id),
                     Err(e) => {
-                        self.error(format!("could not save the plan: {e}"));
+                        self.error(format!("could not save the {}: {e}", noun.to_lowercase()));
                         None
                     }
                 };
@@ -494,9 +533,10 @@ impl Agent {
                     base,
                     approved_at: now,
                     stored,
+                    mode,
                 });
             }
-            Some(k @ PlanDecision::Keep { .. }) => {
+            Some(k @ ModeAction::Keep { .. }) => {
                 let (store, saved) = self.save_plan(d).await;
                 match saved {
                     Ok(m) => {
@@ -505,29 +545,30 @@ impl Agent {
                             self.error(format!("could not record the approval: {e}"));
                         }
                     }
-                    Err(e) => self.error(format!("could not save the plan: {e}")),
+                    Err(e) => self.error(format!("could not save the {}: {e}", noun.to_lowercase())),
                 }
                 self.set_review_base(review::ReviewBase {
                     tree: base,
                     plan_uri: d["uri"].as_str().map(String::from),
                     since: now,
                 });
-                self.exit_plan();
+                self.exit_mode();
                 if let Some(m) = k.model() {
                     self.continue_with(m);
                 }
             }
-            Some(PlanDecision::Park) => {
+            Some(ModeAction::Exit) => self.exit_mode(),
+            Some(ModeAction::Park) => {
                 let (store, saved) = self.save_plan(d).await;
                 match saved {
                     Ok(m) => {
-                        let by_model = self.plan.plan.as_ref().is_some_and(|p| p.by_model);
-                        self.exit_plan_keeping_model();
+                        let by_model = self.plan.mode.as_ref().is_some_and(|p| p.by_model);
+                        self.exit_mode_keeping_model();
                         self.plan.stored_plan = None;
                         self.emit(AgentEvent::PlanParked { id: m.id.clone(), path: store.md_path(&m.id) });
                         if by_model {
                             out.text = format!(
-                                "Plan parked as `{0}`; approve it with /plans or `mu plan approve {0}`. Continue with what the user asked, or end your turn.",
+                                "{noun} parked as `{0}`; approve it with /plans or `mu plan approve {0}`. Continue with what the user asked, or end your turn.",
                                 m.id
                             );
                         } else {
@@ -537,7 +578,7 @@ impl Agent {
                             ));
                         }
                     }
-                    Err(e) => *out = ToolOutput::err(format!("Could not park the plan: {e}")),
+                    Err(e) => *out = ToolOutput::err(format!("Could not park the {}: {e}", noun.to_lowercase())),
                 }
             }
             _ => {}
@@ -545,14 +586,15 @@ impl Agent {
     }
 }
 
-/// Reads the decision a `propose_plan` result records in its details: the tool boundary.
-fn plan_decision(d: &Value) -> Option<PlanDecision> {
+/// Reads the action an exit tool's result records in its details: the tool boundary.
+fn mode_action(d: &Value) -> Option<ModeAction> {
     let model = d["model"].as_str().map(String::from);
-    Some(match d["planDecision"].as_str()? {
-        "execute" => PlanDecision::Execute { model },
-        "compact" => PlanDecision::Compact { model },
-        "keep" => PlanDecision::Keep { model },
-        "park" => PlanDecision::Park,
+    Some(match d["modeAction"].as_str()? {
+        "execute" => ModeAction::Execute { model },
+        "compact" => ModeAction::Compact { model },
+        "keep" => ModeAction::Keep { model },
+        "park" => ModeAction::Park,
+        "exit" => ModeAction::Exit,
         _ => return None,
     })
 }

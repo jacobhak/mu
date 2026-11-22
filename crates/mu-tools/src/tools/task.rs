@@ -136,7 +136,7 @@ impl Tools {
             return ToolOutput::err(format!("task: {e}"));
         }
         let schemas: Vec<Option<&Value>> = a.tasks.iter().map(|t| t.output_schema.as_ref()).collect();
-        let plan = ctx.plan;
+        let forced = ctx.mode.as_ref().and_then(|m| m.subagent.clone());
         let delegated = self.delegated.borrow().clone();
         // (name, agent, task, cwd, model)
         let specs: Vec<(String, String, String, PathBuf, Option<String>)> = match a
@@ -144,7 +144,7 @@ impl Tools {
             .iter()
             .enumerate()
             .map(|(i, t)| -> Result<_, String> {
-                let agent = if plan { "scout" } else { t.agent.as_deref().unwrap_or("task") };
+                let agent = forced.as_deref().unwrap_or_else(|| t.agent.as_deref().unwrap_or("task"));
                 let cwd = resolve_cwd(t.cwd.as_deref(), &self.cwd)?;
                 let model =
                     t.model.as_deref().map(|m| if m.starts_with('@') { m.to_string() } else { format!("@{m}") });
@@ -586,7 +586,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
 
     fn ctx() -> ToolCtx {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None }
+        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -724,8 +724,7 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
     async fn bad_output_schema_is_rejected_before_spawning() {
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), call_id: "c".into(), plan: false, wait_interrupt: None };
+        let ctx = ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None };
         let a: Args = serde_json::from_value(
             json!({"tasks":[{"task":"x","solutionSpace":"one fix: given","outputSchema":{"type":"bogus"}}]}),
         )

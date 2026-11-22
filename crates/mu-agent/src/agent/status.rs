@@ -35,7 +35,7 @@ impl Agent {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (
             &self.model.model.id,
-            self.plan.plan.is_some(),
+            self.plan.mode.as_ref().map(|m| &m.name),
             &self.plugin_ctx,
             &self.run.agent_prompt,
             self.run.subagent,
@@ -126,7 +126,7 @@ impl Agent {
             native: self.model.model.native,
             native_keyless: self.native_keyless(),
             chatgpt_plan: self.on_chatgpt_plan(),
-            plan: self.plan.plan.is_some(),
+            mode: self.plan.mode.as_ref().map(|m| m.name.clone()),
             context_tokens: Some(self.context_tokens()),
             context_window: self.model.model.context_window,
             cost: self.costs.cost.total,

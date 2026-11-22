@@ -89,7 +89,7 @@ impl Catchup {
             WireEvent::Ask { id, .. }
             | WireEvent::Approve { id, .. }
             | WireEvent::WebSetup { id }
-            | WireEvent::PlanReview { id, .. }
+            | WireEvent::Review { id, .. }
             | WireEvent::PtyOpen { id, .. } => Some(*id),
             _ => None,
         };

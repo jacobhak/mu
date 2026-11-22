@@ -28,8 +28,8 @@ mod web;
 
 use self::agent_view::{AgentView, error_lines, notice_lines};
 use self::chatgpt::ChatgptFlow;
-pub(crate) use self::commands::command_entries;
 pub use self::commands::interactive_reference;
+pub(crate) use self::commands::{command_entries, is_builtin};
 use self::keys::KeyFlow;
 use self::mcp_login::McpLoginFlow;
 use self::schedule::Schedule;

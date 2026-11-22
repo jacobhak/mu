@@ -4,14 +4,12 @@
 use mu_tools::context::{Context, Skill};
 use std::path::Path;
 
-/// The note `mu plan` appends to a headless brief.
-pub const HEADLESS_NOTE: &str = concat!("\n", include_str!("prompts/plan-headless.md"));
-
 pub struct PromptInput<'a> {
     pub model: &'a str,
     pub cwd: &'a Path,
     pub ctx: &'a Context,
-    pub plan: Option<&'a str>,
+    /// The active mode's rendered prompt.
+    pub mode: Option<&'a str>,
     pub subagent: bool,
     /// The `ask` tool is offered to this run; the decision rule is only stated then.
     pub ask: bool,
@@ -173,7 +171,7 @@ When the `task` tool is available, SHOULD use it instead of doing everything inl
         }
         s.push_str("</skills>\n");
     }
-    if let Some(p) = i.plan {
+    if let Some(p) = i.mode {
         s.push('\n');
         s.push_str(p.trim_end());
         s.push('\n');
@@ -218,7 +216,7 @@ mod tests {
         w(proj.join(".agents/commands/shared.md"), "From .agents");
         w(home.join(".agent/commands/mine.md"), "From ~/.agent");
         w(agent.join("RULES.md"), "user rule");
-        let ctx = Context::load_all(&proj, &home, &agent, false);
+        let ctx = Context::load_all(&proj, &home, &agent, false, &root.join("modes"));
         let names: Vec<_> = ctx.skills.iter().map(|s| (s.name.as_str(), s.description.as_str(), s.hidden)).collect();
         assert_eq!(names, [("alpha", "first", false), ("hid", "d", true)]);
         let greet = ctx.commands.iter().find(|c| c.name == "greet").unwrap();
@@ -234,7 +232,7 @@ mod tests {
             bash: true,
             cwd: &proj,
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent: false,
             ask: false,
             task: false,
@@ -258,7 +256,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("AGENTS.md"), "x").unwrap();
         }
-        let ctx = Context::load_all(&proj, &home, &root.join("agent"), false);
+        let ctx = Context::load_all(&proj, &home, &root.join("agent"), false, &root.join("modes"));
         assert_eq!(ctx.nested, ["a/AGENTS.md", "a/b/c/d/AGENTS.md"]);
         let sp = system_prompt(&PromptInput {
             model: "m",
@@ -267,7 +265,7 @@ mod tests {
             bash: true,
             cwd: &proj,
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent: false,
             ask: false,
             task: false,
@@ -290,7 +288,7 @@ mod tests {
             bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent: false,
             ask: false,
             task: false,
@@ -317,7 +315,7 @@ mod tests {
             bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent: false,
             ask: false,
             task: false,
@@ -348,7 +346,7 @@ mod tests {
             bash,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent: true,
             ask: false,
             task: false,
@@ -375,7 +373,7 @@ mod tests {
             bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent,
             ask: false,
             task,
@@ -401,7 +399,7 @@ mod tests {
             bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent,
             ask: false,
             task,
@@ -426,7 +424,7 @@ mod tests {
             bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent: false,
             ask,
             task: false,
@@ -452,6 +450,7 @@ mod tests {
             skills: vec![],
             commands: vec![],
             agents: vec![],
+            modes: vec![],
         };
         let block = "\n<agent name=\"x\">\nDo it.\n</agent>\n";
         let sp = system_prompt(&PromptInput {
@@ -461,7 +460,7 @@ mod tests {
             bash: true,
             cwd: Path::new("/tmp"),
             ctx: &ctx,
-            plan: None,
+            mode: None,
             subagent: true,
             ask: false,
             task: false,

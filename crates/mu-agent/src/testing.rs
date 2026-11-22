@@ -82,6 +82,7 @@ pub fn agent_in(
         skills: vec![],
         commands: vec![],
         agents: vec![],
+        modes: mu_tools::context::builtin_modes(),
     });
     let model = ModelSpec::gateway("anthropic/m", 200_000, 8192);
     let deliver: DeliverFn = Rc::new(|_id: String, _session: PathBuf, _cwd: PathBuf| {
@@ -159,6 +160,7 @@ pub async fn save_plan_in(cwd: &Path, read: &[&str]) -> plans::Store {
             session: None,
             base,
             adopt: None,
+            mode: "plan",
         })
         .unwrap();
     store

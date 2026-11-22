@@ -15,7 +15,7 @@ use crate::theme::{self, Role};
 use crate::widgets::overlay::Overlay;
 use mu_base::config::MuBell;
 use mu_base::events::{
-    AgentEvent, Answer, AskQuestion, PlanDecision, PlanMeta, QueueState, RewindPoint, StatusSnapshot,
+    ActionChoice, AgentEvent, Answer, AskQuestion, PlanMeta, QueueState, ReviewRequest, RewindPoint, StatusSnapshot,
 };
 use mu_base::events::{JobKind, SubagentState, SubagentStatus};
 use mu_base::message::UserInput;
@@ -74,14 +74,9 @@ pub(super) enum Effect {
         request: ApprovalRequest,
         reply: oneshot::Sender<ApprovalDecision>,
     },
-    PlanReview {
-        title: String,
-        uri: String,
-        file: PathBuf,
-        content: String,
-        stored: bool,
-        note: Option<String>,
-        reply: oneshot::Sender<PlanDecision>,
+    Review {
+        request: ReviewRequest,
+        reply: oneshot::Sender<ActionChoice>,
     },
     /// `web_search` needs a backend: run the setup wizard and reply whether web search is ready.
     WebSetup {
@@ -397,10 +392,12 @@ impl AgentView {
                 self.ring_if_attention(&mut fx);
                 fx.push(Effect::WebSetup { reply });
             }
-            AgentEvent::PlanReview { title, uri, file, content, stored, note, reply } => {
+            AgentEvent::Review { request, reply } => {
                 self.ring_if_attention(&mut fx);
-                crate::host::plans::hand_out(&file);
-                fx.push(Effect::PlanReview { title, uri, file, content, stored, note, reply });
+                if let Some(file) = &request.file {
+                    crate::host::plans::hand_out(file);
+                }
+                fx.push(Effect::Review { request, reply });
             }
             AgentEvent::PlanParked { id, path } => {
                 self.tr.commit(notice_lines(&format!("plan parked: {id} · {}", path.display())));
@@ -614,7 +611,7 @@ impl App {
             Effect::Ask { questions, reply } => self.start_ask(questions, reply),
             Effect::Approve { request, reply } => self.start_approve(request, reply),
             Effect::WebSetup { reply } => self.start_web_wizard(Some(reply)),
-            Effect::PlanReview { title, uri, file, content, stored, note, reply } => {
+            Effect::Review { request, reply } => {
                 self.set_aside_approval();
                 let context = self
                     .agent
@@ -623,10 +620,8 @@ impl App {
                     .filter(|_| self.agent.status.context_window > 0)
                     .map(|t| (t, self.agent.status.context_window as u64));
                 self.with_plan_tiers(move |app, tiers| {
-                    let review = crate::panels::plan_review::PlanReview::new(
-                        title, uri, file, content, context, tiers, stored, note,
-                    );
-                    app.open_overlay(Overlay::Review { review: Box::new(review), reply: Some(reply), stored });
+                    let review = crate::panels::doc_review::DocReview::new(request, context, tiers);
+                    app.open_overlay(Overlay::Review { review: Box::new(review), reply: Some(reply) });
                 });
             }
             Effect::PlanList(list) => self.show_plans(list),

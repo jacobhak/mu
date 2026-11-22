@@ -45,7 +45,14 @@ pub enum Command {
     Compact(Option<String>),
     /// `/review [focus]`.
     Review(Option<String>),
-    TogglePlan(Option<String>),
+    /// `/<mode> [prompt]`: switch to the mode, then run the prompt; with the mode already on and no
+    /// prompt, leave it.
+    Mode {
+        name: String,
+        prompt: Option<String>,
+    },
+    /// Leave the active mode.
+    ExitMode,
     Resume(PathBuf),
     /// `/fork`: continue in a new session file holding a copy of this conversation.
     Fork,
@@ -75,7 +82,7 @@ pub enum Command {
     /// Approve a parked plan without a dialog (headless).
     StartPlan {
         id: String,
-        decision: PlanDecision,
+        decision: ModeAction,
         anyway: bool,
     },
     /// Revise a parked plan in plan mode.
@@ -131,7 +138,8 @@ pub struct StatusSnapshot {
     /// Runs on the user's ChatGPT plan (Sign in with ChatGPT): shown as `· ChatGPT plan` instead of
     /// `· key`, and not metered per token. Implies `native`.
     pub chatgpt_plan: bool,
-    pub plan: bool,
+    /// The active mode's name.
+    pub mode: Option<String>,
     /// Estimated context tokens of the next request: the last response's usage plus an estimate for
     /// what was added since. `None` only when a producer cannot estimate.
     pub context_tokens: Option<u64>,
@@ -216,6 +224,13 @@ pub struct PlanMeta {
     pub updated: String,
     pub hash: String,
     pub approved: Option<Approval>,
+    /// The mode that wrote it; its document noun, exit tool and dialog come from that mode.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "plan".into()
 }
 
 impl Status {
@@ -314,8 +329,45 @@ pub enum Answer {
     Cancelled,
 }
 
+/// What a mode's exit dialog action does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModeEffect {
+    Execute,
+    Compact,
+    Keep,
+    Park,
+    Refine,
+    Exit,
+}
+
+impl ModeEffect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Compact => "compact",
+            Self::Keep => "keep",
+            Self::Park => "park",
+            Self::Refine => "refine",
+            Self::Exit => "exit",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "execute" => Self::Execute,
+            "compact" => Self::Compact,
+            "keep" => Self::Keep,
+            "park" => Self::Park,
+            "refine" => Self::Refine,
+            "exit" => Self::Exit,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub enum PlanDecision {
+pub enum ModeAction {
     Execute {
         model: Option<String>,
     },
@@ -326,14 +378,16 @@ pub enum PlanDecision {
         model: Option<String>,
     },
     Refine(String),
-    /// Save the plan for later approval and end the turn (live review only).
+    /// Save the document for later approval and end the turn (live review only).
     Park,
-    /// Drop a stored plan (stored review only).
+    /// Drop a stored document (stored review only).
     Drop,
+    /// Accept the document and leave the mode; nothing is executed.
+    Exit,
 }
 
-impl PlanDecision {
-    /// The name the tool result records as `planDecision` and the plan store records as the approval.
+impl ModeAction {
+    /// The name the tool result records as `modeAction` and the plan store records as the approval.
     pub fn wire_name(&self) -> &'static str {
         match self {
             Self::Execute { .. } => "execute",
@@ -342,6 +396,7 @@ impl PlanDecision {
             Self::Refine(_) => "refine",
             Self::Park => "park",
             Self::Drop => "drop",
+            Self::Exit => "exit",
         }
     }
 
@@ -351,6 +406,72 @@ impl PlanDecision {
             _ => None,
         }
     }
+
+    pub fn effect(&self) -> Option<ModeEffect> {
+        Some(match self {
+            Self::Execute { .. } => ModeEffect::Execute,
+            Self::Compact { .. } => ModeEffect::Compact,
+            Self::Keep { .. } => ModeEffect::Keep,
+            Self::Refine(_) => ModeEffect::Refine,
+            Self::Park => ModeEffect::Park,
+            Self::Exit => ModeEffect::Exit,
+            Self::Drop => return None,
+        })
+    }
+}
+
+/// Whether an action takes text, and whether it must.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ActionInput {
+    None,
+    Optional,
+    Required,
+}
+
+/// One row of a document review dialog.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ActionSpec {
+    pub id: String,
+    pub label: String,
+    pub disabled: bool,
+    pub input: ActionInput,
+    /// Continues in this session's context: the dialog shows the context fill and disables it above 95%.
+    pub keeps_context: bool,
+    /// Accepts the document (ACP offers it as `allow_once`; others `reject_once`).
+    pub approves: bool,
+}
+
+/// A document the user reviews and acts on: a plan or any mode's document, a `/review` report.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ReviewRequest {
+    /// Dialog heading, e.g. `Plan review`, `Review`.
+    pub header: String,
+    pub title: String,
+    /// Shown with the scroll position.
+    pub uri: Option<String>,
+    /// `Some`: Ctrl-G edits it and the text is re-read.
+    pub file: Option<PathBuf>,
+    /// Markdown.
+    pub content: String,
+    /// One dim line under the title.
+    pub note: Option<String>,
+    pub actions: Vec<ActionSpec>,
+    /// Index into `actions` preselected.
+    pub default: usize,
+    /// Show the "continue with" model slider.
+    pub models: bool,
+    /// Esc also cancels the running turn.
+    pub cancel_turn: bool,
+    /// Notice shown on Esc.
+    pub cancel_notice: String,
+}
+
+/// The user's pick in a review dialog. A dropped reply means the dialog was closed without one.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ActionChoice {
+    pub id: String,
+    pub text: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -530,16 +651,9 @@ pub enum AgentEvent {
         reply: oneshot::Sender<bool>,
     },
     #[serde(skip)]
-    PlanReview {
-        title: String,
-        uri: String,
-        file: PathBuf,
-        content: String,
-        /// The plan comes from the store (a parked plan being opened), not from a live `propose_plan`.
-        stored: bool,
-        /// One dim line under the title, e.g. how far the code drifted since the plan was written.
-        note: Option<String>,
-        reply: oneshot::Sender<PlanDecision>,
+    Review {
+        request: ReviewRequest,
+        reply: oneshot::Sender<ActionChoice>,
     },
     /// A plan was saved to the store without being approved.
     PlanParked {

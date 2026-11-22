@@ -1,5 +1,6 @@
 use super::uri::{Scheme, physical};
 use super::{Tools, diff};
+use crate::context::ModeDef;
 use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
 use omp_edit::{path_policy::canonical_key, text};
 use serde::Deserialize;
@@ -20,7 +21,7 @@ impl Args {
 }
 
 impl Tools {
-    pub async fn write(&self, a: Args, plan: bool) -> ToolOutput {
+    pub async fn write(&self, a: Args, mode: Option<&ModeDef>) -> ToolOutput {
         let res = match self.resolve(&a.path) {
             Ok(r) => r,
             Err(e) => return ToolOutput::err(e),
@@ -28,10 +29,13 @@ impl Tools {
         if let Some(s @ (Scheme::Artifact | Scheme::Skill | Scheme::Mu)) = res.scheme {
             return ToolOutput::err(format!("{}:// is read-only", s.name()));
         }
-        if plan && res.scheme != Some(Scheme::Local) {
-            return ToolOutput::err(
-                "Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead.",
-            );
+        if let Some(m) = mode.filter(|m| m.read_only() && res.scheme != Some(Scheme::Local)) {
+            return ToolOutput::err(format!(
+                "{} mode: the working tree is read-only. Write your {} to a {} file instead.",
+                m.title(),
+                m.noun(),
+                m.file_pattern()
+            ));
         }
         let abs = res.path;
         let disp = if res.scheme.is_some() { a.path.clone() } else { self.display(&abs) };
@@ -72,7 +76,8 @@ impl Tools {
         let norm = text::normalize_to_lf(text::strip_bom(&a.content).1).into_owned();
         let tag = self.edit_store.record(&canonical_key(&abs), &norm, Some(&[]));
         let mut out = ToolOutput::ok(format!("[{disp}#{tag}]\nSuccessfully wrote {} bytes to {disp}", a.content.len()));
-        let plan = a.path.starts_with("local://") && a.path.ends_with("-plan.md");
+        let suffix = format!("-{}.md", mode.map_or("plan", |m| m.noun()));
+        let plan = a.path.starts_with("local://") && a.path.ends_with(&suffix);
         out.meta = Some(ToolMeta::File(FileMeta { path: disp.clone(), tag: Some(tag), plan }));
         // A large old file was not read, so there is no text to diff against.
         if !too_big {
@@ -126,13 +131,13 @@ mod tests {
         let p = d.join("win.txt");
         std::fs::write(&p, "a\r\nb\r\n").unwrap();
         let t = tools(&d);
-        let o = t.write(Args { path: p.display().to_string(), content: "x\ny\n".into() }, false).await;
+        let o = t.write(Args { path: p.display().to_string(), content: "x\ny\n".into() }, None).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read(&p).unwrap(), b"x\r\ny\r\n");
         // The model's text, and the diff, stay LF.
         assert_eq!(o.changes[0].new.as_deref(), Some("x\ny\n"));
         // Content that brings its own CR is written as it is.
-        let o = t.write(Args { path: p.display().to_string(), content: "p\r\nq\n".into() }, false).await;
+        let o = t.write(Args { path: p.display().to_string(), content: "p\r\nq\n".into() }, None).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read(&p).unwrap(), b"p\r\nq\n");
     }
@@ -146,7 +151,7 @@ mod tests {
         let link = d.join("link.txt");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let t = tools(&d);
-        let o = t.write(Args { path: link.display().to_string(), content: "new\n".into() }, false).await;
+        let o = t.write(Args { path: link.display().to_string(), content: "new\n".into() }, None).await;
         assert!(!o.is_error, "{}", o.text);
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
@@ -161,10 +166,30 @@ mod tests {
         std::fs::write(&p, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         let t = tools(&d);
-        let o = t.write(Args { path: p.display().to_string(), content: "#!/bin/sh\necho hi\n".into() }, false).await;
+        let o = t.write(Args { path: p.display().to_string(), content: "#!/bin/sh\necho hi\n".into() }, None).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "#!/bin/sh\necho hi\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_only_mode_refuses_the_tree_with_its_own_words() {
+        let d = dir();
+        let t = tools(&d);
+        let mut m = crate::context::builtin_modes().remove(0);
+        let o = t.write(Args { path: "src/x".into(), content: "x".into() }, Some(&m)).await;
+        assert_eq!(
+            o.text,
+            "Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead."
+        );
+        m.name = "design".into();
+        m.exit.document = "design".into();
+        let o = t.write(Args { path: "src/x".into(), content: "x".into() }, Some(&m)).await;
+        assert_eq!(
+            o.text,
+            "Design mode: the working tree is read-only. Write your design to a local://<slug>-design.md file instead."
+        );
+        assert!(!d.join("src/x").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -174,7 +199,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let mut t = tools(&d);
         t.home = Home::at(&home);
-        let o = t.write(Args { path: "~/sub/note.txt".into(), content: "hi\n".into() }, false).await;
+        let o = t.write(Args { path: "~/sub/note.txt".into(), content: "hi\n".into() }, None).await;
         assert!(!o.is_error, "{}", o.text);
         assert_eq!(std::fs::read_to_string(home.join("sub/note.txt")).unwrap(), "hi\n");
     }

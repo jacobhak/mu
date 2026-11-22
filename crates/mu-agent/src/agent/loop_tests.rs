@@ -116,14 +116,18 @@ fn plan_prompt_inlines_plan_and_path() {
         content: "do it\n".into(),
         title: "T".into(),
         uri: "local://t-plan.md".into(),
-        decision: PlanDecision::Compact { model: None },
+        decision: ModeAction::Compact { model: None },
+        mode: "plan".into(),
         base: None,
         approved_at: 0,
         stored: None,
     };
-    let s = plan_prompt(&p);
+    let m = &mu_tools::context::builtin_modes()[0];
+    let s = plan_prompt(&p, m);
     assert!(s.contains("<plan path=\"local://t-plan.md\">\ndo it\n</plan>") && s.contains("History usable"));
     assert!(!s.contains("{{"));
+    let p = ExecPlan { content: "uses {{file}} and {{tool}}\n".into(), ..p };
+    assert!(plan_prompt(&p, m).contains("uses {{file}} and {{tool}}"), "the document is not templated");
 }
 
 #[test]
@@ -134,7 +138,8 @@ fn failed_turn_clears_stale_exec_plan() {
             content: "plan".into(),
             title: String::new(),
             uri: String::new(),
-            decision: PlanDecision::Execute { model: None },
+            decision: ModeAction::Execute { model: None },
+            mode: "plan".into(),
             base: None,
             approved_at: 0,
             stored: None,
@@ -808,7 +813,8 @@ fn a_stop_skips_plan_dispatch_and_follow_ups() {
             content: "plan".into(),
             title: "T".into(),
             uri: "local://t-plan.md".into(),
-            decision: PlanDecision::Execute { model: None },
+            decision: ModeAction::Execute { model: None },
+            mode: "plan".into(),
             base: None,
             approved_at: 0,
             stored: None,
@@ -922,7 +928,7 @@ fn parking_a_plan_saves_it_and_leaves_plan_mode_keeping_the_model() {
             cfg,
         );
         a.cwd = tmp_dir();
-        a.enter_plan().await;
+        a.enter_mode("plan", false).await;
         assert_eq!((a.model.model.id.as_str(), a.model.thinking), ("a/c", Thinking::High), "plan mode uses the role");
         let r = a.tools.resolve("local://t-plan.md").unwrap();
         std::fs::create_dir_all(r.path.parent().unwrap()).unwrap();
@@ -931,9 +937,9 @@ fn parking_a_plan_saves_it_and_leaves_plan_mode_keeping_the_model() {
             let mut parked = None;
             while let Some(e) = rx.recv().await {
                 match e {
-                    AgentEvent::PlanReview { reply, stored, .. } => {
-                        assert!(!stored);
-                        let _ = reply.send(PlanDecision::Park);
+                    AgentEvent::Review { reply, request } => {
+                        assert!(request.cancel_turn, "a live review is not a stored one");
+                        let _ = reply.send(choice("park"));
                     }
                     AgentEvent::PlanParked { id, .. } => parked = Some(id),
                     AgentEvent::TurnEnd { .. } => break,
@@ -944,7 +950,7 @@ fn parking_a_plan_saves_it_and_leaves_plan_mode_keeping_the_model() {
         };
         let (_, parked) = futures_util::future::join(a.turn(Some("go".to_string().into())), answer).await;
         assert_eq!(parked.as_deref(), Some("t"));
-        assert!(a.plan.plan.is_none());
+        assert!(a.plan.mode.is_none());
         assert_eq!(
             (a.model.model.id.as_str(), a.model.thinking),
             ("a/c", Thinking::High),
@@ -957,7 +963,15 @@ fn parking_a_plan_saves_it_and_leaves_plan_mode_keeping_the_model() {
 }
 
 fn enter_call(id: &str) -> Block {
-    Block::ToolCall { id: id.into(), name: "enter_plan".into(), arguments: json!({"reason": "a big change"}) }
+    Block::ToolCall {
+        id: id.into(),
+        name: "enter_mode".into(),
+        arguments: json!({"mode": "plan", "reason": "a big change"}),
+    }
+}
+
+fn choice(id: &str) -> mu_base::events::ActionChoice {
+    mu_base::events::ActionChoice { id: id.into(), text: None, model: None }
 }
 
 fn propose_call(id: &str, slug: &str) -> Block {
@@ -981,8 +995,8 @@ async fn answer_plans(
                 asked.push(request);
                 let _ = reply.send(answer());
             }
-            AgentEvent::PlanReview { reply, .. } => {
-                let _ = reply.send(PlanDecision::Park);
+            AgentEvent::Review { reply, .. } => {
+                let _ = reply.send(choice("park"));
             }
             AgentEvent::PlanParked { id, .. } => parked.push(id),
             AgentEvent::TurnEnd { .. } => break,
@@ -1003,7 +1017,7 @@ fn tool_names(a: &Agent) -> Vec<String> {
 }
 
 #[test]
-fn an_approved_enter_plan_turns_plan_mode_on_for_the_rest_of_the_turn() {
+fn an_approved_enter_mode_turns_the_mode_on_for_the_rest_of_the_turn() {
     run(async {
         let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\nplan = \"a/c:high\"\n");
         let script = vec![
@@ -1013,24 +1027,24 @@ fn an_approved_enter_plan_turns_plan_mode_on_for_the_rest_of_the_turn() {
         let (mut a, rx) = agent_with(script, cfg);
         a.cwd = tmp_dir();
         a.title.requested = true; // the title request would take a scripted reply
-        assert!(tool_names(&a).contains(&"enter_plan".to_string()));
+        assert!(tool_names(&a).contains(&"enter_mode".to_string()));
         assert!(!tool_names(&a).contains(&"propose_plan".to_string()));
         let turn = a.turn(Some("go".to_string().into()));
         let ((), (asked, _)) = futures_util::future::join(turn, answer_plans(rx, allow_once)).await;
         assert_eq!(asked.len(), 1);
-        assert_eq!(asked[0].title, "enter_plan: switch to plan mode");
+        assert_eq!(asked[0].title, "enter_mode: switch to plan mode");
         assert_eq!(asked[0].body, "a big change");
         assert!(asked[0].grant.is_none());
-        assert!(a.plan.plan.as_ref().is_some_and(|p| p.by_model));
+        assert!(a.plan.mode.as_ref().is_some_and(|p| p.by_model && p.name == "plan"));
         assert_eq!((a.model.model.id.as_str(), a.model.thinking), ("a/c", Thinking::High));
         let names = tool_names(&a);
-        assert!(names.contains(&"propose_plan".to_string()) && !names.contains(&"enter_plan".to_string()));
+        assert!(names.contains(&"propose_plan".to_string()) && !names.contains(&"enter_mode".to_string()));
         assert!(a.ports.providers.scripted.borrow().is_empty(), "the turn went on to a second request");
     });
 }
 
 #[test]
-fn a_denied_enter_plan_leaves_plan_mode_off_and_returns_the_note() {
+fn a_denied_enter_mode_leaves_the_mode_off_and_returns_the_note() {
     run(async {
         let script = vec![
             Ok(assistant(vec![enter_call("e1")], StopReason::ToolUse)),
@@ -1039,7 +1053,7 @@ fn a_denied_enter_plan_leaves_plan_mode_off_and_returns_the_note() {
         let (mut a, rx) = agent(script);
         let deny = || ApprovalDecision::Deny { note: Some("just do it".into()) };
         futures_util::future::join(a.turn(Some("go".to_string().into())), answer_plans(rx, deny)).await;
-        assert!(a.plan.plan.is_none());
+        assert!(a.plan.mode.is_none());
         let r = results(&a);
         assert!(r[0].0 && r[0].1.contains("just do it"), "{r:?}");
         assert!(a.ports.providers.scripted.borrow().is_empty(), "the model answered the denial");
@@ -1047,7 +1061,7 @@ fn a_denied_enter_plan_leaves_plan_mode_off_and_returns_the_note() {
 }
 
 #[test]
-fn enter_plan_asks_even_when_every_call_is_allowed() {
+fn enter_mode_asks_even_when_every_call_is_allowed() {
     run(async {
         let script = vec![
             Ok(assistant(vec![enter_call("e1")], StopReason::ToolUse)),
@@ -1084,7 +1098,7 @@ fn a_model_can_plan_twice_in_one_turn_and_continues_after_each_park() {
         let (_, (asked, parked)) = futures_util::future::join(turn, answer_plans(rx, allow_once)).await;
         assert_eq!(asked.len(), 2, "each entry asks again");
         assert_eq!(parked, ["one", "two"]);
-        assert!(a.plan.plan.is_none());
+        assert!(a.plan.mode.is_none());
         assert_eq!((a.model.model.id.as_str(), a.model.thinking), ("a/c", Thinking::High));
         let store = plans::store_for(&a.cwd).await;
         assert!(store.load("one").is_ok() && store.load("two").is_ok());
@@ -1105,8 +1119,8 @@ fn a_park_after_the_users_own_plan_mode_still_ends_the_turn() {
         ];
         let (mut a, rx) = agent(script);
         a.cwd = tmp_dir();
-        a.enter_plan().await;
-        assert!(a.plan.plan.as_ref().is_some_and(|p| !p.by_model));
+        a.enter_mode("plan", false).await;
+        assert!(a.plan.mode.as_ref().is_some_and(|p| !p.by_model));
         write_plan(&a, "t");
         let turn = a.turn(Some("go".to_string().into()));
         let (_, (_, parked)) = futures_util::future::join(turn, answer_plans(rx, allow_once)).await;
@@ -1120,34 +1134,223 @@ fn a_park_after_the_users_own_plan_mode_still_ends_the_turn() {
 fn a_session_saved_in_a_model_entered_plan_mode_resumes_with_by_model_set() {
     run(async {
         let (mut a, _rx) = agent(vec![]);
-        a.enter_plan_as(true).await;
+        a.enter_mode("plan", true).await;
         let path = a.session.as_ref().unwrap().path.clone();
         a.end_session().await;
         a.reset_conversation();
-        assert!(a.plan.plan.is_none());
+        assert!(a.plan.mode.is_none());
         assert!(a.load_session(&path).await);
-        assert!(a.plan.plan.as_ref().is_some_and(|p| p.by_model));
+        assert!(a.plan.mode.as_ref().is_some_and(|p| p.by_model));
 
-        a.exit_plan();
-        a.enter_plan().await;
+        a.exit_mode();
+        a.enter_mode("plan", false).await;
         let path = a.session.as_ref().unwrap().path.clone();
         a.end_session().await;
         a.reset_conversation();
         assert!(a.load_session(&path).await);
-        assert!(a.plan.plan.as_ref().is_some_and(|p| !p.by_model));
+        assert!(a.plan.mode.as_ref().is_some_and(|p| !p.by_model));
     });
 }
 
 #[test]
-fn a_subagent_is_offered_neither_plan_tool() {
+fn a_subagent_is_not_offered_enter_mode() {
     run(async {
         let run_cfg = RunConfig { subagent: true, excluded: HEADLESS_EXCLUDED.to_vec(), ..Default::default() };
-        let (mut a, _rx) = agent_run(vec![], Configs::default(), run_cfg);
+        let (a, _rx) = agent_run(vec![], Configs::default(), run_cfg);
         let names = tool_names(&a);
-        assert!(!names.contains(&"enter_plan".to_string()) && !names.contains(&"propose_plan".to_string()));
-        a.enter_plan().await;
-        let names = tool_names(&a);
-        assert!(!names.contains(&"enter_plan".to_string()) && !names.contains(&"propose_plan".to_string()));
+        assert!(!names.contains(&"enter_mode".to_string()) && !names.contains(&"propose_plan".to_string()));
+    });
+}
+
+/// A copy of the built-in plan mode named `name`, writing `local://<slug>-<name>.md`.
+fn custom_mode(name: &str) -> mu_tools::context::ModeDef {
+    use mu_base::events::ModeEffect::{Exit, Keep, Park, Refine};
+    let mut m = mu_tools::context::builtin_modes().remove(0);
+    m.name = name.into();
+    m.exit.document = name.into();
+    m.exit.actions =
+        [(Keep, "Approve and keep context"), (Park, "Park {n}"), (Refine, "Refine {n}"), (Exit, "Leave {name}")]
+            .map(|(e, l)| (e, l.to_string()))
+            .to_vec();
+    m.model = vec![];
+    m
+}
+
+fn add_mode(a: &mut Agent, m: mu_tools::context::ModeDef) {
+    Rc::get_mut(&mut a.ctx).expect("sole owner").modes.push(m);
+}
+
+fn enter_named(id: &str, mode: &str) -> Block {
+    Block::ToolCall { id: id.into(), name: "enter_mode".into(), arguments: json!({"mode": mode, "reason": "r"}) }
+}
+
+fn write_doc(a: &Agent, slug: &str, doc: &str) {
+    let r = a.tools.resolve(&format!("local://{slug}-{doc}.md")).unwrap();
+    std::fs::create_dir_all(r.path.parent().unwrap()).unwrap();
+    std::fs::write(&r.path, "the document\n").unwrap();
+}
+
+#[test]
+fn a_mode_that_allows_entry_is_entered_without_asking() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![enter_named("e1", "free")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent(script);
+        let mut m = custom_mode("free");
+        m.model_entry = mu_tools::context::ModelEntry::Allow;
+        add_mode(&mut a, m);
+        a.cwd = tmp_dir();
+        a.title.requested = true;
+        let turn = a.turn(Some("go".to_string().into()));
+        let (_, (asked, _)) = futures_util::future::join(turn, answer_plans(rx, allow_once)).await;
+        assert!(asked.is_empty(), "no approval request: {asked:?}");
+        assert!(a.plan.mode.as_ref().is_some_and(|m| m.name == "free" && m.by_model));
+    });
+}
+
+#[test]
+fn a_read_only_mode_refuses_the_tree_in_its_own_words() {
+    run(async {
+        let (mut a, _rx) = agent(vec![]);
+        add_mode(&mut a, custom_mode("design"));
+        a.cwd = tmp_dir();
+        a.enter_mode("design", false).await;
+        let args = json!({"path": "src/x", "content": "x"});
+        let out = a.exec_tool("w1", "write", &args, &CancellationToken::new(), None).await;
+        assert!(out.is_error);
+        assert_eq!(
+            out.text,
+            "Design mode: the working tree is read-only. Write your design to a local://<slug>-design.md file instead."
+        );
+    });
+}
+
+#[test]
+fn the_exit_action_leaves_the_mode_and_restores_the_model() {
+    run(async {
+        let cfg = Configs::from_models_toml("[sets.main]\ndefault = \"a/b\"\nplan = \"a/c:high\"\n");
+        let script = vec![
+            Ok(assistant(vec![propose_call("p1", "t")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = agent_with(script, cfg);
+        let mut m = custom_mode("design");
+        m.model = vec!["@plan".into()];
+        add_mode(&mut a, m);
+        a.cwd = tmp_dir();
+        a.title.requested = true;
+        let before = a.model.model.id.clone();
+        a.enter_mode("design", false).await;
+        assert_eq!(a.model.model.id, "a/c");
+        write_doc(&a, "t", "design");
+        let answer = async {
+            while let Some(e) = rx.recv().await {
+                match e {
+                    AgentEvent::Review { reply, .. } => {
+                        let _ = reply.send(choice("exit"));
+                    }
+                    AgentEvent::TurnEnd { .. } => break,
+                    _ => {}
+                }
+            }
+        };
+        futures_util::future::join(a.turn(Some("go".to_string().into())), answer).await;
+        assert!(a.plan.mode.is_none());
+        assert_eq!(a.model.model.id, before, "leaving restores the model");
+        let r = results(&a);
+        assert!(r[0].1.contains("Design accepted; design mode is off."), "{r:?}");
+        let store = plans::store_for(&a.cwd).await;
+        assert!(store.list(true).0.is_empty(), "nothing is stored for an accepted document");
+    });
+}
+
+#[test]
+fn parking_in_a_custom_mode_records_it_and_the_stored_dialog_offers_a_drop() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![propose_call("p1", "t")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("parked")], StopReason::Stop)),
+        ];
+        let (mut a, mut rx) = agent(script);
+        add_mode(&mut a, custom_mode("design"));
+        a.cwd = tmp_dir();
+        a.title.requested = true;
+        a.enter_mode("design", false).await;
+        write_doc(&a, "t", "design");
+        let answer = async {
+            while let Some(e) = rx.recv().await {
+                match e {
+                    AgentEvent::Review { reply, .. } => {
+                        let _ = reply.send(choice("park"));
+                    }
+                    AgentEvent::TurnEnd { .. } => break,
+                    _ => {}
+                }
+            }
+        };
+        futures_util::future::join(a.turn(Some("go".to_string().into())), answer).await;
+        let store = plans::store_for(&a.cwd).await;
+        let (meta, _) = store.load("t").unwrap();
+        assert_eq!(meta.mode, "design");
+        let respond = async {
+            while let Some(e) = rx.recv().await {
+                if let AgentEvent::Review { request, reply } = e {
+                    let _ = reply.send(choice("drop"));
+                    return request;
+                }
+            }
+            panic!("no dialog")
+        };
+        let (start, request) = futures_util::future::join(a.open_plan("t"), respond).await;
+        assert!(start.is_none());
+        assert_eq!(request.header, "Design review");
+        assert!(request.actions.iter().any(|x| x.label == "Drop design") && !request.cancel_turn);
+        assert_eq!(store.load("t").unwrap().0.status, mu_base::events::Status::Dropped);
+    });
+}
+
+#[test]
+fn resuming_in_a_mode_that_is_not_defined_here_says_so() {
+    run(async {
+        let (mut a, mut rx) = agent(vec![]);
+        a.ensure_session().await;
+        a.session.as_mut().unwrap().mode_change("ghost", json!({}));
+        let path = a.session.as_ref().unwrap().path.clone();
+        a.end_session().await;
+        a.reset_conversation();
+        drain(&mut rx);
+        assert!(a.load_session(&path).await);
+        assert!(a.plan.mode.is_none());
+        let notes: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| if let AgentEvent::Notice(n) = e { Some(n) } else { None })
+            .collect();
+        assert!(notes.iter().any(|n| n == "mode ghost is not defined here; resumed without it"), "{notes:?}");
+    });
+}
+
+#[test]
+fn exit_tools_are_mode_bound_and_a_mode_can_deny_tools() {
+    run(async {
+        let script = vec![
+            Ok(assistant(vec![propose_call("p1", "t")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+            Ok(assistant(vec![call("b1", "bash")], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("done")], StopReason::Stop)),
+        ];
+        let (mut a, _rx) = agent(script);
+        let mut m = custom_mode("quiet");
+        m.deny = vec!["bash".into()];
+        add_mode(&mut a, m);
+        a.title.requested = true;
+        a.turn(Some("go".to_string().into())).await;
+        a.enter_mode("quiet", false).await;
+        a.turn(Some("again".to_string().into())).await;
+        let r = results(&a);
+        assert!(r[0].0 && r[0].1.contains("only available in plan mode"), "{r:?}");
+        assert!(r[1].0 && r[1].1.contains("not available in quiet mode"), "{r:?}");
     });
 }
 
@@ -1161,7 +1364,8 @@ fn a_stored_plan_starts_in_the_current_session() {
             content: "do it\n".into(),
             title: "T".into(),
             uri: "local://t-plan.md".into(),
-            decision: PlanDecision::Keep { model: None },
+            decision: ModeAction::Keep { model: None },
+            mode: "plan".into(),
             base: mu_base::git::snapshot_tree(&a.cwd).await.ok(),
             approved_at: 1,
             stored: Some("t".into()),
@@ -1590,7 +1794,7 @@ fn a_drifted_plan_is_refused_without_anyway() {
         a.cwd = git_repo();
         save_plan_in(&a.cwd, &["a.txt"]).await;
         std::fs::write(a.cwd.join("a.txt"), "two\n").unwrap();
-        let start = a.start_plan("t", PlanDecision::Keep { model: None }, false).await;
+        let start = a.start_plan("t", ModeAction::Keep { model: None }, false).await;
         assert!(start.is_none());
         assert_eq!(a.ports.providers.scripted.borrow().len(), 1, "no request was made");
         let mut stale = false;
@@ -1598,7 +1802,7 @@ fn a_drifted_plan_is_refused_without_anyway() {
             stale |= matches!(e, AgentEvent::Error(m) if m.contains("is stale"));
         }
         assert!(stale);
-        assert!(a.start_plan("t", PlanDecision::Keep { model: None }, true).await.is_some());
+        assert!(a.start_plan("t", ModeAction::Keep { model: None }, true).await.is_some());
     });
 }
 

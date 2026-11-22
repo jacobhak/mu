@@ -242,16 +242,28 @@ impl Permissions {
     /// Decides one model tool call.
     pub fn check(&self, tools: &Tools, name: &str, args: &Value) -> Verdict {
         // Before `classify`, so no mode, rule or grant (`yolo` included) can allow it silently.
-        if name == "enter_plan" {
-            return Verdict::Ask(ApprovalRequest {
-                tool: name.to_string(),
-                call_id: String::new(),
-                title: "enter_plan: switch to plan mode".into(),
-                reason: "Plan mode makes this session read-only until a plan is approved or parked, and switches to the plan model if one is set.".into(),
-                body: args["reason"].as_str().unwrap_or("").to_string(),
-                from: None,
-                grant: None,
-            });
+        if name == "enter_mode" {
+            let mode = args["mode"].as_str().unwrap_or("");
+            let entry = tools.mode_entry.borrow().iter().find(|(n, ..)| n == mode).cloned();
+            return match entry {
+                Some((_, crate::context::ModelEntry::Allow, ..)) => Verdict::Allow,
+                Some((n, crate::context::ModelEntry::Ask, description, read_only)) => {
+                    let ro = if read_only { " The working tree is read-only until the mode ends." } else { "" };
+                    Verdict::Ask(ApprovalRequest {
+                        tool: name.to_string(),
+                        call_id: String::new(),
+                        title: format!("enter_mode: switch to {n} mode"),
+                        reason: format!(
+                            "{} mode: {description}.{ro} Switches to the mode's model if one is set.",
+                            crate::context::capitalize(&n)
+                        ),
+                        body: args["reason"].as_str().unwrap_or("").to_string(),
+                        from: None,
+                        grant: None,
+                    })
+                }
+                _ => Verdict::Deny(format!("Mode `{mode}` cannot be entered by the model.")),
+            };
         }
         let gate = self.gate(&tools.cwd);
         let call = match classify::classify(tools, &gate, name, args) {
@@ -419,15 +431,30 @@ mod tests {
         assert!(matches!(v, Verdict::Allow), "local:// is read tier");
     }
 
+    fn entries(t: &Tools) {
+        use crate::context::ModelEntry;
+        let mut e = t.mode_entry.borrow_mut();
+        e.push(("plan".into(), ModelEntry::Ask, "Explore read-only".into(), true));
+        e.push(("free".into(), ModelEntry::Allow, "d".into(), false));
+        e.push(("closed".into(), ModelEntry::Never, "d".into(), false));
+    }
+
     #[test]
-    fn enter_plan_asks_in_every_mode_and_offers_no_grant() {
+    fn enter_mode_follows_the_modes_entry_setting_and_offers_no_grant() {
         for mode in [PermissionMode::Ask, PermissionMode::Edits, PermissionMode::Yolo] {
             let (p, t) = setup(mode);
-            let Verdict::Ask(req) = p.check(&t, "enter_plan", &json!({"reason": "big change"})) else {
+            entries(&t);
+            let Verdict::Ask(req) = p.check(&t, "enter_mode", &json!({"mode": "plan", "reason": "big change"})) else {
                 panic!("{mode:?} must ask")
             };
             assert!(req.grant.is_none(), "{mode:?}");
-            assert_eq!((req.title.as_str(), req.body.as_str()), ("enter_plan: switch to plan mode", "big change"));
+            assert_eq!((req.title.as_str(), req.body.as_str()), ("enter_mode: switch to plan mode", "big change"));
+            assert!(req.reason.contains("read-only until the mode ends"));
+            let v = p.check(&t, "enter_mode", &json!({"mode": "free", "reason": "x"}));
+            assert!(matches!(v, Verdict::Allow), "{mode:?}");
+            let v = p.check(&t, "enter_mode", &json!({"mode": "closed", "reason": "x"}));
+            assert!(matches!(v, Verdict::Deny(m) if m.contains("cannot be entered")), "{mode:?}");
+            assert!(matches!(p.check(&t, "enter_mode", &json!({"mode": "ghost"})), Verdict::Deny(_)));
         }
     }
 

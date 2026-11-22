@@ -88,13 +88,14 @@ impl App {
     /// Makes `name` the active set and moves this session to its model.
     pub(super) fn switch_to(&mut self, name: &str) {
         let name = name.to_string();
-        self.host_call(models_host::SWITCH_SET, &name.clone(), move |app, r: Result<Switched, String>| {
+        let args = (name.clone(), self.agent.status.mode.clone());
+        self.host_call(models_host::SWITCH_SET, &args, move |app, r: Result<Switched, String>| {
             let set = match r {
                 Ok(s) => s,
                 Err(e) => return app.error(&e),
             };
-            if app.agent.status.plan && set.plan {
-                app.send(Command::SetModel("@plan".into()));
+            if let Some(m) = set.mode_model {
+                app.send(Command::SetModel(m));
             } else if let Some(v) = set.default {
                 app.send(Command::SetModel("@default".into()));
                 app.notice(&format!("model set {name}: @default = {v}"));

@@ -7,14 +7,14 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::oneshot;
 
+use crate::panels::doc_review::{DocReview, ReviewResult};
 use crate::panels::jobs_panel::{JobsPanel, JobsResult};
 use crate::panels::model_roles::{RoleEditor, RoleEditorAction};
-use crate::panels::plan_review::{PlanReview, ReviewResult};
 use crate::panels::reply::{ReplyPicker, ReplyResult};
 use crate::widgets::frame::free_rows;
 use crate::widgets::picker::{HasSelect, Pick, Picker};
 use crate::widgets::select::{Item, Select, SelectResult};
-use mu_base::events::{Answer, AskQuestion, PlanDecision};
+use mu_base::events::{ActionChoice, Answer, AskQuestion};
 use mu_base::model_config::RoleMeta;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 
@@ -167,10 +167,8 @@ pub enum Overlay {
     /// A tool call waiting for approval.
     Approve(Box<ApproveState>),
     Review {
-        review: Box<PlanReview>,
-        reply: Option<oneshot::Sender<PlanDecision>>,
-        /// Opened from the store, not from a running `propose_plan`.
-        stored: bool,
+        review: Box<DocReview>,
+        reply: Option<oneshot::Sender<ActionChoice>>,
     },
     Copy {
         pick: Picker<String>,
@@ -285,13 +283,14 @@ pub enum OverlayEvent {
     Resume(PathBuf),
     /// Go back to before the prompt in this session entry.
     Rewind(String),
-    /// Copy the plan text.
-    CopyPlan(String),
-    /// Edit the plan file; the overlay stays up and reloads it afterwards.
-    EditPlan(PathBuf),
-    /// The plan review was dismissed. A live plan cancels the turn; a stored one just stays parked.
-    PlanCancelled {
-        stored: bool,
+    /// Copy the document text.
+    CopyDoc(String),
+    /// Edit the document file; the overlay stays up and reloads it afterwards.
+    EditDoc(PathBuf),
+    /// The review was dismissed; `cancel_turn` also cancels the running turn.
+    ReviewCancelled {
+        cancel_turn: bool,
+        notice: String,
     },
     /// A parked plan was chosen from the list.
     OpenPlan(String),
@@ -1090,17 +1089,20 @@ impl Overlay {
                     Pick::Dismissed => (None, None),
                 }
             }
-            Overlay::Review { mut review, mut reply, stored } => match review.on_key(k) {
-                ReviewResult::Pending => (Some(Overlay::Review { review, reply, stored }), None),
+            Overlay::Review { mut review, mut reply } => match review.on_key(k) {
+                ReviewResult::Pending => (Some(Overlay::Review { review, reply }), None),
                 ReviewResult::Copy => {
                     let text = review.content().to_string();
-                    (Some(Overlay::Review { review, reply, stored }), Some(OverlayEvent::CopyPlan(text)))
+                    (Some(Overlay::Review { review, reply }), Some(OverlayEvent::CopyDoc(text)))
                 }
                 ReviewResult::Edit => {
-                    let file = review.file.clone();
-                    (Some(Overlay::Review { review, reply, stored }), Some(OverlayEvent::EditPlan(file)))
+                    let ev = review.file.clone().map(OverlayEvent::EditDoc);
+                    (Some(Overlay::Review { review, reply }), ev)
                 }
-                ReviewResult::Cancelled => (None, Some(OverlayEvent::PlanCancelled { stored })),
+                ReviewResult::Cancelled => {
+                    let notice = std::mem::take(&mut review.cancel_notice);
+                    (None, Some(OverlayEvent::ReviewCancelled { cancel_turn: review.cancel_turn, notice }))
+                }
                 ReviewResult::Decided(d) => {
                     if let Some(r) = reply.take() {
                         let _ = r.send(d);

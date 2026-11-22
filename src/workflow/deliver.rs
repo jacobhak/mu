@@ -551,6 +551,7 @@ mod tests {
                     session: None,
                     base: None,
                     adopt: None,
+                    mode: "plan",
                 })
                 .unwrap();
             store.approve("x", "keep", Some(Path::new("/s/impl.jsonl"))).unwrap();
@@ -596,6 +597,7 @@ mod tests {
                     session: None,
                     base: None,
                     adopt: None,
+                    mode: "plan",
                 })
                 .unwrap();
             store

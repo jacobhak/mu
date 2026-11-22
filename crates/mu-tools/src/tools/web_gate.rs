@@ -56,13 +56,7 @@ mod tests {
     fn ctx() -> (ToolCtx, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         (
-            ToolCtx {
-                events,
-                cancel: CancellationToken::new(),
-                call_id: "c".into(),
-                plan: false,
-                wait_interrupt: None,
-            },
+            ToolCtx { events, cancel: CancellationToken::new(), call_id: "c".into(), mode: None, wait_interrupt: None },
             rx,
         )
     }

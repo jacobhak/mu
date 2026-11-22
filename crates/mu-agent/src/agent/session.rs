@@ -109,7 +109,7 @@ impl Agent {
         self.title.requested = false;
         self.title.cancel.cancel();
         self.title.cancel = CancellationToken::new();
-        self.plan.plan = None;
+        self.plan.mode = None;
         self.plan.exec_plan = None;
         self.plan.stored_plan = None;
         self.resumed = false;
@@ -195,18 +195,23 @@ impl Agent {
             self.notice(format!("session repaired on load: {}", loaded.warnings.join("; ")));
         }
         self.reset_conversation();
-        let plan_mode = loaded.mode.as_ref().filter(|(m, _)| m == "plan").map(|(_, d)| d.clone());
+        let stored_mode = loaded.mode.as_ref().filter(|(m, _)| m != "none").cloned();
         self.apply_loaded_settings(&loaded, &mut s);
         let resume_hits = self.restore_history(loaded);
         self.session = Some(s);
         self.log_redaction("resume", &resume_hits);
         self.tools.set_session(&self.session_id(), self.session.as_ref().map(|s| s.path.clone()));
-        if let Some(data) = plan_mode {
-            // The model and thinking level in force before plan mode, so leaving it restores them.
-            let prev_model = data["prevModel"].as_str().map(String::from);
-            let prev_thinking = data["prevThinking"].as_str().and_then(Thinking::parse).unwrap_or(self.model.thinking);
-            let by_model = data["byModel"].as_bool().unwrap_or(false);
-            self.plan.plan = Some(PlanState { prev_model, prev_thinking, by_model });
+        if let Some((name, data)) = stored_mode {
+            if self.ctx.mode(&name).is_none() {
+                self.notice(format!("mode {name} is not defined here; resumed without it"));
+            } else {
+                // The model and thinking level in force before the mode, so leaving it restores them.
+                let prev_model = data["prevModel"].as_str().map(String::from);
+                let prev_thinking =
+                    data["prevThinking"].as_str().and_then(Thinking::parse).unwrap_or(self.model.thinking);
+                let by_model = data["byModel"].as_bool().unwrap_or(false);
+                self.plan.mode = Some(ModeState { name, prev_model, prev_thinking, by_model });
+            }
         }
         self.resumed = true;
         self.sync_plugin_session();

@@ -292,8 +292,8 @@ fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
 
 fn seg_mode(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
     let mut line = Vec::new();
-    if s.plan {
-        line.push(span("plan", st(Role::Accent)));
+    if let Some(mode) = &s.mode {
+        line.push(span(mode.clone(), st(Role::Accent)));
     }
     if s.permissions != PermissionMode::Yolo {
         if !line.is_empty() {
@@ -645,7 +645,7 @@ mod tests {
         assert!(seg_mode(&StatusSnapshot::default(), &e, 0).is_none(), "yolo and no plan is silent");
         let s = StatusSnapshot { permissions: PermissionMode::Ask, ..Default::default() };
         assert_eq!(line_text(&seg_mode(&s, &e, 0).unwrap()), "ask");
-        let s = StatusSnapshot { plan: true, permissions: PermissionMode::Edits, ..Default::default() };
+        let s = StatusSnapshot { mode: Some("plan".into()), permissions: PermissionMode::Edits, ..Default::default() };
         assert_eq!(line_text(&seg_mode(&s, &e, 0).unwrap()), "plan edits");
     }
 
@@ -720,13 +720,13 @@ mod tests {
         let c = cfg(&["pi", "pr", "subagents", "bogus", "mode", "cost"], &[]);
         let mut s = snap();
         s.title = None;
-        s.plan = false;
+        s.mode = None;
         s.subscription = false;
         s.cost = 0.0;
         // Only `pi` has something to show, and an empty right side means no padding.
         s.usage = None;
         assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " μ private ");
-        s.plan = true;
+        s.mode = Some("plan".into());
         s.cost = 0.25;
         let c = cfg(&["mode", "cost"], &[]);
         assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " plan · $0.25 ");

@@ -334,7 +334,9 @@ impl Server {
             return None;
         }
         // The client may edit the plan file; the host answers `read_file`/`write_file` only for paths it sent.
-        if let AgentEvent::PlanReview { file, .. } = &ev {
+        if let AgentEvent::Review { request, .. } = &ev
+            && let Some(file) = &request.file
+        {
             mu_tui::host::plans::hand_out(file);
         }
         let line = self.catchup.event(ev);

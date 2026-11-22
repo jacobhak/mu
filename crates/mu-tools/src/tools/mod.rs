@@ -3,7 +3,7 @@ pub mod changes;
 mod diff;
 pub mod docs;
 pub mod edit;
-mod enter_plan;
+mod enter_mode;
 mod glob;
 pub(crate) mod grep;
 mod job_cancel;
@@ -22,6 +22,7 @@ pub mod web_gate;
 pub(crate) mod write;
 mod yield_;
 
+use crate::context::{ModeDef, ModelEntry};
 use crate::jobs::JobsHandle;
 use crate::permissions::Access;
 use crate::plugin::host::PluginHost;
@@ -39,8 +40,8 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     pub wait_interrupt: Option<CancellationToken>,
     pub call_id: String,
-    /// Plan mode is on for this call. The agent owns the plan state and hands it in per call.
-    pub plan: bool,
+    /// The active mode, if one is on. The agent owns the mode state and hands it in per call.
+    pub mode: Option<ModeDef>,
 }
 
 /// The per-session state the tools share: the todo list, the session's ids and file, and its skills.
@@ -70,6 +71,11 @@ pub struct Tools {
     pub delegated: std::cell::RefCell<Vec<String>>,
     /// The model selectors of each custom agent, which a relayed task of that agent may use.
     pub agent_models: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>>,
+    /// Each mode's name, how the model may enter it, its description and whether it is read-only;
+    /// filled from the session's modes with the tool definitions.
+    pub mode_entry: std::cell::RefCell<Vec<(String, ModelEntry, String, bool)>>,
+    /// Each mode's exit tool and the mode it belongs to.
+    pub mode_tools: std::cell::RefCell<Vec<(String, String)>>,
     pub edit_store: omp_edit::EditStore,
     /// Each read this session (path with its selector) and the fingerprint and count of what it
     /// returned, for the repeated-read hint.
@@ -113,6 +119,8 @@ impl Tools {
             output_schema: Default::default(),
             delegated: Default::default(),
             agent_models: Default::default(),
+            mode_entry: Default::default(),
+            mode_tools: Default::default(),
             edit_store: omp_edit::EditStore::new(),
             repeats: Default::default(),
             permissions: Rc::default(),
@@ -212,18 +220,22 @@ impl Tools {
         ToolDef { name: "job_cancel".into(), description: job_cancel::DESCRIPTION.into(), schema: job_cancel::schema() }
     }
 
-    pub fn plan_def() -> ToolDef {
-        ToolDef { name: "propose_plan".into(), description: plan::DESCRIPTION.into(), schema: plan::schema() }
+    /// Offered outside a mode, for the modes the model may ask for (`modes`: name and description).
+    pub fn enter_mode_def(modes: &[(String, String)]) -> ToolDef {
+        enter_mode::def(modes)
     }
 
-    /// Offered outside plan mode, where the user can approve it.
-    pub fn enter_plan_def() -> ToolDef {
-        ToolDef { name: "enter_plan".into(), description: enter_plan::DESCRIPTION.into(), schema: enter_plan::schema() }
+    /// Whether `name` is the exit tool of some mode.
+    pub fn is_mode_tool(&self, name: &str) -> bool {
+        self.mode_tools.borrow().iter().any(|(t, _)| t == name)
     }
 
     /// How the permission gate judges a tool: a built-in's own declaration, a plugin's manifest, and
     /// anything else (an MCP tool, an unknown name) as one that may change things.
     pub(crate) fn access(&self, name: &str) -> Access {
+        if self.is_mode_tool(name) {
+            return Access::Read;
+        }
         match BUILTINS.iter().find(|b| b.name == name) {
             Some(b) => b.access,
             None => {
@@ -239,6 +251,12 @@ impl Tools {
         #[cfg(any(test, feature = "test-support"))]
         if self.panic_tool.get() && name == "__panic" {
             panic!("boom");
+        }
+        if let Some(m) = ctx.mode.as_ref().filter(|m| m.exit.tool == name) {
+            return match parse::<plan::Args>(name, args) {
+                Ok(a) => self.propose(a, ctx, m).await,
+                Err(e) => *e,
+            };
         }
         if let Some(b) = BUILTINS.iter().find(|b| b.name == name) {
             return (b.call)(self, args, ctx).await;
@@ -354,7 +372,7 @@ pub static BUILTINS: &[Builtin] = &[
                 json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
             )
         }),
-        call: dispatch!("write", async |t, a: write::Args, c| t.noted(a.paths(), t.write(a, c.plan))),
+        call: dispatch!("write", async |t, a: write::Args, c| t.noted(a.paths(), t.write(a, c.mode.as_ref()))),
     },
     Builtin {
         name: "edit",
@@ -369,7 +387,7 @@ pub static BUILTINS: &[Builtin] = &[
         }),
         call: dispatch!("edit", async |t, a: edit::Args, c| async {
             let paths = a.authored(t);
-            t.noted(paths, t.edit(a, c.plan)).await
+            t.noted(paths, t.edit(a, c.mode.as_ref().is_some_and(ModeDef::read_only))).await
         }),
     },
     Builtin {
@@ -417,18 +435,13 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| tool_def("ask", ask::description(), ask::schema())),
         call: dispatch!("ask", async |t, a: ask::Args, c| t.ask(a, c)),
     },
-    // Offered per session (plan mode, jobs, custom agents), so no static definition.
+    // Offered per session (modes, jobs, custom agents), so no static definition. A mode's exit tool
+    // is not here: `Tools::call` routes it by the active mode.
     Builtin {
-        name: "propose_plan",
+        name: "enter_mode",
         access: Access::Read,
         def: None,
-        call: dispatch!("propose_plan", async |t, a: plan::Args, c| t.propose_plan(a, c)),
-    },
-    Builtin {
-        name: "enter_plan",
-        access: Access::Read,
-        def: None,
-        call: dispatch!("enter_plan", |t, a: enter_plan::Args| t.enter_plan(a)),
+        call: dispatch!("enter_mode", |t, a: enter_mode::Args| t.enter_mode(a)),
     },
     Builtin {
         name: "task",
@@ -536,14 +549,14 @@ mod table_tests {
     fn one_table_drives_names_definitions_and_dispatch() {
         let names: Vec<String> = Tools::definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "todo", "ask"]);
-        assert!(is_builtin("task") && is_builtin("propose_plan") && is_builtin("wait"));
+        assert!(is_builtin("task") && is_builtin("enter_mode") && is_builtin("wait"));
+        assert!(!is_builtin("propose_plan"), "an exit tool belongs to a mode, not the table");
         assert!(!names.contains(&"wait".to_string()), "wait is session-only");
         assert!(!is_builtin("web_search"));
         // Every built-in dispatches (bad arguments are an argument error, never "Unknown tool").
         let t = Tools::for_test();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx =
-            ToolCtx { events, cancel: Default::default(), wait_interrupt: None, call_id: "c".into(), plan: false };
+        let ctx = ToolCtx { events, cancel: Default::default(), wait_interrupt: None, call_id: "c".into(), mode: None };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         for b in BUILTINS {
             let out = rt.block_on(t.call(b.name, &json!({"__nonsense": true}), &ctx));

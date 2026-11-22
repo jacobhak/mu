@@ -7,7 +7,7 @@ A role is a name for a model, set in mu's own `models.toml` (see [below](#models
 | Role | Used for | When unset |
 |---|---|---|
 | `default` | The model a session starts with; the keep-this-model choice when you approve a plan | mu picks a model itself |
-| `plan` | Plan mode | `@default` |
+| `plan` | The built-in plan mode's `model: "@plan"` ([Modes](modes.md)) | the session keeps its model |
 | `task` | `task` subagents (they can edit and run commands), and agents whose `model:` names nothing you have set | `@default` |
 | `scout` | `scout` subagents: read-only research, plan-mode research, the `/review` scouts | `@smol`, then `@default` |
 | `review` | The `/review` lead (its scouts run on `@scout`) | `@plan`, then `@default` |
@@ -51,7 +51,7 @@ max_tokens = 65536
 
 Every role lives in a **set**: a complete role list, usually one per provider. With one set (`main` by default) you never see sets. A role a set leaves out falls back along the chain in the table above, within that set. The active set is `set` if it names one; otherwise the only set, else `main`, else the first by name (and the file warns at startup when `set` is missing or wrong with several sets). `[roles.<name>]` is not part of a set: a custom role's `description`, `fallback` and `delegate` belong to the role in every set, while the model it points at is per set.
 
-`/modelset` switches sets: bare it lists them, `/modelset <name>` makes one active for this profile (new sessions and subagents follow, and the current session moves to the set's `@default`, or `@plan` in plan mode). `/modelset new <name>` copies the active set and switches to it, `delete`, `rename`, and `import` complete it. `/model` edits roles in the active set.
+`/modelset` switches sets: bare it lists them, `/modelset <name>` makes one active for this profile (new sessions and subagents follow, and the current session moves to the set's `@default`, or the active mode's model). `/modelset new <name>` copies the active set and switches to it, `delete`, `rename`, and `import` complete it. `/model` edits roles in the active set.
 
 ### Importing omp's config
 

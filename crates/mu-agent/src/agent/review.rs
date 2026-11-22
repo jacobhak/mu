@@ -1,5 +1,6 @@
 use super::*;
 use crate::review;
+use mu_base::events::{ActionChoice, ActionInput, ActionSpec, ReviewRequest};
 use mu_base::git::short_sha;
 
 /// What `/review` covers: the snapshots compared, the review model and its totals, and the request.
@@ -20,7 +21,22 @@ fn ask_option(label: String, description: Option<String>) -> mu_base::events::As
     mu_base::events::AskOption { label, description, preview: None, kind: None }
 }
 
+fn action(id: &str, label: String, input: ActionInput, approves: bool) -> ActionSpec {
+    ActionSpec { id: id.into(), label, disabled: false, input, keeps_context: false, approves }
+}
+
 impl Agent {
+    /// The shared document dialog; a cancel or a closed dialog is `None`.
+    async fn review_dialog(&self, req: ReviewRequest, cancel: &CancellationToken) -> Option<ActionChoice> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.emit(AgentEvent::Review { request: req, reply: tx });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            r = rx => r.ok(),
+        }
+    }
+
     /// One single-answer question to the user; a cancel or a closed dialog is `Cancelled`.
     async fn review_ask(&self, q: mu_base::events::AskQuestion, cancel: &CancellationToken) -> mu_base::events::Answer {
         use mu_base::events::Answer;
@@ -74,7 +90,8 @@ impl Agent {
         if let Err(e) = self.write_local_file(&report_uri, &md) {
             self.error(format!("cannot save the review to {report_uri}: {e}"));
         }
-        self.emit(AgentEvent::ToolEnd { id: "review".into(), name: "review".into(), output: ToolOutput::ok(md) });
+        let output = ToolOutput::ok(md.clone());
+        self.emit(AgentEvent::ToolEnd { id: "review".into(), name: "review".into(), output });
         let plan_uri = scope.plan_uri.as_deref();
         let Some(report) = report else {
             return self.ask_unstructured(&out.text, plan_uri, &report_uri, cancel).await;
@@ -83,7 +100,7 @@ impl Agent {
             self.notice("review: no findings");
             return None;
         }
-        self.pick_findings(&report, plan_uri, &report_uri, cancel).await
+        self.pick_findings(&report, &md, plan_uri, &report_uri, cancel).await
     }
 
     /// The changes `/review` covers. `None`, after a notice, when there is nothing to review.
@@ -246,24 +263,24 @@ impl Agent {
         report_uri: &str,
         cancel: &CancellationToken,
     ) -> Option<String> {
-        use mu_base::events::{Answer, AskQuestion};
-        let q = AskQuestion {
-            question: "The reviewer returned an unstructured report.".into(),
-            context: None,
-            header: Some("Review".into()),
-            options: vec![
-                ask_option("Send report to the implementer".into(), None),
-                ask_option("Dismiss".into(), None),
+        let req = ReviewRequest {
+            header: "Review".into(),
+            title: "unstructured report".into(),
+            uri: Some(report_uri.to_string()),
+            file: None,
+            content: text.to_string(),
+            note: None,
+            actions: vec![
+                action("send", "Send report to the implementer".into(), ActionInput::None, true),
+                action("dismiss", "Dismiss".into(), ActionInput::None, false),
             ],
-            multi: false,
-            recommended: Some(1),
-            confirm: false,
-            skippable: false,
+            default: 1,
+            models: false,
+            cancel_turn: false,
+            cancel_notice: "review dismissed".into(),
         };
-        match self.review_ask(q, cancel).await {
-            Answer::Options(o) | Answer::Noted { picks: o, .. } if o.first().is_some_and(|l| l.starts_with("Send")) => {
-                Some(review::report::raw_message(text, plan_uri, report_uri))
-            }
+        match self.review_dialog(req, cancel).await {
+            Some(c) if c.id == "send" => Some(review::report::raw_message(text, plan_uri, report_uri)),
             _ => None,
         }
     }
@@ -272,6 +289,7 @@ impl Agent {
     async fn pick_findings(
         &mut self,
         report: &review::report::Report,
+        md: &str,
         plan_uri: Option<&str>,
         report_uri: &str,
         cancel: &CancellationToken,
@@ -280,80 +298,74 @@ impl Agent {
         let all = &report.findings;
         let blocking: Vec<usize> = (0..all.len()).filter(|&i| review::report::is_blocking(&all[i])).collect();
         let (n, m) = (blocking.len(), all.len());
-        let mut options = Vec::new();
+        let mut actions = Vec::new();
         if n > 0 {
-            options.push(ask_option(format!("Send {n} blocking findings"), None));
+            actions.push(action("blocking", format!("Send {n} blocking findings"), ActionInput::Optional, true));
         }
         if m > n {
-            options.push(ask_option(format!("Send all {m} findings"), None));
+            actions.push(action("all", format!("Send all {m} findings"), ActionInput::Optional, true));
         }
-        options.push(ask_option("Choose findings…".into(), None));
-        options.push(ask_option("Dismiss".into(), None));
-        let recommended = if n > 0 { 0 } else { options.len() - 1 };
-        let q = AskQuestion {
-            question: "Send findings to the implementer?".into(),
-            context: None,
-            header: Some("Review".into()),
-            options,
-            multi: false,
-            recommended: Some(recommended),
-            confirm: false,
-            skippable: false,
+        actions.push(action("choose", "Choose findings…".into(), ActionInput::Optional, false));
+        actions.push(action("dismiss", "Dismiss".into(), ActionInput::None, false));
+        let default = if n > 0 { 0 } else { actions.len() - 1 };
+        let req = ReviewRequest {
+            header: "Review".into(),
+            title: format!("{m} findings, {n} blocking"),
+            uri: Some(report_uri.to_string()),
+            file: None,
+            content: md.to_string(),
+            note: None,
+            actions,
+            default,
+            models: false,
+            cancel_turn: false,
+            cancel_notice: "review dismissed".into(),
         };
-        let default_set = if n > 0 { blocking.clone() } else { (0..m).collect() };
-        let (answer, typed) = match self.review_ask(q, cancel).await {
-            Answer::Noted { picks, note } => (Answer::Options(picks), Some(note)),
-            a => (a, None),
+        let choice = self.review_dialog(req, cancel).await?;
+        let dialog_note = choice.text.filter(|t| !t.trim().is_empty());
+        let (chosen, typed): (Vec<usize>, Option<String>) = match choice.id.as_str() {
+            "all" => ((0..m).collect(), None),
+            "blocking" => (blocking.clone(), None),
+            "choose" => {
+                let options = all
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let first = f.body.lines().next().unwrap_or("");
+                        let at = match f.line {
+                            Some(l) => format!("{}:{l}", f.file),
+                            None => f.file.clone(),
+                        };
+                        let label = format!("{}. [P{}] {}", i + 1, f.priority, f.title);
+                        ask_option(label, Some(format!("{at} — {first}")))
+                    })
+                    .collect();
+                let q = AskQuestion {
+                    question: "Which findings should be sent?".into(),
+                    context: None,
+                    header: Some("Review".into()),
+                    options,
+                    multi: true,
+                    recommended: None,
+                    confirm: false,
+                    skippable: false,
+                };
+                let (sel, typed) = match self.review_ask(q, cancel).await {
+                    Answer::Options(sel) => (sel, None),
+                    Answer::Noted { picks, note } => (picks, Some(note)),
+                    _ => (Vec::new(), None),
+                };
+                let idx = sel
+                    .iter()
+                    .filter_map(|l| l.split('.').next()?.trim().parse::<usize>().ok())
+                    .filter(|i| (1..=m).contains(i))
+                    .map(|i| i - 1)
+                    .collect::<std::collections::BTreeSet<_>>();
+                (idx.into_iter().collect(), typed)
+            }
+            _ => (Vec::new(), None),
         };
-        let (chosen, note): (Vec<usize>, Option<String>) = match answer {
-            Answer::Options(o) => match o.first().map(String::as_str) {
-                Some(l) if l.starts_with("Send all") => ((0..m).collect(), None),
-                Some(l) if l.starts_with("Send ") => (blocking.clone(), None),
-                Some(l) if l.starts_with("Choose") => {
-                    let options = all
-                        .iter()
-                        .enumerate()
-                        .map(|(i, f)| {
-                            let first = f.body.lines().next().unwrap_or("");
-                            let at = match f.line {
-                                Some(l) => format!("{}:{l}", f.file),
-                                None => f.file.clone(),
-                            };
-                            ask_option(
-                                format!("{}. [P{}] {}", i + 1, f.priority, f.title),
-                                Some(format!("{at} — {first}")),
-                            )
-                        })
-                        .collect();
-                    let q = AskQuestion {
-                        question: "Which findings should be sent?".into(),
-                        context: None,
-                        header: Some("Review".into()),
-                        options,
-                        multi: true,
-                        recommended: None,
-                        confirm: false,
-                        skippable: false,
-                    };
-                    let (sel, typed) = match self.review_ask(q, cancel).await {
-                        Answer::Options(sel) => (sel, None),
-                        Answer::Noted { picks, note } => (picks, Some(note)),
-                        _ => (Vec::new(), None),
-                    };
-                    let idx = sel
-                        .iter()
-                        .filter_map(|l| l.split('.').next()?.trim().parse::<usize>().ok())
-                        .filter(|i| (1..=m).contains(i))
-                        .map(|i| i - 1)
-                        .collect::<std::collections::BTreeSet<_>>();
-                    (idx.into_iter().collect(), typed)
-                }
-                _ => (Vec::new(), None),
-            },
-            Answer::Custom(t) => (default_set, Some(t)),
-            Answer::Cancelled | Answer::Skipped | Answer::Noted { .. } => (Vec::new(), None),
-        };
-        let note = note.or(typed);
+        let note = dialog_note.or(typed);
         if chosen.is_empty() {
             return None;
         }
@@ -491,7 +503,6 @@ mod tests {
     #[test]
     fn input_typed_during_the_review_goes_back_before_the_fix_turn() {
         use crate::testing::assistant;
-        use mu_base::events::Answer;
         use mu_base::message::{Block, StopReason};
         run(async {
             let dir = git_repo();
@@ -510,8 +521,8 @@ mod tests {
                 while ends < 2 {
                     let Some(e) = rx.recv().await else { break };
                     match e {
-                        AgentEvent::Ask { reply, .. } => {
-                            let _ = reply.send(Some(vec![Answer::Options(vec!["Send 1 blocking findings".into()])]));
+                        AgentEvent::Review { reply, .. } => {
+                            let _ = reply.send(ActionChoice { id: "blocking".into(), text: None, model: None });
                         }
                         e => {
                             ends += usize::from(matches!(e, AgentEvent::TurnEnd { .. }));
@@ -526,6 +537,49 @@ mod tests {
             let fix_start = ev.iter().rposition(|e| matches!(e, AgentEvent::TurnStart)).unwrap();
             assert!(dropped.is_some_and(|d| first_end < d && d < fix_start), "returned between the two turns");
             assert!(!ev.iter().any(|e| matches!(e, AgentEvent::UserPrompt(t) if t == "typed")));
+        });
+    }
+
+    #[test]
+    fn sending_all_findings_carries_the_dialog_note_into_the_fix_message() {
+        use crate::testing::assistant;
+        use mu_base::message::{Block, StopReason};
+        run(async {
+            let dir = git_repo();
+            std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+            let child = dir.join("fake-mu");
+            let result = r#"{"type":"result","isError":false,"text":"","data":{"verdict":"fail","summary":"s","findings":[{"title":"t","body":"b","file":"a.txt","priority":1,"confidence":1},{"title":"u","body":"c","file":"a.txt","priority":3,"confidence":1}]}}"#;
+            std::fs::write(&child, format!("#!/bin/sh\nIFS= read -r line\necho '{result}'\n")).unwrap();
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let fixed = Ok(assistant(vec![Block::text("fixed")], StopReason::Stop));
+            let (mut a, mut rx) = agent_in(vec![fixed], Configs::default(), RunConfig::default(), dir.clone());
+            a.review_child = Some(child);
+            let mut ev = Vec::new();
+            let answer = async {
+                let mut ends = 0;
+                while ends < 2 {
+                    let Some(e) = rx.recv().await else { break };
+                    match e {
+                        AgentEvent::Review { request, reply } => {
+                            assert!(request.actions.iter().any(|x| x.id == "all"), "{:?}", request.actions);
+                            let text = Some("focus on API".to_string());
+                            let _ = reply.send(ActionChoice { id: "all".into(), text, model: None });
+                        }
+                        e => {
+                            ends += usize::from(matches!(e, AgentEvent::TurnEnd { .. }));
+                            ev.push(e);
+                        }
+                    }
+                }
+            };
+            tokio::join!(review_cmd(&mut a), answer);
+            let fix = ev.iter().find_map(|e| match e {
+                AgentEvent::UserPrompt(t) => Some(t.clone()),
+                _ => None,
+            });
+            let fix = fix.expect("a fix message is sent");
+            assert!(fix.contains("User note: focus on API"), "{fix}");
+            assert!(fix.contains("1. [P1] t") && fix.contains("2. [P3] u"), "{fix}");
         });
     }
 }
