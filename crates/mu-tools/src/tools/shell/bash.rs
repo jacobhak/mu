@@ -1014,29 +1014,49 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn output_keeps_draining_while_a_cancelled_background_run_is_terminated() {
+        // SIGKILL is held far off and the command ignores SIGTERM, so the run cannot end here: what
+        // it can do is keep reading. The command says when it gets the SIGTERM; seeing that, the
+        // test lets the command leave. A loop that waited out the termination would never read it.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                mu_base::process::set_term_grace_for_test(None);
+            }
+        }
+        mu_base::process::set_term_grace_for_test(Some(Duration::from_secs(300)));
+        let _reset = Reset;
+        let flag = std::env::temp_dir().join(format!("mu-drain-{}", uuid::Uuid::new_v4()));
+        let command =
+            format!("trap 'echo termed' TERM; while [ ! -e '{}' ]; do echo tick; sleep 0.02; done", flag.display());
         let cancel = CancellationToken::new();
-        let cancelled_at = std::cell::Cell::new(None);
-        let seen = std::cell::RefCell::new(Vec::new());
-        let canceller = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            cancelled_at.set(Some(Instant::now()));
-            cancel.cancel();
-        };
+        let termed = tokio::sync::Notify::new();
         let run = run_background(
-            "trap '' TERM; while :; do echo tick; sleep 0.02; done".into(),
+            command,
             std::env::temp_dir(),
             std::env::vars().collect(),
             None,
             cancel.clone(),
             || (0, std::env::temp_dir()),
-            |_| seen.borrow_mut().push(Instant::now()),
+            |s| {
+                if s.contains("termed") {
+                    let _ = std::fs::write(&flag, "");
+                    termed.notify_one();
+                } else {
+                    cancel.cancel();
+                }
+            },
         );
-        let (r, ()) = tokio::join!(run, canceller);
-        assert!(!r.ok);
-        let t0 = cancelled_at.get().unwrap();
-        let (from, to) = (t0 + Duration::from_millis(50), t0 + Duration::from_millis(180));
-        let during_grace = seen.borrow().iter().filter(|t| **t > from && **t < to).count();
-        assert!(during_grace > 0, "no output was read during the SIGTERM grace");
+        tokio::pin!(run);
+        // The timeout only turns a hang into a failure; a pass does not depend on how fast it comes.
+        let seen = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::select! {
+                r = &mut run => panic!("ended before the SIGTERM was read: {}", r.text),
+                () = termed.notified() => {}
+            }
+        })
+        .await;
+        let _ = std::fs::remove_file(&flag);
+        assert!(seen.is_ok(), "no output was read while the SIGTERM grace was pending");
     }
 
     #[tokio::test(flavor = "current_thread")]

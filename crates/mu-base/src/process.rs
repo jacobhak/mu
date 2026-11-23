@@ -4,6 +4,18 @@ use std::time::Duration;
 
 /// Time between SIGTERM and SIGKILL.
 pub(crate) const TERM_GRACE: Duration = Duration::from_millis(200);
+
+thread_local! {
+    static TERM_GRACE_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test seam: `terminate_group` calls on this thread wait `grace` instead of `TERM_GRACE`, so a test
+/// can hold the SIGTERM-to-SIGKILL window open without racing it. `None` restores the default.
+#[doc(hidden)]
+pub fn set_term_grace_for_test(grace: Option<Duration>) {
+    TERM_GRACE_OVERRIDE.with(|g| g.set(grace));
+}
+
 /// How long a command's leftover children may keep its stdout open after it exits.
 const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
 
@@ -53,7 +65,7 @@ pub async fn terminate_group(pgid: i32) {
         return;
     }
     kill_group(pgid, libc::SIGTERM);
-    tokio::time::sleep(TERM_GRACE).await;
+    tokio::time::sleep(TERM_GRACE_OVERRIDE.with(std::cell::Cell::get).unwrap_or(TERM_GRACE)).await;
     // ESRCH if the group is already gone is fine.
     kill_group(pgid, libc::SIGKILL);
 }
