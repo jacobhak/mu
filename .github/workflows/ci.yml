@@ -8,6 +8,8 @@ permissions:
 jobs:
   check:
     runs-on: arc-mu
+    # A hung step otherwise holds the runner for GitHub's 6 h default.
+    timeout-minutes: 60
     env:
       # This runner reserves 2 cores; cargo would otherwise use every core it can see.
       CARGO_BUILD_JOBS: 2
@@ -26,6 +28,7 @@ jobs:
     # The same checks on arm64, and the arm64 half of offload's base image. Main only.
     if: github.event_name == 'push' && vars.OFFLOAD_REGISTRY != ''
     runs-on: arc-mu-arm64
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 4
     steps:
@@ -41,6 +44,7 @@ jobs:
     needs: [check, check-arm64]
     if: ${{ !cancelled() && github.event_name == 'push' && vars.OFFLOAD_REGISTRY != '' }}
     runs-on: arc-mu
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - run: scripts/publish-offload-base.sh index
@@ -52,6 +56,7 @@ jobs:
     # A JIT-provisioned runner carries only the labels it was created with, so
     # there is no implicit self-hosted or macOS label to match on.
     runs-on: mu-ci
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add rustfmt clippy
