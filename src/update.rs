@@ -158,6 +158,14 @@ fn gh(args: &[&str]) -> Option<String> {
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
+/// Latest release tag, for `mu update --force` on a dev build (whose sha cannot be compared).
+fn latest_tag() -> Option<String> {
+    match api(&format!("repos/{REPO}/releases/latest")) {
+        Api::Ok(v) => v["tag_name"].as_str().filter(|t| !t.is_empty()).map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Queries GitHub. Blocking; call from a thread or before the runtime starts.
 pub fn check() -> Status {
     let sha = installed_sha();
@@ -262,6 +270,10 @@ pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
     let target = match (&tag, &st) {
         (Some(t), _) => t.clone(),
         (None, Status::Available { tag, .. }) => tag.clone(),
+        // A dev build's sha cannot be classified against releases, so --force resolves the tag here.
+        (None, Status::Dev { .. }) if force => {
+            latest_tag().ok_or_else(|| anyhow::anyhow!("not updating: could not resolve the latest release tag"))?
+        }
         _ => bail!("not updating: no release tag to install"),
     };
     let url = format!("https://raw.githubusercontent.com/{REPO}/{target}/scripts/install.sh");
