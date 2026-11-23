@@ -260,7 +260,8 @@ fn stop_during_a_tool_lets_it_finish_and_skips_the_next() {
     run(async {
         let started_dir = mu_testutil::tmp();
         let started = started_dir.join("started");
-        let command = format!("touch {}; sleep 1", started.display());
+        let release = started_dir.join("release");
+        let command = format!("touch {}; while [ ! -f {} ]; do sleep 0.02; done", started.display(), release.display());
         let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![
             Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse)),
@@ -271,6 +272,7 @@ fn stop_during_a_tool_lets_it_finish_and_skips_the_next() {
         tokio::task::spawn_local(async move {
             mu_testutil::wait_until("the tool to start", || started.exists()).await;
             inbox.borrow_mut().stop = true;
+            std::fs::write(&release, "").unwrap();
         });
         a.turn(Some("go".to_string().into())).await;
         assert!(mu_base::message::check_tool_pairs(&a.messages.to_vec()).is_ok());
@@ -305,7 +307,7 @@ fn stop_plus_cancel_is_an_abort_and_stays_paired() {
     run(async {
         let started_dir = mu_testutil::tmp();
         let started = started_dir.join("started");
-        let command = format!("touch {}; sleep 5", started.display());
+        let command = format!("touch {}; sleep 600", started.display());
         let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![Ok(assistant(vec![sleep, call("t2", "__panic")], StopReason::ToolUse))];
         let (mut a, mut rx) = agent(script);
@@ -345,7 +347,7 @@ fn kill_jobs_is_handled_mid_turn_and_other_commands_queue() {
             live,
             perms: Rc::default(),
         };
-        drive(tokio::time::sleep(std::time::Duration::from_millis(50)), &mut q).await;
+        drive(crate::testing::long_turn(), &mut q).await;
         assert!(matches!(erx.try_recv(), Ok(AgentEvent::Notice(m)) if m.contains("killed")));
         assert_eq!(q.backlog.len(), 1);
         assert!(matches!(q.backlog.pop_front(), Some(Command::NewSession)));
@@ -856,7 +858,8 @@ fn a_message_during_a_turn_joins_that_turn() {
     run(async {
         let started_dir = mu_testutil::tmp();
         let started = started_dir.join("started");
-        let command = format!("touch {}; sleep 0.3", started.display());
+        let release = started_dir.join("release");
+        let command = format!("touch {}; while [ ! -f {} ]; do sleep 0.02; done", started.display(), release.display());
         let sleep = Block::ToolCall { id: "t1".into(), name: "bash".into(), arguments: json!({"command": command}) };
         let script = vec![
             Ok(assistant(vec![sleep], StopReason::ToolUse)),
@@ -868,6 +871,7 @@ fn a_message_during_a_turn_joins_that_turn() {
         tokio::task::spawn_local(async move {
             mu_testutil::wait_until("the tool to start", || started.exists()).await;
             enqueue(&id, "steward", "also HELLO").unwrap();
+            std::fs::write(&release, "").unwrap();
         });
         a.turn(Some("go".to_string().into())).await;
         assert!(a.ports.providers.scripted.borrow().is_empty(), "two requests in one turn");

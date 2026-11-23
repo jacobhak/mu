@@ -91,8 +91,14 @@ impl Agent {
             })
         };
         let mut child = command.spawn().unwrap();
-        let mut first = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (line, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut first = String::new();
+            let read = BufReader::new(stdout).read_line(&mut first);
+            let _ = line.send(read.map(|_| first));
+        });
+        let first = got.recv_timeout(Duration::from_secs(60)).expect("the agent printed no first line").unwrap();
         let v: Value = serde_json::from_str(&first).unwrap_or_else(|e| panic!("first line {first:?}: {e}"));
         Agent {
             socket: PathBuf::from(v["socket"].as_str().unwrap()),
@@ -574,6 +580,12 @@ fn pid_of(home: &Path, id: &str) -> Pid {
     Pid(rec["pid"].as_u64().unwrap() as i32)
 }
 
+/// The `waiting` flag read from the agent's owner record: no process to spawn, so no scheduling window.
+fn waiting_flag(home: &Path, id: &str) -> bool {
+    let text = std::fs::read_to_string(home.join("run").join(format!("{id}.json"))).unwrap();
+    serde_json::from_str::<Value>(&text).unwrap()["waiting"] == true
+}
+
 fn agent_list(home: &Path, cwd: &Path) -> Vec<Value> {
     let o = mu(home, cwd).args(["agent", "list", "--json"]).output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -581,7 +593,7 @@ fn agent_list(home: &Path, cwd: &Path) -> Vec<Value> {
 }
 
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    for _ in 0..300 {
+    for _ in 0..600 {
         if done() {
             return;
         }
@@ -713,22 +725,24 @@ fn an_approval_nobody_attends_is_flagged_announced_and_given_up_after_the_timeou
     let home = home_with_key(&tool_model(json!({"command": "echo x > made-by-the-test"})));
     let cwd = mu_testutil::tmp();
     let notified = home.join("notified");
-    let config = format!("[agent]\nnotify_command = 'echo \"$1|$2\" > {}'\napproval_timeout = 3\n", notified.display());
+    let config =
+        format!("[agent]\nnotify_command = 'echo \"$1|$2\" > {}'\napproval_timeout = 10\n", notified.display());
     let agent = ask_mode_agent(&home, &cwd, &config);
     let mut c = Client::connect(&agent.socket);
     c.hello();
     c.until(caught_up);
     c.command(AgentCommand::Prompt("go".into()));
     c.until(|v| v["event"].get("Approve").is_some());
-    assert!(agent_list(&home, &cwd)[0]["waiting"] == false, "a client is attached and sees it");
+    assert!(!waiting_flag(&home, &agent.session), "a client is attached and sees it");
     c.send(&ClientLine::Detach);
 
-    wait_until("the waiting flag", || agent_list(&home, &cwd)[0]["waiting"] == true);
+    // The notify command runs when the unattended clock starts, so the flag is up for the whole timeout.
     wait_until("the notify command", || notified.exists() && !std::fs::read_to_string(&notified).unwrap().is_empty());
+    wait_until("the waiting flag", || waiting_flag(&home, &agent.session));
     let said = std::fs::read_to_string(&notified).unwrap();
     assert!(said.starts_with(&format!("{}|approval: ", agent.session)), "{said}");
 
-    wait_until("the timeout", || agent_list(&home, &cwd)[0]["waiting"] == false);
+    wait_until("the timeout", || !waiting_flag(&home, &agent.session));
     assert!(!cwd.join("made-by-the-test").exists(), "an approval that timed out does not run the call");
     let mut late = Client::connect(&agent.socket);
     late.hello();
@@ -839,9 +853,15 @@ impl Term {
     /// Types into the composer once the UI is drawn, then presses Enter.
     fn command(&mut self, line: &str) {
         self.wait_for("type here");
-        self.send(line);
-        std::thread::sleep(Duration::from_millis(300));
+        self.type_and_wait(line);
         self.send("\r");
+    }
+
+    /// Types `text` and waits for one more echo of it, so Enter cannot outrun the composer.
+    fn type_and_wait(&mut self, text: &str) {
+        let before = self.text().matches(text).count();
+        self.send(text);
+        wait_until("the composer to echo the typed text", || self.text().matches(text).count() > before);
     }
 
     fn send(&mut self, bytes: &str) {
@@ -1265,8 +1285,7 @@ fn a_session_source_lists_rows_that_open_by_their_attach_command_or_show_their_h
     wait_until("the nested client to attach", || far.client_host().is_some());
     // The nested UI draws its own composer after the outer one's.
     wait_until("the nested UI", || term.text().matches("type here").count() >= 2);
-    term.send("/detach");
-    std::thread::sleep(Duration::from_millis(300));
+    term.type_and_wait("/detach");
     term.send("\r");
     term.wait_for("back from the attached session");
     wait_until("the nested client to leave", || far.client_host().is_none());

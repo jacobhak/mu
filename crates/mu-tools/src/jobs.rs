@@ -43,10 +43,16 @@ struct SinkInner {
     last: Cell<Option<Instant>>,
     /// A deferred update is already waiting.
     pending: Cell<bool>,
+    /// The throttle window; a field so tests need not race the real clock.
+    every: Duration,
 }
 
 impl OutputSink {
     fn new(id: String, cwd: PathBuf, events: EventTx, call: Option<String>) -> Self {
+        Self::with_every(id, cwd, events, call, OUTPUT_EVERY)
+    }
+
+    fn with_every(id: String, cwd: PathBuf, events: EventTx, call: Option<String>, every: Duration) -> Self {
         Self(Rc::new(SinkInner {
             id,
             cwd,
@@ -55,6 +61,7 @@ impl OutputSink {
             buf: RefCell::default(),
             last: Cell::new(None),
             pending: Cell::new(false),
+            every,
         }))
     }
 
@@ -85,10 +92,10 @@ impl OutputSink {
             return;
         }
         match i.last.get().map(|t| t.elapsed()) {
-            Some(since) if since < OUTPUT_EVERY => {
+            Some(since) if since < i.every => {
                 i.pending.set(true);
                 let me = self.clone();
-                let wait = OUTPUT_EVERY - since;
+                let wait = i.every - since;
                 tokio::task::spawn_local(async move {
                     tokio::time::sleep(wait).await;
                     me.0.pending.set(false);
@@ -1207,13 +1214,18 @@ pub(crate) mod tests {
     }
 
     fn sink() -> (OutputSink, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+        sink_every(OUTPUT_EVERY)
+    }
+
+    fn sink_every(every: Duration) -> (OutputSink, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
-        (OutputSink::new("bg_1".into(), PathBuf::from("/"), events, None), rx)
+        (OutputSink::with_every("bg_1".into(), PathBuf::from("/"), events, None, every), rx)
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn output_goes_out_at_once_then_throttled_and_never_unsent() {
-        let (sink, mut rx) = sink();
+        // A window no stall outlasts: the later chunks are held however slowly the test runs.
+        let (sink, mut rx) = sink_every(Duration::from_secs(3600));
         tokio::task::LocalSet::new()
             .run_until(async {
                 sink.push("one\n");
@@ -1223,12 +1235,30 @@ pub(crate) mod tests {
                 sink.push("two\n");
                 sink.push("three\n");
                 assert!(rx.try_recv().is_err(), "chunks inside the window wait");
-                tokio::time::sleep(OUTPUT_EVERY + Duration::from_millis(150)).await;
-                match rx.try_recv() {
-                    Ok(AgentEvent::JobOutput { tail, .. }) => assert_eq!(tail, "one\ntwo\nthree\n"),
-                    _ => panic!("the deferred update never came"),
-                }
-                assert!(rx.try_recv().is_err(), "one update covers both chunks");
+                assert!(sink.0.pending.get(), "one deferred update covers both chunks");
+            })
+            .await;
+
+        // A short window: whichever way the pushes fall, the last chunk goes out in the end.
+        let (sink, mut rx) = sink_every(Duration::from_millis(100));
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                sink.push("one\n");
+                sink.push("two\n");
+                sink.push("three\n");
+                let mut last = String::new();
+                tokio::time::timeout(Duration::from_secs(60), async {
+                    while !last.ends_with("three\n") {
+                        match rx.recv().await {
+                            Some(AgentEvent::JobOutput { tail, .. }) => last = tail,
+                            _ => panic!("no job output event"),
+                        }
+                    }
+                })
+                .await
+                .expect("the deferred update never came");
+                assert_eq!(last, "one\ntwo\nthree\n");
+                assert!(rx.try_recv().is_err(), "nothing is left unsent or sent twice");
             })
             .await;
     }

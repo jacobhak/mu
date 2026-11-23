@@ -34,7 +34,7 @@ fn steer_and_follow_up_sent_mid_turn_are_reported_when_it_ends() {
         tx.send(Command::FollowUp("f".into())).unwrap();
         let mut q = queue(rx, &inbox, etx);
         // The turn outlives the queued commands, so `drive` reads them while it runs.
-        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        drive(crate::testing::long_turn(), &mut q).await;
         assert!(inbox.borrow().steer.is_empty() && inbox.borrow().follow_up.is_empty());
         let evs = drain(&mut erx);
         assert!(
@@ -145,7 +145,7 @@ fn refresh_status_waits_in_the_backlog_during_a_turn() {
         let inbox = new_inbox();
         let mut q = queue(rx, &inbox, events);
         tx.send(Command::RefreshStatus).unwrap();
-        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        drive(crate::testing::long_turn(), &mut q).await;
         assert!(matches!(q.backlog.pop_front(), Some(Command::RefreshStatus)));
     });
 }
@@ -158,7 +158,7 @@ fn compact_waits_in_the_backlog_during_a_turn() {
         let inbox = new_inbox();
         let mut q = queue(rx, &inbox, events);
         tx.send(Command::Compact(Some("focus".into()))).unwrap();
-        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        drive(crate::testing::long_turn(), &mut q).await;
         assert!(matches!(q.backlog.pop_front(), Some(Command::Compact(Some(f))) if f == "focus"));
     });
 }
@@ -173,7 +173,7 @@ fn cancel_drops_a_queued_compact_but_keeps_other_backlog() {
         tx.send(Command::Compact(None)).unwrap();
         tx.send(Command::RefreshStatus).unwrap();
         tx.send(Command::Cancel).unwrap();
-        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        drive(crate::testing::long_turn(), &mut q).await;
         assert!(matches!(q.backlog.pop_front(), Some(Command::RefreshStatus)));
         assert!(q.backlog.is_empty());
         assert!(inbox.borrow().cancel.is_cancelled());
@@ -261,7 +261,7 @@ fn stop_sets_the_flag_for_the_next_boundary() {
         let inbox = new_inbox();
         tx.send(Command::Stop).unwrap();
         let mut q = queue(rx, &inbox, etx);
-        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        drive(crate::testing::long_turn(), &mut q).await;
         assert!(inbox.borrow().stop);
     });
 }
@@ -276,7 +276,7 @@ fn pop_queue_takes_the_newest_steer_and_reports_the_rest() {
         tx.send(Command::FollowUp("f".into())).unwrap();
         tx.send(Command::PopQueue).unwrap();
         let mut q = queue(rx, &inbox, etx);
-        drive(tokio::time::sleep(Duration::from_millis(20)), &mut q).await;
+        drive(crate::testing::long_turn(), &mut q).await;
         let evs = drain(&mut erx);
         assert!(evs.iter().any(|e| matches!(e, AgentEvent::QueuePopped(p) if p.text == "s")));
         assert!(evs.iter().any(|e| matches!(e, AgentEvent::QueuedDropped(d) if texts(d) == ["f"])));

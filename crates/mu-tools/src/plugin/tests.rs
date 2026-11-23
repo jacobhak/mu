@@ -60,11 +60,12 @@ done
 #[test]
 fn a_cancelled_call_releases_its_bookkeeping() {
     run(async {
-        let (h, dir) = host("sleep 100", "session");
+        let (h, dir) = host("touch called; sleep 100", "session");
         let cancel = CancellationToken::new();
         let c = cancel.clone();
+        let called = dir.join("called");
         tokio::task::spawn_local(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            mu_testutil::wait_until("the call to reach the plugin", || called.exists()).await;
             c.cancel();
         });
         let r = h.call_tool("slow", &json!({}), &cancel).await;
@@ -407,8 +408,12 @@ fn mcp_cancel_sends_notifications_cancelled_and_shutdown_leaves_no_process_group
         slot.as_mcp().unwrap().set_tools(&hang, &mut taken, crate::tools::is_builtin);
         let cancel = CancellationToken::new();
         let c = cancel.clone();
+        let log = fx.dir.join("log");
         tokio::task::spawn_local(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            mu_testutil::wait_until("the call to reach the server", || {
+                std::fs::read_to_string(&log).is_ok_and(|l| l.contains(r#""name":"hang""#))
+            })
+            .await;
             c.cancel();
         });
         let r = h.call_tool("mcp__srv_hang", &json!({}), &cancel).await;

@@ -119,6 +119,14 @@ pub fn drain(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
     std::iter::from_fn(|| rx.try_recv().ok()).collect()
 }
 
+/// A stand-in turn that outlives any commands already queued: `drive` reads at least one command per
+/// poll of it, so 32 yields cover the few commands a test queues, whatever the wall clock does.
+pub async fn long_turn() {
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+}
+
 pub fn tmp_dir() -> PathBuf {
     let d = std::env::temp_dir().join(format!("mu-agent-plans-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&d).unwrap();

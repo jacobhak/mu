@@ -112,15 +112,20 @@ impl ShellWorker {
     #[cfg(test)]
     pub fn jam(&self, secs: u64) {
         let inner = self.inner();
-        let barrier = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+        let (started, rx) = std::sync::mpsc::channel();
         for _ in 0..WORKERS {
-            let b = barrier.clone();
+            let started = started.clone();
             inner.handle().spawn(async move {
-                b.wait();
+                let _ = started.send(());
                 std::thread::sleep(Duration::from_secs(secs));
             });
         }
-        barrier.wait();
+        // A sleeping task holds its thread, so each of the tasks lands on a different one; a thread
+        // busy with other work picks its task up when free. The wait is bounded so a lost task fails
+        // the test instead of hanging it.
+        for _ in 0..WORKERS {
+            rx.recv_timeout(Duration::from_secs(secs.max(30))).expect("every worker thread was jammed");
+        }
     }
 }
 
@@ -220,7 +225,10 @@ mod tests {
         let w = ShellWorker::default();
         run(&w, "X_FORK=a", 5000).join().await.unwrap();
         let started = std::env::temp_dir().join(format!("mu-worker-fork-{}", uuid::Uuid::new_v4()));
-        let mut busy = run(&w, &format!("X_FORK=b; touch {}; sleep 2", started.display()), 5000);
+        let release = started.with_extension("release");
+        let busy_cmd =
+            format!("X_FORK=b; touch {}; while [ ! -f {} ]; do sleep 0.02; done", started.display(), release.display());
+        let mut busy = run(&w, &busy_cmd, 60_000);
         mu_testutil::wait_until("the busy command to start", || started.exists()).await;
         let _ = std::fs::remove_file(&started);
         let opts = ShellRunOptions {
@@ -229,10 +237,12 @@ mod tests {
             ..Default::default()
         };
         let fork = w.spawn_fork(opts, None, CancelToken::new(Some(5000))).join().await.unwrap();
+        std::fs::write(&release, "").unwrap();
         assert_eq!(fork.exit_code, Some(0), "the fork saw the pre-command state");
         assert_eq!(busy.join().await.unwrap().exit_code, Some(0));
         let after = run(&w, "test \"$X_FORK\" = b", 5000).join().await.unwrap();
         assert_eq!(after.exit_code, Some(0), "the fork's change stayed in the fork");
+        let _ = std::fs::remove_file(&release);
     }
 
     /// The caller's thread keeps running while every thread of the shell is stuck; the call is given

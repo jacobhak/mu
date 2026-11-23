@@ -361,7 +361,12 @@ impl AgentView {
                                 let out = self.job_out.get(&r.name).map(String::as_str);
                                 blocks::bash_job_result(r, out, self.expanded, w)
                             }
-                            JobKind::Subagent => blocks::subagent_rows(std::slice::from_ref(r), ' ', |_| None),
+                            JobKind::Subagent => blocks::subagent_rows(
+                                std::slice::from_ref(r),
+                                std::time::SystemTime::now(),
+                                ' ',
+                                |_| None,
+                            ),
                         };
                         self.tr.commit(lines);
                     }
@@ -498,8 +503,10 @@ impl AgentView {
             out.extend(blocks::tool_streaming(&c.name, &c.args, spin, w));
         }
         for j in self.jobs.iter().filter(|j| j.state == SubagentState::Running) {
+            let now = std::time::SystemTime::now();
             let mut rows = blocks::job_rows(
                 std::slice::from_ref(j),
+                now,
                 spin,
                 |j| j.session.as_ref().and_then(|p| self.child_costs.get(p)).copied(),
                 !self.expanded,
@@ -509,7 +516,7 @@ impl AgentView {
             }
             out.extend(rows);
             if self.expanded {
-                out.extend(blocks::job_details(j, self.job_out.get(&j.name).map(String::as_str), w));
+                out.extend(blocks::job_details(j, now, self.job_out.get(&j.name).map(String::as_str), w));
             }
         }
         if self.compacting {
@@ -594,7 +601,7 @@ impl App {
 
     /// Shows a finished subagent's row with what its session cost (`None` when that is unknown).
     fn commit_subagent(&mut self, row: SubagentStatus, cost: Option<f64>) {
-        let lines = blocks::subagent_rows(std::slice::from_ref(&row), ' ', |_| cost);
+        let lines = blocks::subagent_rows(std::slice::from_ref(&row), std::time::SystemTime::now(), ' ', |_| cost);
         self.agent.tr.commit(lines);
     }
 
