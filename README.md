@@ -45,21 +45,13 @@ curl -fsSL https://raw.githubusercontent.com/jacobhak/mu/main/scripts/install.sh
 scripts/install.sh --from-source .            # build and install a checkout
 ```
 
-If the repo is private (or you install from a private fork), the public URLs return 404. `install.sh` and `mu update` then fall back to an authenticated `gh`; fetch the script itself with `gh api repos/jacobhak/mu/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' | bash`.
-
-The installer checks the tarball against the `SHA256SUMS` of the same release, which catches a bad download but not a replaced release. When `gh` is signed in and the release carries a GitHub build attestation (the release workflow makes one where the repo supports them: public repos, or GitHub Enterprise Cloud), it also verifies the attestation and refuses to install if that fails. Without an attestation it says so and relies on the checksum.
-
-This installs `mu` and its plugins under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Installing `--from-source` needs only a Rust toolchain. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `--from-source` asks git whether the tree has uncommitted changes and records the answer in `~/.mu/dev-build` (removed by any other install), because the version's `-dirty` suffix misses an unstaged edit. `mu --version` prints `mu 0.1.0 (<sha>) oh-my-pi crates <version>`.
+The installer verifies the download against the release's checksums and, where available, its build attestation. It puts `mu` and its plugins under `~/.mu` and links `~/.local/bin/mu`. If the repo is private, `install.sh` and `mu update` use an authenticated `gh`.
 
 Then start `mu` and run `/login` to add a key or sign in with ChatGPT (see Status above for which providers need what). For the gateway, install with `--with-omp` (`curl … | bash -s -- --with-omp`). Web search and fetch need no gateway, and MCP OAuth is done by mu itself (`/mcp login <name>`).
 
 ### Updating
 
-`mu update` installs the latest release by running the repo's `install.sh`. A dev build is also one that `~/.mu/dev-build` marks. `mu update --check` only reports; `--tag mu-YYYYMMDD-<sha7>` picks a release; `--force` replaces a dev build, which is otherwise refused. On startup the TUI checks for a newer release at most once a day (cached in `~/.mu/update-check`) and shows a notice; it stays silent when offline or on a dev build. Turn it off with `[update] check = false` in config.toml. Checks use the unauthenticated GitHub API (60 requests an hour), or `gh` when the repo is private.
-
-### Pinned oh-my-pi
-
-`upstream.toml` pins one oh-my-pi release: the Rust crates mu builds on (`tag = "v<ver>"` in `Cargo.toml`) and the omp CLI that `--with-omp` installs. Only the gateway plugin runs that CLI; mu itself runs no omp binary.
+`mu update` installs the latest release; `mu update --check` only reports. The TUI checks for a newer release once a day and shows a notice; turn that off with `[update] check = false` in config.toml.
 
 ### Manual build
 
@@ -70,13 +62,7 @@ mkdir -p ~/.mu/plugins
 for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
 ```
 
-Plugins are found in `~/.mu/plugins/*/plugin.toml`; their binaries (`mu-gateway`, `mu-web`, `mu-memory`, `mu-predict`, `mu-mcp-http`) are resolved next to the `mu` binary (the gateway's source and README are in [`plugins/gateway`](plugins/gateway/README.md)). `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` bypass the gateway plugin and point at a running gateway directly.
-
-### Syntax highlighting
-
-Fenced code is highlighted with tree-sitter for Rust, JSON, Bash, TOML, YAML, Python, JavaScript, TypeScript (and TSX), C, C++, CSS, Go, HTML, Java, regex, diff and Markdown. Markdown fences inject the other grammars.
-
-Grammars load on first use of that language (about 1-2 MB resident each); idle memory is unaffected.
+Plugins are found in `~/.mu/plugins/*/plugin.toml`, and their binaries are resolved next to the `mu` binary. The gateway's source is in [`plugins/gateway`](plugins/gateway/README.md).
 
 ## Documentation
 
@@ -86,13 +72,7 @@ Usage, configuration and the individual features are documented in [`docs/`](doc
 
 ### Tests
 
-`scripts/ci-checks.sh` runs everything CI does (fmt, shellcheck, cargo-deny, clippy, the tests); run it before pushing. `cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see [MCP servers](docs/mcp.md)). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction; it needs a gateway plugin, set with `MU_SMOKE_GATEWAY_PLUGIN`, default the `gateway` plugin installed under `~/.mu/plugins`); `scripts/smoke-native.sh` checks a native API-key provider offline against a loopback fake API; `scripts/measure-idle.sh target/release/mu` reports idle memory.
-
-`cargo test --workspace --locked -- --ignored contract_` runs the native, key-gated provider tests.
-
-### Debugging
-
-`MU_DUMP_REQUESTS=/path/file.jsonl` appends the shape of each model request (never its content); see [Providers](docs/providers.md#debugging).
+`scripts/ci-checks.sh` runs everything CI does (fmt, shellcheck, cargo-deny, clippy, the tests); run it before pushing. `scripts/smoke.sh` and `scripts/smoke-native.sh` are opt-in live end-to-end checks, and `scripts/measure-idle.sh target/release/mu` reports idle memory.
 
 ### Maintenance bot
 
