@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ships the current branch to origin/main: fetch, rebase, CI checks, push, install, remove the worktree.
+# Ships the current branch to origin/main: fetch, rebase, CI checks, push, close its open PR, install, remove the worktree.
 # Run from a worktree on a branch, or from the main checkout on main. Commit (and squash) first.
 # Usage: ship.sh [--no-install] [--keep] [--no-checks]
 set -euo pipefail
@@ -63,6 +63,19 @@ for attempt in 1 2 3; do
   say "push rejected (attempt $attempt)"
 done
 [ "$shipped" = 1 ] || die "gave up after 3 attempts"
+
+# The push puts new commits on main, so GitHub never sees the branch's own as merged and leaves its PR open.
+if [ "$branch" != main ] && command -v gh > /dev/null; then
+  pr="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number' 2> /dev/null || true)"
+  if [ -n "$pr" ]; then
+    if gh pr close "$pr" --comment "Shipped to main as $(git rev-parse --short origin/main) by scripts/ship.sh." > /dev/null 2>&1; then
+      say "closed PR #$pr"
+      git push --quiet origin --delete "$branch" > /dev/null 2>&1 || true
+    else
+      say "could not close PR #$pr; close it by hand"
+    fi
+  fi
+fi
 
 git fetch --quiet origin
 stale=0
