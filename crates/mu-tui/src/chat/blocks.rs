@@ -413,9 +413,9 @@ fn bash_box_at(
     frame_at(&Card { tone, title: None, sections, footer }, width)
 }
 
-/// How long a job has run, or ran, in seconds.
-fn job_secs(r: &SubagentStatus) -> f64 {
-    let end = r.ended.unwrap_or_else(std::time::SystemTime::now);
+/// How long a job has run, or ran, in seconds; a running one has run until `now`.
+fn job_secs(r: &SubagentStatus, now: std::time::SystemTime) -> f64 {
+    let end = r.ended.unwrap_or(now);
     end.duration_since(r.started).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
@@ -448,7 +448,7 @@ pub fn bash_job_result(r: &SubagentStatus, out: Option<&str>, expanded: bool, wi
     let args = serde_json::json!({ "command": r.task });
     let output: Vec<&str> = out.unwrap_or("").lines().collect();
     let tone = if r.state == SubagentState::Failed { Tone::Error } else { Tone::Success };
-    let mut footer = vec![Fact::Wall(job_secs(r))];
+    let mut footer = vec![Fact::Wall(job_secs(r, std::time::SystemTime::now()))];
     footer.extend(exit_fact(r.note.as_deref()));
     bash_box(&args, &output, expanded, tone, footer, width)
 }
@@ -707,13 +707,19 @@ pub fn pty_live(
 
 /// Subagent rows: state mark, name, tool count, cost and the last activity. `cost` says what a row's
 /// session has spent; none, or nothing yet, leaves the figure out (omp does the same).
-pub fn subagent_rows(rows: &[SubagentStatus], spin: char, cost: impl Fn(&SubagentStatus) -> Option<f64>) -> Vec<Line> {
-    job_rows(rows, spin, cost, true)
+pub fn subagent_rows(
+    rows: &[SubagentStatus],
+    now: std::time::SystemTime,
+    spin: char,
+    cost: impl Fn(&SubagentStatus) -> Option<f64>,
+) -> Vec<Line> {
+    job_rows(rows, now, spin, cost, true)
 }
 
 /// `subagent_rows`; `with_last: false` leaves the last activity out, for a caller that shows it in full below.
 pub fn job_rows(
     rows: &[SubagentStatus],
+    now: std::time::SystemTime,
     spin: char,
     cost: impl Fn(&SubagentStatus) -> Option<f64>,
     with_last: bool,
@@ -728,7 +734,7 @@ pub fn job_rows(
             let mut row = vec![span(format!("  {mark} "), style), span(r.name.clone(), ContentStyle::default())];
             match r.kind {
                 // A bash job runs one command: its row says how long it has run, not what it called.
-                JobKind::Bash => row.push(span(format!(" · {}", run_time(job_secs(r))), tfg(Role::Muted))),
+                JobKind::Bash => row.push(span(format!(" · {}", run_time(job_secs(r, now))), tfg(Role::Muted))),
                 JobKind::Subagent => {
                     if let Some(m) = r.model.as_deref() {
                         row.push(span(format!(" · {m}"), tfg(Role::Muted)));
@@ -764,7 +770,7 @@ const JOB_TAIL: usize = 8;
 
 /// Rows under a job's row when expanded: its whole task, agent, run time and directory, the full
 /// last activity and, for a bash job, the tail of its output. Long lines wrap, none is cut.
-pub fn job_details(r: &SubagentStatus, out: Option<&str>, width: usize) -> Vec<Line> {
+pub fn job_details(r: &SubagentStatus, now: std::time::SystemTime, out: Option<&str>, width: usize) -> Vec<Line> {
     let inner = width.saturating_sub(6);
     let mut rows = Vec::new();
     let mut row = |text: &str| {
@@ -775,7 +781,7 @@ pub fn job_details(r: &SubagentStatus, out: Option<&str>, width: usize) -> Vec<L
         }));
     };
     r.task.lines().filter(|t| !t.is_empty()).for_each(&mut row);
-    row(&format!("{} · {} · {}", r.agent, run_time(job_secs(r)), r.cwd.display()));
+    row(&format!("{} · {} · {}", r.agent, run_time(job_secs(r, now)), r.cwd.display()));
     if r.kind == JobKind::Subagent && !r.last.is_empty() {
         row(&format!("last: {}", r.last));
     }
@@ -889,7 +895,8 @@ mod tests {
             progress: None,
         };
         let out: String = (0..20).map(|i| format!("l{i}\n")).collect();
-        let text: Vec<String> = job_details(&r, Some(&out), 80).iter().map(text_of).collect();
+        let text: Vec<String> =
+            job_details(&r, std::time::SystemTime::now(), Some(&out), 80).iter().map(text_of).collect();
         assert!(text[0].contains("build it"));
         assert!(text[1].contains("/w"));
         assert_eq!(text.len(), 2 + JOB_TAIL);
@@ -901,7 +908,7 @@ mod tests {
     fn job_details_wrap_a_long_task_whole_and_every_task_line() {
         let mut r = bash_job(SubagentState::Running, 0.0);
         r.task = format!("cd /w && {}\nsecond line", "x".repeat(100));
-        let text: Vec<String> = job_details(&r, None, 40).iter().map(text_of).collect();
+        let text: Vec<String> = job_details(&r, fixed_now(), None, 40).iter().map(text_of).collect();
         assert!(
             text.iter().all(|l| l.starts_with("    │ ") && !l.contains('…') && l.chars().count() <= 40),
             "{text:?}"
@@ -910,7 +917,7 @@ mod tests {
             text.iter().take_while(|l| !l.contains("second")).map(|l| &l[l.find('│').unwrap() + 4..]).collect();
         assert_eq!(task, r.task.lines().next().unwrap());
         assert!(text.iter().any(|l| l.contains("second line")));
-        let row = |with_last| text_of(&job_rows(&[r.clone()], '⠋', |_| None, with_last)[0]);
+        let row = |with_last| text_of(&job_rows(&[r.clone()], fixed_now(), '⠋', |_| None, with_last)[0]);
         assert_eq!(row(false), "  ⠋ bg_1 · 0.0s");
     }
 
@@ -943,7 +950,7 @@ mod tests {
             changes: None,
             progress: None,
         };
-        let text = |cost: Option<f64>, state| text_of(&subagent_rows(&[row(state)], '⠋', |_| cost)[0]);
+        let text = |cost: Option<f64>, state| text_of(&subagent_rows(&[row(state)], fixed_now(), '⠋', |_| cost)[0]);
         assert_eq!(
             text(Some(0.123), SubagentState::Running),
             "  ⠋ scout-1 · scout · anthropic/haiku · 4 tools · $0.12 · read a.rs"
@@ -957,11 +964,16 @@ mod tests {
         assert_eq!(text(Some(0.0), SubagentState::Running), plain, "unpriced is not free: no `$0.00`");
     }
 
-    /// A `bash` job that has been running, or ran, for `secs` seconds.
+    /// The clock every row is rendered at: no real time passes between building a job and showing it.
+    fn fixed_now() -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)
+    }
+
+    /// A `bash` job that has been running, or ran, for `secs` seconds at `fixed_now`.
     fn bash_job(state: SubagentState, secs: f64) -> SubagentStatus {
         let elapsed = std::time::Duration::from_secs_f64(secs);
         let running = state == SubagentState::Running;
-        let now = std::time::SystemTime::now();
+        let now = fixed_now();
         let started = if running { now - elapsed } else { std::time::SystemTime::UNIX_EPOCH };
         let ended = (!running).then(|| started + elapsed);
         SubagentStatus {
@@ -997,12 +1009,12 @@ mod tests {
 
     #[test]
     fn a_bash_job_row_says_how_long_it_has_run() {
-        let row = |state, secs| text_of(&subagent_rows(&[bash_job(state, secs)], '⠋', |_| None)[0]);
+        let row = |state, secs| text_of(&subagent_rows(&[bash_job(state, secs)], fixed_now(), '⠋', |_| None)[0]);
         assert_eq!(row(SubagentState::Running, 0.0), "  ⠋ bg_1 · 0.0s · cargo build", "no tool count");
         assert_eq!(row(SubagentState::Running, 12.5), "  ⠋ bg_1 · 12.5s · cargo build");
         assert_eq!(row(SubagentState::Done, 3.4), "  ✓ bg_1 · 3.4s · cargo build");
         let long = bash_job(SubagentState::Done, 184.0);
-        assert_eq!(text_of(&subagent_rows(&[long], '⠋', |_| None)[0]), "  ✓ bg_1 · 3m04s · cargo build");
+        assert_eq!(text_of(&subagent_rows(&[long], fixed_now(), '⠋', |_| None)[0]), "  ✓ bg_1 · 3m04s · cargo build");
     }
 
     #[test]

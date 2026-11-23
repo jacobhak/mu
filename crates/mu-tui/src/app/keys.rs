@@ -1700,6 +1700,17 @@ pub(super) mod tests {
         }
     }
 
+    /// Carries the answers to the app until `done` holds; the deadline only bounds a failure.
+    async fn settle(app: &mut App, ui: &mut UnboundedReceiver<UiMsg>, what: &str, done: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done(app) {
+            assert!(std::time::Instant::now() < deadline, "never reached: {what}");
+            if let Ok(Some(m)) = tokio::time::timeout(std::time::Duration::from_millis(50), ui.recv()).await {
+                app.on_ui(m);
+            }
+        }
+    }
+
     #[test]
     fn the_model_pickers_fill_from_a_deferred_host() {
         use mu_base::config::Configs;
@@ -1719,7 +1730,15 @@ pub(super) mod tests {
         in_local(async {
             app.request_models();
             assert!(app.overlay.is_none(), "the rows are not here before the host answers");
-            pump_all(&mut app, &mut ui).await;
+            settle(&mut app, &mut ui, "model picker and gateway note", |app| {
+                matches!(app.overlay, Some(Overlay::Model { .. }))
+                    && transcript_text(app).contains("gateway models unavailable")
+            })
+            .await;
+            settle(&mut app, &mut ui, "modal rows", |app| {
+                matches!(&app.overlay, Some(Overlay::Model { pick, .. }) if pick.values().contains(&"modal/x/b".to_string()))
+            })
+            .await;
             let Some(Overlay::Model { pick, .. }) = &app.overlay else { panic!("no model picker") };
             assert!(pick.values().contains(&"@default".to_string()));
             assert!(pick.values().contains(&"modal/x/b".to_string()));
@@ -1728,10 +1747,16 @@ pub(super) mod tests {
             app.overlay = None;
             app.open_model_roles(Some("default".into()));
             assert!(app.overlay.is_none());
-            pump_all(&mut app, &mut ui).await;
-            assert!(matches!(app.overlay, Some(Overlay::ModelRoles { .. })));
+            settle(&mut app, &mut ui, "role editor", |app| matches!(app.overlay, Some(Overlay::ModelRoles { .. })))
+                .await;
             app.on_overlay_event(OverlayEvent::LoadRoleModels);
-            pump_all(&mut app, &mut ui).await;
+            settle(
+                &mut app,
+                &mut ui,
+                "role models",
+                |app| matches!(&app.overlay, Some(Overlay::ModelRoles { st }) if st.select().highlighted().is_some()),
+            )
+            .await;
             let Some(Overlay::ModelRoles { st }) = &app.overlay else { panic!("editor gone") };
             assert!(st.select().highlighted().is_some(), "the list filled the sub-picker");
         });
