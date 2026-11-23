@@ -162,14 +162,18 @@ mod tests {
         (job, rx)
     }
 
-    /// A worker with a fake engine that takes 150 ms per ghost; it reports each computation on `started`.
-    fn slow_worker(mb: Arc<Mailbox<Job>>, started: mpsc::Sender<String>) -> std::thread::JoinHandle<()> {
+    /// A worker whose fake engine blocks on `release` for each ghost; it reports each computation on `started`.
+    fn slow_worker(
+        mb: Arc<Mailbox<Job>>,
+        started: mpsc::Sender<String>,
+        release: mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             loop {
                 match mb.pop() {
                     Job::Complete { text, reply, .. } => {
                         started.send(text.clone()).unwrap();
-                        std::thread::sleep(Duration::from_millis(150));
+                        release.recv_timeout(Duration::from_secs(30)).expect("test releases the engine");
                         let _ = reply.send(format!("ghost:{text}"));
                     }
                     Job::Shutdown(reply) => {
@@ -186,7 +190,8 @@ mod tests {
     fn overtaken_ghost_requests_are_answered_empty_without_being_computed() {
         let mb = Arc::new(Mailbox::default());
         let (started_tx, started) = mpsc::channel();
-        let worker = slow_worker(mb.clone(), started_tx);
+        let (release_tx, release) = mpsc::channel();
+        let worker = slow_worker(mb.clone(), started_tx, release);
 
         let (a, rx_a) = complete("a");
         queue_complete(&mb, a);
@@ -199,18 +204,19 @@ mod tests {
         queue_complete(&mb, c);
         let (d, rx_d) = complete("d");
         queue_complete(&mb, d);
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
 
         assert_eq!(rx_b.blocking_recv().unwrap(), "", "b was overtaken before it started");
         assert_eq!(rx_c.blocking_recv().unwrap(), "", "c was overtaken before it started");
         assert_eq!(rx_a.blocking_recv().unwrap(), "ghost:a", "the request in flight finishes");
         assert_eq!(rx_d.blocking_recv().unwrap(), "ghost:d", "the newest is computed");
         assert_eq!(started.recv_timeout(Duration::from_secs(5)).unwrap(), "d", "only d reached the engine after a");
-        assert!(started.recv_timeout(Duration::from_millis(50)).is_err(), "b and c never reached the engine");
-
         let (done, rx) = oneshot::channel();
         mb.push(Job::Shutdown(done));
         rx.blocking_recv().unwrap();
         worker.join().unwrap();
+        assert!(started.try_recv().is_err(), "b and c never reached the engine");
     }
 
     #[test]
