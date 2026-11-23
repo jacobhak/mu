@@ -23,8 +23,8 @@ mu also adds a few things omp doesn't have:
 - **[Reply picker](docs/reply-picker.md).** `Ctrl+R` lets you move through the last reply by sentence, list item or code line, with vim or emacs keys, and mark parts of it. The marked parts are quoted into your answer, so you can reply point by point.
 - **[Durable plans](docs/durable-plans.md).** A plan doesn't have to be approved in the session that wrote it. You can park it, list it and refine it, then approve it later in the TUI or headless (`mu plan`), or hand it to `/deliver` to be implemented, reviewed and committed in its own worktree. When you open a parked plan, mu tells you which of the files it was based on have changed since.
 - **[Scheduled prompts](docs/schedule.md).** `/schedule 10m <prompt>` sends a prompt later, as if you had typed it then, so you can walk away and come back to an answer. A prompt that comes due during a turn waits for the turn to end.
-
-Also in mu, and covered in [`docs/`](docs/README.md): your own [modes](docs/modes.md), [remote use](docs/remote.md) (the agent on one machine, the terminal on another), [headless review](docs/review.md), [ghost-text prediction](docs/ghost-text.md), [rebindable keys](docs/keys.md) and [`mu --acp`](docs/acp.md).
+- **[Your own modes](docs/modes.md).** A mode is a markdown file: a prompt, a model, a tool policy and an exit step with approval actions. Plan mode is just the built-in one, and you can override it or add others without writing code.
+- **[Taking over detached runs](docs/detached-runs.md).** Stop a `mu -p` run at a tool boundary and pick up its session (`mu take`, `mu --resume`), or leave a message for a running session with `mu notify`.
 
 ## Status
 
