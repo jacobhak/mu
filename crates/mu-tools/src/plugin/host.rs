@@ -31,7 +31,7 @@ pub(super) struct Shared {
     /// The gateway provider plugin's slot.
     pub(super) gateway: RefCell<Option<Weak<Slot>>>,
     pub(super) cache_dir: std::path::PathBuf,
-    /// A terminal UI is attached, so `/login mcp:<name>` can be offered.
+    /// A terminal UI is attached, so `/mcp login <name>` can be offered.
     pub(super) interactive: Cell<bool>,
 }
 

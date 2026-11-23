@@ -84,7 +84,7 @@ fn completions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
             Ok(ids) => (ids, None),
             Err(e) => (Vec::new(), Some(e)),
         };
-        Ok(Completions { entries: command_entries(&l.plugins, &l.ctx, &l.providers.cfg, &ids), error })
+        Ok(Completions { entries: command_entries(&l.ctx, &l.providers.cfg, &ids), error })
     })
 }
 

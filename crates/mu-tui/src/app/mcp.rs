@@ -17,7 +17,7 @@ impl App {
             return self.open_mcp_servers();
         }
         // A subcommand that needs a server, typed without one: pick it from the list.
-        if matches!(arg.trim(), "remove" | "rm" | "enable" | "disable" | "reconnect" | "test") {
+        if matches!(arg.trim(), "remove" | "rm" | "enable" | "disable" | "reconnect" | "test" | "login") {
             return self.open_mcp_servers();
         }
         match mcp_cmd::parse(arg) {
@@ -33,6 +33,7 @@ impl App {
             Ok(McpCmd::Reload) => self.mcp_apply("re-reading the MCP config".into(), true),
             Ok(McpCmd::Reconnect(name)) => self.mcp_reconnect(name, false),
             Ok(McpCmd::Test(name)) => self.mcp_reconnect(name, true),
+            Ok(McpCmd::Login(name)) => self.run_mcp_login(&name),
             Ok(McpCmd::Trust) => self.mcp_trust(),
             Ok(McpCmd::Untrust) => self.mcp_untrust(),
         }

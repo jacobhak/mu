@@ -100,7 +100,7 @@ fn origin(url: &str) -> String {
 
 fn describe(info: &McpInfo, name: &str) -> String {
     if info.needs_login {
-        format!("needs login: /login mcp:{name}")
+        format!("needs login: /mcp login {name}")
     } else if info.failed {
         "failed to list its tools".into()
     } else if info.listed {

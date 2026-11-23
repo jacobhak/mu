@@ -23,8 +23,6 @@ use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope};
 /// One entry of the `/login` picker.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LoginTarget {
-    /// An MCP server, by its name in `mcp.json`.
-    Mcp(String),
     /// A key target (a chat provider or a search service), by id (`KeyTarget::find`).
     ApiKey(String),
     /// Sign in with ChatGPT (or the sign-in menu when already signed in).

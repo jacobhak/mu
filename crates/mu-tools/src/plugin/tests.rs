@@ -355,9 +355,9 @@ fn login_hint_differs_for_interactive_and_headless() {
     run(async {
         let fx = McpFx::new();
         let (h, _n) = fx.host("", "");
-        assert_eq!(h.login_msg("x"), "mcp:x needs login (run /login mcp:x in mu)");
+        assert_eq!(h.login_msg("x"), "mcp:x needs login (run /mcp login x in mu)");
         h.set_interactive();
-        assert_eq!(h.login_msg("x"), "mcp:x needs login: /login mcp:x");
+        assert_eq!(h.login_msg("x"), "mcp:x needs login: /mcp login x");
     });
 }
 

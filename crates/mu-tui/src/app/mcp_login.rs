@@ -26,7 +26,8 @@ impl App {
         self.flows.mcp_login().is_some()
     }
 
-    /// `/login mcp:<name>`: starts the sign-in of a configured server, here or on a remote host.
+    /// `/mcp login <name>`: starts the sign-in of a configured server,
+    /// here or on a remote host.
     pub(super) fn run_mcp_login(&mut self, name: &str) {
         let name = name.to_string();
         self.host_call(crate::host::mcp::MCP_NAMES, &(), move |app, r: Result<Vec<String>, String>| {

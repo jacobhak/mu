@@ -363,13 +363,13 @@ impl PluginHost {
     /// The user-facing text for a server that needs an OAuth login. Only interactive mu can run the flow.
     pub(super) fn login_msg(&self, name: &str) -> String {
         if self.shared.interactive.get() {
-            format!("mcp:{name} needs login: /login mcp:{name}")
+            format!("mcp:{name} needs login: /mcp login {name}")
         } else {
-            format!("mcp:{name} needs login (run /login mcp:{name} in mu)")
+            format!("mcp:{name} needs login (run /mcp login {name} in mu)")
         }
     }
 
-    /// Marks this host as serving an interactive terminal (`/login mcp:<name>` is then possible).
+    /// Marks this host as serving an interactive terminal (`/mcp login <name>` is then possible).
     pub fn set_interactive(&self) {
         self.shared.interactive.set(true);
     }

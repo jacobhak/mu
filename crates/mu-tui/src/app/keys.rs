@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::chat::composer::Action;
-use crate::host::keys::{KeyFacts, KeyInfo, LoginList, LogoutList, TargetKind};
+use crate::host::keys::{KeyFacts, KeyInfo, LogoutList, TargetKind};
 use crate::keymap;
 use crate::term::clipboard;
 use crate::widgets::overlay::{KeyOption, LoginTarget};
@@ -290,8 +290,8 @@ impl App {
         }
     }
 
-    /// `/login`: with a provider id add its key, with `mcp:<name>` log in to that MCP server;
-    /// otherwise list the key rows and the MCP servers that need auth in a picker.
+    /// `/login`: with a provider id add its key; otherwise list the sign-in rows in a picker. MCP
+    /// servers sign in with `/mcp login <name>`.
     pub(super) fn login(&mut self, provider: &str) {
         if chatgpt::is_chatgpt(provider) {
             return self.start_chatgpt();
@@ -305,33 +305,24 @@ impl App {
         {
             return self.start_custom_edit(id);
         }
-        if let Some(name) = provider.strip_prefix("mcp:") {
-            return self.run_mcp_login(name);
-        }
         let name = provider.to_string();
         self.host_call(host::keys::KEY_TARGET, &provider, move |app, r: Result<Option<KeyInfo>, String>| match r {
             Ok(Some(target)) => app.begin_key(target),
+            Ok(None) if name.starts_with("mcp:") => {
+                app.error(&format!("MCP servers sign in under /mcp: /mcp login {}", &name["mcp:".len()..]))
+            }
             Ok(None) if !name.is_empty() => {
                 app.error(&format!("unknown login target `{name}`: /login lists what mu can log in to"))
             }
-            Ok(None) => {
-                app.host_call(host::keys::LOGIN_PROVIDERS, &(), |app, r: Result<LoginList, String>| app.show_login(r));
-            }
+            Ok(None) => app.show_login(),
             Err(e) => app.error(&e),
         });
     }
 
-    /// The `/login` picker: the key rows, then the MCP servers that need auth.
-    fn show_login(&mut self, r: Result<LoginList, String>) {
+    /// The `/login` picker: the sign-in rows.
+    fn show_login(&mut self) {
         self.leave_custom_wizard();
-        let list = r.unwrap_or_else(|e| {
-            self.error(&e);
-            LoginList::default()
-        });
-        self.with_api_key_rows(move |app, mut rows| {
-            for (name, url) in list.mcp {
-                rows.push((Item { label: format!("mcp:{name}"), detail: url }, LoginTarget::Mcp(name)));
-            }
+        self.with_api_key_rows(move |app, rows| {
             app.overlay = Some(Overlay::Login { pick: Picker::from_rows(rows, |items| Select::new("Log in", items)) });
         });
     }
@@ -1414,17 +1405,14 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_deferred_login_list_has_the_key_rows_and_mcp_servers() {
-        use crate::host::keys::LoginList;
+    fn a_deferred_login_list_has_the_key_rows() {
         let (mut app, mut rx) = deferred_app();
         in_local(async {
-            let list = LoginList { mcp: vec![("docs".into(), "https://docs.example".into())] };
-            app.show_login(Ok(list));
+            app.show_login();
             assert!(app.overlay.is_none());
             pump(&mut app, &mut rx).await;
             let Some(Overlay::Login { pick }) = &app.overlay else { panic!("no login list") };
             let labels: Vec<&LoginTarget> = pick.values().iter().collect();
-            assert!(labels.contains(&&LoginTarget::Mcp("docs".into())));
             assert!(labels.contains(&&LoginTarget::ChatGpt));
             assert!(labels.contains(&&LoginTarget::CustomProvider(None)));
             assert!(labels.contains(&&LoginTarget::ApiKey("baseten".into())));

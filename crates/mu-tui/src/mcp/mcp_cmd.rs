@@ -25,6 +25,8 @@ pub enum McpCmd {
     Reload,
     Reconnect(String),
     Test(String),
+    /// OAuth sign-in to a server.
+    Login(String),
     /// Trust this project's MCP servers as they are now, so they start.
     Trust,
     /// Stop this project's MCP servers until they are trusted again.
@@ -50,6 +52,7 @@ pub const USAGE: &str = "\
 /mcp reload                   re-read the config files and reconnect
 /mcp reconnect <name>         reconnect one server
 /mcp test <name>              connect and list the server's tools
+/mcp login <name>             sign in to a server that uses OAuth
 /mcp trust                    trust this project's MCP servers so they start
 /mcp untrust                  stop this project's MCP servers until trusted again
 /mcp help                     show this help
@@ -80,6 +83,7 @@ pub fn parse(arg: &str) -> Result<McpCmd, String> {
         "disable" => one_name(rest, "disable <name>").map(McpCmd::Disable),
         "reconnect" => one_name(rest, "reconnect <name>").map(McpCmd::Reconnect),
         "test" => one_name(rest, "test <name>").map(McpCmd::Test),
+        "login" => one_name(rest, "login <name>").map(McpCmd::Login),
         "trust" => no_args(rest, "trust", McpCmd::Trust),
         "untrust" => no_args(rest, "untrust", McpCmd::Untrust),
         other => Err(format!("unknown /mcp subcommand `{other}` (try /mcp help)")),
@@ -356,6 +360,7 @@ mod tests {
         assert_eq!(parse("disable fs"), Ok(McpCmd::Disable("fs".into())));
         assert_eq!(parse("reconnect fs"), Ok(McpCmd::Reconnect("fs".into())));
         assert_eq!(parse("test fs"), Ok(McpCmd::Test("fs".into())));
+        assert_eq!(parse("login slack"), Ok(McpCmd::Login("slack".into())));
     }
 
     #[test]
@@ -366,10 +371,10 @@ mod tests {
 
     #[test]
     fn name_arg_errors() {
-        for s in ["remove", "rm", "enable", "disable", "reconnect", "test"] {
+        for s in ["remove", "rm", "enable", "disable", "reconnect", "test", "login"] {
             assert!(err(s).starts_with("usage: /mcp "), "{s}");
         }
-        for s in ["remove a b", "enable a b", "disable a b", "reconnect a b", "test a b", "remove ''"] {
+        for s in ["remove a b", "enable a b", "disable a b", "reconnect a b", "test a b", "login a b", "remove ''"] {
             assert!(err(s).starts_with("usage: /mcp "), "{s}");
         }
     }
@@ -620,7 +625,9 @@ mod tests {
 
     #[test]
     fn usage_mentions_every_subcommand() {
-        for s in ["add", "remove", "enable", "disable", "reload", "reconnect", "test", "help", "--project", "--env"] {
+        for s in
+            ["add", "remove", "enable", "disable", "reload", "reconnect", "test", "login", "help", "--project", "--env"]
+        {
             assert!(USAGE.contains(s), "{s}");
         }
     }

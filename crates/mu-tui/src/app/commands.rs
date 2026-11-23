@@ -10,11 +10,9 @@ use mu_base::permissions::PermissionMode;
 use mu_provider::auth::chatgpt::PROVIDER_ID;
 use mu_provider::provider::providers;
 use mu_tools::context::Context;
-use mu_tools::plugin::host::PluginHost;
 
 /// What the completion lists of the built-in commands are built from.
 pub(super) struct CompleteCtx<'a> {
-    pub plugins: &'a PluginHost,
     pub ctx: &'a Context,
     pub cfg: &'a Configs,
     pub custom_ids: &'a [String],
@@ -82,8 +80,7 @@ fn complete_login(c: &CompleteCtx) -> (Vec<String>, Vec<String>) {
         [PROVIDER_ID.to_string(), "custom".to_string()]
             .into_iter()
             .chain(providers::api_key_defs().map(|d| d.id.to_string()))
-            .chain(c.custom_ids.iter().cloned())
-            .chain(c.plugins.mcp_names().iter().map(|n| format!("mcp:{n}"))),
+            .chain(c.custom_ids.iter().cloned()),
     )
 }
 
@@ -134,8 +131,7 @@ pub(super) static BUILTIN: [Builtin; 34] = [
     cmd("switch", "Switch this session's model", App::cmd_switch),
     cmd("modelset", "Switch model sets [name | new | delete | rename | import]", App::modelset_cmd)
         .complete(complete_modelset),
-    cmd("login", "Sign in with ChatGPT, add an API key, or log in to a provider or MCP server", App::login)
-        .complete(complete_login),
+    cmd("login", "Sign in with ChatGPT, add an API key, or add a custom endpoint", App::login).complete(complete_login),
     cmd("logout", "Remove a stored API key, or sign out of ChatGPT", App::logout_cmd).complete(complete_logout),
     cmd("web", "Choose the web search backend", |a, _| a.start_web_wizard(None)),
     cmd("thinking", "Set the thinking level", App::cmd_thinking)
@@ -175,7 +171,7 @@ pub(super) static BUILTIN: [Builtin; 34] = [
 
 /// `/mcp` subcommands for the completion menu, with what each does. The names that need a server
 /// open the server picker when typed bare.
-const MCP_SUBCOMMANDS: [(&str, &str); 12] = [
+const MCP_SUBCOMMANDS: [(&str, &str); 13] = [
     ("add", "Add a server: discovered, popular or custom"),
     ("import", "Copy servers other tools have configured"),
     ("list", "Show servers and their state"),
@@ -184,6 +180,7 @@ const MCP_SUBCOMMANDS: [(&str, &str); 12] = [
     ("remove", "Delete a server from the config"),
     ("test", "Reconnect a server and list its tools"),
     ("reconnect", "Restart a server and refresh its tools"),
+    ("login", "Sign in to a server that uses OAuth"),
     ("reload", "Re-read the config files"),
     ("trust", "Start this project's MCP servers"),
     ("untrust", "Stop trusting this project's MCP servers"),
@@ -219,8 +216,8 @@ pub fn interactive_reference() -> String {
 
 /// The completion list of the composer: the built-in commands with their arguments, then the
 /// commands and skills that come from the context.
-pub(crate) fn command_entries(plugins: &PluginHost, ctx: &Context, cfg: &Configs, custom_ids: &[String]) -> Vec<Entry> {
-    let cc = CompleteCtx { plugins, ctx, cfg, custom_ids };
+pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String]) -> Vec<Entry> {
+    let cc = CompleteCtx { ctx, cfg, custom_ids };
     let mut commands: Vec<Entry> = BUILTIN
         .iter()
         .map(|c| {

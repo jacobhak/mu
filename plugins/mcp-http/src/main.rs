@@ -246,7 +246,7 @@ impl Bridge {
                 let waiting = std::mem::take(&mut self.waiting);
                 self.rebuild(waiting).await
             }
-            Err(Fail::NeedsLogin) => Err("not logged in: run /login mcp:<name> in mu".into()),
+            Err(Fail::NeedsLogin) => Err("not logged in: run /mcp login <name> in mu".into()),
             Err(Fail::Other(e)) => Err(e),
         }
     }

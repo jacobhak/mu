@@ -19,7 +19,6 @@ pub const SAVE_KEY: &str = "save_key";
 pub const SET_CHAT: &str = "set_chat";
 pub const REMOVE_KEY: &str = "remove_key";
 pub const LOGOUT_LIST: &str = "logout_list";
-pub const LOGIN_PROVIDERS: &str = "login_providers";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetKind {
@@ -136,13 +135,6 @@ pub struct LogoutList {
     pub error: Option<String>,
 }
 
-/// The MCP servers that need a login.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct LoginList {
-    /// MCP server name and its URL.
-    pub mcp: Vec<(String, String)>,
-}
-
 pub(super) fn register(r: &mut Registry) {
     r.add(KEY_ROWS, key_rows);
     r.add(KEY_TARGET, key_target);
@@ -151,7 +143,6 @@ pub(super) fn register(r: &mut Registry) {
     r.add(SET_CHAT, set_chat);
     r.add(REMOVE_KEY, remove_key);
     r.add(LOGOUT_LIST, logout_list);
-    r.add(LOGIN_PROVIDERS, login_providers);
 }
 
 /// Whether `name` is set to a value other than blanks.
@@ -264,10 +255,6 @@ fn logout_list(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     })
 }
 
-fn login_providers(l: &Rc<Local>, args: serde_json::Value) -> Answer {
-    ready(args, |(): ()| Ok(LoginList { mcp: l.plugins.needs_login() }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,10 +285,6 @@ mod tests {
         let logout = LogoutList { rows: vec![LogoutRow { id: "exa".into(), label: "Exa".into() }], error: None };
         let back: LogoutList = serde_json::from_value(serde_json::to_value(&logout).unwrap()).unwrap();
         assert_eq!(back, logout);
-
-        let login = LoginList { mcp: vec![("docs".into(), "https://x".into())] };
-        let back: LoginList = serde_json::from_value(serde_json::to_value(&login).unwrap()).unwrap();
-        assert_eq!(back, login);
 
         for c in [Check::Valid, Check::Rejected("no".into()), Check::Unreachable("down".into()), Check::Unchecked] {
             let back: Check = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
