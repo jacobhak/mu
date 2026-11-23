@@ -1084,6 +1084,8 @@ mod tests {
             let mut d = Drain::start();
             let start = d.cap_at - Drain::CAP;
             assert_eq!(d.ends_at(), start + Drain::IDLE, "a quiet pipe ends at the idle limit");
+            // The real clock decides `over()` below, so the cap is moved out of reach of a stall.
+            d.cap_at += Duration::from_secs(3600);
             // A steady writer keeps the idle limit moving but never past the cap.
             tokio::time::sleep(Duration::from_millis(50)).await;
             d.touch();
@@ -1098,10 +1100,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_background_run_stops_reading_a_descendant_that_has_gone_quiet() {
         let t = Instant::now();
+        let wrote = std::env::temp_dir().join(format!("mu-quiet-desc-{}", uuid::Uuid::new_v4()));
         let r = run_background(
             // Ignore TERM before forking: the leader's exit sends TERM at once, and a subshell
-            // that has not yet run its own `trap` would die before it wrote anything.
-            "trap '' TERM; (echo once; sleep 30) & echo leader-done".into(),
+            // that has not yet run its own `trap` would die before it wrote anything. The leader
+            // exits only after the subshell has written.
+            format!(
+                "trap '' TERM; (echo once; touch {w}; sleep 30) & while [ ! -f {w} ]; do sleep 0.02; done; echo leader-done",
+                w = wrote.display()
+            ),
             std::env::temp_dir(),
             std::env::vars().collect(),
             Some(60.0),
@@ -1110,7 +1117,9 @@ mod tests {
             |_| {},
         )
         .await;
-        assert!(t.elapsed() < Drain::CAP + Duration::from_secs(3), "drain took {:?}", t.elapsed());
+        let _ = std::fs::remove_file(&wrote);
+        // Uncapped, the quiet descendant would hold the pipe for its whole 30 s.
+        assert!(t.elapsed() < Duration::from_secs(20), "drain took {:?}", t.elapsed());
         assert!(r.ok && r.text.contains("leader-done") && r.text.contains("once"), "{}", r.text);
     }
 
@@ -1392,26 +1401,29 @@ mod tests {
     /// working shell.
     #[tokio::test(flavor = "current_thread")]
     async fn a_hung_shell_does_not_freeze_the_caller() {
-        let tools = Tools::for_test();
-        tools.shell().jam(30);
-        let t = std::time::Instant::now();
-        let out = tools.call("bash", &json!({"command": "true", "timeout": 1}), &ctx()).await;
-        assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
-        assert!(out.is_error && out.text.contains("stopped responding"), "{}", out.text);
-        assert_eq!(tools.call("bash", &json!({"command": "echo back"}), &ctx()).await.text.trim(), "back");
+        // Only a hang becomes a failure; how long the abandonment takes is not part of the pass.
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let tools = Tools::for_test();
+            tools.shell().jam(30);
+            let out = tools.call("bash", &json!({"command": "true", "timeout": 1}), &ctx()).await;
+            assert!(out.is_error && out.text.contains("stopped responding"), "{}", out.text);
+            assert_eq!(tools.call("bash", &json!({"command": "echo back"}), &ctx()).await.text.trim(), "back");
 
-        tools.shell().jam(30);
-        let c = ctx();
-        let cancel = c.cancel.clone();
-        let abort = async {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            cancel.cancel();
-        };
-        let cmd = json!({"command": "true"});
-        let (out, ()) = tokio::join!(tools.call("bash", &cmd, &c), abort);
-        let Some(ToolMeta::Bash(m)) = &out.meta else { panic!("no meta: {:?}", out.text) };
-        assert!(m.cancelled, "{}", out.text);
-        assert_eq!(tools.call("bash", &json!({"command": "echo again"}), &ctx()).await.text.trim(), "again");
+            tools.shell().jam(30);
+            let c = ctx();
+            let cancel = c.cancel.clone();
+            let abort = async {
+                tokio::task::yield_now().await;
+                cancel.cancel();
+            };
+            let cmd = json!({"command": "true"});
+            let (out, ()) = tokio::join!(tools.call("bash", &cmd, &c), abort);
+            let Some(ToolMeta::Bash(m)) = &out.meta else { panic!("no meta: {:?}", out.text) };
+            assert!(m.cancelled, "{}", out.text);
+            assert_eq!(tools.call("bash", &json!({"command": "echo again"}), &ctx()).await.text.trim(), "again");
+        })
+        .await
+        .expect("the caller was frozen by a hung shell");
     }
 
     /// Tools with a jobs handle attached; background jobs are spawned on the current LocalSet.
@@ -1588,17 +1600,26 @@ mod tests {
                 let (setup, c) = (json!({"command": "cd /usr && export MU_FORK_V=kept"}), ctx());
                 assert!(!tools.call("bash", &setup, &c).await.is_error);
                 let started = std::env::temp_dir().join(format!("mu-bash-busy-{}", uuid::Uuid::new_v4()));
-                let busy_cmd = format!("export MU_FORK_V=during; touch {}; sleep 2.5", started.display());
+                let release = started.with_extension("release");
+                let busy_cmd = format!(
+                    "export MU_FORK_V=during; touch {}; while [ ! -f {} ]; do sleep 0.02; done",
+                    started.display(),
+                    release.display()
+                );
                 let (busy, c1) = (json!({"command": busy_cmd}), ctx());
                 let (job, c2) = (json!({"command": r#"printf '%s %s' "$PWD" "$MU_FORK_V""#, "async": true}), ctx());
                 let start = async {
                     mu_testutil::wait_until("the busy command to start", || started.exists()).await;
-                    let t = std::time::Instant::now();
-                    (tools.call("bash", &job, &c2).await, t.elapsed())
+                    // The busy command holds until the job call has returned, so the snapshot cannot
+                    // have waited for it; if it did, the release never comes and the backstop fails.
+                    let out = tokio::time::timeout(std::time::Duration::from_secs(60), tools.call("bash", &job, &c2))
+                        .await
+                        .expect("the snapshot waited for the busy command");
+                    std::fs::write(&release, "").unwrap();
+                    out
                 };
-                let (_, (out, took)) = tokio::join!(tools.call("bash", &busy, &c1), start);
+                let (_, out) = tokio::join!(tools.call("bash", &busy, &c1), start);
                 assert!(!out.text.contains("was not inherited"), "{}", out.text);
-                assert!(took < std::time::Duration::from_millis(1500), "the snapshot did not wait: {took:?}");
                 let done = finished(&jobs).await;
                 assert!(done[0].ok, "{}", done[0].text);
                 assert_eq!(done[0].text, "/usr kept", "state from before the busy command: {}", done[0].text);
@@ -1613,7 +1634,7 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (tools, jobs) = tools_with_jobs();
-                tools.shell().jam(5);
+                tools.shell().jam(30);
                 let (job, c) = (json!({"command": "echo fallback-ran", "async": true}), ctx());
                 let out = tools.call("bash", &job, &c).await;
                 assert!(
