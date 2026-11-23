@@ -90,7 +90,15 @@ pub fn spawn_grouped(cmd: &mut tokio::process::Command, pdeathsig: bool) -> std:
 /// Runs `cmd` with its stdout captured. `None` on failure, timeout or a non-zero exit. The command
 /// runs in its own process group, which is terminated when `limit` passes, or when it has exited
 /// but a leftover child still holds the pipe open. Children that let go of stdout are left alone.
-pub async fn run_capture(mut cmd: tokio::process::Command, limit: Duration) -> Option<String> {
+pub async fn run_capture(cmd: tokio::process::Command, limit: Duration) -> Option<String> {
+    run_capture_until(cmd, tokio::time::sleep(limit)).await
+}
+
+/// `run_capture` with the deadline as a future, so a test can decide when the command times out.
+async fn run_capture_until(
+    mut cmd: tokio::process::Command,
+    expired: impl std::future::Future<Output = ()>,
+) -> Option<String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
@@ -125,9 +133,9 @@ pub async fn run_capture(mut cmd: tokio::process::Command, limit: Duration) -> O
         read.ok()?;
         st.ok()?.success().then(|| String::from_utf8_lossy(&buf).into_owned())
     };
-    match tokio::time::timeout(limit, run).await {
-        Ok(out) => out,
-        Err(_) => {
+    tokio::select! {
+        out = run => out,
+        () = expired => {
             terminate_group(pgid).await;
             None
         }
@@ -218,27 +226,32 @@ mod tests {
         let pidfile = dir.join("pid");
         let mut c = tokio::process::Command::new("sh");
         c.arg("-c").arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()));
-        assert!(runtime().block_on(run_capture(c, Duration::from_millis(500))).is_none());
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        let gone = (0..50).any(|_| {
-            let dead = !running(pid);
-            if !dead {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            dead
-        });
+        // The deadline passes only once the grandchild has announced its pid.
+        let rt = runtime();
+        let expired = async {
+            mu_testutil::pid_in(&pidfile).await;
+        };
+        assert!(rt.block_on(run_capture_until(c, expired)).is_none());
+        let pid = rt.block_on(mu_testutil::pid_in(&pidfile));
+        rt.block_on(mu_testutil::wait_until("the timed-out grandchild to be gone", || !running(pid)));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(gone, "grandchild {pid} survived the timeout");
     }
 
     #[test]
     fn a_leftover_child_holding_stdout_does_not_hold_the_read() {
+        let dir = std::env::temp_dir().join(format!("mu-proc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
         let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg("sleep 30 & echo ok");
-        let started = std::time::Instant::now();
-        let out = runtime().block_on(run_capture(c, Duration::from_secs(5)));
+        c.arg("-c").arg(format!("sleep 600 & echo $! > {}; echo ok", pidfile.display()));
+        let rt = runtime();
+        // Success before the limit (a failure-only backstop) means the leftover holding stdout was
+        // terminated rather than waited out; otherwise the limit fires and the output is None.
+        let out = rt.block_on(run_capture(c, Duration::from_secs(10)));
         assert_eq!(out.as_deref(), Some("ok\n"));
-        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        let pid = rt.block_on(mu_testutil::pid_in(&pidfile));
+        rt.block_on(mu_testutil::wait_until("the leftover to be terminated", || !running(pid)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A daemon a command starts (an agent it talks to) outlives it once it lets go of stdout.
@@ -248,7 +261,6 @@ mod tests {
         c.arg("-c").arg("sleep 30 >/dev/null & echo $!");
         let out = runtime().block_on(run_capture(c, Duration::from_secs(5))).unwrap();
         let pid: i32 = out.trim().parse().unwrap();
-        std::thread::sleep(Duration::from_millis(800));
         let survived = running(pid);
         // SAFETY: plain kill(2) on the test's own child.
         unsafe { libc::kill(pid, libc::SIGKILL) };
