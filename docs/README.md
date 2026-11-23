@@ -17,6 +17,7 @@
 - [Custom agents](custom-agents.md)
 - [Modes](modes.md): plan mode and your own modes as markdown files: prompt, model, tool policy, exit actions
 - [Memory](memory.md)
+- [Web search and fetch](web.md): choosing a search backend; the `fetch` tool
 - [Secrets](secrets.md): what mu redacts before storing or sending text, and what it does not protect against
 - [Tool permissions](permissions.md): modes (`ask`, `edits`, `yolo`), rules, and the approval prompt
 - [Config](config.md): `~/.mu/config.toml`

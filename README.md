@@ -9,10 +9,10 @@ mu is a terminal coding agent with a Rust core (agent loop, TUI, sessions) built
 mu keeps most of what omp does and changes where the memory goes. A session holds your conversation, and anything else runs only while it's being used.
 
 - **Small core.** A native binary holds the agent loop, the TUI and the built-in tools. An idle session holds about 3.6 MB of private memory (about 20 MB counting the binary's shared pages).
-- **Features start on use.** Web, memory and prediction are separate processes, and so is the optional model gateway (a [gateway provider plugin](docs/providers.md#gateway-plugins)), which only providers without an API key or ChatGPT sign-in in mu need. Each starts on first use and exits after a few idle minutes. A session that talks only to Anthropic, OpenAI or Baseten with your own key, or to OpenAI on your ChatGPT plan, starts no gateway at all. MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
-- **Shared across sessions.** Sessions on one omp profile share one gateway and its broker (about 306 MB total, 216 MB private, while they run, idle; measured with `scripts/measure-gateway.sh`). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
+- **Features start on use.** Web, memory and prediction are separate processes, and so is the optional model gateway (a [gateway provider plugin](docs/providers.md#gateway-plugins)). Each starts on first use and exits after a few idle minutes. A session that talks to a provider with your own key or ChatGPT sign-in starts no gateway at all (see [Providers](docs/providers.md)). MCP servers start on their first tool call; their tool lists are cached so mu can advertise the tools without starting them.
+- **Shared across sessions.** When a gateway is needed, sessions on one omp profile share one gateway and its broker (about 306 MB total, 216 MB private, idle; measured with `scripts/measure-gateway.sh`). [`BENCHMARKS.md`](BENCHMARKS.md) shows what that means per session.
 - **Bulky content goes to disk.** Large tool output and images are written to files instead of being kept in memory.
-- **Works with your omp setup.** mu uses omp's config, models, MCP setup, context files and skills, and, through the gateway, its logins for OAuth providers. Sessions are in omp's format, so you can use both and switch either way. You don't need an existing omp setup, and the installer fetches omp only when you ask (`--with-omp`, for the gateway): Anthropic, OpenAI and Baseten work with just an API key (OpenAI models also run on a ChatGPT plan).
+- **Works with your omp files.** mu reads omp's context files, skills and MCP config, and writes sessions in omp's format, so you can use both and switch either way. Model roles and limits are mu's own (`mu models import` copies omp's). You don't need an existing omp setup, and the installer fetches omp only when you ask (`--with-omp`, for the gateway).
 
 The cost: features that live inside omp's runtime, such as TypeScript extensions, aren't available. The reasoning and measurements behind the design are in [`DESIGN.md`](DESIGN.md).
 
@@ -24,12 +24,14 @@ mu also adds a few things omp doesn't have:
 - **[Durable plans](docs/durable-plans.md).** A plan doesn't have to be approved in the session that wrote it. You can park it, list it and refine it, then approve it later in the TUI or headless (`mu plan`), or hand it to `/deliver` to be implemented, reviewed and committed in its own worktree. When you open a parked plan, mu tells you which of the files it was based on have changed since.
 - **[Scheduled prompts](docs/schedule.md).** `/schedule 10m <prompt>` sends a prompt later, as if you had typed it then, so you can walk away and come back to an answer. A prompt that comes due during a turn waits for the turn to end.
 
+Also in mu, and covered in [`docs/`](docs/README.md): your own [modes](docs/modes.md), [remote use](docs/remote.md) (the agent on one machine, the terminal on another), [headless review](docs/review.md), [ghost-text prediction](docs/ghost-text.md), [rebindable keys](docs/keys.md) and [`mu --acp`](docs/acp.md).
+
 ## Status
 
 Early and experimental: started in October 2026 and changing quickly.
 
-- No stable version. Releases are nightly builds of `main` (`mu-YYYYMMDD-<sha7>`); config, flags and plugin interfaces can change without notice.
-- Model roles, per-model limits and compaction thresholds live in mu's own `models.toml` (copy omp's with `mu models import`). Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth`), with no gateway involved; OpenAI models also run on your ChatGPT plan through Sign in with ChatGPT (`/login`). Every other provider, and subscription logins, go through the gateway plugin that ships with mu, `mu-gateway` (see [Providers](docs/providers.md)).
+- No stable version. Releases are builds of `main`, tagged `mu-YYYYMMDD-<sha7>` and published once `main` passes the checks; config, flags and plugin interfaces can change without notice.
+- Providers: Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth add <provider>`), and OpenAI models also run on your ChatGPT plan (`/login`). Neither involves a gateway. Every other provider, and subscription logins, go through the `mu-gateway` plugin that ships with mu, which needs the omp CLI (`install.sh --with-omp`, about 300 MB; log in with `mu-gateway login <provider>`). Details in [Providers](docs/providers.md).
 - Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
 - No support promised. Issues and PRs are welcome but may go unanswered.
 
@@ -47,17 +49,17 @@ If the repo is private (or you install from a private fork), the public URLs ret
 
 The installer checks the tarball against the `SHA256SUMS` of the same release, which catches a bad download but not a replaced release. When `gh` is signed in and the release carries a GitHub build attestation (the release workflow makes one where the repo supports them: public repos, or GitHub Enterprise Cloud), it also verifies the attestation and refuses to install if that fails. Without an attestation it says so and relies on the checksum.
 
-This installs `mu` and its plugins under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Installing `--from-source` needs only a Rust toolchain; no Bun. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `--from-source` asks git whether the tree has uncommitted changes and records the answer in `~/.mu/dev-build` (removed by any other install), because the version's `-dirty` suffix misses an unstaged edit. `mu --version` prints `mu 0.1.0 (<sha>) oh-my-pi crates <version>`.
+This installs `mu` and its plugins under `~/.mu/{bin,plugins}` and links `~/.local/bin/mu` (not when `MU_HOME` is set). Installing `--from-source` needs only a Rust toolchain. `--skip-if-dev` leaves an installed dev build (dirty, unknown, or not on `origin/main`) alone. `--from-source` asks git whether the tree has uncommitted changes and records the answer in `~/.mu/dev-build` (removed by any other install), because the version's `-dirty` suffix misses an unstaged edit. `mu --version` prints `mu 0.1.0 (<sha>) oh-my-pi crates <version>`.
 
-Then add an API key for Anthropic, OpenAI or Baseten with `/login` in mu, or `mu auth add <provider>`; those models then run without a gateway. Or sign in with ChatGPT (`/login`, or `mu auth login openai-chatgpt` from a shell) to run OpenAI models on your plan. A gateway plugin is only needed for subscription (OAuth) logins and the other providers: install with `--with-omp` (`curl … | bash -s -- --with-omp`, or `scripts/install.sh --with-omp`; it adds the 300 MB omp CLI the plugin runs), then log in with `mu-gateway login <provider>`. Web search and fetch need no gateway, and MCP OAuth is done by mu itself (`/login mcp:<name>`).
+Then start `mu` and run `/login` to add a key or sign in with ChatGPT (see Status above for which providers need what). For the gateway, install with `--with-omp` (`curl … | bash -s -- --with-omp`). Web search and fetch need no gateway, and MCP OAuth is done by mu itself (`/mcp login <name>`).
 
 ### Updating
 
 `mu update` installs the latest release by running the repo's `install.sh`. A dev build is also one that `~/.mu/dev-build` marks. `mu update --check` only reports; `--tag mu-YYYYMMDD-<sha7>` picks a release; `--force` replaces a dev build, which is otherwise refused. On startup the TUI checks for a newer release at most once a day (cached in `~/.mu/update-check`) and shows a notice; it stays silent when offline or on a dev build. Turn it off with `[update] check = false` in config.toml. Checks use the unauthenticated GitHub API (60 requests an hour), or `gh` when the repo is private.
 
-### Pinned oh-my-pi crates
+### Pinned oh-my-pi
 
-`upstream.toml` pins one oh-my-pi release for the Rust crates mu uses (`tag = "v<ver>"` in `Cargo.toml`). mu runs no omp binary.
+`upstream.toml` pins one oh-my-pi release: the Rust crates mu builds on (`tag = "v<ver>"` in `Cargo.toml`) and the omp CLI that `--with-omp` installs. Only the gateway plugin runs that CLI; mu itself runs no omp binary.
 
 ### Manual build
 
@@ -68,11 +70,11 @@ mkdir -p ~/.mu/plugins
 for p in gateway web memory predict; do ln -sfn "$PWD/plugins/$p" ~/.mu/plugins/$p; done
 ```
 
-Plugins are found in `~/.mu/plugins/*/plugin.toml`; `mu-gateway`, `mu-web`, `mu-predict` and `mu-mcp-http` are resolved next to the `mu` binary (the gateway's source and README are in [`plugins/gateway`](plugins/gateway/README.md)). `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` bypass the gateway plugin and point at a running gateway directly.
+Plugins are found in `~/.mu/plugins/*/plugin.toml`; their binaries (`mu-gateway`, `mu-web`, `mu-memory`, `mu-predict`, `mu-mcp-http`) are resolved next to the `mu` binary (the gateway's source and README are in [`plugins/gateway`](plugins/gateway/README.md)). `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` bypass the gateway plugin and point at a running gateway directly.
 
 ### Syntax highlighting
 
-Fenced code is highlighted with tree-sitter for Rust, JSON, Bash, TOML, YAML, Python, JavaScript, TypeScript (and TSX), C, C++, CSS, Go, HTML, Java, regex, diff and Markdown, the grammars omp's `omp-ast` links into the binary anyway. Markdown fences inject the other grammars.
+Fenced code is highlighted with tree-sitter for Rust, JSON, Bash, TOML, YAML, Python, JavaScript, TypeScript (and TSX), C, C++, CSS, Go, HTML, Java, regex, diff and Markdown. Markdown fences inject the other grammars.
 
 Grammars load on first use of that language (about 1-2 MB resident each); idle memory is unaffected.
 
@@ -84,13 +86,13 @@ Usage, configuration and the individual features are documented in [`docs/`](doc
 
 ### Tests
 
-`cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see [MCP servers](docs/mcp.md)). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction; it needs a gateway plugin, set with `MU_SMOKE_GATEWAY_PLUGIN`, default the `gateway` plugin installed under `~/.mu/plugins`); `scripts/smoke-native.sh` checks a native API-key provider offline against a loopback fake API; `scripts/measure-idle.sh target/release/mu` reports idle memory.
+`scripts/ci-checks.sh` runs everything CI does (fmt, shellcheck, cargo-deny, clippy, the tests); run it before pushing. `cargo test --workspace` runs the unit tests; `scripts/build-mcp-http.sh test` runs the bridge's (it is built outside the workspace, see [MCP servers](docs/mcp.md)). `scripts/smoke.sh` runs live end-to-end checks (gateway, tmux TUI, subagents, compaction; it needs a gateway plugin, set with `MU_SMOKE_GATEWAY_PLUGIN`, default the `gateway` plugin installed under `~/.mu/plugins`); `scripts/smoke-native.sh` checks a native API-key provider offline against a loopback fake API; `scripts/measure-idle.sh target/release/mu` reports idle memory.
 
 `cargo test --workspace --locked -- --ignored contract_` runs the native, key-gated provider tests.
 
 ### Debugging
 
-`MU_DUMP_REQUESTS=/path/file.jsonl` appends one JSON line per model request: timestamp, model, `max_tokens`, `thinking`, `output_config` and mu's level. The system prompt, messages and tools are only counted. The gateway's request log does not record the effort it sends upstream, so this file is the place to check it.
+`MU_DUMP_REQUESTS=/path/file.jsonl` appends the shape of each model request (never its content); see [Providers](docs/providers.md#debugging).
 
 ### Maintenance bot
 
@@ -106,7 +108,7 @@ A local systemd timer keeps mu current with oh-my-pi; everything is reported thr
 | finding | the fixer notices a problem in mu the bump did not cause | issue `maint:finding` |
 | publish | `origin/main` is green and newer than the last release | tag `mu-YYYYMMDD-<sha7>`; `.github/workflows/release.yml` builds and releases; the bot reinstalls unless a dev build is installed |
 
-There is one bump PR at a time, on the branch `maint/omp-bump`. A newer omp release rebuilds that branch from `main` and updates the open PR in place, so commits pushed to it are lost; closing the PR unmerged makes the next nightly open a fresh one.
+There is one bump PR at a time, on the branch `maint/omp-bump`. A newer omp release rebuilds that branch from `main` and updates the open PR in place, so commits pushed to it are lost; closing the PR unmerged makes the next nightly run open a fresh one.
 
 Nightly runs at 03:30, the digest on Mondays 05:00. The bot never edits `.github/`.
 
