@@ -1425,6 +1425,9 @@ fn a_failed_reopen_of_the_current_session_keeps_it_and_its_conversation() {
         assert!(before > 0);
         // Loads fine, but cannot be opened for appending.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+            return; // running as root (the release container): permissions do not apply
+        }
         drain(&mut rx);
         let ok = a.load_session(&path).await;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
