@@ -22,15 +22,17 @@ jobs:
       - run: rustup toolchain install && rustup component add rustfmt clippy
       - run: scripts/ci-checks.sh
       - name: publish offload base
-        if: github.event_name == 'push' && vars.OFFLOAD_REGISTRY != ''
+        if: github.event_name == 'push' && vars.OFFLOAD_PUBLISH == 'true'
         env:
-          REGISTRY: ${{ vars.OFFLOAD_REGISTRY }}
+          REGISTRY: ${{ secrets.OFFLOAD_REGISTRY }}
         run: scripts/publish-offload-base.sh
       - run: df -h / && du -sh target
         if: always()
   check-arm64:
     # The same checks on arm64, and the arm64 half of offload's base image. Main only.
-    if: github.event_name == 'push' && vars.OFFLOAD_REGISTRY != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    # The registry address is a secret so Actions masks it in the (public) logs; the OFFLOAD_PUBLISH
+    # variable only switches publishing on, because a job-level `if` cannot read secrets.
+    if: github.event_name == 'push' && vars.OFFLOAD_PUBLISH == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: arc-mu-arm64
     timeout-minutes: 60
     env:
@@ -41,19 +43,19 @@ jobs:
       - run: scripts/ci-checks.sh
       - name: publish offload base
         env:
-          REGISTRY: ${{ vars.OFFLOAD_REGISTRY }}
+          REGISTRY: ${{ secrets.OFFLOAD_REGISTRY }}
         run: scripts/publish-offload-base.sh
   offload-base:
     # Makes the multi-arch main from the per-arch bases. A failed arch keeps its previous, still valid base.
     needs: [check, check-arm64]
-    if: ${{ !cancelled() && github.event_name == 'push' && vars.OFFLOAD_REGISTRY != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ !cancelled() && github.event_name == 'push' && vars.OFFLOAD_PUBLISH == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: arc-mu
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - run: scripts/publish-offload-base.sh index
         env:
-          REGISTRY: ${{ vars.OFFLOAD_REGISTRY }}
+          REGISTRY: ${{ secrets.OFFLOAD_REGISTRY }}
   check-fork:
     # Fork PRs run on a GitHub-hosted runner instead: nothing of ours, no secrets, a read-only token.
     # No sccache here, so this is slower than `check`.
