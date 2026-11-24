@@ -4,7 +4,7 @@
 # incremental build from main. Run from main's CI after the checks, in the checkout they ran in; REGISTRY names the
 # registry (no scheme) that holds arc-mu-runner and offload-base/mu. Each architecture's CI job publishes
 # offload-base/mu:main-<arch>, and `publish-offload-base.sh index` makes the multi-arch main from them. A replaced
-# manifest is deleted so the registry's weekly garbage collection can free its blobs.
+# manifest is deleted so the registry's daily garbage collection can free its blobs.
 set -euo pipefail
 
 : "${REGISTRY:?REGISTRY is not set}"
