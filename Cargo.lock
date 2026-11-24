@@ -155,6 +155,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "archery"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
+dependencies = [
+ "triomphe",
+]
+
+[[package]]
 name = "argmax"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2949,7 +2958,7 @@ dependencies = [
 [[package]]
 name = "grep-searcher"
 version = "0.1.17"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "bstr",
  "encoding_rs",
@@ -3709,7 +3718,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jaq-core"
 version = "3.1.1"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "dyn-clone",
  "once_cell",
@@ -3719,7 +3728,7 @@ dependencies = [
 [[package]]
 name = "jaq-json"
 version = "2.0.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "bstr",
  "bytes",
@@ -3736,7 +3745,7 @@ dependencies = [
 [[package]]
 name = "jaq-std"
 version = "3.0.3"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "bstr",
  "jaq-core",
@@ -4888,8 +4897,8 @@ dependencies = [
 
 [[package]]
 name = "omp-ast"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4924,8 +4933,8 @@ dependencies = [
 
 [[package]]
 name = "omp-builtins"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "ansi-width",
  "argmax",
@@ -5020,16 +5029,16 @@ dependencies = [
 
 [[package]]
 name = "omp-diff"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "xutf",
 ]
 
 [[package]]
 name = "omp-edit"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "async-trait",
  "omp-ast",
@@ -5045,8 +5054,8 @@ dependencies = [
 
 [[package]]
 name = "omp-iso"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "async-trait",
  "libc",
@@ -5059,8 +5068,8 @@ dependencies = [
 
 [[package]]
 name = "omp-shell"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5082,6 +5091,7 @@ dependencies = [
  "pcre2-sys",
  "postcard",
  "regex",
+ "rpds",
  "serde",
  "serde_json",
  "smallvec",
@@ -5098,8 +5108,8 @@ dependencies = [
 
 [[package]]
 name = "omp-vcs"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "futures",
  "gix",
@@ -5116,8 +5126,8 @@ dependencies = [
 
 [[package]]
 name = "omp-vfs"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "async-trait",
  "libc",
@@ -5130,8 +5140,8 @@ dependencies = [
 
 [[package]]
 name = "omp-xfs"
-version = "19.1.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+version = "19.1.1"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "flume",
  "futures",
@@ -5919,6 +5929,17 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpds"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e025feb26210bc196b908e72deb063b1b4000754304341cbc168a1e72c857ebc"
+dependencies = [
+ "archery",
+ "serde",
+ "smallvec",
 ]
 
 [[package]]
@@ -7042,7 +7063,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
-source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.0#a7135b8f31826c878734388b648f52bed8da436e"
+source = "git+https://github.com/can1357/oh-my-pi?tag=v19.1.1#31ffee513f27a01bba7d4dfbe12bae239cdc646a"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -7175,6 +7196,12 @@ dependencies = [
  "cc",
  "tree-sitter-language",
 ]
+
+[[package]]
+name = "triomphe"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d15f4f5898bcfc5d8a8e45ed30b2f108d710c1a2e5489dbf80e078f707181bc"
 
 [[package]]
 name = "try-lock"
