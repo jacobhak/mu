@@ -82,4 +82,5 @@ fn version_names_the_pinned_omp() {
     let o = s.run(&["--version"]);
     let text = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(text.contains("(omp "), "{text}");
+    assert!(text.contains(", pi "), "{text}");
 }

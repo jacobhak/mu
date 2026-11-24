@@ -288,6 +288,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         edit: parse(section("edit"), "edit", warn),
         retry,
         mcp: parse(section("mcp"), "mcp", warn),
+        gateway: parse(section("gateway"), "gateway", warn),
         secrets: parse(section("secrets"), "secrets", warn),
         status,
         task: parse(section("task"), "task", warn),
@@ -724,6 +725,14 @@ mod tests {
         let s =
             toml::from_str::<MuConfig>("[sessions]\nsources = [[\"mu-remote\", \"rows\"], [\"x\"]]").unwrap().sessions;
         assert_eq!(s.sources, [vec!["mu-remote".to_string(), "rows".to_string()], vec!["x".to_string()]]);
+    }
+
+    #[test]
+    fn the_gateway_plugin_is_unset_by_default_and_named_by_config() {
+        assert_eq!(MuConfig::default().gateway.plugin, None);
+        assert_eq!(toml::from_str::<MuConfig>("").unwrap().gateway.plugin, None);
+        let g = toml::from_str::<MuConfig>("[gateway]\nplugin = \"gateway-pi\"").unwrap().gateway;
+        assert_eq!(g.plugin.as_deref(), Some("gateway-pi"));
     }
 
     #[test]

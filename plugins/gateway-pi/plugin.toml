@@ -1,0 +1,4 @@
+name = "gateway-pi"
+command = ["mu-gateway", "--backend", "pi", "mu-plugin"]
+lifetime = "idle:10m"
+provider = "gateway"

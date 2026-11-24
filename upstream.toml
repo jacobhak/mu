@@ -2,3 +2,5 @@
 # the omp binary installed to ~/.mu/bin/omp.
 # Bumped by scripts/maint/bump.sh.
 omp = "19.1.1"
+# The pi (earendil-works/pi) release installed to ~/.mu/bin/pi for the pi gateway backend (plugins/gateway-pi).
+pi = "1.6.0"

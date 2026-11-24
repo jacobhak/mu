@@ -1,5 +1,6 @@
 //! What the CLI commands and the mu adapter both do. They block, so async callers run them on a blocking thread.
 
+use crate::state::Backend;
 use crate::{daemon, sealed_state, state};
 use serde_json::{Value, json};
 use std::fs;
@@ -20,11 +21,20 @@ impl Endpoint {
     }
 }
 
-fn read_token(root: &std::path::Path) -> Result<String, String> {
-    let path = root.join("auth-gateway.token");
-    fs::read_to_string(&path).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty()).ok_or_else(|| {
-        format!("gateway token not found at {}; run `omp auth-gateway token` (or `mu-gateway login`)", path.display())
-    })
+/// The bearer token: omp's `auth-gateway.token`, or the pi daemon's own `token` file in `dir`.
+fn read_token(dir: &std::path::Path) -> Result<String, String> {
+    let (path, hint) = match state::backend() {
+        Backend::Omp => (
+            sealed_state::credential_root().join("auth-gateway.token"),
+            "run `omp auth-gateway token` (or `mu-gateway login`)",
+        ),
+        Backend::Pi => (state::token_path(dir), "the daemon writes it on start"),
+    };
+    fs::read_to_string(&path)
+        .map(|t| t.trim().to_string())
+        .ok()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| format!("gateway token not found at {}; {hint}", path.display()))
 }
 
 /// A live gateway URL and its bearer token, with a lease touched for `pid`. With `start`, the daemon is started if
@@ -35,7 +45,7 @@ pub fn endpoint(pid: u32, start: bool) -> Result<Option<Endpoint>, String> {
         let Some(st) = state::read_state(&dir).filter(|st| state::alive(st.pid) && state::healthy(&st.url)) else {
             return Ok(None);
         };
-        let token = read_token(&sealed_state::credential_root())?;
+        let token = read_token(&dir)?;
         return Ok(Some(Endpoint { base_url: st.url, token }));
     }
     fs::create_dir_all(dir.join("leases")).map_err(|e| e.to_string())?;
@@ -44,26 +54,75 @@ pub fn endpoint(pid: u32, start: bool) -> Result<Option<Endpoint>, String> {
         Some(st) if state::alive(st.pid) && state::healthy(&st.url) => st.url,
         _ => {
             let url = daemon::start(&dir)?;
-            // The daemon may have rotated or created credentials while starting.
-            sealed_state::flush();
+            if state::backend() == Backend::Omp {
+                // The daemon may have rotated or created credentials while starting.
+                sealed_state::flush();
+            }
             url
         }
     };
-    let token = read_token(&sealed_state::credential_root())?;
+    let token = read_token(&dir)?;
     state::touch_lease(&dir, pid).map_err(|e| e.to_string())?;
     Ok(Some(Endpoint { base_url: url, token }))
 }
 
-/// The parsed output of `omp models ls --json`.
+/// The model prices: the parsed output of `omp models ls --json`, or what pi's proxy extension writes in its
+/// one-shot prices mode.
 pub fn prices() -> Result<Value, String> {
+    match state::backend() {
+        Backend::Omp => omp_prices(),
+        Backend::Pi => pi_prices(),
+    }
+}
+
+fn pi_prices() -> Result<Value, String> {
+    let proxy = state::proxy_path();
+    if !proxy.is_file() {
+        return Err(format!("pi proxy extension not found at {} (set MU_GATEWAY_PI_PROXY)", proxy.display()));
+    }
+    let proxy = std::path::absolute(&proxy).unwrap_or(proxy);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let out = std::env::temp_dir().join(format!("mu-gateway-pi-prices-{}-{nanos}.json", std::process::id()));
+    let mut cmd = daemon::pi_proxy_command(&proxy);
+    // Held open for the run: pi exits on stdin EOF, and the extension stops it itself once the file is written.
+    cmd.current_dir(std::env::temp_dir())
+        .env("MU_GW_PI_MODE", "prices")
+        .env("MU_GW_PI_OUT", &out)
+        .stdin(Stdio::piped());
+    let label = "pi prices run";
+    let result = run_capture(cmd, "pi", label).and_then(|(status, _, err)| {
+        if !status.success() {
+            return Err(format!("`{label}` failed ({status}): {}", String::from_utf8_lossy(&err).trim()));
+        }
+        let body = fs::read(&out).map_err(|e| format!("`{label}` wrote no prices file: {e}"))?;
+        serde_json::from_slice(&body).map_err(|e| format!("`{label}` wrote no JSON: {e}"))
+    });
+    let _ = fs::remove_file(&out);
+    result
+}
+
+fn omp_prices() -> Result<Value, String> {
     let mut cmd = Command::new(state::omp_bin());
-    cmd.args(["models", "ls", "--json"]).envs(sealed_state::envs());
+    cmd.args(["models", "ls", "--json"]).envs(sealed_state::envs()).stdin(Stdio::null());
+    let (status, out, err) = run_capture(cmd, "omp", "omp models ls --json")?;
+    sealed_state::flush();
+    if !status.success() {
+        return Err(format!("`omp models ls --json` failed ({status}): {}", String::from_utf8_lossy(&err).trim()));
+    }
+    serde_json::from_slice(&out).map_err(|e| format!("`omp models ls --json` printed no JSON: {e}"))
+}
+
+/// Runs `cmd` with stdout and stderr captured, killing it after `PRICES_TIMEOUT`.
+fn run_capture(
+    mut cmd: Command,
+    program: &str,
+    label: &str,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
     let mut child = cmd
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run `omp` ({e})"))?;
+        .map_err(|e| format!("cannot run `{program}` ({e})"))?;
     let drain = |r: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -83,18 +142,12 @@ pub fn prices() -> Result<Value, String> {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("`omp models ls --json` timed out after {}s", PRICES_TIMEOUT.as_secs()));
+                return Err(format!("`{label}` timed out after {}s", PRICES_TIMEOUT.as_secs()));
             }
             Err(e) => return Err(e.to_string()),
         }
     };
-    let out = out.join().unwrap_or_default();
-    let err = err.join().unwrap_or_default();
-    sealed_state::flush();
-    if !status.success() {
-        return Err(format!("`omp models ls --json` failed ({status}): {}", String::from_utf8_lossy(&err).trim()));
-    }
-    serde_json::from_slice(&out).map_err(|e| format!("`omp models ls --json` printed no JSON: {e}"))
+    Ok((status, out.join().unwrap_or_default(), err.join().unwrap_or_default()))
 }
 
 pub fn status() -> Value {
@@ -110,11 +163,22 @@ pub fn stop() -> bool {
     daemon::stop(&state::gw_dir())
 }
 
-/// `omp login [provider]` with stdio inherited; replaces this process.
+/// `omp login [provider]` (`pi auth login [provider]` for pi) with stdio inherited; replaces this process.
 pub fn login(provider: Option<&str>) -> String {
     use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new(state::omp_bin());
-    cmd.arg("login").args(provider);
+    let (mut cmd, shown) = match state::backend() {
+        Backend::Omp => {
+            let mut cmd = Command::new(state::omp_bin());
+            cmd.arg("login");
+            (cmd, "omp login")
+        }
+        Backend::Pi => {
+            let mut cmd = Command::new(state::pi_bin());
+            cmd.args(["auth", "login"]);
+            (cmd, "pi auth login")
+        }
+    };
+    cmd.args(provider);
     let e = cmd.exec();
-    format!("cannot run `omp login` ({e})")
+    format!("cannot run `{shown}` ({e})")
 }

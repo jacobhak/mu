@@ -11,6 +11,10 @@ models at `/v1/models` and quota windows at `/v1/usage`; it also accepts OpenAI 
 tool also lists model prices (`omp models ls --json`) and runs `omp login`. Its `mu-plugin` mode is mu's
 [gateway provider contract](../../docs/providers.md#gateway-plugins).
 
+A second backend, selected with `--backend pi`, reaches providers through the [pi](https://github.com/earendil-works/pi)
+coding agent instead (see [The pi backend](#the-pi-backend)). Everything below describes the default omp backend
+unless it says otherwise.
+
 ## How the gateway lives and dies
 
 - **One pair per profile.** Every client of the same omp profile shares the pair, because the pair holds that
@@ -29,8 +33,8 @@ tool also lists model prices (`omp models ls --json`) and runs `omp login`. Its 
 
 ## Commands
 
-Every command takes `--profile NAME` (default `$OMP_PROFILE`, then `$PI_PROFILE`). JSON goes to stdout; errors go
-to stderr with exit 1.
+Every command takes `--profile NAME` (default `$OMP_PROFILE`, then `$PI_PROFILE`) and `--backend omp|pi` (default
+`$MU_GATEWAY_BACKEND`, then `omp`). JSON goes to stdout; errors go to stderr with exit 1.
 
 | Command | Output |
 | --- | --- |
@@ -38,7 +42,7 @@ to stderr with exit 1.
 | `prices` | The parsed output of `omp models ls --json` (60 s limit): `{"models":[{provider,id,name?,reasoning?,pricingStatus?,cost:{input,output,cacheRead,cacheWrite,longContext?}}]}`. |
 | `status` | `{"running":true,"pid":123,"url":"http://127.0.0.1:PORT","leases":2}`, or `running:false` with `pid` and `url` null. `leases` counts leases of live processes. |
 | `stop` | `{"stopped":true}` after stopping the daemon (SIGTERM, then SIGKILL after the grace omp's broker needs to finish a token refresh), `{"stopped":false}` when none ran. |
-| `login [PROVIDER]` | Runs `omp login [PROVIDER]` with your terminal, so subscription logins need no other tool. |
+| `login [PROVIDER]` | Runs `omp login [PROVIDER]` (`pi auth login [PROVIDER]` with `--backend pi`) with your terminal, so subscription logins need no other tool. |
 | `mu-plugin` | mu's plugin protocol on stdio (below). |
 
 `daemon` and `guard` are internal.
@@ -121,6 +125,32 @@ The unit and integration tests run with the workspace (`cargo test --workspace`)
 contract_`) run the real omp, named by `MU_GATEWAY_OMP`; mu's maintenance bot (`scripts/maint/`) runs them on every
 omp bump, with the pinned omp fetched by `scripts/fetch-omp.sh`, and its triage agent reads omp's auth-broker and
 auth-gateway changes against the touchpoints listed in `scripts/maint/material.sh`.
+
+## The pi backend
+
+`--backend pi` (or `MU_GATEWAY_BACKEND=pi`; mu selects it with the `gateway-pi` plugin, whose manifest runs
+`mu-gateway --backend pi mu-plugin`) replaces the omp pair with one pi process. Pi has no auth server, so the
+daemon runs `pi --mode rpc --no-session -ne -e <proxy.mjs> --no-mcp --no-skills --no-prompt-templates --no-themes
+--no-context-files -na` with `plugins/gateway-pi/proxy.mjs`, an extension that listens on a loopback port and
+serves the same endpoints through pi's own model registry (credentials, OAuth refresh, catalogue, streaming):
+Anthropic Messages at `/v1/messages`, `/v1/models`, `/v1/usage` and an unauthenticated `/healthz`.
+
+- **Process.** The daemon makes a random token, writes it to `<dir>/token` (0600) and passes it to pi as
+  `MU_GW_PI_TOKEN`, with `MU_GW_PI_MODE=serve`. The extension prints `mu-gateway-pi proxy listening on
+  http://127.0.0.1:PORT` on stderr; the daemon takes the first `http://` URL from pi's output. The pi child is its
+  own process group with the same guard and parent-death handling as the omp pair, and its stdin stays open in
+  the daemon, so pi also exits when the daemon dies. Leases, idle timers, `status` and `stop` work as above.
+- **State.** `$MU_GATEWAY_PI_HOME`, else `<mu home>/gateway-pi`, with the same layout as the omp home plus
+  `token`; `--profile` selects a mu profile directory only and is not passed to pi.
+- **Finding pi.** `$MU_GATEWAY_PI`, else the `pi` next to the `mu-gateway` binary (`~/.mu/bin/pi`), else `pi` on
+  `PATH`. **Finding the proxy.** `$MU_GATEWAY_PI_PROXY`, else `proxy.mjs` in the working directory (mu starts
+  plugins in their own directory), else `<exe dir>/../plugins/gateway-pi/proxy.mjs`.
+- **Prices.** A one-shot run of the same command with `MU_GW_PI_MODE=prices` and `MU_GW_PI_OUT=<temp file>`
+  (60 s limit); the extension writes `{"models":[…]}` from pi's catalogue and exits.
+- **Login.** `mu-gateway --backend pi login [PROVIDER]` runs `pi auth login [PROVIDER]`.
+- **Credentials are not sealed.** The adapter never uses mu's `core/secrets` for pi: no unsealing, no flush, no
+  environment overrides. Pi's own files (`~/.pi`) stay where pi keeps them, in plaintext.
+- **Quota.** Pi reports no quota windows, so `/v1/usage` answers an empty `reports` list.
 
 ## Open risk
 

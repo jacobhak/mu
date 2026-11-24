@@ -11,10 +11,12 @@ stage_layout() {
     mkdir -p "$dest/mu/plugins/$p"
     cp "$root/plugins/$p/plugin.toml" "$dest/mu/plugins/$p/"
   done
+  mkdir -p "$dest/mu/plugins/gateway-pi"
+  cp "$root/plugins/gateway-pi/plugin.toml" "$root/plugins/gateway-pi/proxy.mjs" "$root/plugins/gateway-pi/translate.mjs" "$dest/mu/plugins/gateway-pi/"
   mkdir -p "$dest/mu/plugins/web"
   cp "$root/plugins/web/plugin.toml" "$dest/mu/plugins/web/"
   cp -R "$root/plugins/web/schemas" "$dest/mu/plugins/web/schemas"
   cp -R "$root/plugins/memory/schemas" "$dest/mu/plugins/memory/schemas"
   cp "$root/upstream.toml" "$root/LICENSE" "$root/THIRD-PARTY-NOTICES.md" "$dest/mu/"
-  cp "$root/scripts/install.sh" "$root/scripts/fetch-omp.sh" "$dest/mu/scripts/"
+  cp "$root/scripts/install.sh" "$root/scripts/fetch-omp.sh" "$root/scripts/fetch-pi.sh" "$dest/mu/scripts/"
 }
