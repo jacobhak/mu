@@ -10,6 +10,9 @@ permissions:
 jobs:
   # The Linux build runs in ubuntu:22.04, so the binary's glibc floor is 2.35.
   build-linux:
+    # Same-repo guard as ci.yml: a no-op while only tags and manual runs trigger this, but it keeps a
+    # fork PR trigger added later off the self-hosted runners.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: arc-mu
     # A hung step otherwise holds the runner for GitHub's 6 h default.
     timeout-minutes: 60
@@ -37,6 +40,7 @@ jobs:
           # Only the release job reads it; the published copy is the release asset.
           retention-days: 1
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +63,7 @@ jobs:
   release:
     needs: [build, build-linux]
     # A manual run exercises the matrix; only a tag publishes.
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: arc-mu
     timeout-minutes: 60
     permissions:
