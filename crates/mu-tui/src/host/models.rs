@@ -2,11 +2,13 @@
 //! editor, model sets").
 
 use super::local::{Local, Registry};
+use super::startup::ImportOffer;
 use super::{Answer, pending, ready};
 use crate::panels::doc_review::Tier;
-use mu_base::config::{Configs, models_path};
+use mu_base::config::{self, Configs, models_path};
 use mu_base::model_config::{MAIN_SET, RoleMeta};
 use mu_base::roles::{self, RoleView};
+use mu_provider::pi_import;
 use mu_provider::provider::custom::KeyState;
 use mu_tools::context::Context;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ pub const NEW_SET: &str = "new_set";
 pub const DELETE_SET: &str = "delete_set";
 pub const RENAME_SET: &str = "rename_set";
 pub const IMPORT_MODELS: &str = "import_models";
+pub const IMPORT_OFFERS: &str = "import_offers";
 
 /// Where a listed model comes from, with what the picker says beside it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -103,6 +106,9 @@ pub struct Imported {
     pub lines: Vec<String>,
     pub path: PathBuf,
     pub has_default: bool,
+    /// Parts of a pi import that could not be written.
+    #[serde(default)]
+    pub failed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,6 +136,7 @@ pub(super) fn register(r: &mut Registry) {
     r.add(DELETE_SET, delete_set);
     r.add(RENAME_SET, rename_set);
     r.add(IMPORT_MODELS, import_models);
+    r.add(IMPORT_OFFERS, import_offers);
 }
 
 /// `()`: the roles and every model the pickers list, from what is cached now (never the network).
@@ -252,7 +259,8 @@ fn set_table(l: &Rc<Local>, args: serde_json::Value) -> Answer {
                 name,
             })
             .collect();
-        Ok(SetTable { sets, import_offer: cfg.import_offer.borrow().is_some() })
+        let import_offer = cfg.import_offer.borrow().is_some() || cfg.pi_import_offer.borrow().is_some();
+        Ok(SetTable { sets, import_offer })
     })
 }
 
@@ -289,12 +297,63 @@ fn rename_set(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |r: Rename| l.providers.cfg.rename_set(&r.old, &r.new))
 }
 
-/// `()`: copies omp's model config into models.toml, never over an existing file.
+/// `()`: what can be copied now, from omp and from pi, with the lines that list it.
+fn import_offers(l: &Rc<Local>, args: serde_json::Value) -> Answer {
+    ready(args, |(): ()| Ok(offers(l)))
+}
+
+fn offers(l: &Rc<Local>) -> Vec<ImportOffer> {
+    let offer = |source: &str, lines| ImportOffer { source: source.into(), lines, models_path: models_path() };
+    let mut out: Vec<ImportOffer> = config::omp_import().map(|i| offer("omp", i.lines)).into_iter().collect();
+    if let Some(plan) = config::pi_import() {
+        let r = pi_import::resolve(&plan, l.providers.custom_registry(), l.providers.store(), false);
+        if !r.is_empty() {
+            out.push(offer("pi", r.lines));
+        }
+    }
+    out
+}
+
+/// `source`: `omp` or `pi` (`None`: whichever is the only one) is copied: omp's into models.toml,
+/// never over an existing file; pi's into mu's files, leaving anything mu already has.
 fn import_models(l: &Rc<Local>, args: serde_json::Value) -> Answer {
-    ready(args, |(): ()| {
+    ready(args, |source: Option<String>| {
         let cfg = &l.providers.cfg;
-        let lines = cfg.import_models(false)?;
-        Ok(Imported { lines, path: models_path(), has_default: cfg.role("default").is_some() })
+        let source = match source.as_deref() {
+            Some(s @ ("omp" | "pi")) => s.to_string(),
+            Some(other) => return Err(format!("unknown import source `{other}`: omp or pi")),
+            None => match offers(l).as_slice() {
+                [one] => one.source.clone(),
+                [] => return Err("nothing to import: neither omp nor pi has setup mu can use".into()),
+                _ => {
+                    return Err(
+                        "both omp and pi have setup to import: /modelset import omp, or /modelset import pi".into()
+                    );
+                }
+            },
+        };
+        if source == "omp" {
+            let lines = cfg.import_models(false)?;
+            return Ok(Imported {
+                lines,
+                path: models_path(),
+                has_default: cfg.role("default").is_some(),
+                failed: vec![],
+            });
+        }
+        let plan = config::pi_import().ok_or_else(config::nothing_to_import_from_pi)?;
+        let (registry, store) = (l.providers.custom_registry(), l.providers.store());
+        let resolved = pi_import::resolve(&plan, registry, store, false);
+        if resolved.is_empty() {
+            return Err(format!("nothing to import from pi:\n{}", resolved.lines.join("\n")));
+        }
+        let done = resolved.apply(cfg, registry, store, false);
+        Ok(Imported {
+            lines: resolved.lines,
+            path: models_path(),
+            has_default: cfg.role("default").is_some(),
+            failed: done.failed,
+        })
     })
 }
 
@@ -345,7 +404,7 @@ mod tests {
 
         let sw = Switched { mode_model: Some("@plan".into()), default: Some("a/b".into()) };
         assert_eq!(round(&sw), sw);
-        let imp = Imported { lines: vec!["l".into()], path: "/m".into(), has_default: true };
+        let imp = Imported { lines: vec!["l".into()], path: "/m".into(), has_default: true, failed: vec!["f".into()] };
         assert_eq!(round(&imp), imp);
     }
 }

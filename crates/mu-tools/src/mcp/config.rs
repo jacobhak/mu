@@ -223,15 +223,41 @@ pub(super) fn connection_key(s: &McpServer) -> Value {
     json!({"kind": kind, "auth": s.auth})
 }
 
+/// pi's user-level `mcp.json`. It rides along with omp's real agent dir, so a caller that names some other agent
+/// dir (a test, say) never reads the developer's `~/.pi`; `None` too when pi's dir is omp's (read once).
+fn pi_user_file(agent: &Path) -> Option<PathBuf> {
+    let pi = mu_common::paths::pi_agent_dir();
+    (agent == mu_common::paths::omp_agent_dir() && pi != agent).then(|| pi.join("mcp.json"))
+}
+
+/// Whether `file` is one of pi's own (read-only for mu, and its `timeout` counts seconds, not milliseconds).
+pub fn is_pi_file(cwd: &Path, agent: &Path, file: &Path) -> bool {
+    file == cwd.join(".pi/mcp.json") || pi_user_file(agent).as_deref() == Some(file)
+}
+
+/// pi's entries differ from omp's in one field: `timeout` is in seconds. Its `!command` values (env, headers)
+/// are not run, and an entry that needs one is refused rather than sent literally.
+fn pi_entry(entry: Value) -> Result<Value, String> {
+    let Value::Object(mut o) = entry else { return Ok(entry) };
+    for key in ["env", "headers"] {
+        if let Some(Value::Object(m)) = o.get(key)
+            && let Some(k) = m.iter().find(|(_, v)| v.as_str().is_some_and(|s| s.starts_with('!'))).map(|(k, _)| k)
+        {
+            return Err(format!("`{key}.{k}` is a `!command` value, which mu does not run"));
+        }
+    }
+    if let Some(t) = o.get("timeout").and_then(Value::as_f64) {
+        o.insert("timeout".into(), json!((t * 1000.0).round() as u64));
+    }
+    Ok(Value::Object(o))
+}
+
 pub fn candidate_files(cwd: &Path, agent: &Path) -> Vec<PathBuf> {
-    vec![
-        cwd.join(".omp/mcp.json"),
-        cwd.join(".omp/.mcp.json"),
-        agent.join("mcp.json"),
-        agent.join(".mcp.json"),
-        cwd.join("mcp.json"),
-        cwd.join(".mcp.json"),
-    ]
+    let mut files = vec![cwd.join(".omp/mcp.json"), cwd.join(".omp/.mcp.json"), cwd.join(".pi/mcp.json")];
+    files.extend([agent.join("mcp.json"), agent.join(".mcp.json")]);
+    files.extend(pi_user_file(agent));
+    files.extend([cwd.join("mcp.json"), cwd.join(".mcp.json")]);
+    files
 }
 
 fn names(v: Option<&Value>) -> Vec<String> {
@@ -264,8 +290,10 @@ pub fn load_all_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<
     let mut claimed: Vec<String> = Vec::new();
     let mut out: Vec<Entry> = Vec::new();
     let mut keys: Vec<Value> = Vec::new();
-    let agent_files = [agent.join("mcp.json"), agent.join(".mcp.json")];
+    let mut agent_files = vec![agent.join("mcp.json"), agent.join(".mcp.json")];
+    agent_files.extend(pi_user_file(agent));
     for file in candidate_files(cwd, agent) {
+        let pi = is_pi_file(cwd, agent, &file);
         let Some(Value::Object(root)) = read_json(&file, &mut warnings) else { continue };
         let Some(mcp) = root.get("mcpServers") else { continue };
         let Value::Object(servers) = mcp else { continue };
@@ -277,6 +305,17 @@ pub fn load_all_with(cwd: &Path, agent: &Path, get_env: &dyn Fn(&str) -> Option<
             }
             claimed.push(name.clone());
             let entry = if trusted { expand_value(raw, get_env) } else { raw.clone() };
+            let entry = if pi {
+                match pi_entry(entry) {
+                    Ok(e) => e,
+                    Err(why) => {
+                        warnings.push(format!("mcp {name}: skipped ({why}) in {}", file.display()));
+                        continue;
+                    }
+                }
+            } else {
+                entry
+            };
             let on = entry.get("enabled").and_then(as_bool).unwrap_or(true);
             let on = if disabled.contains(name) { false } else { on || enabled.contains(name) };
             match parse_entry(name, &entry) {
@@ -527,6 +566,28 @@ mod tests {
         assert_eq!(s[2].oauth_key(), None);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("`b`") && w[0].contains("auth.resource"), "{w:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_pi_project_file_is_gated_counts_seconds_and_refuses_bang_commands() {
+        mu_testutil::home();
+        let d = tmp();
+        let (cwd, agent) = (d.join("p"), d.join("a"));
+        let file = cwd.join(".pi/mcp.json");
+        write(
+            &file,
+            r#"{"mcpServers":{"slow":{"url":"http://s","timeout":90},"bang":{"command":"c","env":{"T":"!pass show t"}},"ok":{"command":"x"}}}"#,
+        );
+        assert!(is_pi_file(&cwd, &agent, &file));
+        let (all, w) = load_all_with(&cwd, &agent, &env);
+        assert!(all.iter().all(|e| !e.trusted), "a project file waits for trust");
+        assert!(w.iter().any(|w| w.contains("mcp bang") && w.contains("!command")), "{w:?}");
+        trust_all(&cwd, &agent);
+        let (s, _) = load_with(&cwd, &agent, &env);
+        let names: Vec<_> = s.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["slow", "ok"]);
+        assert_eq!(s[0].timeout_ms, Some(90_000));
         let _ = std::fs::remove_dir_all(d);
     }
 

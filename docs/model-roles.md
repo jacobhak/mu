@@ -56,3 +56,20 @@ Every role lives in a **set**: a complete role list, usually one per provider. W
 ### Importing omp's config
 
 mu copies omp's model config only when you say so: a dialog at startup while `models.toml` does not exist and omp has model config, `/modelset import`, or `mu models import [--yes] [--force]`. It copies `modelRoles` as set `main`, each `modelPresets.<name>.modelRoles` as set `<name>`, `cycleOrder`, the limits in omp's `models.yml`, `compaction.modelThresholds`, and thresholds from `[compaction.model_thresholds]` in mu's old `config.toml`. omp's files are never written.
+
+### Importing pi's setup
+
+`mu models import --from pi` copies from pi's agent dir (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) the same one-time way: a startup row beside omp's (when `models.toml` is missing and pi has something to copy), `/modelset import [omp|pi]`, and `mu models import [--from omp|pi] [--yes] [--force]`. Without `--from` it uses the tool that has something and asks when both do (a script must pass `--from`). The listing before the approval shows what is copied and, one line each, what is skipped and why. pi's files are never written, and neither the listing nor the report shows a key. Each part goes in on its own:
+
+| pi | mu |
+|---|---|
+| `settings.json` `defaultProvider` + `defaultModel` | role `default` of set `main` (`provider/model`; pi and mu name providers alike). Skipped when one is missing or the provider is a `models.json` provider mu did not import |
+| `defaultThinkingLevel` | the role's `:level` suffix (`minimal` is `low`) |
+| `compaction.modelOverrides.<provider/model>.reserveTokens` | `[compaction.thresholds]` `"provider/model" = "f<window - reserve>"`, only for a `models.json` model, whose context window is known; `keepRecentTokens` has no equivalent. Other models are skipped: set the threshold by hand |
+| `models.json` providers with `api: "openai-completions"` | custom endpoints, see [providers.md](providers.md#importing-pi-endpoints-and-keys) |
+| `auth.json` `api_key` logins | keys, see [providers.md](providers.md#importing-pi-endpoints-and-keys) |
+| `theme` | `[theme] source`: `dark` is `tokyo-night`, `light` is `catppuccin-latte`, `system` is `terminal`; a custom pi theme is skipped |
+| `hideThinkingBlock` | `[display] hide_thinking_block` ([config.md](config.md)) |
+| `enabledModels` | not imported |
+
+An existing `models.toml`, a key mu already stores, a `[theme] source` or `[display] hide_thinking_block` in `config.toml` are kept and reported as skipped; `--force` replaces them (`--force` replaces the whole `models.toml`, as for omp). A custom endpoint is never replaced. The other parts still import when `models.toml` exists.

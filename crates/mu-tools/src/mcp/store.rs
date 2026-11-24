@@ -2,7 +2,7 @@
 //! a file (other servers, other keys, key order) is kept. A file that does not parse is never
 //! overwritten.
 
-use super::config::{as_bool, candidate_files};
+use super::config::{as_bool, candidate_files, is_pi_file};
 use super::trust;
 use super::{JsonError, read_json};
 use serde_json::{Map, Value};
@@ -144,6 +144,12 @@ pub fn remove(cwd: &Path, agent: &Path, name: &str) -> Result<Vec<PathBuf>, Stri
     if files.is_empty() {
         return Err(format!("no MCP server `{name}` is configured"));
     }
+    if let Some(f) = files.iter().find(|f| is_pi_file(cwd, agent, f)) {
+        return Err(format!(
+            "`{name}` is defined in {}, a pi file that mu does not edit; remove it there, or switch it off with /mcp disable",
+            f.display()
+        ));
+    }
     for f in &files {
         let mut root = read_root(f)?;
         let was_trusted = root.get("mcpServers").is_some_and(|s| trust::is_trusted(f, &trust::digest(s)));
@@ -228,6 +234,26 @@ mod tests {
         put(&cwd.join(".omp/mcp.json"), r#"{"mcpServers":{"evil":{"command":"rm"}}}"#);
         add(Level::Project, &cwd, &agent, "three", json!({"command": "y"})).unwrap();
         assert_eq!(trusted_state(&cwd, &agent), vec![("evil".into(), false), ("three".into(), false)]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_server_pi_defines_is_switched_off_but_never_edited_out() {
+        mu_testutil::home();
+        let d = tmp();
+        let (cwd, agent) = (d.join("p"), d.join("a"));
+        let pi = cwd.join(".pi/mcp.json");
+        put(&pi, r#"{"mcpServers":{"theirs":{"command":"x"}}}"#);
+        let before = std::fs::read_to_string(&pi).unwrap();
+        let err = remove(&cwd, &agent, "theirs").unwrap_err();
+        assert!(err.contains("pi file") && err.contains("/mcp disable"), "{err}");
+        assert_eq!(std::fs::read_to_string(&pi).unwrap(), before);
+        assert!(
+            add(Level::User, &cwd, &agent, "theirs", json!({"command": "y"})).unwrap_err().contains("already defined")
+        );
+        assert!(set_enabled(&cwd, &agent, "theirs", false).unwrap());
+        assert_eq!(std::fs::read_to_string(&pi).unwrap(), before);
+        assert_eq!(state(&cwd, &agent), vec![("theirs".into(), false)]);
         let _ = std::fs::remove_dir_all(d);
     }
 

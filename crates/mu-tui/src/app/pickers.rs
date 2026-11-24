@@ -511,8 +511,8 @@ impl App {
     pub(super) fn on_overlay_event(&mut self, e: OverlayEvent) {
         match e {
             OverlayEvent::ModelSet(name) => self.switch_to(&name),
-            OverlayEvent::ModelImport(true) => self.import_now(),
-            OverlayEvent::ModelImport(false) => {}
+            OverlayEvent::ModelImport(Some(source)) => self.import_now(Some(&source)),
+            OverlayEvent::ModelImport(None) => {}
             OverlayEvent::McpTrust(true, files) => self.trust_mcp_files(files),
             OverlayEvent::McpTrust(false, _) => {}
             OverlayEvent::SetModel(id) => self.send(Command::SetModel(id)),

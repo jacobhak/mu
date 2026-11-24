@@ -50,6 +50,9 @@ readonly_bash = true   # the built-in read-only command set counts as reading; f
 turn_end = true       # a turn you typed ends with no background command or subagent running
 attention = true      # a running turn asks you something or needs an approval or plan review, or a pty command waits for keyboard input, whoever started it
 
+# [display]
+# hide_thinking_block = false  # hide the model's thinking blocks; unset follows omp's `hideThinkingBlock`. `mu models import --from pi` sets it from pi's setting
+
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 
@@ -85,7 +88,7 @@ user_cap = 1500       # characters in user.md
 project_cap = 4000    # characters in a repository's memory.md
 ```
 
-`/theme` opens a picker of the bundled palettes, your `~/.mu/themes/*.toml`, `terminal`, and `omarchy` when its colours file exists, each tagged dark or light. The screen takes the highlighted theme as you move (the picker, composer and status line recolour; output already printed keeps its colours), Esc puts the old one back, and Enter keeps it and writes `[theme] source` to `config.toml`, leaving its comments and other keys alone. `/theme <name>` does the same without the picker. `terminal` reads the terminal's colours once, at start-up, so it can be previewed only when it was the theme then; chosen from another theme it is saved and takes effect on the next start. `--theme` still overrides the saved source for a run.
+`/theme` opens a picker of the bundled palettes, your `~/.mu/themes/*.toml`, `terminal`, and `omarchy` when its colours file exists, each tagged dark or light. The screen takes the highlighted theme as you move (the picker, composer and status line recolour; output already printed keeps its colours), Esc puts the old one back, and Enter keeps it and writes `[theme] source` to `config.toml`, leaving its comments and other keys alone. `/theme <name>` does the same without the picker. `terminal` reads the terminal's colours once, at start-up, so it can be previewed only when it was the theme then; chosen from another theme it is saved and takes effect on the next start. `--theme` still overrides the saved source for a run. `mu models import --from pi` also writes `[theme] source` from pi's `theme` (`dark` is `tokyo-night`, `light` is `catppuccin-latte`, `system` is `terminal`) unless one is set.
 
 With `[task] launcher` and `[task] launch` set, a `task` subagent of a listed kind (`task`, `scout`, a custom agent's name) runs through the launcher, a command that stands in for `mu --headless` (usually it runs the subagent on another machine). Kinds not listed and `/review` run here, and so do a launched subagent's own subagents. Before each launch mu commits the working tree, untracked files included, as `refs/mu/task/<id>` (deleted when the run ends) and hands the launcher that commit with its full history as a git bundle. What the launcher's worker changed comes back as a bundle that mu imports as `refs/mu/result/<id>`; the task's result then ends with a line saying whether it was applied. The launcher's environment and the files involved are the launcher contract, in [remote.md](remote.md#for-extension-authors). `refs/mu/result/*` older than 14 days are deleted before each launch.
 

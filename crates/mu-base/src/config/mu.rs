@@ -10,6 +10,7 @@ pub struct MuConfig {
     pub predict: MuPredict,
     pub ask: MuAsk,
     pub theme: MuTheme,
+    pub display: MuDisplay,
     pub update: MuUpdate,
     pub edit: MuEdit,
     pub retry: MuRetry,
@@ -269,6 +270,14 @@ impl Default for MuUpdate {
 #[serde(default)]
 pub struct MuSecrets {
     pub env: Vec<String>,
+}
+
+/// `[display]`: settings that otherwise come from omp's `config.yml`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+pub struct MuDisplay {
+    /// Hide the model's thinking blocks; unset follows omp's `hideThinkingBlock`.
+    pub hide_thinking_block: Option<bool>,
 }
 
 /// `[theme]`: palette source, accent and card style.

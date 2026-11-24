@@ -104,7 +104,7 @@ pub enum Sub {
         #[command(subcommand)]
         cmd: web::Cmd,
     },
-    /// Model config: `mu models import` copies omp's model roles, presets and limits into models.toml.
+    /// Model config: `mu models import` copies omp's or pi's model setup into mu's own files.
     Models {
         #[command(subcommand)]
         cmd: models::Cmd,

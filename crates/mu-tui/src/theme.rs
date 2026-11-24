@@ -565,6 +565,17 @@ impl Theme {
 mod tests {
     use super::*;
 
+    /// The themes pi's `dark`, `light` and `system` import as (`mu_base::pi_import`).
+    #[test]
+    fn the_themes_a_pi_import_picks_exist() {
+        let (dark, light) = (
+            PALETTES.iter().find(|(k, _)| *k == "tokyo-night").map(|(_, t)| Palette::from_toml(t).unwrap()),
+            PALETTES.iter().find(|(k, _)| *k == "catppuccin-latte").map(|(_, t)| Palette::from_toml(t).unwrap()),
+        );
+        assert_eq!((dark.as_ref().and_then(is_dark), light.as_ref().and_then(is_dark)), (Some(true), Some(false)));
+        assert!(available().iter().any(|e| e.name == "terminal"));
+    }
+
     fn tokyo() -> Palette {
         Palette::from_toml(PALETTES.iter().find(|(k, _)| *k == "tokyo-night").unwrap().1).unwrap()
     }

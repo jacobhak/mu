@@ -439,11 +439,13 @@ pub async fn run(init: AppInit) -> i32 {
     if let Some(e) = completions.error {
         app.error(&e);
     }
-    if let Some(offer) = startup.import_offer {
+    let offers: Vec<ImportOffer> = startup.import_offer.into_iter().chain(startup.pi_import_offer).collect();
+    if !offers.is_empty() {
         if pick_session {
-            app.notice("omp's model config was not copied: /modelset import");
+            let names = offers.iter().map(|o| o.source.as_str()).collect::<Vec<_>>().join(" and ");
+            app.notice(&format!("{names}'s setup was not copied: /modelset import"));
         } else {
-            app.open_import_offer(&offer);
+            app.open_import_offer(&offers);
         }
     }
     if !startup.untrusted_mcp.is_empty() {

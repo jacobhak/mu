@@ -6,4 +6,5 @@ pub mod auth;
 pub mod gateway;
 pub mod model;
 pub mod net;
+pub mod pi_import;
 pub mod provider;

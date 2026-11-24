@@ -140,9 +140,10 @@ pub enum Overlay {
     ModelSet {
         pick: Picker<String>,
     },
-    /// The startup offer to copy omp's model config into models.toml.
+    /// The offer to copy omp's or pi's setup: a row per tool in `sources`, then "Not now".
     ModelImport {
         sel: Select,
+        sources: Vec<String>,
     },
     /// The startup offer to trust a project's MCP servers: each file, its digest and its server names.
     McpTrust {
@@ -232,7 +233,7 @@ macro_rules! picker_select {
             Overlay::Mcp { sel, .. }
             | Overlay::Custom { sel }
             | Overlay::Web { sel }
-            | Overlay::ModelImport { sel }
+            | Overlay::ModelImport { sel, .. }
             | Overlay::McpTrust { sel, .. } => Some(sel.$m()),
             Overlay::ModelRoles { .. }
             | Overlay::Ask(_)
@@ -278,8 +279,8 @@ pub enum OverlayEvent {
     Custom(PanelPick),
     /// Switch to this model set.
     ModelSet(String),
-    /// The import offer: `true` to copy omp's model config.
-    ModelImport(bool),
+    /// The import offer: the tool to copy from, or `None` for "Not now".
+    ModelImport(Option<String>),
     /// The MCP trust offer: `true` to trust these files as they were shown.
     McpTrust(bool, Vec<(PathBuf, String, Vec<String>)>),
     Copy(Option<String>),
@@ -1041,10 +1042,13 @@ impl Overlay {
                 _ => (None, Some(OverlayEvent::Custom(PanelPick::Row(None)))),
             },
             Overlay::ModelSet { pick } => pick_one(pick, k, |pick| Overlay::ModelSet { pick }, OverlayEvent::ModelSet),
-            Overlay::ModelImport { mut sel } => match sel.on_key(k) {
-                SelectResult::Pending => (Some(Overlay::ModelImport { sel }), None),
-                SelectResult::Chosen(i) => (None, Some(OverlayEvent::ModelImport(i.first() == Some(&0)))),
-                _ => (None, Some(OverlayEvent::ModelImport(false))),
+            Overlay::ModelImport { mut sel, sources } => match sel.on_key(k) {
+                SelectResult::Pending => (Some(Overlay::ModelImport { sel, sources }), None),
+                SelectResult::Chosen(i) => {
+                    let source = i.first().and_then(|i| sources.get(*i)).cloned();
+                    (None, Some(OverlayEvent::ModelImport(source)))
+                }
+                _ => (None, Some(OverlayEvent::ModelImport(None))),
             },
             Overlay::McpTrust { mut sel, files } => match sel.on_key(k) {
                 SelectResult::Pending => (Some(Overlay::McpTrust { sel, files }), None),

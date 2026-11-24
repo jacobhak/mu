@@ -213,6 +213,27 @@ Reads omp's files in place. Agent dir: `~/.omp/agent`, or `~/.omp/profiles/<name
 | MCP servers | `<agent>/mcp.json`, `.omp/mcp.json` (also `.omp/.mcp.json`, `<agent>/.mcp.json`, `./mcp.json`, `./.mcp.json`) | Read: stdio and Streamable HTTP servers, merged and named like omp's (`mcp__<server>_<tool>`). Legacy SSE servers are skipped with a warning. Project files (in the working directory) need trust: their servers start only after `/mcp trust` (or **Trust** in the startup dialog), and again when the file's servers change. Unlike omp, which does not gate them. Agent-dir files are always trusted. `/mcp` is the one writer: add, remove and `disabledServers` / `enabledServers` edits to these files (nothing else in a file changes; an unparseable file is left alone) and a live sync of the running servers. OAuth is mu's own (the `mu-mcp-http` bridge, `/login mcp:<name>`); logins made in omp are not reused |
 | Sessions | `<agent>/sessions/<encoded-cwd>/<ts>_<id>.jsonl`, v3 tree; blobs `<agent>/blobs/<sha256>` | Written in omp's v3 format to mu's own directory; omp opens them with `--resume <path>` or `--session-dir` |
 
+pi (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`; read once when it is omp's dir too; project `.pi/`) is read next to omp, after it on a clash:
+
+| Artifact | pi location | mu |
+|---|---|---|
+| Context files | `<agent>/AGENTS.md` (also `AGENTS.override.md`, `CLAUDE.md`); `AGENTS.override.md` replaces the others in a directory | Read (the override rule applies to every directory) |
+| Appended instructions | `<agent>/APPEND_SYSTEM.md`, `.pi/APPEND_SYSTEM.md` | Read as sticky rules. `SYSTEM.md` (replaces pi's prompt) is not |
+| Skills | `<agent>/skills`, `.pi/skills`, searched recursively | Read, recursively here (omp's roots stay one level) |
+| Prompt templates | `<agent>/prompts`, `.pi/prompts` | Read as slash commands with pi's argument syntax |
+| MCP servers | `<agent>/mcp.json`, `.pi/mcp.json` | Read; `timeout` is seconds; `!command` values are not run (the server is skipped); never edited by mu; the project file needs trust |
+| Sessions | `<agent>/sessions/--<path>--/<ts>_<id>.jsonl`, v3 tree | Open by path with `--resume <file>`; pi's `system` messages are skipped and its `model_change` read. Not listed in the picker |
+
+These pi items (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) are copied once into mu's own files and pi's files are never written: `mu models import --from pi`, the startup row and `/modelset import pi` (see `docs/model-roles.md`).
+
+| Artifact | pi location | mu |
+|---|---|---|
+| Default model, thinking level | `settings.json` `defaultProvider`, `defaultModel`, `defaultThinkingLevel` | Role `default` of set `main`, with the level as `:level` |
+| Compaction | `settings.json` `compaction.modelOverrides.<provider/model>.reserveTokens` | `[compaction.thresholds]` `fN` (window minus reserve), only for a `models.json` model; `keepRecentTokens` has no equivalent |
+| Custom endpoints | `models.json` `providers.<id>` with `api: "openai-completions"` | Custom endpoints in `providers.toml`, never over an existing one; other `api` values are skipped |
+| API keys | `auth.json` `api_key` entries (and `apiKey` of `models.json`) | Key store for anthropic, openai, baseten and the endpoints: literal as stored key, `$NAME` as env, `!command` as command. OAuth logins are never copied; `gateway-pi` serves them |
+| Theme, display | `settings.json` `theme`, `hideThinkingBlock` | `[theme] source` (`dark` `tokyo-night`, `light` `catppuccin-latte`, `system` `terminal`), `[display] hide_thinking_block` |
+
 Non-goal: running pi or omp TypeScript extensions.
 
 ## Memory discipline

@@ -1,5 +1,5 @@
-//! `/modelset`: switch, create, delete and rename model sets, and copy omp's model config into
-//! `models.toml` (also offered once at startup).
+//! `/modelset`: switch, create, delete and rename model sets, and copy omp's or pi's setup into
+//! mu's files (also offered once at startup).
 
 use super::*;
 use crate::host::models::{self as models_host, Imported, Rename, SetTable, Switched};
@@ -7,14 +7,15 @@ use crate::widgets::overlay::Overlay;
 use crate::widgets::picker::Picker;
 use crate::widgets::select::{Item, Select};
 
-const USAGE: &str = "usage: /modelset [name | new <name> | delete <name> | rename <old> <new> | import]";
+const USAGE: &str = "usage: /modelset [name | new <name> | delete <name> | rename <old> <new> | import [omp|pi]]";
 
 impl App {
     pub(super) fn modelset_cmd(&mut self, arg: &str) {
         let words: Vec<&str> = arg.split_whitespace().collect();
         match words.as_slice() {
             [] => self.open_set_picker(),
-            ["import"] => self.import_now(),
+            ["import"] => self.import_choice(),
+            ["import", source @ ("omp" | "pi")] => self.import_now(Some(source)),
             [word] if !matches!(*word, "new" | "delete" | "rename") => self.switch_to(word),
             ["new", name] => {
                 let name = name.to_string();
@@ -65,7 +66,7 @@ impl App {
                     "no model sets yet: roles you save with /model go into set main; /modelset new <name> adds another"
                         .to_string();
                 if table.import_offer {
-                    msg.push_str("\n/modelset import copies omp's model config");
+                    msg.push_str("\n/modelset import copies omp's or pi's setup");
                 }
                 return app.notice(&msg);
             }
@@ -105,15 +106,29 @@ impl App {
         });
     }
 
-    pub(super) fn import_now(&mut self) {
-        self.host_call(models_host::IMPORT_MODELS, &(), |app, r: Result<Imported, String>| match r {
+    /// `/modelset import`: copies from the only tool that has something, or asks which when both do.
+    fn import_choice(&mut self) {
+        self.host_call(models_host::IMPORT_OFFERS, &(), |app, r: Result<Vec<ImportOffer>, String>| match r {
+            Err(e) => app.error(&e),
+            Ok(offers) => match offers.as_slice() {
+                [] => app.error("nothing to import: neither omp nor pi has setup mu can use"),
+                [one] => app.import_now(Some(&one.source)),
+                _ => app.open_import_offer(&offers),
+            },
+        });
+    }
+
+    /// Copies the setup of `source` (`omp` or `pi`).
+    pub(super) fn import_now(&mut self, source: Option<&str>) {
+        let source = source.map(str::to_string);
+        let name = source.clone().unwrap_or_else(|| "omp".into());
+        self.host_call(models_host::IMPORT_MODELS, &source, move |app, r: Result<Imported, String>| match r {
             Ok(done) => {
                 app.refresh_commands();
-                app.notice(&format!(
-                    "imported omp's model config into {}:\n{}",
-                    done.path.display(),
-                    done.lines.join("\n")
-                ));
+                app.notice(&format!("imported {name}'s setup ({}):\n{}", done.path.display(), done.lines.join("\n")));
+                if !done.failed.is_empty() {
+                    app.error(&format!("not written: {}", done.failed.join("; ")));
+                }
                 if app.agent.status.model_id.is_empty() && done.has_default {
                     app.send(Command::SetModel("@default".into()));
                 }
@@ -122,15 +137,39 @@ impl App {
         });
     }
 
-    /// Asks once at startup whether to copy omp's model config; declining asks again next start.
-    pub(super) fn open_import_offer(&mut self, offer: &ImportOffer) {
-        let lines = offer.lines.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
-        let items = vec![
-            Item { label: "Import".into(), detail: "copy it into models.toml".into() },
-            Item { label: "Not now".into(), detail: "ask again next start; /modelset import copies it later".into() },
-        ];
-        let context = format!("mu now keeps model roles in {}. Found in omp:\n{lines}", offer.models_path.display());
-        self.overlay =
-            Some(Overlay::ModelImport { sel: Select::new("Import model config from omp?", items).context(&context) });
+    /// Asks once at startup whether to copy omp's or pi's setup, a row for each that has some;
+    /// declining asks again next start.
+    pub(super) fn open_import_offer(&mut self, offers: &[ImportOffer]) {
+        let mut items: Vec<Item> = offers
+            .iter()
+            .map(|o| Item {
+                label: format!("Import from {}", o.source),
+                detail: if o.source == "pi" {
+                    "copy what is listed above".into()
+                } else {
+                    "copy it into models.toml".into()
+                },
+            })
+            .collect();
+        items.push(Item {
+            label: "Not now".into(),
+            detail: "ask again next start; /modelset import copies it later".into(),
+        });
+        let names = offers.iter().map(|o| o.source.as_str()).collect::<Vec<_>>().join(" or ");
+        let found = offers
+            .iter()
+            .map(|o| {
+                let lines = o.lines.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
+                format!("Found in {}:\n{lines}", o.source)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let path = offers.first().map(|o| o.models_path.display().to_string()).unwrap_or_default();
+        let context = format!("mu now keeps model roles in {path}.\n{found}");
+        let sources = offers.iter().map(|o| o.source.clone()).collect();
+        self.overlay = Some(Overlay::ModelImport {
+            sel: Select::new(&format!("Import setup from {names}?"), items).context(&context),
+            sources,
+        });
     }
 }

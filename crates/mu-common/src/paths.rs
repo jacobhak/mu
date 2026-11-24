@@ -119,6 +119,20 @@ pub fn omp_agent_dir() -> PathBuf {
     }
 }
 
+/// pi's agent dir: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`. pi has no profiles, so unlike omp's it ignores them.
+/// It can equal `omp_agent_dir()` (omp reads the same variable); callers that read both skip the second.
+pub fn pi_agent_dir() -> PathBuf {
+    pi_agent_dir_in(&home())
+}
+
+/// `pi_agent_dir` for a given home directory (the override variable still wins).
+pub fn pi_agent_dir_in(home: &Path) -> PathBuf {
+    match std::env::var_os("PI_CODING_AGENT_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => home.join(".pi/agent"),
+    }
+}
+
 /// Errors when neither `MU_HOME` nor `HOME` names a directory, so state is never written relative to the cwd.
 pub fn check_home() -> Result<(), String> {
     let set = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());

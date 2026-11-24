@@ -1,4 +1,5 @@
 use crate::model_config::{self, Import, ModelConfig, ModelLimits, RoleMeta};
+use crate::pi_import::{self, Applied, PiPlan};
 use mu_common::paths;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -6,7 +7,7 @@ use std::cell::RefCell;
 mod mu;
 mod retry;
 
-pub use mu::{Cards, KeySpec, MuBell, MuConfig, MuKeys, MuPermissions, MuStatus, MuTheme};
+pub use mu::{Cards, KeySpec, MuBell, MuConfig, MuDisplay, MuKeys, MuPermissions, MuStatus, MuTheme};
 pub use mu::{MuAgent, StateKey};
 use mu::{MuPredict, check_predict, check_status, load_permissions};
 use retry::check_retry;
@@ -143,6 +144,8 @@ pub struct Configs {
     pub models: RefCell<ModelConfig>,
     /// What `mu models import` would copy; set at load when models.toml is missing and omp has model config.
     pub import_offer: RefCell<Option<Import>>,
+    /// The same for pi's setup (`mu models import --from pi`).
+    pub pi_import_offer: RefCell<Option<PiPlan>>,
     /// Problems found while loading; shown as notices at startup.
     pub warnings: Vec<String>,
 }
@@ -170,6 +173,16 @@ pub fn omp_import() -> Option<Import> {
     let config = yaml_doc("config.yml", &mut ignored);
     let models = yaml_doc("models.yml", &mut ignored);
     model_config::build_import(&config, &models, &old_mu_thresholds())
+}
+
+/// What importing pi's setup would copy; `None` when pi has nothing mu can use, or when pi's agent
+/// dir is omp's (`PI_CODING_AGENT_DIR` points both at one place).
+pub fn pi_import() -> Option<PiPlan> {
+    let dir = paths::pi_agent_dir();
+    if dir == paths::omp_agent_dir() {
+        return None;
+    }
+    Some(pi_import::plan(&dir)).filter(PiPlan::has_content)
 }
 
 /// One top-level YAML section; a bad one falls back to its default and warns, naming the section only.
@@ -224,7 +237,28 @@ pub fn save_theme_source(source: &str) -> Result<(), String> {
 }
 
 fn set_theme_source(path: &std::path::Path, source: &str) -> Result<(), String> {
-    use toml_edit::{DocumentMut, Item, Table, value};
+    set_config_value(path, "theme", "source", toml_edit::Value::from(source))
+}
+
+/// Sets `[display] hide_thinking_block` in `config.toml`, keeping comments, other keys and sections.
+pub fn save_hide_thinking_block(hide: bool) -> Result<(), String> {
+    set_config_value(
+        &paths::mu_home().join("config.toml"),
+        "display",
+        "hide_thinking_block",
+        toml_edit::Value::from(hide),
+    )
+}
+
+/// Whether `config.toml` sets `[table] key`; a file that cannot be read or parsed sets nothing.
+pub fn mu_config_sets(table: &str, key: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(paths::mu_home().join("config.toml")) else { return false };
+    let Ok(doc) = text.parse::<toml::Table>() else { return false };
+    doc.get(table).and_then(toml::Value::as_table).is_some_and(|t| t.contains_key(key))
+}
+
+fn set_config_value(path: &std::path::Path, table: &str, key: &str, v: toml_edit::Value) -> Result<(), String> {
+    use toml_edit::{DocumentMut, Item, Table};
     let lock_path = path.with_file_name("config.toml.lock");
     let _lock = mu_common::fs::FileLock::exclusive(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?;
     let text = match std::fs::read_to_string(path) {
@@ -233,10 +267,11 @@ fn set_theme_source(path: &std::path::Path, source: &str) -> Result<(), String> 
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let mut doc: DocumentMut = text.parse().map_err(|e| format!("{}: {e}; fix it by hand", path.display()))?;
-    let theme = doc.as_table_mut().entry("theme").or_insert_with(|| Item::Table(Table::new()));
-    let theme =
-        theme.as_table_mut().ok_or_else(|| format!("{}: [theme] is not a table; set it by hand", path.display()))?;
-    theme.insert("source", value(source));
+    let section = doc.as_table_mut().entry(table).or_insert_with(|| Item::Table(Table::new()));
+    let section = section
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: [{table}] is not a table; set it by hand", path.display()))?;
+    section.insert(key, toml_edit::Item::Value(v));
     mu_common::fs::write_atomic(path, doc.to_string().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -284,6 +319,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         predict,
         ask: parse(section("ask"), "ask", warn),
         theme: parse(section("theme"), "theme", warn),
+        display: parse(section("display"), "display", warn),
         update: parse(section("update"), "update", warn),
         edit: parse(section("edit"), "edit", warn),
         retry,
@@ -302,6 +338,10 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
 
 pub fn nothing_to_import() -> String {
     format!("nothing to import: omp has no model config in {}", paths::omp_agent_dir().display())
+}
+
+pub fn nothing_to_import_from_pi() -> String {
+    format!("nothing to import: pi has no models, keys or settings mu can use in {}", paths::pi_agent_dir().display())
 }
 
 /// An import must not silently replace an existing `models.toml`.
@@ -398,7 +438,40 @@ impl Configs {
         }
         *self.models.borrow_mut() = model_config::parse(&out).0;
         *self.import_offer.borrow_mut() = None;
+        *self.pi_import_offer.borrow_mut() = None;
         Ok(())
+    }
+
+    /// Whether the display setting hides thinking blocks: `[display] hide_thinking_block` in
+    /// `config.toml`, else omp's `hideThinkingBlock`.
+    pub fn hide_thinking_block(&self) -> bool {
+        self.mu.display.hide_thinking_block.unwrap_or(self.omp.hide_thinking_block)
+    }
+
+    /// Writes the parts of a pi import that are mu's own files: `models.toml` (never over an
+    /// existing one without `force`), `[theme] source` and `[display] hide_thinking_block` (never
+    /// over a value `config.toml` already sets without `force`). Each item reports on its own.
+    pub fn write_pi_settings(
+        &self,
+        models: Option<&Import>,
+        theme: Option<&str>,
+        hide: Option<bool>,
+        force: bool,
+    ) -> Applied {
+        let mut out = Applied::default();
+        if let Some(import) = models {
+            let r = self.write_import(import, force);
+            out.record(r.map(|()| format!("wrote {}", models_path().display())));
+        }
+        if let Some(source) = theme {
+            let r = save_theme_source(source);
+            out.record(r.map(|()| format!("theme: {source}")));
+        }
+        if let Some(hide) = hide {
+            let r = save_hide_thinking_block(hide);
+            out.record(r.map(|()| format!("hide_thinking_block = {hide}")));
+        }
+        out
     }
 
     /// Assigns or removes a role in a specific set, using the current on-disk configuration.
@@ -513,17 +586,27 @@ impl Configs {
         let path = models_path();
         let mut models = ModelConfig::default();
         let mut import_offer = None;
+        let mut pi_import_offer = None;
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let (cfg, w) = model_config::parse(&text);
                 models = cfg;
                 warnings.extend(w);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => import_offer = omp_import(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                import_offer = omp_import();
+                pi_import_offer = pi_import();
+            }
             Err(e) => warnings.push(format!("{}: {e}", path.display())),
         }
-        let mut cfg =
-            Self { omp, mu, models: RefCell::new(models), import_offer: RefCell::new(import_offer), warnings };
+        let mut cfg = Self {
+            omp,
+            mu,
+            models: RefCell::new(models),
+            import_offer: RefCell::new(import_offer),
+            pi_import_offer: RefCell::new(pi_import_offer),
+            warnings,
+        };
         let mut w = Vec::new();
         cfg.thresholds_with(&mut w);
         cfg.warnings.extend(w);
@@ -852,6 +935,29 @@ mod tests {
         let omp: OmpConfig = serde_yaml_ng::from_str("{}").unwrap();
         assert!(!omp.hide_thinking_block);
         assert!(omp.display.smooth_streaming);
+    }
+
+    #[test]
+    fn mu_display_setting_wins_over_omps() {
+        let mut cfg = Configs::default();
+        cfg.omp.hide_thinking_block = true;
+        assert!(cfg.hide_thinking_block());
+        cfg.mu = toml::from_str("[display]\nhide_thinking_block = false\n").unwrap();
+        assert!(!cfg.hide_thinking_block());
+        cfg.mu = toml::from_str("[display]\n").unwrap();
+        assert!(cfg.hide_thinking_block());
+    }
+
+    #[test]
+    fn display_setting_is_written_beside_the_rest() {
+        let dir = mu_testutil::tmp();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# mine\n[display]\nother = 1\n[theme]\nsource = \"nord\"\n").unwrap();
+        set_config_value(&path, "display", "hide_thinking_block", toml_edit::Value::from(true)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# mine") && text.contains("other = 1") && text.contains("source = \"nord\""), "{text}");
+        let c: MuConfig = toml::from_str(&text).unwrap();
+        assert_eq!(c.display.hide_thinking_block, Some(true));
     }
 
     #[test]

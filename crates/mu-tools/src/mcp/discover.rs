@@ -141,7 +141,10 @@ fn sources(roots: &Roots) -> Vec<Source> {
         let file = home.join(".omp/profiles").join(&p).join("agent/mcp.json");
         c.add(1, &format!("omp (profile {p})"), file, load_json, &mcp_servers);
     }
-    c.add(2, "pi", home.join(".pi/agent/mcp.json"), load_json, &mcp_servers);
+    // mu does not run pi's `!command` env and header values, so those servers are not offered.
+    let pi_servers = |root: &Value| map_servers(root, "mcpServers", pi_entry);
+    c.add(2, "pi", mu_common::paths::pi_agent_dir_in(home).join("mcp.json"), load_json, &pi_servers);
+    c.add(2, "pi (this project)", roots.cwd.join(".pi/mcp.json"), load_json, &pi_servers);
 
     let claude = home.join(".claude.json");
     c.add(3, "Claude Code", claude.clone(), load_json, &mcp_servers);
@@ -254,6 +257,17 @@ fn std_entry(e: &Value) -> Option<Value> {
         "http" => Some(http(&url?, pairs(o.get("headers")))),
         _ => None,
     }
+}
+
+fn pi_entry(e: &Value) -> Option<Value> {
+    let entry = std_entry(e)?;
+    let bang = ["env", "headers"].iter().any(|k| {
+        entry
+            .get(k)
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.values().any(|v| v.as_str().is_some_and(|s| s.starts_with('!'))))
+    });
+    (!bang).then_some(entry)
 }
 
 fn codex_entry(e: &Value) -> Option<Value> {
@@ -530,6 +544,22 @@ mod tests {
         put(&base, "home/.gemini/settings.json", r#"{"mcpServers":{"x":{"command":"two"}}}"#);
         let found = scan(&r, &[]);
         assert_eq!(tool_names(&found), [("pi", "x"), ("Gemini CLI", "x")]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pi_servers_come_from_its_user_and_project_files_without_bang_commands() {
+        let base = tmp();
+        let r = roots(&base);
+        put(
+            &base,
+            "home/.pi/agent/mcp.json",
+            r#"{"mcpServers":{"a":{"command":"one","timeout":5},"piped":{"command":"p","env":{"K":"!pass k"}}}}"#,
+        );
+        put(&base, "proj/.pi/mcp.json", r#"{"mcpServers":{"b":{"url":"https://b.example/mcp"}}}"#);
+        let found = scan(&r, &[]);
+        assert_eq!(tool_names(&found), [("pi", "a"), ("pi (this project)", "b")]);
+        assert_eq!(get(&found, "a").entry, json!({"type":"stdio","command":"one"}));
         let _ = std::fs::remove_dir_all(&base);
     }
 

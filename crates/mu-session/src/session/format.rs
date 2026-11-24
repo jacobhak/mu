@@ -314,6 +314,10 @@ pub(super) fn parse(path: &Path) -> Result<Parsed> {
         let id = || e.id.clone();
         match e.kind.as_str() {
             "message" => {
+                // pi records its system prompt and tool list as a `system` message; mu builds its own.
+                if v["message"]["role"] == "system" {
+                    continue;
+                }
                 let Ok(m) = serde_json::from_value::<Message>(v["message"].clone()) else {
                     loaded.warnings.push(format!("skipped unparseable message entry {}", e.id));
                     continue;
@@ -338,7 +342,13 @@ pub(super) fn parse(path: &Path) -> Result<Parsed> {
                 loaded.entry_ids.push(id());
                 loaded.messages.push(Message::user(&format!("<system-reminder>\n{text}\n</system-reminder>")));
             }
-            "model_change" => loaded.model = v["model"].as_str().map(String::from),
+            "model_change" => {
+                // omp writes `model: "provider/id"`; pi writes `provider` and `modelId`.
+                loaded.model = match (v["provider"].as_str(), v["modelId"].as_str()) {
+                    (Some(p), Some(m)) => Some(format!("{p}/{m}")),
+                    _ => v["model"].as_str().map(String::from),
+                };
+            }
             "thinking_level_change" => loaded.thinking = v["thinkingLevel"].as_str().map(String::from),
             "title_change" => loaded.title = v["title"].as_str().filter(|t| !t.is_empty()).map(String::from),
             "mode_change" => {

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// The project files, relative to the cwd, in the order `candidate_files` lists them.
-const PROJECT_FILES: [&str; 4] = [".omp/mcp.json", ".omp/.mcp.json", "mcp.json", ".mcp.json"];
+const PROJECT_FILES: [&str; 5] = [".omp/mcp.json", ".omp/.mcp.json", ".pi/mcp.json", "mcp.json", ".mcp.json"];
 
 fn store() -> PathBuf {
     mu_common::paths::profile_home().join("mcp/trusted.json")

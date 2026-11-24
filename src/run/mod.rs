@@ -500,7 +500,7 @@ async fn tui(
         keys: ui.cfgs.mu.keys.clone(),
         notify: ui.cfgs.omp.completion.notify,
         bell: ui.cfgs.mu.bell,
-        hide_thinking: ui.cfgs.omp.hide_thinking_block,
+        hide_thinking: ui.cfgs.hide_thinking_block(),
         smooth_streaming: ui.cfgs.omp.display.smooth_streaming,
         status_levels: ui.cfgs.mu.status,
     })

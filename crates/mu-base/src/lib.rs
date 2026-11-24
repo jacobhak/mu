@@ -14,6 +14,7 @@ pub mod message;
 pub mod model_config;
 pub mod models;
 pub mod permissions;
+pub mod pi_import;
 pub mod process;
 pub mod pty;
 pub mod roles;

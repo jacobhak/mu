@@ -174,6 +174,29 @@ mod wire_contract_tests {
         assert_eq!(wire.matches(&format!("\"{LONG_ID}\"")).count(), 2, "{wire}");
     }
 
+    /// pi's own sessions are v3 JSONL of the same shape; opening one by path (`--resume <file>`) must keep working,
+    /// including its string user content, system messages, usage and label entries.
+    #[test]
+    fn a_pi_session_loads_and_replays_to_the_wire() {
+        let dir = std::env::temp_dir().join(format!("mu-pi-session-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, include_str!("testdata/pi_session.jsonl")).unwrap();
+        let loaded = mu_session::session::format::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.model.as_deref(), Some("anthropic/claude-sonnet-5-5"));
+        assert_eq!(loaded.thinking.as_deref(), Some("medium"));
+        let msgs = loaded.messages;
+        // user, assistant, tool result, assistant, the extension's message as a reminder, user, assistant
+        assert_eq!(msgs.len(), 7);
+        let anth = spec("anthropic/claude-sonnet-5-5", Api::AnthropicMessages, ThinkingMode::AnthropicAdaptive);
+        let body = anthropic::native::body(&request(&anth, &msgs)).0.to_string();
+        assert!(body.contains("Read a.txt and tell me what it says.") && body.contains("It says hello."), "{body}");
+        assert!(body.contains("EqQBCkYIARgCIiQ3Zm9vYmFyYmF6MTIzNDU2"), "its own signature replays: {body}");
+        assert!(!body.contains("You are an expert coding assistant"), "pi's system message is not mu's: {body}");
+    }
+
     #[test]
     fn an_omp_session_loads_and_replays_only_to_its_own_wire() {
         let dir = std::env::temp_dir().join(format!("mu-omp-session-{}", uuid::Uuid::new_v4()));

@@ -85,6 +85,7 @@ mod tests {
                 name: "fix".into(),
                 body: "Fix $1 carefully".into(),
                 description: "Fix a thing".into(),
+                pi: false,
             }],
             ..Default::default()
         }

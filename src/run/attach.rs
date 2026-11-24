@@ -623,7 +623,7 @@ pub fn run(link: Link, pick_session: bool) -> Result<i32> {
             keys: cfgs.mu.keys.clone(),
             notify: cfgs.omp.completion.notify,
             bell: cfgs.mu.bell,
-            hide_thinking: cfgs.omp.hide_thinking_block,
+            hide_thinking: cfgs.hide_thinking_block(),
             smooth_streaming: cfgs.omp.display.smooth_streaming,
             status_levels: cfgs.mu.status,
         })
