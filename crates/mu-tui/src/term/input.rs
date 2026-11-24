@@ -136,6 +136,7 @@ impl Reader {
                 Source::Async(fd) => {
                     tokio::select! {
                         _ = winch.recv() => push_resize(queue),
+                        _ = tokio::time::sleep(OSC_HOLD), if parser.pending() => queue.extend(parser.flush_pending()),
                         ready = fd.readable() => {
                             let mut guard = ready.ok()?;
                             match guard.try_io(|fd| read_fd(fd.as_raw_fd(), buf)) {
@@ -152,6 +153,7 @@ impl Reader {
                 Source::Select { fd, ready, ack } => {
                     tokio::select! {
                         _ = winch.recv() => push_resize(queue),
+                        _ = tokio::time::sleep(OSC_HOLD), if parser.pending() => queue.extend(parser.flush_pending()),
                         got = ready.recv() => {
                             got?;
                             let raw = fd.as_raw_fd();
@@ -202,6 +204,9 @@ fn push_resize(q: &mut VecDeque<Input>) {
 const OSC_5522: &[u8] = b"\x1b]5522;";
 /// An OSC without a terminator stops being buffered at this size and is read as plain keys.
 const MAX_OSC: usize = 64 * 1024;
+/// How long a partial `ESC ]5522;` prefix waits for the rest of the reply before it is read as keys.
+/// A reply can arrive in pieces; a real Alt+] costs this much extra latency.
+const OSC_HOLD: std::time::Duration = std::time::Duration::from_millis(30);
 
 #[derive(Default)]
 struct Parser {
@@ -255,6 +260,25 @@ impl Parser {
         std::mem::take(&mut self.writes)
     }
 
+    /// The buffer holds only the start of a clipboard reply (`ESC ]` up to the full prefix), which is
+    /// either a reply cut short by a read boundary or Alt+] followed by a few keys.
+    fn pending(&self) -> bool {
+        self.buf.starts_with(b"\x1b]") && self.buf.len() < OSC_5522.len() && OSC_5522.starts_with(&self.buf)
+    }
+
+    /// Gives up waiting on a `pending` prefix: it is Alt+] and whatever keys follow.
+    fn flush_pending(&mut self) -> Vec<Input> {
+        if !self.pending() {
+            return vec![];
+        }
+        self.buf.drain(..2);
+        let alt =
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char(']'), crossterm::event::KeyModifiers::ALT);
+        let mut out = vec![Input::Term(Event::Key(alt))];
+        out.extend(self.feed(&[]));
+        out
+    }
+
     /// Consumes `chunk` (one `read`), returning every complete input. Incomplete sequences stay
     /// buffered for the next chunk; a lone ESC at the end of the data is an Escape key press.
     fn feed(&mut self, chunk: &[u8]) -> Vec<Input> {
@@ -281,7 +305,7 @@ impl Parser {
         'next: while !self.buf.is_empty() {
             if self.buf.starts_with(b"\x1b]") {
                 let prefix_len = OSC_5522.len().min(self.buf.len());
-                if self.buf[..prefix_len] == OSC_5522[..prefix_len] && self.buf.len() >= 3 {
+                if self.buf[..prefix_len] == OSC_5522[..prefix_len] {
                     // Possibly the clipboard reply (or the start of it): buffer until its terminator.
                     if self.buf.len() >= OSC_5522.len() {
                         match osc_end(&self.buf, self.scan_from) {
@@ -312,7 +336,7 @@ impl Parser {
                             }
                         }
                     }
-                    break; // a partial prefix such as `ESC ] 5`: wait for the rest
+                    break; // a partial prefix such as `ESC ]` or `ESC ] 5`: wait for the rest (see OSC_HOLD)
                 }
                 // Any other `ESC ]` is Alt+]: fall through to the key parser.
             }
@@ -549,6 +573,23 @@ mod tests {
         );
     }
 
+    /// A bare `ESC ]` is held for a possible clipboard reply, but a real Alt+] still arrives.
+    #[tokio::test]
+    async fn alt_bracket_arrives_after_the_hold() {
+        let (rd, wr) = pipe_pair();
+        let mut reader = Reader::from_fd(rd).unwrap();
+        // SAFETY: `wr` is a valid pipe write end; two bytes fit in an empty pipe.
+        assert_eq!(unsafe { libc::write(wr.as_raw_fd(), b"\x1b]".as_ptr().cast(), 2) }, 2);
+        let t = std::time::Instant::now();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next()).await.unwrap();
+        assert!(
+            matches!(got, Some(Input::Term(Event::Key(k)))
+                if k.code == KeyCode::Char(']') && k.modifiers == KeyModifiers::ALT),
+            "Alt+] after the hold"
+        );
+        assert!(t.elapsed() >= OSC_HOLD, "held for at least {OSC_HOLD:?}, was {:?}", t.elapsed());
+    }
+
     /// The select backend reads until EOF before it notices the end, so bytes sent just before a close
     /// are delivered, not lost.
     #[tokio::test]
@@ -613,12 +654,27 @@ mod tests {
     fn alt_bracket_is_a_key_not_an_osc() {
         let mut p = Parser::default();
         let alt = |c| Input::Term(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)));
-        assert!(same(&p.feed(b"\x1b]"), &[alt(']')]));
+        // A bare `ESC ]` is held for the rest of a possible clipboard reply; the reader flushes it after OSC_HOLD.
+        assert!(p.feed(b"\x1b]").is_empty());
+        assert!(same(&p.flush_pending(), &[alt(']')]));
         assert!(same(&p.feed(b"\x1b]x"), &[alt(']'), key(KeyCode::Char('x'))]));
+        assert!(p.feed(b"\x1b]55").is_empty());
+        assert!(same(&p.flush_pending(), &[alt(']'), key(KeyCode::Char('5')), key(KeyCode::Char('5'))]));
+        assert!(p.flush_pending().is_empty(), "nothing pending once flushed");
         // An unterminated 5522 OSC is buffered, but only up to the cap.
         assert!(p.feed(b"\x1b]5522;type=read").is_empty());
         let out = p.feed(&vec![b'a'; MAX_OSC + 10]);
         assert!(!out.is_empty(), "flushed as keys once the cap is passed");
+    }
+
+    /// A read that ends right after `ESC ]` (the terminal or a multiplexer wrote the reply in pieces)
+    /// must not turn the rest of the clipboard reply into typed text.
+    #[test]
+    fn osc_5522_reply_split_right_after_the_introducer_is_not_typed_text() {
+        let mut p = Parser::default();
+        let mut got = p.feed(b"\x1b]");
+        got.extend(p.feed(&osc("type=read:status=OK:pw=YWJj")[2..]));
+        assert!(got.is_empty(), "leaked {} inputs", got.len());
     }
 
     #[test]
