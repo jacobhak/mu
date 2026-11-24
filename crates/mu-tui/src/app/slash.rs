@@ -206,6 +206,12 @@ impl App {
         }
     }
 
+    /// `/retry` re-runs the last request. The agent starts the turn, or says there is nothing to
+    /// retry, so nothing here marks the composer busy.
+    pub(super) fn cmd_retry(&mut self, _: &str) {
+        self.send(Command::Retry);
+    }
+
     pub(super) fn cmd_compact(&mut self, arg: &str) {
         if self.agent.running {
             self.notice("compaction queued until the current turn finishes");

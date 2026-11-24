@@ -69,10 +69,26 @@ impl Agent {
         self.turn_from(first.map_or(Start::Wake, Start::User)).await;
     }
 
+    /// `/retry`: resends the request the last failed or aborted turn left unanswered. No prompt is
+    /// recorded, so the transcript gains only the new reply.
+    pub(super) async fn retry(&mut self) {
+        self.turn_from(Start::Retry).await;
+    }
+
+    /// Whether the last turn has a request to resend: the model has not answered the newest message.
+    fn retry_due(&self) -> bool {
+        self.messages.last().is_some_and(|m| !matches!(m, Message::Assistant { .. }))
+    }
+
     pub(super) async fn turn_from(&mut self, start: Start) {
         if self.model.model.is_unselected() {
             self.error("no model chosen: sign in with /login if you have not, then pick one with /switch");
             self.emit(AgentEvent::TurnEnd { aborted: true });
+            return;
+        }
+        if matches!(start, Start::Retry) && !self.retry_due() {
+            // Nothing to re-run: the turn is not started, so the front end stays idle.
+            self.notice("nothing to retry");
             return;
         }
         if matches!(start, Start::Wake)
@@ -95,6 +111,7 @@ impl Agent {
             Start::User(input) => Some(Step::Prompt { input, synthetic: false }),
             Start::Synthetic(input) => Some(Step::Prompt { input, synthetic: true }),
             Start::Wake => Some(Step::Wake),
+            Start::Retry => Some(Step::Retry),
             Start::Plan(p) => match self.begin_plan(p, &cancel).await {
                 Some(input) => Some(Step::Prompt { input, synthetic: true }),
                 None => {
@@ -185,6 +202,12 @@ impl Agent {
                 estimate_tokens(&input.text) + 1600 * input.images.len() as u64
             }
             Step::Wake => 0,
+            Step::Retry => {
+                // The user asked again, so a compaction that failed before the retried request gets
+                // another chance.
+                self.compaction.failed_at = None;
+                0
+            }
         };
         if self.needs_compaction(extra) {
             self.compact_reporting(cancel).await;
@@ -205,6 +228,7 @@ impl Agent {
                 }
                 self.emit(AgentEvent::Woken);
             }
+            Step::Retry => {}
         }
         true
     }

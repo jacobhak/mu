@@ -117,7 +117,7 @@ fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
         .unzip()
 }
 
-pub(super) static BUILTIN: [Builtin; 37] = [
+pub(super) static BUILTIN: [Builtin; 38] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
@@ -128,6 +128,7 @@ pub(super) static BUILTIN: [Builtin; 37] = [
     cmd("rewind", "Go back to before an earlier prompt, or to after an earlier reply", |a, _| {
         a.send(Command::ListRewind)
     }),
+    cmd("retry", "Resend the last request after a failed or aborted turn", App::cmd_retry),
     cmd("model", "Edit saved model roles [@role]", App::model_cmd).complete(complete_model),
     cmd("switch", "Switch this session's model", App::cmd_switch),
     cmd("modelset", "Switch model sets [name | new | delete | rename | import]", App::modelset_cmd)

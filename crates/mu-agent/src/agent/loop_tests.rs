@@ -372,6 +372,45 @@ fn a_fatal_error_emits_turn_failed_before_turn_end() {
     });
 }
 
+/// Whether a `/retry` only said there was nothing to resend.
+fn is_nothing_to_retry(events: &[AgentEvent]) -> bool {
+    matches!(events, [AgentEvent::Notice(m)] if m == "nothing to retry")
+}
+
+#[test]
+fn retry_resends_the_unanswered_request_without_recording_the_prompt() {
+    run(async {
+        let script =
+            vec![Err(ProviderError::Fatal("nope".into())), Ok(assistant(vec![Block::text("done")], StopReason::Stop))];
+        let (mut a, mut rx) = agent(script);
+        a.turn(Some("go".to_string().into())).await;
+        assert_eq!(a.messages.len(), 1, "the prompt is kept, the failure is not");
+        drain(&mut rx);
+        a.retry().await;
+        let kept: Vec<&Message> = a.messages.iter().collect();
+        assert_eq!(kept.len(), 2, "only the reply is added: {kept:?}");
+        assert!(matches!(kept[0], Message::User { .. }) && matches!(kept[1], Message::Assistant { .. }));
+        let events = drain(&mut rx);
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::UserPrompt(_))), "the prompt is echoed again");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnStart)));
+    });
+}
+
+#[test]
+fn retry_with_nothing_unanswered_starts_nothing() {
+    run(async {
+        let (mut a, mut rx) = agent(vec![Ok(assistant(vec![Block::text("done")], StopReason::Stop))]);
+        a.retry().await;
+        assert!(is_nothing_to_retry(&drain(&mut rx)), "an empty conversation has nothing to resend");
+        assert!(a.messages.is_empty());
+        a.turn(Some("go".to_string().into())).await;
+        drain(&mut rx);
+        a.retry().await;
+        assert!(is_nothing_to_retry(&drain(&mut rx)), "a finished turn has nothing to resend");
+        assert_eq!(a.messages.len(), 2);
+    });
+}
+
 #[test]
 fn a_turn_with_no_model_chosen_sends_nothing_and_keeps_no_message() {
     run(async {

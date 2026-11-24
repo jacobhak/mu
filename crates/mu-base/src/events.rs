@@ -30,6 +30,9 @@ pub fn retry_notice(attempt: u32, max_attempts: u32, delay: Duration, reason: &s
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum Command {
     Prompt(UserInput),
+    /// `/retry`: re-issue the last request, whose turn failed or was aborted, without recording a
+    /// prompt. Nothing at all happens when the turn already has its reply.
+    Retry,
     /// Creates the session file now, so its id is known before the first prompt.
     EnsureSession,
     SetModel(String),

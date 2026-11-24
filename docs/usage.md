@@ -22,7 +22,7 @@ Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max` (`minimal`
 
 `-p` runs one prompt and prints the answer. `--agent` runs it as a [custom agent](custom-agents.md); `--max-cost` aborts once the session has cost more than that many USD and always prints `mu: cost $X` to stderr. Exit codes, interrupting and taking over a `-p` run are in [Detached runs](detached-runs.md).
 
-While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer.
+While a turn runs, Enter steers (the message is delivered after the current tool call), Ctrl+Q queues a follow-up, Esc aborts and returns queued text to the composer. After a turn fails or is aborted, `/retry` resends its request as it was, without recording the prompt a second time; once a turn has its reply, `/retry` says there is nothing to retry.
 
 When the model asks for several tools in one message, calls that only read and need no approval run at the same time (at most 8): `read`, `grep`, `glob`, `bash` lines made only of read-only commands (no `cd`, assignment, redirect, `pty` or `async`), and plugin tools whose manifest says `tier = "read"`. Anything else (a write, a call that asks for approval or is denied, `task`, `ask`, `web_search`, `todo`) waits for the calls before it, runs alone, and the calls after it wait for it. Start and end events and the results follow the order of the calls whatever order they finish in, `tool_call` hooks still run call by call in that order, and Esc aborts every call in flight. In a headless run (no background jobs) `bash` lines share one shell and still run one at a time.
 

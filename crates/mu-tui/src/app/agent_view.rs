@@ -1426,6 +1426,17 @@ mod tests {
         assert!(transcript_text(&app).contains("/work/here"));
     }
 
+    #[test]
+    fn retry_sends_the_retry_command_and_echoes_nothing() {
+        use super::super::keys::tests::{test_app_with_commands, transcript_text};
+        use mu_base::events::Command;
+        let (mut app, mut cmds) = test_app_with_commands(std::env::temp_dir().join("mu-retry-history.jsonl"));
+        app.submit("/retry".into(), false);
+        assert!(matches!(cmds.try_recv(), Ok(Command::Retry)));
+        assert!(!app.agent.running, "the agent's turn start marks it running");
+        assert!(!transcript_text(&app).contains("retry"), "the command leaves no line behind");
+    }
+
     fn subagent_session(cost: f64) -> PathBuf {
         let d = std::env::temp_dir().join(format!("mu-subcost-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();

@@ -117,9 +117,12 @@ enum Start {
     Wake,
     /// Begins executing an approved plan.
     Plan(ExecPlan),
+    /// `/retry`: resends the request the last turn left unanswered, adding no message.
+    Retry,
 }
 
-/// One pass of a turn: a prompt to run, or a wake-up that delivers what finished meanwhile.
+/// One pass of a turn: a prompt to run, a wake-up that delivers what finished meanwhile, or the
+/// re-issued request of a failed one.
 enum Step {
     /// `synthetic`: a message mu sends itself, which the UI does not echo.
     Prompt {
@@ -127,6 +130,8 @@ enum Step {
         synthetic: bool,
     },
     Wake,
+    /// `/retry`: the history already ends where the request belongs, so there is nothing to add.
+    Retry,
 }
 
 /// The hidden prompt that starts executing an approved document.
@@ -499,6 +504,7 @@ impl Agent {
                 unreachable!("queue and stop commands are handled above")
             }
             Command::Prompt(t) => drive(self.turn(Some(t)), q).await,
+            Command::Retry => drive(self.retry(), q).await,
             Command::EnsureSession => {
                 self.ensure_session().await;
                 self.emit_status();
