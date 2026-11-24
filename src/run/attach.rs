@@ -619,7 +619,6 @@ pub fn run(link: Link, pick_session: bool) -> Result<i32> {
             notice_rx,
             cwd: info.cwd,
             pick_session,
-            status_cfg: cfgs.omp.status_line.clone(),
             theme: cfgs.mu.theme.clone(),
             keys: cfgs.mu.keys.clone(),
             notify: cfgs.omp.completion.notify,

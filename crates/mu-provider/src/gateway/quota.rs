@@ -100,6 +100,8 @@ type Slot = Rc<RefCell<Option<(String, Fetch)>>>;
 /// It never waits on the network: a fetch runs as a task, and its result is picked up by `tick`.
 pub struct QuotaTracker {
     usage: Option<ProviderUsage>,
+    /// The provider the session uses now, for the driver that ticks without the agent.
+    provider: String,
     /// When the last fetch finished; `None` means one is due now.
     at: Option<Instant>,
     failures: u32,
@@ -125,6 +127,7 @@ impl Default for QuotaTracker {
         let (wake, wake_rx) = unbounded_channel();
         Self {
             usage: None,
+            provider: String::new(),
             at: None,
             failures: 0,
             no_gateway: false,
@@ -150,6 +153,20 @@ impl QuotaTracker {
         self.wake_rx.take()
     }
 
+    pub fn set_provider(&mut self, provider: &str) {
+        if self.provider != provider {
+            self.provider = provider.to_string();
+        }
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     /// The windows for `provider`, if the last fetch was for it.
     pub fn usage_for(&self, provider: &str) -> Option<ProviderUsage> {
         self.usage.clone().filter(|q| q.provider == provider)
@@ -166,6 +183,7 @@ impl QuotaTracker {
     pub fn provider_changed(&mut self) {
         self.at = None;
         self.failures = 0;
+        let _ = self.wake.send(());
     }
 
     /// Pausing (a native model) stops fetching and makes `wait` long, so the run loop idles. Resuming
@@ -177,6 +195,8 @@ impl QuotaTracker {
         self.paused = paused;
         if !paused {
             self.at = None;
+            // The driver may be asleep for the paused hour.
+            let _ = self.wake.send(());
         }
     }
 
@@ -245,6 +265,14 @@ impl QuotaTracker {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_usage(&mut self, usage: ProviderUsage) {
         self.usage = Some(usage);
+    }
+
+    /// A fetch finishing: its result waits in the slot and the driver is woken, as a real one does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn deliver(&mut self, usage: ProviderUsage) {
+        self.inflight = true;
+        *self.slot.borrow_mut() = Some((usage.provider.clone(), Fetch::Got(usage)));
+        let _ = self.wake.send(());
     }
 }
 

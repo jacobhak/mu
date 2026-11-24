@@ -1,9 +1,8 @@
-//! Footer: an optional quota line, then one status line built from the user's omp
-//! `statusLine` segments (`config.yml`). Segment ids mu cannot supply (e.g. `pr`) are skipped.
+//! Footer: one status line built from mu's own segments. omp's `statusLine` setting is not read.
 use crate::text::line::{Line, line_width, span, truncate};
 use crate::theme::{self, Role};
 use crossterm::style::ContentStyle;
-use mu_base::config::{MuStatus, OmpStatusLine};
+use mu_base::config::MuStatus;
 use mu_base::events::{
     CACHE_TTL_MS, CacheBreak, CacheStatus, GitInfo, ProviderUsage, StatusSnapshot, SubagentState, SubagentStatus,
 };
@@ -11,8 +10,7 @@ use mu_base::permissions::PermissionMode;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Segments shown when `statusLine` lists none (omp's `default` preset).
-const DEFAULT_LEFT: &[&str] = &["pi", "model", "mode", "path", "git", "context_pct", "cost", "cache"];
+const DEFAULT_LEFT: &[&str] = &["pi", "model", "mode", "path", "git", "context_pct", "cost", "cache", "subagents"];
 const DEFAULT_RIGHT: &[&str] = &["session_name"];
 const ACTIVITY_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_ADVANCE_MS: u128 = 80;
@@ -26,7 +24,9 @@ pub struct StatusEnv<'a> {
     pub cwd: &'a Path,
     /// `$HOME`, used to abbreviate paths.
     pub home: Option<String>,
-    pub config: &'a OmpStatusLine,
+    /// Segment ids by side, in order; the built-in layout outside tests.
+    pub left: &'a [&'a str],
+    pub right: &'a [&'a str],
     /// Active profile (`OMP_PROFILE`), shown as `μ <profile>`.
     pub profile: Option<String>,
     /// Ctrl+O "expanded" state.
@@ -61,11 +61,12 @@ impl JobCounts {
 }
 
 impl<'a> StatusEnv<'a> {
-    pub fn new(cwd: &'a Path, config: &'a OmpStatusLine) -> Self {
+    pub fn new(cwd: &'a Path) -> Self {
         Self {
             cwd,
             home: crate::host::host_home(),
-            config,
+            left: DEFAULT_LEFT,
+            right: DEFAULT_RIGHT,
             profile: crate::host::host_profile(),
             expanded: false,
             turn_elapsed: None,
@@ -134,17 +135,12 @@ struct Part {
 }
 
 fn status_line(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Line {
-    let mut path_max = env
-        .config
-        .segment_options
-        .get("path")
-        .and_then(|p| p["maxLength"].as_u64())
-        .map_or(DEFAULT_PATH_MAX, |n| n as usize);
-    let mut left = segments(&env.config.left_segments, DEFAULT_LEFT, s, env, path_max);
+    let mut path_max = DEFAULT_PATH_MAX;
+    let mut left = segments(env.left, s, env, path_max);
     if env.expanded {
         left.push(Part { id: "expanded", line: vec![span("expanded", theme::get().fg(Role::Faint))] });
     }
-    let mut right = segments(&env.config.right_segments, DEFAULT_RIGHT, s, env, path_max);
+    let mut right = segments(env.right, s, env, path_max);
     if let Some(u) = s.usage.as_ref().filter(|u| !u.windows.is_empty()) {
         right.insert(0, Part { id: "usage", line: usage_line(u) });
     }
@@ -215,11 +211,9 @@ fn group(parts: &[Part]) -> Line {
     out
 }
 
-/// Renders the configured ids in order, skipping unknown ids and segments with nothing to show.
 type Render = fn(&StatusSnapshot, &StatusEnv, usize) -> Option<Line>;
 
-/// A status segment: its omp id and how to draw it. The only list of segments; ids mu cannot
-/// supply (`pr`, …) are simply absent and skipped.
+/// A status segment: its id and how to draw it. The only list of segments.
 struct Segment {
     id: &'static str,
     render: Render,
@@ -239,12 +233,11 @@ static SEGMENTS: &[Segment] = &[
     Segment { id: "session_name", render: seg_session_name },
 ];
 
-fn segments(ids: &[String], fallback: &[&str], s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Vec<Part> {
-    let names: Vec<&str> = if ids.is_empty() { fallback.to_vec() } else { ids.iter().map(String::as_str).collect() };
-    names
-        .into_iter()
+/// Renders the ids in order, skipping unknown ids and segments with nothing to show.
+fn segments(ids: &[&str], s: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Vec<Part> {
+    ids.iter()
         .filter_map(|name| {
-            let seg = SEGMENTS.iter().find(|g| g.id == name)?;
+            let seg = SEGMENTS.iter().find(|g| g.id == *name)?;
             Some(Part { id: seg.id, line: (seg.render)(s, env, path_max)? })
         })
         .collect()
@@ -272,12 +265,12 @@ fn seg_pi(_: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
     Some(line)
 }
 
-fn seg_model(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
+fn seg_model(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
     if s.model_id.is_empty() {
         return Some(vec![span("no model", st(Role::Faint)), span(" · /switch", st(Role::Muted))]);
     }
     let mut line = vec![span(s.model_name.clone(), st(Role::Tool))];
-    if let Some(l) = thinking_label(s, env) {
+    if let Some(l) = thinking_label(s) {
         line.push(span(format!(" ({l})"), st(Role::Muted)));
     }
     if s.chatgpt_plan {
@@ -308,8 +301,8 @@ fn seg_path(_: &StatusSnapshot, env: &StatusEnv, path_max: usize) -> Option<Line
     Some(path_line(env, path_max))
 }
 
-fn seg_git(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
-    git_line(s.git.as_ref()?, env)
+fn seg_git(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line> {
+    git_line(s.git.as_ref()?)
 }
 
 fn seg_context_pct(s: &StatusSnapshot, env: &StatusEnv, _: usize) -> Option<Line> {
@@ -420,9 +413,8 @@ fn seg_session_name(s: &StatusSnapshot, _: &StatusEnv, _: usize) -> Option<Line>
 }
 
 /// Abbreviated level after the model name; parenthesised so `Haiku 5.5 h` doesn't read as a version suffix.
-fn thinking_label(s: &StatusSnapshot, env: &StatusEnv) -> Option<&'static str> {
-    let show = env.config.segment_options.get("model").and_then(|m| m["showThinkingLevel"].as_bool()).unwrap_or(true);
-    if !show || !s.reasoning {
+fn thinking_label(s: &StatusSnapshot) -> Option<&'static str> {
+    if !s.reasoning {
         return None;
     }
     Some(match s.thinking.as_str() {
@@ -503,23 +495,16 @@ pub(crate) fn format_number(n: u64) -> String {
 }
 
 /// `branch *unstaged +staged ?untracked`, coloured clean/dirty as omp does. `None` when nothing shows.
-fn git_line(g: &GitInfo, env: &StatusEnv) -> Option<Line> {
-    let opts = env.config.segment_options.get("git");
-    let opt = |k: &str| opts.and_then(|o| o[k].as_bool()).unwrap_or(true);
+fn git_line(g: &GitInfo) -> Option<Line> {
     let t = theme::get();
-    let counts: Vec<(String, Role)> = [
-        (opt("showUnstaged"), g.dirty, "*", Role::Warn),
-        (opt("showStaged"), g.staged, "+", Role::Ok),
-        (opt("showUntracked"), g.untracked, "?", Role::Accent),
-    ]
-    .into_iter()
-    .filter(|(on, n, _, _)| *on && *n > 0)
-    .map(|(_, n, prefix, role)| (format!("{prefix}{n}"), role))
-    .collect();
+    let counts: Vec<(String, Role)> =
+        [(g.dirty, "*", Role::Warn), (g.staged, "+", Role::Ok), (g.untracked, "?", Role::Accent)]
+            .into_iter()
+            .filter(|(n, _, _)| *n > 0)
+            .map(|(n, prefix, role)| (format!("{prefix}{n}"), role))
+            .collect();
     let mut line: Line = vec![];
-    if opt("showBranch")
-        && let Some(b) = &g.branch
-    {
+    if let Some(b) = &g.branch {
         let role = if g.dirty + g.staged + g.untracked == 0 { Role::Ok } else { Role::Warn };
         line.push(span(b.clone(), t.fg(role)));
     }
@@ -535,13 +520,9 @@ fn git_line(g: &GitInfo, env: &StatusEnv) -> Option<Line> {
 /// omp's path segment: `~` for home; project dirs under `~/Projects`, `~/repos` and `/work` shown relative
 /// to that root; left-truncated to `max`.
 fn path_line(env: &StatusEnv, max: usize) -> Line {
-    let opts = env.config.segment_options.get("path");
-    let strip = opts.and_then(|o| o["stripWorkPrefix"].as_bool()).unwrap_or(true);
-    let abbreviate = opts.and_then(|o| o["abbreviate"].as_bool()).unwrap_or(true);
     let home = env.home.as_deref().map(|h| h.trim_end_matches('/')).filter(|h| !h.is_empty());
-    let display = path_display(env.cwd, home, strip);
-    let text = if abbreviate { abbreviate_home(&display, home) } else { display };
-    let text = clamp_left(&text, max);
+    let display = path_display(env.cwd, home, true);
+    let text = clamp_left(&abbreviate_home(&display, home), max);
     vec![span(text, theme::get().fg(Role::Literal))]
 }
 
@@ -598,24 +579,8 @@ mod tests {
     use super::*;
     use crate::text::line::line_text;
     use mu_base::events::QuotaWindow;
-    use std::collections::BTreeMap;
-
-    fn cfg(left: &[&str], right: &[&str]) -> OmpStatusLine {
-        let opts = |y: &str| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(y).unwrap();
-        OmpStatusLine {
-            preset: Some("custom".into()),
-            left_segments: left.iter().map(|s| s.to_string()).collect(),
-            right_segments: right.iter().map(|s| s.to_string()).collect(),
-            segment_options: BTreeMap::from([
-                ("model".to_string(), opts("showThinkingLevel: true")),
-                ("path".to_string(), opts("abbreviate: true\nmaxLength: 40\nstripWorkPrefix: true")),
-            ]),
-        }
-    }
-
     #[test]
     fn the_model_segment_marks_the_plan_apart_from_a_key() {
-        let c = cfg(&["model"], &[]);
         let mut s = StatusSnapshot {
             model_id: "openai-chatgpt/gpt-6.1-sol".into(),
             model_name: "openai-chatgpt/gpt-6.1-sol".into(),
@@ -623,7 +588,7 @@ mod tests {
             chatgpt_plan: true,
             ..Default::default()
         };
-        let text = |s: &StatusSnapshot| line_text(&seg_model(s, &env(&c, Path::new("/")), 0).unwrap());
+        let text = |s: &StatusSnapshot| line_text(&seg_model(s, &env(&["model"], &[], Path::new("/")), 0).unwrap());
         assert!(text(&s).ends_with(" · ChatGPT plan"), "{}", text(&s));
         s.chatgpt_plan = false;
         assert!(text(&s).ends_with(" · key"), "{}", text(&s));
@@ -633,15 +598,13 @@ mod tests {
 
     #[test]
     fn no_model_chosen_is_shown_as_such() {
-        let c = cfg(&["model"], &[]);
-        let t = line_text(&seg_model(&StatusSnapshot::default(), &env(&c, Path::new("/")), 0).unwrap());
+        let t = line_text(&seg_model(&StatusSnapshot::default(), &env(&["model"], &[], Path::new("/")), 0).unwrap());
         assert_eq!(t, "no model · /switch");
     }
 
     #[test]
     fn the_mode_segment_shows_plan_and_a_non_yolo_mode() {
-        let c = cfg(&["mode"], &[]);
-        let e = env(&c, Path::new("/"));
+        let e = env(&["mode"], &[], Path::new("/"));
         assert!(seg_mode(&StatusSnapshot::default(), &e, 0).is_none(), "yolo and no plan is silent");
         let s = StatusSnapshot { permissions: PermissionMode::Ask, ..Default::default() };
         assert_eq!(line_text(&seg_mode(&s, &e, 0).unwrap()), "ask");
@@ -672,11 +635,12 @@ mod tests {
         }
     }
 
-    fn env<'a>(c: &'a OmpStatusLine, cwd: &'a Path) -> StatusEnv<'a> {
+    fn env<'a>(left: &'a [&'a str], right: &'a [&'a str], cwd: &'a Path) -> StatusEnv<'a> {
         StatusEnv {
             cwd,
             home: Some("/home/u".into()),
-            config: c,
+            left,
+            right,
             profile: Some("private".into()),
             expanded: false,
             turn_elapsed: None,
@@ -690,8 +654,7 @@ mod tests {
 
     #[test]
     fn renders_segments_in_order_with_right_title() {
-        let c = cfg(LEFT, &["session_name"]);
-        let lines = render(&snap(), &env(&c, Path::new("/home/u/code/mu")), 140);
+        let lines = render(&snap(), &env(LEFT, &["session_name"], Path::new("/home/u/code/mu")), 140);
         assert_eq!(lines.len(), 1);
         let t = line_text(&lines[0]);
         assert_eq!(line_width(&lines[0]), 140);
@@ -702,22 +665,22 @@ mod tests {
 
     #[test]
     fn model_shows_abbreviated_thinking_level() {
-        let c = cfg(&["model"], &[]);
+        let c: &[&str] = &["model"];
         let cwd = Path::new("/home/u/x");
         let mut s = StatusSnapshot { usage: None, title: None, ..snap() };
         for (level, label) in
             [("off", "off"), ("low", "l"), ("medium", "m"), ("high", "h"), ("xhigh", "xh"), ("max", "max")]
         {
             s.thinking = level.into();
-            assert_eq!(line_text(&render(&s, &env(&c, cwd), 80)[0]).trim(), format!("Haiku 5.5 ({label})"));
+            assert_eq!(line_text(&render(&s, &env(c, &[], cwd), 80)[0]).trim(), format!("Haiku 5.5 ({label})"));
         }
         s.reasoning = false;
-        assert_eq!(line_text(&render(&s, &env(&c, cwd), 80)[0]).trim(), "Haiku 5.5");
+        assert_eq!(line_text(&render(&s, &env(c, &[], cwd), 80)[0]).trim(), "Haiku 5.5");
     }
 
     #[test]
     fn skips_unknown_and_empty_segments() {
-        let c = cfg(&["pi", "pr", "subagents", "bogus", "mode", "cost"], &[]);
+        let c: &[&str] = &["pi", "pr", "subagents", "bogus", "mode", "cost"];
         let mut s = snap();
         s.title = None;
         s.mode = None;
@@ -725,19 +688,20 @@ mod tests {
         s.cost = 0.0;
         // Only `pi` has something to show, and an empty right side means no padding.
         s.usage = None;
-        assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " μ private ");
+        assert_eq!(line_text(&render(&s, &env(c, &[], Path::new("/home/u/x")), 80)[0]), " μ private ");
         s.mode = Some("plan".into());
         s.cost = 0.25;
-        let c = cfg(&["mode", "cost"], &[]);
-        assert_eq!(line_text(&render(&s, &env(&c, Path::new("/home/u/x")), 80)[0]), " plan · $0.25 ");
+        assert_eq!(
+            line_text(&render(&s, &env(&["mode", "cost"], &[], Path::new("/home/u/x")), 80)[0]),
+            " plan · $0.25 "
+        );
     }
 
     #[test]
     fn cost_shows_the_subagent_tree_after_the_sessions_own_spend() {
-        let c = cfg(&["cost"], &[]);
         let cwd = Path::new("/home/u/x");
         let text = |s: &StatusSnapshot, sub: f64| {
-            let mut e = env(&c, cwd);
+            let mut e = env(&["cost"], &[], cwd);
             e.subagent_cost = sub;
             line_text(&render(s, &e, 80)[0]).trim().to_string()
         };
@@ -759,12 +723,11 @@ mod tests {
 
     #[test]
     fn subagents_segment_counts_jobs_and_hides_zeros() {
-        let c = cfg(&["subagents"], &[]);
         let cwd = Path::new("/home/u/x");
         let mut s = snap();
         s.usage = None;
         s.title = None;
-        let mut e = env(&c, cwd);
+        let mut e = env(&["subagents"], &[], cwd);
         assert_eq!(line_text(&render(&s, &e, 80)[0]), "", "no jobs, no segment");
         e.jobs = JobCounts { running: 2, done: 1, failed: 1 };
         assert_eq!(line_text(&render(&s, &e, 80)[0]).trim(), "◌2 ✓1 ✗1");
@@ -802,15 +765,14 @@ mod tests {
 
     #[test]
     fn never_exceeds_width_and_drops_in_omp_order() {
-        let c = cfg(LEFT, &["session_name"]);
         let cwd = Path::new("/home/u/code/mu");
         for w in [5usize, 20, 40, 60, 80, 100] {
-            for l in &render(&snap(), &env(&c, cwd), w) {
+            for l in &render(&snap(), &env(LEFT, &["session_name"], cwd), w) {
                 assert!(line_width(l) <= w, "width {w}: {:?}", line_text(l));
             }
         }
         // Narrow enough to lose the title and the trailing segments, but not the brand.
-        let t = line_text(&render(&snap(), &env(&c, cwd), 50)[0]);
+        let t = line_text(&render(&snap(), &env(LEFT, &["session_name"], cwd), 50)[0]);
         assert!(t.starts_with(" μ private"), "{t}");
         assert!(!t.contains("EVENTS"), "{t}");
     }
@@ -857,32 +819,32 @@ mod tests {
 
     #[test]
     fn git_counts_and_clean_repo() {
-        let c = cfg(&["git"], &[]);
+        let c: &[&str] = &["git"];
         let cwd = Path::new("/home/u/x");
         let mut s = snap();
         s.title = None;
         s.usage = None;
         s.git = Some(GitInfo { branch: Some("dev".into()), ..Default::default() });
-        assert_eq!(line_text(&render(&s, &env(&c, cwd), 40)[0]), " dev ");
+        assert_eq!(line_text(&render(&s, &env(c, &[], cwd), 40)[0]), " dev ");
         s.git = Some(GitInfo { staged: 2, ..Default::default() });
-        assert_eq!(line_text(&render(&s, &env(&c, cwd), 40)[0]), " +2 ");
+        assert_eq!(line_text(&render(&s, &env(c, &[], cwd), 40)[0]), " +2 ");
         s.git = None;
-        assert_eq!(render(&s, &env(&c, cwd), 40).len(), 1);
+        assert_eq!(render(&s, &env(c, &[], cwd), 40).len(), 1);
     }
 
     #[test]
     fn git_colours() {
-        let c = cfg(&["git"], &[]);
+        let c: &[&str] = &["git"];
         let cwd = Path::new("/home/u/x");
         let mut s = snap();
         s.title = None;
         s.usage = None;
         let fg = |l: &Line, txt: &str| l.iter().find(|p| p.text == txt).unwrap().style.foreground_color;
         s.git = Some(GitInfo { branch: Some("dev".into()), ..Default::default() });
-        let l = &render(&s, &env(&c, cwd), 40)[0];
+        let l = &render(&s, &env(c, &[], cwd), 40)[0];
         assert_eq!(fg(l, "dev"), theme::get().color(Role::Ok));
         s.git = Some(GitInfo { branch: Some("dev".into()), dirty: 2, ..Default::default() });
-        let l = &render(&s, &env(&c, cwd), 40)[0];
+        let l = &render(&s, &env(c, &[], cwd), 40)[0];
         assert_eq!(fg(l, "dev"), theme::get().color(Role::Warn));
         assert_eq!(fg(l, "*2"), theme::get().color(Role::Warn));
     }
@@ -893,13 +855,12 @@ mod tests {
 
     #[test]
     fn cache_segment_shows_the_last_hit_and_turns_cold_when_it_will_miss() {
-        let c = cfg(&["cache"], &[]);
         let cwd = Path::new("/home/u/x");
         let now = mu_base::message::now_ms();
         let mut s = snap();
         s.usage = None;
         s.title = None;
-        let text = |s: &StatusSnapshot| line_text(&render(s, &env(&c, cwd), 80)[0]).trim().to_string();
+        let text = |s: &StatusSnapshot| line_text(&render(s, &env(&["cache"], &[], cwd), 80)[0]).trim().to_string();
         s.cache = Some(cache(100, 900, now, None));
         assert_eq!(text(&s), "cache 90%");
         s.cache = Some(cache(100, 900, now, Some(CacheBreak::Model)));

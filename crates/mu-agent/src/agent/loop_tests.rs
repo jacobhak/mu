@@ -1860,12 +1860,15 @@ fn two_senders_and_one_wake_give_one_notice() {
 fn a_native_model_pauses_the_quota_and_shows_no_windows() {
     run(async {
         let (mut a, _rx) = agent(vec![]);
-        a.costs.quota.enabled = true;
-        a.costs.quota.set_usage(mu_base::events::ProviderUsage { provider: "anthropic".into(), windows: vec![] });
+        a.costs.quota.borrow_mut().enabled = true;
+        a.costs
+            .quota
+            .borrow_mut()
+            .set_usage(mu_base::events::ProviderUsage { provider: "anthropic".into(), windows: vec![] });
         a.model.model = ModelSpec::gateway("anthropic/m", 200_000, 8192);
         a.model.model.native = true;
         a.sync_model_state();
-        assert!(a.costs.quota.wait() >= std::time::Duration::from_secs(3600), "the run loop must not spin");
+        assert!(a.costs.quota.borrow().wait() >= std::time::Duration::from_secs(3600), "the run loop must not spin");
         assert!(a.snapshot().usage.is_none(), "subscription windows never show under a per-token model");
         assert!(!a.model.pricing_checked, "a native-only session never starts omp");
         a.model.model.native = false;

@@ -138,6 +138,60 @@ fn refresh_status_reads_git_and_emits_without_a_turn() {
 }
 
 #[test]
+fn the_git_watcher_sends_a_changed_tree_with_no_command_and_no_turn() {
+    run(async {
+        let dir = crate::testing::git_repo();
+        let (mut a, mut events) = crate::testing::agent_in(vec![], Default::default(), Default::default(), dir.clone());
+        a.refresh_external().await;
+        a.emit_status();
+        drain(&mut events);
+        a.watch_git(Duration::from_millis(20));
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Some(AgentEvent::Status(s)) if s.git.as_ref().is_some_and(|g| g.dirty == 1) => break s,
+                    Some(_) => {}
+                    None => panic!("the event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the watcher reports the edit");
+        assert_eq!(seen.model_id, a.snapshot().model_id, "the rest of the status is the last one sent");
+        std::fs::remove_dir_all(dir).unwrap();
+    });
+}
+
+#[test]
+fn a_finished_quota_fetch_reaches_the_status_with_no_reply() {
+    use mu_base::events::{ProviderUsage, QuotaWindow};
+    run(async {
+        let (mut a, mut events) = crate::testing::agent(vec![]);
+        a.model.model = mu_base::models::ModelSpec::gateway("anthropic/m", 200_000, 8192);
+        a.costs.quota.borrow_mut().enabled = true;
+        a.sync_model_state();
+        a.emit_status();
+        drain(&mut events);
+        a.watch_quota();
+        let window = QuotaWindow { label: "5h".into(), used_percent: 42.0, resets_in: Duration::from_secs(3600) };
+        a.costs.quota.borrow_mut().deliver(ProviderUsage { provider: "anthropic".into(), windows: vec![window] });
+        let seen = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Some(AgentEvent::Status(s)) if s.usage.is_some() => break s,
+                    Some(_) => {}
+                    None => panic!("the event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the driver applies the fetch and reports it");
+        assert_eq!(seen.usage.unwrap().windows[0].label, "5h");
+    });
+}
+
+#[test]
 fn refresh_status_waits_in_the_backlog_during_a_turn() {
     run(async {
         let (tx, rx) = unbounded_channel();

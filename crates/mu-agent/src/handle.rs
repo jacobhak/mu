@@ -14,6 +14,9 @@ use std::rc::Rc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
+/// How often the TUI agent reads the working tree for the status line.
+const GIT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Which background features an agent turns on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -95,6 +98,7 @@ pub fn build_agent(s: AgentSetup, cwd: PathBuf, mode: Mode) -> AgentHandle {
     }
     if mode == Mode::Tui {
         wake = agent.enable_notify();
+        agent.watch_git(GIT_POLL);
     }
     let task = tokio::task::spawn_local(agent.run(cmd_rx));
     AgentHandle { cmd, ev, wake, task }

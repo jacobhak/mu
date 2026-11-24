@@ -122,7 +122,7 @@ impl Agent {
             reasoning: !none && self.reasoning_capable(),
             thinking: self.model.live_thinking.get().as_str().into(),
             subscription: self.on_chatgpt_plan()
-                || (!self.gateway_idle() && self.costs.quota.is_subscription(&self.model.model.provider)),
+                || (!self.gateway_idle() && self.costs.quota.borrow().is_subscription(&self.model.model.provider)),
             native: self.model.model.native,
             native_keyless: self.native_keyless(),
             chatgpt_plan: self.on_chatgpt_plan(),
@@ -135,26 +135,96 @@ impl Agent {
             title: self.title.text.clone(),
             session_path: self.session.as_ref().map(|s| s.path.to_string_lossy().into_owned()),
             local_dir: self.session.as_ref().map(|_| self.tools.local_root().to_string_lossy().into_owned()),
-            git: self.costs.git.clone(),
-            usage: if self.gateway_idle() { None } else { self.costs.quota.usage_for(&self.model.model.provider) },
+            git: self.costs.git.borrow().clone(),
+            usage: if self.gateway_idle() {
+                None
+            } else {
+                self.costs.quota.borrow().usage_for(&self.model.model.provider)
+            },
             permissions: self.tools.permissions.mode(),
             cache: self.cache_status(),
         }
     }
 
-    /// Git state for the status line. Runs between turns, never from the draw path.
+    /// Git state for the status line, read off the draw path.
     pub(super) async fn refresh_external(&mut self) {
-        self.costs.git = git::git_status(&self.cwd).await;
+        *self.costs.git.borrow_mut() = git::git_status(&self.cwd).await;
         self.tick_quota();
         self.settle_prices();
     }
 
     pub(super) async fn refresh_status(&mut self) {
         if !self.gateway_idle() {
-            self.costs.quota.force_refresh(&self.model.model.provider);
+            self.costs.quota.borrow_mut().force_refresh(&self.model.model.provider);
         }
-        self.costs.git = git::git_status(&self.cwd).await;
+        *self.costs.git.borrow_mut() = git::git_status(&self.cwd).await;
         self.emit_status();
+    }
+
+    /// Reads the working tree every `period` for as long as the front end listens, in a turn or out
+    /// of one, and sends the last status again when it changed. A turn only emits status as replies
+    /// arrive, and an idle agent not at all, so edits made meanwhile would otherwise show late.
+    pub(crate) fn watch_git(&self, period: std::time::Duration) {
+        let (cwd, git, last, events) =
+            (self.cwd.clone(), self.costs.git.clone(), self.costs.last_status.clone(), self.ports.events.clone());
+        tokio::task::spawn_local(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            while !events.is_closed() {
+                tick.tick().await;
+                // A read that timed out under load says nothing; it is not a repository that vanished.
+                let Some(now) = git::git_status(&cwd).await else { continue };
+                if git.borrow().as_ref() == Some(&now) {
+                    continue;
+                }
+                let now = Some(now);
+                *git.borrow_mut() = now.clone();
+                let Some(mut s) = last.borrow().clone() else { continue };
+                s.git = now;
+                *last.borrow_mut() = Some(s.clone());
+                let _ = events.send(AgentEvent::Status(s));
+            }
+        });
+    }
+
+    /// Fetches and applies the provider's quota on its own schedule, in a turn or out of one, and
+    /// sends the last status again with the new windows. Without this a fetch finished mid-turn
+    /// waited for the next reply to be applied or to start the following one.
+    pub(crate) fn watch_quota(&self) {
+        self.costs.quota.borrow_mut().set_provider(&self.model.model.provider);
+        let (quota, last, events) =
+            (self.costs.quota.clone(), self.costs.last_status.clone(), self.ports.events.clone());
+        let mut wake = quota.borrow_mut().take_wake();
+        tokio::task::spawn_local(async move {
+            loop {
+                let wait = quota.borrow().wait();
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    Some(()) = recv_opt(&mut wake) => {}
+                }
+                if events.is_closed() {
+                    break;
+                }
+                let mut q = quota.borrow_mut();
+                if q.is_paused() {
+                    continue;
+                }
+                let provider = q.provider().to_string();
+                let (usage, sub) = (q.usage_for(&provider), q.is_subscription(&provider));
+                q.tick(&provider);
+                let (now_usage, now_sub) = (q.usage_for(&provider), q.is_subscription(&provider));
+                drop(q);
+                if (usage, sub) == (now_usage.clone(), now_sub) {
+                    continue;
+                }
+                let Some(mut s) = last.borrow().clone() else { continue };
+                s.usage = now_usage;
+                s.subscription = s.chatgpt_plan || now_sub;
+                *last.borrow_mut() = Some(s.clone());
+                let _ = events.send(AgentEvent::Status(s));
+            }
+        });
     }
 
     /// Native models have no gateway quota to poll.
@@ -163,13 +233,13 @@ impl Agent {
             return;
         }
         let provider = self.model.model.provider.clone();
-        self.costs.quota.tick(&provider);
+        self.costs.quota.borrow_mut().tick(&provider);
     }
 
     /// Prices usage recorded before the table knew its model. A model the table does not list forces
     /// one catalogue refresh per process.
     pub(super) fn settle_prices(&mut self) {
-        if self.costs.cost.settle() && self.costs.quota.enabled && !self.gateway_idle() {
+        if self.costs.cost.settle() && self.costs.quota.borrow().enabled && !self.gateway_idle() {
             tokio::task::spawn_local(pricing::refresh_missing(self.ports.providers.gateway_prices()));
         }
     }
@@ -191,7 +261,7 @@ impl Agent {
     /// Native models pause quota polling. The gateway plugin's price list is read only once a gateway model
     /// is in use, so a native-only session never starts the gateway.
     pub(super) fn sync_model_state(&mut self) {
-        self.costs.quota.set_paused(self.gateway_idle());
+        self.costs.quota.borrow_mut().set_paused(self.gateway_idle());
         if !self.gateway_idle() && !self.model.pricing_checked && !self.ports.providers.is_relayed() {
             self.model.pricing_checked = true;
             tokio::task::spawn_local(pricing::refresh(self.ports.providers.gateway_prices()));
@@ -199,7 +269,10 @@ impl Agent {
     }
 
     pub(crate) fn emit_status(&self) {
-        self.emit(AgentEvent::Status(self.snapshot()));
+        let s = self.snapshot();
+        self.costs.quota.borrow_mut().set_provider(&self.model.model.provider);
+        *self.costs.last_status.borrow_mut() = Some(s.clone());
+        self.emit(AgentEvent::Status(s));
     }
 
     pub(crate) fn fresh_usage_tokens(&self) -> Option<u64> {
@@ -274,7 +347,7 @@ impl Agent {
                     s.model_change(&spec.id);
                 }
                 if self.model.model.provider != spec.provider {
-                    self.costs.quota.provider_changed();
+                    self.costs.quota.borrow_mut().provider_changed();
                 }
                 self.model.model = spec;
                 self.sync_model_state();

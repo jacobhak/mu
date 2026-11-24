@@ -910,7 +910,6 @@ pub(super) mod tests {
                 dirty: false,
                 child_busy: false,
                 started: Instant::now(),
-                status_cfg: Default::default(),
                 status_levels: Default::default(),
                 notify: false,
             },

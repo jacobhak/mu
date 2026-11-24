@@ -210,8 +210,7 @@ Each phase ships alone.
 1. **Model + list** (implemented). The extra `SubagentStatus` fields, `crates/mu-tui/src/panels/jobs_panel.rs`, `/jobs` and
    `Alt+J` open the panel, `x`/`X`. Detail is facts only (state, delivery, cwd, task or command, note).
    Deviation: `take_undelivered` now emits a snapshot so the panel's delivery state is current.
-2. **Status segment** `subagents` (implemented). Drawn only where the user's omp `statusLine` lists it; mu's
-   fallback segment list is unchanged.
+2. **Status segment** `subagents` (implemented). In mu's built-in segment list; it draws nothing without jobs.
 3. **Child transcript and cost** (implemented). The headless child prints `{"type":"session","path":…}` once
    its session exists; `run_child_observed` hands it to the job. `agent::history_events` is the resume
    replay as a pure function; `panels/session_view.rs` draws its events with the live transcript's blocks;

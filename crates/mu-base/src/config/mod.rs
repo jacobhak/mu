@@ -72,7 +72,6 @@ impl Threshold {
 #[serde(default, rename_all = "camelCase")]
 pub struct OmpConfig {
     pub skills: OmpSkills,
-    pub status_line: OmpStatusLine,
     pub composer: OmpComposer,
     pub symbol_preset: Option<String>,
     pub hide_thinking_block: bool,
@@ -123,15 +122,6 @@ impl<'de> Deserialize<'de> for OmpCompletion {
         };
         Ok(Self { notify })
     }
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct OmpStatusLine {
-    pub preset: Option<String>,
-    pub left_segments: Vec<String>,
-    pub right_segments: Vec<String>,
-    pub segment_options: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,7 +210,6 @@ fn load_omp(warn: &mut Vec<String>) -> OmpConfig {
     let f = "config.yml";
     OmpConfig {
         skills: yaml_section(&d, "skills", f, warn),
-        status_line: yaml_section(&d, "statusLine", f, warn),
         composer: yaml_section(&d, "composer", f, warn),
         symbol_preset: yaml_section(&d, "symbolPreset", f, warn),
         hide_thinking_block: yaml_section(&d, "hideThinkingBlock", f, warn),

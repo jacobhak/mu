@@ -80,7 +80,6 @@ pub struct AppInit {
     pub notice_rx: UnboundedReceiver<String>,
     pub cwd: PathBuf,
     pub pick_session: bool,
-    pub status_cfg: mu_base::config::OmpStatusLine,
     pub theme: mu_base::config::MuTheme,
     pub keys: mu_base::config::MuKeys,
     /// Ring the terminal when your turn ends with nothing running in the background, or when a
@@ -145,7 +144,6 @@ struct Screen {
     /// until it exits, but agent and plugin tasks keep running.
     child_busy: bool,
     started: Instant,
-    status_cfg: mu_base::config::OmpStatusLine,
     status_levels: mu_base::config::MuStatus,
     notify: bool,
 }
@@ -366,7 +364,6 @@ pub async fn run(init: AppInit) -> i32 {
         mut notice_rx,
         cwd,
         pick_session,
-        status_cfg,
         theme,
         keys,
         notify,
@@ -409,7 +406,6 @@ pub async fn run(init: AppInit) -> i32 {
             dirty: true,
             child_busy: false,
             started: Instant::now(),
-            status_cfg,
             status_levels,
             notify,
         },
@@ -646,7 +642,7 @@ impl App {
         vp.extend(self.agent.todo_hud(w));
         vp.extend(self.queue_bar(w));
         vp.extend(self.schedule_bar(w));
-        let mut env = status::StatusEnv::new(&self.cwd, &self.screen.status_cfg);
+        let mut env = status::StatusEnv::new(&self.cwd);
         env.expanded = self.agent.expanded;
         env.turn_elapsed = self.agent.turn_started.map(|t| t.elapsed());
         env.jobs = status::JobCounts::of(&self.agent.jobs);

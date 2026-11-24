@@ -36,7 +36,6 @@ use mu_base::models::{ModelSpec, Thinking};
 use mu_base::permissions::PermissionMode;
 use mu_base::secrets;
 use mu_base::tool::{ToolDef, ToolMeta, ToolOutput};
-use mu_provider::gateway::quota::QuotaTracker;
 use mu_provider::model::cost::CostLedger;
 use mu_provider::model::pricing;
 use mu_provider::provider::client::Providers;
@@ -312,7 +311,12 @@ impl Agent {
                 announced: HashSet::new(),
             },
             run: i.run,
-            costs: Costs { cost: CostLedger::default(), quota: QuotaTracker::default(), git: None },
+            costs: Costs {
+                cost: CostLedger::default(),
+                quota: Rc::default(),
+                git: Rc::default(),
+                last_status: Rc::default(),
+            },
             compaction: CompactionFlow { state: None, fresh_from: 0, since: 0, failed_at: None },
             memo: Memo::default(),
             plugin_ctx: BTreeMap::new(),
@@ -426,8 +430,11 @@ impl Agent {
     }
 
     pub async fn run(mut self, rx: UnboundedReceiver<Command>) {
-        self.costs.quota.enabled = !self.ports.providers.is_relayed();
-        self.costs.quota.set_peek(self.ports.providers.gateway_peek_fn());
+        {
+            let mut quota = self.costs.quota.borrow_mut();
+            quota.enabled = !self.ports.providers.is_relayed();
+            quota.set_peek(self.ports.providers.gateway_peek_fn());
+        }
         self.sync_model_state();
         let providers = self.ports.providers.clone();
         tokio::task::spawn_local(async move {
@@ -437,7 +444,7 @@ impl Agent {
         self.emit_status();
         let mut title_rx = self.title.rx.take().expect("run once");
         let mut wake_rx = self.mail.wake_rx.take();
-        let mut quota_rx = self.costs.quota.take_wake();
+        self.watch_quota();
         let mut q = Queue {
             rx,
             backlog: Default::default(),
@@ -453,15 +460,6 @@ impl Agent {
             } else {
                 tokio::select! {
                 c = q.rx.recv() => match c { Some(c) => c, None => break },
-                () = tokio::time::sleep(self.costs.quota.wait()) => {
-                    self.tick_quota();
-                    continue;
-                }
-                Some(()) = recv_opt(&mut quota_rx) => {
-                    self.tick_quota();
-                    self.emit_status();
-                    continue;
-                }
                 Some((sid, t)) = title_rx.recv() => {
                     self.apply_title(&sid, t);
                     continue;

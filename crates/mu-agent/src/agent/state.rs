@@ -2,7 +2,7 @@
 
 use super::status::PrefixKey;
 use super::{DeliverFn, ExecPlan, ModeState};
-use mu_base::events::{EventTx, GitInfo};
+use mu_base::events::{EventTx, GitInfo, StatusSnapshot};
 use mu_base::message::UserInput;
 use mu_base::models::{ModelSpec, Thinking};
 use mu_base::permissions::PermissionMode;
@@ -131,8 +131,12 @@ pub(super) struct Mailbox {
 
 pub(super) struct Costs {
     pub(super) cost: CostLedger,
-    pub(super) quota: QuotaTracker,
-    pub(super) git: Option<GitInfo>,
+    /// Shared with the driver (`watch_quota`), which applies fetches while a turn runs.
+    pub(super) quota: Rc<RefCell<QuotaTracker>>,
+    /// Shared with the watcher (`watch_git`), which updates it while a turn runs.
+    pub(super) git: Rc<RefCell<Option<GitInfo>>>,
+    /// The snapshot last sent: the watcher sends it again with new git state.
+    pub(super) last_status: Rc<RefCell<Option<StatusSnapshot>>>,
 }
 
 pub(super) struct CompactionFlow {

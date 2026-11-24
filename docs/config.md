@@ -32,7 +32,7 @@ max_attempts = 5     # attempts per request, retries included: 1 to 20; any othe
 # max_wait = "3h"
 # context_below = 60
 
-[status]              # when the footer's context share turns yellow (warn) or red (err); a level is reached at its percent of the window or its token count, whichever is lower
+[status]              # the footer is mu's own layout (omp's `statusLine` is not read); these set when its context share turns yellow (warn) or red (err); a level is reached at its percent of the window or its token count, whichever is lower
 warn_percent = 50
 warn_tokens = 270000
 err_percent = 70

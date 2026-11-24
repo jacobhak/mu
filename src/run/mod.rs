@@ -496,7 +496,6 @@ async fn tui(
         notice_rx,
         cwd: ui.cwd,
         pick_session: ui.pick_session,
-        status_cfg: ui.cfgs.omp.status_line.clone(),
         theme: ui.cfgs.mu.theme.clone(),
         keys: ui.cfgs.mu.keys.clone(),
         notify: ui.cfgs.omp.completion.notify,
