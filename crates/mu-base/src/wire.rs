@@ -745,6 +745,7 @@ mod tests {
             AgentEvent::Jobs(vec![job()]),
             AgentEvent::JobsDelivered(vec!["w".into()]),
             AgentEvent::JobOutput { id: "w".into(), tail: "t".into() },
+            AgentEvent::PtyWaiting { id: "c".into(), waiting: true },
             AgentEvent::PlanParked { id: "p".into(), path: "/p".into() },
             AgentEvent::PlanList(vec![]),
             AgentEvent::Status(status()),

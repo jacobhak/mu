@@ -302,6 +302,14 @@ impl AgentView {
                     let _ = reply.send(cells);
                 }
             }
+            AgentEvent::PtyWaiting { id, waiting } => {
+                if let Some(p) = self.pty.as_mut().filter(|p| p.id == id) {
+                    p.waiting = waiting;
+                    if waiting {
+                        self.ring_if_attention(&mut fx);
+                    }
+                }
+            }
             AgentEvent::ToolOutput { id, chunk } => {
                 if let Some(p) = self.pty.as_mut().filter(|p| p.id == id) {
                     p.feed(&chunk);
@@ -487,7 +495,7 @@ impl AgentView {
         for t in &self.tools {
             if let Some(p) = self.pty.as_ref().filter(|p| p.id == t.id) {
                 let (rows, cur) = p.screen();
-                let (lines, c) = blocks::pty_live(&t.args, &rows, cur, t.started.elapsed().as_secs(), w);
+                let (lines, c) = blocks::pty_live(&t.args, &rows, cur, t.started.elapsed().as_secs(), p.waiting, w);
                 pty_cursor = c.map(|c| (out.len() + c.0, c.1));
                 out.extend(lines);
                 continue;

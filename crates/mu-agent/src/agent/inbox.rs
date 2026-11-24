@@ -20,8 +20,16 @@ impl Agent {
     pub(super) fn take_jobs(&mut self) -> bool {
         let Some(jobs) = &self.tools.jobs else { return false };
         let done = jobs.take_undelivered();
+        let matches = jobs.take_matches();
+        if !matches.is_empty() {
+            for m in &matches {
+                let line: String = m.lines.first().map(|l| l.chars().take(80).collect()).unwrap_or_default();
+                self.notice(format!("↳ {} output matched: {line}", m.id));
+            }
+            self.push(Message::user(&jobs::matches_notice(&matches)));
+        }
         if done.is_empty() {
-            return false;
+            return !matches.is_empty();
         }
         self.emit(AgentEvent::JobsDelivered(done.iter().map(|d| d.id.clone()).collect()));
         self.push(Message::user(&jobs::notice(&done)));

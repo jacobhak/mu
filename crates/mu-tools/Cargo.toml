@@ -19,6 +19,7 @@ omp-shell.workspace = true
 omp-diff.workspace = true
 omp-xfs.workspace = true
 grep-regex.workspace = true
+regex.workspace = true
 grep-searcher.workspace = true
 serde_yaml_ng.workspace = true
 async-trait.workspace = true

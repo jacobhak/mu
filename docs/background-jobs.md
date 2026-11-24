@@ -10,6 +10,20 @@ A `bash` call with `async` shows in the transcript as one line, `● Bash <comma
 
 A turn that began this way rings the terminal only when it needs you (a question, an approval, plan review), not when it finishes; see [Detached runs](detached-runs.md#terminal-bell).
 
+## Output notices
+
+`bash` also takes `notify`, a regex (Rust syntax, the same as `grep`) that only counts with `async`. While the job runs, each output line that matches reaches the model as a `<system-notice>` with the matching lines, so a model that started a dev server or a watcher hears when `ready` or an error line appears instead of polling. The notice wakes an idle session, arrives at the next tool boundary during a turn and ends a blocked `wait` (which then says output matched, and the job keeps running). Lines that match within 200 ms of each other arrive as one notice (at most 50 lines of 500 characters), and matches that have not been sent yet when the job ends are dropped, since its result follows anyway. The lines are secret-redacted like the jobs panel. An invalid regex is refused before the job starts. The transcript shows `↳ bg_1 output matched: <first line>`.
+
+## `pty` commands waiting for input
+
+A `bash` call with `pty` runs in a terminal you can type into. A `sudo` or `ssh` password prompt there looks like a hung command, so mu checks twice a second, once the output has been quiet for half a second, whether the command waits for the keyboard:
+
+- terminal echo is off (password prompts, full-screen programs), on Linux and macOS;
+- a process in the terminal's foreground group is blocked reading it: on Linux through `/proc/<pid>/syscall`, on macOS through the `ttyin` wait channel `ps` reports;
+- failing both, text with the cursor behind it (a prompt without a newline) and no output for 2 s.
+
+When it does, the call's card says `waiting for input` and the terminal rings once (the `attention` bell in [`[bell]`](config.md); a detached run rings as it does for a question). Typing or any output clears the mark, and nothing rings while you have typed in the last 10 s.
+
 ## Waiting for a job
 
 In an interactive session a turn does not have to end to wait: an ordinary `bash` call (no `async`, no `pty`) runs as a tracked job and waits for its own result.

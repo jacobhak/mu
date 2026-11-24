@@ -143,7 +143,7 @@ pub(super) static BUILTIN: [Builtin; 34] = [
     cmd("compact", "Compact the context [focus]; waits for a running turn", App::cmd_compact).busy_ok(),
     cmd("review", "Review changes against the approved plan [focus]", App::cmd_review),
     cmd("refresh", "Refresh Git and gateway quota status", App::cmd_refresh).busy_ok(),
-    cmd("session", "Show the session file and title", App::cmd_session).busy_ok(),
+    cmd("session", "Show the session file, title and local:// directory", App::cmd_session).busy_ok(),
     cmd("rename", "Rename this session", App::cmd_rename).needs_arg(),
     cmd("todo", "Show the todo list", |a, _| a.show_todo()).busy_ok(),
     cmd("skills", "List skills", App::cmd_skills).busy_ok(),
@@ -156,7 +156,7 @@ pub(super) static BUILTIN: [Builtin; 34] = [
     cmd("hotkeys", "Show key bindings", |a, _| a.notice(HOTKEYS)),
     cmd("copy", "Copy a reply, code block or command", App::copy_cmd)
         .busy_ok()
-        .complete(|_| strings(&["code", "cmd", "link"])),
+        .complete(|_| strings(&["code", "cmd", "link", "local"])),
     cmd("reply", "Quote parts of the last reply into the composer", |a, _| a.open_reply()).busy_ok(),
     cmd("image", "Attach an image file", App::image_cmd).needs_arg().busy_ok(),
     cmd("jobs", "Show background jobs and other mu sessions", App::jobs_cmd).busy_ok().complete(|_| strings(&["kill"])),

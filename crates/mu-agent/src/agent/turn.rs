@@ -76,7 +76,7 @@ impl Agent {
             return;
         }
         if matches!(start, Start::Wake)
-            && !self.tools.jobs.as_ref().is_some_and(|j| j.has_undelivered())
+            && !self.tools.jobs.as_ref().is_some_and(|j| j.has_undelivered() || j.has_matches())
             && !self.notify_pending(true)
         {
             return;

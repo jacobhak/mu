@@ -194,6 +194,7 @@ impl Tools {
                 "timeout":{"type":"number","description":"Seconds; default 300, max 3600, 0 disables"},
                 "cwd":{"type":"string","description":"Working directory for this command"},
                 "async":{"type":"boolean","description":async_desc},
+                "notify":{"type":"string","description":"With `async`: a regex (Rust syntax). Each output line that matches reaches you as a system notice while the job runs: it wakes an idle session and ends a blocked `wait`. Lines matching within 200 ms arrive together. Use it to learn that a server is ready or a watcher hit an error without polling; the job's result still arrives when it ends."},
                 "pty":{"type":"boolean","description":"Run in a terminal the user can type into (passwords, sudo, prompts, confirmations). Fresh login shell, not the persistent one. Use only when the command needs user input."}},"required":["command"]}),
         )
     }

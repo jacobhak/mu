@@ -151,6 +151,9 @@ pub struct StatusSnapshot {
     pub tokens_out: u64,
     pub title: Option<String>,
     pub session_path: Option<String>,
+    /// The directory behind `local://` for this session; `None` until a session exists.
+    #[serde(default)]
+    pub local_dir: Option<String>,
     pub git: Option<GitInfo>,
     /// Quota windows of the current provider, when the gateway reports them.
     pub usage: Option<ProviderUsage>,
@@ -593,6 +596,12 @@ pub enum AgentEvent {
         id: String,
         input: mpsc::UnboundedSender<PtyInput>,
         reply: oneshot::Sender<(u16, u16)>,
+    },
+    /// A pty call (`id`) is waiting for keyboard input (`waiting`), or no longer is. Sent when the
+    /// user should be told; not while they are typing.
+    PtyWaiting {
+        id: String,
+        waiting: bool,
     },
     /// Current todo phases (JSON), after a change or a resume.
     Todo(Value),

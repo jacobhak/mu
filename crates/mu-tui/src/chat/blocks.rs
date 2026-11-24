@@ -694,10 +694,15 @@ pub fn pty_live(
     rows: &[String],
     cursor: (usize, usize),
     elapsed: u64,
+    waiting: bool,
     width: usize,
 ) -> (Vec<Line>, Option<(usize, usize)>) {
     let body: Vec<&str> = rows.iter().map(String::as_str).collect();
-    let footer = vec![Fact::Running(elapsed), Fact::KillHint];
+    let mut footer = vec![Fact::Running(elapsed)];
+    if waiting {
+        footer.push(Fact::Note("waiting for input".into()));
+    }
+    footer.push(Fact::KillHint);
     let (lines, first) = bash_box_at(args, &body, true, Tone::Pending, footer, width);
     // Terminal rows never wrap (they are at most the inner width), so the screen row `r` is
     // `first + r`. With no output rows there is nowhere to put the cursor.
@@ -1046,13 +1051,16 @@ mod tests {
 
     #[test]
     fn pty_live_cursor() {
-        let (lines, cur) = pty_live(&json!({"command":"sudo ls"}), &["[sudo] password: ".into()], (0, 17), 1, 40);
+        let (lines, cur) =
+            pty_live(&json!({"command":"sudo ls"}), &["[sudo] password: ".into()], (0, 17), 1, false, 40);
         let t: Vec<String> = lines.iter().map(text_of).collect();
         let cur = cur.expect("output rows exist");
         assert!(t[cur.0].starts_with("│ [sudo] password:"), "{t:?}");
         assert_eq!(cur.1, 19);
-        let (_, none) = pty_live(&json!({"command":"x"}), &[], (0, 0), 1, 40);
+        let (_, none) = pty_live(&json!({"command":"x"}), &[], (0, 0), 1, false, 40);
         assert_eq!(none, None, "no output rows: the cursor is hidden");
+        let (lines, _) = pty_live(&json!({"command":"sudo ls"}), &["[sudo] password: ".into()], (0, 17), 1, true, 60);
+        assert!(lines.iter().map(text_of).any(|l| l.contains("waiting for input")));
     }
 
     #[test]

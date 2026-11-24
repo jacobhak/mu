@@ -134,6 +134,7 @@ impl Agent {
             tokens_out: self.costs.cost.tokens_out,
             title: self.title.text.clone(),
             session_path: self.session.as_ref().map(|s| s.path.to_string_lossy().into_owned()),
+            local_dir: self.session.as_ref().map(|_| self.tools.local_root().to_string_lossy().into_owned()),
             git: self.costs.git.clone(),
             usage: if self.gateway_idle() { None } else { self.costs.quota.usage_for(&self.model.model.provider) },
             permissions: self.tools.permissions.mode(),

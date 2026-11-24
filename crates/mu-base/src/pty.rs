@@ -162,6 +162,102 @@ impl PtyIo {
             unsafe { libc::kill(self.pid, libc::SIGHUP) };
         }
     }
+
+    /// Terminal echo is off: a password prompt, or a program that reads the keys itself.
+    pub fn echo_off(&self) -> bool {
+        // SAFETY: a zeroed termios is a valid out-parameter; the fd is owned by `self`.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // tcgetattr on the master reads the slave's settings, on Linux and macOS alike.
+        let ok = unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut t) } == 0;
+        ok && t.c_lflag & libc::ECHO == 0
+    }
+
+    /// The terminal's foreground process group; the child's own group when the system will not say.
+    fn foreground_group(&self) -> i32 {
+        // SAFETY: tcgetpgrp(3) on an owned fd.
+        let g = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if g > 0 { g } else { self.pid }
+    }
+
+    /// The command is waiting for keyboard input: echo is off, or a process in the terminal's
+    /// foreground group is blocked reading it (Linux: `/proc/<pid>/syscall`; macOS: the wait
+    /// channel `ps` reports).
+    pub async fn awaiting_input(&self) -> bool {
+        if self.echo_off() {
+            return true;
+        }
+        blocked_on_terminal(self.foreground_group()).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn blocked_on_terminal(group: i32) -> bool {
+    tokio::task::spawn_blocking(move || linux_probe::group_reads_terminal(group)).await.unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+async fn blocked_on_terminal(group: i32) -> bool {
+    let out = tokio::process::Command::new("ps").args(["-axo", "pgid=,wchan="]).output();
+    match tokio::time::timeout(std::time::Duration::from_secs(1), out).await {
+        Ok(Ok(o)) => ps_group_waits_on_tty(&String::from_utf8_lossy(&o.stdout), group),
+        _ => false,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn blocked_on_terminal(_group: i32) -> bool {
+    false
+}
+
+/// Whether `ps -axo pgid=,wchan=` output has a process of `group` asleep in `ttyin`, the wait
+/// channel of a read on a terminal.
+#[cfg(any(target_os = "macos", test))]
+fn ps_group_waits_on_tty(ps: &str, group: i32) -> bool {
+    ps.lines().any(|l| {
+        let mut f = l.split_whitespace();
+        f.next().and_then(|g| g.parse::<i32>().ok()) == Some(group) && f.next() == Some("ttyin")
+    })
+}
+
+#[cfg(target_os = "linux")]
+mod linux_probe {
+    use std::fs;
+
+    /// The process group field of `/proc/<pid>/stat`; the command name may hold spaces and parentheses.
+    pub(super) fn stat_group(stat: &str) -> Option<i32> {
+        // After the last `)`: state, ppid, pgrp, ...
+        stat.rsplit_once(')')?.1.split_whitespace().nth(2)?.parse().ok()
+    }
+
+    /// The descriptor of a `read` that `/proc/<pid>/syscall` shows the process blocked in.
+    pub(super) fn blocked_read_fd(syscall: &str) -> Option<i32> {
+        let mut f = syscall.split_whitespace();
+        if f.next()?.parse::<i64>().ok()? != libc::SYS_read {
+            return None;
+        }
+        i32::from_str_radix(f.next()?.trim_start_matches("0x"), 16).ok()
+    }
+
+    /// A process of `group` is blocked in a `read` of a terminal.
+    pub(super) fn group_reads_terminal(group: i32) -> bool {
+        let Ok(dir) = fs::read_dir("/proc") else { return false };
+        dir.flatten().any(|e| {
+            let name = e.file_name();
+            if !name.to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) {
+                return false;
+            }
+            let proc = e.path();
+            let in_group = fs::read_to_string(proc.join("stat")).ok().and_then(|s| stat_group(&s)) == Some(group);
+            if !in_group {
+                return false;
+            }
+            let Some(fd) = fs::read_to_string(proc.join("syscall")).ok().and_then(|s| blocked_read_fd(&s)) else {
+                return false;
+            };
+            fs::read_link(proc.join("fd").join(fd.to_string()))
+                .is_ok_and(|t| t.starts_with("/dev/pts/") || t.starts_with("/dev/tty"))
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -196,6 +292,11 @@ impl Cleaner {
     pub fn finish(&mut self) -> String {
         self.state = State::Ground;
         std::mem::take(&mut self.line)
+    }
+
+    /// Text sits on the current line: the cursor is after it, as at a prompt.
+    pub fn has_partial_line(&self) -> bool {
+        !self.line.is_empty()
     }
 
     fn step(&mut self, c: char, out: &mut String) {
@@ -266,6 +367,42 @@ impl Cleaner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_output_names_a_group_waiting_on_the_terminal() {
+        let ps = "  1 -\n 812 ttyin\n 900 select\n";
+        assert!(ps_group_waits_on_tty(ps, 812));
+        assert!(!ps_group_waits_on_tty(ps, 900));
+        assert!(!ps_group_waits_on_tty(ps, 5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_files_are_read_for_the_group_and_the_blocked_read() {
+        assert_eq!(linux_probe::stat_group("42 (a b) c) S 1 4242 4242 0 -1"), Some(4242));
+        assert_eq!(linux_probe::stat_group("garbage"), None);
+        let read = format!("{} 0x0 0x7ffd 0x1000 0x0 0x0 0x0 0x7ffd 0x7f00", libc::SYS_read);
+        assert_eq!(linux_probe::blocked_read_fd(&read), Some(0));
+        assert_eq!(linux_probe::blocked_read_fd(&read.replacen(" 0x0 ", " 0x1f ", 1)), Some(31));
+        assert_eq!(linux_probe::blocked_read_fd("running"), None);
+        assert_eq!(linux_probe::blocked_read_fd(&format!("{} 0x0", libc::SYS_write)), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaiting_input_sees_echo_off_and_a_blocked_read_but_not_a_busy_command() {
+        async fn probe(command: &str) -> bool {
+            let pty = spawn(command, &std::env::temp_dir(), 80, 24, &[]).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let r = pty.io.awaiting_input().await;
+            pty.io.signal(libc::SIGKILL);
+            r
+        }
+        assert!(probe("stty -echo; sleep 30").await, "echo off");
+        assert!(!probe("sleep 30").await, "a command that reads nothing");
+        if cfg!(target_os = "linux") {
+            assert!(probe("cat").await, "a process blocked in read on the terminal");
+        }
+    }
 
     fn clean(s: &str) -> String {
         let mut c = Cleaner::default();

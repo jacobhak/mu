@@ -48,7 +48,7 @@ readonly_bash = true   # the built-in read-only command set counts as reading; f
 
 [bell]                # what rings the terminal (BEL, plus a toast in some terminals; see detached-runs.md); omp's `completion: {notify: off}` silences both
 turn_end = true       # a turn you typed ends with no background command or subagent running
-attention = true      # a running turn asks you something or needs an approval or plan review, whoever started it
+attention = true      # a running turn asks you something or needs an approval or plan review, or a pty command waits for keyboard input, whoever started it
 
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"

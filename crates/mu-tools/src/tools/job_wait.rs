@@ -7,7 +7,7 @@ use mu_base::tool::{ToolDef, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub const DESCRIPTION: &str = "Wait for background jobs: the named ids, or any job when `ids` is omitted. Returns as soon as one of them finishes, and the results follow in a system notice. A new prompt from the user stops the wait; the jobs keep running.";
+pub const DESCRIPTION: &str = "Wait for background jobs: the named ids, or any job when `ids` is omitted. Returns as soon as one of them finishes (or prints a line matching its `notify` pattern), and the results follow in a system notice. A new prompt from the user stops the wait; the jobs keep running.";
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -31,10 +31,14 @@ impl Tools {
         let Some(interrupt) = &ctx.wait_interrupt else {
             return ToolOutput::err("wait: no active interruptible wait");
         };
-        match jobs.wait_ready(&a.ids, &ctx.cancel, interrupt).await {
+        match jobs.wait_ready_or_matches(&a.ids, &ctx.cancel, interrupt).await {
             WaitReady::Ready(ids) => {
                 ToolOutput::ok(format!("Finished jobs: {}. Their results follow in a system notice.", ids.join(", ")))
             }
+            WaitReady::Matched(ids) => ToolOutput::ok(format!(
+                "Output matching `notify` from jobs: {}. The matching lines follow in a system notice; the jobs keep running.",
+                ids.join(", ")
+            )),
             WaitReady::Nothing => ToolOutput::ok("No matching background jobs running."),
             WaitReady::Interrupted => ToolOutput::ok(
                 "Waiting stopped for your new prompt. Jobs continue running; their results will arrive automatically.",

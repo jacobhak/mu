@@ -239,7 +239,8 @@ impl App {
             .as_ref()
             .map(|c| format!("\n{}", crate::status::cache_summary(c, mu_base::message::now_ms())))
             .unwrap_or_default();
-        self.notice(&format!("{p}\n{t}{cache}"));
+        let local = self.agent.status.local_dir.as_ref().map(|d| format!("\nlocal://  {d}")).unwrap_or_default();
+        self.notice(&format!("{p}\n{t}{local}{cache}"));
     }
 
     pub(super) fn cmd_rename(&mut self, arg: &str) {
@@ -327,7 +328,14 @@ impl App {
                 let t = self.agent.tr.replies.iter().rev().find_map(|r| markdown::links(r).pop());
                 self.copy_text(t, "No link to copy.");
             }
-            _ => self.error("usage: /copy [code|cmd|link]"),
+            "local" => match self.agent.status.local_dir.clone() {
+                None => self.notice("No session yet, so no local:// directory."),
+                Some(dir) => match std::fs::create_dir_all(&dir) {
+                    Ok(()) => self.copy_async(dir.clone(), format!("copied {dir}")),
+                    Err(e) => self.error(&format!("cannot create {dir}: {e}")),
+                },
+            },
+            _ => self.error("usage: /copy [code|cmd|link|local]"),
         }
     }
 

@@ -10,6 +10,8 @@ pub struct PtyView {
     input: UnboundedSender<PtyInput>,
     /// (cols, rows)
     size: (u16, u16),
+    /// The command is waiting for keyboard input (a prompt, a password).
+    pub waiting: bool,
 }
 
 fn nz(n: u16) -> NonZeroU16 {
@@ -25,7 +27,7 @@ impl PtyView {
     }
 
     pub fn new(id: String, input: UnboundedSender<PtyInput>, size: (u16, u16)) -> Self {
-        Self { id, parser: vt100::Parser::new(nz(size.1), nz(size.0), 0), input, size }
+        Self { id, parser: vt100::Parser::new(nz(size.1), nz(size.0), 0), input, size, waiting: false }
     }
 
     pub fn feed(&mut self, s: &str) {

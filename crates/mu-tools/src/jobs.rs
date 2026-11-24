@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
@@ -26,6 +26,29 @@ const OUTPUT_KEEP: usize = 64 * 1024;
 /// How much of that goes to the UI per update, and how often at most.
 const OUTPUT_EMIT: usize = 16 * 1024;
 const OUTPUT_EVERY: Duration = Duration::from_millis(250);
+/// Output lines that match a job's `notify` pattern within this long of each other go out as one notice.
+const NOTIFY_BATCH: Duration = Duration::from_millis(200);
+/// Most lines, and most characters per line, one notice carries.
+const NOTICE_LINES: usize = 50;
+const NOTICE_LINE_CHARS: usize = 500;
+
+/// Lines of a running job's output that matched its `notify` pattern, not yet handed to the model.
+pub struct Matched {
+    pub id: String,
+    pub pattern: String,
+    pub lines: Vec<String>,
+}
+
+/// A job's `notify` pattern and the matching lines waiting for the batch window to close.
+struct Watch {
+    re: regex::Regex,
+    pattern: String,
+    jobs: Weak<JobsHandle>,
+    pending: Vec<String>,
+    scheduled: bool,
+    /// The job has ended: its result follows, so matches not yet sent are dropped.
+    closed: bool,
+}
 
 /// Where a running bash job's output goes: a bounded buffer whose newest part is sent to the UI as
 /// `AgentEvent::JobOutput` (redacted, throttled), so the panel can show a job while it runs.
@@ -45,6 +68,7 @@ struct SinkInner {
     pending: Cell<bool>,
     /// The throttle window; a field so tests need not race the real clock.
     every: Duration,
+    watch: RefCell<Option<Watch>>,
 }
 
 impl OutputSink {
@@ -62,7 +86,58 @@ impl OutputSink {
             last: Cell::new(None),
             pending: Cell::new(false),
             every,
+            watch: RefCell::new(None),
         }))
+    }
+
+    /// Reports output lines that match `re` to the model through `jobs`.
+    pub fn watch(&self, re: regex::Regex, jobs: Weak<JobsHandle>) {
+        let pattern = re.as_str().to_string();
+        *self.0.watch.borrow_mut() =
+            Some(Watch { re, pattern, jobs, pending: Vec::new(), scheduled: false, closed: false });
+    }
+
+    /// Cleaned output (whole lines): the lines that match the watch pattern are batched for a notice.
+    pub fn lines(&self, clean: &str) {
+        let mut guard = self.0.watch.borrow_mut();
+        let Some(w) = guard.as_mut().filter(|w| !w.closed) else { return };
+        for line in clean.lines() {
+            if w.re.is_match(line) {
+                w.pending.push(line.to_string());
+            }
+        }
+        if w.pending.is_empty() || w.scheduled {
+            return;
+        }
+        w.scheduled = true;
+        let me = self.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(NOTIFY_BATCH).await;
+            me.send_matches();
+        });
+    }
+
+    fn send_matches(&self) {
+        let (lines, pattern, jobs) = {
+            let mut guard = self.0.watch.borrow_mut();
+            let Some(w) = guard.as_mut() else { return };
+            w.scheduled = false;
+            if w.closed || w.pending.is_empty() {
+                return;
+            }
+            (std::mem::take(&mut w.pending), w.pattern.clone(), w.jobs.clone())
+        };
+        let Some(jobs) = jobs.upgrade() else { return };
+        let lines = mu_base::secrets::redact(&lines.join("\n"), &self.0.cwd).text.lines().map(str::to_string).collect();
+        jobs.push_matches(Matched { id: self.0.id.clone(), pattern, lines });
+    }
+
+    /// The job has ended: matches still waiting are dropped, since its result follows.
+    pub fn close(&self) {
+        if let Some(w) = self.0.watch.borrow_mut().as_mut() {
+            w.closed = true;
+            w.pending.clear();
+        }
     }
 
     /// Stops streaming to the call that was waiting: the job runs on as a background job.
@@ -232,6 +307,8 @@ impl Drop for ActiveWait {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WaitReady {
     Ready(Vec<String>),
+    /// Ids of jobs whose `notify` pattern matched; only `wait_ready_or_matches` returns it.
+    Matched(Vec<String>),
     Nothing,
     Interrupted,
     Cancelled,
@@ -244,6 +321,7 @@ pub struct JobsHandle {
     notify: Notify,
     wait_generation: Cell<u64>,
     active_wait: RefCell<Option<(u64, CancellationToken)>>,
+    matches: RefCell<Vec<Matched>>,
     wake: UnboundedSender<()>,
     events: EventTx,
 }
@@ -256,6 +334,7 @@ impl JobsHandle {
             notify: Notify::new(),
             wait_generation: Cell::new(0),
             active_wait: RefCell::new(None),
+            matches: RefCell::default(),
             wake,
             events,
         })
@@ -288,6 +367,26 @@ impl JobsHandle {
         cancel: &CancellationToken,
         interrupt: &CancellationToken,
     ) -> WaitReady {
+        self.wait_inner(ids, cancel, interrupt, false).await
+    }
+
+    /// `wait_ready`, also ending when output matching a selected job's `notify` pattern arrives.
+    pub async fn wait_ready_or_matches(
+        &self,
+        ids: &[String],
+        cancel: &CancellationToken,
+        interrupt: &CancellationToken,
+    ) -> WaitReady {
+        self.wait_inner(ids, cancel, interrupt, true).await
+    }
+
+    async fn wait_inner(
+        &self,
+        ids: &[String],
+        cancel: &CancellationToken,
+        interrupt: &CancellationToken,
+        on_match: bool,
+    ) -> WaitReady {
         let mut seen = HashSet::new();
         let ids: Vec<&str> = ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect();
         loop {
@@ -299,6 +398,17 @@ impl JobsHandle {
             }
             if interrupt.is_cancelled() {
                 return WaitReady::Interrupted;
+            }
+            if on_match {
+                let mut matched: Vec<String> = Vec::new();
+                for m in self.matches.borrow().iter().filter(|m| ids.is_empty() || ids.contains(&m.id.as_str())) {
+                    if !matched.contains(&m.id) {
+                        matched.push(m.id.clone());
+                    }
+                }
+                if !matched.is_empty() {
+                    return WaitReady::Matched(matched);
+                }
             }
             let (ready, unknown, running) = {
                 let jobs = self.inner.borrow();
@@ -337,6 +447,22 @@ impl JobsHandle {
                 _ = &mut notified => {}
             }
         }
+    }
+
+    /// Queues matching output for the model, wakes an idle session and ends a blocked `wait`.
+    fn push_matches(&self, m: Matched) {
+        self.matches.borrow_mut().push(m);
+        self.notify.notify_waiters();
+        let _ = self.wake.send(());
+    }
+
+    pub fn has_matches(&self) -> bool {
+        !self.matches.borrow().is_empty()
+    }
+
+    /// Matching output not yet handed to the model.
+    pub fn take_matches(&self) -> Vec<Matched> {
+        std::mem::take(&mut *self.matches.borrow_mut())
     }
 
     /// `base`, or `base-2`, `base-3`, … when taken this session.
@@ -677,7 +803,21 @@ impl JobsHandle {
     where
         F: Future<Output = BackgroundResult> + 'static,
     {
-        self.spawn_bash_job(command, cwd, None, run)
+        self.spawn_bash_job(command, cwd, None, None, run)
+    }
+
+    /// `spawn_bash`, with output lines that match `notify` reported to the model as the job runs.
+    pub fn spawn_bash_notify<F>(
+        self: &Rc<Self>,
+        command: String,
+        cwd: PathBuf,
+        notify: Option<regex::Regex>,
+        run: impl FnOnce(CancellationToken, OutputSink) -> F,
+    ) -> (String, OutputSink)
+    where
+        F: Future<Output = BackgroundResult> + 'static,
+    {
+        self.spawn_bash_job(command, cwd, None, notify, run)
     }
 
     /// Starts a foreground call's command: a job so an interrupted call leaves it running, but not
@@ -693,7 +833,7 @@ impl JobsHandle {
     where
         F: Future<Output = BackgroundResult> + 'static,
     {
-        self.spawn_bash_job(command, cwd, Some(call), run)
+        self.spawn_bash_job(command, cwd, Some(call), None, run)
     }
 
     fn spawn_bash_job<F>(
@@ -701,6 +841,7 @@ impl JobsHandle {
         command: String,
         cwd: PathBuf,
         call: Option<String>,
+        notify: Option<regex::Regex>,
         run: impl FnOnce(CancellationToken, OutputSink) -> F,
     ) -> (String, OutputSink)
     where
@@ -711,6 +852,9 @@ impl JobsHandle {
         let line = command_line(&command);
         let listed = call.is_none();
         let sink = OutputSink::new(id.clone(), cwd.clone(), self.events.clone(), call);
+        if let Some(re) = notify {
+            sink.watch(re, Rc::downgrade(self));
+        }
         let spec = Spec { id: id.clone(), agent: "bash".into(), cwd, task: one_line(&command, COMMAND_KEEP) };
         let run_cancel = cancel.clone();
         let kept = sink.clone();
@@ -718,6 +862,7 @@ impl JobsHandle {
             let fut = run(run_cancel, kept.clone());
             async move {
                 let r = fut.await;
+                kept.close();
                 kept.flush();
                 Finished { ok: r.ok, text: r.text, note: Some(r.note), meta: r.meta }
             }
@@ -824,6 +969,7 @@ impl JobsHandle {
     pub fn clear(&self) {
         self.kill(None);
         self.inner.borrow_mut().clear();
+        self.matches.borrow_mut().clear();
         self.notify.notify_waiters();
         self.emit();
     }
@@ -917,6 +1063,22 @@ pub fn notice(done: &[Done]) -> String {
         "<system-notice>\n{} background jobs have completed. Resume your work using the results below.\n\n{body}\n</system-notice>",
         done.len()
     )
+}
+
+/// The user message that hands matching output of running jobs to the model.
+pub fn matches_notice(matches: &[Matched]) -> String {
+    let body = matches
+        .iter()
+        .map(|m| {
+            let shown: Vec<String> =
+                m.lines.iter().take(NOTICE_LINES).map(|l| truncate_text(l, NOTICE_LINE_CHARS)).collect();
+            let more = m.lines.len().saturating_sub(NOTICE_LINES);
+            let more = if more > 0 { format!("\n(+{more} more matching lines)") } else { String::new() };
+            format!("Background job {} printed output matching `{}`:\n{}{more}", m.id, m.pattern, shown.join("\n"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("<system-notice>\n{body}\nThe job's final result arrives separately when it ends.\n</system-notice>")
 }
 
 #[cfg(test)]
@@ -1336,6 +1498,94 @@ pub(crate) mod tests {
         assert_eq!((d[0].id.as_str(), d[0].text.as_str(), d[0].ok), ("A", "ALPHA", true));
         assert!(h.take_undelivered().is_empty());
         assert!(!h.has_undelivered());
+    }
+
+    fn watched(h: &Rc<JobsHandle>, pattern: &str) -> OutputSink {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new("bg_1".into(), PathBuf::from("/"), events, None);
+        sink.watch(regex::Regex::new(pattern).unwrap(), Rc::downgrade(h));
+        sink
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn matching_lines_within_a_window_arrive_as_one_notice() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = handle();
+                let sink = watched(&h, "^ready");
+                sink.lines("starting\nready one\n");
+                sink.lines("noise\nready two\n");
+                assert!(!h.has_matches(), "nothing is sent before the window closes");
+                mu_testutil::wait_until("the batch", || h.has_matches()).await;
+                let m = h.take_matches();
+                assert_eq!(m.len(), 1);
+                assert_eq!(
+                    (m[0].id.as_str(), m[0].lines.as_slice()),
+                    ("bg_1", &["ready one".into(), "ready two".into()][..])
+                );
+                let text = matches_notice(&m);
+                assert!(text.contains("bg_1 printed output matching `^ready`:\nready one\nready two"), "{text}");
+                assert!(!h.has_matches());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn matches_not_yet_sent_when_the_job_ends_are_dropped() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = handle();
+                let sink = watched(&h, "ready");
+                sink.lines("ready\n");
+                sink.close();
+                tokio::time::sleep(NOTIFY_BATCH * 3).await;
+                assert!(!h.has_matches());
+                sink.lines("ready again\n");
+                tokio::time::sleep(NOTIFY_BATCH * 3).await;
+                assert!(!h.has_matches(), "a closed sink takes no more");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_match_wakes_the_session_and_ends_a_wait_for_matches_only() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+                let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+                let h = JobsHandle::new(wake, events);
+                h.push_running("bg_1");
+                let sink = watched(&h, "ready");
+                let (cancel, interrupt) = (CancellationToken::new(), CancellationToken::new());
+                let waiting = h.wait_ready_or_matches(&[], &cancel, &interrupt);
+                let feed = async {
+                    tokio::task::yield_now().await;
+                    sink.lines("ready\n");
+                };
+                let (r, ()) = tokio::join!(waiting, feed);
+                assert_eq!(r, WaitReady::Matched(vec!["bg_1".into()]));
+                assert!(woke.try_recv().is_ok(), "an idle session is woken");
+                // The ordinary wait (a foreground call's own) ignores matches and so keeps waiting.
+                let plain =
+                    tokio::time::timeout(Duration::from_millis(100), h.wait_ready(&[], &cancel, &interrupt)).await;
+                assert!(plain.is_err());
+                // Matches of other jobs do not end a wait on a named one.
+                h.push_running("other");
+                let named = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    h.wait_ready_or_matches(&["other".into()], &cancel, &interrupt),
+                )
+                .await;
+                assert!(named.is_err());
+            })
+            .await;
+    }
+
+    #[test]
+    fn a_long_match_list_is_cut_in_the_notice() {
+        let lines: Vec<String> = (0..NOTICE_LINES + 5).map(|i| format!("l{i}")).collect();
+        let text = matches_notice(&[Matched { id: "bg_1".into(), pattern: "l".into(), lines }]);
+        assert!(text.contains("l49") && !text.contains("l50\n") && text.contains("(+5 more matching lines)"), "{text}");
     }
 
     #[tokio::test(flavor = "current_thread")]

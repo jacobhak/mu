@@ -26,6 +26,8 @@ pub struct Args {
     /// Run as a background job (interactive sessions; not with `pty`).
     #[serde(default)]
     r#async: bool,
+    /// Regex; with `async`, output lines that match reach the model while the job runs.
+    notify: Option<String>,
 }
 
 /// The command's timeout, parsed once for both execution paths.
@@ -69,6 +71,31 @@ struct PtyRun {
     timed_out: bool,
     term_at: Option<tokio::time::Instant>,
     killed: bool,
+    wait: InputWait,
+}
+
+/// How often a running pty is checked for waiting on the keyboard, and how long it must have been
+/// quiet before the probes are worth running.
+const INPUT_PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Silence after which text with the cursor behind it counts as a prompt, when no probe says so.
+const PROMPT_SILENCE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Not told that a command waits for input while the user has typed this recently.
+const USER_ACTIVE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a pty command is waiting for the keyboard, and whether the user has been told.
+struct InputWait {
+    last_output: tokio::time::Instant,
+    last_typed: Option<tokio::time::Instant>,
+    /// The command was seen waiting, and nothing has happened since.
+    waiting: bool,
+    /// The front end was told so.
+    told: bool,
+}
+
+impl InputWait {
+    fn new() -> Self {
+        Self { last_output: tokio::time::Instant::now(), last_typed: None, waiting: false, told: false }
+    }
 }
 
 /// Offers the pty at most 4 KB of the queued keystrokes; the queue itself is unbounded.
@@ -86,15 +113,48 @@ impl PtyRun {
     /// Appends raw output: the UI gets it raw, the model gets it cleaned (and spilled when long).
     fn emit(&mut self, (raw, clean): (String, String), ctx: &ToolCtx, tools: &Tools) {
         if !raw.is_empty() {
+            self.wait.last_output = tokio::time::Instant::now();
+            self.not_waiting(ctx);
             let _ = ctx.events.send(AgentEvent::ToolOutput { id: ctx.call_id.clone(), chunk: raw });
         }
         self.collector.push(&clean, &|| tools.next_artifact());
+    }
+
+    /// Output or typing ended a wait: the front end is told if it had been.
+    fn not_waiting(&mut self, ctx: &ToolCtx) {
+        self.wait.waiting = false;
+        if std::mem::take(&mut self.wait.told) {
+            let _ = ctx.events.send(AgentEvent::PtyWaiting { id: ctx.call_id.clone(), waiting: false });
+        }
+    }
+
+    /// Checks whether the command waits for the keyboard: echo off or a read blocked on the
+    /// terminal (see `PtyIo::awaiting_input`), or, failing those, text with the cursor behind it
+    /// and no output for `PROMPT_SILENCE`. The user is told once per wait, never while typing.
+    async fn probe_input(&mut self, ctx: &ToolCtx) {
+        let quiet = self.wait.last_output.elapsed();
+        let waiting = quiet >= INPUT_PROBE_EVERY
+            && (self.io.awaiting_input().await || (quiet >= PROMPT_SILENCE && self.stream.cleaner.has_partial_line()));
+        if !waiting {
+            self.wait.waiting = false;
+            return;
+        }
+        if self.wait.waiting {
+            return;
+        }
+        self.wait.waiting = true;
+        if self.wait.last_typed.is_none_or(|t| t.elapsed() >= USER_ACTIVE) {
+            self.wait.told = true;
+            let _ = ctx.events.send(AgentEvent::PtyWaiting { id: ctx.call_id.clone(), waiting: true });
+        }
     }
 
     /// Runs the command until it exits, or until it is cancelled or times out and has been terminated.
     async fn pump(&mut self, tools: &Tools, ctx: &ToolCtx, timeout: Option<std::time::Duration>) {
         let timeout_sleep = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(1)));
         tokio::pin!(timeout_sleep);
+        let mut probe = tokio::time::interval(INPUT_PROBE_EVERY);
+        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let deadline = self.deadline();
             let esc_sleep = async {
@@ -116,7 +176,11 @@ impl PtyRun {
                     Err(_) => self.pending_in.clear(),
                 },
                 m = self.input.recv(), if self.input_open => match m {
-                    Some(mu_base::events::PtyInput::Bytes(b)) => self.pending_in.extend(b),
+                    Some(mu_base::events::PtyInput::Bytes(b)) => {
+                        self.wait.last_typed = Some(tokio::time::Instant::now());
+                        self.not_waiting(ctx);
+                        self.pending_in.extend(b);
+                    }
                     Some(mu_base::events::PtyInput::Resize { cols, rows }) => self.io.resize(cols, rows),
                     Some(mu_base::events::PtyInput::Kill) => {
                         if self.term() {
@@ -125,6 +189,7 @@ impl PtyRun {
                     }
                     None => self.input_open = false,
                 },
+                _ = probe.tick(), if self.term_at.is_none() && !self.eof => self.probe_input(ctx).await,
                 _ = ctx.cancel.cancelled(), if self.term_at.is_none() => {
                     self.cancelled = true;
                     self.term();
@@ -316,12 +381,22 @@ impl Tools {
     /// `async`: the command runs as a tracked job; its result arrives as a system notice. The job
     /// starts from the persistent shell's cwd and exported environment as of launch.
     async fn bash_background(&self, a: Args, jobs: &Rc<JobsHandle>) -> ToolOutput {
-        let (id, note, _sink) = match self.start_bash_job(a, jobs, None, None, None).await {
+        let notify = match a.notify.as_deref().filter(|p| !p.is_empty()).map(regex::Regex::new).transpose() {
+            Ok(re) => re,
+            Err(e) => return ToolOutput::err(format!("notify: invalid regex: {e}")),
+        };
+        let watching = notify.is_some();
+        let (id, note, _sink) = match self.start_bash_job(a, jobs, None, None, None, notify).await {
             Ok(started) => started,
             Err(e) => return ToolOutput::err(e),
         };
         let next = "When it finishes, mu automatically starts your next turn with its result; use `wait` when you need it now. Until then, do other work that does not depend on it.";
-        let mut out = ToolOutput::ok(format!("Started background job {id}.{note}\n{next}"));
+        let watch = if watching {
+            "\nOutput lines that match `notify` arrive as a system notice while it runs (an idle session is woken, and a blocked `wait` ends)."
+        } else {
+            ""
+        };
+        let mut out = ToolOutput::ok(format!("Started background job {id}.{note}{watch}\n{next}"));
         out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
         out
     }
@@ -334,7 +409,7 @@ impl Tools {
         interrupt: &CancellationToken,
     ) -> ToolOutput {
         let (id, note, sink) = match self
-            .start_bash_job(a, jobs, Some(&ctx.cancel), Some(self.cwd.clone()), Some(ctx.call_id.clone()))
+            .start_bash_job(a, jobs, Some(&ctx.cancel), Some(self.cwd.clone()), Some(ctx.call_id.clone()), None)
             .await
         {
             Ok(started) => started,
@@ -374,7 +449,7 @@ impl Tools {
                 out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
                 out
             }
-            WaitReady::Nothing | WaitReady::Unknown(_) | WaitReady::Cancelled => {
+            WaitReady::Nothing | WaitReady::Unknown(_) | WaitReady::Cancelled | WaitReady::Matched(_) => {
                 ToolOutput::err("Command job is no longer available.")
             }
         }
@@ -392,6 +467,7 @@ impl Tools {
         cancel: Option<&CancellationToken>,
         base: Option<PathBuf>,
         waiting: Option<String>,
+        notify: Option<regex::Regex>,
     ) -> Result<(String, String, crate::jobs::OutputSink), String> {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err("Command cancelled before launch.".into());
@@ -419,12 +495,15 @@ impl Tools {
                 timeout,
                 cancel,
                 move || Tools::next_artifact_in(&artifact_dir),
-                move |s| sink.push(s),
+                move |raw, clean| {
+                    sink.push(raw);
+                    sink.lines(clean);
+                },
             )
         };
         let (id, sink) = match waiting {
             Some(call) => jobs.spawn_bash_waiting(a.command, job_cwd, call, run),
-            None => jobs.spawn_bash(a.command, job_cwd, run),
+            None => jobs.spawn_bash_notify(a.command, job_cwd, notify, run),
         };
         let note = if inherited {
             String::new()
@@ -527,6 +606,7 @@ impl Tools {
             timed_out: false,
             term_at: None,
             killed: false,
+            wait: InputWait::new(),
         };
         let start = Instant::now();
         run.pump(self, ctx, limits.timeout).await;
@@ -808,7 +888,7 @@ pub async fn run_background(
     timeout: Option<f64>,
     cancel: CancellationToken,
     alloc: impl Fn() -> (u32, PathBuf),
-    on_output: impl Fn(&str),
+    on_output: impl Fn(&str, &str),
 ) -> BackgroundResult {
     let limits = Limits::new(timeout);
     let start = Instant::now();
@@ -857,7 +937,7 @@ pub async fn run_background(
             r = read_or_pending(&mut stdout, &mut obuf) => match r {
                 Ok(n) if n > 0 => {
                     let (raw, clean) = out_stream.push(&obuf[..n]);
-                    on_output(&raw);
+                    on_output(&raw, &clean);
                     collector.push(&clean, &alloc);
                     drain.iter_mut().for_each(Drain::touch);
                 }
@@ -866,7 +946,7 @@ pub async fn run_background(
             r = read_or_pending(&mut stderr, &mut ebuf) => match r {
                 Ok(n) if n > 0 => {
                     let (raw, clean) = err_stream.push(&ebuf[..n]);
-                    on_output(&raw);
+                    on_output(&raw, &clean);
                     collector.push(&clean, &alloc);
                     drain.iter_mut().for_each(Drain::touch);
                 }
@@ -953,6 +1033,98 @@ mod tests {
         assert!(out.text.contains("[pty unavailable without the terminal UI; ran without a terminal]"));
     }
 
+    /// Runs a pty command and returns every `PtyWaiting` flag the front end saw. Once the first one
+    /// arrives, `typed` (if any) is sent as keystrokes and the run waits for the next, then is cancelled.
+    async fn pty_waiting_flags(command: &str, typed: Option<&'static [u8]>) -> Vec<bool> {
+        use std::cell::RefCell;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let tools = Tools::for_test();
+                let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let flags = Rc::new(RefCell::new(Vec::new()));
+                let input = Rc::new(RefCell::new(None));
+                let (f, i) = (flags.clone(), input.clone());
+                tokio::task::spawn_local(async move {
+                    while let Some(e) = rx.recv().await {
+                        match e {
+                            AgentEvent::PtyOpen { input, reply, .. } => {
+                                let _ = reply.send((80, 24));
+                                *i.borrow_mut() = Some(input);
+                            }
+                            AgentEvent::PtyWaiting { waiting, .. } => f.borrow_mut().push(waiting),
+                            _ => {}
+                        }
+                    }
+                });
+                let cancel = CancellationToken::new();
+                let ctx =
+                    ToolCtx { events, cancel: cancel.clone(), call_id: "c".into(), mode: None, wait_interrupt: None };
+                let cmd = json!({"command": command, "pty": true, "timeout": 60});
+                let driver = async {
+                    mu_testutil::wait_until("the command to be seen waiting", || !flags.borrow().is_empty()).await;
+                    if let Some(bytes) = typed {
+                        let keys = input.borrow().clone().expect("the pty opened");
+                        keys.send(mu_base::events::PtyInput::Bytes(bytes.to_vec())).unwrap();
+                        mu_testutil::wait_until("the wait to end", || flags.borrow().len() > 1).await;
+                    }
+                    cancel.cancel();
+                };
+                let _ = tokio::join!(tools.call("bash", &cmd, &ctx), driver);
+                flags.take()
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pty_command_with_echo_off_is_reported_waiting_until_the_user_types() {
+        assert_eq!(pty_waiting_flags("stty -echo; cat", Some(b"hi\n")).await, [true, false]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_prompt_left_with_the_cursor_after_it_is_reported_after_two_seconds_of_silence() {
+        assert_eq!(pty_waiting_flags("printf 'Continue? '; sleep 30", None).await, [true]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_process_blocked_reading_the_terminal_is_reported_waiting() {
+        assert_eq!(pty_waiting_flags("cat", None).await, [true]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_busy_pty_command_is_not_reported_waiting() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let tools = Tools::for_test();
+                let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let seen = Rc::new(std::cell::Cell::new(false));
+                let s = seen.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(e) = rx.recv().await {
+                        match e {
+                            AgentEvent::PtyOpen { reply, input, .. } => {
+                                let _ = reply.send((80, 24));
+                                std::mem::forget(input);
+                            }
+                            AgentEvent::PtyWaiting { .. } => s.set(true),
+                            _ => {}
+                        }
+                    }
+                });
+                let ctx = ToolCtx {
+                    events,
+                    cancel: Default::default(),
+                    call_id: "c".into(),
+                    mode: None,
+                    wait_interrupt: None,
+                };
+                let out = tools.call("bash", &json!({"command": "sleep 3; echo done", "pty": true}), &ctx).await;
+                assert!(out.text.contains("done"), "{}", out.text);
+                assert!(!seen.get());
+            })
+            .await;
+    }
+
     /// A parked terminal request (no client attached) is not an answer: Cancel ends the wait.
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_ends_the_wait_for_a_terminal_nobody_sizes() {
@@ -985,7 +1157,7 @@ mod tests {
             None,
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
-            |s| seen.borrow_mut().push_str(s),
+            |s, _| seen.borrow_mut().push_str(s),
         )
         .await;
         assert!(r.ok, "{}", r.text);
@@ -1003,7 +1175,7 @@ mod tests {
             None,
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
-            |s| seen.borrow_mut().push_str(s),
+            |s, _| seen.borrow_mut().push_str(s),
         )
         .await;
         assert!(r.ok, "{}", r.text);
@@ -1037,7 +1209,7 @@ mod tests {
             None,
             cancel.clone(),
             || (0, std::env::temp_dir()),
-            |s| {
+            |s, _| {
                 if s.contains("termed") {
                     let _ = std::fs::write(&flag, "");
                     termed.notify_one();
@@ -1069,7 +1241,7 @@ mod tests {
             Some(30.0),
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
-            |_| {},
+            |_, _| {},
         )
         .await;
         assert!(t.elapsed() < Duration::from_secs(5), "held open for {:?}", t.elapsed());
@@ -1114,7 +1286,7 @@ mod tests {
             Some(60.0),
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
-            |_| {},
+            |_, _| {},
         )
         .await;
         let _ = std::fs::remove_file(&wrote);
@@ -1462,6 +1634,37 @@ mod tests {
                 assert!(jobs.take_undelivered().is_empty() && !jobs.has_undelivered());
                 let msg = crate::jobs::notice(&done);
                 assert!(msg.contains("## bg_1 (bash: echo hi; exit 3) — failed, exit 3\nhi"), "{msg}");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn notify_reports_matching_output_while_the_job_runs() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let cmd =
+                    json!({"command": "echo booting; echo READY on 8080; sleep 30", "async": true, "notify": "^READY"});
+                let out = tools.call("bash", &cmd, &ctx()).await;
+                assert!(!out.is_error && out.text.contains("`notify`"), "{}", out.text);
+                mu_testutil::wait_until("the match", || jobs.has_matches()).await;
+                let m = jobs.take_matches();
+                assert_eq!(m[0].lines, vec!["READY on 8080".to_string()]);
+                assert!(!jobs.has_undelivered(), "the job itself is still running");
+                jobs.kill(None);
+                finished(&jobs).await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_invalid_notify_regex_is_refused_before_the_job_starts() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (tools, jobs) = tools_with_jobs();
+                let out = tools.call("bash", &json!({"command": "true", "async": true, "notify": "("}), &ctx()).await;
+                assert!(out.is_error && out.text.contains("notify: invalid regex"), "{}", out.text);
+                assert_eq!(jobs.running(), 0);
             })
             .await;
     }

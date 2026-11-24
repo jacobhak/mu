@@ -65,6 +65,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 flume = "0.12"
 async-trait = "0.1"
 grep-regex = "0.1"
+regex = "1"
 grep-searcher = "0.1"
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "v7"] }

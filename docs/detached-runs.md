@@ -24,7 +24,7 @@ Messages are files in `<profile home>/inbox/<id>/` (directory mode 0700), writte
 
 ## Terminal bell
 
-A turn that needs you (`ask`, a tool approval, plan review) rings the terminal once when that happens, whoever started it, and does not ring again at its end. A turn you started otherwise rings when it ends, unless a [background job](background-jobs.md) or subagent is still running (aborting does not ring); a turn that began without user input (a `mu notify` message or a finished job or subagent) does not ring when it finishes: BEL, plus an OSC 9 notification under tmux (needs `allow-passthrough`) and in Ghostty, WezTerm, iTerm2 and Warp; omp's `completion: {notify: off}` in `config.yml` turns it off, and `[bell] turn_end` / `attention` in `config.toml` turn off each kind (see [Config](config.md)).
+A turn that needs you (`ask`, a tool approval, plan review, or a `pty` command waiting for keyboard input; see [`pty` commands](background-jobs.md#pty-commands-waiting-for-input)) rings the terminal once when that happens, whoever started it, and does not ring again at its end. A turn you started otherwise rings when it ends, unless a [background job](background-jobs.md) or subagent is still running (aborting does not ring); a turn that began without user input (a `mu notify` message or a finished job or subagent) does not ring when it finishes: BEL, plus an OSC 9 notification under tmux (needs `allow-passthrough`) and in Ghostty, WezTerm, iTerm2 and Warp; omp's `completion: {notify: off}` in `config.yml` turns it off, and `[bell] turn_end` / `attention` in `config.toml` turn off each kind (see [Config](config.md)).
 
 ## Session environment
 

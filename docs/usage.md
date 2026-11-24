@@ -42,7 +42,7 @@ Context files (`AGENTS.md`, `CLAUDE.md`) can pull in other files with `@path` (r
 
 `/refresh` (or `/refresh status`) refreshes Git status and requests a fresh gateway quota reading without starting a model turn. Quota updates arrive asynchronously; native models do not use gateway quota. During a turn the refresh is queued until the turn finishes.
 
-`/copy` opens a picker of recent replies, code blocks and bash commands; `/copy code`, `/copy cmd` and `/copy link` copy the latest one directly. Under tmux the text goes through `tmux load-buffer -w`; otherwise via OSC 52, plus `wl-copy`/`xclip` when a local display exists.
+`/copy` opens a picker of recent replies, code blocks and bash commands; `/copy code`, `/copy cmd` and `/copy link` copy the latest one directly. `/copy local` copies the path of the session's `local://` directory (creating it first, so you can `cd` there before anything is written); `/session` prints that path too. Under tmux the text goes through `tmux load-buffer -w`; otherwise via OSC 52, plus `wl-copy`/`xclip` when a local display exists.
 
 `/memory` opens the memory picker: the user's memory file, this repository's, each note, and the history. Enter on a file opens it in `$VISUAL` or `$EDITOR`. Enter on the history lists the last 50 commits; Enter on one shows its message and diff in the transcript, and `r` reverts it. The history is only there when git is installed and memory has been written. `/memory` waits for a running turn to finish.
 
