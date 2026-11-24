@@ -28,8 +28,8 @@ pub(super) struct Shared {
     pub(super) providers: RefCell<Weak<Providers>>,
     pub(super) notices: mpsc::UnboundedSender<String>,
     pub(super) init: RefCell<InitParams>,
-    /// The gateway provider plugin's slot.
-    pub(super) gateway: RefCell<Option<Weak<Slot>>>,
+    /// `[gateway] plugin`: the plugin that is the gateway; none means the first one with `provider = "gateway"`.
+    pub(super) gateway_plugin: RefCell<Option<String>>,
     pub(super) cache_dir: std::path::PathBuf,
     /// A terminal UI is attached, so `/mcp login <name>` can be offered.
     pub(super) interactive: Cell<bool>,
@@ -210,12 +210,11 @@ impl PluginHost {
         for s in servers {
             slots.push(Self::mcp_slot(s, &init.cwd, &cache_dir, &mut seen, &mut warnings, reserved));
         }
-        let gateway = slots.iter().find(|s| s.native().is_some_and(|m| m.provider.is_some())).map(Rc::downgrade);
         let shared = Rc::new(Shared {
             providers: RefCell::new(Weak::new()),
             notices,
             init: RefCell::new(init),
-            gateway: RefCell::new(gateway),
+            gateway_plugin: RefCell::new(None),
             cache_dir,
             interactive: Cell::new(false),
         });
@@ -230,6 +229,11 @@ impl PluginHost {
             relay_allow: RefCell::new(None),
             relay_spend: Rc::default(),
         })
+    }
+
+    /// Names the plugin that serves as the gateway (`[gateway] plugin`); `None` is the default pick.
+    pub fn set_gateway_plugin(&self, name: Option<String>) {
+        *self.shared.gateway_plugin.borrow_mut() = name.filter(|n| !n.is_empty());
     }
 
     /// Takes the `relayModels` of a task payload; absent or unparsable means none.
@@ -577,19 +581,43 @@ impl PluginHost {
         Ok(args)
     }
 
+    /// The one gateway plugin: the configured name, else the first with `provider = "gateway"`. Every
+    /// gateway call resolves through here so they cannot disagree.
     fn provider_slot(&self, kind: &str) -> Result<Rc<Slot>, String> {
-        let slot =
-            self.slots.borrow().iter().find(|s| s.native().and_then(|m| m.provider.as_deref()) == Some(kind)).cloned();
-        slot.ok_or_else(|| {
-            let dir = mu_common::paths::mu_home().join("plugins");
-            let found: Vec<String> =
-                self.slots.borrow().iter().filter(|s| s.native().is_some()).map(|s| s.name()).collect();
-            let found = if found.is_empty() { "no plugins".to_string() } else { found.join(", ") };
+        let dir = mu_common::paths::mu_home().join("plugins");
+        let slots = self.slots.borrow();
+        let found = || {
+            let found: Vec<String> = slots.iter().filter(|s| s.native().is_some()).map(|s| s.name()).collect();
+            if found.is_empty() { "no plugins".to_string() } else { found.join(", ") }
+        };
+        let configured = self.shared.gateway_plugin.borrow().clone();
+        let Some(name) = configured else {
+            return slots
+                .iter()
+                .find(|s| s.native().and_then(|m| m.provider.as_deref()) == Some(kind))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "no gateway: no plugin in {} provides `{kind}` (loaded: {}); install a gateway plugin there or set MU_GATEWAY_URL and MU_GATEWAY_TOKEN",
+                        dir.display(),
+                        found()
+                    )
+                });
+        };
+        let slot = slots.iter().find(|s| s.native().is_some() && s.name() == name).ok_or_else(|| {
             format!(
-                "no gateway: no plugin in {} provides `{kind}` (loaded: {found}); install a gateway plugin there or set MU_GATEWAY_URL and MU_GATEWAY_TOKEN",
-                dir.display()
+                "no gateway: [gateway] plugin `{name}` is not loaded from {} (loaded: {}); install it there, change [gateway] plugin, or set MU_GATEWAY_URL and MU_GATEWAY_TOKEN",
+                dir.display(),
+                found()
             )
-        })
+        })?;
+        if slot.native().and_then(|m| m.provider.as_deref()) != Some(kind) {
+            return Err(format!(
+                "no gateway: [gateway] plugin `{name}` has no `provider = \"{kind}\"` in its plugin.toml (loaded: {}); set MU_GATEWAY_URL and MU_GATEWAY_TOKEN to bypass it",
+                found()
+            ));
+        }
+        Ok(slot.clone())
     }
 
     pub(crate) async fn provider_endpoint(&self, kind: &str) -> Result<(String, String), String> {
@@ -618,7 +646,7 @@ impl PluginHost {
                 if let Some(r) = mu_provider::gateway::env_endpoint() {
                     return r.ok();
                 }
-                let slot = host.shared.gateway.borrow().as_ref()?.upgrade()?;
+                let slot = host.provider_slot("gateway").ok()?;
                 let proc = slot.proc.borrow().clone()?;
                 let v = proc
                     .request(

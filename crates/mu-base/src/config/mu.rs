@@ -14,6 +14,7 @@ pub struct MuConfig {
     pub edit: MuEdit,
     pub retry: MuRetry,
     pub mcp: MuMcp,
+    pub gateway: MuGateway,
     pub secrets: MuSecrets,
     pub status: MuStatus,
     pub task: MuTask,
@@ -232,6 +233,14 @@ pub enum StateKey {
 #[serde(default)]
 pub struct MuMcp {
     pub lifetime: String,
+}
+
+/// `[gateway]`: `plugin` names the installed plugin that serves as the gateway; unset, the first
+/// loaded plugin with `provider = "gateway"`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MuGateway {
+    pub plugin: Option<String>,
 }
 
 /// `[edit]`: `mode = "hashline"` (default) or `"sloppy"` (find/replace by text, no tags).

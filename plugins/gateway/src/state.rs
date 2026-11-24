@@ -2,7 +2,8 @@
 //!
 //! `$MU_GATEWAY_HOME` (else `<mu home>/gateway`) holds, per omp profile, `profiles/<name>/{state.json, leases/,
 //! daemon.log}` (the profile-less one sits in the home itself). The daemon serves one profile's credentials and
-//! `models.yml`, so each profile gets its own.
+//! `models.yml`, so each profile gets its own. The pi backend keeps the same layout under `$MU_GATEWAY_PI_HOME`
+//! (else `<mu home>/gateway-pi`), plus a `token` file.
 
 use mu_common::fs::FileLock;
 pub use mu_common::paths::self_exe;
@@ -12,16 +13,128 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What the gateway wraps: oh-my-pi's auth broker and gateway, or pi running the proxy extension.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Backend {
+    Omp,
+    Pi,
+}
+
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Omp => "omp",
+            Self::Pi => "pi",
+        }
+    }
+
+    /// Prefix of the daemon's log lines.
+    pub fn log_prefix(self) -> &'static str {
+        match self {
+            Self::Omp => "mu-gateway",
+            Self::Pi => "mu-gateway-pi",
+        }
+    }
+}
+
+/// The flag wins, then `$MU_GATEWAY_BACKEND`, then omp.
+pub fn resolve_backend(flag: Option<Backend>, env: Option<&str>) -> Result<Backend, String> {
+    if let Some(b) = flag {
+        return Ok(b);
+    }
+    match env.map(str::trim).filter(|v| !v.is_empty()) {
+        None | Some("omp") => Ok(Backend::Omp),
+        Some("pi") => Ok(Backend::Pi),
+        Some(v) => Err(format!("MU_GATEWAY_BACKEND must be `omp` or `pi`, not `{v}`")),
+    }
+}
+
+/// Fixes the backend for this process; call once, before anything reads state.
+pub fn set_backend(b: Backend) {
+    let _ = BACKEND.set(b);
+}
+
+pub fn backend() -> Backend {
+    BACKEND.get().copied().unwrap_or(Backend::Omp)
+}
 
 fn env_dir(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 pub fn home_dir() -> PathBuf {
-    env_dir("MU_GATEWAY_HOME").unwrap_or_else(|| mu_home().join("gateway"))
+    home_dir_for(backend())
+}
+
+fn home_dir_for(b: Backend) -> PathBuf {
+    match b {
+        Backend::Omp => env_dir("MU_GATEWAY_HOME").unwrap_or_else(|| mu_home().join("gateway")),
+        Backend::Pi => env_dir("MU_GATEWAY_PI_HOME").unwrap_or_else(|| mu_home().join("gateway-pi")),
+    }
+}
+
+/// The pi binary: `$MU_GATEWAY_PI`, else the `pi` next to this executable when it is a file, else `pi` on `PATH`.
+pub fn pi_bin() -> PathBuf {
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    pi_bin_in(env_dir("MU_GATEWAY_PI"), exe_dir.as_deref())
+}
+
+fn pi_bin_in(env: Option<PathBuf>, exe_dir: Option<&Path>) -> PathBuf {
+    if let Some(p) = env {
+        return p;
+    }
+    let pinned = exe_dir.map(|d| d.join("pi"));
+    pinned.filter(|p| p.is_file()).unwrap_or_else(|| PathBuf::from("pi"))
+}
+
+/// The proxy extension: `$MU_GATEWAY_PI_PROXY`, else `proxy.mjs` in the working directory (mu starts plugins in
+/// their own directory), else `<exe dir>/../plugins/gateway-pi/proxy.mjs`. Falls back to the last when none exists,
+/// so the error names a real path.
+pub fn proxy_path() -> PathBuf {
+    let cwd = std::env::current_dir().ok();
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    proxy_path_in(env_dir("MU_GATEWAY_PI_PROXY"), cwd.as_deref(), exe_dir.as_deref())
+}
+
+fn proxy_path_in(env: Option<PathBuf>, cwd: Option<&Path>, exe_dir: Option<&Path>) -> PathBuf {
+    if let Some(p) = env {
+        return p;
+    }
+    if let Some(p) = cwd.map(|d| d.join("proxy.mjs")).filter(|p| p.is_file()) {
+        return p;
+    }
+    exe_dir.map_or_else(
+        || PathBuf::from("proxy.mjs"),
+        |d| d.join("..").join("plugins").join("gateway-pi").join("proxy.mjs"),
+    )
+}
+
+/// `<dir>/token`: the pi proxy's bearer token, created (0600) before the proxy starts.
+pub fn token_path(dir: &Path) -> PathBuf {
+    dir.join("token")
+}
+
+/// A fresh random token written to `<dir>/token` with mode 0600 (replacing any old one).
+pub fn write_token(dir: &Path) -> io::Result<String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).map_err(|e| io::Error::other(e.to_string()))?;
+    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let path = token_path(dir);
+    let tmp = dir.join("token.tmp");
+    let _ = fs::remove_file(&tmp);
+    let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    f.write_all(token.as_bytes())?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(token)
 }
 
 /// The omp binary: `$MU_GATEWAY_OMP`, else the `omp` next to this executable (where mu's installer puts the
@@ -40,6 +153,11 @@ pub fn gw_dir() -> PathBuf {
 
 fn gw_dir_for(profile: Option<&str>) -> PathBuf {
     profile_subdir(home_dir(), profile)
+}
+
+#[cfg(test)]
+fn gw_dir_of(b: Backend, profile: Option<&str>) -> PathBuf {
+    profile_subdir(home_dir_for(b), profile)
 }
 
 pub fn daemon_log() -> PathBuf {
@@ -185,6 +303,61 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn backend_flag_beats_env_and_default_is_omp() {
+        assert_eq!(resolve_backend(None, None), Ok(Backend::Omp));
+        assert_eq!(resolve_backend(None, Some("")), Ok(Backend::Omp));
+        assert_eq!(resolve_backend(None, Some("pi")), Ok(Backend::Pi));
+        assert_eq!(resolve_backend(Some(Backend::Omp), Some("pi")), Ok(Backend::Omp));
+        assert_eq!(resolve_backend(Some(Backend::Pi), Some("nonsense")), Ok(Backend::Pi));
+        assert!(resolve_backend(None, Some("nonsense")).is_err());
+    }
+
+    #[test]
+    fn backends_keep_separate_state_dirs() {
+        assert_ne!(gw_dir_of(Backend::Omp, None), gw_dir_of(Backend::Pi, None));
+        assert_eq!(gw_dir_of(Backend::Pi, Some("p")), home_dir_for(Backend::Pi).join("profiles/p"));
+    }
+
+    #[test]
+    fn pi_binary_resolution_order() {
+        let dir = scratch("pi-bin");
+        assert_eq!(pi_bin_in(Some("/x/pi".into()), Some(&dir)), PathBuf::from("/x/pi"));
+        assert_eq!(pi_bin_in(None, Some(&dir)), PathBuf::from("pi"), "no pi beside the executable");
+        fs::write(dir.join("pi"), "").unwrap();
+        assert_eq!(pi_bin_in(None, Some(&dir)), dir.join("pi"));
+        assert_eq!(pi_bin_in(None, None), PathBuf::from("pi"));
+    }
+
+    #[test]
+    fn proxy_resolution_order() {
+        let dir = scratch("proxy");
+        let exe = dir.join("bin");
+        assert_eq!(proxy_path_in(Some("/x/p.mjs".into()), Some(&dir), Some(&exe)), PathBuf::from("/x/p.mjs"));
+        assert_eq!(
+            proxy_path_in(None, Some(&dir), Some(&exe)),
+            exe.join("../plugins/gateway-pi/proxy.mjs"),
+            "no proxy.mjs in the cwd"
+        );
+        fs::write(dir.join("proxy.mjs"), "").unwrap();
+        assert_eq!(proxy_path_in(None, Some(&dir), Some(&exe)), dir.join("proxy.mjs"));
+    }
+
+    #[test]
+    fn the_token_file_is_private_random_and_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("token");
+        let a = write_token(&dir).unwrap();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(fs::read_to_string(token_path(&dir)).unwrap(), a);
+        assert_eq!(fs::metadata(token_path(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
+        let b = write_token(&dir).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(fs::read_to_string(token_path(&dir)).unwrap(), b);
+        assert!(!dir.join("token.tmp").exists());
     }
 
     #[test]

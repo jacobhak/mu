@@ -659,6 +659,83 @@ fn a_hook_block_stops_the_later_hooks() {
     });
 }
 
+/// A plugin that answers `provider/endpoint` with a base URL naming itself; `provider` is its manifest's.
+fn gateway_plugin(dir: &std::path::Path, name: &str, provider: Option<&str>) -> Manifest {
+    let script = format!(
+        r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"shutdown"'*) exit 0 ;;
+    *'"provider/endpoint"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"baseUrl":"http://{name}/","token":"t"}}}}\n' "$id" ;;
+  esac
+done
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.sh")), script).unwrap();
+    Manifest {
+        name: name.into(),
+        command: vec!["sh".into(), format!("{name}.sh")],
+        lifetime: manifest::Lifetime::Session,
+        hooks: vec![],
+        required_hooks: vec![],
+        provider: provider.map(Into::into),
+        tools: vec![],
+        timeout: std::time::Duration::from_secs(300),
+        dir: dir.into(),
+    }
+}
+
+fn gateway_host(configured: Option<&str>, plugins: &[(&str, Option<&str>)]) -> (Rc<PluginHost>, std::path::PathBuf) {
+    let dir = hook_dir();
+    let manifests = plugins.iter().map(|(n, p)| gateway_plugin(&dir, n, *p)).collect();
+    let (ntx, _nrx) = mpsc::unbounded_channel();
+    let h = PluginHost::new(manifests, vec![], ntx, Default::default());
+    h.set_gateway_plugin(configured.map(Into::into));
+    (h, dir)
+}
+
+#[test]
+fn the_gateway_defaults_to_the_first_plugin_that_provides_it() {
+    run(async {
+        let (h, dir) = gateway_host(None, &[("tools", None), ("gw-a", Some("gateway")), ("gw-b", Some("gateway"))]);
+        assert_eq!(h.provider_endpoint("gateway").await.unwrap().0, "http://gw-a");
+        h.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn a_configured_gateway_plugin_wins_over_one_that_loads_first() {
+    run(async {
+        let (h, dir) = gateway_host(Some("gw-b"), &[("gw-a", Some("gateway")), ("gw-b", Some("gateway"))]);
+        assert_eq!(h.provider_endpoint("gateway").await.unwrap().0, "http://gw-b");
+        h.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn an_unknown_configured_gateway_plugin_names_it_and_the_loaded_ones() {
+    run(async {
+        let (h, dir) = gateway_host(Some("nope"), &[("gw-a", Some("gateway")), ("other", None)]);
+        let e = h.provider_endpoint("gateway").await.unwrap_err();
+        assert!(e.contains("no gateway") && e.contains("`nope`") && e.contains("gw-a, other"), "{e}");
+        assert!(e.contains("MU_GATEWAY_URL"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn a_configured_plugin_without_a_gateway_provider_is_rejected() {
+    run(async {
+        let (h, dir) = gateway_host(Some("other"), &[("gw-a", Some("gateway")), ("other", None)]);
+        let e = h.provider_endpoint("gateway").await.unwrap_err();
+        assert!(e.contains("no gateway") && e.contains("`other`") && e.contains("provider"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
 #[test]
 fn reconnect_refuses_a_server_whose_project_file_is_not_trusted() {
     run(async {

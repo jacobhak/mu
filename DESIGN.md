@@ -158,7 +158,7 @@ All omp features outside the core become first-party plugins that load on use.
 
 | Plugin | Day one | Implementation |
 |---|---|---|
-| gateway | optional | Any plugin whose manifest says `provider = "gateway"` and serves `provider/endpoint` and `provider/prices`. It serves every provider without a native API key in mu, subscription logins, account pools and quota. The one that ships with mu is `mu-gateway` (`plugins/gateway`), which wraps omp's auth broker and gateway and is the only code that runs the omp CLI. See Providers. |
+| gateway | optional | Any plugin whose manifest says `provider = "gateway"` and serves `provider/endpoint` and `provider/prices`. It serves every provider without a native API key in mu, subscription logins, account pools and quota. Two ship with mu, both from the `mu-gateway` binary: `gateway` (`plugins/gateway`) wraps omp's auth broker and gateway and is the only code that runs the omp CLI; `gateway-pi` (`plugins/gateway-pi`, `--backend pi`) runs a proxy extension inside `pi --mode rpc` over pi's model registry and is the only code that runs pi. `[gateway] plugin` picks one. See Providers. |
 | mcp-http | yes | Rust (`rmcp`); a raw relay between a server's NDJSON on stdin/stdout and a remote Streamable HTTP MCP endpoint, started once per http server. It also does MCP OAuth (`login` and `token` modes, tokens kept through `core/mcpSecret`). It is a separate Cargo project outside the workspace so that the core does not build `rmcp`; it installs its own rustls crypto provider. It answers any other `core/*` request a server sends with -32601. |
 | web | yes | Rust; fetch. Search goes only through the backend the user chose (`/web`, see `docs/web.md`): Parallel or Exa, keyless or with a key, or Anthropic's or OpenAI's own search tool with that provider's key. Until a backend is chosen, no search contacts anything. |
 | memory | yes | Rust; curated markdown memory per repository plus a user file, versioned in git, reviewed in the background by the `memory` role, with FTS5 search over past sessions. See docs/memory.md. |
@@ -193,9 +193,11 @@ All omp features outside the core become first-party plugins that load on use.
   (returns `{baseUrl, token}`, or `null` when `start` is false and nothing runs), `provider/prices {}` (the
   price list), and a base URL that serves Anthropic Messages at `/v1/messages`, `/v1/models` and `/v1/usage`
   (see `docs/providers.md`). The core speaks one wire protocol, Anthropic Messages, to it and holds no
-  credentials for those providers. The core never runs omp. The omp-wrapping implementation (`plugins/gateway`), its lifecycle, state
+  credentials for those providers. The core never runs omp or pi. The omp-wrapping implementation (`plugins/gateway`), its lifecycle, state
   layout, idle memory (about 306 MB total, 216 MB private; `BENCHMARKS.md`) and the open risk of sharing
-  omp's credential store with running omp sessions are in that plugin's README.
+  omp's credential store with running omp sessions are in that plugin's README. The pi backend has no quota
+  windows (`/v1/usage` is empty), logs in with `pi auth login`, keeps its credentials in pi's own files
+  (outside mu's state encryption), and has no omp catalog row for models only pi knows.
 
 ## Compatibility
 

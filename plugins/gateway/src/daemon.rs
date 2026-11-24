@@ -1,7 +1,8 @@
-//! The shared gateway daemon: one `omp auth-broker` + `omp auth-gateway` pair for every client process.
+//! The shared gateway daemon: one `omp auth-broker` + `omp auth-gateway` pair (or one pi proxy process) for every
+//! client process.
 
 use crate::sealed_state;
-use crate::state;
+use crate::state::{self, Backend};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
@@ -44,7 +45,10 @@ pub fn start(dir: &Path) -> Result<String, String> {
     let log = OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| e.to_string())?;
     let exe = state::self_exe().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);
-    cmd.arg("daemon").envs(sealed_state::envs()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
+    cmd.args(backend_args()).arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
+    if state::backend() == Backend::Omp {
+        cmd.envs(sealed_state::envs());
+    }
     unsafe {
         cmd.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
     }
@@ -69,10 +73,10 @@ pub fn start(dir: &Path) -> Result<String, String> {
         if Instant::now() >= deadline {
             // Still starting after the deadline: it is not coming up, so do not leave it running.
             // The omp children sit in their own groups, so the daemon's group does not reach them.
-            let mut kids = omp_children(pid as i32);
+            let mut kids = daemon_children(pid as i32);
             signal_group(pid as i32, libc::SIGTERM);
             thread::sleep(STOP_GRACE.min(Duration::from_millis(500)));
-            for k in omp_children(pid as i32) {
+            for k in daemon_children(pid as i32) {
                 if !kids.contains(&k) {
                     kids.push(k);
                 }
@@ -98,7 +102,7 @@ fn stop_orphaned_pair(dir: &Path) {
         let Ok(out) = Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output() else {
             continue;
         };
-        if is_omp_pair(&String::from_utf8_lossy(&out.stdout)) {
+        if is_backend_child(&String::from_utf8_lossy(&out.stdout)) {
             signal_group(pid, libc::SIGTERM);
         }
     }
@@ -109,23 +113,41 @@ fn is_omp_pair(cmdline: &str) -> bool {
     cmdline.contains("auth-broker") || cmdline.contains("auth-gateway")
 }
 
-/// The omp pair's pids among the direct children of `parent` (each is its own group leader).
-fn omp_children(parent: i32) -> Vec<i32> {
+/// Whether a `ps -o command=` line is the pi proxy process (pi running `proxy.mjs`).
+fn is_pi_proxy(cmdline: &str) -> bool {
+    cmdline.contains("proxy.mjs")
+}
+
+/// Whether a `ps -o command=` line is a child of the current backend's daemon.
+fn is_backend_child(cmdline: &str) -> bool {
+    match state::backend() {
+        Backend::Omp => is_omp_pair(cmdline),
+        Backend::Pi => is_pi_proxy(cmdline),
+    }
+}
+
+/// The backend's pids among the direct children of `parent` (each is its own group leader).
+fn daemon_children(parent: i32) -> Vec<i32> {
     match Command::new("ps").args(["-A", "-o", "pid=,ppid=,command="]).output() {
-        Ok(out) => parse_omp_children(&String::from_utf8_lossy(&out.stdout), parent),
+        Ok(out) => parse_children(&String::from_utf8_lossy(&out.stdout), parent, is_backend_child),
         Err(_) => Vec::new(),
     }
 }
 
-fn parse_omp_children(ps: &str, parent: i32) -> Vec<i32> {
+fn parse_children(ps: &str, parent: i32, matches: fn(&str) -> bool) -> Vec<i32> {
     ps.lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
             let pid: i32 = it.next()?.parse().ok()?;
             let ppid: i32 = it.next()?.parse().ok()?;
-            (ppid == parent && is_omp_pair(l)).then_some(pid)
+            (ppid == parent && matches(l)).then_some(pid)
         })
         .collect()
+}
+
+/// The global options a re-exec of this binary (`daemon`, `guard`) must carry.
+fn backend_args() -> [&'static str; 2] {
+    ["--backend", state::backend().name()]
 }
 
 /// `mu-gateway guard <pgid>`: blocks on stdin, whose write end the daemon holds. When the daemon
@@ -157,7 +179,11 @@ fn watch_group(pgid: i32, mut pipe: impl Read) {
 fn spawn_guard(pgid: u32) -> Option<Child> {
     let exe = state::self_exe().ok()?;
     let mut cmd = Command::new(exe);
-    cmd.args(["guard", &pgid.to_string()]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(backend_args())
+        .args(["guard", &pgid.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     // SAFETY: setsid is async-signal-safe.
     unsafe {
         cmd.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
@@ -221,7 +247,7 @@ pub fn run() -> i32 {
     match serve() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("mu-gateway daemon: {e}");
+            eprintln!("{} daemon: {e}", state::backend().log_prefix());
             1
         }
     }
@@ -255,6 +281,7 @@ fn serve() -> Result<i32, String> {
     let idle = env_secs("MU_GATEWAY_IDLE_SECS", 1800.0);
     let tick = env_secs("MU_GATEWAY_TICK_SECS", 30.0);
     let me = std::process::id();
+    let prefix = state::backend().log_prefix();
     for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
         // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
         let handler = request_stop as extern "C" fn(libc::c_int);
@@ -263,40 +290,29 @@ fn serve() -> Result<i32, String> {
 
     // Dropping `kids` (on any early return) terminates the children.
     let mut kids = Kids(Vec::new(), Vec::new());
-    let (broker, broker_url) = spawn_omp(&["auth-broker", "serve", "--bind=127.0.0.1:0"], &[], &mut kids.1)?;
-    kids.0.push(broker);
-    let mut token_cmd = Command::new(state::omp_bin());
-    token_cmd.envs(sealed_state::envs());
-    run_with_timeout(
-        token_cmd.args(["auth-gateway", "token"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()),
-        TOKEN_TIMEOUT,
-    );
-    let token_path = sealed_state::credential_root().join("auth-broker.token");
-    let token = fs::read_to_string(&token_path).map(|t| t.trim().to_string()).unwrap_or_default();
-    if token.is_empty() {
-        return Err(format!("broker token not found at {}", token_path.display()));
-    }
-    let (gw, gw_url) = spawn_omp(
-        &["auth-gateway", "serve", "--bind=127.0.0.1:0"],
-        &[("OMP_AUTH_BROKER_URL", &broker_url), ("OMP_AUTH_BROKER_TOKEN", &token)],
-        &mut kids.1,
-    )?;
-    kids.0.push(gw);
+    let (gw_url, broker_url) = match state::backend() {
+        Backend::Omp => spawn_omp_pair(&mut kids)?,
+        Backend::Pi => (spawn_pi_proxy(&dir, &mut kids)?, String::new()),
+    };
     let kid_pids: Vec<i32> = kids.0.iter().map(|c| c.id() as i32).collect();
     state::write_state_with_kids(&dir, me, &gw_url, &broker_url, &kid_pids).map_err(|e| e.to_string())?;
-    eprintln!("mu-gateway daemon {me}: gateway at {gw_url}");
+    eprintln!("{prefix} daemon {me}: gateway at {gw_url}");
 
     loop {
         if sleep_unless_stopped(tick) {
             state::remove_state_if_owned(&dir, me);
-            eprintln!("mu-gateway daemon {me}: stopping on a signal");
+            eprintln!("{prefix} daemon {me}: stopping on a signal");
             return Ok(0);
         }
         if kids.exited() {
             let lock = state::lock(&dir).map_err(|e| e.to_string())?;
             state::remove_state_if_owned(&dir, me);
             drop(lock);
-            eprintln!("mu-gateway daemon {me}: broker or gateway exited; stopping");
+            let what = match state::backend() {
+                Backend::Omp => "broker or gateway",
+                Backend::Pi => "pi proxy",
+            };
+            eprintln!("{prefix} daemon {me}: {what} exited; stopping");
             return Ok(1);
         }
         state::prune_leases(&dir);
@@ -309,7 +325,7 @@ fn serve() -> Result<i32, String> {
         {
             state::remove_state_if_owned(&dir, me);
             drop(lock);
-            eprintln!("mu-gateway daemon {me}: no client lease within {}s; stopping", idle.as_secs_f64());
+            eprintln!("{prefix} daemon {me}: no client lease within {}s; stopping", idle.as_secs_f64());
             return Ok(0);
         }
     }
@@ -363,13 +379,75 @@ impl Drop for Kids {
     }
 }
 
-/// Spawns `omp <args>` on an ephemeral loopback port and returns the URL it reports.
-/// Output is forwarded to the daemon log. The child dies with the daemon: PDEATHSIG on Linux, and on
-/// every platform a guard process that kills the child's group when the daemon's pipe to it closes.
+/// Starts the broker, then the gateway against it; returns the gateway's and the broker's URLs.
+fn spawn_omp_pair(kids: &mut Kids) -> Result<(String, String), String> {
+    let (broker, broker_url) = spawn_omp(&["auth-broker", "serve", "--bind=127.0.0.1:0"], &[], &mut kids.1)?;
+    kids.0.push(broker);
+    let mut token_cmd = Command::new(state::omp_bin());
+    token_cmd.envs(sealed_state::envs());
+    run_with_timeout(
+        token_cmd.args(["auth-gateway", "token"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()),
+        TOKEN_TIMEOUT,
+    );
+    let token_path = sealed_state::credential_root().join("auth-broker.token");
+    let token = fs::read_to_string(&token_path).map(|t| t.trim().to_string()).unwrap_or_default();
+    if token.is_empty() {
+        return Err(format!("broker token not found at {}", token_path.display()));
+    }
+    let (gw, gw_url) = spawn_omp(
+        &["auth-gateway", "serve", "--bind=127.0.0.1:0"],
+        &[("OMP_AUTH_BROKER_URL", &broker_url), ("OMP_AUTH_BROKER_TOKEN", &token)],
+        &mut kids.1,
+    )?;
+    kids.0.push(gw);
+    Ok((gw_url, broker_url))
+}
+
+/// The pi command line that serves the proxy extension. The extra flags keep the user's own extensions, MCP
+/// servers, skills, prompt templates, themes and project files out of the proxy process.
+pub fn pi_proxy_command(proxy: &Path) -> Command {
+    let mut cmd = Command::new(state::pi_bin());
+    cmd.args(["--mode", "rpc", "--no-session", "-ne", "-e"])
+        .arg(proxy)
+        .args(["--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "-na"])
+        .env_remove("OMP_PROFILE");
+    cmd
+}
+
+/// Writes a fresh token, then starts pi with the proxy extension; returns the URL the proxy reports.
+fn spawn_pi_proxy(dir: &Path, kids: &mut Kids) -> Result<String, String> {
+    let proxy = state::proxy_path();
+    if !proxy.is_file() {
+        return Err(format!("pi proxy extension not found at {} (set MU_GATEWAY_PI_PROXY)", proxy.display()));
+    }
+    let proxy = std::path::absolute(&proxy).unwrap_or(proxy);
+    let token = state::write_token(dir).map_err(|e| format!("cannot write the gateway token: {e}"))?;
+    let mut cmd = pi_proxy_command(&proxy);
+    cmd.current_dir(dir).env("MU_GW_PI_MODE", "serve").env("MU_GW_PI_TOKEN", token);
+    // Piped and never written: pi exits when stdin reaches EOF, which happens when this daemon dies.
+    cmd.stdin(Stdio::piped());
+    let (child, url) = spawn_listening(cmd, "pi proxy", PI_LISTENING, &mut kids.1)?;
+    kids.0.push(child);
+    Ok(url)
+}
+
 fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Result<(Child, String), String> {
     let mut cmd = Command::new(state::omp_bin());
     cmd.envs(sealed_state::envs());
-    cmd.args(args).envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args).envs(env.iter().copied()).stdin(Stdio::null());
+    spawn_listening(cmd, &format!("omp {}", args.join(" ")), "", guards)
+}
+
+/// Spawns `cmd` and returns it with the first `http://` URL it prints on stdout or stderr. `tag` names it in
+/// the daemon log. Output is forwarded to the log. The child dies with the daemon: PDEATHSIG on Linux, and on
+/// every platform a guard process that kills the child's group when the daemon's pipe to it closes.
+fn spawn_listening(
+    mut cmd: Command,
+    tag: &str,
+    marker: &str,
+    guards: &mut Vec<Child>,
+) -> Result<(Child, String), String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.process_group(0);
     #[cfg(target_os = "linux")]
     unsafe {
@@ -378,12 +456,12 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Re
             Ok(())
         });
     }
-    let mut child = cmd.spawn().map_err(|e| format!("cannot run `omp` ({e})"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("cannot run `{}` ({e})", tag.split(' ').next().unwrap_or(tag)))?;
     match spawn_guard(child.id()) {
         Some(g) => guards.push(g),
-        None => eprintln!("mu-gateway daemon: no guard for `omp {}`", args.join(" ")),
+        None => eprintln!("{} daemon: no guard for `{tag}`", state::backend().log_prefix()),
     }
-    let tag = args.join(" ");
+    let tag = tag.to_string();
     let (tx, rx) = mpsc::channel::<String>();
     let out = child.stdout.take().expect("stdout is piped");
     let err = child.stderr.take().expect("stderr is piped");
@@ -391,7 +469,7 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Re
         let (tx, tag) = (tx.clone(), tag.clone());
         thread::spawn(move || {
             for line in BufReader::new(r).lines().map_while(Result::ok) {
-                eprintln!("[omp {tag}] {line}");
+                eprintln!("[{tag}] {line}");
                 let _ = tx.send(line);
             }
         });
@@ -401,7 +479,9 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Re
     loop {
         match rx.recv_timeout(SPAWN_WAIT) {
             Ok(line) => {
-                if let Some(url) = listen_url(&line) {
+                if line.contains(marker)
+                    && let Some(url) = listen_url(&line)
+                {
                     return Ok((child, url));
                 }
                 seen.push_str(&line);
@@ -410,11 +490,14 @@ fn spawn_omp(args: &[&str], env: &[(&str, &str)], guards: &mut Vec<Child>) -> Re
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("`omp {tag}` did not report a listening URL:\n{seen}"));
+                return Err(format!("`{tag}` did not report a listening URL:\n{seen}"));
             }
         }
     }
 }
+
+/// What pi's proxy prints before its URL; pi's own warnings can carry URLs too.
+const PI_LISTENING: &str = "proxy listening on ";
 
 fn listen_url(line: &str) -> Option<String> {
     let i = line.find("http://")?;
@@ -455,8 +538,41 @@ mod timeout_tests {
     fn omp_children_are_picked_by_parent_and_command() {
         let ps = "  10     1 mu-gateway daemon\n  11    10 omp auth-broker serve --bind=127.0.0.1:0\n  \
                   12    10 mu-gateway guard 11\n  13    99 omp auth-gateway serve\n  14    10 omp auth-gateway serve\n";
-        assert_eq!(parse_omp_children(ps, 10), vec![11, 14]);
-        assert!(parse_omp_children("garbage\n\n", 10).is_empty());
+        assert_eq!(parse_children(ps, 10, is_omp_pair), vec![11, 14]);
+        assert!(parse_children("garbage\n\n", 10, is_omp_pair).is_empty());
+    }
+
+    #[test]
+    fn the_pi_child_is_picked_by_its_proxy_command() {
+        assert!(is_pi_proxy("/home/u/.mu/bin/pi --mode rpc --no-session -ne -e /opt/gateway-pi/proxy.mjs --no-mcp"));
+        assert!(!is_pi_proxy("mu-gateway --backend pi guard 11"));
+        assert!(!is_pi_proxy("omp auth-gateway serve"));
+        let ps = "  10     1 mu-gateway --backend pi daemon\n  11    10 pi --mode rpc -e /x/proxy.mjs -na\n  \
+                  12    10 mu-gateway --backend pi guard 11\n  13    99 pi -e /x/proxy.mjs\n";
+        assert_eq!(parse_children(ps, 10, is_pi_proxy), vec![11]);
+    }
+
+    #[test]
+    fn the_pi_command_line_matches_the_contract() {
+        let cmd = pi_proxy_command(Path::new("/x/proxy.mjs"));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            [
+                "--mode",
+                "rpc",
+                "--no-session",
+                "-ne",
+                "-e",
+                "/x/proxy.mjs",
+                "--no-mcp",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files",
+                "-na"
+            ]
+        );
     }
 
     fn wait_exit(child: &mut Child) -> bool {

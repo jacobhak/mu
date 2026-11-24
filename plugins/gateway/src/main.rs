@@ -1,5 +1,6 @@
-//! `mu-gateway`: one shared `omp auth-broker` + `omp auth-gateway` pair per omp profile, leased by client pid and
-//! stopped when idle. Any client can use it; `mu-plugin` is the adapter for mu.
+//! `mu-gateway`: one shared `omp auth-broker` + `omp auth-gateway` pair per omp profile (or, with `--backend pi`,
+//! one pi process running the proxy extension), leased by client pid and stopped when idle. Any client can use it;
+//! `mu-plugin` is the adapter for mu.
 
 mod adapter;
 mod commands;
@@ -9,6 +10,7 @@ mod state;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use state::Backend;
 
 #[derive(Parser)]
 #[command(name = "mu-gateway", version = env!("MU_GATEWAY_VERSION"), about)]
@@ -16,6 +18,9 @@ struct Cli {
     /// The omp profile to serve (default: $OMP_PROFILE).
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// What to wrap (default: $MU_GATEWAY_BACKEND, then omp). `pi` ignores --profile for pi itself.
+    #[arg(long, global = true, value_enum)]
+    backend: Option<Backend>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -31,13 +36,13 @@ enum Cmd {
         #[arg(long)]
         no_start: bool,
     },
-    /// Print the parsed output of `omp models ls --json`.
+    /// Print the model prices: the parsed output of `omp models ls --json`, or pi's catalogue.
     Prices,
     /// Print {"running","pid","url","leases"}.
     Status,
     /// Stop the daemon.
     Stop,
-    /// Run `omp login [PROVIDER]`.
+    /// Run `omp login [PROVIDER]` (`pi auth login [PROVIDER]` with --backend pi).
     Login { provider: Option<String> },
     /// Serve mu's gateway provider contract on stdio.
     MuPlugin,
@@ -49,6 +54,13 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
+    match state::resolve_backend(cli.backend, std::env::var("MU_GATEWAY_BACKEND").ok().as_deref()) {
+        Ok(b) => state::set_backend(b),
+        Err(e) => {
+            eprintln!("mu-gateway: {e}");
+            std::process::exit(2);
+        }
+    }
     if let Some(p) = cli.profile.filter(|p| !p.is_empty()) {
         // SAFETY: still single-threaded; children (the daemon, omp) inherit the profile this way.
         unsafe { std::env::set_var("OMP_PROFILE", p) };

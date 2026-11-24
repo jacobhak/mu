@@ -53,6 +53,9 @@ attention = true      # a running turn asks you something or needs an approval o
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"
 
+# [gateway]
+# plugin = "gateway-pi"  # the installed plugin that serves as the gateway; unset, the first loaded plugin with `provider = "gateway"`. A name that is not loaded, or has no `provider = "gateway"`, is an error; MU_GATEWAY_URL and MU_GATEWAY_TOKEN still bypass it
+
 [task]                # a subagent's soft request budget: cross it and it is told to wrap up, at 1.5x it is stopped and asked for what it has, and five requests later the run ends; 0 turns the guard off
 soft_request_budget = 200  # a scout is capped at 100 however high this is
 budget_notice = true       # the wrap-up notice at the budget

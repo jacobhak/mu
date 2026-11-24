@@ -102,6 +102,7 @@ pub fn build(cwd: &std::path::Path, loaded: Loaded) -> Setup {
         plugin::host::InitParams { cwd: cwd.to_string_lossy().into(), ..Default::default() },
         tools::is_builtin,
     );
+    host.set_gateway_plugin(cfgs.mu.gateway.plugin.clone());
     let providers = Rc::new(Providers::new(
         cfgs.clone(),
         mu_provider::provider::endpoint::GatewaySource::new(host.gateway_start())

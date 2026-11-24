@@ -3,6 +3,7 @@
 
 use crate::commands;
 use crate::sealed_state::{self, Info, Secrets};
+use crate::state::{self, Backend};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use mu_common::rpc;
@@ -71,13 +72,20 @@ fn err(code: i64, message: impl Into<String>) -> rpc::RpcError {
     rpc::RpcError::new(code, message)
 }
 
+/// Only omp's credentials are sealed; pi keeps its own files where it keeps them.
+fn seals() -> bool {
+    state::backend() == Backend::Omp
+}
+
 /// Runs `f` on a blocking thread, after making sure omp's state is unsealed when mu has it sealed and unlocked.
 async fn blocking<T: Send + 'static>(
     mu: Arc<RpcMu>,
     f: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, rpc::RpcError> {
     tokio::task::spawn_blocking(move || {
-        sealed_state::materialize(mu).map_err(|e| format!("cannot unseal omp's credentials: {e}"))?;
+        if seals() {
+            sealed_state::materialize(mu).map_err(|e| format!("cannot unseal omp's credentials: {e}"))?;
+        }
         f()
     })
     .await
@@ -89,10 +97,12 @@ async fn handle(mu: Arc<RpcMu>, req: rpc::Request) -> Result<Value, rpc::RpcErro
     match req.method.as_str() {
         "initialize" => {
             // Unseal in the background; the first endpoint or prices call waits for it by taking the same lock.
-            let mu = mu.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = sealed_state::materialize(mu);
-            });
+            if seals() {
+                let mu = mu.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = sealed_state::materialize(mu);
+                });
+            }
             Ok(json!({}))
         }
         "provider/endpoint" => {
@@ -109,7 +119,9 @@ async fn handle(mu: Arc<RpcMu>, req: rpc::Request) -> Result<Value, rpc::RpcErro
         "provider/prices" => blocking(mu, commands::prices).await,
         "shutdown" => {
             mu.timeout_ms.store(SHUTDOWN_TIMEOUT.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
-            let _ = tokio::task::spawn_blocking(sealed_state::shutdown).await;
+            if seals() {
+                let _ = tokio::task::spawn_blocking(sealed_state::shutdown).await;
+            }
             Ok(Value::Null)
         }
         m => Err(err(-32601, format!("method not found: {m}"))),

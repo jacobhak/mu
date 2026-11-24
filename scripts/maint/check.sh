@@ -43,13 +43,19 @@ cmd_test() {
   # binaries links in 1.5 GB), and 2 costs little. aarch64 needs .cargo/config.toml's lld flags as well.
   if [ "$offloaded" = 1 ]; then offload_run env CARGO_BUILD_JOBS="${MU_MAINT_OFFLOAD_JOBS:-2}" scripts/ci-checks.sh; else timeout "$stage_secs" scripts/ci-checks.sh; fi
 }
-# The gateway plugin's contract tests run the real omp, pinned by the worktree's upstream.toml.
+# The gateway plugins' contract tests run the real omp and the real pi, pinned by the worktree's upstream.toml.
 cmd_contract() {
-  local ver omp
+  local ver omp pi_ver pi
   ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' upstream.toml)"
   omp="$MAINT/omp/$ver/omp"
   timeout "$stage_secs" scripts/fetch-omp.sh "$ver" "$omp" \
-    && MU_GATEWAY_OMP="$omp" timeout "$stage_secs" cargo test --workspace --locked -- --ignored contract_
+    && MU_GATEWAY_OMP="$omp" timeout "$stage_secs" cargo test --workspace --locked -- --ignored contract_ \
+    || return 1
+  command -v node > /dev/null || { echo "contract: node is not installed (needed for the pi proxy tests)" >&2; return 1; }
+  pi_ver="$(sed -n 's/^pi = "\(.*\)"/\1/p' upstream.toml)"
+  pi="$MAINT/pi/$pi_ver/pi"
+  timeout "$stage_secs" scripts/fetch-pi.sh "$pi_ver" "$pi" \
+    && MU_GATEWAY_PI="$pi" timeout "$stage_secs" node --test plugins/gateway-pi/test/*.test.mjs
 }
 # The smoke stage drives a live model and flakes: it gets one retry, and a pass on the retry is recorded as such.
 cmd_smoke() {
