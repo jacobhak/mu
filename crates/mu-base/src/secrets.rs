@@ -323,8 +323,29 @@ fn url_password(v: &str) -> Option<&str> {
     (!pw.is_empty()).then_some(pw)
 }
 
+/// Every directory `redact` has been asked about: a session that switched directory still masks
+/// the old one's `.env` values.
+static DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 fn dotenv_for(cwd: &Path) -> Vec<Known> {
-    dotenv_within(cwd, DOTENV_RECHECK)
+    let dirs = match DIRS.lock() {
+        Ok(mut d) => {
+            if !d.iter().any(|p| p == cwd) {
+                d.push(cwd.to_path_buf());
+            }
+            d.clone()
+        }
+        Err(_) => vec![cwd.to_path_buf()],
+    };
+    let mut out: Vec<Known> = Vec::new();
+    for d in &dirs {
+        for k in dotenv_within(d, DOTENV_RECHECK) {
+            if !out.iter().any(|o| o.value == k.value) {
+                out.push(k);
+            }
+        }
+    }
+    out
 }
 
 fn dotenv_within(cwd: &Path, recheck: Duration) -> Vec<Known> {
@@ -593,6 +614,24 @@ mod tests {
         std::fs::write(d.join(".env"), "STRIPE_SECRET=Nw-value-9999\n").unwrap();
         assert_eq!(dotenv_within(&d, Duration::ZERO)[0].value, "Nw-value-9999");
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn dotenv_values_of_every_directory_seen_stay_masked() {
+        let base = std::env::temp_dir().join(format!("mu-secrets-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join(".env"), "A_SECRET=Aa-secret-1111\n").unwrap();
+        std::fs::write(b.join(".env"), "B_SECRET=Bb-secret-2222\n").unwrap();
+        let text = "x Aa-secret-1111 y Bb-secret-2222";
+        assert_eq!(redact(text, &a).text, "x [REDACTED:A_SECRET] y Bb-secret-2222");
+        let r = redact(text, &b);
+        assert_eq!(r.text, "x [REDACTED:A_SECRET] y [REDACTED:B_SECRET]");
+        let mut v = serde_json::json!({"k": text});
+        redact_json(&mut v, &b);
+        assert_eq!(v["k"], "x [REDACTED:A_SECRET] y [REDACTED:B_SECRET]");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

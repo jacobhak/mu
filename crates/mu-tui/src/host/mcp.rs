@@ -123,7 +123,7 @@ fn tool_names(info: &McpInfo) -> String {
 fn level_of(l: &Local, e: &Entry, user_file: &std::path::Path) -> String {
     if e.file == user_file {
         "user".to_string()
-    } else if e.file.starts_with(&l.cwd) {
+    } else if e.file.starts_with(l.cwd()) {
         "project".to_string()
     } else {
         e.file.display().to_string()
@@ -146,10 +146,11 @@ fn state_of(l: &Local, e: &Entry) -> String {
 fn servers(l: &Rc<Local>, args: Value) -> Answer {
     ready(args, |with_found: bool| {
         let agent = paths::omp_agent_dir();
-        let (all, warnings) = config::load_all(&l.cwd, &agent);
+        let cwd = l.cwd();
+        let (all, warnings) = config::load_all(&cwd, &agent);
         let user_file = agent.join("mcp.json");
         let found = if with_found {
-            let roots = Roots { home: paths::home(), cwd: l.cwd.clone(), agent_dir: agent };
+            let roots = Roots { home: paths::home(), cwd, agent_dir: agent };
             discover::scan(&roots, &all)
         } else {
             Vec::new()
@@ -181,7 +182,7 @@ fn servers(l: &Rc<Local>, args: Value) -> Answer {
 /// connected so their tools are known right away.
 fn apply(l: &Rc<Local>, args: Value) -> Answer {
     pending(args, |show_warnings: bool| {
-        let (plugins, cwd) = (l.plugins.clone(), l.cwd.clone());
+        let (plugins, cwd) = (l.plugins.clone(), l.cwd());
         async move {
             let (servers, warnings) = config::load(&cwd, &paths::omp_agent_dir());
             let sync = plugins.mcp_sync(servers).await;
@@ -231,7 +232,7 @@ fn trust_files(l: &Rc<Local>, args: Value) -> Answer {
     ready(args, |files: Option<Vec<(PathBuf, String)>>| {
         let files = match files {
             Some(f) => f,
-            None => config::untrusted_files(&l.cwd, &paths::omp_agent_dir())
+            None => config::untrusted_files(&l.cwd(), &paths::omp_agent_dir())
                 .into_iter()
                 .map(|(file, digest, _)| (file, digest))
                 .collect(),
@@ -245,8 +246,9 @@ fn trust_files(l: &Rc<Local>, args: Value) -> Answer {
 
 fn untrust(l: &Rc<Local>, args: Value) -> Answer {
     ready(args, |(): ()| {
-        for file in config::candidate_files(&l.cwd, &paths::omp_agent_dir()) {
-            if trust::is_project_file(&l.cwd, &file) {
+        let cwd = l.cwd();
+        for file in config::candidate_files(&cwd, &paths::omp_agent_dir()) {
+            if trust::is_project_file(&cwd, &file) {
                 trust::untrust(&file);
             }
         }
@@ -274,14 +276,14 @@ fn env_set(_: &Rc<Local>, args: Value) -> Answer {
 
 fn add(l: &Rc<Local>, args: Value) -> Answer {
     ready(args, |(level, name, entry): (Level, String, Value)| {
-        store::add(level, &l.cwd, &paths::omp_agent_dir(), &name, entry)
+        store::add(level, &l.cwd(), &paths::omp_agent_dir(), &name, entry)
     })
 }
 
 fn remove(l: &Rc<Local>, args: Value) -> Answer {
-    ready(args, |name: String| store::remove(&l.cwd, &paths::omp_agent_dir(), &name))
+    ready(args, |name: String| store::remove(&l.cwd(), &paths::omp_agent_dir(), &name))
 }
 
 fn set_enabled(l: &Rc<Local>, args: Value) -> Answer {
-    ready(args, |(name, on): (String, bool)| store::set_enabled(&l.cwd, &paths::omp_agent_dir(), &name, on))
+    ready(args, |(name, on): (String, bool)| store::set_enabled(&l.cwd(), &paths::omp_agent_dir(), &name, on))
 }

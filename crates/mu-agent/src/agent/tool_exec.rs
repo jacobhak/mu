@@ -491,6 +491,11 @@ impl Agent {
             {
                 self.enter_mode(name, true).await;
             }
+            if let Some(dir) = d["setCwd"].as_str()
+                && !out.is_error
+            {
+                self.set_cwd(PathBuf::from(dir), cwd::Why::Model).await;
+            }
             self.apply_mode_action(d, &mut out).await;
         }
         if name == "enter_mode" {

@@ -38,6 +38,7 @@ Keys are tool-name globs, values are `allow`, `ask` or `deny`, either for every 
 - `bash`: every simple command of the line, as written (`cargo test --release`), including those inside `$(…)`, loops and subshells. A `deny` or `ask` rule also sees the command with quotes, a directory on the program (`/usr/bin/git`) and the wrappers `sudo`, `doas`, `command`, `builtin`, `exec`, `env`, `nice`, `nohup`, `time`, `timeout` and `xargs` taken off, and the commands inside a literal `sh -c '…'`, `bash -c` or `eval` string (three levels deep), so `"git push *" = "deny"` also stops `env git push` and `sh -c 'git push'`. It does not see through a variable, a `cd` or a string built at run time.
 - `write`, `edit`, `read`, `grep`, `glob`: each target path, matched either as it is shown (relative to the project when inside it) or by its absolute path, so `src/*` and `/home/you/code/mu/src/*` both cover `src/a.rs`.
 - `fetch`: the URL.
+- `set_cwd`: the path as given; its target directory is also judged as a `write` subject when it lies outside the project (see below).
 - Other tools: only `"*"` and whole-tool string values match.
 
 `*` matches anything, including `/` and spaces; `?` matches one character; everything else is literal. A pattern ending in ` *` also matches the text before it, so `cargo test *` matches `cargo test`.
@@ -45,6 +46,10 @@ Keys are tool-name globs, values are `allow`, `ask` or `deny`, either for every 
 A `deny` always wins, then an `ask`, and only then does a covering `allow` (or the read-only classifier) let the call run. `yolo` still honours `deny` and `ask` rules. A command that does not parse, or one that starts with an assignment (`FOO=1 cmd`), can never be covered by an `allow` rule.
 
 One deny is built in and no mode or rule lifts it: a recursive `rm` of `/`, `~` or `$HOME` (also written as `/*`, `~/*`, `"$HOME"`, the home path itself, with `..` resolved so `/..` and `~/../..` count, behind `sudo` and the like, or inside `sh -c '…'` and `eval`). It reads the literal command: `cd / && rm -rf *`, `X=/; rm -rf $X` and `echo ~ | xargs rm -rf` are not caught.
+
+## Changing the working directory
+
+The model's `set_cwd` tool moves the whole session to another directory (a git worktree of the repository, say). A switch moves the project root, so it is gated as a write to the target directory: a target already inside the current project root runs unasked in every mode, and any other target asks in `ask` and `edits` with the usual write widths ("this checkout", "the checkouts beside it", …), and runs in `yolo`. `deny` and `ask` rules apply: a `write` rule for the target directory, or `set_cwd = "deny"` / `"ask"` as a whole-tool rule, in every mode. A `-p` run refuses a switch that needs approval like any other call. `/cd <dir>` is your own choice and is not gated. Secrets in the `.env` files of every directory the session has used stay redacted.
 
 ## The prompt
 

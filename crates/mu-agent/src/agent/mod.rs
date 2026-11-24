@@ -1,5 +1,8 @@
 mod budget;
 mod compaction;
+mod cwd;
+#[cfg(test)]
+mod cwd_tests;
 mod history;
 mod state;
 pub use state::RunConfig;
@@ -278,7 +281,7 @@ impl Agent {
         let (title_tx, title_rx) = unbounded_channel();
         Self {
             tools,
-            cwd: i.cwd,
+            cwd: i.cwd.clone(),
             ctx: i.ctx,
             session: None,
             messages: History::default(),
@@ -315,6 +318,7 @@ impl Agent {
                 cost: CostLedger::default(),
                 quota: Rc::default(),
                 git: Rc::default(),
+                watch_cwd: Rc::new(std::cell::RefCell::new(i.cwd.clone())),
                 last_status: Rc::default(),
             },
             compaction: CompactionFlow { state: None, fresh_from: 0, since: 0, failed_at: None },
@@ -507,6 +511,7 @@ impl Agent {
             Command::RefreshStatus => {
                 self.refresh_status().await;
             }
+            Command::SetCwd(p) => self.user_set_cwd(p).await,
             Command::SetThinking(t) => self.set_thinking(t),
             Command::CycleThinking => self.set_thinking(self.model.live_thinking.get().cycle()),
             Command::SetPermissionMode(m) => {

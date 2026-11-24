@@ -7,7 +7,7 @@ use mu_provider::provider::client::Providers;
 use mu_tools::context::Context;
 use mu_tools::plugin::host::PluginHost;
 use serde_json::Value;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -16,12 +16,41 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// What the handlers work on.
 pub struct Local {
     pub providers: Rc<Providers>,
-    pub ctx: Rc<Context>,
+    ctx: RefCell<Rc<Context>>,
     pub plugins: Rc<PluginHost>,
-    pub cwd: PathBuf,
+    cwd: RefCell<PathBuf>,
+    /// Counts working-directory switches, so a slow context load that lost the race is dropped.
+    cwd_seq: Cell<u64>,
     pub profile_home: PathBuf,
     /// Where a handler's background task sends values the UI did not ask for.
     pub push: UnboundedSender<Pushed>,
+}
+
+impl Local {
+    pub fn cwd(&self) -> PathBuf {
+        self.cwd.borrow().clone()
+    }
+
+    pub fn ctx(&self) -> Rc<Context> {
+        self.ctx.borrow().clone()
+    }
+
+    /// Moves to `cwd`; returns the switch number to pass to `set_ctx`.
+    pub fn set_cwd(&self, cwd: PathBuf) -> u64 {
+        *self.cwd.borrow_mut() = cwd;
+        let n = self.cwd_seq.get() + 1;
+        self.cwd_seq.set(n);
+        n
+    }
+
+    /// Installs the context loaded for switch `seq`; false (and nothing changes) when another switch came since.
+    pub fn set_ctx(&self, seq: u64, ctx: Context) -> bool {
+        let current = self.cwd_seq.get() == seq;
+        if current {
+            *self.ctx.borrow_mut() = Rc::new(ctx);
+        }
+        current
+    }
 }
 
 pub type Handler = fn(&Rc<Local>, Value) -> Answer;
@@ -72,8 +101,17 @@ impl LocalHost {
         super::memory::register(&mut registry);
         super::results::register(&mut registry);
         super::state::register(&mut registry);
+        super::cwd::register(&mut registry);
         Self {
-            local: Rc::new(Local { providers, ctx, plugins, cwd, profile_home: info.profile_home.clone(), push }),
+            local: Rc::new(Local {
+                providers,
+                ctx: RefCell::new(ctx),
+                plugins,
+                cwd: RefCell::new(cwd),
+                cwd_seq: Cell::new(0),
+                profile_home: info.profile_home.clone(),
+                push,
+            }),
             info,
             handlers: registry.0,
             pushed: RefCell::new(Some(pushed)),
@@ -143,9 +181,10 @@ mod tests {
         // Its own profile, so the state calls never touch the test process's shared one.
         h.local = Rc::new(Local {
             providers: l.providers.clone(),
-            ctx: l.ctx.clone(),
+            ctx: RefCell::new(l.ctx()),
             plugins: l.plugins.clone(),
-            cwd: l.cwd.clone(),
+            cwd: RefCell::new(l.cwd()),
+            cwd_seq: Cell::new(0),
             profile_home: profile_dir.to_path_buf(),
             push: l.push.clone(),
         });
@@ -167,6 +206,23 @@ mod tests {
         crate::host::state::set_wanted(false);
         crate::host::state::reset_failures();
         g
+    }
+
+    #[test]
+    fn a_context_loaded_for_an_older_switch_is_dropped() {
+        let h = host();
+        let l = &h.local;
+        let first = l.set_cwd("/a".into());
+        let second = l.set_cwd("/b".into());
+        assert_eq!(l.cwd(), PathBuf::from("/b"));
+        let mut stale = Context::default();
+        stale.warnings.push("stale".into());
+        assert!(!l.set_ctx(first, stale));
+        assert!(l.ctx().warnings.is_empty());
+        let mut fresh = Context::default();
+        fresh.warnings.push("fresh".into());
+        assert!(l.set_ctx(second, fresh));
+        assert_eq!(l.ctx().warnings, vec!["fresh".to_string()]);
     }
 
     fn ready(h: &LocalHost, name: &str, args: Value) -> Result<Value, String> {

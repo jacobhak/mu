@@ -3,7 +3,7 @@
 //! so it is portable.
 use mu_common::paths;
 use mu_session::session::control::{Recheck, Want, recheck, signal};
-use mu_session::session::list::{find, header_cwd};
+use mu_session::session::list::{find, header_cwd, last_cwd};
 use mu_session::session::mirror::checkout;
 use mu_session::session::owner::{Owner, is_free, owner};
 use std::io::IsTerminal;
@@ -164,7 +164,8 @@ fn resume(path: &Path) -> anyhow::Result<i32> {
     match checkout(path) {
         Ok(Some(dir)) => std::env::set_current_dir(&dir)?,
         Ok(None) => {
-            if let Some(dir) = header_cwd(path) {
+            let last = last_cwd(path).filter(|d| d.is_dir());
+            if let Some(dir) = last.or_else(|| header_cwd(path)) {
                 if dir.is_dir() {
                     std::env::set_current_dir(&dir)?;
                 } else {

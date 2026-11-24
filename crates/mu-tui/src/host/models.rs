@@ -166,7 +166,7 @@ fn model_rows(l: &Rc<Local>, args: serde_json::Value) -> Answer {
                 rows.push(ModelRow { id, kind: ModelKind::Listed });
             }
         }
-        Ok(ModelRows { roles: role_views(&providers.cfg, &l.ctx), rows, error })
+        Ok(ModelRows { roles: role_views(&providers.cfg, &l.ctx()), rows, error })
     })
 }
 
@@ -176,7 +176,7 @@ fn role_table(l: &Rc<Local>, args: serde_json::Value) -> Answer {
         Ok(RoleTable {
             set: cfg.active_set().unwrap_or_else(|| MAIN_SET.into()),
             path: models_path(),
-            roles: role_views(cfg, &l.ctx),
+            roles: role_views(cfg, &l.ctx()),
         })
     })
 }
@@ -270,7 +270,7 @@ fn switch_set(l: &Rc<Local>, args: serde_json::Value) -> Answer {
         let cfg = &l.providers.cfg;
         cfg.switch_set(&name)?;
         let mode_model = mode.and_then(|m| {
-            l.ctx
+            l.ctx()
                 .mode(&m)?
                 .model
                 .iter()

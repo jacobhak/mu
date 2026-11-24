@@ -80,6 +80,11 @@ pub fn set_attention(change: impl FnOnce(&mut Attention)) {
 /// Rewrites `waiting`, `locked` and `client` of our own record in place. The new text is padded to the old
 /// length and written in one call, so a reader never sees a torn or empty file.
 fn rewrite(path: &Path, a: &Attention) {
+    rewrite_with(path, |v| set_attention_fields(v, a));
+}
+
+/// Applies `change` to our own record in place.
+fn rewrite_with(path: &Path, change: impl FnOnce(&mut Value)) {
     use std::io::Read;
     use std::os::unix::fs::FileExt;
     let Ok(mut f) = OpenOptions::new().read(true).write(true).open(path) else { return };
@@ -91,7 +96,7 @@ fn rewrite(path: &Path, a: &Attention) {
     if v["pid"].as_u64() != Some(u64::from(std::process::id())) {
         return;
     }
-    set_attention_fields(&mut v, a);
+    change(&mut v);
     let mut out = v.to_string();
     while out.len() < text.len() {
         out.push(' ');
@@ -412,6 +417,11 @@ impl OwnerRecord {
         )
     }
 
+    /// Points the record's `cwd` at where the session now works.
+    pub(super) fn set_cwd(&self, cwd: &Path) {
+        rewrite_with(&self.path, |v| v["cwd"] = json!(cwd.to_string_lossy()));
+    }
+
     #[cfg(test)]
     fn claim_as(session: &Path, print_run: bool, inbox: bool) -> Option<Self> {
         Self::claim_with(session, print_run, inbox, &Extra::default())
@@ -584,6 +594,19 @@ mod tests {
         assert_eq!(l.cwd.as_deref(), Some(Path::new("/opt/rec-cwd")));
         assert_eq!(l.parent.as_deref(), Some(Path::new("/p/parent.jsonl")));
         drop(s);
+    }
+
+    #[test]
+    fn a_switch_moves_the_records_cwd_and_the_record_stays_whole() {
+        home();
+        let mut s = SessionFile::create(Path::new("/opt/rec-before"), None).unwrap();
+        let long = Path::new("/opt/rec-after/a/much/longer/path/than/before");
+        s.record_cwd(long);
+        assert_eq!(listed(&s.path).unwrap().cwd.as_deref(), Some(long));
+        s.record_cwd(Path::new("/x"));
+        let l = listed(&s.path).unwrap();
+        assert_eq!(l.cwd.as_deref(), Some(Path::new("/x")));
+        assert_eq!(l.pid, std::process::id());
     }
 
     #[test]

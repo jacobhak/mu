@@ -117,12 +117,13 @@ fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
         .unzip()
 }
 
-pub(super) static BUILTIN: [Builtin; 34] = [
+pub(super) static BUILTIN: [Builtin; 35] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
     cmd("new", "Start a new session", App::cmd_new),
     cmd("resume", "Resume a session from this directory", |a, _| a.open_session_picker()),
+    cmd("cd", "Change the working directory [dir]; shows it without one", App::cmd_cd),
     cmd("fork", "Continue in a copy of this session; the original stays as it is", |a, _| a.send(Command::Fork)),
     cmd("rewind", "Go back to before an earlier prompt, or to after an earlier reply", |a, _| {
         a.send(Command::ListRewind)

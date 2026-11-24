@@ -69,6 +69,8 @@ pub struct Loaded {
     pub mode: Option<(String, Value)>,
     pub plugin_context: BTreeMap<String, String>,
     pub review_base: Option<Value>,
+    /// Where the active branch last worked: its newest `cwd_change`, `None` if it never switched.
+    pub cwd: Option<std::path::PathBuf>,
     pub todo: Option<Value>,
     /// Problems found (and repaired) while loading.
     pub warnings: Vec<String>,
@@ -126,6 +128,8 @@ struct Index {
     plugin_ctx: bool,
     /// A `review_base` custom entry.
     review_base: bool,
+    /// A `cwd_change` custom entry.
+    cwd_change: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -264,9 +268,10 @@ fn scan(path: &Path) -> Result<Scan> {
             && p.message.is_some_and(|m| m.tool_name.as_deref() == Some("todo") && m.is_error == Some(false));
         let plugin_ctx = kind == "custom" && p.custom_type.as_deref() == Some("plugin_context");
         let review_base = kind == "custom" && p.custom_type.as_deref() == Some("review_base");
+        let cwd_change = kind == "custom" && p.custom_type.as_deref() == Some(super::file::CWD_CHANGE);
         by_id.insert(id.clone(), index.len());
         last = Some(index.len());
-        index.push(Index { id, parent: p.parent_id, offset: start, kind, todo, plugin_ctx, review_base });
+        index.push(Index { id, parent: p.parent_id, offset: start, kind, todo, plugin_ctx, review_base, cwd_change });
     }
     if !header_seen {
         bail!("not a v3 session file: {}", path.display());
@@ -304,7 +309,7 @@ pub(super) fn parse(path: &Path) -> Result<Parsed> {
             "message" => in_window || last_todo == Some(pos),
             "custom_message" => in_window,
             "model_change" | "thinking_level_change" | "title_change" | "mode_change" => true,
-            "custom" => e.plugin_ctx || e.review_base,
+            "custom" => e.plugin_ctx || e.review_base || e.cwd_change,
             _ => false,
         };
         if !needed {
@@ -357,6 +362,8 @@ pub(super) fn parse(path: &Path) -> Result<Parsed> {
             "custom" => {
                 if e.review_base {
                     loaded.review_base = Some(v["data"].clone());
+                } else if e.cwd_change {
+                    loaded.cwd = v["data"]["cwd"].as_str().filter(|c| !c.is_empty()).map(std::path::PathBuf::from);
                 } else if let (Some(p), Some(c)) = (v["data"]["plugin"].as_str(), v["data"]["context"].as_str()) {
                     loaded.plugin_context.insert(p.into(), c.into());
                 }

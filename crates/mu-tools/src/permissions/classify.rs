@@ -154,6 +154,20 @@ fn by_args(tools: &Tools, gate: &Gate, name: &str, args: &Value) -> Result<Optio
         });
         return Ok(Some(call));
     }
+    if name == "set_cwd" {
+        let raw = args["path"].as_str().ok_or(())?;
+        // The tool's own rule applies in every mode; a target outside the project root is also a write there.
+        call.subjects.push(Subject::new(name, raw, Capability::ReadProject));
+        if let Ok(target) = tools.set_cwd_target(raw)
+            && !gate.inside(&target)
+        {
+            // The directory is what is written into, so a deny or ask rule for `<dir>/*` covers it.
+            let mut s = gate.write_subject("write", &target);
+            s.also.push(format!("{}/", target.display()));
+            call.subjects.push(s);
+        }
+        return Ok(Some(call));
+    }
     Ok(None)
 }
 

@@ -77,6 +77,18 @@ pub(super) fn grant(gate: &Gate, call: &Call, name: &str, args: &Value, hits: &[
                 patterns: writes.iter().map(|s| s.text.clone()).collect(),
             })
         }
+        "set_cwd" => {
+            // What is left to ask about is the write the target directory stands for.
+            let writes: Vec<&Subject> = call.subjects.iter().filter(|s| s.tool == "write" && open(s)).collect();
+            if writes.is_empty() {
+                return None;
+            }
+            Some(Grant {
+                tool: "write".to_string(),
+                wider: path_widths(&writes),
+                patterns: writes.iter().map(|s| s.text.clone()).collect(),
+            })
+        }
         "write" | "edit" | "read" | "grep" | "glob" => {
             // The subjects are the paths, so the grant remembers exactly what was reached.
             let taken: Vec<&Subject> = call.subjects.iter().filter(|s| taken(s)).collect();

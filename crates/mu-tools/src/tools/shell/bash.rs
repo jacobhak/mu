@@ -346,7 +346,18 @@ impl Tools {
         self.shell_cwd.borrow().clone().unwrap_or_else(|| self.cwd.clone())
     }
 
+    /// After `set_cwd`: moves the persistent shell to the new directory before anything reads or runs in it.
+    async fn sync_shell_cwd(&self) {
+        let Some(dir) = self.shell_cd.borrow_mut().take() else { return };
+        let ms = SNAPSHOT_TIMEOUT.as_millis() as u32;
+        let command = format!("cd -- '{}'", dir.to_string_lossy().replace('\'', "'\\''"));
+        let opts = ShellRunOptions { command, timeout_ms: Some(ms), ..Default::default() };
+        let mut run = self.shell().spawn(opts, None, CancelToken::new(Some(ms)));
+        let _ = tokio::time::timeout(SNAPSHOT_TIMEOUT, run.join()).await;
+    }
+
     pub async fn bash(&self, a: Args, ctx: &ToolCtx) -> ToolOutput {
+        self.sync_shell_cwd().await;
         if let Some(jobs) = &self.jobs
             && a.r#async
             && !a.pty
@@ -1749,6 +1760,50 @@ mod tests {
                 tools.call("bash", &job, &c).await;
                 let done = finished(&jobs).await;
                 assert_eq!(done[0].text, "[unset]");
+            })
+            .await;
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mu-setcwd-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    /// The persistent shell (no jobs: headless runs) keeps its own directory between calls, so a
+    /// switch must move it, whatever an earlier `cd` left it in.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_switch_moves_the_persistent_shell() {
+        let mut tools = Tools::for_test();
+        let (old, new) = (fresh_dir("old"), fresh_dir("new"));
+        tools.set_cwd(old.clone());
+        let pwd = json!({"command": "pwd"});
+        assert!(!tools.call("bash", &json!({"command": "cd /usr"}), &ctx()).await.is_error);
+        tools.set_cwd(new.clone());
+        let out = tools.call("bash", &pwd, &ctx()).await;
+        assert_eq!(out.text.trim(), new.to_string_lossy(), "{}", out.text);
+        // It stays there: the move is made once, not before every call.
+        tools.call("bash", &json!({"command": "cd /usr"}), &ctx()).await;
+        assert_eq!(tools.call("bash", &pwd, &ctx()).await.text.trim(), "/usr");
+        let _ = (std::fs::remove_dir_all(&old), std::fs::remove_dir_all(&new));
+    }
+
+    /// With jobs (interactive sessions) a foreground call starts in `Tools.cwd`, and a background
+    /// job starts where the persistent shell is: both must be the new directory.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_switch_moves_foreground_calls_and_new_jobs_in_an_interactive_session() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut tools, jobs) = tools_with_jobs();
+                let new = fresh_dir("jobs");
+                tools.call("bash", &json!({"command": "cd /usr"}), &ctx()).await;
+                tools.set_cwd(new.clone());
+                let fg = tools.call("bash", &json!({"command": "pwd"}), &ctx()).await;
+                assert_eq!(fg.text.trim(), new.to_string_lossy(), "{}", fg.text);
+                tools.call("bash", &json!({"command": "pwd", "async": true}), &ctx()).await;
+                let done = finished(&jobs).await;
+                assert_eq!(done[0].text.trim(), new.to_string_lossy(), "{}", done[0].text);
+                let _ = std::fs::remove_dir_all(&new);
             })
             .await;
     }

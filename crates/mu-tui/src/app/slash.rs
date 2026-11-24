@@ -259,6 +259,18 @@ impl App {
         });
     }
 
+    pub(super) fn cmd_cd(&mut self, arg: &str) {
+        if arg.is_empty() {
+            return self.notice(&self.cwd.display().to_string());
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let path = match mu_common::paths::expand_tilde(arg, &home) {
+            Some(p) => p,
+            None => self.cwd.join(arg),
+        };
+        self.send(Command::SetCwd(path));
+    }
+
     pub(super) fn cmd_skills(&mut self, _: &str) {
         self.host_call(host::completion::SKILLS, &(), |app, r: Result<Vec<SkillRow>, String>| match r {
             Ok(rows) => {

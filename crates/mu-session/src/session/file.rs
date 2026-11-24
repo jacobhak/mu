@@ -29,6 +29,9 @@ pub struct SessionFile {
 
 const MAX_WRITE_FAILURES: u32 = 3;
 
+/// `customType` of the entry `record_cwd` writes.
+pub const CWD_CHANGE: &str = "cwd_change";
+
 /// Takes an exclusive, non-blocking `flock` that lives as long as `file`.
 fn lock(file: &File, path: &Path) -> Result<()> {
     let deadline = std::time::Instant::now() + LOCK_RETRY;
@@ -291,6 +294,22 @@ impl SessionFile {
     }
     pub fn custom(&mut self, custom_type: &str, data: Value) {
         self.append(EntryKind::Custom, json!({"customType":custom_type,"data":data}));
+    }
+
+    /// Notes that the session now works in `cwd`: a `cwd_change` custom entry (readers that do not
+    /// know it skip it) and the live owner record. The header keeps the directory the session was
+    /// created in, which is where it is listed.
+    pub fn record_cwd(&mut self, cwd: &Path) {
+        self.append(EntryKind::Custom, json!({"customType":CWD_CHANGE,"data":{"cwd":cwd.to_string_lossy()}}));
+        self.sync();
+        self.set_owner_cwd(cwd);
+    }
+
+    /// Points the live owner record at `cwd` without writing an entry (a session opened while the agent is elsewhere).
+    pub fn set_owner_cwd(&self, cwd: &Path) {
+        if let Some(o) = &self.owner {
+            o.set_cwd(cwd);
+        }
     }
 
     /// Rewrites the fixed title slot in place (only if line 1 really is one) and records a

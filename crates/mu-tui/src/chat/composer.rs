@@ -276,6 +276,10 @@ impl Composer {
         self
     }
 
+    pub fn set_cwd(&mut self, cwd: &Path) {
+        self.cwd = cwd.to_string_lossy().into_owned();
+    }
+
     /// While on, submitted text stays out of the history, in memory and on disk.
     pub fn set_private(&mut self, on: bool) {
         self.private = on;

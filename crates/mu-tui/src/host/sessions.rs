@@ -254,7 +254,7 @@ thread_local! {
 
 fn recent_sessions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     pending(args, |(): ()| {
-        let cwd = l.cwd.clone();
+        let cwd = l.cwd();
         async move {
             Ok(tokio::task::spawn_blocking(move || list::list_recent(&cwd, Some(&cwd), RECENT_MAX))
                 .await
@@ -303,7 +303,7 @@ fn live_sessions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
             return live_rows(s.as_ref(), me, a);
         }
         let mut live = live_rows(&RunDir::profile(), me, a);
-        live.notice = changes::unapplied_notice(&l.cwd, changes::KEPT_AFTER);
+        live.notice = changes::unapplied_notice(&l.cwd(), changes::KEPT_AFTER);
         live
     };
     if !has_sources() {
@@ -375,7 +375,7 @@ fn tree_cost(_: &Rc<Local>, args: serde_json::Value) -> Answer {
 }
 
 fn send_message(l: &Rc<Local>, args: serde_json::Value) -> Answer {
-    ready(args, |a: MessageArgs| inbox::send(&a.session, Some("mu jobs panel"), &a.text, &l.cwd))
+    ready(args, |a: MessageArgs| inbox::send(&a.session, Some("mu jobs panel"), &a.text, &l.cwd()))
 }
 
 fn stop_session(_: &Rc<Local>, args: serde_json::Value) -> Answer {

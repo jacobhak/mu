@@ -4,7 +4,6 @@ use mu_base::{config, secrets};
 use mu_common::paths;
 use mu_provider::provider::client::Providers;
 use mu_tools::{context, plugin, tools};
-use std::path::PathBuf;
 use std::rc::Rc;
 
 /// Everything a session needs that depends only on the working directory.
@@ -52,15 +51,8 @@ pub struct Loaded {
 }
 
 pub fn load(cwd: &std::path::Path) -> Loaded {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let cfgs = config::Configs::load();
-    let ctx = context::Context::load_all(
-        cwd,
-        &home,
-        &paths::omp_agent_dir(),
-        cfgs.omp.skills.enable_claude_user,
-        &paths::profile_home().join("modes"),
-    );
+    let ctx = context::Context::load_for(cwd, &cfgs);
     let (manifests, mut warnings) = plugin::manifest::discover(&paths::mu_home().join("plugins"));
     let (servers, mcp_warnings) = mu_tools::mcp::config::load(cwd, &paths::omp_agent_dir());
     warnings.extend(mcp_warnings);

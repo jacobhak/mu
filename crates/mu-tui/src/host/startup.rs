@@ -85,8 +85,8 @@ fn startup(l: &Rc<Local>, args: serde_json::Value) -> Answer {
             let r = pi_import::resolve(plan, l.providers.custom_registry(), store, false);
             (!r.is_empty()).then(|| ImportOffer { source: "pi".into(), lines: r.lines, models_path: models_path() })
         });
-        let all = config::load_all_with(&l.cwd, &paths::omp_agent_dir(), &|_| None).0;
-        let untrusted_mcp = config::untrusted_files(&l.cwd, &paths::omp_agent_dir())
+        let all = config::load_all_with(&l.cwd(), &paths::omp_agent_dir(), &|_| None).0;
+        let untrusted_mcp = config::untrusted_files(&l.cwd(), &paths::omp_agent_dir())
             .into_iter()
             .map(|(file, digest, names)| UntrustedFile {
                 servers: names

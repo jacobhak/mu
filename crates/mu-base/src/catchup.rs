@@ -24,6 +24,7 @@ enum State {
     Todo,
     PermissionMode,
     ThinkingLevel,
+    Cwd,
 }
 
 fn state_of(e: &AgentEvent) -> Option<State> {
@@ -34,6 +35,7 @@ fn state_of(e: &AgentEvent) -> Option<State> {
         AgentEvent::Todo(_) => State::Todo,
         AgentEvent::PermissionMode(_) => State::PermissionMode,
         AgentEvent::ThinkingLevel(_) => State::ThinkingLevel,
+        AgentEvent::Cwd(_) => State::Cwd,
         _ => return None,
     })
 }

@@ -135,6 +135,8 @@ pub(super) struct Costs {
     pub(super) quota: Rc<RefCell<QuotaTracker>>,
     /// Shared with the watcher (`watch_git`), which updates it while a turn runs.
     pub(super) git: Rc<RefCell<Option<GitInfo>>>,
+    /// The directory the watcher reads; follows a working-directory switch.
+    pub(super) watch_cwd: Rc<RefCell<std::path::PathBuf>>,
     /// The snapshot last sent: the watcher sends it again with new git state.
     pub(super) last_status: Rc<RefCell<Option<StatusSnapshot>>>,
 }

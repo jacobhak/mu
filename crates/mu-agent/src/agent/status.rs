@@ -34,6 +34,7 @@ impl Agent {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (
+            &self.cwd,
             &self.model.model.id,
             self.plan.mode.as_ref().map(|m| &m.name),
             &self.plugin_ctx,
@@ -165,8 +166,12 @@ impl Agent {
     /// of one, and sends the last status again when it changed. A turn only emits status as replies
     /// arrive, and an idle agent not at all, so edits made meanwhile would otherwise show late.
     pub(crate) fn watch_git(&self, period: std::time::Duration) {
-        let (cwd, git, last, events) =
-            (self.cwd.clone(), self.costs.git.clone(), self.costs.last_status.clone(), self.ports.events.clone());
+        let (cwd, git, last, events) = (
+            self.costs.watch_cwd.clone(),
+            self.costs.git.clone(),
+            self.costs.last_status.clone(),
+            self.ports.events.clone(),
+        );
         tokio::task::spawn_local(async move {
             let mut tick = tokio::time::interval(period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -174,7 +179,12 @@ impl Agent {
             while !events.is_closed() {
                 tick.tick().await;
                 // A read that timed out under load says nothing; it is not a repository that vanished.
-                let Some(now) = git::git_status(&cwd).await else { continue };
+                let dir = cwd.borrow().clone();
+                let Some(now) = git::git_status(&dir).await else { continue };
+                // A switch during the read: its result is for the old directory.
+                if *cwd.borrow() != dir {
+                    continue;
+                }
                 if git.borrow().as_ref() == Some(&now) {
                     continue;
                 }

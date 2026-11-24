@@ -50,7 +50,7 @@ impl Agent {
         }));
     }
 
-    fn sync_plugin_session(&self) {
+    pub(super) fn sync_plugin_session(&self) {
         self.ports.plugins.set_session(InitParams {
             cwd: self.cwd.to_string_lossy().into(),
             session_id: self.session_id(),
@@ -196,11 +196,24 @@ impl Agent {
         }
         self.reset_conversation();
         let stored_mode = loaded.mode.as_ref().filter(|(m, _)| m != "none").cloned();
+        let last_cwd = loaded.cwd.clone();
         self.apply_loaded_settings(&loaded, &mut s);
         let resume_hits = self.restore_history(loaded);
+        s.set_owner_cwd(&self.cwd);
         self.session = Some(s);
         self.log_redaction("resume", &resume_hits);
         self.tools.set_session(&self.session_id(), self.session.as_ref().map(|s| s.path.clone()));
+        // Before the stored mode, which is looked up in the context of the directory it worked in.
+        if matches!(how, Reopen::Resume)
+            && !self.tools.mirror
+            && let Some(dir) = last_cwd.filter(|d| *d != self.cwd)
+        {
+            if dir.is_dir() {
+                self.set_cwd(dir, cwd::Why::Resume).await;
+            } else {
+                self.notice(format!("the session last worked in {}, which no longer exists", dir.display()));
+            }
+        }
         if let Some((name, data)) = stored_mode {
             if self.ctx.mode(&name).is_none() {
                 self.notice(format!("mode {name} is not defined here; resumed without it"));

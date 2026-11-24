@@ -586,6 +586,18 @@ impl Context {
         Self { warnings, files, nested, rules, skills, commands, agents, modes }
     }
 
+    /// What a session working in `cwd` loads: at startup and again when it switches directory.
+    pub fn load_for(cwd: &Path, cfg: &mu_base::config::Configs) -> Self {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        Self::load_all(
+            cwd,
+            &home,
+            &mu_common::paths::omp_agent_dir(),
+            cfg.omp.skills.enable_claude_user,
+            &mu_common::paths::profile_home().join("modes"),
+        )
+    }
+
     pub fn mode(&self, name: &str) -> Option<&ModeDef> {
         self.modes.iter().find(|m| m.name == name)
     }
@@ -608,6 +620,18 @@ impl Context {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn load_for_reads_the_given_directory() {
+        let root = std::env::temp_dir().join(format!("mu-ctx-for-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join(".omp")).unwrap();
+        fs::write(root.join("AGENTS.md"), "SWITCHED-HERE").unwrap();
+        fs::write(root.join(".omp/RULES.md"), "RULE-HERE").unwrap();
+        let ctx = Context::load_for(&root, &mu_base::config::Configs::default());
+        assert!(ctx.files.iter().any(|f| f.content == "SWITCHED-HERE"));
+        assert!(ctx.rules.iter().any(|r| r == "RULE-HERE"));
+        fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn precedence_and_order() {

@@ -72,7 +72,7 @@ pub enum Verdict {
 struct Project {
     root: PathBuf,
     key: PathBuf,
-    rules: RefCell<RuleSet>,
+    rules: RuleSet,
 }
 
 /// The per-session permission state, shared by the agent and `Tools`.
@@ -80,7 +80,7 @@ pub struct Permissions {
     mode: Cell<PermissionMode>,
     readonly_bash: bool,
     global: RefCell<RuleSet>,
-    project: std::cell::OnceCell<Project>,
+    project: RefCell<Option<Project>>,
     session: RefCell<RuleSet>,
     searched: RefCell<Vec<String>>,
 }
@@ -91,7 +91,7 @@ impl Default for Permissions {
             mode: Cell::new(PermissionMode::Yolo),
             readonly_bash: true,
             global: RefCell::new(RuleSet::default()),
-            project: std::cell::OnceCell::new(),
+            project: RefCell::new(None),
             session: RefCell::new(RuleSet::default()),
             searched: RefCell::default(),
         }
@@ -104,7 +104,7 @@ impl Permissions {
             mode: Cell::new(cfg.mode),
             readonly_bash: cfg.readonly_bash,
             global: RefCell::new(cfg.rules.clone()),
-            project: std::cell::OnceCell::new(),
+            project: RefCell::new(None),
             session: RefCell::new(RuleSet::default()),
             searched: RefCell::default(),
         }
@@ -134,14 +134,20 @@ impl Permissions {
 
     /// Resolves the project root, its key and its stored grants, once.
     pub async fn ensure_project(&self, cwd: &Path, warn: &mut Vec<String>) {
-        if self.project.get().is_some() {
+        if self.project.borrow().is_some() {
             return;
         }
+        self.rebase_project(cwd, warn).await;
+    }
+
+    /// Resolves the project root, key and stored grants from `cwd` again, replacing the old ones.
+    /// Session and global rules stay.
+    pub async fn rebase_project(&self, cwd: &Path, warn: &mut Vec<String>) {
         let root = mu_base::git::repo_root(cwd).await.unwrap_or_else(|_| cwd.to_path_buf());
         let root = physical(&root);
         let key = mu_base::git::main_checkout(cwd).await;
         let rules = store::load_project(&key, warn);
-        let _ = self.project.set(Project { root, key, rules: RefCell::new(rules) });
+        *self.project.borrow_mut() = Some(Project { root, key, rules });
     }
 
     /// A `Grant` is added to a rule set and, when `persist`, written to disk first.
@@ -149,19 +155,22 @@ impl Permissions {
         if scope == ApprovalScope::Once {
             return Ok(GrantOutcome::Written);
         }
-        let rules = match scope {
-            ApprovalScope::Session => &self.session,
-            ApprovalScope::Project => match self.project.get() {
-                Some(p) => &p.rules,
+        let grant_rules = grant::grant_rules(g);
+        let mut project_key = None;
+        match scope {
+            ApprovalScope::Session => self.session.borrow_mut().0.extend(grant_rules),
+            ApprovalScope::Project => match self.project.borrow_mut().as_mut() {
+                Some(p) => {
+                    p.rules.0.extend(grant_rules);
+                    project_key = Some(p.key.clone());
+                }
                 None => return Ok(GrantOutcome::Written),
             },
-            ApprovalScope::Global => &self.global,
+            ApprovalScope::Global => self.global.borrow_mut().0.extend(grant_rules),
             ApprovalScope::Once => return Ok(GrantOutcome::Written),
-        };
-        let grant_rules = grant::grant_rules(g);
-        rules.borrow_mut().0.extend(grant_rules);
+        }
         match scope {
-            ApprovalScope::Project if persist => store::add_project(&self.project.get().expect("checked above").key, g),
+            ApprovalScope::Project if persist => store::add_project(&project_key.expect("set above"), g),
             ApprovalScope::Global if persist => store::add_global(g),
             _ => Ok(GrantOutcome::Written),
         }
@@ -220,11 +229,10 @@ impl Permissions {
 
     /// What the rules and the mode decide, as of now, for a project at `cwd`.
     pub fn gate(&self, cwd: &Path) -> Gate {
-        let root = match self.project.get() {
-            Some(p) => p.root.clone(),
-            None => physical(cwd),
+        let (root, project) = match self.project.borrow().as_ref() {
+            Some(p) => (p.root.clone(), p.rules.clone()),
+            None => (physical(cwd), RuleSet::default()),
         };
-        let project = self.project.get().map(|p| p.rules.borrow().clone()).unwrap_or_default();
         Gate {
             mode: self.mode.get(),
             readonly_bash: self.readonly_bash,
@@ -458,6 +466,101 @@ mod tests {
             assert!(matches!(v, Verdict::Deny(m) if m.contains("cannot be entered")), "{mode:?}");
             assert!(matches!(p.check(&t, "enter_mode", &json!({"mode": "ghost"})), Verdict::Deny(_)));
         }
+    }
+
+    fn switch(p: &Permissions, t: &Tools, path: &str) -> Verdict {
+        p.check(t, "set_cwd", &json!({"path": path}))
+    }
+
+    #[test]
+    fn a_switch_outside_the_project_is_gated_as_a_write_there() {
+        let dir = outside("set-cwd");
+        let shown = dir.to_string_lossy().into_owned();
+        let (p, t) = setup(PermissionMode::Yolo);
+        assert!(matches!(switch(&p, &t, &shown), Verdict::Allow), "yolo runs it unasked");
+        for mode in [PermissionMode::Ask, PermissionMode::Edits] {
+            p.set_mode(mode);
+            let Verdict::Ask(req) = switch(&p, &t, &shown) else { panic!("{mode:?} must ask") };
+            assert_eq!(req.title, format!("set_cwd: {shown}"));
+            assert_eq!(req.reason, format!("{} mode: writing {shown} needs approval", mode.as_str()));
+            let g = req.grant.expect("a grant to offer");
+            assert_eq!((g.tool.as_str(), g.patterns.as_slice()), ("write", [shown.clone()].as_slice()));
+            assert_eq!(g.wider[0].patterns, [format!("{shown}/*")]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_switch_inside_the_project_runs_in_every_mode() {
+        for mode in [PermissionMode::Ask, PermissionMode::Edits, PermissionMode::Yolo] {
+            let (p, t) = setup(mode);
+            let sub = t.cwd.join("src");
+            assert!(matches!(switch(&p, &t, "src"), Verdict::Allow), "{mode:?}");
+            assert!(matches!(switch(&p, &t, &sub.to_string_lossy()), Verdict::Allow), "{mode:?}");
+            assert!(matches!(switch(&p, &t, "."), Verdict::Allow), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn deny_and_ask_rules_apply_to_a_switch() {
+        let dir = outside("set-cwd-deny");
+        let shown = dir.to_string_lossy().into_owned();
+        let rule = |tool: &str, pattern: &str, action| (tool.to_string(), Rule { pattern: pattern.into(), action });
+        let (p, t) = setup(PermissionMode::Yolo);
+        p.global.borrow_mut().0.push(rule("write", &format!("{shown}/*"), Action::Deny));
+        assert!(matches!(switch(&p, &t, &shown), Verdict::Deny(_)), "a write rule for the target");
+        assert!(matches!(switch(&p, &t, "."), Verdict::Allow), "the project is not under it");
+
+        let (p, t) = setup(PermissionMode::Yolo);
+        p.global.borrow_mut().0.push(rule("set_cwd", "*", Action::Deny));
+        assert!(matches!(switch(&p, &t, &shown), Verdict::Deny(_)));
+        assert!(matches!(switch(&p, &t, "."), Verdict::Deny(_)), "the tool rule applies inside the project too");
+
+        let (p, t) = setup(PermissionMode::Yolo);
+        p.global.borrow_mut().0.push(rule("set_cwd", "*", Action::Ask));
+        assert!(matches!(switch(&p, &t, "."), Verdict::Ask(_)), "an ask rule asks even in yolo");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_write_grant_covers_later_switches() {
+        let dir = outside("set-cwd-grant");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (shown, sub_shown) = (dir.to_string_lossy().into_owned(), sub.to_string_lossy().into_owned());
+        let (p, t) = setup(PermissionMode::Ask);
+        let Verdict::Ask(req) = switch(&p, &t, &shown) else { panic!() };
+        let g = req.grant.unwrap();
+        p.remember(&g.picked(Some(g.wider[0].patterns.clone())), ApprovalScope::Session, false).unwrap();
+        assert!(matches!(switch(&p, &t, &shown), Verdict::Allow));
+        assert!(matches!(switch(&p, &t, &sub_shown), Verdict::Allow), "below the granted directory");
+        let write = json!({"path": format!("{shown}/a.txt"), "content": "x"});
+        assert!(matches!(p.check(&t, "write", &write), Verdict::Allow), "it is a write grant");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rebasing_the_project_replaces_its_root_key_and_rules_but_not_the_session_grants() {
+        let (p, t) = setup(PermissionMode::Ask);
+        let first = t.cwd.clone();
+        let grant =
+            |tool: &str, pattern: &str| Grant { tool: tool.into(), wider: Vec::new(), patterns: vec![pattern.into()] };
+        p.remember(&grant("write", "zz-project/*"), ApprovalScope::Project, true).unwrap();
+        p.remember(&grant("read", "/zz-session/*"), ApprovalScope::Session, false).unwrap();
+        let key = p.project.borrow().as_ref().unwrap().key.clone();
+
+        let other = repo();
+        block_on(p.rebase_project(&other, &mut Vec::new()));
+        let gate = p.gate(&other);
+        assert_eq!(gate.root, physical(&other));
+        assert!(gate.rules[1].0.0.is_empty(), "the other repository has its own rules");
+        assert!(!gate.rules[2].0.0.is_empty(), "session grants stay");
+        assert_ne!(p.project.borrow().as_ref().unwrap().key, key);
+
+        block_on(p.rebase_project(&first, &mut Vec::new()));
+        let gate = p.gate(&first);
+        assert_eq!(gate.root, physical(&first));
+        assert!(!gate.rules[1].0.0.is_empty(), "back in the first repository its stored rules load again");
     }
 
     #[test]

@@ -7,6 +7,7 @@ use super::ui_msgs::UiMsg;
 use crate::chat::blocks;
 use crate::chat::partial_json::Partial;
 use crate::chat::transcript::{Stream, Transcript};
+use crate::host::cwd::{SET_CWD, Switched};
 use crate::host::sessions::{self, Spend, TreeArgs};
 use crate::panels::ptyview::PtyView;
 use crate::term::bell::WokenBell;
@@ -63,6 +64,8 @@ pub(super) struct StreamingCall {
 pub(super) enum Effect {
     /// The turn is waiting for the user: ring the terminal, if the setting is on.
     Ring,
+    /// The session's working directory changed.
+    Cwd(PathBuf),
     /// The view starts afresh (a client about to replay a conversation): clear the terminal too.
     ClearScreen,
     Ask {
@@ -234,6 +237,7 @@ impl AgentView {
                 | AgentEvent::Status(_)
                 | AgentEvent::ThinkingLevel(_)
                 | AgentEvent::PermissionMode(_)
+                | AgentEvent::Cwd(_)
                 | AgentEvent::Jobs(_)
                 | AgentEvent::Todo(_)
                 | AgentEvent::TurnStart
@@ -244,6 +248,7 @@ impl AgentView {
         }
         let mut fx = Vec::new();
         match e {
+            AgentEvent::Cwd(p) => fx.push(Effect::Cwd(p)),
             AgentEvent::TurnMark { .. } => {}
             AgentEvent::Replay(true) => {
                 let (bell_cfg, (show, smooth)) = (self.bell_cfg, self.fresh);
@@ -577,6 +582,30 @@ impl App {
         }
     }
 
+    /// The working directory changed: this view's copy, the host's copy and its context follow. The
+    /// host reloads the context where it runs, so an attached client whose agent is on another
+    /// machine asks that machine, and a directory this one cannot read only changes the display.
+    fn on_cwd(&mut self, cwd: PathBuf) {
+        if cwd == self.cwd {
+            return;
+        }
+        self.prompt.composer.set_cwd(&cwd);
+        self.cwd = cwd.clone();
+        let quiet = self.agent.catching_up;
+        self.host_call(SET_CWD, &cwd, move |app, r: Result<Switched, String>| match r {
+            Ok(s) => {
+                if s.applied {
+                    app.refresh_commands();
+                }
+                if s.untrusted_mcp > 0 && !quiet {
+                    app.notice("this directory's MCP servers are off until you trust them: /mcp trust");
+                }
+            }
+            Err(e) if !quiet => app.error(&format!("cannot reload the context for the new directory: {e}")),
+            Err(_) => {}
+        });
+    }
+
     /// Asks the host for what the subagents have spent; it reads their session files when that is
     /// due and answers with the total.
     pub(super) fn poll_spend(&mut self) {
@@ -623,6 +652,7 @@ impl App {
             Effect::ClearScreen => {
                 let _ = self.screen.renderer.clear_all();
             }
+            Effect::Cwd(p) => self.on_cwd(p),
             Effect::Ask { questions, reply } => self.start_ask(questions, reply),
             Effect::Approve { request, reply } => self.start_approve(request, reply),
             Effect::WebSetup { reply } => self.start_web_wizard(Some(reply)),
@@ -1331,6 +1361,51 @@ mod tests {
         press(&mut app, crossterm::event::KeyCode::Esc);
         assert!(matches!(app.overlay, Some(Overlay::Logout { .. })), "the queued picker opens next");
         assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Deny { note: None })));
+    }
+
+    #[test]
+    fn a_cwd_event_moves_the_app_and_reloads_the_hosts_context_with_either_host() {
+        for deferred in [false, true] {
+            let mut app = test_app(std::env::temp_dir().join("mu-cwd-history.jsonl"));
+            let mut rx = with_host(&mut app, deferred);
+            let dir = std::env::temp_dir().join(format!("mu-cwd-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            super::super::keys::tests::in_local(async {
+                app.on_agent(AgentEvent::Cwd(dir.clone()));
+                assert_eq!(app.cwd, dir);
+                assert!(app.prompt.commands.is_empty(), "the list is rebuilt once the context is loaded");
+                // The switch's answer asks for the completion list; a host may answer that inline or as a second message.
+                while app.prompt.commands.is_empty() {
+                    let m = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+                    app.on_ui(m);
+                }
+            });
+            assert!(!app.prompt.commands.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_cwd_event_for_the_directory_already_held_asks_nothing_of_the_host() {
+        let mut app = test_app(std::env::temp_dir().join("mu-cwd-same-history.jsonl"));
+        let mut rx = with_host(&mut app, true);
+        app.on_agent(AgentEvent::Cwd(app.cwd.clone()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cd_sends_the_directory_and_bare_cd_shows_the_current_one() {
+        use super::super::keys::tests::{test_app_with_commands, transcript_text};
+        use mu_base::events::Command;
+        let (mut app, mut cmds) = test_app_with_commands(std::env::temp_dir().join("mu-cd-history.jsonl"));
+        app.cwd = PathBuf::from("/work/here");
+        app.submit("/cd /elsewhere".into(), false);
+        assert!(matches!(cmds.try_recv(), Ok(Command::SetCwd(p)) if p == std::path::Path::new("/elsewhere")));
+        app.submit("/cd sub".into(), false);
+        assert!(matches!(cmds.try_recv(), Ok(Command::SetCwd(p)) if p == std::path::Path::new("/work/here/sub")));
+        app.submit("/cd".into(), false);
+        assert!(cmds.try_recv().is_err());
+        assert!(transcript_text(&app).contains("/work/here"));
     }
 
     fn subagent_session(cost: f64) -> PathBuf {

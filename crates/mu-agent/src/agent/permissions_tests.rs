@@ -249,6 +249,101 @@ fn a_write_grant_covers_editing_the_same_file() {
     });
 }
 
+fn set_cwd_call(id: &str, path: &std::path::Path) -> Block {
+    Block::ToolCall { id: id.into(), name: "set_cwd".into(), arguments: json!({"path": path.to_string_lossy()}) }
+}
+
+fn allow_once() -> ApprovalDecision {
+    ApprovalDecision::Allow { scope: ApprovalScope::Once, note: None, patterns: None, model: None }
+}
+
+#[test]
+fn the_model_switches_directory_unasked_in_yolo() {
+    run(async {
+        let target = outside("cwd-yolo");
+        let script = vec![
+            Ok(assistant(vec![set_cwd_call("t1", &target)], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let run_cfg = RunConfig { permission_mode: Some(PermissionMode::Yolo), ..RunConfig::default() };
+        let (mut a, rx) = agent_run(script, Configs::default(), run_cfg);
+        let reqs = turn_answered(&mut a, rx, "go", |_| panic!("no prompt expected")).await;
+        assert!(reqs.is_empty());
+        assert_eq!(a.cwd, target);
+        assert_eq!(a.tools.cwd, target);
+        assert!(tool_texts(&a)[0].starts_with("Working directory is now"), "{:?}", tool_texts(&a));
+        let users = a.messages.iter().filter(|m| matches!(m, Message::User { .. })).count();
+        assert_eq!(users, 1, "the tool's text is the model's only notice");
+        std::fs::remove_dir_all(&target).ok();
+    });
+}
+
+#[test]
+fn a_switch_outside_the_project_asks_and_a_denial_leaves_the_directory() {
+    run(async {
+        let target = outside("cwd-deny");
+        let script = vec![
+            Ok(assistant(vec![set_cwd_call("t1", &target)], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let root = mu_testutil::repo();
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), &root);
+        let reqs = turn_answered(&mut a, rx, "go", |_| ApprovalDecision::Deny { note: Some("no".into()) }).await;
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].title.starts_with("set_cwd"), "{}", reqs[0].title);
+        assert_eq!(a.cwd, root.path());
+        assert_eq!(a.tools.cwd, root.path());
+        assert!(tool_texts(&a)[0].starts_with("Not run: the user denied"));
+        std::fs::remove_dir_all(&target).ok();
+    });
+}
+
+#[test]
+fn an_approved_switch_moves_the_project_so_the_new_directory_is_judged_as_the_project() {
+    run(async {
+        let target = outside("cwd-allow");
+        let write = Block::ToolCall {
+            id: "t2".into(),
+            name: "write".into(),
+            arguments: json!({"path": "c.txt", "content": "x\n"}),
+        };
+        let script = vec![
+            Ok(assistant(vec![set_cwd_call("t1", &target)], StopReason::ToolUse)),
+            Ok(assistant(vec![write], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let root = mu_testutil::repo();
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), &root);
+        let reqs = turn_answered(&mut a, rx, "go", |_| allow_once()).await;
+        // `ask` mode asks for every write; what moved is the root, so the write is no longer "outside".
+        assert_eq!(reqs.len(), 2, "{:?}", reqs.iter().map(|r| r.title.clone()).collect::<Vec<_>>());
+        assert!(reqs[0].title.starts_with("set_cwd"), "{}", reqs[0].title);
+        assert!(reqs[1].title.starts_with("write"), "{}", reqs[1].title);
+        assert!(!reqs[1].reason.contains("outside"), "{}", reqs[1].reason);
+        assert_eq!(a.cwd, target);
+        assert_eq!(std::fs::read_to_string(target.join("c.txt")).unwrap(), "x\n");
+        assert!(!root.join("c.txt").exists());
+        std::fs::remove_dir_all(&target).ok();
+    });
+}
+
+#[test]
+fn a_switch_inside_the_project_needs_no_approval() {
+    run(async {
+        let root = mu_testutil::repo();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let script = vec![
+            Ok(assistant(vec![set_cwd_call("t1", &sub)], StopReason::ToolUse)),
+            Ok(assistant(vec![Block::text("ok")], StopReason::Stop)),
+        ];
+        let (mut a, rx) = agent_in(script, Configs::default(), ask(), &root);
+        let reqs = turn_answered(&mut a, rx, "go", |_| panic!("no prompt expected")).await;
+        assert!(reqs.is_empty());
+        assert_eq!(a.cwd, sub);
+    });
+}
+
 #[test]
 fn esc_denies_and_ends_the_turn() {
     run(async {

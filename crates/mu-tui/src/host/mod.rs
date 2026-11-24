@@ -19,6 +19,7 @@
 pub mod chatgpt;
 pub mod completion;
 pub mod custom;
+pub mod cwd;
 pub mod keys;
 pub mod local;
 pub mod mcp;

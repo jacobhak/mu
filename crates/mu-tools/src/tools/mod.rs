@@ -12,6 +12,7 @@ mod pathnote;
 mod plan;
 pub(crate) mod read;
 pub mod relay;
+mod set_cwd;
 pub(crate) mod shell;
 mod spill;
 pub mod subagent;
@@ -89,6 +90,8 @@ pub struct Tools {
     shell: shell::worker::ShellWorker,
     /// Where the persistent shell was after the last foreground bash call; see `pathnote`.
     shell_cwd: std::cell::RefCell<Option<PathBuf>>,
+    /// Set by `set_cwd`: where the persistent shell goes before its next use.
+    shell_cd: std::cell::RefCell<Option<PathBuf>>,
     /// The persistent shell's exported variables as of the last bash call; `None` before the first.
     shell_env: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>>,
     /// Test seam: the `__panic` tool panics. Only test builders turn it on.
@@ -128,6 +131,7 @@ impl Tools {
             mirror: false,
             shell: Default::default(),
             shell_cwd: Default::default(),
+            shell_cd: Default::default(),
             shell_env: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             panic_tool: Default::default(),
@@ -138,6 +142,14 @@ impl Tools {
 
     pub(crate) fn shell(&self) -> &shell::worker::ShellWorker {
         &self.shell
+    }
+
+    /// Moves the session to `dir`: file tools and new commands resolve from it, and the persistent
+    /// shell follows before its next use. Running jobs keep the directory they started in.
+    pub fn set_cwd(&mut self, dir: PathBuf) {
+        *self.shell_cwd.get_mut() = None;
+        *self.shell_cd.get_mut() = Some(dir.clone());
+        self.cwd = dir;
     }
 
     /// `PI_SESSION_FILE` / `PI_SESSION_ID` for bash commands (omp's names). Always both, empty
@@ -425,6 +437,12 @@ pub static BUILTINS: &[Builtin] = &[
         call: dispatch!("glob", async |t, a: glob::Args, _c| t.noted(a.paths(), t.glob(a))),
     },
     Builtin {
+        name: "set_cwd",
+        access: Access::ByArgs,
+        def: Some(set_cwd::def),
+        call: dispatch!("set_cwd", |t, a: set_cwd::Args| t.set_cwd_tool(a)),
+    },
+    Builtin {
         name: "todo",
         access: Access::Read,
         def: Some(|| tool_def("todo", todo::description(), todo::schema())),
@@ -499,7 +517,7 @@ fn with_args<A: DeserializeOwned>(name: &str, args: &Value, f: impl FnOnce(A) ->
 pub fn summary(name: &str, args: &Value) -> String {
     let first = |k: &str| args[k].as_str().and_then(|s| s.lines().next()).unwrap_or("");
     let s = match name {
-        "read" | "write" => first("path"),
+        "read" | "write" | "set_cwd" => first("path"),
         "glob" | "grep" => first("pattern"),
         "edit" => first("input"),
         "bash" => first("command"),
@@ -549,7 +567,7 @@ mod table_tests {
     #[test]
     fn one_table_drives_names_definitions_and_dispatch() {
         let names: Vec<String> = Tools::definitions().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "todo", "ask"]);
+        assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "set_cwd", "todo", "ask"]);
         assert!(is_builtin("task") && is_builtin("enter_mode") && is_builtin("wait"));
         assert!(!is_builtin("propose_plan"), "an exit tool belongs to a mode, not the table");
         assert!(!names.contains(&"wait".to_string()), "wait is session-only");
@@ -569,7 +587,7 @@ mod table_tests {
     #[test]
     fn only_the_file_and_shell_tools_are_judged_by_their_arguments() {
         let by_args: Vec<&str> = BUILTINS.iter().filter(|b| b.access == Access::ByArgs).map(|b| b.name).collect();
-        assert_eq!(by_args, ["read", "write", "edit", "bash", "grep", "glob"]);
+        assert_eq!(by_args, ["read", "write", "edit", "bash", "grep", "glob", "set_cwd"]);
         assert!(
             BUILTINS.iter().all(|b| b.access != Access::Exec),
             "a built-in that may act is judged by its arguments"

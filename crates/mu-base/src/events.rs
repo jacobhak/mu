@@ -41,6 +41,9 @@ pub enum Command {
     CycleThinking,
     /// `/permissions` or `--permissions`: the mode applies to the next tool call.
     SetPermissionMode(PermissionMode),
+    /// `/cd <dir>`: the user moves the session to another working directory. Not gated: the user
+    /// chose it. The model's own `set_cwd` tool call goes through the permission gate instead.
+    SetCwd(PathBuf),
     NewSession,
     Compact(Option<String>),
     /// `/review [focus]`.
@@ -569,6 +572,9 @@ pub enum AgentEvent {
     ThinkingLevel(Thinking),
     /// Tool permissions changed (`/permissions`).
     PermissionMode(PermissionMode),
+    /// The session's working directory changed (`/cd` or the model's `set_cwd`). The new directory,
+    /// absolute. A client that attaches later gets the latest one.
+    Cwd(PathBuf),
     BlockEnd,
     /// The model began a tool call; its arguments follow as `ToolCallDelta`s.
     ToolCallStart {

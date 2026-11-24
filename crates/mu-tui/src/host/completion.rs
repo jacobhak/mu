@@ -62,7 +62,7 @@ fn ghost(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     pending(args, |(text, assistant): (String, String)| {
         let params = serde_json::json!({
             "text": text,
-            "cwd": l.cwd,
+            "cwd": l.cwd(),
             "assistant": assistant,
             "threshold": l.providers.cfg.mu.predict.threshold,
         });
@@ -84,22 +84,23 @@ fn completions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
             Ok(ids) => (ids, None),
             Err(e) => (Vec::new(), Some(e)),
         };
-        Ok(Completions { entries: command_entries(&l.ctx, &l.providers.cfg, &ids), error })
+        Ok(Completions { entries: command_entries(&l.ctx(), &l.providers.cfg, &ids), error })
     })
 }
 
 /// `{name, arg}`: a skill (`skill:<name>`) or a user command, expanded to the prompt text it sends.
 fn expand(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |(name, arg): (String, String)| {
+        let ctx = l.ctx();
         Ok(if let Some(sk) = name.strip_prefix("skill:") {
-            match l.ctx.skill_prompt(sk, &arg) {
+            match ctx.skill_prompt(sk, &arg) {
                 Some(p) => Expanded::Prompt(p),
                 None => Expanded::UnknownSkill,
             }
-        } else if l.ctx.modes.iter().any(|m| m.command && m.name == name && !is_builtin(&name)) {
+        } else if ctx.modes.iter().any(|m| m.command && m.name == name && !is_builtin(&name)) {
             let prompt = (!arg.is_empty()).then(|| arg.clone());
             Expanded::Mode { name, prompt }
-        } else if let Some(c) = l.ctx.commands.iter().find(|c| c.name == name) {
+        } else if let Some(c) = ctx.commands.iter().find(|c| c.name == name) {
             Expanded::Prompt(c.expand(&arg))
         } else {
             Expanded::UnknownCommand
@@ -109,7 +110,7 @@ fn expand(l: &Rc<Local>, args: serde_json::Value) -> Answer {
 
 fn skills(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |(): ()| {
-        Ok(l.ctx
+        Ok(l.ctx()
             .skills
             .iter()
             .map(|s| SkillRow { name: s.name.clone(), hidden: s.hidden, description: s.description.clone() })
@@ -131,7 +132,7 @@ fn plugins(l: &Rc<Local>, args: serde_json::Value) -> Answer {
 fn observe(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |text: String| {
         if l.providers.cfg.mu.predict.enabled {
-            let params = serde_json::json!({ "text": text, "cwd": l.cwd });
+            let params = serde_json::json!({ "text": text, "cwd": l.cwd() });
             let plugins = l.plugins.clone();
             tokio::task::spawn_local(async move {
                 let _ = plugins.request("predict", "predict/observe", params, Duration::from_secs(2)).await;

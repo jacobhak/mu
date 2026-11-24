@@ -175,6 +175,13 @@ pub fn header_cwd(path: &Path) -> Option<PathBuf> {
     read_info(path.to_path_buf())?.cwd
 }
 
+/// The directory the session last worked in: the newest `cwd_change` on its active branch (a switch
+/// on a rewound branch does not count), else `None` (it never switched, so the header's is the one).
+/// Loads the session, so call it once on resume, not per listing.
+pub fn last_cwd(path: &Path) -> Option<PathBuf> {
+    super::format::load(path).ok()?.cwd
+}
+
 /// The newest `limit` sessions (of `only_cwd`'s project, or of every project), newest first.
 /// File names start with a timestamp, so they are sorted without opening anything; only the
 /// files that make the cut are read.
@@ -246,6 +253,44 @@ mod tests {
         std::fs::write(dir.join("9999_empty.jsonl"), "").unwrap();
         std::fs::write(dir.join("9998_torn.jsonl"), "{\"type\":\"sess").unwrap();
         assert_eq!(latest_for(cwd), Some(s.path.clone()));
+    }
+
+    #[test]
+    fn a_switch_is_recorded_and_the_session_stays_listed_where_it_was_made() {
+        home();
+        let (a, b) = (Path::new("/opt/switch-a"), Path::new("/opt/switch-b"));
+        let mut s = SessionFile::create(a, None).unwrap();
+        s.message(&Message::user("hello"));
+        assert_eq!(last_cwd(&s.path), None);
+        s.record_cwd(b);
+        s.message(&Message::user("again"));
+        s.record_cwd(Path::new("/opt/switch-c"));
+        assert_eq!(last_cwd(&s.path).as_deref(), Some(Path::new("/opt/switch-c")));
+        assert_eq!(header_cwd(&s.path).as_deref(), Some(a));
+        let path = s.path.clone();
+        assert_eq!(list_recent(a, Some(a), 10).iter().filter(|i| i.path == path).count(), 1);
+        assert!(list_recent(b, Some(b), 10).iter().all(|i| i.path != path));
+        // The entry is tolerated on load and does not become a message.
+        let loaded = crate::session::format::load(&path).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        // A reopened session keeps appending after it.
+        drop(s);
+        let mut s = SessionFile::open_append(&path).unwrap();
+        s.record_cwd(b);
+        assert_eq!(last_cwd(&path).as_deref(), Some(b));
+    }
+
+    #[test]
+    fn a_switch_on_a_rewound_branch_is_not_where_the_session_last_worked() {
+        home();
+        let (a, b) = (Path::new("/opt/rewind-a"), Path::new("/opt/rewind-b"));
+        let mut s = SessionFile::create(a, None).unwrap();
+        let first = s.message(&Message::user("hello")).unwrap();
+        s.record_cwd(b);
+        s.message(&Message::user("in b"));
+        assert_eq!(last_cwd(&s.path).as_deref(), Some(b));
+        s.rewind_after(&first).unwrap();
+        assert_eq!(last_cwd(&s.path), None);
     }
 
     #[test]
