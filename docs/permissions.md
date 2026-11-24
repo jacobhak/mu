@@ -36,7 +36,7 @@ The modes prevent mistakes; they are not a boundary against a model that is tryi
 Keys are tool-name globs, values are `allow`, `ask` or `deny`, either for every call of the tool (`"mcp__github_*" = "allow"`) or for commands and paths that match a pattern:
 
 - `bash`: every simple command of the line, as written (`cargo test --release`), including those inside `$(…)`, loops and subshells. A `deny` or `ask` rule also sees the command with quotes, a directory on the program (`/usr/bin/git`) and the wrappers `sudo`, `doas`, `command`, `builtin`, `exec`, `env`, `nice`, `nohup`, `time`, `timeout` and `xargs` taken off, and the commands inside a literal `sh -c '…'`, `bash -c` or `eval` string (three levels deep), so `"git push *" = "deny"` also stops `env git push` and `sh -c 'git push'`. It does not see through a variable, a `cd` or a string built at run time.
-- `write`, `edit`, `read`, `grep`, `glob`: each target path, matched either as it is shown (relative to the project when inside it) or by its absolute path, so `src/*` and `/home/jacob/code/private/mu/src/*` both cover `src/a.rs`.
+- `write`, `edit`, `read`, `grep`, `glob`: each target path, matched either as it is shown (relative to the project when inside it) or by its absolute path, so `src/*` and `/home/you/code/mu/src/*` both cover `src/a.rs`.
 - `fetch`: the URL.
 - Other tools: only `"*"` and whole-tool string values match.
 
@@ -53,8 +53,8 @@ When a call needs approval, mu first asks how much to allow. The widths are land
 - **Yes, just this once** — run it now and remember nothing.
 - **For what it asked for** — the exact paths or command line the call touched.
 - **For its directory** — `/etc/*` for a read of `/etc/passwd`.
-- **For this checkout** — the git root the path lives in, `/home/jacob/code/private/mu/*`.
-- **For the checkouts beside it** — that root's parent, `/home/jacob/code/private/*`.
+- **For this checkout** — the git root the path lives in, `/home/you/code/mu/*`.
+- **For the checkouts beside it** — that root's parent, `/home/you/code/*`.
 - **For all of ~** and **For everything** — `~/*` and `/*`.
 - **e** — type a pattern of your own, prefilled with the directory, so anything else is one keystroke away.
 - **No** — do not run it. Esc on this step denies.

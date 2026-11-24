@@ -1,5 +1,5 @@
 corpus: 3976 prompts, 4115 sightings; evaluating the last 60 single-line sightings (from sighting 4052)
-smollm: /home/jacob/.cache/mu-predict-bench/SmolLM2-360M; max words 4, p_ext 0.02, wrong ghost costs 1 keystroke(s), trailing-space ghosts off, free trailing space off
+smollm: ~/.cache/mu-predict-bench/SmolLM2-360M; max words 4, p_ext 0.02, wrong ghost costs 1 keystroke(s), trailing-space ghosts off, free trailing space off
 evaluated 60 sightings: 3369 positions, 2649 with a SmolLM candidate, 555 after a space
 positions by words in the longest candidate: 1 word(s): 303, 2 word(s): 220, 3 word(s): 260, 4 word(s): 1866; none: 720
 raw probability of each extension word: median 0.158, p90 0.502, over 6338 extensions

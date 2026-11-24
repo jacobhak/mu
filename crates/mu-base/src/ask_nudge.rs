@@ -259,7 +259,7 @@ mod tests {
             ("Summary:\n> Should we keep it?", false),
             ("The user wrote \"Should I?\"\n", false),
             // Does not fire: greetings and short open invitations.
-            ("Beep! I'm here. What do you want to work on in `/home/jacob/code/private`?", false),
+            ("Beep! I'm here. What do you want to work on in `/home/you/code`?", false),
             ("Hi! What would you like to work on?", false),
             ("How can I help?", false),
             ("Anything else?", false),
