@@ -49,3 +49,7 @@ Context files (`AGENTS.md`, `CLAUDE.md`) can pull in other files with `@path` (r
 `/memory` opens the memory picker: the user's memory file, this repository's, each note, and the history. Enter on a file opens it in `$VISUAL` or `$EDITOR`. Enter on the history lists the last 50 commits; Enter on one shows its message and diff in the transcript, and `r` reverts it. The history is only there when git is installed and memory has been written. `/memory` waits for a running turn to finish.
 
 Images: paste an image file path, run `/image <path>`, press Ctrl+V (reads `wl-paste`/`xclip`), or paste an image from the terminal clipboard when it supports kitty's OSC 5522 (tmux needs `allow-passthrough on`). PNG, JPEG, GIF and WebP up to 5 MB; no resizing.
+
+`/open <path>` shows a file the agent mentioned: text opens in `$VISUAL`/`$EDITOR` on a copy (changes are not sent back), anything else goes to the system's opener, and extensions that would run (`exe`, `command`, `app`, …) are refused with the copy's path. `/open` with no path picks from the files the agent has touched. When attached, the path is the agent's and the copy lands here; locally it is an ordinary read.
+
+`/upload <path>…` sends files from this machine to the agent's, when the agent runs on another one: each lands in `<session local dir>/uploads/` with a random prefix, and its `local://uploads/…` name goes into the composer. Pasting a path that names a local file only suggests it; nothing is sent without the command. See [remote use](remote.md#open-upload-and-ports).

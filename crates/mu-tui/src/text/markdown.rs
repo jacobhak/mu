@@ -1,13 +1,14 @@
 //! Markdown to styled transcript lines. Tolerates incomplete input (streaming).
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use crossterm::style::{Attribute, ContentStyle};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthChar;
 
 use crate::text::highlight;
-use crate::text::line::{Line, bold, line_text, span, wrap};
+use crate::text::line::{self, Line, bold, line_text, span, wrap};
 use crate::theme::{self, Role};
 use mu_base::text::sanitize;
 
@@ -22,8 +23,10 @@ fn heading_style() -> ContentStyle {
     s
 }
 
-/// A styled character; the working unit before lines are formed.
-type Ch = (char, ContentStyle);
+/// A styled character; the working unit before lines are formed. The third part says where it links
+/// to: 0 for nowhere, else 1 + the index into the renderer's link list.
+type Ch = (char, ContentStyle, Link);
+type Link = u32;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -38,9 +41,19 @@ const OPTS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_STRIKETHROUGH
 
 /// Renders `md` wrapped to `width` columns. Never ends with a blank line.
 pub fn render(md: &str, width: usize) -> Vec<Line> {
+    render_with(md, width, false)
+}
+
+/// `render`, with markdown links and bare http(s) URLs outside code carrying hyperlinks: for the
+/// assistant's text, not for tool output.
+pub fn render_linked(md: &str, width: usize) -> Vec<Line> {
+    render_with(md, width, true)
+}
+
+fn render_with(md: &str, width: usize, linked: bool) -> Vec<Line> {
     let opts = OPTS;
     let ev: Vec<(Event, Range<usize>)> = Parser::new_ext(md, opts).into_offset_iter().collect();
-    let mut r = R { ev, pos: 0, src: md };
+    let mut r = R { ev, pos: 0, src: md, linked, links: Vec::new() };
     let w = width.max(1);
     let mut out: Vec<Vec<Ch>> = Vec::new();
     while r.pos < r.ev.len() {
@@ -53,7 +66,7 @@ pub fn render(md: &str, width: usize) -> Vec<Line> {
         }
         r.pos += 1; // stray End event
     }
-    out.iter().map(|c| chars_to_line(c)).collect()
+    out.iter().map(|c| chars_to_line_with(c, &r.links)).collect()
 }
 
 /// `(lang, body)` of each fenced or indented code block, in order; `lang` is the first info-string word.
@@ -85,6 +98,11 @@ pub fn code_blocks(text: &str) -> Vec<(String, String)> {
 /// bracket; parentheses belong to it only when balanced (`…/Rust_(language)`, not `(see …)`). A URL
 /// with no host is not a link.
 pub fn links(text: &str) -> Vec<String> {
+    url_ranges(text).into_iter().map(|r| text[r].to_string()).collect()
+}
+
+/// Byte ranges of the URLs `links` finds.
+fn url_ranges(text: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(at) = ["http://", "https://"].iter().filter_map(|p| text[from..].find(p).map(|i| from + i)).min() {
@@ -115,7 +133,7 @@ pub fn links(text: &str) -> Vec<String> {
         let rest = &url[url.find("://").map_or(0, |i| i + 3)..];
         let host = rest.split(['/', '?', '#', ':']).next().unwrap_or("");
         if !host.is_empty() {
-            out.push(url.to_string());
+            out.push(at..at + url.len());
         }
     }
     out
@@ -175,9 +193,36 @@ struct R<'a> {
     ev: Vec<(Event<'a>, Range<usize>)>,
     pos: usize,
     src: &'a str,
+    /// Whether links and bare URLs are collected (`render_linked`).
+    linked: bool,
+    /// The URLs the `Link` ids of the characters point into.
+    links: Vec<Arc<str>>,
 }
 
 impl<'a> R<'a> {
+    fn intern(&mut self, url: Arc<str>) -> Link {
+        let i = self.links.iter().position(|l| *l == url).unwrap_or_else(|| {
+            self.links.push(url);
+            self.links.len() - 1
+        });
+        i as Link + 1
+    }
+
+    /// Links the bare URLs in `out` that are not already links or inline code (`skip`, char ranges).
+    fn link_bare(&mut self, out: &mut [Ch], skip: &[Range<usize>]) {
+        let text: String = out.iter().map(|c| c.0).collect();
+        for r in url_ranges(&text) {
+            let (a, b) = (text[..r.start].chars().count(), text[..r.end].chars().count());
+            if out[a..b].iter().any(|c| c.2 != 0) || skip.iter().any(|s| s.start < b && a < s.end) {
+                continue;
+            }
+            if let Some(url) = line::link(&text[r]) {
+                let id = self.intern(url);
+                out[a..b].iter_mut().for_each(|c| c.2 = id);
+            }
+        }
+    }
+
     fn cur(&self) -> Option<Event<'a>> {
         self.ev.get(self.pos).map(|(e, _)| e.clone())
     }
@@ -241,12 +286,12 @@ impl<'a> R<'a> {
                     .into_iter()
                     .map(|l| {
                         let mut v = chs("▏ ", key(Role::Line));
-                        v.extend(l.into_iter().map(|(c, mut st)| {
+                        v.extend(l.into_iter().map(|(c, mut st, link)| {
                             if st.foreground_color.is_none() {
                                 st = theme::get().apply(Role::Muted, st);
                             }
                             st.attributes.set(Attribute::Italic);
-                            (c, st)
+                            (c, st, link)
                         }));
                         v
                     })
@@ -316,13 +361,20 @@ impl<'a> R<'a> {
         let mut st = base;
         let mut stack: Vec<ContentStyle> = Vec::new();
         let mut links: Vec<(usize, String)> = Vec::new();
+        // The link the text being pushed belongs to, and where inline code sits (no bare URL is linked there).
+        let mut cur_link: Link = 0;
+        let mut code: Vec<Range<usize>> = Vec::new();
         while let Some(ev) = self.cur() {
             match ev {
-                Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => push_str(&mut out, &s, st),
-                Event::Code(s) => push_str(&mut out, &s, theme::get().apply(Role::Strong, st)),
-                Event::SoftBreak => out.push((' ', st)),
-                Event::HardBreak => out.push(('\n', st)),
-                Event::TaskListMarker(done) => push_str(&mut out, if done { "☑ " } else { "☐ " }, st),
+                Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => push_str(&mut out, &s, st, cur_link),
+                Event::Code(s) => {
+                    let from = out.len();
+                    push_str(&mut out, &s, theme::get().apply(Role::Strong, st), cur_link);
+                    code.push(from..out.len());
+                }
+                Event::SoftBreak => out.push((' ', st, 0)),
+                Event::HardBreak => out.push(('\n', st, 0)),
+                Event::TaskListMarker(done) => push_str(&mut out, if done { "☑ " } else { "☐ " }, st, 0),
                 Event::Start(Tag::Emphasis) => {
                     stack.push(st);
                     st.attributes.set(Attribute::Italic);
@@ -340,6 +392,9 @@ impl<'a> R<'a> {
                     st.attributes.set(Attribute::Underlined);
                     st.foreground_color = theme::get().color(Role::Literal);
                     links.push((out.len(), dest_url.to_string()));
+                    if self.linked {
+                        cur_link = line::link(&dest_url).map_or(0, |u| self.intern(u));
+                    }
                 }
                 Event::Start(Tag::Image { .. }) => stack.push(st),
                 Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Image) => {
@@ -347,16 +402,20 @@ impl<'a> R<'a> {
                 }
                 Event::End(TagEnd::Link) => {
                     st = stack.pop().unwrap_or(base);
+                    cur_link = 0;
                     if let Some((start, url)) = links.pop() {
                         let text: String = out[start..].iter().map(|c| c.0).collect();
                         if !url.is_empty() && text != url {
-                            push_str(&mut out, &format!(" ({url})"), key(Role::Faint));
+                            push_str(&mut out, &format!(" ({url})"), key(Role::Faint), 0);
                         }
                     }
                 }
                 _ => break,
             }
             self.pos += 1;
+        }
+        if self.linked {
+            self.link_bare(&mut out, &code);
         }
         out
     }
@@ -466,10 +525,10 @@ impl<'a> R<'a> {
 
         let bdr = key(Role::Line);
         let border = |l: char, m: char, r: char| -> Vec<Ch> {
-            let mut v = vec![(l, bdr)];
+            let mut v = vec![(l, bdr, 0)];
             for (i, cw) in colw.iter().enumerate() {
-                v.extend(std::iter::repeat_n(('─', bdr), cw + 2));
-                v.push((if i + 1 < ncols { m } else { r }, bdr));
+                v.extend(std::iter::repeat_n(('─', bdr, 0), cw + 2));
+                v.push((if i + 1 < ncols { m } else { r }, bdr, 0));
             }
             v
         };
@@ -483,7 +542,7 @@ impl<'a> R<'a> {
                 .collect();
             let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
             for li in 0..height {
-                let mut v = vec![('│', bdr)];
+                let mut v = vec![('│', bdr, 0)];
                 for (i, &cw) in colw.iter().enumerate() {
                     let cell: &[Ch] = wrapped[i].get(li).map(Vec::as_slice).unwrap_or(&[]);
                     let pad = cw.saturating_sub(text_width(cell));
@@ -492,12 +551,12 @@ impl<'a> R<'a> {
                         Alignment::Center => (pad / 2, pad - pad / 2),
                         _ => (0, pad),
                     };
-                    v.push((' ', Default::default()));
-                    v.extend(std::iter::repeat_n((' ', Default::default()), l));
+                    v.push((' ', Default::default(), 0));
+                    v.extend(std::iter::repeat_n((' ', Default::default(), 0), l));
                     v.extend_from_slice(cell);
-                    v.extend(std::iter::repeat_n((' ', Default::default()), r));
-                    v.push((' ', Default::default()));
-                    v.push(('│', bdr));
+                    v.extend(std::iter::repeat_n((' ', Default::default(), 0), r));
+                    v.push((' ', Default::default(), 0));
+                    v.push(('│', bdr, 0));
                 }
                 out.push(v);
             }
@@ -551,7 +610,7 @@ fn code_lines(lang: &str, body: &str, w: usize) -> Vec<Vec<Ch>> {
         }
         for part in wrap(line, w.saturating_sub(2).max(1)) {
             let mut p = chs("  ", ContentStyle::default());
-            p.extend(part.iter().flat_map(|s| s.text.chars().map(move |c| (c, s.style))));
+            p.extend(part.iter().flat_map(|s| s.text.chars().map(move |c| (c, s.style, 0))));
             out.push(p);
         }
     }
@@ -631,19 +690,29 @@ fn text_width(chs: &[Ch]) -> usize {
 }
 
 pub(crate) fn chs(s: &str, st: ContentStyle) -> Vec<Ch> {
-    sanitize(s).chars().map(|c| (c, st)).collect()
+    sanitize(s).chars().map(|c| (c, st, 0)).collect()
 }
 
-fn push_str(out: &mut Vec<Ch>, s: &str, st: ContentStyle) {
-    out.extend(sanitize(s).chars().map(|c| (c, st)));
+fn push_str(out: &mut Vec<Ch>, s: &str, st: ContentStyle, link: Link) {
+    out.extend(sanitize(s).chars().map(|c| (c, st, link)));
 }
 
 pub(crate) fn chars_to_line(cs: &[Ch]) -> Line {
+    chars_to_line_with(cs, &[])
+}
+
+/// Spans from characters; `links` is what the characters' `Link` ids index.
+fn chars_to_line_with(cs: &[Ch], links: &[Arc<str>]) -> Line {
     let mut out: Line = Vec::new();
-    for &(c, st) in cs {
+    for &(c, st, id) in cs {
+        let link = id.checked_sub(1).and_then(|i| links.get(i as usize)).cloned();
         match out.last_mut() {
-            Some(s) if s.style == st => s.text.push(c),
-            _ => out.push(span(c.to_string(), st)),
+            Some(s) if s.style == st && s.link == link => s.text.push(c),
+            _ => {
+                let mut sp = span(c.to_string(), st);
+                sp.link = link;
+                out.push(sp);
+            }
         }
     }
     out
@@ -656,6 +725,47 @@ mod tests {
 
     fn texts(md: &str, w: usize) -> Vec<String> {
         render(md, w).iter().map(line_text).collect()
+    }
+
+    /// The linked text of each span that has a link, with its URL.
+    fn linked(md: &str, w: usize) -> Vec<(String, String)> {
+        render_linked(md, w)
+            .iter()
+            .flatten()
+            .filter_map(|s| s.link.as_ref().map(|u| (s.text.clone(), u.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn markdown_links_and_bare_urls_carry_hyperlinks() {
+        let got = linked("see [the docs](https://a.test/d) and https://b.test/x_y_z?q=1&r=2, ok", 80);
+        assert_eq!(
+            got,
+            [
+                ("the docs".to_string(), "https://a.test/d".to_string()),
+                // The address shown after the text is a link too.
+                ("https://a.test/d".to_string(), "https://a.test/d".to_string()),
+                ("https://b.test/x_y_z?q=1&r=2".to_string(), "https://b.test/x_y_z?q=1&r=2".to_string()),
+            ]
+        );
+        // The same text rendered without links has none.
+        assert!(render("https://b.test", 80).iter().flatten().all(|s| s.link.is_none()));
+    }
+
+    #[test]
+    fn code_and_unsafe_links_are_not_linked() {
+        assert!(linked("run `curl https://a.test/x`", 80).is_empty());
+        assert!(linked("```\nhttps://a.test/x\n```", 80).is_empty());
+        assert!(linked("[x](javascript:alert(1)) [y](ftp://a.test)", 80).is_empty());
+    }
+
+    #[test]
+    fn a_wrapped_url_keeps_its_link_on_every_row() {
+        let rows = render_linked("https://example.test/a/long/path/to/a/page", 12);
+        assert!(rows.len() > 1);
+        for row in &rows {
+            assert!(row.iter().all(|s| s.link.as_deref() == Some("https://example.test/a/long/path/to/a/page")));
+        }
     }
 
     #[test]

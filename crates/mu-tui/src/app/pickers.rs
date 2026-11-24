@@ -373,6 +373,20 @@ impl App {
         self.open_overlay(Overlay::Copy { pick: Picker::from_rows(rows, |items| Select::new("Copy", items)) });
     }
 
+    /// `/open` with no path: the files the agent touched, newest first.
+    pub(super) fn open_recent_picker(&mut self) {
+        let rows: Vec<(Item, String)> = self
+            .agent
+            .recent_files
+            .iter()
+            .map(|p| (Item { label: p.clone(), detail: String::new() }, p.clone()))
+            .collect();
+        if rows.is_empty() {
+            return self.notice("the agent has not touched a file yet: /open <path>");
+        }
+        self.open_overlay(Overlay::Open { pick: Picker::from_rows(rows, |items| Select::new("Open a file", items)) });
+    }
+
     /// The panel as this session sees it: its jobs, their output, and itself left out of the sessions.
     fn jobs_panel(&self) -> JobsPanel {
         JobsPanel::new(self.agent.jobs.clone())
@@ -537,6 +551,8 @@ impl App {
             OverlayEvent::Web(row) => self.on_web_pick(row),
             OverlayEvent::Custom(pick) => self.on_custom_pick(pick),
             OverlayEvent::Copy(t) => self.copy_text(t, "nothing to copy"),
+            OverlayEvent::Open(path) => self.open_cmd(&path),
+            OverlayEvent::OpenPorts { job, ports } => self.open_ports(job, ports),
             OverlayEvent::Quote(q) => self.prompt.composer.append_quotes(&q),
             OverlayEvent::Resume(p) => {
                 let path = p.clone();
@@ -841,6 +857,7 @@ mod session_tests {
                 model: None,
                 changes: None,
                 progress: None,
+                ports: Vec::new(),
             };
             let (mut app, mut rx, _cmds) = app_with(deferred, dir);
             app.agent.jobs = vec![job];

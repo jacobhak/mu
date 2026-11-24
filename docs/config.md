@@ -52,6 +52,7 @@ attention = true      # a running turn asks you something or needs an approval o
 
 # [display]
 # hide_thinking_block = false  # hide the model's thinking blocks; unset follows omp's `hideThinkingBlock`. `mu models import --from pi` sets it from pi's setting
+# hyperlinks = true           # write URLs in replies as OSC 8 links your terminal opens on click (see remote.md#open-upload-and-ports for tmux)
 
 [mcp]
 lifetime = "session"  # MCP server processes: "session", "idle:10m" or "call"

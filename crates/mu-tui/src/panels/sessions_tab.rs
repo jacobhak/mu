@@ -382,6 +382,7 @@ mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         };
         let rows = build(
             rows_of(vec![mine, sub, other]),

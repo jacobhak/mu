@@ -532,6 +532,9 @@ pub struct SubagentStatus {
     /// The latest step of a worker still being started on a remote ("pulling image", …); gone once connected.
     #[serde(default)]
     pub progress: Option<String>,
+    /// The ports a running bash job's processes listen on, sorted.
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 /// Input from the TUI to a command running on a pseudo-terminal.

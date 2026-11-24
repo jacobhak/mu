@@ -756,6 +756,7 @@ mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         };
         let jobs =
             [mk(SubagentState::Running), mk(SubagentState::Done), mk(SubagentState::Done), mk(SubagentState::Failed)];

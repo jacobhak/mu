@@ -145,6 +145,8 @@ pub(super) struct AgentView {
     pub(super) status: StatusSnapshot,
     /// Bash commands run, for `/copy`.
     pub(super) bash_cmds: Vec<String>,
+    /// Files the tools read, wrote or edited, newest first, for `/open`.
+    pub(super) recent_files: std::collections::VecDeque<String>,
     /// Embedded terminal of a running `bash` call with `pty: true`.
     pub(super) pty: Option<PtyView>,
     pub(super) running: bool,
@@ -185,6 +187,7 @@ impl AgentView {
             todo: Vec::new(),
             status: StatusSnapshot::default(),
             bash_cmds: Vec::new(),
+            recent_files: Default::default(),
             pty: None,
             running: false,
             compacting: false,
@@ -485,6 +488,9 @@ impl AgentView {
     }
 
     fn commit_tool_result(&mut self, name: &str, args: &Value, output: &ToolOutput, w: usize) {
+        if let Some(mu_base::tool::ToolMeta::File(f)) = &output.meta {
+            super::open::note_recent(&mut self.recent_files, &f.path);
+        }
         let mut l = blocks::tool_result(name, args, output, self.expanded, w);
         // Breathing room: a blank row after every tool block, as text blocks have.
         l.push(vec![]);
@@ -579,6 +585,17 @@ impl App {
         self.open_next_dialog();
         if spend {
             self.poll_spend();
+        }
+        self.drop_finished_forwards();
+    }
+
+    /// A job's forwarded ports go when it stops: they name a process that is gone.
+    fn drop_finished_forwards(&mut self) {
+        let running: Vec<&str> =
+            self.agent.jobs.iter().filter(|j| j.state == SubagentState::Running).map(|j| j.name.as_str()).collect();
+        for job in self.forwards.stale(|j| running.contains(&j)) {
+            let forwards = self.forwards.take_job(&job);
+            self.unforward(forwards);
         }
     }
 
@@ -765,6 +782,7 @@ mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         }
     }
 

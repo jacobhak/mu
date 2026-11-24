@@ -369,6 +369,7 @@ mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         }
     }
 

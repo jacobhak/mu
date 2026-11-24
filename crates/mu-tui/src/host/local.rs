@@ -98,6 +98,7 @@ impl LocalHost {
         super::mcp::register(&mut registry);
         super::sessions::register(&mut registry);
         super::plans::register(&mut registry);
+        super::files::register(&mut registry);
         super::memory::register(&mut registry);
         super::results::register(&mut registry);
         super::state::register(&mut registry);

@@ -174,6 +174,10 @@ pub enum Overlay {
     Copy {
         pick: Picker<String>,
     },
+    /// `/open` with no argument: files the agent recently touched, by path.
+    Open {
+        pick: Picker<String>,
+    },
     /// Pick parts of the last reply to quote into the composer.
     Reply {
         st: Box<ReplyPicker>,
@@ -227,6 +231,7 @@ macro_rules! picker_select {
             Overlay::Plans { pick, .. } => Some(pick.$m()),
             Overlay::Rewind { pick } => Some(pick.$m()),
             Overlay::Copy { pick } => Some(pick.$m()),
+            Overlay::Open { pick } => Some(pick.$m()),
             Overlay::Memory { pick } => Some(pick.$m()),
             Overlay::MemoryLog { pick } => Some(pick.$m()),
             Overlay::Theme { st } => Some(st.$m()),
@@ -284,6 +289,8 @@ pub enum OverlayEvent {
     /// The MCP trust offer: `true` to trust these files as they were shown.
     McpTrust(bool, Vec<(PathBuf, String, Vec<String>)>),
     Copy(Option<String>),
+    /// Open this file of the agent's machine (`/open <path>`).
+    Open(String),
     /// Insert these blockquotes at the end of the composer.
     Quote(Vec<String>),
     Resume(PathBuf),
@@ -330,6 +337,11 @@ pub enum OverlayEvent {
     DiffResult {
         job: String,
         result: crate::host::results::ResultArgs,
+    },
+    /// Forward the job's listening ports and open the first one; an empty `ports` says so.
+    OpenPorts {
+        job: String,
+        ports: Vec<u16>,
     },
     /// Apply a launched job's result with a three-way merge.
     ApplyResult {
@@ -1060,6 +1072,7 @@ impl Overlay {
                 Pick::Chosen(text) => (None, Some(OverlayEvent::Copy(text))),
                 Pick::Dismissed => (None, None),
             },
+            Overlay::Open { pick } => pick_one(pick, k, |pick| Overlay::Open { pick }, OverlayEvent::Open),
             Overlay::Reply { mut st } => match st.on_key(k) {
                 ReplyResult::Pending => (Some(Overlay::Reply { st }), None),
                 ReplyResult::Close => (None, None),
@@ -1085,6 +1098,9 @@ impl Overlay {
                 }
                 JobsResult::Apply { job, result } => {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::ApplyResult { job, result }))
+                }
+                JobsResult::OpenPorts { job, ports } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::OpenPorts { job, ports }))
                 }
             },
             Overlay::Theme { mut st } => match st.on_key(k) {

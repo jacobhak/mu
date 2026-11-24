@@ -24,6 +24,8 @@ pub(super) enum ChildThen {
     Take,
     /// `mu --attach` ran on the terminal for a session another host listed.
     Attach,
+    /// The editor was run on a copy of a host file made by `/open`, in this directory, which goes now.
+    OpenCopy(PathBuf),
 }
 
 /// A host file being edited on this machine: the copy the editor works on, and the text it had.
@@ -92,6 +94,12 @@ impl App {
                     Err(e) => self.error(&format!("cannot run mu --attach: {e}")),
                 }
                 self.open_sessions();
+            }
+            ChildThen::OpenCopy(dir) => {
+                if let Err(e) = status {
+                    self.error(&format!("editor failed: {e}"));
+                }
+                let _ = std::fs::remove_dir_all(dir);
             }
             ChildThen::MemoryEdit(edit) => self.finish_host_edit(edit, status, "memory file", |_, _| {}),
             ChildThen::DocEdit(edit) => self.finish_host_edit(edit, status, "plan", |app, text| {
@@ -289,11 +297,16 @@ async fn bridge(listener: tokio::net::UnixListener, mut tunnel: crate::host::Tun
 
 /// A fresh directory only this user can enter (0700), for the socket of a take-over's nested client.
 fn private_socket_dir() -> std::io::Result<PathBuf> {
+    private_dir("mu-take")
+}
+
+/// A fresh directory only this user can enter (0700), named `<prefix>-<8 hex>`, in `$XDG_RUNTIME_DIR` or the temp dir.
+pub(super) fn private_dir(prefix: &str) -> std::io::Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|d| d.is_dir())
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("mu-take-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    let dir = base.join(format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     mu_common::fs::create_private_dir(&dir)?;
     Ok(dir)
 }

@@ -12,6 +12,8 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
@@ -499,6 +501,7 @@ impl Tools {
             return Err("Command cancelled before launch.".into());
         }
         let run = move |cancel: CancellationToken, sink: crate::jobs::OutputSink| {
+            let pgid = sink.pgid();
             run_background(
                 command,
                 cwd,
@@ -510,6 +513,7 @@ impl Tools {
                     sink.push(raw);
                     sink.lines(clean);
                 },
+                pgid,
             )
         };
         let (id, sink) = match waiting {
@@ -892,6 +896,7 @@ async fn read_or_pending<R: AsyncRead + Unpin>(r: &mut Option<R>, buf: &mut [u8]
 /// Runs `command` for a background job: `bash -c` in its own process group, with `env` as its whole
 /// environment and the foreground run's output limits and timeout. Cancel, timeout and the end of
 /// the command all kill the group, so nothing the command started outlives the job.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_background(
     command: String,
     cwd: PathBuf,
@@ -900,6 +905,7 @@ pub async fn run_background(
     cancel: CancellationToken,
     alloc: impl Fn() -> (u32, PathBuf),
     on_output: impl Fn(&str, &str),
+    pgid_out: Arc<AtomicU32>,
 ) -> BackgroundResult {
     let limits = Limits::new(timeout);
     let start = Instant::now();
@@ -925,6 +931,8 @@ pub async fn run_background(
         }
     };
     let pid = child.id().unwrap_or(0) as i32;
+    // The child leads its own group (`spawn_grouped`), so this is the group's id too.
+    pgid_out.store(u32::try_from(pid).unwrap_or(0), AtomicOrdering::Relaxed);
     let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
     let (mut out_stream, mut err_stream) = (Stream::default(), Stream::default());
     let (mut obuf, mut ebuf) = (vec![0u8; 8192], vec![0u8; 8192]);
@@ -1030,6 +1038,11 @@ mod tests {
     use super::*;
     use mu_base::events::EventTx;
     use serde_json::json;
+
+    /// A fresh process-group slot, as a job's sink hands one to `run_background`.
+    fn pgid() -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(0))
+    }
     use std::future::Future;
     use std::time::Duration;
 
@@ -1161,6 +1174,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_background_run_reports_its_output_as_it_arrives() {
         let seen = std::cell::RefCell::new(String::new());
+        let group = pgid();
         let r = run_background(
             "echo first; echo second >&2".into(),
             std::env::temp_dir(),
@@ -1169,9 +1183,11 @@ mod tests {
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
             |s, _| seen.borrow_mut().push_str(s),
+            group.clone(),
         )
         .await;
         assert!(r.ok, "{}", r.text);
+        assert!(group.load(AtomicOrdering::Relaxed) > 1, "the group is recorded for the port scan");
         let seen = seen.into_inner();
         assert!(seen.contains("first") && seen.contains("second"), "{seen:?}");
     }
@@ -1187,6 +1203,7 @@ mod tests {
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
             |s, _| seen.borrow_mut().push_str(s),
+            pgid(),
         )
         .await;
         assert!(r.ok, "{}", r.text);
@@ -1228,6 +1245,7 @@ mod tests {
                     cancel.cancel();
                 }
             },
+            pgid(),
         );
         tokio::pin!(run);
         // The timeout only turns a hang into a failure; a pass does not depend on how fast it comes.
@@ -1253,6 +1271,7 @@ mod tests {
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
             |_, _| {},
+            pgid(),
         )
         .await;
         assert!(t.elapsed() < Duration::from_secs(5), "held open for {:?}", t.elapsed());
@@ -1298,6 +1317,7 @@ mod tests {
             CancellationToken::new(),
             || (0, std::env::temp_dir()),
             |_, _| {},
+            pgid(),
         )
         .await;
         let _ = std::fs::remove_file(&wrote);

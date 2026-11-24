@@ -1,6 +1,6 @@
 # Remote use: `mu agent`, `mu --attach`
 
-The agent and the terminal UI can run in two processes, on two machines. `mu agent` runs a session with no terminal and keeps running when you close the laptop; `mu --attach 'COMMAND'` runs the usual UI on your terminal as a client of it, over whatever pipe that command gives (`ssh host mu attach --stdio ID` is the plainest). Everything the UI does works the same attached: the transcript, approvals and questions, plan review, `/model`, `/login`, custom providers, MCP servers, the Sessions tab, `$EDITOR` for a plan or a memory file, terminal (`pty`) tool calls.
+The agent and the terminal UI can run in two processes, on two machines. `mu agent` runs a session with no terminal and keeps running when you close the laptop; `mu --attach 'COMMAND'` runs the usual UI on your terminal as a client of it, over whatever pipe that command gives (`ssh host mu attach --stdio ID` is the plainest). Everything the UI does works the same attached: the transcript, approvals and questions, plan review, `/model`, `/login`, custom providers, MCP servers, the Sessions tab, `$EDITOR` for a plan or a memory file, terminal (`pty`) tool calls, clickable links in replies, `/open` and `/upload` for files, and `o` in the jobs panel to reach the ports a job listens on.
 
 mu knows nothing about ssh, Kubernetes or any other way to reach a machine. It offers the entry points described here ([For extension authors](#for-extension-authors)) and a separate program uses them: a script of your own, or a tool such as `mu-remote`, which keeps named remotes, starts agents in Kubernetes pods, runs tasks there and encrypts the stream. See that program's own documentation for remotes, trust and an encrypted transport.
 
@@ -29,7 +29,7 @@ mu --attach 'mu attach --stdio' --state-key ~/.ssh/work_ed25519   # this machine
 
 `mu attach --stdio [SESSION]` runs on the agent's machine: a raw pipe that copies lines between its stdin and stdout and the agent's socket (with no session it finds the one agent running in the current directory, `--socket PATH` names a socket). `mu --attach COMMAND` runs `COMMAND` under `sh -c` and speaks the protocol over its stdin and stdout; the command's stderr lines show as notices. When the command ends the UI stays up and runs it again.
 
-The first line the client sends names a wire number (`WIRE`, now 4) and its version, and a different wire number is refused with a readable message. Display settings (`theme`, `notify`, `bell`, `hide_thinking_block`, `smooth_streaming`, the `[status]` levels) and composer history come from the client's own config and profile home; everything about models, keys, MCP servers, sessions and plugins is the agent's.
+The first line the client sends names a wire number (`WIRE`, now 6) and its version, and a different wire number is refused with a readable message. Display settings (`theme`, `notify`, `bell`, `hide_thinking_block`, `smooth_streaming`, the `[status]` levels) and composer history come from the client's own config and profile home; everything about models, keys, MCP servers, sessions and plugins is the agent's.
 
 A client sees what it missed when it attaches: the stored conversation up to the turn in progress, that turn's events (up to 20 000 events or 16 MB; past that the oldest blocks are dropped with a notice), the latest status, jobs, queue and todo, and every question, approval, plan review or terminal request still waiting. Nothing rings until it is caught up.
 
@@ -58,7 +58,15 @@ Sealing is general: a laptop agent can use it as well as one in a pod.
 
 ## Sign-ins and your editor
 
-`/login`, an MCP server's OAuth sign-in and the ChatGPT sign-in run on the agent's machine, because that is where the credentials go. Each is a flow in the composer, not a program on a terminal: the sign-in URL opens in your browser, and where the browser cannot reach the agent's loopback callback (ChatGPT listens on `127.0.0.1:1455`; an MCP server's callback port is its own), you paste the address your browser ends up at into the composer. Esc cancels. `$EDITOR` runs on your machine, on a private copy of a plan or memory file, and the changed text is written back to the agent's machine when the editor exits successfully.
+`/login`, an MCP server's OAuth sign-in and the ChatGPT sign-in run on the agent's machine, because that is where the credentials go. Each is a flow in the composer, not a program on a terminal: the sign-in URL opens in your browser, and where the browser cannot reach the agent's loopback callback (ChatGPT listens on `127.0.0.1:1455`; an MCP server's callback port is its own), you paste the address your browser ends up at into the composer. Esc cancels. `$EDITOR` runs on your machine, on a private copy of a plan or memory file, and the changed text is written back to the agent's machine when the editor exits successfully. [Open and upload](#open-upload-and-ports) cover other files, and the ports a job listens on.
+
+## Open, upload and ports
+
+`/open PATH` shows you a file of the agent's machine without leaving the client: it copies it here (into a private temp directory, removed when mu exits) and runs `$EDITOR` on the copy when it is text, with the notice `opened a copy; changes are not sent back`, or hands it to the system's opener otherwise, refusing the extensions that would run (`app`, `exe`, `command`, …). A trailing `:N` or `:N-M` is dropped, `~`, a relative path and `local://` resolve on the agent's machine, and `/open` with no path lists the files the agent has touched. `/upload PATH…` goes the other way: it sends files of the client's machine to `<session local dir>/uploads/<8 hex>-<basename>` on the agent's machine and puts `local://uploads/…` in the composer, for the agent's tools to resolve as usual. Pasting a path that names an existing file here only adds a hint about `/upload`; nothing is sent unless you ask.
+
+The bytes move through [`MU_ATTACH_HELPER`](#for-extension-authors) when the program that started the client set it, and otherwise over the attach stream (32 MiB at most). The ports a `bash` job listens on arrive with its job: `o` in the [jobs panel](background-jobs.md#jobs-panel) forwards them here through the helper and opens the lowest, and they are taken back when the job ends or mu exits. Without a helper, mu says it cannot forward and prints the `ssh -L` line to run instead.
+
+Replies in an attached client carry clickable URLs: `[display] hyperlinks` ([config.md](config.md)) writes them as OSC 8 links, which kitty, iTerm2, wezterm, foot, Ghostty and most others open on click. Under tmux, tell it the terminal handles them, with `set -as terminal-features ',*:hyperlinks'` (the `hyperlinks` feature is documented as "supports OSC 8 hyperlinks"). A terminal that ignores them shows plain text.
 
 ## Taking over a `-p` run
 
@@ -66,7 +74,7 @@ Sealing is general: a laptop agent can use it as well as one in a pod.
 
 ## For extension authors
 
-A program that reaches other machines uses four contracts and nothing else of mu. Each is versioned: a change to one is a change to its number here.
+A program that reaches other machines uses five contracts and nothing else of mu. Each is versioned: a change to one is a change to its number here.
 
 **A. Launcher, contract 2.** `[task] launcher = ["prog", "arg", …]` and `[task] launch = ["task", …]` (the agent kinds that use it: `task`, `scout`, a custom agent's name; `/review` and the agents of a subagent stay local) in `config.toml`.
 
@@ -84,6 +92,19 @@ A program that reaches other machines uses four contracts and nothing else of mu
 **C. Attach client.** `mu --attach '<command>' [--state-key PATH]`: see [Attach](#attach). `--state-key` is the SSH ed25519 private key that unlocks a sealed agent, `~/.ssh/id_ed25519` by default.
 
 **D. Session sources.** `[sessions] sources = [["prog", "arg", …], …]` in `config.toml`. Each command prints JSON lines in the shape of `mu agent list --json` (`id` is required, the rest optional), plus `host` (the machine, shown in a column), `hint` (how to open the row, shown in the Sessions tab's status line) and `attach` (a command that opens it: `Enter` hands the terminal to `mu --attach '<that command>'` and comes back to the tab). mu runs the commands off the UI thread, all at once, each with a 20 s limit, whenever the tab refreshes; a command that fails adds no rows. A row is not a local session: it has no pid, and only `Enter` does anything on it.
+
+**E. Attach helper, contract 1.** `MU_ATTACH_HELPER` in the environment of the `mu --attach` client: a shell command line. mu runs `sh -c '<helper> "$@"' mu-attach-helper VERB ARGS…` and passes the arguments as separate words, so the helper may take arguments of its own (the `$EDITOR` pattern). Paths are on the agent's machine.
+
+| Verb | stdin | stdout | |
+|---|---|---|---|
+| `forward PORT` | - | one JSON line `{"local":N}` | Make `127.0.0.1:N` on this machine reach `localhost:PORT` on the agent's machine, then return and leave it open |
+| `unforward PORT LOCAL` | - | - | Remove that forward |
+| `read PATH` | - | the file's bytes | Read a regular file |
+| `write PATH` | the bytes | - | Create PATH (and parent directories), mode 0600; fail if it exists |
+
+- Failure is a non-zero exit and one line of error text per line on stderr. Exit code **64** means "not supported here": mu then falls back to `read_bytes` and `write_bytes` host calls over the attach stream (32 MiB at most) for files, and reports that this remote cannot forward ports.
+- mu allows 30 s for `forward` and `unforward`, 10 minutes for `read` and `write`, and 512 MiB through the helper; it kills the helper's process group when a read goes past that.
+- `read_bytes` and `write_bytes` are host calls like the others, available with or without a helper: `read_bytes {path, max}` answers `{size, data_b64}`, and `write_bytes {path, data_b64}` creates a file that must not exist. Neither has a list of allowed paths, and it does not need one: a client that can attach is already as trusted as the agent's socket owner, who can read `auth.json`.
 
 ## Where your data goes
 

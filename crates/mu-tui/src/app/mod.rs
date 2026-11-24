@@ -18,11 +18,13 @@ mod mcp;
 mod mcp_login;
 mod memory;
 mod model_sets;
+mod open;
 mod pickers;
 mod schedule;
 #[cfg(test)]
 mod services;
 mod slash;
+mod transfer;
 mod ui_msgs;
 mod web;
 
@@ -93,6 +95,8 @@ pub struct AppInit {
     pub hide_thinking: bool,
     pub smooth_streaming: bool,
     pub status_levels: mu_base::config::MuStatus,
+    /// `[display] hyperlinks`: write URLs as OSC 8 links.
+    pub hyperlinks: bool,
 }
 
 struct App {
@@ -121,6 +125,10 @@ struct App {
     quitting: bool,
     /// The first Ctrl-C was pressed: the next one exits, whatever the screen holds.
     ctrl_c_armed: bool,
+    /// Copies of host files made by `/open`, removed when mu exits.
+    opened: open::Opened,
+    /// Ports forwarded here for the jobs that listen on them; removed with the job or at exit.
+    forwards: transfer::Forwards,
 }
 
 /// `run` is never called by a test, which builds its `App` and the handles itself.
@@ -371,7 +379,9 @@ pub async fn run(init: AppInit) -> i32 {
         hide_thinking,
         smooth_streaming,
         status_levels,
+        hyperlinks,
     } = init;
+    crate::text::line::set_hyperlinks(hyperlinks);
     crate::host::set_facts(host.info().clone());
     let mut theme_warnings = theme::init(&theme);
     theme_warnings.extend(crate::keymap::init(&keys));
@@ -432,6 +442,8 @@ pub async fn run(init: AppInit) -> i32 {
         },
         quitting: false,
         ctrl_c_armed: false,
+        opened: Default::default(),
+        forwards: Default::default(),
     };
     for w in theme_warnings.iter().chain(startup.warnings.iter()) {
         app.agent.tr.pending.push(styled(w.clone(), |_| theme::get().fg(Role::Warn)));
@@ -606,6 +618,8 @@ impl App {
             n => self.notice(&format!("{n} scheduled prompt(s) dropped")),
         }
         self.send(Command::Cancel);
+        // What this client forwarded is its own to take back.
+        transfer::unforward_now(self.forwards.take_all());
         self.notice("exiting…");
         self.send(Command::Exit);
     }

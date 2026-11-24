@@ -343,6 +343,7 @@ async fn run_foreground(
                 model: None,
                 changes: None,
                 progress: None,
+                ports: Vec::new(),
             })
             .collect::<Vec<_>>(),
     );

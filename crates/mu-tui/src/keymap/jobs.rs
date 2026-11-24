@@ -20,6 +20,8 @@ binds! {
     JOBS_STOP = "jobs", "stop", ["s"];
     JOBS_TERMINATE = "jobs", "terminate", ["S"];
     JOBS_TAKE = "jobs", "take", ["t"];
+    /// Forward the job's listening ports here and open the first in the browser.
+    JOBS_OPEN_PORT = "jobs", "open_port", ["o"];
 
     JOBS_VIEW_CLOSE = "jobs_view", "close", ["esc", "q"];
     JOBS_VIEW_DOWN = "jobs_view", "down", ["down", "j", "ctrl+n"];

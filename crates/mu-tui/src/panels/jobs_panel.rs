@@ -97,6 +97,11 @@ pub enum JobsResult {
         job: String,
         result: ResultArgs,
     },
+    /// Open the ports a running job listens on (`o`); `ports` may be empty.
+    OpenPorts {
+        job: String,
+        ports: Vec<u16>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -777,6 +782,10 @@ impl JobsPanel {
                 Some((job, result, false)) => return JobsResult::Apply { job, result },
                 None => {}
             }
+        } else if keymap::JOBS_OPEN_PORT.hit(&k)
+            && let Some(j) = self.jobs.get(self.at).filter(|j| j.state == SubagentState::Running)
+        {
+            return JobsResult::OpenPorts { job: j.name.clone(), ports: j.ports.clone() };
         }
         JobsResult::Pending
     }
@@ -1149,7 +1158,9 @@ fn list_row(
         JobKind::Bash => " ".repeat(9),
     };
     let last = j.progress.as_deref().filter(|_| j.state == SubagentState::Running).unwrap_or(&j.last);
-    let rest = format!(" {} {tools}  {:>7}  {cost:>6}  {last}", pad(&j.agent, agent_w), clock(elapsed(j, now)));
+    // Where it listens, when it does: `o` forwards these.
+    let ports: String = j.ports.iter().map(|p| format!(" :{p}")).collect();
+    let rest = format!(" {} {tools}  {:>7}  {cost:>6}{ports}  {last}", pad(&j.agent, agent_w), clock(elapsed(j, now)));
     let mut name = t.fg(Role::Strong);
     if selected {
         name.attributes.set(crossterm::style::Attribute::Bold);
@@ -1211,9 +1222,14 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
     } else if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
         rows.push(vec![span(format!("   last {}", j.last), muted)]);
     }
+    if !j.ports.is_empty() {
+        let list: Vec<String> = j.ports.iter().map(|p| format!("localhost:{p}")).collect();
+        rows.push(vec![span(format!("   listening {}", list.join(", ")), muted)]);
+    }
     let hint = match (j.kind, &j.session) {
         (JobKind::Subagent, Some(_)) => "Enter  read its transcript",
         (JobKind::Subagent, None) => "no session file yet",
+        (JobKind::Bash, _) if !j.ports.is_empty() => "Enter  see its output · o  open its ports",
         (JobKind::Bash, _) => "Enter  see its output",
     };
     rows.push(vec![span(format!("   {hint}"), t.fg(Role::Faint))]);
@@ -1251,6 +1267,7 @@ mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         }
     }
 
@@ -1372,6 +1389,25 @@ mod tests {
         p.on_key(key(KeyCode::Home));
         let rows = text(&mut p, 60, 16);
         assert!(rows.iter().any(|r| r.contains("j00")) && !rows.iter().any(|r| r.contains("j19")));
+    }
+
+    #[test]
+    fn o_opens_a_running_jobs_ports() {
+        let mut j = job("a", SubagentState::Running);
+        j.kind = JobKind::Bash;
+        j.ports = vec![3000, 8080];
+        let mut p = JobsPanel::new(vec![j, job("b", SubagentState::Done)]);
+        p.at = 0;
+        assert!(matches!(p.on_key(key(KeyCode::Char('o'))), JobsResult::OpenPorts { job, ports }
+            if job == "a" && ports == [3000, 8080]));
+        p.at = 1;
+        assert!(
+            matches!(p.on_key(key(KeyCode::Char('o'))), JobsResult::Pending),
+            "a finished job has no ports to open"
+        );
+        // The row and its detail say where it listens.
+        let rows = text(&mut p, 100, 20);
+        assert!(rows.iter().any(|r| r.contains(":3000") && r.contains(":8080")), "{rows:?}");
     }
 
     #[test]

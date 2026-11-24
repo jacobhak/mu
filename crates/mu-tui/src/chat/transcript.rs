@@ -119,7 +119,7 @@ impl Transcript {
     }
 
     pub fn commit_text(&mut self, text: &str, blank_after: bool, w: usize) {
-        let mut lines = markdown::render(&format!("{}{text}", self.md_refs), w);
+        let mut lines = markdown::render_linked(&format!("{}{text}", self.md_refs), w);
         self.md_refs.push_str(&markdown::reference_defs(text));
         self.live_gen += 1;
         if blank_after {
@@ -278,7 +278,7 @@ impl Transcript {
             let mut cache = self.live_cache.borrow_mut();
             let key = (w, self.live_gen);
             if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                let lines = markdown::render(&format!("{}{}", self.md_refs, self.live_text), w);
+                let lines = markdown::render_linked(&format!("{}{}", self.md_refs, self.live_text), w);
                 *cache = Some((key, lines));
             }
             if let Some((_, lines)) = cache.as_ref() {

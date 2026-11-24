@@ -7,5 +7,6 @@ pub mod jobs;
 pub mod mcp;
 pub mod permissions;
 pub mod plugin;
+pub mod ports;
 pub mod tools;
 pub(crate) mod walk;

@@ -898,6 +898,7 @@ mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         };
         let out: String = (0..20).map(|i| format!("l{i}\n")).collect();
         let text: Vec<String> =
@@ -954,6 +955,7 @@ mod tests {
             model: Some("scout · anthropic/haiku".into()),
             changes: None,
             progress: None,
+            ports: Vec::new(),
         };
         let text = |cost: Option<f64>, state| text_of(&subagent_rows(&[row(state)], fixed_now(), '⠋', |_| cost)[0]);
         assert_eq!(
@@ -998,6 +1000,7 @@ mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         }
     }
 

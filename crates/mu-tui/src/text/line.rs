@@ -1,12 +1,17 @@
 use crossterm::style::{Attribute, Color, ContentStyle, StyledContent};
 use mu_base::text::{grapheme_width, sanitize};
 use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Span {
     pub text: String,
     pub style: ContentStyle,
+    /// Where the text links to (an OSC 8 hyperlink). Never inline escape bytes in `text`: only a
+    /// `link_ok` URL goes here, and `to_ansi` writes the escapes.
+    pub link: Option<Arc<str>>,
 }
 
 pub type Line = Vec<Span>;
@@ -17,7 +22,34 @@ pub fn span(text: impl Into<String>, style: ContentStyle) -> Span {
         Cow::Borrowed(_) => text,
         Cow::Owned(clean) => clean,
     };
-    Span { text, style }
+    Span { text, style, link: None }
+}
+
+/// A span with `s`'s style and link and other text.
+fn like(s: &Span, text: impl Into<String>) -> Span {
+    Span { link: s.link.clone(), ..span(text, s.style) }
+}
+
+/// Longest URL written as a hyperlink.
+const LINK_MAX: usize = 2048;
+
+/// Whether `url` is safe to put in an OSC 8 escape: an http(s) URL with no control character and no space.
+pub fn link_ok(url: &str) -> bool {
+    (url.starts_with("http://") || url.starts_with("https://"))
+        && url.len() <= LINK_MAX
+        && !url.chars().any(|c| c.is_control() || c == ' ')
+}
+
+/// A span's link, when it is one that can be written.
+pub fn link(url: &str) -> Option<Arc<str>> {
+    link_ok(url).then(|| Arc::from(url))
+}
+
+static HYPERLINKS: AtomicBool = AtomicBool::new(true);
+
+/// `[display] hyperlinks`: whether `to_ansi` writes OSC 8 links.
+pub fn set_hyperlinks(on: bool) {
+    HYPERLINKS.store(on, Ordering::Relaxed);
 }
 
 pub fn plain(text: impl Into<String>) -> Line {
@@ -105,7 +137,7 @@ pub fn layout(l: &Line, width: usize) -> Layout {
             let w = grapheme_width(g);
             if col > 0 && col + w > width {
                 if !cur.is_empty() {
-                    rows[row].push(span(std::mem::take(&mut cur), s.style));
+                    rows[row].push(like(s, std::mem::take(&mut cur)));
                 }
                 rows.push(vec![]);
                 row += 1;
@@ -118,7 +150,7 @@ pub fn layout(l: &Line, width: usize) -> Layout {
             src += g.chars().count();
         }
         if !cur.is_empty() {
-            rows[row].push(span(cur, s.style));
+            rows[row].push(like(s, cur));
         }
     }
     Layout { rows, cells, end: (row, col), chars: src }
@@ -142,15 +174,15 @@ pub fn truncate(l: &Line, width: usize) -> Line {
             let w = grapheme_width(g);
             if col + w + 1 > width {
                 if !cur.is_empty() {
-                    out.push(span(cur, s.style));
+                    out.push(like(s, cur));
                 }
-                out.push(span("…", s.style));
+                out.push(like(s, "…"));
                 break 'outer;
             }
             cur.push_str(g);
             col += w;
         }
-        out.push(span(cur, s.style));
+        out.push(like(s, cur));
     }
     out
 }
@@ -165,7 +197,10 @@ pub fn bg(c: Option<Color>) -> ContentStyle {
 pub fn fill(l: &Line, width: usize, bg: Option<Color>) -> Line {
     let mut out: Line = l
         .iter()
-        .map(|s| span(s.text.clone(), ContentStyle { background_color: s.style.background_color.or(bg), ..s.style }))
+        .map(|s| {
+            let style = ContentStyle { background_color: s.style.background_color.or(bg), ..s.style };
+            Span { link: s.link.clone(), ..span(s.text.clone(), style) }
+        })
         .collect();
     let pad = width.saturating_sub(line_width(l));
     if pad > 0 {
@@ -176,13 +211,35 @@ pub fn fill(l: &Line, width: usize, bg: Option<Color>) -> Line {
 
 /// Renders a line as an ANSI string without a trailing newline.
 pub fn to_ansi(l: &Line) -> String {
+    to_ansi_with(l, HYPERLINKS.load(Ordering::Relaxed))
+}
+
+/// `to_ansi`, with OSC 8 hyperlinks written or left out. Every call closes its own links, so a row
+/// that ends inside a link does not carry it to the next.
+pub fn to_ansi_with(l: &Line, hyperlinks: bool) -> String {
     let mut out = String::new();
+    let mut open: Option<&str> = None;
     for s in l {
+        let want = s.link.as_deref().filter(|u| hyperlinks && link_ok(u));
+        if want != open {
+            if open.is_some() {
+                out.push_str("\x1b]8;;\x1b\\");
+            }
+            if let Some(url) = want {
+                out.push_str("\x1b]8;;");
+                out.push_str(url);
+                out.push_str("\x1b\\");
+            }
+            open = want;
+        }
         if s.style == ContentStyle::default() {
             out.push_str(&s.text);
         } else {
             out.push_str(&StyledContent::new(s.style, &s.text).to_string());
         }
+    }
+    if open.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
     }
     out
 }
@@ -198,6 +255,65 @@ mod tests {
         assert_eq!(w.iter().map(line_text).collect::<Vec<_>>(), ["ab日", "本cd"]);
         assert_eq!(line_text(&truncate(&l, 5)), "ab日…");
         assert_eq!(wrap(&vec![], 4).len(), 1);
+    }
+
+    fn linked(text: &str, url: &str) -> Span {
+        Span { link: link(url), ..span(text, ContentStyle::default()) }
+    }
+
+    #[test]
+    fn a_linked_span_is_wrapped_in_osc_8() {
+        let l = vec![
+            span("see ", ContentStyle::default()),
+            linked("here", "https://a.test/x"),
+            span(" now", ContentStyle::default()),
+        ];
+        assert_eq!(to_ansi_with(&l, true), "see \x1b]8;;https://a.test/x\x1b\\here\x1b]8;;\x1b\\ now");
+        assert_eq!(to_ansi_with(&l, false), "see here now");
+    }
+
+    #[test]
+    fn a_link_that_wraps_closes_and_reopens_on_each_row() {
+        let rows = wrap(&vec![linked("abcdef", "https://a.test/x")], 3);
+        assert_eq!(rows.len(), 2);
+        for (row, text) in rows.iter().zip(["abc", "def"]) {
+            assert_eq!(to_ansi_with(row, true), format!("\x1b]8;;https://a.test/x\x1b\\{text}\x1b]8;;\x1b\\"));
+        }
+        let cut = truncate(&vec![linked("abcdef", "https://a.test/x")], 4);
+        assert!(cut.iter().all(|s| s.link.is_some()), "{cut:?}");
+        assert!(fill(&rows[0], 5, None).iter().filter(|s| s.link.is_some()).count() == 1);
+    }
+
+    #[test]
+    fn adjacent_links_to_different_places_stay_apart() {
+        let l = vec![linked("a", "https://a.test"), linked("b", "https://b.test")];
+        assert_eq!(
+            to_ansi_with(&l, true),
+            "\x1b]8;;https://a.test\x1b\\a\x1b]8;;\x1b\\\x1b]8;;https://b.test\x1b\\b\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn only_plain_http_urls_become_links() {
+        assert!(link_ok("https://a.test/x?y=1#z"));
+        assert!(link_ok("http://a.test"));
+        for bad in [
+            "ftp://a.test",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://a.test/\x1b]8;;x",
+            "https://a b",
+            "https://a.test/\x07",
+            "https://a.test/\u{9c}",
+            "https://a.test/\u{7f}",
+        ] {
+            assert!(!link_ok(bad), "{bad:?}");
+        }
+        assert!(!link_ok(&format!("https://a.test/{}", "a".repeat(LINK_MAX))));
+        assert!(link("https://a b").is_none());
+        // A span that carries a bad URL anyway is written without a link.
+        let l = vec![Span { link: Some(Arc::from("https://a.test/\x1b[2J")), ..span("x", ContentStyle::default()) }];
+        assert_eq!(to_ansi_with(&l, true), "x");
     }
 
     #[test]

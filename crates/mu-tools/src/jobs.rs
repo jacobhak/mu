@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
@@ -26,6 +28,13 @@ const OUTPUT_KEEP: usize = 64 * 1024;
 /// How much of that goes to the UI per update, and how often at most.
 const OUTPUT_EMIT: usize = 16 * 1024;
 const OUTPUT_EVERY: Duration = Duration::from_millis(250);
+/// How often a running bash job's listening ports are looked up.
+const PORT_EVERY: Duration = Duration::from_secs(2);
+
+thread_local! {
+    /// A port scan is already running.
+    static PORT_SCAN: Cell<bool> = const { Cell::new(false) };
+}
 /// Output lines that match a job's `notify` pattern within this long of each other go out as one notice.
 const NOTIFY_BATCH: Duration = Duration::from_millis(200);
 /// Most lines, and most characters per line, one notice carries.
@@ -66,6 +75,8 @@ struct SinkInner {
     last: Cell<Option<Instant>>,
     /// A deferred update is already waiting.
     pending: Cell<bool>,
+    /// The process group of the command behind it; 0 until the shell has started.
+    pgid: Arc<AtomicU32>,
     /// The throttle window; a field so tests need not race the real clock.
     every: Duration,
     watch: RefCell<Option<Watch>>,
@@ -85,9 +96,15 @@ impl OutputSink {
             buf: RefCell::default(),
             last: Cell::new(None),
             pending: Cell::new(false),
+            pgid: Arc::new(AtomicU32::new(0)),
             every,
             watch: RefCell::new(None),
         }))
+    }
+
+    /// The process group of the command, once it has started.
+    pub fn pgid(&self) -> Arc<AtomicU32> {
+        self.0.pgid.clone()
     }
 
     /// Reports output lines that match `re` to the model through `jobs`.
@@ -225,6 +242,8 @@ enum Work {
         meta: Option<BashMeta>,
         /// How it ended ("exit 3", "timed out", …).
         note: Option<String>,
+        /// The command's process group, once its shell is running (0 until then).
+        pgid: Arc<AtomicU32>,
     },
 }
 
@@ -233,8 +252,15 @@ impl Work {
         Work::Subagent { tools: 0, session: None, model: None, changes: None, progress: None }
     }
 
-    fn bash(command: String) -> Self {
-        Work::Bash { command: Some(command), meta: None, note: None }
+    fn bash(command: String, pgid: Arc<AtomicU32>) -> Self {
+        Work::Bash { command: Some(command), meta: None, note: None, pgid }
+    }
+
+    fn pgid(&self) -> Option<&Arc<AtomicU32>> {
+        match self {
+            Work::Bash { pgid, .. } => Some(pgid),
+            Work::Subagent { .. } => None,
+        }
     }
 
     fn kind(&self) -> JobKind {
@@ -260,6 +286,8 @@ struct Job {
     /// Counted and shown as a background job. A foreground call's job is not, so the call keeps its
     /// usual running card; it is listed once the call is interrupted and the command runs on.
     listed: bool,
+    /// The ports its processes listen on, as the last scan found them.
+    ports: Vec<u16>,
     cancel: CancellationToken,
 }
 
@@ -525,6 +553,7 @@ impl JobsHandle {
                     model,
                     changes,
                     progress,
+                    ports: j.ports.clone(),
                 }
             })
             .collect()
@@ -532,6 +561,52 @@ impl JobsHandle {
 
     fn emit(&self) {
         let _ = self.events.send(AgentEvent::Jobs(self.snapshot()));
+    }
+
+    /// Watches the listening ports of the running bash jobs, every `PORT_EVERY`, until none is left.
+    /// One scan runs at a time, however many jobs start.
+    fn scan_ports(self: &Rc<Self>) {
+        if PORT_SCAN.replace(true) {
+            return;
+        }
+        let handle = Rc::downgrade(self);
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::time::sleep(PORT_EVERY).await;
+                let Some(jobs) = handle.upgrade() else { return };
+                let groups: Vec<(u64, u32)> = jobs
+                    .inner
+                    .borrow()
+                    .iter()
+                    .filter(|j| j.listed && j.state == SubagentState::Running)
+                    .filter_map(|j| j.work.pgid().map(|p| (j.seq, p.load(Ordering::Relaxed))))
+                    .filter(|&(_, pgid)| pgid > 1)
+                    .collect();
+                if groups.is_empty() {
+                    PORT_SCAN.set(false);
+                    return;
+                }
+                let found = tokio::task::spawn_blocking(move || {
+                    groups.into_iter().map(|(seq, pgid)| (seq, crate::ports::listening(pgid))).collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                drop(jobs);
+                let Some(jobs) = handle.upgrade() else { return };
+                let mut changed = false;
+                for (seq, ports) in found {
+                    if let Some(mut j) = jobs.job_mut(seq)
+                        && j.ports != ports
+                    {
+                        j.ports = ports;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    jobs.emit();
+                }
+            }
+        });
     }
 
     /// The job `seq`, for mutation.
@@ -560,6 +635,7 @@ impl JobsHandle {
             started: SystemTime::now(),
             ended: None,
             delivered: false,
+            ports: Vec::new(),
             notice_owned,
             listed,
             cancel,
@@ -858,7 +934,7 @@ impl JobsHandle {
         let spec = Spec { id: id.clone(), agent: "bash".into(), cwd, task: one_line(&command, COMMAND_KEEP) };
         let run_cancel = cancel.clone();
         let kept = sink.clone();
-        self.spawn_job(spec, Work::bash(command), line, cancel, listed, move |_| {
+        self.spawn_job(spec, Work::bash(command, sink.pgid()), line, cancel, listed, move |_| {
             let fut = run(run_cancel, kept.clone());
             async move {
                 let r = fut.await;
@@ -867,6 +943,7 @@ impl JobsHandle {
                 Finished { ok: r.ok, text: r.text, note: Some(r.note), meta: r.meta }
             }
         });
+        self.scan_ports();
         (id, sink)
     }
 
@@ -890,7 +967,7 @@ impl JobsHandle {
             .map(|j| {
                 j.delivered = true;
                 let (command, note, meta) = match &mut j.work {
-                    Work::Bash { command, note, meta } => (command.take(), note.clone(), meta.take()),
+                    Work::Bash { command, note, meta, .. } => (command.take(), note.clone(), meta.take()),
                     Work::Subagent { .. } => (None, None, None),
                 };
                 Done {
@@ -1012,6 +1089,7 @@ impl JobsHandle {
             started: SystemTime::now(),
             ended: None,
             delivered: false,
+            ports: Vec::new(),
             notice_owned: true,
             listed: true,
             cancel: CancellationToken::new(),
@@ -1189,13 +1267,19 @@ pub(crate) mod tests {
         h.inner.borrow_mut().push(Job {
             seq: 0,
             spec: Spec { id: "A".into(), agent: "scout".into(), cwd: PathBuf::from("/w"), task: "echo".into() },
-            work: Work::Bash { command: Some("echo".into()), meta: None, note: Some("exit 0".into()) },
+            work: Work::Bash {
+                command: Some("echo".into()),
+                meta: None,
+                note: Some("exit 0".into()),
+                pgid: Arc::new(AtomicU32::new(0)),
+            },
             last: String::new(),
             state: SubagentState::Done,
             text: "big output".into(),
             started: SystemTime::now(),
             ended: Some(SystemTime::now()),
             delivered: false,
+            ports: Vec::new(),
             notice_owned: true,
             listed: true,
             cancel: CancellationToken::new(),

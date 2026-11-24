@@ -18,8 +18,9 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Raised with every change to `WireCommand`, `WireEvent` or a host request, or to how a connection
 /// starts (4: plain JSON lines behind the hello; encrypting the pipe is up to whatever carries it;
-/// 5: the plan dialog became a generic document review).
-pub const WIRE: u32 = 5;
+/// 5: the plan dialog became a generic document review; 6: the `read_bytes` and `write_bytes` host
+/// calls, and listening `ports` on a job).
+pub const WIRE: u32 = 6;
 
 /// Front end to agent.
 #[derive(Serialize, Deserialize)]
@@ -703,6 +704,7 @@ mod tests {
                 applied: false,
             }),
             progress: None,
+            ports: vec![3000, 8080],
         }
     }
 
@@ -767,6 +769,16 @@ mod tests {
             assert_eq!(json_of(&back), before);
         }
         assert_eq!(agent.parked(), 0);
+    }
+
+    #[test]
+    fn a_job_from_an_agent_without_ports_still_reads() {
+        let mut v = serde_json::to_value(job()).unwrap();
+        v.as_object_mut().unwrap().remove("ports");
+        let back: SubagentStatus = serde_json::from_value(v).unwrap();
+        assert!(back.ports.is_empty(), "an older agent's job has no ports");
+        assert_eq!((back.name.as_str(), back.tools), ("w", 2), "the rest reads as before");
+        assert_eq!(serde_json::to_value(job()).unwrap()["ports"], json!([3000, 8080]), "ports go over the wire");
     }
 
     #[test]

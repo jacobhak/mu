@@ -273,11 +273,19 @@ pub struct MuSecrets {
 }
 
 /// `[display]`: settings that otherwise come from omp's `config.yml`.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
 pub struct MuDisplay {
     /// Hide the model's thinking blocks; unset follows omp's `hideThinkingBlock`.
     pub hide_thinking_block: Option<bool>,
+    /// Write URLs in the assistant's replies as clickable terminal hyperlinks (OSC 8).
+    pub hyperlinks: bool,
+}
+
+impl Default for MuDisplay {
+    fn default() -> Self {
+        Self { hide_thinking_block: None, hyperlinks: true }
+    }
 }
 
 /// `[theme]`: palette source, accent and card style.

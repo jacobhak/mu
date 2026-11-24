@@ -117,7 +117,7 @@ fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
         .unzip()
 }
 
-pub(super) static BUILTIN: [Builtin; 35] = [
+pub(super) static BUILTIN: [Builtin; 37] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
@@ -159,7 +159,12 @@ pub(super) static BUILTIN: [Builtin; 35] = [
         .busy_ok()
         .complete(|_| strings(&["code", "cmd", "link", "local"])),
     cmd("reply", "Quote parts of the last reply into the composer", |a, _| a.open_reply()).busy_ok(),
+    cmd("open", "Open a file of the agent's machine here [path]; no path lists files it touched", App::open_cmd)
+        .busy_ok(),
     cmd("image", "Attach an image file", App::image_cmd).needs_arg().busy_ok(),
+    cmd("upload", "Send files of this machine to the agent's session (when attached)", App::upload_cmd)
+        .needs_arg()
+        .busy_ok(),
     cmd("jobs", "Show background jobs and other mu sessions", App::jobs_cmd).busy_ok().complete(|_| strings(&["kill"])),
     cmd("schedule", "Send a prompt later [<delay> <prompt> | list | cancel [N|all]]", App::schedule_cmd)
         .needs_arg()
@@ -264,10 +269,10 @@ mod tests {
 
     #[test]
     fn commands_that_work_bare_do_not_wait_for_an_argument() {
-        for name in ["permissions", "mcp", "model", "jobs", "copy", "theme"] {
+        for name in ["permissions", "mcp", "model", "jobs", "copy", "theme", "open"] {
             assert!(!find(name).unwrap().needs_arg, "/{name} runs without an argument");
         }
-        for name in ["rename", "image", "schedule"] {
+        for name in ["rename", "image", "upload", "schedule"] {
             assert!(find(name).unwrap().needs_arg, "/{name} needs an argument");
         }
     }
@@ -290,7 +295,9 @@ mod tests {
                 "theme",
                 "copy",
                 "reply",
+                "open",
                 "image",
+                "upload",
                 "jobs",
                 "schedule"
             ]

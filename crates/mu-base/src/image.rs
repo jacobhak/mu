@@ -201,7 +201,8 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn image_path(line: &str) -> Option<PathBuf> {
+/// The path a pasted line names: quotes, `file://`, `\ ` and `~/` are undone; the file's type is not checked.
+fn pasted_path(line: &str) -> Option<PathBuf> {
     let mut s = line.trim();
     for q in ['\'', '"'] {
         if let Some(inner) = s.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
@@ -218,9 +219,21 @@ fn image_path(line: &str) -> Option<PathBuf> {
     if p.starts_with("~/") {
         path = mu_common::paths::expand_tilde(&p, Path::new(&std::env::var_os("HOME")?))?;
     }
+    Some(path)
+}
+
+fn image_path(line: &str) -> Option<PathBuf> {
+    let path = pasted_path(line)?;
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     (path.is_absolute() && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") && path.is_file())
         .then_some(path)
+}
+
+/// The existing regular file a paste of one line names, whatever its type.
+pub fn file_in_paste(text: &str) -> Option<PathBuf> {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let path = pasted_path(lines.next()?)?;
+    (lines.next().is_none() && path.is_absolute() && path.is_file()).then_some(path)
 }
 
 /// The image files a paste consists of, when every non-empty line is one.

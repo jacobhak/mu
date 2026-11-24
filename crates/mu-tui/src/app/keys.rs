@@ -128,6 +128,8 @@ impl App {
                     _ => {
                         if let Err(e) = self.prompt.composer.on_paste(&s, &self.prompt.commands) {
                             self.error(&format!("image: {e}"));
+                        } else {
+                            self.upload_hint(&s);
                         }
                         self.request_ghost();
                     }
@@ -936,6 +938,8 @@ pub(super) mod tests {
             },
             quitting: false,
             ctrl_c_armed: false,
+            opened: Default::default(),
+            forwards: Default::default(),
         };
         (app, cmd_rx)
     }
@@ -1059,6 +1063,7 @@ pub(super) mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         };
         let (ui_tx, mut ui_rx) = unbounded_channel();
         let mut app = test_app(std::env::temp_dir().join("mu-unused-history.jsonl"));
@@ -1136,6 +1141,7 @@ pub(super) mod tests {
             model: None,
             changes: None,
             progress: None,
+            ports: Vec::new(),
         };
         let (mut app, mut commands) = test_app_with_commands(std::env::temp_dir().join("mu-unused-history.jsonl"));
         in_local(async {

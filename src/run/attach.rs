@@ -626,6 +626,7 @@ pub fn run(link: Link, pick_session: bool) -> Result<i32> {
             hide_thinking: cfgs.hide_thinking_block(),
             smooth_streaming: cfgs.omp.display.smooth_streaming,
             status_levels: cfgs.mu.status,
+            hyperlinks: cfgs.mu.display.hyperlinks,
         })
         .await)
     })

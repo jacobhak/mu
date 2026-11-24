@@ -92,6 +92,7 @@ The list, on both of its tabs (Jobs and Sessions), is context `jobs`:
 | `stop` | `s` | Sessions: stop the selected session's turn. |
 | `terminate` | `S` | Sessions: terminate the session (asks first). |
 | `take` | `t` | Sessions: take the session over. |
+| `open_port` | `o` | Jobs: forward the job's listening ports and open the first in the browser. |
 
 A transcript opened from either tab is context `jobs_view`:
 

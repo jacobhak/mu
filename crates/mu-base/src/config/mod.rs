@@ -826,6 +826,13 @@ mod tests {
     }
 
     #[test]
+    fn hyperlinks_default_on_and_switch_off() {
+        assert!(toml::from_str::<MuConfig>("").unwrap().display.hyperlinks);
+        assert!(toml::from_str::<MuConfig>("[display]\nhide_thinking_block = true").unwrap().display.hyperlinks);
+        assert!(!toml::from_str::<MuConfig>("[display]\nhyperlinks = false").unwrap().display.hyperlinks);
+    }
+
+    #[test]
     fn the_removed_wait_sections_warn_and_other_sections_still_load() {
         let path = mu_testutil::home().join("config.toml");
         let text = "[bash]\nwait_sleep_secs = 0\n[experimental]\ninterruptible_wait = true\n\

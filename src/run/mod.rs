@@ -503,6 +503,7 @@ async fn tui(
         hide_thinking: ui.cfgs.hide_thinking_block(),
         smooth_streaming: ui.cfgs.omp.display.smooth_streaming,
         status_levels: ui.cfgs.mu.status,
+        hyperlinks: ui.cfgs.mu.display.hyperlinks,
     })
     .await
 }
