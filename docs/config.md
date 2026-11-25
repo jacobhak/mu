@@ -37,6 +37,7 @@ warn_percent = 50
 warn_tokens = 270000
 err_percent = 70
 err_tokens = 500000
+# wrap = false        # true: a footer too wide for the terminal flows onto more lines instead of dropping segments from its end
 
 [permissions]
 mode = "yolo"          # ask | edits | yolo (see permissions.md); --permissions overrides it for one run

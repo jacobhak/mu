@@ -77,9 +77,10 @@ impl<'a> StatusEnv<'a> {
     }
 }
 
-/// The status line; at most `width` columns. Account quota windows sit at the right edge.
+/// The status line; at most `width` columns. Account quota windows sit at the right edge. When it
+/// does not fit, segments are dropped, or with `[status] wrap` flowed onto more lines.
 pub fn render(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Vec<Line> {
-    vec![status_line(s, env, width)]
+    status_lines(s, env, width)
 }
 
 /// `5h 34% 3h43m  7d 25% 3d20h`: window label, used share coloured by level, time to reset dimmed.
@@ -129,12 +130,13 @@ fn reset_text(label: &str, resets_in: Duration) -> String {
     }
 }
 
+#[derive(Clone)]
 struct Part {
     id: &'static str,
     line: Line,
 }
 
-fn status_line(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Line {
+fn status_lines(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Vec<Line> {
     let mut path_max = DEFAULT_PATH_MAX;
     let mut left = segments(env.left, s, env, path_max);
     if env.expanded {
@@ -145,8 +147,12 @@ fn status_line(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Line {
         right.insert(0, Part { id: "usage", line: usage_line(u) });
     }
 
-    // Overflow, in omp's order: shorten the title, drop right segments, shorten the path, drop left segments.
     let total = |left: &[Part], right: &[Part]| group_width(left) + group_width(right) + gap(left, right);
+    if env.levels.wrap && total(&left, &right) > width {
+        return wrapped(&left, &right, width);
+    }
+
+    // Overflow, in omp's order: shorten the title, drop right segments, shorten the path, drop left segments.
     if total(&left, &right) > width
         && let Some(i) = right.iter().position(|p| p.id == "session_name")
     {
@@ -172,14 +178,50 @@ fn status_line(s: &StatusSnapshot, env: &StatusEnv, width: usize) -> Line {
 
     let left_group = group(&left);
     if right.is_empty() {
-        return truncate(&left_group, width);
+        return vec![truncate(&left_group, width)];
     }
     let right_group = group(&right);
     let pad = width.saturating_sub(line_width(&left_group) + line_width(&right_group)).max(1);
     let mut line = left_group;
     line.push(span(" ".repeat(pad), ContentStyle::default()));
     line.extend(right_group);
-    truncate(&line, width)
+    vec![truncate(&line, width)]
+}
+
+/// The `wrap` layout: parts flow onto as many lines as they need and none is dropped. The left
+/// parts fill lines from the left; the right ones go to the last line's right edge when they fit
+/// there, else onto lines of their own, flush right. A part wider than a line is cut to it.
+fn wrapped(left: &[Part], right: &[Part], width: usize) -> Vec<Line> {
+    let mut rows: Vec<Line> = flow(left, width).iter().map(|row| truncate(&group(row), width)).collect();
+    let right_rows = flow(right, width);
+    if let [only] = right_rows.as_slice()
+        && let Some(last) = rows.last_mut()
+        && line_width(last) + line_width(&group(only)) < width
+    {
+        let pad = width - line_width(last) - line_width(&group(only));
+        last.push(span(" ".repeat(pad), ContentStyle::default()));
+        last.extend(group(only));
+        return rows;
+    }
+    for row in &right_rows {
+        let g = truncate(&group(row), width);
+        let mut line = vec![span(" ".repeat(width.saturating_sub(line_width(&g))), ContentStyle::default())];
+        line.extend(g);
+        rows.push(line);
+    }
+    rows
+}
+
+/// Greedy line fill: each row holds as many parts as fit in `width`, at least one.
+fn flow(parts: &[Part], width: usize) -> Vec<Vec<Part>> {
+    let mut rows: Vec<Vec<Part>> = Vec::new();
+    for p in parts {
+        match rows.last_mut() {
+            Some(row) if group_width(row) + SEP_WIDTH + line_width(&p.line) <= width => row.push(p.clone()),
+            _ => rows.push(vec![p.clone()]),
+        }
+    }
+    rows
 }
 
 /// Visible width of a group: its parts, the separators between them, and the outer spaces.
@@ -776,6 +818,41 @@ mod tests {
         let t = line_text(&render(&snap(), &env(LEFT, &["session_name"], cwd), 50)[0]);
         assert!(t.starts_with(" μ private"), "{t}");
         assert!(!t.contains("EVENTS"), "{t}");
+    }
+
+    #[test]
+    fn wrap_flows_segments_onto_more_lines_instead_of_dropping_them() {
+        let cwd = Path::new("/home/u/code/mu");
+        let mut e = env(LEFT, &["session_name"], cwd);
+        e.levels.wrap = true;
+        let text = |w| render(&snap(), &e, w).iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(text(140).len(), 1, "fits: one line, as without wrap");
+        for w in [30usize, 40, 60, 80, 100] {
+            let lines = render(&snap(), &e, w);
+            assert!(lines.len() > 1, "width {w}");
+            let all = text(w).join(" ");
+            for want in [
+                "μ private",
+                "Haiku 5.5 (h)",
+                "~/code/mu",
+                "main *2 +1 ?3",
+                "1.5% of 1M",
+                "(sub)",
+                "5h 82%",
+                "7d 16%",
+                "EVENTS",
+            ] {
+                assert!(all.contains(want), "width {w}: {want} missing from {all:?}");
+            }
+            for l in &lines {
+                assert!(line_width(l) <= w, "width {w}: {:?}", line_text(l));
+            }
+        }
+        // The right side shares the last line when it fits there, else sits flush right on its own.
+        let t = text(100);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[1].ends_with(" EVENTS: Read mu events.rs header "), "{t:?}");
+        assert_eq!(line_width(&render(&snap(), &e, 100)[1]), 100, "flush right");
     }
 
     #[test]

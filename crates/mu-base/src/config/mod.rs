@@ -777,6 +777,8 @@ mod tests {
         check_status(&mut s, &mut w);
         assert_eq!(s, MuStatus { warn_tokens: 100_000, ..MuStatus::default() });
         assert_eq!(w.len(), 2, "{w:?}");
+        assert!(!d.wrap);
+        assert!(toml::from_str::<MuConfig>("[status]\nwrap = true").unwrap().status.wrap);
     }
 
     #[test]

@@ -129,7 +129,8 @@ impl Default for MuBell {
 }
 
 /// `[status]`: when the footer's context share turns warning or error colour. A level is reached at
-/// its percent of the window or its token count, whichever is lower.
+/// its percent of the window or its token count, whichever is lower. `wrap = true` flows a footer
+/// that does not fit onto further lines instead of dropping segments.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct MuStatus {
@@ -137,11 +138,12 @@ pub struct MuStatus {
     pub warn_tokens: u64,
     pub err_percent: f64,
     pub err_tokens: u64,
+    pub wrap: bool,
 }
 
 impl Default for MuStatus {
     fn default() -> Self {
-        Self { warn_percent: 50.0, warn_tokens: 270_000, err_percent: 70.0, err_tokens: 500_000 }
+        Self { warn_percent: 50.0, warn_tokens: 270_000, err_percent: 70.0, err_tokens: 500_000, wrap: false }
     }
 }
 
