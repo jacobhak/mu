@@ -235,6 +235,10 @@ struct Menu {
     arg: Option<String>,
     /// The typed token already equals an exact command (or argument).
     exact: bool,
+    /// The arguments are directories (`Entry::paths`).
+    paths: bool,
+    /// The selection was moved by key: Enter then takes it even where the typed text would do.
+    moved: bool,
 }
 
 impl Composer {
@@ -418,15 +422,21 @@ impl Composer {
         let m = self.menu.as_mut()?;
         let n = m.items.len();
         match key {
-            k if keymap::MENU_PREV.hit(k) => m.sel = (m.sel + n - 1) % n,
-            k if keymap::MENU_NEXT.hit(k) => m.sel = (m.sel + 1) % n,
+            k if keymap::MENU_PREV.hit(k) => {
+                m.sel = (m.sel + n - 1) % n;
+                m.moved = true;
+            }
+            k if keymap::MENU_NEXT.hit(k) => {
+                m.sel = (m.sel + 1) % n;
+                m.moved = true;
+            }
             k if keymap::COMPLETE.hit(k) => {
                 let text = self.menu_text(true);
                 self.set_text(&text);
-                self.magic_space = true;
+                self.magic_space = text.ends_with(' ');
             }
             k if keymap::SUBMIT.hit(k) => {
-                let (exact, arg, needs) = (m.exact, m.arg.is_some(), m.needs_arg[m.sel]);
+                let (exact, arg, needs) = (m.exact && !(m.paths && m.moved), m.arg.is_some(), m.needs_arg[m.sel]);
                 if exact {
                     return None;
                 }
@@ -460,10 +470,16 @@ impl Composer {
             Some(cmd) => format!("/{cmd} {item}"),
             None => format!("/{item}"),
         };
-        if space {
+        // A directory is gone into, not finished: the next name continues it.
+        if space && !(m.paths && item.ends_with('/')) {
             t.push(' ');
         }
         t
+    }
+
+    /// Rebuilds the menu after `commands` changed under it (a path argument's directories arrived).
+    pub fn refresh(&mut self, commands: &[Entry]) {
+        self.refresh_menu(commands);
     }
 
     fn refresh_menu(&mut self, commands: &[Entry]) {
@@ -475,6 +491,7 @@ impl Composer {
         self.menu = match (new, self.menu.take()) {
             (Some(mut n), Some(old)) if old.items == n.items && old.arg == n.arg => {
                 n.sel = old.sel.min(n.items.len() - 1);
+                n.moved = old.moved;
                 Some(n)
             }
             (n, _) => n,
@@ -490,7 +507,7 @@ impl Composer {
             return None;
         }
         let body = text.strip_prefix('/')?;
-        let (items, descs, needs_arg, arg, exact) = match body.split_once(char::is_whitespace) {
+        let (items, descs, needs_arg, arg, exact, paths) = match body.split_once(char::is_whitespace) {
             None => {
                 let idx = complete::rank(commands, body, &self.slash_usage);
                 let pick = |f: fn(&Entry) -> String| idx.iter().map(|&i| f(&commands[i])).collect::<Vec<_>>();
@@ -501,6 +518,7 @@ impl Composer {
                     idx.iter().map(|&i| commands[i].needs_arg).collect::<Vec<_>>(),
                     None,
                     exact,
+                    false,
                 )
             }
             Some((name, partial)) => {
@@ -515,11 +533,13 @@ impl Composer {
                 let descs: Vec<String> =
                     hits.iter().map(|&i| e.arg_descs.get(i).cloned().unwrap_or_default()).collect();
                 let n = items.len();
-                let exact = e.args.iter().any(|a| a == partial);
-                (items, descs, vec![false; n], Some(name.to_owned()), exact)
+                // A directory typed out (or nothing yet) is the argument; its entries are what could follow.
+                let exact =
+                    e.args.iter().any(|a| a == partial) || (e.paths && (partial.is_empty() || partial.ends_with('/')));
+                (items, descs, vec![false; n], Some(name.to_owned()), exact, e.paths)
             }
         };
-        (!items.is_empty()).then_some(Menu { items, descs, needs_arg, sel: 0, arg, exact })
+        (!items.is_empty()).then_some(Menu { items, descs, needs_arg, sel: 0, arg, exact, paths, moved: false })
     }
 
     fn on_key_inner(&mut self, key: KeyEvent, running: bool) -> Action {
@@ -974,6 +994,7 @@ mod tests {
             needs_arg,
             args: args.iter().map(|s| s.to_string()).collect(),
             arg_descs: vec![],
+            paths: false,
         }
     }
 
@@ -998,6 +1019,33 @@ mod tests {
         for ch in s.chars() {
             pr(c, KeyCode::Char(ch));
         }
+    }
+
+    #[test]
+    fn a_path_argument_is_gone_into_with_tab_and_a_typed_directory_runs_with_enter() {
+        let mut cd = entry("cd", false, &["a/", "a/b/", "a/c/", "z/"]);
+        cd.paths = true;
+        let cmds = vec![cd];
+        let press_cmds = |c: &mut Composer, code| c.on_key(key(code, KeyModifiers::NONE), false, &cmds);
+        let mut c = Composer::new(None);
+        for ch in "/cd z".chars() {
+            press_cmds(&mut c, KeyCode::Char(ch));
+        }
+        press_cmds(&mut c, KeyCode::Tab);
+        assert_eq!(c.text(), "/cd z/", "a directory takes no space, so the next name continues it");
+
+        c.set_text("/cd a/");
+        c.refresh(&cmds);
+        assert_eq!(press_cmds(&mut c, KeyCode::Enter), Action::Submit("/cd a/".into()), "the typed directory runs");
+
+        c.set_text("/cd a/");
+        c.refresh(&cmds);
+        press_cmds(&mut c, KeyCode::Down);
+        assert_eq!(
+            press_cmds(&mut c, KeyCode::Enter),
+            Action::Submit("/cd a/b/".into()),
+            "a selection moved by key is taken"
+        );
     }
 
     fn temp_path(name: &str) -> PathBuf {

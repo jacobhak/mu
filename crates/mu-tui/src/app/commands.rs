@@ -29,11 +29,13 @@ pub(super) struct Builtin {
     /// May run while a turn is in progress.
     pub busy_ok: bool,
     pub complete: Option<Completions>,
+    /// The argument is a directory path, completed from the host's file system (`Entry::paths`).
+    pub paths: bool,
     pub run: fn(&mut App, &str),
 }
 
 const fn cmd(name: &'static str, desc: &'static str, run: fn(&mut App, &str)) -> Builtin {
-    Builtin { name, desc, needs_arg: false, busy_ok: false, complete: None, run }
+    Builtin { name, desc, needs_arg: false, busy_ok: false, complete: None, paths: false, run }
 }
 
 impl Builtin {
@@ -49,6 +51,11 @@ impl Builtin {
 
     const fn complete(mut self, f: Completions) -> Self {
         self.complete = Some(f);
+        self
+    }
+
+    const fn paths(mut self) -> Self {
+        self.paths = true;
         self
     }
 }
@@ -123,7 +130,7 @@ pub(super) static BUILTIN: [Builtin; 38] = [
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
     cmd("new", "Start a new session", App::cmd_new),
     cmd("resume", "Resume a session from this directory", |a, _| a.open_session_picker()),
-    cmd("cd", "Change the working directory [dir]; shows it without one", App::cmd_cd),
+    cmd("cd", "Change the working directory [dir]; shows it without one", App::cmd_cd).paths(),
     cmd("fork", "Continue in a copy of this session; the original stays as it is", |a, _| a.send(Command::Fork)),
     cmd("rewind", "Go back to before an earlier prompt, or to after an earlier reply", |a, _| {
         a.send(Command::ListRewind)
@@ -233,7 +240,7 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         .iter()
         .map(|c| {
             let (args, arg_descs) = c.complete.map(|f| f(&cc)).unwrap_or_default();
-            Entry { name: c.name.into(), desc: c.desc.into(), needs_arg: c.needs_arg, args, arg_descs }
+            Entry { name: c.name.into(), desc: c.desc.into(), needs_arg: c.needs_arg, args, arg_descs, paths: c.paths }
         })
         .collect();
     commands.extend(ctx.commands.iter().map(|c| Entry {
@@ -242,6 +249,7 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         needs_arg: false,
         args: vec![],
         arg_descs: vec![],
+        paths: false,
     }));
     commands.extend(ctx.modes.iter().filter(|m| m.command && find(&m.name).is_none()).map(|m| Entry {
         name: m.name.clone(),
@@ -249,6 +257,7 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         needs_arg: false,
         args: vec![],
         arg_descs: vec![],
+        paths: false,
     }));
     commands.extend(ctx.skills.iter().map(|s| Entry {
         name: format!("skill:{}", s.name),
@@ -256,6 +265,7 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         needs_arg: false,
         args: vec![],
         arg_descs: vec![],
+        paths: false,
     }));
     commands
 }

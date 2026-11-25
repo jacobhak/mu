@@ -10,6 +10,10 @@ pub struct Entry {
     pub args: Vec<String>,
     /// What each of `args` does, parallel to it; may be empty.
     pub arg_descs: Vec<String>,
+    /// The argument is a path: `args` are directories, a Tab on one that ends in `/` goes on into it, and
+    /// Enter on a typed directory (or none) runs it rather than the highlighted entry.
+    #[serde(default)]
+    pub paths: bool,
 }
 
 /// Match quality of `cand` for `query` (higher is better); `None` when it does not match.
@@ -59,7 +63,14 @@ mod tests {
     use super::*;
 
     fn e(name: &str) -> Entry {
-        Entry { name: name.into(), desc: String::new(), needs_arg: false, args: vec![], arg_descs: vec![] }
+        Entry {
+            name: name.into(),
+            desc: String::new(),
+            needs_arg: false,
+            args: vec![],
+            arg_descs: vec![],
+            paths: false,
+        }
     }
 
     fn names(es: &[Entry], idx: Vec<usize>) -> Vec<&str> {

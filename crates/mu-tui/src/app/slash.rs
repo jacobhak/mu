@@ -30,6 +30,7 @@ impl App {
                     app.error(&e);
                 }
                 app.prompt.commands = c.entries;
+                app.prompt.dirs_asked = None;
             }
             Err(e) => app.error(&format!("cannot read the completion list: {e}")),
         });

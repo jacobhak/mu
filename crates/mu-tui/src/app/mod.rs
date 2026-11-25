@@ -165,6 +165,9 @@ struct Prompt {
     predict: bool,
     ghost_seq: u64,
     ghost_asked: String,
+    /// The `/cd` argument whose directories were asked for, and the number of that ask.
+    dirs_asked: Option<String>,
+    dirs_seq: u64,
     /// Queued inputs that could not go back into the composer while a key was typed.
     held_back: Vec<UserInput>,
 }
@@ -424,6 +427,8 @@ pub async fn run(init: AppInit) -> i32 {
             commands: completions.entries,
             ghost_seq: 0,
             ghost_asked: String::new(),
+            dirs_asked: None,
+            dirs_seq: 0,
             held_back: Vec::new(),
             predict: startup.predict,
         },

@@ -132,11 +132,48 @@ impl App {
                             self.upload_hint(&s);
                         }
                         self.request_ghost();
+                        self.request_dirs();
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    /// Asks the host for the directories `/cd <partial>` can go on to while the composer holds that, and
+    /// drops them when it holds anything else. Failures are silent: the menu just has no directories.
+    fn request_dirs(&mut self) {
+        let text = self.prompt.composer.text();
+        let partial = text
+            .strip_prefix("/cd ")
+            .filter(|p| !p.contains(char::is_whitespace) && self.overlay.is_none() && !self.typing());
+        let Some(partial) = partial else {
+            if self.prompt.dirs_asked.take().is_some() {
+                self.prompt.dirs_seq += 1;
+                self.set_dirs(Vec::new());
+            }
+            return;
+        };
+        if self.prompt.dirs_asked.as_deref() == Some(partial) {
+            return;
+        }
+        self.prompt.dirs_asked = Some(partial.to_owned());
+        self.prompt.dirs_seq += 1;
+        let seq = self.prompt.dirs_seq;
+        self.host_call(host::cwd::COMPLETE_DIRS, &partial, move |app, r: Result<Vec<String>, String>| {
+            if seq == app.prompt.dirs_seq {
+                app.set_dirs(r.unwrap_or_default());
+            }
+        });
+    }
+
+    /// Makes `dirs` the arguments `/cd` completes to, and redraws the menu over them.
+    fn set_dirs(&mut self, dirs: Vec<String>) {
+        if let Some(e) = self.prompt.commands.iter_mut().find(|e| e.paths) {
+            e.args = dirs;
+        }
+        self.prompt.composer.refresh(&self.prompt.commands);
+        self.screen.dirty = true;
     }
 
     /// Asks the predict plugin for a ghost when the composer wants one. Failures are silent.
@@ -178,6 +215,7 @@ impl App {
         if self.overlay.is_none() {
             self.request_ghost();
         }
+        self.request_dirs();
     }
 
     /// Ctrl-C before anything else sees the key: the first press arms the exit and does nothing
@@ -921,6 +959,8 @@ pub(super) mod tests {
                 predict: false,
                 ghost_seq: 0,
                 ghost_asked: String::new(),
+                dirs_asked: None,
+                dirs_seq: 0,
                 held_back: vec![],
             },
             overlay: None,
@@ -1032,6 +1072,44 @@ pub(super) mod tests {
         let shown = transcript_text(&app);
         assert!(!shown.contains("sk-ab") && !shown.contains("PASTED"), "{shown}");
         assert!(!hist.exists(), "nothing typed is written to history");
+    }
+
+    #[test]
+    fn cd_completes_directories_from_the_host_and_goes_on_into_one() {
+        let hist = std::env::temp_dir().join(format!("mu-cd-complete-{}", uuid::Uuid::new_v4())).join("history.jsonl");
+        let mut app = test_app(hist);
+        in_local(async {
+            let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+            app.ui_tx = ui_tx;
+            app.prompt.commands = vec![crate::widgets::complete::Entry {
+                name: "cd".into(),
+                desc: String::new(),
+                needs_arg: false,
+                args: vec![],
+                arg_descs: vec![],
+                paths: true,
+            }];
+            let args = |app: &App| app.prompt.commands[0].args.clone();
+            // The host's directory is "/": the first answer lists it all, the last lists what starts with "e".
+            for c in "/cd e".chars() {
+                app.on_terminal(press(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            while !args(&app).iter().any(|a| a == "etc/") {
+                app.on_ui(ui_rx.recv().await.unwrap());
+            }
+            assert!(args(&app).iter().all(|a| a.starts_with('e') && a.ends_with('/')), "{:?}", args(&app));
+
+            app.on_terminal(press(KeyCode::Tab, KeyModifiers::NONE));
+            let text = app.prompt.composer.text();
+            assert!(
+                text.starts_with("/cd e") && text.ends_with('/'),
+                "a directory is gone into, with no space: {text:?}"
+            );
+
+            app.prompt.composer.set_text("hello");
+            app.request_dirs();
+            assert!(args(&app).is_empty(), "the directories go when the composer holds something else");
+        });
     }
 
     #[test]
