@@ -28,8 +28,8 @@ unless it says otherwise.
 - **Cleanup.** The daemon is detached (`setsid`). Each omp child is its own process group, with a guard process
   that kills the group if the daemon dies by any means. A start that finds a dead daemon's recorded children
   stops them first.
-- **Memory.** Idle, the pair measured about 306 MB total and 216 MB private (broker 93 / 58 MB, gateway
-  214 / 158 MB); `scripts/measure-gateway.sh` reproduces it.
+- **Memory.** Idle, the pair measured about 275 MB total and 199 MB private (broker 80 / 48 MB, gateway
+  195 / 150 MB, omp 19.1.1, 2026-11-25); `scripts/measure-gateway.sh` reproduces it.
 
 ## Commands
 

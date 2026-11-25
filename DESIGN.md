@@ -17,14 +17,14 @@ Status: early and experimental, changing quickly; no stable version (see README,
 
 ## Why
 
-Measured 2026-10-23 on this machine (method in the appendix), except the mu row (2026-11-06). [`BENCHMARKS.md`](BENCHMARKS.md) has the current comparison on a scripted task.
+Measured 2026-10-23 on this machine (method in the appendix), except the mu row (2026-11-25). [`BENCHMARKS.md`](BENCHMARKS.md) has the current comparison on a scripted task.
 
 | Agent | Private RAM per idle session | Notes |
 |---|---|---|
 | omp 18.12.6 | 165 MB (133 MB with extensions, LSP, skills, rules off) | Disabled features stay resident; plus machine-wide helpers of 97 + 23 + 23 MB |
 | pi 1.4.0 | 72 MB | Node runtime floor |
 | Codex CLI (Rust) | 27 MB | 308 MB binary; everything bundled |
-| mu | 3.6 MB (20 MB total with the binary's shared pages) | Without its gateway pair, which is shared by all sessions and only needed for providers without an API key in mu: 216 MB private, 306 MB total idle |
+| mu | 3.4 MB (24 MB total with the binary's shared pages) | Without its gateway pair, which is shared by all sessions and only needed for providers without an API key in mu: 199 MB private, 275 MB total idle |
 | Rust floor (HTTPS + TLS + async runtime) | 0.6 MB | 6.2 MB binary |
 
 ## Architecture
@@ -194,7 +194,7 @@ All omp features outside the core become first-party plugins that load on use.
   price list), and a base URL that serves Anthropic Messages at `/v1/messages`, `/v1/models` and `/v1/usage`
   (see `docs/providers.md`). The core speaks one wire protocol, Anthropic Messages, to it and holds no
   credentials for those providers. The core never runs omp or pi. The omp-wrapping implementation (`plugins/gateway`), its lifecycle, state
-  layout, idle memory (about 306 MB total, 216 MB private; `BENCHMARKS.md`) and the open risk of sharing
+  layout, idle memory (about 275 MB total, 199 MB private; `BENCHMARKS.md`) and the open risk of sharing
   omp's credential store with running omp sessions are in that plugin's README. The pi backend has no quota
   windows (`/v1/usage` is empty), logs in with `pi auth login`, keeps its credentials in pi's own files
   (outside mu's state encryption), and has no omp catalog row for models only pi knows.
