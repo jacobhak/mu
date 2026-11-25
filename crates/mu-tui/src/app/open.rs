@@ -8,7 +8,7 @@ use mu_provider::auth::chatgpt::browser::open_browser;
 use std::cell::RefCell;
 use std::path::Path;
 
-/// Files the agent touched that `/open` offers, newest first.
+/// Files the agent touched or mentioned that `/open` offers, newest first.
 pub(super) const RECENT_MAX: usize = 50;
 /// How much of a file decides whether it is text.
 const SNIFF: usize = 8 * 1024;
@@ -43,6 +43,48 @@ pub(super) fn note_recent(recent: &mut std::collections::VecDeque<String>, path:
     recent.retain(|p| p != path);
     recent.push_front(path.to_string());
     recent.truncate(RECENT_MAX);
+}
+
+/// Records path-like tokens without consulting the client's filesystem (which may be remote).
+pub(super) fn note_mentioned(recent: &mut std::collections::VecDeque<String>, text: &str) {
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start_matches(char::is_whitespace);
+        if remaining.is_empty() {
+            break;
+        }
+        let word_end = remaining.find(char::is_whitespace).unwrap_or(remaining.len());
+        let prefix = remaining.trim_start_matches(|c: char| "()[]{}<>,;!?*".contains(c));
+        let quote = prefix.chars().next().filter(|c| "`'\"".contains(*c));
+        let end = quote
+            .and_then(|q| {
+                let start = remaining.len() - prefix.len() + q.len_utf8();
+                remaining[start..].find(q).map(|end| start + end + q.len_utf8())
+            })
+            .map(|end| end + remaining[end..].find(char::is_whitespace).unwrap_or(remaining.len() - end))
+            .unwrap_or(word_end);
+        let (token, rest) = remaining.split_at(end);
+        remaining = rest;
+        let token = token.trim_start_matches(|c: char| "`'\"()[]{}<>,;!?*".contains(c));
+        let token = token.trim_end_matches(|c: char| "`'\"()[]{}<>,;!?*.".contains(c));
+        if token.contains("://") && !token.starts_with("local://") {
+            continue;
+        }
+        let token = token.trim_end_matches(':');
+        let path = strip_line_suffix(token);
+        let explicit = path.starts_with('/')
+            || path.starts_with("./")
+            || path.starts_with("../")
+            || path.starts_with("~/")
+            || path.starts_with("local://");
+        let relative_file = path.contains('/')
+            && path.rsplit('/').next().is_some_and(|name| {
+                name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+            });
+        if (explicit || relative_file) && path.chars().any(char::is_alphanumeric) {
+            note_recent(recent, path);
+        }
+    }
 }
 
 /// The first 8 KiB has no NUL and is UTF-8, allowing the cut to fall inside a character.
@@ -289,6 +331,43 @@ mod tests {
         assert_eq!(sanitize(".hidden"), "hidden");
         assert_eq!(sanitize("日本語"), "---");
         assert_eq!(sanitize(""), "file");
+    }
+
+    #[test]
+    fn mentioned_paths_ignore_urls_and_prose() {
+        let mut recent = std::collections::VecDeque::new();
+        note_mentioned(
+            &mut recent,
+            "See `/usr/share/cmake-4.2/Templates/Windows/SplashScreen.png`, (src/app/main.rs:42), \
+             `./config/settings.toml` and ~/notes.txt. Not https://example.com/a.png or and/or.",
+        );
+        assert_eq!(
+            recent,
+            [
+                "~/notes.txt",
+                "./config/settings.toml",
+                "src/app/main.rs",
+                "/usr/share/cmake-4.2/Templates/Windows/SplashScreen.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn mentioned_paths_keep_quoted_spaces_without_fragments() {
+        let mut recent = std::collections::VecDeque::new();
+        note_mentioned(
+            &mut recent,
+            "See `/tmp/my notes/file.txt`, (\"src/my files/main.rs:42\") and \
+             'local://uploads/my file.txt'. Not `https://example.com/my file.txt`.",
+        );
+        assert_eq!(recent, ["local://uploads/my file.txt", "src/my files/main.rs", "/tmp/my notes/file.txt"]);
+    }
+
+    #[test]
+    fn mentioned_paths_keep_unmatched_quotes_as_separate_words() {
+        let mut recent = std::collections::VecDeque::new();
+        note_mentioned(&mut recent, "See `/tmp/a.txt and ./other.txt");
+        assert_eq!(recent, ["./other.txt", "/tmp/a.txt"]);
     }
 
     #[test]

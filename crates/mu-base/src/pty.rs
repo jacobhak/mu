@@ -229,16 +229,17 @@ mod linux_probe {
         stat.rsplit_once(')')?.1.split_whitespace().nth(2)?.parse().ok()
     }
 
-    /// The descriptor of a `read` that `/proc/<pid>/syscall` shows the process blocked in.
+    /// The input descriptor of a `read` or `splice` shown in `/proc/<pid>/syscall`.
     pub(super) fn blocked_read_fd(syscall: &str) -> Option<i32> {
         let mut f = syscall.split_whitespace();
-        if f.next()?.parse::<i64>().ok()? != libc::SYS_read {
+        let number = f.next()?.parse::<i64>().ok()?;
+        if number != libc::SYS_read && number != libc::SYS_splice {
             return None;
         }
         i32::from_str_radix(f.next()?.trim_start_matches("0x"), 16).ok()
     }
 
-    /// A process of `group` is blocked in a `read` of a terminal.
+    /// A process of `group` is blocked reading a terminal.
     pub(super) fn group_reads_terminal(group: i32) -> bool {
         let Ok(dir) = fs::read_dir("/proc") else { return false };
         dir.flatten().any(|e| {
@@ -378,14 +379,30 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn proc_files_are_read_for_the_group_and_the_blocked_read() {
+    fn proc_stat_names_the_process_group() {
         assert_eq!(linux_probe::stat_group("42 (a b) c) S 1 4242 4242 0 -1"), Some(4242));
         assert_eq!(linux_probe::stat_group("garbage"), None);
-        let read = format!("{} 0x0 0x7ffd 0x1000 0x0 0x0 0x0 0x7ffd 0x7f00", libc::SYS_read);
-        assert_eq!(linux_probe::blocked_read_fd(&read), Some(0));
-        assert_eq!(linux_probe::blocked_read_fd(&read.replacen(" 0x0 ", " 0x1f ", 1)), Some(31));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blocked_read_fd_parses_read_and_splice_input() {
+        let read = format!("{} 0x1f 0x7ffd 0x1000 0x0 0x0 0x0 0x7ffd 0x7f00", libc::SYS_read);
+        let splice = format!("{} 0x0 0x0 0x1f 0x0 0x1000 0x0 0x7ffd 0x7f00", libc::SYS_splice);
+        assert_eq!(linux_probe::blocked_read_fd(&read), Some(31));
+        assert_eq!(linux_probe::blocked_read_fd(&splice), Some(0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blocked_read_fd_rejects_invalid_syscalls_and_descriptors() {
         assert_eq!(linux_probe::blocked_read_fd("running"), None);
         assert_eq!(linux_probe::blocked_read_fd(&format!("{} 0x0", libc::SYS_write)), None);
+        for number in [libc::SYS_read, libc::SYS_splice] {
+            assert_eq!(linux_probe::blocked_read_fd(&number.to_string()), None);
+            assert_eq!(linux_probe::blocked_read_fd(&format!("{number} 0xnothex")), None);
+            assert_eq!(linux_probe::blocked_read_fd(&format!("{number} 0x80000000")), None);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

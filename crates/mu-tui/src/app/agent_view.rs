@@ -145,8 +145,9 @@ pub(super) struct AgentView {
     pub(super) status: StatusSnapshot,
     /// Bash commands run, for `/copy`.
     pub(super) bash_cmds: Vec<String>,
-    /// Files the tools read, wrote or edited, newest first, for `/open`.
+    /// Files the tools touched or replies mentioned, newest first, for `/open`.
     pub(super) recent_files: std::collections::VecDeque<String>,
+    reply_text: String,
     /// Embedded terminal of a running `bash` call with `pty: true`.
     pub(super) pty: Option<PtyView>,
     pub(super) running: bool,
@@ -188,6 +189,7 @@ impl AgentView {
             status: StatusSnapshot::default(),
             bash_cmds: Vec::new(),
             recent_files: Default::default(),
+            reply_text: String::new(),
             pty: None,
             running: false,
             compacting: false,
@@ -272,7 +274,10 @@ impl AgentView {
                 l.push(vec![]);
                 self.tr.commit(l);
             }
-            AgentEvent::Text(s) => self.tr.queue_reveal(Stream::Text, s, w),
+            AgentEvent::Text(s) => {
+                self.reply_text.push_str(&s);
+                self.tr.queue_reveal(Stream::Text, s, w);
+            }
             AgentEvent::Thinking(s) => self.tr.queue_reveal(Stream::Thinking, s, w),
             AgentEvent::ToolCallStart { id, name } => {
                 self.tr.finish_thinking(w);
@@ -284,7 +289,11 @@ impl AgentView {
                     c.stale = true;
                 }
             }
-            AgentEvent::BlockEnd => self.tr.end_block(w),
+            AgentEvent::BlockEnd => {
+                super::open::note_mentioned(&mut self.recent_files, &self.reply_text);
+                self.reply_text.clear();
+                self.tr.end_block(w);
+            }
             AgentEvent::ToolStart { id, name, args } => {
                 self.calls.retain(|c| c.id != id);
                 self.tr.finish_thinking(w);
@@ -345,6 +354,7 @@ impl AgentView {
                 self.commit_tool_result(&name, &args, &output, w);
             }
             AgentEvent::Retry { attempt, max_attempts, delay, reason } => {
+                self.reply_text.clear();
                 self.tr.reset_stream();
                 self.calls.clear();
                 let msg = format!("↻ {}", mu_base::events::retry_notice(attempt, max_attempts, delay, &reason));
@@ -430,6 +440,8 @@ impl AgentView {
             AgentEvent::PermissionMode(m) => self.status.permissions = m,
             AgentEvent::Todo(v) => self.todo = serde_json::from_value(v).unwrap_or_default(),
             AgentEvent::TurnEnd { aborted } => {
+                super::open::note_mentioned(&mut self.recent_files, &self.reply_text);
+                self.reply_text.clear();
                 self.pty = None;
                 self.calls.clear();
                 self.tr.end_turn(w);
@@ -788,6 +800,20 @@ mod tests {
 
     fn output(text: &str) -> ToolOutput {
         ToolOutput::ok(text)
+    }
+
+    #[test]
+    fn mentioned_paths_survive_streaming_and_replay() {
+        let mut v = view();
+        v.on_event(AgentEvent::Replay(true), SIZE);
+        v.on_event(AgentEvent::Text("See `/usr/share/cmake-4.2/".into()), SIZE);
+        v.on_event(AgentEvent::Text("Templates/Windows/SplashScreen.png`.".into()), SIZE);
+        v.on_event(AgentEvent::BlockEnd, SIZE);
+        v.on_event(AgentEvent::Replay(false), SIZE);
+        assert_eq!(v.recent_files, ["/usr/share/cmake-4.2/Templates/Windows/SplashScreen.png"]);
+        v.on_event(AgentEvent::Text("Again: src/main.rs:12".into()), SIZE);
+        v.on_event(AgentEvent::TurnEnd { aborted: false }, SIZE);
+        assert_eq!(v.recent_files.front().unwrap(), "src/main.rs");
     }
 
     #[test]

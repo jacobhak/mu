@@ -160,8 +160,12 @@ pub(super) static BUILTIN: [Builtin; 38] = [
         .busy_ok()
         .complete(|_| strings(&["code", "cmd", "link", "local"])),
     cmd("reply", "Quote parts of the last reply into the composer", |a, _| a.open_reply()).busy_ok(),
-    cmd("open", "Open a file of the agent's machine here [path]; no path lists files it touched", App::open_cmd)
-        .busy_ok(),
+    cmd(
+        "open",
+        "Open a file of the agent's machine here [path]; no path lists touched or mentioned files",
+        App::open_cmd,
+    )
+    .busy_ok(),
     cmd("image", "Attach an image file", App::image_cmd).needs_arg().busy_ok(),
     cmd("upload", "Send files of this machine to the agent's session (when attached)", App::upload_cmd)
         .needs_arg()

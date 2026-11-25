@@ -174,7 +174,7 @@ pub enum Overlay {
     Copy {
         pick: Picker<String>,
     },
-    /// `/open` with no argument: files the agent recently touched, by path.
+    /// `/open` with no argument: files the agent recently touched or mentioned, by path.
     Open {
         pick: Picker<String>,
     },

@@ -373,7 +373,7 @@ impl App {
         self.open_overlay(Overlay::Copy { pick: Picker::from_rows(rows, |items| Select::new("Copy", items)) });
     }
 
-    /// `/open` with no path: the files the agent touched, newest first.
+    /// `/open` with no path: files the agent touched or mentioned, newest first.
     pub(super) fn open_recent_picker(&mut self) {
         let rows: Vec<(Item, String)> = self
             .agent
@@ -382,7 +382,7 @@ impl App {
             .map(|p| (Item { label: p.clone(), detail: String::new() }, p.clone()))
             .collect();
         if rows.is_empty() {
-            return self.notice("the agent has not touched a file yet: /open <path>");
+            return self.notice("the agent has not touched or mentioned a file yet: /open <path>");
         }
         self.open_overlay(Overlay::Open { pick: Picker::from_rows(rows, |items| Select::new("Open a file", items)) });
     }
