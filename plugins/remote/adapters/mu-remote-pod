@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# The pod adapter for mu-remote (docs/adapters.md, "The adapter contract"): `mu-remote-pod VERB ARGS`, one pod per
+# agent or worker, driven through kubectl. Install it with `mu-remote install-adapter pod`.
+# Everything travels through `kubectl exec`: config as a tar, the repository as a git bundle, the stream
+# (`mu-remote bridge`) and the result bundle. A pod is deleted only after a successful `fetch` or by `stop`, never
+# because a stream dropped. Diagnostics go to stderr, one line each; stdout carries only a verb's reply.
+# The image needs `mu` and `mu-remote` (see the Dockerfile).
+#
+# Environment from mu-remote: MU_REMOTE_NAME, MU_REMOTE_SETTINGS (JSON), MU_REMOTE_TRUSTED (0 or 1; unset reads as 0).
+# Settings (all optional; parsed with jq):
+#   context              kubectl context
+#   namespace            namespace of workers and of agents without agent_namespace (default default)
+#   agent_namespace      namespace of agent pods
+#   image                image (default mu-remote-worker:latest)
+#   pull_policy          imagePullPolicy (default IfNotPresent)
+#   cpu, memory          resource requests (default 2, 4Gi)
+#   deadline             activeDeadlineSeconds of a worker pod (default 21600, 6 h)
+#   agent_deadline       the same for an agent pod (default none)
+#   ready_timeout        wait for the pod to be scheduled and Ready (default 300s)
+#   sccache_secret_name  secret whose keys become the pod's environment (default mu-sccache, trusted remotes only;
+#                        naming one on an untrusted remote is an error)
+# Environment for tests: KUBECTL (kubectl binary), MU_POD_SPEC (pod template, default mu-remote-pod.yaml beside this
+# script). SCCACHE_BUCKET, SCCACHE_ENDPOINT, SCCACHE_REGION, SCCACHE_S3_USE_SSL and SCCACHE_S3_KEY_PREFIX, when set
+# here, are set in the pod.
+set -euo pipefail
+# bash 5.2 treats `&` in a ${var//pat/rep} replacement specially.
+shopt -u patsub_replacement 2> /dev/null || true
+
+KUBECTL=${KUBECTL:-kubectl}
+SETTINGS=${MU_REMOTE_SETTINGS:-}
+[ -n "$SETTINGS" ] || SETTINGS='{}'
+TRUSTED=${MU_REMOTE_TRUSTED:-0}
+SPEC=${MU_POD_SPEC:-$(dirname "$0")/mu-remote-pod.yaml}
+
+die() {
+  echo "mu-remote-pod: $*" >&2
+  exit 1
+}
+progress() { printf '{"progress":"%s"}\n' "$1" >&2; }
+setting() { jq -r --arg k "$1" '.[$k] // empty | tostring' <<< "$SETTINGS"; }
+# Escapes a string for a double-quoted YAML scalar.
+yq() {
+  local s=${1//\\/\\\\}
+  echo "${s//\"/\\\"}"
+}
+rand() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
+
+NS=
+CTX=()
+# The array idiom: bash 3.2 (macOS) fails on an empty one under `set -u`.
+kc() { "$KUBECTL" ${CTX[@]+"${CTX[@]}"} -n "$NS" "$@"; }
+
+load_settings() {
+  command -v jq > /dev/null 2>&1 || die "jq is needed to read the remote's settings"
+  jq -e type > /dev/null 2>&1 <<< "$SETTINGS" || die "MU_REMOTE_SETTINGS is not JSON"
+  local context
+  context=$(setting context)
+  [ -z "$context" ] || CTX=(--context "$context")
+  WORKER_NS=$(setting namespace)
+  WORKER_NS=${WORKER_NS:-default}
+  AGENT_NS=$(setting agent_namespace)
+  AGENT_NS=${AGENT_NS:-$WORKER_NS}
+  READY_TIMEOUT=$(setting ready_timeout)
+  READY_TIMEOUT=${READY_TIMEOUT:-300s}
+}
+
+# The id of this machine's launcher: random, made once, in mu-remote's state directory. Two machines can share a
+# host name.
+launcher_id() {
+  local dir=${MU_REMOTE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/mu-remote} f
+  f=$dir/launcher-id
+  if [ ! -s "$f" ]; then
+    mkdir -p "$dir"
+    (umask 077 && rand 8 > "$f")
+  fi
+  cat "$f"
+}
+
+# "name|kind|launcher|phase" per pod of mu in namespace $NS.
+pods() {
+  kc get pods -l app=mu-task \
+    -o 'jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.mu-kind}|{.metadata.labels.mu-launcher}|{.status.phase}{"\n"}{end}'
+}
+
+# Deletes this launcher's pods that ended (finished or past their deadline): their result is gone with them.
+sweep() {
+  local out name launcher phase
+  out=$(pods) || {
+    echo "mu-remote-pod: orphan sweep: could not list pods" >&2
+    return 0
+  }
+  while IFS='|' read -r name _ launcher phase; do
+    [ -n "$name" ] && [ "$launcher" = "$1" ] || continue
+    case $phase in Succeeded | Failed) kc delete pod "$name" --wait=false --ignore-not-found > /dev/null 2>&1 || true ;; esac
+  done <<< "$out"
+}
+
+# Sets NS and POD for an agent or worker id: a pod named by it (workers), else the pod whose `mu agent list` has it.
+find_pod() {
+  local id=$1 ns name kind listed out
+  for ns in "$WORKER_NS" "$AGENT_NS"; do
+    NS=$ns
+    out=$(pods 2> /dev/null) || continue
+    while IFS='|' read -r name _; do
+      [ -n "$name" ] || continue
+      if [ "$name" = "$id" ]; then
+        POD=$name
+        return 0
+      fi
+    done <<< "$out"
+    while IFS='|' read -r name kind _; do
+      [ "$kind" = agent ] || continue
+      listed=$(kc exec "$name" -- mu agent list --json < /dev/null 2> /dev/null) || continue
+      if grep -qF "\"id\":\"$id\"" <<< "$listed"; then
+        POD=$name
+        return 0
+      fi
+    done <<< "$out"
+    [ "$AGENT_NS" != "$WORKER_NS" ] || break
+  done
+  die "no pod runs $id"
+}
+
+verb_version() { echo '{"contract":2}'; }
+
+verb_list() {
+  local seen=" " ns name
+  for ns in "$WORKER_NS" "$AGENT_NS"; do
+    case $seen in *" $ns "*) continue ;; esac
+    seen="$seen$ns "
+    NS=$ns
+    while IFS='|' read -r name _; do
+      [ -n "$name" ] || continue
+      kc exec "$name" -- mu agent list --json < /dev/null 2> /dev/null |
+        jq -c '. + {kind: (.kind // "agent")}' || true
+    done < <(pods)
+  done
+}
+
+verb_connect() {
+  find_pod "${1:?connect needs an id}"
+  exec "$KUBECTL" ${CTX[@]+"${CTX[@]}"} -n "$NS" exec -i "$POD" -- mu-remote bridge "$1"
+}
+
+verb_fetch() {
+  local id=${1:?fetch needs an id}
+  find_pod "$id"
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/mu-remote-pod.XXXXXX")
+  trap cleanup_failed EXIT
+  kc exec "$POD" -- mu-remote worker bundle "$id" < /dev/null > "$TMP/bundle" || die "no result bundle for $id"
+  cat "$TMP/bundle"
+  kc delete pod "$POD" --wait=false --ignore-not-found > /dev/null 2>&1 || echo "mu-remote-pod: could not delete pod $POD" >&2
+}
+
+verb_stop() {
+  local id=${1:?stop needs an id}
+  find_pod "$id"
+  kc exec "$POD" -- mu-remote worker stop "$id" < /dev/null > /dev/null 2>&1 || true
+  kc delete pod "$POD" --wait=false --ignore-not-found > /dev/null
+}
+
+verb_read() {
+  find_pod "${1:?read needs an id}"
+  kc exec "$POD" -- cat -- "${2:?read needs a path}" < /dev/null
+}
+
+verb_write() {
+  find_pod "${1:?write needs an id}"
+  kc exec -i "$POD" -- sh -c 'umask 077; mkdir -p -- "$(dirname -- "$1")" && [ ! -e "$1" ] && cat > "$1"' sh "${2:?write needs a path}"
+}
+
+# Where the port-forward processes of this machine are recorded: one pid file per pod and local port.
+forwards_dir() {
+  local dir=${MU_REMOTE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/mu-remote}/forwards
+  mkdir -p "$dir"
+  echo "$dir"
+}
+
+verb_forward() {
+  local id=${1:?forward needs an id} port=${2:?forward needs a port} local_port=${3:?forward needs a local port}
+  find_pod "$id"
+  local dir log pid i
+  dir=$(forwards_dir)
+  log=$dir/$POD-$local_port.log
+  # All three descriptors are redirected (mu-remote waits for this verb's stderr to close), and the subshell
+  # execs kubectl so that the recorded pid is kubectl's.
+  (
+    (exec "$KUBECTL" ${CTX[@]+"${CTX[@]}"} -n "$NS" port-forward --address 127.0.0.1 "pod/$POD" "$local_port:$port" > "$log" 2>&1 < /dev/null) &
+    echo $! > "$dir/$POD-$local_port.pid"
+  )
+  pid=$(cat "$dir/$POD-$local_port.pid")
+  for ((i = 0; i < 100; i++)); do
+    if grep -qF "Forwarding from 127.0.0.1:$local_port" "$log" 2> /dev/null; then
+      return 0
+    fi
+    kill -0 "$pid" 2> /dev/null || break
+    sleep 0.1
+  done
+  kill "$pid" 2> /dev/null || true
+  rm -f "$dir/$POD-$local_port.pid"
+  die "port-forward: $(grep -v '^[[:space:]]*$' "$log" 2> /dev/null | tail -n 1 || true)"
+}
+
+verb_unforward() {
+  local id=${1:?unforward needs an id} local_port=${3:?unforward needs a local port}
+  find_pod "$id"
+  local f pid
+  f=$(forwards_dir)/$POD-$local_port.pid
+  [ -f "$f" ] || return 0
+  pid=$(cat "$f")
+  if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then kill "$pid" 2> /dev/null || true; fi
+  rm -f "$f"
+}
+
+POD_CREATED=0
+TMP=
+cleanup_failed() {
+  local rc=$?
+  trap - EXIT
+  [ "$rc" = 0 ] || [ "$POD_CREATED" != 1 ] || kc delete pod "$POD" --wait=false --ignore-not-found > /dev/null 2>&1 || true
+  [ -z "$TMP" ] || rm -rf "$TMP"
+  exit "$rc"
+}
+
+# The config the pod gets: only the files that exist; never auth.json or a token file.
+stage_config() {
+  local stage=$1 mu_home=${MU_HOME:-$HOME/.mu} profile profile_home agent_dir f d
+  profile=${OMP_PROFILE:-${PI_PROFILE:-}}
+  case $profile in '' | */* | *\\* | . | ..) profile= ;; esac
+  profile_home=$mu_home
+  [ -z "$profile" ] || profile_home=$mu_home/profiles/$profile
+  if [ -n "$profile" ]; then
+    agent_dir=$HOME/.omp/profiles/$profile/agent
+  else
+    agent_dir=${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}
+  fi
+  mkdir -p "$stage/.mu" "$stage/.omp/agent"
+  [ ! -f "$mu_home/config.toml" ] || cp "$mu_home/config.toml" "$stage/.mu/"
+  for f in models.toml providers.toml; do
+    [ ! -f "$profile_home/$f" ] || cp "$profile_home/$f" "$stage/.mu/"
+  done
+  for f in AGENTS.md RULES.md; do
+    [ ! -f "$agent_dir/$f" ] || cp "$agent_dir/$f" "$stage/.omp/agent/"
+  done
+  for d in agents skills; do
+    [ ! -d "$agent_dir/$d" ] || cp -RL "$agent_dir/$d" "$stage/.omp/agent/"
+  done
+  find "$stage" \( -iname 'auth.json' -o -iname '*token*' \) -exec rm -rf {} + 2> /dev/null || true
+}
+
+verb_start() {
+  local kind='' launch='' bundle='' dir='' resume='' cont=0 model=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --kind) kind=${2:?--kind needs a value}; shift 2 ;;
+      --launch) launch=${2:?--launch needs a value}; shift 2 ;;
+      --bundle) bundle=${2:?--bundle needs a value}; shift 2 ;;
+      --dir) dir=${2:?--dir needs a value}; shift 2 ;;
+      --resume) resume=${2:?--resume needs a value}; shift 2 ;;
+      --model) model=${2:?--model needs a value}; shift 2 ;;
+      -c) cont=1; shift ;;
+      *) die "start: unexpected argument $1" ;;
+    esac
+  done
+  local launcher sccache_name sccache_set=0 deadline env_from='' sccache_env='' v val
+  case $kind in
+    agent)
+      NS=$AGENT_NS
+      dir=${dir:-/work}
+      [ -z "$bundle" ] || [ -f "$bundle" ] || die "bundle $bundle does not exist"
+      POD=mu-agent-$(rand 4)
+      deadline=$(setting agent_deadline)
+      ;;
+    worker)
+      NS=$WORKER_NS
+      [ -n "$launch" ] && [ -n "$bundle" ] && [ -n "$dir" ] || die "start --kind worker needs --launch, --bundle and --dir"
+      [ -f "$bundle" ] || die "bundle $bundle does not exist"
+      POD=$launch
+      deadline=$(setting deadline)
+      deadline=${deadline:-21600}
+      ;;
+    *) die "start: --kind must be agent or worker" ;;
+  esac
+  [ "$deadline" != 0 ] || deadline=
+  case $dir in /*) ;; *) die "start: --dir must be an absolute path" ;; esac
+  [ -z "$(setting sccache_secret_name)" ] || sccache_set=1
+  if [ "$TRUSTED" = 1 ]; then
+    sccache_name=$(setting sccache_secret_name)
+    sccache_name=${sccache_name:-mu-sccache}
+    printf -v env_from '      envFrom:\n        - secretRef:\n            name: "%s"\n            optional: true' "$(yq "$sccache_name")"
+  elif [ "$sccache_set" = 1 ]; then
+    die "the remote is not trusted, so the pod adapter will not mount a secret: remove sccache_secret_name or set trusted = true"
+  fi
+
+  launcher=$(launcher_id)
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/mu-remote-pod.XXXXXX")
+  trap cleanup_failed EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  sweep "$launcher"
+
+  local spec
+  spec=$(cat "$SPEC")
+  for v in SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_USE_SSL SCCACHE_S3_KEY_PREFIX; do
+    val=${!v:-}
+    [ -z "$val" ] || sccache_env="${sccache_env}        - {name: $v, value: \"$(yq "$val")\"}"$'\n'
+  done
+  val=$(setting image)
+  spec=${spec//@IMAGE@/$(yq "${val:-mu-worker:latest}")}
+  val=$(setting pull_policy)
+  spec=${spec//@PULL_POLICY@/$(yq "${val:-IfNotPresent}")}
+  val=$(setting cpu)
+  spec=${spec//@CPU@/$(yq "${val:-2}")}
+  val=$(setting memory)
+  spec=${spec//@MEMORY@/$(yq "${val:-4Gi}")}
+  spec=${spec//@NAME@/$POD}
+  spec=${spec//@NAMESPACE@/$(yq "$NS")}
+  spec=${spec//@KIND@/$kind}
+  spec=${spec//@LAUNCHER@/$launcher}
+  spec=${spec//@DEADLINE_LINE@/${deadline:+  activeDeadlineSeconds: $(yq "$deadline")}}
+  spec=${spec//@ROOT@/$(yq "$dir")}
+  spec=${spec//@ENV@/${sccache_env%$'\n'}}
+  spec=${spec//@ENVFROM@/$env_from}
+
+  progress scheduling
+  printf '%s\n' "$spec" | kc create -f - > /dev/null
+  POD_CREATED=1
+  kc wait --for=condition=PodScheduled "pod/$POD" "--timeout=$READY_TIMEOUT" > /dev/null
+  progress "pulling image"
+  kc wait --for=condition=Ready "pod/$POD" "--timeout=$READY_TIMEOUT" > /dev/null
+
+  progress "copying repository"
+  stage_config "$TMP/config"
+  # Without the "." entry: the worker owns the files but not the mount point, so extracting "." fails on its mode.
+  # shellcheck disable=SC2046
+  tar -cf - -C "$TMP/config" -- $(ls -A "$TMP/config") | kc exec -i "$POD" -- sh -c 'tar -xf - -C "$HOME"' > /dev/null
+  if [ -n "$bundle" ]; then
+    kc exec -i "$POD" -- sh -c 'cat > "$HOME/task.bundle"' < "$bundle" > /dev/null
+  fi
+  if [ "$kind" = worker ]; then
+    # The bundle's first ref is the snapshot; the checkout is detached at it.
+    kc exec "$POD" -- sh -c '
+      set -e
+      cd "$1"
+      git init -q
+      ref=$(git bundle list-heads "$HOME/task.bundle" | awk "\$2 ~ /^refs\\// { print \$2; exit }")
+      [ -n "$ref" ] || ref=HEAD
+      git fetch -q "$HOME/task.bundle" "$ref"
+      git checkout -q --detach FETCH_HEAD
+    ' sh "$dir" < /dev/null > /dev/null
+  elif [ -n "$bundle" ]; then
+    # The client's HEAD and branch, with their full history; the bundle is no remote worth keeping.
+    kc exec "$POD" -- sh -c '
+      set -e
+      git clone -q "$HOME/task.bundle" "$1"
+      git -C "$1" remote remove origin
+    ' sh "$dir" < /dev/null > /dev/null
+  fi
+
+  progress starting
+  if [ "$kind" = worker ]; then
+    kc exec "$POD" -- mu-remote worker run --launch "$launch" --dir "$dir" --detach < /dev/null > /dev/null
+    printf '{"id":"%s"}\n' "$launch"
+  else
+    local args=()
+    [ -z "$model" ] || args+=(--model "$model")
+    if [ -n "$resume" ]; then args+=(--resume "$resume"); elif [ "$cont" = 1 ]; then args+=(-c); fi
+    kc exec "$POD" -- sh -c 'cd "$1" && shift && exec mu agent --detach "$@"' sh "$dir" ${args[@]+"${args[@]}"} < /dev/null
+  fi
+  POD_CREATED=0
+}
+
+verb=${1:-}
+[ $# -eq 0 ] || shift
+case $verb in
+  version) verb_version ;;
+  start | list | connect | fetch | stop | forward | unforward | read | write)
+    load_settings
+    "verb_$verb" "$@"
+    ;;
+  *) die "unknown verb '$verb' (version, start, list, connect, fetch, stop, forward, unforward, read, write)" ;;
+esac

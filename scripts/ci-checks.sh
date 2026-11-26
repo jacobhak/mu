@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The checks CI runs, in order: formatting, shellcheck, cargo-deny, the pi gateway's translation tests, clippy,
-# the workspace's tests, and the MCP bridge's tests. ci.yml, release.yml, ship.sh, the maintenance bot's check.sh and AGENTS.md
+# the workspace's tests, the MCP bridge's tests, and the remote pod adapter's fake-kubectl test.
+# ci.yml, release.yml, ship.sh, the maintenance bot's check.sh and AGENTS.md
 # all run this one list. The catalog generator's test is not here: it guards a bump-time transform that
 # no runner touches, so `scripts/maint/check.sh` runs it.
 set -euo pipefail
@@ -23,3 +24,10 @@ cargo test --workspace --locked
 # The terminal UI's tests again with every command and event sent through the wire form (see mu_base::wire).
 MU_WIRE_LOOPBACK=1 cargo test -p mu-tui --lib --locked
 scripts/build-mcp-http.sh test
+# Skipped with a note when jq is missing; MU_REQUIRE_JQ=1 makes that a failure.
+if command -v jq > /dev/null 2>&1; then
+  plugins/remote/scripts/test-pod-run.sh
+else
+  echo "jq: not installed" >&2
+  [ -z "${MU_REQUIRE_JQ:-}" ] || exit 1
+fi

@@ -9,4 +9,4 @@ if ! command -v shellcheck > /dev/null; then
   [ -z "${MU_REQUIRE_SHELLCHECK:-}" ] || exit 1
   exit 0
 fi
-git ls-files -z '*.sh' .githooks | xargs -0 shellcheck --external-sources --source-path=SCRIPTDIR --severity=warning
+git ls-files -z '*.sh' .githooks 'plugins/remote/adapters/mu-remote-*' ':!:*.yaml' | xargs -0 shellcheck --external-sources --source-path=SCRIPTDIR --severity=warning

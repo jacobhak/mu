@@ -1,0 +1,130 @@
+# The main agent: one pod running `mu agent --detach`. <agent-image> is the `agent` target of the Dockerfile (it
+# carries mu, mu-remote, omp, kubectl, jq, tini and the adapter in /usr/local/lib/mu-remote); <image> in the
+# mu-remote config is the `worker` target, or your own image built FROM it (see docs/kubernetes.md). Labels
+# app=mu-task and mu-kind=agent are how the pod adapter finds it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mu-agent-init
+  namespace: mu-agent
+data:
+  init.sh: |
+    #!/bin/sh
+    # Starts the agent, then follows its log so `kubectl logs` shows it and the container lives while the agent does.
+    # The liveness probe restarts the container (and with it the agent) when the agent is gone.
+    set -eu
+    mkdir -p "$MU_HOME/logs" /work
+    cd /work
+    mu agent --detach > /dev/null
+    exec tail -F "$MU_HOME"/logs/agent-*.log
+  mu-config.toml: |
+    # Copied to $MU_HOME/config.toml by the `config` init container when none exists; edit the real file afterwards.
+    # Seal credentials (auth.json, omp's login database) with your SSH ed25519 key, so a volume snapshot or backup
+    # holds none in the clear. The first attach asks for the key; after a pod restart the agent is locked until a
+    # client attaches. Remove the comment to turn it on (see docs/kubernetes.md).
+    # [agent]
+    # state_key = "ssh"
+    [task]
+    launcher = ["mu-remote", "launch", "workers"]
+    launch = ["task"]
+  remote-config.toml: |
+    # Copied to ~/.config/mu-remote/config.toml by the `config` init container when none exists.
+    # The pod adapter talks to the API server with the pod's service account (Role in mu-workers only).
+    [remote.workers]
+    adapter = "/usr/local/lib/mu-remote/mu-remote-pod"
+    trusted = true
+    [remote.workers.settings]
+    namespace = "mu-workers"
+    image = "<image>"
+    sccache_secret_name = "mu-sccache"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mu-agent
+  namespace: mu-agent
+spec:
+  serviceName: mu-agent
+  replicas: 1
+  selector:
+    matchLabels: {app: mu-task, mu-kind: agent}
+  template:
+    metadata:
+      labels:
+        app: mu-task
+        mu-kind: agent
+    spec:
+      serviceAccountName: mu-agent
+      # The agent's own adapter talks to the API server with this account (Role in mu-workers only).
+      automountServiceAccountToken: true
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        - name: config
+          image: "<agent-image>"
+          command:
+            - sh
+            - -c
+            - |
+              # The volume's root belongs to root (fsGroup sets only the group) and mu must chmod its profile home,
+              # so the profile is a directory this user owns, one level down.
+              mkdir -p "$MU_HOME"
+              [ -f "$MU_HOME/config.toml" ] || cp /init/mu-config.toml "$MU_HOME/config.toml"
+              mkdir -p "$HOME/.config/mu-remote"
+              [ -f "$HOME/.config/mu-remote/config.toml" ] || cp /init/remote-config.toml "$HOME/.config/mu-remote/config.toml"
+          env:
+            - {name: HOME, value: /home/mu}
+            - {name: MU_HOME, value: /home/mu/.mu/profile}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: init, mountPath: /init, readOnly: true}
+            - {name: home, mountPath: /home/mu}
+            - {name: auth, mountPath: /home/mu/.mu}
+      containers:
+        - name: agent
+          image: "<agent-image>"
+          imagePullPolicy: IfNotPresent
+          command: ["tini", "--", "sh", "/init/init.sh"]
+          env:
+            - {name: HOME, value: /home/mu}
+            - {name: MU_HOME, value: /home/mu/.mu/profile}
+            # omp keeps its own credentials (`/login`) in its agent directory: on the `auth` volume with mu's.
+            - {name: PI_CODING_AGENT_DIR, value: /home/mu/.mu/profile/omp}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "mu agent list --json | grep -q '\"id\"'"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - {name: init, mountPath: /init, readOnly: true}
+            - {name: home, mountPath: /home/mu}
+            - {name: auth, mountPath: /home/mu/.mu}
+            - {name: work, mountPath: /work}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: init
+          configMap: {name: mu-agent-init}
+        - name: home
+          persistentVolumeClaim: {claimName: home}
+        - name: auth
+          persistentVolumeClaim: {claimName: auth}
+        - name: work
+          persistentVolumeClaim: {claimName: work}
+        - name: tmp
+          emptyDir: {}
