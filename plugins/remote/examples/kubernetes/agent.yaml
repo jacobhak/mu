@@ -1,5 +1,5 @@
 # The main agent: one pod running `mu agent --detach`. <agent-image> is the `agent` target of the Dockerfile (it
-# carries mu, mu-remote, omp, kubectl, jq, tini and the adapter in /usr/local/lib/mu-remote); <image> in the
+# carries mu, mu-remote, kubectl, jq, tini and the adapter in /usr/local/lib/mu-remote); <image> in the
 # mu-remote config is the `worker` target, or your own image built FROM it (see docs/kubernetes.md). Labels
 # app=mu-task and mu-kind=agent are how the pod adapter finds it.
 apiVersion: v1
@@ -19,7 +19,7 @@ data:
     exec tail -F "$MU_HOME"/logs/agent-*.log
   mu-config.toml: |
     # Copied to $MU_HOME/config.toml by the `config` init container when none exists; edit the real file afterwards.
-    # Seal credentials (auth.json, omp's login database) with your SSH ed25519 key, so a volume snapshot or backup
+    # Seal credentials (auth.json) with your SSH ed25519 key, so a volume snapshot or backup
     # holds none in the clear. The first attach asks for the key; after a pod restart the agent is locked until a
     # client attaches. Remove the comment to turn it on (see docs/kubernetes.md).
     # [agent]
@@ -95,8 +95,6 @@ spec:
           env:
             - {name: HOME, value: /home/mu}
             - {name: MU_HOME, value: /home/mu/.mu/profile}
-            # omp keeps its own credentials (`/login`) in its agent directory: on the `auth` volume with mu's.
-            - {name: PI_CODING_AGENT_DIR, value: /home/mu/.mu/profile/omp}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

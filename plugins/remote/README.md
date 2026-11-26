@@ -2,7 +2,7 @@
 
 Remotes for mu, the coding agent: agents and tasks on other machines, over an encrypted channel.
 
-mu itself knows nothing about ssh, Kubernetes or any other way to reach a machine. It publishes four entry points (see "For extension authors" in mu's `docs/remote.md`), and `mu-remote` is a separate program built only on them. It depends on no mu crate; it runs `mu` and talks to it over mu's documented commands and stdio protocols.
+mu itself knows nothing about ssh, Kubernetes or any other way to reach a machine. It publishes versioned contracts ([docs/remote-contracts.md](../../docs/remote-contracts.md)), and `mu-remote` is a program built only on them. It is not a `plugin.toml` plugin: it depends on no mu crate, runs `mu` and talks to it over mu's documented commands and stdio protocols. It lives in mu's repository and ships in every mu release, as the worked example of a third-party transport.
 
 What it does:
 
@@ -13,13 +13,7 @@ What it does:
 
 ## Install
 
-```sh
-scripts/install.sh                          # the latest release into ~/.local/bin (needs an authenticated gh while the repo is private)
-scripts/install.sh --tag mu-remote-20261115-abc1234
-scripts/install.sh --from-source .          # build this checkout
-```
-
-The script checks the tarball against the release's `SHA256SUMS`, and against its build attestation when the release has one. A release names the mu it was tested against in its notes (`mu-version` in the repository). The pinned nightly toolchain in `rust-toolchain.toml` is installed by `rustup` on the first source build. `mu-remote` needs `mu` on the `PATH` (or `MU_REMOTE_MU` naming it), on your machine and on every remote that runs an agent or a worker, and `mu-remote` itself on the remote too (the far end of the channel is `mu-remote bridge`).
+`mu-remote` comes with mu: mu's `scripts/install.sh` installs it under `~/.mu/bin` and links `~/.local/bin/mu-remote` (see mu's README). It needs `mu` on the `PATH` (or `MU_REMOTE_MU` naming it), on your machine and on every remote that runs an agent or a worker, and `mu-remote` itself on the remote too (the far end of the channel is `mu-remote bridge`). A worker's `mu` must be the same build as the launching mu.
 
 ## Quick start: ssh
 
@@ -66,7 +60,7 @@ launcher = ["mu-remote", "launch", "cluster"]
 launch = ["task"]
 ```
 
-The image comes from this repository's `Dockerfile` (`docker build --target worker …`); see [docs/kubernetes.md](docs/kubernetes.md) for the images and for running the main agent itself in a cluster (`examples/kubernetes/`).
+The image comes from `plugins/remote/Dockerfile`, built from mu's repository root (`docker build -f plugins/remote/Dockerfile --target worker …`); see [docs/kubernetes.md](docs/kubernetes.md) for the images and for running the main agent itself in a cluster (`examples/kubernetes/`).
 
 ## Commands
 
@@ -97,15 +91,8 @@ The image comes from this repository's `Dockerfile` (`docker build --target work
 - [docs/data-flow.md](docs/data-flow.md): where your data goes
 - [docs/kubernetes.md](docs/kubernetes.md): the main agent in a cluster
 
-mu's own side of this (the launcher contract, `mu --attach`, `[sessions] sources`) is in mu's `docs/remote.md`.
+mu's side of this (the launcher contract, `mu --attach`, `[sessions] sources`, the attach helper) is in mu's [docs/remote-contracts.md](../../docs/remote-contracts.md).
 
 ## Development
 
-`scripts/ci-checks.sh` runs the checks (format, shellcheck, cargo-deny, clippy, tests, and `scripts/test-pod-run.sh`, which runs the pod adapter against a fake `kubectl`; needs `jq`). Integration tests that need a real `mu` read its path from `MU_REMOTE_TEST_MU` and skip without it.
-
-### CI and releases
-
-- **CI** (`.github/workflows/ci.yml`) runs `scripts/ci-checks.sh` on Linux (`arc-mu-remote`) and macOS (`mu-remote-ci`) runners. Nothing gates a merge on it: branch protection needs a paid plan on a private repository.
-- **mu for the tests.** `mu-version` holds the full sha of the mu commit the integration tests run against. `scripts/fetch-mu.sh DIR` checks it out and `scripts/build-mu.sh DIR` builds it and prints the binary's path (`MU_REMOTE_TEST_MU`); `.github/actions/mu` does both in CI, with the build cached. mu is private, so CI authenticates with the repository secret `MU_DEPLOY_KEY`, the private half of a read-only deploy key on `jacobhak/mu` (created with `gh api -X POST repos/jacobhak/mu/keys -F read_only=true`). It always names a commit on mu's main; bump it in the same change as a protocol or contract change that needs a newer mu.
-- **Releases** are tag-driven: push a tag `mu-remote-<YYYYMMDD>-<short sha>`. `.github/workflows/release.yml` runs the checks on both platforms (Linux in `ubuntu:22.04`, so the glibc floor is 2.35), packages `mu-remote-<plat>.tar.gz` (`linux-x64`, `darwin-arm64`), publishes them with `SHA256SUMS` and a best-effort build attestation (it needs a public repository or Enterprise Cloud; on a private one the release goes out with the checksum only). Run the workflow by hand (`workflow_dispatch`) for a dry run that publishes nothing.
-- **Runners.** Linux jobs use the `arc-mu-remote` scale set of the Actions Runner Controller, macOS jobs the `mu-remote-ci` label. Both are registered to this repository only (a repository's runners are invisible to others); the machines' setup is documented where they are managed.
+mu's `scripts/ci-checks.sh` runs the checks for the whole repository, this directory included: its tests run against the `mu` the workspace builds (`target/debug/mu`; `MU_REMOTE_TEST_MU` names another), and `scripts/test-pod-run.sh` runs the pod adapter against a fake `kubectl` (needs `jq`). A test (`tests/standalone.rs`) fails if `Cargo.toml` names a mu crate or a path dependency.

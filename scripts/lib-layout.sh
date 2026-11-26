@@ -4,7 +4,7 @@ stage_layout() {
   local root="$1" rel="$2" dest="$3" p
   rm -rf "$dest/mu"
   mkdir -p "$dest/mu/bin" "$dest/mu/plugins" "$dest/mu/scripts"
-  for p in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do
+  for p in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory mu-remote; do
     cp "$rel/$p" "$dest/mu/bin/$p"
   done
   for p in gateway predict memory; do

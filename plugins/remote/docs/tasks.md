@@ -1,6 +1,6 @@
 # Tasks on a remote
 
-With mu's `[task] launcher = ["mu-remote", "launch", "NAME"]` and `[task] launch = ["task"]` (see mu's `docs/remote.md`, "For extension authors"), mu runs `task` subagents through `mu-remote launch NAME` instead of as a local `mu --headless`; scouts and kinds not listed stay local. To mu the launcher is a child: its stdin and stdout carry the subagent stream as a local child's would, and it reads the task's environment (`MU_TASK_*`). The remote's adapter only moves bytes and runs processes; the launcher does the rest.
+With mu's `[task] launcher = ["mu-remote", "launch", "NAME"]` and `[task] launch = ["task"]` (see [the launcher contract](../../../docs/remote-contracts.md)), mu runs `task` subagents through `mu-remote launch NAME` instead of as a local `mu --headless`; scouts and kinds not listed stay local. To mu the launcher is a child: its stdin and stdout carry the subagent stream as a local child's would, and it reads the task's environment (`MU_TASK_*`). The remote's adapter only moves bytes and runs processes; the launcher does the rest.
 
 ## The launcher's flow
 
