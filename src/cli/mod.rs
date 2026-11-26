@@ -75,7 +75,7 @@ pub struct Cli {
 
 #[derive(clap::Subcommand)]
 pub enum Sub {
-    /// Check for a newer release and install it (uses the public GitHub API; falls back to an authenticated gh for a private repo).
+    /// Check for a newer release and install it (uses the public GitHub API; falls back to an authenticated gh for a private fork).
     Update {
         /// Only report whether a newer release exists.
         #[arg(long)]

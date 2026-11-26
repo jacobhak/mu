@@ -14,7 +14,7 @@ A full run is ~90 s with sccache warm (~240 s with its cache empty), almost all 
 
 PR checks run on the PR merged with `main`; if CI fails on files you didn't touch, merge `origin/main`, fix, and push.
 
-`ci.yml` has a `macos` job on the self-hosted Mac as well as the Linux one, and release builds run `scripts/ci-checks.sh` on both platforms. Nothing gates a merge on either job (branch protection needs a paid plan on a private repo), so a red job is a signal to act on, not a block. Be careful about platform specifics: `/proc`, `/sys`, `readlink -f`, GNU `sed`/`date`/`stat` flags, `/tmp` vs `$TMPDIR`, case-insensitive filesystems and Linux-only syscalls. mu supports Linux and macOS equally: use portable APIs, and where the platforms differ, implement both rather than skipping one.
+`ci.yml` has a `macos` job on the self-hosted Mac as well as the Linux one, and release builds run `scripts/ci-checks.sh` on both platforms. Nothing gates a merge on either job (branch protection is not enabled), so a red job is a signal to act on, not a block. Be careful about platform specifics: `/proc`, `/sys`, `readlink -f`, GNU `sed`/`date`/`stat` flags, `/tmp` vs `$TMPDIR`, case-insensitive filesystems and Linux-only syscalls. mu supports Linux and macOS equally: use portable APIs, and where the platforms differ, implement both rather than skipping one.
 
 CI uses no GitHub Actions cache (no `rust-cache`): caches counted against the account's shared Actions storage, filled it, and a release artifact upload failed. Linux jobs get compiled crates from sccache; the macOS job builds cold (about as fast as a cache restore was). Do not add one back.
 

@@ -32,7 +32,7 @@ esac
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# Public URLs first; a private repo (or fork) falls back to an authenticated gh.
+# Public URLs first; a private fork falls back to an authenticated gh.
 has_gh() { command -v gh >/dev/null && gh auth status >/dev/null 2>&1; }
 
 # A file's physical path, following symlinks (macOS has no `readlink -f`) and any `..` or symlinked
@@ -97,7 +97,7 @@ else
   elif has_gh; then
     gh release download ${tag:+"$tag"} -R "$REPO" -p "mu-$plat.tar.gz" -p SHA256SUMS -D "$tmp" --clobber
   else
-    echo "install.sh: could not download $url (a private repo needs an authenticated gh)" >&2
+    echo "install.sh: could not download $url (a private fork needs an authenticated gh)" >&2
     exit 1
   fi
   # Refuse to unpack anything that does not match the published checksum.
@@ -159,7 +159,7 @@ fi
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
 for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory mu-remote; do
-  [ -e "$stage/bin/$b" ] || continue
+  [ -e "$stage/bin/$b" ] || { echo "install: this release has no $b"; continue; }
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"
 done

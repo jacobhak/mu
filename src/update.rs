@@ -133,7 +133,7 @@ fn curl(url: &str, accept: &str) -> Result<(u16, String)> {
     Ok((code.trim().parse().unwrap_or(0), body.to_string()))
 }
 
-/// Public API first; on a 404 (which is also what a private repo looks like), retries through an
+/// Public API first; on a 404 (which is also what a private fork looks like), retries through an
 /// authenticated `gh`. Without a working `gh` the 404 stands.
 fn api(path: &str) -> Api {
     match curl(&format!("https://api.github.com/{path}"), "Accept: application/vnd.github+json") {
@@ -174,7 +174,7 @@ pub fn check() -> Status {
     }
     let tag = match api(&format!("repos/{REPO}/releases/latest")) {
         Api::Ok(v) => v["tag_name"].as_str().unwrap_or_default().to_string(),
-        // A repo with no releases and a private repo both answer 404; the repo itself tells them apart.
+        // A repo with no releases and a private fork both answer 404; the repo itself tells them apart.
         Api::NotFound => {
             return match api(&format!("repos/{REPO}")) {
                 Api::Ok(_) => Status::NoReleases,
@@ -287,7 +287,7 @@ pub fn run(check_only: bool, force: bool, tag: Option<String>) -> Result<i32> {
         ])
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("could not fetch install.sh: HTTP 404 (a private repo needs an authenticated gh)")
+            anyhow::anyhow!("could not fetch install.sh: HTTP 404 (a private fork needs an authenticated gh)")
         })?,
         (code, _) => bail!("could not fetch install.sh: HTTP {code}"),
     };

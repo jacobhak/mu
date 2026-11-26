@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/jacobhak/mu/main/scripts/install.sh
 scripts/install.sh --from-source .            # build and install a checkout
 ```
 
-The installer verifies the download against the release's checksums and, where available, its build attestation. It puts `mu`, `mu-remote` and the plugins under `~/.mu` and links `~/.local/bin/mu` and `~/.local/bin/mu-remote`. `mu-remote`: remotes (agents and tasks on other machines); see [plugins/remote/README.md](plugins/remote/README.md). If the repo is private, `install.sh` and `mu update` use an authenticated `gh`.
+The installer verifies the download against the release's checksums and, where available, its build attestation. It puts `mu`, `mu-remote` and the plugins under `~/.mu` and links `~/.local/bin/mu` and `~/.local/bin/mu-remote`. `mu-remote`: remotes (agents and tasks on other machines); see [plugins/remote/README.md](plugins/remote/README.md). A private fork needs an authenticated `gh` for `install.sh` and `mu update`.
 
 Then start `mu` and run `/login` to add a key or sign in with ChatGPT (see Status above for which providers need what). For the gateway, install with `--with-omp` (`curl … | bash -s -- --with-omp`). Web search and fetch need no gateway, and MCP OAuth is done by mu itself (`/mcp login <name>`).
 

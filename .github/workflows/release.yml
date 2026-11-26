@@ -87,10 +87,8 @@ jobs:
           path: dist
           merge-multiple: true
       - run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
-      # Attestations need a public repo or GitHub Enterprise Cloud; on a private repo without either this
-      # step fails, and the release goes out with its checksum only. install.sh verifies one when it exists.
+      # install.sh verifies the attestation when the release has one.
       - uses: actions/attest-build-provenance@v2
-        continue-on-error: true
         with:
           subject-path: dist/*.tar.gz
       - run: |
