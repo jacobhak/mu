@@ -829,6 +829,23 @@ fn a_dismissal_is_kept_in_history_but_not_streamed() {
 }
 
 #[test]
+fn a_dismissed_reminder_is_not_sent_to_the_model() {
+    run(async {
+        let (mut a, _rx) = agent(vec![
+            Ok(assistant(vec![Block::text("Keep the cache or drop it?")], StopReason::Stop)),
+            Ok(assistant(vec![Block::text(".")], StopReason::Stop)),
+        ]);
+        a.turn(Some("go".to_string().into())).await;
+        assert_eq!(a.messages.len(), 4);
+        let wire = a.wire_messages();
+        assert_eq!(wire.len(), 2, "the user turn and the question only");
+        assert!(
+            matches!(&wire[1], Message::Assistant { content, .. } if text_of(content) == "Keep the cache or drop it?")
+        );
+    });
+}
+
+#[test]
 fn a_dismissal_is_not_rendered_on_resume() {
     run(async {
         let (mut a, mut rx) = agent(vec![]);

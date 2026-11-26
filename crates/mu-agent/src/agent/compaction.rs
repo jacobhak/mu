@@ -1,7 +1,7 @@
 use super::Agent;
 use mu_base::config::Threshold;
 use mu_base::events::AgentEvent;
-use mu_base::message::{Block, Message, text_of};
+use mu_base::message::{Block, Message, is_dismissal, text_of};
 use mu_base::models::ModelSpec;
 use mu_session::session::format::CompactionState;
 use serde_json::json;
@@ -215,13 +215,24 @@ impl Agent {
         }
     }
 
-    /// Messages as sent to the provider: the summary context first when compacted.
+    /// Messages as sent to the provider: the summary context first when compacted. A dismissed ask
+    /// reminder (the reminder and the bare `.` reply) is left out: the user never saw that exchange,
+    /// and a model shown it reads the reminder as a turn of the conversation.
     pub(crate) fn wire_messages(&self) -> Vec<Message> {
         let mut v = Vec::with_capacity(self.messages.len() + 1);
         if let Some(c) = &self.compaction.state {
             v.push(context_message(&c.summary));
         }
-        v.extend(self.messages.iter().cloned());
+        let entries = self.messages.entries();
+        let mut i = 0;
+        while i < entries.len() {
+            if entries[i].reminder && entries.get(i + 1).is_some_and(|n| is_dismissal(&n.msg)) {
+                i += 2;
+                continue;
+            }
+            v.push(entries[i].msg.clone());
+            i += 1;
+        }
         v
     }
 

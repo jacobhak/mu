@@ -185,8 +185,10 @@ fn flush_images(out: &mut Vec<Value>, pending: &mut Vec<Value>) {
     if pending.is_empty() {
         return;
     }
-    let mut parts = vec![json!({"type":"text","text":"Attached image(s) from tool result:"})];
+    // Marked like every other message mu injects under the user role, so it is not read as the user.
+    let mut parts = vec![json!({"type":"text","text":"<system-notice>\nAttached image(s) from tool result:"})];
     parts.append(pending);
+    parts.push(json!({"type":"text","text":"</system-notice>"}));
     out.push(json!({"role":"user","content":parts}));
 }
 
@@ -783,6 +785,30 @@ mod tests {
         let b = body(&request(&stripped, Thinking::Off, &[], &msgs));
         assert_eq!(b["messages"][1]["content"][1]["type"], "text");
         assert!(b.to_string().contains("[image omitted"));
+    }
+
+    #[test]
+    fn tool_result_images_follow_as_a_marked_notice() {
+        let m = kimi();
+        let msgs = [
+            Message::user("look"),
+            own(&m, vec![Block::ToolCall { id: "c1".into(), name: "read".into(), arguments: json!({}) }]),
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                tool_name: "read".into(),
+                content: vec![Block::Image(Image { data: "QUJD".into(), mime_type: "image/png".into() })],
+                is_error: false,
+                details: None,
+                timestamp: 0,
+            },
+        ];
+        let b = body(&request(&m, Thinking::Off, &[], &msgs));
+        let last = b["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "user");
+        let parts = last["content"].as_array().unwrap();
+        assert!(parts[0]["text"].as_str().unwrap().starts_with("<system-notice>\nAttached image(s)"));
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[2]["text"], "</system-notice>");
     }
 
     #[test]
