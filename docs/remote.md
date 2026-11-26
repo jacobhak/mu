@@ -9,6 +9,8 @@ mu's core still knows no transport: nothing in it speaks ssh, Kubernetes or any 
 ```sh
 mu agent [--model M] [--thinking T] [--permissions P] [--resume SESSION | -c] [--detach]
 mu agent list [--json]
+mu agent stop ID
+mu agent cancel ID
 ```
 
 It prints one line, `{"session":"<id>","socket":"<path>"}`, and serves a client on that Unix socket: `<profile home>/run/<session id>.sock`, mode 0600 in a private directory, beside the session's owner record (kind `agent` in the [jobs panel](background-jobs.md#sessions-tab)). There is no network listener: who may connect is who may reach the socket, and reaching one on another machine is `ssh` or `kubectl exec` (below). With no client, the agent goes on with what it was doing; a tool approval or a question waits for a client. A `-p` run holding the session you `--resume` is stopped after its current step first, as `mu take` does, without asking.
@@ -17,7 +19,11 @@ It prints one line, `{"session":"<id>","socket":"<path>"}`, and serves a client 
 
 `/new`, `/resume` and `/fork` inside the session move the socket to the new session's id; the client stays connected. `--permissions` takes effect for tool calls as usual, so an unattended agent should not be in `ask` mode unless you will attach to answer.
 
-The agent ends on `/quit` or Ctrl-D in a client, on `SIGTERM`, `SIGHUP` or `SIGINT` (it ends the session's jobs and plugins first; a second signal exits at once), and from the Sessions tab (`S`). It does not end when a client goes away.
+The agent ends on `/quit` or Ctrl-D in a client, on `SIGTERM`, `SIGHUP` or `SIGINT` (it ends the session's jobs and plugins first; a second signal exits at once), and from the Sessions tab (`S`). It does not end when a client goes away. `mu agent stop ID` on its machine does the same as `S`, and `mu agent cancel ID` cancels its turn as `s` does; `mu notify ID TEXT` leaves it a message. A program that reaches other machines offers the same for remote rows (see [remote-contracts.md](remote-contracts.md#d-session-sources-contract-2)).
+
+## Manage agents
+
+`/agents` lists this machine's agents and those your session sources list; `/agents stop|cancel|notify|attach ID` acts on one (`HOST:ID` when two machines share a prefix). The CLI equivalents are `mu agent stop|cancel ID` and `mu notify ID TEXT` here, and `mu-remote stop|cancel|notify NAME ID` for a remote.
 
 ## Attach
 

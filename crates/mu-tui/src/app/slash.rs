@@ -2,11 +2,14 @@
 //! list, plus the copy and todo commands.
 
 use super::*;
+use crate::host::sessions::{self, AttachTarget, Live, LiveArgs, LiveRow};
 use crate::term::clipboard;
 use crate::text::markdown;
+use crate::widgets::overlay::OverlayEvent;
 use mu_base::image;
 use mu_base::models::Thinking;
 use mu_base::permissions::PermissionMode;
+use mu_common::text::sh_quote as quote;
 use mu_provider::provider::client::Providers;
 use mu_tools::tools::todo::Status;
 
@@ -317,6 +320,108 @@ impl App {
         }
     }
 
+    /// `/agents`: the agents here and on the session sources, and stop, cancel, message or attach one.
+    pub(super) fn agents_cmd(&mut self, arg: &str) {
+        let arg = arg.trim();
+        let (verb, rest) = arg.split_once(char::is_whitespace).map_or((arg, ""), |(v, r)| (v, r.trim()));
+        let one_word = |s: &str| !s.is_empty() && !s.contains(char::is_whitespace);
+        let (verb, id, text): (&'static str, String, String) = match (verb, rest) {
+            ("", _) => ("list", String::new(), String::new()),
+            ("stop", id) if one_word(id) => ("stop", id.into(), String::new()),
+            ("cancel", id) if one_word(id) => ("cancel", id.into(), String::new()),
+            ("attach", id) if one_word(id) => ("attach", id.into(), String::new()),
+            ("notify", r) => match r.split_once(char::is_whitespace) {
+                Some((id, t)) if !t.trim().is_empty() => ("notify", id.into(), t.trim().into()),
+                _ => return self.error("usage: /agents notify <id> <text>"),
+            },
+            _ => return self.error("usage: /agents [stop|cancel|notify|attach <id> [text]]"),
+        };
+        self.host_call(sessions::LIVE_SESSIONS, &LiveArgs::default(), move |app, r: Result<Live, String>| {
+            let rows: Vec<LiveRow> = match r {
+                Ok(l) => l.rows.into_iter().filter(|r| r.live.kind.as_deref() == Some("agent")).collect(),
+                Err(e) => return app.error(&format!("cannot list the agents: {e}")),
+            };
+            if verb == "list" {
+                return app.list_agents(&rows);
+            }
+            match pick_agent(&rows, &id) {
+                Ok(row) => app.act_on_agent(verb, row, text),
+                Err(e) => app.error(&e),
+            }
+        });
+    }
+
+    fn list_agents(&mut self, rows: &[LiveRow]) {
+        if rows.is_empty() {
+            return self.notice("no agents are running here or on your session sources");
+        }
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                let state = if r.live.locked {
+                    "locked"
+                } else if r.live.waiting {
+                    "waiting"
+                } else {
+                    "-"
+                };
+                let client = r.live.client.as_ref().map_or("-", |c| c.host.as_str());
+                let mut keys: Vec<&str> = match r.host {
+                    Some(_) => r.actions.iter().map(String::as_str).collect(),
+                    None => vec!["stop", "cancel", "notify"],
+                };
+                if r.attach.is_some() || (r.host.is_none() && !self.host.is_remote()) {
+                    keys.push("attach");
+                }
+                let title = r.title.as_deref().unwrap_or_default();
+                format!("{}  {}  {state}  {client}  {title}  [{}]", r.host_label(), r.agent_id(), keys.join(" "))
+            })
+            .collect();
+        out.push("/agents stop|cancel|notify|attach <id>; the Sessions tab (/jobs, Tab) does the same".into());
+        self.notice(&out.join("\n"));
+    }
+
+    /// Runs `verb` on `row` through the panel's handlers, whose replies show as a notice here.
+    fn act_on_agent(&mut self, verb: &'static str, row: &LiveRow, text: String) {
+        let id = row.agent_id();
+        let Some(host) = row.host.clone() else {
+            let (session, pid, started) = (row.live.path.clone(), row.live.pid, row.live.started.clone());
+            return match verb {
+                "stop" => self.on_overlay_event(OverlayEvent::TerminateSession { session, pid, started }),
+                "cancel" => {
+                    self.on_overlay_event(OverlayEvent::StopSession { session, pid, started, kind: "agent".into() })
+                }
+                "notify" => self.on_overlay_event(OverlayEvent::NotifySession { session, text }),
+                _ if self.host.is_remote() => {
+                    self.error("that agent runs on the machine this client is attached to; attach to it from there")
+                }
+                _ => match mu_common::paths::self_exe() {
+                    Ok(exe) => self.attach_session(AttachTarget {
+                        command: format!("{} attach --stdio {}", quote(&exe.to_string_lossy()), quote(&id)),
+                        helper: None,
+                        state_key: None,
+                    }),
+                    Err(e) => self.error(&format!("cannot locate mu: {e}")),
+                },
+            };
+        };
+        if verb == "attach" {
+            return match &row.attach {
+                Some(command) => self.attach_session(AttachTarget {
+                    command: command.clone(),
+                    helper: row.helper.clone(),
+                    state_key: row.state_key.clone(),
+                }),
+                None => self.error(&format!("{host} offers no attach for its agents")),
+            };
+        }
+        if !row.actions.iter().any(|a| a == verb) {
+            return self.error(&format!("{host} offers no {verb} for its agents"));
+        }
+        let text = (verb == "notify").then_some(text);
+        self.on_overlay_event(OverlayEvent::RemoteAction { host, id, action: verb, text });
+    }
+
     pub(super) fn image_cmd(&mut self, arg: &str) {
         if arg.is_empty() {
             return self.error("usage: /image <path>");
@@ -401,5 +506,82 @@ impl App {
             }
         }
         self.notice(&out.join("\n"));
+    }
+}
+
+/// The agent `arg` names: a prefix of its id, or `HOST:PREFIX` (`here` is this host).
+fn pick_agent<'a>(rows: &'a [LiveRow], arg: &str) -> Result<&'a LiveRow, String> {
+    let (host, prefix) = match arg.split_once(':') {
+        Some((h, p)) => (Some(h), p),
+        None => (None, arg),
+    };
+    let hits: Vec<&LiveRow> =
+        rows.iter().filter(|r| host.is_none_or(|h| r.host_label() == h) && r.agent_id().starts_with(prefix)).collect();
+    match hits.as_slice() {
+        [] => Err(format!("no agent matches {arg}")),
+        [one] => Ok(one),
+        many => {
+            let names: Vec<String> = many.iter().map(|r| format!("{}:{}", r.host_label(), r.agent_id())).collect();
+            Err(format!("several agents match {arg}: {}; use HOST:ID", names.join(", ")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod agents_tests {
+    use super::*;
+    use mu_session::session::owner::LiveSession;
+
+    fn row(host: Option<&str>, path: &str) -> LiveRow {
+        LiveRow {
+            live: LiveSession {
+                path: path.into(),
+                pid: 1,
+                print_run: false,
+                inbox: false,
+                started: String::new(),
+                kind: Some("agent".into()),
+                agent: None,
+                cwd: None,
+                parent: None,
+                abort: false,
+                waiting: false,
+                locked: false,
+                client: None,
+            },
+            parent: None,
+            modified: None,
+            title: None,
+            host: host.map(String::from),
+            hint: None,
+            attach: None,
+            helper: None,
+            state_key: None,
+            actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_agent_is_picked_by_an_id_prefix_or_host_and_prefix() {
+        let rows = [
+            row(None, "/s/2026-01-01T00-00-00Z_abc123.jsonl"),
+            row(Some("far"), "remote/far/abd_9.jsonl"),
+            row(Some("near"), "remote/near/xyz.jsonl"),
+        ];
+        assert_eq!(pick_agent(&rows, "abc").unwrap().agent_id(), "abc123");
+        assert_eq!(pick_agent(&rows, "abd_").unwrap().host_label(), "far", "a remote id keeps its underscore");
+        assert_eq!(pick_agent(&rows, "near:x").unwrap().host_label(), "near");
+        assert_eq!(pick_agent(&rows, "here:abc").unwrap().host_label(), "here");
+        assert_eq!(pick_agent(&rows, "far:").unwrap().agent_id(), "abd_9");
+    }
+
+    #[test]
+    fn an_ambiguous_or_unknown_agent_is_an_error() {
+        let rows = [row(None, "/s/t_abc1.jsonl"), row(Some("far"), "remote/far/abc2.jsonl")];
+        let e = pick_agent(&rows, "ab").unwrap_err();
+        assert_eq!(e, "several agents match ab: here:abc1, far:abc2; use HOST:ID");
+        assert!(pick_agent(&rows, "far:abc").is_ok());
+        assert_eq!(pick_agent(&rows, "zz").unwrap_err(), "no agent matches zz");
+        assert_eq!(pick_agent(&rows, "here:abc2").unwrap_err(), "no agent matches here:abc2");
     }
 }

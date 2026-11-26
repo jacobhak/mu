@@ -1,4 +1,5 @@
-//! The adapter contract (version 2; 1 still works, without the file and port verbs): `<adapter> <verb> ...` with
+//! The adapter contract (version 2; 1 still works, without the file and port verbs; `stop` of an agent, `cancel` and
+//! `notify` are optional, exit 64 meaning not supported): `<adapter> <verb> ...` with
 //! `MU_REMOTE_NAME`, `MU_REMOTE_SETTINGS` (JSON), `MU_REMOTE_TRUSTED` (`0`/`1`) and `MU_REMOTE_CONTRACT` in the
 //! environment (docs/adapters.md is the spec). Replies are
 //! JSON on stdout, errors are stderr lines, and `{"progress":"..."}` stderr lines report progress. `ssh` is built
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 
 pub const CONTRACT: u32 = 2;
 
-/// The exit code of a file or port verb that "is not supported here".
+/// The exit code of an optional verb (file, port, stop, cancel, notify) that "is not supported here".
 const NOT_SUPPORTED: i32 = 64;
 
 /// The adapter cannot do this (a contract-1 adapter, or no private directory for ssh's control socket).
@@ -380,8 +381,8 @@ impl Adapter {
             bail!("`{verb}` timed out after {}s", timeout.map_or(0, |t| t.as_secs()));
         }
         let status = status.context("adapter status unknown")?;
-        let file_or_port = matches!(verb, "forward" | "unforward" | "read" | "write");
-        if status.code() == Some(NOT_SUPPORTED) && file_or_port && matches!(self.kind, Kind::Program(_)) {
+        let optional = matches!(verb, "forward" | "unforward" | "read" | "write" | "stop" | "cancel" | "notify");
+        if status.code() == Some(NOT_SUPPORTED) && optional && matches!(self.kind, Kind::Program(_)) {
             let why =
                 errors.first().cloned().unwrap_or_else(|| format!("adapter `{}` does not support `{verb}`", self.name));
             return Err(Unsupported(why).into());
@@ -545,10 +546,26 @@ impl Adapter {
         self.exec("fetch", cmd, None, &mut |_| {}, out)
     }
 
-    pub fn stop(&self, id: &str) -> Result<()> {
-        let cmd = self
-            .command("stop", &[id.to_string()], || bail!("the ssh adapter cannot stop an agent; use `/quit` in it"))?;
-        self.capture("stop", cmd, None, &mut |_| {}).map(drop)
+    /// Ends agent or worker `id`.
+    pub fn stop(&self, id: &str, timeout: Option<Duration>) -> Result<()> {
+        let cmd = self.command("stop", &[id.to_string()], || Ok(ssh::stop(id)))?;
+        self.capture("stop", cmd, timeout, &mut |_| {}).map(drop)
+    }
+
+    /// Cancels the current turn of agent `id`.
+    pub fn cancel(&self, id: &str, timeout: Option<Duration>) -> Result<()> {
+        let cmd = self.command("cancel", &[id.to_string()], || Ok(ssh::cancel(id)))?;
+        self.capture("cancel", cmd, timeout, &mut |_| {}).map(drop)
+    }
+
+    /// Leaves `text` for agent `id`; the adapter's one line of stdout says what happened.
+    pub fn notify(&self, id: &str, text: &str, timeout: Option<Duration>) -> Result<String> {
+        let cmd = self.command("notify", &[id.to_string()], || Ok(ssh::notify(id)))?;
+        let bytes = format!("{text}\n").into_bytes();
+        let mut input: &[u8] = &bytes;
+        let mut out = Vec::new();
+        self.run("notify", cmd, timeout, &mut |_| {}, Some(&mut input), &mut out)?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 }
 
@@ -576,6 +593,8 @@ case "$1" in
   connect) cat ;;
   fetch) printf 'BUNDLE' ;;
   stop) ;;
+  cancel) ;;
+  notify) cat > '{notified}'; echo 'queued (x)' ;;
   forward | unforward) ;;
   read) printf 'FILE:%s' "$3" ;;
   write) cat > '{wrote}' ;;
@@ -583,7 +602,8 @@ case "$1" in
 esac
 "#,
             log = log.display(),
-            wrote = dir.join("wrote").display()
+            wrote = dir.join("wrote").display(),
+            notified = dir.join("notified").display()
         );
         let p = dir.join("adapter");
         std::fs::write(&p, script).unwrap();
@@ -639,7 +659,7 @@ esac
         let mut fetched = Vec::new();
         a.fetch("abc123", &mut fetched).unwrap();
         assert_eq!(fetched, b"BUNDLE");
-        a.stop("abc123").unwrap();
+        a.stop("abc123", None).unwrap();
         let mut child = a.connect("abc123").unwrap();
         child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
         let mut echoed = String::new();
@@ -678,6 +698,21 @@ esac
         for (line, args) in got.iter().zip(want) {
             assert_eq!(line, &format!("cluster|{settings}|1|{args}"));
         }
+    }
+
+    #[test]
+    fn cancel_and_notify_reach_the_adapter_with_the_id_and_the_text() {
+        let dir = crate::testutil::tmp();
+        let a = Adapter::from_config("cluster", &remote(&fake(&dir, 2), true)).unwrap();
+        a.cancel("abc123", Some(Duration::from_secs(30))).unwrap();
+        let line = a.notify("abc123", "hello there", Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(line, "queued (x)");
+        assert_eq!(std::fs::read_to_string(dir.join("notified")).unwrap(), "hello there\n");
+        let settings = r#"{"namespace":"ns"}"#;
+        assert_eq!(
+            log(&dir),
+            [format!("cluster|{settings}|1|cancel abc123"), format!("cluster|{settings}|1|notify abc123")]
+        );
     }
 
     #[test]

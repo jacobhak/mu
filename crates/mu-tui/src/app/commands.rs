@@ -124,7 +124,7 @@ fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
         .unzip()
 }
 
-pub(super) static BUILTIN: [Builtin; 38] = [
+pub(super) static BUILTIN: [Builtin; 39] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
@@ -178,6 +178,13 @@ pub(super) static BUILTIN: [Builtin; 38] = [
         .needs_arg()
         .busy_ok(),
     cmd("jobs", "Show background jobs and other mu sessions", App::jobs_cmd).busy_ok().complete(|_| strings(&["kill"])),
+    cmd(
+        "agents",
+        "List mu agents here and on other machines [stop | cancel | notify | attach <id> …]",
+        App::agents_cmd,
+    )
+    .busy_ok()
+    .complete(|_| strings(&["stop", "cancel", "notify", "attach"])),
     cmd("schedule", "Send a prompt later [<delay> <prompt> | list | cancel [N|all]]", App::schedule_cmd)
         .needs_arg()
         .busy_ok()
@@ -314,6 +321,7 @@ mod tests {
                 "image",
                 "upload",
                 "jobs",
+                "agents",
                 "schedule"
             ]
         );

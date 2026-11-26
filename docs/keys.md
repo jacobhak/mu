@@ -88,9 +88,9 @@ The list, on both of its tabs (Jobs and Sessions), is context `jobs`:
 | `kill` | `x` | Jobs: cancel the selected running job. |
 | `kill_all` | `X` | Jobs: cancel every running job (asks first). |
 | `diff`, `apply` | `d` / `a` | Jobs: show or apply a finished job's result. |
-| `message` | `n` | Sessions: type a message to the selected session. |
-| `stop` | `s` | Sessions: stop the selected session's turn. |
-| `terminate` | `S` | Sessions: terminate the session (asks first). |
+| `message` | `n` | Sessions: type a message to the selected session, or on another machine's agent through its session source. |
+| `stop` | `s` | Sessions: stop the selected session's turn, or on another machine's agent through its session source. |
+| `terminate` | `S` | Sessions: terminate the session (asks first), or on another machine's agent through its session source. |
 | `take` | `t` | Sessions: take the session over. |
 | `open_port` | `o` | Jobs: forward the job's listening ports and open the first in the browser. |
 

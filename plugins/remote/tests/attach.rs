@@ -401,6 +401,9 @@ fn rows_list_the_agents_of_a_trusted_remote_with_host_hint_and_attach() {
     };
     assert_eq!(argv("attach")[1..], ["connect", "far", agent.session.as_str()]);
     assert_eq!(argv("helper")[1..], ["helper", "far", agent.session.as_str()]);
+    assert_eq!(argv("stop")[1..], ["stop", "far", agent.session.as_str()]);
+    assert_eq!(argv("cancel")[1..], ["cancel", "far", agent.session.as_str()]);
+    assert_eq!(argv("notify")[1..], ["notify", "far", agent.session.as_str(), "-"]);
 
     std::fs::write(far.dir.join("down"), "").unwrap();
     let o = far.mr().arg("rows").output().unwrap();

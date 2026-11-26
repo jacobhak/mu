@@ -127,6 +127,18 @@ pub fn connect(id: &str) -> String {
     format!("mu-remote bridge {}", quote(id))
 }
 
+pub fn stop(id: &str) -> String {
+    format!("mu agent stop {}", quote(id))
+}
+
+pub fn cancel(id: &str) -> String {
+    format!("mu agent cancel {}", quote(id))
+}
+
+pub fn notify(id: &str) -> String {
+    format!("mu notify {} -", quote(id))
+}
+
 /// A hint for ssh's stderr, when it says why the login failed.
 pub fn hint(stderr: &str) -> Option<&'static str> {
     stderr.contains("Permission denied").then_some(
@@ -196,6 +208,9 @@ mod tests {
     #[test]
     fn file_commands_quote_every_path() {
         assert_eq!(read("/a b/it's"), r"cat -- '/a b/it'\''s'");
+        assert_eq!(stop("a'b"), r"mu agent stop 'a'\''b'");
+        assert_eq!(cancel("a'b"), r"mu agent cancel 'a'\''b'");
+        assert_eq!(notify("a'b"), r"mu notify 'a'\''b' -");
         assert_eq!(write("/a b"), "umask 077; mkdir -p -- \"$(dirname -- '/a b')\" && [ ! -e '/a b' ] && cat > '/a b'");
     }
 

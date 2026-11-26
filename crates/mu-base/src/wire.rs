@@ -19,7 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 /// Raised with every change to `WireCommand`, `WireEvent` or a host request, or to how a connection
 /// starts (4: plain JSON lines behind the hello; encrypting the pipe is up to whatever carries it;
 /// 5: the plan dialog became a generic document review; 6: the `read_bytes` and `write_bytes` host
-/// calls, and listening `ports` on a job; 7: session rows carry `helper` and `state_key`).
+/// calls, and listening `ports` on a job; 7: session rows carry `helper`, `state_key` and `actions`;
+/// the `remote_action` host call).
 pub const WIRE: u32 = 7;
 
 /// Front end to agent.

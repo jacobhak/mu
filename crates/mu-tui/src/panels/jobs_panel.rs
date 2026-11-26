@@ -79,6 +79,13 @@ pub enum JobsResult {
         pid: u32,
         started: String,
     },
+    /// Run a session source's `stop`, `cancel` or `notify` for a row on another host.
+    RemoteAction {
+        host: String,
+        id: String,
+        action: &'static str,
+        text: Option<String>,
+    },
     /// Join a session on another host: run `mu --attach` with this command, helper and state key.
     Attach {
         target: AttachTarget,
@@ -249,16 +256,32 @@ struct Totals {
     settled: bool,
 }
 
+/// The session a key acts on: one on this host by path, or one on another host by the source's id.
+#[derive(Clone)]
+enum Target {
+    Local(PathBuf),
+    Remote { host: String, id: String },
+}
+
+impl Target {
+    fn of(r: &Row) -> Self {
+        match &r.host {
+            Some(host) => Target::Remote { host: host.clone(), id: r.source_id() },
+            None => Target::Local(r.live.path.clone()),
+        }
+    }
+}
+
 /// A one-line message for `mu notify`.
 struct Compose {
-    session: PathBuf,
+    target: Target,
     label: String,
     text: String,
 }
 
 /// The run `S` was pressed on, until the user answers.
 struct Confirm {
-    session: PathBuf,
+    target: Target,
     pid: u32,
     started: String,
     label: String,
@@ -665,7 +688,12 @@ impl JobsPanel {
             if let Some(c) = self.input.take() {
                 let text = c.text.trim().to_string();
                 if !text.is_empty() {
-                    return JobsResult::Notify { session: c.session, text };
+                    return match c.target {
+                        Target::Local(session) => JobsResult::Notify { session, text },
+                        Target::Remote { host, id } => {
+                            JobsResult::RemoteAction { host, id, action: "notify", text: Some(text) }
+                        }
+                    };
                 }
             }
         } else if keymap::JOBS_INPUT_BACKSPACE.hit(&k) {
@@ -811,11 +839,14 @@ impl JobsPanel {
                 return result;
             }
         } else if keymap::JOBS_MESSAGE.hit(&k) {
-            if let Some(r) = self.rows.get(self.s_at).filter(|r| r.host.is_none()) {
-                self.input = Some(Compose { session: r.live.path.clone(), label: r.label(), text: String::new() });
+            if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_message()) {
+                self.input = Some(Compose { target: Target::of(r), label: r.label(), text: String::new() });
             }
         } else if keymap::JOBS_STOP.hit(&k) {
             if let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_stop()) {
+                if let Target::Remote { host, id } = Target::of(r) {
+                    return JobsResult::RemoteAction { host, id, action: "cancel", text: None };
+                }
                 return JobsResult::Stop {
                     session: r.live.path.clone(),
                     pid: r.live.pid,
@@ -831,7 +862,7 @@ impl JobsPanel {
             && let Some(r) = self.rows.get(self.s_at).filter(|r| r.can_terminate())
         {
             self.confirm = Some(Confirm {
-                session: r.live.path.clone(),
+                target: Target::of(r),
                 pid: r.live.pid,
                 started: r.live.started.clone(),
                 label: r.label(),
@@ -844,7 +875,10 @@ impl JobsPanel {
     fn confirm_key(&mut self, k: KeyEvent) -> JobsResult {
         let Some(c) = self.confirm.take() else { return JobsResult::Pending };
         if keymap::JOBS_CONFIRM.hit(&k) {
-            return JobsResult::Terminate { session: c.session, pid: c.pid, started: c.started };
+            return match c.target {
+                Target::Local(session) => JobsResult::Terminate { session, pid: c.pid, started: c.started },
+                Target::Remote { host, id } => JobsResult::RemoteAction { host, id, action: "stop", text: None },
+            };
         }
         JobsResult::Pending
     }
@@ -933,10 +967,16 @@ impl JobsPanel {
         let (footer, footer_cursor) = match (&self.confirm, &self.input) {
             (Some(c), _) => (
                 vec![span(
-                    format!(
-                        "terminate {} (pid {})? it exits and its unsent input is lost · y to confirm, any other key cancels",
-                        c.label, c.pid
-                    ),
+                    match &c.target {
+                        Target::Local(_) => format!(
+                            "terminate {} (pid {})? it exits and its unsent input is lost · y to confirm, any other key cancels",
+                            c.label, c.pid
+                        ),
+                        Target::Remote { host, .. } => format!(
+                            "stop {} on {host}? it ends the agent there · y to confirm, any other key cancels",
+                            c.label
+                        ),
+                    },
                     accent(),
                 )],
                 None,
@@ -1304,9 +1344,55 @@ mod tests {
             attach: None,
             helper: None,
             state_key: None,
+            actions: Vec::new(),
             live,
         });
         Live { rows: rows.collect(), canon: Vec::new(), notice: None }
+    }
+
+    /// A panel on the Sessions tab with one agent on host `far`, offering `actions`.
+    fn remote_panel(actions: &[&str]) -> JobsPanel {
+        let path = std::path::Path::new("remote/far/agent_7.jsonl");
+        let mut row = live_of(vec![lived(path, "agent", "2026-01-01T00:00:00Z")]);
+        row.rows[0].host = Some("far".into());
+        row.rows[0].actions = actions.iter().map(|a| a.to_string()).collect();
+        let mut p = JobsPanel::new(vec![]);
+        p.tab = Tab::Sessions;
+        p.set_sessions(row);
+        p
+    }
+
+    #[test]
+    fn a_remote_row_runs_the_actions_its_source_offers() {
+        let want = |action, text: Option<&str>| {
+            Some(("far".to_string(), "agent_7".to_string(), action, text.map(String::from)))
+        };
+        let got = |r: JobsResult| match r {
+            JobsResult::RemoteAction { host, id, action, text } => Some((host, id, action, text)),
+            _ => None,
+        };
+        let mut p = remote_panel(&["stop", "cancel", "notify"]);
+        assert_eq!(got(p.on_key(key(KeyCode::Char('s')))), want("cancel", None));
+
+        assert!(matches!(p.on_key(key(KeyCode::Char('S'))), JobsResult::Pending));
+        let rows = text(&mut p, 140, 14);
+        assert!(rows.last().unwrap().contains("stop agent on far? it ends the agent there"), "{rows:?}");
+        assert_eq!(got(p.on_key(key(KeyCode::Char('y')))), want("stop", None));
+
+        p.on_key(key(KeyCode::Char('n')));
+        for ch in "hello".chars() {
+            p.on_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(got(p.on_key(key(KeyCode::Enter))), want("notify", Some("hello")));
+    }
+
+    #[test]
+    fn a_remote_row_with_no_actions_ignores_s_shift_s_and_n() {
+        let mut p = remote_panel(&[]);
+        for c in ['s', 'S', 'n'] {
+            assert!(matches!(p.on_key(key(KeyCode::Char(c))), JobsResult::Pending));
+        }
+        assert!(p.confirm.is_none() && p.input.is_none());
     }
 
     #[test]

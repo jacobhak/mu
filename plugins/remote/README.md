@@ -74,8 +74,16 @@ The image comes from `plugins/remote/Dockerfile`, built from mu's repository roo
 | `mu-remote worker run \| bundle \| stop` | the remote end of a launched task (run by adapters) |
 | `mu-remote list`, `check NAME [--full [--agent ID]]` | the remotes; what fails on one (`--full` runs a synthetic worker, and with an agent the file and port verbs, through its adapter) |
 | `mu-remote rows [NAME]` | agents as JSON lines, for `[sessions] sources = [["mu-remote","rows"]]` |
+| `mu-remote agents [NAME] [--json]` | the agents and workers on every remote, or on NAME |
+| `mu-remote stop NAME ID` | end agent (or worker) ID on NAME |
+| `mu-remote cancel NAME ID` | cancel the current turn of agent ID on NAME |
+| `mu-remote notify NAME ID TEXT\|-` | leave agent ID on NAME a message |
 | `mu-remote install-adapter pod \| local` | write a shipped adapter into the state directory (`local` is the reference adapter) |
 | `mu-remote helper NAME ID VERB …` | what `mu-remote NAME` gives mu as `MU_ATTACH_HELPER` (not for typing; see below) |
+
+### Managing agents
+
+`mu-remote agents` lists them; `mu-remote stop|cancel|notify NAME ID` ends one, cancels its turn or messages it (the remote's adapter must support it; `ssh` and the shipped pod and local adapters do). In mu, rows from `mu-remote rows` get the same on the Sessions tab (`s` cancels the turn, `S` stops after `y`, `n` messages) and `/agents` does it from the composer (`/agents stop|cancel|notify|attach ID`). `/quit` inside an attached agent ends it too.
 
 ### Files and ports
 

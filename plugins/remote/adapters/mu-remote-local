@@ -84,6 +84,7 @@ verb_list() {
 
 verb_stop() {
   safe_id "$1"
+  [ -d "$state/workers/$1" ] || exec "$mu" agent stop "$1"
   mu-remote worker stop "$1"
   rm -rf -- "$root/work/$1" "$state/workers/$1"
 }
@@ -97,6 +98,8 @@ case $verb in
   connect) exec mu-remote bridge "$1" ;;
   fetch) exec mu-remote worker bundle "$1" ;;
   stop) verb_stop "$@" ;;
+  cancel) exec "$mu" agent cancel "$1" ;;
+  notify) exec "$mu" notify "$1" - ;;
   forward | unforward)
     echo "the local adapter does not forward: the agent's ports are on this machine already" >&2
     exit 64

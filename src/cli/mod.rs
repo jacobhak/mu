@@ -213,6 +213,10 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// End a running agent here: it ends its jobs and plugins and exits, as `/quit` does. ID is a session id or a prefix of one.
+    Stop { id: String },
+    /// Cancel the current turn of a running agent here; the agent keeps running.
+    Cancel { id: String },
 }
 
 #[cfg(test)]
@@ -249,5 +253,8 @@ mod tests {
         assert!(Cli::try_parse_from(["mu", "attach", "--stdio", "abc", "--socket", "/x"]).is_err());
         assert!(Cli::try_parse_from(["mu", "agent", "--detach"]).is_ok());
         assert!(Cli::try_parse_from(["mu", "agent", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "stop", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "cancel", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "stop"]).is_err());
     }
 }

@@ -642,6 +642,38 @@ fn a_detached_agent_prints_its_id_and_survives_sighup() {
 }
 
 #[test]
+fn an_agent_is_cancelled_and_stopped_by_id_prefix() {
+    let (home, cwd) = fixture();
+    let o = mu(&home, &cwd)
+        .args(["agent", "--detach", "--model", MODEL, "--permissions", "yolo"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    let printed: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let id = printed["id"].as_str().unwrap().to_string();
+    let pid = pid_of(&home, &id);
+    let prefix = &id[..8];
+
+    let o = mu(&home, &cwd).args(["agent", "cancel", prefix]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("abort"), "{}", String::from_utf8_lossy(&o.stdout));
+
+    let o = mu(&home, &cwd).args(["agent", "stop", prefix]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("stopped agent"));
+    // An unreaped zombie still answers signal 0 (a container without init); it has exited.
+    let zombie = std::fs::read_to_string(format!("/proc/{}/stat", pid.0))
+        .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z')));
+    assert!(zombie || unsafe { libc::kill(pid.0, 0) } != 0, "the agent is gone");
+    assert!(agent_list(&home, &cwd).is_empty());
+
+    let o = mu(&home, &cwd).args(["agent", "stop", "nosuch"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no agent with a session starting nosuch"));
+}
+
+#[test]
 fn an_agent_that_cannot_make_its_session_file_says_why_and_exits() {
     let (home, cwd) = fixture();
     // The session directory cannot be made below a file.

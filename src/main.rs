@@ -44,6 +44,8 @@ fn dispatch() -> Result<i32> {
             Err(other) => Ok(plans_cli::run_cli(other, &std::env::current_dir()?)),
         },
         Some(Sub::Agent { cmd: Some(cli::AgentCmd::List { json }), .. }) => cli::agents::list(json),
+        Some(Sub::Agent { cmd: Some(cli::AgentCmd::Stop { id }), .. }) => cli::agents::stop(&id),
+        Some(Sub::Agent { cmd: Some(cli::AgentCmd::Cancel { id }), .. }) => cli::agents::cancel(&id),
         Some(Sub::Agent { detach: true, .. }) => run::detach::run(),
         Some(Sub::Agent { model, thinking, resume, continue_latest, detached, .. }) => {
             if detached {

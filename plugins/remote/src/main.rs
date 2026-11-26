@@ -12,6 +12,7 @@ mod helper;
 mod install;
 mod launch;
 mod link;
+mod manage;
 mod paths;
 mod rows;
 mod rpc;
@@ -75,6 +76,24 @@ enum Cmd {
     },
     /// A `[sessions] sources` command: the agents on every remote (or NAME), as JSON lines.
     Rows { name: Option<String> },
+    /// End agent (or worker) ID on remote NAME.
+    Stop { name: String, id: String },
+    /// Cancel the current turn of agent ID on remote NAME.
+    Cancel { name: String, id: String },
+    /// Leave a message for agent ID on remote NAME (`-` reads it from stdin).
+    Notify {
+        name: String,
+        id: String,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// List the agents and workers on every remote, or on NAME.
+    Agents {
+        name: Option<String>,
+        /// One JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Write a shipped adapter into the state directory: `pod` is the Kubernetes one, `local` the reference
     /// adapter that runs everything on this machine.
     InstallAdapter { name: String },
@@ -136,6 +155,10 @@ fn dispatch() -> Result<i32> {
         Some(Cmd::List) => rows::list(),
         Some(Cmd::Check { name, full, agent }) => rows::check(&name, full, agent.as_deref()),
         Some(Cmd::Rows { name }) => rows::rows(name.as_deref()),
+        Some(Cmd::Stop { name, id }) => manage::stop(&name, &id),
+        Some(Cmd::Cancel { name, id }) => manage::cancel(&name, &id),
+        Some(Cmd::Notify { name, id, text }) => manage::notify(&name, &id, &text),
+        Some(Cmd::Agents { name, json }) => manage::agents(name.as_deref(), json),
         Some(Cmd::InstallAdapter { name }) => install::run(&name),
         Some(Cmd::Helper { name, id, verb, args }) => helper::run(&name, &id, &verb, &args),
     }

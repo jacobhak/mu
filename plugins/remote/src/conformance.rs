@@ -160,7 +160,11 @@ fn worker_steps(a: &Adapter, work_dir: &str, steps: &mut Steps) {
             Ok(()) => Outcome::Failed(format!("{} bytes came back for a worker that changed nothing", bundle.len())),
         },
     );
-    steps.add("worker stop", a.stop(&id).map_or_else(|e| Outcome::Failed(first_line(&e)), |()| Outcome::Ok(None)));
+    steps.add(
+        "worker stop",
+        a.stop(&id, Some(Duration::from_secs(60)))
+            .map_or_else(|e| Outcome::Failed(first_line(&e)), |()| Outcome::Ok(None)),
+    );
     steps.add(
         "worker gone",
         match a.list(Some(Duration::from_secs(30))) {

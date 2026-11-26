@@ -86,6 +86,7 @@ A line mu cannot read is dropped (and quoted as the error text when no result co
 
 - `mu agent [--detach] [--resume ID | -c] [--model M] [--thinking T]` runs a session with no terminal. It prints `{"session":ID,"socket":PATH}` once it listens, or, with `--detach` (which leaves the terminal and logs to `<profile home>/logs/agent-<id>.log`), `{"id":ID}`. `--detached` (what `--detach` starts) is for mu's own use, and so is `mu --headless`, the local child that a launcher stands in for.
 - `mu agent list --json` prints one JSON line per live agent here, oldest first: `id` (string), `kind` (`"agent"`), `cwd` (string), `started` (unix seconds), `title` (string or null), `client` (`{"host":…,"since":…}` or null: who is attached), `waiting` (bool: a request waits for a client), `locked` (bool: sealed state not yet unlocked).
+- `mu agent stop ID` ends a running agent here with SIGTERM, waits up to 15 s for it to go and exits 1 if it still runs. `mu agent cancel ID` cancels its current turn. `mu notify ID TEXT|-` leaves it a message (`-` reads the text from stdin). ID is a session id or a prefix of one.
 - `mu attach --stdio [ID] [--socket PATH]` is a raw pipe between its stdin and stdout and the agent's Unix socket. With no ID it finds the one agent running in the current directory; `--socket` names a socket instead. The socket is private (mode 0600 in a 0700 directory): whoever can run this can already read the agent's memory and `auth.json`.
 
 ## C. Attach client (contract 1)
@@ -107,12 +108,15 @@ A line mu cannot read is dropped (and quoted as the error text when no result co
 | `attach` | array of strings, or string | what opens it: `Enter` hands the terminal to `mu --attach` with it, and comes back to the tab |
 | `helper` | array of strings, or string | becomes `MU_ATTACH_HELPER` for that attach (contract E) |
 | `state_key` | string | becomes `--state-key` for that attach |
+| `stop` | array of strings | ends the agent there |
+| `cancel` | array of strings | cancels the agent's current turn |
+| `notify` | array of strings | leaves the agent a message: it arrives on stdin, one line |
 
-`attach` and `helper` as an array are an argument vector: mu quotes each word for `sh` and joins them, so an agent id from a remote never reaches a shell unquoted. This is the preferred form. A string is a shell line run as written, and so is the source's responsibility to quote. An empty array or a blank string means none. A row is not a local session: it has no pid, and only `Enter` does anything on it.
+`attach` and `helper` as an array are an argument vector: mu quotes each word for `sh` and joins them, so an agent id from a remote never reaches a shell unquoted. This is the preferred form. A string is a shell line run as written, and so is the source's responsibility to quote. An empty array or a blank string means none. A row is not a local session: it has no pid. `stop`, `cancel` and `notify` are argument vectors only (no string form); an empty array or a blank first word means none, and a field of any other shape is ignored without dropping the row. `S` (after a confirmation), `s` and `n` on a row run them where the source ran, with no shell and `MU_SOURCES_CONTRACT` set, with a 60 s limit; the first line of stdout is shown, or on failure the first line of stderr. Without them those keys do nothing on the row.
 
 **Trust.** A configured source is trusted as much as the launcher is: `Enter` runs what it prints, as you.
 
-History: 2 added the argument-vector form of `attach`, and `helper` and `state_key`. (1 had `attach` as a shell line only.)
+History: 2 added the argument-vector form of `attach`, and `helper`, `state_key`, `stop`, `cancel` and `notify`. (1 had `attach` as a shell line only.)
 
 ## E. Attach helper (contract 1)
 

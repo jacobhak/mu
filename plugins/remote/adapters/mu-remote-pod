@@ -5,6 +5,8 @@
 # (`mu-remote bridge`) and the result bundle. A pod is deleted only after a successful `fetch` or by `stop`, never
 # because a stream dropped. Diagnostics go to stderr, one line each; stdout carries only a verb's reply.
 # The image needs `mu` and `mu-remote` (see the Dockerfile).
+# Verbs: version, start, list, connect, fetch, stop (an agent or a worker), cancel (an agent's turn), notify
+# (message on stdin), forward, unforward, read, write.
 #
 # Environment from mu-remote: MU_REMOTE_NAME, MU_REMOTE_SETTINGS (JSON), MU_REMOTE_TRUSTED (0 or 1; unset reads as 0).
 # Settings (all optional; parsed with jq):
@@ -95,24 +97,25 @@ sweep() {
   done <<< "$out"
 }
 
-# Sets NS and POD for an agent or worker id: a pod named by it (workers), else the pod whose `mu agent list` has it.
+# Sets NS, POD, POD_KIND and POD_LAUNCHER for an agent or worker id: a pod named by it (workers), else the pod
+# whose `mu agent list` has it.
 find_pod() {
-  local id=$1 ns name kind listed out
+  local id=$1 ns name kind launcher listed out
   for ns in "$WORKER_NS" "$AGENT_NS"; do
     NS=$ns
     out=$(pods 2> /dev/null) || continue
-    while IFS='|' read -r name _; do
+    while IFS='|' read -r name kind launcher _; do
       [ -n "$name" ] || continue
       if [ "$name" = "$id" ]; then
-        POD=$name
+        POD=$name POD_KIND=$kind POD_LAUNCHER=$launcher
         return 0
       fi
     done <<< "$out"
-    while IFS='|' read -r name kind _; do
+    while IFS='|' read -r name kind launcher _; do
       [ "$kind" = agent ] || continue
       listed=$(kc exec "$name" -- mu agent list --json < /dev/null 2> /dev/null) || continue
       if grep -qF "\"id\":\"$id\"" <<< "$listed"; then
-        POD=$name
+        POD=$name POD_KIND=$kind POD_LAUNCHER=$launcher
         return 0
       fi
     done <<< "$out"
@@ -153,10 +156,28 @@ verb_fetch() {
 }
 
 verb_stop() {
-  local id=${1:?stop needs an id}
+  local id=${1:?stop needs an id} out
   find_pod "$id"
+  if [ "$POD_KIND" = agent ]; then
+    out=$(kc exec "$POD" -- mu agent stop "$id" < /dev/null 2>&1 > /dev/null) || die "$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -n 1)"
+    # Only a pod this adapter made (it has a launcher label) goes with its agent, and only when it is empty.
+    if [ -n "$POD_LAUNCHER" ] && [ -z "$(kc exec "$POD" -- mu agent list --json < /dev/null 2> /dev/null)" ]; then
+      kc delete pod "$POD" --wait=false --ignore-not-found > /dev/null
+    fi
+    return 0
+  fi
   kc exec "$POD" -- mu-remote worker stop "$id" < /dev/null > /dev/null 2>&1 || true
   kc delete pod "$POD" --wait=false --ignore-not-found > /dev/null
+}
+
+verb_cancel() {
+  find_pod "${1:?cancel needs an id}"
+  kc exec "$POD" -- mu agent cancel "$1" < /dev/null
+}
+
+verb_notify() {
+  find_pod "${1:?notify needs an id}"
+  kc exec -i "$POD" -- mu notify "$1" -
 }
 
 verb_read() {
@@ -375,9 +396,9 @@ verb=${1:-}
 [ $# -eq 0 ] || shift
 case $verb in
   version) verb_version ;;
-  start | list | connect | fetch | stop | forward | unforward | read | write)
+  start | list | connect | fetch | stop | cancel | notify | forward | unforward | read | write)
     load_settings
     "verb_$verb" "$@"
     ;;
-  *) die "unknown verb '$verb' (version, start, list, connect, fetch, stop, forward, unforward, read, write)" ;;
+  *) die "unknown verb '$verb' (version, start, list, connect, fetch, stop, cancel, notify, forward, unforward, read, write)" ;;
 esac

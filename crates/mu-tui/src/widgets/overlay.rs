@@ -330,6 +330,13 @@ pub enum OverlayEvent {
         pid: u32,
         started: String,
     },
+    /// Run a session source's `stop`, `cancel` or `notify` for an agent on another host.
+    RemoteAction {
+        host: String,
+        id: String,
+        action: &'static str,
+        text: Option<String>,
+    },
     /// Take over a `-p` run: the panel closes and `mu take` runs on the terminal.
     TakeSession(PathBuf),
     /// Join a session on another host: the panel closes and `mu --attach COMMAND` runs on the terminal.
@@ -1091,6 +1098,9 @@ impl Overlay {
                 }
                 JobsResult::Terminate { session, pid, started } => {
                     (Some(Overlay::Jobs { st }), Some(OverlayEvent::TerminateSession { session, pid, started }))
+                }
+                JobsResult::RemoteAction { host, id, action, text } => {
+                    (Some(Overlay::Jobs { st }), Some(OverlayEvent::RemoteAction { host, id, action, text }))
                 }
                 JobsResult::Take { session } => (None, Some(OverlayEvent::TakeSession(session))),
                 JobsResult::Attach { target } => (None, Some(OverlayEvent::AttachSession(target))),

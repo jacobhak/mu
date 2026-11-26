@@ -127,7 +127,7 @@ async fn launch(adapter: Arc<Adapter>, task: Task, give_up: Duration) -> Result<
         Err(e) => eprintln!("could not fetch the result of worker {id}: {e:#}"),
     }
     if fetched.is_ok() || matches!(end, End::Cancelled) {
-        if let Err(e) = adapter.stop(&id) {
+        if let Err(e) = adapter.stop(&id, None) {
             eprintln!("could not stop worker {id}: {e:#}");
         }
     } else {

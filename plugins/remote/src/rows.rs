@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn first_line(e: &anyhow::Error) -> String {
     format!("{e:#}").lines().next().unwrap_or_default().to_string()
@@ -119,9 +119,9 @@ pub fn check(name: &str, full: bool, agent: Option<&str>) -> Result<i32> {
 /// The sources contract this program speaks (docs/remote-contracts.md, D).
 const SOURCES_CONTRACT: u32 = 2;
 
-/// One session-source row (sources contract 2): the agent's fields plus `host`, `hint`, and `attach` and `helper`
-/// as argument vectors, which mu quotes itself, so an id never reaches a shell unquoted. `state_key` is the key
-/// file `mu --attach` unlocks the agent with, only when the remote's config names one.
+/// One session-source row (sources contract 2): the agent's fields plus `host`, `hint`, and `attach`, `helper`,
+/// `stop`, `cancel` and `notify` as argument vectors, which mu runs without a shell, so an id never reaches one.
+/// `state_key` is the key file `mu --attach` unlocks the agent with, only when the remote's config names one.
 fn row(remote: &str, exe: &Path, a: &AgentInfo, state_key: Option<&Path>) -> Value {
     let exe = exe.to_string_lossy();
     let mut v = json!({
@@ -136,6 +136,9 @@ fn row(remote: &str, exe: &Path, a: &AgentInfo, state_key: Option<&Path>) -> Val
         "hint": format!("mu-remote {remote} --resume {}", a.id),
         "attach": [exe, "connect", remote, a.id],
         "helper": [exe, "helper", remote, a.id],
+        "stop": [exe, "stop", remote, a.id],
+        "cancel": [exe, "cancel", remote, a.id],
+        "notify": [exe, "notify", remote, a.id, "-"],
     });
     if let Some(k) = state_key {
         v["state_key"] = json!(k.to_string_lossy());
@@ -256,6 +259,9 @@ mod tests {
         assert_eq!(r[0]["hint"], "mu-remote far --resume abc123");
         assert_eq!(r[0]["attach"], json!(["/o pt/mu-remote", "connect", "far", "abc123"]));
         assert_eq!(r[0]["helper"], json!(["/o pt/mu-remote", "helper", "far", "abc123"]));
+        assert_eq!(r[0]["stop"], json!(["/o pt/mu-remote", "stop", "far", "abc123"]));
+        assert_eq!(r[0]["cancel"], json!(["/o pt/mu-remote", "cancel", "far", "abc123"]));
+        assert_eq!(r[0]["notify"], json!(["/o pt/mu-remote", "notify", "far", "abc123", "-"]));
         assert!(r[0].get("state_key").is_none(), "no state_key unless the remote sets one");
         let keyed = Remote { state_key: Some("/k/id".into()), ..program(&adapter, true) };
         assert_eq!(rows_of("far", &keyed, exe)[0]["state_key"], "/k/id");

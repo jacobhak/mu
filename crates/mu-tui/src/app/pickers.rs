@@ -617,6 +617,19 @@ impl App {
                     },
                 );
             }
+            OverlayEvent::RemoteAction { host, id, action, text } => {
+                self.host_call(
+                    sessions::REMOTE_ACTION,
+                    &sessions::RemoteActionArgs { host: host.clone(), id: id.clone(), action: action.into(), text },
+                    move |app, r: Result<String, String>| {
+                        let msg = match r {
+                            Ok(line) => format!("{action} {id} on {host}: {line}"),
+                            Err(e) => format!("{action} failed for {id} on {host}: {e}"),
+                        };
+                        app.panel_status(msg);
+                    },
+                );
+            }
             OverlayEvent::SetTheme(source) => self.apply_theme(&source),
             OverlayEvent::MemoryOpen(path) => self.open_memory_file(path),
             OverlayEvent::MemoryHistory => self.open_memory_history(),
@@ -896,6 +909,32 @@ mod session_tests {
                 pump(&mut app, &mut rx, |a| panel_text(a).contains("not stopped:")).await;
                 app.on_overlay_event(OverlayEvent::TerminateSession { session, pid: 4242, started });
                 pump(&mut app, &mut rx, |a| panel_text(a).contains("not terminated:")).await;
+            });
+        }
+    }
+
+    #[test]
+    fn agents_lists_the_agents_here_and_acts_on_one_with_either_host() {
+        mu_testutil::home();
+        for deferred in [false, true] {
+            let dir = fresh_dir();
+            let path = session_file(&dir, "other", &dir, "hi", 0.0);
+            serve_runs(vec![live(&path, "agent"), live(&session_file(&dir, "tui1", &dir, "hi", 0.0), "tui")]);
+            let (mut app, mut rx, _cmds) = app_with(deferred, dir);
+            in_local(async {
+                app.agents_cmd("");
+                pump(&mut app, &mut rx, |a| transcript_text(a).contains("here  other  ")).await;
+                let t = transcript_text(&app);
+                assert!(t.contains("[stop cancel notify attach]") && !t.contains("tui1"), "{deferred}: {t}");
+                app.agents_cmd("stop oth");
+                pump(&mut app, &mut rx, |a| transcript_text(a).contains("not terminated:")).await;
+                app.agents_cmd("stop zz");
+                pump(&mut app, &mut rx, |a| transcript_text(a).contains("no agent matches zz")).await;
+                app.agents_cmd("nosuch");
+                app.agents_cmd("notify other");
+                let t = transcript_text(&app);
+                assert!(t.contains("usage: /agents [stop|cancel|notify|attach <id> [text]]"), "{deferred}: {t}");
+                assert!(t.contains("usage: /agents notify <id> <text>"), "{deferred}: {t}");
             });
         }
     }

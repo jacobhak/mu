@@ -78,6 +78,9 @@ echo "$*" >> "$FAKE/mu-calls"
 case "$1 $2" in
   "agent list") [ ! -f "$FAKE/list-$FAKE_POD" ] || cat "$FAKE/list-$FAKE_POD" ;;
   "agent --detach") echo '{"id":"agent-9"}' ;;
+  "agent stop") rm -f "$FAKE/list-$FAKE_POD" ;;
+  "agent cancel") ;;
+  "notify "*) cat >> "$FAKE/notified"; echo 'queued (x)' ;;
 esac
 EOF
 cat > "$T/bin/mu-remote" << 'EOF'
@@ -193,6 +196,28 @@ adapter start --kind worker --launch w2 --bundle "$T/w2.bundle" --dir "$DIR" || 
 adapter stop w2 || fail "stop failed: $(cat "$T/err")"
 has "$FAKE/mu-remote-calls" 'worker stop w2'
 has "$FAKE/deletes" w2
+
+# stop, cancel and notify of an agent: an adapter-made pod goes with its agent, a manifest pod stays.
+fresh
+printf 'mu-agent-7|agent|%s|Running\n' "$id1" > "$FAKE/pods.tsv"
+echo '{"id":"agent-9","cwd":"/p"}' > "$FAKE/list-mu-agent-7"
+adapter stop agent-9 || fail "agent stop failed: $(cat "$T/err")"
+has "$FAKE/mu-calls" 'agent stop agent-9'
+has "$FAKE/deletes" mu-agent-7
+lacks "$FAKE/mu-calls" 'worker stop'
+fresh
+printf 'mu-agent-0|agent||Running\n' > "$FAKE/pods.tsv"
+echo '{"id":"agent-1","cwd":"/p"}' > "$FAKE/list-mu-agent-0"
+adapter stop agent-1 || fail "manifest agent stop failed: $(cat "$T/err")"
+has "$FAKE/mu-calls" 'agent stop agent-1'
+[ ! -f "$FAKE/deletes" ] || fail "stop deleted a pod this adapter did not make: $(cat "$FAKE/deletes")"
+echo '{"id":"agent-1","cwd":"/p"}' > "$FAKE/list-mu-agent-0"
+adapter cancel agent-1 || fail "cancel failed: $(cat "$T/err")"
+has "$FAKE/mu-calls" 'agent cancel agent-1'
+echo hello | adapter notify agent-1 || fail "notify failed: $(cat "$T/err")"
+[ "$(cat "$T/out")" = 'queued (x)' ] || fail "notify printed: $(cat "$T/out")"
+has "$FAKE/notified" hello
+has "$FAKE/mu-calls" 'notify agent-1 -'
 
 # A failed start deletes the pod it made.
 fresh
