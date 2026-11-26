@@ -27,6 +27,24 @@ pub struct Resolved {
     pub scheme: Option<Scheme>,
 }
 
+/// The first existing `rest` under an ancestor session's directory (`root_of` maps a session id to
+/// it): the session's parent from its header, then that one's parent, up to a depth limit.
+fn in_ancestors(session: Option<PathBuf>, rest: &str, root_of: impl Fn(&str) -> PathBuf) -> Option<PathBuf> {
+    let mut cur = session;
+    for _ in 0..8 {
+        let parent = mu_session::session::owner::header_parent(&cur?)?;
+        let id = mu_session::session::list::id_of(&parent);
+        if mu_session::session::list::valid_id(&id) {
+            let found = safe_join(&root_of(&id), rest).ok().filter(|f| f.exists());
+            if found.is_some() {
+                return found;
+            }
+        }
+        cur = Some(parent);
+    }
+    None
+}
+
 fn split_scheme(p: &str) -> Option<(Scheme, &str)> {
     for s in [Scheme::Local, Scheme::Artifact, Scheme::Skill, Scheme::Mu] {
         if let Some(rest) = p.strip_prefix(s.name()).and_then(|r| r.strip_prefix("://")) {
@@ -100,8 +118,24 @@ impl Tools {
     /// show results under when it was an internal URL.
     pub(super) fn search_root(&self, path: Option<&str>) -> Result<(PathBuf, Option<String>), String> {
         let p = path.unwrap_or(".");
-        let r = self.resolve(p)?;
+        let r = self.resolve_read(p)?;
         Ok((r.path, r.scheme.map(|_| p.to_string())))
+    }
+
+    /// `resolve` for reading: a `local://` file this session lacks is looked for in the local
+    /// directories of its ancestors, nearest first, so a subagent reads what its parent wrote (a
+    /// plan handed over by path). Writes use `resolve` and never leave the session's own directory.
+    pub fn resolve_read(&self, p: &str) -> Result<Resolved, String> {
+        let r = self.resolve(p)?;
+        if r.scheme != Some(Scheme::Local) || r.path.exists() {
+            return Ok(r);
+        }
+        let Some((_, rest)) = split_scheme(p) else { return Ok(r) };
+        let session = self.session.path.borrow().clone();
+        Ok(match in_ancestors(session, rest, local_root) {
+            Some(path) => Resolved { path, scheme: r.scheme },
+            None => r,
+        })
     }
 
     /// Maps a user-supplied path or internal URL to a filesystem path.
@@ -273,6 +307,31 @@ mod tests {
         assert_eq!(physical(&d.join("a/zz/../b")), d.join("a/b"));
         std::os::unix::fs::symlink("loop", d.join("loop")).unwrap();
         assert_eq!(physical(&d.join("loop")), d.join("loop"), "a link that points at itself stays put");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_local_file_is_found_in_an_ancestors_directory() {
+        let d = std::env::temp_dir().join(format!("mu-anc-{}", std::process::id()));
+        let sess = |name: &str, parent: Option<&str>| {
+            let p = d.join(format!("{name}.jsonl"));
+            let parent = parent.map(|x| format!(",\"parentSession\":\"{}\"", d.join(format!("{x}.jsonl")).display()));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(&p, format!("{{\"type\":\"session\",\"id\":\"{name}\"{}}}\n", parent.unwrap_or_default()))
+                .unwrap();
+            p
+        };
+        let root_of = |id: &str| d.join("local").join(id);
+        sess("2026_aaaa1111", None);
+        sess("2026_bbbb2222", Some("2026_aaaa1111"));
+        let child = sess("2026_cccc3333", Some("2026_bbbb2222"));
+        std::fs::create_dir_all(root_of("aaaa1111")).unwrap();
+        std::fs::write(root_of("aaaa1111").join("plan.md"), "p").unwrap();
+        let got = in_ancestors(Some(child.clone()), "plan.md", root_of);
+        assert_eq!(got, Some(root_of("aaaa1111").join("plan.md")), "the grandparent's file");
+        assert_eq!(in_ancestors(Some(child.clone()), "nope.md", root_of), None);
+        assert_eq!(in_ancestors(Some(child), "../x", root_of), None, "never outside the root");
+        assert_eq!(in_ancestors(None, "plan.md", root_of), None);
         std::fs::remove_dir_all(&d).ok();
     }
 

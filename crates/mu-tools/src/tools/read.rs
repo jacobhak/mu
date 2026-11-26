@@ -344,13 +344,13 @@ impl Tools {
     /// The file a `read` path names, selector and `:raw` split off: what `read` opens, and what the
     /// gate judges.
     pub(crate) fn read_file(&self, raw: &str) -> super::uri::ReadTarget {
-        super::uri::read_target(raw, |p| self.resolve(p).is_ok_and(|r| r.path.exists()))
+        super::uri::read_target(raw, |p| self.resolve_read(p).is_ok_and(|r| r.path.exists()))
     }
 
     pub async fn read(&self, a: Args) -> ToolOutput {
-        let exists = |p: &str| self.resolve(p).is_ok_and(|r| r.path.exists());
+        let exists = |p: &str| self.resolve_read(p).is_ok_and(|r| r.path.exists());
         let super::uri::ReadTarget { path: authored, sel, raw: raw_mode } = self.read_file(&a.path);
-        let res = match self.resolve(&authored) {
+        let res = match self.resolve_read(&authored) {
             Ok(r) => r,
             Err(e) => return ToolOutput::err(e),
         };
