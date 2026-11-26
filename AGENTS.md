@@ -22,4 +22,6 @@ Start work in a worktree with `scripts/start.sh <branch>`, never in the main che
 
 Run builds, tests and checks as `offload run -- <command>` (for example `offload run -- scripts/ci-checks.sh`), never locally. A subagent that builds must run where `offload` is available: with a `[task] launcher`, list only agent kinds that need no build in `launch` (workers behind a launcher have no toolchain or `offload`).
 
+`scripts/install.sh --from-source` (so `scripts/ship.sh`'s install step) builds on an offload node as well: on Linux, with `offload` installed (one that has `run --fetch`/`--arch`) and an `offload.toml`, it runs the release build there for this machine's architecture and fetches the binaries into `target/release/`; `MU_BUILD_SHA` gives the build the real commit, since the job's checkout is a snapshot commit. Anywhere else (macOS, no `offload`, `MU_INSTALL_OFFLOAD=0`, or a failed offloaded build) it builds locally as before.
+
 Enable the pre-commit fmt check once per clone: `git config core.hooksPath .githooks`.

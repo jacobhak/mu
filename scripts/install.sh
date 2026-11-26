@@ -55,10 +55,40 @@ resolved_path() {
 # clean-looking sha. The tree is asked here instead, and the answer recorded for `mu update` and --skip-if-dev.
 dirty=0
 if [ -n "$src" ] && [ -n "$(git -C "$src" status --porcelain --untracked-files=no 2>/dev/null)" ]; then dirty=1; fi
+# Builds the workspace and the mcp-http bridge on an offload build node of this machine's architecture and fetches the
+# binaries into $src/target/release. Returns 1, having said why when it matters, if that is not possible: the
+# caller then builds here. MU_INSTALL_OFFLOAD=0 never offloads.
+build_offloaded() {
+  local arch sha b fetch=()
+  [ "${MU_INSTALL_OFFLOAD:-1}" != 0 ] && [ -f "$src/offload.toml" ] && command -v offload >/dev/null || return 1
+  case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64) arch=amd64 ;;
+    Linux/aarch64 | Linux/arm64) arch=arm64 ;;
+    *) return 1 ;;
+  esac
+  sha="$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null)" || return 1
+  [ "$dirty" = 0 ] || sha="$sha-dirty"
+  for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do fetch+=(--fetch "target/release/$b"); done
+  echo "install: building on an offload node ($arch)"
+  # The job's checkout is a snapshot commit, so build.rs gets the sha from MU_BUILD_SHA. Two jobs, as
+  # scripts/maint/check.sh: x86_64 nodes peak near their 6 GiB limit at four.
+  if (cd "$src" && offload run --arch "$arch" "${fetch[@]}" -- env CARGO_BUILD_JOBS=2 MU_BUILD_SHA="$sha" \
+    sh -c 'cargo build --release --workspace --locked && scripts/build-mcp-http.sh build'); then
+    return 0
+  fi
+  echo "install: the offloaded build failed; building here" >&2
+  return 1
+}
+
 if [ -n "$src" ]; then
-  (cd "$src" && cargo build --release --workspace --locked && scripts/build-mcp-http.sh build)
+  if build_offloaded; then
+    reldir="$src/target/release"
+  else
+    (cd "$src" && cargo build --release --workspace --locked && scripts/build-mcp-http.sh build)
+    reldir="${CARGO_TARGET_DIR:-$src/target}/release"
+  fi
   . "$src/scripts/lib-layout.sh"
-  stage_layout "$src" "${CARGO_TARGET_DIR:-$src/target}/release" "$tmp"
+  stage_layout "$src" "$reldir" "$tmp"
 else
   if [ -n "$tag" ]; then url="https://github.com/$REPO/releases/download/$tag/mu-$plat.tar.gz"
   else url="https://github.com/$REPO/releases/latest/download/mu-$plat.tar.gz"; fi

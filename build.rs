@@ -7,9 +7,17 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-changed=upstream.toml");
-    let mut sha =
-        git(&["rev-parse", "--short=12", "HEAD"]).filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into());
-    if sha != "unknown" && git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty()) {
+    println!("cargo:rerun-if-env-changed=MU_BUILD_SHA");
+    // install.sh sets this when it builds in an offload job, whose checkout is a snapshot commit, not HEAD.
+    let given = std::env::var("MU_BUILD_SHA").ok().filter(|s| !s.is_empty());
+    let mut sha = given
+        .clone()
+        .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "unknown".into());
+    if given.is_none()
+        && sha != "unknown"
+        && git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty())
+    {
         sha.push_str("-dirty");
     }
     if let Some(gd) = git(&["rev-parse", "--absolute-git-dir"]) {
