@@ -514,14 +514,7 @@ pub async fn run(init: AppInit) -> i32 {
         let cache_expiry = app.cache_expires_in();
         tokio::select! {
             inp = reader.next(), if !app.screen.child_busy => match inp {
-                Some(Input::Term(e)) => {
-                    match e {
-                        Event::FocusGained => term::pane_focus(true),
-                        Event::FocusLost => term::pane_focus(false),
-                        _ => {}
-                    }
-                    app.on_terminal(e)
-                }
+                Some(Input::Term(e)) => app.on_terminal(e),
                 Some(Input::PasteText(s)) => app.on_terminal(Event::Paste(s)),
                 Some(Input::PasteImage(img)) => app.on_ui(UiMsg::ClipboardImage(Ok(Some(img)))),
                 Some(Input::Status(s)) => app.notice(&s),

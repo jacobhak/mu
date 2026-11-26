@@ -151,11 +151,7 @@ fn on() -> io::Result<()> {
         // xterm modifyOtherKeys: how tmux (`extended-keys on`) and xterm tell Ctrl+Enter from Enter.
         out.write_all(b"\x1b[>4;2m")?;
     }
-    write_terminal_seq("\x1b[?5522h");
-    if in_tmux() {
-        // Only tmux needs this one: it reports whether the pane has focus.
-        out.write_all(b"\x1b[?1004h")?;
-    }
+    write_terminal_seq(paste_events_seq(in_tmux()));
     Ok(())
 }
 
@@ -163,20 +159,13 @@ fn in_tmux() -> bool {
     std::env::var("TMUX").is_ok_and(|v| !v.is_empty())
 }
 
-/// The sequence that keeps the terminal's paste events (mode 5522) on for the focused tmux pane
-/// only. The mode belongs to the terminal's one surface, not to a pane, so left on it would hand
-/// every paste in another pane (a shell) the clipboard reply as typed text.
-fn focus_seq(tmux: bool, focused: bool) -> Option<&'static str> {
-    tmux.then_some(if focused { "\x1b[?5522h" } else { "\x1b[?5522l" })
-}
-
-/// The pane gained or lost focus (tmux's `focus-events`).
-pub fn pane_focus(focused: bool) {
-    if APPLIED.load(SeqCst)
-        && let Some(seq) = focus_seq(in_tmux(), focused)
-    {
-        write_terminal_seq(seq);
-    }
+/// The sequence sent on entry for the terminal's paste events (mode 5522). tmux implements no part
+/// of the protocol: with `extended-keys on` it breaks an event into keys, so the composer fills
+/// with `5522;type=read:…`, and the mode belongs to the terminal's one surface, so while it is on
+/// a paste into any other pane arrives there as typed text. Under tmux it is therefore turned off
+/// (which also clears it after a mu that left it on); a paste then comes as bracketed paste.
+fn paste_events_seq(tmux: bool) -> &'static str {
+    if tmux { "\x1b[?5522l" } else { "\x1b[?5522h" }
 }
 
 /// Idempotent; errors are ignored so it is safe from panic hooks and drop.
@@ -195,9 +184,6 @@ fn off() {
     let _ = execute!(out, DisableBracketedPaste, ResetColor, cursor::Show);
     let _ = terminal::disable_raw_mode();
     write_terminal_seq("\x1b[?5522l");
-    if in_tmux() {
-        let _ = out.write_all(b"\x1b[?1004l");
-    }
     let _ = out.flush();
 }
 
@@ -276,10 +262,9 @@ mod tests {
     }
 
     #[test]
-    fn paste_events_follow_the_focused_tmux_pane() {
-        assert_eq!(focus_seq(true, true), Some("\x1b[?5522h"));
-        assert_eq!(focus_seq(true, false), Some("\x1b[?5522l"));
-        assert_eq!(focus_seq(false, false), None);
+    fn paste_events_are_asked_for_outside_tmux_only() {
+        assert_eq!(paste_events_seq(false), "\x1b[?5522h");
+        assert_eq!(paste_events_seq(true), "\x1b[?5522l");
     }
 
     #[test]
