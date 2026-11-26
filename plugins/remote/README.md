@@ -72,9 +72,9 @@ The image comes from `plugins/remote/Dockerfile`, built from mu's repository roo
 | `mu-remote key` | this machine's bridge key fingerprint |
 | `mu-remote launch NAME` | mu's `[task] launcher` |
 | `mu-remote worker run \| bundle \| stop` | the remote end of a launched task (run by adapters) |
-| `mu-remote list`, `check NAME` | the remotes; what fails on one |
+| `mu-remote list`, `check NAME [--full [--agent ID]]` | the remotes; what fails on one (`--full` runs a synthetic worker, and with an agent the file and port verbs, through its adapter) |
 | `mu-remote rows [NAME]` | agents as JSON lines, for `[sessions] sources = [["mu-remote","rows"]]` |
-| `mu-remote install-adapter pod` | write the shipped pod adapter into the state directory |
+| `mu-remote install-adapter pod \| local` | write a shipped adapter into the state directory (`local` is the reference adapter) |
 | `mu-remote helper NAME ID VERB …` | what `mu-remote NAME` gives mu as `MU_ATTACH_HELPER` (not for typing; see below) |
 
 ### Files and ports
@@ -84,7 +84,7 @@ The image comes from `plugins/remote/Dockerfile`, built from mu's repository roo
 ## Documentation
 
 - [docs/config.md](docs/config.md): the config file and `[remote.NAME]`
-- [docs/adapters.md](docs/adapters.md): the adapter contract, the ssh and pod adapters
+- [docs/adapters.md](docs/adapters.md): the adapter contract, the ssh and pod adapters; `adapters/mu-remote-local` is the reference adapter
 - [docs/trust.md](docs/trust.md): trusted and untrusted remotes
 - [docs/channel.md](docs/channel.md): the encrypted channel and the worker link
 - [docs/tasks.md](docs/tasks.md): how a task runs on a remote

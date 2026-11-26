@@ -33,10 +33,10 @@ repos = ["/src/app", "https://example.com/team/app.git"]   # untrusted: only the
 
 | Key | Meaning |
 |---|---|
-| `adapter` | `ssh` (built in, needs `host`), `pod` (the adapter written by `mu-remote install-adapter pod`) or a program on the `PATH` or a path ([adapters](adapters.md)). Required |
+| `adapter` | `ssh` (built in, needs `host`), `pod` (the adapter written by `mu-remote install-adapter pod`), `local` (the reference adapter, written by `mu-remote install-adapter local`, which runs everything on this machine) or a program on the `PATH` or a path ([adapters](adapters.md)). Required |
 | `host` | The ssh host. Must not start with `-`. Used by the `ssh` adapter only |
 | `state_key` | The SSH ed25519 private key that unlocks a sealed agent's state, passed to `mu --attach --state-key`. Default `~/.ssh/id_ed25519`. A path, not a key |
-| `settings` | A table handed to the adapter as JSON in `MU_REMOTE_SETTINGS`. `work_dir` (default `/work`) is read by `mu-remote` itself: a new agent's repository is cloned to `<work_dir>/<repo name>` |
+| `settings` | A table handed to the adapter as JSON in `MU_REMOTE_SETTINGS`. `work_dir` (default `/work`) is read by `mu-remote` itself: a new agent's repository is cloned to `<work_dir>/<repo name>` and a worker's to `<work_dir>/<launch id>` (an adapter may place either elsewhere) |
 | `trusted` | `true` marks a remote you control: it may run a main agent, and the pod adapter may mount a secret. Default `false` ([trust](trust.md)) |
 | `repos` | On an untrusted remote, the repositories (paths or origin URLs, with or without `.git`) whose tasks may run there |
 | `reconnect_timeout` | Seconds a launched task's stream may stay down before the launcher gives up and fetches what the worker has ([tasks](tasks.md)). Default 600 |

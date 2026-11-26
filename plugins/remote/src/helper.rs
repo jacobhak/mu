@@ -70,7 +70,7 @@ fn parse_port(s: &str) -> Result<u16> {
 }
 
 /// A free local port: `port` itself when free (so the URL means the same on both machines), else any.
-fn pick_local(port: u16, prefer_same: bool) -> Result<u16> {
+pub(crate) fn pick_local(port: u16, prefer_same: bool) -> Result<u16> {
     if prefer_same && TcpListener::bind(("127.0.0.1", port)).is_ok() {
         return Ok(port);
     }

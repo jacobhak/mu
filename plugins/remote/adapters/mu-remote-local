@@ -1,0 +1,115 @@
+#!/bin/sh
+# The reference adapter for mu-remote (docs/adapters.md): it runs every verb on this machine, so it needs no
+# remote and no settings. Install it with `mu-remote install-adapter local`, set `adapter = "local"` in a
+# [remote.NAME] section, and check it with `mu-remote check NAME --full`. Copy it to start your own: replace the
+# bodies below with whatever reaches your machines; the verbs, their arguments and their output stay the same.
+#
+# Contract 2: MU_REMOTE_NAME, MU_REMOTE_SETTINGS, MU_REMOTE_TRUSTED and MU_REMOTE_CONTRACT are set (unused here).
+# Replies go to stdout, errors and {"progress":...} lines to stderr, exit 64 means "not supported here".
+set -eu
+
+state=${MU_REMOTE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/mu-remote}
+root=$state/local
+mu=${MU_REMOTE_MU:-mu}
+
+die() {
+  echo "mu-remote-local: $*" >&2
+  exit 1
+}
+
+# An id names a directory below, so it is one plain path component.
+safe_id() {
+  case $1 in '' | . | .. | */*) die "bad id: $1" ;; esac
+}
+
+verb_start() {
+  kind='' launch='' bundle='' dir='' resume='' cont=0 model=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --kind) kind=$2 ;;
+      --launch) launch=$2 ;;
+      --bundle) bundle=$2 ;;
+      --dir) dir=$2 ;;
+      --resume) resume=$2 ;;
+      --model) model=$2 ;;
+      -c) cont=1; shift; continue ;;
+      *) die "start: unexpected argument $1" ;;
+    esac
+    shift 2
+  done
+  case $kind in
+    agent)
+      if [ -n "$dir" ]; then
+        # The caller's PATH is only a name here: the checkout lives under the adapter's own directory.
+        dir=$root/agents/$(basename -- "$dir")
+        if [ -n "$bundle" ] && [ ! -d "$dir" ]; then
+          echo '{"progress":"copying repository"}' >&2
+          git clone -q -- "$bundle" "$dir" > /dev/null
+          git -C "$dir" remote remove origin
+        fi
+        mkdir -p -- "$dir"
+        cd -- "$dir"
+      else
+        cd -- "$HOME"
+      fi
+      set --
+      [ -z "$model" ] || set -- --model "$model"
+      if [ -n "$resume" ]; then set -- "$@" --resume "$resume"; elif [ "$cont" = 1 ]; then set -- "$@" -c; fi
+      exec "$mu" agent --detach "$@" < /dev/null
+      ;;
+    worker)
+      [ -n "$launch" ] && [ -n "$bundle" ] || die "start --kind worker needs --launch and --bundle"
+      safe_id "$launch"
+      dir=$root/work/$launch
+      echo '{"progress":"copying repository"}' >&2
+      git init -q -- "$dir"
+      # The bundle's first ref is the snapshot; the checkout is detached at it.
+      ref=$(git bundle list-heads "$bundle" | awk '$2 ~ /^refs\// { print $2; exit }')
+      git -C "$dir" fetch -q "$bundle" "${ref:-HEAD}"
+      git -C "$dir" checkout -q --detach FETCH_HEAD
+      exec mu-remote worker run --launch "$launch" --dir "$dir" --detach < /dev/null
+      ;;
+    *) die "start: --kind must be agent or worker" ;;
+  esac
+}
+
+verb_list() {
+  "$mu" agent list --json
+  [ -d "$state/workers" ] || return 0
+  for d in "$state"/workers/*; do
+    [ -d "$d" ] || continue
+    printf '{"id":"%s","kind":"worker"}\n' "$(basename -- "$d")"
+  done
+}
+
+verb_stop() {
+  safe_id "$1"
+  mu-remote worker stop "$1"
+  rm -rf -- "$root/work/$1" "$state/workers/$1"
+}
+
+verb=${1:-}
+[ $# -eq 0 ] || shift
+case $verb in
+  version) echo '{"contract":2}' ;;
+  start) verb_start "$@" ;;
+  list) verb_list ;;
+  connect) exec mu-remote bridge "$1" ;;
+  fetch) exec mu-remote worker bundle "$1" ;;
+  stop) verb_stop "$@" ;;
+  forward | unforward)
+    echo "the local adapter does not forward: the agent's ports are on this machine already" >&2
+    exit 64
+    ;;
+  read) exec cat -- "$2" ;;
+  write)
+    umask 077
+    mkdir -p -- "$(dirname -- "$2")"
+    [ ! -e "$2" ] || die "$2 exists"
+    exec cat > "$2"
+    ;;
+  *)
+    echo "mu-remote-local: unknown verb ${verb:-(none)}" >&2
+    exit 2
+    ;;
+esac

@@ -4,25 +4,54 @@ An adapter moves bytes and runs processes on a remote; `mu-remote` does the rest
 
 ## The adapter contract (version 2)
 
-`mu-remote` runs `<adapter> <verb> …` with these in the environment: `MU_REMOTE_NAME`, `MU_REMOTE_SETTINGS` (the settings as JSON) and `MU_REMOTE_TRUSTED` (`0` or `1`). An adapter must not mount or pass a secret into a remote whose `MU_REMOTE_TRUSTED` is `0`. A failing verb exits non-zero and writes its error to stderr, one line each; those lines are what is shown. A stderr line `{"progress":"pulling image"}` is progress, not an error. For an untrusted remote the adapter runs with secret-looking environment variables removed ([trust](trust.md)).
+`mu-remote` runs `<adapter> <verb> …`, one process per call. The contract is versioned (below): you can write an adapter in any language, and `mu-remote check NAME --full` runs it through every verb it can without an agent.
 
-| Verb | Does | Prints |
-|---|---|---|
-| `version` | the contract version; 1 and 2 are accepted, anything else is refused | `{"contract":2}` |
-| `start --kind agent [--resume ID \| -c] [--bundle FILE --dir PATH] [--model M]` | starts a detached `mu agent` there; with `--bundle` it first clones the bundle (the repository's full history) into `PATH` and runs the agent with `PATH` as its directory | `{"id":ID}` once it listens |
-| `start --kind worker --launch ID --bundle FILE --dir PATH` | makes a git checkout of the bundle's first ref in `PATH` and starts `mu-remote worker run --launch ID --dir PATH --detach` there | `{"id":ID}` |
-| `list` | the agents and workers there | one JSON object per line, as `mu agent list --json` prints them (`id` is required; `kind` is `agent` or `worker`) |
-| `connect ID` | a stdio pipe to `mu-remote bridge ID` on the far side | the stream |
-| `fetch ID` | `mu-remote worker bundle ID` there: the worker's result bundle | the bundle's bytes (nothing when unchanged) |
-| `stop ID` | `mu-remote worker stop ID` there, then removes the worker | nothing |
-| `forward ID PORT LOCAL` | makes `127.0.0.1:LOCAL` on this machine reach `localhost:PORT` where agent `ID` runs, then returns and leaves it open | nothing |
-| `unforward ID PORT LOCAL` | removes that forward | nothing |
-| `read ID PATH` | the regular file `PATH` on the agent's machine | the file's bytes |
-| `write ID PATH` | creates `PATH` (and its parent directories) from stdin, mode 0600; fails when it exists | nothing |
+### Environment
 
-The last four verbs are what [`mu-remote helper`](../README.md#files-and-ports) runs for mu (`MU_ATTACH_HELPER`); `mu-remote` picks `LOCAL`. They run only for a trusted remote ([trust](trust.md)). A version 1 adapter keeps working, without them: `mu-remote helper` answers exit code 64 ("not supported here") for each, and mu then does without. An adapter may also exit 64 from one of them for the same reason. `forward` and `unforward` have 30 seconds, `read` and `write` ten minutes. `forward` must not leave a process holding `stdout` or `stderr` open, or `mu-remote` waits for it.
+| Variable | Value |
+|---|---|
+| `MU_REMOTE_NAME` | the remote's name in the config |
+| `MU_REMOTE_SETTINGS` | the `[remote.NAME.settings]` table as one JSON object (`{}` when there is none) |
+| `MU_REMOTE_TRUSTED` | `1` for a remote with `trusted = true`, else `0` |
+| `MU_REMOTE_CONTRACT` | the contract number `mu-remote` speaks (2) |
+
+An adapter must not mount or pass a secret into a remote whose `MU_REMOTE_TRUSTED` is `0`. For an untrusted remote `mu-remote` also removes from the adapter's environment every variable whose name contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `AUTH` (any case; `SSH_AUTH_SOCK` stays), see [trust](trust.md). stdin is `/dev/null` except for `write` (the bytes) and `connect` (the stream).
+
+### Verbs
+
+Exit codes for every verb: `0` is success; `64` is "not supported here", which only the four file and port verbs may use (`mu-remote` then does without: mu falls back to its own file transfer and says ports cannot be forwarded); any other code is an error, and the stderr lines are the error text, one per line. A stderr line `{"progress":"pulling image"}` is progress, not an error. Keep stdout for a verb's reply.
+
+| Verb | Does | stdout | Time limit |
+|---|---|---|---|
+| `version` | the contract version; 1 and 2 are accepted, anything else is refused | `{"contract":N}` | 10 s (`check`, `list`, `rows`); 30 s before a file or port verb |
+| `start --kind agent [--resume ID \| -c] [--bundle FILE --dir PATH] [--model M]` | starts a detached `mu agent` there; with `--bundle` it first clones the bundle (the repository's full history) into `PATH` and runs the agent with `PATH` as its directory | `{"id":ID}` once it listens (`mu agent`'s own `{"session":ID,…}` line is accepted too) | none |
+| `start --kind worker --launch ID --bundle FILE --dir PATH` | makes a git checkout of the bundle's first ref in `PATH` and starts `mu-remote worker run --launch ID --dir PATH --detach` there | `{"id":ID}` | none |
+| `list` | the agents and workers there | one JSON object per line (below) | 30 s (to pick an agent); 10 s (`check`, `list`, `rows`) |
+| `connect ID` | a stdio pipe to `mu-remote bridge ID` on the far side | the stream | none; it ending is a lost connection, which `mu-remote` reconnects |
+| `fetch ID` | `mu-remote worker bundle ID` there: the worker's result bundle | the bundle's bytes (nothing when unchanged) | none |
+| `stop ID` | `mu-remote worker stop ID` there, then removes the worker | nothing | none |
+| `forward ID PORT LOCAL` | makes `127.0.0.1:LOCAL` on this machine reach `localhost:PORT` where agent `ID` runs, then returns and leaves it open | nothing | 30 s |
+| `unforward ID PORT LOCAL` | removes that forward | nothing | 30 s |
+| `read ID PATH` | the regular file `PATH` on the agent's machine | the file's bytes | none here; mu ends the helper after 10 minutes |
+| `write ID PATH` | creates `PATH` (and its parent directories) from stdin, mode 0600; fails when it exists | nothing | none here; mu ends the helper after 10 minutes |
+
+A call that passes its time limit is killed with its process group. `forward` must not leave a process holding `stdout` or `stderr` open, or `mu-remote` waits for it.
+
+**`list` fields.** `id` is required. `kind` is `agent` or `worker` (default `agent`); the rest are as `mu agent list --json` prints them: `cwd`, `started` (unix seconds), `title`, `client` (`{"host","since"}`), `waiting`, `locked`. Unknown fields are ignored.
+
+**`start --dir PATH`.** `PATH` is where the caller wants the checkout. An adapter may place it elsewhere, as long as `connect`, `fetch` and `stop` find the worker (or agent) by the ID `start` printed. A worker's `PATH` is under the remote's `work_dir` setting (default `/work`) when it has one.
+
+The last four verbs are what [`mu-remote helper`](../README.md#files-and-ports) runs for mu (`MU_ATTACH_HELPER`); `mu-remote` picks `LOCAL`. They run only for a trusted remote ([trust](trust.md)). A version 1 adapter keeps working without them: `mu-remote helper` answers exit code 64 for each, and mu does without.
 
 `connect` carries an opaque byte stream of lines: it must not interpret or buffer it. `mu-remote bridge` on the far side ends the [encrypted channel](channel.md) next to the agent (or the worker), so the adapter, the API server and every hop in between see only ciphertext.
+
+### Negotiation and stability
+
+`version` prints `{"contract":N}`; `mu-remote` accepts 1 and 2 and refuses any other number with a message that names both. The number goes up when an adapter written for the old one could break: a removed or renamed verb, flag or field, a changed meaning, a new required input. An optional addition keeps the number and is listed here. A new environment variable is such an addition, so an adapter ignores variables it does not know and `mu-remote` ignores fields it does not know. Contract 2 added `forward`, `unforward`, `read`, `write` and `MU_REMOTE_CONTRACT`.
+
+### Writing an adapter
+
+Start from `adapters/mu-remote-local` (a short POSIX `sh` program that runs everything on this machine; `mu-remote install-adapter local` writes it and `adapter = "local"` runs it) and verify yours with `mu-remote check NAME --full`.
 
 ## The ssh adapter
 
@@ -62,6 +91,6 @@ sccache_secret_name = "mu-sccache"   # trusted remotes only
 
 For the main agent in a cluster you control, with workers in a second namespace, see [kubernetes.md](kubernetes.md). `scripts/test-pod-run.sh` runs the adapter against a fake `kubectl`; pod scheduling, `kubectl wait`, jsonpath on real labels and exec behaviour on a dropped connection need a real cluster.
 
-## Writing an adapter
+## What an adapter needs
 
-Copy the verbs above. `list` and `connect` are enough to attach to agents someone else started; `forward`, `unforward`, `read` and `write` (contract 2) let mu open the agent's files and reach its servers; `start --kind worker`, `fetch` and `stop` make it usable as a task remote. Keep stdout for a verb's reply, send diagnostics to stderr one per line, and never pass a secret into a remote whose `MU_REMOTE_TRUSTED` is `0`. `mu-remote check NAME` runs `version` and `list` and says which failed.
+`list` and `connect` are enough to attach to agents someone else started; `forward`, `unforward`, `read` and `write` (contract 2) let mu open the agent's files and reach its servers; `start --kind worker`, `fetch` and `stop` make it usable as a task remote. Keep stdout for a verb's reply, send diagnostics to stderr one per line, and never pass a secret into a remote whose `MU_REMOTE_TRUSTED` is `0`. `mu-remote check NAME` runs `version` and `list` and says which failed; `--full` also runs a synthetic worker through `start`, `connect`, `fetch` and `stop`, and with `--agent ID` the file and port verbs.

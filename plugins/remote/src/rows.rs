@@ -99,13 +99,20 @@ fn report(name: &str, r: &Remote, timeout: Duration) -> (String, bool) {
     (out, ok)
 }
 
-pub fn check(name: &str) -> Result<i32> {
+/// `check`, and with `full` the conformance steps after it (see `conformance`).
+pub fn check(name: &str, full: bool, agent: Option<&str>) -> Result<i32> {
     let cfg = Config::load()?;
     let Some(r) = cfg.remote.get(name) else {
         bail!("unknown remote `{name}`; `mu-remote list` shows the configured ones")
     };
-    let (text, ok) = report(name, r, ANSWER_TIMEOUT);
+    let (text, mut ok) = report(name, r, ANSWER_TIMEOUT);
     print!("{text}");
+    // An adapter that cannot be built was reported as such above.
+    if full && let Ok(adapter) = Adapter::from_config(name, r) {
+        let (steps, passed) = crate::conformance::full(&adapter, agent);
+        print!("{steps}");
+        ok &= passed;
+    }
     Ok(if ok { 0 } else { 1 })
 }
 

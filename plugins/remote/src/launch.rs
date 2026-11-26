@@ -140,7 +140,7 @@ async fn launch(adapter: Arc<Adapter>, task: Task, give_up: Duration) -> Result<
 /// still be stopped.
 async fn start(adapter: &Arc<Adapter>, task: &Task, cancel: &CancellationToken) -> Result<String> {
     let what =
-        Start::Worker { launch: task.name.clone(), bundle: task.bundle.clone(), dir: format!("/work/{}", task.name) };
+        Start::Worker { launch: task.name.clone(), bundle: task.bundle.clone(), dir: worker_dir(adapter, &task.name) };
     let a = adapter.clone();
     let mut starting = tokio::task::spawn_blocking(move || a.start(&what, &mut progress));
     let joined = tokio::select! {
@@ -155,6 +155,12 @@ async fn start(adapter: &Arc<Adapter>, task: &Task, cancel: &CancellationToken) 
         .map_err(|e| anyhow!("cannot start a worker on remote {}: {e:#}", adapter.name()))
 }
 
+/// Where the caller wants worker `name`'s checkout: under the remote's `work_dir` setting (default `/work`).
+fn worker_dir(adapter: &Adapter, name: &str) -> String {
+    let base = adapter.setting("work_dir").unwrap_or_else(|| crate::client::DEFAULT_WORK_DIR.to_string());
+    format!("{}/{name}", base.trim_end_matches('/'))
+}
+
 /// Writes the worker's result bundle to `path`: empty when it changed nothing, and when the fetch fails.
 fn fetch(adapter: &Adapter, id: &str, path: &Path) -> Result<()> {
     let mut file = std::fs::File::create(path).with_context(|| path.display().to_string())?;
@@ -163,4 +169,24 @@ fn fetch(adapter: &Adapter, id: &str, path: &Path) -> Result<()> {
         let _ = file.set_len(0);
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Remote;
+
+    fn adapter(work_dir: Option<&str>) -> Adapter {
+        let mut settings = toml::Table::new();
+        if let Some(w) = work_dir {
+            settings.insert("work_dir".into(), w.into());
+        }
+        Adapter::from_config("far", &Remote { adapter: "/bin/true".into(), settings, ..Default::default() }).unwrap()
+    }
+
+    #[test]
+    fn a_worker_checks_out_under_the_remotes_work_dir() {
+        assert_eq!(worker_dir(&adapter(None), "fix-ab12cd34"), "/work/fix-ab12cd34");
+        assert_eq!(worker_dir(&adapter(Some("/w/")), "fix-ab12cd34"), "/w/fix-ab12cd34");
+    }
 }

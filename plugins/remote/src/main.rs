@@ -5,6 +5,7 @@
 mod adapter;
 mod client;
 mod config;
+mod conformance;
 mod connect;
 mod fs;
 mod helper;
@@ -62,11 +63,20 @@ enum Cmd {
     },
     /// The configured remotes: adapter, whether trusted, whether it answers.
     List,
-    /// Run an adapter's `version` and `list` and report what fails.
-    Check { name: String },
+    /// Run an adapter's `version` and `list` and report what fails. With `--full` it also runs a synthetic worker
+    /// through `start`, `connect`, `fetch` and `stop` and, with `--agent ID`, the file and port verbs.
+    Check {
+        name: String,
+        #[arg(long)]
+        full: bool,
+        /// With `--full`: an agent on the remote to try the file and port verbs on (a trusted remote only).
+        #[arg(long, requires = "full")]
+        agent: Option<String>,
+    },
     /// A `[sessions] sources` command: the agents on every remote (or NAME), as JSON lines.
     Rows { name: Option<String> },
-    /// Write a shipped adapter into the state directory; `pod` is the Kubernetes one.
+    /// Write a shipped adapter into the state directory: `pod` is the Kubernetes one, `local` the reference
+    /// adapter that runs everything on this machine.
     InstallAdapter { name: String },
     /// What mu's `MU_ATTACH_HELPER` runs: `forward`, `unforward`, `read` and `write` for agent ID on remote NAME.
     #[command(hide = true)]
@@ -124,7 +134,7 @@ fn dispatch() -> Result<i32> {
             WorkerCmd::Stop { id } => worker::stop(&id),
         },
         Some(Cmd::List) => rows::list(),
-        Some(Cmd::Check { name }) => rows::check(&name),
+        Some(Cmd::Check { name, full, agent }) => rows::check(&name, full, agent.as_deref()),
         Some(Cmd::Rows { name }) => rows::rows(name.as_deref()),
         Some(Cmd::InstallAdapter { name }) => install::run(&name),
         Some(Cmd::Helper { name, id, verb, args }) => helper::run(&name, &id, &verb, &args),

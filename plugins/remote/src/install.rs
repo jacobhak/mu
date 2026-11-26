@@ -5,11 +5,19 @@ use std::path::{Path, PathBuf};
 
 const POD_ADAPTER: &str = include_str!("../adapters/mu-remote-pod");
 const POD_TEMPLATE: &str = include_str!("../adapters/mu-remote-pod.yaml");
+const LOCAL_ADAPTER: &str = include_str!("../adapters/mu-remote-local");
 
 /// Installs the adapter `name` into `dir` and returns the program's path. Running it again replaces the files.
 fn install(name: &str, dir: &Path) -> Result<PathBuf> {
+    if name == "local" {
+        crate::fs::create_private_dir(dir).with_context(|| dir.display().to_string())?;
+        let program = dir.join("mu-remote-local");
+        crate::fs::write_atomic(&program, LOCAL_ADAPTER.as_bytes(), 0o755)
+            .with_context(|| program.display().to_string())?;
+        return Ok(program);
+    }
     if name != "pod" {
-        bail!("unknown adapter `{name}`; mu-remote ships `pod` (`ssh` is built in and needs no install)");
+        bail!("unknown adapter `{name}`; mu-remote ships `pod` and `local` (`ssh` is built in and needs no install)");
     }
     crate::fs::create_private_dir(dir).with_context(|| dir.display().to_string())?;
     let program = dir.join("mu-remote-pod");
@@ -45,6 +53,16 @@ mod tests {
         install("pod", &dir).unwrap();
         assert_eq!(std::fs::read_to_string(&program).unwrap(), POD_ADAPTER);
         let e = install("nope", &dir).unwrap_err().to_string();
-        assert!(e.contains("unknown adapter") && e.contains("`pod`"), "{e}");
+        assert!(e.contains("unknown adapter") && e.contains("`pod`") && e.contains("`local`"), "{e}");
+    }
+
+    #[test]
+    fn the_local_adapter_is_installed_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testutil::tmp().join("bin");
+        let program = install("local", &dir).unwrap();
+        assert_eq!(program, dir.join("mu-remote-local"));
+        assert_eq!(std::fs::metadata(&program).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read_to_string(&program).unwrap(), LOCAL_ADAPTER);
     }
 }

@@ -54,6 +54,7 @@ ARG KUBECTL_VERSION=1.31.14
 USER root
 COPY --chmod=0755 plugins/remote/adapters/mu-remote-pod /usr/local/lib/mu-remote/mu-remote-pod
 COPY plugins/remote/adapters/mu-remote-pod.yaml /usr/local/lib/mu-remote/mu-remote-pod.yaml
+COPY --chmod=0755 plugins/remote/adapters/mu-remote-local /usr/local/lib/mu-remote/mu-remote-local
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl jq tini \
  && rm -rf /var/lib/apt/lists/* \

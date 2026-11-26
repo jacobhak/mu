@@ -1,5 +1,6 @@
 //! The adapter contract (version 2; 1 still works, without the file and port verbs): `<adapter> <verb> ...` with
-//! `MU_REMOTE_NAME`, `MU_REMOTE_SETTINGS` (JSON) and `MU_REMOTE_TRUSTED` (`0`/`1`) in the environment. Replies are
+//! `MU_REMOTE_NAME`, `MU_REMOTE_SETTINGS` (JSON), `MU_REMOTE_TRUSTED` (`0`/`1`) and `MU_REMOTE_CONTRACT` in the
+//! environment (docs/adapters.md is the spec). Replies are
 //! JSON on stdout, errors are stderr lines, and `{"progress":"..."}` stderr lines report progress. `ssh` is built
 //! in (`ssh.rs`); any other adapter is a program.
 
@@ -15,6 +16,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const CONTRACT: u32 = 2;
+
+/// The exit code of a file or port verb that "is not supported here".
+const NOT_SUPPORTED: i32 = 64;
 
 /// The adapter cannot do this (a contract-1 adapter, or no private directory for ssh's control socket).
 #[derive(Debug)]
@@ -236,6 +240,8 @@ impl Adapter {
             Kind::Ssh { host: r.host.clone().unwrap_or_default().trim().to_string(), program: ssh::program() }
         } else if r.adapter.trim() == "pod" {
             Kind::Program(crate::paths::state_dir().join("bin/mu-remote-pod").to_string_lossy().into_owned())
+        } else if r.adapter.trim() == "local" {
+            Kind::Program(crate::paths::state_dir().join("bin/mu-remote-local").to_string_lossy().into_owned())
         } else {
             Kind::Program(r.adapter.trim().to_string())
         };
@@ -280,7 +286,8 @@ impl Adapter {
         }
         cmd.env("MU_REMOTE_NAME", &self.name)
             .env("MU_REMOTE_SETTINGS", &self.settings)
-            .env("MU_REMOTE_TRUSTED", if self.trusted { "1" } else { "0" });
+            .env("MU_REMOTE_TRUSTED", if self.trusted { "1" } else { "0" })
+            .env("MU_REMOTE_CONTRACT", CONTRACT.to_string());
         cmd
     }
 
@@ -373,6 +380,12 @@ impl Adapter {
             bail!("`{verb}` timed out after {}s", timeout.map_or(0, |t| t.as_secs()));
         }
         let status = status.context("adapter status unknown")?;
+        let file_or_port = matches!(verb, "forward" | "unforward" | "read" | "write");
+        if status.code() == Some(NOT_SUPPORTED) && file_or_port && matches!(self.kind, Kind::Program(_)) {
+            let why =
+                errors.first().cloned().unwrap_or_else(|| format!("adapter `{}` does not support `{verb}`", self.name));
+            return Err(Unsupported(why).into());
+        }
         if !status.success() {
             let mut msg = errors.join("\n");
             if msg.is_empty() {
@@ -423,7 +436,7 @@ impl Adapter {
         let cmd = self.command("version", &[], || unreachable!())?;
         let v = parse_contract(&self.capture("version", cmd, timeout, &mut |_| {})?)?;
         if !(1..=CONTRACT).contains(&v) {
-            bail!("adapter `{}` speaks contract {v}; this mu-remote speaks 1 and 2", self.name);
+            bail!("adapter `{}` speaks contract {v}; this mu-remote speaks 1 and {CONTRACT}", self.name);
         }
         Ok(v)
     }
@@ -684,6 +697,30 @@ esac
         assert!(!dir.join("log").exists(), "the adapter was never called");
         let w = Start::Worker { launch: "L".into(), bundle: "/b".into(), dir: "/d".into() };
         a.start(&w, &mut |_| {}).unwrap();
+    }
+
+    #[test]
+    fn exit_64_from_a_file_or_port_verb_means_not_supported() {
+        let dir = crate::testutil::tmp();
+        let path = dir.join("adapter");
+        std::fs::write(&path, "#!/bin/sh\ncase \"$1\" in version) echo '{\"contract\":2}' ;; list) exit 64 ;; *) echo nope >&2; exit 64 ;; esac\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = Adapter::from_config("x", &remote(&path, true)).unwrap();
+        let e = a.forward("a", 1, 2, None).unwrap_err();
+        assert!(e.downcast_ref::<Unsupported>().is_some_and(|u| u.0 == "nope"), "{e:#}");
+        assert!(a.read("a", "/x", &mut Vec::new()).unwrap_err().downcast_ref::<Unsupported>().is_some());
+        let e = a.list(None).unwrap_err();
+        assert!(e.downcast_ref::<Unsupported>().is_none(), "only the file and port verbs may be unsupported");
+    }
+
+    #[test]
+    fn the_adapter_is_told_the_contract_it_is_run_under() {
+        let dir = crate::testutil::tmp();
+        let path = dir.join("adapter");
+        std::fs::write(&path, "#!/bin/sh\necho \"{\\\"contract\\\":$MU_REMOTE_CONTRACT}\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = Adapter::from_config("x", &remote(&path, false)).unwrap();
+        assert_eq!(a.version(None).unwrap(), CONTRACT);
     }
 
     #[test]
