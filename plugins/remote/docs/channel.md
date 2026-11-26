@@ -30,7 +30,14 @@ On the wire each Noise message is one line, a JSON string holding its base64, so
 first contact with agent ID on NAME: its key is SHA256:…, now pinned
 ```
 
-so you can compare it with `mu-remote key` run on the remote another way (the remote's own terminal, say). A later connection to that agent id with another key is refused with a message that names both fingerprints and the file to edit if the machine's state was reset on purpose, and nothing is told to the agent. A new agent id is a new pin: agents served by one machine share a key, so their fingerprints match.
+so you can compare it with `mu-remote key` run on the remote another way (the remote's own terminal, say). A later connection to that agent id with another key is refused with a message that names both fingerprints and the file to edit if the machine's state was reset on purpose, and nothing is told to the agent. A new agent id is a new pin: agents served by one machine share a key, so their fingerprints match. When the remote already has pinned agents, the line says how the new key compares with theirs:
+
+```
+first contact with agent ID on NAME: its key is SHA256:…, the same as agent OTHER's; now pinned
+first contact with agent ID on NAME: its key SHA256:… is not one this remote showed before (it showed SHA256:…); compare it with `mu-remote key` run there, now pinned
+```
+
+The first is the expected case. The second is the one to look at: a key no other agent of that remote showed means a different machine behind the same remote name, or a reset profile (or someone in the middle); compare it with `mu-remote key` run on the remote. The key is pinned either way, and a refusal works as before.
 
 For tasks the keys exist only in memory: the launcher makes a new key for every task and the worker makes its own when it starts. The launcher pins the worker's key from the first connection and refuses a different one later; the worker pins the launcher's key likewise.
 

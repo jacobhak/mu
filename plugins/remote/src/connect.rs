@@ -91,12 +91,23 @@ async fn connect_stream(child: &mut std::process::Child, name: &str, id: &str) -
     };
     hs.read(&reply).map_err(msg)?;
     let key = hs.remote_key().context("the agent showed no key")?;
-    if secure::check_pin(&secure::pins_path(), name, id, &key).map_err(msg)? == Pinned::First {
-        eprintln!(
+    match secure::check_pin(&secure::pins_path(), name, id, &key).map_err(msg)? {
+        Pinned::Known => {}
+        Pinned::First { same_as: None } => eprintln!(
             "first contact with agent {id} on {name}: its key is {}, now pinned. Compare it with `mu-remote key` run \
              there; a later change is refused.",
             secure::fingerprint(&key)
-        );
+        ),
+        Pinned::First { same_as: Some(other) } => eprintln!(
+            "first contact with agent {id} on {name}: its key is {}, the same as agent {other}'s; now pinned",
+            secure::fingerprint(&key)
+        ),
+        Pinned::NewKey { known } => eprintln!(
+            "first contact with agent {id} on {name}: its key {} is not one this remote showed before (it showed {}); \
+             compare it with `mu-remote key` run there, now pinned",
+            secure::fingerprint(&key),
+            known.join(", ")
+        ),
     }
     put(&mut to_adapter, &hs.write().map_err(msg)?).await?;
     let (mut sealer, mut opener, _) = hs.finish().map_err(msg)?;

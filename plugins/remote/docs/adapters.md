@@ -59,7 +59,7 @@ Start from `adapters/mu-remote-local` (a short POSIX `sh` program that runs ever
 
 ## The pod adapter
 
-`mu-remote install-adapter pod` writes `mu-remote-pod` and its pod template `mu-remote-pod.yaml` into `<state>/bin/` (running it again replaces them), and `adapter = "pod"` then runs that program. It drives `kubectl` (your kubeconfig is the credential) and needs `jq`, to read the settings. One pod per agent or worker, from the `worker` (or, for the main agent, `agent`) image built with this repository's `Dockerfile`. The image needs `mu` and `mu-remote`; the worker's `mu` must be the version the launching mu runs.
+`mu-remote install-adapter pod` writes `mu-remote-pod` and its pod template `mu-remote-pod.yaml` into `<state>/bin/` (running it again replaces them), and `adapter = "pod"` then runs that program. It drives `kubectl` (your kubeconfig is the credential) and needs `jq`, to read the settings. One pod per agent or worker, from the `worker` (or, for the main agent, `agent`) image built with `plugins/remote/Dockerfile` ([kubernetes.md](kubernetes.md)). The image needs `mu` and `mu-remote`; the worker's `mu` must be the version the launching mu runs.
 
 ```toml
 [remote.cluster]

@@ -108,8 +108,16 @@ pub fn pins_path() -> PathBuf {
 /// What `check_pin` found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Pinned {
-    /// Never seen: it is pinned now.
-    First,
+    /// This agent was never seen: its key is pinned now. `same_as` names another agent of the remote that
+    /// showed the same key (agents served by one machine share it).
+    First {
+        same_as: Option<String>,
+    },
+    /// This agent was never seen and its key is none of those the remote's other agents showed: pinned now,
+    /// but worth comparing. `known` holds their fingerprints.
+    NewKey {
+        known: Vec<String>,
+    },
     Known,
 }
 
@@ -135,10 +143,19 @@ pub fn check_pin(file: &Path, remote: &str, id: &str, key: &[u8]) -> Result<Pinn
             ))
         }
         None => {
+            let others = pins.get(remote).cloned().unwrap_or_default();
+            let same_as = others.iter().find(|(_, k)| **k == now).map(|(other, _)| other.clone());
+            let mut known: Vec<String> = Vec::new();
+            for k in others.values() {
+                let f = STANDARD.decode(k).map(|k| fingerprint(&k)).unwrap_or_else(|_| k.clone());
+                if !known.contains(&f) {
+                    known.push(f);
+                }
+            }
             pins.entry(remote.to_string()).or_default().insert(id.to_string(), now);
             let text = serde_json::to_string_pretty(&pins).map_err(|e| e.to_string())?;
             crate::fs::write_private(file, text.as_bytes()).map_err(|e| format!("{}: {e}", file.display()))?;
-            Ok(Pinned::First)
+            Ok(if known.is_empty() || same_as.is_some() { Pinned::First { same_as } } else { Pinned::NewKey { known } })
         }
     }
 }
@@ -440,13 +457,34 @@ mod tests {
     fn a_pin_is_made_once_per_remote_and_agent_and_a_change_is_refused() {
         let file = tmp().join("keys").join("pins.json");
         let (a, b) = (Keypair::generate().unwrap(), Keypair::generate().unwrap());
-        assert_eq!(check_pin(&file, "cluster", "s1", a.public()), Ok(Pinned::First));
+        assert_eq!(check_pin(&file, "cluster", "s1", a.public()), Ok(Pinned::First { same_as: None }));
         assert_eq!(check_pin(&file, "cluster", "s1", a.public()), Ok(Pinned::Known));
         let refused = check_pin(&file, "cluster", "s1", b.public()).unwrap_err();
         assert!(refused.contains(&a.fingerprint()) && refused.contains(&b.fingerprint()), "{refused}");
         assert!(refused.contains("Refusing to connect"));
-        // Another agent, and another remote, have their own pin.
-        assert_eq!(check_pin(&file, "cluster", "s2", b.public()), Ok(Pinned::First));
-        assert_eq!(check_pin(&file, "devbox", "s1", b.public()), Ok(Pinned::First));
+        // Another remote has its own pins.
+        assert_eq!(check_pin(&file, "devbox", "s1", b.public()), Ok(Pinned::First { same_as: None }));
+    }
+
+    #[test]
+    fn a_new_agent_with_the_key_of_another_agent_of_the_remote_is_pinned_and_says_whose() {
+        let file = tmp().join("keys").join("pins.json");
+        let a = Keypair::generate().unwrap();
+        assert_eq!(check_pin(&file, "cluster", "s1", a.public()), Ok(Pinned::First { same_as: None }));
+        assert_eq!(check_pin(&file, "cluster", "s2", a.public()), Ok(Pinned::First { same_as: Some("s1".into()) }));
+        assert_eq!(check_pin(&file, "cluster", "s2", a.public()), Ok(Pinned::Known));
+    }
+
+    #[test]
+    fn a_new_agent_with_a_key_the_remote_never_showed_is_pinned_and_flagged() {
+        let file = tmp().join("keys").join("pins.json");
+        let (a, b) = (Keypair::generate().unwrap(), Keypair::generate().unwrap());
+        check_pin(&file, "cluster", "s1", a.public()).unwrap();
+        assert_eq!(check_pin(&file, "cluster", "s2", b.public()), Ok(Pinned::NewKey { known: vec![a.fingerprint()] }));
+        assert_eq!(check_pin(&file, "cluster", "s2", b.public()), Ok(Pinned::Known), "it is pinned all the same");
+        // Both keys are known now, so a third agent lists both.
+        let c = Keypair::generate().unwrap();
+        let Ok(Pinned::NewKey { known }) = check_pin(&file, "cluster", "s3", c.public()) else { panic!("not flagged") };
+        assert_eq!(known.len(), 2);
     }
 }

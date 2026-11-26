@@ -17,6 +17,10 @@ remote NAME is not trusted to run a main agent (set trusted = true on a remote y
 
 The helper verbs of `mu --attach` (`mu-remote helper`: `read`, `write`, `forward`, `unforward`) run only for a trusted remote. On any other the helper exits 1 with `remote NAME is not trusted` and the adapter is never called.
 
+## Sessions tab rows
+
+`mu-remote rows` lists trusted remotes only, and its `attach` and `helper` are argument vectors (sources contract 2): mu quotes each word itself, so an agent id from a remote never reaches a shell unquoted.
+
 ## Tasks
 
 An untrusted remote runs a launch (`mu-remote launch NAME`) only when both hold:
