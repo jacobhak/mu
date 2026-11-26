@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::host::results::ResultArgs;
-use crate::host::sessions::{Live, LiveArgs, TailArgs, TailDelta};
+use crate::host::sessions::{AttachTarget, Live, LiveArgs, TailArgs, TailDelta};
 use crate::keymap;
 use crate::panels::reply::rule;
 use crate::panels::session_view;
@@ -79,9 +79,9 @@ pub enum JobsResult {
         pid: u32,
         started: String,
     },
-    /// Join a session on another host: run `mu --attach` with this shell command.
+    /// Join a session on another host: run `mu --attach` with this command, helper and state key.
     Attach {
-        command: String,
+        target: AttachTarget,
     },
     /// Take over a `-p` run (`mu take`).
     Take {
@@ -596,8 +596,8 @@ impl JobsPanel {
     fn open_session_view(&mut self) -> Option<JobsResult> {
         let r = self.rows.get(self.s_at)?;
         if r.host.is_some() {
-            if let Some(command) = &r.attach {
-                return Some(JobsResult::Attach { command: command.clone() });
+            if let Some(target) = &r.attach {
+                return Some(JobsResult::Attach { target: target.clone() });
             }
             self.status = Some(r.hint.clone().unwrap_or_else(|| "this session runs on another machine".into()));
             return None;
@@ -1302,6 +1302,8 @@ mod tests {
             host: None,
             hint: None,
             attach: None,
+            helper: None,
+            state_key: None,
             live,
         });
         Live { rows: rows.collect(), canon: Vec::new(), notice: None }

@@ -592,6 +592,17 @@ fn agent_list(home: &Path, cwd: &Path) -> Vec<Value> {
     String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
+#[test]
+fn contracts_prints_each_version_on_one_line() {
+    let (home, cwd) = fixture();
+    let o = mu(&home, &cwd).arg("contracts").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        "{\"wire\":7,\"launcher\":2,\"agents\":1,\"attach\":1,\"sources\":2,\"helper\":1}\n"
+    );
+}
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     for _ in 0..600 {
         if done() {

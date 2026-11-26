@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::host::sessions::LiveRow;
+use crate::host::sessions::{AttachTarget, LiveRow};
 use crate::text::line::{self, Line, dim, span};
 use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
@@ -26,8 +26,8 @@ pub struct Row {
     pub host: Option<String>,
     /// How to open a session on another host, from the source that listed it.
     pub hint: Option<String>,
-    /// A shell command that opens it (`mu --attach`).
-    pub attach: Option<String>,
+    /// What opens it (`mu --attach`).
+    pub attach: Option<AttachTarget>,
 }
 
 impl Row {
@@ -113,7 +113,11 @@ pub fn build(
             modified: l.modified,
             host: l.host.clone(),
             hint: l.hint.clone(),
-            attach: l.attach.clone(),
+            attach: l.attach.clone().map(|command| AttachTarget {
+                command,
+                helper: l.helper.clone(),
+                state_key: l.state_key.clone(),
+            }),
         });
     }
     out
@@ -285,6 +289,8 @@ mod tests {
                 host: None,
                 hint: None,
                 attach: None,
+                helper: None,
+                state_key: None,
                 live,
             })
             .collect()

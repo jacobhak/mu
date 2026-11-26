@@ -75,6 +75,10 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Predict { cmd } => cli::predict::run(cmd),
         Sub::MigrateProfile { name, dry_run } => workflow::migrate::run(&name, dry_run),
         Sub::Attach { session, socket, .. } => cli::attach::run(session.as_deref(), socket),
+        Sub::Contracts => {
+            println!("{}", mu_base::contracts::json());
+            Ok(0)
+        }
         Sub::Plan { .. } => unreachable!("`mu plan` is routed in dispatch"),
         Sub::Agent { .. } => unreachable!("`mu agent` is routed in dispatch"),
     }

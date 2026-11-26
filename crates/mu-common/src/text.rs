@@ -1,5 +1,10 @@
 //! Text helpers shared by mu and its plugins.
 
+/// `s` as one word of a `sh` command line.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// `s` cut to `max` characters, with `…` appended when it was cut.
 pub fn truncate_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {

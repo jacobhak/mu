@@ -14,7 +14,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const WIRE: u64 = 6;
+/// The wire number of the `mu` under test, from `mu contracts`: the first line of a client names it.
+fn wire() -> u64 {
+    static WIRE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WIRE.get_or_init(|| {
+        let o = Command::new(mu_bin()).arg("contracts").output().unwrap();
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+        v["wire"].as_u64().unwrap()
+    })
+}
 
 /// A plain client of an agent's socket (what `mu attach --stdio` pipes to).
 struct Client {
@@ -57,7 +65,7 @@ impl Client {
 
     fn hello(&mut self, host: &str, take: bool) -> Value {
         self.send(&json!({"hello": {
-            "wire": WIRE, "version": "test", "reconnect": false,
+            "wire": wire(), "version": "test", "reconnect": false,
             "host": host, "client": format!("client-of-{host}"), "take": take,
         }}));
         self.next().expect("the agent's hello")
@@ -388,8 +396,11 @@ fn rows_list_the_agents_of_a_trusted_remote_with_host_hint_and_attach() {
     assert_eq!(row["id"], agent.session.as_str());
     assert_eq!(row["host"], "far");
     assert_eq!(row["hint"], format!("mu-remote far --resume {}", agent.session));
-    let attach = row["attach"].as_str().unwrap();
-    assert!(attach.ends_with(&format!("connect 'far' '{}'", agent.session)), "{attach}");
+    let argv = |k: &str| -> Vec<String> {
+        row[k].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(argv("attach")[1..], ["connect", "far", agent.session.as_str()]);
+    assert_eq!(argv("helper")[1..], ["helper", "far", agent.session.as_str()]);
 
     std::fs::write(far.dir.join("down"), "").unwrap();
     let o = far.mr().arg("rows").output().unwrap();

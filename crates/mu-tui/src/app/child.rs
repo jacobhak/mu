@@ -7,10 +7,8 @@ use crate::host::plans::{READ_FILE, ReadFile, WRITE_FILE, WriteFile};
 use crate::render::Renderer;
 use crate::term::term;
 
-/// `s` as one word of a `sh` command line.
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+use crate::host::sessions::AttachTarget;
+use mu_common::text::sh_quote as quote;
 
 /// What to do when a child that owned the terminal exits.
 pub(super) enum ChildThen {
@@ -204,12 +202,12 @@ impl App {
     }
 
     /// Hands the terminal to `mu --attach COMMAND`, then comes back to the Sessions tab.
-    pub(super) fn attach_session(&mut self, command: String) {
+    pub(super) fn attach_session(&mut self, target: AttachTarget) {
         let exe = match mu_common::paths::self_exe() {
             Ok(e) => e,
             Err(e) => return self.error(&format!("cannot locate mu: {e}")),
         };
-        self.start_child(ChildThen::Attach, move || run_attach(&exe, &command));
+        self.start_child(ChildThen::Attach, move || run_attach(&exe, &target));
     }
 
     /// Takes over a `-p` run beside a remote host. The agent stops the run and starts an agent on its session;
@@ -246,18 +244,28 @@ impl App {
                 tokio::task::spawn_local(bridge(listener, tunnel, sock.clone()));
                 let command =
                     format!("{} attach --socket {}", quote(&exe.to_string_lossy()), quote(&sock.to_string_lossy()));
-                app.start_child(ChildThen::Take, move || run_attach(&exe, &command));
+                let target = AttachTarget { command, helper: None, state_key: None };
+                app.start_child(ChildThen::Take, move || run_attach(&exe, &target));
             },
         );
     }
 }
 
-/// `mu --attach COMMAND` on the terminal, with Ctrl-C going to it and not to this mu.
-fn run_attach(exe: &std::path::Path, command: &str) -> std::io::Result<std::process::ExitStatus> {
+/// `mu --attach COMMAND` on the terminal, with Ctrl-C going to it and not to this mu. The target's helper
+/// becomes `MU_ATTACH_HELPER` and its state key `--state-key`.
+fn run_attach(exe: &std::path::Path, target: &AttachTarget) -> std::io::Result<std::process::ExitStatus> {
     extern "C" fn noop(_: libc::c_int) {}
     // SAFETY: installs a no-op handler; restored to the default below.
     unsafe { libc::signal(libc::SIGINT, noop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
-    let status = std::process::Command::new(exe).arg("--attach").arg(command).status();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--attach").arg(&target.command);
+    if let Some(key) = &target.state_key {
+        cmd.arg("--state-key").arg(key);
+    }
+    if let Some(helper) = &target.helper {
+        cmd.env("MU_ATTACH_HELPER", helper);
+    }
+    let status = cmd.status();
     // SAFETY: back to the default disposition.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
     status

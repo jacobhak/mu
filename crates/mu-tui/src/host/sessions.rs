@@ -67,6 +67,40 @@ pub struct LiveRow {
     /// A shell command that opens it: `mu --attach` runs it, as a take-over's nested client does.
     #[serde(default)]
     pub attach: Option<String>,
+    /// A shell command line that becomes `MU_ATTACH_HELPER` for that attach.
+    #[serde(default)]
+    pub helper: Option<String>,
+    /// The private key file passed as `--state-key` for that attach.
+    #[serde(default)]
+    pub state_key: Option<String>,
+}
+
+/// What `mu --attach` is started with for a row of another machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachTarget {
+    pub command: String,
+    pub helper: Option<String>,
+    pub state_key: Option<String>,
+}
+
+/// A command a source gives, as an argument vector (each word quoted for `sh`; preferred) or as a shell
+/// line that is run as written.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Words {
+    Line(String),
+    Argv(Vec<String>),
+}
+
+impl Words {
+    /// The shell line, or `None` for a blank one or an empty argument vector.
+    fn line(self) -> Option<String> {
+        let line = match self {
+            Words::Line(l) => l,
+            Words::Argv(v) => v.iter().map(|w| mu_common::text::sh_quote(w)).collect::<Vec<_>>().join(" "),
+        };
+        (!line.trim().is_empty()).then_some(line)
+    }
 }
 
 /// How long one session source may take.
@@ -94,7 +128,11 @@ struct SourceRow {
     #[serde(default)]
     hint: Option<String>,
     #[serde(default)]
-    attach: Option<String>,
+    attach: Option<Words>,
+    #[serde(default)]
+    helper: Option<Words>,
+    #[serde(default)]
+    state_key: Option<String>,
 }
 
 impl SourceRow {
@@ -122,7 +160,9 @@ impl SourceRow {
             title: self.title,
             host: Some(host),
             hint: self.hint,
-            attach: self.attach.filter(|a| !a.trim().is_empty()),
+            attach: self.attach.and_then(Words::line),
+            helper: self.helper.and_then(Words::line),
+            state_key: self.state_key.filter(|k| !k.trim().is_empty()),
         }
     }
 }
@@ -150,7 +190,7 @@ async fn remote_rows() -> Vec<LiveRow> {
     for argv in SOURCES.get().into_iter().flatten().cloned() {
         runs.spawn(async move {
             let mut cmd = tokio::process::Command::new(&argv[0]);
-            cmd.args(&argv[1..]);
+            cmd.args(&argv[1..]).env(mu_base::contracts::SOURCES_ENV, mu_base::contracts::SOURCES.to_string());
             let out = mu_base::process::run_capture(cmd, SOURCE_WAIT).await.unwrap_or_default();
             source_rows(&argv[0], &out)
         });
@@ -289,6 +329,8 @@ fn live_rows(source: &dyn SessionSource, me: u32, a: LiveArgs) -> Live {
             host: None,
             hint: None,
             attach: None,
+            helper: None,
+            state_key: None,
             live: l,
         })
         .collect();
@@ -428,6 +470,8 @@ mod tests {
                 host: Some("cluster".into()),
                 hint: Some("mu-remote cluster".into()),
                 attach: Some("mu-remote connect cluster a".into()),
+                helper: Some("mu-remote helper cluster a".into()),
+                state_key: Some("/k".into()),
             }],
             canon: vec![("/a".into(), "/b".into())],
             notice: Some("n".into()),
@@ -480,6 +524,22 @@ mod tests {
         assert_eq!(first.title.as_deref(), Some("t"));
         assert_eq!(rows[1].host.as_deref(), Some("prog"), "a row with no host names the source");
         assert!(rows[1].attach.is_none());
+    }
+
+    #[test]
+    fn an_argv_attach_is_quoted_and_helper_and_state_key_reach_the_row() {
+        let out = concat!(
+            "{\"id\":\"a\",\"attach\":[\"/o pt/x\",\"a'b\"],\"helper\":[\"h\",\"1 2\"],\"state_key\":\"/k/id\"}\n",
+            "{\"id\":\"b\",\"attach\":[],\"helper\":\"  \",\"state_key\":\" \"}\n",
+            "{\"id\":\"c\",\"attach\":\"x $HOME\",\"helper\":\"h --flag\"}\n",
+        );
+        let rows = source_rows("prog", out);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].attach.as_deref(), Some(r"'/o pt/x' 'a'\''b'"));
+        assert_eq!(rows[0].helper.as_deref(), Some("'h' '1 2'"));
+        assert_eq!(rows[0].state_key.as_deref(), Some("/k/id"));
+        assert!(rows[1].attach.is_none() && rows[1].helper.is_none() && rows[1].state_key.is_none());
+        assert_eq!((rows[2].attach.as_deref(), rows[2].helper.as_deref()), (Some("x $HOME"), Some("h --flag")));
     }
 
     #[test]

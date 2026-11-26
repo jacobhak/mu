@@ -4,6 +4,7 @@
 pub mod ask_nudge;
 pub mod catchup;
 pub mod config;
+pub mod contracts;
 pub mod events;
 pub mod git;
 pub mod image;

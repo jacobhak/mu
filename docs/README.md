@@ -12,6 +12,7 @@
 - [MCP servers](mcp.md)
 - [Agent Client Protocol](acp.md): `mu --acp`
 - [Remote use](remote.md): `mu agent`, `mu --attach`: the agent on one machine, the terminal UI on another; the launcher, attach and session-source contracts for programs that reach other machines
+- [Remote contracts](remote-contracts.md): the versioned contracts a program that reaches other machines is built on (`mu contracts`)
 - [Providers](providers.md): API keys for Anthropic, OpenAI and Baseten, custom vLLM/OpenAI-compatible endpoints (`mu providers`), Sign in with ChatGPT, `mu auth`, `/login`, routing and thinking per provider, what needs a gateway plugin
 - [Model roles](model-roles.md): what each role is for, and where to see and set them
 - [Custom agents](custom-agents.md)
@@ -23,4 +24,4 @@
 - [Config](config.md): `~/.mu/config.toml`
 - [mu documents itself](self-documentation.md): `mu://`, these pages and generated references for the agent to read and search
 
-Design and measurements: [`DESIGN.md`](../DESIGN.md). Ghost-text evaluation record: [`ghost-text/`](ghost-text/README.md).
+Design and measurements: [`DESIGN.md`](../DESIGN.md). mu-remote, the in-tree program built on the remote contracts: [`plugins/remote/`](../plugins/remote/README.md). Ghost-text evaluation record: [`ghost-text/`](ghost-text/README.md).

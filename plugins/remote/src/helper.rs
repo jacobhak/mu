@@ -13,7 +13,16 @@ const NOT_SUPPORTED: i32 = 64;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 const FORWARD_TRIES: usize = 3;
 
+/// The helper contract this program speaks (docs/remote-contracts.md, E).
+const HELPER_CONTRACT: &str = "1";
+
 pub fn run(name: &str, id: &str, verb: &str, args: &[String]) -> Result<i32> {
+    if let Ok(n) = std::env::var("MU_ATTACH_HELPER_CONTRACT")
+        && n != HELPER_CONTRACT
+    {
+        eprintln!("mu-remote: helper contract {n} is not supported (this mu-remote speaks {HELPER_CONTRACT})");
+        return Ok(NOT_SUPPORTED);
+    }
     if !matches!(verb, "forward" | "unforward" | "read" | "write") {
         eprintln!("mu-remote: helper: unknown verb {verb}");
         return Ok(NOT_SUPPORTED);

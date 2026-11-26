@@ -2,7 +2,6 @@
 
 use crate::adapter::{Adapter, AgentInfo};
 use crate::config::{Config, Remote};
-use crate::ssh::quote;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -110,9 +109,15 @@ pub fn check(name: &str) -> Result<i32> {
     Ok(if ok { 0 } else { 1 })
 }
 
-/// One session-source row: the agent's fields plus `host`, `hint` and `attach`.
-fn row(remote: &str, exe: &Path, a: &AgentInfo) -> Value {
-    json!({
+/// The sources contract this program speaks (docs/remote-contracts.md, D).
+const SOURCES_CONTRACT: u32 = 2;
+
+/// One session-source row (sources contract 2): the agent's fields plus `host`, `hint`, and `attach` and `helper`
+/// as argument vectors, which mu quotes itself, so an id never reaches a shell unquoted. `state_key` is the key
+/// file `mu --attach` unlocks the agent with, only when the remote's config names one.
+fn row(remote: &str, exe: &Path, a: &AgentInfo, state_key: Option<&Path>) -> Value {
+    let exe = exe.to_string_lossy();
+    let mut v = json!({
         "id": a.id,
         "cwd": a.cwd,
         "started": a.started,
@@ -122,8 +127,23 @@ fn row(remote: &str, exe: &Path, a: &AgentInfo) -> Value {
         "locked": a.locked,
         "host": remote,
         "hint": format!("mu-remote {remote} --resume {}", a.id),
-        "attach": format!("{} connect {} {}", quote(&exe.to_string_lossy()), quote(remote), quote(&a.id)),
-    })
+        "attach": [exe, "connect", remote, a.id],
+        "helper": [exe, "helper", remote, a.id],
+    });
+    if let Some(k) = state_key {
+        v["state_key"] = json!(k.to_string_lossy());
+    }
+    v
+}
+
+/// Refuses a mu that offers another sources contract number than this program speaks.
+fn check_contract(offered: Option<&str>) -> Result<()> {
+    match offered {
+        Some(n) if n != SOURCES_CONTRACT.to_string() => {
+            bail!("mu-remote rows speaks sources contract {SOURCES_CONTRACT}; this mu offers {n}")
+        }
+        _ => Ok(()),
+    }
 }
 
 fn rows_of(name: &str, r: &Remote, exe: &Path) -> Vec<Value> {
@@ -132,11 +152,13 @@ fn rows_of(name: &str, r: &Remote, exe: &Path) -> Vec<Value> {
         return Vec::new();
     }
     let Ok(found) = adapter.list(Some(ANSWER_TIMEOUT)) else { return Vec::new() };
-    found.iter().filter(|a| a.is_agent()).map(|a| row(name, exe, a)).collect()
+    let key = r.state_key.is_some().then(|| adapter.state_key_path());
+    found.iter().filter(|a| a.is_agent()).map(|a| row(name, exe, a, key.as_deref())).collect()
 }
 
 /// A `[sessions] sources` command. A remote that is unreachable or not trusted adds no rows.
 pub fn rows(name: Option<&str>) -> Result<i32> {
+    check_contract(std::env::var("MU_SOURCES_CONTRACT").ok().as_deref())?;
     let cfg = Config::load()?;
     let exe = std::env::current_exe()?;
     let chosen: Vec<(&String, &Remote)> = match name {
@@ -186,6 +208,13 @@ mod tests {
     }
 
     #[test]
+    fn another_sources_contract_is_refused() {
+        assert!(check_contract(None).is_ok() && check_contract(Some("2")).is_ok());
+        let e = check_contract(Some("3")).unwrap_err().to_string();
+        assert_eq!(e, "mu-remote rows speaks sources contract 2; this mu offers 3");
+    }
+
+    #[test]
     fn list_shows_adapter_trust_and_whether_it_answers() {
         let dir = crate::testutil::tmp();
         let mut remotes = BTreeMap::new();
@@ -209,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_carry_the_agent_the_host_a_hint_and_a_quoted_attach_command() {
+    fn rows_carry_the_agent_the_host_a_hint_and_argv_attach_and_helper() {
         let dir = crate::testutil::tmp();
         let adapter = fake(&dir, 1);
         let exe = Path::new("/o pt/mu-remote");
@@ -218,7 +247,11 @@ mod tests {
         assert_eq!(r[0]["id"], "abc123");
         assert_eq!(r[0]["host"], "far");
         assert_eq!(r[0]["hint"], "mu-remote far --resume abc123");
-        assert_eq!(r[0]["attach"], "'/o pt/mu-remote' connect 'far' 'abc123'");
+        assert_eq!(r[0]["attach"], json!(["/o pt/mu-remote", "connect", "far", "abc123"]));
+        assert_eq!(r[0]["helper"], json!(["/o pt/mu-remote", "helper", "far", "abc123"]));
+        assert!(r[0].get("state_key").is_none(), "no state_key unless the remote sets one");
+        let keyed = Remote { state_key: Some("/k/id".into()), ..program(&adapter, true) };
+        assert_eq!(rows_of("far", &keyed, exe)[0]["state_key"], "/k/id");
         assert_eq!(r[0]["client"]["host"], "h");
         assert_eq!(r[0]["waiting"], true);
         assert!(rows_of("far", &program(&adapter, false), exe).is_empty(), "untrusted: no rows");

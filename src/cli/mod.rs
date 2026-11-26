@@ -159,7 +159,6 @@ pub enum Sub {
     },
     /// Join a running `mu agent` from this process's stdin and stdout: copies lines to and from its socket.
     /// With no session it finds the one agent running in this directory.
-    #[command(hide = true)]
     Attach {
         /// Required: the raw protocol stream, for `ssh host mu attach --stdio ID`.
         #[arg(long, required = true)]
@@ -170,6 +169,8 @@ pub enum Sub {
         #[arg(long, conflicts_with = "session")]
         socket: Option<PathBuf>,
     },
+    /// Print the version of each contract that programs reaching other machines use (docs/remote-contracts.md), as one JSON line.
+    Contracts,
     /// Take over a running `mu -p` session: stop it after its current step, then resume it here.
     Take {
         /// Session file or id (prefix).

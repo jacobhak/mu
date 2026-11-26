@@ -623,7 +623,7 @@ impl App {
             OverlayEvent::MemoryShow(sha) => self.show_memory_commit(sha),
             OverlayEvent::MemoryRevert(sha) => self.revert_memory_commit(sha),
             OverlayEvent::TakeSession(path) => self.take_session(path),
-            OverlayEvent::AttachSession(command) => self.attach_session(command),
+            OverlayEvent::AttachSession(target) => self.attach_session(target),
             OverlayEvent::DiffResult { job, result } => {
                 self.host_call(RESULT_DIFF, &result, move |app, r: Result<String, String>| match r {
                     Ok(diff) => {

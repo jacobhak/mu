@@ -102,7 +102,7 @@ pub fn launch_id(name: &str) -> String {
 type ProgressFn = Rc<dyn Fn(Option<&str>)>;
 
 /// Where `task` subagents of some kinds run: the `[task] launcher` command, for the kinds in `kinds`.
-/// The launcher is the extension point of launcher contract 2 (docs/remote.md).
+/// The launcher is the extension point of launcher contract 2 (docs/remote-contracts.md).
 #[derive(Clone, Debug, Default)]
 pub struct WorkerLaunch {
     pub launcher: Vec<String>,
@@ -497,7 +497,7 @@ pub async fn run_child_observed(
             // No credential reaches the launcher: it gets mu's own environment and the task's paths.
             let mut cmd = tokio::process::Command::new(&l.argv[0]);
             cmd.args(&l.argv[1..])
-                .env("MU_TASK_CONTRACT", "2")
+                .env(mu_base::contracts::LAUNCHER_ENV, mu_base::contracts::LAUNCHER.to_string())
                 .env("MU_TASK_NAME", &l.id)
                 .env("MU_TASK_ROOT", &l.root)
                 .env("MU_TASK_CWD", cwd)
