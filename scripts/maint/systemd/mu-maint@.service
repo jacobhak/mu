@@ -8,4 +8,7 @@ EnvironmentFile=-%h/.mu/maint/config.env
 WorkingDirectory=%h/.mu/maint/mu
 ExecStart=/bin/bash -c 'git fetch -q origin && git reset -q --hard origin/main && exec scripts/maint/run.sh %i'
 TimeoutStartSec=3h
+# The default (stop) turned one OOM-killed rustc into SIGTERM for the whole run (issue #46): let the
+# stage fail instead, so the run reports it and still publishes main.
+OOMPolicy=continue
 Nice=10

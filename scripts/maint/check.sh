@@ -16,6 +16,9 @@ out="$(cd "$out" && pwd)"
 # everything local. A stage that outlives
 # MU_MAINT_STAGE_SECS fails: a hung test (issue #21) once held the nightly run until systemd killed it after 3 h.
 stage_secs="${MU_MAINT_STAGE_SECS:-2400}"
+# Cargo jobs for the stages that compile on the bot's own box. The box is small (2 cores, ~3.4 GB): a bump
+# recompiles gix, jj-lib and reqwest, and two rustc at once ran it out of memory (issue #46).
+local_jobs="${MU_MAINT_LOCAL_JOBS:-1}"
 use_offload() {
   [ "${MU_MAINT_OFFLOAD:-1}" != 0 ] && [ -f offload.toml ] && command -v offload > /dev/null \
     && timeout 300 offload run -- true > /dev/null 2>&1
@@ -36,12 +39,12 @@ offload_run() {
 }
 
 stages=(build test contract smoke)
-cmd_build() { cargo build --release --workspace --locked && scripts/build-mcp-http.sh build && scripts/maint/gen-catalog.sh --check && node --test scripts/maint/gen-catalog.test.mjs && scripts/maint/test-only.test.sh; }
+cmd_build() { CARGO_BUILD_JOBS="$local_jobs" cargo build --release --workspace --locked && scripts/build-mcp-http.sh build && scripts/maint/gen-catalog.sh --check && node --test scripts/maint/gen-catalog.test.mjs && scripts/maint/test-only.test.sh; }
 # The same list CI, ship.sh and the release run: fmt, clippy, the workspace tests, the MCP bridge's tests.
 cmd_test() {
   # Two jobs, as ci.yml's runner: x86_64 build nodes peak near their 6 GiB at four (each of the five test
   # binaries links in 1.5 GB), and 2 costs little. aarch64 needs .cargo/config.toml's lld flags as well.
-  if [ "$offloaded" = 1 ]; then offload_run env CARGO_BUILD_JOBS="${MU_MAINT_OFFLOAD_JOBS:-2}" scripts/ci-checks.sh; else timeout "$stage_secs" scripts/ci-checks.sh; fi
+  if [ "$offloaded" = 1 ]; then offload_run env CARGO_BUILD_JOBS="${MU_MAINT_OFFLOAD_JOBS:-2}" scripts/ci-checks.sh; else CARGO_BUILD_JOBS="$local_jobs" timeout "$stage_secs" scripts/ci-checks.sh; fi
 }
 # The gateway plugins' contract tests run the real omp and the real pi, pinned by the worktree's upstream.toml.
 cmd_contract() {
@@ -49,7 +52,7 @@ cmd_contract() {
   ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' upstream.toml)"
   omp="$MAINT/omp/$ver/omp"
   timeout "$stage_secs" scripts/fetch-omp.sh "$ver" "$omp" \
-    && MU_GATEWAY_OMP="$omp" timeout "$stage_secs" cargo test --workspace --locked -- --ignored contract_ \
+    && CARGO_BUILD_JOBS="$local_jobs" MU_GATEWAY_OMP="$omp" timeout "$stage_secs" cargo test --workspace --locked -- --ignored contract_ \
     || return 1
   command -v node > /dev/null || { echo "contract: node is not installed (needed for the pi proxy tests)" >&2; return 1; }
   pi_ver="$(sed -n 's/^pi = "\(.*\)"/\1/p' upstream.toml)"
