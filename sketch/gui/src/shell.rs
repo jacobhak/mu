@@ -751,9 +751,15 @@ impl Shell {
                 // Focus: an accent ring over a lifted card; the other tiles recede.
                 let dim = !focused && rects.len() > 1;
                 // The unfocused card also sinks a layer, towards the chrome, so the focused one stands proud.
-                panel(t, focused)
+                let max = match tab.tiles[*id] {
+                    View::Session(_) => session::max_width(t),
+                    _ => f32::MAX,
+                };
+                let card = panel(t, focused)
                     .id(("tile", *id))
-                    .size_full()
+                    .h_full()
+                    .w_full()
+                    .max_w(px(max))
                     .bg(if dim { t.bar } else { t.window })
                     .child(
                         div()
@@ -761,8 +767,9 @@ impl Shell {
                             .when(dim, |d| d.opacity(DIM_OPACITY))
                             .child(self.render_view(tab.tiles[*id], focused, wide, tab.last_session)),
                     )
-                    .when(focused, |d| d.child(ring(t, metrics::TILE_RADIUS)))
-                    .into_any_element()
+                    .when(focused, |d| d.child(ring(t, metrics::TILE_RADIUS)));
+                // A tile with a max width is centred in its slot.
+                div().size_full().flex().justify_center().child(card).into_any_element()
             }
             Node::Split { axis, ratio, a, b } => {
                 let child = |n: &Node, grow: f32| {
