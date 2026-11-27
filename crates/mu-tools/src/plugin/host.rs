@@ -136,6 +136,25 @@ pub struct McpInfo {
     pub tools: Vec<String>,
 }
 
+/// A provider the gateway plugin signs in to. Without an `id`, the plugin's own tool asks which.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayLogin {
+    pub id: Option<String>,
+    pub label: String,
+}
+
+/// The program that signs in, which the caller runs on the user's terminal with `env` added.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayLoginCommand {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// A plugin written before an optional method existed answers it with a JSON-RPC "method not found".
+fn is_method_not_found(e: &str) -> bool {
+    e.starts_with("method not found")
+}
+
 pub struct PluginHost {
     pub(super) slots: RefCell<Vec<Rc<Slot>>>,
     pub(super) shared: Rc<Shared>,
@@ -676,6 +695,68 @@ impl PluginHost {
                 Ok(v.to_string())
             })
         })
+    }
+
+    /// A gateway plugin is installed and `MU_GATEWAY_URL` does not bypass it: asking it to sign in can work.
+    pub fn has_gateway_plugin(&self) -> bool {
+        std::env::var_os("MU_GATEWAY_URL").is_none_or(|u| u.is_empty()) && self.provider_slot("gateway").is_ok()
+    }
+
+    /// The providers the gateway plugin can sign in to (`provider/logins`). Empty when there is no gateway
+    /// plugin, when `MU_GATEWAY_URL` bypasses it, or when the plugin has no sign-in to offer.
+    pub async fn gateway_logins(&self) -> Result<Vec<GatewayLogin>, String> {
+        if !self.has_gateway_plugin() {
+            return Ok(Vec::new());
+        }
+        let slot = self.provider_slot("gateway")?;
+        let proc = self.ensure(&slot).await?;
+        let v = match proc.request("provider/logins", json!({}), Some(Duration::from_secs(20))).await {
+            Ok(v) => v,
+            Err(e) if is_method_not_found(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let rows = v["providers"].as_array().map(Vec::as_slice).unwrap_or_default();
+        Ok(rows
+            .iter()
+            .filter_map(|p| {
+                let label = p["label"].as_str().filter(|l| !l.is_empty())?;
+                Some(GatewayLogin { id: p["id"].as_str().map(String::from), label: label.into() })
+            })
+            .collect())
+    }
+
+    /// Asks the gateway plugin which program signs in to `provider` (`None`: the plugin's own picker). The
+    /// caller runs it on the user's terminal and then calls `gateway_login_done`.
+    pub async fn gateway_login(&self, provider: Option<&str>) -> Result<GatewayLoginCommand, String> {
+        let slot = self.provider_slot("gateway")?;
+        let proc = self.ensure(&slot).await?;
+        let params = provider.map_or_else(|| json!({}), |p| json!({"provider": p}));
+        let v = proc
+            .request("provider/login", params, Some(Duration::from_secs(45)))
+            .await
+            .map_err(|e| if is_method_not_found(&e) { "the gateway plugin has no sign-in".to_string() } else { e })?;
+        let argv: Vec<String> = v["command"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if argv.is_empty() {
+            return Err("the gateway plugin returned no sign-in command".into());
+        }
+        let env = v["env"]
+            .as_object()
+            .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+            .unwrap_or_default();
+        Ok(GatewayLoginCommand { argv, env })
+    }
+
+    /// Tells the gateway plugin the sign-in program has exited, so it can seal what that wrote.
+    pub async fn gateway_login_done(&self) -> Result<(), String> {
+        let slot = self.provider_slot("gateway")?;
+        let proc = self.ensure(&slot).await?;
+        match proc.request("provider/login_done", json!({}), Some(Duration::from_secs(20))).await {
+            Err(e) if !is_method_not_found(&e) => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// The gateway endpoint `GatewaySource` resolves: `MU_GATEWAY_URL` if set, else the gateway plugin.

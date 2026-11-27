@@ -117,6 +117,25 @@ async fn handle(mu: Arc<RpcMu>, req: rpc::Request) -> Result<Value, rpc::RpcErro
             Ok(found.map_or(Value::Null, |e| e.to_json()))
         }
         "provider/prices" => blocking(mu, commands::prices).await,
+        "provider/logins" => {
+            Ok(json!({"providers": commands::login_providers().iter().map(|p| p.to_json()).collect::<Vec<_>>()}))
+        }
+        "provider/login" => {
+            let provider = match req.params.get("provider") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(p)) => Some(p.clone()),
+                Some(_) => return Err(err(-32602, "provider/login: provider must be a string")),
+            };
+            blocking(mu, move || commands::login_spec(provider.as_deref())).await.map(|s| s.to_json())
+        }
+        "provider/login_done" => {
+            blocking(mu, || {
+                commands::login_done();
+                Ok(())
+            })
+            .await?;
+            Ok(json!({}))
+        }
         "shutdown" => {
             mu.timeout_ms.store(SHUTDOWN_TIMEOUT.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
             if seals() {

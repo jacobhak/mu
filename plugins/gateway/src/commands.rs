@@ -26,7 +26,7 @@ fn read_token(dir: &std::path::Path) -> Result<String, String> {
     let (path, hint) = match state::backend() {
         Backend::Omp => (
             sealed_state::credential_root().join("auth-gateway.token"),
-            "run `omp auth-gateway token` (or `mu-gateway login`)",
+            "run `omp auth-gateway token` (or sign in from mu's /login)",
         ),
         Backend::Pi => (state::token_path(dir), "the daemon writes it on start"),
     };
@@ -166,6 +166,12 @@ pub fn stop() -> bool {
 /// `omp login [provider]` (`pi auth login [provider]` for pi) with stdio inherited; replaces this process.
 pub fn login(provider: Option<&str>) -> String {
     use std::os::unix::process::CommandExt;
+    let (mut cmd, shown) = login_command(provider);
+    let e = cmd.exec();
+    format!("cannot run `{shown}` ({e})")
+}
+
+fn login_command(provider: Option<&str>) -> (Command, &'static str) {
     let (mut cmd, shown) = match state::backend() {
         Backend::Omp => {
             let mut cmd = Command::new(state::omp_bin());
@@ -179,6 +185,72 @@ pub fn login(provider: Option<&str>) -> String {
         }
     };
     cmd.args(provider);
-    let e = cmd.exec();
-    format!("cannot run `{shown}` ({e})")
+    (cmd, shown)
+}
+
+/// A provider the sign-in offers. Without an `id`, the tool asks which one itself.
+pub struct LoginProvider {
+    pub id: Option<&'static str>,
+    pub label: &'static str,
+}
+
+impl LoginProvider {
+    pub fn to_json(&self) -> Value {
+        json!({"id": self.id, "label": self.label})
+    }
+}
+
+/// What `provider/logins` offers: the subscription logins both backends know, then their own picker for the rest.
+pub fn login_providers() -> Vec<LoginProvider> {
+    let (claude, codex, other) = match state::backend() {
+        Backend::Omp => ("Claude Pro/Max (omp)", "OpenAI Codex (omp)", "Another provider (omp)"),
+        Backend::Pi => ("Claude Pro/Max (pi)", "OpenAI Codex (pi)", "Another provider (pi)"),
+    };
+    vec![
+        LoginProvider { id: Some("anthropic"), label: claude },
+        LoginProvider { id: Some("openai-codex"), label: codex },
+        LoginProvider { id: None, label: other },
+    ]
+}
+
+/// The program that signs in, for a client that owns the terminal (mu hands it over): its argv and the
+/// environment to add to its own.
+pub struct LoginSpec {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl LoginSpec {
+    pub fn to_json(&self) -> Value {
+        let env: serde_json::Map<String, Value> = self.env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+        json!({"command": self.argv, "env": env})
+    }
+}
+
+/// `provider/login`. omp's sealed state must be unsealed first by the caller, so the login lands in the
+/// credentials the gateway reads; `login_done` seals it back.
+pub fn login_spec(provider: Option<&str>) -> Result<LoginSpec, String> {
+    if let Some(p) = provider
+        && (p.is_empty()
+            || p.starts_with('-')
+            || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    {
+        return Err(format!("`{p}` is not a provider id"));
+    }
+    let (cmd, _) = login_command(provider);
+    let argv = std::iter::once(cmd.get_program()).chain(cmd.get_args()).map(|a| a.to_string_lossy().into_owned());
+    let env: Vec<(String, String)> = match state::backend() {
+        Backend::Omp => {
+            sealed_state::envs().into_iter().map(|(k, v)| (k.to_string(), v.to_string_lossy().into_owned())).collect()
+        }
+        Backend::Pi => Vec::new(),
+    };
+    Ok(LoginSpec { argv: argv.collect(), env })
+}
+
+/// `provider/login_done`: seals what the sign-in wrote.
+pub fn login_done() {
+    if state::backend() == Backend::Omp {
+        sealed_state::flush();
+    }
 }

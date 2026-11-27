@@ -536,6 +536,7 @@ impl App {
             }
             OverlayEvent::DeleteRole { set, role } => self.delete_role(&set, &role),
             OverlayEvent::Login(LoginTarget::ChatGpt) => self.chatgpt_row(),
+            OverlayEvent::Login(LoginTarget::Gateway(id)) => self.start_gateway_login(id),
             OverlayEvent::Login(LoginTarget::CustomProvider(None)) => self.start_custom_wizard(),
             OverlayEvent::Login(LoginTarget::CustomProvider(Some(id))) => self.start_custom_edit(&id),
             OverlayEvent::Login(LoginTarget::ApiKey(id)) => {

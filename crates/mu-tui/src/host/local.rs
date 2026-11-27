@@ -91,6 +91,7 @@ impl LocalHost {
         super::completion::register(&mut registry);
         super::models::register(&mut registry);
         super::keys::register(&mut registry);
+        super::gateway_login::register(&mut registry);
         super::web::register(&mut registry);
         super::chatgpt::register(&mut registry);
         super::mcp_login::register(&mut registry);

@@ -30,6 +30,8 @@ pub enum LoginTarget {
     ChatGpt,
     /// The custom-endpoint panel: a new endpoint, or the existing one with this id to edit.
     CustomProvider(Option<String>),
+    /// A sign-in through the gateway plugin, for this provider id (`None`: the plugin's own picker).
+    Gateway(Option<String>),
 }
 
 /// What the user does next in the API-key picker.

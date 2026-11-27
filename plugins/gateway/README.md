@@ -79,7 +79,8 @@ with the agent directory in `agent/` (or `$PI_CODING_AGENT_DIR`).
 
 mu's `scripts/install.sh` (and `mu update`) installs `mu-gateway` next to `mu` and its manifest,
 [`plugin.toml`](plugin.toml), under `~/.mu/plugins/gateway`. The omp CLI it runs is a 300 MB download and is
-opt-in: `scripts/install.sh --with-omp`. Then log in with `mu-gateway login <provider>`.
+opt-in: `scripts/install.sh --with-omp`, which also links `mu-gateway` into `~/.local/bin`. Then sign in from mu's
+`/login`, or by hand with `mu-gateway login <provider>`.
 
 ## The mu adapter
 
@@ -89,6 +90,14 @@ opt-in: `scripts/install.sh --with-omp`. Then log in with `mu-gateway login <pro
 - `provider/endpoint {clientPid, start}` is `endpoint --client-pid clientPid`, with `--no-start` when `start` is
   false (default true). It answers `{baseUrl, token}` or `null`.
 - `provider/prices {}` is `prices`.
+- `provider/logins {}` answers `{"providers":[{id,label}]}`: `anthropic`, `openai-codex`, and one row without an `id`
+  that leaves the choice to `omp login` (`pi auth login` with `--backend pi`). mu lists them in `/login`.
+- `provider/login {provider?}` answers `{"command":[argv…],"env":{…}}`, the `login` command's program, for mu to run
+  on its own terminal (a plugin's stdio is the JSON-RPC pipe, so it cannot). `provider` must be an id made of
+  letters, digits, `-` and `_`. With sealing on, the credentials are unsealed first and `env` points omp at the
+  memory copy, so the sign-in lands in it.
+- `provider/login_done {}` is sent when that program has exited, whatever its status: it seals what the sign-in
+  wrote (the pi backend has nothing to seal).
 - `shutdown` (a request; mu keeps the plugin's stdin open until it is answered) seals omp's credentials once
   more, bounded to 4 s, leaves the shared memory copy (below) and only then replies.
 

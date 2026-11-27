@@ -12,6 +12,12 @@ impl Providers {
         self.gw_models.borrow().clone().unwrap_or_default()
     }
 
+    /// Makes the next `gateway_models` or gateway request read the list again: a sign-in changes what the
+    /// gateway serves.
+    pub fn invalidate_gateway_models(&self) {
+        self.gw_fresh.set(false);
+    }
+
     /// Gateway `/v1/models` rows (context windows). `None` when the gateway is not running or unreachable.
     pub async fn gateway_models(&self) -> Result<Vec<GatewayModel>> {
         if self.is_relayed() {
@@ -36,7 +42,7 @@ impl Providers {
         let rows: Vec<GatewayModel> =
             v["data"].as_array().map(|a| a.iter().filter_map(model_row).collect()).unwrap_or_default();
         if rows.is_empty() {
-            return Err(anyhow!("the gateway returned no models"));
+            return Err(anyhow!("the gateway lists no models: no provider is signed in on it; /login adds one"));
         }
         save_cache(&rows);
         *self.gw_models.borrow_mut() = Some(rows.clone());

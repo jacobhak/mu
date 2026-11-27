@@ -55,7 +55,7 @@ cat > "$out/touchpoints.md" <<'TP'
   - `omp auth-gateway token`: creates `auth-broker.token` and `auth-gateway.token` in omp's config root.
   - `omp auth-gateway serve --bind=127.0.0.1:0` with `OMP_AUTH_BROKER_URL` and `OMP_AUTH_BROKER_TOKEN`: prints its URL, answers `/healthz`, serves `/v1/messages`, `/v1/models` and `/v1/usage` to clients with the gateway token.
   - `omp models ls --json`: parsed as `{"models":[{provider,id,name?,reasoning?,pricingStatus?,cost:{input,output,cacheRead,cacheWrite,longContext?}}]}` and handed to mu as the price list.
-  - `omp login [provider]`: run with stdio inherited (`mu-gateway login`).
+  - `omp login [provider]`: run with stdio inherited (`mu-gateway login`), or run by mu on its terminal from the argv `provider/login` hands it (with `PI_CONFIG_DIR` when credentials are sealed). `provider/logins` lists the ids `anthropic` and `openai-codex` it passes.
   - `omp --version`: checked by `scripts/fetch-omp.sh` (`omp/<ver>`).
 - Files and environment the plugin relies on: `<config root>/auth-gateway.token` and `auth-broker.token` (config root: `~/.omp` or `~/.omp/profiles/<p>`); `agent/agent.db` (SQLite credential store, read by the plugin's sealing code in `plugins/gateway/src/sealed_state.rs`); `PI_CONFIG_DIR` (relative to `$HOME`) and `PI_CODING_AGENT_DIR`, which the plugin sets to point omp at a memory copy; `OMP_PROFILE` / `PI_PROFILE`.
 - Provider APIs reached through the gateway plugin; the gateway's request and response shapes (`/v1/messages`, `/v1/models`, `/v1/usage`) are parsed by `crates/mu-provider`.

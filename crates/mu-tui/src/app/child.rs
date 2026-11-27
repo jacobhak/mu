@@ -24,6 +24,8 @@ pub(super) enum ChildThen {
     Attach,
     /// The editor was run on a copy of a host file made by `/open`, in this directory, which goes now.
     OpenCopy(PathBuf),
+    /// The gateway plugin's sign-in program ran on the terminal, from `/login`.
+    GatewayLogin,
 }
 
 /// A host file being edited on this machine: the copy the editor works on, and the text it had.
@@ -93,6 +95,7 @@ impl App {
                 }
                 self.open_sessions();
             }
+            ChildThen::GatewayLogin => self.finish_gateway_login(status),
             ChildThen::OpenCopy(dir) => {
                 if let Err(e) = status {
                     self.error(&format!("editor failed: {e}"));
