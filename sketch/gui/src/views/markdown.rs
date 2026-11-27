@@ -38,7 +38,7 @@ fn heading(t: &Theme, level: u8, text: &'static str) -> impl IntoElement {
     div()
         .text_size(px(t.ty.prose * scale))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(t.strong)
+        .text_color(t.tool)
         .line_height(relative(1.3))
         .child(text)
 }
@@ -68,8 +68,9 @@ fn inline(t: &Theme, spans: &[Span]) -> StyledText {
         match s.style {
             SpanStyle::Plain => {}
             SpanStyle::Code => {
+                // The TUI draws inline code in `Strong`, no fill; only the face tells it from prose.
                 f = font(MONO);
-                run.color = t.literal;
+                run.color = t.strong;
             }
             SpanStyle::Bold => {
                 f.weight = FontWeight::SEMIBOLD;
@@ -77,8 +78,9 @@ fn inline(t: &Theme, spans: &[Span]) -> StyledText {
             }
             SpanStyle::Italic => f = f.italic(),
             SpanStyle::Link => {
-                run.color = t.accent;
-                run.underline = Some(UnderlineStyle { thickness: px(1.), color: Some(t.accent), wavy: false });
+                // As the TUI: underlined, in the `Literal` role.
+                run.color = t.literal;
+                run.underline = Some(UnderlineStyle { thickness: px(1.), color: Some(t.literal), wavy: false });
             }
         }
         run.font = f;
@@ -105,7 +107,7 @@ fn list(t: &Theme, ordered: bool, items: &[Vec<Span>]) -> impl IntoElement {
                         .justify_end()
                         .w(px(MARKER_W))
                         .pr(px(8.))
-                        .text_color(t.muted)
+                        .text_color(t.literal)
                         .child(marker),
                 )
                 .child(div().flex_1().min_w_0().child(inline(t, item))),
