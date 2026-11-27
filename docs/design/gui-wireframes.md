@@ -284,7 +284,7 @@ What the agent can ask for:
   - Once you have answered, Esc closes the panel; it also closes by itself when nothing else waits in that session. `o` instead puts the session in the focused tile.
 - **If a tile already shows that session,** the panel still opens, so the jump always behaves the same. That tile shows the answered request as soon as you answer.
 
-## 4. Composer (draft)
+## 4. Composer (agreed)
 
 The TUI's composer (contexts `chat` and `editor` in `docs/keys.md`, `crates/mu-tui/src/chat/composer.rs`) with the same keys and behaviour. What it does there:
 
@@ -344,8 +344,82 @@ The TUI's composer (contexts `chat` and `editor` in `docs/keys.md`, `crates/mu-t
 - **Images come from the native clipboard,** and can also be dropped onto the composer. There is no `wl-paste`/`xclip`, and no OSC 5522.
 - **The text field is `gpui-component`'s Input** (decided in gui.md), so IME and selection are native. The editor keys are bound around it.
 
+- **Ctrl+G grows the composer to fill its tile,** for a long prompt, and pressing it again shrinks it back. A second action, unbound by default, edits the prompt in `$VISUAL` (or a configured command) and waits for it to exit, as git does. Meanwhile the composer says "editing in …".
+- **The session bar uses the TUI's status-line configuration** (the same segment ids and config keys), drawn as chips, each with its picker.
+- **A dropped file that is not an image inserts its path,** quoted where needed, as pasting a path does in the TUI.
+
+## 5. Agent list and jobs (draft)
+
+These are the TUI's jobs panel, as two views: the agent list is its Sessions tab, and the jobs view is its Jobs tab (`docs/background-jobs.md`). Each has the same rows, actions and keys (contexts `jobs`, `jobs_view`, `jobs_input`, `jobs_confirm`).
+
+### 5a. Agent list
+
+What a Sessions row has in the TUI:
+
+- kind (`tui`, `print`, `subagent`, `acp`, `agent` with the agent's name), pid, cost, run time, directory and first prompt;
+- for rows from `[sessions] sources`: the host, who is attached, and whether it waits for you;
+- subagents, listed under the session that spawned them.
+
+Narrow, in a bar:
+
+```
+┌─────────────────────────────┐
+│ ⌕ Find…                     │
+│                             │
+│ NEEDS YOU                   │
+│ ⚑ Deploy pod adapter        │
+│   agent · test-cluster · 4m │
+│ ⚑ Fix flaky attach test     │
+│   agent · devbox · 12m      │
+│                             │
+│ ~/code/private/mu           │
+│ ● Desktop app design   ◂    │
+│   tui · here · 2h   $3.10   │
+│   └ ● ReviewDiff  subagent  │
+│ ○ Bump omp to 0.46          │
+│   agent · here · 3h  $0.20  │
+│ ✓ Release notes             │
+│   print · here · 1d  $0.08  │
+│                             │
+│ ~/code/private/brewery      │
+│ ○ Formula audit             │
+│   agent · build-pod-3 · 2d  │
+└─────────────────────────────┘
+```
+
+Wide, as a tile: the same rows as a table, with the TUI's columns:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ⌕ Find…                                                  group: project ▾         12 agents │
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│    STATE  TITLE / FIRST PROMPT          KIND      HOST          ATTACHED     RAN    COST    │
+│ NEEDS YOU                                                                                    │
+│ ▸  ⚑      Deploy pod adapter            agent     test-cluster  —            4m     $0.41   │
+│    ⚑      Fix flaky attach test         agent     devbox        laptop 12m   12m    $1.20   │
+│ ~/code/private/mu                                                                            │
+│    ●      Desktop app design            tui       here          —            2h     $3.10   │
+│      └ ●  ReviewDiff                    subagent  here          —            1m     $0.22   │
+│    ○      Bump omp to 0.46              agent     here          —            3h     $0.20   │
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Enter open · n message · s stop · S terminate · t take · / find                              │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Rows are grouped by project** (the working directory's repository), with a pinned "Needs you" group. A subagent stays under its parent.
+- **The state icon** comes from what the row already says (waiting, a turn running, idle, finished, failed):
+  - `⚑` needs you, `●` running, `○` idle, `✓` finished and unseen, `✗` failed.
+  - "Unseen" is new state, kept by the app: a turn that ended while no tile showed the session.
+- **The TUI's keys:** Enter opens the session (attaches, for a remote one), `n` sends a message, `s` stops the turn, `S` terminates after `y`, `t` takes a `-p` run over. Search with `/` is new.
+- **What opening changes in the app:** the session opens in the focused tile (`o`), or in a floating panel when you jump from a request (section 3d). The TUI cannot do either; it hands over the whole terminal.
+
+### 5b. Jobs view
+
+- **The TUI's Jobs tab:** one row per subagent or `async` bash job, with state, name, agent, tool count, elapsed time, cost and last activity. The selected job's details sit below.
+- **Its keys:** `x` cancels a job, `X` cancels all after `y`, `d`/`a` show or apply a finished job's result, `o` forwards a job's ports, Enter opens a job.
+- **What the app changes:** Enter opens the job's transcript or output in a tile, as the TUI's `jobs_view` with its keys. The job rows above the composer (`Alt+↓` marks one, `k`/`x` cancels it) stay as in the TUI.
+
 ### Questions for this section
 
-- What Ctrl+G opens when there is no terminal to suspend.
-- Whether the session bar reads the TUI's status-line segment configuration.
-- What a dropped file that is not an image does.
+- Whether a row shows git state (branch, `+N −M`), which the TUI's rows do not have. It would need new data from the agent.
+- Whether the agent list also lists finished sessions (history), or only live ones as the TUI does.
