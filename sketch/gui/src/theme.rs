@@ -180,10 +180,6 @@ pub struct Theme {
     pub hover: Hsla,
     /// The focused tile's edge.
     pub focus_ring: Hsla,
-    pub diff_add_bg: Hsla,
-    pub diff_add_hi: Hsla,
-    pub diff_del_bg: Hsla,
-    pub diff_del_hi: Hsla,
     /// Behind overlays.
     pub scrim: Hsla,
 }
@@ -199,12 +195,6 @@ impl Theme {
         let dark = luminance(bg) < luminance(fg);
         let h = |c: Rgb| hsla(c);
         let (green, red) = (pal.get("green"), pal.get("red"));
-        // The changed part of a line is a stronger shade than the line.
-        let (add_bg, add_hi, del_bg, del_hi) = if dark {
-            (mix(bg, green, 16), mix(bg, green, 34), mix(bg, red, 16), mix(bg, red, 34))
-        } else {
-            (mix(bg, green, 20), mix(bg, green, 40), mix(bg, red, 18), mix(bg, red, 36))
-        };
         // Every layer is a key of the palette, no derived colour: from the back, chrome (`darker_background`),
         // bar and surface (`dark_background`, the TUI's `Surface`), window (`background`), raised
         // (`lighter_background`).
@@ -253,10 +243,6 @@ impl Theme {
             raised: h(raised),
             hover: h(pal.get("selection")),
             focus_ring: h(accent),
-            diff_add_bg: h(add_bg),
-            diff_add_hi: h(add_hi),
-            diff_del_bg: h(del_bg),
-            diff_del_hi: h(del_hi),
             scrim: gpui::hsla(0.0, 0.0, 0.0, if dark { 0.55 } else { 0.35 }),
         }
     }

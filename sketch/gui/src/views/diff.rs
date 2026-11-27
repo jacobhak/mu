@@ -4,7 +4,7 @@ use super::{mono, ui};
 use crate::data::{Diff, DiffKind, DiffLine};
 use crate::theme::{MONO, Theme, metrics};
 use gpui::prelude::*;
-use gpui::{AnyElement, FontWeight, StyledText, TextRun, div, font, px, relative};
+use gpui::{AnyElement, FontWeight, StyledText, TextRun, UnderlineStyle, div, font, px, relative};
 
 /// Gutter and sign column widths, in code-size ems (Lilex advances ~0.6em per cell).
 const GUTTER_EM: f32 = 3.6;
@@ -20,10 +20,11 @@ pub fn lines(t: &Theme, lines: &[DiffLine]) -> AnyElement {
 }
 
 fn row(t: &Theme, l: &DiffLine) -> impl IntoElement {
-    let (sign, bg, hi, sign_fg, no_fg) = match l.kind {
-        DiffKind::Context => (" ", None, t.hover, t.faint, t.faint),
-        DiffKind::Add => ("+", Some(t.diff_add_bg), t.diff_add_hi, t.ok, t.muted),
-        DiffKind::Del => ("−", Some(t.diff_del_bg), t.diff_del_hi, t.err, t.muted),
+    // Coloured text, as in the TUI: the sign and the line take the palette's green or red; no line backgrounds.
+    let (sign, fg, no_fg) = match l.kind {
+        DiffKind::Context => (" ", t.text, t.faint),
+        DiffKind::Add => ("+", t.ok, t.muted),
+        DiffKind::Del => ("−", t.err, t.muted),
     };
     let changed = if l.kind == DiffKind::Context { None } else { l.changed };
     let no = l.no.map(|n| n.to_string()).unwrap_or_default();
@@ -31,7 +32,6 @@ fn row(t: &Theme, l: &DiffLine) -> impl IntoElement {
         .flex()
         .flex_none()
         .w_full()
-        .when_some(bg, |d, b| d.bg(b))
         // The gutter is its own band, so the numbers read as a column apart from the code.
         .child(
             div()
@@ -50,10 +50,10 @@ fn row(t: &Theme, l: &DiffLine) -> impl IntoElement {
                 .w(px(t.ty.code * SIGN_EM))
                 .pl(px(t.ty.code * 0.4))
                 .font_weight(FontWeight::BOLD)
-                .text_color(sign_fg)
+                .text_color(fg)
                 .child(sign),
         )
-        .child(div().flex_1().min_w_0().truncate().child(text(t, l.text, changed, hi)))
+        .child(div().flex_1().min_w_0().truncate().child(text(t, l.text, changed, fg)))
 }
 
 /// One edit as a card: a header bar (verb, file, counts), the lines, and a footer for the lines not shown.
@@ -93,24 +93,32 @@ pub fn card(t: &Theme, d: &Diff) -> gpui::Div {
 }
 
 /// The line's text with the changed char range on a stronger background.
-fn text(t: &Theme, text: &'static str, changed: Option<(usize, usize)>, hi: gpui::Hsla) -> StyledText {
+fn text(t: &Theme, text: &'static str, changed: Option<(usize, usize)>, fg: gpui::Hsla) -> StyledText {
     if text.is_empty() {
         return StyledText::new(" ");
     }
+    let _ = t;
     let byte = |chars: usize| text.char_indices().nth(chars).map_or(text.len(), |(i, _)| i);
     let (a, b) = changed.map_or((0, 0), |(a, b)| (byte(a), byte(b.max(a))));
-    let run = |len: usize, background: Option<gpui::Hsla>| TextRun {
-        len,
-        font: font(MONO),
-        color: t.text,
-        background_color: background,
-        underline: None,
-        strikethrough: None,
+    // The changed part of a line is bold and underlined; the rest of the line is plain.
+    let run = |len: usize, changed: bool| {
+        let mut f = font(MONO);
+        if changed {
+            f.weight = FontWeight::BOLD;
+        }
+        TextRun {
+            len,
+            font: f,
+            color: fg,
+            background_color: None,
+            underline: changed.then(|| UnderlineStyle { thickness: px(1.), color: Some(fg), wavy: false }),
+            strikethrough: None,
+        }
     };
     let mut runs = Vec::new();
-    for (len, bg) in [(a, None), (b - a, Some(hi)), (text.len() - b, None)] {
+    for (len, changed) in [(a, false), (b - a, true), (text.len() - b, false)] {
         if len > 0 {
-            runs.push(run(len, bg));
+            runs.push(run(len, changed));
         }
     }
     StyledText::new(text).with_runs(runs)
