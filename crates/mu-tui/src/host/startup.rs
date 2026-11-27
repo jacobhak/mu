@@ -14,6 +14,8 @@ use std::rc::Rc;
 pub const STARTUP: &str = "startup";
 /// `/detach`: leave the agent running and end this client. Only an attached client has anyone to leave.
 pub const DETACH: &str = "detach";
+/// `/reconnect`: connect to the agent again now. Only an attached client has a connection.
+pub const RECONNECT: &str = "reconnect";
 
 /// One MCP server of an untrusted project file, with its definition as written.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +70,7 @@ fn as_written(s: &McpServer) -> String {
 pub(super) fn register(r: &mut Registry) {
     r.add(STARTUP, startup);
     r.add(DETACH, |_, _| Answer::Ready(Err("not attached: /detach applies to a client of `mu agent`".into())));
+    r.add(RECONNECT, |_, _| Answer::Ready(Err("not attached: /reconnect applies to a client of `mu agent`".into())));
 }
 
 fn startup(l: &Rc<Local>, args: serde_json::Value) -> Answer {

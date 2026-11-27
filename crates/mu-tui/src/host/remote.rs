@@ -12,9 +12,19 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 const LOST: &str = "the connection to the agent was lost";
+
+/// What the user asked of the connection itself, for the driver to carry out: a call cannot, since it
+/// only ever reaches a live connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wish {
+    /// Drop the link if there is one and connect again now, whatever the pause.
+    Reconnect,
+    /// `/detach` with no connection: end the client.
+    Detach,
+}
 
 pub struct RemoteHost {
     info: HostInfo,
@@ -24,6 +34,8 @@ pub struct RemoteHost {
     push_tx: UnboundedSender<Pushed>,
     push_rx: RefCell<Option<UnboundedReceiver<Pushed>>>,
     tunnels: RefCell<HashMap<u64, UnboundedSender<TunnelIn>>>,
+    wish: Cell<Option<Wish>>,
+    wake: Notify,
 }
 
 impl RemoteHost {
@@ -37,7 +49,29 @@ impl RemoteHost {
             push_tx,
             push_rx: RefCell::new(Some(push_rx)),
             tunnels: RefCell::new(HashMap::new()),
+            wish: Cell::new(None),
+            wake: Notify::new(),
         })
+    }
+
+    fn wishes(&self, w: Wish) {
+        self.wish.set(Some(w));
+        self.wake.notify_one();
+    }
+
+    /// The next thing the user asked of the connection.
+    pub async fn wished(&self) -> Wish {
+        loop {
+            if let Some(w) = self.wish.take() {
+                return w;
+            }
+            self.wake.notified().await;
+        }
+    }
+
+    /// Forgets a wish nobody was there to carry out, so a new connection is not dropped for it.
+    pub fn forget_wish(&self) {
+        self.wish.set(None);
     }
 
     /// Calls go out on `out` from now on.
@@ -103,11 +137,16 @@ impl Host for RemoteHost {
 
     fn call(&self, name: &str, args: Value) -> Answer {
         if name == super::startup::DETACH {
-            // Leaves the agent running: the driver sees the line pass and ends the attach.
-            return Answer::Ready(match &*self.out.borrow() {
-                Some(out) if out.send(ClientLine::Detach).is_ok() => Ok(Value::Null),
-                _ => Err("not connected to the agent".into()),
-            });
+            // Leaves the agent running: the driver sees the line pass and ends the attach. With no
+            // connection there is no line: the driver is asked directly.
+            if !matches!(&*self.out.borrow(), Some(out) if out.send(ClientLine::Detach).is_ok()) {
+                self.wishes(Wish::Detach);
+            }
+            return Answer::Ready(Ok(Value::Null));
+        }
+        if name == super::startup::RECONNECT {
+            self.wishes(Wish::Reconnect);
+            return Answer::Ready(Ok(Value::Null));
         }
         let Some(out) = self.out.borrow().clone() else {
             return Answer::Ready(Err("not connected to the agent".into()));
@@ -164,5 +203,17 @@ mod tests {
         host.connect(tx);
         assert!(matches!(host.call(crate::host::startup::DETACH, Value::Null), Answer::Ready(Ok(_))));
         assert!(matches!(lines.recv().await, Some(ClientLine::Detach)));
+    }
+
+    #[tokio::test]
+    async fn detach_without_a_connection_and_reconnect_are_wishes_for_the_driver() {
+        let host = RemoteHost::new(HostInfo::default());
+        assert!(matches!(host.call(crate::host::startup::DETACH, Value::Null), Answer::Ready(Ok(_))));
+        assert_eq!(host.wished().await, Wish::Detach);
+        assert!(matches!(host.call(crate::host::startup::RECONNECT, Value::Null), Answer::Ready(Ok(_))));
+        assert_eq!(host.wished().await, Wish::Reconnect);
+        host.call(crate::host::startup::RECONNECT, Value::Null);
+        host.forget_wish();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), host.wished()).await.is_err());
     }
 }

@@ -141,10 +141,12 @@ fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
         .unzip()
 }
 
-pub(super) static BUILTIN: [Builtin; 40] = [
+pub(super) static BUILTIN: [Builtin; 41] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
+    cmd("reconnect", "Connect to the agent again now, without waiting out the pause", |a, _| a.cmd_reconnect())
+        .busy_ok(),
     cmd("new", "Start a new session", App::cmd_new),
     cmd("resume", "Resume a session from this directory", |a, _| a.open_session_picker()),
     cmd("cd", "Change the working directory [dir]; shows it without one", App::cmd_cd).paths(),
@@ -341,6 +343,7 @@ mod tests {
             busy,
             [
                 "detach",
+                "reconnect",
                 "thinking",
                 "permissions",
                 "compact",

@@ -1009,6 +1009,24 @@ fn the_ui_attaches_over_a_command_link_detaches_and_rejoins() {
 }
 
 #[test]
+fn reconnect_drops_the_link_and_joins_again_at_once() {
+    let far = Far::new();
+    let agent = far.start(&[]);
+    let mut term = Term::spawn(far.mu(&agent.session));
+    wait_until("the agent to have a client", || far.client_host().is_some());
+    term.command("a question");
+    term.wait_for("hello from the fake");
+    let pid = || std::fs::read_to_string(far.dir.join("connect.pid")).ok().and_then(|s| s.trim().parse::<i32>().ok());
+    let old = pid().unwrap();
+
+    term.command("/reconnect");
+    wait_until("a new link", || pid().is_some_and(|p| p != old));
+    wait_until("the agent to have its client back", || far.client_host().is_some());
+    term.command("/detach");
+    assert!(term.wait_exit().success(), "{}", term.text());
+}
+
+#[test]
 fn a_command_that_is_not_an_agents_stream_is_an_error() {
     let far = Far::new();
     let mut c = mu(&far.client, &far.cwd);

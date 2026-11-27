@@ -5,8 +5,8 @@
 //! plain JSON behind the hello, so the stream is as private as whatever the command runs over. stderr
 //! lines are shown as notices. The UI runs as it does in one process, over a `RemoteHost` and the
 //! client adapter. When the connection drops the UI stays up and says so; the command is run again
-//! after 1 s, doubling to 30 s, and the agent's catch-up repaints the conversation. The agent ending, a
-//! take-over by another client and `/detach` end the client for good. An agent that already has
+//! after 1 s, doubling to 30 s (`/reconnect` skips the wait), and the agent's catch-up repaints the
+//! conversation. The agent ending, a take-over by another client and `/detach` end the client for good. An agent that already has
 //! another client answers `Busy`: a reconnect then stops retrying and asks whether to take the session
 //! over.
 
@@ -16,7 +16,7 @@ use mu_base::config::Configs;
 use mu_base::events::{AgentEvent, Answer, AskQuestion, Command};
 use mu_base::wire::{AgentLine, ClientAdapter, ClientLine, Incoming, WIRE, WireCommand, to_line};
 use mu_common::rpc::{Framed, Line};
-use mu_tui::host::remote::RemoteHost;
+use mu_tui::host::remote::{RemoteHost, Wish};
 use mu_tui::host::{Host, HostInfo};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -169,9 +169,11 @@ async fn connect(
         return Err(ended(&mut child, stderr_task, &seen, format!("{command}: {e}")).await);
     }
     let mut framed = Framed::new(BufReader::new(stdout));
-    let answer = tokio::time::timeout(HELLO_WAIT, framed.next_line())
-        .await
-        .map_err(|_| format!("{command} did not answer within {}s", HELLO_WAIT.as_secs()))?;
+    let Ok(answer) = tokio::time::timeout(HELLO_WAIT, framed.next_line()).await else {
+        let waited = format!("no answer from the agent within {}s", HELLO_WAIT.as_secs());
+        let said = seen.borrow().0.join("\n");
+        return Err(Refused::Failed(if said.is_empty() { waited } else { format!("{waited}: {said}") }));
+    };
     let value = match answer {
         Some(Line::Value(v)) => v,
         _ => {
@@ -238,6 +240,8 @@ enum End {
     /// The UI is done, or the agent ended, or the client left: nothing to reconnect.
     Over,
     Lost,
+    /// The user asked for a new connection: made at once.
+    Redo,
 }
 
 struct Wires {
@@ -303,6 +307,16 @@ async fn session(conn: &mut Conn, w: &mut Wires) -> End {
                     return End::Lost;
                 }
             }
+            wish = w.host.wished() => match wish {
+                Wish::Reconnect => {
+                    let _ = w.events.send(AgentEvent::Notice("dropping the connection; reconnecting now…".into()));
+                    return End::Redo;
+                }
+                Wish::Detach => {
+                    let _ = w.events.send(AgentEvent::Exit);
+                    return End::Over;
+                }
+            },
             _ = conn.child.wait() => {
                 // What the command wrote before it ended is still queued: let it be read first.
                 while let Ok(line) = conn.lines.try_recv() {
@@ -479,54 +493,97 @@ async fn drive(link: Link, who: Who, first: Conn, mut w: Wires, notices: Unbound
     let mut next = Some(first);
     let mut pause = FIRST_PAUSE;
     let mut take = false;
+    // The next attempt is made without the pause before it.
+    let mut now = false;
     loop {
         let mut conn = match next.take() {
             Some(c) => c,
-            None => loop {
-                if !pause.is_zero() {
-                    let _ = w.events.send(AgentEvent::Notice(format!(
-                        "connection lost; reconnecting in {}s (Ctrl-C quits)",
-                        pause.as_secs()
-                    )));
-                }
-                let sleep = tokio::time::sleep(pause);
-                tokio::pin!(sleep);
+            None => {
+                let mut failure: Option<String> = None;
+                let mut attempts = 0u32;
                 loop {
-                    tokio::select! {
-                        () = &mut sleep => break,
-                        c = w.commands.recv() => match c {
-                            None | Some(Command::Exit) => {
+                    if !now {
+                        let how = "/reconnect retries now, Ctrl-C quits";
+                        let text = match &failure {
+                            None => format!("connection lost; reconnecting in {}s · {how}", pause.as_secs()),
+                            Some(e) => format!(
+                                "reconnecting failed (attempt {attempts}): {e}; trying again in {}s · {how}",
+                                pause.as_secs()
+                            ),
+                        };
+                        let _ = w.events.send(AgentEvent::Notice(text));
+                        let sleep = tokio::time::sleep(pause);
+                        tokio::pin!(sleep);
+                        loop {
+                            tokio::select! {
+                                () = &mut sleep => break,
+                                c = w.commands.recv() => match c {
+                                    None | Some(Command::Exit) => {
+                                        let _ = w.events.send(AgentEvent::Exit);
+                                        return;
+                                    }
+                                    Some(Command::Cancel) => {}
+                                    Some(_) => {
+                                        let _ = w.events.send(AgentEvent::Notice("not connected: waiting to reconnect".into()));
+                                    }
+                                },
+                                wish = w.host.wished() => match wish {
+                                    Wish::Detach => {
+                                        let _ = w.events.send(AgentEvent::Exit);
+                                        return;
+                                    }
+                                    Wish::Reconnect => {
+                                        let _ = w.events.send(AgentEvent::Notice("reconnecting now…".into()));
+                                        pause = FIRST_PAUSE;
+                                        break;
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    now = false;
+                    attempts += 1;
+                    let join = Join { reconnect: true, take };
+                    let result =
+                        match connect_unless_quit(&link, &notices, &who, join, &mut w.commands, &w.events, &w.host)
+                            .await
+                        {
+                            Attempt::Done(r) => *r,
+                            Attempt::Quit => {
                                 let _ = w.events.send(AgentEvent::Exit);
                                 return;
                             }
-                            Some(_) => {
-                                let _ = w.events.send(AgentEvent::Notice("not connected: waiting to reconnect".into()));
+                            Attempt::Again => {
+                                let _ = w.events.send(AgentEvent::Notice("reconnecting now…".into()));
+                                pause = FIRST_PAUSE;
+                                now = true;
+                                continue;
                             }
-                        },
-                    }
-                }
-                match connect(&link, &notices, &who, Join { reconnect: true, take }).await {
-                    Ok((mut c, _)) => {
-                        settle_state(&mut c, &link, &mut NoticeTerminal(notices.clone())).await;
-                        pause = FIRST_PAUSE;
-                        take = false;
-                        break c;
-                    }
-                    Err(Refused::Busy { host, since }) => {
-                        if !ask_take_over(&mut w, &host, since).await {
-                            let _ = w.events.send(AgentEvent::Exit);
-                            return;
+                        };
+                    match result {
+                        Ok((mut c, _)) => {
+                            settle_state(&mut c, &link, &mut NoticeTerminal(notices.clone())).await;
+                            pause = FIRST_PAUSE;
+                            take = false;
+                            break c;
                         }
-                        take = true;
-                        pause = Duration::ZERO;
-                    }
-                    Err(Refused::Failed(e)) => {
-                        let _ = notices.send(e);
-                        pause = (pause * 2).min(LONGEST_PAUSE);
+                        Err(Refused::Busy { host, since }) => {
+                            if !ask_take_over(&mut w, &host, since).await {
+                                let _ = w.events.send(AgentEvent::Exit);
+                                return;
+                            }
+                            take = true;
+                            now = true;
+                        }
+                        Err(Refused::Failed(e)) => {
+                            failure = Some(e);
+                            pause = (pause * 2).min(LONGEST_PAUSE);
+                        }
                     }
                 }
-            },
+            }
         };
+        w.host.forget_wish();
         w.host.connect(conn.out.clone());
         let end = session(&mut conn, &mut w).await;
         w.host.disconnect();
@@ -537,6 +594,49 @@ async fn drive(link: Link, who: Who, first: Conn, mut w: Wires, notices: Unbound
                 return;
             }
             End::Lost => {}
+            End::Redo => {
+                pause = FIRST_PAUSE;
+                now = true;
+            }
+        }
+    }
+}
+
+enum Attempt {
+    Done(Box<Result<(Conn, HostInfo), Refused>>),
+    /// The UI asked to exit or to detach meanwhile.
+    Quit,
+    /// The user asked to start over: `/reconnect`.
+    Again,
+}
+
+/// `connect`, given up when the UI asks to exit or to reconnect meanwhile: the attempt's command is
+/// killed with it, so neither Ctrl-C nor `/reconnect` waits out a link that never answers.
+async fn connect_unless_quit(
+    link: &Link,
+    notices: &UnboundedSender<String>,
+    who: &Who,
+    join: Join,
+    commands: &mut UnboundedReceiver<Command>,
+    events: &UnboundedSender<AgentEvent>,
+    host: &RemoteHost,
+) -> Attempt {
+    let attempt = connect(link, notices, who, join);
+    tokio::pin!(attempt);
+    loop {
+        tokio::select! {
+            r = &mut attempt => return Attempt::Done(Box::new(r)),
+            c = commands.recv() => match c {
+                None | Some(Command::Exit) => return Attempt::Quit,
+                Some(Command::Cancel) => {}
+                Some(_) => {
+                    let _ = events.send(AgentEvent::Notice("not connected: waiting to reconnect".into()));
+                }
+            },
+            wish = host.wished() => return match wish {
+                Wish::Reconnect => Attempt::Again,
+                Wish::Detach => Attempt::Quit,
+            },
         }
     }
 }
@@ -641,5 +741,47 @@ mod tests {
     fn lines_of_either_direction_round_trip_through_the_envelope() {
         let line = to_line(&ClientLine::Detach);
         assert!(matches!(from_line::<ClientLine>(&line), Ok(ClientLine::Detach)));
+    }
+
+    #[test]
+    fn exiting_gives_up_an_attempt_that_never_gets_an_answer() {
+        let rt = mu_base::runtime::current_thread_runtime().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let link = Link::new("sleep 60".into(), None);
+            let who = Who { host: "h".into(), client: "c".into() };
+            let (notices, _kept) = unbounded_channel();
+            let (cmd_tx, mut commands) = unbounded_channel();
+            let (events, mut seen) = unbounded_channel();
+            let host = RemoteHost::new(HostInfo::default());
+            cmd_tx.send(Command::Cancel).unwrap();
+            cmd_tx.send(Command::Exit).unwrap();
+            let join = Join { reconnect: true, take: false };
+            let started = std::time::Instant::now();
+            let r = connect_unless_quit(&link, &notices, &who, join, &mut commands, &events, &host).await;
+            assert!(matches!(r, Attempt::Quit), "the attempt was given up");
+            assert!(started.elapsed() < Duration::from_secs(5), "without waiting for the hello");
+            assert!(seen.try_recv().is_err(), "Cancel alone says nothing");
+        });
+    }
+
+    #[test]
+    fn reconnect_gives_up_an_attempt_that_never_gets_an_answer_and_asks_for_another() {
+        let rt = mu_base::runtime::current_thread_runtime().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let link = Link::new("sleep 60".into(), None);
+            let who = Who { host: "h".into(), client: "c".into() };
+            let (notices, _kept) = unbounded_channel();
+            let (_cmd_tx, mut commands) = unbounded_channel();
+            let (events, _seen) = unbounded_channel();
+            let host = RemoteHost::new(HostInfo::default());
+            host.call(mu_tui::host::startup::RECONNECT, serde_json::Value::Null);
+            let join = Join { reconnect: true, take: false };
+            let started = std::time::Instant::now();
+            let r = connect_unless_quit(&link, &notices, &who, join, &mut commands, &events, &host).await;
+            assert!(matches!(r, Attempt::Again));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        });
     }
 }

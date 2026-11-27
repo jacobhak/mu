@@ -271,6 +271,14 @@ impl App {
         });
     }
 
+    pub(super) fn cmd_reconnect(&mut self) {
+        self.host_call(host::startup::RECONNECT, &(), |app, r: Result<(), String>| {
+            if let Err(e) = r {
+                app.error(&e);
+            }
+        });
+    }
+
     pub(super) fn cmd_cd(&mut self, arg: &str) {
         if arg.is_empty() {
             return self.notice(&self.cwd.display().to_string());
