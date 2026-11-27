@@ -13,6 +13,7 @@ mod install;
 mod launch;
 mod link;
 mod manage;
+mod mu_config;
 mod paths;
 mod rows;
 mod rpc;
@@ -104,6 +105,10 @@ enum Cmd {
     /// Write a shipped adapter into the state directory: `pod` is the Kubernetes one, `local` the reference
     /// adapter that runs everything on this machine.
     InstallAdapter { name: String },
+    /// Print mu's `config.toml` as the active profile sees it (the shared file with the profile's own merged
+    /// over it), for an adapter that sends it to a machine without the profile.
+    #[command(hide = true)]
+    MuConfig,
     /// What mu's `MU_ATTACH_HELPER` runs: `forward`, `unforward`, `read` and `write` for agent ID on remote NAME.
     #[command(hide = true)]
     Helper {
@@ -168,6 +173,7 @@ fn dispatch() -> Result<i32> {
         Some(Cmd::Notify { name, id, text }) => manage::notify(&name, &id, &text),
         Some(Cmd::Agents { name, json }) => manage::agents(name.as_deref(), json),
         Some(Cmd::InstallAdapter { name }) => install::run(&name),
+        Some(Cmd::MuConfig) => mu_config::run(),
         Some(Cmd::Helper { name, id, verb, args }) => helper::run(&name, &id, &verb, &args),
     }
 }

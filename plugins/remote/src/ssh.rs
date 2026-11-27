@@ -58,10 +58,20 @@ fn options() -> Vec<String> {
     o
 }
 
-/// ssh's arguments for running `remote` (one command line for the remote shell) on `host`.
+/// `remote` run under the active mu profile there: agents keep their owner records in the profile's home, so
+/// `start`, `list`, `connect`, `stop` and the rest must all name the same one.
+fn under_profile(profile: Option<&str>, remote: &str) -> String {
+    match profile {
+        Some(p) => format!("export MU_PROFILE={}; {remote}", quote(p)),
+        None => remote.to_string(),
+    }
+}
+
+/// ssh's arguments for running `remote` (one command line for the remote shell) on `host`, under the active
+/// mu profile.
 pub fn argv(host: &str, remote: &str) -> Vec<String> {
     let mut a = options();
-    a.extend([host.to_string(), remote.to_string()]);
+    a.extend([host.to_string(), under_profile(crate::paths::profile().as_deref(), remote)]);
     a
 }
 
@@ -174,6 +184,15 @@ mod tests {
         assert_eq!(start(&Start::Agent(c)).unwrap(), "mu agent --detach -c");
         let w = Start::Worker { launch: "l".into(), bundle: "/b".into(), dir: "/d".into() };
         assert!(start(&w).unwrap_err().to_string().contains("cannot run workers"));
+    }
+
+    #[test]
+    fn the_active_profile_goes_to_the_remote_mu() {
+        assert_eq!(under_profile(None, "mu agent list --json"), "mu agent list --json");
+        assert_eq!(
+            under_profile(Some("wo rk"), "cd '/w' && mu agent --detach"),
+            "export MU_PROFILE='wo rk'; cd '/w' && mu agent --detach"
+        );
     }
 
     #[test]

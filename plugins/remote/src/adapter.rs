@@ -1,6 +1,7 @@
 //! The adapter contract (version 2; 1 still works, without the file and port verbs; `stop` of an agent, `cancel` and
 //! `notify` are optional, exit 64 meaning not supported): `<adapter> <verb> ...` with
-//! `MU_REMOTE_NAME`, `MU_REMOTE_SETTINGS` (JSON), `MU_REMOTE_TRUSTED` (`0`/`1`) and `MU_REMOTE_CONTRACT` in the
+//! `MU_REMOTE_NAME`, `MU_REMOTE_SETTINGS` (JSON), `MU_REMOTE_TRUSTED` (`0`/`1`), `MU_REMOTE_CONTRACT` and
+//! `MU_REMOTE_EXE` (this program; `mu-config` prints mu's config as the active profile sees it) in the
 //! environment (docs/adapters.md is the spec). Replies are
 //! JSON on stdout, errors are stderr lines, and `{"progress":"..."}` stderr lines report progress. `ssh` is built
 //! in (`ssh.rs`); any other adapter is a program.
@@ -289,6 +290,9 @@ impl Adapter {
             .env("MU_REMOTE_SETTINGS", &self.settings)
             .env("MU_REMOTE_TRUSTED", if self.trusted { "1" } else { "0" })
             .env("MU_REMOTE_CONTRACT", CONTRACT.to_string());
+        if let Ok(exe) = std::env::current_exe() {
+            cmd.env("MU_REMOTE_EXE", exe);
+        }
         cmd
     }
 

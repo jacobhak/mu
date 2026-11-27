@@ -45,11 +45,34 @@ impl Default for MuCwd {
 
 /// `[sessions]`: `sources` are commands that list agents on other machines for the Sessions tab.
 /// Each prints JSON lines in the shape of `mu agent list --json`, plus `host` and `hint` (and
-/// optionally `attach`, a command that opens the row); see docs/remote-contracts.md.
+/// optionally `attach`, a command that opens the row); see docs/remote-contracts.md. Unset, the list is
+/// `mu-remote rows` when mu-remote is installed; any list, `[]` included, replaces that.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct MuSessions {
-    pub sources: Vec<Vec<String>>,
+    pub sources: Option<Vec<Vec<String>>>,
+}
+
+impl MuSessions {
+    /// The commands to run: the configured ones, else `mu-remote rows` if a `mu-remote` sits beside this
+    /// `mu` or on the `PATH`.
+    pub fn effective_sources(&self) -> Vec<Vec<String>> {
+        if let Some(s) = &self.sources {
+            return s.clone();
+        }
+        let exe = std::env::current_exe().ok();
+        default_sources(exe.as_deref().and_then(std::path::Path::parent), std::env::var_os("PATH").as_deref())
+    }
+}
+
+fn default_sources(beside: Option<&std::path::Path>, path: Option<&std::ffi::OsStr>) -> Vec<Vec<String>> {
+    let found = beside
+        .into_iter()
+        .map(std::path::Path::to_path_buf)
+        .chain(path.into_iter().flat_map(std::env::split_paths))
+        .map(|d| d.join("mu-remote"))
+        .find(|p| p.is_file());
+    found.map(|p| vec![vec![p.to_string_lossy().into_owned(), "rows".into()]]).unwrap_or_default()
 }
 
 /// `[keys.<context>]`: `action = "chord"` or `action = ["chord", ...]`. The UI owns the context and
@@ -356,5 +379,28 @@ impl Default for MuPredict {
 pub(super) fn check_predict(p: &MuPredict, warn: &mut Vec<String>) {
     if !matches!(p.engine.as_str(), "ngram" | "smollm") {
         warn.push(format!("config.toml: [predict] engine {:?} is not \"ngram\" or \"smollm\"; using ngram", p.engine));
+    }
+}
+
+#[cfg(test)]
+mod sessions_tests {
+    use super::*;
+
+    #[test]
+    fn mu_remote_is_the_default_source_unless_the_config_says_otherwise() {
+        let t = std::env::temp_dir().join(format!("mu-sources-{}", std::process::id()));
+        let (bin, other) = (t.join("bin"), t.join("other"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(default_sources(Some(&bin), Some(other.as_os_str())).is_empty());
+        std::fs::write(other.join("mu-remote"), "").unwrap();
+        let on_path = vec![vec![other.join("mu-remote").to_string_lossy().into_owned(), "rows".to_string()]];
+        assert_eq!(default_sources(Some(&bin), Some(other.as_os_str())), on_path);
+        std::fs::write(bin.join("mu-remote"), "").unwrap();
+        let beside = vec![vec![bin.join("mu-remote").to_string_lossy().into_owned(), "rows".to_string()]];
+        assert_eq!(default_sources(Some(&bin), Some(other.as_os_str())), beside, "beside mu wins");
+        let _ = std::fs::remove_dir_all(&t);
+        let empty = MuSessions { sources: Some(vec![]) };
+        assert!(empty.effective_sources().is_empty(), "an explicit empty list turns the default off");
     }
 }

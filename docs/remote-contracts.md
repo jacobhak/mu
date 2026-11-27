@@ -97,7 +97,7 @@ A line mu cannot read is dropped (and quoted as the error text when no result co
 
 ## D. Session sources (contract 2)
 
-`[sessions] sources = [["prog", "arg", …], …]` in `config.toml`. mu runs each command **as an argument vector, with no shell**, all at once, each with a 20 s limit, off the UI thread, whenever the Sessions tab refreshes. `MU_SOURCES_CONTRACT=2` is in its environment. A command that fails or is slow adds no rows. Each prints one JSON object per line (a line that is not one is skipped):
+`[sessions] sources = [["prog", "arg", …], …]` in `config.toml`. Unset, mu uses `[["mu-remote", "rows"]]` when a `mu-remote` sits beside its own binary or on the `PATH`; a list of any length, `[]` included, replaces that. mu runs each command **as an argument vector, with no shell**, all at once, each with a 20 s limit, off the UI thread, whenever the Sessions tab refreshes. `MU_SOURCES_CONTRACT=2` is in its environment. A command that fails or is slow adds no rows. Each prints one JSON object per line (a line that is not one is skipped):
 
 | Field | Type | |
 |---|---|---|

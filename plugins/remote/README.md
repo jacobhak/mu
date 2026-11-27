@@ -9,7 +9,7 @@ What it does:
 - **Named remotes** in `~/.config/mu-remote/config.toml`: `mu-remote NAME` starts or finds an agent on the remote and attaches your terminal to it (`mu --attach`), over an end-to-end encrypted channel.
 - **Tasks on a remote.** As mu's `[task] launcher`, it runs a task subagent as a worker on a remote, in a copy of your repository, and brings the result back as a git bundle. The stream survives dropped connections.
 - **Adapters** move the bytes: `ssh` is built in; a Kubernetes (`kubectl`) adapter ships with it; anything else is a program that follows the [adapter contract](docs/adapters.md).
-- **Sessions tab rows** for the agents on your remotes, as a mu `[sessions] sources` command.
+- **Sessions tab rows** for the agents on your remotes, as a mu `[sessions] sources` command (mu runs it by default when `mu-remote` is installed).
 
 ## Install
 
@@ -74,7 +74,7 @@ The image comes from `plugins/remote/Dockerfile`, built from mu's repository roo
 | `mu-remote launch NAME` | mu's `[task] launcher` |
 | `mu-remote worker run \| bundle \| stop` | the remote end of a launched task (run by adapters) |
 | `mu-remote list`, `check NAME [--full [--agent ID]]` | the remotes; what fails on one (`--full` runs a synthetic worker, and with an agent the file and port verbs, through its adapter) |
-| `mu-remote rows [NAME]` | agents as JSON lines, for `[sessions] sources = [["mu-remote","rows"]]` |
+| `mu-remote rows [NAME]` | agents as JSON lines, for `[sessions] sources` (mu's default when `mu-remote` is installed) |
 | `mu-remote agents [NAME] [--json]` | the agents and workers on every remote, or on NAME |
 | `mu-remote stop NAME ID` | end agent (or worker) ID on NAME |
 | `mu-remote cancel NAME ID` | cancel the current turn of agent ID on NAME |

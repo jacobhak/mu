@@ -256,10 +256,14 @@ stage_config() {
     agent_dir=${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}
   fi
   mkdir -p "$stage/.mu" "$stage/.omp/agent"
-  [ ! -f "$mu_home/config.toml" ] || cp "$mu_home/config.toml" "$stage/.mu/"
-  # The pod runs without a profile, and merging two TOML files is not a shell job: the shared file goes alone.
-  [ "$profile_home" = "$mu_home" ] || [ ! -f "$profile_home/config.toml" ] ||
-    echo "mu-remote-pod: profile $profile has its own config.toml; the pod gets only the shared one" >&2
+  # The pod runs without a profile, so a profile's config.toml goes as one file: the shared one with the
+  # profile's own merged over it (mu-remote does the merge; this is not a shell job).
+  if [ "$profile_home" != "$mu_home" ] && [ -f "$profile_home/config.toml" ]; then
+    "${MU_REMOTE_EXE:-mu-remote}" mu-config > "$stage/.mu/config.toml" ||
+      die "cannot merge the config of profile $profile (mu-remote mu-config failed)"
+  elif [ -f "$mu_home/config.toml" ]; then
+    cp "$mu_home/config.toml" "$stage/.mu/"
+  fi
   for f in models.toml providers.toml; do
     [ ! -f "$profile_home/$f" ] || cp "$profile_home/$f" "$stage/.mu/"
   done

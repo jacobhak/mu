@@ -794,10 +794,10 @@ mod tests {
         assert_eq!((a.state_key, a.state_key_file.as_deref(), a.state_key_command), (StateKey::Ssh, Some("/k"), None));
         let d = MuAgent::default();
         assert!(d.state_key == StateKey::Off && d.state_key_file.is_none() && d.state_key_command.is_none());
-        assert!(MuConfig::default().sessions.sources.is_empty());
+        assert!(MuConfig::default().sessions.sources.is_none());
         let s =
             toml::from_str::<MuConfig>("[sessions]\nsources = [[\"mu-remote\", \"rows\"], [\"x\"]]").unwrap().sessions;
-        assert_eq!(s.sources, [vec!["mu-remote".to_string(), "rows".to_string()], vec!["x".to_string()]]);
+        assert_eq!(s.sources, Some(vec![vec!["mu-remote".to_string(), "rows".to_string()], vec!["x".to_string()]]));
     }
 
     #[test]

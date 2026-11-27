@@ -15,6 +15,8 @@ A missing config file is an empty config. A remote that cannot be used is droppe
 
 The profile's file, when there is one, is merged over the shared one: a `[remote.NAME]` in it replaces the shared remote of that name as a whole (its keys are not merged), other remotes are added, and its `default_remote` wins. State (keys, pins, workers) is shared by all profiles.
 
+**The profile goes to the agents it starts.** Over `ssh` the remote `mu` runs under the same profile name (`MU_PROFILE`), so it uses that machine's profile of the name. The pod adapter has no profile in the pod, so it sends the profile's config as one file: mu's shared `config.toml` with the profile's own merged over it (`mu-remote mu-config`), plus the profile's `models.toml` and `providers.toml`. See [adapters](adapters.md).
+
 ## `[remote.NAME]`
 
 ```toml
@@ -58,9 +60,8 @@ No secret goes in this file: an adapter reads credentials from where its tool ke
 [task]
 launcher = ["mu-remote", "launch", "cluster"]   # run task subagents on the remote `cluster`
 launch = ["task"]                                # which agent kinds use the launcher
-
-[sessions]
-sources = [["mu-remote", "rows"]]                # the agents on every remote, in the Sessions tab
 ```
+
+The agents on every remote show in the Sessions tab with no setting: unset, mu's `[sessions] sources` is `mu-remote rows` when `mu-remote` is beside `mu` or on the `PATH`. Set `sources = []` to turn that off, or a list to use other programs instead.
 
 `mu-remote NAME` itself runs `mu --attach 'mu-remote connect NAME ID' --state-key KEY`, so it needs nothing in mu's config.

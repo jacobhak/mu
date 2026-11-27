@@ -91,6 +91,7 @@ case "$1 $2" in
     [ ! -f "$FAKE/bundle-fails" ] || { echo "nothing to bundle" >&2; exit 1; }
     printf 'BUNDLE-BYTES' ;;
   "bridge "*) cat; exit 7 ;;
+  "mu-config "*) echo 'merged = true' ;;
 esac
 EOF
 chmod +x "$T/kubectl" "$T/bin/mu" "$T/bin/mu-remote"
@@ -123,7 +124,7 @@ adapter() {
   env -u MU_PROFILE -u OMP_PROFILE -u PI_PROFILE -u SCCACHE_BUCKET -u SCCACHE_ENDPOINT -u SCCACHE_REGION -u SCCACHE_S3_USE_SSL \
     -u SCCACHE_S3_KEY_PREFIX FAKE="$FAKE" KUBECTL="$T/kubectl" PATH="$T/bin:$PATH" MU_POD_SPEC="$here/mu-remote-pod.yaml" \
     MU_REMOTE_NAME=pods MU_REMOTE_SETTINGS="$SETTINGS" MU_REMOTE_TRUSTED="$TRUSTED" DIR="$DIR" \
-    HOME="$T/home" MU_HOME="$T/mu-home" MU_REMOTE_HOME="$T/state" PI_CODING_AGENT_DIR="$T/agent" \
+    HOME="$T/home" MU_HOME="$T/mu-home" MU_REMOTE_HOME="$T/state" PI_CODING_AGENT_DIR="$T/agent" MU_PROFILE="${PROFILE:-}" \
     "$here/mu-remote-pod" "$@" > "$T/out" 2> "$T/err"
 }
 fresh() {
@@ -256,6 +257,21 @@ adapter start --kind agent --dir "$DIR" -c || fail "$(cat "$T/err")"
 has "$FAKE/mu-calls" 'agent --detach -c'
 SETTINGS='{"agent_deadline":"7200"}' adapter start --kind agent --dir "$DIR" || fail "$(cat "$T/err")"
 has "$FAKE/pod.yaml" 'activeDeadlineSeconds: 7200'
+
+# start with a profile that has its own config.toml: the pod gets the merged config, not the shared file.
+fresh
+mkdir -p "$T/mu-home/profiles/work"
+echo 'y = 2' > "$T/mu-home/profiles/work/config.toml"
+PROFILE=work adapter start --kind agent --dir "$DIR" || fail "profile start failed: $(cat "$T/err")"
+tar -xOf "$FAKE/config.tar" .mu/config.toml > "$T/pod-config"
+has "$T/pod-config" 'merged = true'
+lacks "$T/err" 'only the shared one'
+# A profile with no config.toml of its own: the shared file as it is.
+fresh
+rm "$T/mu-home/profiles/work/config.toml"
+PROFILE=work adapter start --kind agent --dir "$DIR" || fail "profile start failed: $(cat "$T/err")"
+tar -xOf "$FAKE/config.tar" .mu/config.toml > "$T/pod-config"
+has "$T/pod-config" 'x = 1'
 
 # start --kind agent --bundle: the repository is cloned into the directory (history and branch), nothing secret is sent.
 fresh

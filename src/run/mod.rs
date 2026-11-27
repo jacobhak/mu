@@ -135,7 +135,7 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
         return attach::run(attach::Link::new(command.clone(), cli.state_key.clone()), false);
     }
     if Mode::interactive(cli, plan.is_some()) && !agent {
-        let sources = mu_base::config::Configs::load().mu.sessions.sources;
+        let sources = mu_base::config::Configs::load().mu.sessions.effective_sources();
         if !sources.is_empty() {
             mu_tui::host::sessions::set_session_sources(sources);
         }
