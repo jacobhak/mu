@@ -903,7 +903,7 @@ fn a_wake_delivers_the_queued_message_and_empties_the_inbox() {
         assert!(
             evs.iter().any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("mu notify from steward: say PONG")))
         );
-        assert!(session_text(&a).contains("Message from steward (via mu notify"));
+        assert!(session_text(&a).contains("<mu-notify from=\\\"steward\\\""));
         assert!(!inbox::has_pending(&id));
         assert!(a.ports.providers.scripted.borrow().is_empty());
     });
@@ -1520,7 +1520,7 @@ fn messages_waiting_at_open_are_announced_and_go_out_with_the_next_prompt() {
         a.turn(Some("hi".to_string().into())).await;
         let users = user_texts(&a);
         assert_eq!(users.len(), 2, "{users:?}");
-        assert!(users[0].contains("Message from steward") && users[1] == "hi", "{users:?}");
+        assert!(users[0].contains("<mu-notify from=\"steward\"") && users[1] == "hi", "{users:?}");
         assert!(!inbox::has_pending(&id));
     });
 }
@@ -1873,7 +1873,7 @@ fn the_real_loop_wakes_on_the_channel() {
         ctx.send(Command::Exit).unwrap();
         drop(ctx);
         let _ = task.await;
-        assert!(std::fs::read_to_string(path).unwrap().contains("Message from steward (via mu notify"));
+        assert!(std::fs::read_to_string(path).unwrap().contains("<mu-notify from=\\\"steward\\\""));
         assert!(!inbox::has_pending(&id));
     });
 }
@@ -1908,7 +1908,7 @@ fn two_senders_and_one_wake_give_one_notice() {
         a.turn(None).await;
         let users = user_texts(&a);
         assert_eq!(users.len(), 1, "{users:?}");
-        assert!(users[0].contains("Message from a") && users[0].contains("Message from b"));
+        assert!(users[0].contains("<mu-notify from=\"a\"") && users[0].contains("<mu-notify from=\"b\""));
     });
 }
 
