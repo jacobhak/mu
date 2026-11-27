@@ -1,5 +1,6 @@
 mod ask;
 pub mod changes;
+pub mod chart;
 mod diff;
 pub mod docs;
 pub mod edit;
@@ -454,6 +455,12 @@ pub static BUILTINS: &[Builtin] = &[
         def: Some(|| tool_def("ask", ask::description(), ask::schema())),
         call: dispatch!("ask", async |t, a: ask::Args, c| t.ask(a, c)),
     },
+    Builtin {
+        name: "chart",
+        access: Access::Read,
+        def: Some(|| tool_def("chart", chart::description(), chart::schema())),
+        call: dispatch!("chart", |_t, a: chart::Args| chart::run(a)),
+    },
     // Offered per session (modes, jobs, custom agents), so no static definition. A mode's exit tool
     // is not here: `Tools::call` routes it by the active mode.
     Builtin {
@@ -528,6 +535,7 @@ pub fn summary(name: &str, args: &Value) -> String {
             return if ids.is_empty() { "any".into() } else { trunc(&ids.join(", "), 120) };
         }
         "web_search" => first("query"),
+        "chart" => first("title"),
         "fetch" => first("url"),
         "review" => first("scope"),
         "task" => {
@@ -567,7 +575,7 @@ mod table_tests {
     #[test]
     fn one_table_drives_names_definitions_and_dispatch() {
         let names: Vec<String> = Tools::definitions().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "set_cwd", "todo", "ask"]);
+        assert_eq!(names, ["read", "write", "edit", "bash", "grep", "glob", "set_cwd", "todo", "ask", "chart"]);
         assert!(is_builtin("task") && is_builtin("enter_mode") && is_builtin("wait"));
         assert!(!is_builtin("propose_plan"), "an exit tool belongs to a mode, not the table");
         assert!(!names.contains(&"wait".to_string()), "wait is session-only");

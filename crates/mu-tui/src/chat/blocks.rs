@@ -1,4 +1,5 @@
 //! Transcript blocks: user prompts, tool headers and framed tool cards, thinking markers, subagent rows.
+use crate::text::chart;
 use crate::text::diffview;
 use crate::text::line::{self, Line, fill, span, truncate, wrap};
 use crate::text::markdown;
@@ -16,6 +17,8 @@ const CMD_CUT: usize = 12;
 const TEXT_CUT: usize = 10;
 const ERR_LINES: usize = 10;
 const DEFAULT_TIMEOUT_SECS: f64 = 300.0;
+/// Widest a chart card is drawn: a line stretched over a wide terminal reads worse, not better.
+const CHART_WIDTH: usize = 100;
 
 fn tfg(role: Role) -> ContentStyle {
     theme::get().fg(role)
@@ -563,6 +566,20 @@ pub fn tool_result(name: &str, args: &Value, out: &ToolOutput, expanded: bool, w
             lines.extend(frame(&card, width));
         }
         "ask" => lines.extend(ask_rows(args, &out.text, width)),
+        "chart" => match mu_tools::tools::chart::parse(args) {
+            Ok(c) => {
+                let w = width.min(CHART_WIDTH);
+                let rows = chart::render(&c, w.saturating_sub(4).max(2));
+                let card = Card {
+                    tone: Tone::Success,
+                    title: None,
+                    sections: vec![Section { label: None, rows }],
+                    footer: None,
+                };
+                lines.extend(frame(&card, w));
+            }
+            Err(_) => lines.extend(text_rows(&out.text, expanded, |_| tfg(Role::Muted))),
+        },
         "task" => lines.extend(text_rows(&out.text, expanded, |l| {
             if l.starts_with("## ") { name_style() } else { tfg(Role::Muted) }
         })),
@@ -1115,6 +1132,24 @@ mod tests {
         cleared.details = Some(json!({"op": "rm", "phases": []}));
         let t = texts(&tool_result("todo", &json!({"op": "rm"}), &cleared, false, 40));
         assert_eq!(t, ["● Todo", "  Todo list cleared."], "{t:?}");
+    }
+
+    #[test]
+    fn chart_result_is_a_card_drawn_at_the_width_and_capped() {
+        let args = json!({"kind": "bar", "title": "Weekly", "height": 6,
+            "bars": [{"label": "mon", "value": 3}, {"label": "tue", "value": 9}]});
+        let out = ToolOutput::ok("Chart shown");
+        let rows = tool_result("chart", &args, &out, false, 40);
+        let t = texts(&rows);
+        assert_eq!(t[0], "● Chart Weekly");
+        assert!(t[1].starts_with('╭') && t.last().unwrap().starts_with('╰'), "{t:?}");
+        assert_eq!(t.len(), 1 + 6 + 2, "header, card rules and the chart's rows: {t:?}");
+        assert!(rows.iter().all(|r| line::line_width(r) <= 40));
+        assert!(t.iter().any(|r| r.contains("tue")), "{t:?}");
+        let wide = tool_result("chart", &args, &out, false, 300);
+        assert!(wide.iter().all(|r| line::line_width(r) <= CHART_WIDTH + 2), "capped");
+        let bad = tool_result("chart", &json!({"kind": "bar"}), &ToolOutput::ok("fell back"), false, 40);
+        assert_eq!(texts(&bad)[1], "  fell back");
     }
 
     #[test]

@@ -19,7 +19,7 @@ edit = { "*.lock" = "ask" }
 
 | Mode | Runs without asking | Asks |
 |---|---|---|
-| `ask` | reads inside the project: `read`, `grep`, `glob`, read-only `bash`; and `todo`, `ask`, `web_search`, `fetch` of a host a `web_search` returned, … | everything that writes or runs, reads outside the project, and `fetch` of any other host |
+| `ask` | reads inside the project: `read`, `grep`, `glob`, read-only `bash`; and `todo`, `ask`, `chart`, `web_search`, `fetch` of a host a `web_search` returned, … | everything that writes or runs, reads outside the project, and `fetch` of any other host |
 | `edits` | the same, plus file edits inside the project | commands, writes outside the project or into `.git`, and reads outside the project |
 | `yolo` | everything | only what a rule says to ask |
 

@@ -872,7 +872,8 @@ async fn open_session(
         permission_mode: permissions,
         task_launch: crate::run::task_launch(None, &cfgs),
         // Plans are approved through `session/request_permission`, which every client has.
-        excluded: if elicit { vec![] } else { vec!["ask"] },
+        // An ACP client draws no terminal charts.
+        excluded: if elicit { vec!["chart"] } else { vec!["ask", "chart"] },
         ..Default::default()
     };
     let AgentHandle { cmd: cmd_tx, ev: mut ev_rx, task, .. } = build_agent(

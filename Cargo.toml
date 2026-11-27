@@ -35,6 +35,8 @@ serde_yaml_ng = "0.10"
 toml = "1"
 toml_edit = "0.25"
 crossterm = "0.28"
+ratatui-core = "0.1"
+ratatui-widgets = { version = "0.3", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-width = "0.2"
 tree-sitter = "0.25"
