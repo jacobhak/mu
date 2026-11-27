@@ -206,21 +206,27 @@ impl Theme {
         let (green, red) = (pal.get("green"), pal.get("red"));
         // The changed part of a line is a stronger shade than the line.
         let (add_bg, add_hi, del_bg, del_hi) = if dark {
-            (mix(bg, green, 16), mix(bg, green, 34), mix(bg, red, 16), mix(bg, red, 34))
+            (mix(bg, green, 22), mix(bg, green, 46), mix(bg, red, 22), mix(bg, red, 46))
         } else {
             (mix(bg, green, 20), mix(bg, green, 40), mix(bg, red, 18), mix(bg, red, 36))
         };
+        // Layers, from the back: chrome, bar, surface (the prompt, code, cards in the transcript), window (the tile),
+        // raised (the dock, composer, menus). The steps are wide on purpose: the TUI's bands read at a glance
+        // because its darker and lighter backgrounds sit far apart.
+        let black = (0, 0, 0);
         let (window, bar, raised) = (
             pal.rgb.get("window").copied().unwrap_or(bg),
-            pal.rgb.get("bar").copied().unwrap_or_else(|| pal.get("dark_background")),
-            pal.rgb.get("raised").copied().unwrap_or_else(|| if dark { mix(bg, fg, 8) } else { mix(bg, (255, 255, 255), 60) }),
+            pal.rgb.get("bar").copied().unwrap_or_else(|| if dark { mix(bg, black, 32) } else { mix(bg, fg, 7) }),
+            pal.rgb.get("raised").copied().unwrap_or_else(|| if dark { mix(bg, fg, 13) } else { mix(bg, (255, 255, 255), 70) }),
         );
-        let chrome = pal.rgb.get("chrome").copied().unwrap_or_else(|| if dark { mix(bg, (0, 0, 0), 45) } else { mix(bg, fg, 11) });
+        let surface = if dark { mix(bg, black, 48) } else { mix(bg, fg, 10) };
+        let chrome = pal.rgb.get("chrome").copied().unwrap_or_else(|| if dark { mix(bg, black, 62) } else { mix(bg, fg, 16) });
         // The TUI's text roles, lifted until they clear a contrast floor on every surface they sit on. Glyphs at
         // 12-14 px in a proportional face look thinner than a terminal's, so the TUI's own floor (2.4 for faint
         // text) is too low here.
         let hi = pal.get("bright_foreground");
-        let surfaces = [window, bar, raised, pal.get("dark_background")];
+        let white = (255, 255, 255);
+        let surfaces = [window, bar, raised, surface];
         let lift = |mut c: Rgb, min: f64| {
             for _ in 0..24 {
                 if surfaces.iter().all(|s| contrast(c, *s) >= min) {
@@ -230,18 +236,25 @@ impl Theme {
             }
             c
         };
-        let (text, muted, faint) = (lift(fg, FLOOR_TEXT), lift(mix(fg, bg, 35), FLOOR_MUTED), lift(pal.get("dark_foreground"), FLOOR_FAINT));
+        // Dark themes read near-white (the TUI's text looks brighter than its palette's foreground because a terminal
+        // draws it heavier); light themes get a step toward black.
+        let (text, strong) = if dark {
+            (mix(hi, white, 25), mix(hi, white, 60))
+        } else {
+            (lift(mix(fg, hi, 50), FLOOR_TEXT), hi)
+        };
+        let (muted, faint) = (lift(mix(text, bg, 30), FLOOR_MUTED), lift(pal.get("dark_foreground"), FLOOR_FAINT));
         Self {
             name,
             dark,
             ty,
-            strong: h(pal.get("bright_foreground")),
+            strong: h(strong),
             muted: h(muted),
             faint: h(faint),
             thinking: h(faint),
-            line: h(mix(bg, fg, 22)),
-            line_faint: h(mix(bg, fg, 13)),
-            surface: h(pal.get("dark_background")),
+            line: h(mix(bg, fg, 32)),
+            line_faint: h(mix(bg, fg, 20)),
+            surface: h(surface),
             selected: h(pal.get("selection")),
             accent: h(accent),
             accent_soft: h(mix(bg, accent, 55)),
@@ -263,7 +276,7 @@ impl Theme {
             window: h(window),
             bar: h(bar),
             raised: h(raised),
-            hover: h(mix(bg, fg, 10)),
+            hover: h(mix(bg, fg, 14)),
             focus_ring: h(accent),
             diff_add_bg: h(add_bg),
             diff_add_hi: h(add_hi),
