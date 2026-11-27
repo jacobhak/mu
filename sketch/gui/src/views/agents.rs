@@ -50,7 +50,9 @@ fn find_field(t: &Theme) -> Div {
         .py(px(4.))
         .rounded(px(metrics::RADIUS))
         .bg(t.surface)
-        .text_color(t.faint)
+        .border_1()
+        .border_color(t.line_faint)
+        .text_color(t.muted)
         .child("⌕ Find…")
 }
 
@@ -97,7 +99,17 @@ fn narrow(c: &ViewCtx) -> AnyElement {
 }
 
 fn group_label(t: &Theme, text: &'static str, color: Hsla) -> Div {
-    small(t).font_weight(FontWeight::SEMIBOLD).text_color(color).px(px(4.)).pt(px(12.)).pb(px(4.)).truncate().child(text)
+    small(t)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color)
+        .px(px(4.))
+        .mt(px(12.))
+        .pb(px(4.))
+        .mb(px(4.))
+        .border_b_1()
+        .border_color(t.line_faint)
+        .truncate()
+        .child(text)
 }
 
 fn narrow_row(t: &Theme, r: &AgentRow, pinned: bool) -> Div {

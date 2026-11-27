@@ -34,6 +34,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .gap(px(2.))
         .px(px(metrics::PAD))
         .py(px(metrics::PAD_SM + 2.))
+        .bg(t.bar)
         .border_b_1()
         .border_color(t.line)
         .child(ui(t).font_weight(FontWeight::SEMIBOLD).text_color(t.strong).truncate().child(title))
@@ -66,11 +67,12 @@ fn file(t: &Theme, f: &ReviewFile) -> Div {
         .gap(px(6.))
         .px(px(metrics::PAD))
         .py(px(4.))
+        .py(px(6.))
         .bg(t.surface)
-        .border_b_1()
-        .border_color(t.line_faint)
+        .border_y_1()
+        .border_color(t.line)
         .child(ui(t).flex_none().text_color(t.muted).child(if f.expanded { "▾" } else { "▸" }))
-        .child(div().flex_1().min_w_0().truncate().child(f.path))
+        .child(div().flex_1().min_w_0().truncate().text_color(t.strong).child(f.path))
         .child(counts(t, f.plus, f.minus));
     let d = div().flex().flex_col().child(head);
     if f.expanded {

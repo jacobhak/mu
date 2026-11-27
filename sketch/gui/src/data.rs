@@ -597,7 +597,6 @@ fn rest_blocks() -> Vec<Block> {
                 ],
             },
         ]),
-        tool(ToolKind::Edit, "Edit", "src/run/serve.rs", "+6 −2"),
         Block::Diff(serve_diff()),
         Block::Bash(Bash {
             command: "cargo test -p mu --test agent reconnect",

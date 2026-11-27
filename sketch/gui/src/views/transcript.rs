@@ -57,7 +57,6 @@ fn row_like(b: &Block) -> bool {
         b,
         Block::Thinking { .. }
             | Block::Tool(_)
-            | Block::Bash(_)
             | Block::Retry(_)
             | Block::Notice(_)
             | Block::Compaction(_)
@@ -74,8 +73,8 @@ fn block(t: &Theme, b: &Block) -> AnyElement {
         Block::Prose(md) => div().child(markdown::render(t, md)).into_any_element(),
         Block::Diff(d) => diff_block(t, d).into_any_element(),
         Block::Bash(b) => bash(t, b).into_any_element(),
-        Block::Subagents(subs) => subagents(t, subs).into_any_element(),
-        Block::Todo(items) => todo(t, items).into_any_element(),
+        Block::Subagents(subs) => boxed(t).child(subagents(t, subs)).into_any_element(),
+        Block::Todo(items) => boxed(t).child(todo(t, items)).into_any_element(),
         Block::Retry(s) => line(t, "↻", t.warn, t.muted, *s).into_any_element(),
         Block::Notice(s) => line(t, "ℹ", t.faint, t.muted, *s).into_any_element(),
         Block::Error(s) => error(t, *s).into_any_element(),
@@ -104,6 +103,8 @@ fn user(t: &Theme, text: &'static str, image: Option<&'static str>) -> impl Into
         .px(px(14.))
         .py(px(10.))
         .bg(t.surface)
+        .border_1()
+        .border_color(t.line_faint)
         .rounded(px(metrics::RADIUS_LG))
         .line_height(relative(t.ty.prose_lh))
         .child(div().flex_1().min_w_0().text_color(t.strong).child(text))
@@ -168,40 +169,7 @@ fn tool_row(t: &Theme, tool: &Tool) -> impl IntoElement {
 }
 
 fn diff_block(t: &Theme, d: &Diff) -> impl IntoElement {
-    ui(t)
-        .flex()
-        .flex_col()
-        .gap(px(5.))
-        .child(
-            ui(t)
-                .flex()
-                .items_center()
-                .whitespace_nowrap()
-                .text_color(t.muted)
-                .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("✎"))
-                .child(div().flex_none().w(px(t.ty.code * VERB_EM)).child("Edit"))
-                .child(mono(t).min_w_0().truncate().text_color(t.text).child(d.file))
-                .child(div().flex_none().pl(px(t.ty.code)).text_color(t.ok).child(format!("+{}", d.plus)))
-                .child(div().flex_none().pl(px(t.ty.code * 0.5)).text_color(t.err).child(format!("−{}", d.minus))),
-        )
-        .child(
-            div()
-                .w_full()
-                .overflow_hidden()
-                .border_1()
-                .border_color(t.line_faint)
-                .rounded(px(metrics::RADIUS))
-                .child(diff::lines(t, &d.lines)),
-        )
-        .when(d.more > 0, |el| {
-            el.child(
-                ui(t)
-                    .pl(px(t.ty.code * ICON_W))
-                    .text_size(px(t.ty.small))
-                    .text_color(t.faint)
-                    .child(format!("{} more lines", d.more)),
-            )
-        })
+    diff::card(t, d)
 }
 
 fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
@@ -211,7 +179,19 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
         Some(0) => (format!("✓ 0 · {}", b.time), t.ok),
         Some(code) => (format!("✗ {code} · {}", b.time), t.err),
     };
-    let mut tail = mono(t).flex().flex_col().pl(px(t.ty.code * ICON_W)).pt(px(2.)).text_color(t.muted);
+    // A block: the command on a header bar, the output under it. A failure tints the bar and the edge.
+    let header = ui(t)
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(6.))
+        .whitespace_nowrap()
+        .bg(if failed { t.err.opacity(0.14) } else { t.surface })
+        .child(mono(t).flex_none().text_color(t.tool).child("$"))
+        .child(mono(t).flex_1().min_w_0().truncate().text_color(t.strong).child(b.command))
+        .child(div().flex_none().text_color(status_fg).child(status));
+    let mut tail = mono(t).flex().flex_col().px(px(12.)).py(px(6.)).text_color(t.muted);
     for l in &b.tail {
         tail = tail.child(div().flex_none().truncate().child(if l.is_empty() { " " } else { *l }));
     }
@@ -220,22 +200,19 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
             div().flex().justify_end().text_size(px(t.ty.small)).text_color(t.faint).child(format!("({} lines)", b.hidden)),
         );
     }
-    ui(t)
-        .flex()
-        .flex_col()
-        .border_l_2()
-        .border_color(if failed { t.err } else { gpui::transparent_black() })
-        .pl(px(if failed { 8. } else { 0. }))
-        .child(
-            ui(t)
-                .flex()
-                .items_center()
-                .whitespace_nowrap()
-                .child(mono(t).flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("$"))
-                .child(mono(t).flex_1().min_w_0().truncate().child(b.command))
-                .child(div().flex_none().pl(px(t.ty.code)).text_color(status_fg).child(status)),
-        )
-        .when(!b.tail.is_empty() || b.hidden > 0, |d| d.child(tail))
+    div()
+        .w_full()
+        .overflow_hidden()
+        .rounded(px(metrics::RADIUS))
+        .border_1()
+        .border_color(if failed { t.err.opacity(0.55) } else { t.line })
+        .child(header)
+        .when(!b.tail.is_empty() || b.hidden > 0, |d| d.child(div().border_t_1().border_color(t.line_faint).child(tail)))
+}
+
+/// A bordered band for a group of rows (todo, subagents).
+fn boxed(t: &Theme) -> gpui::Div {
+    div().w_full().rounded(px(metrics::RADIUS)).bg(t.surface).border_1().border_color(t.line_faint).px(px(12.)).py(px(8.))
 }
 
 fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {

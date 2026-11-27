@@ -185,6 +185,9 @@ pub struct Theme {
     pub hover: Hsla,
     /// The focused tile's edge.
     pub focus_ring: Hsla,
+    /// The line-number gutter of an added / removed line: between the line's background and its changed part.
+    pub diff_add_gutter: Hsla,
+    pub diff_del_gutter: Hsla,
     pub diff_add_bg: Hsla,
     pub diff_add_hi: Hsla,
     pub diff_del_bg: Hsla,
@@ -209,6 +212,11 @@ impl Theme {
             (mix(bg, green, 22), mix(bg, green, 46), mix(bg, red, 22), mix(bg, red, 46))
         } else {
             (mix(bg, green, 20), mix(bg, green, 40), mix(bg, red, 18), mix(bg, red, 36))
+        };
+        let (add_gutter, del_gutter) = if dark {
+            (mix(bg, green, 34), mix(bg, red, 34))
+        } else {
+            (mix(bg, green, 30), mix(bg, red, 28))
         };
         // Layers, from the back: chrome, bar, surface (the prompt, code, cards in the transcript), window (the tile),
         // raised (the dock, composer, menus). The steps are wide on purpose: the TUI's bands read at a glance
@@ -278,6 +286,8 @@ impl Theme {
             raised: h(raised),
             hover: h(mix(bg, fg, 14)),
             focus_ring: h(accent),
+            diff_add_gutter: h(add_gutter),
+            diff_del_gutter: h(del_gutter),
             diff_add_bg: h(add_bg),
             diff_add_hi: h(add_hi),
             diff_del_bg: h(del_bg),

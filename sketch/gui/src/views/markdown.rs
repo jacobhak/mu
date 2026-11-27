@@ -120,22 +120,30 @@ fn code(t: &Theme, lang: &'static str, lines: &[&'static str]) -> impl IntoEleme
     for l in lines {
         body = body.child(div().flex_none().truncate().child(highlight(t, l)));
     }
+    // A block: a label strip (the language) over the code on the darkest band.
     div()
         .flex()
         .flex_col()
         .w_full()
         .min_w_0()
         .overflow_hidden()
-        .bg(t.surface)
         .border_1()
-        .border_color(t.line_faint)
+        .border_color(t.line)
         .rounded(px(crate::theme::metrics::RADIUS))
-        .px(px(12.))
-        .py(px(8.))
         .when(!lang.is_empty(), |d| {
-            d.child(div().text_size(px(t.ty.small)).text_color(t.faint).pb(px(2.)).child(lang))
+            d.child(
+                div()
+                    .px(px(12.))
+                    .py(px(4.))
+                    .bg(t.bar)
+                    .border_b_1()
+                    .border_color(t.line_faint)
+                    .text_size(px(t.ty.small))
+                    .text_color(t.muted)
+                    .child(lang),
+            )
         })
-        .child(body)
+        .child(div().bg(t.surface).px(px(12.)).py(px(8.)).child(body))
 }
 
 const KEYWORDS: &[&str] = &[
