@@ -5,8 +5,15 @@ use std::collections::HashMap;
 
 pub type Rgb = (u8, u8, u8);
 
-pub const SANS: &str = "IBM Plex Sans";
-pub const MONO: &str = "Lilex";
+/// The system UI font and a system monospace, so nothing is bundled.
+#[cfg(target_os = "macos")]
+pub const SANS: &str = ".SystemUIFont";
+#[cfg(target_os = "macos")]
+pub const MONO: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
+pub const SANS: &str = "sans-serif";
+#[cfg(not(target_os = "macos"))]
+pub const MONO: &str = "monospace";
 
 /// The two sets of type sizes under review; a key toggles between them.
 #[derive(Clone, Copy, Debug)]
