@@ -60,7 +60,7 @@ pub fn floating(t: &Theme, data: &Data, session: SessionId, body: AnyElement) ->
         .border_b_1()
         .border_color(t.line)
         .child(div().font_weight(FontWeight::SEMIBOLD).text_color(t.strong).truncate().child(s.title))
-        .child(div().flex_none().text_color(t.faint).child(s.host))
+        .child(div().flex_none().text_color(t.muted).child(s.host))
         .child(
             div()
                 .flex_none()
@@ -116,8 +116,9 @@ fn query_row(t: &Theme, query: &str) -> gpui::Div {
         .flex()
         .items_center()
         .gap(px(1.))
-        .when(query.is_empty(), |d| d.child(cursor(t)).child(div().text_color(t.faint).child("Find agent…")))
+        .when(query.is_empty(), |d| d.child(cursor(t)).child(div().text_color(t.muted).child("Find agent…")))
         .when(!query.is_empty(), |d| d.child(div().text_color(t.strong).child(query.to_string())).child(cursor(t)));
+    // The input sits on the bar layer, apart from the list.
     ui(t)
         .h(px(QUERY_H))
         .flex_none()
@@ -125,6 +126,7 @@ fn query_row(t: &Theme, query: &str) -> gpui::Div {
         .items_center()
         .px(px(14.))
         .gap(px(10.))
+        .bg(t.bar)
         .child(div().text_color(t.accent).font_weight(FontWeight::SEMIBOLD).child("›"))
         .child(typed)
 }
@@ -141,8 +143,9 @@ fn footer(t: &Theme) -> gpui::Div {
         .justify_between()
         .px(px(14.))
         .py(px(7.))
+        .bg(t.bar)
         .text_size(px(t.ty.small))
-        .text_color(t.faint)
+        .text_color(t.muted)
         .child("actions · /commands · agents · layouts")
         .child(
             div()
@@ -164,9 +167,9 @@ fn cap(t: &Theme, key: &str) -> gpui::Div {
         .rounded(px(CAP_RADIUS))
         .border_1()
         .border_color(t.line)
-        .bg(t.surface)
+        .bg(t.window)
         .text_size(px(t.ty.small))
-        .text_color(t.muted)
+        .text_color(t.text)
         .child(key.to_string())
 }
 
@@ -191,9 +194,11 @@ fn row(t: &Theme, selected: bool) -> gpui::Div {
         .gap(px(8.))
         .mx(px(6.))
         .px(px(8.))
-        .py(px(ROW_PAD_Y))
-        .rounded(px(CAP_RADIUS))
-        .when(selected, |d| d.bg(t.selected))
+        .py(px(ROW_PAD_Y + 1.))
+        .rounded(px(CAP_RADIUS + 2.))
+        .border_1()
+        .border_color(if selected { t.accent } else { gpui::transparent_black() })
+        .when(selected, |d| d.bg(t.accent.opacity(0.14)))
         .child(
             div()
                 .w(px(MARKER_W - 8.))
@@ -230,7 +235,7 @@ fn agent_row(t: &Theme, e: &PaletteEntry, selected: bool) -> AnyElement {
                 .text_color(if selected { t.strong } else { t.text })
                 .child(e.label),
         )
-        .child(div().flex_1().min_w_0().truncate().text_color(t.faint).child(e.detail))
+        .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(e.detail))
         .into_any_element()
 }
 
@@ -248,15 +253,18 @@ fn full_row(t: &Theme, e: &PaletteEntry, query: &str, selected: bool) -> AnyElem
     let keys = e.key.split(' ').filter(|k| !k.is_empty()).map(|k| cap(t, k));
     row(t, selected)
         .child(
-            div()
-                .w(px(KIND_W))
-                .flex_none()
-                .text_size(px(t.ty.small))
-                .text_color(t.faint)
-                .child(kind_tag(e.kind)),
+            div().w(px(KIND_W)).flex_none().flex().child(
+                div()
+                    .px(px(7.))
+                    .rounded(px(999.))
+                    .bg(t.surface)
+                    .text_size(px(t.ty.small))
+                    .text_color(t.muted)
+                    .child(kind_tag(e.kind)),
+            ),
         )
         .child(div().flex_none().child(label(t, e.label, query, selected)))
-        .child(div().flex_1().min_w_0().truncate().text_color(t.faint).child(e.detail))
+        .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(e.detail))
         .child(div().flex_none().flex().items_center().gap(px(3.)).children(keys))
         .into_any_element()
 }
