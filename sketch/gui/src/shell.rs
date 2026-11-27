@@ -2,7 +2,7 @@
 //! floating panel). Keys are GPUI actions bound in `bind_keys` with the defaults of
 //! `docs/design/gui-wireframes.md` section 6.
 use crate::data::{self, AgentState, Data, SessionId, sid};
-use crate::theme::{Theme, metrics, palette_names};
+use crate::theme::{Lift, Theme, metrics, palette_names};
 use crate::views::{ViewCtx, agents, jobs, palette, review, session, ui};
 use gpui::prelude::*;
 use gpui::{
@@ -33,6 +33,8 @@ actions!(
         SplitRight,
         SplitDown,
         CloseTile,
+        FocusNext,
+        FocusPrev,
         FocusLeft,
         FocusRight,
         FocusUp,
@@ -67,45 +69,62 @@ actions!(
 pub fn bind_keys(cx: &mut App) {
     let w = Some("window");
     let mut keys = vec![
-        KeyBinding::new("ctrl-x a", JumpRequest, None),
-        KeyBinding::new("ctrl-x q", Quit, None),
-        KeyBinding::new("ctrl-x c", CyclePalette, None),
-        KeyBinding::new("ctrl-x f", ToggleScale, None),
-        KeyBinding::new("ctrl-x h", FocusLeft, w),
-        KeyBinding::new("ctrl-x j", FocusDown, w),
-        KeyBinding::new("ctrl-x k", FocusUp, w),
-        KeyBinding::new("ctrl-x l", FocusRight, w),
-        KeyBinding::new("ctrl-x shift-h", SwapLeft, w),
-        KeyBinding::new("ctrl-x shift-j", SwapDown, w),
-        KeyBinding::new("ctrl-x shift-k", SwapUp, w),
-        KeyBinding::new("ctrl-x shift-l", SwapRight, w),
+        // Emacs windows: `o` other window, `0` delete, `1` delete others (zoom), `2` below, `3` right.
+        KeyBinding::new("ctrl-x o", FocusNext, w),
+        KeyBinding::new("ctrl-x shift-o", FocusPrev, w),
+        KeyBinding::new("ctrl-x 0", CloseTile, w),
+        KeyBinding::new("ctrl-x 1", Zoom, w),
+        KeyBinding::new("ctrl-x 2", SplitDown, w),
+        KeyBinding::new("ctrl-x 3", SplitRight, w),
         KeyBinding::new("ctrl-x enter", Split, w),
-        KeyBinding::new("ctrl-x v", SplitRight, w),
-        KeyBinding::new("ctrl-x s", SplitDown, w),
-        KeyBinding::new("ctrl-x x", CloseTile, w),
-        KeyBinding::new("ctrl-x z", Zoom, w),
-        KeyBinding::new("ctrl-x <", Narrower, w),
-        KeyBinding::new("ctrl-x >", Wider, w),
+        // `^` enlarge-window, `{` `}` shrink and enlarge horizontally. The shifted spellings cover keyboards where
+        // GPUI reports the base key.
+        KeyBinding::new("ctrl-x ^", Taller, w),
+        KeyBinding::new("ctrl-x shift-6", Taller, w),
         KeyBinding::new("ctrl-x -", Shorter, w),
-        KeyBinding::new("ctrl-x +", Taller, w),
-        KeyBinding::new("ctrl-x shift-=", Taller, w),
+        KeyBinding::new("ctrl-x {", Narrower, w),
+        KeyBinding::new("ctrl-x shift-[", Narrower, w),
+        KeyBinding::new("ctrl-x }", Wider, w),
+        KeyBinding::new("ctrl-x shift-]", Wider, w),
+        // Directions, as arrows: Shift+arrow (Emacs's windmove) is the composer's, so they stay on the leader.
+        KeyBinding::new("ctrl-x left", FocusLeft, w),
+        KeyBinding::new("ctrl-x down", FocusDown, w),
+        KeyBinding::new("ctrl-x up", FocusUp, w),
+        KeyBinding::new("ctrl-x right", FocusRight, w),
+        KeyBinding::new("ctrl-x shift-left", SwapLeft, w),
+        KeyBinding::new("ctrl-x shift-down", SwapDown, w),
+        KeyBinding::new("ctrl-x shift-up", SwapUp, w),
+        KeyBinding::new("ctrl-x shift-right", SwapRight, w),
+        // `b` switch buffer is the agent palette; `M-x` is the full one; `C-g` cancels, as everywhere in Emacs.
+        KeyBinding::new("ctrl-x b", AgentPalette, None),
+        KeyBinding::new("alt-x", FullPalette, None),
+        KeyBinding::new("ctrl-x ctrl-c", Quit, None),
+        KeyBinding::new("ctrl-g", CloseOverlay, Some("palette")),
+        // Tabs are the tab-bar prefix `C-x t`: `2` new, `0` close, `o` other, `r` rename.
+        KeyBinding::new("ctrl-x t 2", NewTab, w),
+        KeyBinding::new("ctrl-x t 0", CloseTab, w),
+        KeyBinding::new("ctrl-x t o", NextTab, w),
+        KeyBinding::new("ctrl-x t shift-o", PrevTab, w),
+        KeyBinding::new("ctrl-x t r", RenameTab, w),
+        KeyBinding::new("ctrl-x t 1", GoTab1, w),
+        KeyBinding::new("ctrl-x t 3", GoTab3, w),
+        KeyBinding::new("ctrl-x t 4", GoTab4, w),
+        KeyBinding::new("ctrl-x t 5", GoTab5, w),
+        KeyBinding::new("ctrl-x t 6", GoTab6, w),
+        KeyBinding::new("ctrl-x t 7", GoTab7, w),
+        KeyBinding::new("ctrl-x t 8", GoTab8, w),
+        KeyBinding::new("ctrl-x t 9", GoTab9, w),
+        // Window configurations live in registers: `C-x r w` saves one, `C-x r j` jumps to one.
+        KeyBinding::new("ctrl-x r w", SaveLayout, w),
+        KeyBinding::new("ctrl-x r j", SwitchLayout, w),
+        KeyBinding::new("ctrl-x a", JumpRequest, None),
         KeyBinding::new("ctrl-x [", ToggleLeftBar, w),
         KeyBinding::new("ctrl-x ]", ToggleRightBar, w),
-        KeyBinding::new("ctrl-x o", OpenView, w),
+        KeyBinding::new("ctrl-x v", OpenView, w),
         KeyBinding::new("ctrl-x p", Pin, w),
-        KeyBinding::new("ctrl-x t", NewTab, w),
-        KeyBinding::new("ctrl-x ,", RenameTab, w),
-        KeyBinding::new("ctrl-x w", SaveLayout, w),
-        KeyBinding::new("ctrl-x '", SwitchLayout, w),
-        KeyBinding::new("ctrl-x 1", GoTab1, w),
-        KeyBinding::new("ctrl-x 2", GoTab2, w),
-        KeyBinding::new("ctrl-x 3", GoTab3, w),
-        KeyBinding::new("ctrl-x 4", GoTab4, w),
-        KeyBinding::new("ctrl-x 5", GoTab5, w),
-        KeyBinding::new("ctrl-x 6", GoTab6, w),
-        KeyBinding::new("ctrl-x 7", GoTab7, w),
-        KeyBinding::new("ctrl-x 8", GoTab8, w),
-        KeyBinding::new("ctrl-x 9", GoTab9, w),
+        // Sketch only: cycle the palette, toggle the type size.
+        KeyBinding::new("ctrl-x c", CyclePalette, None),
+        KeyBinding::new("ctrl-x f", ToggleScale, None),
         KeyBinding::new("escape", CloseOverlay, Some("palette")),
         KeyBinding::new("up", PaletteUp, Some("palette")),
         KeyBinding::new("down", PaletteDown, Some("palette")),
@@ -163,6 +182,25 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-b", ToggleLeftBar, w),
     ]);
     cx.bind_keys(keys);
+}
+
+/// Content of tiles and bars that do not have focus.
+const DIM_OPACITY: f32 = 0.74;
+
+/// A tile or a bar: a rounded card on the chrome, with a hairline and a shadow that grows with focus.
+fn panel(t: &Theme, focused: bool) -> gpui::Div {
+    div()
+        .relative()
+        .overflow_hidden()
+        .rounded(px(metrics::TILE_RADIUS))
+        .border_1()
+        .border_color(t.line_faint)
+        .shadow(t.shadow(if focused { Lift::Card } else { Lift::Rest }))
+}
+
+/// The focus ring: drawn over the card so the layout does not move when focus does.
+fn ring(t: &Theme, radius: f32) -> gpui::Div {
+    div().absolute().inset_0().rounded(px(radius)).border_2().border_color(t.focus_ring)
 }
 
 // ---------------------------------------------------------------- tiling
@@ -420,6 +458,22 @@ impl Tab {
             }
             Focus::Bar(_) => {}
         }
+    }
+
+    /// Emacs's `other-window`: the next tile in tree order, wrapping; from a bar, the first (or last) tile.
+    fn focus_cycle(&mut self, forward: bool) {
+        let order: Vec<usize> = self.rects().into_iter().map(|(i, _)| i).collect();
+        if order.is_empty() {
+            return;
+        }
+        let at = self.focused_tile().and_then(|f| order.iter().position(|i| *i == f));
+        let next = match (at, forward) {
+            (Some(p), true) => order[(p + 1) % order.len()],
+            (Some(p), false) => order[(p + order.len() - 1) % order.len()],
+            (None, true) => order[0],
+            (None, false) => order[order.len() - 1],
+        };
+        self.set_focus(Focus::Tile(next));
     }
 
     fn view_not_shown(&self) -> View {
@@ -694,26 +748,31 @@ impl Shell {
             Node::Leaf(id) => {
                 let focused = tab.focus == Focus::Tile(*id);
                 let wide = rects.iter().find(|(i, _)| i == id).is_some_and(|(_, r)| r.w * vw > 700.0);
-                div()
+                // Focus: an accent ring over a lifted card; the other tiles recede.
+                let dim = !focused && rects.len() > 1;
+                panel(t, focused)
                     .id(("tile", *id))
                     .size_full()
-                    .overflow_hidden()
                     .bg(t.window)
-                    .border_l_2()
-                    .border_color(if focused { t.focus_ring } else { transparent_black() })
-                    .child(self.render_view(tab.tiles[*id], focused, wide, tab.last_session))
+                    .child(
+                        div()
+                            .size_full()
+                            .when(dim, |d| d.opacity(DIM_OPACITY))
+                            .child(self.render_view(tab.tiles[*id], focused, wide, tab.last_session)),
+                    )
+                    .when(focused, |d| d.child(ring(t, metrics::TILE_RADIUS)))
                     .into_any_element()
             }
             Node::Split { axis, ratio, a, b } => {
                 let child = |n: &Node, grow: f32| {
-                    let mut d = div().flex_basis(px(0.)).flex_grow(grow).flex_shrink(1.0).min_w_0().min_h_0().overflow_hidden();
+                    let mut d = div().flex_basis(px(0.)).flex_grow(grow).flex_shrink(1.0).min_w_0().min_h_0();
                     d = match axis {
                         Axis::Row => d.h_full(),
                         Axis::Col => d.w_full(),
                     };
                     d.child(self.render_node(n, tab, vw, rects))
                 };
-                let d = div().flex().size_full().bg(t.line).gap(px(metrics::TILE_GAP));
+                let d = div().flex().size_full().gap(px(metrics::TILE_GAP));
                 let d = match axis {
                     Axis::Row => d.flex_row(),
                     Axis::Col => d.flex_col(),
@@ -731,18 +790,23 @@ impl Shell {
         let view = view.filter(|_| on)?;
         let t = &self.theme;
         let focused = tab.focus == Focus::Bar(side);
-        let (w, edge) = match side {
-            Side::Left => (metrics::LEFT_BAR_W, div().border_r_1()),
-            Side::Right => (metrics::RIGHT_BAR_W, div().border_l_1()),
+        let w = match side {
+            Side::Left => metrics::LEFT_BAR_W,
+            Side::Right => metrics::RIGHT_BAR_W,
         };
         Some(
-            edge.w(px(w))
+            panel(t, focused)
+                .w(px(w))
                 .h_full()
                 .flex_none()
-                .overflow_hidden()
                 .bg(t.bar)
-                .border_color(if focused { t.focus_ring } else { t.line })
-                .child(self.render_view(view, focused, false, tab.last_session))
+                .child(
+                    div()
+                        .size_full()
+                        .when(!focused, |d| d.opacity(DIM_OPACITY))
+                        .child(self.render_view(view, focused, false, tab.last_session)),
+                )
+                .when(focused, |d| d.child(ring(t, metrics::TILE_RADIUS)))
                 .into_any_element(),
         )
     }
@@ -754,31 +818,26 @@ impl Shell {
             .flex_none()
             .items_center()
             .h(px(metrics::TAB_BAR_H))
-            .px(px(8.))
+            .px(px(metrics::TILE_GAP + 4.))
             .gap_1()
-            .bg(t.bar)
-            .border_b_1()
-            .border_color(t.line);
+            .text_color(t.muted);
         for (n, tab) in self.tabs.iter().enumerate() {
             let active = n == self.active;
             bar = bar.child(
                 div()
-                    .px(px(10.))
-                    .py(px(3.))
+                    .px(px(12.))
+                    .py(px(4.))
                     .rounded(px(metrics::RADIUS))
-                    .when(active, |d| d.bg(t.selected).text_color(t.strong))
-                    .when(!active, |d| d.text_color(t.muted))
+                    .when(active, |d| {
+                        d.bg(t.window).text_color(t.strong).border_1().border_color(t.line_faint).shadow(t.shadow(Lift::Rest))
+                    })
+                    .when(!active, |d| d.border_1().border_color(transparent_black()).text_color(t.muted))
                     .child(self.tab_title(tab)),
             );
         }
-        bar.child(div().text_color(t.faint).child("+"))
+        bar.child(div().px(px(8.)).text_color(t.faint).child("+"))
             .child(div().flex_1())
-            .child(div().text_color(t.faint).child(format!(
-                "{} · {} · {}",
-                t.name,
-                t.ty.name,
-                data::plat("⌘P", "Ctrl+Shift+P")
-            )))
+            .child(div().text_color(t.faint).child(format!("{} · {} · C-x b agents · M-x all", t.name, t.ty.name)))
             .into_any_element()
     }
 
@@ -799,10 +858,7 @@ impl Shell {
             .items_center()
             .gap_4()
             .h(px(metrics::STATUS_BAR_H))
-            .px(px(10.))
-            .bg(t.bar)
-            .border_t_1()
-            .border_color(t.line)
+            .px(px(metrics::PAD))
             .text_size(px(t.ty.small))
             .text_color(t.muted)
             .child(div().text_color(t.strong).child(s.profile))
@@ -844,6 +900,9 @@ impl Render for Shell {
             .flex_row()
             .flex_1()
             .min_h_0()
+            .gap(px(metrics::TILE_GAP))
+            .px(px(metrics::TILE_GAP))
+            .pb(px(metrics::TILE_GAP))
             .when_some(self.render_bar(tab, Side::Left), |d, b| d.child(b))
             .child(div().flex_1().min_w_0().h_full().child(main))
             .when_some(self.render_bar(tab, Side::Right), |d, b| d.child(b));
@@ -865,7 +924,7 @@ impl Render for Shell {
             .relative()
             .flex()
             .flex_col()
-            .bg(t.window)
+            .bg(t.chrome)
             .text_color(t.text)
             .child(self.render_tab_bar())
             .child(body)
@@ -923,6 +982,8 @@ impl Render for Shell {
         let root = on!(root, cx, SplitRight, |this| this.note = this.tab().split(Some(Axis::Row)).map(Into::into));
         let root = on!(root, cx, SplitDown, |this| this.note = this.tab().split(Some(Axis::Col)).map(Into::into));
         let root = on!(root, cx, CloseTile, |this| this.note = this.tab().close_tile().map(Into::into));
+        let root = on!(root, cx, FocusNext, |this| this.tab().focus_cycle(true));
+        let root = on!(root, cx, FocusPrev, |this| this.tab().focus_cycle(false));
         let root = on!(root, cx, FocusLeft, |this| this.tab().focus_dir(Dir::Left));
         let root = on!(root, cx, FocusRight, |this| this.tab().focus_dir(Dir::Right));
         let root = on!(root, cx, FocusUp, |this| this.tab().focus_dir(Dir::Up));

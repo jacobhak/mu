@@ -107,7 +107,7 @@ fn job_row(t: &Theme, j: &JobRow, selected: bool) -> Div {
         .gap(px(COL_GAP))
         .px(px(6.))
         .py(px(ROW_PY))
-        .rounded(px(4.))
+        .rounded(px(metrics::RADIUS_SM))
         .border_l_2()
         .border_color(gpui::transparent_black());
     let d = if selected { d.bg(t.selected).border_color(t.accent) } else { d };

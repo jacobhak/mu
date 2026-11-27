@@ -1,9 +1,9 @@
 //! The agent palette, the full palette and the floating panel's frame.
 //!
 //! The shell draws the scrim and centres what these return; they size themselves (a palette about 640 px wide).
-use super::{mono, ui};
+use super::ui;
 use crate::data::{Data, EntryKind, PaletteEntry, SessionId};
-use crate::theme::{Theme, metrics};
+use crate::theme::{Lift, Theme, metrics};
 use gpui::prelude::*;
 use gpui::{AnyElement, FontWeight, Hsla, StyledText, TextRun, div, font, px};
 
@@ -15,7 +15,7 @@ const ROW_PAD_Y: f32 = 4.0;
 const MARKER_W: f32 = 18.0;
 const KIND_W: f32 = 64.0;
 const GLYPH_W: f32 = 18.0;
-const CAP_RADIUS: f32 = 4.0;
+const CAP_RADIUS: f32 = 6.0;
 const HEADER_H: f32 = 38.0;
 const BADGE_BG_OPACITY: f32 = 0.16;
 
@@ -80,10 +80,10 @@ pub fn floating(t: &Theme, data: &Data, session: SessionId, body: AnyElement) ->
         .w(px(FLOAT_W))
         .h(px(FLOAT_H))
         .bg(t.window)
-        .rounded(px(metrics::RADIUS + 2.))
+        .rounded(px(metrics::RADIUS_LG + 2.))
         .border_1()
         .border_color(t.focus_ring)
-        .shadow_lg()
+        .shadow(t.shadow(Lift::Float))
         .overflow_hidden()
         .flex()
         .flex_col()
@@ -98,10 +98,10 @@ fn shell(t: &Theme) -> gpui::Div {
     ui(t)
         .w(px(PALETTE_W))
         .bg(t.raised)
-        .rounded(px(metrics::RADIUS + 2.))
+        .rounded(px(metrics::RADIUS_LG + 2.))
         .border_1()
         .border_color(t.line)
-        .shadow_lg()
+        .shadow(t.shadow(Lift::Float))
         .overflow_hidden()
         .flex()
         .flex_col()
@@ -157,7 +157,7 @@ fn footer(t: &Theme) -> gpui::Div {
 
 /// A key as a small rounded cap.
 fn cap(t: &Theme, key: &str) -> gpui::Div {
-    mono(t)
+    ui(t)
         .flex_none()
         .px(px(6.))
         .py(px(1.))

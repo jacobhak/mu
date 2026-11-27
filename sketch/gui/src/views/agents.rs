@@ -142,7 +142,7 @@ fn narrow_row(t: &Theme, r: &AgentRow, pinned: bool) -> Div {
 }
 
 fn row_box(t: &Theme, current: bool, pinned: bool) -> Div {
-    let d = div_col().px(px(4.)).py(px(ROW_PY + 1.)).rounded(px(4.)).border_l_2().border_color(gpui::transparent_black());
+    let d = div_col().px(px(4.)).py(px(ROW_PY + 1.)).rounded(px(metrics::RADIUS_SM)).border_l_2().border_color(gpui::transparent_black());
     if current {
         d.bg(t.selected)
     } else if pinned {
@@ -278,7 +278,7 @@ fn table_row(t: &Theme, r: &AgentRow, selected: bool, sub: bool) -> Div {
         .gap(px(COL_GAP))
         .px(px(4.))
         .py(px(ROW_PY))
-        .rounded(px(4.))
+        .rounded(px(metrics::RADIUS_SM))
         .border_l_2()
         .border_color(gpui::transparent_black());
     if selected {

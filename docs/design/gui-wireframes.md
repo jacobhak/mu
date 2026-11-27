@@ -496,21 +496,30 @@ Two tiers, all of them rebindable in `[keys.window]` and `[keys.palette]`:
 | Close tile | Cmd+W | Ctrl+Shift+W |
 | Toggle left bar | Cmd+B | Ctrl+Shift+B |
 
-| After Ctrl+X | Action |
-|---|---|
-| `h` `j` `k` `l` | Focus left, down, up, right |
-| `H` `J` `K` `L` | Swap the tile in that direction |
-| Enter | Split (spiral) |
-| `v` / `s` | Split right / down |
-| `x` | Close the tile |
-| `z` | Zoom the tile, or zoom back |
-| `<` `>` `-` `+` | Narrower, wider, shorter, taller |
-| `[` / `]` | Toggle the left / right bar |
-| `o` | Open a view in the tile (picker) |
-| `p` | Pin or unpin the view to its session |
-| `a` | Jump to the next request waiting on you (section 3d) |
-| `t` / `,` | New tab / rename the tab |
-| `1`…`9` | Go to tab |
-| `w` / `'` | Save the layout / switch layout |
+The leader sequences follow Emacs where Emacs has the action, so `C-x` finger memory carries over (changed after trying the sketch):
+
+| After Ctrl+X | Action | Emacs |
+|---|---|---|
+| `o` / `O` | Focus the next / previous tile, wrapping (bars are reached by direction) | `other-window` |
+| `b` | Agent palette (switch session) | `switch-to-buffer` |
+| `2` / `3` | Split down / right | `split-window-below/right` |
+| `0` | Close the tile | `delete-window` |
+| `1` | Zoom the tile, or zoom back | `delete-other-windows` |
+| `←` `↓` `↑` `→` | Focus by direction (Shift+arrow is the composer's) | windmove |
+| Shift+`←↓↑→` | Swap the tile in that direction | |
+| Enter | Split (spiral) | |
+| `^` `-` `{` `}` | Taller, shorter, narrower, wider | `enlarge-window`, … |
+| `[` / `]` | Toggle the left / right bar | |
+| `v` | Open a view in the tile (picker) | |
+| `p` | Pin or unpin the view to its session | |
+| `a` | Jump to the next request waiting on you (section 3d) | |
+| `t 2` / `t 0` | New / close tab | tab-bar prefix |
+| `t o` / `t O` | Next / previous tab | |
+| `t r` | Rename the tab | |
+| `t 1`, `t 3`…`t 9` | Go to tab (tab 2 is Cmd+2 / Ctrl+Shift+2) | |
+| `r w` / `r j` | Save the layout / switch layout | window configuration registers |
+| `C-c` | Quit | |
+
+- **`M-x` opens the full palette** and `C-g` cancels any palette, as in Emacs. Cmd+K and Cmd+P stay on the platform tier.
 
 - **The defaults are a starting point.** The GPUI sketch app is where they get tried.

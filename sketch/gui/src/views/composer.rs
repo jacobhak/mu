@@ -1,9 +1,9 @@
 //! Queue rows, the composer's states, the `/` menu, the session bar.
-use super::{ViewCtx, mono, ui};
+use super::{ViewCtx, ui};
 use crate::data::{Session, SlashMenu};
-use crate::theme::{Theme, metrics};
+use crate::theme::{Lift, Theme, metrics};
 use gpui::prelude::FluentBuilder as _;
-use gpui::{AnyElement, Div, FontWeight, IntoElement as _, ParentElement as _, Styled as _, div, px};
+use gpui::{AnyElement, Div, FontWeight, IntoElement as _, ParentElement as _, Styled as _, div, px, relative};
 
 const MENU_W: f32 = 380.0;
 const CMD_W: f32 = 96.0;
@@ -15,7 +15,7 @@ pub fn queue(c: &ViewCtx) -> Option<AnyElement> {
         return None;
     }
     let rows = s.queue.iter().map(|q| {
-        mono(t)
+        ui(t)
             .flex()
             .items_center()
             .gap(px(8.))
@@ -29,7 +29,7 @@ pub fn queue(c: &ViewCtx) -> Option<AnyElement> {
             .flex()
             .flex_col()
             .gap(px(2.))
-            .px(px(metrics::PAD))
+            .px(px(metrics::PAD + 14.))
             .pt(px(metrics::PAD_SM))
             .pb(px(2.))
             .children(rows)
@@ -42,33 +42,35 @@ pub fn input(c: &ViewCtx) -> AnyElement {
     let (t, s) = (c.t, c.s());
     let cm = &s.composer;
     let empty = cm.before.is_empty() && cm.after.is_empty();
-    let cursor = div().text_color(if c.focused { t.accent } else { t.faint }).child("▌");
+    let caret = || div().flex_none().w(px(2.)).h(px(t.ty.ui + 4.)).bg(if c.focused { t.accent } else { t.faint });
+    let field = ui(t).text_size(px(t.ty.ui + 1.)).line_height(relative(1.4)).flex().flex_wrap().items_center();
     let text = if empty && cm.ghost.is_empty() {
         // The cursor sits at the start; the placeholder follows it.
-        mono(t).flex().flex_wrap().child(cursor).child(div().text_color(t.faint).child(cm.placeholder))
+        field.child(caret()).child(div().pl(px(2.)).text_color(t.faint).child(cm.placeholder))
     } else {
-        mono(t)
-            .flex()
-            .flex_wrap()
+        field
             .child(div().text_color(t.strong).child(cm.before))
-            .child(cursor)
+            .child(caret())
             .child(div().text_color(t.strong).child(cm.after))
             .child(div().text_color(t.faint).child(cm.ghost))
     };
-    let mut boxed = div()
+    // An input card: lifted off the tile, with an accent edge while the tile has focus.
+    let mut card = div()
         .flex()
         .flex_col()
         .gap(px(6.))
         .px(px(metrics::PAD))
-        .pt(px(metrics::PAD_SM + 2.))
-        .pb(px(metrics::PAD_SM))
-        .border_t_1()
-        .border_color(t.line)
+        .py(px(metrics::PAD_SM + 3.))
+        .rounded(px(metrics::RADIUS_LG))
+        .bg(t.raised)
+        .border_1()
+        .border_color(if c.focused { t.accent } else { t.line })
+        .shadow(t.shadow(Lift::Rest))
         .child(text);
     if let Some((name, size)) = cm.image {
-        boxed = boxed.child(image_chip(t, name, size));
+        card = card.child(image_chip(t, name, size));
     }
-    let mut wrap = div().relative().child(boxed);
+    let mut wrap = div().relative().px(px(metrics::PAD)).pt(px(metrics::PAD_SM)).pb(px(2.)).child(card);
     if let Some(menu) = &cm.slash {
         wrap = wrap.child(slash_menu(t, menu));
     }
@@ -77,10 +79,10 @@ pub fn input(c: &ViewCtx) -> AnyElement {
 
 fn image_chip(t: &Theme, name: &'static str, size: &'static str) -> Div {
     div().flex().child(
-        mono(t)
+        ui(t)
             .px(px(8.))
             .py(px(1.))
-            .rounded(px(10.))
+            .rounded(px(metrics::RADIUS_SM))
             .bg(t.surface)
             .border_1()
             .border_color(t.line)
@@ -93,13 +95,13 @@ fn image_chip(t: &Theme, name: &'static str, size: &'static str) -> Div {
 fn slash_menu(t: &Theme, m: &SlashMenu) -> Div {
     let rows = m.entries.iter().enumerate().map(|(i, (cmd, desc))| {
         let on = i == m.selected;
-        mono(t)
+        ui(t)
             .flex()
             .gap(px(10.))
             .px(px(8.))
             .h(px(metrics::ROW_H))
             .items_center()
-            .rounded(px(4.))
+            .rounded(px(metrics::RADIUS_SM))
             .when(on, |d| d.bg(t.selected))
             .child(
                 div()
@@ -111,24 +113,24 @@ fn slash_menu(t: &Theme, m: &SlashMenu) -> Div {
             )
             .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(*desc))
     });
-    div().absolute().bottom_full().left(px(metrics::PAD)).pb(px(4.)).child(
+    div().absolute().bottom_full().left(px(metrics::PAD)).pb(px(6.)).child(
         div()
             .flex()
             .flex_col()
             .w(px(MENU_W))
-            .p(px(4.))
-            .rounded(px(metrics::RADIUS))
+            .p(px(6.))
+            .rounded(px(metrics::RADIUS_LG))
             .bg(t.raised)
             .border_1()
             .border_color(t.line)
-            .shadow_md()
+            .shadow(t.shadow(Lift::Float))
             .child(div().px(px(8.)).pb(px(2.)).text_size(px(t.ty.small)).text_color(t.faint).child("/"))
             .children(rows),
     )
 }
 
 fn chip(t: &Theme, text: String, fg: gpui::Hsla) -> Div {
-    ui(t).flex_none().whitespace_nowrap().px(px(7.)).py(px(1.)).rounded(px(10.)).text_size(px(t.ty.small)).text_color(fg).child(text)
+    ui(t).flex_none().whitespace_nowrap().px(px(8.)).py(px(2.)).rounded(px(999.)).text_size(px(t.ty.small)).text_color(fg).child(text)
 }
 
 fn mode_colour(t: &Theme, mode: &str) -> gpui::Hsla {
@@ -157,10 +159,9 @@ pub fn session_bar(c: &ViewCtx) -> AnyElement {
         .items_center()
         .gap(px(4.))
         .h(px(metrics::STATUS_BAR_H + 4.))
-        .px(px(metrics::PAD - 7.))
+        .px(px(metrics::PAD))
         .pb(px(2.))
         .overflow_hidden()
-        .when(!c.focused, |d| d.opacity(0.6))
         .child(chip(t, s.model.to_string(), t.strong).font_weight(FontWeight::MEDIUM))
         .child(chip(t, s.thinking.to_string(), t.muted))
         .child(chip(t, s.mode.to_string(), mode).bg(mode.opacity(0.14)))

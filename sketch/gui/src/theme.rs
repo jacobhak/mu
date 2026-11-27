@@ -1,6 +1,6 @@
 //! A mu palette resolved to the TUI's roles (the same keys and mixes as `crates/mu-tui/src/theme.rs`, `DEFS`),
 //! the GUI-only roles, and the type scale. Every size lives in `SCALES` so a review edits one place.
-use gpui::{Hsla, Rgba, rgb};
+use gpui::{BoxShadow, Hsla, Rgba, point, px, rgb};
 use std::collections::HashMap;
 
 pub type Rgb = (u8, u8, u8);
@@ -26,21 +26,26 @@ pub struct TypeScale {
 }
 
 pub const SCALES: [TypeScale; 2] = [
-    TypeScale { name: "15/13", prose: 15.0, ui: 13.0, code: 13.0, small: 11.5, prose_lh: 1.55, code_lh: 1.45 },
-    TypeScale { name: "16/14", prose: 16.0, ui: 14.0, code: 14.0, small: 12.5, prose_lh: 1.55, code_lh: 1.45 },
+    TypeScale { name: "16/14", prose: 16.0, ui: 14.0, code: 13.0, small: 12.0, prose_lh: 1.55, code_lh: 1.45 },
+    TypeScale { name: "17/15", prose: 17.0, ui: 15.0, code: 14.0, small: 13.0, prose_lh: 1.55, code_lh: 1.45 },
 ];
 
 /// Spacing and shape constants shared by the views.
 pub mod metrics {
-    pub const TILE_GAP: f32 = 1.0;
-    pub const PAD: f32 = 12.0;
-    pub const PAD_SM: f32 = 6.0;
-    pub const ROW_H: f32 = 24.0;
-    pub const RADIUS: f32 = 6.0;
+    /// The chrome showing between tiles, and around them.
+    pub const TILE_GAP: f32 = 4.0;
+    pub const TILE_RADIUS: f32 = 10.0;
+    pub const PAD: f32 = 14.0;
+    pub const PAD_SM: f32 = 8.0;
+    pub const ROW_H: f32 = 28.0;
+    /// Cards and rows; chips, options and key caps; overlays and the dock.
+    pub const RADIUS: f32 = 8.0;
+    pub const RADIUS_SM: f32 = 6.0;
+    pub const RADIUS_LG: f32 = 12.0;
     pub const LEFT_BAR_W: f32 = 260.0;
     pub const RIGHT_BAR_W: f32 = 300.0;
-    pub const TAB_BAR_H: f32 = 32.0;
-    pub const STATUS_BAR_H: f32 = 24.0;
+    pub const TAB_BAR_H: f32 = 38.0;
+    pub const STATUS_BAR_H: f32 = 28.0;
 }
 
 const PALETTES: &[(&str, &str)] = &[
@@ -164,9 +169,11 @@ pub struct Theme {
     pub text: Hsla,
 
     // GUI-only roles, derived when the palette does not set them.
-    /// The window and the transcript's background.
+    /// The outermost layer: the gutter between tiles, behind the tab and status bars.
+    pub chrome: Hsla,
+    /// A tile's card, and the transcript's background.
     pub window: Hsla,
-    /// Side bars, tab bar and status bar.
+    /// Side bars: between the chrome and a tile.
     pub bar: Hsla,
     /// Menus, palettes, the dock: surfaces that sit above the window.
     pub raised: Hsla,
@@ -203,6 +210,7 @@ impl Theme {
             pal.rgb.get("bar").copied().unwrap_or_else(|| pal.get("dark_background")),
             pal.rgb.get("raised").copied().unwrap_or_else(|| if dark { mix(bg, fg, 8) } else { mix(bg, (255, 255, 255), 60) }),
         );
+        let chrome = pal.rgb.get("chrome").copied().unwrap_or_else(|| if dark { mix(bg, (0, 0, 0), 45) } else { mix(bg, fg, 11) });
         Self {
             name,
             dark,
@@ -231,6 +239,7 @@ impl Theme {
             syn_comment: h(pal.get("dark_foreground")),
             syn_punct: h(mix(fg, bg, 20)),
             text: h(fg),
+            chrome: h(chrome),
             window: h(window),
             bar: h(bar),
             raised: h(raised),
@@ -243,6 +252,39 @@ impl Theme {
             scrim: gpui::hsla(0.0, 0.0, 0.0, if dark { 0.55 } else { 0.35 }),
         }
     }
+}
+
+impl Theme {
+    /// A shadow for a surface lifted off its background. Dark themes need a heavier one to show at all; light
+    /// themes read as paper, so theirs is soft and wide.
+    pub fn shadow(&self, level: Lift) -> Vec<BoxShadow> {
+        let (alpha, blur, y) = match (self.dark, level) {
+            (true, Lift::Rest) => (0.30, 6.0, 1.0),
+            (true, Lift::Card) => (0.45, 14.0, 4.0),
+            (true, Lift::Float) => (0.60, 36.0, 12.0),
+            (false, Lift::Rest) => (0.07, 4.0, 1.0),
+            (false, Lift::Card) => (0.12, 14.0, 4.0),
+            (false, Lift::Float) => (0.22, 36.0, 12.0),
+        };
+        vec![BoxShadow {
+            color: gpui::hsla(0.0, 0.0, 0.0, alpha),
+            offset: point(px(0.), px(y)),
+            blur_radius: px(blur),
+            spread_radius: px(0.),
+            inset: false,
+        }]
+    }
+}
+
+/// How far a surface sits above what is behind it.
+#[derive(Clone, Copy)]
+pub enum Lift {
+    /// A control or an input.
+    Rest,
+    /// A card: the dock, a focused tile.
+    Card,
+    /// An overlay.
+    Float,
 }
 
 /// `Rgba` is what `gpui::rgb` returns; views that need a one-off colour can use it.

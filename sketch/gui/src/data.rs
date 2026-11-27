@@ -1156,13 +1156,13 @@ pub fn build() -> Data {
     let palette = PaletteData {
         query: "tile spl",
         entries: vec![
-            entry(EntryKind::Action, "Tile: split right", "", plat("⌘⇧\\", "Ctrl+X v")),
-            entry(EntryKind::Action, "Tile: split down", "", plat("⌘⇧-", "Ctrl+X s")),
-            entry(EntryKind::Action, "Tile: split (spiral)", "", plat("⌘\\", "Ctrl+X Enter")),
+            entry(EntryKind::Action, "Tile: split right", "", "C-x 3"),
+            entry(EntryKind::Action, "Tile: split down", "", "C-x 2"),
+            entry(EntryKind::Action, "Tile: split (spiral)", "", "C-x RET"),
             entry(EntryKind::Command, "/compact", "compact the conversation", ""),
             entry(EntryKind::Agent, "Agent: Deploy pod adapter", "test-cluster · ⚑ needs you", ""),
             entry(EntryKind::Layout, "Layout: review", "3 tiles", ""),
-            entry(EntryKind::View, "View: jobs", "open in the focused tile", "Ctrl+X o"),
+            entry(EntryKind::View, "View: jobs", "open in the focused tile", "C-x v"),
         ],
         agents: vec![
             entry(EntryKind::Agent, "Desktop app design", "here · running · 2m", ""),

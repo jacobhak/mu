@@ -1,7 +1,7 @@
 //! The dock: approval (both steps), questions with a preview, the final review, document review.
 use super::{ViewCtx, markdown, mono, ui};
 use crate::data::{Approval, DocReview, Question, QuestionsReview, Request};
-use crate::theme::{Theme, metrics};
+use crate::theme::{Lift, Theme, metrics};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, Div, FontWeight, InteractiveElement as _, IntoElement as _, ParentElement as _,
@@ -25,18 +25,22 @@ pub fn dock(c: &ViewCtx) -> Option<AnyElement> {
         Request::Review(r) => review(c, r),
     };
     Some(
-        ui(t)
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .px(px(metrics::PAD))
-            .pt(px(metrics::PAD_SM + 2.))
-            .pb(px(metrics::PAD_SM + 2.))
-            .bg(t.raised)
-            .border_t_2()
-            .border_color(t.muted)
-            .child(body)
-            .into_any_element(),
+        // A raised card that interrupts the flow: lifted off the tile, with an accent edge on top.
+        div().px(px(metrics::PAD)).pt(px(metrics::PAD_SM)).pb(px(2.)).child(
+            ui(t)
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .px(px(metrics::PAD))
+                .py(px(metrics::PAD_SM + 4.))
+                .rounded(px(metrics::RADIUS_LG))
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.accent_soft)
+                .shadow(t.shadow(Lift::Card))
+                .child(body),
+        )
+        .into_any_element(),
     )
 }
 
@@ -53,7 +57,7 @@ fn marker(t: &Theme, selected: bool) -> Div {
 }
 
 fn key(t: &Theme, k: &'static str, selected: bool) -> Div {
-    mono(t)
+    ui(t)
         .flex_none()
         .w(px(KEY_W))
         .text_size(px(t.ty.small))
@@ -68,8 +72,8 @@ fn choice_row(t: &Theme, selected: bool, k: &'static str, label: &'static str, d
         .items_center()
         .gap(px(6.))
         .h(px(metrics::ROW_H))
-        .px(px(4.))
-        .rounded(px(4.))
+        .px(px(6.))
+        .rounded(px(metrics::RADIUS_SM))
         .when_selected(selected, t)
         .child(marker(t, selected))
         .child(key(t, k, selected))
@@ -112,9 +116,9 @@ fn approval(t: &Theme, a: &Approval) -> AnyElement {
     head = head.child(div().text_color(t.faint).child(a.why));
     let code = mono(t)
         .my(px(4.))
-        .px(px(8.))
-        .py(px(5.))
-        .rounded(px(4.))
+        .px(px(10.))
+        .py(px(7.))
+        .rounded(px(metrics::RADIUS))
         .bg(t.surface)
         .border_1()
         .border_color(t.line_faint)
@@ -150,9 +154,9 @@ fn option_row(t: &Theme, q: &Question, i: usize) -> Div {
     div()
         .flex()
         .gap(px(6.))
-        .px(px(4.))
-        .py(px(3.))
-        .rounded(px(4.))
+        .px(px(6.))
+        .py(px(4.))
+        .rounded(px(metrics::RADIUS_SM))
         .when_selected(selected, t)
         .child(marker(t, selected))
         .child(key(t, number, selected))
@@ -164,7 +168,7 @@ fn preview_box(t: &Theme, text: &'static str) -> Div {
         .flex_none()
         .w(px(PREVIEW_W))
         .self_start()
-        .rounded(px(4.))
+        .rounded(px(metrics::RADIUS))
         .border_1()
         .border_color(t.line)
         .bg(t.surface)
@@ -210,9 +214,9 @@ fn model_slider(t: &Theme, r: &DocReview) -> Div {
     let segs = r.models.iter().enumerate().map(|(i, m)| {
         let on = i == r.model;
         div()
-            .px(px(8.))
-            .py(px(2.))
-            .rounded(px(10.))
+            .px(px(10.))
+            .py(px(3.))
+            .rounded(px(999.))
             .text_size(px(t.ty.small))
             .when(on, |d| d.bg(t.accent_soft.opacity(0.35)).border_color(t.accent).text_color(t.accent))
             .when(!on, |d| d.border_color(t.line_faint).text_color(t.muted))
@@ -235,9 +239,9 @@ fn review(c: &ViewCtx, r: &DocReview) -> AnyElement {
         .max_h(px(DOC_MAX_H))
         .overflow_y_scroll()
         .mt(px(4.))
-        .px(px(10.))
-        .py(px(6.))
-        .rounded(px(4.))
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(metrics::RADIUS))
         .bg(t.window)
         .border_1()
         .border_color(t.line_faint)

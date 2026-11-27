@@ -85,14 +85,14 @@ fn block(t: &Theme, b: &Block) -> AnyElement {
         Block::Notice(s) => line(t, "ℹ", t.faint, t.muted, *s).into_any_element(),
         Block::Error(s) => error(t, *s).into_any_element(),
         Block::Compaction(s) => line(t, "⊟", t.faint, t.muted, *s).into_any_element(),
-        Block::Answered(s) => mono(t).text_color(t.muted).truncate().child(*s).into_any_element(),
+        Block::Answered(s) => ui(t).text_color(t.muted).truncate().child(*s).into_any_element(),
         Block::Plan(s) => plan(t, *s).into_any_element(),
     }
 }
 
 /// A muted one-line row with an icon in its own colour.
 fn line(t: &Theme, icon: &'static str, icon_fg: gpui::Hsla, fg: gpui::Hsla, text: &'static str) -> gpui::Div {
-    mono(t)
+    ui(t)
         .flex()
         .items_start()
         .text_color(fg)
@@ -101,26 +101,24 @@ fn line(t: &Theme, icon: &'static str, icon_fg: gpui::Hsla, fg: gpui::Hsla, text
 }
 
 fn user(t: &Theme, text: &'static str, image: Option<&'static str>) -> impl IntoElement {
-    mono(t)
+    prose(t)
         .flex()
         .items_start()
         .gap(px(12.))
         .w_full()
-        .px(px(12.))
-        .py(px(9.))
+        .px(px(14.))
+        .py(px(10.))
         .bg(t.surface)
-        .border_1()
-        .border_color(t.line)
-        .rounded(px(metrics::RADIUS))
-        .line_height(relative(t.ty.code_lh))
-        .child(div().flex_1().min_w_0().child(text))
+        .rounded(px(metrics::RADIUS_LG))
+        .line_height(relative(t.ty.prose_lh))
+        .child(div().flex_1().min_w_0().text_color(t.strong).child(text))
         .when_some(image, |d, label| {
             d.child(
                 ui(t)
                     .flex_none()
-                    .px(px(7.))
+                    .px(px(8.))
                     .py(px(1.))
-                    .rounded(px(4.))
+                    .rounded(px(metrics::RADIUS_SM))
                     .border_1()
                     .border_color(t.accent_soft)
                     .text_size(px(t.ty.small))
@@ -162,31 +160,32 @@ fn tool_row(t: &Theme, tool: &Tool) -> impl IntoElement {
         (_, true) => format!("{} …", tool.facts),
         _ => tool.facts.to_string(),
     };
-    mono(t)
+    // The verb and the facts are interface text; only the arguments (a path, a pattern) are code.
+    ui(t)
         .flex()
         .items_center()
         .whitespace_nowrap()
         .text_color(t.muted)
         .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child(tool.kind.icon()))
         .child(div().flex_none().w(px(t.ty.code * VERB_EM)).child(tool.verb))
-        .child(div().min_w_0().truncate().text_color(t.text).child(tool.target))
+        .child(mono(t).min_w_0().truncate().text_color(t.text).child(tool.target))
         .when(!facts.is_empty(), |d| d.child(div().flex_none().pl(px(t.ty.code)).text_color(t.faint).child(facts)))
 }
 
 fn diff_block(t: &Theme, d: &Diff) -> impl IntoElement {
-    mono(t)
+    ui(t)
         .flex()
         .flex_col()
         .gap(px(5.))
         .child(
-            mono(t)
+            ui(t)
                 .flex()
                 .items_center()
                 .whitespace_nowrap()
                 .text_color(t.muted)
                 .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("✎"))
                 .child(div().flex_none().w(px(t.ty.code * VERB_EM)).child("Edit"))
-                .child(div().min_w_0().truncate().text_color(t.text).child(d.file))
+                .child(mono(t).min_w_0().truncate().text_color(t.text).child(d.file))
                 .child(div().flex_none().pl(px(t.ty.code)).text_color(t.ok).child(format!("+{}", d.plus)))
                 .child(div().flex_none().pl(px(t.ty.code * 0.5)).text_color(t.err).child(format!("−{}", d.minus))),
         )
@@ -201,7 +200,7 @@ fn diff_block(t: &Theme, d: &Diff) -> impl IntoElement {
         )
         .when(d.more > 0, |el| {
             el.child(
-                mono(t)
+                ui(t)
                     .pl(px(t.ty.code * ICON_W))
                     .text_size(px(t.ty.small))
                     .text_color(t.faint)
@@ -226,19 +225,19 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
             div().flex().justify_end().text_size(px(t.ty.small)).text_color(t.faint).child(format!("({} lines)", b.hidden)),
         );
     }
-    mono(t)
+    ui(t)
         .flex()
         .flex_col()
         .border_l_2()
         .border_color(if failed { t.err } else { gpui::transparent_black() })
         .pl(px(if failed { 8. } else { 0. }))
         .child(
-            mono(t)
+            ui(t)
                 .flex()
                 .items_center()
                 .whitespace_nowrap()
-                .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("$"))
-                .child(div().flex_1().min_w_0().truncate().child(b.command))
+                .child(mono(t).flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("$"))
+                .child(mono(t).flex_1().min_w_0().truncate().child(b.command))
                 .child(div().flex_none().pl(px(t.ty.code)).text_color(status_fg).child(status)),
         )
         .when(!b.tail.is_empty() || b.hidden > 0, |d| d.child(tail))
@@ -248,8 +247,8 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
     let done = subs.iter().filter(|s| s.done).count();
     let running = subs.len() - done;
     let head = if running == 0 { format!("{done} done") } else { format!("{done} done · {running} running") };
-    let mut col = mono(t).flex().flex_col().gap(px(3.)).child(
-        mono(t)
+    let mut col = ui(t).flex().flex_col().gap(px(3.)).child(
+        ui(t)
             .flex()
             .text_color(t.muted)
             .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("◆"))
@@ -259,15 +258,15 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
     for s in subs {
         let (icon, fg) = if s.done { ("✓", t.ok) } else { ("●", t.accent) };
         col = col.child(
-            mono(t)
+            ui(t)
                 .flex()
                 .items_center()
                 .whitespace_nowrap()
                 .pl(px(t.ty.code * ICON_W))
                 .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(fg).child(icon))
-                .child(div().flex_none().w(px(t.ty.code * SUB_NAME_EM * 0.6 + 8.)).child(s.name))
-                .child(div().flex_none().w(px(t.ty.code * SUB_KIND_EM * 0.6 + 8.)).text_color(t.muted).child(s.kind))
-                .child(div().flex_none().w(px(t.ty.code * SUB_TIME_EM * 0.6 + 8.)).text_color(t.muted).child(s.time))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_NAME_EM * 0.6 + 8.)).child(s.name))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_KIND_EM * 0.6 + 8.)).text_color(t.muted).child(s.kind))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_TIME_EM * 0.6 + 8.)).text_color(t.muted).child(s.time))
                 .child(div().flex_1().min_w_0().truncate().text_color(t.faint).child(format!("\"{}\"", s.summary))),
         );
     }
@@ -276,8 +275,8 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
 
 fn todo(t: &Theme, items: &[TodoItem]) -> impl IntoElement {
     let done = items.iter().filter(|i| i.state == 2).count();
-    let mut col = mono(t).flex().flex_col().gap(px(2.)).child(
-        mono(t)
+    let mut col = ui(t).flex().flex_col().gap(px(2.)).child(
+        ui(t)
             .flex()
             .text_color(t.muted)
             .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("☰"))
@@ -291,7 +290,7 @@ fn todo(t: &Theme, items: &[TodoItem]) -> impl IntoElement {
             _ => ("○", t.faint, t.muted),
         };
         col = col.child(
-            mono(t)
+            ui(t)
                 .flex()
                 .pl(px(t.ty.code * ICON_W))
                 .text_color(fg)
@@ -306,12 +305,12 @@ fn error(t: &Theme, msg: &'static str) -> impl IntoElement {
     ui(t)
         .flex()
         .items_start()
-        .border_l_2()
-        .border_color(t.err)
+        .border_1()
+        .border_color(t.err.opacity(0.4))
+        .rounded(px(metrics::RADIUS))
         .bg(t.err.opacity(0.08))
-        .pl(px(10.))
-        .pr(px(10.))
-        .py(px(5.))
+        .px(px(12.))
+        .py(px(7.))
         .child(div().flex_none().w(px(t.ty.ui * 1.5)).text_color(t.err).child("✗"))
         .child(div().flex_1().min_w_0().text_color(t.text).child(msg))
 }
@@ -321,11 +320,11 @@ fn plan(t: &Theme, msg: &'static str) -> impl IntoElement {
         .text_size(px(t.ty.ui))
         .flex()
         .items_start()
-        .px(px(12.))
-        .py(px(7.))
+        .px(px(14.))
+        .py(px(9.))
         .border_1()
         .border_color(t.accent_soft)
-        .rounded(px(metrics::RADIUS))
+        .rounded(px(metrics::RADIUS_LG))
         .child(div().flex_none().w(px(t.ty.ui * 1.7)).text_color(t.accent).child("▣"))
         .child(div().flex_1().min_w_0().child(msg))
 }
