@@ -185,7 +185,7 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 /// Content of tiles and bars that do not have focus.
-const DIM_OPACITY: f32 = 0.74;
+const DIM_OPACITY: f32 = 0.55;
 
 /// A tile or a bar: a rounded card on the chrome, with a hairline and a shadow that grows with focus.
 fn panel(t: &Theme, focused: bool) -> gpui::Div {
@@ -200,7 +200,7 @@ fn panel(t: &Theme, focused: bool) -> gpui::Div {
 
 /// The focus ring: drawn over the card so the layout does not move when focus does.
 fn ring(t: &Theme, radius: f32) -> gpui::Div {
-    div().absolute().inset_0().rounded(px(radius)).border_2().border_color(t.focus_ring)
+    div().absolute().inset_0().rounded(px(radius)).border_1().border_color(t.accent_soft)
 }
 
 // ---------------------------------------------------------------- tiling

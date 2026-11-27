@@ -64,7 +64,7 @@ pub fn input(c: &ViewCtx) -> AnyElement {
         .rounded(px(metrics::RADIUS_LG))
         .bg(t.raised)
         .border_1()
-        .border_color(if c.focused { t.accent } else { t.line })
+        .border_color(if c.focused { t.accent_soft } else { t.line })
         .shadow(t.shadow(Lift::Rest))
         .child(text);
     if let Some((name, size)) = cm.image {
