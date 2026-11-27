@@ -428,3 +428,56 @@ Wide, as a tile: the same rows as a table, with the TUI's columns:
 - **The TUI's Jobs tab:** one row per subagent or `async` bash job, with state, name, agent, tool count, elapsed time, cost and last activity. The selected job's details sit below.
 - **Its keys:** `x` cancels a job, `X` cancels all after `y`, `d`/`a` show or apply a finished job's result, `o` forwards a job's ports, Enter opens a job.
 - **What the app changes:** Enter opens the job's transcript or output in a tile, as the TUI's `jobs_view` with its keys. The job rows above the composer (`Alt+↓` marks one, `k`/`x` cancels it) stay as in the TUI.
+
+## 6. Palette and keys (draft)
+
+### What exists
+
+- **Keys:** the TUI's contexts (`app`, `chat`, `editor`, `jobs`, `reply`, `select`, `overlay`, `review`, …) and their defaults in `docs/keys.md`. The app uses them unchanged, generated into GPUI bindings, with `[keys]` overrides honoured.
+- **Commands:** the TUI's slash commands, prompt templates and skills, reached through the `/` menu in the composer.
+- **Keys the defaults already take** in the composer, where `app`, `chat` and `editor` all see every key:
+  - with Ctrl: `a b c d e f g h j k n o p q r t u v w y`;
+  - with Alt: `b d f j k m`, Alt+↑/↓, Alt+Enter, Alt+Backspace;
+  - with Shift: Shift+Tab, Shift+↑, Shift+Enter;
+  - plain: Tab, Esc, ↑/↓, →.
+
+  A window-management key that lands on one of these steals it from the composer.
+
+### New actions
+
+They live in new contexts: `window` (tabs, tiles, bars, layouts) and `palette`.
+
+| Group | Actions |
+|---|---|
+| Palette | open the palette; find an agent; jump to the next request waiting on you; cycle recent sessions |
+| Tabs | new, close, next, previous, go to tab 1–9, rename |
+| Tiles | split (spiral), split right or down, close, focus left/right/up/down, swap by direction, grow or shrink, zoom |
+| Bars | toggle left, toggle right, focus left, focus right |
+| Views | open a view (agent list, review, jobs, plan, files) in the focused tile; pin or unpin to its session |
+| Layouts | save the layout, switch to a named layout |
+
+### 6a. The palette
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ ›  tile spl▌                                                     │
+├──────────────────────────────────────────────────────────────────┤
+│ ▸ Tile: split right                                   ⌘⇧\  ···   │
+│   Tile: split down                                    ⌘⇧-        │
+│   Tile: split (spiral)                                ⌘\         │
+│   /compact   compact the conversation                            │
+│   Agent: Deploy pod adapter       test-cluster · ⚑ needs you     │
+├──────────────────────────────────────────────────────────────────┤
+│ actions · /commands · agents · layouts         Enter run · Esc   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- **One palette searches everything:** every action with its current binding, the slash commands for the focused session, agents (local and remote), named layouts and views.
+- **Each result shows its key,** so the palette teaches the bindings. That covers the survey's warning about shortcuts only a separate dialog reveals.
+- **A slash command runs in the focused session,** as if typed in its composer.
+
+### Questions for this section
+
+- Which modifier window keys use on each platform, given what the composer already takes.
+- Whether the palette is one search, or separate ones for actions and for agents.
+- The default keys for jumping to the next request, cycling recent sessions and opening the palette.
