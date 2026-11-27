@@ -51,7 +51,7 @@ Conventions:
 │   local · 1d      $0.08 │┃   └─────────────────────────────────┘│   + …                           │
 │                         │┃  ⠋ Thinking · 14s                    │ ▸ docs/README.md        +1 −1   │
 │ BREWERY                 │┃──────────────────────────────────────│                                 │
-│ ○ Formula audit         │┃  Message mu — @ files, / commands    │                                 │
+│ ○ Formula audit         │┃  Message mu — / for commands         │                                 │
 │   build-pod-3 · 2d      │┃                                      │                                 │
 │                         │┃  opus-5 · high · edits  41%  $3.10 ■ │                                 │
 ├─────────────────────────┴────────────────────────────────────────┴─────────────────────────────────┤
@@ -182,19 +182,22 @@ What a turn contains, from the agent's events (`crates/mu-base/src/events.rs`, `
 
 ### 2c. Keyboard in the transcript
 
-The transcript behaves like a read-only editor buffer, as Delta's does. A text cursor goes anywhere in it, and nothing in the transcript needs the mouse.
+The transcript behaves like a read-only document with a cursor that goes anywhere in it, as Delta's does, and nothing in it needs the mouse.
 
-- **Movement** is by the editor motions you use on code: characters, words, lines, paragraphs, search. A motion also jumps by block (to the next tool call, diff hunk or prompt).
-- **Blocks are folds in that buffer.** A collapsed tool call or thinking line is a fold, and Enter on it toggles it.
-- **Actions on what the cursor or selection is in:**
-  - `o` opens the block in a tile (a diff in review, a subagent's transcript, a tool's full output);
-  - `y` copies the selection, or the block when nothing is selected;
-  - `r` quotes the selection or block into the composer. This is the TUI's reply picker, generalised to all of the transcript.
-- **To the composer:** `i`, or typing a character that is not a motion.
+- **The cursor is the TUI's reply picker** (context `reply` in `docs/keys.md`), extended from the model's replies to the whole transcript, with the same keys:
+  - units, words and pages, with counts (`3j`);
+  - `{`/`}` between blocks and `[`/`]` between replies;
+  - selections, and marks with `space`;
+  - Enter quotes the marks and the selection into the composer.
+- **Entering and leaving it work as in the TUI:** Ctrl+R from the composer, and Esc or `q` back. Focusing the transcript tile by direction also enters it.
+- **What the app adds, as new actions in the `reply` context that the TUI gets too:**
+  - a fold action, to expand or fold the block under the cursor. The TUI only has the global Ctrl+O (tool output) and Ctrl+T (thinking);
+  - copying the selection or the block to the clipboard.
+- **What only the app has:** opening the block under the cursor in a tile (a diff in review, a subagent's transcript, a tool's full output).
 
 ### Open in this section
 
-- The exact motions and their keys, which are settled with the palette in section 6.
+- Keys for the new actions; settled with the palette in section 6.
 - Whether a quote can be anchored to its place in the transcript (Delta's comments) rather than copied into the composer as text.
 
 ## 3. Requests that need you (agreed)
@@ -280,3 +283,69 @@ What the agent can ask for:
   - The session opens in a floating panel over the layout: its transcript, with the request docked at the bottom. The tiles underneath do not change.
   - Once you have answered, Esc closes the panel; it also closes by itself when nothing else waits in that session. `o` instead puts the session in the focused tile.
 - **If a tile already shows that session,** the panel still opens, so the jump always behaves the same. That tile shows the answered request as soon as you answer.
+
+## 4. Composer (draft)
+
+The TUI's composer (contexts `chat` and `editor` in `docs/keys.md`, `crates/mu-tui/src/chat/composer.rs`) with the same keys and behaviour. What it does there:
+
+- **Sending:**
+  - Enter sends. While a turn runs, Enter steers (delivered after the current tool call) and Ctrl+Q queues a follow-up.
+  - Esc aborts the turn, and queued text returns to the composer.
+  - Shift+↑ takes the last queued message back to edit it.
+- **Above the composer, the queue:** one row per queued message (`↳ steer: …`, `↳ after turn: …`), the newest with "shift+↑ edit".
+- **Completion:**
+  - ghost text predicted from history, taken with Tab or → at the end of the line;
+  - a `/` menu of commands and their arguments.
+  - There is no `@` file completion.
+- **Editing:**
+  - ↑/↓ walk the prompt history from the first or last line, and Ctrl+G edits the prompt in `$EDITOR`;
+  - Shift+Enter, Alt+Enter, Ctrl+Enter and Ctrl+J insert a newline;
+  - the editor keys are emacs-style.
+- **Attaching an image:** Ctrl+V pastes one from the clipboard, a pasted image path attaches it, and `/image <path>` does the same.
+- **Other keys:**
+  - Shift+Tab cycles the thinking level and Alt+M opens the model picker;
+  - Ctrl+T shows or hides thinking, and Ctrl+O expands tool output;
+  - Ctrl+R opens the reply picker, and Alt+J the jobs panel.
+
+### 4a. The composer in its tile
+
+```
+│┃  (transcript)                                                       │
+│┃                                                                     │
+│┃  ↳ steer: also check that the macOS job is green                    │
+│┃  ↳ after turn: then open a PR                       shift+↑ edit    │
+│┃──────────────────────────────────────────────────────────────────── │
+│┃  run the attach tests again▌ on both platforms and push            │
+│┃  [image 1 · screenshot.png 212 KB]                                  │
+│┃                                                                     │
+│┃  opus-5 · high · ask · gui-design    ctx 41%   $3.10   ⠋ 1m 12s  ■ │
+```
+
+```
+│┃  ┌ / ────────────────────────────────────────┐                       │
+│┃  │ /model       switch model                 │                       │
+│┃  │ /mcp         MCP servers                  │                       │
+│┃  │ /memory      memory history               │                       │
+│┃  └───────────────────────────────────────────┘                       │
+│┃──────────────────────────────────────────────────────────────────── │
+│┃  /m▌                                                                │
+```
+
+- **Ghost text is dimmed after the cursor** (`on both platforms and push` above).
+- **An attached image shows as a chip** with its name and size.
+- **The `/` menu opens above the composer,** with the TUI's entries and keys.
+- **The session bar under the composer** shows the TUI status line's segments: model, thinking level, permission mode, branch, context share, cost, and the turn's spinner and timer.
+  - Each segment that has a picker in the TUI (model, thinking, mode) opens it on its key.
+  - ■ stops the turn (Esc).
+
+### What being a GUI changes
+
+- **Shift+Enter always inserts a newline.** The TUI needs the kitty keyboard protocol for that.
+- **Images come from the native clipboard,** and can also be dropped onto the composer. There is no `wl-paste`/`xclip`, and no OSC 5522.
+- **The text field is `gpui-component`'s Input** (decided in gui.md), so IME and selection are native. The editor keys are bound around it.
+
+### Questions for this section
+
+- What Ctrl+G opens when there is no terminal to suspend.
+- Whether the session bar reads the TUI's status-line segment configuration.
+- What a dropped file that is not an image does.
