@@ -15,7 +15,7 @@ use state::Backend;
 #[derive(Parser)]
 #[command(name = "mu-gateway", version = env!("MU_GATEWAY_VERSION"), about)]
 struct Cli {
-    /// The omp profile to serve (default: $OMP_PROFILE).
+    /// The profile to serve (default: $MU_PROFILE, then $OMP_PROFILE, then $PI_PROFILE).
     #[arg(long, global = true)]
     profile: Option<String>,
     /// What to wrap (default: $MU_GATEWAY_BACKEND, then omp). `pi` ignores --profile for pi itself.
@@ -61,9 +61,13 @@ fn main() {
             std::process::exit(2);
         }
     }
-    if let Some(p) = cli.profile.filter(|p| !p.is_empty()) {
-        // SAFETY: still single-threaded; children (the daemon, omp) inherit the profile this way.
-        unsafe { std::env::set_var("OMP_PROFILE", p) };
+    if let Some(p) = cli.profile.filter(|p| !p.is_empty()).or_else(mu_common::paths::profile) {
+        // SAFETY: still single-threaded; children (the daemon) inherit the profile this way, and omp reads
+        // only OMP_PROFILE, so a profile named by MU_PROFILE must reach it under that name too.
+        unsafe {
+            std::env::set_var("MU_PROFILE", &p);
+            std::env::set_var("OMP_PROFILE", p);
+        }
     }
     let out = match cli.cmd {
         Cmd::Daemon => std::process::exit(daemon::run()),

@@ -1,3 +1,4 @@
+pub mod config;
 pub mod fs;
 pub mod paths;
 pub mod plugin_secrets;

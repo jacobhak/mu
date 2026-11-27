@@ -10,7 +10,7 @@ pub struct Home {
 }
 
 impl Home {
-    /// `$HOME`, `$MU_HOME` (default `<home>/.mu`) and the active omp profile.
+    /// `$HOME`, `$MU_HOME` (default `<home>/.mu`) and the active profile.
     pub fn from_env() -> Self {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let mu_home = match std::env::var_os("MU_HOME") {
@@ -46,6 +46,24 @@ impl Home {
         profile_subdir(self.mu_home.clone(), self.profile.as_deref())
     }
 
+    /// The files `config.toml` is read from: the shared one, then this profile's own over it.
+    pub fn config_files(&self) -> Vec<PathBuf> {
+        crate::config::files(&self.mu_home, self.profile.as_deref())
+    }
+
+    /// The `config.toml` that mu's own changes (a saved theme, a granted permission) are written to: the
+    /// profile's under a profile, else the shared one.
+    pub fn config_path(&self) -> PathBuf {
+        self.profile_home().join("config.toml")
+    }
+
+    /// Where custom themes are looked up, a profile's own first.
+    pub fn theme_dirs(&self) -> Vec<PathBuf> {
+        let own = self.profile_home().join("themes");
+        let shared = self.mu_home.join("themes");
+        if own == shared { vec![shared] } else { vec![own, shared] }
+    }
+
     pub fn encode_cwd(&self, cwd: &Path) -> String {
         if let Ok(rel) = cwd.strip_prefix(std::env::temp_dir()) {
             return format!("-tmp-{}", dashed(rel));
@@ -79,9 +97,12 @@ pub fn expand_tilde(p: &str, home: &Path) -> Option<PathBuf> {
     p.strip_prefix("~/").map(|rest| home.join(rest))
 }
 
-/// The active omp profile name (`OMP_PROFILE`, else `PI_PROFILE`), if any.
+/// The environment variables that name the profile, in order: mu's own, then omp's and pi's.
+pub const PROFILE_VARS: [&str; 3] = ["MU_PROFILE", "OMP_PROFILE", "PI_PROFILE"];
+
+/// The active profile name (`MU_PROFILE`, else `OMP_PROFILE`, else `PI_PROFILE`; an empty one is unset), if any.
 pub fn profile() -> Option<String> {
-    std::env::var("OMP_PROFILE").ok().or_else(|| std::env::var("PI_PROFILE").ok()).filter(|s| !s.is_empty())
+    PROFILE_VARS.iter().find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
 }
 
 /// `name` is safe to use as one path component: no separators, not `.` or `..`.
@@ -147,10 +168,26 @@ pub fn mu_home() -> PathBuf {
     Home::from_env().mu_home
 }
 
+/// See `Home::config_path`.
+pub fn config_path() -> PathBuf {
+    Home::from_env().config_path()
+}
+
+/// `$MU_HOME/config.toml` with the profile's own merged over it, and what went wrong reading either.
+pub fn load_config() -> (toml::Table, Vec<String>) {
+    crate::config::load(&Home::from_env().config_files())
+}
+
+/// See `Home::theme_dirs`.
+pub fn theme_dirs() -> Vec<PathBuf> {
+    Home::from_env().theme_dirs()
+}
+
 /// Per-profile state: `$MU_HOME`, or `$MU_HOME/profiles/<name>` under an omp profile. Everything that belongs
 /// to one profile's work lives here (sessions and their run records, inbox, artifacts, plans, prompt history,
 /// credentials, model and price caches), so profiles never see or overwrite each other's. Install-wide files
-/// (bin, plugins, logs, config.toml, themes, model weights) stay in `mu_home()`.
+/// (bin, plugins, logs, model weights) stay in `mu_home()`; `config.toml` and `themes/` are read from both,
+/// the profile's over the shared (see `config`).
 pub fn profile_home() -> PathBuf {
     Home::from_env().profile_home()
 }
@@ -215,6 +252,29 @@ mod tests {
         assert_eq!(home.encode_cwd(Path::new("/home/u/code/private/mu")), "-code-private-mu");
         assert_eq!(home.encode_cwd(Path::new("/home/u")), "-");
         assert_eq!(home.encode_cwd(Path::new("/opt/x")), "--opt-x--");
+    }
+
+    #[test]
+    fn a_profile_adds_its_own_config_and_themes_and_receives_writes() {
+        let plain = Home::at("/home/u");
+        assert_eq!(plain.config_files(), [PathBuf::from("/home/u/.mu/config.toml")]);
+        assert_eq!(plain.config_path(), PathBuf::from("/home/u/.mu/config.toml"));
+        assert_eq!(plain.theme_dirs(), [PathBuf::from("/home/u/.mu/themes")]);
+
+        let mut work = Home::at("/home/u");
+        work.profile = Some("work".into());
+        assert_eq!(
+            work.config_files(),
+            [PathBuf::from("/home/u/.mu/config.toml"), PathBuf::from("/home/u/.mu/profiles/work/config.toml")]
+        );
+        assert_eq!(work.config_path(), PathBuf::from("/home/u/.mu/profiles/work/config.toml"));
+        assert_eq!(
+            work.theme_dirs(),
+            [PathBuf::from("/home/u/.mu/profiles/work/themes"), PathBuf::from("/home/u/.mu/themes")]
+        );
+
+        work.profile = Some("../x".into());
+        assert_eq!(work.config_path(), PathBuf::from("/home/u/.mu/config.toml"), "an unsafe name is no profile");
     }
 
     #[test]

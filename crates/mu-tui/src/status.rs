@@ -27,7 +27,7 @@ pub struct StatusEnv<'a> {
     /// Segment ids by side, in order; the built-in layout outside tests.
     pub left: &'a [&'a str],
     pub right: &'a [&'a str],
-    /// Active profile (`OMP_PROFILE`), shown as `μ <profile>`.
+    /// Active profile (`MU_PROFILE`), shown as `μ <profile>`.
     pub profile: Option<String>,
     /// Ctrl+O "expanded" state.
     pub expanded: bool,

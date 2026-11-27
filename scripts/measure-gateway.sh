@@ -12,7 +12,7 @@ omp="${MU_GATEWAY_OMP:-omp}"
 reqs="${1:-1}"
 H="$(mktemp -d)"
 export HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" XDG_CACHE_HOME="$H/.cache"
-unset OMP_PROFILE OMP_AUTH_BROKER_URL OMP_AUTH_BROKER_TOKEN
+unset MU_PROFILE OMP_PROFILE OMP_AUTH_BROKER_URL OMP_AUTH_BROKER_TOKEN
 bp="" gp=""
 trap 'kill $bp $gp 2>/dev/null; wait 2>/dev/null; rm -rf "$H"' EXIT
 

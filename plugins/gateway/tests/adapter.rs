@@ -29,6 +29,7 @@ impl Mu {
             .env("HOME", &dir)
             .env("MU_GATEWAY_HOME", dir.join("gw"))
             .env("XDG_RUNTIME_DIR", &dir)
+            .env_remove("MU_PROFILE")
             .env_remove("OMP_PROFILE")
             .env_remove("PI_PROFILE")
             .env_remove("PI_CODING_AGENT_DIR")

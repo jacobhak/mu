@@ -7,7 +7,7 @@ set -uo pipefail
 mu="$(readlink -f "${1:-target/release/mu}")"
 MU_HOME="$(mktemp -d)"
 export MU_HOME
-export OMP_PROFILE="mutest-$$"
+export MU_PROFILE="mutest-$$"
 work="$(mktemp -d)"
 tm="mu-native-smoke-$$"
 fail=0
@@ -99,7 +99,7 @@ key_listed() { env -u ANTHROPIC_API_KEY "$mu" auth list | grep -q anthropic; }
 check "key stored for the fake API" key_listed
 
 tmux new -d -s "$tm" -x 150 -y 40 \
-  "cd $work && env -u ANTHROPIC_API_KEY PATH=$work/bin:\$PATH MU_HOME=$MU_HOME OMP_PROFILE=$OMP_PROFILE $mu --model anthropic/claude-haiku-5-5; echo EXIT=\$?; sleep 60"
+  "cd $work && env -u ANTHROPIC_API_KEY PATH=$work/bin:\$PATH MU_HOME=$MU_HOME MU_PROFILE=$MU_PROFILE $mu --model anthropic/claude-haiku-5-5; echo EXIT=\$?; sleep 60"
 wait_for "μ" 20 || bad "tui starts"
 tmux send-keys -t "$tm" 'Say hi.' Enter
 check "native reply renders" wait_for "NATIVE-OK" 30

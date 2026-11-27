@@ -183,6 +183,7 @@ pub fn mu(home: &Path, cwd: &Path) -> Command {
         .env("HOME", home)
         .env("PATH", home.join("empty-bin"))
         .env("MU_OMP", home.join("no-omp"))
+        .env_remove("MU_PROFILE")
         .env_remove("OMP_PROFILE")
         .env_remove("MU_GATEWAY_URL")
         .env_remove("MU_THEME")

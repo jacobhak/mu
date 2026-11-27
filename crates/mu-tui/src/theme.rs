@@ -235,8 +235,11 @@ fn omarchy_file() -> PathBuf {
     mu_common::paths::home().join(".local/state/omarchy/current/theme/colors.toml")
 }
 
+/// The theme file `name` names: the profile's own, else the shared one (which need not exist).
 fn user_theme(name: &str) -> PathBuf {
-    mu_common::paths::mu_home().join("themes").join(format!("{name}.toml"))
+    let dirs = mu_common::paths::theme_dirs();
+    let file = |d: &PathBuf| d.join(format!("{name}.toml"));
+    dirs.iter().map(file).find(|p| p.exists()).unwrap_or_else(|| file(&dirs[dirs.len() - 1]))
 }
 
 fn load_palette(source: &str) -> Result<Palette, String> {
@@ -290,8 +293,9 @@ fn is_dark(p: &Palette) -> Option<bool> {
     Some(luminance(*p.rgb.get("background")?) < luminance(*p.rgb.get("foreground")?))
 }
 
-/// The themes a user can pick: bundled and `~/.mu/themes/*.toml` by name (a file shadows a bundled
-/// palette of the same name), then `terminal`, then `omarchy` when its colours file exists.
+/// The themes a user can pick: bundled and `~/.mu/themes/*.toml` (and the profile's own `themes/`) by name (a
+/// file shadows a bundled palette of the same name, a profile's a shared file), then `terminal`, then
+/// `omarchy` when its colours file exists.
 pub fn available() -> Vec<Entry> {
     let mut named: std::collections::BTreeMap<String, Entry> = PALETTES
         .iter()
@@ -300,7 +304,9 @@ pub fn available() -> Vec<Entry> {
             (name.to_string(), Entry { name: name.to_string(), origin: Origin::Bundled, dark })
         })
         .collect();
-    if let Ok(dir) = std::fs::read_dir(mu_common::paths::mu_home().join("themes")) {
+    // Shared first, so a profile's file of the same name replaces it.
+    for dir in mu_common::paths::theme_dirs().iter().rev() {
+        let Ok(dir) = std::fs::read_dir(dir) else { continue };
         for f in dir.flatten() {
             let p = f.path();
             let (Some(name), true) =

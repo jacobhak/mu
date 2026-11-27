@@ -68,7 +68,7 @@ Then, for any width, where to remember it:
 
 1. **This session** — until mu exits.
 2. **In this project** — saved under `~/.mu/permissions/`, per checkout (worktrees share it). Never in the repository. The file is named after the checkout's path with `/` written as `-`, so `~/code/a-b` and `~/code/a/b` name the same file; each file records the checkout's absolute path (`root`) and applies only to that one. For any other project the file is ignored with a warning, and a new grant is not saved over it.
-3. **Everywhere** — added to `~/.mu/config.toml`.
+3. **Everywhere** — added to `~/.mu/config.toml`, or to the profile's own `config.toml` under a profile.
 4. **No** — do not run it.
 
 Esc on the second step goes back to the widths without answering. Tab (or Right) attaches a note for the model at either step, and a note on **No** lets the turn continue instead of ending it.

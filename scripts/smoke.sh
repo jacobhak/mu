@@ -8,7 +8,7 @@ mu="$(readlink -f "${1:-target/release/mu}")"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 MU_HOME="$(mktemp -d)"
 export MU_HOME
-profile="${OMP_PROFILE:-${PI_PROFILE:-}}"
+profile="${MU_PROFILE:-${OMP_PROFILE:-${PI_PROFILE:-}}}"
 state="$MU_HOME${profile:+/profiles/$profile}" # mu's per-profile state (paths::profile_home)
 gateway_plugin="${MU_SMOKE_GATEWAY_PLUGIN:-$HOME/.mu/plugins/gateway}"
 if [ ! -d "$gateway_plugin" ]; then
@@ -82,7 +82,7 @@ mv "$work/models.toml.bak" "$state/models.toml"
 check "task: two scouts" test "$(grep -l parentSession "$state"/sessions/*/*.jsonl | wc -l)" -ge 2
 
 # TUI
-tmux new -d -s "$tm" -x 150 -y 40 "cd $work && MU_HOME=$MU_HOME OMP_PROFILE=${OMP_PROFILE:-} $mu --model @smol; echo EXIT=\$?; sleep 120"
+tmux new -d -s "$tm" -x 150 -y 40 "cd $work && MU_HOME=$MU_HOME MU_PROFILE=$profile $mu --model @smol; echo EXIT=\$?; sleep 120"
 wait_for "μ" 20 || bad "tui starts"
 tmux send-keys -t "$tm" 'run bash: sleep 8; echo done. Then reply FIN.' Enter
 # Steer while that turn is certainly running. Waiting for the bash card first races the model's reply

@@ -23,7 +23,7 @@ Enter on a role in `/model` opens its editor: **Model** (a concrete model; the l
 
 ## models.toml
 
-mu reads model config from `models.toml` in its profile home (`~/.mu/models.toml`, or `~/.mu/profiles/<name>/models.toml` under an omp profile), never from omp's files. It holds the roles, the plan-approval `cycle_order`, per-model limits (what `models.yml` did) and compaction thresholds:
+mu reads model config from `models.toml` in its profile home (`~/.mu/models.toml`, or `~/.mu/profiles/<name>/models.toml` under a profile), never from omp's files. It holds the roles, the plan-approval `cycle_order`, per-model limits (what `models.yml` did) and compaction thresholds:
 
 ```toml
 set = "openai"                        # the active set; optional

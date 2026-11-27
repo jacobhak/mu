@@ -17,6 +17,7 @@ impl Scratch {
             .args(args)
             .env("HOME", &self.0)
             .env("MU_GATEWAY_HOME", self.0.join("gw"))
+            .env_remove("MU_PROFILE")
             .env_remove("OMP_PROFILE")
             .env_remove("PI_PROFILE")
             .output()

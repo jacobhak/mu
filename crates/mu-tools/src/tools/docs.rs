@@ -240,7 +240,9 @@ impl Tools {
         let mut config = String::from(
             "# Config in effect\n\nKeys that are absent take their defaults; see `mu://config.md` and `mu://model-roles.md`.\n",
         );
-        file_section(&mut config, &paths::mu_home().join("config.toml"));
+        for f in paths::Home::from_env().config_files() {
+            file_section(&mut config, &f);
+        }
         file_section(&mut config, &mu_base::config::models_path());
         let mut plugins = String::from("# Plugins and MCP servers\n\n");
         let status = self.plugins.status();

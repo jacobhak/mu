@@ -41,7 +41,7 @@ pub struct Cli {
     /// Resume a session by id or path, or pick one when no value is given.
     #[arg(long, num_args = 0..=1)]
     pub resume: Option<Option<PathBuf>>,
-    /// Config profile (sets OMP_PROFILE).
+    /// Config profile (sets MU_PROFILE; OMP_PROFILE and PI_PROFILE name one too).
     #[arg(long)]
     pub profile: Option<String>,
     /// Palette for this run, overriding `[theme] source` (a bundled name, `terminal`, or a file).

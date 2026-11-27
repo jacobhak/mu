@@ -410,6 +410,7 @@ pub fn pi_proxy_command(proxy: &Path) -> Command {
     cmd.args(["--mode", "rpc", "--no-session", "-ne", "-e"])
         .arg(proxy)
         .args(["--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "-na"])
+        .env_remove("MU_PROFILE")
         .env_remove("OMP_PROFILE");
     cmd
 }

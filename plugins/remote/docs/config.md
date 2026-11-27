@@ -5,12 +5,15 @@
 | What | Where | Override |
 |---|---|---|
 | Config | `~/.config/mu-remote/config.toml` (`$XDG_CONFIG_HOME/mu-remote/config.toml`) | `MU_REMOTE_CONFIG` |
+| Profile config | `profiles/<name>/config.toml` beside the config, for the active mu profile (`MU_PROFILE`, else `OMP_PROFILE`, else `PI_PROFILE`) | beside `MU_REMOTE_CONFIG` |
 | State | `~/.local/state/mu-remote` (`$XDG_STATE_HOME/mu-remote`) | `MU_REMOTE_HOME` |
 | `mu` program | `mu` on the `PATH` | `MU_REMOTE_MU` |
 
 Under the state directory: `keys/bridge.key` and `keys/client.key` (the [channel](channel.md) keys, mode 0600 in a 0700 directory), `keys/pins.json` (the pinned keys), `bin/` (adapters written by `install-adapter`), `workers/<id>/` (the records of workers served on this machine) and `launcher-id` (the pod adapter's id of this machine). Nothing here is mu's: mu's own configuration stays in mu's `config.toml`.
 
 A missing config file is an empty config. A remote that cannot be used is dropped with a warning on stderr.
+
+The profile's file, when there is one, is merged over the shared one: a `[remote.NAME]` in it replaces the shared remote of that name as a whole (its keys are not merged), other remotes are added, and its `default_remote` wins. State (keys, pins, workers) is shared by all profiles.
 
 ## `[remote.NAME]`
 

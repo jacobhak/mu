@@ -27,7 +27,7 @@ fn dispatch() -> Result<i32> {
     let mut cli = Cli::parse();
     if let Some(p) = &cli.profile {
         // Single-threaded here: no runtime or plugin has started yet.
-        unsafe { std::env::set_var("OMP_PROFILE", p) };
+        unsafe { std::env::set_var("MU_PROFILE", p) };
     }
     if let Some(t) = &cli.theme {
         unsafe { std::env::set_var("MU_THEME", t) };

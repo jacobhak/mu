@@ -29,6 +29,7 @@ impl Scratch {
             .env("XDG_CACHE_HOME", self.0.join(".cache"))
             .stdin(Stdio::null());
         for k in [
+            "MU_PROFILE",
             "OMP_PROFILE",
             "PI_PROFILE",
             "PI_CONFIG_DIR",

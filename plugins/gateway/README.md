@@ -33,7 +33,7 @@ unless it says otherwise.
 
 ## Commands
 
-Every command takes `--profile NAME` (default `$OMP_PROFILE`, then `$PI_PROFILE`) and `--backend omp|pi` (default
+Every command takes `--profile NAME` (default `$MU_PROFILE`, then `$OMP_PROFILE`, then `$PI_PROFILE`; omp itself is started with the result as `OMP_PROFILE`) and `--backend omp|pi` (default
 `$MU_GATEWAY_BACKEND`, then `omp`). JSON goes to stdout; errors go to stderr with exit 1.
 
 | Command | Output |

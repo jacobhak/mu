@@ -81,7 +81,7 @@ ready_timeout = "300s"
 sccache_secret_name = "mu-sccache"   # trusted remotes only
 ```
 
-- **`start`** creates the pod, copies the config tar (`config.toml`, `models.toml`, `providers.toml`, `AGENTS.md`, `RULES.md`, `agents/`, `skills/`; never `auth.json` or a token file) and then, for an agent, clones `--bundle` into `--dir` when it has one and runs `mu agent --detach` there, or, for a worker, unpacks the bundle into `--dir` and runs `mu-remote worker run --launch ID --dir DIR --detach`. It reports `{"progress":"scheduling"}`, `"pulling image"`, `"copying repository"` and `"starting"` on stderr. A start that fails deletes its pod.
+- **`start`** creates the pod, copies the config tar (the shared `config.toml` (a profile's own `config.toml` is not copied, and the adapter says so on stderr), `models.toml`, `providers.toml`, `AGENTS.md`, `RULES.md`, `agents/`, `skills/`; never `auth.json` or a token file) and then, for an agent, clones `--bundle` into `--dir` when it has one and runs `mu agent --detach` there, or, for a worker, unpacks the bundle into `--dir` and runs `mu-remote worker run --launch ID --dir DIR --detach`. It reports `{"progress":"scheduling"}`, `"pulling image"`, `"copying repository"` and `"starting"` on stderr. A start that fails deletes its pod.
 - **`connect ID`** is `kubectl exec -i POD -- mu-remote bridge ID`. A pod is found by its name (a worker's launch id) or, for an agent, by asking each pod's `mu agent list --json`.
 - **`list`** adds `"kind":"agent"` to a line that has no kind.
 - **`read ID PATH`** is `kubectl exec POD -- cat -- PATH`; **`write ID PATH`** is `kubectl exec -i POD -- sh -c 'umask 077; mkdir -p …; [ ! -e "$1" ] && cat > "$1"'`.

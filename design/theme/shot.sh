@@ -23,7 +23,7 @@ mu=$root/target/release/mu
 run() { # name cwd cmd
   tmux -L $sock -f /dev/null kill-session -t "$1" 2>/dev/null || true
   tmux -L $sock -f /dev/null new-session -d -s "$1" -x "$cols" -y "$rows" -c "$2" \
-    -e COLORTERM=truecolor -e OMP_PROFILE="${OMP_PROFILE:-}" -e PATH="$HOME/.mu/bin:$PATH" "$3"
+    -e COLORTERM=truecolor -e MU_PROFILE="${MU_PROFILE:-${OMP_PROFILE:-${PI_PROFILE:-}}}" -e PATH="$HOME/.mu/bin:$PATH" "$3"
   tmux -L $sock set -g history-limit 20000 >/dev/null
 }
 
@@ -58,7 +58,7 @@ live)
   tmux -L $sock send-keys -t live Enter
   settle live
   capture live
-  profile="${OMP_PROFILE:-${PI_PROFILE:-}}"
+  profile="${MU_PROFILE:-${OMP_PROFILE:-${PI_PROFILE:-}}}"
   s=$(ls -t "${MU_HOME:-$HOME/.mu}${profile:+/profiles/$profile}"/sessions/*themeshot-fixture*/*.jsonl | head -1)
   cp "$s" "$out/session.jsonl"
   echo "session: $out/session.jsonl (from $s)"

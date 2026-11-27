@@ -1,5 +1,5 @@
 //! Persisted approval grants: per-project files under the profile home, and
-//! `~/.mu/config.toml` for "always everywhere".
+//! `config.toml` for "always everywhere" (the profile's own under a profile, else `~/.mu/config.toml`).
 
 use mu_base::permissions::{Grant, RuleSet};
 use mu_common::fs::{self, FileLock};
@@ -61,7 +61,7 @@ pub fn add_project(key: &Path, g: &Grant) -> Result<GrantOutcome, String> {
 }
 
 pub fn add_global(g: &Grant) -> Result<GrantOutcome, String> {
-    write_grant(&paths::mu_home().join("config.toml"), &["permissions", "rules"], None, g)
+    write_grant(&paths::config_path(), &["permissions", "rules"], None, g)
 }
 
 /// Adds `allow` rules for `g` under `section`, keeping everything else in the file.
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn grants_round_trip_and_keep_what_is_there() {
         mu_testutil::home();
-        let config = paths::mu_home().join("config.toml");
+        let config = paths::config_path();
         std::fs::create_dir_all(paths::mu_home()).unwrap();
         std::fs::write(&config, "# keep me\n[theme]\nname = \"x\"\n").unwrap();
 

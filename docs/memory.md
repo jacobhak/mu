@@ -4,7 +4,7 @@ mu keeps long-term memory as short markdown files: one file about you, and one p
 
 ## Where it lives
 
-Per omp profile (see [Profile home](usage.md#profile-home)), so work and private memory never mix:
+Per profile (see [Profile home](usage.md#profile-home)), so work and private memory never mix:
 
 ```
 <profile home>/memory/            a git repository, one commit per change

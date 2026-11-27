@@ -130,10 +130,23 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The configured remotes, `~/.config/mu-remote/config.toml` (warnings go to stderr).
+    /// `over` on top of `self`: its remotes replace the ones of the same name (whole), its `default_remote`
+    /// wins when set.
+    pub fn overlay(&mut self, over: Config) {
+        self.remote.extend(over.remote);
+        if over.default_remote.is_some() {
+            self.default_remote = over.default_remote;
+        }
+    }
+
+    /// The configured remotes, `~/.config/mu-remote/config.toml` with the active profile's own file over it
+    /// (warnings go to stderr).
     pub fn load() -> Result<Config> {
         let mut warn = Vec::new();
-        let cfg = Config::read(&crate::paths::config_file(), &mut warn)?;
+        let mut cfg = Config::read(&crate::paths::config_file(), &mut warn)?;
+        if let Some(own) = crate::paths::profile_config_file() {
+            cfg.overlay(Config::read(&own, &mut warn)?);
+        }
         for w in warn {
             eprintln!("mu-remote: {w}");
         }
@@ -224,6 +237,22 @@ mod tests {
         let mut w = Vec::new();
         let c = Config::read(&crate::testutil::tmp().join("nothing.toml"), &mut w).unwrap();
         assert!(c.remote.is_empty() && c.default_remote.is_none() && w.is_empty());
+    }
+
+    #[test]
+    fn a_profile_file_replaces_remotes_by_name_and_adds_the_rest() {
+        let (mut shared, _) = parse(
+            "default_remote = \"a\"\n[remote.a]\nadapter = \"ssh\"\nhost = \"a\"\n[remote.b]\nadapter = \"ssh\"\nhost = \"b\"\n",
+        );
+        let (own, _) =
+            parse("[remote.b]\nadapter = \"ssh\"\nhost = \"b2\"\n[remote.c]\nadapter = \"ssh\"\nhost = \"c\"\n");
+        shared.overlay(own);
+        assert_eq!(shared.default_remote.as_deref(), Some("a"));
+        assert_eq!(shared.remote.keys().collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(shared.remote["b"].host.as_deref(), Some("b2"));
+        let (own, _) = parse("default_remote = \"c\"\n[remote.c]\nadapter = \"ssh\"\nhost = \"c\"\n");
+        shared.overlay(own);
+        assert_eq!(shared.default_remote.as_deref(), Some("c"));
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub struct HostInfo {
     pub profile_home: PathBuf,
     pub tmp: PathBuf,
     pub cwd: PathBuf,
-    /// The profile name on the host (`OMP_PROFILE`), shown in the status line.
+    /// The profile name on the host (`MU_PROFILE`), shown in the status line.
     #[serde(default)]
     pub profile: Option<String>,
 }
@@ -95,7 +95,7 @@ pub(crate) fn host_tmp() -> PathBuf {
 pub(crate) fn host_profile() -> Option<String> {
     match FACTS.get() {
         Some(i) => i.profile.clone(),
-        None => std::env::var("OMP_PROFILE").or_else(|_| std::env::var("PI_PROFILE")).ok(),
+        None => mu_common::paths::profile(),
     }
     .filter(|p| !p.is_empty())
 }

@@ -54,6 +54,7 @@ fn mu(home: &Path, cwd: &Path) -> Command {
         .env("MU_HOME", home)
         .env("HOME", home)
         .env("PATH", home.join("empty-bin"))
+        .env_remove("MU_PROFILE")
         .env_remove("OMP_PROFILE")
         .env_remove("MU_GATEWAY_URL")
         .env_remove("MU_THEME")

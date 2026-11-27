@@ -34,8 +34,9 @@ pub fn home() -> &'static Path {
         // SAFETY: set once, before any test in this process reads it through `home()`.
         unsafe {
             std::env::set_var("MU_HOME", &d);
-            std::env::remove_var("OMP_PROFILE");
-            std::env::remove_var("PI_PROFILE");
+            for k in ["MU_PROFILE", "OMP_PROFILE", "PI_PROFILE"] {
+                std::env::remove_var(k);
+            }
         }
         d
     })

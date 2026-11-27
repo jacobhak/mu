@@ -112,6 +112,7 @@ impl Acp {
             .env("MU_HOME", home)
             .env("HOME", home)
             .env("PATH", "/usr/bin:/bin")
+            .env_remove("MU_PROFILE")
             .env_remove("OMP_PROFILE")
             .env_remove("MU_GATEWAY_URL")
             .env_remove("ANTHROPIC_API_KEY")

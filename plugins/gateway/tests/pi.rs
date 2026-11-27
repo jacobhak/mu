@@ -64,6 +64,7 @@ impl Scratch {
             .env("FAKE_PI_PRICES", PRICES)
             .env("XDG_RUNTIME_DIR", &self.dir)
             .env_remove("MU_GATEWAY_BACKEND")
+            .env_remove("MU_PROFILE")
             .env_remove("OMP_PROFILE")
             .env_remove("PI_PROFILE")
             .env_remove("FAKE_PI_FAIL");

@@ -157,9 +157,8 @@ pub fn models_path() -> PathBuf {
 
 /// mu's old `[compaction.model_thresholds]` in `config.toml`, which an import carries over.
 fn old_mu_thresholds() -> BTreeMap<String, toml::Value> {
-    let Ok(text) = std::fs::read_to_string(paths::mu_home().join("config.toml")) else { return Default::default() };
-    let Ok(table) = text.parse::<toml::Table>() else { return Default::default() };
-    table
+    paths::load_config()
+        .0
         .get("compaction")
         .and_then(|c| c.get("model_thresholds"))
         .and_then(toml::Value::as_table)
@@ -233,7 +232,7 @@ fn load_omp(warn: &mut Vec<String>) -> OmpConfig {
 
 /// Sets `[theme] source` in `config.toml`, keeping comments, other keys and other sections.
 pub fn save_theme_source(source: &str) -> Result<(), String> {
-    set_theme_source(&paths::mu_home().join("config.toml"), source)
+    set_theme_source(&paths::config_path(), source)
 }
 
 fn set_theme_source(path: &std::path::Path, source: &str) -> Result<(), String> {
@@ -242,18 +241,13 @@ fn set_theme_source(path: &std::path::Path, source: &str) -> Result<(), String> 
 
 /// Sets `[display] hide_thinking_block` in `config.toml`, keeping comments, other keys and sections.
 pub fn save_hide_thinking_block(hide: bool) -> Result<(), String> {
-    set_config_value(
-        &paths::mu_home().join("config.toml"),
-        "display",
-        "hide_thinking_block",
-        toml_edit::Value::from(hide),
-    )
+    set_config_value(&paths::config_path(), "display", "hide_thinking_block", toml_edit::Value::from(hide))
 }
 
-/// Whether `config.toml` sets `[table] key`; a file that cannot be read or parsed sets nothing.
+/// Whether `config.toml` (this profile's, over the shared one) sets `[table] key`; a file that cannot be
+/// read or parsed sets nothing.
 pub fn mu_config_sets(table: &str, key: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(paths::mu_home().join("config.toml")) else { return false };
-    let Ok(doc) = text.parse::<toml::Table>() else { return false };
+    let doc = paths::load_config().0;
     doc.get(table).and_then(toml::Value::as_table).is_some_and(|t| t.contains_key(key))
 }
 
@@ -276,15 +270,8 @@ fn set_config_value(path: &std::path::Path, table: &str, key: &str, v: toml_edit
 }
 
 fn load_mu(warn: &mut Vec<String>) -> MuConfig {
-    let p = paths::mu_home().join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&p) else { return MuConfig::default() };
-    let table: toml::Table = match text.parse() {
-        Ok(t) => t,
-        Err(e) => {
-            warn.push(format!("{}: {e}; ignored", p.display()));
-            return MuConfig::default();
-        }
-    };
+    let (table, problems) = paths::load_config();
+    warn.extend(problems);
     let section =
         |key: &str| -> toml::Value { table.get(key).cloned().unwrap_or(toml::Value::Table(Default::default())) };
     fn parse<T: Default + for<'de> Deserialize<'de>>(v: toml::Value, key: &str, warn: &mut Vec<String>) -> T {

@@ -154,6 +154,7 @@ esac
             .env("MU_REMOTE_MU", &self.mu)
             .env("MU_REMOTE_CONFIG", self.config())
             .env("MU_REMOTE_HOME", self.client_state())
+            .env_remove("MU_PROFILE")
             .env_remove("OMP_PROFILE")
             .env_remove("MU_GATEWAY_URL")
             .env_remove("MU_THEME")

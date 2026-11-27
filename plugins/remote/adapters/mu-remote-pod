@@ -246,7 +246,7 @@ cleanup_failed() {
 # The config the pod gets: only the files that exist; never auth.json or a token file.
 stage_config() {
   local stage=$1 mu_home=${MU_HOME:-$HOME/.mu} profile profile_home agent_dir f d
-  profile=${OMP_PROFILE:-${PI_PROFILE:-}}
+  profile=${MU_PROFILE:-${OMP_PROFILE:-${PI_PROFILE:-}}}
   case $profile in '' | */* | *\\* | . | ..) profile= ;; esac
   profile_home=$mu_home
   [ -z "$profile" ] || profile_home=$mu_home/profiles/$profile
@@ -257,6 +257,9 @@ stage_config() {
   fi
   mkdir -p "$stage/.mu" "$stage/.omp/agent"
   [ ! -f "$mu_home/config.toml" ] || cp "$mu_home/config.toml" "$stage/.mu/"
+  # The pod runs without a profile, and merging two TOML files is not a shell job: the shared file goes alone.
+  [ "$profile_home" = "$mu_home" ] || [ ! -f "$profile_home/config.toml" ] ||
+    echo "mu-remote-pod: profile $profile has its own config.toml; the pod gets only the shared one" >&2
   for f in models.toml providers.toml; do
     [ ! -f "$profile_home/$f" ] || cp "$profile_home/$f" "$stage/.mu/"
   done

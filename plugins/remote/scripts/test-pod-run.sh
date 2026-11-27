@@ -120,7 +120,7 @@ TRUSTED=0
 SETTINGS='{"namespace":"ns","agent_namespace":"agents","image":"img:1"}'
 # Runs the adapter as mu would. Output in $T/out and $T/err; returns its status.
 adapter() {
-  env -u OMP_PROFILE -u PI_PROFILE -u SCCACHE_BUCKET -u SCCACHE_ENDPOINT -u SCCACHE_REGION -u SCCACHE_S3_USE_SSL \
+  env -u MU_PROFILE -u OMP_PROFILE -u PI_PROFILE -u SCCACHE_BUCKET -u SCCACHE_ENDPOINT -u SCCACHE_REGION -u SCCACHE_S3_USE_SSL \
     -u SCCACHE_S3_KEY_PREFIX FAKE="$FAKE" KUBECTL="$T/kubectl" PATH="$T/bin:$PATH" MU_POD_SPEC="$here/mu-remote-pod.yaml" \
     MU_REMOTE_NAME=pods MU_REMOTE_SETTINGS="$SETTINGS" MU_REMOTE_TRUSTED="$TRUSTED" DIR="$DIR" \
     HOME="$T/home" MU_HOME="$T/mu-home" MU_REMOTE_HOME="$T/state" PI_CODING_AGENT_DIR="$T/agent" \

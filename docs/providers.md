@@ -136,7 +136,7 @@ Discovery (`GET /models`, at most daily, an hour after a failure) is cached per 
 
 ## The store
 
-`auth.json` lives in the [profile home](usage.md#profile-home) (`~/.mu/auth.json`, or `~/.mu/profiles/<name>/auth.json` under an omp profile), mode 0600, in a 0700 directory. mu warns when it is readable by others, and at startup when it cannot be read or parsed.
+`auth.json` lives in the [profile home](usage.md#profile-home) (`~/.mu/auth.json`, or `~/.mu/profiles/<name>/auth.json` under a profile), mode 0600, in a 0700 directory. mu warns when it is readable by others, and at startup when it cannot be read or parsed.
 
 ```json
 {"version":2,"providers":{

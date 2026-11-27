@@ -1,4 +1,4 @@
-//! The `[predict]` keys the plugin reads from `<mu_home>/config.toml`. The host validates the same section
+//! The `[predict]` keys the plugin reads from `<mu_home>/config.toml` and the profile's. The host validates the same section
 //! and warns; a section that fails to parse here is ignored here too, as it is there.
 
 use serde::Deserialize;
@@ -30,13 +30,13 @@ pub struct Settings {
     pub other_histories: bool,
 }
 
+#[cfg(test)]
 pub fn parse(text: &str) -> Settings {
-    let section = text
-        .parse::<toml::Table>()
-        .ok()
-        .and_then(|t| t.get("predict").cloned())
-        .and_then(|v| v.try_into::<Section>().ok())
-        .unwrap_or_default();
+    from_table(&text.parse::<toml::Table>().unwrap_or_default())
+}
+
+fn from_table(t: &toml::Table) -> Settings {
+    let section = t.get("predict").cloned().and_then(|v| v.try_into::<Section>().ok()).unwrap_or_default();
     Settings {
         smollm: section.engine == "smollm",
         threads: (section.threads > 0).then_some(section.threads),
@@ -44,8 +44,9 @@ pub fn parse(text: &str) -> Settings {
     }
 }
 
+/// The settings of the active profile: its `config.toml` over `<mu_home>/config.toml`.
 pub fn read(mu_home: &Path) -> Settings {
-    parse(&std::fs::read_to_string(mu_home.join("config.toml")).unwrap_or_default())
+    from_table(&mu_common::config::load_in(mu_home, mu_common::paths::profile().as_deref()).0)
 }
 
 #[cfg(test)]

@@ -20,15 +20,19 @@ impl Default for Config {
 }
 
 impl Config {
-    /// `[memory]` of `$MU_HOME/config.toml`: `review`, `user_cap`, `project_cap`. Anything unreadable keeps the defaults.
+    /// `[memory]` of `config.toml` (the profile's over `$MU_HOME`'s): `review`, `user_cap`, `project_cap`.
+    /// Anything unreadable keeps the defaults.
     pub fn load() -> Self {
-        let text = std::fs::read_to_string(mu_common::paths::mu_home().join("config.toml")).unwrap_or_default();
-        Self::parse(&text)
+        Self::from_table(&mu_common::paths::load_config().0)
     }
 
+    #[cfg(test)]
     pub fn parse(text: &str) -> Self {
+        text.parse::<toml::Table>().map_or_else(|_| Self::default(), |t| Self::from_table(&t))
+    }
+
+    fn from_table(t: &toml::Table) -> Self {
         let mut c = Self::default();
-        let Ok(t) = text.parse::<toml::Table>() else { return c };
         let Some(m) = t.get("memory").and_then(toml::Value::as_table) else { return c };
         if let Some(b) = m.get("review").and_then(toml::Value::as_bool) {
             c.review = b;
