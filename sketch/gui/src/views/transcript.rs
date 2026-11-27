@@ -33,7 +33,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
     div()
         .size_full()
         .relative()
-        .child(div().id(("transcript-scroll", c.session)).size_full().overflow_y_scroll().child(super::column(t, col)))
+        .child(div().id(("transcript-scroll", c.session)).size_full().overflow_y_scroll().child(col))
         .when(s.new_output, |d| {
             d.child(
                 div().absolute().bottom_3().left_0().right_0().flex().justify_center().child(

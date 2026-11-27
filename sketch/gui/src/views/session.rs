@@ -1,6 +1,6 @@
 //! A session tile: header, transcript, the request dock, the queue, the composer and the session bar.
 //! Owned by the shell; the pieces are the other views' functions.
-use super::{ViewCtx, column, composer, request, transcript, ui};
+use super::{ViewCtx, composer, request, transcript, ui};
 use gpui::{AnyElement, InteractiveElement as _, IntoElement as _, ParentElement as _, Styled as _, div, px};
 
 pub fn view(c: &ViewCtx) -> AnyElement {
@@ -21,12 +21,12 @@ pub fn view(c: &ViewCtx) -> AnyElement {
     let mut col = div().flex().flex_col().size_full().min_h_0().child(header);
     col = col.child(div().id(("transcript", c.session)).flex_1().min_h_0().overflow_hidden().child(transcript::view(c)));
     if let Some(dock) = request::dock(c) {
-        col = col.child(div().flex_none().child(column(t, dock)));
+        col = col.child(div().flex_none().child(dock));
     }
     if let Some(q) = composer::queue(c) {
-        col = col.child(div().flex_none().child(column(t, q)));
+        col = col.child(div().flex_none().child(q));
     }
-    col.child(div().flex_none().relative().child(column(t, composer::input(c))))
-        .child(div().flex_none().child(column(t, composer::session_bar(c))))
+    col.child(div().flex_none().relative().child(composer::input(c)))
+        .child(div().flex_none().child(composer::session_bar(c)))
         .into_any_element()
 }
