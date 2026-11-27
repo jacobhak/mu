@@ -212,6 +212,8 @@ pub struct Theme {
     // GUI-only roles, derived when the palette does not set them.
     /// The outermost layer: the gutter between tiles, behind the tab and status bars.
     pub chrome: Hsla,
+    /// An unfocused tile's own background, one step off `window` so the boxes in it still stand off it.
+    pub sunk: Hsla,
     /// A tile's card, and the transcript's background.
     pub window: Hsla,
     /// Side bars: between the chrome and a tile.
@@ -236,17 +238,20 @@ impl Theme {
         let dark = luminance(bg) < luminance(fg);
         let h = |c: Rgb| hsla(c);
         let (green, red) = (pal.get("green"), pal.get("red"));
-        // A terminal has one background; a GUI needs layers, and a box never has the same background as what it
-        // sits in. The palette already has the ladder, darkest to lightest: `darker_background` (chrome: the gutter,
-        // tab bar, status bar), `dark_background` (side bars, and the TUI's `Surface` for cards and the prompt),
-        // `background` (a tile), `lighter_background` (what sits on a tile: the dock, composer, menus, overlays).
+        // A box never has the same background as what it sits in, and the step between them has to be visible.
+        // Measured in L*, `dark_background` is only 3-4 from `background` in every bundled palette, which reads as
+        // the same colour; `lighter_background` is 6-9 and `darker_background` 6-9 the other way. So: chrome
+        // (gutter, tab and status bars) is `darker_background`; a tile or side bar is `background`; any box, band,
+        // card or chip on a tile is `lighter_background`; things inside the dock, composer or an overlay go back to
+        // `background`; an unfocused tile is sunk (`sunk`) so its boxes still stand off it.
         let (window, bar, raised, chrome, surface) = (
             bg,
-            pal.get("dark_background"),
+            bg,
             pal.get("lighter_background"),
             pal.get("darker_background"),
-            pal.get("dark_background"),
+            pal.get("lighter_background"),
         );
+        let sunk = if dark { pal.get("dark_background") } else { bg };
         // Plain text is the palette's `foreground`, which is what the TUI gets from the terminal's default
         // colour; `bright_foreground` is the TUI's `Strong` (bold, names, inline code), so the two differ.
         let strong = pal.get("bright_foreground");
@@ -280,6 +285,7 @@ impl Theme {
             syn_punct: h(mix(fg, bg, 20)),
             text: h(text),
             chrome: h(chrome),
+            sunk: h(sunk),
             window: h(window),
             bar: h(bar),
             raised: h(raised),

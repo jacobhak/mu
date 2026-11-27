@@ -91,7 +91,7 @@ fn image_chip(t: &Theme, name: &'static str, size: &'static str) -> Div {
             .min_h(px(metrics::CONTROL_H_SM))
             .px(px(metrics::PAD_X))
             .rounded(px(metrics::RADIUS_SM))
-            .bg(t.surface)
+            .bg(t.window)
             .border_1()
             .border_color(t.line)
             .text_size(px(t.ty.small))

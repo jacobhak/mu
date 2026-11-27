@@ -248,7 +248,7 @@ fn code(t: &Theme, lang: &'static str, lines: &[&'static str]) -> impl IntoEleme
                 div()
                     .px(px(metrics::PAD_X))
                     .py(px(metrics::PAD_Y))
-                    .bg(t.bar)
+                    .bg(t.surface)
                     .border_b_1()
                     .border_color(t.line)
                     .text_size(px(t.ty.small))
@@ -256,7 +256,7 @@ fn code(t: &Theme, lang: &'static str, lines: &[&'static str]) -> impl IntoEleme
                     .child(lang),
             )
         })
-        .child(div().bg(t.surface).px(px(metrics::PAD_X)).py(px(metrics::PAD_Y)).child(body))
+        .child(div().px(px(metrics::PAD_X)).py(px(metrics::PAD_Y)).child(body))
 }
 
 const KEYWORDS: &[&str] = &[

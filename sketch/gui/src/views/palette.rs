@@ -53,7 +53,7 @@ pub fn floating(t: &Theme, data: &Data, session: SessionId, body: AnyElement) ->
         .gap(px(metrics::GAP))
         .px(px(metrics::PAD_X))
         .py(px(metrics::PAD_Y))
-        .bg(t.bar)
+        .bg(t.surface)
         .border_b_1()
         .border_color(t.line)
         .child(div().font_weight(FontWeight::BOLD).text_color(t.accent).truncate().child(s.title))
@@ -95,7 +95,7 @@ pub fn floating(t: &Theme, data: &Data, session: SessionId, body: AnyElement) ->
 fn shell(t: &Theme) -> gpui::Div {
     ui(t)
         .w(px(PALETTE_W))
-        .bg(t.raised)
+        .bg(t.window)
         .rounded(px(metrics::RADIUS_LG))
         .border_1()
         .border_color(t.line)
@@ -123,7 +123,7 @@ fn query_row(t: &Theme, query: &str) -> gpui::Div {
         .items_center()
         .px(px(metrics::PAD_X))
         .gap(px(metrics::GAP_SM))
-        .bg(t.bar)
+        .bg(t.surface)
         .child(div().text_color(t.text).child("›"))
         .child(typed)
 }
@@ -140,7 +140,7 @@ fn footer(t: &Theme) -> gpui::Div {
         .justify_between()
         .px(px(metrics::PAD_X))
         .py(px(metrics::PAD_Y))
-        .bg(t.bar)
+        .bg(t.surface)
         .text_size(px(t.ty.small))
         .text_color(t.muted)
         .child(

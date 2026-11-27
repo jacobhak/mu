@@ -37,7 +37,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .gap(px(metrics::GAP_SM))
         .px(px(metrics::PAD_X))
         .py(px(metrics::PAD_Y))
-        .bg(t.bar)
+        .bg(t.surface)
         .border_b_1()
         .border_color(t.line)
         .child(ui(t).text_color(t.accent).truncate().child(title))

@@ -21,7 +21,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .gap(px(metrics::GAP))
         .h(px(metrics::ROW_H))
         .px(px(metrics::PAD_X))
-        .bg(t.bar)
+        .bg(t.surface)
         .border_b_1()
         .border_color(t.line)
         .child(div().flex_1().truncate().text_color(t.tool).child(s.title))
