@@ -20,11 +20,6 @@ pub mod sid {
     pub const DEPLOY: SessionId = 10;
 }
 
-/// A platform's key hint: `(mac, linux)`.
-pub fn plat(mac: &'static str, linux: &'static str) -> &'static str {
-    if cfg!(target_os = "macos") { mac } else { linux }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentState {
     /// ⚑
@@ -60,6 +55,8 @@ pub enum SpanStyle {
     Bold,
     Italic,
     Link,
+    /// Crossed out: the TUI's `CrossedOut`, in the surrounding colour.
+    Strike,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +72,26 @@ pub enum Md {
     Para(Vec<Span>),
     List { ordered: bool, items: Vec<Vec<Span>> },
     Code { lang: &'static str, lines: Vec<&'static str> },
+    /// `▏` down the left in the line role, the text muted and italic.
+    Quote(Vec<Span>),
+    /// A `─` run in the line role.
+    Rule,
+    Table(Table),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// A table: the header and the rows are cells of inline spans; the borders are the line role.
+#[derive(Clone, Debug)]
+pub struct Table {
+    pub aligns: Vec<Align>,
+    pub head: Vec<Vec<Span>>,
+    pub rows: Vec<Vec<Vec<Span>>>,
 }
 
 fn p(text: &'static str) -> Span {
@@ -92,43 +109,20 @@ fn i(text: &'static str) -> Span {
 fn l(text: &'static str) -> Span {
     Span { text, style: SpanStyle::Link }
 }
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ToolKind {
-    /// ⌕
-    Read,
-    /// ⌕
-    Grep,
-    /// ✎
-    Edit,
-    /// ✎
-    Write,
-    /// ⇣
-    Web,
-    /// ◇
-    Other,
-}
-
-impl ToolKind {
-    pub fn icon(self) -> &'static str {
-        match self {
-            Self::Read | Self::Grep => "⌕",
-            Self::Edit | Self::Write => "✎",
-            Self::Web => "⇣",
-            Self::Other => "◇",
-        }
-    }
+fn strike(text: &'static str) -> Span {
+    Span { text, style: SpanStyle::Strike }
 }
 
 /// One muted line: icon, verb, target, short facts.
 #[derive(Clone, Debug)]
 pub struct Tool {
-    pub kind: ToolKind,
     pub verb: &'static str,
     pub target: &'static str,
     pub facts: &'static str,
     /// The arguments are still arriving: the row ends in `…`.
     pub streaming: bool,
+    /// A failed call's output: the first line in err, the rest muted. Empty when the call succeeded.
+    pub error: Vec<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -170,14 +164,23 @@ pub struct Bash {
     pub hidden: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubState {
+    Running,
+    Done,
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sub {
     pub name: &'static str,
     /// scout / task
     pub kind: &'static str,
     pub time: &'static str,
+    /// The spend, `$0.22`; empty when none is shown.
+    pub cost: &'static str,
     pub summary: &'static str,
-    pub done: bool,
+    pub state: SubState,
 }
 
 #[derive(Clone, Debug)]
@@ -232,8 +235,6 @@ pub struct Approval {
     pub why: &'static str,
     /// The command, content or arguments, in a code box.
     pub body: &'static str,
-    /// 1: how much to allow. 2: where to remember it.
-    pub step: u8,
     pub choices: Vec<Choice>,
     pub selected: usize,
     pub hint: &'static str,
@@ -348,10 +349,40 @@ pub struct Session {
     pub thinking: &'static str,
     /// ask / edits / yolo / plan
     pub mode: &'static str,
-    pub ctx_pct: u8,
+    pub context: ContextWindow,
+    pub git: Git,
     pub cost: &'static str,
     /// The turn's spinner and timer; `None` when idle.
     pub turn_timer: Option<&'static str>,
+}
+
+/// The TUI's git segment: unstaged (`*`), staged (`+`) and untracked (`?`) counts. All zero is a clean branch.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Git {
+    pub dirty: u32,
+    pub staged: u32,
+    pub untracked: u32,
+}
+
+impl Git {
+    pub fn is_clean(self) -> bool {
+        self.dirty + self.staged + self.untracked == 0
+    }
+}
+
+/// The context window: tokens in use, the window's size and its label as shown (`1M`).
+#[derive(Clone, Copy, Debug)]
+pub struct ContextWindow {
+    pub used: u64,
+    pub size: u64,
+    pub size_label: &'static str,
+}
+
+impl ContextWindow {
+    /// The share of the window in use, in percent.
+    pub fn share(self) -> f64 {
+        self.used as f64 / self.size as f64 * 100.0
+    }
 }
 
 // ---------------------------------------------------------------- agents and jobs
@@ -406,6 +437,8 @@ pub struct JobRow {
     pub elapsed: &'static str,
     pub cost: &'static str,
     pub last: &'static str,
+    /// Listening ports, drawn after the cost as the TUI's jobs panel does.
+    pub ports: Vec<u16>,
     /// Details of the selected job: its task, then recent output.
     pub task: &'static str,
     pub output: Vec<&'static str>,
@@ -505,8 +538,8 @@ fn line_hi(no: u32, kind: DiffKind, text: &'static str, changed: (usize, usize))
     DiffLine { no: Some(no), kind, text, changed: Some(changed) }
 }
 
-fn tool(kind: ToolKind, verb: &'static str, target: &'static str, facts: &'static str) -> Block {
-    Block::Tool(Tool { kind, verb, target, facts, streaming: false })
+fn tool(verb: &'static str, target: &'static str, facts: &'static str) -> Block {
+    Block::Tool(Tool { verb, target, facts, streaming: false, error: vec![] })
 }
 
 fn serve_diff() -> Diff {
@@ -557,7 +590,8 @@ fn session(id: SessionId, title: &'static str, host: &'static str, branch: &'sta
         model: "opus-5",
         thinking: "high",
         mode: "edits",
-        ctx_pct: 41,
+        context: ContextWindow { used: 180_000, size: 1_000_000, size_label: "1M" },
+        git: Git::default(),
         cost: "$3.10",
         turn_timer: None,
     }
@@ -574,9 +608,9 @@ fn rest_blocks() -> Vec<Block> {
             image: Some("image 1"),
         },
         Block::Thinking { time: "14s", live: None },
-        tool(ToolKind::Read, "Read", "src/run/serve.rs", "L340-400"),
-        tool(ToolKind::Read, "Read", "src/run/attach.rs", "142 lines"),
-        tool(ToolKind::Grep, "Grep", "`reconnect` in src/", "6 matches"),
+        tool("Read", "src/run/serve.rs", "L340-400"),
+        tool("Read", "src/run/attach.rs", "142 lines"),
+        tool("Grep", "`reconnect` in src/", "6 matches"),
         Block::Prose(vec![
             Md::Heading(2, "Where the flag is lost"),
             Md::Para(vec![
@@ -624,15 +658,25 @@ fn rest_blocks() -> Vec<Block> {
                 name: "ReviewDiff",
                 kind: "scout",
                 time: "1m 12s",
+                cost: "$0.22",
                 summary: "No issues; one nit on the error message in take_over()",
-                done: true,
+                state: SubState::Done,
             },
             Sub {
                 name: "CheckMacOS",
                 kind: "task",
                 time: "3m 40s",
+                cost: "$0.38",
                 summary: "Builds and passes on the Mac; the attach tests took 2m",
-                done: true,
+                state: SubState::Done,
+            },
+            Sub {
+                name: "AuditLicenses",
+                kind: "scout",
+                time: "52s",
+                cost: "$0.04",
+                summary: "provider: 529 overloaded_error",
+                state: SubState::Failed,
             },
         ]),
         Block::Todo(vec![
@@ -651,6 +695,33 @@ fn rest_blocks() -> Vec<Block> {
             i("take"),
             p(" rules."),
         ])]),
+        Block::Prose(vec![
+            Md::Heading(2, "Follow-ups"),
+            Md::Para(vec![
+                p("The old flag is gone, so "),
+                strike("reconnect"),
+                p(" matches nothing. A second client with the same id is a takeover, not a "),
+                c("Busy"),
+                p("."),
+            ]),
+            Md::Quote(vec![p("Only the "), b("client id"), p(" decides. The "), c("take"), p(" flag is for a different client.")]),
+            Md::Rule,
+            Md::List {
+                ordered: false,
+                items: vec![
+                    vec![p("☑ "), p("Compare the client id in join()")],
+                    vec![p("☐ "), p("Document the new rule in remote-contracts.md")],
+                ],
+            },
+            Md::Table(Table {
+                aligns: vec![Align::Left, Align::Center, Align::Right],
+                head: vec![vec![p("Case")], vec![p("Before")], vec![p("After")]],
+                rows: vec![
+                    vec![vec![p("same client id")], vec![c("Busy")], vec![p("takes over")]],
+                    vec![vec![p("different client")], vec![c("Busy")], vec![p("Busy")]],
+                ],
+            }),
+        ]),
     ]
 }
 
@@ -664,13 +735,13 @@ fn stream_blocks() -> Vec<Block> {
                 "The reconnect flag is sent but serve.rs never reads it, so the fix belongs in join();\ncheck whether take() also clears the old client's pending requests …",
             ),
         },
-        tool(ToolKind::Read, "Read", "src/run/serve.rs", "…"),
+        tool("Read", "src/run/serve.rs", "…"),
         Block::Tool(Tool {
-            kind: ToolKind::Edit,
             verb: "Edit",
             target: "src/run/serve.rs",
             facts: "{\"old\": \"if old.who == hello.client\", \"new\": \"let same = …",
             streaming: true,
+            error: vec![],
         }),
         Block::Bash(Bash {
             command: "cargo test -p mu --test agent reconnect",
@@ -678,6 +749,21 @@ fn stream_blocks() -> Vec<Block> {
             time: "12s",
             tail: vec!["   Compiling mu v0.1.0", "   Compiling mu-tui v0.1.0", "   Compiling mu-agent v0.1.0"],
             hidden: 0,
+        }),
+        Block::Subagents(vec![Sub {
+            name: "FindCallers",
+            kind: "scout",
+            time: "12s",
+            cost: "$0.03",
+            summary: "Read tests/agent.rs",
+            state: SubState::Running,
+        }]),
+        Block::Tool(Tool {
+            verb: "Read",
+            target: "src/run/old_attach.rs",
+            facts: "",
+            streaming: false,
+            error: vec!["No such file or directory (os error 2)", "  it moved in the last commit"],
         }),
         Block::Retry("Retrying in 8s (2/5): overloaded"),
         Block::Error("provider: 529 overloaded_error — the request was not accepted"),
@@ -729,7 +815,6 @@ fn approval_session(step: u8, id: SessionId) -> Session {
         from: Some("CheckMacOS"),
         why: "not covered by your rules (mode: ask)",
         body: "git push origin HEAD:refs/heads/fix/attach-reconnect",
-        step,
         choices,
         selected: if step == 1 { 0 } else { 1 },
         hint,
@@ -742,7 +827,7 @@ fn question_session(review: bool, id: SessionId) -> Session {
     s.mode = "plan";
     s.blocks = vec![
         user("let's settle how observers connect to an agent"),
-        tool(ToolKind::Read, "Read", "src/run/serve.rs", "L1-120"),
+        tool("Read", "src/run/serve.rs", "L1-120"),
         Block::Prose(vec![Md::Para(vec![p(
             "Three things are open before the wire bump. I'll ask them one at a time.",
         )])]),
@@ -792,8 +877,8 @@ fn plan_session() -> Session {
     s.mode = "plan";
     s.blocks = vec![
         user("plan how /login signs in to a gateway provider"),
-        tool(ToolKind::Read, "Read", "plugins/gateway/src/main.rs", "310 lines"),
-        tool(ToolKind::Grep, "Grep", "`Pushed` in crates/", "9 matches"),
+        tool("Read", "plugins/gateway/src/main.rs", "310 lines"),
+        tool("Grep", "`Pushed` in crates/", "9 matches"),
         Block::Plan("Plan parked: Sign in to gateway providers from /login"),
     ];
     s.composer.placeholder = "Message mu — the agent waits for your answer above";
@@ -842,7 +927,7 @@ fn composer_session() -> Session {
     let mut s = session(sid::COMPOSER, "Attach tests", "local", "gui-design", AgentState::Running);
     s.blocks = vec![
         user("run the attach tests"),
-        tool(ToolKind::Read, "Read", "tests/agent.rs", "212 lines"),
+        tool("Read", "tests/agent.rs", "212 lines"),
         Block::Bash(Bash {
             command: "cargo test -p mu --test agent",
             exit: None,
@@ -879,14 +964,14 @@ fn design_session() -> Session {
     let mut s = session(sid::DESIGN, "Desktop app design", "local", "gui-design", AgentState::Running);
     s.blocks = vec![
         user("let's work through the design"),
-        tool(ToolKind::Read, "Read", "docs/remote-contracts.md", "210 lines"),
-        tool(ToolKind::Grep, "Grep", "`Busy` in crates/", "4 matches"),
+        tool("Read", "docs/remote-contracts.md", "210 lines"),
+        tool("Grep", "`Busy` in crates/", "4 matches"),
         Block::Prose(vec![Md::Para(vec![
             p("The agent serves one client today. I'll write the observer model into "),
             c("docs/design/gui.md"),
             p(", wrapped to the tile's width."),
         ])]),
-        tool(ToolKind::Edit, "Edit", "docs/design/gui.md", "+180"),
+        tool("Edit", "docs/design/gui.md", "+180"),
         Block::Diff(Diff {
             file: "docs/design/gui.md",
             plus: 4,
@@ -902,6 +987,8 @@ fn design_session() -> Session {
         Block::Thinking { time: "14s", live: Some("Which of the open questions blocks the wire bump?") },
     ];
     s.turn_timer = Some("2m 03s");
+    s.context.used = 410_000;
+    s.git = Git { dirty: 3, staged: 1, untracked: 1 };
     s.cost = "$3.10";
     s
 }
@@ -911,10 +998,10 @@ fn flaky_session() -> Session {
     s.mode = "ask";
     s.model = "sonnet-5";
     s.cost = "$1.20";
-    s.ctx_pct = 22;
+    s.context.used = 220_000;
     s.blocks = vec![
         user("the attach test is flaky on CI, find out why"),
-        tool(ToolKind::Grep, "Grep", "`attach_busy` in tests/", "3 matches"),
+        tool("Grep", "`attach_busy` in tests/", "3 matches"),
         Block::Bash(Bash {
             command: "cargo test -p mu --test agent -- --test-threads=1 attach_busy",
             exit: Some(1),
@@ -928,7 +1015,6 @@ fn flaky_session() -> Session {
         from: None,
         why: "not covered by your rules (mode: ask)",
         body: "cargo test -p mu --test agent -- --repeat 50",
-        step: 1,
         choices: vec![
             Choice { key: "1", label: "Yes, just this once", detail: "" },
             Choice { key: "2", label: "For cargo test", detail: "cargo test *" },
@@ -944,10 +1030,10 @@ fn deploy_session() -> Session {
     let mut s = session(sid::DEPLOY, "Deploy pod adapter", "test-cluster", "pod-adapter", AgentState::NeedsYou);
     s.mode = "ask";
     s.cost = "$0.41";
-    s.ctx_pct = 18;
+    s.context.used = 180_000;
     s.blocks = vec![
         user("deploy the pod adapter to the test cluster"),
-        tool(ToolKind::Read, "Read", "plugins/remote/adapters/pod.sh", "88 lines"),
+        tool("Read", "plugins/remote/adapters/pod.sh", "88 lines"),
         Block::Bash(Bash {
             command: "kubectl rollout status deploy/mu-adapter",
             exit: Some(0),
@@ -961,7 +1047,6 @@ fn deploy_session() -> Session {
         from: None,
         why: "not covered by your rules (mode: ask)",
         body: "kubectl delete pod mu-adapter-0 --namespace mu",
-        step: 1,
         choices: vec![
             Choice { key: "1", label: "Yes, just this once", detail: "" },
             Choice { key: "2", label: "For kubectl delete", detail: "kubectl delete *" },
@@ -1046,6 +1131,8 @@ pub fn build() -> Data {
             s.blocks = stream_blocks();
             s.new_output = true;
             s.turn_timer = Some("38s");
+            s.context.used = 760_000;
+            s.git = Git { dirty: 2, staged: 0, untracked: 0 };
             s
         },
         approval_session(1, sid::APPROVAL),
@@ -1104,6 +1191,7 @@ pub fn build() -> Data {
             cost: "$0.22",
             last: "Read src/run/serve.rs",
             task: "Review the diff of the branch against main and report only real problems.",
+            ports: vec![],
             output: vec!["Reading the changed files", "Checking take_over() against the contract", "Looking at the new test"],
         },
         JobRow {
@@ -1115,6 +1203,7 @@ pub fn build() -> Data {
             cost: "—",
             last: "test result: ok. 211 passed",
             task: "cargo test --workspace",
+            ports: vec![],
             output: vec!["     Running unittests src/lib.rs", "test result: ok. 211 passed; 0 failed"],
         },
         JobRow {
@@ -1126,6 +1215,7 @@ pub fn build() -> Data {
             cost: "$0.38",
             last: "Builds and passes on the Mac",
             task: "Build and test the branch on the Mac and report the result.",
+            ports: vec![],
             output: vec!["Built mu in 2m 1s", "Attach tests: 14 passed"],
         },
         JobRow {
@@ -1137,6 +1227,7 @@ pub fn build() -> Data {
             cost: "$0.04",
             last: "Error: provider overloaded",
             task: "List dependencies whose licence changed since the last release.",
+            ports: vec![],
             output: vec!["Reading Cargo.lock", "provider: 529 overloaded_error"],
         },
         JobRow {
@@ -1149,6 +1240,19 @@ pub fn build() -> Data {
             last: "cancelled",
             task: "sleep 600",
             output: vec![],
+            ports: vec![],
+        },
+        JobRow {
+            state: JobState::Running,
+            name: "vite dev",
+            agent: "bash",
+            tools: 0,
+            elapsed: "2m 40s",
+            cost: "—",
+            last: "ready in 412 ms",
+            task: "npm run dev",
+            output: vec!["  VITE v7.0.0  ready in 412 ms", "  ➜  Local:   http://localhost:5173/"],
+            ports: vec![3000, 5173],
         },
     ];
 

@@ -1,6 +1,6 @@
 //! Queue rows, the composer's states, the `/` menu, the session bar.
 use super::{ViewCtx, ui};
-use crate::data::{Session, SlashMenu};
+use crate::data::{ContextWindow, Session, SlashMenu};
 use crate::theme::{Lift, Theme, metrics};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{AnyElement, Div, IntoElement as _, ParentElement as _, Styled as _, div, px, relative};
@@ -133,14 +133,55 @@ fn sep(t: &Theme) -> Div {
     ui(t).flex_none().text_color(t.line).child("·")
 }
 
-/// Context share: accent in the normal range, warn and err at the `[status]` defaults. Those are
-/// also token levels, which need the window; the session carries only the percent.
-fn ctx_colour(t: &Theme, pct: u8) -> gpui::Hsla {
-    match pct {
-        70.. => t.err,
-        50.. => t.warn,
-        _ => t.accent,
+/// The `[status]` defaults (`MuStatus`). A level is reached at its percent or its token count, whichever is
+/// lower, as the TUI's `context_color` does.
+const WARN_PERCENT: f64 = 50.0;
+const WARN_TOKENS: u64 = 270_000;
+const ERR_PERCENT: f64 = 70.0;
+const ERR_TOKENS: u64 = 500_000;
+
+/// Context share in warn or err once it reaches that level, else accent (the TUI's muted level shows as accent).
+fn ctx_colour(t: &Theme, c: &ContextWindow) -> gpui::Hsla {
+    let share = c.share();
+    let reaches = |percent: f64, tokens: u64| share >= percent.min(tokens as f64 / c.size as f64 * 100.0);
+    if reaches(ERR_PERCENT, ERR_TOKENS) {
+        t.err
+    } else if reaches(WARN_PERCENT, WARN_TOKENS) {
+        t.warn
+    } else {
+        t.accent
     }
+}
+
+/// The branch in the ok tone when clean, warn when dirty, then the counts the TUI's git segment prints after it:
+/// `*unstaged` in warn, `+staged` in ok, `?untracked` in accent.
+fn branch(t: &Theme, s: &Session) -> Div {
+    let g = s.git;
+    let mut d = ui(t)
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .min_w_0()
+        .overflow_hidden()
+        .text_size(px(t.ty.small))
+        .child(div().min_w_0().truncate().text_color(if g.is_clean() { t.ok } else { t.warn }).child(s.branch));
+    for (n, mark, fg) in [(g.dirty, "*", t.warn), (g.staged, "+", t.ok), (g.untracked, "?", t.accent)] {
+        if n > 0 {
+            d = d.child(div().flex_none().text_color(fg).child(format!("{mark}{n}")));
+        }
+    }
+    d
+}
+
+/// Context share as the TUI's context segment: the share in its level's colour, then the window's size.
+fn context(t: &Theme, s: &Session) -> Div {
+    ui(t)
+        .flex()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_size(px(t.ty.small))
+        .child(div().text_color(ctx_colour(t, &s.context)).child(format!("{:.1}%", s.context.share())))
+        .child(div().text_color(t.faint).child(format!(" of {}", s.context.size_label)))
 }
 
 /// The status line's segments in the TUI's order: turn glyph and timer, model and thinking level, mode,
@@ -177,9 +218,9 @@ pub fn session_bar(c: &ViewCtx) -> AnyElement {
         .child(sep(t))
         .child(chip(t, s.mode.to_string(), t.accent))
         .child(sep(t))
-        .child(chip(t, s.branch.to_string(), t.muted).min_w_0().truncate())
+        .child(branch(t, s))
         .child(div().flex_1())
-        .child(chip(t, format!("ctx {}%", s.ctx_pct), ctx_colour(t, s.ctx_pct)))
+        .child(context(t, s))
         .child(sep(t))
         .child(chip(t, s.cost.to_string(), t.syn_type));
     let bar = match s.turn_timer {

@@ -1,7 +1,7 @@
 //! Every block type, at rest and streaming. The view is top-aligned: anchoring to the live end needs scroll
 //! state the sketch does not keep.
 use super::{ViewCtx, diff, markdown, mono, prose, ui};
-use crate::data::{Bash, Block, Diff, Sub, TodoItem, Tool};
+use crate::data::{Bash, Block, Diff, Sub, SubState, TodoItem, Tool};
 use crate::theme::{Theme, metrics};
 use gpui::prelude::*;
 use gpui::{AnyElement, FontWeight, div, px, relative};
@@ -15,6 +15,7 @@ const VERB_EM: f32 = 4.4;
 const SUB_NAME_EM: f32 = 11.0;
 const SUB_KIND_EM: f32 = 5.0;
 const SUB_TIME_EM: f32 = 7.0;
+const SUB_COST_EM: f32 = 6.0;
 const SPINNER: &str = "⠋";
 
 /// The session's transcript as a scrollable column: blocks in order, "↓ new output" when `new_output`.
@@ -53,15 +54,14 @@ pub fn view(c: &ViewCtx) -> AnyElement {
 }
 
 fn row_like(b: &Block) -> bool {
-    matches!(
-        b,
-        Block::Thinking { .. }
-            | Block::Tool(_)
-            | Block::Retry(_)
-            | Block::Notice(_)
-            | Block::Compaction(_)
-            | Block::Answered(_)
-    )
+    match b {
+        // A failed call is a card under its header, not a row.
+        Block::Tool(tool) => tool.error.is_empty(),
+        _ => matches!(
+            b,
+            Block::Thinking { .. } | Block::Retry(_) | Block::Notice(_) | Block::Compaction(_) | Block::Answered(_)
+        ),
+    }
 }
 
 fn block(t: &Theme, b: &Block) -> AnyElement {
@@ -69,7 +69,7 @@ fn block(t: &Theme, b: &Block) -> AnyElement {
         Block::User { text, image } => user(t, *text, *image).into_any_element(),
         Block::Woken { text } => line(t, "✦", t.accent, t.muted, *text).italic().into_any_element(),
         Block::Thinking { time, live } => thinking(t, *time, *live).into_any_element(),
-        Block::Tool(tool) => tool_row(t, tool).into_any_element(),
+        Block::Tool(tool) => tool_row(t, tool),
         Block::Prose(md) => div().child(markdown::render(t, md)).into_any_element(),
         Block::Diff(d) => diff_block(t, d).into_any_element(),
         Block::Bash(b) => bash(t, b).into_any_element(),
@@ -156,7 +156,7 @@ fn thinking(t: &Theme, time: &'static str, live: Option<&'static str>) -> impl I
     }
 }
 
-fn tool_row(t: &Theme, tool: &Tool) -> impl IntoElement {
+fn tool_row(t: &Theme, tool: &Tool) -> AnyElement {
     let facts = match (tool.facts.is_empty(), tool.streaming) {
         (_, true) if tool.facts.is_empty() => "…".to_string(),
         (_, true) => format!("{} …", tool.facts),
@@ -164,8 +164,16 @@ fn tool_row(t: &Theme, tool: &Tool) -> impl IntoElement {
     };
     // As the TUI's tool header: a bullet (a spinner while the arguments stream), the verb in bold, the target
     // in the tool role, the facts faint. The verb and the facts are interface text; only the target is code.
-    let (icon, icon_fg) = if tool.streaming { (SPINNER, t.accent) } else { ("●", t.faint) };
-    ui(t)
+    // A failed call's bullet is err, and its output sits under the header in a card on the err_soft edge.
+    let failed = !tool.error.is_empty();
+    let (icon, icon_fg) = if tool.streaming {
+        (SPINNER, t.accent)
+    } else if failed {
+        ("●", t.err)
+    } else {
+        ("●", t.faint)
+    };
+    let header = ui(t)
         .flex()
         .items_center()
         .whitespace_nowrap()
@@ -173,7 +181,25 @@ fn tool_row(t: &Theme, tool: &Tool) -> impl IntoElement {
         .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(icon_fg).child(icon))
         .child(div().flex_none().w(px(t.ty.code * VERB_EM)).font_weight(FontWeight::BOLD).text_color(t.tool).child(tool.verb))
         .child(mono(t).min_w_0().truncate().text_color(t.tool).child(tool.target))
-        .when(!facts.is_empty(), |d| d.child(div().flex_none().pl(px(t.ty.code)).text_color(t.faint).child(facts)))
+        .when(!facts.is_empty(), |d| d.child(div().flex_none().pl(px(t.ty.code)).text_color(t.faint).child(facts)));
+    if !failed {
+        return header.into_any_element();
+    }
+    // As the TUI's error rows: the first line in err, the rest muted.
+    let mut card = ui(t)
+        .w_full()
+        .min_w_0()
+        .mt(px(3.))
+        .px(px(12.))
+        .py(px(7.))
+        .rounded(px(metrics::RADIUS))
+        .border_1()
+        .border_color(t.err_soft)
+        .bg(t.surface);
+    for (i, l) in tool.error.iter().enumerate() {
+        card = card.child(div().min_w_0().text_color(if i == 0 { t.err } else { t.muted }).child(*l));
+    }
+    div().flex().flex_col().w_full().child(header).child(card).into_any_element()
 }
 
 fn diff_block(t: &Theme, d: &Diff) -> impl IntoElement {
@@ -232,11 +258,19 @@ fn boxed(t: &Theme) -> gpui::Div {
 }
 
 fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
-    let done = subs.iter().filter(|s| s.done).count();
-    let running = subs.len() - done;
-    let head = if running == 0 { format!("{done} done") } else { format!("{done} done · {running} running") };
-    // As the TUI's job rows: a state mark (the spinner while running, ✓ when done), the name in the default text,
-    // the kind and time muted, the last activity muted; the counts in the header are faint, as the todo's are.
+    let count = |state: SubState| subs.iter().filter(|s| s.state == state).count();
+    let (done, failed, running) = (count(SubState::Done), count(SubState::Failed), count(SubState::Running));
+    let mut parts = vec![format!("{done} done")];
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    let head = parts.join(" · ");
+    // As the TUI's job rows: a state mark (the spinner while running, ✓ when done, ✗ when failed), the name in the default text,
+    // the kind and time muted, the spend in syn_type, the last activity muted; the counts in the header are faint,
+    // as the todo's are.
     let mut col = ui(t).flex().flex_col().gap(px(3.)).child(
         ui(t)
             .flex()
@@ -245,7 +279,11 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
             .child(div().pl(px(t.ty.code)).text_color(t.faint).child(head)),
     );
     for s in subs {
-        let (icon, fg) = if s.done { ("✓", t.ok) } else { (SPINNER, t.accent) };
+        let (icon, fg) = match s.state {
+            SubState::Running => (SPINNER, t.accent),
+            SubState::Done => ("✓", t.ok),
+            SubState::Failed => ("✗", t.err),
+        };
         col = col.child(
             ui(t)
                 .flex()
@@ -256,6 +294,7 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
                 .child(div().flex_none().w(px(t.ty.ui * SUB_NAME_EM * 0.6 + 8.)).child(s.name))
                 .child(div().flex_none().w(px(t.ty.ui * SUB_KIND_EM * 0.6 + 8.)).text_color(t.muted).child(s.kind))
                 .child(div().flex_none().w(px(t.ty.ui * SUB_TIME_EM * 0.6 + 8.)).text_color(t.muted).child(s.time))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_COST_EM * 0.6 + 8.)).text_color(t.syn_type).child(s.cost))
                 .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(s.summary)),
         );
     }

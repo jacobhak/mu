@@ -12,6 +12,7 @@ const COL_AGENT: f32 = 56.;
 const COL_TOOLS: f32 = 44.;
 const COL_ELAPSED: f32 = 56.;
 const COL_COST: f32 = 52.;
+const COL_PORTS: f32 = 96.;
 const ROW_PY: f32 = 3.;
 
 fn small(t: &Theme) -> Div {
@@ -101,12 +102,15 @@ fn head_row(t: &Theme) -> Div {
         .child(h("TOOLS", Some(COL_TOOLS), true))
         .child(h("ELAPSED", Some(COL_ELAPSED), true))
         .child(h("COST", Some(COL_COST), true))
+        .child(h("", Some(COL_PORTS), false))
         .child(h("LAST ACTIVITY", None, false))
 }
 
 fn job_row(t: &Theme, j: &JobRow, selected: bool) -> Div {
     let (icon, color) = glyph(t, j.state);
     let muted = |d: Div| d.text_color(t.muted);
+    // Where the job listens, as the TUI's jobs panel prints it after the cost.
+    let ports = j.ports.iter().map(|p| format!(":{p}")).collect::<Vec<_>>().join(" ");
     let d = ui(t)
         .flex()
         .items_center()
@@ -126,6 +130,7 @@ fn job_row(t: &Theme, j: &JobRow, selected: bool) -> Div {
         .child(cell(muted(small(t)), Some(COL_TOOLS)).text_right().child(j.tools.to_string()))
         .child(cell(muted(small(t)), Some(COL_ELAPSED)).text_right().child(j.elapsed))
         .child(cell(muted(small(t)), Some(COL_COST)).text_right().child(j.cost))
+        .child(cell(muted(small(t)), Some(COL_PORTS)).child(ports))
         .child(cell(muted(small(t)), None).child(j.last))
 }
 

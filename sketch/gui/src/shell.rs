@@ -765,7 +765,7 @@ impl Shell {
                     .h_full()
                     .w_full()
                     .max_w(px(max))
-                    .bg(if dim { t.bar } else { t.window })
+                    .bg(if dim { t.surface } else { t.window })
                     .child(
                         div()
                             .size_full()

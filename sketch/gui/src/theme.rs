@@ -195,20 +195,19 @@ impl Theme {
         let dark = luminance(bg) < luminance(fg);
         let h = |c: Rgb| hsla(c);
         let (green, red) = (pal.get("green"), pal.get("red"));
-        // Every layer is a key of the palette, no derived colour: from the back, chrome (`darker_background`),
-        // bar and surface (`dark_background`, the TUI's `Surface`), window (`background`), raised
-        // (`lighter_background`).
+        // As the TUI: one background (`background`) for every tile, bar, composer and dock; `dark_background`
+        // (the TUI's `Surface`) only for cards, the user prompt and the gutter around the tiles.
         let (window, bar, raised, chrome, surface) = (
             bg,
+            bg,
+            bg,
             pal.get("dark_background"),
-            pal.get("lighter_background"),
-            pal.get("darker_background"),
             pal.get("dark_background"),
         );
-        // Text is the palette's `bright_foreground`, the TUI's `Strong`; the hierarchy comes from the TUI's own
-        // muted and faint roles and from weight, not from new shades.
+        // Plain text is the palette's `foreground`, which is what the TUI gets from the terminal's default
+        // colour; `bright_foreground` is the TUI's `Strong` (bold, names, inline code), so the two differ.
         let strong = pal.get("bright_foreground");
-        let (text, muted, faint) = (strong, mix(fg, bg, 35), pal.get("dark_foreground"));
+        let (text, muted, faint) = (fg, mix(fg, bg, 35), pal.get("dark_foreground"));
         Self {
             name,
             dark,
