@@ -754,7 +754,7 @@ impl Shell {
                 // The cap only applies to a lone tile; tiles that share a row or column fill their slots, or the
                 // leftover space would show as gaps between cards.
                 let max = match tab.tiles[*id] {
-                    View::Session(_) if rects.len() == 1 => session::max_width(t),
+                    View::Session(_) if rects.len() == 1 => session::max_width(vw),
                     _ => f32::MAX,
                 };
                 let card = panel(t, focused)

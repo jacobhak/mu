@@ -3,12 +3,12 @@
 use super::{ViewCtx, composer, request, transcript, ui};
 use gpui::{AnyElement, InteractiveElement as _, IntoElement as _, ParentElement as _, Styled as _, div, px};
 
-/// The widest a session tile grows, in prose-size ems. Past it the shell centres the tile in its slot and the
-/// chrome shows either side; the content inside always fills the tile.
-const MAX_TILE_EM: f32 = 56.0;
+/// The widest a lone session tile grows, as a share of the window's width. Past it the shell centres the tile and
+/// the chrome shows either side; the content inside always fills the tile.
+const MAX_TILE_SHARE: f32 = 0.6;
 
-pub fn max_width(t: &crate::theme::Theme) -> f32 {
-    t.ty.prose * MAX_TILE_EM
+pub fn max_width(window_w: f32) -> f32 {
+    window_w * MAX_TILE_SHARE
 }
 
 pub fn view(c: &ViewCtx) -> AnyElement {
