@@ -55,6 +55,11 @@ resolved_path() {
 # clean-looking sha. The tree is asked here instead, and the answer recorded for `mu update` and --skip-if-dev.
 dirty=0
 if [ -n "$src" ] && [ -n "$(git -C "$src" status --porcelain --untracked-files=no 2>/dev/null)" ]; then dirty=1; fi
+# Runs a command with its output held back: shown (on stderr) only if it fails.
+quietly() {
+  local log="$tmp/quiet.log"
+  "$@" > "$log" 2>&1 || { cat "$log" >&2; return 1; }
+}
 # Builds the workspace and the mcp-http bridge on an offload build node of this machine's architecture and fetches the
 # binaries into $src/target/release. Returns 1, having said why when it matters, if that is not possible: the
 # caller then builds here. MU_INSTALL_OFFLOAD=0 never offloads.
@@ -72,7 +77,7 @@ build_offloaded() {
   echo "install: building on an offload node ($arch)"
   # The job's checkout is a snapshot commit, so build.rs gets the sha from MU_BUILD_SHA. Two jobs, as
   # scripts/maint/check.sh: x86_64 nodes peak near their 6 GiB limit at four.
-  if (cd "$src" && offload run --arch "$arch" "${fetch[@]}" -- env CARGO_BUILD_JOBS=2 MU_BUILD_SHA="$sha" \
+  if (cd "$src" && quietly offload run --arch "$arch" "${fetch[@]}" -- env CARGO_BUILD_JOBS=2 MU_BUILD_SHA="$sha" \
     sh -c 'cargo build --release --workspace --locked && scripts/build-mcp-http.sh build'); then
     return 0
   fi
@@ -84,7 +89,8 @@ if [ -n "$src" ]; then
   if build_offloaded; then
     reldir="$src/target/release"
   else
-    (cd "$src" && cargo build --release --workspace --locked && scripts/build-mcp-http.sh build)
+    echo "install: building here"
+    (cd "$src" && quietly sh -c 'cargo build --release --workspace --locked && scripts/build-mcp-http.sh build')
     reldir="${CARGO_TARGET_DIR:-$src/target}/release"
   fi
   . "$src/scripts/lib-layout.sh"
@@ -174,18 +180,20 @@ for p in gateway gateway-pi web predict memory; do
   rm -rf "$dest.old"
 done
 # The gateway plugin's omp: opt-in, kept current once present.
+gateway=0
 if [ "$with_omp" = 1 ] || [ -e "$home/bin/omp" ]; then
+  gateway=1
   omp_ver="$(sed -n 's/^omp = "\(.*\)"/\1/p' "$stage/upstream.toml")"
   "$stage/scripts/fetch-omp.sh" "$omp_ver" "$home/bin/omp"
-else
-  echo "install: the gateway plugin (subscription logins and providers without an API key) needs omp; run install.sh --with-omp to add it"
 fi
 # The gateway-pi plugin's pi: the same.
 if [ "$with_pi" = 1 ] || [ -e "$home/bin/pi" ]; then
+  gateway=1
   pi_ver="$(sed -n 's/^pi = "\(.*\)"/\1/p' "$stage/upstream.toml")"
   "$stage/scripts/fetch-pi.sh" "$pi_ver" "$home/bin/pi"
-else
-  echo "install: the gateway-pi plugin (a gateway through the pi coding agent) needs pi; run install.sh --with-pi to add it"
+fi
+if [ "$gateway" = 0 ]; then
+  echo "install: no gateway plugin backend installed (subscription logins and providers without an API key need one); run install.sh --with-omp or --with-pi to add it"
 fi
 # The memory plugin used to be a Bun daemon; its socket and lock are all it left in $MU_HOME/memory.
 rm -f "$home/bin/mu-memory-daemon" "$home/memory/sock" "$home/memory/lock"
