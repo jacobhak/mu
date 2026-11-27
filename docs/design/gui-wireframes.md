@@ -196,3 +196,99 @@ The transcript behaves like a read-only editor buffer, as Delta's does. A text c
 
 - The exact motions and their keys, which are settled with the palette in section 6.
 - Whether a quote can be anchored to its place in the transcript (Delta's comments) rather than copied into the composer as text.
+
+## 3. Requests that need you (draft)
+
+What the agent can ask for:
+
+- **An approval** (`ApprovalRequest`, `crates/mu-base/src/permissions.rs`):
+  - the request: a title (`tool: summary`), why it needs approval, the body (command, content or arguments), the subagent it was forwarded from, and the grant "don't ask again" would remember;
+  - the choices: a model to run the call on instead;
+  - the answer: allow once, for the session, the project or everywhere (with patterns picked from the wider levels), or deny, with an optional note.
+- **Questions** (`AskQuestion`): a header and context, then options with descriptions and previews. A question can take several answers, have a recommended option, be a yes/no, or be skipped; any answer can carry a note, or be typed freely.
+- **A document review** (`ReviewRequest`): a plan or another mode's document, or a `/review` report.
+  - The document is markdown, with the actions the mode defines (execute, keep, compact, refine with text, park, …).
+  - Some actions continue with a chosen model.
+- **Web search setup,** and an interactive `bash` (declined in v1).
+
+### 3a. Approval, in the session that asks
+
+```
+│┃  $ cargo test -p mu --test agent reconnect          ✓ 0 · 41s      │
+│┃                                                                     │
+│┃  ┏ Run this command? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
+│┃  ┃ bash · not covered by your rules (mode: ask)                  ┃ │
+│┃  ┃ from subagent CheckMacOS                                       ┃ │
+│┃  ┃ ┌────────────────────────────────────────────────────────────┐ ┃ │
+│┃  ┃ │ git push origin HEAD:refs/heads/fix/attach-reconnect       │ ┃ │
+│┃  ┃ └────────────────────────────────────────────────────────────┘ ┃ │
+│┃  ┃  [y] Run once                                                  ┃ │
+│┃  ┃  [s] Always run `git push *` in this session                   ┃ │
+│┃  ┃  [p] Always run `git push *` in this project                   ┃ │
+│┃  ┃  [m] Run once on @slow  ▾                                      ┃ │
+│┃  ┃  [n] Don't run          [Tab] add a note                       ┃ │
+│┃  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
+│┃──────────────────────────────────────────────────────────────────── │
+│┃  Message mu — the agent waits for your answer above                 │
+```
+
+- **The card sits at the live end of the transcript**, never in a modal.
+  - You can still scroll and search the transcript while it waits.
+  - It takes the keyboard when its session's tile is focused.
+- **Buttons are verbs, and scopes are named precisely:** "Always run `git push *` in this project", not "Yes, don't ask again". The patterns come from the request's grant.
+- **Once answered,** the card folds to one line in the transcript, saying who answered from where: "✓ Ran once · answered on devbox". Another connection that answered first closes it the same way.
+
+### 3b. Questions
+
+```
+│┃  ┏ Desktop app · question 2 of 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
+│┃  ┃ The agent accepts one client today; a cockpit needs more.     ┃ │
+│┃  ┃ How does a connection become an observer?                      ┃ │
+│┃  ┃                                                                ┃ │
+│┃  ┃  1 ● Role in hello  (recommended)    ┌ preview ──────────────┐ ┃ │
+│┃  ┃      Explicit; old semantics kept    │ {"hello":{"role":     │ ┃ │
+│┃  ┃  2 ○ Observer by default             │   "observe", …}}      │ ┃ │
+│┃  ┃      Busy disappears                 └───────────────────────┘ ┃ │
+│┃  ┃  3 ○ Something else…                                           ┃ │
+│┃  ┃                                                                ┃ │
+│┃  ┃  [Enter] answer   [Tab] note   [←/→] question   [s] skip       ┃ │
+│┃  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
+```
+
+- **One card holds the whole batch.** ←/→ move between the questions, and answers are kept until the last one is sent.
+- **Context reads first, dimmed; the question is the strongest line.**
+- **An option with a preview** shows it beside the list while it is highlighted.
+
+### 3c. Document review (a plan)
+
+```
+┌───────────────────────────────────────────┬────────────────────────────────────────────┐
+│┃ (session transcript)                     │ Plan review · Desktop app design      📌   │
+│┃                                          │                                            │
+│┃  ┏ Plan ready for review ━━━━━━━━━━━━━┓  │ # Observers                                │
+│┃  ┃ Observers in the agent  (42 lines) ┃  │                                            │
+│┃  ┃ opened beside →        [o] focus   ┃  │ 1. Hello carries `role` …                  │
+│┃  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  │ 2. …                                       │
+│┃                                          │                                            │
+│┃                                          │────────────────────────────────────────────│
+│┃                                          │ [x] Execute  [k] Keep context  [c] Compact │
+│┃                                          │ [r] Refine…  [p] Park           on opus-5 ▾│
+└───────────────────────────────────────────┴────────────────────────────────────────────┘
+```
+
+- **A document is too big for a card,** so it opens in a tile beside the session: a review view, pinned to that session.
+- **The card in the transcript names it and links to it.** The actions sit at the bottom of the document's tile, with the "continue with" model where the mode offers it.
+
+### 3d. A request from an agent you are not looking at
+
+- **It shows only as `⚑`** on the agent's row in the list, and on the title of its tab if one shows it. The OS notification follows the `[notify]` rules.
+- **A key jumps to the oldest request waiting on you,** in any session; pressed again, it goes to the next.
+  - If a tile already shows that session, focus moves there.
+  - If not, the session opens in the focused tile, and the key back returns to what was there.
+
+### Questions for this section
+
+- Where the card sits: at the live end of the transcript, or docked above the composer so it stays in view while you scroll back.
+- Whether a document review opens its tile by itself, or waits for `o`.
+- What the jump key does when no tile shows the session: replace the focused tile's view, or open a new tile.
+- How choices are picked: letters as drafted, digits, or arrows and Enter only.
