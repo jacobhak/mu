@@ -24,4 +24,4 @@
 - [Config](config.md): `~/.mu/config.toml`
 - [mu documents itself](self-documentation.md): `mu://`, these pages and generated references for the agent to read and search
 
-Design and measurements: [`DESIGN.md`](../DESIGN.md). mu-remote, the in-tree program built on the remote contracts: [`plugins/remote/`](../plugins/remote/README.md). Ghost-text evaluation record: [`ghost-text/`](ghost-text/README.md).
+Design and measurements: [`DESIGN.md`](../DESIGN.md). mu-remote, the in-tree program built on the remote contracts: [`plugins/remote/`](../plugins/remote/README.md). Ghost-text evaluation record: [`ghost-text/`](ghost-text/README.md). Desktop app design (not built yet): [`design/gui.md`](design/gui.md).
