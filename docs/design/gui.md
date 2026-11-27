@@ -86,7 +86,7 @@ Process-wide globals (the theme, the keymap, host facts) are passed in explicitl
 ## Layout and rendering
 
 - **The window is tabs of tiles, plus two bars.** Each tab is tiled like a tiling window manager, and any view (session, agent list, review, jobs, plan, files) can fill a tile. The left and right bars are docked outside the tiling and hold whatever views you put there. Named layouts save the arrangement. See [the window shell wireframes](gui-wireframes.md#1-window-shell-agreed).
-- **Proportional prose.** Model prose uses a proportional font, with real headings and lists. Code, tool output, diffs and paths use a monospace font. Fonts and sizes are configurable.
+- **Proportional prose.** Model prose uses a proportional font, with real headings and lists. Code, tool output, diffs and paths use a monospace font. Fonts and sizes are configurable; the default is the system UI font and the system monospace, with nothing bundled.
 - **Theme.** The app uses the TUI's palette files (`crates/mu-tui/src/palettes/`), extended with roles only a GUI needs (surfaces, borders, focus ring, selection). Each new role gets a default derived from the palette when a palette does not set it, so one theme choice covers both UIs.
 - **Composer.** Text editing and IME use `gpui-component`'s Input. mu's actions are bound around it through the shared action list.
 

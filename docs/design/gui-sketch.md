@@ -24,7 +24,7 @@ Status: plan only, not built. It turns the agreed wireframes ([gui-wireframes.md
 
 | File | Holds |
 |---|---|
-| `main.rs` | App start, font loading, key bindings, window |
+| `main.rs` | App start, key bindings, window |
 | `theme.rs` | A mu palette resolved to the TUI's roles, plus the GUI-only roles and type sizes |
 | `data.rs` | Fake sessions, agents, jobs and requests, built from the screens list below |
 | `shell.rs` | Tabs, tile tree, bars, status bar, focus, zoom, the overlays (palette, floating panel) |
@@ -34,7 +34,7 @@ Status: plan only, not built. It turns the agreed wireframes ([gui-wireframes.md
 | `views/agents.rs` | The agent list, narrow (bar) and wide (tile) |
 | `views/jobs.rs` | The jobs view |
 | `views/palette.rs` | The agent palette and the full palette |
-| `assets/` | Four of mu's palettes, IBM Plex Sans and Lilex (copied from the GPUI crate's assets, licences included) |
+| `assets/` | Four of mu's palettes |
 
 - **Views get their data passed in.** Each view is a function from the theme, the data, its session and whether it has focus to an element, so the views can be written independently of the shell and of each other.
 
@@ -47,9 +47,8 @@ Status: plan only, not built. It turns the agreed wireframes ([gui-wireframes.md
   - diff added/removed backgrounds, and a stronger shade of each for the changed part of a line;
   - the scrim behind overlays.
 - **Type:**
-  - prose in Plex Sans at about 15 px;
-  - interface text at about 13 px;
-  - code, tool rows, diffs and paths in Lilex at about 13 px.
+  - prose and interface text in the system UI font, at about 15 px and 13 px;
+  - code, tool rows, diffs and paths in a system monospace (Menlo on macOS) at about 13 px.
 - **Four palettes,** two dark and two light (catppuccin, tokyo-night, catppuccin-latte, flexoki-light). A key cycles them, to check that every role holds up in each.
 - **Sizes are constants in one place,** so a review can adjust them in a single edit.
 
@@ -123,4 +122,4 @@ These overlays open on top of any tab:
 ## Open
 
 - **Whether the offload image already carries GPUI's Linux build dependencies.** This is unknown until the first build.
-- **Fonts.** The sketch bundles Plex Sans and Lilex so screenshots match across machines. Which fonts the real app bundles, if any, or whether it uses system fonts, is decided after the review.
+- **Fonts.** The sketch uses the system UI font and a system monospace and bundles nothing. The real app does the same by default, and the user can configure both families; the sketch does not.
