@@ -41,14 +41,8 @@ Status: plan only, not built. It turns the agreed wireframes ([gui-wireframes.md
 ## Theme
 
 - **The TUI's roles, computed the same way:** the same palette keys and mixes as `crates/mu-tui/src/theme.rs` (`DEFS`). The roles are strong, muted, faint, thinking, line, surface, selected, accent, ok, warn, err, tool and the syntax roles.
-- **GUI-only roles, derived when the palette lacks them:**
-  - window, bar and raised surfaces;
-  - hover and focus ring;
-  - diff added/removed backgrounds, and a stronger shade of each for the changed part of a line;
-  - the scrim behind overlays.
-- **Type:**
-  - prose and interface text in the system UI font, at about 15 px and 13 px;
-  - code, tool rows, diffs and paths in a system monospace (Menlo on macOS) at about 13 px.
+- **Everything beyond the TUI's roles is undecided:** which surfaces, colours, sizes, spacing, radii and type the GUI has beyond the TUI's roles and the owner's decisions is not settled here. See [gui-decisions.md](gui-decisions.md); this file does not set any of it.
+- **Fonts:** the system UI font and a system monospace, nothing bundled.
 - **Four palettes,** two dark and two light (catppuccin, tokyo-night, catppuccin-latte, flexoki-light). A key cycles them, to check that every role holds up in each.
 - **Sizes are constants in one place,** so a review can adjust them in a single edit.
 
@@ -122,4 +116,4 @@ These overlays open on top of any tab:
 ## Open
 
 - **Whether the offload image already carries GPUI's Linux build dependencies.** This is unknown until the first build.
-- **Fonts.** The sketch uses the system UI font and a system monospace and bundles nothing. The real app does the same by default, and the user can configure both families; the sketch does not.
+- **Everything visual.** Colours, sizes, spacing, radii and which face is used where are decided by the owner, not by this plan; see [gui-decisions.md](gui-decisions.md).

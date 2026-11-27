@@ -9,13 +9,15 @@ Running notes, written into `docs/design/gui*.md` at the end of the review; then
 - **macOS:** plain `cargo build` fails with `unable to find utility "metal"` on a machine with only the Command Line Tools: GPUI compiles its shaders with Xcode's `metal`. The sketch enables `gpui_platform`'s `runtime_shaders` feature on macOS (shaders compile when the app starts), so no Xcode is needed. It also needs `gpui_platform`'s `font-kit` feature: without it the Core Text text system is not compiled in, and the window draws every box but no glyph, with no error. The real app picks either that or requiring Xcode with its Metal toolchain in the Mac build image.
 - The binary needs `libxkbcommon-x11.so.0` at run time (`libxkbcommon-x11-0`) on the machine that runs it.
 
-## Look (after the first review)
+## Look
 
-- **Chosen with the reviewer:** panels with hairlines (a 4px chrome gutter between tiles and around them, every tile and bar a rounded card with a 1px hairline); focus as a 2px accent ring plus dimmed content in the other tiles (0.74 opacity); the request dock as a raised, shadowed card and the composer as a lifted input card with an accent edge while its tile has focus; tool arguments, paths, diffs, bash commands and code stay in Lilex while everything else (the user's prompt, composer, tool verbs, counts, key caps, subagent rows) is Plex Sans; type 16/14/13/12 (a 17/15/14/13 toggle), radii 6 (chips, rows), 8 (cards), 10 (tiles), 12 (dock, composer, menus), pills fully round; depth tuned per theme (`Theme::shadow`: heavier on dark, soft and wide on light).
-- **Three layers:** chrome (darkest, behind the bars and between tiles), bars, then tile cards; overlays and the dock sit above on `raised`.
+What the look should be is decided by the owner and recorded in [`docs/design/gui-decisions.md`](../../docs/design/gui-decisions.md). Colours, sizes, spacing, radii and fonts in this sketch are not decisions; where they differ from that file, the file wins.
+
+Technical findings only:
+
 - **Shadows get clipped by `overflow_hidden`** on the wrapper around a tile, so the split wrappers must not clip; the tile itself does, for its rounded corners.
-- **Width belongs to the tile, not the content:** a session tile has a max width (56 prose-ems, `session::max_width`) and is centred in its slot with the chrome showing either side; everything inside fills the tile. Other views (agent list, jobs, review) have no max. A text column inside a wide tile, and a cap on prose alone, both read as broken.
 - **The focus ring is an absolutely positioned overlay,** so focusing a tile never shifts its layout.
+- **A scrolling list's children shrink to fit the container** unless they are `flex_none`, which squashes labels and rows once the content is taller than the container. Put the content in one non-shrinking inner column inside the scroller.
 
 ## Keys
 
