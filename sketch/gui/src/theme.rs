@@ -236,13 +236,15 @@ impl Theme {
         let dark = luminance(bg) < luminance(fg);
         let h = |c: Rgb| hsla(c);
         let (green, red) = (pal.get("green"), pal.get("red"));
-        // As the TUI: one background (`background`) for every tile, bar, composer and dock; `dark_background`
-        // (the TUI's `Surface`) only for cards, the user prompt and the gutter around the tiles.
+        // A terminal has one background; a GUI needs layers, and a box never has the same background as what it
+        // sits in. The palette already has the ladder, darkest to lightest: `darker_background` (chrome: the gutter,
+        // tab bar, status bar), `dark_background` (side bars, and the TUI's `Surface` for cards and the prompt),
+        // `background` (a tile), `lighter_background` (what sits on a tile: the dock, composer, menus, overlays).
         let (window, bar, raised, chrome, surface) = (
             bg,
-            bg,
-            bg,
             pal.get("dark_background"),
+            pal.get("lighter_background"),
+            pal.get("darker_background"),
             pal.get("dark_background"),
         );
         // Plain text is the palette's `foreground`, which is what the TUI gets from the terminal's default

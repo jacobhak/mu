@@ -24,6 +24,10 @@ Source tags: **S** = said or chose in the session of 2026-11-28. **E** = from ea
 - **The unfocused-tile treatment keeps both the dimming and the sunk background.** (S)
 - **The focus ring is `accent_soft`.** (S)
 
+### Surfaces and contrast
+- **A box never has the same background as the tile it sits in.** Backgrounds, foregrounds and the differentiation between layers have to be clearly distinguishable. This was said several times and was not met when the sketch drew the dock, composer and option rows on the tile's own background. (S)
+- **The GUI differs from the TUI here by construction.** A terminal has one background; the GUI needs layered surfaces. "The backgrounds and foregrounds in the gui is different by construction from the tui." (S)
+
 ### Diffs
 - **Coloured text only**, no line backgrounds. (E, "Coloured text only")
 
@@ -40,5 +44,5 @@ Source tags: **S** = said or chose in the session of 2026-11-28. **E** = from ea
 None of these has a decision; do not treat anything in the code as one.
 
 - **The actual sizes:** text sizes, spacing, control and row heights, corner radii. The owner has said they must be derived from what the UI needs and from a real reference, not from the agent's taste. Which reference, if any, has not been chosen.
-- **Backgrounds and foregrounds:** the owner said the GUI's are "different by construction from the tui" and later said "whatever" when asked for what that means. Whether the GUI should use the TUI's single background with surfaces, or something else, is not decided. "I don't know" was the answer to the question asked.
+- **Which colours the layers are:** that they must be clearly differentiated is decided (above); which palette keys or values make up the layers, and the foreground hierarchy, are not. "I don't know" was the answer when asked.
 - **Primary text colour:** whether plain body text is the palette's `foreground` or `bright_foreground` is not decided. The owner said it was "not even close" and has not said what it should be.
