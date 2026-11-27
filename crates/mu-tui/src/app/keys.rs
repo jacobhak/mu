@@ -98,6 +98,9 @@ fn chat_rows(target: &KeyInfo, current: Option<bool>) -> Vec<(Item, KeyOption)> 
     ]
 }
 
+/// How long a listing of agents offered for completion is reused before the next `/agents ` or `/remote ` asks again.
+const AGENTS_TTL: Duration = Duration::from_secs(10);
+
 impl App {
     /// The events of the terminal: the pty, paste, resize and keys.
     pub(super) fn on_terminal(&mut self, e: Event) {
@@ -134,6 +137,7 @@ impl App {
                         }
                         self.request_ghost();
                         self.request_dirs();
+                        self.request_agents();
                     }
                 }
             }
@@ -164,6 +168,28 @@ impl App {
         self.host_call(host::cwd::COMPLETE_DIRS, &partial, move |app, r: Result<Vec<String>, String>| {
             if seq == app.prompt.dirs_seq {
                 app.set_dirs(r.unwrap_or_default());
+            }
+        });
+    }
+
+    /// Asks the host for the agents while the composer holds `/agents ` or `/remote ` and the last answer is
+    /// older than `AGENTS_TTL`, so that their ids complete. One ask is out at a time, and a failure is silent.
+    pub(super) fn request_agents(&mut self) {
+        let text = self.prompt.composer.text();
+        let wanted = ["/agents ", "/remote "].iter().any(|p| text.starts_with(p));
+        if !wanted || self.overlay.is_some() || self.typing() || self.prompt.agents_busy {
+            return;
+        }
+        if self.prompt.agents_asked.is_some_and(|t| t.elapsed() < AGENTS_TTL) {
+            return;
+        }
+        use crate::host::sessions::{LIVE_SESSIONS, Live, LiveArgs};
+        self.prompt.agents_busy = true;
+        self.prompt.agents_asked = Some(Instant::now());
+        self.host_call(LIVE_SESSIONS, &LiveArgs::default(), |app, r: Result<Live, String>| {
+            app.prompt.agents_busy = false;
+            if let Ok(live) = r {
+                app.set_agent_choices(live);
             }
         });
     }
@@ -217,6 +243,7 @@ impl App {
             self.request_ghost();
         }
         self.request_dirs();
+        self.request_agents();
     }
 
     /// Ctrl-C before anything else sees the key: the first press arms the exit and does nothing
@@ -970,6 +997,8 @@ pub(super) mod tests {
                 ghost_asked: String::new(),
                 dirs_asked: None,
                 dirs_seq: 0,
+                agents_asked: None,
+                agents_busy: false,
                 held_back: vec![],
             },
             overlay: None,
@@ -1097,6 +1126,7 @@ pub(super) mod tests {
                 args: vec![],
                 arg_descs: vec![],
                 paths: true,
+                sub: vec![],
             }];
             let args = |app: &App| app.prompt.commands[0].args.clone();
             // The host's directory is "/": the first answer lists it all, the last lists what starts with "e".

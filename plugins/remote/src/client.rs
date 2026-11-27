@@ -74,6 +74,38 @@ fn helper_command(exe: &Path, name: &str, id: &str) -> String {
     format!("{} helper {} {}", quote(&exe.to_string_lossy()), quote(name), quote(id))
 }
 
+/// Starts the agent `s` describes and returns its id. A new session gets a bundle of the repository in the
+/// current directory when the adapter takes one.
+fn start(adapter: &Adapter, mut s: StartAgent) -> Result<String> {
+    let staged = if adapter.takes_bundle() && s.resume.is_none() && !s.continue_latest {
+        let base = adapter.setting("work_dir").unwrap_or_else(|| DEFAULT_WORK_DIR.to_string());
+        let cwd = std::env::current_dir()?;
+        stage_bundle(&cwd, &base, &std::env::temp_dir()).context("could not bundle the repository")?
+    } else {
+        None
+    };
+    if let Some(b) = &staged {
+        eprintln!("mu-remote: sending {} to {}…", b.repo, adapter.name());
+        s.bundle = Some(b.file());
+        s.dir = Some(b.dir.clone());
+    }
+    adapter.start(&Start::Agent(s), &mut |p| eprintln!("mu-remote: {p}…"))
+}
+
+/// `mu-remote new NAME [--model M]`: starts an agent on the remote and prints a session-source row for it
+/// (sources contract 2: what `/remote new` attaches with). Progress goes to stderr.
+pub fn new_agent(name: &str, model: Option<String>) -> Result<i32> {
+    let cfg = Config::load()?;
+    let (name, remote) = cfg.pick(Some(name))?;
+    let adapter = Adapter::from_config(name, remote)?;
+    if !adapter.trusted() {
+        return Err(adapter.untrusted_agent());
+    }
+    let id = start(&adapter, StartAgent { model, ..Default::default() })?;
+    println!("{}", crate::rows::started_row(name, remote, &adapter, &id)?);
+    Ok(0)
+}
+
 /// Joins or starts an agent on the remote and hands the terminal to `mu --attach`. A remote that does not
 /// answer is refused with the adapter's error; nothing falls back to running here.
 pub fn run(name: Option<String>, resume: Option<PathBuf>, continue_latest: bool, model: Option<String>) -> Result<i32> {
@@ -91,21 +123,7 @@ pub fn run(name: Option<String>, resume: Option<PathBuf>, continue_latest: bool,
     };
     let id = match plan(&want, &found, model.as_deref())? {
         Plan::Connect(id) => id,
-        Plan::Start(mut s) => {
-            let staged = if adapter.takes_bundle() && s.resume.is_none() && !s.continue_latest {
-                let base = adapter.setting("work_dir").unwrap_or_else(|| DEFAULT_WORK_DIR.to_string());
-                let cwd = std::env::current_dir()?;
-                stage_bundle(&cwd, &base, &std::env::temp_dir()).context("could not bundle the repository")?
-            } else {
-                None
-            };
-            if let Some(b) = &staged {
-                eprintln!("mu-remote: sending {} to {}…", b.repo, adapter.name());
-                s.bundle = Some(b.file());
-                s.dir = Some(b.dir.clone());
-            }
-            adapter.start(&Start::Agent(s), &mut |p| eprintln!("mu-remote: {p}…"))?
-        }
+        Plan::Start(s) => start(&adapter, s)?,
     };
     let exe = std::env::current_exe().context("cannot find this program's path")?;
     let args = attach_args(&exe, adapter.name(), &id, &adapter.state_key_path());

@@ -103,6 +103,23 @@ fn strings(items: &[&str]) -> (Vec<String>, Vec<String>) {
     names(items.iter().map(|s| s.to_string()))
 }
 
+/// The verbs of `/agents` and `/remote` (`new` only for the latter), with what each does.
+const AGENT_VERBS: [(&str, &str); 5] = [
+    ("new", "Start an agent on a remote and attach to it"),
+    ("stop", "End an agent"),
+    ("cancel", "Cancel an agent's current turn"),
+    ("notify", "Leave an agent a message"),
+    ("attach", "Open an agent here"),
+];
+
+fn complete_agents(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
+    AGENT_VERBS[1..].iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip()
+}
+
+fn complete_remote(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
+    AGENT_VERBS.iter().map(|&(a, d)| (a.to_string(), d.to_string())).unzip()
+}
+
 fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
     use crate::theme::Origin;
     crate::theme::available()
@@ -124,7 +141,7 @@ fn complete_theme(_: &CompleteCtx) -> (Vec<String>, Vec<String>) {
         .unzip()
 }
 
-pub(super) static BUILTIN: [Builtin; 39] = [
+pub(super) static BUILTIN: [Builtin; 40] = [
     cmd("exit", "Exit mu", |a, _| a.quit()),
     cmd("quit", "Exit mu", |a, _| a.quit()),
     cmd("detach", "Leave the agent running and close this client", |a, _| a.cmd_detach()).busy_ok(),
@@ -184,7 +201,14 @@ pub(super) static BUILTIN: [Builtin; 39] = [
         App::agents_cmd,
     )
     .busy_ok()
-    .complete(|_| strings(&["stop", "cancel", "notify", "attach"])),
+    .complete(complete_agents),
+    cmd(
+        "remote",
+        "List agents on your remotes, start one or act on one [new <remote> | stop | cancel | notify | attach <id> …]",
+        App::remote_cmd,
+    )
+    .busy_ok()
+    .complete(complete_remote),
     cmd("schedule", "Send a prompt later [<delay> <prompt> | list | cancel [N|all]]", App::schedule_cmd)
         .needs_arg()
         .busy_ok()
@@ -247,7 +271,15 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         .iter()
         .map(|c| {
             let (args, arg_descs) = c.complete.map(|f| f(&cc)).unwrap_or_default();
-            Entry { name: c.name.into(), desc: c.desc.into(), needs_arg: c.needs_arg, args, arg_descs, paths: c.paths }
+            Entry {
+                name: c.name.into(),
+                desc: c.desc.into(),
+                needs_arg: c.needs_arg,
+                args,
+                arg_descs,
+                paths: c.paths,
+                sub: vec![],
+            }
         })
         .collect();
     commands.extend(ctx.commands.iter().map(|c| Entry {
@@ -257,6 +289,7 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         args: vec![],
         arg_descs: vec![],
         paths: false,
+        sub: vec![],
     }));
     commands.extend(ctx.modes.iter().filter(|m| m.command && find(&m.name).is_none()).map(|m| Entry {
         name: m.name.clone(),
@@ -265,6 +298,7 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         args: vec![],
         arg_descs: vec![],
         paths: false,
+        sub: vec![],
     }));
     commands.extend(ctx.skills.iter().map(|s| Entry {
         name: format!("skill:{}", s.name),
@@ -273,6 +307,7 @@ pub(crate) fn command_entries(ctx: &Context, cfg: &Configs, custom_ids: &[String
         args: vec![],
         arg_descs: vec![],
         paths: false,
+        sub: vec![],
     }));
     commands
 }
@@ -322,6 +357,7 @@ mod tests {
                 "upload",
                 "jobs",
                 "agents",
+                "remote",
                 "schedule"
             ]
         );

@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 /// starts (4: plain JSON lines behind the hello; encrypting the pipe is up to whatever carries it;
 /// 5: the plan dialog became a generic document review; 6: the `read_bytes` and `write_bytes` host
 /// calls, and listening `ports` on a job; 7: session rows carry `helper`, `state_key` and `actions`;
-/// the `remote_action` host call).
-pub const WIRE: u32 = 7;
+/// the `remote_action` host call; 8: the `new_agent` host call, and `targets` in the live sessions).
+pub const WIRE: u32 = 8;
 
 /// Front end to agent.
 #[derive(Serialize, Deserialize)]

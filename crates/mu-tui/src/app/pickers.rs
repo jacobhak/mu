@@ -23,7 +23,7 @@ use mu_session::session::owner::Owner;
 use tokio::sync::oneshot;
 
 /// How long ago `t` was, in words for the session picker.
-fn ago(t: std::time::SystemTime) -> String {
+pub(super) fn ago(t: std::time::SystemTime) -> String {
     let s = t.elapsed().map_or(0, |d| d.as_secs());
     match s {
         0..=59 => "just now".into(),
@@ -936,6 +936,83 @@ mod session_tests {
                 let t = transcript_text(&app);
                 assert!(t.contains("usage: /agents [stop|cancel|notify|attach <id> [text]]"), "{deferred}: {t}");
                 assert!(t.contains("usage: /agents notify <id> <text>"), "{deferred}: {t}");
+            });
+        }
+    }
+
+    #[test]
+    fn typing_agents_asks_once_for_the_agents_and_offers_their_ids_with_context() {
+        use crate::widgets::complete::Entry;
+        mu_testutil::home();
+        for deferred in [false, true] {
+            let dir = fresh_dir();
+            let path = session_file(&dir, "other", &dir, "hi", 0.0);
+            serve_runs(vec![live(&path, "agent"), live(&session_file(&dir, "tui1", &dir, "hi", 0.0), "tui")]);
+            let (mut app, mut rx, _cmds) = app_with(deferred, dir.clone());
+            let entry = |name: &str| Entry {
+                name: name.into(),
+                desc: String::new(),
+                needs_arg: false,
+                args: vec!["stop".into()],
+                arg_descs: vec![],
+                paths: false,
+                sub: vec![],
+            };
+            app.prompt.commands = vec![entry("agents"), entry("remote")];
+            in_local(async {
+                app.prompt.composer.set_text("/remote ");
+                app.request_agents();
+                assert!(app.prompt.agents_asked.is_some());
+                pump(&mut app, &mut rx, |a| !a.prompt.agents_busy).await;
+                let sub = |app: &App, cmd: usize| app.prompt.commands[cmd].sub.clone();
+                let agents = sub(&app, 0);
+                let stop = agents.iter().find(|s| s.arg == "stop").unwrap();
+                assert_eq!(stop.items, ["other"], "{deferred}: only agents, not the tui");
+                assert!(stop.descs[0].starts_with("here · "), "{deferred}: {:?}", stop.descs);
+                assert!(
+                    stop.descs[0].contains(" ago · /work/") && stop.descs[0].ends_with(" · hi"),
+                    "{:?}",
+                    stop.descs
+                );
+                assert!(sub(&app, 1).iter().find(|s| s.arg == "stop").unwrap().items.is_empty(), "no remote rows");
+                assert!(sub(&app, 1).iter().any(|s| s.arg == "new"));
+
+                let asked = app.prompt.agents_asked;
+                app.request_agents();
+                assert!(!app.prompt.agents_busy && app.prompt.agents_asked == asked, "one ask per ten seconds");
+                app.prompt.composer.set_text("/model ");
+                app.prompt.agents_asked = None;
+                app.request_agents();
+                assert!(!app.prompt.agents_busy, "only /agents and /remote ask");
+            });
+        }
+    }
+
+    #[test]
+    fn remote_lists_only_remote_agents_and_refuses_a_remote_that_cannot_start_one() {
+        mu_testutil::home();
+        for deferred in [false, true] {
+            let dir = fresh_dir();
+            let path = session_file(&dir, "other", &dir, "hi", 0.0);
+            serve_runs(vec![live(&path, "agent")]);
+            let (mut app, mut rx, _cmds) = app_with(deferred, dir);
+            in_local(async {
+                app.remote_cmd("");
+                pump(&mut app, &mut rx, |a| transcript_text(a).contains("no agents on your remotes")).await;
+                let t = transcript_text(&app);
+                assert!(t.contains("no remote offers to start an agent") && !t.contains("other"), "{deferred}: {t}");
+                app.remote_cmd("new far --model x");
+                pump(&mut app, &mut rx, |a| transcript_text(a).contains("no remote `far` can start an agent")).await;
+                app.remote_cmd("new");
+                app.remote_cmd("nosuch");
+                app.remote_cmd("notify other");
+                let t = transcript_text(&app);
+                assert!(t.contains("usage: /remote new <remote> [args…]"), "{deferred}: {t}");
+                assert!(
+                    t.contains("usage: /remote [stop|cancel|notify|attach <id> [text] | new <remote> [args…]]"),
+                    "{t}"
+                );
+                assert!(t.contains("usage: /remote notify <id> <text>"), "{deferred}: {t}");
             });
         }
     }

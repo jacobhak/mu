@@ -169,6 +169,9 @@ struct Prompt {
     /// The `/cd` argument whose directories were asked for, and the number of that ask.
     dirs_asked: Option<String>,
     dirs_seq: u64,
+    /// When the agents offered to `/agents` and `/remote` completion were last asked for, and whether an ask is out.
+    agents_asked: Option<Instant>,
+    agents_busy: bool,
     /// Queued inputs that could not go back into the composer while a key was typed.
     held_back: Vec<UserInput>,
 }
@@ -430,6 +433,8 @@ pub async fn run(init: AppInit) -> i32 {
             ghost_asked: String::new(),
             dirs_asked: None,
             dirs_seq: 0,
+            agents_asked: None,
+            agents_busy: false,
             held_back: Vec::new(),
             predict: startup.predict,
         },

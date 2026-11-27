@@ -23,16 +23,16 @@ The transport is whatever `COMMAND` runs over: `ssh`, `kubectl exec -i`, a socke
 | C | attach | 1 | - |
 | D | sources | 2 | `MU_SOURCES_CONTRACT` |
 | E | helper | 1 | `MU_ATTACH_HELPER_CONTRACT` |
-| - | wire | 7 | - |
+| - | wire | 8 | - |
 
-`mu contracts` prints the current numbers as one JSON line: `{"wire":7,"launcher":2,"agents":1,"attach":1,"sources":2,"helper":1}`. mu sets the environment variable in the environment of the program it runs under that contract (A: the launcher; D: each session source; E: the attach helper). A program that speaks one number checks it and refuses another, with a message that names both.
+`mu contracts` prints the current numbers as one JSON line: `{"wire":8,"launcher":2,"agents":1,"attach":1,"sources":2,"helper":1}`. mu sets the environment variable in the environment of the program it runs under that contract (A: the launcher; D: each session source; E: the attach helper). A program that speaks one number checks it and refuses another, with a message that names both.
 
 **Policy.** A contract's number goes up when a program written for the old number could break: a removed or renamed field, verb or flag, a changed meaning, a new required input. An optional addition keeps the number and gets a line in the contract's history list below. A program may therefore ignore fields and verbs it does not know, and must.
 
 **The wire** is the protocol between an attached UI and its agent (`WireCommand`, `WireEvent`, the host calls). It is internal to mu and changes with every release that touches it, so both ends of an attach must be the same mu release. A transport carries it opaquely, line by line, and must not parse or buffer it. Only the first line of each side is stable:
 
 - client to agent: `{"hello":{"wire":N,"version":"…", …}}` (more fields may follow);
-- agent to client: `{"hello":{"wire":N,"version":"…", …}}`, or, when the numbers differ, `{"error":"this agent speaks wire 7, the client wire 6"}` and the agent closes the connection.
+- agent to client: `{"hello":{"wire":N,"version":"…", …}}`, or, when the numbers differ, `{"error":"this agent speaks wire 8, the client wire 7"}` and the agent closes the connection.
 
 ## A. Launcher (contract 2)
 
@@ -114,9 +114,11 @@ A line mu cannot read is dropped (and quoted as the error text when no result co
 
 `attach` and `helper` as an array are an argument vector: mu quotes each word for `sh` and joins them, so an agent id from a remote never reaches a shell unquoted. This is the preferred form. A string is a shell line run as written, and so is the source's responsibility to quote. An empty array or a blank string means none. A row is not a local session: it has no pid. `stop`, `cancel` and `notify` are argument vectors only (no string form); an empty array or a blank first word means none, and a field of any other shape is ignored without dropping the row. `S` (after a confirmation), `s` and `n` on a row run them where the source ran, with no shell and `MU_SOURCES_CONTRACT` set, with a 60 s limit; the first line of stdout is shown, or on failure the first line of stderr. Without them those keys do nothing on the row.
 
-**Trust.** A configured source is trusted as much as the launcher is: `Enter` runs what it prints, as you.
+**Starting an agent.** A line with no `id`, a `remote` (a name, which `/remote` takes) and a `new` argument vector says that agents can be started there: `{"remote":"devbox","new":["prog","new","devbox"]}`. `/remote new NAME [ARGS…]` runs `new` with the words after the name appended (each as one argument, with no shell), in the session's directory, with `MU_SOURCES_CONTRACT` set and a 300 s limit. The first line it prints must be a row for the new agent, as above, with `attach` (and `helper`, `state_key`, `stop`, … when it has them): mu hands the terminal to `mu --attach` with it. Without `attach` mu shows the row's `hint`. On failure the first line of stderr is shown. A source should print the line only for a remote that answers and that it may start agents on; a name two sources both give goes to the later one.
 
-History: 2 added the argument-vector form of `attach`, and `helper`, `state_key`, `stop`, `cancel` and `notify`. (1 had `attach` as a shell line only.)
+**Trust.** A configured source is trusted as much as the launcher is: `Enter` runs what it prints, as you, and so does `/remote new`.
+
+History: 2 added the argument-vector form of `attach`, and `helper`, `state_key`, `stop`, `cancel` and `notify`. (1 had `attach` as a shell line only.) The `remote`/`new` line was added to 2 later, without a new number: a source line that lacks an `id` was skipped before.
 
 ## E. Attach helper (contract 1)
 

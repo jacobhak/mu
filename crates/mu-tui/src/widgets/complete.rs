@@ -2,6 +2,15 @@
 
 use std::collections::HashMap;
 
+/// What the second word of a command completes to once the first is `arg` (`/remote stop <id>`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SubArgs {
+    pub arg: String,
+    pub items: Vec<String>,
+    /// What each of `items` is, parallel to it; may be shorter.
+    pub descs: Vec<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub name: String,
@@ -14,6 +23,10 @@ pub struct Entry {
     /// Enter on a typed directory (or none) runs it rather than the highlighted entry.
     #[serde(default)]
     pub paths: bool,
+    /// What a second word completes to, by the first (`/remote stop` offers the agents). Filled in as it is
+    /// learned, so it starts empty.
+    #[serde(default)]
+    pub sub: Vec<SubArgs>,
 }
 
 /// Match quality of `cand` for `query` (higher is better); `None` when it does not match.
@@ -70,6 +83,7 @@ mod tests {
             args: vec![],
             arg_descs: vec![],
             paths: false,
+            sub: vec![],
         }
     }
 

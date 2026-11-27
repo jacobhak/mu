@@ -32,6 +32,7 @@ pub const SEND_MESSAGE: &str = "send_message";
 pub const STOP_SESSION: &str = "stop_session";
 pub const TERMINATE_SESSION: &str = "terminate_session";
 pub const REMOTE_ACTION: &str = "remote_action";
+pub const NEW_AGENT: &str = "new_agent";
 
 /// Most sessions the resume picker lists.
 const RECENT_MAX: usize = 200;
@@ -131,6 +132,9 @@ const SOURCE_WAIT: Duration = Duration::from_secs(20);
 /// How long one row action (stop, cancel, notify) may take.
 const ACTION_WAIT: Duration = Duration::from_secs(60);
 
+/// How long starting an agent may take (a pod may have to pull an image first).
+const NEW_WAIT: Duration = Duration::from_secs(300);
+
 /// A source row's commands for acting on it, as argument vectors run with no shell.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Actions {
@@ -160,6 +164,9 @@ impl Actions {
 
 /// The commands of the rows of the last refresh, by (host, id).
 static ACTIONS: LazyLock<Mutex<HashMap<(String, String), Actions>>> = LazyLock::new(Mutex::default);
+
+/// The `new` commands of the last refresh, by the remote's name.
+static TARGETS: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Mutex::default);
 
 /// An array of strings with a non-blank first word; anything else is no command, and not a bad row.
 fn argv_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
@@ -202,6 +209,14 @@ struct SourceRow {
     notify: Option<Vec<String>>,
 }
 
+/// A line of a source that says agents can be started on a remote: no `id`, a `remote` and a `new` command.
+#[derive(Deserialize)]
+struct SourceTarget {
+    remote: String,
+    #[serde(default, deserialize_with = "argv_or_none")]
+    new: Option<Vec<String>>,
+}
+
 impl SourceRow {
     fn row(self, source: &str) -> (LiveRow, Actions) {
         let host = self.host.filter(|h| !h.trim().is_empty()).unwrap_or_else(|| source.to_string());
@@ -242,6 +257,22 @@ fn source_rows(source: &str, out: &str) -> Vec<(LiveRow, Actions)> {
     out.lines().filter_map(|l| serde_json::from_str::<SourceRow>(l).ok()).map(|r| r.row(source)).collect()
 }
 
+/// The remotes a source's output says can start an agent, with the command that does.
+fn source_targets(out: &str) -> Vec<(String, Vec<String>)> {
+    out.lines()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            if v.get("id").is_some() {
+                return None;
+            }
+            let t: SourceTarget = serde_json::from_value(v).ok()?;
+            let name = t.remote.trim().to_string();
+            (!name.is_empty()).then_some(())?;
+            Some((name, t.new?))
+        })
+        .collect()
+}
+
 /// Commands that list agents on other machines (`[sessions] sources`), listed beside this host's.
 /// Set once at start-up; they block, so they run off the UI thread.
 static SOURCES: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
@@ -254,39 +285,54 @@ fn has_sources() -> bool {
     SOURCES.get().is_some_and(|s| !s.is_empty())
 }
 
-/// Runs every source at once and returns what they print as rows, and keeps their action commands for
-/// `remote_action`. A source that fails or is slow adds none.
-async fn remote_rows() -> Vec<LiveRow> {
+/// Runs every source at once and returns what they print as rows and the names of the remotes that can
+/// start an agent, and keeps their commands for `remote_action` and `new_agent`. A source that fails or is
+/// slow adds none.
+async fn remote_rows() -> (Vec<LiveRow>, Vec<String>) {
     let mut runs = tokio::task::JoinSet::new();
     for argv in SOURCES.get().into_iter().flatten().cloned() {
         runs.spawn(async move {
             let mut cmd = tokio::process::Command::new(&argv[0]);
             cmd.args(&argv[1..]).env(mu_base::contracts::SOURCES_ENV, mu_base::contracts::SOURCES.to_string());
             let out = mu_base::process::run_capture(cmd, SOURCE_WAIT).await.unwrap_or_default();
-            source_rows(&argv[0], &out)
+            (source_rows(&argv[0], &out), source_targets(&out))
         });
     }
     let mut rows = Vec::new();
     let mut actions = HashMap::new();
+    let mut targets = HashMap::new();
     while let Some(done) = runs.join_next().await {
-        for (row, a) in done.unwrap_or_default() {
+        let (found, news) = done.unwrap_or_default();
+        for (row, a) in found {
             if let Some(host) = &row.host {
                 let id = row.live.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
                 actions.insert((host.clone(), id), a);
             }
             rows.push(row);
         }
+        targets.extend(news);
     }
     *ACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = actions;
-    rows
+    let mut names: Vec<String> = targets.keys().cloned().collect();
+    names.sort();
+    *TARGETS.lock().unwrap_or_else(|e| e.into_inner()) = targets;
+    (rows, names)
 }
 
-/// Runs a row action's command; `stdin` is fed to it (else it reads nothing). Ok is the first line it
-/// prints, Err the first line it complains with.
-async fn run_action(argv: &[String], stdin: Option<String>, wait: Duration) -> Result<String, String> {
+/// Runs a row action's command in `dir` (else mu's own); `stdin` is fed to it (else it reads nothing). Ok is
+/// the first line it prints, Err the first line it complains with.
+async fn run_action(
+    argv: &[String],
+    stdin: Option<String>,
+    dir: Option<&Path>,
+    wait: Duration,
+) -> Result<String, String> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
     let mut cmd = tokio::process::Command::new(&argv[0]);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
     cmd.args(&argv[1..])
         .env(mu_base::contracts::SOURCES_ENV, mu_base::contracts::SOURCES.to_string())
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -319,6 +365,9 @@ pub struct Live {
     /// A line the tab shows under the list: worker results kept because nobody applied them.
     #[serde(default)]
     pub notice: Option<String>,
+    /// The remotes the sources say can start an agent, sorted.
+    #[serde(default)]
+    pub targets: Vec<String>,
 }
 
 /// `tail_read` arguments: the session file, how far the caller has read it, and whether it was caught up.
@@ -388,6 +437,13 @@ pub struct RemoteActionArgs {
     pub text: Option<String>,
 }
 
+/// `new_agent` arguments: the remote, and the words typed after its name, which go to the source's command.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NewAgentArgs {
+    pub remote: String,
+    pub args: Vec<String>,
+}
+
 pub(super) fn register(r: &mut Registry) {
     r.add(RECENT_SESSIONS, recent_sessions);
     r.add(SESSION_OWNER, session_owner);
@@ -400,6 +456,7 @@ pub(super) fn register(r: &mut Registry) {
     r.add(STOP_SESSION, stop_session);
     r.add(TERMINATE_SESSION, terminate_session);
     r.add(REMOTE_ACTION, remote_action);
+    r.add(NEW_AGENT, new_agent);
 }
 
 thread_local! {
@@ -453,7 +510,12 @@ fn live_rows(source: &dyn SessionSource, me: u32, a: LiveArgs) -> Live {
             live: l,
         })
         .collect();
-    Live { rows, canon: a.canon.into_iter().map(|p| (p.clone(), canon(&p))).collect(), notice: None }
+    Live {
+        rows,
+        canon: a.canon.into_iter().map(|p| (p.clone(), canon(&p))).collect(),
+        notice: None,
+        targets: Vec::new(),
+    }
 }
 
 fn live_sessions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
@@ -473,7 +535,9 @@ fn live_sessions(l: &Rc<Local>, args: serde_json::Value) -> Answer {
     pending(args, |a: LiveArgs| {
         let mut live = local(a);
         async move {
-            live.rows.extend(remote_rows().await);
+            let (rows, targets) = remote_rows().await;
+            live.rows.extend(rows);
+            live.targets = targets;
             Ok::<_, String>(live)
         }
     })
@@ -559,7 +623,32 @@ fn remote_action(_: &Rc<Local>, args: serde_json::Value) -> Answer {
                 return Err(format!("this row offers no {}; the list may be out of date", a.action));
             };
             let stdin = (a.action == "notify").then(|| a.text.unwrap_or_default());
-            run_action(&argv, stdin, ACTION_WAIT).await
+            run_action(&argv, stdin, None, ACTION_WAIT).await
+        }
+    })
+}
+
+/// Starts an agent on a remote with the source's `new` command (run in this session's directory, with the
+/// user's words appended). The first line it prints is a source row for the new agent, which comes back
+/// so that the caller can attach to it.
+fn new_agent(l: &Rc<Local>, args: serde_json::Value) -> Answer {
+    pending(args, |a: NewAgentArgs| {
+        let argv = TARGETS.lock().unwrap_or_else(|e| e.into_inner()).get(&a.remote).cloned();
+        let dir = l.cwd();
+        async move {
+            let Some(mut argv) = argv else {
+                return Err(format!("{} does not offer to start agents; the list may be out of date", a.remote));
+            };
+            argv.extend(a.args);
+            let line = run_action(&argv, None, Some(&dir), NEW_WAIT).await?;
+            let row = serde_json::from_str::<SourceRow>(&line)
+                .map_err(|_| format!("{} printed no agent row: {line}", argv[0]))?;
+            let (row, actions) = row.row(&a.remote);
+            if let Some(host) = row.host.clone() {
+                let id = row.live.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                ACTIONS.lock().unwrap_or_else(|e| e.into_inner()).insert((host, id), actions);
+            }
+            Ok(row)
         }
     })
 }
@@ -612,6 +701,7 @@ mod tests {
             }],
             canon: vec![("/a".into(), "/b".into())],
             notice: Some("n".into()),
+            targets: vec!["cluster".into()],
         });
         round(TailDelta { from: 3, reset: true, messages: vec![], offset: 9, cost: 0.5, tokens: 12, caught_up: true });
         round(Spend { total: 0.75, costs: vec![("/s/k.jsonl".into(), 0.75)] });
@@ -693,6 +783,42 @@ mod tests {
         assert_eq!(rows[1].1, Actions::default());
     }
 
+    #[test]
+    fn a_line_with_a_remote_and_a_new_command_and_no_id_is_a_target() {
+        let out = concat!(
+            "{\"remote\":\"far\",\"new\":[\"x\",\"new\",\"far\"]}\n",
+            "{\"remote\":\"empty\",\"new\":[]}\n",
+            "{\"remote\":\" \",\"new\":[\"x\"]}\n",
+            "{\"remote\":\"bad\",\"new\":\"x new\"}\n",
+            "{\"remote\":\"far2\"}\n",
+            "{\"id\":\"a\",\"remote\":\"row\",\"new\":[\"x\"]}\n",
+            "not json\n",
+        );
+        assert_eq!(source_targets(out), [("far".to_string(), vec!["x".to_string(), "new".into(), "far".into()])]);
+        let rows = source_rows("prog", out);
+        assert_eq!(rows.len(), 1, "a target line is not a row");
+        assert_eq!(rows[0].0.host.as_deref(), Some("prog"));
+    }
+
+    #[tokio::test]
+    async fn a_new_agents_command_runs_in_the_given_directory_and_its_first_line_is_a_row() {
+        let (s, d) = script(
+            "echo \"$@\" > \"$(dirname \"$0\")/args\"; pwd > \"$(dirname \"$0\")/cwd\"; \
+             echo '{\"id\":\"n1\",\"host\":\"far\",\"attach\":[\"x\",\"n1\"],\"stop\":[\"x\",\"stop\",\"n1\"]}'",
+        );
+        let work = d.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let argv: Vec<String> =
+            ["/bin/sh", &s.display().to_string(), "new", "far", "--model", "p/m"].map(String::from).into();
+        let line = run_action(&argv, None, Some(&work), NEW_WAIT).await.unwrap();
+        let (row, actions) = serde_json::from_str::<SourceRow>(&line).unwrap().row("far");
+        assert_eq!((row.host.as_deref(), row.attach.as_deref()), (Some("far"), Some("'x' 'n1'")));
+        assert_eq!(actions.names(), ["stop"]);
+        assert_eq!(std::fs::read_to_string(d.join("args")).unwrap(), "new far --model p/m\n");
+        let cwd = std::fs::canonicalize(&work).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("cwd")).unwrap().trim(), cwd.display().to_string());
+    }
+
     fn script(body: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let d = std::env::temp_dir().join(format!("mu-host-action-{}", uuid::Uuid::new_v4()));
@@ -708,19 +834,19 @@ mod tests {
         let (s, d) =
             script("d=$(dirname \"$0\"); echo \"$1|$2\" > \"$d/args\"; cat > \"$d/in\"; echo queued; echo more");
         let argv: Vec<String> = ["/bin/sh", &s.display().to_string(), "/o pt/x", "a b"].map(String::from).into();
-        let line = run_action(&argv, Some("hello there".into()), ACTION_WAIT).await;
+        let line = run_action(&argv, Some("hello there".into()), None, ACTION_WAIT).await;
         assert_eq!(line, Ok("queued".to_string()));
         assert_eq!(std::fs::read_to_string(d.join("args")).unwrap(), "/o pt/x|a b\n");
         assert_eq!(std::fs::read_to_string(d.join("in")).unwrap(), "hello there\n");
 
         let (bad, _) = script("echo ' '; echo 'no such agent' >&2; echo again >&2; exit 3");
-        let err = run_action(&["/bin/sh".into(), bad.display().to_string()], None, ACTION_WAIT).await;
+        let err = run_action(&["/bin/sh".into(), bad.display().to_string()], None, None, ACTION_WAIT).await;
         assert_eq!(err, Err("no such agent".to_string()));
 
         let (slow, _) = script("sleep 5");
         let t = std::time::Instant::now();
         let argv = ["/bin/sh".to_string(), slow.display().to_string()];
-        let err = run_action(&argv, None, Duration::from_millis(200)).await.unwrap_err();
+        let err = run_action(&argv, None, None, Duration::from_millis(200)).await.unwrap_err();
         assert!(err.contains("did not finish"), "{err}");
         assert!(t.elapsed() < Duration::from_secs(4));
     }

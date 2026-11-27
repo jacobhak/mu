@@ -385,6 +385,27 @@ fn an_unreachable_default_remote_is_refused_with_the_adapters_error() {
 }
 
 #[test]
+fn new_starts_an_agent_and_prints_its_row_and_an_untrusted_remote_is_refused() {
+    let Some(far) = Far::new(true) else { return };
+    let o = far.mr().args(["new", "far"]).stdin(Stdio::null()).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(out.lines().count(), 1, "{out}");
+    let row: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(far.calls("start"), 1, "{:?}", far.log());
+    assert_eq!(row["id"], far.first_id().as_str());
+    assert_eq!(row["host"], "far");
+    assert_eq!(row["attach"].as_array().unwrap()[1..], ["connect", "far", row["id"].as_str().unwrap()]);
+    assert_eq!(row["stop"].as_array().unwrap()[1..], ["stop", "far", row["id"].as_str().unwrap()]);
+
+    let Some(untrusted) = Far::new(false) else { return };
+    let o = untrusted.mr().args(["new", "far"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!o.status.success() && o.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("not trusted"), "{:?}", o.stderr);
+    assert_eq!(untrusted.calls("start"), 0);
+}
+
+#[test]
 fn rows_list_the_agents_of_a_trusted_remote_with_host_hint_and_attach() {
     let Some(far) = Far::new(true) else { return };
     let agent = Agent::start(&far.remote, &far.cwd, &[]);
@@ -392,8 +413,10 @@ fn rows_list_the_agents_of_a_trusted_remote_with_host_hint_and_attach() {
     assert!(o.status.success());
     let rows: Vec<Value> =
         String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    let row = &rows[0];
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["remote"], "far");
+    assert_eq!(rows[0]["new"].as_array().unwrap()[1..], ["new", "far"]);
+    let row = &rows[1];
     assert_eq!(row["id"], agent.session.as_str());
     assert_eq!(row["host"], "far");
     assert_eq!(row["hint"], format!("mu-remote far --resume {}", agent.session));

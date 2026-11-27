@@ -156,14 +156,30 @@ fn check_contract(offered: Option<&str>) -> Result<()> {
     }
 }
 
-fn rows_of(name: &str, r: &Remote, exe: &Path) -> Vec<Value> {
+/// The line that says `mu-remote new NAME` can start an agent there (sources contract 2, "Starting an agent").
+fn target(remote: &str, exe: &Path) -> Value {
+    json!({"remote": remote, "new": [exe.to_string_lossy(), "new", remote]})
+}
+
+/// The row for agent `id`, just started on remote `name`: what `mu-remote new` prints for mu to attach with.
+pub(crate) fn started_row(name: &str, r: &Remote, adapter: &Adapter, id: &str) -> Result<Value> {
+    let exe = std::env::current_exe()?;
+    let key = r.state_key.is_some().then(|| adapter.state_key_path());
+    Ok(row(name, &exe, &AgentInfo { id: id.to_string(), ..Default::default() }, key.as_deref()))
+}
+
+/// What a remote adds to the output: the `new` line, then a row per agent. Nothing for one that is not
+/// trusted or does not answer.
+fn lines_of(name: &str, r: &Remote, exe: &Path) -> Vec<Value> {
     let Ok(adapter) = Adapter::from_config(name, r) else { return Vec::new() };
     if !adapter.trusted() {
         return Vec::new();
     }
     let Ok(found) = adapter.list(Some(ANSWER_TIMEOUT)) else { return Vec::new() };
     let key = r.state_key.is_some().then(|| adapter.state_key_path());
-    found.iter().filter(|a| a.is_agent()).map(|a| row(name, exe, a, key.as_deref())).collect()
+    let mut out = vec![target(name, exe)];
+    out.extend(found.iter().filter(|a| a.is_agent()).map(|a| row(name, exe, a, key.as_deref())));
+    out
 }
 
 /// A `[sessions] sources` command. A remote that is unreachable or not trusted adds no rows.
@@ -179,7 +195,7 @@ pub fn rows(name: Option<&str>) -> Result<i32> {
         None => cfg.remote.iter().collect(),
     };
     let found: Vec<Vec<Value>> = std::thread::scope(|s| {
-        let handles: Vec<_> = chosen.iter().map(|(n, r)| s.spawn(|| rows_of(n, r, &exe))).collect();
+        let handles: Vec<_> = chosen.iter().map(|(n, r)| s.spawn(|| lines_of(n, r, &exe))).collect();
         handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
     });
     for v in found.into_iter().flatten() {
@@ -252,7 +268,9 @@ mod tests {
         let dir = crate::testutil::tmp();
         let adapter = fake(&dir, 1);
         let exe = Path::new("/o pt/mu-remote");
-        let r = rows_of("far", &program(&adapter, true), exe);
+        let lines = lines_of("far", &program(&adapter, true), exe);
+        assert_eq!(lines[0], json!({"remote": "far", "new": ["/o pt/mu-remote", "new", "far"]}));
+        let r = &lines[1..];
         assert_eq!(r.len(), 2);
         assert_eq!(r[0]["id"], "abc123");
         assert_eq!(r[0]["host"], "far");
@@ -264,10 +282,10 @@ mod tests {
         assert_eq!(r[0]["notify"], json!(["/o pt/mu-remote", "notify", "far", "abc123", "-"]));
         assert!(r[0].get("state_key").is_none(), "no state_key unless the remote sets one");
         let keyed = Remote { state_key: Some("/k/id".into()), ..program(&adapter, true) };
-        assert_eq!(rows_of("far", &keyed, exe)[0]["state_key"], "/k/id");
+        assert_eq!(lines_of("far", &keyed, exe)[1]["state_key"], "/k/id");
         assert_eq!(r[0]["client"]["host"], "h");
         assert_eq!(r[0]["waiting"], true);
-        assert!(rows_of("far", &program(&adapter, false), exe).is_empty(), "untrusted: no rows");
-        assert!(rows_of("far", &program(&dir.join("nope"), true), exe).is_empty(), "unreachable: no rows");
+        assert!(lines_of("far", &program(&adapter, false), exe).is_empty(), "untrusted: no rows, no new");
+        assert!(lines_of("far", &program(&dir.join("nope"), true), exe).is_empty(), "unreachable: no rows, no new");
     }
 }

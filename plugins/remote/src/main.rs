@@ -47,6 +47,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Start an agent on remote NAME and print a session-source row for it (what mu's `/remote new` runs).
+    New {
+        name: String,
+        /// The model the new agent uses.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// The stream to agent ID on remote NAME, for `mu --attach`: the adapter's `connect`, then the encrypted
     /// channel. Plain lines on stdin and stdout.
     Connect { name: String, id: String },
@@ -143,6 +150,7 @@ fn dispatch() -> Result<i32> {
     let cli = Cli::parse();
     match cli.command {
         None => client::run(cli.name, cli.resume, cli.continue_latest, cli.model),
+        Some(Cmd::New { name, model }) => client::new_agent(&name, model),
         Some(Cmd::Connect { name, id }) => connect::connect(&name, &id),
         Some(Cmd::Bridge { id }) => connect::bridge(&id),
         Some(Cmd::Key) => connect::key(),

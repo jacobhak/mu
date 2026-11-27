@@ -1347,7 +1347,7 @@ mod tests {
             actions: Vec::new(),
             live,
         });
-        Live { rows: rows.collect(), canon: Vec::new(), notice: None }
+        Live { rows: rows.collect(), canon: Vec::new(), notice: None, targets: Vec::new() }
     }
 
     /// A panel on the Sessions tab with one agent on host `far`, offering `actions`.

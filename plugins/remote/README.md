@@ -67,6 +67,7 @@ The image comes from `plugins/remote/Dockerfile`, built from mu's repository roo
 | Command | Does |
 |---|---|
 | `mu-remote [NAME] [--resume ID \| -c] [--model M]` | pick or start an agent on NAME and attach to it |
+| `mu-remote new NAME [--model M]` | start an agent on NAME and print a session-source row for it (what mu's `/remote new` runs) |
 | `mu-remote connect NAME ID` | the encrypted stream to agent ID, for `mu --attach` |
 | `mu-remote bridge ID` | on the remote: the far end of `connect` |
 | `mu-remote key` | this machine's bridge key fingerprint |
@@ -83,7 +84,7 @@ The image comes from `plugins/remote/Dockerfile`, built from mu's repository roo
 
 ### Managing agents
 
-`mu-remote agents` lists them; `mu-remote stop|cancel|notify NAME ID` ends one, cancels its turn or messages it (the remote's adapter must support it; `ssh` and the shipped pod and local adapters do). In mu, rows from `mu-remote rows` get the same on the Sessions tab (`s` cancels the turn, `S` stops after `y`, `n` messages) and `/agents` does it from the composer (`/agents stop|cancel|notify|attach ID`). `/quit` inside an attached agent ends it too.
+`mu-remote agents` lists them; `mu-remote stop|cancel|notify NAME ID` ends one, cancels its turn or messages it (the remote's adapter must support it; `ssh` and the shipped pod and local adapters do). In mu, rows from `mu-remote rows` get the same on the Sessions tab (`s` cancels the turn, `S` stops after `y`, `n` messages) and `/agents` does it from the composer (`/agents stop|cancel|notify|attach ID`). `/remote` is the same for remotes only, and `/remote new NAME [--model M]` starts an agent on NAME (`mu-remote new`; `rows` offers it for every trusted remote that answers) and attaches to it. `/quit` inside an attached agent ends it too.
 
 ### Files and ports
 

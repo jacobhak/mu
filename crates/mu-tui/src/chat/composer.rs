@@ -522,21 +522,31 @@ impl Composer {
                 )
             }
             Some((name, partial)) => {
-                if partial.contains(char::is_whitespace) {
-                    return None;
-                }
-                let e = commands.iter().find(|c| c.name == name && !c.args.is_empty())?;
+                // The second word completes from what the first one allows (`/remote stop <id>`); a third has none.
+                let (cmd, first, partial) = match partial.split_once(char::is_whitespace) {
+                    Some((first, rest)) if !rest.contains(char::is_whitespace) => (name, Some(first), rest),
+                    Some(_) => return None,
+                    None => (name, None, partial),
+                };
+                let e = commands.iter().find(|c| c.name == cmd)?;
+                let (args, arg_descs, paths, owner) = match first {
+                    None if !e.args.is_empty() => (&e.args, &e.arg_descs, e.paths, name.to_owned()),
+                    Some(first) => {
+                        let s = e.sub.iter().find(|s| s.arg == first)?;
+                        (&s.items, &s.descs, false, format!("{name} {first}"))
+                    }
+                    None => return None,
+                };
                 let lower = partial.to_lowercase();
                 let hits: Vec<usize> =
-                    (0..e.args.len()).filter(|&i| e.args[i].to_lowercase().starts_with(&lower)).collect();
-                let items: Vec<String> = hits.iter().map(|&i| e.args[i].clone()).collect();
-                let descs: Vec<String> =
-                    hits.iter().map(|&i| e.arg_descs.get(i).cloned().unwrap_or_default()).collect();
+                    (0..args.len()).filter(|&i| args[i].to_lowercase().starts_with(&lower)).collect();
+                let items: Vec<String> = hits.iter().map(|&i| args[i].clone()).collect();
+                let descs: Vec<String> = hits.iter().map(|&i| arg_descs.get(i).cloned().unwrap_or_default()).collect();
                 let n = items.len();
                 // A directory typed out (or nothing yet) is the argument; its entries are what could follow.
                 let exact =
-                    e.args.iter().any(|a| a == partial) || (e.paths && (partial.is_empty() || partial.ends_with('/')));
-                (items, descs, vec![false; n], Some(name.to_owned()), exact, e.paths)
+                    args.iter().any(|a| a == partial) || (paths && (partial.is_empty() || partial.ends_with('/')));
+                (items, descs, vec![false; n], Some(owner), exact, paths)
             }
         };
         (!items.is_empty()).then_some(Menu { items, descs, needs_arg, sel: 0, arg, exact, paths, moved: false })
@@ -995,7 +1005,43 @@ mod tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             arg_descs: vec![],
             paths: false,
+            sub: vec![],
         }
+    }
+
+    #[test]
+    fn a_second_word_completes_from_what_the_first_allows() {
+        use crate::widgets::complete::SubArgs;
+        let mut remote = entry("remote", false, &["new", "stop"]);
+        remote.sub = vec![
+            SubArgs {
+                arg: "stop".into(),
+                items: vec!["abc1".into(), "abd2".into()],
+                descs: vec!["far · fix it".into()],
+            },
+            SubArgs { arg: "new".into(), items: vec!["far".into()], descs: vec![] },
+        ];
+        let cmds = vec![remote];
+        let press_cmds = |c: &mut Composer, code| c.on_key(key(code, KeyModifiers::NONE), false, &cmds);
+        let mut c = Composer::new(None);
+        for ch in "/remote stop ab".chars() {
+            press_cmds(&mut c, KeyCode::Char(ch));
+        }
+        press_cmds(&mut c, KeyCode::Down);
+        press_cmds(&mut c, KeyCode::Tab);
+        assert_eq!(c.text(), "/remote stop abd2 ", "Tab takes the second id");
+
+        c.set_text("/remote new ");
+        c.refresh(&cmds);
+        assert_eq!(press_cmds(&mut c, KeyCode::Tab), Action::Redraw);
+        assert_eq!(c.text(), "/remote new far ");
+
+        c.set_text("/remote stop abd2 more");
+        c.refresh(&cmds);
+        assert!(c.menu.is_none(), "a third word has no menu");
+        c.set_text("/remote notify ");
+        c.refresh(&cmds);
+        assert!(c.menu.is_none(), "a verb with nothing to offer has no menu");
     }
 
     fn cmds() -> Vec<Entry> {

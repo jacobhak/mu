@@ -5,6 +5,7 @@ use super::*;
 use crate::host::sessions::{self, AttachTarget, Live, LiveArgs, LiveRow};
 use crate::term::clipboard;
 use crate::text::markdown;
+use crate::widgets::complete::SubArgs;
 use crate::widgets::overlay::OverlayEvent;
 use mu_base::image;
 use mu_base::models::Thinking;
@@ -34,6 +35,7 @@ impl App {
                 }
                 app.prompt.commands = c.entries;
                 app.prompt.dirs_asked = None;
+                app.prompt.agents_asked = None;
             }
             Err(e) => app.error(&format!("cannot read the completion list: {e}")),
         });
@@ -322,6 +324,16 @@ impl App {
 
     /// `/agents`: the agents here and on the session sources, and stop, cancel, message or attach one.
     pub(super) fn agents_cmd(&mut self, arg: &str) {
+        self.manage_agents(arg, false);
+    }
+
+    /// `/remote`: the agents the session sources list, the same actions on them, and `new` to start one.
+    pub(super) fn remote_cmd(&mut self, arg: &str) {
+        self.manage_agents(arg, true);
+    }
+
+    fn manage_agents(&mut self, arg: &str, remote: bool) {
+        let cmd = if remote { "/remote" } else { "/agents" };
         let arg = arg.trim();
         let (verb, rest) = arg.split_once(char::is_whitespace).map_or((arg, ""), |(v, r)| (v, r.trim()));
         let one_word = |s: &str| !s.is_empty() && !s.contains(char::is_whitespace);
@@ -332,28 +344,99 @@ impl App {
             ("attach", id) if one_word(id) => ("attach", id.into(), String::new()),
             ("notify", r) => match r.split_once(char::is_whitespace) {
                 Some((id, t)) if !t.trim().is_empty() => ("notify", id.into(), t.trim().into()),
-                _ => return self.error("usage: /agents notify <id> <text>"),
+                _ => return self.error(&format!("usage: {cmd} notify <id> <text>")),
             },
+            ("new", r) if remote => match r.split_whitespace().next() {
+                Some(name) => ("new", name.into(), r[name.len()..].trim().into()),
+                None => return self.error("usage: /remote new <remote> [args…]"),
+            },
+            _ if remote => {
+                return self.error("usage: /remote [stop|cancel|notify|attach <id> [text] | new <remote> [args…]]");
+            }
             _ => return self.error("usage: /agents [stop|cancel|notify|attach <id> [text]]"),
         };
         self.host_call(sessions::LIVE_SESSIONS, &LiveArgs::default(), move |app, r: Result<Live, String>| {
-            let rows: Vec<LiveRow> = match r {
-                Ok(l) => l.rows.into_iter().filter(|r| r.live.kind.as_deref() == Some("agent")).collect(),
+            let (rows, targets): (Vec<LiveRow>, Vec<String>) = match r {
+                Ok(l) => (l.rows.into_iter().filter(|r| is_listed(r, remote)).collect(), l.targets),
                 Err(e) => return app.error(&format!("cannot list the agents: {e}")),
             };
-            if verb == "list" {
-                return app.list_agents(&rows);
-            }
-            match pick_agent(&rows, &id) {
-                Ok(row) => app.act_on_agent(verb, row, text),
-                Err(e) => app.error(&e),
+            match verb {
+                "list" => app.list_agents(&rows, remote.then_some(targets.as_slice())),
+                "new" => app.new_remote_agent(&targets, &id, &text),
+                _ => match pick_agent(&rows, &id) {
+                    Ok(row) => app.act_on_agent(verb, row, text),
+                    Err(e) => app.error(&e),
+                },
             }
         });
     }
 
-    fn list_agents(&mut self, rows: &[LiveRow]) {
+    /// Offers the agents of `live` as the ids `/agents` and `/remote` complete (and the remotes `/remote new`
+    /// does), each with where it runs, its state, age, directory and title.
+    pub(super) fn set_agent_choices(&mut self, live: Live) {
+        for (name, remote) in [("agents", false), ("remote", true)] {
+            let rows: Vec<&LiveRow> = live.rows.iter().filter(|r| is_listed(r, remote)).collect();
+            let ids: Vec<String> = rows.iter().map(|r| r.agent_id()).collect();
+            let items: Vec<String> = rows
+                .iter()
+                .zip(&ids)
+                .map(|(r, id)| {
+                    let shared = ids.iter().filter(|j| *j == id).count() > 1;
+                    if shared { format!("{}:{id}", r.host_label()) } else { id.clone() }
+                })
+                .collect();
+            let descs: Vec<String> = rows.iter().map(|r| agent_detail(r)).collect();
+            let mut sub: Vec<SubArgs> = ["stop", "cancel", "notify", "attach"]
+                .map(|arg| SubArgs { arg: arg.into(), items: items.clone(), descs: descs.clone() })
+                .into();
+            if remote {
+                let descs = live.targets.iter().map(|_| "start an agent here".to_string()).collect();
+                sub.push(SubArgs { arg: "new".into(), items: live.targets.clone(), descs });
+            }
+            if let Some(e) = self.prompt.commands.iter_mut().find(|e| e.name == name) {
+                e.sub = sub;
+            }
+        }
+        self.prompt.composer.refresh(&self.prompt.commands);
+        self.screen.dirty = true;
+    }
+
+    /// Starts an agent on remote `name` (its source's `new` command gets `args` appended) and attaches to it.
+    fn new_remote_agent(&mut self, targets: &[String], name: &str, args: &str) {
+        if !targets.iter().any(|t| t == name) {
+            let known = if targets.is_empty() { "none".to_string() } else { targets.join(", ") };
+            return self.error(&format!("no remote `{name}` can start an agent (remotes that can: {known})"));
+        }
+        self.notice(&format!("starting an agent on {name}…"));
+        let call =
+            sessions::NewAgentArgs { remote: name.into(), args: args.split_whitespace().map(String::from).collect() };
+        self.host_call(sessions::NEW_AGENT, &call, |app, r: Result<LiveRow, String>| match r {
+            Err(e) => app.error(&format!("cannot start an agent: {e}")),
+            Ok(row) => match row.attach.clone() {
+                Some(command) => app.attach_session(AttachTarget {
+                    command,
+                    helper: row.helper.clone(),
+                    state_key: row.state_key.clone(),
+                }),
+                None => {
+                    let hint = row.hint.as_deref().map(|h| format!(": {h}")).unwrap_or_default();
+                    app.notice(&format!("started {} on {}{hint}", row.agent_id(), row.host_label()));
+                }
+            },
+        });
+    }
+
+    /// `remote` is the remotes that can start an agent, when the list is `/remote`'s.
+    fn list_agents(&mut self, rows: &[LiveRow], remote: Option<&[String]>) {
+        let starts = remote.map(|t| match t {
+            [] => "no remote offers to start an agent".to_string(),
+            t => format!("/remote new <remote> [args…] starts an agent on {}", t.join(", ")),
+        });
         if rows.is_empty() {
-            return self.notice("no agents are running here or on your session sources");
+            return match starts {
+                Some(s) => self.notice(&format!("no agents on your remotes; {s}")),
+                None => self.notice("no agents are running here or on your session sources"),
+            };
         }
         let mut out: Vec<String> = rows
             .iter()
@@ -374,10 +457,20 @@ impl App {
                     keys.push("attach");
                 }
                 let title = r.title.as_deref().unwrap_or_default();
-                format!("{}  {}  {state}  {client}  {title}  [{}]", r.host_label(), r.agent_id(), keys.join(" "))
+                let when = Some(started_ago(r)).filter(|a| !a.is_empty()).unwrap_or_else(|| "-".into());
+                let cwd = r.live.cwd.as_ref().map_or_else(|| "-".to_string(), |c| c.display().to_string());
+                format!(
+                    "{}  {}  {state}  {client}  {when}  {cwd}  {title}  [{}]",
+                    r.host_label(),
+                    r.agent_id(),
+                    keys.join(" ")
+                )
             })
             .collect();
-        out.push("/agents stop|cancel|notify|attach <id>; the Sessions tab (/jobs, Tab) does the same".into());
+        out.push(match starts {
+            Some(s) => format!("/remote stop|cancel|notify|attach <id>; {s}"),
+            None => "/agents stop|cancel|notify|attach <id>; the Sessions tab (/jobs, Tab) does the same".into(),
+        });
         self.notice(&out.join("\n"));
     }
 
@@ -507,6 +600,32 @@ impl App {
         }
         self.notice(&out.join("\n"));
     }
+}
+
+/// Whether `/agents` (every agent) or `/remote` (those on other machines) lists the row.
+fn is_listed(r: &LiveRow, remote: bool) -> bool {
+    r.live.kind.as_deref() == Some("agent") && (!remote || r.host.is_some())
+}
+
+/// How long ago the agent started, from its record's timestamp; empty when that does not read.
+fn started_ago(r: &LiveRow) -> String {
+    r.live.started.parse::<jiff::Timestamp>().map(|t| super::pickers::ago(t.into())).unwrap_or_default()
+}
+
+/// Where the agent runs and what it is doing, for the list and the completion menu: host, state, who is
+/// attached, age, directory and title, leaving out what is empty.
+fn agent_detail(r: &LiveRow) -> String {
+    let state = if r.live.locked {
+        "locked"
+    } else if r.live.waiting {
+        "waiting"
+    } else {
+        ""
+    };
+    let client = r.live.client.as_ref().map(|c| format!("@{}", c.host)).unwrap_or_default();
+    let cwd = r.live.cwd.as_ref().map(|c| c.display().to_string()).unwrap_or_default();
+    let parts = [r.host_label(), state, &client, &started_ago(r), &cwd, r.title.as_deref().unwrap_or_default()];
+    parts.iter().filter(|p| !p.is_empty()).copied().collect::<Vec<_>>().join(" · ")
 }
 
 /// The agent `arg` names: a prefix of its id, or `HOST:PREFIX` (`here` is this host).
