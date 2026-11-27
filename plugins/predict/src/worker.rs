@@ -4,7 +4,6 @@
 
 use crate::engine::State;
 use pi_predict::Predictor;
-use serde_json::json;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -15,6 +14,8 @@ const WAITING_MAX: usize = 256;
 
 pub enum Job {
     Complete {
+        /// Who asked: a newer request overtakes only that client's older ones.
+        client: String,
         text: String,
         cwd: String,
         assistant: String,
@@ -93,9 +94,14 @@ impl<J> Mailbox<J> {
     }
 }
 
-/// Queues a ghost request, answering any older ghost request still waiting in the queue with no ghost.
+/// Queues a ghost request, answering any older ghost request of the same client still waiting in the queue
+/// with no ghost.
 pub fn queue_complete(mb: &Mailbox<Job>, job: Job) {
-    for old in mb.push_superseding(job, |j| matches!(j, Job::Complete { .. })) {
+    let who = match &job {
+        Job::Complete { client, .. } => client.clone(),
+        _ => String::new(),
+    };
+    for old in mb.push_superseding(job, |j| matches!(j, Job::Complete { client, .. } if *client == who)) {
         old.supersede();
     }
 }
@@ -116,7 +122,7 @@ pub fn run(mb: Arc<Mailbox<Job>>, mut st: State, loading: bool, state_dir: PathB
             None => mb.pop(),
         };
         match job {
-            Job::Complete { text, cwd, assistant, threshold, reply } => {
+            Job::Complete { text, cwd, assistant, threshold, reply, .. } => {
                 let _ = reply.send(st.complete(&text, &cwd, &assistant, threshold));
             }
             Job::Observe { text, cwd } => {
@@ -135,8 +141,7 @@ pub fn run(mb: Arc<Mailbox<Job>>, mut st: State, loading: bool, state_dir: PathB
             }
             Job::Attach(Err(why)) => {
                 waiting = None;
-                let note = crate::smollm::fallback_notice(&format!("SmolLM failed to load ({why})"));
-                mu_common::rpc::notify("ui/notify", json!({ "level": "warn", "message": note }));
+                crate::notice::warn(crate::smollm::fallback_notice(&format!("SmolLM failed to load ({why})")));
             }
             Job::Shutdown(reply) => {
                 if let Err(e) = st.persist() {
@@ -156,10 +161,40 @@ mod tests {
     use std::time::Duration;
 
     fn complete(text: &str) -> (Job, oneshot::Receiver<String>) {
+        complete_for("", text)
+    }
+
+    fn complete_for(client: &str, text: &str) -> (Job, oneshot::Receiver<String>) {
         let (reply, rx) = oneshot::channel();
-        let job =
-            Job::Complete { text: text.into(), cwd: String::new(), assistant: String::new(), threshold: 0.3, reply };
+        let job = Job::Complete {
+            client: client.into(),
+            text: text.into(),
+            cwd: String::new(),
+            assistant: String::new(),
+            threshold: 0.3,
+            reply,
+        };
         (job, rx)
+    }
+
+    #[test]
+    fn a_client_overtakes_only_its_own_requests() {
+        let mb: Mailbox<Job> = Mailbox::default();
+        let (a1, mut r_a1) = complete_for("a", "a1");
+        let (b1, mut r_b1) = complete_for("b", "b1");
+        let (a2, _r_a2) = complete_for("a", "a2");
+        queue_complete(&mb, a1);
+        queue_complete(&mb, b1);
+        queue_complete(&mb, a2);
+        assert_eq!(r_a1.try_recv().unwrap(), "", "a's older request was overtaken by a's newer one");
+        assert!(r_b1.try_recv().is_err(), "b's request is still queued, not answered");
+        let texts: Vec<String> = (0..2)
+            .map(|_| match mb.pop() {
+                Job::Complete { text, .. } => text,
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(texts, ["b1", "a2"]);
     }
 
     /// A worker whose fake engine blocks on `release` for each ghost; it reports each computation on `started`.

@@ -8,7 +8,8 @@ use std::path::Path;
 const BEFORE_LIMIT: usize = 2000;
 
 pub struct State {
-    ngram: Box<dyn Predictor>,
+    /// The word engine until SmolLM attaches; dropped then, to free its table (tens of MB).
+    ngram: Option<Box<dyn Predictor>>,
     /// The word engine when SmolLM is selected and loaded; replaces the n-gram for word ghosts.
     smollm: Option<Box<dyn Predictor>>,
     /// cwd -> prompt -> times submitted.
@@ -20,7 +21,7 @@ impl State {
         // The model is rebuilt from the corpus on every start and never persisted.
         let cfg = Config { state_dir: state_dir.to_owned(), model_dir: None, show_threshold: Some(0.0) };
         let ngram = pi_predict::ngram::open(&cfg).map_err(|e| e.to_string())?;
-        Ok(Self { ngram, smollm: None, lines: HashMap::new() })
+        Ok(Self { ngram: Some(ngram), smollm: None, lines: HashMap::new() })
     }
 
     pub fn observe(&mut self, text: &str, cwd: &str) {
@@ -29,7 +30,9 @@ impl State {
 
     /// Feeds the n-gram once and counts the prompt `n` times for whole-prompt ghosts.
     pub fn observe_n(&mut self, text: &str, cwd: &str, n: u32) {
-        self.ngram.observe(text);
+        if let Some(p) = self.ngram.as_mut() {
+            p.observe(text);
+        }
         if let Some(p) = self.smollm.as_mut() {
             p.observe(text);
         }
@@ -68,9 +71,10 @@ impl State {
     pub fn word_suggestion(&mut self, text: &str) -> Option<Suggestion> {
         let (before, prefix) = split_word(text)?;
         let q = Query { before, prefix };
-        match self.smollm.as_mut() {
-            Some(p) => p.complete(&q),
-            None => self.ngram.complete(&q),
+        match (self.smollm.as_mut(), self.ngram.as_mut()) {
+            (Some(p), _) => p.complete(&q),
+            (None, Some(p)) => p.complete(&q),
+            (None, None) => None,
         }
     }
 
@@ -91,6 +95,7 @@ impl State {
             p.observe(prompt);
         }
         self.smollm = Some(p);
+        self.ngram = None;
     }
 
     /// Saves the state an engine keeps across runs (SmolLM's recent prompts). The n-gram is rebuilt from history.
@@ -199,6 +204,19 @@ mod tests {
     fn state() -> State {
         let dir = std::env::temp_dir().join(format!("mu-predict-test-{}", std::process::id()));
         State::open(&dir).unwrap()
+    }
+
+    #[test]
+    fn attaching_smollm_drops_the_ngram() {
+        let mut s = state();
+        s.observe("commit and push", "/x");
+        s.observe("commit and push", "/x");
+        assert!(s.ngram.is_some());
+        s.attach_smollm(Box::new(Fake), &[]);
+        assert!(s.ngram.is_none());
+        s.observe("commit and push", "/x");
+        assert_eq!(s.complete("comm", "/x", "", 0.3), "it and push", "line ghosts do not need the n-gram");
+        assert_eq!(s.complete("fix the pa", "/x", "", 0.3), "XYZ");
     }
 
     #[test]
