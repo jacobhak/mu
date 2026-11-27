@@ -197,7 +197,9 @@ The transcript behaves like a read-only editor buffer, as Delta's does. A text c
 - The exact motions and their keys, which are settled with the palette in section 6.
 - Whether a quote can be anchored to its place in the transcript (Delta's comments) rather than copied into the composer as text.
 
-## 3. Requests that need you (draft)
+## 3. Requests that need you (agreed)
+
+**Where the TUI already has an interaction, the app does the same thing.** It is drawn better, but has the same steps, the same keys (the `select`, `overlay` and `review` contexts in `docs/keys.md`) and the same results. The app departs from the TUI only for a reason that comes from being a GUI.
 
 What the agent can ask for:
 
@@ -211,84 +213,70 @@ What the agent can ask for:
   - Some actions continue with a chosen model.
 - **Web search setup,** and an interactive `bash` (declined in v1).
 
-### 3a. Approval, in the session that asks
+### 3a. Where a request sits
 
 ```
 │┃  $ cargo test -p mu --test agent reconnect          ✓ 0 · 41s      │
-│┃                                                                     │
-│┃  ┏ Run this command? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
-│┃  ┃ bash · not covered by your rules (mode: ask)                  ┃ │
-│┃  ┃ from subagent CheckMacOS                                       ┃ │
-│┃  ┃ ┌────────────────────────────────────────────────────────────┐ ┃ │
-│┃  ┃ │ git push origin HEAD:refs/heads/fix/attach-reconnect       │ ┃ │
-│┃  ┃ └────────────────────────────────────────────────────────────┘ ┃ │
-│┃  ┃  [y] Run once                                                  ┃ │
-│┃  ┃  [s] Always run `git push *` in this session                   ┃ │
-│┃  ┃  [p] Always run `git push *` in this project                   ┃ │
-│┃  ┃  [m] Run once on @slow  ▾                                      ┃ │
-│┃  ┃  [n] Don't run          [Tab] add a note                       ┃ │
-│┃  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
-│┃──────────────────────────────────────────────────────────────────── │
+│┃  (the transcript scrolls freely above the dock)                     │
+│┃━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
+│┃  bash: git push origin HEAD:refs/heads/fix/attach-reconnect          │
+│┃  from CheckMacOS                                                     │
+│┃  not covered by your rules (mode: ask)                               │
+│┃  ┌────────────────────────────────────────────────────────────────┐ │
+│┃  │ git push origin HEAD:refs/heads/fix/attach-reconnect           │ │
+│┃  └────────────────────────────────────────────────────────────────┘ │
+│┃ ▸ 1  Yes, just this once                                            │
+│┃   2  For what it asked for      git push origin HEAD:refs/heads/…   │
+│┃   3  For git push               git push *                          │
+│┃   4  No                                                             │
+│┃  y yes · n no · 1–4 pick · e type a pattern · Enter choose ·        │
+│┃  Tab/→ note · Esc cancel                                            │
+│┃━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
 │┃  Message mu — the agent waits for your answer above                 │
+│┃  opus-5 · high · ask    41%  $3.10                                ■ │
 ```
 
-- **The card sits at the live end of the transcript**, never in a modal.
-  - You can still scroll and search the transcript while it waits.
-  - It takes the keyboard when its session's tile is focused.
-- **Buttons are verbs, and scopes are named precisely:** "Always run `git push *` in this project", not "Yes, don't ask again". The patterns come from the request's grant.
-- **Once answered,** the card folds to one line in the transcript, saying who answered from where: "✓ Ran once · answered on devbox". Another connection that answered first closes it the same way.
+- **A request is docked between the transcript and the composer** until it is answered. The transcript scrolls freely above it.
+- **It takes the keyboard when its session's tile is focused,** as the TUI's dialog does.
+- **The TUI's steps, rows and hints** (`ApproveState`, `crates/mu-tui/src/widgets/overlay.rs`):
+  1. **How much to allow:** yes this once, each model choice, each width the grant offers ("what it asked for", then wider ones), or no. `e` types a pattern instead.
+  2. **Where to remember a width:** this session, this project, everywhere, or no.
+- **Choices are picked by the TUI's row shortcuts** (`y`, `n`, digits), or by arrows and Enter. The shortcuts are not rebindable, as in the TUI.
+- **Any change to labels or steps** (the survey's case for verb labels, for instance) is made in the shared dialog model, so both UIs get it.
+- **Once answered,** the dock closes and the answer becomes one line in the transcript, saying who answered from where: "✓ Ran once · answered on devbox". If another connection answered first, the dock closes the same way.
+- **Several requests are queued, as in the TUI:** the dock shows one at a time.
 
 ### 3b. Questions
 
 ```
-│┃  ┏ Desktop app · question 2 of 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
-│┃  ┃ The agent accepts one client today; a cockpit needs more.     ┃ │
-│┃  ┃ How does a connection become an observer?                      ┃ │
-│┃  ┃                                                                ┃ │
-│┃  ┃  1 ● Role in hello  (recommended)    ┌ preview ──────────────┐ ┃ │
-│┃  ┃      Explicit; old semantics kept    │ {"hello":{"role":     │ ┃ │
-│┃  ┃  2 ○ Observer by default             │   "observe", …}}      │ ┃ │
-│┃  ┃      Busy disappears                 └───────────────────────┘ ┃ │
-│┃  ┃  3 ○ Something else…                                           ┃ │
-│┃  ┃                                                                ┃ │
-│┃  ┃  [Enter] answer   [Tab] note   [←/→] question   [s] skip       ┃ │
-│┃  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
+│┃━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
+│┃  Desktop app · question 2 of 3                                      │
+│┃  The agent accepts one client today; a cockpit needs more.          │
+│┃  How does a connection become an observer?                          │
+│┃                                                                     │
+│┃ ▸ 1  Role in hello  (recommended)       ┌ preview ────────────────┐ │
+│┃      Explicit; old semantics kept       │ {"hello":{"role":       │ │
+│┃   2  Observer by default                │   "observe", …}}        │ │
+│┃      Busy disappears                    └─────────────────────────┘ │
+│┃   3  Something else…                                                │
+│┃━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
 ```
 
-- **One card holds the whole batch.** ←/→ move between the questions, and answers are kept until the last one is sent.
-- **Context reads first, dimmed; the question is the strongest line.**
+- **The same steps as the TUI's ask dialog:** one question after another, then a final review, with `back` to the previous step. It also has the same note, skip and free-text rows.
+- **Context reads first, dimmed, and the question is the strongest line.**
 - **An option with a preview** shows it beside the list while it is highlighted.
 
 ### 3c. Document review (a plan)
 
-```
-┌───────────────────────────────────────────┬────────────────────────────────────────────┐
-│┃ (session transcript)                     │ Plan review · Desktop app design      📌   │
-│┃                                          │                                            │
-│┃  ┏ Plan ready for review ━━━━━━━━━━━━━┓  │ # Observers                                │
-│┃  ┃ Observers in the agent  (42 lines) ┃  │                                            │
-│┃  ┃ opened beside →        [o] focus   ┃  │ 1. Hello carries `role` …                  │
-│┃  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  │ 2. …                                       │
-│┃                                          │                                            │
-│┃                                          │────────────────────────────────────────────│
-│┃                                          │ [x] Execute  [k] Keep context  [c] Compact │
-│┃                                          │ [r] Refine…  [p] Park           on opus-5 ▾│
-└───────────────────────────────────────────┴────────────────────────────────────────────┘
-```
-
-- **A document is too big for a card,** so it opens in a tile beside the session: a review view, pinned to that session.
-- **The card in the transcript names it and links to it.** The actions sit at the bottom of the document's tile, with the "continue with" model where the mode offers it.
+- **The same dialog as the TUI's review**, in the same dock: the document above, then the actions and the "continue with" model slider.
+  - The keys are the TUI's `review` context: Tab between the document and the actions, `c` to copy, Ctrl+G to edit, `n` for a note.
+  - The dock grows to hold the document, up to most of the tile's height. The transcript keeps at least a few lines above it.
+- **What a GUI adds:** the document renders as real markdown in proportional type, and `o` opens it in a tile of its own when you want more room. Deciding still happens in the dock.
 
 ### 3d. A request from an agent you are not looking at
 
 - **It shows only as `⚑`** on the agent's row in the list, and on the title of its tab if one shows it. The OS notification follows the `[notify]` rules.
 - **A key jumps to the oldest request waiting on you,** in any session; pressed again, it goes to the next.
-  - If a tile already shows that session, focus moves there.
-  - If not, the session opens in the focused tile, and the key back returns to what was there.
-
-### Questions for this section
-
-- Where the card sits: at the live end of the transcript, or docked above the composer so it stays in view while you scroll back.
-- Whether a document review opens its tile by itself, or waits for `o`.
-- What the jump key does when no tile shows the session: replace the focused tile's view, or open a new tile.
-- How choices are picked: letters as drafted, digits, or arrows and Enter only.
+  - The session opens in a floating panel over the layout: its transcript, with the request docked at the bottom. The tiles underneath do not change.
+  - Once you have answered, Esc closes the panel; it also closes by itself when nothing else waits in that session. `o` instead puts the session in the focused tile.
+- **If a tile already shows that session,** the panel still opens, so the jump always behaves the same. That tile shows the answered request as soon as you answer.

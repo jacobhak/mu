@@ -7,6 +7,7 @@ A native desktop app for mu, with no web engine or runtime. It is a cockpit for 
 ## Scope and relation to the TUI
 
 - **Both UIs are first-class.** A feature lands in the TUI and the app. The TUI stays what you use over ssh and on machines without a display.
+- **Where the TUI already has an interaction, the app does the same thing:** the same steps, keys and results, drawn better. The app departs from the TUI only for a reason that comes from being a GUI, and a change to an interaction is made in the shared model, so both UIs get it.
 - **Parity comes from shared code, extracted incrementally.** Each TUI subsystem moves into a shared crate when the app needs it; until it has moved, the app lacks it. See [Shared crate](#shared-crate).
 
 ## Framework, packaging, CI
