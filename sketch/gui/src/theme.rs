@@ -25,6 +25,11 @@ pub struct TypeScale {
     pub code_lh: f32,
 }
 
+/// Minimum contrast of the text roles against the surfaces they sit on (WCAG AAA body, AA, and AA for dim text).
+const FLOOR_TEXT: f64 = 11.0;
+const FLOOR_MUTED: f64 = 7.0;
+const FLOOR_FAINT: f64 = 4.5;
+
 pub const SCALES: [TypeScale; 2] = [
     TypeScale { name: "16/14", prose: 16.0, ui: 14.0, code: 13.0, small: 12.0, prose_lh: 1.55, code_lh: 1.45 },
     TypeScale { name: "17/15", prose: 17.0, ui: 15.0, code: 14.0, small: 13.0, prose_lh: 1.55, code_lh: 1.45 },
@@ -211,14 +216,29 @@ impl Theme {
             pal.rgb.get("raised").copied().unwrap_or_else(|| if dark { mix(bg, fg, 8) } else { mix(bg, (255, 255, 255), 60) }),
         );
         let chrome = pal.rgb.get("chrome").copied().unwrap_or_else(|| if dark { mix(bg, (0, 0, 0), 45) } else { mix(bg, fg, 11) });
+        // The TUI's text roles, lifted until they clear a contrast floor on every surface they sit on. Glyphs at
+        // 12-14 px in a proportional face look thinner than a terminal's, so the TUI's own floor (2.4 for faint
+        // text) is too low here.
+        let hi = pal.get("bright_foreground");
+        let surfaces = [window, bar, raised, pal.get("dark_background")];
+        let lift = |mut c: Rgb, min: f64| {
+            for _ in 0..24 {
+                if surfaces.iter().all(|s| contrast(c, *s) >= min) {
+                    break;
+                }
+                c = mix(c, hi, 8);
+            }
+            c
+        };
+        let (text, muted, faint) = (lift(fg, FLOOR_TEXT), lift(mix(fg, bg, 35), FLOOR_MUTED), lift(pal.get("dark_foreground"), FLOOR_FAINT));
         Self {
             name,
             dark,
             ty,
             strong: h(pal.get("bright_foreground")),
-            muted: h(mix(fg, bg, 35)),
-            faint: h(pal.get("dark_foreground")),
-            thinking: h(pal.get("dark_foreground")),
+            muted: h(muted),
+            faint: h(faint),
+            thinking: h(faint),
             line: h(mix(bg, fg, 22)),
             line_faint: h(mix(bg, fg, 13)),
             surface: h(pal.get("dark_background")),
@@ -236,9 +256,9 @@ impl Theme {
             syn_string: h(green),
             syn_number: h(pal.get("orange")),
             syn_type: h(pal.get("bright_cyan")),
-            syn_comment: h(pal.get("dark_foreground")),
+            syn_comment: h(faint),
             syn_punct: h(mix(fg, bg, 20)),
-            text: h(fg),
+            text: h(text),
             chrome: h(chrome),
             window: h(window),
             bar: h(bar),

@@ -9,8 +9,6 @@ use gpui::{AnyElement, FontWeight, div, px, relative};
 /// Space between consecutive blocks: tight between one-line rows, open around prose, diffs and groups.
 const ROW_GAP: f32 = 3.0;
 const BLOCK_GAP: f32 = 14.0;
-/// Prose stops at this many prose-size ems so lines stay readable in a wide tile.
-const PROSE_MEASURE_EM: f32 = 50.0;
 /// Column widths of the tool and subagent rows, in code-size ems.
 const ICON_W: f32 = 1.7;
 const VERB_EM: f32 = 4.4;
@@ -22,7 +20,7 @@ const SPINNER: &str = "⠋";
 /// The session's transcript as a scrollable column: blocks in order, "↓ new output" when `new_output`.
 pub fn view(c: &ViewCtx) -> AnyElement {
     let (t, s) = (c.t, c.s());
-    let mut col = ui(t).flex().flex_col().w_full().px(px(metrics::PAD + 4.)).py(px(metrics::PAD));
+    let mut col = ui(t).flex().flex_col().w_full().px(px(metrics::PAD)).py(px(metrics::PAD));
     let mut prev: Option<&Block> = None;
     for b in &s.blocks {
         let top = prev.map_or(0.0, |p| if row_like(p) && row_like(b) { ROW_GAP } else { BLOCK_GAP });
@@ -35,7 +33,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
     div()
         .size_full()
         .relative()
-        .child(div().id(("transcript-scroll", c.session)).size_full().overflow_y_scroll().child(col))
+        .child(div().id(("transcript-scroll", c.session)).size_full().overflow_y_scroll().child(super::column(t, col)))
         .when(s.new_output, |d| {
             d.child(
                 div().absolute().bottom_3().left_0().right_0().flex().justify_center().child(
@@ -73,10 +71,7 @@ fn block(t: &Theme, b: &Block) -> AnyElement {
         Block::Woken { text } => line(t, "✦", t.accent, t.muted, *text).italic().into_any_element(),
         Block::Thinking { time, live } => thinking(t, *time, *live).into_any_element(),
         Block::Tool(tool) => tool_row(t, tool).into_any_element(),
-        Block::Prose(md) => div()
-            .max_w(px(t.ty.prose * PROSE_MEASURE_EM))
-            .child(markdown::render(t, md))
-            .into_any_element(),
+        Block::Prose(md) => div().child(markdown::render(t, md)).into_any_element(),
         Block::Diff(d) => diff_block(t, d).into_any_element(),
         Block::Bash(b) => bash(t, b).into_any_element(),
         Block::Subagents(subs) => subagents(t, subs).into_any_element(),

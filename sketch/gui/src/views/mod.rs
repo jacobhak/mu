@@ -34,6 +34,16 @@ impl ViewCtx<'_> {
     }
 }
 
+/// The widest a session's content column grows, in prose-size ems. Everything in a session (transcript, dock,
+/// queue, composer, session bar) shares it, so their edges line up.
+const COLUMN_EM: f32 = 52.0;
+
+/// `child` in the session's content column: full width up to `COLUMN_EM`, then centred in its parent.
+pub fn column(t: &Theme, child: impl gpui::IntoElement) -> Div {
+    use gpui::{ParentElement as _, Styled as _};
+    div().w_full().flex().justify_center().child(div().w_full().min_w_0().max_w(px(t.ty.prose * COLUMN_EM)).child(child))
+}
+
 /// A box in interface type: Plex Sans at the UI size, in the palette's text colour.
 pub fn ui(t: &Theme) -> Div {
     div().font_family(SANS).text_size(px(t.ty.ui)).text_color(t.text)

@@ -573,7 +573,7 @@ fn rest_blocks() -> Vec<Block> {
             text: "make attach reconnect without asking when the client id is the same, and add a test",
             image: Some("image 1"),
         },
-        Block::Thinking { time: "Thought for 14s", live: None },
+        Block::Thinking { time: "14s", live: None },
         tool(ToolKind::Read, "Read", "src/run/serve.rs", "L340-400"),
         tool(ToolKind::Read, "Read", "src/run/attach.rs", "142 lines"),
         tool(ToolKind::Grep, "Grep", "`reconnect` in src/", "6 matches"),
