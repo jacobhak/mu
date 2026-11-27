@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::chat::composer::Action;
+use crate::host::gateway_login::LoginRow;
 use crate::host::keys::{KeyFacts, KeyInfo, LogoutList, TargetKind};
 use crate::keymap;
 use crate::term::clipboard;
@@ -513,7 +514,15 @@ impl App {
             let add =
                 Item { label: "+ Add a custom endpoint…".into(), detail: "guided: address, key, models".into() };
             rows.push((add, LoginTarget::CustomProvider(None)));
-            then(app, rows);
+            // The gateway's sign-ins run a program on this terminal, so only a local host offers them.
+            if app.host.is_remote() {
+                return then(app, rows);
+            }
+            app.host_call(host::gateway_login::GATEWAY_LOGINS, &(), move |app, gw: Result<Vec<LoginRow>, String>| {
+                let gw = super::gateway_login::login_items(gw.unwrap_or_default());
+                rows.splice(1..1, gw);
+                then(app, rows);
+            });
         });
     }
 
@@ -1493,7 +1502,9 @@ pub(super) mod tests {
         in_local(async {
             app.show_login();
             assert!(app.overlay.is_none());
-            pump(&mut app, &mut rx).await;
+            pump(&mut app, &mut rx).await; // key_rows
+            assert!(app.overlay.is_none(), "the gateway's sign-ins are asked for before the list opens");
+            pump(&mut app, &mut rx).await; // gateway_logins
             let Some(Overlay::Login { pick }) = &app.overlay else { panic!("no login list") };
             let labels: Vec<&LoginTarget> = pick.values().iter().collect();
             assert!(labels.contains(&&LoginTarget::ChatGpt));

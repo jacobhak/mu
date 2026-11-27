@@ -201,7 +201,9 @@ fi
 if [ "$link" = 1 ]; then
   mkdir -p "$HOME/.local/bin"
   ln -sfn "$home/bin/mu" "$HOME/.local/bin/mu"
-  [ ! -e "$home/bin/mu-remote" ] || ln -sfn "$home/bin/mu-remote" "$HOME/.local/bin/mu-remote"
+  for b in mu-remote mu-gateway; do
+    [ ! -e "$home/bin/$b" ] || ln -sfn "$home/bin/$b" "$HOME/.local/bin/$b"
+  done
   other="$(command -v mu || true)"
   if [ -n "$other" ] && [ "$(resolved_path "$other")" != "$(resolved_path "$HOME/.local/bin/mu")" ]; then
     echo "another mu shadows ~/.local/bin/mu: $other" >&2

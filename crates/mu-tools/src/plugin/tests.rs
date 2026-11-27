@@ -668,6 +668,10 @@ fn gateway_plugin(dir: &std::path::Path, name: &str, provider: Option<&str>) -> 
     *'"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
     *'"shutdown"'*) exit 0 ;;
     *'"provider/endpoint"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"baseUrl":"http://{name}/","token":"t"}}}}\n' "$id" ;;
+    *'"provider/logins"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"providers":[{{"id":"anthropic","label":"Claude ({name})"}},{{"id":null,"label":"Other"}},{{"label":""}}]}}}}\n' "$id" ;;
+    *'"provider/login"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"command":["{name}-login","x"],"env":{{"K":"v","N":3}}}}}}\n' "$id" ;;
+    *'"provider/login_done"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"provider/'*) printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"method not found: x"}}}}\n' "$id" ;;
   esac
 done
 "#
@@ -732,6 +736,58 @@ fn a_configured_plugin_without_a_gateway_provider_is_rejected() {
         let (h, dir) = gateway_host(Some("other"), &[("gw-a", Some("gateway")), ("other", None)]);
         let e = h.provider_endpoint("gateway").await.unwrap_err();
         assert!(e.contains("no gateway") && e.contains("`other`") && e.contains("provider"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn the_gateway_plugin_lists_its_logins_and_names_the_program_that_signs_in() {
+    run(async {
+        let (h, dir) = gateway_host(None, &[("tools", None), ("gw-a", Some("gateway"))]);
+        let logins = h.gateway_logins().await.unwrap();
+        let got: Vec<(Option<&str>, &str)> = logins.iter().map(|l| (l.id.as_deref(), l.label.as_str())).collect();
+        assert_eq!(got, [(Some("anthropic"), "Claude (gw-a)"), (None, "Other")], "rows without a label are dropped");
+        let cmd = h.gateway_login(Some("anthropic")).await.unwrap();
+        assert_eq!(cmd.argv, ["gw-a-login", "x"]);
+        assert_eq!(cmd.env, [("K".to_string(), "v".to_string())], "only string values are environment");
+        h.gateway_login_done().await.unwrap();
+        h.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn no_gateway_plugin_means_no_logins_and_a_login_that_says_why() {
+    run(async {
+        let (h, dir) = gateway_host(None, &[("tools", None)]);
+        assert_eq!(h.gateway_logins().await.unwrap(), vec![]);
+        let e = h.gateway_login(None).await.unwrap_err();
+        assert!(e.contains("no gateway"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn a_gateway_plugin_that_predates_logins_offers_none() {
+    run(async {
+        let dir = hook_dir();
+        let m = gateway_plugin(&dir, "old", Some("gateway"));
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"shutdown"'*) exit 0 ;;
+    *) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found: x"}}\n' "$id" ;;
+  esac
+done
+"#;
+        std::fs::write(dir.join("old.sh"), script).unwrap();
+        let (ntx, _nrx) = mpsc::unbounded_channel();
+        let h = PluginHost::new(vec![m], vec![], ntx, Default::default());
+        assert_eq!(h.gateway_logins().await.unwrap(), vec![]);
+        assert_eq!(h.gateway_login(None).await.unwrap_err(), "the gateway plugin has no sign-in");
+        h.gateway_login_done().await.unwrap();
+        h.shutdown_all().await;
         let _ = std::fs::remove_dir_all(dir);
     });
 }

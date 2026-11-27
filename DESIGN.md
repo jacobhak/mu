@@ -193,10 +193,13 @@ All omp features outside the core become first-party plugins that load on use.
   (returns `{baseUrl, token}`, or `null` when `start` is false and nothing runs), `provider/prices {}` (the
   price list), and a base URL that serves Anthropic Messages at `/v1/messages`, `/v1/models` and `/v1/usage`
   (see `docs/providers.md`). The core speaks one wire protocol, Anthropic Messages, to it and holds no
-  credentials for those providers. The core never runs omp or pi. The omp-wrapping implementation (`plugins/gateway`), its lifecycle, state
+  credentials for those providers. The core never runs omp or pi by name. For `/login` the plugin
+  optionally serves `provider/logins`, `provider/login` and `provider/login_done`: it names the sign-in program
+  (and the environment it needs), the core runs whatever that is on its terminal, and the plugin seals what it
+  wrote afterwards. The omp-wrapping implementation (`plugins/gateway`), its lifecycle, state
   layout, idle memory (about 275 MB total, 199 MB private; `BENCHMARKS.md`) and the open risk of sharing
   omp's credential store with running omp sessions are in that plugin's README. The pi backend has no quota
-  windows (`/v1/usage` is empty), logs in with `pi auth login`, keeps its credentials in pi's own files
+  windows (`/v1/usage` is empty), signs in with `pi auth login`, keeps its credentials in pi's own files
   (outside mu's state encryption), and has no omp catalog row for models only pi knows.
 
 ## Compatibility

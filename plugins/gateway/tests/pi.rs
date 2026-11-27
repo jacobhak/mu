@@ -231,6 +231,13 @@ fn the_pi_adapter_never_touches_core_secrets() {
     let ep = call(4, "provider/endpoint", json!({"clientPid": std::process::id()}));
     assert_eq!(ep["result"]["baseUrl"], format!("http://127.0.0.1:{}", s.port), "{ep}");
     assert!(ep["result"]["token"].as_str().is_some_and(|t| t.len() == 64));
+    let logins = call(6, "provider/logins", json!({}));
+    assert_eq!(logins["result"]["providers"][0]["label"], "Claude Pro/Max (pi)", "{logins}");
+    let login = call(7, "provider/login", json!({"provider": "anthropic"}));
+    let argv: Vec<&str> = login["result"]["command"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert_eq!(argv, [s.dir.join("pi").to_str().unwrap(), "auth", "login", "anthropic"], "{login}");
+    assert_eq!(login["result"]["env"], json!({}));
+    assert_eq!(call(8, "provider/login_done", json!({}))["result"], json!({}));
     assert!(call(5, "shutdown", json!({}))["result"].is_null());
     drop(stdin);
     assert!(child.wait().unwrap().success());

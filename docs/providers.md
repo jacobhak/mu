@@ -4,7 +4,7 @@ mu reaches a model one of three ways:
 
 - **Natively**, for Anthropic, OpenAI and Baseten, with an API key you add in mu. Requests go straight to the provider's API. No gateway runs.
 - **Natively, on your ChatGPT plan**, for `openai-chatgpt/*` models after [Sign in with ChatGPT](#sign-in-with-chatgpt). Requests go straight to `api.openai.com`. No gateway runs.
-- **Through a gateway provider plugin** for everything else: subscription logins (Claude Pro/Max, Codex), every other provider omp supports, and any of the three providers you have not given a key to. The gateway holds those credentials. Two gateway plugins ship with mu, see [Gateway plugins](#gateway-plugins): `gateway` wraps omp's auth broker and gateway (it needs the omp CLI, which `install.sh --with-omp` adds, 300 MB so opt-in; you log in with `mu-gateway login <provider>`), and `gateway-pi` goes through the pi coding agent (`install.sh --with-pi`; you log in with `pi auth login`). mu itself runs neither, and without one of them or another gateway plugin these models are unavailable.
+- **Through a gateway provider plugin** for everything else: subscription logins (Claude Pro/Max, Codex), every other provider omp supports, and any of the three providers you have not given a key to. The gateway holds those credentials. Two gateway plugins ship with mu, see [Gateway plugins](#gateway-plugins): `gateway` wraps omp's auth broker and gateway (it needs the omp CLI, which `install.sh --with-omp` adds, 300 MB so opt-in), and `gateway-pi` goes through the pi coding agent (`install.sh --with-pi`). You sign in to either from `/login`, which lists the gateway's providers ([Signing in](#signing-in-through-a-gateway)). mu itself runs neither, and without one of them or another gateway plugin these models are unavailable.
 
 How a gateway starts, is shared between mu processes and stops when idle is up to the plugin; see its README. mu starts it with the first request that needs it.
 
@@ -61,6 +61,14 @@ mu auth test openai-chatgpt                  # does the plan answer?
 ```
 
 `--no-validate` saves without asking the provider. `--env` and `--cmd` are exclusive.
+
+## Signing in through a gateway
+
+With a gateway plugin installed (`mu-gateway`, from `install.sh --with-omp` or `--with-pi`), `/login` also lists its providers, after the ChatGPT row: "Claude Pro/Max (omp)", "OpenAI Codex (omp)" and "Another provider (omp)", which opens omp's own provider list (the same rows say `(pi)` for `gateway-pi`). Choosing one hands the terminal to `omp login <provider>` (`pi auth login <provider>`); when it exits, mu reads the gateway's model list again, so the provider's models show up in `/switch` and `/model` without a restart. With state encryption on, the credentials the sign-in writes are sealed like the rest of omp's.
+
+Without a sign-in the gateway lists no models, and `/switch` says so (`gateway models unavailable: the gateway lists no models: no provider is signed in on it; /login adds one`). A profile with some sign-ins lists only those providers' models.
+
+These rows appear only beside a local agent: the sign-in program runs on the terminal mu is on, so for an agent on another machine run `mu-gateway login <provider>` there.
 
 ## Custom endpoints (vLLM, Modal, any OpenAI-compatible server)
 
@@ -201,6 +209,12 @@ A gateway is a native plugin whose manifest says `provider = "gateway"`. mu asks
 
 The base URL must serve `/v1/messages`, `/v1/models` and `/v1/usage`.
 
+A plugin that holds credentials can also serve three optional methods for `/login`; a plugin without them just offers no sign-in:
+
+- `provider/logins {}` returns `{"providers":[{id,label}]}`, the sign-ins to list. An `id` of `null` means the plugin's own tool asks which provider.
+- `provider/login {provider?}` returns `{"command":[argv…],"env":{NAME:value}}`, the program that signs in (a string `provider` is an id from `provider/logins`). The plugin does the preparation here, such as unsealing the credentials the program will write. mu runs it on its own terminal with `env` added, so it needs a terminal that is on the plugin's machine.
+- `provider/login_done {}` is sent once the program has exited, whatever its status, so the plugin can seal what it wrote.
+
 Two plugins ship with mu, both from the `mu-gateway` binary:
 
 - **`gateway`** ([`plugins/gateway`](../plugins/gateway/README.md)) wraps omp's auth broker and gateway; its CLI (`endpoint`, `status`, `stop`, `login`) also works without mu. Needs omp: `install.sh --with-omp`.
@@ -211,7 +225,7 @@ Two plugins ship with mu, both from the `mu-gateway` binary:
 What differs for pi:
 
 - No quota windows: `/v1/usage` reports nothing, so no subscription usage shows.
-- Log in with `pi auth login`. Pi's credentials stay in pi's own files and are not sealed by mu's state encryption.
+- `/login` runs `pi auth login`. Pi's credentials stay in pi's own files and are not sealed by mu's state encryption.
 - Prices and limits come from pi's catalog, but the model snapshot is omp's, so a pi-only model may have no snapshot limits.
 
 Without a plugin, `MU_GATEWAY_URL` plus `MU_GATEWAY_TOKEN` point mu at a running gateway directly; that has no price list, so gateway models outside the snapshot show no cost.

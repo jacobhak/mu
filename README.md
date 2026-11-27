@@ -29,7 +29,7 @@ mu also adds a few things omp doesn't have:
 Early and experimental: started in October 2026 and changing quickly.
 
 - No stable version. Releases are builds of `main`, tagged `mu-YYYYMMDD-<sha7>` and published once `main` passes the checks; config, flags and plugin interfaces can change without notice.
-- Providers: Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth add <provider>`), and OpenAI models also run on your ChatGPT plan (`/login`). Neither involves a gateway. Every other provider, and subscription logins, go through the `mu-gateway` plugin that ships with mu, which needs the omp CLI (`install.sh --with-omp`, about 300 MB; log in with `mu-gateway login <provider>`). Details in [Providers](docs/providers.md).
+- Providers: Anthropic, OpenAI and Baseten work with an API key you add in mu (`/login`, `mu auth add <provider>`), and OpenAI models also run on your ChatGPT plan (`/login`). Neither involves a gateway. Every other provider, and subscription logins, go through the `mu-gateway` plugin that ships with mu, which needs the omp CLI (`install.sh --with-omp`, about 300 MB; sign in from `/login`). Details in [Providers](docs/providers.md).
 - Prebuilt for Linux x86_64 and macOS arm64; other platforms are untested.
 - No support promised. Issues and PRs are welcome but may go unanswered.
 
@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/jacobhak/mu/main/scripts/install.sh
 scripts/install.sh --from-source .            # build and install a checkout
 ```
 
-The installer verifies the download against the release's checksums and, where available, its build attestation. It puts `mu`, `mu-remote` and the plugins under `~/.mu` and links `~/.local/bin/mu` and `~/.local/bin/mu-remote`. `mu-remote`: remotes (agents and tasks on other machines); see [plugins/remote/README.md](plugins/remote/README.md). A private fork needs an authenticated `gh` for `install.sh` and `mu update`.
+The installer verifies the download against the release's checksums and, where available, its build attestation. It puts `mu`, `mu-remote`, `mu-gateway` and the plugins under `~/.mu` and links `mu`, `mu-remote` and `mu-gateway` into `~/.local/bin`. `mu-remote`: remotes (agents and tasks on other machines); see [plugins/remote/README.md](plugins/remote/README.md). A private fork needs an authenticated `gh` for `install.sh` and `mu update`.
 
 Then start `mu` and run `/login` to add a key or sign in with ChatGPT (see Status above for which providers need what). For the gateway, install with `--with-omp` (`curl … | bash -s -- --with-omp`). Web search and fetch need no gateway, and MCP OAuth is done by mu itself (`/mcp login <name>`).
 

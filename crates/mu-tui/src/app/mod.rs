@@ -12,6 +12,7 @@ mod chatgpt;
 mod child;
 mod commands;
 mod custom_providers;
+mod gateway_login;
 mod hostcall;
 mod keys;
 mod mcp;

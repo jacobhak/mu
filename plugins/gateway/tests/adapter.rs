@@ -111,6 +111,49 @@ fn initialize_then_an_endpoint_peek_with_no_daemon_answers_null() {
 }
 
 #[test]
+fn the_login_methods_list_providers_and_hand_mu_the_program_to_run() {
+    let mut mu = Mu::start("login", false);
+    assert_eq!(mu.call(1, "initialize", json!({}))["result"], json!({}));
+
+    let r = mu.call(2, "provider/logins", json!({}));
+    let providers = r["result"]["providers"].as_array().unwrap();
+    assert_eq!(providers[0]["id"], "anthropic", "{r}");
+    assert!(providers.iter().any(|p| p["id"].is_null()), "the backend's own picker is offered: {r}");
+
+    let r = mu.call(3, "provider/login", json!({"provider": "anthropic"}));
+    let argv: Vec<&str> = r["result"]["command"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert_eq!(&argv[1..], ["login", "anthropic"], "{r}");
+    assert_eq!(r["result"]["env"], json!({}), "nothing is sealed, so omp keeps its own files");
+
+    let r = mu.call(4, "provider/login", json!({}));
+    assert_eq!(r["result"]["command"].as_array().unwrap().len(), 2, "no provider: omp asks: {r}");
+
+    for bad in [json!("--help"), json!(""), json!("a b"), json!(3)] {
+        let r = mu.call(5, "provider/login", json!({"provider": bad}));
+        assert!(r["error"].is_object(), "{bad} must be refused: {r}");
+    }
+    assert_eq!(mu.call(6, "provider/login_done", json!({}))["result"], json!({}));
+    mu.shutdown();
+}
+
+#[test]
+fn a_sealed_login_runs_in_the_unsealed_mirror_and_is_sealed_again_when_done() {
+    let mut mu = Mu::start("login-sealed", true);
+    assert_eq!(mu.call(1, "initialize", json!({}))["result"], json!({}));
+    let r = mu.call(2, "provider/login", json!({"provider": "anthropic"}));
+    // omp reads a relative PI_CONFIG_DIR against $HOME, which is `mu.dir` here.
+    let mirror = mu.dir.join(r["result"]["env"]["PI_CONFIG_DIR"].as_str().expect("omp runs in the mirror"));
+    assert!(mirror.is_dir(), "{}", mirror.display());
+
+    std::fs::write(mirror.join("auth-gateway.token"), "tok-after-login").unwrap();
+    assert_eq!(mu.call(3, "provider/login_done", json!({}))["result"], json!({}));
+    use base64::Engine;
+    let sealed = base64::engine::general_purpose::STANDARD.decode(&mu.store["auth-gateway.token"]).unwrap();
+    assert_eq!(sealed, b"tok-after-login", "what the sign-in wrote is sealed through mu");
+    mu.shutdown();
+}
+
+#[test]
 fn a_sealed_mu_gets_omps_plaintext_credentials_through_core_secrets() {
     let mut mu = Mu::start("sealed", true);
     let token = mu.dir.join(".omp/auth-gateway.token");

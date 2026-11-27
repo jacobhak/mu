@@ -21,6 +21,7 @@ pub mod completion;
 pub mod custom;
 pub mod cwd;
 pub mod files;
+pub mod gateway_login;
 pub mod keys;
 pub mod local;
 pub mod mcp;
