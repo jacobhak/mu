@@ -16,10 +16,12 @@ path = "src/main.rs"
 gpui = { package = "gpui-unofficial", version = "=1.30.2" }
 gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.30.2" }
 
-# Compiles GPUI's Metal shaders at run time, so building needs only the Command Line Tools: the offline
-# `metal` compiler ships with full Xcode (plus its Metal toolchain component) and a plain `cargo build` fails without it.
+# macOS needs both features:
+# - `runtime_shaders` compiles GPUI's Metal shaders at run time, so building needs only the Command Line Tools: the
+#   offline `metal` compiler ships with full Xcode (plus its Metal toolchain component).
+# - `font-kit` compiles the Core Text text system. Without it the window draws boxes and no text at all.
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.30.2", features = ["runtime_shaders"] }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.30.2", features = ["runtime_shaders", "font-kit"] }
 
 [profile.release]
 debug = false
