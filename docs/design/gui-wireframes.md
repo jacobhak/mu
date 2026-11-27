@@ -92,7 +92,7 @@ Conventions:
 - **Default keys for splitting, resizing, swapping, zooming and moving between tiles.** These are new actions in a new key context; they are settled with the palette in section 6.
 - **What a new window shows the first time:** a starting named layout.
 
-## 2. Transcript (draft)
+## 2. Transcript (agreed)
 
 What a turn contains, from the agent's events (`crates/mu-base/src/events.rs`, `AgentEvent`):
 
@@ -142,17 +142,22 @@ What a turn contains, from the agent's events (`crates/mu-base/src/events.rs`, `
 │┃                                                                     │
 │┃  Done: a hello with the same client id now takes over silently,    │
 │┃  and `tests/agent.rs` covers it.                                    │
-│┃                                                   4m 52s · $0.84   │
 ```
 
 - **The user's prompt** is a bordered box in monospace, as Zed does, so it reads as the user's own words, apart from the model's prose.
+- **The same defaults as the TUI.** The cut-off lengths and summaries below are the TUI's (`crates/mu-tui/src/chat/blocks.rs`). They move into the shared crate with the semantic blocks, so the two UIs cannot drift apart.
 - **Tool calls are one muted line each:** an icon, a verb, the target, and short facts (a range, a match count, `+N −M`, an exit code, the duration).
-- **Reads and searches show no output by default**; Enter expands one.
-- **Diffs are shown in full** (with line numbers and whole-line added/removed backgrounds), never collapsed by default. A very long diff shows its first screen and "N more lines", and expands in place or opens in a review tile.
-- **Bash shows its last few lines.** The command is a header with its exit code and duration, and a failure has a red edge.
+  - They are never folded together: five reads in a row are five lines.
+- **Reads and searches show a summary only,** as in the TUI: "N lines", "N matches", "N files". Expanding one shows its output.
+- **Diffs are shown in full** (with line numbers and whole-line added/removed backgrounds), never collapsed by default.
+  - A diff past the TUI's cut-off shows that much and "N more lines".
+  - It expands in place, or opens in a review tile.
+- **Bash shows its last 10 lines,** as in the TUI.
+  - The command is a header with its exit code and duration, and a failure has a red edge.
+  - An error result shows its first 10 lines.
 - **Thinking is one line** ("Thought for 14s") that expands. While it streams, see 2b.
 - **Subagents are a group:** one row per job, with its kind, duration and the first line of its result. Opening a row shows that subagent's own transcript in a tile.
-- **The turn ends with its duration and cost,** right-aligned and muted.
+- **Nothing marks the end of a turn.** Duration, cost and context share live in the session bar.
 
 ### 2b. A turn in progress
 
@@ -177,16 +182,17 @@ What a turn contains, from the agent's events (`crates/mu-base/src/events.rs`, `
 
 ### 2c. Keyboard in the transcript
 
-A cursor moves block by block, and nothing in the transcript needs the mouse:
+The transcript behaves like a read-only editor buffer, as Delta's does. A text cursor goes anywhere in it, and nothing in the transcript needs the mouse.
 
-- `j`/`k` (or ↑/↓) move between blocks: the prompt, a prose paragraph, a tool call, a diff hunk, a subagent row.
-- Enter expands or folds the block under the cursor, and `o` opens it in a tile (a diff in review, a subagent's transcript, a tool's full output).
-- `y` copies the block, and `r` quotes it into the composer. This is the TUI's reply picker, generalised to every block.
-- `i` (or typing any character) goes to the composer.
+- **Movement** is by the editor motions you use on code: characters, words, lines, paragraphs, search. A motion also jumps by block (to the next tool call, diff hunk or prompt).
+- **Blocks are folds in that buffer.** A collapsed tool call or thinking line is a fold, and Enter on it toggles it.
+- **Actions on what the cursor or selection is in:**
+  - `o` opens the block in a tile (a diff in review, a subagent's transcript, a tool's full output);
+  - `y` copies the selection, or the block when nothing is selected;
+  - `r` quotes the selection or block into the composer. This is the TUI's reply picker, generalised to all of the transcript.
+- **To the composer:** `i`, or typing a character that is not a motion.
 
-### Questions for this section
+### Open in this section
 
-- How much bash output shows by default (the last N lines, or none), and whether reads and searches stay output-free.
-- Whether runs of similar calls (five reads in a row) fold into one row ("Read 5 files").
-- Whether the cursor moves only by block, or also by line and word inside a block, as in Delta.
-- What the end-of-turn line shows.
+- The exact motions and their keys, which are settled with the palette in section 6.
+- Whether a quote can be anchored to its place in the transcript (Delta's comments) rather than copied into the composer as text.
