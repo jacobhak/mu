@@ -16,7 +16,7 @@ The pid in an owner record is only meaningful on the same host and pid namespace
 
 ## Messaging a session: `mu notify`
 
-`mu notify <session|id|path> [--from NAME] <text|->` leaves a message for a session and, if an interactive mu has it open, wakes it: that mu starts a turn by itself, shows `↳ mu notify from NAME: …` and the model sees the text in a `<system-notice>` user message (`-` reads the text from stdin; at most 64 KiB; `--from` defaults to `another process`).
+`mu notify <session|id|path> [--from NAME] <text|->` leaves a message for a session and, if an interactive mu has it open, wakes it: that mu starts a turn by itself, shows `↳ mu notify from NAME: …` and the model sees the text in a `<mu-notify from="NAME" at="…">` user message, one per message, which the system prompt tells it comes from another process rather than from mu or the user (`-` reads the text from stdin; at most 64 KiB; `--from` defaults to `another process`).
 
 It prints one line: `delivered (pid N)` or `queued (<reason>)`, where the reason is `not running`, `pid N does not take messages`, `owner unknown`, `owner changed` or `cannot signal pid N: <error>`; exit 0 for delivered or queued, 1 for an error (unknown session, empty or oversized text).
 

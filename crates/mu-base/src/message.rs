@@ -157,9 +157,10 @@ impl From<&str> for UserInput {
 }
 
 /// User-role text that mu injected rather than the user typed: job and inbox notices, reminders,
-/// `!cmd` output and the compaction summary.
+/// `!cmd` output, `mu notify` messages (`<mu-notify>`) and the compaction summary.
 pub fn is_injected(text: &str) -> bool {
-    const PREFIXES: [&str; 3] = ["<system-notice>", "<system-reminder>", "Prior model work/tool state available."];
+    const PREFIXES: [&str; 4] =
+        ["<system-notice>", "<system-reminder>", "<mu-notify ", "Prior model work/tool state available."];
     let t = text.trim_start();
     PREFIXES.iter().any(|p| t.starts_with(p)) || (t.starts_with("I ran `") && t.contains("`:\n```"))
 }
@@ -675,6 +676,7 @@ mod estimate_tests {
         for t in [
             "<system-notice>\njob done",
             "<system-reminder>\nx",
+            "<mu-notify from=\"a\" at=\"T\">\nx\n</mu-notify>",
             "I ran `ls`:\n```\n```",
             "Prior model work/tool state available.\n",
         ] {

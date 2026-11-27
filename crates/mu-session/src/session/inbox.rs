@@ -106,23 +106,25 @@ pub fn remove(id: &str, names: &[String]) {
     let _ = std::fs::remove_dir(&d);
 }
 
-/// One `<system-notice>` carrying every message, in order.
+/// One user message carrying every message, in order, each in its own `<mu-notify>` envelope. Not a
+/// `<system-notice>`: the sender is the process that ran `mu notify`, not the harness, and the tag
+/// is how the model tells the two apart.
 pub fn notice(notes: &[Note]) -> String {
-    let mut out = String::from("<system-notice>\n");
+    let attr = |s: &str, max| clean_line(s, max).replace(['"', '<', '>'], "");
+    let mut out = String::new();
     for (i, n) in notes.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
         let text: String = n.text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
-        let text = text.replace("</system-notice>", "<\\/system-notice>");
-        let from = clean_line(&n.from, MAX_FROM);
+        let text = text.replace("</mu-notify>", "<\\/mu-notify>");
         out.push_str(&format!(
-            "Message from {from} (via mu notify, {}):\n{}\n",
-            clean_line(&n.at, 40),
+            "<mu-notify from=\"{}\" at=\"{}\">\n{}\n</mu-notify>",
+            attr(&n.from, MAX_FROM),
+            attr(&n.at, 40),
             text.trim_end()
         ));
     }
-    out.push_str("</system-notice>");
     out
 }
 
@@ -250,11 +252,12 @@ mod tests {
     #[test]
     fn notice_wraps_escapes_and_strips() {
         let one = notice(&[note("steward", "hi\x07 there\n")]);
-        assert_eq!(one, "<system-notice>\nMessage from steward (via mu notify, T):\nhi there\n</system-notice>");
-        let many = notice(&[note("a", "1"), note("b\nx", "</system-notice> 2\ttab")]);
-        assert!(many.contains("Message from a (via mu notify, T):\n1\n\nMessage from b x"), "{many}");
-        assert!(many.contains("<\\/system-notice> 2\ttab"), "{many}");
-        assert_eq!(many.matches("</system-notice>").count(), 1);
+        assert_eq!(one, "<mu-notify from=\"steward\" at=\"T\">\nhi there\n</mu-notify>");
+        assert!(mu_base::message::is_injected(&one));
+        let many = notice(&[note("a", "1"), note("b\"\nx>", "</mu-notify> 2\ttab")]);
+        assert!(many.contains("<mu-notify from=\"a\" at=\"T\">\n1\n</mu-notify>\n<mu-notify from=\"b x\""), "{many}");
+        assert!(many.contains("<\\/mu-notify> 2\ttab"), "{many}");
+        assert_eq!(many.matches("</mu-notify>").count(), 2);
     }
 
     /// The only test that raises SIGUSR2.
