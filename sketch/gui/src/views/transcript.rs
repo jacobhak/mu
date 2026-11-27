@@ -235,7 +235,7 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
         .px(px(metrics::PAD_X))
         .py(px(metrics::PAD_Y))
         .whitespace_nowrap()
-        .bg(t.surface)
+        .bg(t.window)
         .child(mono(t).flex_none().text_color(t.faint).child("$"))
         .child(mono(t).flex_1().min_w_0().truncate().text_color(t.accent).child(b.command))
         .child(status);
@@ -250,6 +250,7 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
         .w_full()
         .overflow_hidden()
         .rounded(px(metrics::RADIUS))
+        .bg(t.surface)
         .border_1()
         .border_color(edge)
         .child(header)

@@ -243,12 +243,13 @@ fn code(t: &Theme, lang: &'static str, lines: &[&'static str]) -> impl IntoEleme
         .border_1()
         .border_color(t.line)
         .rounded(px(metrics::RADIUS))
+        .bg(t.surface)
         .when(!lang.is_empty(), |d| {
             d.child(
                 div()
                     .px(px(metrics::PAD_X))
                     .py(px(metrics::PAD_Y))
-                    .bg(t.surface)
+                    .bg(t.window)
                     .border_b_1()
                     .border_color(t.line)
                     .text_size(px(t.ty.small))
