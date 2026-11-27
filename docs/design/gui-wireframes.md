@@ -44,7 +44,7 @@ Conventions:
 │ MU                      │┃                                      │                                 │
 │ ● Desktop app design    │┃  Prose of the reply, proportional,   │                                 │
 │   local · gui-design    │┃  wrapped to the tile's width.        ├─────────────────────────────────┤
-│   +245 −13 · 2m   $3.10 │┃                                      │ Review · Desktop app design  📌 │
+│   2m              $3.10 │┃                                      │ Review · Desktop app design  📌 │
 │ ○ Bump omp to 0.46      │┃  ✎ Edit  docs/design/gui.md  +180    │ Branch since main  +245 −13     │
 │   local · maint · 3h    │┃   ┌ diff in full ───────────────────┐│ ▾ docs/design/gui.md      +180  │
 │ ✓ Release notes         │┃   │ + # Desktop app: design         ││   + # Desktop app: design       │
@@ -60,7 +60,7 @@ Conventions:
 ```
 
 - **Left bar: the agent list.** Rows are grouped by project, with a pinned "Needs you" group at the top.
-  - A row shows a state icon (`⚑` needs you, `●` running, `○` idle, `✓` finished and unseen, `✗` failed), the title and a meta line: host, branch, `+N −M`, age, cost.
+  - A row shows a state icon (`⚑` needs you, `●` running, `○` idle, `✓` finished and unseen, `✗` failed), the title and a meta line: host, branch, age, cost.
   - The rows themselves are drawn in section 5.
 - **Tiles.** The focused session fills the left tile. The right column is split in two: another session above, and below it a review pinned to the first session (`📌`).
 - **Session tile.** A header (title, host, menu), the transcript as a column, then the composer with the session bar under it: model, thinking level, permission mode, context share, cost, stop.
@@ -348,7 +348,7 @@ The TUI's composer (contexts `chat` and `editor` in `docs/keys.md`, `crates/mu-t
 - **The session bar uses the TUI's status-line configuration** (the same segment ids and config keys), drawn as chips, each with its picker.
 - **A dropped file that is not an image inserts its path,** quoted where needed, as pasting a path does in the TUI.
 
-## 5. Agent list and jobs (draft)
+## 5. Agent list and jobs (agreed)
 
 These are the TUI's jobs panel, as two views: the agent list is its Sessions tab, and the jobs view is its Jobs tab (`docs/background-jobs.md`). Each has the same rows, actions and keys (contexts `jobs`, `jobs_view`, `jobs_input`, `jobs_confirm`).
 
@@ -374,12 +374,17 @@ Narrow, in a bar:
 │                             │
 │ ~/code/private/mu           │
 │ ● Desktop app design   ◂    │
-│   tui · here · 2h   $3.10   │
+│   tui · here · gui-design   │
+│   2h               $3.10    │
 │   └ ● ReviewDiff  subagent  │
 │ ○ Bump omp to 0.46          │
-│   agent · here · 3h  $0.20  │
+│   agent · here · maint/omp  │
+│   3h               $0.20    │
 │ ✓ Release notes             │
 │   print · here · 1d  $0.08  │
+│   RECENT                    │
+│   Attach reconnect fix  2d  │
+│   Pod adapter test      4d  │
 │                             │
 │ ~/code/private/brewery      │
 │ ○ Formula audit             │
@@ -393,14 +398,16 @@ Wide, as a tile: the same rows as a table, with the TUI's columns:
 ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
 │ ⌕ Find…                                                  group: project ▾         12 agents │
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
-│    STATE  TITLE / FIRST PROMPT          KIND      HOST          ATTACHED     RAN    COST    │
-│ NEEDS YOU                                                                                    │
-│ ▸  ⚑      Deploy pod adapter            agent     test-cluster  —            4m     $0.41   │
-│    ⚑      Fix flaky attach test         agent     devbox        laptop 12m   12m    $1.20   │
-│ ~/code/private/mu                                                                            │
-│    ●      Desktop app design            tui       here          —            2h     $3.10   │
-│      └ ●  ReviewDiff                    subagent  here          —            1m     $0.22   │
-│    ○      Bump omp to 0.46              agent     here          —            3h     $0.20   │
+│    STATE  TITLE / FIRST PROMPT       KIND      HOST          BRANCH      ATTACHED   RAN   COST  │
+│ NEEDS YOU                                                                                      │
+│ ▸  ⚑      Deploy pod adapter         agent     test-cluster  pod-adapter —          4m   $0.41  │
+│    ⚑      Fix flaky attach test      agent     devbox        fix/attach  laptop     12m  $1.20  │
+│ ~/code/private/mu                                                                              │
+│    ●      Desktop app design         tui       here          gui-design  —          2h   $3.10  │
+│      └ ●  ReviewDiff                 subagent  here          gui-design  —          1m   $0.22  │
+│    ○      Bump omp to 0.46           agent     here          maint/omp   —          3h   $0.20  │
+│    RECENT                                                                                      │
+│           Attach reconnect fix       ended 2d ago                                     $0.84  │
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Enter open · n message · s stop · S terminate · t take · / find                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -410,16 +417,14 @@ Wide, as a tile: the same rows as a table, with the TUI's columns:
 - **The state icon** comes from what the row already says (waiting, a turn running, idle, finished, failed):
   - `⚑` needs you, `●` running, `○` idle, `✓` finished and unseen, `✗` failed.
   - "Unseen" is new state, kept by the app: a turn that ended while no tile showed the session.
-- **The TUI's keys:** Enter opens the session (attaches, for a remote one), `n` sends a message, `s` stops the turn, `S` terminates after `y`, `t` takes a `-p` run over. Search with `/` is new.
-- **What opening changes in the app:** the session opens in the focused tile (`o`), or in a floating panel when you jump from a request (section 3d). The TUI cannot do either; it hands over the whole terminal.
+- **The branch** is a new field. Each agent publishes its working directory's branch in its owner record, and a session source's rows may carry it. The TUI's Sessions tab shows it too.
+- **Recent sessions.** Under each project, a muted "Recent" group lists sessions that ended in the last few days. Opening one resumes it, as `/resume` does, and `/resume` keeps its picker for anything older.
+- **The TUI's keys:** `n` sends a message, `s` stops the turn, `S` terminates after `y`, `t` takes a `-p` run over. Search with `/` is new.
+- **Enter opens the session in the focused tile, as an observer,** local or remote alike. Typing a prompt asks to take control, as decided for observers. In the TUI, Enter on a local row only peeks at its transcript. Once observers exist, the TUI's Enter opens a session the same way.
+- **A jump from a request** (section 3d) opens the session in a floating panel instead.
 
 ### 5b. Jobs view
 
 - **The TUI's Jobs tab:** one row per subagent or `async` bash job, with state, name, agent, tool count, elapsed time, cost and last activity. The selected job's details sit below.
 - **Its keys:** `x` cancels a job, `X` cancels all after `y`, `d`/`a` show or apply a finished job's result, `o` forwards a job's ports, Enter opens a job.
 - **What the app changes:** Enter opens the job's transcript or output in a tile, as the TUI's `jobs_view` with its keys. The job rows above the composer (`Alt+↓` marks one, `k`/`x` cancels it) stay as in the TUI.
-
-### Questions for this section
-
-- Whether a row shows git state (branch, `+N −M`), which the TUI's rows do not have. It would need new data from the agent.
-- Whether the agent list also lists finished sessions (history), or only live ones as the TUI does.
