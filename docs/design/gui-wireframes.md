@@ -91,3 +91,102 @@ Conventions:
 
 - **Default keys for splitting, resizing, swapping, zooming and moving between tiles.** These are new actions in a new key context; they are settled with the palette in section 6.
 - **What a new window shows the first time:** a starting named layout.
+
+## 2. Transcript (draft)
+
+What a turn contains, from the agent's events (`crates/mu-base/src/events.rs`, `AgentEvent`):
+
+- the user's prompt, with images and skill calls;
+- a "woken" mark for a turn that no prompt started (a finished job or a `mu notify` message);
+- prose;
+- thinking;
+- tool calls: the arguments stream in, the call runs with its output streaming, the call ends, or it is skipped;
+- the todo list as it changes;
+- retries and notices;
+- errors;
+- compaction;
+- results of background jobs handed back to the model;
+- a parked plan;
+- the end of the turn: normal, aborted or failed.
+
+### 2a. One turn, at rest
+
+```
+│┃  ┌──────────────────────────────────────────────────────────────┐   │
+│┃  │ make attach reconnect without asking when the client id is   │   │
+│┃  │ the same, and add a test                          [image 1]  │   │
+│┃  └──────────────────────────────────────────────────────────────┘   │
+│┃                                                                     │
+│┃  ▸ Thought for 14s                                                  │
+│┃  ⌕ Read   src/run/serve.rs  L340-400                                │
+│┃  ⌕ Read   src/run/attach.rs                                         │
+│┃  ⌕ Grep   `reconnect` in src/ · 6 matches                           │
+│┃                                                                     │
+│┃  The agent already ignores `reconnect` (it matches the hello with  │
+│┃  `..`). I'll make a hello with the same client id take over        │
+│┃  without `Busy`, and test it with two connections.                 │
+│┃                                                                     │
+│┃  ✎ Edit   src/run/serve.rs  +6 −2                                   │
+│┃  ┌────────────────────────────────────────────────────────────────┐ │
+│┃  │ 370   if let Some(old) = &self.client {                        │ │
+│┃  │ 371 −     if old.who == hello.client && !hello.client.is_empty│ │
+│┃  │ 371 +     let same = !hello.client.is_empty() && old.who == …  │ │
+│┃  │ …                                                              │ │
+│┃  └────────────────────────────────────────────────────────────────┘ │
+│┃  $ cargo test -p mu --test agent reconnect          ✓ 0 · 41s      │
+│┃    test result: ok. 2 passed; 0 failed                   (2 lines) │
+│┃                                                                     │
+│┃  ◆ Subagents  2 done                                                │
+│┃    ✓ ReviewDiff      scout   1m 12s   "No issues; one nit on …"    │
+│┃    ✓ CheckMacOS      task    3m 40s   "Builds and passes on …"     │
+│┃                                                                     │
+│┃  Done: a hello with the same client id now takes over silently,    │
+│┃  and `tests/agent.rs` covers it.                                    │
+│┃                                                   4m 52s · $0.84   │
+```
+
+- **The user's prompt** is a bordered box in monospace, as Zed does, so it reads as the user's own words, apart from the model's prose.
+- **Tool calls are one muted line each:** an icon, a verb, the target, and short facts (a range, a match count, `+N −M`, an exit code, the duration).
+- **Reads and searches show no output by default**; Enter expands one.
+- **Diffs are shown in full** (with line numbers and whole-line added/removed backgrounds), never collapsed by default. A very long diff shows its first screen and "N more lines", and expands in place or opens in a review tile.
+- **Bash shows its last few lines.** The command is a header with its exit code and duration, and a failure has a red edge.
+- **Thinking is one line** ("Thought for 14s") that expands. While it streams, see 2b.
+- **Subagents are a group:** one row per job, with its kind, duration and the first line of its result. Opening a row shows that subagent's own transcript in a tile.
+- **The turn ends with its duration and cost,** right-aligned and muted.
+
+### 2b. A turn in progress
+
+```
+│┃  ⠋ Thinking · 6s                                                    │
+│┃    The reconnect flag is sent but serve.rs never reads it, so the  │
+│┃    fix belongs in join(); check whether take() …                   │
+│┃  ⌕ Read   src/run/serve.rs  …                                       │
+│┃  $ cargo test -p mu --test agent reconnect                ⠋ 12s    │
+│┃    Compiling mu v0.1.0                                              │
+│┃    Compiling mu-tui v0.1.0                                          │
+│┃                                                                     │
+│┃  ↻ Retrying in 8s (2/5): overloaded                                 │
+```
+
+- **The live block streams at the bottom.** Thinking shows its last lines, dimmed, while it streams, then folds to one line.
+- **A call whose arguments are still streaming** shows what has arrived so far (`…`).
+- **A running command shows its live tail and a timer.**
+- **Retries, compaction and notices** are one-line rows with their own icons.
+- **An error** is a row with a red edge and the message.
+- **The view stays at the bottom while you are there.** Once you scroll up it holds still, and shows "↓ new output" until you return.
+
+### 2c. Keyboard in the transcript
+
+A cursor moves block by block, and nothing in the transcript needs the mouse:
+
+- `j`/`k` (or ↑/↓) move between blocks: the prompt, a prose paragraph, a tool call, a diff hunk, a subagent row.
+- Enter expands or folds the block under the cursor, and `o` opens it in a tile (a diff in review, a subagent's transcript, a tool's full output).
+- `y` copies the block, and `r` quotes it into the composer. This is the TUI's reply picker, generalised to every block.
+- `i` (or typing any character) goes to the composer.
+
+### Questions for this section
+
+- How much bash output shows by default (the last N lines, or none), and whether reads and searches stay output-free.
+- Whether runs of similar calls (five reads in a row) fold into one row ("Read 5 files").
+- Whether the cursor moves only by block, or also by line and word inside a block, as in Delta.
+- What the end-of-turn line shows.
