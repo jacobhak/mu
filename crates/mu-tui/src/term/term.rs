@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn a_write_after_the_master_closed_is_a_hangup() {
-        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         let (mut master, mut slave) = (-1 as libc::c_int, -1 as libc::c_int);
         let ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: valid out-pointers; name and termios are null. macOS declares the winsize pointer
@@ -321,8 +321,26 @@ mod tests {
         assert_eq!(r, 0, "openpty: {}", io::Error::last_os_error());
         // SAFETY: openpty returned two fresh descriptors that nothing else owns.
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        // openpty does not set close-on-exec, so a process another test spawns right now would keep a
+        // copy of the master, and the pty would not hang up until that copy closes.
+        for fd in [&master, &slave] {
+            // SAFETY: fcntl on a descriptor this test owns.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0 && unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0);
+        }
         drop(master);
-        let e = std::fs::File::from(slave).write_all(b"x").expect_err("a hung-up pty takes no writes");
+        let mut slave = std::fs::File::from(slave);
+        // A copy inherited between openpty and the fcntl above is closed by the child's exec, so wait for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let e = loop {
+            match slave.write_all(b"x") {
+                Err(e) => break e,
+                Ok(()) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Ok(()) => panic!("a hung-up pty takes no writes"),
+            }
+        };
         assert!(hangup(&e), "the write reported {e:?}");
     }
 
