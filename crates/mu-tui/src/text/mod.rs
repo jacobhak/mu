@@ -1,6 +1,7 @@
 use crate::theme::{self, Role};
 use crossterm::style::{Attribute, ContentStyle};
 
+pub(crate) mod chart;
 pub(crate) mod diffview;
 pub(crate) mod highlight;
 pub(crate) mod line;

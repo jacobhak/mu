@@ -257,8 +257,8 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
         require_output_schema(&mut run, s)?;
     }
     if !interactive {
-        // No one can answer or approve in a headless run.
-        for tool in ["ask", "enter_mode"] {
+        // No one can answer or approve in a headless run, or see a chart.
+        for tool in ["ask", "enter_mode", "chart"] {
             if !run.excluded.contains(&tool) {
                 run.excluded.push(tool);
             }

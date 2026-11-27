@@ -173,8 +173,9 @@ const SKIP_YIELDED: &str = "Skipped: the result was already submitted with `yiel
 const SKIP_TRUNCATED: &str = "Tool call not executed: output was truncated (max_tokens)";
 const SKIP_BUDGET: &str = "Skipped: the run is past its request budget, deliver the final result";
 
-/// Tools a headless front end never offers: nobody is there to answer `ask` or let the model switch mode.
-pub const HEADLESS_EXCLUDED: [&str; 2] = ["ask", "enter_mode"];
+/// Tools a headless front end never offers: nobody is there to answer `ask`, let the model switch mode
+/// or see a `chart`.
+pub const HEADLESS_EXCLUDED: [&str; 3] = ["ask", "enter_mode", "chart"];
 
 /// How a loop pass ended.
 enum Flow {
