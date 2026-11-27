@@ -114,9 +114,13 @@ mod tests {
         let busy = l.local_addr().unwrap().port();
         assert_ne!(pick_local(busy, true).unwrap(), busy);
         drop(l);
-        // Another test's process may take the freed port first, so try a few.
-        let taken = (0..5).any(|_| pick_local(busy, true).unwrap() == busy);
-        assert!(taken, "the freed port was never picked");
+        // A freed port is not ours: another process on the machine can take it and hold it, and asking
+        // again for the same port then keeps failing. Free a fresh one each time instead.
+        let taken = (0..10).any(|_| {
+            let port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+            pick_local(port, true).unwrap() == port
+        });
+        assert!(taken, "a freed port was never picked");
     }
 
     #[test]
