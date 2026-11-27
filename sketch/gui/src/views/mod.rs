@@ -39,7 +39,7 @@ pub fn ui(t: &Theme) -> Div {
     div().font_family(SANS).text_size(px(t.ty.ui)).text_color(t.text)
 }
 
-/// A box in code type: Lilex, for code, tool rows, diffs, paths and the composer.
+/// A box in code type: the mono face, for code, tool arguments, diffs and paths. The composer is interface type.
 pub fn mono(t: &Theme) -> Div {
     div().font_family(MONO).text_size(px(t.ty.code)).text_color(t.text)
 }

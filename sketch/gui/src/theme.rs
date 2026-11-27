@@ -23,7 +23,7 @@ pub struct TypeScale {
     pub prose: f32,
     /// Interface text (bars, headers, rows, hints), Plex Sans.
     pub ui: f32,
-    /// Code, tool rows, diffs, paths, the composer, Lilex.
+    /// Code, tool arguments, diffs, paths, the mono face. The composer is interface type, not this.
     pub code: f32,
     /// Small text: meta lines, key hints.
     pub small: f32,
