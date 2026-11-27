@@ -720,16 +720,19 @@ impl Shell {
         self.theme = Theme::build(self.palette_ix, self.scale_ix);
     }
 
-    fn tab_title(&self, tab: &Tab) -> String {
+    /// The tab's name; while sessions in it need you, a warn `⚑ n` after it.
+    fn tab_title(&self, t: &Theme, tab: &Tab) -> gpui::Div {
         let waiting = tab
             .sessions()
             .iter()
             .filter(|s| self.data.session(**s).state == AgentState::NeedsYou)
             .count();
-        match waiting {
-            0 => tab.title.to_string(),
-            n => format!("⚑ {} · {n}", tab.title),
-        }
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(tab.title)
+            .when(waiting > 0, |d| d.child(div().text_color(t.warn).child(format!("⚑ {waiting}"))))
     }
 
     fn render_view(&self, v: View, focused: bool, wide: bool, last: SessionId) -> AnyElement {
@@ -842,12 +845,24 @@ impl Shell {
                         d.bg(t.window).text_color(t.strong).border_1().border_color(t.line_faint).shadow(t.shadow(Lift::Rest))
                     })
                     .when(!active, |d| d.border_1().border_color(transparent_black()).text_color(t.muted))
-                    .child(self.tab_title(tab)),
+                    .child(self.tab_title(t, tab)),
             );
         }
+        let sep = || div().text_color(t.line).child(" · ");
         bar.child(div().px(px(8.)).text_color(t.faint).child("+"))
             .child(div().flex_1())
-            .child(div().text_color(t.faint).child(format!("{} · {} · C-x b agents · M-x all", t.name, t.ty.name)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(t.name)
+                    .child(sep())
+                    .child(t.ty.name)
+                    .child(sep())
+                    .child("C-x b agents")
+                    .child(sep())
+                    .child("M-x all"),
+            )
             .into_any_element()
     }
 
@@ -858,9 +873,31 @@ impl Shell {
             .pending_input_keystrokes()
             .map(|k| k.iter().map(|k| k.unparse(HOST_OS)).collect::<Vec<_>>().join(" "))
             .unwrap_or_default();
-        let mut remotes = ui(t).flex().gap_3().text_color(t.muted);
-        for (name, ok) in &s.remotes {
-            remotes = remotes.child(div().child(format!("{name} {}", if *ok { "✓" } else { "✗" })).text_color(if *ok { t.muted } else { t.err }));
+        // Segments are joined by ` · ` in the line role, as the TUI's status line joins its own.
+        let sep = || div().text_color(t.line).child(" · ");
+        let attention = if s.need_you > 0 { t.warn } else { t.muted };
+        let left = div()
+            .flex()
+            .items_center()
+            .child(s.profile)
+            .child(sep())
+            .child(div().text_color(t.accent).child(format!("◌ {} running", s.running)))
+            .child(sep())
+            .child(div().text_color(attention).child(format!("⚑ {} need you", s.need_you)))
+            .child(sep())
+            .child(div().flex().gap_1().child("today").child(div().text_color(t.syn_type).child(s.today)));
+        let mut remotes = div().flex().items_center();
+        for (i, (name, ok)) in s.remotes.iter().enumerate() {
+            if i > 0 {
+                remotes = remotes.child(sep());
+            }
+            remotes = remotes.child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(*name)
+                    .child(div().text_color(if *ok { t.ok } else { t.err }).child(if *ok { "✓" } else { "✗" })),
+            );
         }
         ui(t)
             .flex()
@@ -871,8 +908,7 @@ impl Shell {
             .px(px(metrics::PAD))
             .text_size(px(t.ty.small))
             .text_color(t.muted)
-            .child(div().text_color(t.strong).child(s.profile))
-            .child(format!("{} running · {} need you · today {}", s.running, s.need_you, s.today))
+            .child(left)
             .when(!pending.is_empty(), |d| d.child(div().text_color(t.accent).child(format!("{pending} …"))))
             .when_some(self.note.clone(), |d, n| d.child(div().text_color(t.warn).child(n)))
             .child(div().flex_1())

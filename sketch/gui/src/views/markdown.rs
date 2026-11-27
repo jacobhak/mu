@@ -34,13 +34,30 @@ pub fn render(t: &Theme, blocks: &[Md]) -> AnyElement {
 }
 
 fn heading(t: &Theme, level: u8, text: &'static str) -> impl IntoElement {
-    let scale = HEADING_SCALE[(level.clamp(1, 3) - 1) as usize];
+    let level = level.clamp(1, 3);
+    let scale = HEADING_SCALE[(level - 1) as usize];
+    // As the TUI: the hashes in faint bold, the title in the tool role, bold.
+    let prefix = format!("{} ", "#".repeat(level as usize));
+    let face = || {
+        let mut f = font(SANS);
+        f.weight = FontWeight::SEMIBOLD;
+        f
+    };
+    let run = |len: usize, color: Hsla| TextRun {
+        len,
+        font: face(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let runs = vec![run(prefix.len(), t.faint), run(text.len(), t.tool)];
     div()
         .text_size(px(t.ty.prose * scale))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(t.tool)
         .line_height(relative(1.3))
-        .child(text)
+        .child(StyledText::new(format!("{prefix}{text}")).with_runs(runs))
 }
 
 fn para(t: &Theme, spans: &[Span]) -> impl IntoElement {
@@ -74,7 +91,6 @@ fn inline(t: &Theme, spans: &[Span]) -> StyledText {
             }
             SpanStyle::Bold => {
                 f.weight = FontWeight::SEMIBOLD;
-                run.color = t.strong;
             }
             SpanStyle::Italic => f = f.italic(),
             SpanStyle::Link => {
@@ -138,9 +154,9 @@ fn code(t: &Theme, lang: &'static str, lines: &[&'static str]) -> impl IntoEleme
                     .py(px(4.))
                     .bg(t.bar)
                     .border_b_1()
-                    .border_color(t.line_faint)
+                    .border_color(t.line)
                     .text_size(px(t.ty.small))
-                    .text_color(t.muted)
+                    .text_color(t.faint)
                     .child(lang),
             )
         })
@@ -168,7 +184,10 @@ fn highlight(t: &Theme, line: &str) -> StyledText {
     };
     let trimmed = line.trim_start();
     if trimmed.starts_with("//") || trimmed.starts_with('#') {
-        return StyledText::new(line.to_string()).with_runs(vec![colour_of(t.syn_comment, line.len())]);
+        // Comments are italic in the TUI's highlighter.
+        let mut run = colour_of(t.syn_comment, line.len());
+        run.font = font(MONO).italic();
+        return StyledText::new(line.to_string()).with_runs(vec![run]);
     }
     let mut runs: Vec<TextRun> = Vec::new();
     let mut push = |c: Hsla, len: usize| match runs.last_mut() {

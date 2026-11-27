@@ -3,7 +3,7 @@ use super::{ViewCtx, ui};
 use crate::data::{Session, SlashMenu};
 use crate::theme::{Lift, Theme, metrics};
 use gpui::prelude::FluentBuilder as _;
-use gpui::{AnyElement, Div, FontWeight, IntoElement as _, ParentElement as _, Styled as _, div, px, relative};
+use gpui::{AnyElement, Div, IntoElement as _, ParentElement as _, Styled as _, div, px, relative};
 
 const MENU_W: f32 = 380.0;
 const CMD_W: f32 = 96.0;
@@ -22,7 +22,7 @@ pub fn queue(c: &ViewCtx) -> Option<AnyElement> {
             .text_size(px(t.ty.small + 0.5))
             .text_color(t.muted)
             .child(div().flex_1().min_w_0().truncate().child(format!("↳ {}: {}", q.kind, q.text)))
-            .when(q.newest, |d| d.child(div().flex_none().text_color(t.faint).child("shift+↑ edit")))
+            .when(q.newest, |d| d.child(div().flex_none().text_color(t.muted).child("shift+↑ edit")))
     });
     Some(
         div()
@@ -37,24 +37,26 @@ pub fn queue(c: &ViewCtx) -> Option<AnyElement> {
     )
 }
 
-/// The input box: typed text, ghost text, image chip; the `/` menu opens above it.
+/// The input box: prompt, typed text, ghost text, image chip; the `/` menu opens above it.
 pub fn input(c: &ViewCtx) -> AnyElement {
     let (t, s) = (c.t, c.s());
     let cm = &s.composer;
     let empty = cm.before.is_empty() && cm.after.is_empty();
     let caret = || div().flex_none().w(px(2.)).h(px(t.ty.ui + 4.)).bg(if c.focused { t.accent } else { t.faint });
+    let prompt = || div().flex_none().pr(px(6.)).text_color(t.accent).child("μ ❯");
     let field = ui(t).text_size(px(t.ty.ui + 1.)).line_height(relative(1.4)).flex().flex_wrap().items_center();
     let text = if empty && cm.ghost.is_empty() {
-        // The cursor sits at the start; the placeholder follows it.
-        field.child(caret()).child(div().pl(px(2.)).text_color(t.faint).child(cm.placeholder))
+        // The cursor sits after the prompt; the placeholder follows it.
+        field.child(prompt()).child(caret()).child(div().pl(px(2.)).text_color(t.faint).child(cm.placeholder))
     } else {
         field
-            .child(div().text_color(t.strong).child(cm.before))
+            .child(prompt())
+            .child(div().text_color(t.text).child(cm.before))
             .child(caret())
-            .child(div().text_color(t.strong).child(cm.after))
+            .child(div().text_color(t.text).child(cm.after))
             .child(div().text_color(t.faint).child(cm.ghost))
     };
-    // An input card: lifted off the tile, with an accent edge while the tile has focus.
+    // An input card: lifted off the tile. Its edge is the TUI's composer rule, which is LineFaint.
     let mut card = div()
         .flex()
         .flex_col()
@@ -64,7 +66,7 @@ pub fn input(c: &ViewCtx) -> AnyElement {
         .rounded(px(metrics::RADIUS_LG))
         .bg(t.raised)
         .border_1()
-        .border_color(if c.focused { t.accent_soft } else { t.line })
+        .border_color(t.line_faint)
         .shadow(t.shadow(Lift::Rest))
         .child(text);
     if let Some((name, size)) = cm.image {
@@ -87,8 +89,8 @@ fn image_chip(t: &Theme, name: &'static str, size: &'static str) -> Div {
             .border_1()
             .border_color(t.line)
             .text_size(px(t.ty.small))
-            .text_color(t.muted)
-            .child(format!("[image 1 · {name} {size}]")),
+            .text_color(t.text)
+            .child(format!("[Image #1 · {name} {size}]")),
     )
 }
 
@@ -103,15 +105,8 @@ fn slash_menu(t: &Theme, m: &SlashMenu) -> Div {
             .items_center()
             .rounded(px(metrics::RADIUS_SM))
             .when(on, |d| d.bg(t.selected))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(CMD_W))
-                    .text_color(if on { t.accent } else { t.strong })
-                    .when(on, |d| d.font_weight(FontWeight::SEMIBOLD))
-                    .child(*cmd),
-            )
-            .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(*desc))
+            .child(div().flex_none().w(px(CMD_W)).text_color(t.text).child(*cmd))
+            .child(div().flex_1().min_w_0().truncate().text_color(t.faint).child(*desc))
     });
     div().absolute().bottom_full().left(px(metrics::PAD)).pb(px(6.)).child(
         div()
@@ -130,54 +125,76 @@ fn slash_menu(t: &Theme, m: &SlashMenu) -> Div {
 }
 
 fn chip(t: &Theme, text: String, fg: gpui::Hsla) -> Div {
-    ui(t).flex_none().whitespace_nowrap().px(px(8.)).py(px(2.)).rounded(px(999.)).text_size(px(t.ty.small)).text_color(fg).child(text)
+    ui(t).flex_none().whitespace_nowrap().text_size(px(t.ty.small)).text_color(fg).child(text)
 }
 
-fn mode_colour(t: &Theme, mode: &str) -> gpui::Hsla {
-    match mode {
-        "ask" => t.warn,
-        "plan" => t.accent,
-        "yolo" => t.err,
-        _ => t.muted,
-    }
+/// The TUI's " · " between status segments.
+fn sep(t: &Theme) -> Div {
+    ui(t).flex_none().text_color(t.line).child("·")
 }
 
+/// Context share: accent in the normal range, warn and err at the `[status]` defaults. Those are
+/// also token levels, which need the window; the session carries only the percent.
 fn ctx_colour(t: &Theme, pct: u8) -> gpui::Hsla {
     match pct {
-        90.. => t.err,
-        75.. => t.warn,
-        _ => t.muted,
+        70.. => t.err,
+        50.. => t.warn,
+        _ => t.accent,
     }
 }
 
-/// The status line's segments as chips: model, thinking, mode, branch, context, cost, turn timer, stop.
+/// The status line's segments in the TUI's order: turn glyph and timer, model and thinking level, mode,
+/// branch, then the context share, cost and the stop control at the right.
 pub fn session_bar(c: &ViewCtx) -> AnyElement {
     let (t, s): (&Theme, &Session) = (c.t, c.s());
-    let mode = mode_colour(t, s.mode);
+    let pi = match s.turn_timer {
+        Some(timer) => div()
+            .flex_none()
+            .flex()
+            .gap(px(4.))
+            .child(chip(t, "⠋".into(), t.accent))
+            .child(chip(t, timer.to_string(), t.muted)),
+        None => chip(t, "μ".into(), t.muted),
+    };
+    let model = ui(t)
+        .flex_none()
+        .whitespace_nowrap()
+        .flex()
+        .text_size(px(t.ty.small))
+        .child(div().text_color(t.tool).child(s.model))
+        .child(div().text_color(t.muted).child(format!(" ({})", s.thinking)));
     let bar = ui(t)
         .flex()
         .items_center()
-        .gap(px(4.))
+        .gap(px(6.))
         .h(px(metrics::STATUS_BAR_H + 4.))
         .px(px(metrics::PAD))
         .pb(px(2.))
         .overflow_hidden()
-        .child(chip(t, s.model.to_string(), t.strong).font_weight(FontWeight::MEDIUM))
-        .child(chip(t, s.thinking.to_string(), t.muted))
-        .child(chip(t, s.mode.to_string(), mode).bg(mode.opacity(0.14)))
+        .child(pi)
+        .child(sep(t))
+        .child(model)
+        .child(sep(t))
+        .child(chip(t, s.mode.to_string(), t.accent))
+        .child(sep(t))
         .child(chip(t, s.branch.to_string(), t.muted).min_w_0().truncate())
         .child(div().flex_1())
         .child(chip(t, format!("ctx {}%", s.ctx_pct), ctx_colour(t, s.ctx_pct)))
-        .child(chip(t, s.cost.to_string(), t.muted));
+        .child(sep(t))
+        .child(chip(t, s.cost.to_string(), t.syn_type));
     let bar = match s.turn_timer {
-        Some(timer) => bar
-            .child(chip(t, format!("⠋ {timer}"), t.accent))
-            .child(
-                chip(t, "■".to_string(), t.err)
-                    .px(px(8.))
-                    .bg(t.err.opacity(0.14))
-                    .text_size(px(t.ty.ui)),
-            ),
+        Some(_) => bar.child(
+            ui(t)
+                .flex_none()
+                .px(px(8.))
+                .py(px(1.))
+                .rounded(px(metrics::RADIUS_SM))
+                .border_1()
+                .border_color(t.err_soft)
+                .text_size(px(t.ty.ui))
+                .text_color(t.err)
+                .child("■"),
+        ),
         None => bar,
     };
     bar.into_any_element()

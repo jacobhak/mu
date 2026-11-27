@@ -75,10 +75,10 @@ fn block(t: &Theme, b: &Block) -> AnyElement {
         Block::Bash(b) => bash(t, b).into_any_element(),
         Block::Subagents(subs) => boxed(t).child(subagents(t, subs)).into_any_element(),
         Block::Todo(items) => boxed(t).child(todo(t, items)).into_any_element(),
-        Block::Retry(s) => line(t, "↻", t.warn, t.muted, *s).into_any_element(),
-        Block::Notice(s) => line(t, "ℹ", t.faint, t.muted, *s).into_any_element(),
+        Block::Retry(s) => note(t, format!("↻ {s}")).into_any_element(),
+        Block::Notice(s) => note(t, *s).into_any_element(),
         Block::Error(s) => error(t, *s).into_any_element(),
-        Block::Compaction(s) => line(t, "⊟", t.faint, t.muted, *s).into_any_element(),
+        Block::Compaction(s) => note(t, format!("── {s}")).into_any_element(),
         Block::Answered(s) => ui(t).text_color(t.muted).truncate().child(*s).into_any_element(),
         Block::Plan(s) => plan(t, *s).into_any_element(),
     }
@@ -94,6 +94,11 @@ fn line(t: &Theme, icon: &'static str, icon_fg: gpui::Hsla, fg: gpui::Hsla, text
         .child(div().flex_1().min_w_0().child(text))
 }
 
+/// A dim row, as the TUI's notice lines: the whole line in the muted tone, its glyph included.
+fn note(t: &Theme, text: impl IntoElement) -> gpui::Div {
+    ui(t).text_color(t.muted).child(text)
+}
+
 fn user(t: &Theme, text: &'static str, image: Option<&'static str>) -> impl IntoElement {
     prose(t)
         .flex()
@@ -103,8 +108,9 @@ fn user(t: &Theme, text: &'static str, image: Option<&'static str>) -> impl Into
         .px(px(14.))
         .py(px(10.))
         .bg(t.surface)
-        .border_1()
-        .border_color(t.line_faint)
+        // The TUI's user band has an accent bar down its edge and no outline.
+        .border_l_2()
+        .border_color(t.accent)
         .rounded(px(metrics::RADIUS_LG))
         .line_height(relative(t.ty.prose_lh))
         .child(div().flex_1().min_w_0().text_color(t.strong).child(text))
@@ -126,7 +132,7 @@ fn user(t: &Theme, text: &'static str, image: Option<&'static str>) -> impl Into
 
 fn thinking(t: &Theme, time: &'static str, live: Option<&'static str>) -> impl IntoElement {
     match live {
-        None => ui(t).text_color(t.thinking).child(format!("▸ Thought for {time}")).into_any_element(),
+        None => ui(t).italic().text_color(t.faint).child(format!("◇ Thought for {time}")).into_any_element(),
         Some(tail) => div()
             .flex()
             .flex_col()
@@ -135,7 +141,7 @@ fn thinking(t: &Theme, time: &'static str, live: Option<&'static str>) -> impl I
                     .flex()
                     .text_color(t.accent)
                     .child(div().flex_none().w(px(t.ty.code * ICON_W)).child(SPINNER))
-                    .child(format!("Thinking · {time}")),
+                    .child(div().italic().text_color(t.faint).child(format!("Thinking… {time}"))),
             )
             .child(
                 ui(t)
@@ -156,15 +162,17 @@ fn tool_row(t: &Theme, tool: &Tool) -> impl IntoElement {
         (_, true) => format!("{} …", tool.facts),
         _ => tool.facts.to_string(),
     };
-    // The verb and the facts are interface text; only the arguments (a path, a pattern) are code.
+    // As the TUI's tool header: a bullet (a spinner while the arguments stream), the verb in bold, the target
+    // in the tool role, the facts faint. The verb and the facts are interface text; only the target is code.
+    let (icon, icon_fg) = if tool.streaming { (SPINNER, t.accent) } else { ("●", t.faint) };
     ui(t)
         .flex()
         .items_center()
         .whitespace_nowrap()
         .text_color(t.muted)
-        .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child(tool.kind.icon()))
-        .child(div().flex_none().w(px(t.ty.code * VERB_EM)).child(tool.verb))
-        .child(mono(t).min_w_0().truncate().text_color(t.text).child(tool.target))
+        .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(icon_fg).child(icon))
+        .child(div().flex_none().w(px(t.ty.code * VERB_EM)).font_weight(FontWeight::BOLD).text_color(t.tool).child(tool.verb))
+        .child(mono(t).min_w_0().truncate().text_color(t.tool).child(tool.target))
         .when(!facts.is_empty(), |d| d.child(div().flex_none().pl(px(t.ty.code)).text_color(t.faint).child(facts)))
 }
 
@@ -173,13 +181,23 @@ fn diff_block(t: &Theme, d: &Diff) -> impl IntoElement {
 }
 
 fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
-    let failed = b.exit.is_some_and(|c| c != 0);
-    let (status, status_fg) = match b.exit {
-        None => (format!("{SPINNER} {}", b.time), t.accent),
-        Some(0) => (format!("✓ 0 · {}", b.time), t.ok),
-        Some(code) => (format!("✗ {code} · {}", b.time), t.err),
+    // As the TUI's bash card: the command behind a faint `$`, the output muted, the footer facts faint (a failed
+    // exit in err). The edge takes the tone: pending accent_soft, success line, error err_soft.
+    let (edge, status) = match b.exit {
+        None => (t.accent_soft, ui(t).flex_none().text_color(t.faint).child(format!("running {}", b.time))),
+        Some(0) => (t.line, ui(t).flex_none().text_color(t.faint).child(format!("Wall: {}", b.time))),
+        Some(code) => (
+            t.err_soft,
+            ui(t)
+                .flex()
+                .flex_none()
+                .text_color(t.faint)
+                .child(format!("Wall: {}", b.time))
+                .child(div().text_color(t.line).child(" · "))
+                .child(div().text_color(t.err).child(format!("Exit: {code}"))),
+        ),
     };
-    // A block: the command on a header bar, the output under it. A failure tints the bar and the edge.
+    // A block: the command on a header bar, the output under it.
     let header = ui(t)
         .flex()
         .items_center()
@@ -188,47 +206,46 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
         .py(px(6.))
         .whitespace_nowrap()
         .bg(t.surface)
-        .child(mono(t).flex_none().text_color(t.tool).child("$"))
-        .child(mono(t).flex_1().min_w_0().truncate().text_color(t.strong).child(b.command))
-        .child(div().flex_none().text_color(status_fg).child(status));
+        .child(mono(t).flex_none().text_color(t.faint).child("$"))
+        .child(mono(t).flex_1().min_w_0().truncate().text_color(t.accent).child(b.command))
+        .child(status);
     let mut tail = mono(t).flex().flex_col().px(px(12.)).py(px(6.)).text_color(t.muted);
+    if b.hidden > 0 {
+        tail = tail.child(div().flex_none().text_color(t.faint).child(format!("… {} more lines", b.hidden)));
+    }
     for l in &b.tail {
         tail = tail.child(div().flex_none().truncate().child(if l.is_empty() { " " } else { *l }));
-    }
-    if b.hidden > 0 {
-        tail = tail.child(
-            div().flex().justify_end().text_size(px(t.ty.small)).text_color(t.faint).child(format!("({} lines)", b.hidden)),
-        );
     }
     div()
         .w_full()
         .overflow_hidden()
         .rounded(px(metrics::RADIUS))
         .border_1()
-        .border_color(if failed { t.err } else { t.line })
+        .border_color(edge)
         .child(header)
-        .when(!b.tail.is_empty() || b.hidden > 0, |d| d.child(div().border_t_1().border_color(t.line_faint).child(tail)))
+        .when(!b.tail.is_empty() || b.hidden > 0, |d| d.child(div().border_t_1().border_color(edge).child(tail)))
 }
 
 /// A bordered band for a group of rows (todo, subagents).
 fn boxed(t: &Theme) -> gpui::Div {
-    div().w_full().rounded(px(metrics::RADIUS)).bg(t.surface).border_1().border_color(t.line_faint).px(px(12.)).py(px(8.))
+    div().w_full().rounded(px(metrics::RADIUS)).bg(t.surface).border_1().border_color(t.line).px(px(12.)).py(px(8.))
 }
 
 fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
     let done = subs.iter().filter(|s| s.done).count();
     let running = subs.len() - done;
     let head = if running == 0 { format!("{done} done") } else { format!("{done} done · {running} running") };
+    // As the TUI's job rows: a state mark (the spinner while running, ✓ when done), the name in the default text,
+    // the kind and time muted, the last activity muted; the counts in the header are faint, as the todo's are.
     let mut col = ui(t).flex().flex_col().gap(px(3.)).child(
         ui(t)
             .flex()
-            .text_color(t.muted)
-            .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("◆"))
-            .child(div().text_color(t.text).child("Subagents"))
-            .child(div().pl(px(t.ty.code)).child(head)),
+            .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.faint).child("●"))
+            .child(div().font_weight(FontWeight::BOLD).text_color(t.tool).child("Subagents"))
+            .child(div().pl(px(t.ty.code)).text_color(t.faint).child(head)),
     );
     for s in subs {
-        let (icon, fg) = if s.done { ("✓", t.ok) } else { ("●", t.accent) };
+        let (icon, fg) = if s.done { ("✓", t.ok) } else { (SPINNER, t.accent) };
         col = col.child(
             ui(t)
                 .flex()
@@ -239,7 +256,7 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
                 .child(div().flex_none().w(px(t.ty.ui * SUB_NAME_EM * 0.6 + 8.)).child(s.name))
                 .child(div().flex_none().w(px(t.ty.ui * SUB_KIND_EM * 0.6 + 8.)).text_color(t.muted).child(s.kind))
                 .child(div().flex_none().w(px(t.ty.ui * SUB_TIME_EM * 0.6 + 8.)).text_color(t.muted).child(s.time))
-                .child(div().flex_1().min_w_0().truncate().text_color(t.faint).child(format!("\"{}\"", s.summary))),
+                .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(s.summary)),
         );
     }
     col
@@ -247,18 +264,18 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
 
 fn todo(t: &Theme, items: &[TodoItem]) -> impl IntoElement {
     let done = items.iter().filter(|i| i.state == 2).count();
+    // As the TUI's todo result: a bullet header, `Todo · done/total`, then a mark per task.
     let mut col = ui(t).flex().flex_col().gap(px(2.)).child(
         ui(t)
             .flex()
-            .text_color(t.muted)
-            .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.tool).child("☰"))
-            .child(div().text_color(t.text).child("Todo"))
-            .child(div().pl(px(t.ty.code)).child(format!("{done}/{}", items.len()))),
+            .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.faint).child("●"))
+            .child(div().font_weight(FontWeight::BOLD).text_color(t.tool).child("Todo"))
+            .child(div().text_color(t.faint).child(format!(" · {done}/{}", items.len()))),
     );
     for i in items {
         let (icon, icon_fg, fg) = match i.state {
             2 => ("✓", t.ok, t.faint),
-            1 => ("▸", t.accent, t.text),
+            1 => ("▸", t.warn, t.warn),
             _ => ("○", t.faint, t.muted),
         };
         col = col.child(
@@ -267,36 +284,34 @@ fn todo(t: &Theme, items: &[TodoItem]) -> impl IntoElement {
                 .pl(px(t.ty.code * ICON_W))
                 .text_color(fg)
                 .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(icon_fg).child(icon))
-                .child(div().flex_1().min_w_0().when(i.state == 2, |d| d.line_through()).child(i.text)),
+                .child(div().flex_1().min_w_0().child(i.text)),
         );
     }
     col
 }
 
 fn error(t: &Theme, msg: &'static str) -> impl IntoElement {
+    // As the TUI's error lines: the whole text in the err role.
     ui(t)
-        .flex()
-        .items_start()
         .border_1()
-        .border_color(t.err)
+        .border_color(t.err_soft)
         .rounded(px(metrics::RADIUS))
         .bg(t.surface)
         .px(px(12.))
         .py(px(7.))
-        .child(div().flex_none().w(px(t.ty.ui * 1.5)).text_color(t.err).child("✗"))
-        .child(div().flex_1().min_w_0().text_color(t.text).child(msg))
+        .text_color(t.err)
+        .child(msg)
 }
 
 fn plan(t: &Theme, msg: &'static str) -> impl IntoElement {
+    // The TUI prints a parked plan as a notice: muted text, no glyph; the outline is the pending tone.
     prose(t)
         .text_size(px(t.ty.ui))
-        .flex()
-        .items_start()
         .px(px(14.))
         .py(px(9.))
         .border_1()
         .border_color(t.accent_soft)
         .rounded(px(metrics::RADIUS_LG))
-        .child(div().flex_none().w(px(t.ty.ui * 1.7)).text_color(t.accent).child("▣"))
-        .child(div().flex_1().min_w_0().child(msg))
+        .text_color(t.muted)
+        .child(msg)
 }

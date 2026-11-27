@@ -45,6 +45,8 @@ fn row(t: &Theme, l: &DiffLine, listing: bool, w: usize) -> impl IntoElement {
 
 /// One edit as a card: a header bar (verb, file, counts), the lines, and a footer for the lines not shown.
 pub fn card(t: &Theme, d: &Diff) -> gpui::Div {
+    // As the TUI's edit card: `✎ Edit: path ⟦+adds/-dels⟧` in the tool role, the counts in ok and err, the rule
+    // in the card's tone (line), `… n more lines` faint.
     let header = ui(t)
         .flex()
         .items_center()
@@ -53,21 +55,29 @@ pub fn card(t: &Theme, d: &Diff) -> gpui::Div {
         .py(px(6.))
         .bg(t.surface)
         .border_b_1()
-        .border_color(t.line_faint)
-        .child(div().flex_none().text_color(t.tool).child("✎"))
-        .child(div().flex_none().text_color(t.muted).child("Edit"))
-        .child(mono(t).flex_1().min_w_0().truncate().text_color(t.strong).child(d.file))
-        .child(div().flex_none().text_color(t.ok).child(format!("+{}", d.plus)))
-        .child(div().flex_none().text_color(t.err).child(format!("−{}", d.minus)));
+        .border_color(t.line)
+        .child(div().flex_none().text_color(t.tool).child("✎ Edit"))
+        .child(mono(t).flex_1().min_w_0().truncate().text_color(t.tool).child(d.file))
+        .child(
+            ui(t)
+                .flex()
+                .flex_none()
+                .text_color(t.faint)
+                .child("⟦")
+                .child(div().text_color(t.ok).child(format!("+{}", d.plus)))
+                .child("/")
+                .child(div().text_color(t.err).child(format!("-{}", d.minus)))
+                .child("⟧"),
+        );
     let footer = ui(t)
         .px(px(12.))
         .py(px(4.))
         .bg(t.surface)
         .border_t_1()
-        .border_color(t.line_faint)
+        .border_color(t.line)
         .text_size(px(t.ty.small))
-        .text_color(t.muted)
-        .child(format!("{} more lines", d.more));
+        .text_color(t.faint)
+        .child(format!("… {} more lines", d.more));
     div()
         .w_full()
         .overflow_hidden()

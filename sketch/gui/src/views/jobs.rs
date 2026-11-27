@@ -6,6 +6,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Div, FontWeight, Hsla, div, px};
 
 const COL_GAP: f32 = 10.;
+const COL_MARK: f32 = 12.;
 const COL_STATE: f32 = 18.;
 const COL_AGENT: f32 = 56.;
 const COL_TOOLS: f32 = 44.;
@@ -17,9 +18,11 @@ fn small(t: &Theme) -> Div {
     ui(t).text_size(px(t.ty.small))
 }
 
+/// The TUI's job marks: running `◌` (accent), done `✓` (ok), failed `✗` (err). A cancelled job has
+/// no mark in the TUI, which says `cancelled` in faint; `⊘` stays faint for it.
 fn glyph(t: &Theme, s: JobState) -> (&'static str, Hsla) {
     match s {
-        JobState::Running => ("●", t.accent),
+        JobState::Running => ("◌", t.accent),
         JobState::Done => ("✓", t.ok),
         JobState::Failed => ("✗", t.err),
         JobState::Cancelled => ("⊘", t.faint),
@@ -37,6 +40,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
     let t = c.t;
     let d = c.data;
     let running = d.jobs.iter().filter(|j| j.state == JobState::Running).count();
+    let finished = d.jobs.len() - running;
 
     let header = ui(t)
         .flex()
@@ -47,8 +51,8 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .bg(t.bar)
         .border_b_1()
         .border_color(t.line)
-        .child(ui(t).font_weight(FontWeight::SEMIBOLD).text_color(t.strong).child("Jobs"))
-        .child(small(t).text_color(t.muted).child(format!("{running} running · {} total", d.jobs.len())));
+        .child(ui(t).text_color(t.accent).child("Jobs"))
+        .child(small(t).text_color(t.muted).child(format!("{running} running · {finished} finished")));
 
     let mut table = div().flex().flex_col().px(px(metrics::PAD_SM)).py(px(metrics::PAD_SM)).child(head_row(t));
     for (i, j) in d.jobs.iter().enumerate() {
@@ -74,14 +78,14 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .border_t_1()
         .border_color(t.line)
         .text_color(t.muted)
-        .child("Enter open · x cancel · X cancel all · d result · a apply · o ports");
+        .child("Enter transcript · x kill · X kill all · d diff · a apply · o ports");
 
     div().flex().flex_col().size_full().bg(t.window).child(header).child(body).child(footer).into_any_element()
 }
 
 fn head_row(t: &Theme) -> Div {
     let h = |text: &'static str, w: Option<f32>, right: bool| {
-        let d = cell(small(t).font_weight(FontWeight::SEMIBOLD).text_color(t.faint), w);
+        let d = cell(small(t).text_color(t.faint), w);
         (if right { d.text_right() } else { d }).child(text)
     };
     small(t)
@@ -90,8 +94,7 @@ fn head_row(t: &Theme) -> Div {
         .px(px(6.))
         .py(px(5.))
         .mb(px(2.))
-        .rounded(px(metrics::RADIUS_SM))
-        .bg(t.surface)
+        .child(cell(small(t), Some(COL_MARK)))
         .child(h("", Some(COL_STATE), false))
         .child(h("NAME", None, false))
         .child(h("AGENT", Some(COL_AGENT), false))
@@ -110,12 +113,15 @@ fn job_row(t: &Theme, j: &JobRow, selected: bool) -> Div {
         .gap(px(COL_GAP))
         .px(px(6.))
         .py(px(ROW_PY))
-        .rounded(px(metrics::RADIUS_SM))
-        .border_l_2()
-        .border_color(gpui::transparent_black());
-    let d = if selected { d.bg(t.selected).border_color(t.accent) } else { d };
-    d.child(cell(ui(t).text_color(color), Some(COL_STATE)).child(icon))
-        .child(cell(ui(t).text_color(if selected { t.strong } else { t.text }), None).child(j.name))
+        .rounded(px(metrics::RADIUS_SM));
+    let d = if selected { d.bg(t.selected) } else { d };
+    d.child(cell(ui(t).text_color(t.accent), Some(COL_MARK)).child(if selected { "❯" } else { "" }))
+        .child(cell(ui(t).text_color(color), Some(COL_STATE)).child(icon))
+        .child(
+            cell(ui(t).text_color(t.strong), None)
+                .when(selected, |d| d.font_weight(FontWeight::BOLD))
+                .child(j.name),
+        )
         .child(cell(muted(small(t)), Some(COL_AGENT)).child(j.agent))
         .child(cell(muted(small(t)), Some(COL_TOOLS)).text_right().child(j.tools.to_string()))
         .child(cell(muted(small(t)), Some(COL_ELAPSED)).text_right().child(j.elapsed))
@@ -125,6 +131,12 @@ fn job_row(t: &Theme, j: &JobRow, selected: bool) -> Div {
 
 fn details(t: &Theme, j: &JobRow) -> Div {
     let (icon, color) = glyph(t, j.state);
+    // The output box takes the TUI's card tone: pending while running, error when failed, else success.
+    let tone = match j.state {
+        JobState::Running => t.accent_soft,
+        JobState::Failed => t.err_soft,
+        JobState::Done | JobState::Cancelled => t.line,
+    };
     let mut out = mono(t)
         .flex()
         .flex_col()
@@ -133,7 +145,7 @@ fn details(t: &Theme, j: &JobRow) -> Div {
         .rounded(px(metrics::RADIUS))
         .bg(t.surface)
         .border_1()
-        .border_color(t.line_faint)
+        .border_color(tone)
         .text_size(px(t.ty.small + 0.5))
         .text_color(t.muted);
     if j.output.is_empty() {
@@ -157,9 +169,14 @@ fn details(t: &Theme, j: &JobRow) -> Div {
                 .flex()
                 .gap(px(6.))
                 .child(ui(t).text_color(color).child(icon))
-                .child(ui(t).font_weight(FontWeight::SEMIBOLD).text_color(t.strong).child(j.name)),
+                .child(ui(t).text_color(t.accent).child(j.name)),
         )
-        .child(ui(t).text_color(t.text).child(j.task))
-        .child(small(t).text_color(t.faint).child("OUTPUT"))
+        .child(
+            ui(t)
+                .flex()
+                .child(ui(t).text_color(t.faint).child("task "))
+                .child(ui(t).text_color(t.strong).child(j.task)),
+        )
+        .child(small(t).text_color(t.tool).child("Output"))
         .child(out)
 }

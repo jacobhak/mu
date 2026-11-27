@@ -4,19 +4,22 @@ use super::{ViewCtx, diff, mono, ui};
 use crate::data::ReviewFile;
 use crate::theme::{Theme, metrics};
 use gpui::prelude::*;
-use gpui::{AnyElement, Div, FontWeight, div, px};
+use gpui::{AnyElement, Div, div, px};
 
 fn small(t: &Theme) -> Div {
     ui(t).text_size(px(t.ty.small))
 }
 
+/// The TUI's diff counts, as its edit card writes them: `⟦+3/-1⟧`, the brackets and slash faint.
 fn counts(t: &Theme, plus: u32, minus: u32) -> Div {
     small(t)
         .flex()
         .flex_none()
-        .gap(px(6.))
+        .child(div().text_color(t.faint).child("⟦"))
         .child(div().text_color(t.ok).child(format!("+{plus}")))
-        .child(div().text_color(t.err).child(format!("−{minus}")))
+        .child(div().text_color(t.faint).child("/"))
+        .child(div().text_color(t.err).child(format!("-{minus}")))
+        .child(div().text_color(t.faint).child("⟧"))
 }
 
 pub fn view(c: &ViewCtx) -> AnyElement {
@@ -37,7 +40,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .bg(t.bar)
         .border_b_1()
         .border_color(t.line)
-        .child(ui(t).font_weight(FontWeight::SEMIBOLD).text_color(t.strong).truncate().child(title))
+        .child(ui(t).text_color(t.accent).truncate().child(title))
         .child(
             small(t)
                 .flex()
@@ -72,7 +75,7 @@ fn file(t: &Theme, f: &ReviewFile) -> Div {
         .border_y_1()
         .border_color(t.line)
         .child(ui(t).flex_none().text_color(t.muted).child(if f.expanded { "▾" } else { "▸" }))
-        .child(div().flex_1().min_w_0().truncate().text_color(t.strong).child(f.path))
+        .child(div().flex_1().min_w_0().truncate().text_color(t.tool).child(f.path))
         .child(counts(t, f.plus, f.minus));
     let d = div().flex().flex_col().child(head);
     if f.expanded {

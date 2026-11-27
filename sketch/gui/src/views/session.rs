@@ -13,7 +13,6 @@ pub fn max_width(window_w: f32) -> f32 {
 
 pub fn view(c: &ViewCtx) -> AnyElement {
     let (t, s) = (c.t, c.s());
-    let header_fg = if c.focused { t.text } else { t.faint };
     let header = ui(t)
         .flex()
         .flex_none()
@@ -24,8 +23,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .bg(t.bar)
         .border_b_1()
         .border_color(t.line)
-        .text_color(header_fg)
-        .child(div().flex_1().truncate().child(s.title))
+        .child(div().flex_1().truncate().text_color(t.tool).child(s.title))
         .child(div().text_color(t.faint).child(s.host))
         .child(div().text_color(t.faint).child("⋯"));
 
