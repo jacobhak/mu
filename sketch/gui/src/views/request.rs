@@ -63,7 +63,7 @@ fn key(t: &Theme, k: &'static str, selected: bool) -> Div {
         .rounded(px(metrics::RADIUS_SM - 2.))
         .border_1()
         .border_color(if selected { t.accent } else { t.line })
-        .bg(if selected { t.accent.opacity(0.18) } else { t.window })
+        .bg(if selected { t.selected } else { t.window })
         .text_size(px(t.ty.small))
         .text_color(if selected { t.accent } else { t.muted })
         .child(k)
@@ -105,7 +105,7 @@ fn button(t: &Theme, selected: bool) -> Div {
         .rounded(px(metrics::RADIUS_SM))
         .border_1()
         .border_color(if selected { t.accent } else { t.line_faint })
-        .bg(if selected { t.accent.opacity(0.14) } else { t.window })
+        .bg(if selected { t.selected } else { t.window })
 }
 
 
@@ -152,7 +152,7 @@ fn option_row(t: &Theme, q: &Question, i: usize) -> Div {
             div()
                 .px(px(6.))
                 .rounded(px(999.))
-                .bg(t.ok.opacity(0.16))
+                .bg(t.surface)
                 .text_size(px(t.ty.small))
                 .text_color(t.ok)
                 .child("recommended"),
@@ -236,7 +236,7 @@ fn model_slider(t: &Theme, r: &DocReview) -> Div {
             .py(px(3.))
             .rounded(px(999.))
             .text_size(px(t.ty.small))
-            .when(on, |d| d.bg(t.accent.opacity(0.18)).border_color(t.accent).text_color(t.accent).font_weight(FontWeight::SEMIBOLD))
+            .when(on, |d| d.bg(t.selected).border_color(t.accent).text_color(t.strong).font_weight(FontWeight::SEMIBOLD))
             .when(!on, |d| d.border_color(t.line).bg(t.window).text_color(t.muted))
             .border_1()
             .child(*m)

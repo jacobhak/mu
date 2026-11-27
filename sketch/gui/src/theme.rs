@@ -25,11 +25,6 @@ pub struct TypeScale {
     pub code_lh: f32,
 }
 
-/// Minimum contrast of the text roles against the surfaces they sit on (WCAG AAA body, AA, and AA for dim text).
-const FLOOR_TEXT: f64 = 11.0;
-const FLOOR_MUTED: f64 = 7.0;
-const FLOOR_FAINT: f64 = 4.5;
-
 pub const SCALES: [TypeScale; 2] = [
     TypeScale { name: "16/14", prose: 16.0, ui: 14.0, code: 13.0, small: 12.0, prose_lh: 1.55, code_lh: 1.45 },
     TypeScale { name: "17/15", prose: 17.0, ui: 15.0, code: 14.0, small: 13.0, prose_lh: 1.55, code_lh: 1.45 },
@@ -185,9 +180,6 @@ pub struct Theme {
     pub hover: Hsla,
     /// The focused tile's edge.
     pub focus_ring: Hsla,
-    /// The line-number gutter of an added / removed line: between the line's background and its changed part.
-    pub diff_add_gutter: Hsla,
-    pub diff_del_gutter: Hsla,
     pub diff_add_bg: Hsla,
     pub diff_add_hi: Hsla,
     pub diff_del_bg: Hsla,
@@ -209,49 +201,24 @@ impl Theme {
         let (green, red) = (pal.get("green"), pal.get("red"));
         // The changed part of a line is a stronger shade than the line.
         let (add_bg, add_hi, del_bg, del_hi) = if dark {
-            (mix(bg, green, 22), mix(bg, green, 46), mix(bg, red, 22), mix(bg, red, 46))
+            (mix(bg, green, 16), mix(bg, green, 34), mix(bg, red, 16), mix(bg, red, 34))
         } else {
             (mix(bg, green, 20), mix(bg, green, 40), mix(bg, red, 18), mix(bg, red, 36))
         };
-        let (add_gutter, del_gutter) = if dark {
-            (mix(bg, green, 34), mix(bg, red, 34))
-        } else {
-            (mix(bg, green, 30), mix(bg, red, 28))
-        };
-        // Layers, from the back: chrome, bar, surface (the prompt, code, cards in the transcript), window (the tile),
-        // raised (the dock, composer, menus). The steps are wide on purpose: the TUI's bands read at a glance
-        // because its darker and lighter backgrounds sit far apart.
-        let black = (0, 0, 0);
-        let (window, bar, raised) = (
-            pal.rgb.get("window").copied().unwrap_or(bg),
-            pal.rgb.get("bar").copied().unwrap_or_else(|| if dark { mix(bg, black, 32) } else { mix(bg, fg, 7) }),
-            pal.rgb.get("raised").copied().unwrap_or_else(|| if dark { mix(bg, fg, 13) } else { mix(bg, (255, 255, 255), 70) }),
+        // Every layer is a key of the palette, no derived colour: from the back, chrome (`darker_background`),
+        // bar and surface (`dark_background`, the TUI's `Surface`), window (`background`), raised
+        // (`lighter_background`).
+        let (window, bar, raised, chrome, surface) = (
+            bg,
+            pal.get("dark_background"),
+            pal.get("lighter_background"),
+            pal.get("darker_background"),
+            pal.get("dark_background"),
         );
-        let surface = if dark { mix(bg, black, 48) } else { mix(bg, fg, 10) };
-        let chrome = pal.rgb.get("chrome").copied().unwrap_or_else(|| if dark { mix(bg, black, 62) } else { mix(bg, fg, 16) });
-        // The TUI's text roles, lifted until they clear a contrast floor on every surface they sit on. Glyphs at
-        // 12-14 px in a proportional face look thinner than a terminal's, so the TUI's own floor (2.4 for faint
-        // text) is too low here.
-        let hi = pal.get("bright_foreground");
-        let white = (255, 255, 255);
-        let surfaces = [window, bar, raised, surface];
-        let lift = |mut c: Rgb, min: f64| {
-            for _ in 0..24 {
-                if surfaces.iter().all(|s| contrast(c, *s) >= min) {
-                    break;
-                }
-                c = mix(c, hi, 8);
-            }
-            c
-        };
-        // Dark themes read near-white (the TUI's text looks brighter than its palette's foreground because a terminal
-        // draws it heavier); light themes get a step toward black.
-        let (text, strong) = if dark {
-            (mix(hi, white, 25), mix(hi, white, 60))
-        } else {
-            (lift(mix(fg, hi, 50), FLOOR_TEXT), hi)
-        };
-        let (muted, faint) = (lift(mix(text, bg, 30), FLOOR_MUTED), lift(pal.get("dark_foreground"), FLOOR_FAINT));
+        // Text is the palette's `bright_foreground`, the TUI's `Strong`; the hierarchy comes from the TUI's own
+        // muted and faint roles and from weight, not from new shades.
+        let strong = pal.get("bright_foreground");
+        let (text, muted, faint) = (strong, mix(fg, bg, 35), pal.get("dark_foreground"));
         Self {
             name,
             dark,
@@ -260,8 +227,8 @@ impl Theme {
             muted: h(muted),
             faint: h(faint),
             thinking: h(faint),
-            line: h(mix(bg, fg, 32)),
-            line_faint: h(mix(bg, fg, 20)),
+            line: h(mix(bg, fg, 22)),
+            line_faint: h(mix(bg, fg, 13)),
             surface: h(surface),
             selected: h(pal.get("selection")),
             accent: h(accent),
@@ -284,10 +251,8 @@ impl Theme {
             window: h(window),
             bar: h(bar),
             raised: h(raised),
-            hover: h(mix(bg, fg, 14)),
+            hover: h(pal.get("selection")),
             focus_ring: h(accent),
-            diff_add_gutter: h(add_gutter),
-            diff_del_gutter: h(del_gutter),
             diff_add_bg: h(add_bg),
             diff_add_hi: h(add_hi),
             diff_del_bg: h(del_bg),

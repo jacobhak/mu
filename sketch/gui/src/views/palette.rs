@@ -198,7 +198,7 @@ fn row(t: &Theme, selected: bool) -> gpui::Div {
         .rounded(px(CAP_RADIUS + 2.))
         .border_1()
         .border_color(if selected { t.accent } else { gpui::transparent_black() })
-        .when(selected, |d| d.bg(t.accent.opacity(0.14)))
+        .when(selected, |d| d.bg(t.selected))
         .child(
             div()
                 .w(px(MARKER_W - 8.))

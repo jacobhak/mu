@@ -20,10 +20,10 @@ pub fn lines(t: &Theme, lines: &[DiffLine]) -> AnyElement {
 }
 
 fn row(t: &Theme, l: &DiffLine) -> impl IntoElement {
-    let (sign, bg, gutter_bg, hi, sign_fg, no_fg) = match l.kind {
-        DiffKind::Context => (" ", None, t.surface, t.hover, t.faint, t.faint),
-        DiffKind::Add => ("+", Some(t.diff_add_bg), t.diff_add_gutter, t.diff_add_hi, t.ok, t.text),
-        DiffKind::Del => ("−", Some(t.diff_del_bg), t.diff_del_gutter, t.diff_del_hi, t.err, t.text),
+    let (sign, bg, hi, sign_fg, no_fg) = match l.kind {
+        DiffKind::Context => (" ", None, t.hover, t.faint, t.faint),
+        DiffKind::Add => ("+", Some(t.diff_add_bg), t.diff_add_hi, t.ok, t.muted),
+        DiffKind::Del => ("−", Some(t.diff_del_bg), t.diff_del_hi, t.err, t.muted),
     };
     let changed = if l.kind == DiffKind::Context { None } else { l.changed };
     let no = l.no.map(|n| n.to_string()).unwrap_or_default();
@@ -40,7 +40,7 @@ fn row(t: &Theme, l: &DiffLine) -> impl IntoElement {
                 .justify_end()
                 .w(px(t.ty.code * GUTTER_EM))
                 .pr(px(t.ty.code * 0.6))
-                .bg(gutter_bg)
+                .bg(t.surface)
                 .text_color(no_fg)
                 .child(no),
         )
