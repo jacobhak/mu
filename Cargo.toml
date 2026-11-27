@@ -6,7 +6,7 @@ license.workspace = true
 
 [workspace]
 members = ["crates/mu-agent", "crates/mu-common", "crates/mu-base", "crates/mu-bench", "crates/mu-provider", "crates/mu-session", "crates/mu-testutil", "crates/mu-tools", "crates/mu-tui", "plugins/gateway", "plugins/memory", "plugins/predict", "plugins/remote", "plugins/web"]
-exclude = ["plugins/mcp-http"]
+exclude = ["plugins/mcp-http", "sketch/gui"]
 resolver = "3"
 
 [workspace.package]

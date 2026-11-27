@@ -4,3 +4,4 @@
 __pycache__/
 rustc-ice-*.txt
 *.bun-build
+/sketch/gui/target

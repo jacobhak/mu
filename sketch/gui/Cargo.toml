@@ -1,0 +1,20 @@
+[package]
+name = "mu-gui-sketch"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Throwaway GPUI sketch of mu's desktop app (docs/design/gui-sketch.md). Deleted once its findings are written down."
+
+# Its own workspace and lockfile: mu's Cargo.lock, deny.toml and scripts/ci-checks.sh never see it.
+[workspace]
+
+[[bin]]
+name = "mu-gui-sketch"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { package = "gpui-unofficial", version = "=1.30.2" }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.30.2" }
+
+[profile.release]
+debug = false
