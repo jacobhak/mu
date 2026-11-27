@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::host::sessions::LiveRow;
+use crate::host::sessions::{AttachTarget, LiveRow};
 use crate::text::line::{self, Line, dim, span};
 use crate::text::{accent, pad, wrap};
 use crate::theme::{self, Role};
@@ -26,11 +26,17 @@ pub struct Row {
     pub host: Option<String>,
     /// How to open a session on another host, from the source that listed it.
     pub hint: Option<String>,
-    /// A shell command that opens it (`mu --attach`).
-    pub attach: Option<String>,
+    /// What opens it (`mu --attach`).
+    pub attach: Option<AttachTarget>,
+    /// What a row on another host offers: `stop`, `cancel`, `notify`.
+    pub actions: Vec<String>,
 }
 
 impl Row {
+    fn offers(&self, action: &str) -> bool {
+        self.actions.iter().any(|a| a == action)
+    }
+
     /// `print`, `subagent review-lead`, `tui`; `?` for a record that says nothing. An agent with a
     /// request that waits for a client adds ` waiting`, and one whose state is still locked ` locked`.
     pub fn label(&self) -> String {
@@ -47,7 +53,7 @@ impl Row {
     /// that takes abort requests cancels its current turn.
     pub fn can_stop(&self) -> bool {
         if self.host.is_some() {
-            return false;
+            return self.offers("cancel");
         }
         match self.live.kind.as_deref() {
             Some("print" | "subagent") => true,
@@ -59,12 +65,25 @@ impl Row {
     /// `S` can terminate it: an interactive mu or an agent (it ends its session the proper way), after a
     /// confirmation. An agent is joined by a client, not taken over, so `t` is not offered for it.
     pub fn can_terminate(&self) -> bool {
-        self.host.is_none() && matches!(self.live.kind.as_deref(), Some("tui" | "agent"))
+        if self.host.is_some() {
+            return self.offers("stop");
+        }
+        matches!(self.live.kind.as_deref(), Some("tui" | "agent"))
+    }
+
+    /// `n` can leave it a message.
+    pub fn can_message(&self) -> bool {
+        self.host.is_none() || self.offers("notify")
     }
 
     /// `t` can take it over: only a `-p` run hands its session over.
     pub fn can_take(&self) -> bool {
         self.host.is_none() && self.live.kind.as_deref() == Some("print") && self.live.print_run
+    }
+
+    /// The id a session source gave the row: its file name without `.jsonl` (`id` would cut at a `_`).
+    pub fn source_id(&self) -> String {
+        self.live.path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
     }
 
     /// The session id that `mu notify` and `mu take` accept.
@@ -113,7 +132,12 @@ pub fn build(
             modified: l.modified,
             host: l.host.clone(),
             hint: l.hint.clone(),
-            attach: l.attach.clone(),
+            attach: l.attach.clone().map(|command| AttachTarget {
+                command,
+                helper: l.helper.clone(),
+                state_key: l.state_key.clone(),
+            }),
+            actions: l.actions.clone(),
         });
     }
     out
@@ -231,7 +255,17 @@ pub fn detail(r: &Row, cost: &str, width: usize, now: SystemTime) -> Vec<Line> {
             (None, Some(h)) => h.clone(),
             (None, None) => "it runs on another machine".to_string(),
         };
-        rows.push(vec![span(format!("   {how}"), faint)]);
+        let mut keys = vec![how];
+        if r.can_stop() {
+            keys.push("s cancels its turn".into());
+        }
+        if r.can_terminate() {
+            keys.push("S stops it".into());
+        }
+        if r.can_message() {
+            keys.push("n messages it".into());
+        }
+        rows.push(vec![span(format!("   {}", keys.join(" · ")), faint)]);
         return rows;
     }
     let mut keys = vec!["Enter peek", "n message"];
@@ -285,6 +319,9 @@ mod tests {
                 host: None,
                 hint: None,
                 attach: None,
+                helper: None,
+                state_key: None,
+                actions: Vec::new(),
                 live,
             })
             .collect()
@@ -407,6 +444,7 @@ mod tests {
             host: None,
             hint: None,
             attach: None,
+            actions: Vec::new(),
         };
         assert!(row("print").can_stop() && row("print").can_take());
         assert!(row("subagent").can_stop() && !row("subagent").can_take());
@@ -428,6 +466,32 @@ mod tests {
         r.live.agent = Some("review-lead".into());
         assert_eq!(r.label(), "subagent review-lead");
         assert_eq!(row("print").id(), "a");
+    }
+
+    #[test]
+    fn a_remote_row_can_do_what_its_source_offers() {
+        let remote = |actions: &[&str]| Row {
+            live: live("remote/far/a.jsonl", "agent", "2026-01-01T00:00:00Z"),
+            title: String::new(),
+            depth: 0,
+            job: None,
+            modified: None,
+            host: Some("far".into()),
+            hint: None,
+            attach: None,
+            actions: actions.iter().map(|a| a.to_string()).collect(),
+        };
+        let none = remote(&[]);
+        assert!(!none.can_stop() && !none.can_terminate() && !none.can_message() && !none.can_take());
+        let all = remote(&["stop", "cancel", "notify"]);
+        assert!(all.can_stop() && all.can_terminate() && all.can_message() && !all.can_take());
+        let only = remote(&["notify"]);
+        assert!(!only.can_stop() && !only.can_terminate() && only.can_message());
+        let d: Vec<String> = detail(&all, "", 60, SystemTime::UNIX_EPOCH).iter().map(line_text).collect();
+        let last = d.last().unwrap();
+        assert!(last.contains("s cancels its turn") && last.contains("S stops it") && last.contains("n messages it"));
+        let d: Vec<String> = detail(&only, "", 60, SystemTime::UNIX_EPOCH).iter().map(line_text).collect();
+        assert!(!d.last().unwrap().contains("S stops it"));
     }
 
     #[test]
@@ -455,6 +519,7 @@ mod tests {
             host: None,
             hint: None,
             attach: None,
+            actions: Vec::new(),
         };
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600 + 3700);
         let row = list_row(&r, true, 24, 0, "$0.12", 80, now, None);

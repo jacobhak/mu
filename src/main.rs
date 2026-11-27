@@ -44,6 +44,8 @@ fn dispatch() -> Result<i32> {
             Err(other) => Ok(plans_cli::run_cli(other, &std::env::current_dir()?)),
         },
         Some(Sub::Agent { cmd: Some(cli::AgentCmd::List { json }), .. }) => cli::agents::list(json),
+        Some(Sub::Agent { cmd: Some(cli::AgentCmd::Stop { id }), .. }) => cli::agents::stop(&id),
+        Some(Sub::Agent { cmd: Some(cli::AgentCmd::Cancel { id }), .. }) => cli::agents::cancel(&id),
         Some(Sub::Agent { detach: true, .. }) => run::detach::run(),
         Some(Sub::Agent { model, thinking, resume, continue_latest, detached, .. }) => {
             if detached {
@@ -75,6 +77,10 @@ fn subcommand(sub: Sub) -> Result<i32> {
         Sub::Predict { cmd } => cli::predict::run(cmd),
         Sub::MigrateProfile { name, dry_run } => workflow::migrate::run(&name, dry_run),
         Sub::Attach { session, socket, .. } => cli::attach::run(session.as_deref(), socket),
+        Sub::Contracts => {
+            println!("{}", mu_base::contracts::json());
+            Ok(0)
+        }
         Sub::Plan { .. } => unreachable!("`mu plan` is routed in dispatch"),
         Sub::Agent { .. } => unreachable!("`mu agent` is routed in dispatch"),
     }

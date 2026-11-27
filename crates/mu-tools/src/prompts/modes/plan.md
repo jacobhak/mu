@@ -18,7 +18,7 @@ exit:
     <instruction>
     Full plan inlined below; durable copy at `{{path}}` (identical content).
     Execute plan step-by-step with full tool access; MUST verify each step before next.
-    NEVER re-read `{{path}}` while the inline plan is intact; the path is for subagent handoff and recovery only.
+    NEVER re-read `{{path}}` while the inline plan is intact; the path is for subagent handoff and recovery only (a subagent on this machine reads it; one launched to another machine cannot, so give it the text in `context`).
     Track progress with `todo` when available.
     </instruction>
 

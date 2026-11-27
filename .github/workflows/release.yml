@@ -20,8 +20,9 @@ jobs:
     env:
       # The container installs shellcheck below, so here a missing one is a failure.
       MU_REQUIRE_SHELLCHECK: 1
+      MU_REQUIRE_JQ: 1
     steps:
-      - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git pkg-config python3 shellcheck libatomic1
+      - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git pkg-config python3 shellcheck libatomic1 jq
       # Ubuntu 22.04's apt nodejs is 12.x; ci-checks.sh needs `node --test` (18+).
       - run: |
           curl -sSfO https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-x64.tar.gz
@@ -86,10 +87,8 @@ jobs:
           path: dist
           merge-multiple: true
       - run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
-      # Attestations need a public repo or GitHub Enterprise Cloud; on a private repo without either this
-      # step fails, and the release goes out with its checksum only. install.sh verifies one when it exists.
+      # install.sh verifies the attestation when the release has one.
       - uses: actions/attest-build-provenance@v2
-        continue-on-error: true
         with:
           subject-path: dist/*.tar.gz
       - run: |

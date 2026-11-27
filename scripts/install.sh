@@ -32,7 +32,7 @@ esac
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# Public URLs first; a private repo (or fork) falls back to an authenticated gh.
+# Public URLs first; a private fork falls back to an authenticated gh.
 has_gh() { command -v gh >/dev/null && gh auth status >/dev/null 2>&1; }
 
 # A file's physical path, following symlinks (macOS has no `readlink -f`) and any `..` or symlinked
@@ -68,7 +68,7 @@ build_offloaded() {
   esac
   sha="$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null)" || return 1
   [ "$dirty" = 0 ] || sha="$sha-dirty"
-  for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do fetch+=(--fetch "target/release/$b"); done
+  for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory mu-remote; do fetch+=(--fetch "target/release/$b"); done
   echo "install: building on an offload node ($arch)"
   # The job's checkout is a snapshot commit, so build.rs gets the sha from MU_BUILD_SHA. Two jobs, as
   # scripts/maint/check.sh: x86_64 nodes peak near their 6 GiB limit at four.
@@ -97,7 +97,7 @@ else
   elif has_gh; then
     gh release download ${tag:+"$tag"} -R "$REPO" -p "mu-$plat.tar.gz" -p SHA256SUMS -D "$tmp" --clobber
   else
-    echo "install.sh: could not download $url (a private repo needs an authenticated gh)" >&2
+    echo "install.sh: could not download $url (a private fork needs an authenticated gh)" >&2
     exit 1
   fi
   # Refuse to unpack anything that does not match the published checksum.
@@ -158,8 +158,8 @@ fi
 
 # 3. Install
 mkdir -p "$home/bin" "$home/plugins"
-for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory; do
-  [ -e "$stage/bin/$b" ] || continue
+for b in mu mu-gateway mu-web mu-mcp-http mu-predict mu-memory mu-remote; do
+  [ -e "$stage/bin/$b" ] || { echo "install: this release has no $b"; continue; }
   cp "$stage/bin/$b" "$home/bin/.$b.new"
   mv -f "$home/bin/.$b.new" "$home/bin/$b"
 done
@@ -201,6 +201,7 @@ fi
 if [ "$link" = 1 ]; then
   mkdir -p "$HOME/.local/bin"
   ln -sfn "$home/bin/mu" "$HOME/.local/bin/mu"
+  [ ! -e "$home/bin/mu-remote" ] || ln -sfn "$home/bin/mu-remote" "$HOME/.local/bin/mu-remote"
   other="$(command -v mu || true)"
   if [ -n "$other" ] && [ "$(resolved_path "$other")" != "$(resolved_path "$HOME/.local/bin/mu")" ]; then
     echo "another mu shadows ~/.local/bin/mu: $other" >&2

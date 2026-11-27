@@ -1,6 +1,6 @@
 //! Moving files and ports between this machine and the one the agent runs on. When attached,
 //! `MU_ATTACH_HELPER` (a shell command line, set by whatever launched `mu --attach`; see
-//! docs/remote.md) carries them; without it, or when it answers exit 64 ("not supported here"), files go
+//! docs/remote-contracts.md) carries them; without it, or when it answers exit 64 ("not supported here"), files go
 //! over the attach stream as `read_bytes` and `write_bytes` host calls and ports cannot be forwarded.
 
 use super::*;
@@ -43,6 +43,7 @@ pub(super) async fn run_helper(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(format!("{helper} \"$@\"")).arg("mu-attach-helper").arg(verb).args(args);
+    cmd.env(mu_base::contracts::HELPER_ENV, mu_base::contracts::HELPER.to_string());
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -336,6 +337,7 @@ pub(super) fn unforward_now(forwards: Vec<Forward>) {
                 .arg("unforward")
                 .arg(f.port.to_string())
                 .arg(f.local.to_string())
+                .env(mu_base::contracts::HELPER_ENV, mu_base::contracts::HELPER.to_string())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -392,6 +394,13 @@ mod tests {
         let dir = mu_testutil::tmp();
         let h = script(dir.path(), r#"printf '%s|%s|%s' "$1" "$2" "$3""#);
         assert_eq!(run(&h, "read", &["/a b", "x"], None, 100, 5000).unwrap(), b"read|/a b|x");
+    }
+
+    #[test]
+    fn the_helper_is_told_its_contract_number() {
+        let dir = mu_testutil::tmp();
+        let h = script(dir.path(), r#"printf '%s' "$MU_ATTACH_HELPER_CONTRACT""#);
+        assert_eq!(run(&h, "read", &["/x"], None, 100, 5000).unwrap(), b"1");
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub struct Cli {
 
 #[derive(clap::Subcommand)]
 pub enum Sub {
-    /// Check for a newer release and install it (uses the public GitHub API; falls back to an authenticated gh for a private repo).
+    /// Check for a newer release and install it (uses the public GitHub API; falls back to an authenticated gh for a private fork).
     Update {
         /// Only report whether a newer release exists.
         #[arg(long)]
@@ -159,7 +159,6 @@ pub enum Sub {
     },
     /// Join a running `mu agent` from this process's stdin and stdout: copies lines to and from its socket.
     /// With no session it finds the one agent running in this directory.
-    #[command(hide = true)]
     Attach {
         /// Required: the raw protocol stream, for `ssh host mu attach --stdio ID`.
         #[arg(long, required = true)]
@@ -170,6 +169,8 @@ pub enum Sub {
         #[arg(long, conflicts_with = "session")]
         socket: Option<PathBuf>,
     },
+    /// Print the version of each contract that programs reaching other machines use (docs/remote-contracts.md), as one JSON line.
+    Contracts,
     /// Take over a running `mu -p` session: stop it after its current step, then resume it here.
     Take {
         /// Session file or id (prefix).
@@ -212,6 +213,10 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// End a running agent here: it ends its jobs and plugins and exits, as `/quit` does. ID is a session id or a prefix of one.
+    Stop { id: String },
+    /// Cancel the current turn of a running agent here; the agent keeps running.
+    Cancel { id: String },
 }
 
 #[cfg(test)]
@@ -248,5 +253,8 @@ mod tests {
         assert!(Cli::try_parse_from(["mu", "attach", "--stdio", "abc", "--socket", "/x"]).is_err());
         assert!(Cli::try_parse_from(["mu", "agent", "--detach"]).is_ok());
         assert!(Cli::try_parse_from(["mu", "agent", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "stop", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "cancel", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["mu", "agent", "stop"]).is_err());
     }
 }

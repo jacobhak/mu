@@ -27,6 +27,10 @@ cd "$wt"
 [ -z "$pi_ver" ] || sed -i -E "s/^pi = \"[^\"]*\"/pi = \"$pi_ver\"/" upstream.toml
 [ -n "$ver" ] || exit 0
 sed -i -E "s/^omp = \"[^\"]*\"/omp = \"$ver\"/" upstream.toml
+# The notices name the release and its commit: the peeled commit of an annotated tag, else the tag's own (a lightweight tag).
+sha7="$(git ls-remote https://github.com/can1357/oh-my-pi "refs/tags/v$ver^{}" "refs/tags/v$ver" |
+  awk '/\^\{\}$/ { p = substr($1, 1, 7) } !/\^\{\}$/ { t = substr($1, 1, 7) } END { print (p != "" ? p : t) }')"
+[ -z "$sha7" ] || sed -i -E "s/release v[0-9][0-9.]* \(commit [0-9a-f]+\)/release v$ver (commit $sha7)/" THIRD-PARTY-NOTICES.md
 sed -i -E "/can1357\/oh-my-pi/ s/(rev|tag) = \"[^\"]*\"/tag = \"v$ver\"/" Cargo.toml
 # A timeout is the network; any other failure is a manifest the new tag no longer satisfies, which the fixer can repair.
 rc=0

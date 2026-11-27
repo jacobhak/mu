@@ -4,7 +4,7 @@ mu is MIT licensed (see `LICENSE`). It includes material from these projects.
 
 ## oh-my-pi
 
-<https://github.com/can1357/oh-my-pi>, release v18.12.6 (commit 45c35e4). mu reimplements much of omp's
+<https://github.com/can1357/oh-my-pi>, release v19.1.1 (commit 31ffee5). mu reimplements much of omp's
 behaviour in Rust and copies or adapts this material from it:
 
 - `crates/mu-agent/src/prompts/*.md`: compaction, summarisation and plan-mode prompts; `crates/mu-tools/src/prompts/*.md`: `ask` and `todo` prompts

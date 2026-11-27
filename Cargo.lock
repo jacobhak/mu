@@ -4424,6 +4424,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "libc",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "snow",
+ "ssh-key",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "mu-session"
 version = "0.1.0"
 dependencies = [
@@ -6452,6 +6472,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "snow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82"
+dependencies = [
+ "aes-gcm",
+ "blake2",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "getrandom 0.3.4",
+ "ring",
+ "rustc_version",
+ "sha2 0.10.9",
+ "subtle",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7258,7 +7295,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -148,7 +148,7 @@ Hooks other than `tool_call` run concurrently under one deadline (30 s; 10 s for
 | plugin → core | `core/secrets` | Native plugins: a sealed key-value store. Params `{op: "get"\|"put"\|"delete"\|"info", name?, value?}` with base64 values; `get` returns `{value}` (null when absent), `put` `{}`, `delete` `{deleted}`, `info` `{sealed, unlocked}`. The namespace is always the calling plugin's (`<profile home>/secrets/plugin-<name>/<name>`), never chosen by the plugin. With [state encryption](docs/remote.md#encrypted-state) on, values are sealed and a locked agent answers `locked: attach to unlock` |
 | plugin → core | `core/mcpSecret` | Only from an MCP http bridge: `{op: "get"\|"put"\|"delete", value?}` on the OAuth blob (a JSON string) for its server, kept in the secret store under the server's OAuth key (the http URL, or a stdio server's `auth.resource`). A `get` of nothing marks the server as needing `/mcp login <name>` |
 | plugin → core | `core/webSearch` | Web plugin only (other plugins get an error): the chosen search backend and the one key it needs, for a `web_search` call |
-| core → plugin | `tool/call`, `command/run`, `hook/<name>` | Dispatch |
+| core → plugin | `tool/call`, `hook/<name>` | Dispatch |
 
 Tool results carry `content` for the model and optional `display` for the user, as in pi.
 

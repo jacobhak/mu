@@ -1,0 +1,59 @@
+# Both namespaces refuse all ingress: attaching goes through the API server's exec, not the network.
+# Egress to "the internet" is every address outside the private ranges, so pods cannot reach each other or the nodes.
+# The API server's address is cluster specific: replace <api-server-cidr> (kubectl get endpoints kubernetes -n default).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mu-workers
+  namespace: mu-workers
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    # A compiler cache's object store (sccache, say), when it is inside the private ranges. Delete this rule if
+    # you use none.
+    - to:
+        - ipBlock:
+            cidr: <object-store-cidr>
+      ports:
+        - {protocol: TCP, port: <object-store-port>}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mu-agent
+  namespace: mu-agent
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    - to:
+        - ipBlock:
+            cidr: <api-server-cidr>
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 6443}

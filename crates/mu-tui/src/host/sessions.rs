@@ -15,9 +15,11 @@ use mu_session::session::tree_cost::{self, Child, TreeCost};
 use mu_tools::tools::changes;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
 
 pub const RECENT_SESSIONS: &str = "recent_sessions";
 pub const SESSION_OWNER: &str = "session_owner";
@@ -29,6 +31,7 @@ pub const TREE_COST: &str = "tree_cost";
 pub const SEND_MESSAGE: &str = "send_message";
 pub const STOP_SESSION: &str = "stop_session";
 pub const TERMINATE_SESSION: &str = "terminate_session";
+pub const REMOTE_ACTION: &str = "remote_action";
 
 /// Most sessions the resume picker lists.
 const RECENT_MAX: usize = 200;
@@ -67,10 +70,102 @@ pub struct LiveRow {
     /// A shell command that opens it: `mu --attach` runs it, as a take-over's nested client does.
     #[serde(default)]
     pub attach: Option<String>,
+    /// A shell command line that becomes `MU_ATTACH_HELPER` for that attach.
+    #[serde(default)]
+    pub helper: Option<String>,
+    /// The private key file passed as `--state-key` for that attach.
+    #[serde(default)]
+    pub state_key: Option<String>,
+    /// The actions the row offers (`stop`, `cancel`, `notify`, in that order); their commands stay on the host.
+    #[serde(default)]
+    pub actions: Vec<String>,
+}
+
+impl LiveRow {
+    /// `here` for a row of this host, else the machine's name.
+    pub fn host_label(&self) -> &str {
+        self.host.as_deref().unwrap_or("here")
+    }
+
+    /// The id commands take: what the source gave for a row of another machine (its file stem, whole),
+    /// else the session id.
+    pub fn agent_id(&self) -> String {
+        match self.host {
+            Some(_) => self.live.path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+            None => list::id_of(&self.live.path),
+        }
+    }
+}
+
+/// What `mu --attach` is started with for a row of another machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachTarget {
+    pub command: String,
+    pub helper: Option<String>,
+    pub state_key: Option<String>,
+}
+
+/// A command a source gives, as an argument vector (each word quoted for `sh`; preferred) or as a shell
+/// line that is run as written.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Words {
+    Line(String),
+    Argv(Vec<String>),
+}
+
+impl Words {
+    /// The shell line, or `None` for a blank one or an empty argument vector.
+    fn line(self) -> Option<String> {
+        let line = match self {
+            Words::Line(l) => l,
+            Words::Argv(v) => v.iter().map(|w| mu_common::text::sh_quote(w)).collect::<Vec<_>>().join(" "),
+        };
+        (!line.trim().is_empty()).then_some(line)
+    }
 }
 
 /// How long one session source may take.
-const SOURCE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+const SOURCE_WAIT: Duration = Duration::from_secs(20);
+
+/// How long one row action (stop, cancel, notify) may take.
+const ACTION_WAIT: Duration = Duration::from_secs(60);
+
+/// A source row's commands for acting on it, as argument vectors run with no shell.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Actions {
+    stop: Option<Vec<String>>,
+    cancel: Option<Vec<String>>,
+    notify: Option<Vec<String>>,
+}
+
+impl Actions {
+    fn names(&self) -> Vec<String> {
+        [("stop", &self.stop), ("cancel", &self.cancel), ("notify", &self.notify)]
+            .into_iter()
+            .filter(|(_, a)| a.is_some())
+            .map(|(n, _)| n.to_string())
+            .collect()
+    }
+
+    fn argv(&self, action: &str) -> Option<&Vec<String>> {
+        match action {
+            "stop" => self.stop.as_ref(),
+            "cancel" => self.cancel.as_ref(),
+            "notify" => self.notify.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// The commands of the rows of the last refresh, by (host, id).
+static ACTIONS: LazyLock<Mutex<HashMap<(String, String), Actions>>> = LazyLock::new(Mutex::default);
+
+/// An array of strings with a non-blank first word; anything else is no command, and not a bad row.
+fn argv_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<Vec<String>>(v).ok().filter(|a| a.first().is_some_and(|w| !w.trim().is_empty())))
+}
 
 /// What a session source prints, a line per agent: the shape of `mu agent list --json`, plus where it
 /// runs and how to open it.
@@ -94,14 +189,25 @@ struct SourceRow {
     #[serde(default)]
     hint: Option<String>,
     #[serde(default)]
-    attach: Option<String>,
+    attach: Option<Words>,
+    #[serde(default)]
+    helper: Option<Words>,
+    #[serde(default)]
+    state_key: Option<String>,
+    #[serde(default, deserialize_with = "argv_or_none")]
+    stop: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "argv_or_none")]
+    cancel: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "argv_or_none")]
+    notify: Option<Vec<String>>,
 }
 
 impl SourceRow {
-    fn row(self, source: &str) -> LiveRow {
+    fn row(self, source: &str) -> (LiveRow, Actions) {
         let host = self.host.filter(|h| !h.trim().is_empty()).unwrap_or_else(|| source.to_string());
         let started = jiff::Timestamp::from_second(self.started).map(|t| t.to_string()).unwrap_or_default();
-        LiveRow {
+        let actions = Actions { stop: self.stop, cancel: self.cancel, notify: self.notify };
+        let row = LiveRow {
             live: LiveSession {
                 path: Path::new("remote").join(&host).join(format!("{}.jsonl", self.id)),
                 pid: 0,
@@ -122,13 +228,17 @@ impl SourceRow {
             title: self.title,
             host: Some(host),
             hint: self.hint,
-            attach: self.attach.filter(|a| !a.trim().is_empty()),
-        }
+            attach: self.attach.and_then(Words::line),
+            helper: self.helper.and_then(Words::line),
+            state_key: self.state_key.filter(|k| !k.trim().is_empty()),
+            actions: actions.names(),
+        };
+        (row, actions)
     }
 }
 
 /// The rows a session source's output holds; a line that is not one is skipped.
-fn source_rows(source: &str, out: &str) -> Vec<LiveRow> {
+fn source_rows(source: &str, out: &str) -> Vec<(LiveRow, Actions)> {
     out.lines().filter_map(|l| serde_json::from_str::<SourceRow>(l).ok()).map(|r| r.row(source)).collect()
 }
 
@@ -144,22 +254,61 @@ fn has_sources() -> bool {
     SOURCES.get().is_some_and(|s| !s.is_empty())
 }
 
-/// Runs every source at once and returns what they print as rows. A source that fails or is slow adds none.
+/// Runs every source at once and returns what they print as rows, and keeps their action commands for
+/// `remote_action`. A source that fails or is slow adds none.
 async fn remote_rows() -> Vec<LiveRow> {
     let mut runs = tokio::task::JoinSet::new();
     for argv in SOURCES.get().into_iter().flatten().cloned() {
         runs.spawn(async move {
             let mut cmd = tokio::process::Command::new(&argv[0]);
-            cmd.args(&argv[1..]);
+            cmd.args(&argv[1..]).env(mu_base::contracts::SOURCES_ENV, mu_base::contracts::SOURCES.to_string());
             let out = mu_base::process::run_capture(cmd, SOURCE_WAIT).await.unwrap_or_default();
             source_rows(&argv[0], &out)
         });
     }
     let mut rows = Vec::new();
+    let mut actions = HashMap::new();
     while let Some(done) = runs.join_next().await {
-        rows.extend(done.unwrap_or_default());
+        for (row, a) in done.unwrap_or_default() {
+            if let Some(host) = &row.host {
+                let id = row.live.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                actions.insert((host.clone(), id), a);
+            }
+            rows.push(row);
+        }
     }
+    *ACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = actions;
     rows
+}
+
+/// Runs a row action's command; `stdin` is fed to it (else it reads nothing). Ok is the first line it
+/// prints, Err the first line it complains with.
+async fn run_action(argv: &[String], stdin: Option<String>, wait: Duration) -> Result<String, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .env(mu_base::contracts::SOURCES_ENV, mu_base::contracts::SOURCES.to_string())
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", argv[0]))?;
+    let pgid = child.id().map_or(0, |p| p as i32);
+    if let (Some(text), Some(mut si)) = (stdin, child.stdin.take()) {
+        let _ = si.write_all(format!("{text}\n").as_bytes()).await;
+    }
+    let first = |b: &[u8]| String::from_utf8_lossy(b).lines().map(str::trim).find(|l| !l.is_empty()).map(String::from);
+    match tokio::time::timeout(wait, child.wait_with_output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(first(&out.stdout).unwrap_or_else(|| "done".into())),
+        Ok(Ok(out)) => Err(first(&out.stderr).unwrap_or_else(|| format!("exited with {}", out.status))),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => {
+            mu_base::process::kill_group(pgid, libc::SIGKILL);
+            Err(format!("{} did not finish in {wait:?}", argv[0]))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -231,6 +380,14 @@ pub struct TerminateArgs {
     pub started: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RemoteActionArgs {
+    pub host: String,
+    pub id: String,
+    pub action: String,
+    pub text: Option<String>,
+}
+
 pub(super) fn register(r: &mut Registry) {
     r.add(RECENT_SESSIONS, recent_sessions);
     r.add(SESSION_OWNER, session_owner);
@@ -242,6 +399,7 @@ pub(super) fn register(r: &mut Registry) {
     r.add(SEND_MESSAGE, send_message);
     r.add(STOP_SESSION, stop_session);
     r.add(TERMINATE_SESSION, terminate_session);
+    r.add(REMOTE_ACTION, remote_action);
 }
 
 thread_local! {
@@ -289,6 +447,9 @@ fn live_rows(source: &dyn SessionSource, me: u32, a: LiveArgs) -> Live {
             host: None,
             hint: None,
             attach: None,
+            helper: None,
+            state_key: None,
+            actions: Vec::new(),
             live: l,
         })
         .collect();
@@ -386,6 +547,23 @@ fn terminate_session(_: &Rc<Local>, args: serde_json::Value) -> Answer {
     ready(args, |a: TerminateArgs| control::terminate_session(&a.session, a.pid, &a.started).map_err(|e| e.to_string()))
 }
 
+fn remote_action(_: &Rc<Local>, args: serde_json::Value) -> Answer {
+    pending(args, |a: RemoteActionArgs| {
+        let argv = ACTIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(a.host.clone(), a.id.clone()))
+            .and_then(|x| x.argv(&a.action).cloned());
+        async move {
+            let Some(argv) = argv else {
+                return Err(format!("this row offers no {}; the list may be out of date", a.action));
+            };
+            let stdin = (a.action == "notify").then(|| a.text.unwrap_or_default());
+            run_action(&argv, stdin, ACTION_WAIT).await
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +606,9 @@ mod tests {
                 host: Some("cluster".into()),
                 hint: Some("mu-remote cluster".into()),
                 attach: Some("mu-remote connect cluster a".into()),
+                helper: Some("mu-remote helper cluster a".into()),
+                state_key: Some("/k".into()),
+                actions: vec!["stop".into()],
             }],
             canon: vec![("/a".into(), "/b".into())],
             notice: Some("n".into()),
@@ -471,7 +652,7 @@ mod tests {
             "not json\n",
             "{\"id\":\"def\"}\n",
         );
-        let rows = source_rows("prog", out);
+        let rows: Vec<LiveRow> = source_rows("prog", out).into_iter().map(|r| r.0).collect();
         assert_eq!(rows.len(), 2);
         let first = &rows[0];
         assert_eq!(first.host.as_deref(), Some("far"));
@@ -480,6 +661,68 @@ mod tests {
         assert_eq!(first.title.as_deref(), Some("t"));
         assert_eq!(rows[1].host.as_deref(), Some("prog"), "a row with no host names the source");
         assert!(rows[1].attach.is_none());
+    }
+
+    #[test]
+    fn an_argv_attach_is_quoted_and_helper_and_state_key_reach_the_row() {
+        let out = concat!(
+            "{\"id\":\"a\",\"attach\":[\"/o pt/x\",\"a'b\"],\"helper\":[\"h\",\"1 2\"],\"state_key\":\"/k/id\"}\n",
+            "{\"id\":\"b\",\"attach\":[],\"helper\":\"  \",\"state_key\":\" \"}\n",
+            "{\"id\":\"c\",\"attach\":\"x $HOME\",\"helper\":\"h --flag\"}\n",
+        );
+        let rows: Vec<LiveRow> = source_rows("prog", out).into_iter().map(|r| r.0).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].attach.as_deref(), Some(r"'/o pt/x' 'a'\''b'"));
+        assert_eq!(rows[0].helper.as_deref(), Some("'h' '1 2'"));
+        assert_eq!(rows[0].state_key.as_deref(), Some("/k/id"));
+        assert!(rows[1].attach.is_none() && rows[1].helper.is_none() && rows[1].state_key.is_none());
+        assert_eq!((rows[2].attach.as_deref(), rows[2].helper.as_deref()), (Some("x $HOME"), Some("h --flag")));
+    }
+
+    #[test]
+    fn a_row_lists_the_actions_it_offers_and_a_bad_command_drops_only_itself() {
+        let out = concat!(
+            "{\"id\":\"a\",\"stop\":[\"x\",\"stop\",\"a\"],\"cancel\":[\"x\",\"cancel\"],\"notify\":[\"x\",\"n\",\"-\"]}\n",
+            "{\"id\":\"b\",\"stop\":[],\"cancel\":\"x\",\"notify\":[\" \"]}\n",
+        );
+        let rows = source_rows("prog", out);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.actions, ["stop", "cancel", "notify"]);
+        assert_eq!(rows[0].1.argv("cancel"), Some(&vec!["x".to_string(), "cancel".to_string()]));
+        assert!(rows[1].0.actions.is_empty());
+        assert_eq!(rows[1].1, Actions::default());
+    }
+
+    fn script(body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("mu-host-action-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let s = d.join("act.sh");
+        std::fs::write(&s, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (s, d)
+    }
+
+    #[tokio::test]
+    async fn an_action_gets_its_words_and_text_unchanged_and_reports_how_it_ended() {
+        let (s, d) =
+            script("d=$(dirname \"$0\"); echo \"$1|$2\" > \"$d/args\"; cat > \"$d/in\"; echo queued; echo more");
+        let argv: Vec<String> = ["/bin/sh", &s.display().to_string(), "/o pt/x", "a b"].map(String::from).into();
+        let line = run_action(&argv, Some("hello there".into()), ACTION_WAIT).await;
+        assert_eq!(line, Ok("queued".to_string()));
+        assert_eq!(std::fs::read_to_string(d.join("args")).unwrap(), "/o pt/x|a b\n");
+        assert_eq!(std::fs::read_to_string(d.join("in")).unwrap(), "hello there\n");
+
+        let (bad, _) = script("echo ' '; echo 'no such agent' >&2; echo again >&2; exit 3");
+        let err = run_action(&["/bin/sh".into(), bad.display().to_string()], None, ACTION_WAIT).await;
+        assert_eq!(err, Err("no such agent".to_string()));
+
+        let (slow, _) = script("sleep 5");
+        let t = std::time::Instant::now();
+        let argv = ["/bin/sh".to_string(), slow.display().to_string()];
+        let err = run_action(&argv, None, Duration::from_millis(200)).await.unwrap_err();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(4));
     }
 
     #[test]

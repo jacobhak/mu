@@ -30,7 +30,7 @@ pub struct MuConfig {
 
 /// `[sessions]`: `sources` are commands that list agents on other machines for the Sessions tab.
 /// Each prints JSON lines in the shape of `mu agent list --json`, plus `host` and `hint` (and
-/// optionally `attach`, a command that opens the row); see docs/remote.md.
+/// optionally `attach`, a command that opens the row); see docs/remote-contracts.md.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct MuSessions {

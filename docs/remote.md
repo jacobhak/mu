@@ -2,13 +2,15 @@
 
 The agent and the terminal UI can run in two processes, on two machines. `mu agent` runs a session with no terminal and keeps running when you close the laptop; `mu --attach 'COMMAND'` runs the usual UI on your terminal as a client of it, over whatever pipe that command gives (`ssh host mu attach --stdio ID` is the plainest). Everything the UI does works the same attached: the transcript, approvals and questions, plan review, `/model`, `/login`, custom providers, MCP servers, the Sessions tab, `$EDITOR` for a plan or a memory file, terminal (`pty`) tool calls, clickable links in replies, `/open` and `/upload` for files, and `o` in the jobs panel to reach the ports a job listens on.
 
-mu knows nothing about ssh, Kubernetes or any other way to reach a machine. It offers the entry points described here ([For extension authors](#for-extension-authors)) and a separate program uses them: a script of your own, or a tool such as `mu-remote`, which keeps named remotes, starts agents in Kubernetes pods, runs tasks there and encrypts the stream. See that program's own documentation for remotes, trust and an encrypted transport.
+mu's core still knows no transport: nothing in it speaks ssh, Kubernetes or any other way to reach a machine. `mu-remote` (in `plugins/remote`, shipped with mu) is one program built only on the contracts in [remote-contracts.md](remote-contracts.md), and anyone can write another. It keeps named remotes, starts agents in Kubernetes pods, runs tasks there and encrypts the stream; see [its documentation](../plugins/remote/README.md) for remotes, trust and an encrypted transport.
 
 ## Start an agent
 
 ```sh
 mu agent [--model M] [--thinking T] [--permissions P] [--resume SESSION | -c] [--detach]
 mu agent list [--json]
+mu agent stop ID
+mu agent cancel ID
 ```
 
 It prints one line, `{"session":"<id>","socket":"<path>"}`, and serves a client on that Unix socket: `<profile home>/run/<session id>.sock`, mode 0600 in a private directory, beside the session's owner record (kind `agent` in the [jobs panel](background-jobs.md#sessions-tab)). There is no network listener: who may connect is who may reach the socket, and reaching one on another machine is `ssh` or `kubectl exec` (below). With no client, the agent goes on with what it was doing; a tool approval or a question waits for a client. A `-p` run holding the session you `--resume` is stopped after its current step first, as `mu take` does, without asking.
@@ -17,7 +19,11 @@ It prints one line, `{"session":"<id>","socket":"<path>"}`, and serves a client 
 
 `/new`, `/resume` and `/fork` inside the session move the socket to the new session's id; the client stays connected. `--permissions` takes effect for tool calls as usual, so an unattended agent should not be in `ask` mode unless you will attach to answer.
 
-The agent ends on `/quit` or Ctrl-D in a client, on `SIGTERM`, `SIGHUP` or `SIGINT` (it ends the session's jobs and plugins first; a second signal exits at once), and from the Sessions tab (`S`). It does not end when a client goes away.
+The agent ends on `/quit` or Ctrl-D in a client, on `SIGTERM`, `SIGHUP` or `SIGINT` (it ends the session's jobs and plugins first; a second signal exits at once), and from the Sessions tab (`S`). It does not end when a client goes away. `mu agent stop ID` on its machine does the same as `S`, and `mu agent cancel ID` cancels its turn as `s` does; `mu notify ID TEXT` leaves it a message. A program that reaches other machines offers the same for remote rows (see [remote-contracts.md](remote-contracts.md#d-session-sources-contract-2)).
+
+## Manage agents
+
+`/agents` lists this machine's agents and those your session sources list; `/agents stop|cancel|notify|attach ID` acts on one (`HOST:ID` when two machines share a prefix). The CLI equivalents are `mu agent stop|cancel ID` and `mu notify ID TEXT` here, and `mu-remote stop|cancel|notify NAME ID` for a remote.
 
 ## Attach
 
@@ -29,7 +35,7 @@ mu --attach 'mu attach --stdio' --state-key ~/.ssh/work_ed25519   # this machine
 
 `mu attach --stdio [SESSION]` runs on the agent's machine: a raw pipe that copies lines between its stdin and stdout and the agent's socket (with no session it finds the one agent running in the current directory, `--socket PATH` names a socket). `mu --attach COMMAND` runs `COMMAND` under `sh -c` and speaks the protocol over its stdin and stdout; the command's stderr lines show as notices. When the command ends the UI stays up and runs it again.
 
-The first line the client sends names a wire number (`WIRE`, now 6) and its version, and a different wire number is refused with a readable message. Display settings (`theme`, `notify`, `bell`, `hide_thinking_block`, `smooth_streaming`, the `[status]` levels) and composer history come from the client's own config and profile home; everything about models, keys, MCP servers, sessions and plugins is the agent's.
+The first line the client sends names a wire number (`WIRE`, now 7) and its version, and a different wire number is refused with a readable message. Display settings (`theme`, `notify`, `bell`, `hide_thinking_block`, `smooth_streaming`, the `[status]` levels) and composer history come from the client's own config and profile home; everything about models, keys, MCP servers, sessions and plugins is the agent's.
 
 A client sees what it missed when it attaches: the stored conversation up to the turn in progress, that turn's events (up to 20 000 events or 16 MB; past that the oldest blocks are dropped with a notice), the latest status, jobs, queue and todo, and every question, approval, plan review or terminal request still waiting. Nothing rings until it is caught up.
 
@@ -64,7 +70,7 @@ Sealing is general: a laptop agent can use it as well as one in a pod.
 
 `/open PATH` shows you a file of the agent's machine without leaving the client: it copies it here (into a private temp directory, removed when mu exits) and runs `$EDITOR` on the copy when it is text, with the notice `opened a copy; changes are not sent back`, or hands it to the system's opener otherwise, refusing the extensions that would run (`app`, `exe`, `command`, …). A trailing `:N` or `:N-M` is dropped, `~`, a relative path and `local://` resolve on the agent's machine, and `/open` with no path lists files the agent's tools touched or its replies mentioned, including replayed replies. Mentioned paths are detected heuristically without checking existence. `/upload PATH…` goes the other way: it sends files of the client's machine to `<session local dir>/uploads/<8 hex>-<basename>` on the agent's machine and puts `local://uploads/…` in the composer, for the agent's tools to resolve as usual. Pasting a path that names an existing file here only adds a hint about `/upload`; nothing is sent unless you ask.
 
-The bytes move through [`MU_ATTACH_HELPER`](#for-extension-authors) when the program that started the client set it, and otherwise over the attach stream (32 MiB at most). The ports a `bash` job listens on arrive with its job: `o` in the [jobs panel](background-jobs.md#jobs-panel) forwards them here through the helper and opens the lowest, and they are taken back when the job ends or mu exits. Without a helper, mu says it cannot forward and prints the `ssh -L` line to run instead.
+The bytes move through [`MU_ATTACH_HELPER`](remote-contracts.md#e-attach-helper-contract-1) when the program that started the client set it, and otherwise over the attach stream (32 MiB at most). The ports a `bash` job listens on arrive with its job: `o` in the [jobs panel](background-jobs.md#jobs-panel) forwards them here through the helper and opens the lowest, and they are taken back when the job ends or mu exits. Without a helper, mu says it cannot forward and prints the `ssh -L` line to run instead.
 
 Replies in an attached client carry clickable URLs: `[display] hyperlinks` ([config.md](config.md)) writes them as OSC 8 links, which kitty, iTerm2, wezterm, foot, Ghostty and most others open on click. Under tmux, tell it the terminal handles them, with `set -as terminal-features ',*:hyperlinks'` (the `hyperlinks` feature is documented as "supports OSC 8 hyperlinks"). A terminal that ignores them shows plain text.
 
@@ -74,37 +80,7 @@ Replies in an attached client carry clickable URLs: `[display] hyperlinks` ([con
 
 ## For extension authors
 
-A program that reaches other machines uses five contracts and nothing else of mu. Each is versioned: a change to one is a change to its number here.
-
-**A. Launcher, contract 2.** `[task] launcher = ["prog", "arg", …]` and `[task] launch = ["task", …]` (the agent kinds that use it: `task`, `scout`, a custom agent's name; `/review` and the agents of a subagent stay local) in `config.toml`.
-
-- mu runs the launcher in the task's directory in place of `mu --headless`, in a process group of its own. Its stdin and stdout carry the subagent stream exactly as a local child's do: the first stdin line is the task payload (`task`, `context`, `agent`, `parentSession`, `muVersion`, `permissions`, `relay` with `relayModels` and `relayTools`, `mirrorSession`, `outputSchema`, `model`, `depth`), later stdin lines are answers to the child's requests (`approval`, and the relay's), and the stdout lines are the child's events: `tool`, `model`, `entry` (a line of its session file), `approve`, `relay` (a model or search call) and last `result`. A launcher that runs `mu --headless` itself passes the stream through unchanged; one that runs it elsewhere must carry every line both ways. A child that is sent `relay` has no credential: its model and search calls come back to this session as `relay` lines (see [config.md](config.md)).
-- Environment (on top of mu's own; no credential is added): `MU_TASK_CONTRACT=2`, `MU_TASK_DEPTH` (this subagent's depth, 1 for a child of the main agent), `MU_TASK_NAME` (the launch id: a slug of the task's name and 8 hex digits, a valid pod name and ref component), `MU_TASK_ROOT` (the git repository's root), `MU_TASK_CWD`, `MU_TASK_REF` (`refs/mu/task/<launch id>`), `MU_TASK_SESSION` (the parent's session file, when it has one), `MU_TASK_PARENT_PID`, `MU_TASK_MU_HOME`, `MU_TASK_PROFILE_HOME` and `MU_TASK_AGENT_DIR` (the parent's omp agent directory).
-- `MU_TASK_BUNDLE`: a git bundle holding exactly `MU_TASK_REF`, the commit of the working tree (untracked files included) on top of `HEAD`, with its full history. mu deleted nothing yet; it removes the ref and the bundles when the run ends.
-- `MU_TASK_RESULT_BUNDLE`: a path in the same private directory, an empty file to begin with. The launcher writes the result there as a bundle holding exactly `refs/mu/result/<launch id>` (the checkout's changes committed on top of the snapshot), or leaves it empty when nothing changed.
-- stderr: `{"progress":"pulling image"}` lines go to the job's row in the jobs panel (until the launcher sends a line on stdout; later ones show while they last). Other lines are kept, the last twenty, as the error text when the task has no result.
-- End: when the launcher exits, mu imports the result bundle (it must hold nothing but that ref, and the commit must descend from the snapshot; otherwise nothing is kept and the task says so). It then applies the changes when every file they touch is unchanged since the snapshot, and otherwise keeps the ref and says how to apply it; the jobs panel offers the diff (`d`) and the apply (`a`). A task that failed or was cancelled leaves its changes unapplied. After stdout closes mu waits for the launcher to exit for up to five minutes, then kills its group.
-- Cancel: mu sends `TERM` to the group and `KILL` thirty seconds later. The launcher stops its worker, writes whatever result it can, and exits. Reconnecting, buffering and giving up are the launcher's business: to mu the stream is one pipe, so a launcher that reconnects must number and keep the lines it sends in both directions itself.
-- A subagent ignores `[task] launcher`: its own subagents run locally.
-
-**B. Agents.** `mu agent [--detach] [--resume ID | -c] [--model M]` prints `{"id":ID}` (detached) or `{"session":ID,"socket":PATH}` once it listens. `mu agent list --json` lists live agents with their client, `waiting` and `locked`. `mu attach --stdio ID` is a raw pipe to the agent's socket. The protocol on it is the one in `mu_base::wire`: `ClientLine` and `AgentLine`, JSON lines, the client's `hello` first.
-
-**C. Attach client.** `mu --attach '<command>' [--state-key PATH]`: see [Attach](#attach). `--state-key` is the SSH ed25519 private key that unlocks a sealed agent, `~/.ssh/id_ed25519` by default.
-
-**D. Session sources.** `[sessions] sources = [["prog", "arg", …], …]` in `config.toml`. Each command prints JSON lines in the shape of `mu agent list --json` (`id` is required, the rest optional), plus `host` (the machine, shown in a column), `hint` (how to open the row, shown in the Sessions tab's status line) and `attach` (a command that opens it: `Enter` hands the terminal to `mu --attach '<that command>'` and comes back to the tab). mu runs the commands off the UI thread, all at once, each with a 20 s limit, whenever the tab refreshes; a command that fails adds no rows. A row is not a local session: it has no pid, and only `Enter` does anything on it.
-
-**E. Attach helper, contract 1.** `MU_ATTACH_HELPER` in the environment of the `mu --attach` client: a shell command line. mu runs `sh -c '<helper> "$@"' mu-attach-helper VERB ARGS…` and passes the arguments as separate words, so the helper may take arguments of its own (the `$EDITOR` pattern). Paths are on the agent's machine.
-
-| Verb | stdin | stdout | |
-|---|---|---|---|
-| `forward PORT` | - | one JSON line `{"local":N}` | Make `127.0.0.1:N` on this machine reach `localhost:PORT` on the agent's machine, then return and leave it open |
-| `unforward PORT LOCAL` | - | - | Remove that forward |
-| `read PATH` | - | the file's bytes | Read a regular file |
-| `write PATH` | the bytes | - | Create PATH (and parent directories), mode 0600; fail if it exists |
-
-- Failure is a non-zero exit and one line of error text per line on stderr. Exit code **64** means "not supported here": mu then falls back to `read_bytes` and `write_bytes` host calls over the attach stream (32 MiB at most) for files, and reports that this remote cannot forward ports.
-- mu allows 30 s for `forward` and `unforward`, 10 minutes for `read` and `write`, and 512 MiB through the helper; it kills the helper's process group when a read goes past that.
-- `read_bytes` and `write_bytes` are host calls like the others, available with or without a helper: `read_bytes {path, max}` answers `{size, data_b64}`, and `write_bytes {path, data_b64}` creates a file that must not exist. Neither has a list of allowed paths, and it does not need one: a client that can attach is already as trusted as the agent's socket owner, who can read `auth.json`.
+A program that reaches other machines uses five contracts and nothing else of mu: the launcher (`[task] launcher`), the agent commands, the attach client, session sources (`[sessions] sources`) and the attach helper (`MU_ATTACH_HELPER`). Each is versioned, and `mu contracts` prints the numbers. They are specified in [remote-contracts.md](remote-contracts.md).
 
 ## Where your data goes
 
