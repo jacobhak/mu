@@ -185,7 +185,7 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 /// Content of tiles and bars that do not have focus.
-const DIM_OPACITY: f32 = 0.55;
+const DIM_OPACITY: f32 = 0.42;
 
 /// A tile or a bar: a rounded card on the chrome, with a hairline and a shadow that grows with focus.
 fn panel(t: &Theme, focused: bool) -> gpui::Div {
@@ -750,10 +750,11 @@ impl Shell {
                 let wide = rects.iter().find(|(i, _)| i == id).is_some_and(|(_, r)| r.w * vw > 700.0);
                 // Focus: an accent ring over a lifted card; the other tiles recede.
                 let dim = !focused && rects.len() > 1;
+                // The unfocused card also sinks a layer, towards the chrome, so the focused one stands proud.
                 panel(t, focused)
                     .id(("tile", *id))
                     .size_full()
-                    .bg(t.window)
+                    .bg(if dim { t.bar } else { t.window })
                     .child(
                         div()
                             .size_full()
