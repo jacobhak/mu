@@ -22,10 +22,25 @@ pub struct MuConfig {
     pub agent: MuAgent,
     pub sessions: MuSessions,
     pub keys: MuKeys,
+    pub cwd: MuCwd,
     /// `[permissions]`, parsed by `load_permissions` rather than serde.
     #[serde(skip)]
     pub permissions: MuPermissions,
     pub bell: MuBell,
+}
+
+/// `[cwd]`: `restore = false` keeps the working directory where `/cd` or the model's `set_cwd` left it
+/// when `/new` starts a session or mu quits; by default both go back to the directory mu started in.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct MuCwd {
+    pub restore: bool,
+}
+
+impl Default for MuCwd {
+    fn default() -> Self {
+        Self { restore: true }
+    }
 }
 
 /// `[sessions]`: `sources` are commands that list agents on other machines for the Sessions tab.

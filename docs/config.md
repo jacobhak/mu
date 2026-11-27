@@ -78,6 +78,9 @@ max_cost = 5.0             # most a launched worker may spend (USD) on the model
 # [sessions]             # the Sessions tab, beside this machine's (see remote-contracts.md#d-session-sources-contract-2)
 # sources = [["mu-remote", "rows"]]  # commands that print other machines' agents as JSON lines: id, cwd, started, title, client, waiting, host, hint, attach, helper, state_key
 
+[cwd]
+restore = true        # /new goes back to the directory mu started in after /cd or the model's set_cwd, and quitting records it as the session's last directory (so `--resume` from there starts where the run began); false leaves both where they were
+
 [update]
 check = true          # daily release check at startup
 

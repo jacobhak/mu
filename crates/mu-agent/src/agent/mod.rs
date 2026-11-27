@@ -62,6 +62,8 @@ use tokio_util::sync::CancellationToken;
 pub struct Agent {
     tools: Tools,
     cwd: PathBuf,
+    /// The directory the agent started in: `/new` and quitting go back to it (`[cwd] restore`).
+    origin_cwd: PathBuf,
     ctx: Rc<Context>,
     session: Option<SessionFile>,
     pub(crate) messages: History,
@@ -287,6 +289,7 @@ impl Agent {
         Self {
             tools,
             cwd: i.cwd.clone(),
+            origin_cwd: i.cwd.clone(),
             ctx: i.ctx,
             session: None,
             messages: History::default(),
@@ -528,6 +531,7 @@ impl Agent {
             Command::NewSession => {
                 self.end_session().await;
                 self.reset_conversation();
+                self.restore_origin_cwd().await;
                 self.notice("new session");
                 self.emit_status();
             }
@@ -600,6 +604,7 @@ impl Agent {
             }
             Command::Exit => {
                 self.end_session().await;
+                self.record_origin_cwd();
                 return false;
             }
         }

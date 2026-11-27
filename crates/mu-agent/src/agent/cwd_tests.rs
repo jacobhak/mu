@@ -173,6 +173,67 @@ fn a_review_base_survives_a_move_to_another_worktree_but_not_to_another_reposito
     });
 }
 
+fn restore_cfg(restore: bool) -> Configs {
+    let mut cfg = Configs::default();
+    cfg.mu.cwd.restore = restore;
+    cfg
+}
+
+/// Runs the agent through `cmds` and `Exit`; the directories its `Cwd` events named, in order.
+async fn moves(restore: bool, start: &Path, cmds: Vec<Command>) -> Vec<PathBuf> {
+    let (a, mut rx) = agent_in(vec![], restore_cfg(restore), RunConfig::default(), start);
+    let (ctx, crx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::task::spawn_local(a.run(crx));
+    for c in cmds {
+        ctx.send(c).unwrap();
+    }
+    ctx.send(Command::Exit).unwrap();
+    drop(ctx);
+    task.await.unwrap();
+    drain(&mut rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::Cwd(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_new_session_goes_back_to_the_starting_directory() {
+    run(async {
+        let (old, new) = (tmp_dir(), tmp_dir());
+        let moved = moves(true, &old, vec![Command::SetCwd(new.clone()), Command::NewSession]).await;
+        assert_eq!(moved, [new, old]);
+    });
+}
+
+#[test]
+fn a_new_session_stays_put_when_restoring_is_off() {
+    run(async {
+        let (old, new) = (tmp_dir(), tmp_dir());
+        let moved = moves(false, &old, vec![Command::SetCwd(new.clone()), Command::NewSession]).await;
+        assert_eq!(moved, [new]);
+    });
+}
+
+#[test]
+fn quitting_records_the_starting_directory_unless_restoring_is_off() {
+    run(async {
+        for (restore, expect_origin) in [(true, true), (false, false)] {
+            let (old, new) = (tmp_dir(), tmp_dir());
+            let (mut a, _rx) = agent_in(vec![reply()], restore_cfg(restore), RunConfig::default(), &old);
+            a.turn(Some("hi".to_string().into())).await;
+            a.user_set_cwd(new.clone()).await;
+            let path = a.session.as_ref().unwrap().path.clone();
+            let (ctx, crx) = tokio::sync::mpsc::unbounded_channel();
+            ctx.send(Command::Exit).unwrap();
+            a.run(crx).await;
+            assert_eq!(last_cwd(&path), Some(if expect_origin { old } else { new }));
+        }
+    });
+}
+
 #[test]
 fn a_switch_before_any_session_exists_leaves_the_history_alone() {
     run(async {

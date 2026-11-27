@@ -333,6 +333,7 @@ fn load_mu(warn: &mut Vec<String>) -> MuConfig {
         bell: parse(section("bell"), "bell", warn),
         sessions: parse(section("sessions"), "sessions", warn),
         keys: parse(section("keys"), "keys", warn),
+        cwd: parse(section("cwd"), "cwd", warn),
     }
 }
 

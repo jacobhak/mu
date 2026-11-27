@@ -34,6 +34,27 @@ impl Agent {
         self.turn_msgs.clear(); // not a model turn: no `turn_end` hook for it
     }
 
+    fn restores_cwd(&self) -> bool {
+        self.ports.providers.cfg.mu.cwd.restore && !self.tools.mirror && self.cwd != self.origin_cwd
+    }
+
+    /// `/new`: back to the directory the agent started in, unless `[cwd] restore` is off.
+    pub(super) async fn restore_origin_cwd(&mut self) {
+        if self.restores_cwd() {
+            self.set_cwd(self.origin_cwd.clone(), Why::User).await;
+        }
+    }
+
+    /// Quitting: the session's last directory becomes the one the agent started in, so a resume
+    /// from there lands where the run began. Nothing is re-derived: the process is ending.
+    pub(super) fn record_origin_cwd(&mut self) {
+        if self.restores_cwd()
+            && let Some(s) = self.session.as_mut()
+        {
+            s.record_cwd(&self.origin_cwd);
+        }
+    }
+
     /// Moves the session to `dir`. `false` when it did not move (an error or notice says why).
     pub(super) async fn set_cwd(&mut self, dir: PathBuf, why: Why) -> bool {
         let new = match std::fs::canonicalize(&dir) {
