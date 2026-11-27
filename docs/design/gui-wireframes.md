@@ -429,7 +429,7 @@ Wide, as a tile: the same rows as a table, with the TUI's columns:
 - **Its keys:** `x` cancels a job, `X` cancels all after `y`, `d`/`a` show or apply a finished job's result, `o` forwards a job's ports, Enter opens a job.
 - **What the app changes:** Enter opens the job's transcript or output in a tile, as the TUI's `jobs_view` with its keys. The job rows above the composer (`Alt+↓` marks one, `k`/`x` cancels it) stay as in the TUI.
 
-## 6. Palette and keys (draft)
+## 6. Palette and keys (agreed)
 
 ### What exists
 
@@ -472,12 +472,45 @@ They live in new contexts: `window` (tabs, tiles, bars, layouts) and `palette`.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-- **One palette searches everything:** every action with its current binding, the slash commands for the focused session, agents (local and remote), named layouts and views.
+- **One palette, two ways in:**
+  - the agent palette opens narrowed to agents and sessions (local, remote and recent), sorted by most recent use, so its key then Enter returns to the previous session. This replaces a Ctrl+Tab switcher;
+  - the full palette searches everything: every action with its current binding, the slash commands for the focused session, agents, named layouts and views.
 - **Each result shows its key,** so the palette teaches the bindings. That covers the survey's warning about shortcuts only a separate dialog reveals.
 - **A slash command runs in the focused session,** as if typed in its composer.
 
-### Questions for this section
+### 6b. Default keys for the new actions
 
-- Which modifier window keys use on each platform, given what the composer already takes.
-- Whether the palette is one search, or separate ones for actions and for agents.
-- The default keys for jumping to the next request, cycling recent sessions and opening the palette.
+Two tiers, all of them rebindable in `[keys.window]` and `[keys.palette]`:
+
+- **Frequent actions on a platform modifier:** Cmd on macOS, Ctrl+Shift on Linux. The TUI never receives these chords, so they cannot clash with it.
+- **Everything else after the leader key, Ctrl+X** (as in Emacs), then one key. Ctrl+X is free in the composer.
+
+| Action | macOS | Linux |
+|---|---|---|
+| Agent palette | Cmd+P | Ctrl+Shift+P |
+| Full palette | Cmd+K | Ctrl+Shift+K |
+| New tab | Cmd+T | Ctrl+Shift+T |
+| Go to tab 1–9 | Cmd+1…9 | Ctrl+Shift+1…9 |
+| Next / previous tab | Cmd+Shift+] / [ | Ctrl+PageDown / PageUp |
+| Focus left/down/up/right | Cmd+Opt+←↓↑→ | Ctrl+Shift+H/J/K/L |
+| Close tile | Cmd+W | Ctrl+Shift+W |
+| Toggle left bar | Cmd+B | Ctrl+Shift+B |
+
+| After Ctrl+X | Action |
+|---|---|
+| `h` `j` `k` `l` | Focus left, down, up, right |
+| `H` `J` `K` `L` | Swap the tile in that direction |
+| Enter | Split (spiral) |
+| `v` / `s` | Split right / down |
+| `x` | Close the tile |
+| `z` | Zoom the tile, or zoom back |
+| `<` `>` `-` `+` | Narrower, wider, shorter, taller |
+| `[` / `]` | Toggle the left / right bar |
+| `o` | Open a view in the tile (picker) |
+| `p` | Pin or unpin the view to its session |
+| `a` | Jump to the next request waiting on you (section 3d) |
+| `t` / `,` | New tab / rename the tab |
+| `1`…`9` | Go to tab |
+| `w` / `'` | Save the layout / switch layout |
+
+- **The defaults are a starting point.** The GPUI sketch app is where they get tried.

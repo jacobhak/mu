@@ -78,7 +78,10 @@ Process-wide globals (the theme, the keymap, host facts) are passed in explicitl
 
 - **One action list, the same default keys.** Both UIs use the same list of actions with the same default bindings, and `[keys.<context>]` overrides apply to both.
 - **GPUI dispatches keys in the app.** At start-up the app turns every action (context, name, keys) and the user's overrides into GPUI actions and key bindings. GPUI's key contexts mirror the TUI's (app, chat, editor, jobs, reply, review, select).
-- **The app adds bindings that only make sense there,** such as Cmd+1..9 to switch sessions. `docs/keys.md` lists those too.
+- **The app adds bindings that only make sense there,** in new `window` and `palette` contexts.
+  - Frequent ones use a platform modifier (Cmd on macOS, Ctrl+Shift on Linux), which the TUI never receives.
+  - The rest come after a leader key, Ctrl+X.
+  - `docs/keys.md` lists them too. See [the palette and keys wireframes](gui-wireframes.md#6-palette-and-keys-agreed).
 
 ## Layout and rendering
 
