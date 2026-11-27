@@ -11,12 +11,9 @@ const PALETTE_W: f32 = 640.0;
 const FLOAT_W: f32 = 820.0;
 const FLOAT_H: f32 = 620.0;
 const QUERY_H: f32 = 40.0;
-const ROW_PAD_Y: f32 = 4.0;
-const MARKER_W: f32 = 18.0;
-const KIND_W: f32 = 64.0;
-const GLYPH_W: f32 = 18.0;
-const CAP_RADIUS: f32 = 6.0;
-const HEADER_H: f32 = 38.0;
+const MARKER_W: f32 = 16.0;
+const KIND_W: f32 = 72.0;
+const GLYPH_W: f32 = 16.0;
 
 /// Agents and sessions, most recent first. `selected` indexes `data.palette.agents`.
 pub fn agent(t: &Theme, data: &Data, selected: usize) -> AnyElement {
@@ -24,7 +21,7 @@ pub fn agent(t: &Theme, data: &Data, selected: usize) -> AnyElement {
     shell(t)
         .child(query_row(t, ""))
         .child(rule(t))
-        .child(div().flex().flex_col().py(px(metrics::PAD_SM)).children(rows))
+        .child(div().flex().flex_col().py(px(metrics::PAD_Y)).children(rows))
         .child(rule(t))
         .child(footer(t))
         .into_any_element()
@@ -38,7 +35,7 @@ pub fn full(t: &Theme, data: &Data, selected: usize) -> AnyElement {
     shell(t)
         .child(query_row(t, q))
         .child(rule(t))
-        .child(div().flex().flex_col().py(px(metrics::PAD_SM)).children(rows))
+        .child(div().flex().flex_col().py(px(metrics::PAD_Y)).children(rows))
         .child(rule(t))
         .child(footer(t))
         .into_any_element()
@@ -49,12 +46,13 @@ pub fn full(t: &Theme, data: &Data, selected: usize) -> AnyElement {
 pub fn floating(t: &Theme, data: &Data, session: SessionId, body: AnyElement) -> AnyElement {
     let s = data.session(session);
     let header = ui(t)
-        .h(px(HEADER_H))
+        .h(px(metrics::ROW_H))
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(10.))
-        .px(px(metrics::PAD))
+        .gap(px(metrics::GAP))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .bg(t.bar)
         .border_b_1()
         .border_color(t.line)
@@ -63,9 +61,8 @@ pub fn floating(t: &Theme, data: &Data, session: SessionId, body: AnyElement) ->
         .child(
             div()
                 .flex_none()
-                .px(px(7.))
-                .py(px(1.))
-                .rounded(px(CAP_RADIUS))
+                .px(px(metrics::GAP))
+                .rounded(px(999.))
                 .border_1()
                 .border_color(t.line)
                 .bg(t.window)
@@ -81,7 +78,7 @@ pub fn floating(t: &Theme, data: &Data, session: SessionId, body: AnyElement) ->
         .w(px(FLOAT_W))
         .h(px(FLOAT_H))
         .bg(t.window)
-        .rounded(px(metrics::RADIUS_LG + 2.))
+        .rounded(px(metrics::RADIUS_LG))
         .border_1()
         .border_color(t.focus_ring)
         .shadow(t.shadow(Lift::Float))
@@ -99,7 +96,7 @@ fn shell(t: &Theme) -> gpui::Div {
     ui(t)
         .w(px(PALETTE_W))
         .bg(t.raised)
-        .rounded(px(metrics::RADIUS_LG + 2.))
+        .rounded(px(metrics::RADIUS_LG))
         .border_1()
         .border_color(t.line)
         .shadow(t.shadow(Lift::Float))
@@ -116,7 +113,6 @@ fn query_row(t: &Theme, query: &str) -> gpui::Div {
     let typed = div()
         .flex()
         .items_center()
-        .gap(px(1.))
         .when(query.is_empty(), |d| d.child(cursor(t)).child(div().text_color(t.faint).child("Find agent…")))
         .when(!query.is_empty(), |d| d.child(div().text_color(t.text).child(query.to_string())).child(cursor(t)));
     // The input sits on the bar layer, apart from the list.
@@ -125,15 +121,15 @@ fn query_row(t: &Theme, query: &str) -> gpui::Div {
         .flex_none()
         .flex()
         .items_center()
-        .px(px(14.))
-        .gap(px(10.))
+        .px(px(metrics::PAD_X))
+        .gap(px(metrics::GAP_SM))
         .bg(t.bar)
         .child(div().text_color(t.text).child("›"))
         .child(typed)
 }
 
 fn cursor(t: &Theme) -> gpui::Div {
-    div().w(px(2.)).h(px(t.ty.ui + 3.)).bg(t.accent)
+    div().w(px(2.)).h(px(t.ty.ui)).bg(t.accent)
 }
 
 fn footer(t: &Theme) -> gpui::Div {
@@ -142,8 +138,8 @@ fn footer(t: &Theme) -> gpui::Div {
         .flex()
         .items_center()
         .justify_between()
-        .px(px(14.))
-        .py(px(7.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .bg(t.bar)
         .text_size(px(t.ty.small))
         .text_color(t.muted)
@@ -151,7 +147,7 @@ fn footer(t: &Theme) -> gpui::Div {
             div()
                 .flex()
                 .items_center()
-                .gap(px(5.))
+                .gap(px(metrics::GAP))
                 .child("actions")
                 .child(sep(t))
                 .child("/commands")
@@ -164,9 +160,8 @@ fn footer(t: &Theme) -> gpui::Div {
             div()
                 .flex()
                 .items_center()
-                .gap(px(5.))
-                .child(cap(t, "Enter"))
-                .child("run")
+                .gap(px(metrics::GAP))
+                .child(div().flex().items_center().gap(px(metrics::GAP_SM)).child(cap(t, "Enter")).child("run"))
                 .child(sep(t))
                 .child(cap(t, "Esc")),
         )
@@ -176,9 +171,9 @@ fn footer(t: &Theme) -> gpui::Div {
 fn cap(t: &Theme, key: &str) -> gpui::Div {
     ui(t)
         .flex_none()
-        .px(px(6.))
-        .py(px(1.))
-        .rounded(px(CAP_RADIUS))
+        .px(px(metrics::CAP_PX))
+        .py(px(metrics::CAP_PY))
+        .rounded(px(metrics::RADIUS_SM))
         .border_1()
         .border_color(t.line)
         .bg(t.window)
@@ -193,7 +188,7 @@ fn hint(t: &Theme, key: &str, what: &str) -> gpui::Div {
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(5.))
+        .gap(px(metrics::GAP_SM))
         .text_size(px(t.ty.small))
         .text_color(t.muted)
         .child(cap(t, key))
@@ -205,22 +200,23 @@ fn sep(t: &Theme) -> gpui::Div {
     div().text_size(px(t.ty.small)).text_color(t.line).child("·")
 }
 
-/// The row's frame: the `❯` marker column and the selected background.
+/// The row's frame: the `❯` marker column and the selected background. Its content starts at `PAD_X`, as the
+/// query row's does.
 fn row(t: &Theme, selected: bool) -> gpui::Div {
     div()
         .flex()
         .items_center()
-        .gap(px(8.))
-        .mx(px(6.))
-        .px(px(8.))
-        .py(px(ROW_PAD_Y + 1.))
-        .rounded(px(CAP_RADIUS + 2.))
+        .gap(px(metrics::ROW_GAP))
+        .mx(px(metrics::GAP_SM))
+        .px(px(metrics::ROW_PX))
+        .py(px(metrics::ROW_PY))
+        .rounded(px(metrics::RADIUS))
         .border_1()
         .border_color(if selected { t.selected } else { gpui::transparent_black() })
         .when(selected, |d| d.bg(t.selected))
         .child(
             div()
-                .w(px(MARKER_W - 8.))
+                .w(px(MARKER_W))
                 .flex_none()
                 .text_color(t.accent)
                 .child(if selected { "❯" } else { "" }),
@@ -275,8 +271,11 @@ fn full_row(t: &Theme, e: &PaletteEntry, selected: bool) -> AnyElement {
         .child(
             div().w(px(KIND_W)).flex_none().flex().child(
                 div()
-                    .px(px(7.))
-                    .rounded(px(999.))
+                    .min_h(px(metrics::CONTROL_H_SM))
+                    .flex()
+                    .items_center()
+                    .px(px(metrics::PAD_X))
+                    .rounded(px(metrics::RADIUS_SM))
                     .bg(t.surface)
                     .text_size(px(t.ty.small))
                     .text_color(t.muted)
@@ -291,6 +290,6 @@ fn full_row(t: &Theme, e: &PaletteEntry, selected: bool) -> AnyElement {
                 .child(e.label),
         )
         .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(e.detail))
-        .child(div().flex_none().flex().items_center().gap(px(3.)).children(keys))
+        .child(div().flex_none().flex().items_center().gap(px(metrics::GAP_SM)).children(keys))
         .into_any_element()
 }

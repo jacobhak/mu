@@ -11,8 +11,8 @@ use gpui::{
 /// The document may take this much of the tile; the tile's height is unknown here, so a pixel cap stands in
 /// for the wireframe's 55% (a percentage needs a definite parent height, which the dock's wrapper lacks).
 const DOC_MAX_H: f32 = 340.0;
-const PREVIEW_W: f32 = 230.0;
-const MARKER_W: f32 = 14.0;
+const PREVIEW_W: f32 = 232.0;
+const MARKER_W: f32 = 16.0;
 const KEY_W: f32 = 16.0;
 
 /// The session's request docked between the transcript and the composer; `None` when nothing waits.
@@ -26,13 +26,13 @@ pub fn dock(c: &ViewCtx) -> Option<AnyElement> {
     };
     Some(
         // A raised card that interrupts the flow: lifted off the tile, with an accent edge on top.
-        div().px(px(metrics::PAD)).pt(px(metrics::PAD_SM)).pb(px(2.)).child(
+        div().px(px(metrics::PAD)).pt(px(metrics::PAD_SM)).pb(px(metrics::S0_5)).child(
             ui(t)
                 .flex()
                 .flex_col()
-                .gap(px(4.))
-                .px(px(metrics::PAD))
-                .py(px(metrics::PAD_SM + 4.))
+                .gap(px(metrics::GAP_SM))
+                .px(px(metrics::PAD_X))
+                .py(px(metrics::PAD_Y))
                 .rounded(px(metrics::RADIUS_LG))
                 .bg(t.raised)
                 .border_1()
@@ -44,12 +44,18 @@ pub fn dock(c: &ViewCtx) -> Option<AnyElement> {
     )
 }
 
+/// A stack of text lines (a head): tight pairs.
 fn col() -> Div {
-    div().flex().flex_col().gap(px(2.))
+    div().flex().flex_col().gap(px(metrics::GAP_SM))
+}
+
+/// A stack of blocks in the dock: head, command, options, hint.
+fn blocks() -> Div {
+    div().flex().flex_col().gap(px(metrics::GAP))
 }
 
 fn hint(t: &Theme, text: &'static str) -> Div {
-    div().pt(px(6.)).text_size(px(t.ty.small)).text_color(t.muted).child(text)
+    div().text_size(px(t.ty.small)).text_color(t.muted).child(text)
 }
 
 /// The `❯` the TUI puts before the highlighted row, in the accent.
@@ -64,8 +70,9 @@ fn key(t: &Theme, k: &'static str, selected: bool) -> Div {
         .flex()
         .justify_center()
         .min_w(px(KEY_W))
-        .px(px(5.))
-        .rounded(px(metrics::RADIUS_SM - 2.))
+        .px(px(metrics::CAP_PX))
+        .py(px(metrics::CAP_PY))
+        .rounded(px(metrics::RADIUS_SM))
         .border_1()
         .border_color(if selected { t.accent } else { t.line })
         .bg(if selected { t.selected } else { t.window })
@@ -78,8 +85,7 @@ fn key(t: &Theme, k: &'static str, selected: bool) -> Div {
 fn choice_row(t: &Theme, selected: bool, k: &'static str, label: &'static str, detail: &'static str) -> Div {
     let mut row = button(t, selected)
         .items_center()
-        .gap(px(8.))
-        .h(px(metrics::ROW_H + 2.))
+        .gap(px(metrics::GAP))
         .child(marker(t, selected))
         .child(key(t, k, selected))
         .child(
@@ -90,30 +96,23 @@ fn choice_row(t: &Theme, selected: bool, k: &'static str, label: &'static str, d
                 .child(label),
         );
     if !detail.is_empty() {
-        row = row.child(
-            mono(t)
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_right()
-                .text_size(px(t.ty.small))
-                .text_color(t.muted)
-                .child(detail),
-        );
+        row = row.child(mono(t).flex_1().min_w_0().truncate().text_right().text_color(t.muted).child(detail));
     }
     row
 }
 
+/// A button or option row: at least a control high, PAD_X across, the row's vertical padding.
 fn button(t: &Theme, selected: bool) -> Div {
     div()
         .flex()
-        .px(px(8.))
-        .rounded(px(metrics::RADIUS_SM))
+        .min_h(px(metrics::CONTROL_H))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::ROW_PY))
+        .rounded(px(metrics::RADIUS))
         .border_1()
         .border_color(if selected { t.accent } else { t.line_faint })
         .bg(if selected { t.selected } else { t.window })
 }
-
 
 fn approval(t: &Theme, a: &Approval) -> AnyElement {
     let mut head = col().child(div().text_color(t.text).font_weight(FontWeight::SEMIBOLD).child(a.title));
@@ -122,19 +121,18 @@ fn approval(t: &Theme, a: &Approval) -> AnyElement {
     }
     head = head.child(div().text_color(t.text).child(a.why));
     let code = mono(t)
-        .my(px(6.))
-        .px(px(12.))
-        .py(px(8.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .rounded(px(metrics::RADIUS))
         .bg(t.surface)
         .border_1()
         .border_color(t.line)
         .text_color(t.text)
         .child(a.body);
-    let rows = div().flex().flex_col().gap(px(4.)).children(
+    let rows = div().flex().flex_col().gap(px(metrics::GAP_SM)).children(
         a.choices.iter().enumerate().map(|(i, ch)| choice_row(t, i == a.selected, ch.key, ch.label, ch.detail)),
     );
-    col().child(head).child(code).child(rows).child(hint(t, a.hint)).into_any_element()
+    blocks().child(head).child(code).child(rows).child(hint(t, a.hint)).into_any_element()
 }
 
 fn option_row(t: &Theme, q: &Question, i: usize) -> Div {
@@ -154,8 +152,7 @@ fn option_row(t: &Theme, q: &Question, i: usize) -> Div {
     }
     button(t, selected)
         .items_start()
-        .gap(px(8.))
-        .py(px(5.))
+        .gap(px(metrics::GAP))
         .child(marker(t, selected))
         .child(key(t, number, selected))
         .child(text.flex_1().min_w_0())
@@ -225,8 +222,10 @@ fn preview_box(t: &Theme, text: &'static str) -> Div {
         .border_color(role)
         .child(
             ui(t)
-                .px(px(10.))
-                .py(px(4.))
+                .h(px(metrics::ROW_H))
+                .flex()
+                .items_center()
+                .px(px(metrics::PAD_X))
                 .border_b_1()
                 .border_color(role)
                 .text_size(px(t.ty.small))
@@ -237,9 +236,8 @@ fn preview_box(t: &Theme, text: &'static str) -> Div {
             mono(t)
                 .flex()
                 .flex_col()
-                .px(px(10.))
-                .py(px(8.))
-                .text_size(px(t.ty.small))
+                .px(px(metrics::PAD_X))
+                .py(px(metrics::PAD_Y))
                 .children(rows),
         )
 }
@@ -257,25 +255,24 @@ fn question(t: &Theme, q: &Question) -> AnyElement {
     let list = div()
         .flex()
         .flex_col()
-        .gap(px(4.))
+        .gap(px(metrics::GAP_SM))
         .flex_1()
         .min_w_0()
-        .pt(px(6.))
         .children((0..q.options.len()).map(|i| option_row(t, q, i)));
-    let mut body = div().flex().gap(px(12.)).child(list);
+    let mut body = div().flex().gap(px(metrics::GAP)).child(list);
     if let Some(p) = q.options.get(q.selected).and_then(|o| o.preview) {
-        body = body.child(preview_box(t, p).mt(px(6.)));
+        body = body.child(preview_box(t, p));
     }
-    col().child(head).child(body).child(hint(t, q.hint)).into_any_element()
+    blocks().child(head).child(body).child(hint(t, q.hint)).into_any_element()
 }
 
 fn questions_review(t: &Theme, r: &QuestionsReview) -> AnyElement {
     let pairs = r.answers.iter().enumerate().map(|(i, (q, a))| {
         col()
             .gap(px(0.))
-            .px(px(10.))
-            .py(px(5.))
-            .rounded(px(metrics::RADIUS_SM))
+            .px(px(metrics::PAD_X))
+            .py(px(metrics::PAD_Y))
+            .rounded(px(metrics::RADIUS))
             .bg(t.surface)
             .border_1()
             .border_color(t.line_faint)
@@ -285,12 +282,11 @@ fn questions_review(t: &Theme, r: &QuestionsReview) -> AnyElement {
     // The TUI's review opens with "Submit answers" highlighted.
     let submit = button(t, true)
         .items_center()
-        .gap(px(8.))
-        .h(px(metrics::ROW_H + 2.))
+        .gap(px(metrics::GAP))
         .child(marker(t, true))
         .child(div().flex_none().text_color(t.text).font_weight(FontWeight::SEMIBOLD).child("Submit answers"));
-    let rows = div().flex().flex_col().gap(px(4.)).pt(px(6.)).children(pairs).child(submit);
-    col()
+    let rows = div().flex().flex_col().gap(px(metrics::GAP_SM)).children(pairs).child(submit);
+    blocks()
         .child(div().text_color(t.accent).font_weight(FontWeight::SEMIBOLD).child(r.header))
         .child(rows)
         .child(hint(t, r.hint))
@@ -304,9 +300,8 @@ fn model_slider(t: &Theme, r: &DocReview) -> Div {
     div()
         .flex()
         .items_center()
-        .gap(px(6.))
-        .pt(px(4.))
-        .text_size(px(t.ty.small))
+        .gap(px(metrics::GAP_SM))
+        .min_h(px(metrics::CONTROL_H_SM))
         .child(div().text_color(t.muted).child("continue with"))
         .child(div().text_color(arrow(r.model > 0)).child("◂"))
         .child(div().text_color(t.text).child(r.models.get(r.model).copied().unwrap_or_default()))
@@ -319,19 +314,20 @@ fn review(c: &ViewCtx, r: &DocReview) -> AnyElement {
         .id(("review-doc-scroll", c.session))
         .max_h(px(DOC_MAX_H))
         .overflow_y_scroll()
-        .mt(px(6.))
-        .px(px(16.))
-        .py(px(12.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .rounded(px(metrics::RADIUS))
         .bg(t.window)
         .border_1()
         .border_color(t.line)
         .shadow(t.shadow(Lift::Rest))
         .child(markdown::render(t, &r.doc));
-    let actions = div().flex().flex_col().gap(px(4.)).pt(px(6.)).children(
-        r.actions.iter().enumerate().map(|(i, a)| choice_row(t, i == r.selected, a.key, a.label, a.detail)),
-    );
-    col()
+    let actions = div()
+        .flex()
+        .flex_col()
+        .gap(px(metrics::GAP_SM))
+        .children(r.actions.iter().enumerate().map(|(i, a)| choice_row(t, i == r.selected, a.key, a.label, a.detail)));
+    blocks()
         .child(div().text_color(t.accent).font_weight(FontWeight::SEMIBOLD).child(r.title))
         .child(doc)
         .child(actions)

@@ -1,6 +1,7 @@
 //! A session tile: header, transcript, the request dock, the queue, the composer and the session bar.
 //! Owned by the shell; the pieces are the other views' functions.
 use super::{ViewCtx, composer, request, transcript, ui};
+use crate::theme::metrics;
 use gpui::{AnyElement, InteractiveElement as _, IntoElement as _, ParentElement as _, Styled as _, div, px};
 
 /// The widest a lone session tile grows, as a share of the window's width. Past it the shell centres the tile and
@@ -17,9 +18,9 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .flex()
         .flex_none()
         .items_center()
-        .gap_2()
-        .h(px(32.))
-        .px(px(12.))
+        .gap(px(metrics::GAP))
+        .h(px(metrics::ROW_H))
+        .px(px(metrics::PAD_X))
         .bg(t.bar)
         .border_b_1()
         .border_color(t.line)

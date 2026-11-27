@@ -5,15 +5,13 @@ use crate::theme::{Theme, metrics};
 use gpui::prelude::*;
 use gpui::{AnyElement, Div, FontWeight, Hsla, div, px};
 
-const COL_GAP: f32 = 10.;
 const COL_MARK: f32 = 12.;
-const COL_STATE: f32 = 18.;
+const COL_STATE: f32 = 16.;
 const COL_AGENT: f32 = 56.;
 const COL_TOOLS: f32 = 44.;
 const COL_ELAPSED: f32 = 56.;
-const COL_COST: f32 = 52.;
+const COL_COST: f32 = 56.;
 const COL_PORTS: f32 = 96.;
-const ROW_PY: f32 = 3.;
 
 fn small(t: &Theme) -> Div {
     ui(t).text_size(px(t.ty.small))
@@ -46,16 +44,16 @@ pub fn view(c: &ViewCtx) -> AnyElement {
     let header = ui(t)
         .flex()
         .items_center()
-        .gap(px(metrics::PAD))
-        .px(px(metrics::PAD))
-        .py(px(metrics::PAD_SM + 2.))
+        .gap(px(metrics::GAP))
+        .h(px(metrics::ROW_H))
+        .px(px(metrics::PAD_X))
         .bg(t.bar)
         .border_b_1()
         .border_color(t.line)
         .child(ui(t).text_color(t.accent).child("Jobs"))
         .child(small(t).text_color(t.muted).child(format!("{running} running · {finished} finished")));
 
-    let mut table = div().flex().flex_col().px(px(metrics::PAD_SM)).py(px(metrics::PAD_SM)).child(head_row(t));
+    let mut table = div().flex().flex_col().flex_none().px(px(metrics::PAD_SM)).py(px(metrics::PAD_SM)).child(head_row(t));
     for (i, j) in d.jobs.iter().enumerate() {
         table = table.child(job_row(t, j, i == d.job_selected));
     }
@@ -69,12 +67,12 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .overflow_y_scroll()
         .child(table);
     if let Some(j) = d.jobs.get(d.job_selected) {
-        body = body.child(details(t, j));
+        body = body.child(details(t, j).flex_none());
     }
 
     let footer = small(t)
-        .px(px(metrics::PAD))
-        .py(px(7.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .bg(t.bar)
         .border_t_1()
         .border_color(t.line)
@@ -91,10 +89,10 @@ fn head_row(t: &Theme) -> Div {
     };
     small(t)
         .flex()
-        .gap(px(COL_GAP))
-        .px(px(6.))
-        .py(px(5.))
-        .mb(px(2.))
+        .items_center()
+        .h(px(metrics::ROW_H))
+        .gap(px(metrics::GAP))
+        .px(px(metrics::ROW_PX))
         .child(cell(small(t), Some(COL_MARK)))
         .child(h("", Some(COL_STATE), false))
         .child(h("NAME", None, false))
@@ -114,10 +112,10 @@ fn job_row(t: &Theme, j: &JobRow, selected: bool) -> Div {
     let d = ui(t)
         .flex()
         .items_center()
-        .gap(px(COL_GAP))
-        .px(px(6.))
-        .py(px(ROW_PY))
-        .rounded(px(metrics::RADIUS_SM));
+        .gap(px(metrics::GAP))
+        .px(px(metrics::ROW_PX))
+        .py(px(metrics::ROW_PY))
+        .rounded(px(metrics::RADIUS));
     let d = if selected { d.bg(t.selected) } else { d };
     d.child(cell(ui(t).text_color(t.accent), Some(COL_MARK)).child(if selected { "❯" } else { "" }))
         .child(cell(ui(t).text_color(color), Some(COL_STATE)).child(icon))
@@ -145,13 +143,12 @@ fn details(t: &Theme, j: &JobRow) -> Div {
     let mut out = mono(t)
         .flex()
         .flex_col()
-        .px(px(metrics::PAD_SM + 2.))
-        .py(px(metrics::PAD_SM))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .rounded(px(metrics::RADIUS))
         .bg(t.surface)
         .border_1()
         .border_color(tone)
-        .text_size(px(t.ty.small + 0.5))
         .text_color(t.muted);
     if j.output.is_empty() {
         out = out.text_color(t.faint).child("(no output yet)");
@@ -162,17 +159,17 @@ fn details(t: &Theme, j: &JobRow) -> Div {
     div()
         .flex()
         .flex_col()
-        .gap(px(metrics::PAD_SM))
-        .mx(px(metrics::PAD_SM))
-        .mt(px(metrics::PAD_SM))
-        .mb(px(metrics::PAD))
-        .p(px(metrics::PAD_SM))
+        .gap(px(metrics::GAP))
+        .mt(px(metrics::GAP))
+        .mb(px(metrics::GAP_LG))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .border_t_1()
         .border_color(t.line)
         .child(
             ui(t)
                 .flex()
-                .gap(px(6.))
+                .gap(px(metrics::GAP_SM))
                 .child(ui(t).text_color(color).child(icon))
                 .child(ui(t).text_color(t.accent).child(j.name)),
         )

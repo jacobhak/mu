@@ -18,20 +18,23 @@ pub fn queue(c: &ViewCtx) -> Option<AnyElement> {
         ui(t)
             .flex()
             .items_center()
-            .gap(px(8.))
-            .text_size(px(t.ty.small + 0.5))
+            .gap(px(metrics::GAP))
+            .px(px(metrics::PAD_X))
+            .py(px(metrics::ROW_PY))
+            .text_size(px(t.ty.small))
             .text_color(t.muted)
             .child(div().flex_1().min_w_0().truncate().child(format!("↳ {}: {}", q.kind, q.text)))
             .when(q.newest, |d| d.child(div().flex_none().text_color(t.muted).child("shift+↑ edit")))
     });
+    // Indented by the composer's own padding and the card's, so the queued text lines up with the typed text.
     Some(
         div()
             .flex()
             .flex_col()
-            .gap(px(2.))
-            .px(px(metrics::PAD + 14.))
+            .gap(px(metrics::GAP_SM))
+            .px(px(metrics::PAD))
             .pt(px(metrics::PAD_SM))
-            .pb(px(2.))
+            .pb(px(metrics::S0_5))
             .children(rows)
             .into_any_element(),
     )
@@ -42,12 +45,12 @@ pub fn input(c: &ViewCtx) -> AnyElement {
     let (t, s) = (c.t, c.s());
     let cm = &s.composer;
     let empty = cm.before.is_empty() && cm.after.is_empty();
-    let caret = || div().flex_none().w(px(2.)).h(px(t.ty.ui + 4.)).bg(if c.focused { t.accent } else { t.faint });
-    let prompt = || div().flex_none().pr(px(6.)).text_color(t.accent).child("μ ❯");
-    let field = ui(t).text_size(px(t.ty.ui + 1.)).line_height(relative(1.4)).flex().flex_wrap().items_center();
+    let caret = || div().flex_none().w(px(2.)).h(px(t.ty.ui)).bg(if c.focused { t.accent } else { t.faint });
+    let prompt = || div().flex_none().pr(px(metrics::S1_5)).text_color(t.accent).child("μ ❯");
+    let field = ui(t).line_height(relative(1.4)).flex().flex_wrap().items_center();
     let text = if empty && cm.ghost.is_empty() {
         // The cursor sits after the prompt; the placeholder follows it.
-        field.child(prompt()).child(caret()).child(div().pl(px(2.)).text_color(t.faint).child(cm.placeholder))
+        field.child(prompt()).child(caret()).child(div().pl(px(metrics::S0_5)).text_color(t.faint).child(cm.placeholder))
     } else {
         field
             .child(prompt())
@@ -60,10 +63,11 @@ pub fn input(c: &ViewCtx) -> AnyElement {
     let mut card = div()
         .flex()
         .flex_col()
-        .gap(px(6.))
-        .px(px(metrics::PAD))
-        .py(px(metrics::PAD_SM + 3.))
-        .rounded(px(metrics::RADIUS_LG))
+        .gap(px(metrics::GAP_SM))
+        .min_h(px(metrics::CONTROL_H))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
+        .rounded(px(metrics::RADIUS))
         .bg(t.raised)
         .border_1()
         .border_color(t.line_faint)
@@ -72,7 +76,7 @@ pub fn input(c: &ViewCtx) -> AnyElement {
     if let Some((name, size)) = cm.image {
         card = card.child(image_chip(t, name, size));
     }
-    let mut wrap = div().relative().px(px(metrics::PAD)).pt(px(metrics::PAD_SM)).pb(px(2.)).child(card);
+    let mut wrap = div().relative().px(px(metrics::PAD)).pt(px(metrics::PAD_SM)).pb(px(metrics::S0_5)).child(card);
     if let Some(menu) = &cm.slash {
         wrap = wrap.child(slash_menu(t, menu));
     }
@@ -82,8 +86,10 @@ pub fn input(c: &ViewCtx) -> AnyElement {
 fn image_chip(t: &Theme, name: &'static str, size: &'static str) -> Div {
     div().flex().child(
         ui(t)
-            .px(px(8.))
-            .py(px(1.))
+            .flex()
+            .items_center()
+            .min_h(px(metrics::CONTROL_H_SM))
+            .px(px(metrics::PAD_X))
             .rounded(px(metrics::RADIUS_SM))
             .bg(t.surface)
             .border_1()
@@ -99,27 +105,36 @@ fn slash_menu(t: &Theme, m: &SlashMenu) -> Div {
         let on = i == m.selected;
         ui(t)
             .flex()
-            .gap(px(10.))
-            .px(px(8.))
-            .h(px(metrics::ROW_H))
+            .gap(px(metrics::ROW_GAP))
+            .px(px(metrics::ROW_PX))
+            .py(px(metrics::ROW_PY))
             .items_center()
-            .rounded(px(metrics::RADIUS_SM))
+            .rounded(px(metrics::RADIUS))
             .when(on, |d| d.bg(t.selected))
             .child(div().flex_none().w(px(CMD_W)).text_color(t.text).child(*cmd))
             .child(div().flex_1().min_w_0().truncate().text_color(t.faint).child(*desc))
     });
-    div().absolute().bottom_full().left(px(metrics::PAD)).pb(px(6.)).child(
+    div().absolute().bottom_full().left(px(metrics::PAD)).pb(px(metrics::GAP_SM)).child(
         div()
             .flex()
             .flex_col()
             .w(px(MENU_W))
-            .p(px(6.))
+            .p(px(metrics::ROW_PX))
             .rounded(px(metrics::RADIUS_LG))
             .bg(t.raised)
             .border_1()
             .border_color(t.line)
             .shadow(t.shadow(Lift::Float))
-            .child(div().px(px(8.)).pb(px(2.)).text_size(px(t.ty.small)).text_color(t.faint).child("/"))
+            .child(
+                div()
+                    .h(px(metrics::ROW_H))
+                    .flex()
+                    .items_center()
+                    .px(px(metrics::ROW_PX))
+                    .text_size(px(t.ty.small))
+                    .text_color(t.faint)
+                    .child("/"),
+            )
             .children(rows),
     )
 }
@@ -160,7 +175,7 @@ fn branch(t: &Theme, s: &Session) -> Div {
     let mut d = ui(t)
         .flex()
         .items_center()
-        .gap(px(4.))
+        .gap(px(metrics::GAP_SM))
         .min_w_0()
         .overflow_hidden()
         .text_size(px(t.ty.small))
@@ -192,7 +207,7 @@ pub fn session_bar(c: &ViewCtx) -> AnyElement {
         Some(timer) => div()
             .flex_none()
             .flex()
-            .gap(px(4.))
+            .gap(px(metrics::GAP_SM))
             .child(chip(t, "⠋".into(), t.accent))
             .child(chip(t, timer.to_string(), t.muted)),
         None => chip(t, "μ".into(), t.muted),
@@ -207,10 +222,9 @@ pub fn session_bar(c: &ViewCtx) -> AnyElement {
     let bar = ui(t)
         .flex()
         .items_center()
-        .gap(px(6.))
-        .h(px(metrics::STATUS_BAR_H + 4.))
-        .px(px(metrics::PAD))
-        .pb(px(2.))
+        .gap(px(metrics::GAP_SM))
+        .h(px(metrics::STATUS_BAR_H))
+        .px(px(metrics::PAD_X))
         .overflow_hidden()
         .child(pi)
         .child(sep(t))
@@ -226,13 +240,14 @@ pub fn session_bar(c: &ViewCtx) -> AnyElement {
     let bar = match s.turn_timer {
         Some(_) => bar.child(
             ui(t)
+                .flex()
+                .items_center()
                 .flex_none()
-                .px(px(8.))
-                .py(px(1.))
+                .min_h(px(metrics::CONTROL_H_SM))
+                .px(px(metrics::PAD_X))
                 .rounded(px(metrics::RADIUS_SM))
                 .border_1()
                 .border_color(t.err_soft)
-                .text_size(px(t.ty.ui))
                 .text_color(t.err)
                 .child("■"),
         ),

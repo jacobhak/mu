@@ -730,9 +730,11 @@ impl Shell {
         div()
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(metrics::GAP_SM))
             .child(tab.title)
-            .when(waiting > 0, |d| d.child(div().text_color(t.warn).child(format!("⚑ {waiting}"))))
+            .when(waiting > 0, |d| {
+                d.child(div().text_size(px(t.ty.small)).text_color(t.warn).child(format!("⚑ {waiting}")))
+            })
     }
 
     fn render_view(&self, v: View, focused: bool, wide: bool, last: SessionId) -> AnyElement {
@@ -831,15 +833,16 @@ impl Shell {
             .flex_none()
             .items_center()
             .h(px(metrics::TAB_BAR_H))
-            .px(px(metrics::TILE_GAP + 4.))
-            .gap_1()
+            .px(px(metrics::PAD_X))
+            .gap(px(metrics::GAP))
             .text_color(t.muted);
         for (n, tab) in self.tabs.iter().enumerate() {
             let active = n == self.active;
             bar = bar.child(
                 div()
-                    .px(px(12.))
-                    .py(px(4.))
+                    .px(px(metrics::ROW_PX))
+                    .py(px(metrics::ROW_PY))
+                    .gap(px(metrics::ROW_GAP))
                     .rounded(px(metrics::RADIUS))
                     .when(active, |d| {
                         d.bg(t.window).text_color(t.strong).border_1().border_color(t.line_faint).shadow(t.shadow(Lift::Rest))
@@ -849,21 +852,29 @@ impl Shell {
             );
         }
         let sep = || div().text_color(t.line).child(" · ");
-        bar.child(div().px(px(8.)).text_color(t.faint).child("+"))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(t.name)
-                    .child(sep())
-                    .child(t.ty.name)
-                    .child(sep())
-                    .child("C-x b agents")
-                    .child(sep())
-                    .child("M-x all"),
-            )
-            .into_any_element()
+        bar.child(
+            div()
+                .min_h(px(metrics::CONTROL_H))
+                .flex()
+                .items_center()
+                .px(px(metrics::PAD_X))
+                .text_color(t.faint)
+                .child("+"),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .child(t.name)
+                .child(sep())
+                .child(t.ty.name)
+                .child(sep())
+                .child("C-x b agents")
+                .child(sep())
+                .child("M-x all"),
+        )
+        .into_any_element()
     }
 
     fn render_status_bar(&self, window: &Window) -> AnyElement {
@@ -885,7 +896,13 @@ impl Shell {
             .child(sep())
             .child(div().text_color(attention).child(format!("⚑ {} need you", s.need_you)))
             .child(sep())
-            .child(div().flex().gap_1().child("today").child(div().text_color(t.syn_type).child(s.today)));
+            .child(
+                div()
+                    .flex()
+                    .gap(px(metrics::GAP_SM))
+                    .child("today")
+                    .child(div().text_color(t.syn_type).child(s.today)),
+            );
         let mut remotes = div().flex().items_center();
         for (i, (name, ok)) in s.remotes.iter().enumerate() {
             if i > 0 {
@@ -894,7 +911,7 @@ impl Shell {
             remotes = remotes.child(
                 div()
                     .flex()
-                    .gap_1()
+                    .gap(px(metrics::GAP_SM))
                     .child(*name)
                     .child(div().text_color(if *ok { t.ok } else { t.err }).child(if *ok { "✓" } else { "✗" })),
             );
@@ -903,9 +920,9 @@ impl Shell {
             .flex()
             .flex_none()
             .items_center()
-            .gap_4()
+            .gap(px(metrics::GAP))
             .h(px(metrics::STATUS_BAR_H))
-            .px(px(metrics::PAD))
+            .px(px(metrics::PAD_X))
             .text_size(px(t.ty.small))
             .text_color(t.muted)
             .child(left)

@@ -34,9 +34,9 @@ pub fn view(c: &ViewCtx) -> AnyElement {
     let header = div()
         .flex()
         .flex_col()
-        .gap(px(2.))
-        .px(px(metrics::PAD))
-        .py(px(metrics::PAD_SM + 2.))
+        .gap(px(metrics::GAP_SM))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .bg(t.bar)
         .border_b_1()
         .border_color(t.line)
@@ -44,7 +44,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .child(
             small(t)
                 .flex()
-                .gap(px(10.))
+                .gap(px(metrics::GAP))
                 .child(div().min_w_0().truncate().text_color(t.muted).child(r.scope))
                 .child(counts(t, r.plus, r.minus)),
         );
@@ -57,7 +57,7 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .min_h_0()
         .overflow_y_scroll();
     for f in &r.files {
-        body = body.child(file(t, f));
+        body = body.child(file(t, f).flex_none());
     }
 
     div().flex().flex_col().size_full().bg(t.window).child(header).child(body).into_any_element()
@@ -67,10 +67,9 @@ fn file(t: &Theme, f: &ReviewFile) -> Div {
     let head = mono(t)
         .flex()
         .items_center()
-        .gap(px(6.))
-        .px(px(metrics::PAD))
-        .py(px(4.))
-        .py(px(6.))
+        .gap(px(metrics::GAP))
+        .h(px(metrics::ROW_H))
+        .px(px(metrics::PAD_X))
         .bg(t.surface)
         .border_y_1()
         .border_color(t.line)

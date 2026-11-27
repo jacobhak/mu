@@ -39,19 +39,53 @@ pub const SCALES: [TypeScale; 2] = [
 
 /// Spacing and shape constants shared by the views.
 pub mod metrics {
+    //! Spacing, control heights and text sizes follow Zed's UI crate (crates/ui: spacing.rs, typography.rs,
+    //! ButtonSize, ListItem, ListHeader, Tab): spacing steps 0/1/2/4/6/8/12/16, text 16/14/12, controls 32/28/22,
+    //! list rows 6 across and 4 down with 6 between items, list headers 28, tabs 32, key caps 2 vertical.
+    //! Nothing else is used for padding, gaps, heights or text sizes.
+
+    pub const S0_5: f32 = 2.0;
+    pub const S1: f32 = 4.0;
+    pub const S1_5: f32 = 6.0;
+    pub const S2: f32 = 8.0;
+    pub const S3: f32 = 12.0;
+    pub const S4: f32 = 16.0;
+
+    /// A list row (agents, jobs, palette, slash menu, tab item): 6 across, 4 down, 6 between its items (Zed `ListItem`).
+    pub const ROW_PX: f32 = S1_5;
+    pub const ROW_PY: f32 = S1;
+    pub const ROW_GAP: f32 = S1_5;
+    /// Inside every card, header band, footer band and input: 12 across, 8 down.
+    pub const PAD_X: f32 = S3;
+    pub const PAD_Y: f32 = S2;
+    /// Between items in a row or column; between blocks of a card stack or the transcript.
+    pub const GAP: f32 = S2;
+    pub const GAP_SM: f32 = S1;
+    pub const GAP_LG: f32 = S4;
+    /// A key cap: 4 across, 2 down.
+    pub const CAP_PX: f32 = S1;
+    pub const CAP_PY: f32 = S0_5;
+
+    /// Control heights (Zed `ButtonSize`): option rows, buttons and inputs are `CONTROL_H`; compact controls and chips `CONTROL_H_SM`.
+    pub const CONTROL_H: f32 = 28.0;
+    pub const CONTROL_H_SM: f32 = 22.0;
+
     /// The chrome showing between tiles, and around them.
-    pub const TILE_GAP: f32 = 4.0;
-    pub const TILE_RADIUS: f32 = 10.0;
-    pub const PAD: f32 = 14.0;
-    pub const PAD_SM: f32 = 8.0;
+    pub const TILE_GAP: f32 = S1;
+    /// A tile's inner padding.
+    pub const PAD: f32 = S4;
+    pub const PAD_SM: f32 = S2;
+    /// A list header or column header band (Zed `ListHeader`).
     pub const ROW_H: f32 = 28.0;
-    /// Cards and rows; chips, options and key caps; overlays and the dock.
+    /// Chips, key caps and options; cards, rows and tiles; overlays and the dock.
+    pub const RADIUS_SM: f32 = 4.0;
     pub const RADIUS: f32 = 8.0;
-    pub const RADIUS_SM: f32 = 6.0;
     pub const RADIUS_LG: f32 = 12.0;
+    pub const TILE_RADIUS: f32 = RADIUS_LG;
     pub const LEFT_BAR_W: f32 = 260.0;
     pub const RIGHT_BAR_W: f32 = 300.0;
-    pub const TAB_BAR_H: f32 = 38.0;
+    /// The tab bar (Zed `Tab`).
+    pub const TAB_BAR_H: f32 = 32.0;
     pub const STATUS_BAR_H: f32 = 28.0;
 }
 

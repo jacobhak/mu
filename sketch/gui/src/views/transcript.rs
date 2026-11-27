@@ -6,16 +6,14 @@ use crate::theme::{Theme, metrics};
 use gpui::prelude::*;
 use gpui::{AnyElement, FontWeight, div, px, relative};
 
-/// Space between consecutive blocks: tight between one-line rows, open around prose, diffs and groups.
-const ROW_GAP: f32 = 3.0;
-const BLOCK_GAP: f32 = 14.0;
-/// Column widths of the tool and subagent rows, in code-size ems.
+/// Column widths of the tool and subagent rows, in ems: the glyph columns in code size, the subagent text
+/// columns in interface size. Each text column is followed by a `GAP` of padding.
 const ICON_W: f32 = 1.7;
 const VERB_EM: f32 = 4.4;
-const SUB_NAME_EM: f32 = 11.0;
-const SUB_KIND_EM: f32 = 5.0;
-const SUB_TIME_EM: f32 = 7.0;
-const SUB_COST_EM: f32 = 6.0;
+const SUB_NAME_EM: f32 = 7.2;
+const SUB_KIND_EM: f32 = 3.6;
+const SUB_TIME_EM: f32 = 4.8;
+const SUB_COST_EM: f32 = 4.2;
 const SPINNER: &str = "⠋";
 
 /// The session's transcript as a scrollable column: blocks in order, "↓ new output" when `new_output`.
@@ -24,12 +22,13 @@ pub fn view(c: &ViewCtx) -> AnyElement {
     let mut col = ui(t).flex().flex_col().w_full().px(px(metrics::PAD)).py(px(metrics::PAD));
     let mut prev: Option<&Block> = None;
     for b in &s.blocks {
-        let top = prev.map_or(0.0, |p| if row_like(p) && row_like(b) { ROW_GAP } else { BLOCK_GAP });
+        // Tight between one-line rows, open around prose, diffs and groups.
+        let top = prev.map_or(0.0, |p| if row_like(p) && row_like(b) { metrics::GAP_SM } else { metrics::GAP_LG });
         col = col.child(div().flex_none().w_full().min_w_0().mt(px(top)).child(block(t, b)));
         prev = Some(b);
     }
     // Room under the last block so the pill never covers it.
-    col = col.child(div().flex_none().h(px(metrics::PAD * 2.)));
+    col = col.child(div().flex_none().h(px(metrics::PAD)).mb(px(metrics::PAD)));
 
     div()
         .size_full()
@@ -37,10 +36,12 @@ pub fn view(c: &ViewCtx) -> AnyElement {
         .child(div().id(("transcript-scroll", c.session)).size_full().overflow_y_scroll().child(col))
         .when(s.new_output, |d| {
             d.child(
-                div().absolute().bottom_3().left_0().right_0().flex().justify_center().child(
+                div().absolute().bottom(px(metrics::S3)).left_0().right_0().flex().justify_center().child(
                     ui(t)
-                        .px(px(12.))
-                        .py(px(3.))
+                        .flex()
+                        .items_center()
+                        .min_h(px(metrics::CONTROL_H_SM))
+                        .px(px(metrics::PAD_X))
                         .rounded(px(999.))
                         .bg(t.accent)
                         .text_color(t.window)
@@ -103,23 +104,25 @@ fn user(t: &Theme, text: &'static str, image: Option<&'static str>) -> impl Into
     prose(t)
         .flex()
         .items_start()
-        .gap(px(12.))
+        .gap(px(metrics::GAP))
         .w_full()
-        .px(px(14.))
-        .py(px(10.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .bg(t.surface)
         // The TUI's user band has an accent bar down its edge and no outline.
         .border_l_2()
         .border_color(t.accent)
-        .rounded(px(metrics::RADIUS_LG))
+        .rounded(px(metrics::RADIUS))
         .line_height(relative(t.ty.prose_lh))
         .child(div().flex_1().min_w_0().text_color(t.strong).child(text))
         .when_some(image, |d, label| {
             d.child(
                 ui(t)
                     .flex_none()
-                    .px(px(8.))
-                    .py(px(1.))
+                    .flex()
+                    .items_center()
+                    .min_h(px(metrics::CONTROL_H_SM))
+                    .px(px(metrics::PAD_X))
                     .rounded(px(metrics::RADIUS_SM))
                     .border_1()
                     .border_color(t.accent_soft)
@@ -146,10 +149,10 @@ fn thinking(t: &Theme, time: &'static str, live: Option<&'static str>) -> impl I
             .child(
                 ui(t)
                     .pl(px(t.ty.code * ICON_W))
-                    .pt(px(2.))
+                    .pt(px(metrics::GAP_SM))
                     .italic()
                     .text_color(t.thinking)
-                    .line_height(relative(1.45))
+                    .line_height(relative(t.ty.code_lh))
                     .child(tail),
             )
             .into_any_element(),
@@ -176,12 +179,13 @@ fn tool_row(t: &Theme, tool: &Tool) -> AnyElement {
     let header = ui(t)
         .flex()
         .items_center()
+        .gap(px(metrics::ROW_GAP))
         .whitespace_nowrap()
         .text_color(t.muted)
         .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(icon_fg).child(icon))
         .child(div().flex_none().w(px(t.ty.code * VERB_EM)).font_weight(FontWeight::BOLD).text_color(t.tool).child(tool.verb))
         .child(mono(t).min_w_0().truncate().text_color(t.tool).child(tool.target))
-        .when(!facts.is_empty(), |d| d.child(div().flex_none().pl(px(t.ty.code)).text_color(t.faint).child(facts)));
+        .when(!facts.is_empty(), |d| d.child(div().flex_none().text_color(t.faint).child(facts)));
     if !failed {
         return header.into_any_element();
     }
@@ -189,9 +193,9 @@ fn tool_row(t: &Theme, tool: &Tool) -> AnyElement {
     let mut card = ui(t)
         .w_full()
         .min_w_0()
-        .mt(px(3.))
-        .px(px(12.))
-        .py(px(7.))
+        .mt(px(metrics::GAP_SM))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .rounded(px(metrics::RADIUS))
         .border_1()
         .border_color(t.err_soft)
@@ -227,15 +231,15 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
     let header = ui(t)
         .flex()
         .items_center()
-        .gap(px(8.))
-        .px(px(12.))
-        .py(px(6.))
+        .gap(px(metrics::GAP))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .whitespace_nowrap()
         .bg(t.surface)
         .child(mono(t).flex_none().text_color(t.faint).child("$"))
         .child(mono(t).flex_1().min_w_0().truncate().text_color(t.accent).child(b.command))
         .child(status);
-    let mut tail = mono(t).flex().flex_col().px(px(12.)).py(px(6.)).text_color(t.muted);
+    let mut tail = mono(t).flex().flex_col().px(px(metrics::PAD_X)).py(px(metrics::PAD_Y)).text_color(t.muted);
     if b.hidden > 0 {
         tail = tail.child(div().flex_none().text_color(t.faint).child(format!("… {} more lines", b.hidden)));
     }
@@ -254,7 +258,14 @@ fn bash(t: &Theme, b: &Bash) -> impl IntoElement {
 
 /// A bordered band for a group of rows (todo, subagents).
 fn boxed(t: &Theme) -> gpui::Div {
-    div().w_full().rounded(px(metrics::RADIUS)).bg(t.surface).border_1().border_color(t.line).px(px(12.)).py(px(8.))
+    div()
+        .w_full()
+        .rounded(px(metrics::RADIUS))
+        .bg(t.surface)
+        .border_1()
+        .border_color(t.line)
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
 }
 
 fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
@@ -271,12 +282,12 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
     // As the TUI's job rows: a state mark (the spinner while running, ✓ when done, ✗ when failed), the name in the default text,
     // the kind and time muted, the spend in syn_type, the last activity muted; the counts in the header are faint,
     // as the todo's are.
-    let mut col = ui(t).flex().flex_col().gap(px(3.)).child(
+    let mut col = ui(t).flex().flex_col().gap(px(metrics::GAP_SM)).child(
         ui(t)
             .flex()
             .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.faint).child("●"))
             .child(div().font_weight(FontWeight::BOLD).text_color(t.tool).child("Subagents"))
-            .child(div().pl(px(t.ty.code)).text_color(t.faint).child(head)),
+            .child(div().pl(px(metrics::GAP)).text_color(t.faint).child(head)),
     );
     for s in subs {
         let (icon, fg) = match s.state {
@@ -291,10 +302,10 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
                 .whitespace_nowrap()
                 .pl(px(t.ty.code * ICON_W))
                 .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(fg).child(icon))
-                .child(div().flex_none().w(px(t.ty.ui * SUB_NAME_EM * 0.6 + 8.)).child(s.name))
-                .child(div().flex_none().w(px(t.ty.ui * SUB_KIND_EM * 0.6 + 8.)).text_color(t.muted).child(s.kind))
-                .child(div().flex_none().w(px(t.ty.ui * SUB_TIME_EM * 0.6 + 8.)).text_color(t.muted).child(s.time))
-                .child(div().flex_none().w(px(t.ty.ui * SUB_COST_EM * 0.6 + 8.)).text_color(t.syn_type).child(s.cost))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_NAME_EM)).pr(px(metrics::GAP)).child(s.name))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_KIND_EM)).pr(px(metrics::GAP)).text_color(t.muted).child(s.kind))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_TIME_EM)).pr(px(metrics::GAP)).text_color(t.muted).child(s.time))
+                .child(div().flex_none().w(px(t.ty.ui * SUB_COST_EM)).pr(px(metrics::GAP)).text_color(t.syn_type).child(s.cost))
                 .child(div().flex_1().min_w_0().truncate().text_color(t.muted).child(s.summary)),
         );
     }
@@ -304,7 +315,7 @@ fn subagents(t: &Theme, subs: &[Sub]) -> impl IntoElement {
 fn todo(t: &Theme, items: &[TodoItem]) -> impl IntoElement {
     let done = items.iter().filter(|i| i.state == 2).count();
     // As the TUI's todo result: a bullet header, `Todo · done/total`, then a mark per task.
-    let mut col = ui(t).flex().flex_col().gap(px(2.)).child(
+    let mut col = ui(t).flex().flex_col().gap(px(metrics::GAP_SM)).child(
         ui(t)
             .flex()
             .child(div().flex_none().w(px(t.ty.code * ICON_W)).text_color(t.faint).child("●"))
@@ -336,8 +347,8 @@ fn error(t: &Theme, msg: &'static str) -> impl IntoElement {
         .border_color(t.err_soft)
         .rounded(px(metrics::RADIUS))
         .bg(t.surface)
-        .px(px(12.))
-        .py(px(7.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .text_color(t.err)
         .child(msg)
 }
@@ -346,11 +357,11 @@ fn plan(t: &Theme, msg: &'static str) -> impl IntoElement {
     // The TUI prints a parked plan as a notice: muted text, no glyph; the outline is the pending tone.
     prose(t)
         .text_size(px(t.ty.ui))
-        .px(px(14.))
-        .py(px(9.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .border_1()
         .border_color(t.accent_soft)
-        .rounded(px(metrics::RADIUS_LG))
+        .rounded(px(metrics::RADIUS))
         .text_color(t.muted)
         .child(msg)
 }

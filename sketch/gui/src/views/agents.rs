@@ -6,18 +6,15 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Div, FontWeight, Hsla, div, px};
 
 const ICON_W: f32 = 16.;
-const SUB_INDENT: f32 = 14.;
-const COL_GAP: f32 = 8.;
+const SUB_INDENT: f32 = 16.;
 const COL_MARK: f32 = 16.;
 const COL_STATE: f32 = 44.;
 const COL_KIND: f32 = 76.;
-const COL_HOST: f32 = 110.;
-const COL_BRANCH: f32 = 110.;
+const COL_HOST: f32 = 112.;
+const COL_BRANCH: f32 = 112.;
 const COL_ATTACHED: f32 = 80.;
 const COL_RAN: f32 = 48.;
 const COL_COST: f32 = 56.;
-const ROW_PY: f32 = 3.;
-const HEAD_PY: f32 = 5.;
 
 pub fn view(c: &ViewCtx) -> AnyElement {
     if c.wide { wide(c) } else { narrow(c) }
@@ -51,8 +48,8 @@ fn find_field(t: &Theme) -> Div {
     ui(t)
         .flex()
         .items_center()
-        .px(px(metrics::PAD_SM + 2.))
-        .py(px(4.))
+        .min_h(px(metrics::CONTROL_H))
+        .px(px(metrics::PAD_X))
         .rounded(px(metrics::RADIUS))
         .bg(t.surface)
         .border_1()
@@ -73,7 +70,7 @@ fn div_col() -> Div {
 
 fn narrow(c: &ViewCtx) -> AnyElement {
     let t = c.t;
-    let mut body = shell_col(c, "agents-scroll").px(px(metrics::PAD_SM)).pb(px(metrics::PAD));
+    let mut body = div_col().flex_none();
     if !c.data.needs_you.is_empty() {
         body = body.child(group_label(t, "NEEDS YOU", t.muted));
         for r in &c.data.needs_you {
@@ -89,7 +86,14 @@ fn narrow(c: &ViewCtx) -> AnyElement {
             }
         }
         if !g.recent.is_empty() {
-            body = body.child(small(t).pl(px(ICON_W)).pt(px(6.)).text_color(t.faint).child("RECENT"));
+            body = body.child(
+                small(t)
+                    .px(px(metrics::ROW_PX))
+                    .pt(px(metrics::GAP_LG))
+                    .pb(px(metrics::GAP_SM))
+                    .text_color(t.faint)
+                    .child("RECENT"),
+            );
             for r in &g.recent {
                 body = body.child(narrow_recent(t, r));
             }
@@ -99,7 +103,7 @@ fn narrow(c: &ViewCtx) -> AnyElement {
         .size_full()
         .bg(t.bar)
         .child(div_col().p(px(metrics::PAD_SM)).child(find_field(t)))
-        .child(body)
+        .child(shell_col(c, "agents-scroll").px(px(metrics::PAD_SM)).pb(px(metrics::PAD)).child(body))
         .into_any_element()
 }
 
@@ -107,10 +111,10 @@ fn group_label(t: &Theme, text: &'static str, color: Hsla) -> Div {
     small(t)
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color)
-        .px(px(4.))
-        .mt(px(12.))
-        .pb(px(4.))
-        .mb(px(4.))
+        .px(px(metrics::ROW_PX))
+        .mt(px(metrics::GAP_LG))
+        .pb(px(metrics::GAP_SM))
+        .mb(px(metrics::GAP_SM))
         .border_b_1()
         .border_color(t.line_faint)
         .truncate()
@@ -136,7 +140,9 @@ fn narrow_row(t: &Theme, r: &AgentRow, pinned: bool) -> Div {
         .items_center()
         .child(ui(t).w(px(ICON_W)).flex_none().text_color(color).child(icon))
         .child(title)
-        .when(r.current, |d| d.child(ui(t).flex_none().pl(px(4.)).text_color(t.accent).child("❯")));
+        .when(r.current, |d| {
+            d.child(ui(t).flex_none().pl(px(metrics::GAP_SM)).text_color(t.accent).child("❯"))
+        });
     let meta_line = small(t)
         .flex()
         .pl(px(ICON_W))
@@ -160,11 +166,10 @@ fn narrow_row(t: &Theme, r: &AgentRow, pinned: bool) -> Div {
 
 fn row_box(t: &Theme, current: bool) -> Div {
     let d = div_col()
-        .px(px(4.))
-        .py(px(ROW_PY + 1.))
-        .rounded(px(metrics::RADIUS_SM))
-        .border_l_2()
-        .border_color(gpui::transparent_black());
+        .px(px(metrics::ROW_PX))
+        .py(px(metrics::ROW_PY))
+        .gap(px(metrics::ROW_GAP))
+        .rounded(px(metrics::RADIUS));
     if current { d.bg(t.selected) } else { d }
 }
 
@@ -173,25 +178,23 @@ fn narrow_sub(t: &Theme, s: &AgentRow) -> Div {
     small(t)
         .flex()
         .items_center()
-        .px(px(4.))
-        .pl(px(4. + SUB_INDENT))
-        .py(px(2.))
+        .px(px(metrics::ROW_PX))
+        .py(px(metrics::ROW_PY))
         .text_color(t.muted)
-        .child(small(t).w(px(ICON_W - 2.)).flex_none().text_color(color).child(icon))
+        .child(small(t).w(px(ICON_W)).flex_none().ml(px(SUB_INDENT)).text_color(color).child(icon))
         .child(small(t).flex_1().min_w_0().truncate().text_color(t.strong).child(s.title))
-        .child(small(t).flex_none().pl(px(6.)).child(s.kind))
+        .child(small(t).flex_none().pl(px(metrics::GAP_SM)).child(s.kind))
 }
 
 fn narrow_recent(t: &Theme, r: &RecentRow) -> Div {
     small(t)
         .flex()
-        .px(px(4.))
-        .pl(px(4. + ICON_W))
-        .py(px(2.))
+        .px(px(metrics::ROW_PX))
+        .py(px(metrics::ROW_PY))
         .text_color(t.muted)
-        .child(div_col().flex_1().min_w_0().truncate().child(r.title))
-        .child(small(t).flex_none().pl(px(6.)).child(r.age))
-        .child(small(t).flex_none().pl(px(8.)).w(px(44.)).text_right().child(r.cost))
+        .child(div_col().flex_1().min_w_0().truncate().pl(px(ICON_W)).child(r.title))
+        .child(small(t).flex_none().pl(px(metrics::GAP_SM)).child(r.age))
+        .child(small(t).flex_none().pl(px(metrics::GAP)).w(px(44.)).text_right().child(r.cost))
 }
 
 // ---------------------------------------------------------------- wide
@@ -202,15 +205,16 @@ fn wide(c: &ViewCtx) -> AnyElement {
     let top = ui(t)
         .flex()
         .items_center()
-        .gap(px(metrics::PAD))
-        .p(px(metrics::PAD_SM))
+        .gap(px(metrics::GAP))
+        .min_h(px(metrics::ROW_H))
+        .px(px(metrics::PAD_X))
         .border_b_1()
         .border_color(t.line)
         .child(find_field(t).flex_1().min_w_0())
         .child(small(t).flex_none().text_color(t.muted).child("group: project ▾"))
         .child(small(t).flex_none().text_color(t.muted).child(format!("sessions · {total} live")));
 
-    let mut body = shell_col(c, "agents-table-scroll").px(px(metrics::PAD_SM)).pb(px(metrics::PAD_SM));
+    let mut body = div_col().flex_none();
     body = body.child(header_row(t));
     if !c.data.needs_you.is_empty() {
         body = body.child(table_label(t, "NEEDS YOU", t.muted));
@@ -235,13 +239,14 @@ fn wide(c: &ViewCtx) -> AnyElement {
     }
 
     let footer = small(t)
-        .px(px(metrics::PAD))
-        .py(px(HEAD_PY + 1.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .border_t_1()
         .border_color(t.line)
         .text_color(t.muted)
         .child("Enter peek · n message · s stop · S terminate · t take over · / find");
 
+    let body = shell_col(c, "agents-table-scroll").px(px(metrics::PAD_SM)).pb(px(metrics::PAD_SM)).child(body);
     div_col().size_full().bg(t.window).child(top).child(body).child(footer).into_any_element()
 }
 
@@ -259,9 +264,10 @@ fn header_row(t: &Theme) -> Div {
     };
     small(t)
         .flex()
-        .gap(px(COL_GAP))
-        .px(px(4.))
-        .py(px(HEAD_PY))
+        .items_center()
+        .h(px(metrics::ROW_H))
+        .gap(px(metrics::GAP))
+        .px(px(metrics::ROW_PX))
         .border_b_1()
         .border_color(t.line_faint)
         .child(cell(small(t), Some(COL_MARK)))
@@ -276,7 +282,14 @@ fn header_row(t: &Theme) -> Div {
 }
 
 fn table_label(t: &Theme, text: &'static str, color: Hsla) -> Div {
-    small(t).font_weight(FontWeight::SEMIBOLD).text_color(color).px(px(4.)).pt(px(10.)).pb(px(3.)).truncate().child(text)
+    small(t)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color)
+        .px(px(metrics::ROW_PX))
+        .pt(px(metrics::GAP_LG))
+        .pb(px(metrics::GAP_SM))
+        .truncate()
+        .child(text)
 }
 
 fn table_row(t: &Theme, r: &AgentRow, sub: bool) -> Div {
@@ -287,12 +300,10 @@ fn table_row(t: &Theme, r: &AgentRow, sub: bool) -> Div {
     let mut d = ui(t)
         .flex()
         .items_center()
-        .gap(px(COL_GAP))
-        .px(px(4.))
-        .py(px(ROW_PY))
-        .rounded(px(metrics::RADIUS_SM))
-        .border_l_2()
-        .border_color(gpui::transparent_black());
+        .gap(px(metrics::GAP))
+        .px(px(metrics::ROW_PX))
+        .py(px(metrics::ROW_PY))
+        .rounded(px(metrics::RADIUS));
     if selected {
         d = d.bg(t.selected);
     }
@@ -312,14 +323,14 @@ fn table_row(t: &Theme, r: &AgentRow, sub: bool) -> Div {
 }
 
 fn recent_row(t: &Theme, r: &RecentRow) -> Div {
-    let span = COL_KIND + COL_HOST + COL_GAP;
-    let skip = COL_BRANCH + COL_ATTACHED + COL_GAP;
+    let span = COL_KIND + COL_HOST + metrics::GAP;
+    let skip = COL_BRANCH + COL_ATTACHED + metrics::GAP;
     small(t)
         .flex()
         .items_center()
-        .gap(px(COL_GAP))
-        .px(px(4.))
-        .py(px(ROW_PY))
+        .gap(px(metrics::GAP))
+        .px(px(metrics::ROW_PX))
+        .py(px(metrics::ROW_PY))
         .text_color(t.muted)
         .child(cell(small(t), Some(COL_MARK)))
         .child(cell(small(t), Some(COL_STATE)))

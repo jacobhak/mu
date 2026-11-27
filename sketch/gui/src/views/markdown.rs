@@ -9,16 +9,12 @@ use gpui::{
     AnyElement, FontWeight, Hsla, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, font, px, relative,
 };
 
-/// Heading sizes as multiples of the prose size, levels 1..=3.
-const HEADING_SCALE: [f32; 3] = [1.4, 1.2, 1.06];
-/// Space between blocks, and the extra space above a heading, in px.
-const BLOCK_GAP: f32 = 10.0;
-const HEADING_TOP: f32 = 8.0;
-const LIST_GAP: f32 = 4.0;
-const MARKER_W: f32 = 22.0;
+/// The width of a list's marker column.
+const MARKER_W: f32 = 24.0;
 /// The `▏` bar of a quote, one per line; the quote clips the ones past its height.
 const QUOTE_BAR_LINES: usize = 40;
-const QUOTE_BAR_W: f32 = 14.0;
+/// The bar's column; the quote's text starts after it.
+const QUOTE_BAR_W: f32 = metrics::PAD_X;
 /// The `─` run of a rule; the block clips it to the width the transcript gives.
 const RULE_GLYPHS: usize = 200;
 
@@ -34,10 +30,11 @@ pub fn render(t: &Theme, blocks: &[Md]) -> AnyElement {
             Md::Rule => rule(t).into_any_element(),
             Md::Table(table) => table_block(t, table).into_any_element(),
         };
+        // A heading opens a section; other blocks are set off by a GAP.
         let top = match (i, b) {
             (0, _) => 0.0,
-            (_, Md::Heading(..)) => BLOCK_GAP + HEADING_TOP,
-            _ => BLOCK_GAP,
+            (_, Md::Heading(..)) => metrics::GAP_LG,
+            _ => metrics::GAP,
         };
         col = col.child(div().flex_none().mt(px(top)).child(el));
     }
@@ -46,7 +43,6 @@ pub fn render(t: &Theme, blocks: &[Md]) -> AnyElement {
 
 fn heading(t: &Theme, level: u8, text: &'static str) -> impl IntoElement {
     let level = level.clamp(1, 3);
-    let scale = HEADING_SCALE[(level - 1) as usize];
     // As the TUI: the hashes in faint bold, the title in the tool role, bold.
     let prefix = format!("{} ", "#".repeat(level as usize));
     let face = || {
@@ -64,10 +60,9 @@ fn heading(t: &Theme, level: u8, text: &'static str) -> impl IntoElement {
     };
     let runs = vec![run(prefix.len(), t.faint), run(text.len(), t.tool)];
     div()
-        .text_size(px(t.ty.prose * scale))
+        .text_size(px(t.ty.prose))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(t.tool)
-        .line_height(relative(1.3))
         .child(StyledText::new(format!("{prefix}{text}")).with_runs(runs))
 }
 
@@ -175,7 +170,12 @@ fn table_block(t: &Theme, tb: &Table) -> impl IntoElement {
     let row = |cells: &[Vec<Span>], tone: Tone| {
         let mut r = div().flex().w_full().min_w_0();
         for (i, cell) in cells.iter().enumerate() {
-            let mut c = div().flex_1().min_w_0().px(px(8.)).py(px(4.)).border_color(t.line);
+            let mut c = div()
+                .flex_1()
+                .min_w_0()
+                .px(px(metrics::ROW_PX))
+                .py(px(metrics::ROW_PY))
+                .border_color(t.line);
             c = match tb.aligns.get(i).copied().unwrap_or(Align::Left) {
                 Align::Left => c,
                 Align::Center => c.text_center(),
@@ -194,7 +194,7 @@ fn table_block(t: &Theme, tb: &Table) -> impl IntoElement {
         .w_full()
         .min_w_0()
         .overflow_hidden()
-        .rounded(px(metrics::RADIUS_SM))
+        .rounded(px(metrics::RADIUS))
         .border_1()
         .border_color(t.line)
         .child(row(tb.head.as_slice(), Tone::Head));
@@ -205,7 +205,7 @@ fn table_block(t: &Theme, tb: &Table) -> impl IntoElement {
 }
 
 fn list(t: &Theme, ordered: bool, items: &[Vec<Span>]) -> impl IntoElement {
-    let mut col = div().flex().flex_col().gap(px(LIST_GAP)).w_full().min_w_0();
+    let mut col = div().flex().flex_col().gap(px(metrics::GAP_SM)).w_full().min_w_0();
     for (i, item) in items.iter().enumerate() {
         let marker = if ordered { format!("{}.", i + 1) } else { "•".to_string() };
         col = col.child(
@@ -218,7 +218,7 @@ fn list(t: &Theme, ordered: bool, items: &[Vec<Span>]) -> impl IntoElement {
                         .flex_none()
                         .justify_end()
                         .w(px(MARKER_W))
-                        .pr(px(8.))
+                        .pr(px(metrics::GAP))
                         .text_color(t.literal)
                         .child(marker),
                 )
@@ -246,8 +246,8 @@ fn code(t: &Theme, lang: &'static str, lines: &[&'static str]) -> impl IntoEleme
         .when(!lang.is_empty(), |d| {
             d.child(
                 div()
-                    .px(px(12.))
-                    .py(px(4.))
+                    .px(px(metrics::PAD_X))
+                    .py(px(metrics::PAD_Y))
                     .bg(t.bar)
                     .border_b_1()
                     .border_color(t.line)
@@ -256,7 +256,7 @@ fn code(t: &Theme, lang: &'static str, lines: &[&'static str]) -> impl IntoEleme
                     .child(lang),
             )
         })
-        .child(div().bg(t.surface).px(px(12.)).py(px(8.)).child(body))
+        .child(div().bg(t.surface).px(px(metrics::PAD_X)).py(px(metrics::PAD_Y)).child(body))
 }
 
 const KEYWORDS: &[&str] = &[

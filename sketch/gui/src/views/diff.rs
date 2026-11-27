@@ -38,8 +38,16 @@ fn row(t: &Theme, l: &DiffLine, listing: bool, w: usize) -> impl IntoElement {
         .flex_none()
         .w_full()
         .whitespace_nowrap()
-        .child(div().flex_none().px(px(t.ty.code * 0.6)).text_color(if listing { t.faint } else { role }).child(gutter))
-        .when(!listing, |d| d.child(div().flex_none().pr(px(t.ty.code * 0.6)).text_color(t.line).child("│")))
+        .child(
+            div()
+                .flex_none()
+                .px(px(metrics::GAP))
+                .text_color(if listing { t.faint } else { role })
+                .child(gutter),
+        )
+        .when(!listing, |d| {
+            d.child(div().flex_none().pr(px(metrics::GAP)).text_color(t.line).child("│"))
+        })
         .child(div().flex_1().min_w_0().truncate().child(text(t, l.text, changed, code_fg)))
 }
 
@@ -50,9 +58,9 @@ pub fn card(t: &Theme, d: &Diff) -> gpui::Div {
     let header = ui(t)
         .flex()
         .items_center()
-        .gap(px(8.))
-        .px(px(12.))
-        .py(px(6.))
+        .gap(px(metrics::GAP))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .bg(t.surface)
         .border_b_1()
         .border_color(t.line)
@@ -70,8 +78,8 @@ pub fn card(t: &Theme, d: &Diff) -> gpui::Div {
                 .child("⟧"),
         );
     let footer = ui(t)
-        .px(px(12.))
-        .py(px(4.))
+        .px(px(metrics::PAD_X))
+        .py(px(metrics::PAD_Y))
         .bg(t.surface)
         .border_t_1()
         .border_color(t.line)
@@ -85,7 +93,7 @@ pub fn card(t: &Theme, d: &Diff) -> gpui::Div {
         .border_1()
         .border_color(t.line)
         .child(header)
-        .child(lines(t, &d.lines))
+        .child(div().px(px(metrics::PAD_X)).py(px(metrics::PAD_Y)).child(lines(t, &d.lines)))
         .when(d.more > 0, |c| c.child(footer))
 }
 
