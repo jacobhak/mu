@@ -70,7 +70,6 @@ fn inline(t: &Theme, spans: &[Span]) -> StyledText {
             SpanStyle::Code => {
                 f = font(MONO);
                 run.color = t.literal;
-                run.background_color = Some(t.line_faint);
             }
             SpanStyle::Bold => {
                 f.weight = FontWeight::SEMIBOLD;
