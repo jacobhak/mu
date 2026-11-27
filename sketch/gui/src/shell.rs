@@ -751,8 +751,10 @@ impl Shell {
                 // Focus: an accent ring over a lifted card; the other tiles recede.
                 let dim = !focused && rects.len() > 1;
                 // The unfocused card also sinks a layer, towards the chrome, so the focused one stands proud.
+                // The cap only applies to a lone tile; tiles that share a row or column fill their slots, or the
+                // leftover space would show as gaps between cards.
                 let max = match tab.tiles[*id] {
-                    View::Session(_) => session::max_width(t),
+                    View::Session(_) if rects.len() == 1 => session::max_width(t),
                     _ => f32::MAX,
                 };
                 let card = panel(t, focused)
