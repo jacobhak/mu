@@ -1,6 +1,6 @@
 # The oh-my-pi release every omp artifact mu uses is pinned to: the Rust crates (Cargo.toml tags),
 # the omp binary installed to ~/.mu/bin/omp.
 # Bumped by scripts/maint/bump.sh.
-omp = "19.1.1"
+omp = "19.2.1"
 # The pi (earendil-works/pi) release installed to ~/.mu/bin/pi for the pi gateway backend (plugins/gateway-pi).
-pi = "1.6.0"
+pi = "1.7.0"
