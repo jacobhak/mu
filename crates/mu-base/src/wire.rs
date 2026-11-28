@@ -20,8 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 /// starts (4: plain JSON lines behind the hello; encrypting the pipe is up to whatever carries it;
 /// 5: the plan dialog became a generic document review; 6: the `read_bytes` and `write_bytes` host
 /// calls, and listening `ports` on a job; 7: session rows carry `helper`, `state_key` and `actions`;
-/// the `remote_action` host call; 8: the `new_agent` host call, and `targets` in the live sessions).
-pub const WIRE: u32 = 8;
+/// the `remote_action` host call; 8: the `new_agent` host call, and `targets` in the live sessions;
+/// 9: `SubagentState::Queued` and `Command::Interrupt`).
+pub const WIRE: u32 = 9;
 
 /// Front end to agent.
 #[derive(Serialize, Deserialize)]
@@ -218,7 +219,7 @@ fn map_inputs(inputs: &mut [UserInput], f: fn(&mut UserInput)) {
 }
 
 fn command_inputs(c: &mut Command, f: fn(&mut UserInput)) {
-    if let Command::Prompt(i) | Command::Steer(i) | Command::FollowUp(i) = c {
+    if let Command::Prompt(i) | Command::Steer(i) | Command::Interrupt(i) | Command::FollowUp(i) = c {
         f(i);
     }
 }

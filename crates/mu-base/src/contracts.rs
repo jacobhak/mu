@@ -55,6 +55,6 @@ mod tests {
 
     #[test]
     fn the_json_line_is_stable() {
-        assert_eq!(json().to_string(), r#"{"wire":8,"launcher":2,"agents":1,"attach":1,"sources":2,"helper":1}"#);
+        assert_eq!(json().to_string(), r#"{"wire":9,"launcher":2,"agents":1,"attach":1,"sources":2,"helper":1}"#);
     }
 }

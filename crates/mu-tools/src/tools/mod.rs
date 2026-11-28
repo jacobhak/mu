@@ -8,6 +8,8 @@ mod enter_mode;
 mod glob;
 pub(crate) mod grep;
 mod job_cancel;
+mod job_send;
+mod job_status;
 mod job_wait;
 mod pathnote;
 mod plan;
@@ -222,7 +224,7 @@ impl Tools {
             description.push_str(&list.join("; "));
         }
         let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
-        ToolDef { name: "task".into(), description, schema: task::schema(&names, roles) }
+        ToolDef { name: "task".into(), description, schema: task::schema(&names, roles, async_jobs) }
     }
 
     pub fn yield_def(output: &Value) -> ToolDef {
@@ -232,6 +234,16 @@ impl Tools {
     /// Offered only where background jobs exist (interactive sessions).
     pub fn job_cancel_def() -> ToolDef {
         ToolDef { name: "job_cancel".into(), description: job_cancel::DESCRIPTION.into(), schema: job_cancel::schema() }
+    }
+
+    /// Offered only where background jobs exist (interactive sessions).
+    pub fn job_status_def() -> ToolDef {
+        ToolDef { name: "job_status".into(), description: job_status::DESCRIPTION.into(), schema: job_status::schema() }
+    }
+
+    /// Offered only where background jobs exist (interactive sessions).
+    pub fn job_send_def() -> ToolDef {
+        ToolDef { name: "job_send".into(), description: job_send::DESCRIPTION.into(), schema: job_send::schema() }
     }
 
     /// Offered outside a mode, for the modes the model may ask for (`modes`: name and description).
@@ -482,6 +494,18 @@ pub static BUILTINS: &[Builtin] = &[
         call: dispatch!("job_cancel", |t, a: job_cancel::Args| t.job_cancel(a)),
     },
     Builtin {
+        name: "job_status",
+        access: Access::Read,
+        def: None,
+        call: dispatch!("job_status", |t, a: job_status::Args| t.job_status(a)),
+    },
+    Builtin {
+        name: "job_send",
+        access: Access::Read,
+        def: None,
+        call: dispatch!("job_send", |t, a: job_send::Args| t.job_send(a)),
+    },
+    Builtin {
         name: "wait",
         access: Access::Read,
         def: None,
@@ -530,6 +554,12 @@ pub fn summary(name: &str, args: &Value) -> String {
         "bash" => first("command"),
         "job_cancel" if args["all"].as_bool() == Some(true) => "all",
         "job_cancel" => first("id"),
+        "job_status" if args["id"].is_null() => "all",
+        "job_status" => first("id"),
+        "job_send" => {
+            let id = first("id");
+            return if args["urgent"].as_bool() == Some(true) { format!("{id} (urgent)") } else { trunc(id, 120) };
+        }
         "wait" => {
             let ids: Vec<&str> = args["ids"].as_array().into_iter().flatten().filter_map(|i| i.as_str()).collect();
             return if ids.is_empty() { "any".into() } else { trunc(&ids.join(", "), 120) };

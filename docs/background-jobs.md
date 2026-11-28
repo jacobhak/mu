@@ -1,6 +1,6 @@
 # Background jobs
 
-`task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session, so a turn that has nothing else to do just ends. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
+`task` runs subagents in the background: it returns job ids at once and the results arrive later as a `<system-notice>` message that wakes an idle session (or inline from `wait`), so a turn that has nothing else to do just ends. With `-p` and for subagents themselves, `task` blocks until its subagents finish.
 
 A result longer than 5000 characters comes back as its head plus a pointer: the whole text is written to an `artifact://` file the notice names, which `read` opens. A subagent also runs under a soft request budget ([`[task]`](config.md)): at the budget it is told to wrap up, at 1.5x it is stopped and asked for what it has, and five requests later the run ends.
 
@@ -30,11 +30,37 @@ In an interactive session a turn does not have to end to wait: an ordinary `bash
 
 - The result comes back in that call, not as a separate notice. Each call runs in its own shell: pass `cwd` and the environment the command needs, group setup that must carry over into the same command, and expect `cmd &` and background descendants to end with the call.
 - It stays an ordinary `bash` card while it runs: it is not listed among the background jobs (no row above the prompt, no jobs-panel entry, no count in the status line) until a prompt releases the wait, at which point the command keeps running as a job of its own.
-- The model can also call `wait` with job ids (or none, for any job). It returns when one of those jobs finishes; their results still arrive as a notice, once.
+- The model can also call `wait` with job ids (or none, for any job). It returns when one of those jobs finishes, with the finished jobs' results in the call itself, so no notice follows for them. Options: `all` waits until every named job (every job when none is named) has finished; `timeout` (1-3600 s) gives up after that long and still returns what finished, naming what still runs; `until` is a regex (Rust syntax) that returns as soon as a named `bash` job prints a matching line, counting output printed before the call, with the job still running (a bash job that ends without a match returns its result instead).
 - A prompt you submit while the model waits releases the wait: the job keeps running and its result arrives later, and your message steers the turn at the next tool boundary. A second tool call in the same reply is skipped so your message is answered first.
 - Esc still cancels the turn, including a waiting command. Nothing else cancels a wait, and releasing a wait never cancels the work.
 
 Waiting does not apply to `pty` commands, to `async` calls (which keep returning a job id at once), to commands you run yourself with `!`, or to `-p` runs and subagents. Those places keep a shell that persists across calls, and a model `bash` call there blocks the turn until the command ends.
+
+## Looking at jobs (`job_status`)
+
+`job_status` shows the model what its jobs are doing without a turn of polling. With no arguments it lists every job of the session, oldest first, one line each: `id · agent (or bash) · queued|running|done|failed · elapsed · N tools · $cost · last activity`, plus the listening ports of a bash job and `result waiting` for a finished job whose result has not been delivered. With `id` it shows one job in detail: its directory, task or command, what it waits for, model, session file, cost, messages sent to it, then the last 10 tool calls of a subagent, or the last `tail` lines of a bash job's output (default 40, at most 400; secrets redacted). A subagent's cost is read from its session file, so a job with no session yet shows none.
+
+## Messaging a subagent (`job_send`)
+
+`job_send` sends a message to a running subagent. The subagent reads it at its next tool boundary, as it would a user steering a turn. With `urgent` it also cancels the tool call it is running (the result says `[interrupted: a new message arrived…]`) and skips the rest of that reply's calls, so it reads the message now; the turn itself goes on. A subagent that has not started yet (queued) gets the message added to its task instead. A finished subagent cannot be messaged: the error points at `resume`. A message that reaches a subagent after its last turn was not read; the job's result says so (`N message(s) sent with job_send arrived after the subagent had finished`).
+
+## Continuing a subagent (`resume`)
+
+`task` with `resume: "<id>"` continues the conversation of a finished subagent of this session, with `task` as its next prompt. It runs in the same directory and as the same agent (leave `agent` and `cwd` out), keeps the model of its session unless `model` names one, and runs under the current permissions, not those of its first run. The continuation is a new job named after the old one (`<id>-2`), so the original's result and row stay. Only subagents that ran on this machine can be resumed (not those on a remote worker, not `bash` jobs), and not one that another job is already continuing.
+
+## Queue and dependencies
+
+At most 8 jobs run at once. Further subagents wait in a queue of at most 16, start in order as slots free, and show as `· queued` in the jobs panel and `job_status` (the `task` result also says why: `[queued: no free slot]`). A queued job takes no slot; `job_cancel` and `x` in the panel cancel it without starting it, and `job_send` adds to its task. An async `bash` call is not queued: at 8 running jobs it still errors.
+
+`after` on a task lists job ids, or names of other tasks in the same call, that must succeed first. The task starts when all of them are done and its context gets their results (`# Results of the jobs this task waited for`, each capped like a result in a notice); when one fails or is cancelled the task ends without starting, with a result that names it. A task cannot wait for itself, for an unknown job, or in a cycle.
+
+## Per-task limits
+
+`task` takes three limits per task:
+
+- `timeout` (seconds, at most 7200): at the limit the subagent is told to stop and report what it has; if it is still running two minutes later it is cancelled. The result notes it either way.
+- `maxRequests`: lowers the soft request budget for this task (wrap-up notice at it, stop at 1.5x). It can only lower what `[task] soft_request_budget` and the agent's bundled cap allow, but sets a budget where none is configured.
+- `maxCost` (USD): a wrap-up notice at 80 %, tools refused at the limit and the result asked for. For a [relayed](remote.md) worker it also lowers the spend cap `[task] max_cost` sets, for this task.
 
 ## Cancelling a job
 
@@ -45,7 +71,7 @@ You do not need the jobs panel to stop a job. While jobs run, their rows sit abo
 - `Alt+K` cancels the marked job, or the only running job when none is marked. With several running and none marked it says so instead of guessing. No key cancels everything at once; use the jobs panel (`X`, which asks `y` to confirm) or `/jobs kill all` for that.
 - `Ctrl+O` expands the rows with each job's task, run time and output tail.
 
-The model has the same power through the `job_cancel` tool, offered in interactive sessions: `id` cancels one job, `all` every running job. The job's result reaches the model as the usual notice, so the model never needs `kill` to stop something it started with `bash` `async` or `task`.
+The model has the same power through the `job_cancel` tool, offered in interactive sessions: `id` cancels one job, `all` every running or queued job. The job's result reaches the model as the usual notice, so the model never needs `kill` to stop something it started with `bash` `async` or `task`.
 
 ## Jobs panel
 
@@ -63,7 +89,9 @@ The ports come from the job's process group and its children, read every two sec
 
 `Enter` reads a session's transcript, as for a job, but never writes. `n` types a one-line message that goes out through `mu notify` (the footer says `delivered` for a live interactive mu and `queued` for a run that is never signalled, which sees it when its session is opened again). `s` stops a session: a `-p` run after its current step (`SIGUSR1`; press it again to cancel the step), a subagent by terminating its process group (`SIGTERM`), and an interactive mu by cancelling its current turn, as Esc does there (`SIGUSR1`; the mu keeps running; only an interactive mu new enough to say so in its owner record can be aborted). `S` terminates an interactive mu or a `mu agent` after a `y` confirmation (`SIGTERM`: it exits and restores its terminal, and whatever is typed but unsent in it is lost). `/agents` does the same from the composer. `t` takes a `-p` run over: the panel hands the terminal to `mu take`, which stops the run and opens its session in a nested mu; when that exits you are back in the panel. `s`, `S` and `t` first check that the session is still held by the run that was listed (same pid and start time) and otherwise do nothing. An interactive session cannot be taken over, since that would end somebody's open terminal; terminate it first if you must.
 
-The `subagents` status-line segment shows the job counts as `◌2 ✓1 ✗1` (running, done, failed); zero counts are left out, and with no jobs there is no segment.
+The `subagents` status-line segment shows the job counts as `◌2 ✓1 ✗1` (running, done, failed; a queued job counts as running); zero counts are left out, and with no jobs there is no segment.
+
+A queued job's row has a `·` mark and the state `queued` in the details.
 
 The `cost` segment shows the session's own spend, then its subagents' as `$0.38 (+0.12)`, as omp does. The subagent figure sums the assistant replies in the session files of every subagent the session has started, grandchildren included, and updates while they run. A resumed session finds its earlier subagents by the `parentSession` in their headers, so the figure survives a restart. The unit (`$`, or `S` for subscription spend) belongs to the session's own amount; subagents on a different billing are not told apart. Replies the price table could not price are stored as zero, so the figure can undercount for a model it does not know.
 

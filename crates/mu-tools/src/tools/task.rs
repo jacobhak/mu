@@ -1,9 +1,11 @@
 use super::relay::{RelayAllow, RelayServer};
 use super::subagent::WorkerLaunch;
 use super::subagent::{
-    ArtifactAlloc, ChildCmd, MU_VERSION, Mirror, Outcome, prepare_launch, preview_result, run_child_observed,
+    ArtifactAlloc, ChildCmd, ChildControl, MU_VERSION, Mirror, Outcome, prepare_launch, preview_result,
+    run_child_controlled,
 };
 use super::{ToolCtx, Tools};
+use crate::jobs::{Resumable, SpawnOpts};
 use crate::permissions::Permissions;
 use futures_util::future::join_all;
 use mu_base::events::{EventTx, JobKind, SubagentState, SubagentStatus};
@@ -11,11 +13,15 @@ use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 /// Hard cap on tasks per call and on running background jobs.
 pub const MAX_TASKS: usize = 8;
+/// Longest `timeout` a task may ask for, in seconds.
+const MAX_TIMEOUT: u64 = 7200;
 
 /// omp's bundled caps: a scout answers a slice, so its budget is half a worker's; a configured
 /// budget can lower these but never raise them.
@@ -56,6 +62,15 @@ struct T {
     /// JSON Schema of the result; the subagent then returns validated `data`.
     #[serde(rename = "outputSchema")]
     output_schema: Option<Value>,
+    /// Jobs (ids, or names of tasks in this call) that must succeed first.
+    after: Option<Vec<String>>,
+    /// A finished subagent job whose conversation this task continues.
+    resume: Option<String>,
+    timeout: Option<u64>,
+    #[serde(rename = "maxRequests")]
+    max_requests: Option<u32>,
+    #[serde(rename = "maxCost")]
+    max_cost: Option<f64>,
 }
 
 macro_rules! guidance {
@@ -70,11 +85,12 @@ pub const DESCRIPTION: &str = concat!(
 );
 
 pub const ASYNC_WAIT_DESCRIPTION: &str = concat!(
-    "Spawn subagents in the background; job ids return immediately. Their results arrive as <system-notice> messages when they finish. Use `wait` when a job's result is needed now: it returns when one of the jobs finishes, and a new prompt from the user stops the wait without stopping the work. Stop a job with `job_cancel`. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
+    "Spawn subagents in the background; job ids return immediately. At most 8 jobs run at once; more wait in a queue, and `after` holds a task until the jobs it names succeed and passes it their results. Results arrive as <system-notice> messages, or inline from `wait`. `job_status` shows progress, `job_send` messages a running subagent, `job_cancel` stops one, and `resume` continues a finished subagent with a follow-up. A task's `cwd` (absolute existing directory, e.g. a git worktree) sets where it runs; the default is this session's directory.",
     guidance!()
 );
 
-pub fn schema(names: &[&str], roles: &[&str]) -> Value {
+/// `jobs`: background jobs exist, so a task may wait for other jobs (`after`) or continue a finished one (`resume`).
+pub fn schema(names: &[&str], roles: &[&str], jobs: bool) -> Value {
     let mut agents = vec!["task", "scout"];
     agents.extend_from_slice(names);
     let mut item = json!({"type":"object","properties":{
@@ -83,7 +99,21 @@ pub fn schema(names: &[&str], roles: &[&str]) -> Value {
         "agent":{"type":"string","enum":agents},
         "solutionSpace":{"type":"string","description":"How open-ended the child's problem is: the fix or design given, or which causes or designs remain open. Volume of work does not widen it."},
         "cwd":{"type":"string","description":"absolute path of an existing directory the task runs in (e.g. a git worktree); defaults to this session's directory"},
-        "outputSchema":{"type":"object","description":"JSON Schema for this task's result. The subagent must submit matching JSON via `yield`; you get it back as a ```json block. Omit for a free-text answer."}},"required":["task","solutionSpace"]});
+        "outputSchema":{"type":"object","description":"JSON Schema for this task's result. The subagent must submit matching JSON via `yield`; you get it back as a ```json block. Omit for a free-text answer."},
+        "timeout":{"type":"integer","minimum":1,"maximum":MAX_TIMEOUT,"description":"Seconds; at the limit the subagent is told to wrap up and is cancelled 2 minutes later"},
+        "maxRequests":{"type":"integer","minimum":1,"description":"Lower the soft request budget for this task: told to wrap up at it, stopped at 1.5x"},
+        "maxCost":{"type":"number","exclusiveMinimum":0,"description":"USD this task may spend: told to wrap up at 80 %, stopped at the limit"}},"required":["task","solutionSpace"]});
+    if jobs {
+        item["properties"]["after"] = json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Job ids, or names of tasks in this call, to wait for. This task starts when they all succeed and gets their results in its context; it is not started if one fails"
+        });
+        item["properties"]["resume"] = json!({
+            "type": "string",
+            "description": "Id of a finished subagent job of this session: continue its conversation with `task` as the next prompt, in its directory and with its agent"
+        });
+    }
     if !roles.is_empty() {
         item["properties"]["model"] = json!({
             "type": "string",
@@ -135,17 +165,69 @@ impl Tools {
         {
             return ToolOutput::err(format!("task: {e}"));
         }
+        for t in &a.tasks {
+            if t.timeout.is_some_and(|s| !(1..=MAX_TIMEOUT).contains(&s)) {
+                return ToolOutput::err("task: timeout must be 1-7200 seconds");
+            }
+            if t.max_requests == Some(0) {
+                return ToolOutput::err("task: maxRequests must be at least 1");
+            }
+            if t.max_cost.is_some_and(|c| c.is_nan() || c <= 0.0) {
+                return ToolOutput::err("task: maxCost must be above 0");
+            }
+            if self.jobs.is_none() && (t.resume.is_some() || t.after.as_ref().is_some_and(|v| !v.is_empty())) {
+                return ToolOutput::err("task: `after` and `resume` need an interactive session");
+            }
+        }
         let schemas: Vec<Option<&Value>> = a.tasks.iter().map(|t| t.output_schema.as_ref()).collect();
         let forced = ctx.mode.as_ref().and_then(|m| m.subagent.clone());
         let delegated = self.delegated.borrow().clone();
+        // The finished jobs `resume` continues: they fix the agent and the directory.
+        let mut resumed: Vec<Option<Resumable>> = Vec::new();
+        for t in &a.tasks {
+            let r = match (&t.resume, &self.jobs) {
+                (Some(id), Some(jobs)) => match jobs.resumable(id) {
+                    Ok(r) => Some(r),
+                    Err(e) => return ToolOutput::err(format!("task: resume: {e}")),
+                },
+                _ => None,
+            };
+            if let Some(r) = &r
+                && resumed.iter().flatten().any(|o| o.session == r.session)
+            {
+                return ToolOutput::err(format!(
+                    "task: resume: `{}` is continued by two tasks of this call",
+                    t.resume.as_deref().unwrap_or_default()
+                ));
+            }
+            resumed.push(r);
+        }
         // (name, agent, task, cwd, model)
         let specs: Vec<(String, String, String, PathBuf, Option<String>)> = match a
             .tasks
             .iter()
             .enumerate()
             .map(|(i, t)| -> Result<_, String> {
-                let agent = forced.as_deref().unwrap_or_else(|| t.agent.as_deref().unwrap_or("task"));
-                let cwd = resolve_cwd(t.cwd.as_deref(), &self.cwd)?;
+                let prior = resumed[i].as_ref();
+                let id = t.resume.as_deref().unwrap_or_default();
+                if let (Some(r), Some(asked)) = (prior, t.agent.as_deref())
+                    && r.agent != asked
+                {
+                    return Err(format!("task: resume: `{id}` ran as `{}`; leave `agent` out", r.agent));
+                }
+                if let (Some(r), Some(asked)) = (prior, t.cwd.as_deref())
+                    && Path::new(asked) != r.cwd
+                {
+                    return Err(format!("task: resume: `{id}` ran in {}; leave `cwd` out", r.cwd.display()));
+                }
+                let agent = forced
+                    .as_deref()
+                    .or(prior.map(|r| r.agent.as_str()))
+                    .unwrap_or_else(|| t.agent.as_deref().unwrap_or("task"));
+                let cwd = match prior {
+                    Some(r) => resolve_cwd(r.cwd.to_str(), &self.cwd)?,
+                    None => resolve_cwd(t.cwd.as_deref(), &self.cwd)?,
+                };
                 let model =
                     t.model.as_deref().map(|m| if m.starts_with('@') { m.to_string() } else { format!("@{m}") });
                 if let Some(m) = &model
@@ -159,7 +241,7 @@ impl Tools {
                     return Err(format!("task: model `{m}` is not offered; {list}"));
                 }
                 Ok((
-                    t.name.clone().unwrap_or_else(|| format!("Task{}", i + 1)),
+                    t.name.clone().or_else(|| t.resume.clone()).unwrap_or_else(|| format!("Task{}", i + 1)),
                     agent.to_string(),
                     t.task.clone(),
                     cwd,
@@ -206,7 +288,7 @@ impl Tools {
             cwd: self.cwd.clone(),
         });
         let relay_tools = if relayed { self.plugins.relay_tools_payload() } else { Vec::new() };
-        let payload = |agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
+        let payload = |i: usize, agent: &str, task: &str, schema: Option<&Value>, model: Option<&str>| {
             let launched = remote(agent).is_some();
             let mut p = json!({
                 "task": task, "context": a.context, "agent": agent, "parentSession": parent, "muVersion": MU_VERSION
@@ -231,48 +313,53 @@ impl Tools {
             if let Some(m) = model {
                 p["model"] = json!(m);
             }
+            if let Some(n) = a.tasks[i].max_requests {
+                p["requestBudget"] = json!(n);
+            }
+            if let Some(c) = a.tasks[i].max_cost {
+                p["maxCost"] = json!(c);
+            }
+            if let Some(r) = &resumed[i] {
+                p["resume"] = json!(r.session);
+            }
             p
         };
+        let timeouts: Vec<Option<Duration>> = a.tasks.iter().map(|t| t.timeout.map(Duration::from_secs)).collect();
 
         if let Some(jobs) = &self.jobs {
-            if let Err(e) = jobs.check_capacity(specs.len()) {
-                return ToolOutput::err(e);
+            if let Err(e) = jobs.check_queue(specs.len()) {
+                return ToolOutput::err(format!("task: {e}"));
             }
-            // Ids and launches first: a launch that fails then starts nothing, and drops the others'
-            // task refs.
             let mut ids: Vec<String> = Vec::new();
-            let mut children = Vec::new();
-            for (name, agent, _, cwd, _) in &specs {
+            for (name, ..) in &specs {
                 let id = (1..)
                     .map(|n| if n == 1 { name.clone() } else { format!("{name}-{n}") })
                     .find(|c| jobs.unique_id(c) == *c && !ids.contains(c))
                     .unwrap_or_default();
-                children.push(match remote(agent) {
-                    None => ChildCmd::Local(exe.clone()),
-                    Some(on) => match prepare_launch(on, cwd, &id).await {
-                        Ok(l) => ChildCmd::Launched(l),
-                        Err(e) => return ToolOutput::err(e),
-                    },
-                });
                 ids.push(id);
             }
+            let after = match resolve_after(&a.tasks, &specs, &ids, |e| jobs.state_of(e).is_some()) {
+                Ok(v) => v,
+                Err(e) => return ToolOutput::err(e),
+            };
             let mut started = Vec::new();
-            for (i, ((_, agent, task, cwd, model), child)) in specs.iter().zip(children).enumerate() {
+            for (i, (_, agent, task, cwd, model)) in specs.iter().enumerate() {
                 let id = ids[i].clone();
                 jobs.spawn(
                     id.clone(),
                     agent.clone(),
-                    child,
+                    exe.clone(),
                     cwd.clone(),
-                    payload(agent, task, schemas[i], model.as_deref()),
+                    payload(i, agent, task, schemas[i], model.as_deref()),
                     self.permissions.clone(),
                     self.artifact_dir(),
                     mirror_of(agent),
                     relay.clone(),
+                    SpawnOpts { after: after[i].clone(), timeout: timeouts[i], launch: remote(agent).cloned() },
                 );
-                started.push(format!("{id} ({agent})"));
+                started.push(format!("{id} ({agent}){}", queued_note(jobs, &id, &after[i])));
             }
-            let next = "When each finishes, mu automatically starts your next turn with its result; use `wait` when you need a result now. Until then, do other work that does not depend on them.";
+            let next = "When each finishes, mu automatically starts your next turn with its result; use `wait` to block on results now, `job_status` to look at progress, and `job_send` to redirect a running one. Until then, do other work that does not depend on them.";
             return ToolOutput::ok(format!(
                 "Started {} background job(s): {}\n{next}",
                 started.len(),
@@ -280,7 +367,7 @@ impl Tools {
             ));
         }
         let alloc = || self.next_artifact();
-        let how = Starter { exe: &exe, launch: self.launch.as_ref(), mirror: &mirror_of };
+        let how = Starter { exe: &exe, launch: self.launch.as_ref(), mirror: &mirror_of, timeouts: &timeouts };
         run_foreground(
             &specs,
             &schemas,
@@ -297,16 +384,101 @@ impl Tools {
     }
 }
 
+/// The ids each task waits for: its `after` entries as the ids of this call's tasks or of existing
+/// jobs. Errs on an unknown job, a task waiting for itself and a cycle among this call's tasks.
+fn resolve_after(
+    tasks: &[T],
+    specs: &[(String, String, String, PathBuf, Option<String>)],
+    ids: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> Result<Vec<Vec<String>>, String> {
+    let by_name: HashMap<&str, &str> = specs.iter().zip(ids).map(|(s, id)| (s.0.as_str(), id.as_str())).collect();
+    let mut resolved: Vec<Vec<String>> = Vec::new();
+    for (i, t) in tasks.iter().enumerate() {
+        let mut deps: Vec<String> = Vec::new();
+        for e in t.after.iter().flatten() {
+            let id = match by_name.get(e.as_str()) {
+                Some(id) => (*id).to_string(),
+                None if exists(e) => e.clone(),
+                None => return Err(format!("task: `after` names unknown job `{e}`")),
+            };
+            if id == ids[i] {
+                return Err(format!("task: `{}` cannot wait for itself", specs[i].0));
+            }
+            if !deps.contains(&id) {
+                deps.push(id);
+            }
+        }
+        resolved.push(deps);
+    }
+    // A cycle can only run through this call's own tasks.
+    let edges: Vec<Vec<usize>> =
+        resolved.iter().map(|deps| deps.iter().filter_map(|d| ids.iter().position(|i| i == d)).collect()).collect();
+    // 0 unvisited, 1 on the current path, 2 done.
+    let mut mark = vec![0u8; tasks.len()];
+    let mut path: Vec<usize> = Vec::new();
+    for start in 0..tasks.len() {
+        if let Some(cycle) = find_cycle(start, &edges, &mut mark, &mut path) {
+            let names: Vec<&str> = cycle.iter().map(|&i| specs[i].0.as_str()).collect();
+            return Err(format!("task: `after` forms a cycle: {}", names.join(" → ")));
+        }
+    }
+    Ok(resolved)
+}
+
+fn find_cycle(at: usize, edges: &[Vec<usize>], mark: &mut [u8], path: &mut Vec<usize>) -> Option<Vec<usize>> {
+    match mark[at] {
+        1 => {
+            let from = path.iter().position(|&p| p == at).unwrap_or(0);
+            let mut cycle = path[from..].to_vec();
+            cycle.push(at);
+            return Some(cycle);
+        }
+        2 => return None,
+        _ => {}
+    }
+    mark[at] = 1;
+    path.push(at);
+    for &next in &edges[at] {
+        if let Some(c) = find_cycle(next, edges, mark, path) {
+            return Some(c);
+        }
+    }
+    path.pop();
+    mark[at] = 2;
+    None
+}
+
+/// What the started-jobs line says about a job that is not running yet.
+fn queued_note(jobs: &crate::jobs::JobsHandle, id: &str, after: &[String]) -> String {
+    use mu_base::events::SubagentState;
+    match jobs.state_of(id) {
+        Some(SubagentState::Queued) => {
+            let waiting: Vec<&str> =
+                after.iter().map(String::as_str).filter(|d| jobs.state_of(d) != Some(SubagentState::Done)).collect();
+            if waiting.is_empty() {
+                " [queued: no free slot]".to_string()
+            } else {
+                format!(" [queued: waits for {}]", waiting.join(", "))
+            }
+        }
+        Some(SubagentState::Failed) => " [not started: a job it waited for failed]".to_string(),
+        _ => String::new(),
+    }
+}
+
 /// What starts a foreground task's child: this executable, or a worker on the remote for the agent
 /// kinds `[task] launch` names, which needs a launch prepared per task.
 struct Starter<'a> {
     exe: &'a Path,
     launch: Option<&'a WorkerLaunch>,
     mirror: &'a dyn Fn(&str) -> Mirror,
+    /// Each task's time limit.
+    timeouts: &'a [Option<Duration>],
 }
 
-/// Builds one child's task payload.
-type Payload<'a> = dyn Fn(&str, &str, Option<&Value>, Option<&str>) -> Value + 'a;
+/// Builds one child's task payload: the task's index, agent, prompt, output schema and model role.
+type Payload<'a> = dyn Fn(usize, &str, &str, Option<&Value>, Option<&str>) -> Value + 'a;
 
 /// Runs every task to completion in this call; each row's progress is reported in `details`, and an
 /// approval a task needs is asked in the parent's UI.
@@ -349,7 +521,7 @@ async fn run_foreground(
     );
     let futs = specs.iter().enumerate().map(|(i, (name, agent, task, cwd, model))| {
         let rows = &rows;
-        let payload = payload(agent, task, schemas[i], model.as_deref());
+        let payload = payload(i, agent, task, schemas[i], model.as_deref());
         let label = format!("{name} ({agent})");
         async move {
             let child = match how.launch.filter(|l| l.runs(agent)) {
@@ -362,7 +534,7 @@ async fn run_foreground(
                     }
                 },
             };
-            let out = run_child_observed(
+            let out = run_child_controlled(
                 child,
                 cwd,
                 &payload,
@@ -377,6 +549,7 @@ async fn run_foreground(
                 Some(&|r| perms.forward(events, &label, r)),
                 (how.mirror)(agent),
                 relay,
+                ChildControl { steer: None, timeout: how.timeouts[i] },
             )
             .await;
             rows.borrow_mut()[i].state = if out.ok { SubagentState::Done } else { SubagentState::Failed };
@@ -408,7 +581,7 @@ async fn run_foreground(
 mod schema_tests {
     #[test]
     fn schema_enum_includes_custom_agents() {
-        let s = super::schema(&["x"], &[]);
+        let s = super::schema(&["x"], &[], false);
         assert_eq!(
             s["properties"]["tasks"]["items"]["properties"]["agent"]["enum"],
             serde_json::json!(["task", "scout", "x"])
@@ -417,14 +590,25 @@ mod schema_tests {
 
     #[test]
     fn the_model_field_is_offered_only_with_roles() {
-        let s = super::schema(&[], &["@w"]);
+        let s = super::schema(&[], &["@w"], false);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["model"]["enum"], serde_json::json!(["@w"]));
-        assert!(super::schema(&[], &[])["properties"]["tasks"]["items"]["properties"].get("model").is_none());
+        assert!(super::schema(&[], &[], false)["properties"]["tasks"]["items"]["properties"].get("model").is_none());
+    }
+
+    #[test]
+    fn after_and_resume_are_offered_only_with_jobs() {
+        let props = |jobs| super::schema(&[], &[], jobs)["properties"]["tasks"]["items"]["properties"].clone();
+        let (with, without) = (props(true), props(false));
+        assert!(with.get("after").is_some() && with.get("resume").is_some());
+        assert!(without.get("after").is_none() && without.get("resume").is_none());
+        for p in [&with, &without] {
+            assert!(p.get("timeout").is_some() && p.get("maxRequests").is_some() && p.get("maxCost").is_some());
+        }
     }
 
     #[test]
     fn tasks_is_required_at_the_top_level() {
-        let s = super::schema(&[], &[]);
+        let s = super::schema(&[], &[], false);
         assert_eq!(s["required"], serde_json::json!(["tasks"]));
         assert!(s["properties"]["tasks"].get("required").is_none());
     }
@@ -433,12 +617,12 @@ mod schema_tests {
 #[cfg(test)]
 mod cwd_tests {
     use super::*;
-    use crate::tools::subagent::run_child;
+    use crate::tools::subagent::{run_child, run_child_observed};
     use tokio_util::sync::CancellationToken;
 
     #[test]
     fn schema_accepts_an_optional_cwd_per_task() {
-        let s = schema(&[], &[]);
+        let s = schema(&[], &[], false);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["cwd"]["type"], "string");
         assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task", "solutionSpace"]));
     }
@@ -521,7 +705,7 @@ mod typed_tests {
 
     #[test]
     fn schema_accepts_an_optional_output_schema_per_task() {
-        let s = schema(&[], &[]);
+        let s = schema(&[], &[], false);
         assert_eq!(s["properties"]["tasks"]["items"]["properties"]["outputSchema"]["type"], "object");
         assert_eq!(s["properties"]["tasks"]["items"]["required"], json!(["task", "solutionSpace"]));
     }
@@ -732,6 +916,104 @@ printf '{"type":"result","text":"%s"}\n' "$escaped"
         .unwrap();
         let out = t.task(a, &ctx).await;
         assert!(out.is_error && out.text.contains("outputSchema"), "{}", out.text);
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use crate::jobs::JobsHandle;
+
+    fn ctx() -> ToolCtx {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ToolCtx { events, cancel: Default::default(), call_id: "c".into(), mode: None, wait_interrupt: None }
+    }
+
+    fn args(tasks: Value) -> Args {
+        let tasks: Vec<Value> = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                t["solutionSpace"] = json!("one fix: given");
+                t
+            })
+            .collect();
+        serde_json::from_value(json!({ "tasks": tasks })).unwrap()
+    }
+
+    fn resolve(tasks: Value, existing: &[&str]) -> Result<Vec<Vec<String>>, String> {
+        let a = args(tasks);
+        let specs: Vec<(String, String, String, PathBuf, Option<String>)> = a
+            .tasks
+            .iter()
+            .map(|t| (t.name.clone().unwrap(), "scout".into(), t.task.clone(), PathBuf::new(), None))
+            .collect();
+        let ids: Vec<String> = specs.iter().map(|s| s.0.clone()).collect();
+        resolve_after(&a.tasks, &specs, &ids, |e| existing.contains(&e))
+    }
+
+    #[test]
+    fn after_names_tasks_of_this_call_or_existing_jobs() {
+        let r = resolve(json!([{"name":"a","task":"x"},{"name":"b","task":"y","after":["a","old","a"]}]), &["old"])
+            .unwrap();
+        assert_eq!(r, [Vec::<String>::new(), vec!["a".to_string(), "old".to_string()]]);
+    }
+
+    #[test]
+    fn after_rejects_unknown_self_and_cyclic_waits() {
+        let e = resolve(json!([{"name":"a","task":"x","after":["zz"]}]), &[]).unwrap_err();
+        assert_eq!(e, "task: `after` names unknown job `zz`");
+        let e = resolve(json!([{"name":"a","task":"x","after":["a"]}]), &[]).unwrap_err();
+        assert_eq!(e, "task: `a` cannot wait for itself");
+        let e = resolve(json!([{"name":"a","task":"x","after":["b"]},{"name":"b","task":"y","after":["a"]}]), &[])
+            .unwrap_err();
+        assert_eq!(e, "task: `after` forms a cycle: a → b → a");
+        let ok = resolve(
+            json!([{"name":"a","task":"x"},{"name":"b","task":"y","after":["a"]},{"name":"c","task":"z","after":["a","b"]}]),
+            &[],
+        );
+        assert!(ok.is_ok(), "a diamond is not a cycle: {ok:?}");
+    }
+
+    #[tokio::test]
+    async fn limits_and_background_only_fields_are_checked() {
+        let t = Tools::for_test();
+        for (field, text) in [
+            (json!({"timeout": 0}), "task: timeout must be 1-7200 seconds"),
+            (json!({"timeout": 7201}), "task: timeout must be 1-7200 seconds"),
+            (json!({"maxRequests": 0}), "task: maxRequests must be at least 1"),
+            (json!({"maxCost": 0.0}), "task: maxCost must be above 0"),
+            (json!({"after": ["x"]}), "task: `after` and `resume` need an interactive session"),
+            (json!({"resume": "x"}), "task: `after` and `resume` need an interactive session"),
+        ] {
+            let mut task = json!({"task": "x"});
+            task.as_object_mut().unwrap().extend(field.as_object().unwrap().clone());
+            let out = t.task(args(json!([task])), &ctx()).await;
+            assert!(out.is_error && out.text == text, "{}", out.text);
+        }
+    }
+
+    fn with_jobs() -> (Tools, Rc<JobsHandle>) {
+        let mut t = Tools::for_test();
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _erx) = tokio::sync::mpsc::unbounded_channel();
+        let jobs = JobsHandle::new(wake, events);
+        t.jobs = Some(jobs.clone());
+        (t, jobs)
+    }
+
+    #[tokio::test]
+    async fn resume_needs_a_finished_local_subagent_and_after_a_known_job() {
+        let (t, jobs) = with_jobs();
+        let out = t.task(args(json!([{"task": "x", "resume": "nope"}])), &ctx()).await;
+        assert!(out.is_error && out.text == "task: resume: no job `nope`", "{}", out.text);
+        jobs.push_running("run");
+        let out = t.task(args(json!([{"task": "x", "resume": "run"}])), &ctx()).await;
+        assert!(out.is_error && out.text.contains("is still running"), "{}", out.text);
+        let out = t.task(args(json!([{"task": "x", "after": ["ghost"]}])), &ctx()).await;
+        assert!(out.is_error && out.text == "task: `after` names unknown job `ghost`", "{}", out.text);
     }
 }
 

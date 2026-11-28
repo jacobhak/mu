@@ -4,7 +4,7 @@ use mu_base::tool::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub const DESCRIPTION: &str = "Cancel a background job (a `task` subagent or a `bash` command run with `async`) by its id, or every running job with `all`. Stops the job; its result arrives as a system notice, like any finished job. Use this, not `kill`, to stop one. Cancelling a job that already finished does nothing.";
+pub const DESCRIPTION: &str = "Cancel a background job (a `task` subagent or a `bash` command run with `async`), running or queued, by its id, or every running or queued job with `all`. Stops the job; its result arrives as a system notice, like any finished job. Use this, not `kill`, to stop one. Cancelling a job that already finished does nothing.";
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -36,7 +36,7 @@ impl Tools {
             (Some(id), false) => match jobs.state_of(&id) {
                 None if running.is_empty() => ToolOutput::err(format!("job_cancel: no job `{id}`; none are running")),
                 None => ToolOutput::err(format!("job_cancel: no job `{id}`; running: {}", running.join(", "))),
-                Some(SubagentState::Running) => {
+                Some(s) if s.is_active() => {
                     jobs.kill(Some(&id));
                     ToolOutput::ok(format!("Cancelled job {id}."))
                 }

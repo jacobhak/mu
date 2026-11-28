@@ -98,6 +98,8 @@ pub enum Command {
     },
     /// Deliver between tool calls of the running turn; when idle, the message goes back to the composer.
     Steer(UserInput),
+    /// Steer, and cancel the tool call running now; calls of the same reply not yet started are skipped. When idle, like Steer.
+    Interrupt(UserInput),
     /// Run after the running turn; when idle, the message goes back to the composer.
     FollowUp(UserInput),
     /// Take the newest queued message back as `QueuePopped`.
@@ -485,9 +487,17 @@ pub struct ActionChoice {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SubagentState {
+    Queued,
     Running,
     Done,
     Failed,
+}
+
+impl SubagentState {
+    /// Not finished: waiting to start, or running.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
 }
 
 /// What a background job runs.

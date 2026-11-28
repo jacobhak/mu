@@ -249,6 +249,15 @@ async fn drive<F: std::future::Future<Output = ()>>(fut: F, q: &mut Queue) {
                     let _ = q.events.send(AgentEvent::ThinkingLevel(t));
                     q.backlog.push_back(Command::SetThinking(t));
                 }
+                Some(Command::Interrupt(i)) => {
+                    if let Some(j) = &q.jobs {
+                        j.interrupt_wait();
+                    }
+                    steer_now(Command::Steer(i), &q.inbox, &q.events);
+                    let mut ib = q.inbox.borrow_mut();
+                    ib.urgent = true;
+                    ib.tool_cancel.cancel();
+                }
                 Some(c @ (Command::Prompt(_) | Command::Steer(_) | Command::FollowUp(_)))
                     if q.jobs.as_ref().is_some_and(|j| j.interrupt_wait()) =>
                 {
@@ -284,8 +293,8 @@ impl Agent {
         tools.permissions = permissions;
         tools.launch = i.run.task_launch.clone();
         tools.mirror = i.run.mirror_session;
-        let budget = (i.run.subagent && i.run.request_budget > 0)
-            .then(|| budget::Budget::new(i.run.request_budget, i.run.budget_notice));
+        let budget = (i.run.subagent && (i.run.request_budget > 0 || i.run.cost_cap > 0.0))
+            .then(|| budget::Budget::new(i.run.request_budget, i.run.budget_notice, i.run.cost_cap));
         let (title_tx, title_rx) = unbounded_channel();
         Self {
             tools,
@@ -493,7 +502,7 @@ impl Agent {
     /// Runs one command. `false` ends the run loop.
     async fn command(&mut self, cmd: Command, q: &mut Queue) -> bool {
         let cmd = match cmd {
-            Command::Steer(i) | Command::FollowUp(i) => {
+            Command::Steer(i) | Command::Interrupt(i) | Command::FollowUp(i) => {
                 // Only a running turn takes queued input; an idle one goes back to the composer.
                 self.emit(AgentEvent::QueuedDropped(vec![i]));
                 return true;
@@ -504,7 +513,12 @@ impl Agent {
             },
         };
         match cmd {
-            Command::Steer(_) | Command::FollowUp(_) | Command::PopQueue | Command::Cancel | Command::Stop => {
+            Command::Steer(_)
+            | Command::Interrupt(_)
+            | Command::FollowUp(_)
+            | Command::PopQueue
+            | Command::Cancel
+            | Command::Stop => {
                 unreachable!("queue and stop commands are handled above")
             }
             Command::Prompt(t) => drive(self.turn(Some(t)), q).await,

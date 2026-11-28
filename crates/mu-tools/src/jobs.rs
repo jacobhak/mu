@@ -2,22 +2,27 @@
 //! are delivered to the model as a `<system-notice>` message.
 
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
+use regex::Regex;
+use serde_json::{Value, json};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::permissions::Permissions;
 use crate::tools::relay::RelayServer;
-use crate::tools::subagent::{BackgroundResult, ChildCmd, Mirror, Outcome, preview_result, run_child_observed};
+use crate::tools::subagent::{
+    BackgroundResult, ChildCmd, ChildControl, Mirror, Outcome, RESULT_PREVIEW_CHARS, WorkerLaunch, prepare_launch,
+    preview_result, run_child_controlled,
+};
 use crate::tools::task::MAX_TASKS;
 use mu_base::events::{AgentEvent, EventTx, JobChanges, JobKind, SubagentState, SubagentStatus};
 use mu_base::text::truncate_text;
@@ -41,7 +46,13 @@ const NOTIFY_BATCH: Duration = Duration::from_millis(200);
 const NOTICE_LINES: usize = 50;
 const NOTICE_LINE_CHARS: usize = 500;
 
+/// Most subagents that may wait for a slot or for the jobs they follow.
+const MAX_QUEUED: usize = 16;
+/// Tool calls a running subagent's status keeps.
+const RECENT_TOOLS: usize = 10;
+
 /// Lines of a running job's output that matched its `notify` pattern, not yet handed to the model.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Matched {
     pub id: String,
     pub pattern: String,
@@ -72,6 +83,12 @@ struct SinkInner {
     /// the call's card shows progress. Cleared once the call stops waiting.
     call: RefCell<Option<String>>,
     buf: RefCell<String>,
+    /// The newest cleaned output (at most `OUTPUT_KEEP` bytes), for `job_status` and `wait`'s `until`.
+    clean: RefCell<String>,
+    /// Bytes of cleaned output ever appended.
+    clean_total: Cell<u64>,
+    /// Woken when output arrives, so a `wait` with `until` rescans.
+    jobs: RefCell<Weak<JobsHandle>>,
     last: Cell<Option<Instant>>,
     /// A deferred update is already waiting.
     pending: Cell<bool>,
@@ -94,6 +111,9 @@ impl OutputSink {
             events,
             call: RefCell::new(call),
             buf: RefCell::default(),
+            clean: RefCell::default(),
+            clean_total: Cell::new(0),
+            jobs: RefCell::new(Weak::new()),
             last: Cell::new(None),
             pending: Cell::new(false),
             pgid: Arc::new(AtomicU32::new(0)),
@@ -107,6 +127,50 @@ impl OutputSink {
         self.0.pgid.clone()
     }
 
+    fn set_jobs(&self, jobs: Weak<JobsHandle>) {
+        *self.0.jobs.borrow_mut() = jobs;
+    }
+
+    /// Keeps cleaned output, newest `OUTPUT_KEEP` bytes.
+    fn keep(&self, clean: &str) {
+        let i = &self.0;
+        i.clean_total.set(i.clean_total.get() + clean.len() as u64);
+        let mut c = i.clean.borrow_mut();
+        c.push_str(clean);
+        if c.len() > OUTPUT_KEEP {
+            let mut cut = c.len() - OUTPUT_KEEP;
+            while !c.is_char_boundary(cut) {
+                cut += 1;
+            }
+            c.drain(..cut);
+        }
+    }
+
+    /// The last `lines` lines of cleaned output, redacted.
+    pub fn clean_tail(&self, lines: usize) -> String {
+        let c = self.0.clean.borrow();
+        let all: Vec<&str> = c.lines().collect();
+        let text = all[all.len().saturating_sub(lines)..].join("\n");
+        mu_base::secrets::redact(&text, &self.0.cwd).text
+    }
+
+    /// Complete lines that match `re`, from absolute output offset `*from` (or the oldest byte still
+    /// kept, when output before it is gone); advances `*from` past the last whole line looked at.
+    fn scan(&self, re: &Regex, from: &mut u64) -> Vec<String> {
+        let i = &self.0;
+        let c = i.clean.borrow();
+        let base = i.clean_total.get() - c.len() as u64;
+        let start = (*from).max(base);
+        let Some(region) = c.get((start - base) as usize..) else { return Vec::new() };
+        let Some(end) = region.rfind('\n') else { return Vec::new() };
+        *from = start + end as u64 + 1;
+        let hits: Vec<&str> = region[..end].lines().filter(|l| re.is_match(l)).collect();
+        if hits.is_empty() {
+            return Vec::new();
+        }
+        mu_base::secrets::redact(&hits.join("\n"), &i.cwd).text.lines().map(str::to_string).collect()
+    }
+
     /// Reports output lines that match `re` to the model through `jobs`.
     pub fn watch(&self, re: regex::Regex, jobs: Weak<JobsHandle>) {
         let pattern = re.as_str().to_string();
@@ -116,6 +180,10 @@ impl OutputSink {
 
     /// Cleaned output (whole lines): the lines that match the watch pattern are batched for a notice.
     pub fn lines(&self, clean: &str) {
+        self.keep(clean);
+        if let Some(jobs) = self.0.jobs.borrow().upgrade() {
+            jobs.notify.notify_waiters();
+        }
         let mut guard = self.0.watch.borrow_mut();
         let Some(w) = guard.as_mut().filter(|w| !w.closed) else { return };
         for line in clean.lines() {
@@ -235,6 +303,18 @@ enum Work {
         changes: Option<JobChanges>,
         /// The remote's latest start step, until the worker is connected.
         progress: Option<String>,
+        /// The last `RECENT_TOOLS` tool calls, as "name summary".
+        recent: VecDeque<String>,
+        /// Lines for the child's stdin (steering); `None` for a job that takes none.
+        steer: Option<UnboundedSender<String>>,
+        /// Messages sent with `send`.
+        sent: u32,
+        /// The task payload, kept while the job waits to start.
+        payload: Option<Value>,
+        /// Runs on a remote worker.
+        launched: bool,
+        /// The session this job continues (`task` with `resume`).
+        resumes: Option<PathBuf>,
     },
     Bash {
         /// Taken on delivery, like `text`.
@@ -244,16 +324,30 @@ enum Work {
         note: Option<String>,
         /// The command's process group, once its shell is running (0 until then).
         pgid: Arc<AtomicU32>,
+        /// Where its output goes; also kept for `job_status` and `wait`'s `until`.
+        sink: OutputSink,
     },
 }
 
 impl Work {
     fn subagent() -> Self {
-        Work::Subagent { tools: 0, session: None, model: None, changes: None, progress: None }
+        Work::Subagent {
+            tools: 0,
+            session: None,
+            model: None,
+            changes: None,
+            progress: None,
+            recent: VecDeque::new(),
+            steer: None,
+            sent: 0,
+            payload: None,
+            launched: false,
+            resumes: None,
+        }
     }
 
-    fn bash(command: String, pgid: Arc<AtomicU32>) -> Self {
-        Work::Bash { command: Some(command), meta: None, note: None, pgid }
+    fn bash(command: String, sink: OutputSink) -> Self {
+        Work::Bash { command: Some(command), meta: None, note: None, pgid: sink.pgid(), sink }
     }
 
     fn pgid(&self) -> Option<&Arc<AtomicU32>> {
@@ -289,6 +383,67 @@ struct Job {
     /// The ports its processes listen on, as the last scan found them.
     ports: Vec<u16>,
     cancel: CancellationToken,
+    /// Jobs that must succeed before this one starts.
+    after: Vec<String>,
+    /// A copy of the result for the jobs that wait for this one; kept after delivery.
+    kept: String,
+    /// Starts a queued job: given its seq and its (completed) payload.
+    start: Option<StartFn>,
+}
+
+type StartFn = Box<dyn FnOnce(u64, Value) -> Pin<Box<dyn Future<Output = Finished>>>>;
+
+/// What `JobsHandle::pump` does next.
+enum Step {
+    Idle,
+    /// End a queued job that cannot start.
+    Fail(u64, String),
+    /// Run a queued job that now may.
+    Start(u64, StartFn, Value),
+}
+
+/// How a subagent job is scheduled.
+#[derive(Default)]
+pub struct SpawnOpts {
+    /// Jobs that must succeed first; the job gets their results in its context.
+    pub after: Vec<String>,
+    /// Time limit: the subagent is told to wrap up, and cancelled two minutes later.
+    pub timeout: Option<Duration>,
+    /// Run on a worker through this launcher instead of here.
+    pub launch: Option<WorkerLaunch>,
+}
+
+impl Job {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        seq: u64,
+        spec: Spec,
+        work: Work,
+        last: String,
+        state: SubagentState,
+        cancel: CancellationToken,
+        notice_owned: bool,
+        listed: bool,
+    ) -> Self {
+        Self {
+            seq,
+            spec,
+            work,
+            last,
+            state,
+            text: String::new(),
+            started: SystemTime::now(),
+            ended: None,
+            delivered: false,
+            ports: Vec::new(),
+            notice_owned,
+            listed,
+            cancel,
+            after: Vec::new(),
+            kept: String::new(),
+            start: None,
+        }
+    }
 }
 
 /// A job's outcome once its work has ended.
@@ -337,14 +492,36 @@ pub enum WaitReady {
     Ready(Vec<String>),
     /// Ids of jobs whose `notify` pattern matched; only `wait_ready_or_matches` returns it.
     Matched(Vec<String>),
+    /// The deadline passed: the selected jobs that had finished, and those still active.
+    TimedOut {
+        finished: Vec<String>,
+        running: Vec<String>,
+    },
+    /// Output lines of the selected jobs matched `until`.
+    Until(Vec<Matched>),
     Nothing,
     Interrupted,
     Cancelled,
     Unknown(Vec<String>),
 }
 
+/// What a `wait` is for.
+pub struct WaitSpec<'a> {
+    /// The jobs to wait for; empty means every job whose result is still to come.
+    pub ids: &'a [String],
+    /// Wait until every selected job has ended, instead of the first.
+    pub all: bool,
+    /// Return when an output line of a selected bash job matches, including output already printed.
+    pub until: Option<&'a Regex>,
+    pub deadline: Option<tokio::time::Instant>,
+    /// Also return when a selected job's `notify` pattern matched.
+    pub on_match: bool,
+}
+
 pub struct JobsHandle {
     inner: RefCell<Vec<Job>>,
+    /// What `session_cost` read of a session file at a given length, so `job_status` rereads only when it grew.
+    costs: RefCell<HashMap<PathBuf, (u64, f64)>>,
     next_seq: Cell<u64>,
     notify: Notify,
     wait_generation: Cell<u64>,
@@ -358,6 +535,7 @@ impl JobsHandle {
     pub fn new(wake: UnboundedSender<()>, events: EventTx) -> Rc<Self> {
         Rc::new(Self {
             inner: RefCell::default(),
+            costs: RefCell::default(),
             next_seq: Cell::new(0),
             notify: Notify::new(),
             wait_generation: Cell::new(0),
@@ -395,7 +573,8 @@ impl JobsHandle {
         cancel: &CancellationToken,
         interrupt: &CancellationToken,
     ) -> WaitReady {
-        self.wait_inner(ids, cancel, interrupt, false).await
+        let spec = WaitSpec { ids, all: false, until: None, deadline: None, on_match: false };
+        self.wait_for(spec, cancel, interrupt).await
     }
 
     /// `wait_ready`, also ending when output matching a selected job's `notify` pattern arrives.
@@ -405,18 +584,21 @@ impl JobsHandle {
         cancel: &CancellationToken,
         interrupt: &CancellationToken,
     ) -> WaitReady {
-        self.wait_inner(ids, cancel, interrupt, true).await
+        let spec = WaitSpec { ids, all: false, until: None, deadline: None, on_match: true };
+        self.wait_for(spec, cancel, interrupt).await
     }
 
-    async fn wait_inner(
+    /// The general wait: see `WaitSpec`. Unknown ids and an exhausted selection return immediately.
+    pub async fn wait_for(
         &self,
-        ids: &[String],
+        spec: WaitSpec<'_>,
         cancel: &CancellationToken,
         interrupt: &CancellationToken,
-        on_match: bool,
     ) -> WaitReady {
         let mut seen = HashSet::new();
-        let ids: Vec<&str> = ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect();
+        let ids: Vec<&str> = spec.ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect();
+        // Where each job's output was last scanned for `until`; 0 so retained output counts.
+        let mut scanned: HashMap<String, u64> = HashMap::new();
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -427,7 +609,13 @@ impl JobsHandle {
             if interrupt.is_cancelled() {
                 return WaitReady::Interrupted;
             }
-            if on_match {
+            if let Some(re) = spec.until {
+                let found = self.scan_until(re, &ids, &mut scanned);
+                if !found.is_empty() {
+                    return WaitReady::Until(found);
+                }
+            }
+            if spec.on_match && !spec.all && spec.until.is_none() {
                 let mut matched: Vec<String> = Vec::new();
                 for m in self.matches.borrow().iter().filter(|m| ids.is_empty() || ids.contains(&m.id.as_str())) {
                     if !matched.contains(&m.id) {
@@ -438,7 +626,7 @@ impl JobsHandle {
                     return WaitReady::Matched(matched);
                 }
             }
-            let (ready, unknown, running) = {
+            let (ready, unknown, active) = {
                 let jobs = self.inner.borrow();
                 let unknown = ids
                     .iter()
@@ -451,30 +639,59 @@ impl JobsHandle {
                 } else {
                     ids.iter().filter_map(|id| jobs.iter().find(|j| j.spec.id == *id)).filter(eligible).collect()
                 };
-                let ready = selected
-                    .iter()
-                    .filter(|j| j.state != SubagentState::Running)
-                    .map(|j| j.spec.id.clone())
-                    .collect::<Vec<_>>();
-                let running = selected.iter().any(|j| j.state == SubagentState::Running);
-                (ready, unknown, running)
+                let ready =
+                    selected.iter().filter(|j| !j.state.is_active()).map(|j| j.spec.id.clone()).collect::<Vec<_>>();
+                let active =
+                    selected.iter().filter(|j| j.state.is_active()).map(|j| j.spec.id.clone()).collect::<Vec<_>>();
+                (ready, unknown, active)
             };
             if !unknown.is_empty() {
                 return WaitReady::Unknown(unknown);
             }
-            if !ready.is_empty() {
+            if !ready.is_empty() && (!spec.all || active.is_empty()) {
                 return WaitReady::Ready(ready);
             }
-            if !running {
+            if active.is_empty() {
                 return WaitReady::Nothing;
             }
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return WaitReady::Cancelled,
                 _ = interrupt.cancelled() => return WaitReady::Interrupted,
+                () = async {
+                    match spec.deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => return WaitReady::TimedOut { finished: ready, running: active },
                 _ = &mut notified => {}
             }
         }
+    }
+
+    /// Output lines of the selected bash jobs that match `re` and were not looked at before.
+    fn scan_until(&self, re: &Regex, ids: &[&str], scanned: &mut HashMap<String, u64>) -> Vec<Matched> {
+        let jobs = self.inner.borrow();
+        let mut found = Vec::new();
+        for j in jobs.iter().filter(|j| ids.contains(&j.spec.id.as_str())) {
+            let Work::Bash { sink, .. } = &j.work else { continue };
+            let from = scanned.entry(j.spec.id.clone()).or_insert(0);
+            let lines = sink.scan(re, from);
+            if !lines.is_empty() {
+                found.push(Matched { id: j.spec.id.clone(), pattern: re.as_str().to_string(), lines });
+            }
+        }
+        found
+    }
+
+    /// Matching output of the named jobs (all jobs when `ids` is empty) not yet handed to the model;
+    /// takes it.
+    pub fn take_matches_for(&self, ids: &[String]) -> Vec<Matched> {
+        let mut all = self.matches.borrow_mut();
+        let (taken, kept): (Vec<Matched>, Vec<Matched>) =
+            std::mem::take(&mut *all).into_iter().partition(|m| ids.is_empty() || ids.contains(&m.id));
+        *all = kept;
+        taken
     }
 
     /// Queues matching output for the model, wakes an idle session and ends a blocked `wait`.
@@ -503,8 +720,23 @@ impl JobsHandle {
         (2..).map(|n| format!("{base}-{n}")).find(|id| !taken(id)).unwrap_or_default()
     }
 
+    /// Jobs not finished: running, or waiting to start.
     pub fn running(&self) -> usize {
-        self.inner.borrow().iter().filter(|j| j.state == SubagentState::Running).count()
+        self.inner.borrow().iter().filter(|j| j.state.is_active()).count()
+    }
+
+    /// Subagents waiting for a slot or for the jobs they follow.
+    pub fn queued(&self) -> usize {
+        self.inner.borrow().iter().filter(|j| j.state == SubagentState::Queued).count()
+    }
+
+    /// Errs when `n` more subagents would overflow the queue.
+    pub fn check_queue(&self, n: usize) -> Result<(), String> {
+        let q = self.queued();
+        if q + n > MAX_QUEUED {
+            return Err(format!("too many jobs waiting to start ({q}/{MAX_QUEUED}); wait for some to finish"));
+        }
+        Ok(())
     }
 
     /// Running jobs that count against the cap: the listed ones. A foreground call's command is
@@ -531,7 +763,7 @@ impl JobsHandle {
             .filter(|j| j.listed)
             .map(|j| {
                 let (tools, note, session, model, changes, progress) = match &j.work {
-                    Work::Subagent { tools, session, model, changes, progress } => {
+                    Work::Subagent { tools, session, model, changes, progress, .. } => {
                         (*tools, None, session.clone(), model.clone(), changes.clone(), progress.clone())
                     }
                     Work::Bash { note, .. } => (0, note.clone(), None, None, None, None),
@@ -625,21 +857,16 @@ impl JobsHandle {
     ) -> u64 {
         let seq = self.next_seq.get();
         self.next_seq.set(seq + 1);
-        self.inner.borrow_mut().push(Job {
+        self.inner.borrow_mut().push(Job::new(
             seq,
             spec,
             work,
             last,
-            state: SubagentState::Running,
-            text: String::new(),
-            started: SystemTime::now(),
-            ended: None,
-            delivered: false,
-            ports: Vec::new(),
+            SubagentState::Running,
+            cancel,
             notice_owned,
             listed,
-            cancel,
-        });
+        ));
         self.emit();
         seq
     }
@@ -665,12 +892,24 @@ impl JobsHandle {
 
     /// The one place a job ends: records its outcome. `handed_back`: the caller waiting on the job
     /// gets the result itself, so it is marked delivered and no idle agent is woken for it.
-    fn complete(&self, seq: u64, done: Finished, handed_back: bool) {
+    fn complete(self: &Rc<Self>, seq: u64, done: Finished, handed_back: bool) {
+        self.finish_job(seq, done, handed_back);
+        self.pump();
+    }
+
+    /// `complete` without starting what was waiting for a slot or for this job.
+    fn finish_job(&self, seq: u64, done: Finished, handed_back: bool) {
         if let Some(mut j) = self.job_mut(seq) {
             j.state = if done.ok { SubagentState::Done } else { SubagentState::Failed };
             j.ended = Some(SystemTime::now());
             if handed_back {
                 j.delivered = true;
+            }
+            j.kept = truncate_text(&done.text, RESULT_PREVIEW_CHARS);
+            j.start = None;
+            if let Work::Subagent { payload, steer, .. } = &mut j.work {
+                *payload = None;
+                *steer = None;
             }
             let keep = !j.delivered;
             if keep {
@@ -687,7 +926,88 @@ impl JobsHandle {
         if !handed_back {
             let _ = self.wake.send(());
         }
+    }
+
+    /// Starts the queued jobs that may start: those whose `after` jobs all succeeded, while a slot
+    /// is free, oldest first; one whose `after` job failed (or is gone) ends without starting.
+    /// Runs whenever a job ends or one is queued.
+    fn pump(self: &Rc<Self>) {
+        loop {
+            match self.next_step() {
+                Step::Idle => break,
+                Step::Fail(seq, text) => {
+                    self.finish_job(seq, Finished { ok: false, text, note: None, meta: None }, false);
+                }
+                Step::Start(seq, start, payload) => {
+                    let me = self.clone();
+                    tokio::task::spawn_local(async move {
+                        let done = start(seq, payload).await;
+                        me.complete(seq, done, false);
+                    });
+                }
+            }
+        }
         self.emit();
+    }
+
+    /// The next thing `pump` does, if any. A job it starts is marked running, with the results of
+    /// the jobs it waited for added to its context.
+    fn next_step(&self) -> Step {
+        let mut jobs = self.inner.borrow_mut();
+        let running = jobs.iter().filter(|j| j.listed && j.state == SubagentState::Running).count();
+        let free = running < MAX_TASKS;
+        for i in 0..jobs.len() {
+            if jobs[i].state != SubagentState::Queued {
+                continue;
+            }
+            let mut ready = true;
+            for dep in &jobs[i].after {
+                match jobs.iter().find(|d| d.spec.id == *dep).map(|d| &d.state) {
+                    Some(SubagentState::Done) => {}
+                    Some(SubagentState::Failed) => {
+                        let text = format!("not started: job `{dep}`, which it waited for, failed");
+                        return Step::Fail(jobs[i].seq, text);
+                    }
+                    Some(_) => ready = false,
+                    None => {
+                        let text = format!("not started: job `{dep}`, which it waited for, no longer exists");
+                        return Step::Fail(jobs[i].seq, text);
+                    }
+                }
+            }
+            if !ready || !free {
+                continue;
+            }
+            let block = if jobs[i].after.is_empty() {
+                None
+            } else {
+                let results: Vec<String> = jobs[i]
+                    .after
+                    .iter()
+                    .filter_map(|dep| jobs.iter().find(|d| d.spec.id == *dep))
+                    .map(|d| format!("## {} ({}) — ok\n{}", d.spec.id, d.spec.agent, d.kept))
+                    .collect();
+                Some(format!("# Results of the jobs this task waited for\n\n{}", results.join("\n\n")))
+            };
+            let job = &mut jobs[i];
+            let Some(start) = job.start.take() else {
+                return Step::Fail(job.seq, "not started: nothing to start".into());
+            };
+            let mut payload = match &mut job.work {
+                Work::Subagent { payload, .. } => payload.take().unwrap_or(Value::Null),
+                Work::Bash { .. } => Value::Null,
+            };
+            if let Some(block) = block {
+                payload["context"] = match payload["context"].as_str().filter(|c| !c.is_empty()) {
+                    Some(existing) => Value::String(format!("{existing}\n\n{block}")),
+                    None => Value::String(block),
+                };
+            }
+            job.state = SubagentState::Running;
+            job.started = SystemTime::now();
+            return Step::Start(job.seq, start, payload);
+        }
+        Step::Idle
     }
 
     /// The one path a job starts on: records it, runs `work` on the local set and records what
@@ -712,62 +1032,93 @@ impl JobsHandle {
         });
     }
 
+    /// Queues a subagent job; it starts as soon as the jobs in `opts.after` have succeeded and fewer
+    /// than `MAX_TASKS` run. `exe` is this executable, which runs the child unless `opts.launch`
+    /// sends it to a worker (prepared when the job starts).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         self: &Rc<Self>,
         id: String,
         agent: String,
-        child: ChildCmd,
+        exe: PathBuf,
         cwd: PathBuf,
         payload: Value,
         perms: Rc<Permissions>,
         artifacts: PathBuf,
         mirror: Mirror,
         relay: Option<RelayServer>,
+        opts: SpawnOpts,
     ) {
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
         let label = format!("{id} ({agent})");
+        let SpawnOpts { after, timeout, launch } = opts;
+        let (stx, srx) = unbounded_channel::<String>();
+        let job_id = id.clone();
         let spec = Spec { id, agent, cwd: cwd.clone(), task: command_line(payload["task"].as_str().unwrap_or("")) };
+        let mut work = Work::subagent();
+        if let Work::Subagent { steer, payload: kept, launched, resumes, .. } = &mut work {
+            *steer = Some(stx);
+            *kept = Some(payload.clone());
+            *launched = launch.is_some();
+            *resumes = payload["resume"].as_str().map(PathBuf::from);
+        }
         let me = self.clone();
-        self.spawn_job(spec, Work::subagent(), String::new(), cancel, true, move |seq| async move {
-            let mut child = child;
-            if let ChildCmd::Launched(l) = &mut child {
-                let me = me.clone();
-                l.on_progress(move |p| {
-                    if let Some(mut j) = me.job_mut(seq)
-                        && let Work::Subagent { progress, .. } = &mut j.work
-                    {
-                        *progress = p.map(str::to_string);
-                    }
-                    me.emit();
-                });
-            }
-            let out = me
-                .run_subagent(
-                    seq,
-                    child,
-                    &cwd,
-                    &payload,
-                    &child_cancel,
-                    |_, _| {},
-                    &perms,
-                    &label,
-                    mirror,
-                    relay.as_ref(),
-                )
-                .await;
-            // `run_child` already says "cancelled" when a cancelled child produced no result; a child
-            // that finished before the kill landed keeps its real result.
-            let text = preview_result(&out.text, &cwd, || crate::tools::Tools::next_artifact_in(&artifacts));
-            if let Some(c) = out.changes
-                && let Some(mut j) = me.job_mut(seq)
-                && let Work::Subagent { changes, .. } = &mut j.work
-            {
-                *changes = Some(c);
-            }
-            Finished { ok: out.ok, text, note: None, meta: None }
+        let start: StartFn = Box::new(move |seq, payload| {
+            Box::pin(async move {
+                let mut child = match &launch {
+                    None => ChildCmd::Local(exe),
+                    Some(on) => match prepare_launch(on, &cwd, &job_id).await {
+                        Ok(l) => ChildCmd::Launched(l),
+                        Err(text) => return Finished { ok: false, text, note: None, meta: None },
+                    },
+                };
+                if let ChildCmd::Launched(l) = &mut child {
+                    let me = me.clone();
+                    l.on_progress(move |p| {
+                        if let Some(mut j) = me.job_mut(seq)
+                            && let Work::Subagent { progress, .. } = &mut j.work
+                        {
+                            *progress = p.map(str::to_string);
+                        }
+                        me.emit();
+                    });
+                }
+                let control = ChildControl { steer: Some(srx), timeout };
+                let out = me
+                    .run_subagent(
+                        seq,
+                        child,
+                        &cwd,
+                        &payload,
+                        &child_cancel,
+                        |_, _| {},
+                        &perms,
+                        &label,
+                        mirror,
+                        relay.as_ref(),
+                        control,
+                    )
+                    .await;
+                // `run_child` already says "cancelled" when a cancelled child produced no result; a child
+                // that finished before the kill landed keeps its real result.
+                let text = preview_result(&out.text, &cwd, || crate::tools::Tools::next_artifact_in(&artifacts));
+                if let Some(c) = out.changes
+                    && let Some(mut j) = me.job_mut(seq)
+                    && let Work::Subagent { changes, .. } = &mut j.work
+                {
+                    *changes = Some(c);
+                }
+                Finished { ok: out.ok, text, note: None, meta: None }
+            })
         });
+        let seq = self.next_seq.get();
+        self.next_seq.set(seq + 1);
+        let mut job = Job::new(seq, spec, work, String::new(), SubagentState::Queued, cancel, true, true);
+        job.after = after;
+        job.start = Some(start);
+        self.inner.borrow_mut().push(job);
+        self.pump();
     }
 
     /// Runs a subagent as a job the caller waits for: listed in the jobs panel, cancellable there,
@@ -808,6 +1159,7 @@ impl JobsHandle {
                 "review",
                 mirror,
                 None,
+                ChildControl::default(),
             )
             .await;
         self.complete(seq, Finished { ok: out.ok, text: String::new(), note: None, meta: None }, true);
@@ -829,18 +1181,24 @@ impl JobsHandle {
         from: &str,
         mirror: Mirror,
         relay: Option<&RelayServer>,
+        control: ChildControl,
     ) -> Outcome {
-        run_child_observed(
+        run_child_controlled(
             child,
             cwd,
             payload,
             cancel,
             |name, summary| {
                 if let Some(mut j) = self.job_mut(seq) {
-                    if let Work::Subagent { tools, .. } = &mut j.work {
+                    let last = format!("{name} {summary}");
+                    if let Work::Subagent { tools, recent, .. } = &mut j.work {
                         *tools += 1;
+                        if recent.len() == RECENT_TOOLS {
+                            recent.pop_front();
+                        }
+                        recent.push_back(last.clone());
                     }
-                    j.last = format!("{name} {summary}");
+                    j.last = last;
                 }
                 on_tool(name, summary);
                 self.emit();
@@ -864,6 +1222,7 @@ impl JobsHandle {
             Some(&|r| perms.forward(&self.events, from, r)),
             mirror,
             relay,
+            control,
         )
         .await
     }
@@ -928,13 +1287,14 @@ impl JobsHandle {
         let line = command_line(&command);
         let listed = call.is_none();
         let sink = OutputSink::new(id.clone(), cwd.clone(), self.events.clone(), call);
+        sink.set_jobs(Rc::downgrade(self));
         if let Some(re) = notify {
             sink.watch(re, Rc::downgrade(self));
         }
         let spec = Spec { id: id.clone(), agent: "bash".into(), cwd, task: one_line(&command, COMMAND_KEEP) };
         let run_cancel = cancel.clone();
         let kept = sink.clone();
-        self.spawn_job(spec, Work::bash(command, sink.pgid()), line, cancel, listed, move |_| {
+        self.spawn_job(spec, Work::bash(command, sink.clone()), line, cancel, listed, move |_| {
             let fut = run(run_cancel, kept.clone());
             async move {
                 let r = fut.await;
@@ -959,10 +1319,7 @@ impl JobsHandle {
             .borrow_mut()
             .iter_mut()
             .filter(|j| {
-                j.notice_owned
-                    && j.state != SubagentState::Running
-                    && !j.delivered
-                    && (ids.is_empty() || ids.contains(&j.spec.id))
+                j.notice_owned && !j.state.is_active() && !j.delivered && (ids.is_empty() || ids.contains(&j.spec.id))
             })
             .map(|j| {
                 j.delivered = true;
@@ -989,7 +1346,7 @@ impl JobsHandle {
     }
 
     pub fn has_undelivered(&self) -> bool {
-        self.inner.borrow().iter().any(|j| j.notice_owned && j.state != SubagentState::Running && !j.delivered)
+        self.inner.borrow().iter().any(|j| j.notice_owned && !j.state.is_active() && !j.delivered)
     }
 
     /// Discards a notice-owned result, including one that has yet to finish.
@@ -1018,7 +1375,12 @@ impl JobsHandle {
     /// Ids of the running listed jobs, oldest first.
     pub fn running_ids(&self) -> Vec<String> {
         let jobs = self.inner.borrow();
-        jobs.iter().filter(|j| j.listed && j.state == SubagentState::Running).map(|j| j.spec.id.clone()).collect()
+        jobs.iter().filter(|j| j.listed && j.state.is_active()).map(|j| j.spec.id.clone()).collect()
+    }
+
+    /// Whether `id` names a subagent job.
+    pub fn is_subagent(&self, id: &str) -> bool {
+        self.inner.borrow().iter().any(|j| j.spec.id == id && j.work.kind() == JobKind::Subagent)
     }
 
     /// The state of job `id`, `None` when this session has no such job.
@@ -1032,23 +1394,237 @@ impl JobsHandle {
     }
 
     /// Cancels running jobs (all when `id` is `None`); returns how many.
-    pub fn kill(&self, id: Option<&str>) -> usize {
-        let jobs = self.inner.borrow();
-        let targets: Vec<&Job> =
-            jobs.iter().filter(|j| j.state == SubagentState::Running && id.is_none_or(|i| i == j.spec.id)).collect();
-        for j in &targets {
-            j.cancel.cancel();
+    pub fn kill(self: &Rc<Self>, id: Option<&str>) -> usize {
+        let mut waiting = Vec::new();
+        let n = {
+            let jobs = self.inner.borrow();
+            let mut n = 0;
+            for j in jobs.iter().filter(|j| j.state.is_active() && id.is_none_or(|i| i == j.spec.id)) {
+                n += 1;
+                if j.state == SubagentState::Queued {
+                    waiting.push(j.seq);
+                } else {
+                    j.cancel.cancel();
+                }
+            }
+            n
+        };
+        // A queued job has no process to stop: it ends here, and nothing waiting for a slot may take
+        // its place before the rest of the batch is ended too.
+        for seq in waiting {
+            let done = Finished { ok: false, text: "cancelled before it started".into(), note: None, meta: None };
+            self.finish_job(seq, done, false);
         }
-        targets.len()
+        self.pump();
+        n
     }
 
     /// Kills everything and forgets all jobs (session end).
-    pub fn clear(&self) {
+    pub fn clear(self: &Rc<Self>) {
         self.kill(None);
         self.inner.borrow_mut().clear();
         self.matches.borrow_mut().clear();
         self.notify.notify_waiters();
         self.emit();
+    }
+
+    /// Sends `text` to the subagent `id`: to its stdin as a steering line when it runs, into its task
+    /// when it has not started. `urgent` also cancels the tool call it is in.
+    pub fn send(&self, id: &str, text: &str, urgent: bool) -> Result<Sent, String> {
+        let mut jobs = self.inner.borrow_mut();
+        let Some(j) = jobs.iter_mut().find(|j| j.spec.id == id) else { return Err(format!("no job `{id}`")) };
+        let finished = || format!("`{id}` has finished; continue it with `task` and `resume: \"{id}\"`");
+        let state = j.state.clone();
+        match &mut j.work {
+            Work::Bash { .. } => Err(format!("`{id}` is a bash job; only subagents take messages")),
+            Work::Subagent { payload, steer, sent, .. } => match state {
+                SubagentState::Done | SubagentState::Failed => Err(finished()),
+                SubagentState::Queued => {
+                    let extra = format!("Additional instructions from the agent that started this task:\n{text}");
+                    if let Some(p) = payload.as_mut() {
+                        p["context"] = match p["context"].as_str().filter(|c| !c.is_empty()) {
+                            Some(c) => Value::String(format!("{c}\n\n{extra}")),
+                            None => Value::String(extra),
+                        };
+                    }
+                    Ok(Sent::Queued)
+                }
+                SubagentState::Running => {
+                    let Some(tx) = steer else { return Err(format!("`{id}` does not take messages")) };
+                    let line = json!({
+                        "type": "steer",
+                        "text": format!("Message from the agent that started this task:\n\n{text}"),
+                        "urgent": urgent,
+                    });
+                    tx.send(line.to_string()).map_err(|_| finished())?;
+                    *sent += 1;
+                    Ok(Sent::Live)
+                }
+            },
+        }
+    }
+
+    /// What `task` needs to continue the finished subagent `id`.
+    pub fn resumable(&self, id: &str) -> Result<Resumable, String> {
+        let jobs = self.inner.borrow();
+        let Some(j) = jobs.iter().find(|j| j.spec.id == id) else { return Err(format!("no job `{id}`")) };
+        let Work::Subagent { session, launched, .. } = &j.work else { return Err(format!("`{id}` is a bash job")) };
+        if j.state.is_active() {
+            return Err(format!("`{id}` is still running; message it with job_send"));
+        }
+        if *launched {
+            return Err(format!("`{id}` ran on a remote worker; only local subagents can be resumed"));
+        }
+        let Some(session) = session.clone() else { return Err(format!("`{id}` has no session to continue")) };
+        let other = jobs.iter().find(|o| {
+            o.spec.id != id
+                && o.state.is_active()
+                && matches!(&o.work, Work::Subagent { session: s, resumes, .. }
+                    if s.as_ref() == Some(&session) || resumes.as_ref() == Some(&session))
+        });
+        if let Some(o) = other {
+            return Err(format!("`{id}` is already being continued by `{}`", o.spec.id));
+        }
+        Ok(Resumable { agent: j.spec.agent.clone(), cwd: j.spec.cwd.clone(), session })
+    }
+
+    /// The text `job_status` returns: every listed job, or `id` in detail.
+    pub fn status(&self, id: Option<&str>, tail: usize) -> Result<String, String> {
+        let jobs = self.inner.borrow();
+        let listed: Vec<&Job> = jobs.iter().filter(|j| j.listed).collect();
+        let now = SystemTime::now();
+        let Some(id) = id else {
+            if listed.is_empty() {
+                return Ok("No background jobs in this session.".into());
+            }
+            return Ok(listed.iter().map(|j| self.status_line(j, now)).collect::<Vec<_>>().join("\n"));
+        };
+        let Some(j) = listed.iter().find(|j| j.spec.id == id) else {
+            let names = listed.iter().map(|j| j.spec.id.as_str()).collect::<Vec<_>>().join(", ");
+            let names = if names.is_empty() { "none".to_string() } else { names };
+            return Err(format!("job_status: no job `{id}`; jobs: {names}"));
+        };
+        Ok(self.status_detail(j, tail, now))
+    }
+
+    /// What the session file of a subagent has cost so far; read again only when the file grew.
+    fn session_cost(&self, path: &Path) -> f64 {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if let Some((l, c)) = self.costs.borrow().get(path)
+            && *l == len
+        {
+            return *c;
+        }
+        let cost = mu_session::session::tree_cost::session_cost(path);
+        self.costs.borrow_mut().insert(path.to_path_buf(), (len, cost));
+        cost
+    }
+
+    fn job_cost(&self, j: &Job) -> Option<f64> {
+        match &j.work {
+            Work::Subagent { session: Some(p), .. } => Some(self.session_cost(p)).filter(|c| *c > 0.0),
+            _ => None,
+        }
+    }
+
+    fn status_line(&self, j: &Job, now: SystemTime) -> String {
+        let mut parts = vec![
+            j.spec.id.clone(),
+            if j.work.kind() == JobKind::Bash { "bash".into() } else { j.spec.agent.clone() },
+            state_label(&j.state).to_string(),
+            elapsed_label(j, now),
+        ];
+        if let Work::Subagent { tools, .. } = &j.work {
+            parts.push(format!("{tools} tools"));
+        }
+        if let Some(c) = self.job_cost(j) {
+            parts.push(format!("${c:.2}"));
+        }
+        let last = match (&j.state, j.after.is_empty()) {
+            (SubagentState::Queued, false) => format!("waits for {}", j.after.join(", ")),
+            (SubagentState::Queued, true) => "waits for a free slot".to_string(),
+            _ => j.last.clone(),
+        };
+        if !last.is_empty() {
+            parts.push(last);
+        }
+        let mut line = parts.join(" · ");
+        if !j.ports.is_empty() {
+            line.push_str(&format!(" · {}", j.ports.iter().map(|p| format!(":{p}")).collect::<Vec<_>>().join(" ")));
+        }
+        if !j.state.is_active() && j.notice_owned && !j.delivered {
+            line.push_str(" · result waiting");
+        }
+        line
+    }
+
+    fn status_detail(&self, j: &Job, tail: usize, now: SystemTime) -> String {
+        let bash = j.work.kind() == JobKind::Bash;
+        let agent = if bash { "bash" } else { j.spec.agent.as_str() };
+        let mut out = format!("Job {} ({agent}) — {}, {}", j.spec.id, state_label(&j.state), elapsed_label(j, now));
+        if !j.spec.cwd.as_os_str().is_empty() {
+            out.push_str(&format!("\ncwd: {}", j.spec.cwd.display()));
+        }
+        out.push_str(&format!("\n{}: {}", if bash { "command" } else { "task" }, j.spec.task));
+        if j.state == SubagentState::Queued && !j.after.is_empty() {
+            out.push_str(&format!("\nwaits for: {}", j.after.join(", ")));
+        }
+        match &j.work {
+            Work::Subagent { model, session, sent, recent, .. } => {
+                if let Some(m) = model {
+                    out.push_str(&format!("\nmodel: {m}"));
+                }
+                if let Some(s) = session {
+                    out.push_str(&format!("\nsession: {}", s.display()));
+                }
+                if let Some(c) = self.job_cost(j) {
+                    out.push_str(&format!("\ncost: ${c:.2}"));
+                }
+                if *sent > 0 {
+                    out.push_str(&format!("\nmessages sent: {sent}"));
+                }
+                if !j.ports.is_empty() {
+                    out.push_str(&format!(
+                        "\nports: {}",
+                        j.ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                self.status_tail(&mut out, j, now);
+                out.push_str("\nRecent tool calls:");
+                if recent.is_empty() {
+                    out.push_str("\n- none yet");
+                }
+                for r in recent {
+                    out.push_str(&format!("\n- {r}"));
+                }
+            }
+            Work::Bash { note, sink, .. } => {
+                if !j.ports.is_empty() {
+                    out.push_str(&format!(
+                        "\nports: {}",
+                        j.ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if let Some(n) = note.as_deref().filter(|n| !n.is_empty()) {
+                    out.push_str(&format!("\nended: {n}"));
+                }
+                self.status_tail(&mut out, j, now);
+                let shown = sink.clean_tail(tail);
+                let n = shown.lines().count();
+                if n == 0 {
+                    out.push_str("\nOutput: none yet");
+                } else {
+                    out.push_str(&format!("\nOutput (last {n} lines):\n{shown}"));
+                }
+            }
+        }
+        out
+    }
+
+    fn status_tail(&self, out: &mut String, j: &Job, _now: SystemTime) {
+        if !j.state.is_active() && j.notice_owned {
+            out.push_str(if j.delivered { "\nresult: delivered" } else { "\nresult: waiting (use `wait`)" });
+        }
     }
 
     /// Resolves with the first finished jobs, delivering them; for tests to wait on a job.
@@ -1071,6 +1647,7 @@ impl JobsHandle {
         if let Some(j) = self.inner.borrow_mut().iter_mut().find(|j| j.spec.id == id) {
             j.state = if ok { SubagentState::Done } else { SubagentState::Failed };
             j.text = text.into();
+            j.kept = truncate_text(text, RESULT_PREVIEW_CHARS);
         }
         self.notify.notify_waiters();
     }
@@ -1079,21 +1656,86 @@ impl JobsHandle {
     pub(crate) fn push_running(&self, id: &str) {
         let seq = self.next_seq.get();
         self.next_seq.set(seq + 1);
-        self.inner.borrow_mut().push(Job {
+        let spec = Spec { id: id.into(), agent: "scout".into(), cwd: PathBuf::new(), task: String::new() };
+        self.inner.borrow_mut().push(Job::new(
             seq,
-            spec: Spec { id: id.into(), agent: "scout".into(), cwd: PathBuf::new(), task: String::new() },
-            work: Work::subagent(),
-            last: String::new(),
-            state: SubagentState::Running,
-            text: String::new(),
-            started: SystemTime::now(),
-            ended: None,
-            delivered: false,
-            ports: Vec::new(),
-            notice_owned: true,
-            listed: true,
-            cancel: CancellationToken::new(),
-        });
+            spec,
+            Work::subagent(),
+            String::new(),
+            SubagentState::Running,
+            CancellationToken::new(),
+            true,
+            true,
+        ));
+    }
+
+    /// A running subagent that takes messages: the receiver gets the lines `send` writes.
+    #[cfg(test)]
+    pub(crate) fn push_steerable(&self, id: &str) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        self.push_running(id);
+        let (tx, rx) = unbounded_channel();
+        if let Some(j) = self.inner.borrow_mut().iter_mut().find(|j| j.spec.id == id)
+            && let Work::Subagent { steer, .. } = &mut j.work
+        {
+            *steer = Some(tx);
+        }
+        rx
+    }
+
+    /// A subagent waiting for the jobs in `after` (and a slot); once it may start its job returns "Q",
+    /// and the payload it was given is sent to `payloads`.
+    #[cfg(test)]
+    pub(crate) fn push_queued(&self, id: &str, after: &[&str], payloads: tokio::sync::mpsc::UnboundedSender<Value>) {
+        let seq = self.next_seq.get();
+        self.next_seq.set(seq + 1);
+        let spec = Spec { id: id.into(), agent: "scout".into(), cwd: PathBuf::new(), task: String::new() };
+        let mut work = Work::subagent();
+        if let Work::Subagent { payload, .. } = &mut work {
+            *payload = Some(json!({"task": "t"}));
+        }
+        let mut job =
+            Job::new(seq, spec, work, String::new(), SubagentState::Queued, CancellationToken::new(), true, true);
+        job.after = after.iter().map(|a| a.to_string()).collect();
+        job.start = Some(Box::new(move |_, p| {
+            let _ = payloads.send(p);
+            Box::pin(async { Finished { ok: true, text: "Q".into(), note: None, meta: None } })
+        }));
+        self.inner.borrow_mut().push(job);
+    }
+}
+
+/// How `send` delivered a message.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Sent {
+    /// To the running subagent.
+    Live,
+    /// Into the task of a subagent that has not started.
+    Queued,
+}
+
+/// What `task` needs to continue a finished subagent.
+#[derive(Debug)]
+pub struct Resumable {
+    pub agent: String,
+    pub cwd: PathBuf,
+    pub session: PathBuf,
+}
+
+fn state_label(s: &SubagentState) -> &'static str {
+    match s {
+        SubagentState::Queued => "queued",
+        SubagentState::Running => "running",
+        SubagentState::Done => "done",
+        SubagentState::Failed => "failed",
+    }
+}
+
+fn elapsed_label(j: &Job, now: SystemTime) -> String {
+    let secs = j.ended.unwrap_or(now).duration_since(j.started).map_or(0, |d| d.as_secs());
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
     }
 }
 
@@ -1143,9 +1785,9 @@ pub fn notice(done: &[Done]) -> String {
     )
 }
 
-/// The user message that hands matching output of running jobs to the model.
-pub fn matches_notice(matches: &[Matched]) -> String {
-    let body = matches
+/// The matching lines of running jobs, as text.
+pub fn matches_body(matches: &[Matched]) -> String {
+    matches
         .iter()
         .map(|m| {
             let shown: Vec<String> =
@@ -1155,7 +1797,12 @@ pub fn matches_notice(matches: &[Matched]) -> String {
             format!("Background job {} printed output matching `{}`:\n{}{more}", m.id, m.pattern, shown.join("\n"))
         })
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join("\n\n")
+}
+
+/// The user message that hands matching output of running jobs to the model.
+pub fn matches_notice(matches: &[Matched]) -> String {
+    let body = matches_body(matches);
     format!("<system-notice>\n{body}\nThe job's final result arrives separately when it ends.\n</system-notice>")
 }
 
@@ -1264,26 +1911,27 @@ pub(crate) mod tests {
     #[test]
     fn delivered_output_is_released() {
         let h = handle();
-        h.inner.borrow_mut().push(Job {
-            seq: 0,
-            spec: Spec { id: "A".into(), agent: "scout".into(), cwd: PathBuf::from("/w"), task: "echo".into() },
-            work: Work::Bash {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new("A".into(), PathBuf::from("/w"), events, None);
+        let mut job = Job::new(
+            0,
+            Spec { id: "A".into(), agent: "scout".into(), cwd: PathBuf::from("/w"), task: "echo".into() },
+            Work::Bash {
                 command: Some("echo".into()),
                 meta: None,
                 note: Some("exit 0".into()),
                 pgid: Arc::new(AtomicU32::new(0)),
+                sink,
             },
-            last: String::new(),
-            state: SubagentState::Done,
-            text: "big output".into(),
-            started: SystemTime::now(),
-            ended: Some(SystemTime::now()),
-            delivered: false,
-            ports: Vec::new(),
-            notice_owned: true,
-            listed: true,
-            cancel: CancellationToken::new(),
-        });
+            String::new(),
+            SubagentState::Done,
+            CancellationToken::new(),
+            true,
+            true,
+        );
+        job.text = "big output".into();
+        job.ended = Some(SystemTime::now());
+        h.inner.borrow_mut().push(job);
         let snap = h.snapshot();
         assert_eq!(
             (snap[0].delivered, snap[0].task.as_str(), snap[0].note.as_deref()),
@@ -1332,13 +1980,14 @@ pub(crate) mod tests {
                 h.spawn(
                     "A".into(),
                     "scout".into(),
-                    ChildCmd::Local(exe),
+                    exe,
                     base.clone(),
                     serde_json::json!({"task": "find  x\nnow"}),
                     Rc::default(),
                     base.join("artifacts"),
                     Mirror::Off,
                     None,
+                    SpawnOpts::default(),
                 );
                 assert_eq!(h.finished().await.len(), 1);
             })
@@ -1682,5 +2331,263 @@ pub(crate) mod tests {
         };
         let (d, ()) = tokio::join!(h.finished(), finisher);
         assert!(!d[0].ok);
+    }
+
+    async fn settled(h: &Rc<JobsHandle>, id: &str, state: SubagentState) {
+        let what = format!("{id} to be {state:?}");
+        mu_testutil::wait_until(&what, || h.state_of(id) == Some(state.clone())).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_job_starts_when_a_slot_frees() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = handle();
+                for i in 0..MAX_TASKS {
+                    h.push_running(&format!("r{i}"));
+                }
+                let (tx, mut payloads) = unbounded_channel();
+                h.push_queued("Q", &[], tx);
+                h.pump();
+                assert_eq!((h.state_of("Q"), h.queued(), h.running()), (Some(SubagentState::Queued), 1, MAX_TASKS + 1));
+                h.finish("r0", true, "x");
+                h.pump();
+                assert_eq!(h.state_of("Q"), Some(SubagentState::Running));
+                assert!(payloads.recv().await.is_some(), "its start function ran");
+                settled(&h, "Q", SubagentState::Done).await;
+                assert_eq!(h.queued(), 0);
+            })
+            .await;
+    }
+
+    #[test]
+    fn the_queue_is_bounded() {
+        let h = handle();
+        let (tx, _rx) = unbounded_channel();
+        for i in 0..MAX_QUEUED {
+            h.push_queued(&format!("q{i}"), &[], tx.clone());
+        }
+        let e = h.check_queue(1).unwrap_err();
+        assert_eq!(e, format!("too many jobs waiting to start ({MAX_QUEUED}/{MAX_QUEUED}); wait for some to finish"));
+        assert!(h.check_queue(0).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn after_passes_results_and_fails_fast() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = handle();
+                let (tx, mut payloads) = unbounded_channel();
+                h.push_running("A");
+                h.push_queued("B", &["A"], tx.clone());
+                h.pump();
+                assert_eq!(h.state_of("B"), Some(SubagentState::Queued), "A has not finished");
+                h.finish("A", true, "ALPHA");
+                h.pump();
+                let p = payloads.recv().await.unwrap();
+                let context = p["context"].as_str().unwrap();
+                assert!(context.contains("## A (scout) — ok\nALPHA"), "{context}");
+                settled(&h, "B", SubagentState::Done).await;
+
+                h.push_running("C");
+                h.push_queued("D", &["C"], tx);
+                h.finish("C", false, "boom");
+                h.pump();
+                assert_eq!(h.state_of("D"), Some(SubagentState::Failed));
+                let d = h.take_undelivered_for(&["D".to_string()]);
+                assert_eq!(d[0].text, "not started: job `C`, which it waited for, failed");
+                assert!(payloads.try_recv().is_err(), "D never started");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dependency_result_is_added_to_an_existing_context() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = handle();
+                let (tx, mut payloads) = unbounded_channel();
+                h.push_running("A");
+                h.push_queued("B", &["A"], tx);
+                h.send("B", "also look at b.rs", false).unwrap();
+                h.finish("A", true, "ALPHA");
+                h.pump();
+                let p = payloads.recv().await.unwrap();
+                let context = p["context"].as_str().unwrap();
+                let extra = "Additional instructions from the agent that started this task:\nalso look at b.rs";
+                assert!(
+                    context.starts_with(extra) && context.contains("\n\n# Results of the jobs this task waited for")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kill_cancels_a_queued_job_without_starting_it() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = handle();
+                let (tx, mut payloads) = unbounded_channel();
+                h.push_running("A");
+                h.push_queued("B", &["A"], tx.clone());
+                h.push_queued("C", &["B"], tx);
+                assert_eq!(h.kill(Some("B")), 1);
+                assert_eq!(h.state_of("B"), Some(SubagentState::Failed));
+                assert_eq!(h.state_of("C"), Some(SubagentState::Failed), "what waited for it does not start");
+                assert!(!h.is_cancelled("A"));
+                assert_eq!(h.take_undelivered_for(&["B".to_string()])[0].text, "cancelled before it started");
+                h.finish("A", true, "");
+                h.pump();
+                assert!(payloads.try_recv().is_err());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_times_out_with_partial_results() {
+        let h = handle();
+        h.push_running("A");
+        h.push_running("B");
+        h.finish("B", true, "b");
+        let (cancel, interrupt) = (CancellationToken::new(), CancellationToken::new());
+        let spec = |all, ms| WaitSpec {
+            ids: &[],
+            all,
+            until: None,
+            deadline: Some(tokio::time::Instant::now() + Duration::from_millis(ms)),
+            on_match: false,
+        };
+        // Without `all`, the finished one returns at once.
+        assert_eq!(h.wait_for(spec(false, 5000), &cancel, &interrupt).await, WaitReady::Ready(vec!["B".into()]));
+        // With `all`, the running one keeps the wait until the deadline.
+        assert_eq!(
+            h.wait_for(spec(true, 30), &cancel, &interrupt).await,
+            WaitReady::TimedOut { finished: vec!["B".into()], running: vec!["A".into()] }
+        );
+        h.finish("A", true, "a");
+        assert_eq!(
+            h.wait_for(spec(true, 5000), &cancel, &interrupt).await,
+            WaitReady::Ready(vec!["A".into(), "B".into()])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn until_matches_retained_and_new_output() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let h = handle();
+                let idle = |cancel: CancellationToken, _| async move {
+                    cancel.cancelled().await;
+                    BackgroundResult { ok: false, text: String::new(), note: "cancelled".into(), meta: None }
+                };
+                let (first, sink) = h.spawn_bash("serve".into(), "/".into(), idle);
+                sink.lines("starting\nready on :3000\n");
+                let re = Regex::new("ready").unwrap();
+                let (cancel, interrupt) = (CancellationToken::new(), CancellationToken::new());
+                let ids = [first.clone()];
+                let spec = |ids| WaitSpec { ids, all: false, until: Some(&re), deadline: None, on_match: true };
+                let got = h.wait_for(spec(&ids), &cancel, &interrupt).await;
+                let expect =
+                    Matched { id: first.clone(), pattern: "ready".into(), lines: vec!["ready on :3000".into()] };
+                assert_eq!(got, WaitReady::Until(vec![expect]), "output printed before the call counts");
+
+                let (second, sink2) = h.spawn_bash("watch".into(), "/".into(), idle);
+                let ids = [second.clone()];
+                let waiting = h.wait_for(spec(&ids), &cancel, &interrupt);
+                let feed = async {
+                    tokio::task::yield_now().await;
+                    sink2.lines("noise\nthe app is ready\n");
+                };
+                let (got, ()) = tokio::join!(waiting, feed);
+                match got {
+                    WaitReady::Until(m) => assert_eq!(m[0].lines, ["the app is ready"]),
+                    other => panic!("{other:?}"),
+                }
+                // A job that ended without a match returns its result instead.
+                h.kill(None);
+                settled(&h, &second, SubagentState::Failed).await;
+                let ids = [second.clone()];
+                let r = h.wait_for(spec(&ids), &cancel, &interrupt).await;
+                assert!(matches!(r, WaitReady::Until(_) | WaitReady::Ready(_)), "{r:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clean_output_is_kept_bounded_and_the_tail_is_redacted() {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new("bg_1".into(), PathBuf::from("/"), events, None);
+        sink.lines("a\nb\nc\nd\n");
+        assert_eq!(sink.clean_tail(2), "c\nd");
+        assert_eq!(sink.clean_tail(50), "a\nb\nc\nd");
+        let big = format!("{}\n", "é".repeat(100 * 1024));
+        sink.lines(&big);
+        assert!(sink.0.clean.borrow().len() <= OUTPUT_KEEP);
+        assert_eq!(sink.0.clean_total.get(), 8 + big.len() as u64);
+        // A scan resumes after what it has seen, and skips what has been dropped.
+        sink.lines("tail line\n");
+        let mut from = 0;
+        let re = Regex::new("tail").unwrap();
+        assert_eq!(sink.scan(&re, &mut from), ["tail line"]);
+        assert!(sink.scan(&re, &mut from).is_empty(), "nothing new");
+    }
+
+    #[test]
+    fn send_reaches_a_running_subagent_and_edits_a_queued_one() {
+        let h = handle();
+        let mut lines = h.push_steerable("A");
+        assert_eq!(h.send("A", "go left", true), Ok(Sent::Live));
+        let line: Value = serde_json::from_str(&lines.try_recv().unwrap()).unwrap();
+        assert_eq!((line["type"].as_str(), line["urgent"].as_bool()), (Some("steer"), Some(true)));
+        assert_eq!(line["text"], "Message from the agent that started this task:\n\ngo left");
+        assert_eq!(h.snapshot().len(), 1);
+
+        let (tx, _payloads) = unbounded_channel();
+        h.push_queued("Q", &["A"], tx);
+        assert_eq!(h.send("Q", "also b", false), Ok(Sent::Queued));
+        let jobs = h.inner.borrow();
+        let Work::Subagent { payload: Some(p), sent, .. } = &jobs[1].work else { panic!("a queued subagent") };
+        assert!(p["context"].as_str().unwrap().ends_with("also b") && *sent == 0);
+        drop(jobs);
+
+        assert_eq!(h.send("nope", "x", false), Err("no job `nope`".into()));
+        h.finish("A", true, "");
+        let e = h.send("A", "x", false).unwrap_err();
+        assert_eq!(e, "`A` has finished; continue it with `task` and `resume: \"A\"`");
+    }
+
+    #[test]
+    fn only_a_finished_local_subagent_with_a_session_can_be_resumed() {
+        let h = handle();
+        h.push_running("A");
+        assert_eq!(h.resumable("A").unwrap_err(), "`A` is still running; message it with job_send");
+        assert_eq!(h.resumable("zz").unwrap_err(), "no job `zz`");
+        h.finish("A", true, "x");
+        assert_eq!(h.resumable("A").unwrap_err(), "`A` has no session to continue");
+        let set = |id: &str, f: &dyn Fn(&mut Work)| {
+            let mut jobs = h.inner.borrow_mut();
+            f(&mut jobs.iter_mut().find(|j| j.spec.id == id).unwrap().work);
+        };
+        let path = PathBuf::from("/s/a.jsonl");
+        set("A", &|w| {
+            if let Work::Subagent { session, .. } = w {
+                *session = Some(path.clone());
+            }
+        });
+        let r = h.resumable("A").unwrap();
+        assert_eq!((r.agent.as_str(), r.session.as_path()), ("scout", path.as_path()));
+        h.push_running("B");
+        set("B", &|w| {
+            if let Work::Subagent { resumes, .. } = w {
+                *resumes = Some(path.clone());
+            }
+        });
+        assert_eq!(h.resumable("A").unwrap_err(), "`A` is already being continued by `B`");
+        set("A", &|w| {
+            if let Work::Subagent { launched, .. } = w {
+                *launched = true;
+            }
+        });
+        assert!(h.resumable("A").unwrap_err().contains("remote worker"));
     }
 }

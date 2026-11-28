@@ -23,16 +23,16 @@ The transport is whatever `COMMAND` runs over: `ssh`, `kubectl exec -i`, a socke
 | C | attach | 1 | - |
 | D | sources | 2 | `MU_SOURCES_CONTRACT` |
 | E | helper | 1 | `MU_ATTACH_HELPER_CONTRACT` |
-| - | wire | 8 | - |
+| - | wire | 9 | - |
 
-`mu contracts` prints the current numbers as one JSON line: `{"wire":8,"launcher":2,"agents":1,"attach":1,"sources":2,"helper":1}`. mu sets the environment variable in the environment of the program it runs under that contract (A: the launcher; D: each session source; E: the attach helper). A program that speaks one number checks it and refuses another, with a message that names both.
+`mu contracts` prints the current numbers as one JSON line: `{"wire":9,"launcher":2,"agents":1,"attach":1,"sources":2,"helper":1}`. mu sets the environment variable in the environment of the program it runs under that contract (A: the launcher; D: each session source; E: the attach helper). A program that speaks one number checks it and refuses another, with a message that names both.
 
 **Policy.** A contract's number goes up when a program written for the old number could break: a removed or renamed field, verb or flag, a changed meaning, a new required input. An optional addition keeps the number and gets a line in the contract's history list below. A program may therefore ignore fields and verbs it does not know, and must.
 
 **The wire** is the protocol between an attached UI and its agent (`WireCommand`, `WireEvent`, the host calls). It is internal to mu and changes with every release that touches it, so both ends of an attach must be the same mu release. A transport carries it opaquely, line by line, and must not parse or buffer it. Only the first line of each side is stable:
 
 - client to agent: `{"hello":{"wire":N,"version":"…", …}}` (more fields may follow);
-- agent to client: `{"hello":{"wire":N,"version":"…", …}}`, or, when the numbers differ, `{"error":"this agent speaks wire 8, the client wire 7"}` and the agent closes the connection.
+- agent to client: `{"hello":{"wire":N,"version":"…", …}}`, or, when the numbers differ, `{"error":"this agent speaks wire 9, the client wire 8"}` and the agent closes the connection.
 
 ## A. Launcher (contract 2)
 

@@ -187,6 +187,11 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     } else {
         None
     };
+    // `task` with `resume`: the subagent continues an earlier session of its parent.
+    let task_resume = task.as_ref().and_then(|t| t["resume"].as_str()).map(std::path::PathBuf::from);
+    if task_resume.is_some() {
+        resume = task_resume.clone();
+    }
     let sel = select_model(cli, &cfgs, agent_def.as_ref(), task.as_ref())?;
     let def_thinking = agent_def.as_ref().and_then(|d| d.thinking.as_deref()).and_then(models::Thinking::parse);
     let role_sel = sel.clone();
@@ -239,8 +244,8 @@ fn run_as(cli: &Cli, plan: Option<PlanRun>, agent: bool) -> Result<i32> {
     }
 
     let mut run = agent::RunConfig {
-        exit_on_resume_failure: cli.print.is_some(),
-        pin_model: cli.model.is_some() && resume.is_some(),
+        exit_on_resume_failure: cli.print.is_some() || task_resume.is_some(),
+        pin_model: (cli.model.is_some() || task.as_ref().is_some_and(|t| t["model"].is_string())) && resume.is_some(),
         pin_thinking: cli_thinking.is_some() && resume.is_some(),
         permission_mode: permissions,
         ..Default::default()
@@ -430,7 +435,13 @@ fn apply_task(run: &mut agent::RunConfig, p: &Value, cfgs: &mu_base::config::Con
     run.inherited_permissions = p.get("permissions").cloned();
     // A budget the parent cannot raise: `[task] soft_request_budget`, capped per agent.
     let agent_name = p["agent"].as_str().unwrap_or(context::TASK);
-    run.request_budget = mu_tools::tools::task::soft_request_budget(agent_name, cfgs.mu.task.soft_request_budget);
+    let cfg = mu_tools::tools::task::soft_request_budget(agent_name, cfgs.mu.task.soft_request_budget);
+    run.request_budget = match p["requestBudget"].as_u64().filter(|n| *n > 0).map(|n| n as u32) {
+        Some(n) if cfg > 0 => cfg.min(n),
+        Some(n) => n,
+        None => cfg,
+    };
+    run.cost_cap = p["maxCost"].as_f64().unwrap_or(0.0);
     run.budget_notice = cfgs.mu.task.budget_notice;
     run.mirror_session = mirrors_session(p);
 }
@@ -599,6 +610,22 @@ mod tests {
         cfgs.mu.task.launcher = vec!["/bin/launcher".into()];
         assert!(task_launch(Some(&json!({"task": "t"})), &cfgs).is_none());
         assert!(task_launch(None, &cfgs).is_some_and(|l| l.runs("task") && !l.runs("scout")));
+    }
+
+    #[test]
+    fn a_task_can_lower_its_budget_and_cap_its_cost() {
+        let run = |p: Value, configured: u32| {
+            let mut cfgs = mu_base::config::Configs::default();
+            cfgs.mu.task.soft_request_budget = configured;
+            let mut run = agent::RunConfig::default();
+            apply_task(&mut run, &p, &cfgs);
+            (run.request_budget, run.cost_cap)
+        };
+        assert_eq!(run(json!({"agent": "task"}), 200), (200, 0.0), "nothing asked, the configured budget");
+        assert_eq!(run(json!({"agent": "task", "requestBudget": 10}), 200), (10, 0.0), "lowered");
+        assert_eq!(run(json!({"agent": "task", "requestBudget": 500}), 200), (200, 0.0), "never raised");
+        assert_eq!(run(json!({"agent": "task", "requestBudget": 10}), 0), (10, 0.0), "a budget where none is set");
+        assert_eq!(run(json!({"agent": "task", "maxCost": 0.5}), 200), (200, 0.5));
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub struct RunConfig {
     /// Soft request budget for a subagent run (0 = no budget): a wrap-up notice at the budget, the
     /// free-running turn stopped at 1.5x, and the run ended five requests after that.
     pub request_budget: u32,
+    /// USD a subagent run may spend (0 = no cap): a wrap-up notice at 80 %, tools refused at the cap.
+    pub cost_cap: f64,
     /// Whether the wrap-up notice is injected when the budget is crossed.
     pub budget_notice: bool,
     /// `[task] launcher`: the command `task` subagents of some kinds go through. `None` in a subagent.
@@ -66,6 +68,10 @@ pub(super) struct Inbox {
     pub(super) cancel: CancellationToken,
     /// Set by a headless run when asked to stop: finish at the next tool/turn boundary.
     pub(super) stop: bool,
+    /// Cancels the tool call running now (an `Interrupt`); each call takes a fresh child token.
+    pub(super) tool_cancel: CancellationToken,
+    /// An `Interrupt` arrived and its steering text has not been taken yet: calls not started are skipped.
+    pub(super) urgent: bool,
 }
 
 pub(super) type SharedInbox = Rc<RefCell<Inbox>>;
@@ -76,6 +82,8 @@ pub(super) fn new_inbox() -> SharedInbox {
         follow_up: VecDeque::new(),
         cancel: CancellationToken::new(),
         stop: false,
+        tool_cancel: CancellationToken::new(),
+        urgent: false,
     }))
 }
 

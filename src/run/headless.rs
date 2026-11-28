@@ -296,6 +296,8 @@ pub(crate) async fn run_subagent(
         Default::default();
     let mut next_id: u64 = 0;
     let mut stdin_open = true;
+    // False once the final turn has ended: a later `steer` line has nobody to read it.
+    let mut turn_live = true;
     let mut mirrored: Option<Mirrored> = None;
     let mut tick = mirror.then(|| {
         let mut t = tokio::time::interval(MIRROR_EVERY);
@@ -316,8 +318,20 @@ pub(crate) async fn run_subagent(
             },
             line = lines.recv(), if stdin_open => match line {
                 Some(l) => {
+                    // `{"type":"steer","text":…,"urgent":bool}` and
                     // `{"type":"approval","id":N,"decision":{…}}`; anything else is ignored.
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l)
+                        && v["type"] == "steer"
+                    {
+                        let input = mu_base::message::UserInput::from(v["text"].as_str().unwrap_or("").to_string());
+                        if !turn_live {
+                            out(json!({"type": "dropped", "count": 1}));
+                        } else if v["urgent"] == true {
+                            let _ = cmd.send(Command::Interrupt(input));
+                        } else {
+                            let _ = cmd.send(Command::Steer(input));
+                        }
+                    } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l)
                         && v["type"] == "approval"
                         && let Some(id) = v["id"].as_u64()
                         && let Some(tx) = pending.remove(&id)
@@ -390,15 +404,20 @@ pub(crate) async fn run_subagent(
             }
             AgentEvent::TurnEnd { aborted } => {
                 is_error |= aborted;
+                turn_live = false;
                 if !exit_sent {
                     if data.is_none() && yield_error.is_none() && !is_error && !nudged {
                         nudged = true;
+                        turn_live = true;
                         let _ = cmd.send(Command::Prompt(NUDGE.into()));
                     } else {
                         exit_sent = true;
                         let _ = cmd.send(Command::Exit);
                     }
                 }
+            }
+            AgentEvent::QueuedDropped(v) => {
+                out(json!({"type": "dropped", "count": v.len()}));
             }
             AgentEvent::Exit => break,
             _ => {}
@@ -651,6 +670,49 @@ mod tests {
             cmds.push(c);
         }
         (r, code, cmds)
+    }
+
+    /// A `steer` line from the parent steers the run (`urgent` interrupts it); one that arrives after
+    /// the last turn has nobody to read it, and the parent is told.
+    #[test]
+    fn steer_lines_reach_the_agent_and_a_late_one_is_reported_dropped() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let lines = std::cell::RefCell::new(Vec::new());
+        rt.block_on(async {
+            let (ctx, mut crx) = unbounded_channel();
+            let (etx, erx) = unbounded_channel();
+            let (ltx, lrx) = unbounded_channel();
+            let sub = run_subagent("x".into(), false, false, ctx, erx, lrx, |l| lines.borrow_mut().push(l));
+            let feed = async {
+                ltx.send(json!({"type": "steer", "text": "a", "urgent": false}).to_string()).unwrap();
+                ltx.send(json!({"type": "steer", "text": "b", "urgent": true}).to_string()).unwrap();
+                let mut cmds = Vec::new();
+                for _ in 0..4 {
+                    cmds.push(crx.recv().await.unwrap());
+                }
+                assert!(matches!(&cmds[0], Command::Prompt(_)) && matches!(&cmds[1], Command::Exit));
+                assert!(matches!(&cmds[2], Command::Steer(i) if i.text == "a"));
+                assert!(matches!(&cmds[3], Command::Interrupt(i) if i.text == "b"));
+                etx.send(AgentEvent::TurnEnd { aborted: false }).unwrap();
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                ltx.send(json!({"type": "steer", "text": "late"}).to_string()).unwrap();
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                etx.send(AgentEvent::QueuedDropped(vec!["x".to_string().into(), "y".to_string().into()])).unwrap();
+                etx.send(AgentEvent::Exit).unwrap();
+            };
+            let _ = tokio::join!(sub, feed);
+        });
+        let dropped: Vec<serde_json::Value> =
+            lines.into_inner().into_iter().filter(|l| l["type"] == "dropped").collect();
+        assert_eq!(
+            dropped,
+            [json!({"type": "dropped", "count": 1}), json!({"type": "dropped", "count": 2})],
+            "the late line, then what the agent itself dropped"
+        );
     }
 
     #[test]

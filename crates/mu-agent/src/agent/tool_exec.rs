@@ -1,6 +1,6 @@
 use super::*;
 use crate::review;
-use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+use mu_base::events::{JobKind, SubagentStatus};
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest, ApprovalScope, PermissionMode};
 use mu_tools::permissions::{GrantOutcome, Verdict};
 use std::time::SystemTime;
@@ -68,6 +68,8 @@ impl Agent {
         v.push(Tools::task_def(jobs, &self.ctx.agents, &role_names));
         if jobs {
             v.push(Tools::job_cancel_def());
+            v.push(Tools::job_status_def());
+            v.push(Tools::job_send_def());
             v.push(Tools::wait_def());
         }
         if let Some(o) = self.tools.output_schema.borrow().as_ref() {
@@ -158,7 +160,7 @@ impl Agent {
             .as_ref()?
             .snapshot()
             .into_iter()
-            .filter(|j| j.state == SubagentState::Running && j.started < since)
+            .filter(|j| j.state.is_active() && j.started < since)
             .collect();
         let line = |j: &SubagentStatus| {
             let label = match j.kind {
@@ -390,6 +392,25 @@ impl Agent {
         (stop, user_note)
     }
 
+    /// A token for the call(s) about to run: the turn's token plus the one an `Interrupt` cancels.
+    /// Already cancelled when an interrupt arrived since the last steering was taken.
+    pub(super) fn call_token(&self, turn: &CancellationToken) -> CancellationToken {
+        let call = turn.child_token();
+        let mut ib = self.ports.inbox.borrow_mut();
+        ib.tool_cancel = call.clone();
+        if ib.urgent {
+            call.cancel();
+        }
+        call
+    }
+
+    /// Tells the model a call ended because an `Interrupt` cancelled it, not the turn.
+    pub(super) fn mark_interrupted(call: &CancellationToken, turn: &CancellationToken, out: &mut ToolOutput) {
+        if call.is_cancelled() && !turn.is_cancelled() {
+            out.text.push_str("\n\n[interrupted: a new message arrived, so this call was cancelled]");
+        }
+    }
+
     /// The tool itself; a panic becomes an error result. `wait` releases an interruptible wait.
     pub(super) async fn exec_tool(
         &self,
@@ -446,7 +467,10 @@ impl Agent {
                     None => {
                         // Only the call itself is interruptible: the approval above is not.
                         let guard = self.wait_guard(name, &args);
-                        self.exec_tool(id, name, &args, cancel, guard.as_ref().map(|g| g.token())).await
+                        let call = self.call_token(cancel);
+                        let mut out = self.exec_tool(id, name, &args, &call, guard.as_ref().map(|g| g.token())).await;
+                        Self::mark_interrupted(&call, cancel, &mut out);
+                        out
                     }
                 }
             }

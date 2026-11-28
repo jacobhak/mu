@@ -605,11 +605,22 @@ fn wait_is_offered_only_with_jobs() {
 
         let (headless, _rx) = agent(vec![]);
         assert!(!names(&headless).contains(&"wait".to_string()), "no jobs, no wait");
+        for tool in ["job_status", "job_send"] {
+            assert!(!names(&headless).contains(&tool.to_string()), "no jobs, no {tool}");
+        }
         assert!(bash(&headless).contains("The shell persists across calls"), "no jobs keeps the persistent shell");
 
         let (mut interactive, _rx) = agent(vec![]);
         interactive.enable_jobs();
         assert!(names(&interactive).contains(&"wait".to_string()));
+        for tool in ["job_status", "job_send"] {
+            assert!(names(&interactive).contains(&tool.to_string()), "jobs offer {tool}");
+        }
+        let task = interactive.tool_defs().into_iter().find(|d| d.name == "task").unwrap();
+        let item = &task.schema["properties"]["tasks"]["items"]["properties"];
+        assert!(item.get("after").is_some() && item.get("resume").is_some(), "jobs offer after and resume");
+        let task = headless.tool_defs().into_iter().find(|d| d.name == "task").unwrap();
+        assert!(task.schema["properties"]["tasks"]["items"]["properties"].get("after").is_none());
         assert!(bash(&interactive).contains("Each call runs in its own shell"), "jobs describe isolated calls");
         assert!(!bash(&interactive).contains("Never wait for a job in the foreground"));
     });

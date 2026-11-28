@@ -177,13 +177,19 @@ impl Drop for RelayRun {
 
 impl RelayServer {
     /// Starts serving one child, which may call the models of `allow`; its spend is recorded under
-    /// `job`, and each answer line goes to `out`.
-    pub fn start(&self, out: UnboundedSender<String>, job: &str, allow: RelayAllow) -> RelayRun {
+    /// `job`, and each answer line goes to `out`. `task_cap`, a cap the task itself asked for, can
+    /// only lower the configured one.
+    pub fn start(&self, out: UnboundedSender<String>, job: &str, allow: RelayAllow, task_cap: Option<f64>) -> RelayRun {
+        let cap = match task_cap {
+            Some(c) if self.max_cost > 0.0 => self.max_cost.min(c),
+            Some(c) => c,
+            None => self.max_cost,
+        };
         let meter = Meter {
             allow,
             job: job.to_string(),
             spent: Cell::new(0.0),
-            cap: self.max_cost,
+            cap,
             capped: Cell::new(false),
             ledger: self.plugins.relay_spend(),
         };
@@ -526,7 +532,7 @@ mod tests {
             max_cost,
             cwd: std::env::temp_dir(),
         };
-        let run = server.start(tx, JOB, allow());
+        let run = server.start(tx, JOB, allow(), None);
         Rig { run, rx, providers, plugins, permissions, server }
     }
 

@@ -270,6 +270,7 @@ fn job_id(name: &str) -> String {
 
 fn status_of(s: &SubagentState) -> &'static str {
     match s {
+        SubagentState::Queued => "pending",
         SubagentState::Running => "in_progress",
         SubagentState::Done => "completed",
         SubagentState::Failed => "failed",
@@ -307,7 +308,11 @@ impl Jobs {
                 }));
             }
             match j.state {
+                SubagentState::Queued => {}
                 SubagentState::Running => {
+                    if prev == Some(SubagentState::Queued) {
+                        out.push(json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "status": status_of(&j.state)}));
+                    }
                     if j.kind == JobKind::Subagent {
                         out.extend(stream.replace(&id, job_text(j), cwd));
                     }
@@ -335,7 +340,7 @@ impl Jobs {
 
     /// The newest output of a running `bash` job. Output that arrives after the job ended is dropped.
     pub fn output(&mut self, name: &str, tail: String, stream: &mut Stream, cwd: &Path) -> Option<Value> {
-        let seen = self.seen.get_mut(name).filter(|s| s.state == SubagentState::Running)?;
+        let seen = self.seen.get_mut(name).filter(|s| s.state.is_active())?;
         seen.tail = tail.clone();
         stream.replace(&job_id(name), tail, cwd)
     }

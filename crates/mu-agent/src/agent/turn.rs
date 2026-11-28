@@ -273,7 +273,8 @@ impl Agent {
             if cancel.is_cancelled() {
                 return Flow::Aborted;
             }
-            let due = self.budget.as_mut().map(|b| b.step());
+            let spent = self.costs.cost.total;
+            let due = self.budget.as_mut().map(|b| b.step(spent));
             let notice = match (due, self.budget.as_ref()) {
                 (Some(d), Some(b)) => b.message(d),
                 _ => None,
@@ -493,6 +494,7 @@ impl Agent {
             let runnable = pass.skip.is_none()
                 && !cancel.is_cancelled()
                 && !self.ports.inbox.borrow().stop
+                && !self.ports.inbox.borrow().urgent
                 && !self.budget.as_ref().is_some_and(|b| b.stopped());
             let together = runnable && self.tools.permissions.runs_concurrently(&self.tools, &name, &args);
             if !together {
@@ -540,6 +542,8 @@ impl Agent {
                 pass.skip = Some(SKIP_ABORTED);
             } else if self.ports.inbox.borrow().stop {
                 pass.skip = Some(SKIP_STOPPED);
+            } else if self.ports.inbox.borrow().urgent {
+                pass.skip = Some(SKIP_STEER);
             }
         }
         if let Some(reason) = pass.skip {
@@ -559,16 +563,20 @@ impl Agent {
         // One interruptible wait for the group: only the latest registered wait hears the user.
         let guard = items.iter().find_map(|p| self.wait_guard(&p.name, &p.args));
         let wait = guard.as_ref().map(|g| g.token());
-        let outs: Vec<ToolOutput> = {
+        let call = self.call_token(cancel);
+        let mut outs: Vec<ToolOutput> = {
             use futures_util::StreamExt;
             let this = &*self;
             futures_util::stream::iter(&items)
-                .map(|p| this.exec_tool(&p.id, &p.name, &p.args, cancel, wait.clone()))
+                .map(|p| this.exec_tool(&p.id, &p.name, &p.args, &call, wait.clone()))
                 .buffered(MAX_CONCURRENT_CALLS)
                 .collect()
                 .await
         };
         drop(guard);
+        for out in &mut outs {
+            Self::mark_interrupted(&call, cancel, out);
+        }
         for (p, out) in items.into_iter().zip(outs) {
             let out = self.end_tool(&p.id, &p.name, p.args, None, out).await;
             self.after_call(p.i, &p.id, &p.name, out, pass);

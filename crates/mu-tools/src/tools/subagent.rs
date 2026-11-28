@@ -17,6 +17,7 @@ use std::process::Stdio;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -167,6 +168,23 @@ pub enum ChildCmd {
 const LAUNCHER_CANCEL_GRACE: Duration = Duration::from_secs(30);
 /// How long a launcher that closed its stream has to finish (fetch its result) and exit.
 const LAUNCHER_EXIT_WAIT: Duration = Duration::from_secs(300);
+/// How long a subagent that was told its time is up has to wrap up before it is cancelled.
+pub const TIMEOUT_GRACE: Duration = Duration::from_secs(120);
+
+/// What the parent says to a subagent when its time limit passes.
+fn time_up_text(secs: u64) -> String {
+    format!(
+        "Time limit reached ({secs}s). Stop now and start no new work: reply with your final result from what you have, naming anything unfinished or unverified (call `yield` if this task has an output schema)."
+    )
+}
+
+/// What a running child takes from its parent besides the task: lines to write to its stdin (steering,
+/// as JSON) and a time limit.
+#[derive(Default)]
+pub struct ChildControl {
+    pub steer: Option<UnboundedReceiver<String>>,
+    pub timeout: Option<Duration>,
+}
 
 /// Commits the parent's working tree (untracked files included) as `refs/mu/task/<id>` and writes
 /// it, with its full history, as a bundle for the launcher to start from.
@@ -247,6 +265,11 @@ enum ChildEvent {
     Approve {
         id: u64,
         request: ApprovalRequest,
+    },
+    /// Steering lines that reached the child after its last turn, so nobody read them.
+    Dropped {
+        #[serde(default)]
+        count: u32,
     },
     /// A model or search call of a relayed child; the line is read again as a `Call`.
     Relay(serde::de::IgnoredAny),
@@ -473,12 +496,44 @@ pub async fn run_child_observed(
     cwd: &Path,
     payload: &Value,
     cancel: &CancellationToken,
+    on_tool: impl FnMut(&str, &str),
+    on_session: impl FnMut(&str),
+    on_model: impl FnMut(&str),
+    approve: Option<&dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision>>,
+    mirror: Mirror,
+    relay: Option<&RelayServer>,
+) -> Outcome {
+    run_child_controlled(
+        child,
+        cwd,
+        payload,
+        cancel,
+        on_tool,
+        on_session,
+        on_model,
+        approve,
+        mirror,
+        relay,
+        ChildControl::default(),
+    )
+    .await
+}
+
+/// `run_child_observed` with `control`: lines the parent writes to the child while it runs, and a
+/// time limit (the child is told to wrap up, and cancelled `TIMEOUT_GRACE` later).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_child_controlled(
+    child: ChildCmd,
+    cwd: &Path,
+    payload: &Value,
+    cancel: &CancellationToken,
     mut on_tool: impl FnMut(&str, &str),
     mut on_session: impl FnMut(&str),
     mut on_model: impl FnMut(&str),
     approve: Option<&dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision>>,
     mirror: Mirror,
     relay: Option<&RelayServer>,
+    control: ChildControl,
 ) -> Outcome {
     let (wtx, wrx) = tokio::sync::mpsc::unbounded_channel::<String>();
     // What the parent put in the payload is what the child may call; a payload without it, none.
@@ -537,10 +592,31 @@ pub async fn run_child_observed(
     let mut stdin = child.stdin.take().expect("stdin is piped");
     // The task payload, then one line per approval answer, for as long as the child reads them.
     let mut wrx = wrx;
+    let ChildControl { steer, timeout } = control;
     tokio::task::spawn_local(async move {
+        let mut steer = steer;
         let _ = stdin.write_all(task.as_bytes()).await;
         let _ = stdin.write_all(b"\n").await;
-        while let Some(line) = wrx.recv().await {
+        loop {
+            let line = tokio::select! {
+                l = wrx.recv() => match l {
+                    Some(l) => l,
+                    None => break,
+                },
+                // A closed steering channel only switches this arm off.
+                s = async {
+                    match &mut steer {
+                        Some(r) => r.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match s {
+                    Some(l) => l,
+                    None => {
+                        steer = None;
+                        continue;
+                    }
+                },
+            };
             if stdin.write_all(line.as_bytes()).await.is_err() || stdin.write_all(b"\n").await.is_err() {
                 break;
             }
@@ -587,9 +663,11 @@ pub async fn run_child_observed(
         }
     };
     let mut stopper: Option<tokio::task::JoinHandle<()>> = None;
-    let relay = relay.map(|r| r.start(wtx.clone(), &job, allow));
+    let relay = relay.map(|r| r.start(wtx.clone(), &job, allow, payload["maxCost"].as_f64()));
     let mut result: Option<ChildResult> = None;
     let mut cancelled = false;
+    let mut deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+    let (mut timed_out, mut killed, mut dropped) = (false, false, 0u32);
     let mut bad_line: Option<String> = None;
     let mut mirrors = Mirrors::default();
     let mut notices: Vec<String> = Vec::new();
@@ -623,6 +701,7 @@ pub async fn run_child_observed(
                             }
                         }
                         Ok(ChildEvent::Model { label }) => on_model(&label),
+                        Ok(ChildEvent::Dropped { count }) => dropped += count,
                         Ok(ChildEvent::Entry { file, line }) if !matches!(mirror, Mirror::Off) => {
                             match entry_line(&line) {
                                 EntryLine::Cost => {}
@@ -707,6 +786,24 @@ pub async fn run_child_observed(
                 cancelled = true;
                 stopper.get_or_insert_with(&stop);
             }
+            () = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            }, if deadline.is_some() && !cancelled => {
+                if timed_out {
+                    cancelled = true;
+                    killed = true;
+                    deadline = None;
+                    stopper.get_or_insert_with(&stop);
+                } else {
+                    timed_out = true;
+                    let secs = timeout.map_or(0, |t| t.as_secs());
+                    let _ = wtx.send(json!({"type": "steer", "urgent": true, "text": time_up_text(secs)}).to_string());
+                    deadline = Some(tokio::time::Instant::now() + TIMEOUT_GRACE);
+                }
+            }
         }
     }
     let capped = relay.as_ref().and_then(|r| r.capped());
@@ -746,6 +843,16 @@ pub async fn run_child_observed(
     }
     if let Some(cap) = capped {
         out.text.push_str(&format!("\n[task spend cap of ${cap:.2} reached; later model calls were refused]"));
+    }
+    if timed_out {
+        let secs = timeout.map_or(0, |t| t.as_secs());
+        out.text.push_str(&format!("\n[time limit of {secs}s reached: the subagent was asked to wrap up"));
+        out.text.push_str(if killed { " and was cancelled 120 s later]" } else { "]" });
+    }
+    if dropped > 0 {
+        out.text.push_str(&format!(
+            "\n[{dropped} message(s) sent with job_send arrived after the subagent had finished and were not read]"
+        ));
     }
     if let Some(l) = &launch {
         match changes::import_bundle(&l.root, &l.result_bundle(), &l.id, &l.base).await {
@@ -859,6 +966,94 @@ mod child_line_tests {
         let out = run("#!/bin/sh\nsleep 20 >/dev/null &\necho '{\"type\":\"result\",\"text\":\"fine\"}'\n").await;
         assert!(out.ok && out.text == "fine", "{}", out.text);
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Reads the task line, then exactly one more, and echoes that as the result text. Never reads
+    /// to the end of input: the parent keeps stdin open.
+    const ECHO_SECOND_LINE: &str = r#"#!/bin/sh
+IFS= read -r task
+IFS= read -r line
+escaped=$(printf '%s' "$line" | sed 's/"/\\"/g')
+printf '{"type":"result","text":"%s"}\n' "$escaped"
+"#;
+
+    async fn run(script: &str, control: ChildControl) -> Outcome {
+        let base = std::env::temp_dir().join(format!("mu-child-control-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("fake-mu");
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = tokio::task::LocalSet::new()
+            .run_until(run_child_controlled(
+                ChildCmd::Local(exe),
+                &base,
+                &json!({"task": "go"}),
+                &CancellationToken::new(),
+                |_, _| {},
+                |_| {},
+                |_| {},
+                None,
+                Mirror::Off,
+                None,
+                control,
+            ))
+            .await;
+        let _ = std::fs::remove_dir_all(&base);
+        out
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_steer_line_written_by_the_parent_reaches_the_child() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(json!({"type": "steer", "text": "look at b.rs", "urgent": false}).to_string()).unwrap();
+        let out = run(ECHO_SECOND_LINE, ChildControl { steer: Some(rx), timeout: None }).await;
+        assert!(out.ok, "{}", out.text);
+        assert!(out.text.contains(r#""type":"steer""#) && out.text.contains("look at b.rs"), "{}", out.text);
+        drop(tx);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_steer_channel_does_not_end_the_writer() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        drop(tx);
+        let script = "#!/bin/sh\nIFS= read -r task\necho '{\"type\":\"result\",\"text\":\"fine\"}'\n";
+        let out = run(script, ChildControl { steer: Some(rx), timeout: None }).await;
+        assert!(out.ok && out.text == "fine", "{}", out.text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_messages_are_reported_after_the_result() {
+        let script = "#!/bin/sh\nIFS= read -r task\necho '{\"type\":\"dropped\",\"count\":2}'\necho '{\"type\":\"result\",\"text\":\"done\"}'\n";
+        let out = run(script, ChildControl::default()).await;
+        assert!(out.ok && out.text.starts_with("done"), "{}", out.text);
+        assert!(
+            out.text.contains(
+                "[2 message(s) sent with job_send arrived after the subagent had finished and were not read]"
+            ),
+            "{}",
+            out.text
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_time_limit_tells_the_child_to_wrap_up() {
+        let started = std::time::Instant::now();
+        let out = run(ECHO_SECOND_LINE, ChildControl { steer: None, timeout: Some(Duration::from_secs(1)) }).await;
+        assert!(started.elapsed() >= Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(out.ok, "{}", out.text);
+        assert!(out.text.contains("Time limit reached (1s)") && out.text.contains(r#""urgent":true"#), "{}", out.text);
+        assert!(out.text.ends_with("[time limit of 1s reached: the subagent was asked to wrap up]"), "{}", out.text);
+    }
+
+    #[test]
+    fn the_time_up_text_names_the_limit() {
+        assert!(time_up_text(90).starts_with("Time limit reached (90s). Stop now"));
     }
 }
 

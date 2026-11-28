@@ -749,6 +749,7 @@ pub fn job_rows(
     rows.iter()
         .map(|r| {
             let (mark, style) = match r.state {
+                SubagentState::Queued => ('·', tfg(Role::Muted)),
                 SubagentState::Running => (spin, tfg(Role::Accent)),
                 SubagentState::Done => ('✓', tfg(Role::Ok)),
                 SubagentState::Failed => ('✗', tfg(Role::Err)),
@@ -996,7 +997,7 @@ mod tests {
     /// A `bash` job that has been running, or ran, for `secs` seconds at `fixed_now`.
     fn bash_job(state: SubagentState, secs: f64) -> SubagentStatus {
         let elapsed = std::time::Duration::from_secs_f64(secs);
-        let running = state == SubagentState::Running;
+        let running = state.is_active();
         let now = fixed_now();
         let started = if running { now - elapsed } else { std::time::SystemTime::UNIX_EPOCH };
         let ended = (!running).then(|| started + elapsed);

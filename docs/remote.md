@@ -37,7 +37,7 @@ mu --attach 'mu attach --stdio' --state-key ~/.ssh/work_ed25519   # this machine
 
 `mu attach --stdio [SESSION]` runs on the agent's machine: a raw pipe that copies lines between its stdin and stdout and the agent's socket (with no session it finds the one agent running in the current directory, `--socket PATH` names a socket). `mu --attach COMMAND` runs `COMMAND` under `sh -c` and speaks the protocol over its stdin and stdout; the command's stderr lines show as notices. When the command ends the UI stays up and runs it again.
 
-The first line the client sends names a wire number (`WIRE`, now 8) and its version, and a different wire number is refused with a readable message. Display settings (`theme`, `notify`, `bell`, `hide_thinking_block`, `smooth_streaming`, the `[status]` levels) and composer history come from the client's own config and profile home; everything about models, keys, MCP servers, sessions and plugins is the agent's.
+The first line the client sends names a wire number (`WIRE`, now 9) and its version, and a different wire number is refused with a readable message. Display settings (`theme`, `notify`, `bell`, `hide_thinking_block`, `smooth_streaming`, the `[status]` levels) and composer history come from the client's own config and profile home; everything about models, keys, MCP servers, sessions and plugins is the agent's.
 
 A client sees what it missed when it attaches: the stored conversation up to the turn in progress, that turn's events (up to 20 000 events or 16 MB; past that the oldest blocks are dropped with a notice), the latest status, jobs, queue and todo, and every question, approval, plan review or terminal request still waiting. Nothing rings until it is caught up.
 

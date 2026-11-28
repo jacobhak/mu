@@ -600,7 +600,7 @@ fn contracts_prints_each_version_on_one_line() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(
         String::from_utf8_lossy(&o.stdout),
-        "{\"wire\":8,\"launcher\":2,\"agents\":1,\"attach\":1,\"sources\":2,\"helper\":1}\n"
+        "{\"wire\":9,\"launcher\":2,\"agents\":1,\"attach\":1,\"sources\":2,\"helper\":1}\n"
     );
 }
 

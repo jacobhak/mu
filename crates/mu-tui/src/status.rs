@@ -53,7 +53,7 @@ impl JobCounts {
     pub fn of(jobs: &[SubagentStatus]) -> Self {
         let count = |s: SubagentState| jobs.iter().filter(|j| j.state == s).count();
         Self {
-            running: count(SubagentState::Running),
+            running: jobs.iter().filter(|j| j.state.is_active()).count(),
             done: count(SubagentState::Done),
             failed: count(SubagentState::Failed),
         }

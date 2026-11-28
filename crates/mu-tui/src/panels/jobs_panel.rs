@@ -354,7 +354,7 @@ impl View {
 impl JobsPanel {
     pub fn new(jobs: Vec<SubagentStatus>) -> Self {
         // Open on the newest running job, else the newest job.
-        let at = jobs.iter().rposition(|j| j.state == SubagentState::Running).unwrap_or(jobs.len().saturating_sub(1));
+        let at = jobs.iter().rposition(|j| j.state.is_active()).unwrap_or(jobs.len().saturating_sub(1));
         Self {
             tab: Tab::Jobs,
             jobs,
@@ -528,7 +528,7 @@ impl JobsPanel {
                 if !t.settled
                     && let Some(j) = self.jobs.iter().find(|j| j.session.as_deref() == Some(path))
                 {
-                    t.settled = j.state != SubagentState::Running && t.tail.caught_up();
+                    t.settled = !j.state.is_active() && t.tail.caught_up();
                 }
             }
             TailFor::View => {
@@ -546,7 +546,7 @@ impl JobsPanel {
                     Err(_) => t.asked = false,
                 }
                 if !v.settled {
-                    v.settled = job_state.is_some_and(|s| s != SubagentState::Running) && t.caught_up();
+                    v.settled = job_state.is_some_and(|s| !s.is_active()) && t.caught_up();
                 }
             }
         }
@@ -582,7 +582,7 @@ impl JobsPanel {
     }
 
     fn running(&self) -> usize {
-        self.jobs.iter().filter(|j| j.state == SubagentState::Running).count()
+        self.jobs.iter().filter(|j| j.state.is_active()).count()
     }
 
     fn new_view(name: String, label: Option<String>, tail: Option<Followed>) -> View {
@@ -671,7 +671,7 @@ impl JobsPanel {
             v.follow = !v.follow;
         } else if keymap::JOBS_VIEW_KILL.hit(&k) && v.label.is_none() {
             let name = v.name.clone();
-            if self.jobs.iter().any(|j| j.name == name && j.state == SubagentState::Running) {
+            if self.jobs.iter().any(|j| j.name == name && j.state.is_active()) {
                 return JobsResult::Kill(Some(name));
             }
         }
@@ -742,7 +742,7 @@ impl JobsPanel {
 
     /// The selected job and its result, when it finished and left one.
     fn result_of(&self) -> Option<(&SubagentStatus, ResultArgs, bool)> {
-        let j = self.jobs.get(self.at).filter(|j| j.state != SubagentState::Running)?;
+        let j = self.jobs.get(self.at).filter(|j| !j.state.is_active())?;
         let c = j.changes.as_ref()?;
         let args = ResultArgs { cwd: j.cwd.clone(), r#ref: c.r#ref.clone(), base: c.base.clone() };
         Some((j, args, c.applied || self.applied.contains(&j.name)))
@@ -794,7 +794,7 @@ impl JobsPanel {
         } else if keymap::JOBS_OPEN.hit(&k) {
             self.open_view();
         } else if keymap::JOBS_KILL.hit(&k) {
-            if let Some(j) = self.jobs.get(self.at).filter(|j| j.state == SubagentState::Running) {
+            if let Some(j) = self.jobs.get(self.at).filter(|j| j.state.is_active()) {
                 return JobsResult::Kill(Some(j.name.clone()));
             }
         } else if keymap::JOBS_KILL_ALL.hit(&k) && self.running() > 0 {
@@ -811,7 +811,7 @@ impl JobsPanel {
                 None => {}
             }
         } else if keymap::JOBS_OPEN_PORT.hit(&k)
-            && let Some(j) = self.jobs.get(self.at).filter(|j| j.state == SubagentState::Running)
+            && let Some(j) = self.jobs.get(self.at).filter(|j| j.state.is_active())
         {
             return JobsResult::OpenPorts { job: j.name.clone(), ports: j.ports.clone() };
         }
@@ -1135,6 +1135,7 @@ fn draw(f: Screen, top: &mut usize, page: &mut usize, width: usize, max_rows: us
 
 fn mark(state: &SubagentState) -> (char, Role) {
     match state {
+        SubagentState::Queued => ('·', Role::Muted),
         SubagentState::Running => ('◌', Role::Accent),
         SubagentState::Done => ('✓', Role::Ok),
         SubagentState::Failed => ('✗', Role::Err),
@@ -1197,7 +1198,7 @@ fn list_row(
         JobKind::Subagent => format!("{:>3} tools", j.tools),
         JobKind::Bash => " ".repeat(9),
     };
-    let last = j.progress.as_deref().filter(|_| j.state == SubagentState::Running).unwrap_or(&j.last);
+    let last = j.progress.as_deref().filter(|_| j.state.is_active()).unwrap_or(&j.last);
     // Where it listens, when it does: `o` forwards these.
     let ports: String = j.ports.iter().map(|p| format!(" :{p}")).collect();
     let rest = format!(" {} {tools}  {:>7}  {cost:>6}{ports}  {last}", pad(&j.agent, agent_w), clock(elapsed(j, now)));
@@ -1223,6 +1224,7 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
     let t = theme::get();
     let (m, role) = mark(&j.state);
     let state = match j.state {
+        SubagentState::Queued => "queued",
         SubagentState::Running => "running",
         SubagentState::Done => "done",
         SubagentState::Failed => "failed",
@@ -1241,7 +1243,7 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
     if let Some(n) = j.note.as_deref().filter(|n| !n.is_empty()) {
         facts.push_str(&format!(" · {n}"));
     }
-    if j.state != SubagentState::Running {
+    if !j.state.is_active() {
         facts.push_str(if j.delivered { " · result delivered" } else { " · result not delivered yet" });
     }
     let mut rows: Vec<Line> = vec![vec![span(format!(" {m} "), t.fg(role)), span(facts, muted)]];
@@ -1257,9 +1259,9 @@ fn detail(j: &SubagentStatus, cost: &str, width: usize, now: SystemTime) -> Vec<
         let lead = if i == 0 { format!("   {label} ") } else { format!("   {} ", " ".repeat(label.len())) };
         rows.push(vec![span(lead, t.fg(Role::Faint)), span(r, t.fg(Role::Strong))]);
     }
-    if let Some(p) = j.progress.as_deref().filter(|_| j.state == SubagentState::Running) {
+    if let Some(p) = j.progress.as_deref().filter(|_| j.state.is_active()) {
         rows.push(vec![span(format!("   starting {p}"), muted)]);
-    } else if j.state == SubagentState::Running && !j.last.is_empty() && j.last != j.task {
+    } else if j.state.is_active() && !j.last.is_empty() && j.last != j.task {
         rows.push(vec![span(format!("   last {}", j.last), muted)]);
     }
     if !j.ports.is_empty() {

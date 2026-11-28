@@ -462,9 +462,12 @@ impl Tools {
                 out.meta = Some(ToolMeta::Bash(BashMeta { background: Some(id), ..Default::default() }));
                 out
             }
-            WaitReady::Nothing | WaitReady::Unknown(_) | WaitReady::Cancelled | WaitReady::Matched(_) => {
-                ToolOutput::err("Command job is no longer available.")
-            }
+            WaitReady::Nothing
+            | WaitReady::Unknown(_)
+            | WaitReady::Cancelled
+            | WaitReady::Matched(_)
+            | WaitReady::TimedOut { .. }
+            | WaitReady::Until(_) => ToolOutput::err("Command job is no longer available."),
         }
     }
 

@@ -417,6 +417,74 @@ fn a_follow_up_that_starts_running_leaves_the_published_queue() {
     });
 }
 
+/// An urgent message cancels the call that is running and skips the rest of its reply, but the turn
+/// goes on: the next request carries the message.
+#[test]
+fn interrupt_cancels_only_the_running_tool() {
+    use crate::testing::assistant;
+    use mu_base::message::{Block, StopReason};
+    use serde_json::json;
+    run(async {
+        let dir = std::env::temp_dir().join(format!("mu-interrupt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unwanted = dir.join("unwanted");
+        let bash = |id: &str, command: String| Block::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: json!({"command": command, "cwd": dir.clone()}),
+        };
+        let script = vec![
+            Ok(assistant(
+                vec![bash("b1", "sleep 30".into()), bash("b2", format!("touch '{}'", unwanted.display()))],
+                StopReason::ToolUse,
+            )),
+            Ok(assistant(vec![Block::text("handled stop")], StopReason::Stop)),
+        ];
+        let (mut a, mut ev) = crate::testing::agent(script);
+        let (tx, rx) = unbounded_channel();
+        let mut q = queue(rx, &a.ports.inbox, a.ports.events.clone());
+        let observer = async {
+            while let Some(e) = ev.recv().await {
+                if matches!(&e, AgentEvent::ToolStart { id, .. } if id == "b1") {
+                    tx.send(Command::Interrupt("stop".to_string().into())).unwrap();
+                    break;
+                }
+            }
+        };
+        let started = std::time::Instant::now();
+        let ((), ()) = tokio::join!(drive(a.turn(Some("go".to_string().into())), &mut q), observer);
+        assert!(started.elapsed() < Duration::from_secs(20), "the sleep was cancelled");
+        let r = crate::testing::results(&a);
+        assert!(r[0].1.contains("[interrupted: a new message arrived"), "{:?}", r[0]);
+        assert!(r[1].0 && r[1].1.contains("the user sent a new message"), "{:?}", r[1]);
+        assert!(!unwanted.exists(), "the second call did not run");
+        assert!(
+            a.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content, .. } if mu_base::message::text_of(content) == "stop")),
+            "the message reached the model"
+        );
+        assert!(a.ports.providers.scripted.borrow().is_empty(), "the turn went on to the next request");
+        assert!(!a.ports.inbox.borrow().urgent, "taking the message clears the flag");
+        let evs = drain(&mut ev);
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::TurnEnd { aborted: false })), "the turn was not aborted");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// An interrupt sent to an idle agent comes back like a steer.
+#[test]
+fn an_interrupt_sent_to_an_idle_agent_goes_back_to_the_composer() {
+    run(async {
+        let (mut a, mut rx) = crate::testing::agent(vec![]);
+        let (_tx, qrx) = unbounded_channel();
+        let mut q = queue(qrx, &a.ports.inbox, a.ports.events.clone());
+        assert!(a.command(Command::Interrupt("now".to_string().into()), &mut q).await);
+        let evs = drain(&mut rx);
+        assert!(evs.iter().any(|e| matches!(e, AgentEvent::QueuedDropped(d) if texts(d) == ["now"])));
+    });
+}
+
 /// One end-to-end case: a foreground command waits for its result, the user submits `mk()`, and the
 /// command keeps running as a job while the new message is answered first.
 fn interruptible_wait_case(cmd: fn() -> Command) {

@@ -111,6 +111,8 @@ fn tools_reference() -> String {
     let mut defs = Tools::definitions();
     defs.push(Tools::task_def(true, &[], &[]));
     defs.push(Tools::job_cancel_def());
+    defs.push(Tools::job_status_def());
+    defs.push(Tools::job_send_def());
     defs.push(Tools::wait_def());
     if let Some(plan) = crate::context::builtin_modes().first() {
         defs.push(Tools::exit_def(plan));

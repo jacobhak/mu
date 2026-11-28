@@ -4,7 +4,11 @@ use mu_session::session::inbox;
 impl Agent {
     /// Takes queued steering text and pushes it as user messages. Returns whether any was pending.
     pub(super) fn take_steer(&mut self) -> bool {
-        let steer: Vec<UserInput> = self.ports.inbox.borrow_mut().steer.drain(..).collect();
+        let steer: Vec<UserInput> = {
+            let mut ib = self.ports.inbox.borrow_mut();
+            ib.urgent = false;
+            ib.steer.drain(..).collect()
+        };
         if !steer.is_empty() {
             publish(&self.ports.inbox, &self.ports.events);
         }

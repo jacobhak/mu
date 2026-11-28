@@ -18,7 +18,7 @@ use mu_base::config::MuBell;
 use mu_base::events::{
     ActionChoice, AgentEvent, Answer, AskQuestion, PlanMeta, QueueState, ReviewRequest, RewindPoint, StatusSnapshot,
 };
-use mu_base::events::{JobKind, SubagentState, SubagentStatus};
+use mu_base::events::{JobKind, SubagentStatus};
 use mu_base::message::UserInput;
 use mu_base::permissions::{ApprovalDecision, ApprovalRequest};
 use mu_base::text::truncate_text as trunc;
@@ -212,7 +212,7 @@ impl AgentView {
             || self.tr.thinking_active()
             || !self.tools.is_empty()
             || !self.calls.is_empty()
-            || self.jobs.iter().any(|j| j.state == SubagentState::Running)
+            || self.jobs.iter().any(|j| j.state.is_active())
     }
 
     /// Recomputes the arguments of streaming calls that got new bytes; at most once per frame,
@@ -373,7 +373,7 @@ impl AgentView {
                 if v.is_empty() {
                     self.jobs_committed.clear();
                 }
-                for r in v.iter().filter(|r| r.state != SubagentState::Running) {
+                for r in v.iter().filter(|r| !r.state.is_active()) {
                     if self.jobs_committed.insert(r.name.clone()) {
                         // Its file is final now, and the periodic read may not have seen the end of it:
                         // the app reads it on a blocking thread and commits the row when it has the cost.
@@ -450,7 +450,7 @@ impl AgentView {
                 self.retry_wait = None;
                 self.running = false;
                 self.turn_started = None;
-                let jobs_running = self.jobs.iter().any(|j| j.state == SubagentState::Running);
+                let jobs_running = self.jobs.iter().any(|j| j.state.is_active());
                 if self.bell.on_turn_end(aborted, jobs_running) && self.bell_cfg.turn_end {
                     fx.push(Effect::Ring);
                 }
@@ -471,7 +471,7 @@ impl AgentView {
     }
 
     pub(super) fn running_names(&self) -> Vec<String> {
-        self.jobs.iter().filter(|j| j.state == SubagentState::Running).map(|j| j.name.clone()).collect()
+        self.jobs.iter().filter(|j| j.state.is_active()).map(|j| j.name.clone()).collect()
     }
 
     /// Moves the inline marker over the running jobs by `by` places; past either end it is off.
@@ -533,7 +533,7 @@ impl AgentView {
         for c in &self.calls {
             out.extend(blocks::tool_streaming(&c.name, &c.args, spin, w));
         }
-        for j in self.jobs.iter().filter(|j| j.state == SubagentState::Running) {
+        for j in self.jobs.iter().filter(|j| j.state.is_active()) {
             let now = std::time::SystemTime::now();
             let mut rows = blocks::job_rows(
                 std::slice::from_ref(j),
@@ -604,7 +604,7 @@ impl App {
     /// A job's forwarded ports go when it stops: they name a process that is gone.
     fn drop_finished_forwards(&mut self) {
         let running: Vec<&str> =
-            self.agent.jobs.iter().filter(|j| j.state == SubagentState::Running).map(|j| j.name.as_str()).collect();
+            self.agent.jobs.iter().filter(|j| j.state.is_active()).map(|j| j.name.as_str()).collect();
         for job in self.forwards.stale(|j| running.contains(&j)) {
             let forwards = self.forwards.take_job(&job);
             self.unforward(forwards);
@@ -648,7 +648,7 @@ impl App {
             .jobs
             .iter()
             .filter(|j| j.kind == JobKind::Subagent)
-            .filter_map(|j| Some(Child { path: j.session.clone()?, running: j.state == SubagentState::Running }))
+            .filter_map(|j| Some(Child { path: j.session.clone()?, running: j.state.is_active() }))
             .collect();
         self.agent.spend.asked = true;
         self.agent.spend.last = Some(Instant::now());
@@ -761,7 +761,7 @@ mod tests {
     use super::super::keys::tests::test_app;
     use super::*;
     use crate::text::line::line_text;
-    use mu_base::events::{JobKind, StatusSnapshot};
+    use mu_base::events::{JobKind, StatusSnapshot, SubagentState};
     use mu_base::permissions::ApprovalScope;
     use mu_base::tool::ToolMeta;
     use std::time::{Duration, SystemTime};
