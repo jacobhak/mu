@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use mu_base::tool::{CHANGE_TEXT_MAX, FileChange, FileMeta, ToolMeta, ToolOutput};
 use omp_edit::modes::hashline::input::{Patch, SplitOptions};
 use omp_edit::modes::hashline::types::FileOp as HashlineOp;
-use omp_edit::modes::sloppy::parse::split_sloppy_sections;
+use omp_edit::modes::sloppy::SloppyEngine;
 use omp_edit::{
-    ApplyRequest, EditError, EditMode, EditResult, EditWriter, PathPolicy, Session, UrlResolution, WriteRequest,
-    WriteResponse, engine::FileOp, session::SessionConfig,
+    ApplyRequest, ArgSnapshot, EditError, EditMode, EditResult, EditWriter, ModeEngine, PathPolicy, Session,
+    UrlResolution, WriteRequest, WriteResponse, engine::FileOp, session::SessionConfig,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -31,7 +31,7 @@ pub(crate) struct Target {
 }
 
 impl Args {
-    /// The files the payload names: the same splitting and resolving the editor does.
+    /// The files the payload names, split and resolved as the editor does.
     pub(crate) fn targets(&self, t: &Tools) -> Result<Vec<Target>, String> {
         t.edit_targets(&self.input)
     }
@@ -366,15 +366,22 @@ impl Tools {
         }
     }
 
-    /// The files `input` writes: split by the active format's own splitter and resolved by the
-    /// editor's own policy, so the gate reads a payload as the editor does.
+    /// The files `input` writes: split by the active format's own parser and resolved by the
+    /// editor's own policy, so the gate reads a payload as the editor does. Sloppy mode asks the engine
+    /// itself, which routes `*** Update File:` hunks to a parser of their own; a payload neither parser
+    /// accepts names the paths its headers declare, and the editor refuses it before writing.
     pub(crate) fn edit_targets(&self, input: &str) -> Result<Vec<Target>, String> {
         self.edit_targets_in(mode(), input)
     }
 
     fn edit_targets_in(&self, mode: EditMode, input: &str) -> Result<Vec<Target>, String> {
         let authored: Vec<String> = if mode == EditMode::Sloppy {
-            split_sloppy_sections(input).map_err(|e| e.to_string())?.into_iter().map(|s| s.path).collect()
+            let engine = SloppyEngine { allow_fuzzy: true, fuzzy_threshold: 0.95 };
+            let args = ArgSnapshot { input: Some(input.to_string()), complete: true, ..Default::default() };
+            let mut paths = engine.inspect(&args).paths;
+            let mut seen = HashSet::new();
+            paths.retain(|p| seen.insert(p.clone()));
+            paths
         } else {
             let patch =
                 Patch::parse(input, &SplitOptions { cwd: Some(&self.cwd), path: None }).map_err(|e| e.to_string())?;
@@ -481,6 +488,12 @@ mod tests {
         let sloppy = "***  Edit   File: /abs/x\n*** Find\na\n*** Replace\nb";
         let targets = t.edit_targets_in(EditMode::Sloppy, sloppy).unwrap();
         assert_eq!(targets.iter().map(|x| x.authored.as_str()).collect::<Vec<_>>(), ["/abs/x"]);
+        for begin in ["", "*** Begin Patch\n"] {
+            let update = format!(
+                "{begin}*** Update File: a.txt\n@@\n-old\n+new\n*** Update File: /abs/b.txt\n@@\n x\n+y\n*** End Patch"
+            );
+            assert_eq!(abs(&update, EditMode::Sloppy), [some("/work/a.txt"), some("/abs/b.txt")], "{update}");
+        }
         assert!(t.edit_targets_in(EditMode::Hashline, "[local://plan.md#1A2B]\nPUT 1:\n+x").unwrap()[0].internal);
     }
 
